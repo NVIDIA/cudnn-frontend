@@ -159,6 +159,97 @@ def host(
 
 
 @cute.jit
+def paged_host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    lse_ptr: Optional[cute.Pointer],
+    sinks_ptr: cute.Pointer,
+    meta_ptr: cute.Pointer,
+    o_desc_ptr: cute.Pointer,
+    problem_size: Tuple[int, int, int, int, int, int],
+    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_ext: cutlass.Int64,
+    scale_softmax_log2: cutlass.Float32,
+    seq_q_lens_addr: cutlass.Int64,
+    thd_q_lens_ptr: Optional[cute.Pointer],
+    thd_kv_lens_ptr: Optional[cute.Pointer],
+    thd_lens_form: Optional[cutlass.Int32],
+    n_thd_units: cutlass.Int32,
+    block_table_ptr: cute.Pointer,
+    block_table_v_ptr: cute.Pointer,
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    n_pages: cutlass.Int32,
+    kernel: cutlass.Constexpr,
+    qh: cutlass.Constexpr[int],
+    kh: cutlass.Constexpr[int],
+    d_qk: cutlass.Constexpr[int],
+    d_v: cutlass.Constexpr[int],
+    persistent_ctas: cutlass.Constexpr[int],
+    thd_max_sq: cutlass.Constexpr[int],
+    stream: cuda_driver.CUstream,
+):
+    q, k, v, o, lse, sinks, q_lens, kv_lens, thd_q_lens, thd_kv_lens, n_ctas = _operands(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        lse_ptr,
+        sinks_ptr,
+        meta_ptr,
+        problem_size,
+        q_strides,
+        k_strides,
+        v_strides,
+        o_strides,
+        lse_strides,
+        lse_ext,
+        seq_q_lens_addr,
+        thd_q_lens_ptr,
+        thd_kv_lens_ptr,
+        thd_lens_form,
+        n_thd_units,
+        kernel,
+        qh,
+        kh,
+        d_qk,
+        d_v,
+        persistent_ctas,
+        thd_max_sq,
+    )
+    b, _, _, _, skv, _ = problem_size
+    n_blocks = skv // kernel.page_size
+    table = cute.make_tensor(block_table_ptr, cute.make_layout((b, n_blocks), stride=table_strides))
+    table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout((b, n_blocks), stride=table_v_strides))
+    kernel(
+        q,
+        k,
+        v,
+        o,
+        lse,
+        sinks,
+        q_lens,
+        kv_lens,
+        scale_softmax_log2,
+        cutlass.Int32(thd_max_sq),
+        thd_q_lens,
+        thd_kv_lens,
+        thd_lens_form,
+        n_ctas,
+        stream,
+        prepared=True,
+        block_table=table,
+        block_table_v=table_v,
+    )
+
+
+@cute.jit
 def fp8_host(
     q_ptr: cute.Pointer,
     k_ptr: cute.Pointer,
@@ -287,6 +378,7 @@ def compile_host(
     has_amax=False,
     scale_o_in_combine=False,
     sfo_geometry=None,
+    kv_dtype=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -300,10 +392,10 @@ def compile_host(
     fp8 = output_dtype is not None
     strides = (cutlass.Int64(0),) * 3
     return compile_cached(
-        fp8_host if fp8 else host,
+        fp8_host if fp8 else (paged_host if getattr(kernel, "page_size", 0) else host),
         ptr(dtype),
-        ptr(dtype),
-        ptr(dtype),
+        ptr(dtype if kv_dtype is None else kv_dtype),
+        ptr(dtype if kv_dtype is None else kv_dtype),
         ptr(output_dtype if fp8 else dtype),
         ptr(cutlass.Float32, 4) if has_lse else None,
         ptr(cutlass.Float32, 4),
@@ -322,6 +414,11 @@ def compile_host(
         ptr(cutlass.Int32, 4) if kernel.thd_varlen else None,
         cutlass.Int32(0) if kernel.thd_varlen else None,
         cutlass.Int32(0),
+        *(
+            (ptr(cutlass.Int32, 4), ptr(cutlass.Int32, 4), (cutlass.Int64(0),) * 2, (cutlass.Int64(0),) * 2, cutlass.Int32(0))
+            if getattr(kernel, "page_size", 0)
+            else ()
+        ),
         *(
             (ptr(cutlass.Float32, 4),) * 3
             + (

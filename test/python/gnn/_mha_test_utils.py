@@ -14,6 +14,8 @@ def _require_gnn_mha(variant: str) -> None:
         pytest.skip(f"cudnn-frontend was built without cudnnGnnMha{variant.title().replace('_', '')} support")
     if cudnn.backend_version() < 92800:
         pytest.skip("GAT and GATv2 require cuDNN 9.28.0 or newer")
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("the GAT / GATv2 backend requires SM 8.0 or newer")
 
 
 def _tolerances(dtype: torch.dtype) -> tuple[float, float]:

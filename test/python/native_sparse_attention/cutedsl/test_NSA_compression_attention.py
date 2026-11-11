@@ -15,6 +15,16 @@ from native_sparse_attention.cutedsl.nsa_utils import (
 from native_sparse_attention.cutedsl.nsa_reference import check_ref_nsa_compression_attention
 
 
+def _requires_tcgen05():
+    """This API runs an SM100-family tcgen05 kernel and declines cc 12.x in check_support() (#2169); skip there instead of
+    reaching that RuntimeError. The other NSA APIs (selection, SWA) serve cc 12.x, so the shared nsa_init gate stays as it is."""
+    from cudnn.tensor_adapter import has_tcgen05
+
+    major, minor = torch.cuda.get_device_capability()
+    if not has_tcgen05(major):
+        pytest.skip(f"requires an SM100-family (tcgen05) device, found SM{major}{minor}")
+
+
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 @with_nsa_compression_attention_params
@@ -36,6 +46,8 @@ def test_nsa_compression_compile_execute(
         from cuda.bindings import driver as cuda
     except ImportError as e:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    _requires_tcgen05()
 
     cfg = nsa_init(
         request=request,
@@ -128,6 +140,8 @@ def test_nsa_compression_wrapper(
         from cuda.bindings import driver as cuda
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+
+    _requires_tcgen05()
 
     cfg = nsa_init(
         request=request,

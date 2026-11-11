@@ -165,6 +165,19 @@ def _in_axis_order_of(shape, stride, reference_stride):
     return tuple(shape[a] for a in permutation), tuple(stride[a] for a in permutation)
 
 
+def _nhwc_stride(dim):
+    """Mirror the C++ graph's packed NHWC output-layout inference."""
+    if len(dim) < 2:
+        return _row_major_stride(dim)
+    fastest_to_slowest = [1, *range(len(dim) - 1, 1, -1), 0]
+    stride = [0] * len(dim)
+    product = 1
+    for axis in fastest_to_slowest:
+        stride[axis] = product
+        product *= dim[axis]
+    return stride
+
+
 def _python_plan_deserialize_args(args: tuple, kwargs: Dict[str, Any]):
     """``(handle, data, enforce_precompiled)`` when a deserialize call carries a python-engine
     plan blob, else None. Mirrors the two classic overloads: ``(data)`` and
@@ -958,6 +971,25 @@ class pygraph:
         try:
             for node in self._nodes:
                 node.infer_properties(self._context)
+                if node.node_type == NodeType.CUSTOM_REDUCTION:
+                    reduction_dims = node.params["reduction_dims"]
+                    for i in range(node.params["_stream_count"]):
+                        input_tensor = node.inputs[f"X{i}"]
+                        output_tensor = node.outputs[f"Y{i}"]
+                        # The builder copied the input type. Copy it again, because the input type can change after
+                        # that, unless the caller set the output type.
+                        if not output_tensor.data_type_assigned and input_tensor.data_type is not None:
+                            output_tensor.data_type = input_tensor.data_type
+                        if not output_tensor.dim and input_tensor.dim:
+                            output_dim = list(input_tensor.dim)
+                            if all(0 <= dim < len(output_dim) for dim in reduction_dims):
+                                for dim in reduction_dims:
+                                    output_dim[dim] = 1
+                                output_tensor.dim = output_dim
+                        # The native node gets only an assigned stride and infers packed NHWC otherwise
+                        # (CustomReductionNode::infer_properties_node).
+                        if output_tensor.dim and not output_tensor.stride_assigned:
+                            output_tensor.stride = _nhwc_stride(output_tensor.dim)
                 # Table-driven shape inference, topologically: builder-time infer
                 # only sees graph-input dims; chained ops (e.g. conv on a virtual
                 # relu output) get their output dims here, once inputs are known.
@@ -1068,6 +1100,21 @@ class pygraph:
             return None
         facts = self._facts_for(analyzer)
         return None if facts is None else guard(self, facts)
+
+    def _backend_engine_exclusions(self) -> Dict[int, str]:
+        """Backend engines (global ids) a family keeps off this graph, each with the reason
+        (``manifest.EngineFamily.backend_engine_guard``). Planning drops their configs from the backend's list
+        (``backend_plan_entries``) and an explicit pin of one is a typed decline (``_append_backend_plan``)."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return {}
+        guard, analyzer = manifest.resolve_backend_engine_guard(family), manifest.resolve_analyzer(family)
+        if guard is None or analyzer is None:
+            return {}
+        facts = self._facts_for(analyzer)
+        return {} if facts is None else dict(guard(self, facts))
 
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
@@ -1284,7 +1331,7 @@ class pygraph:
         for node in self._nodes:
             if has_convolution and node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE and len(node.params.get("block_size") or ()) == 5:
                 return node
-            if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE):
+            if node.node_type in (NodeType.MATMUL, NodeType.POINTWISE, NodeType.CUSTOM_REDUCTION):
                 continue
             spec_entry = _CAPTURED_BY_TYPE.get(node.node_type) or _STRUCTURED_BY_TYPE.get(node.node_type)
             if spec_entry is None:
@@ -1391,10 +1438,10 @@ class pygraph:
         from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
 
         # One entry per DISTINCT (engine, knobs). Graph::create_execution_plans
-        # checks override_heuristics_query() and returns before reading the mode
-        # -- deterministic SDPA backward and FP8 backward override -- so every
-        # per-mode call appends the same config. First index wins; it is the one
-        # whose mode span is real.
+        # enqueues a node's preferred config (INode::override_heuristics_query:
+        # the deterministic SDPA backward, half and FP8) ahead of each mode's
+        # configs, so every per-mode call appends it again. First index wins; it
+        # is the one whose mode span is real.
         entries, seen = [], set()
         for i in range(self._lowered_graph.get_execution_plan_count()):
             engine_id, knobs = self._lowered_graph.get_engine_and_knobs_at_index(i)
@@ -1403,10 +1450,21 @@ class pygraph:
                 continue
             seen.add(key)
             entries.append(PlanConfig(engine_id, knobs, cpp_index=i, mode=self._mode_of_backend_plan(i)))
+        excluded = self._backend_engine_exclusions()
+        dropped = sorted({int(e.engine_id) for e in entries if int(e.engine_id) in excluded})
+        for engine in dropped:
+            _LOG.info("backend engine %d is not offered for this graph: %s", engine, excluded[engine])
+        entries = [e for e in entries if int(e.engine_id) not in excluded]
+        if dropped and not entries:
+            self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
-        if asked_oss or (not entries and self._lowered_graph.get_engine_count()):
+        # The delegating entry lets C++ pick from its own unfiltered list, so it would hand an excluded engine back:
+        # withheld whenever the guard dropped one.
+        if dropped and asked_oss:
+            _LOG.info("the OPENSOURCE delegating entry is withheld: its fallback list holds excluded engines %s", dropped)
+        if not dropped and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because
@@ -1726,6 +1784,9 @@ class pygraph:
         nor selected by the plain calls. Everything downstream therefore has to
         address it BY INDEX — which is why this returns one."""
         self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
+        reason = self._backend_engine_exclusions().get(int(engine_id))
+        if reason is not None:
+            raise cudnn_graph_not_supported(reason)
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for
         at = self._lowered_graph.get_execution_plan_count()
         self._lowered_graph.create_execution_plan(engine_id, knobs or {})
@@ -2746,36 +2807,42 @@ class pygraph:
 
         tensor_map: Dict[int, Any] = {}
 
-        def lower_tensor(t: Tensor) -> Any:
-            if t.uid in tensor_map:
-                return tensor_map[t.uid]
-            if t.pass_by_value is not None and t.scalar_type is not None:
-                cpp = graph.tensor_scalar(t.pass_by_value, t.scalar_type)
-                cpp.set_uid(t.uid)
+        def tensor_lowerer(owner: Any) -> Any:
+            # Lowers IR tensors into `owner`, the C++ graph or a weak proxy to it.
+            def lower_tensor(t: Tensor) -> Any:
+                if t.uid in tensor_map:
+                    return tensor_map[t.uid]
+                if t.pass_by_value is not None and t.scalar_type is not None:
+                    cpp = owner.tensor_scalar(t.pass_by_value, t.scalar_type)
+                    cpp.set_uid(t.uid)
+                    tensor_map[t.uid] = cpp
+                    return cpp
+                mk_kwargs = dict(
+                    dim=t.dim,
+                    stride=t.stride,
+                    is_virtual=t.is_virtual,
+                    is_pass_by_value=t.is_pass_by_value,
+                    name=t.name,
+                    # Always propagate the IR uid so execute()'s variant pack (keyed
+                    # by IR uid) matches; otherwise cuDNN assigns its own and the
+                    # buffers never bind. IR uids are unique and positive.
+                    uid=t.uid,
+                )
+                if t.data_type is not None:  # else NOT_SET → cuDNN infers from the
+                    mk_kwargs["data_type"] = _library_type(t.data_type)  # graph intermediate default
+                if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
+                    mk_kwargs["reordering_type"] = t.reordering_type
+                if t.ragged_offset is not None:
+                    mk_kwargs["ragged_offset"] = lower_tensor(t.ragged_offset)
+                    if t.ragged_offset_multiplier not in (None, 1):  # non-default only
+                        mk_kwargs["ragged_offset_multiplier"] = t.ragged_offset_multiplier
+                cpp = owner._make_tensor(**mk_kwargs)
                 tensor_map[t.uid] = cpp
                 return cpp
-            mk_kwargs = dict(
-                dim=t.dim,
-                stride=t.stride,
-                is_virtual=t.is_virtual,
-                is_pass_by_value=t.is_pass_by_value,
-                name=t.name,
-                # Always propagate the IR uid so execute()'s variant pack (keyed
-                # by IR uid) matches; otherwise cuDNN assigns its own and the
-                # buffers never bind. IR uids are unique and positive.
-                uid=t.uid,
-            )
-            if t.data_type is not None:  # else NOT_SET → cuDNN infers from the
-                mk_kwargs["data_type"] = _library_type(t.data_type)  # graph intermediate default
-            if t.reordering_type is not None:  # e.g. F8_128x4 for block-scale SFs
-                mk_kwargs["reordering_type"] = t.reordering_type
-            if t.ragged_offset is not None:
-                mk_kwargs["ragged_offset"] = lower_tensor(t.ragged_offset)
-                if t.ragged_offset_multiplier not in (None, 1):  # non-default only
-                    mk_kwargs["ragged_offset_multiplier"] = t.ragged_offset_multiplier
-            cpp = graph._make_tensor(**mk_kwargs)
-            tensor_map[t.uid] = cpp
-            return cpp
+
+            return lower_tensor
+
+        lower_tensor = tensor_lowerer(graph)
 
         def push_output_attrs(out_t: Tensor, cpp_t: Any) -> None:
             # Every attribute a user may set on an OP OUTPUT via the classic
@@ -2826,6 +2893,31 @@ class pygraph:
                 if node.compute_data_type is not None:
                     extra["compute_data_type"] = _library_type(node.compute_data_type)
                 cpp_out = getattr(graph, node.params["mode"])(*inputs, name=node.name, **extra)
+            elif node.node_type == NodeType.CUSTOM_REDUCTION:
+                stream_count = node.params["_stream_count"]
+                kwargs = dict(
+                    inputs=[tensor_map[node.inputs[f"X{i}"].uid] for i in range(stream_count)],
+                    # Keep the lowering adapter's graph reference weak while the native node retains the reducer.
+                    reducer=_custom_reduction_callback(node.params["reducer"], tensor_lowerer(weakref.proxy(graph))),
+                    reducer_semantic_key=node.params["reducer_semantic_key"],
+                    reduction_dims=node.params["reduction_dims"],
+                    identity_values=node.params["identity_values"],
+                    name=node.name,
+                )
+                compute_data_types = node.params.get("compute_data_types")
+                if compute_data_types is not None:
+                    kwargs["compute_data_types"] = [_library_type(data_type) for data_type in compute_data_types]
+                compute_data_type = node.params.get("compute_data_type")
+                if compute_data_type is not None:
+                    kwargs["compute_data_type"] = _library_type(compute_data_type)
+                cpp_outs = list(graph.custom_reduction(**kwargs))
+                if len(cpp_outs) != stream_count:
+                    raise RuntimeError(f"custom_reduction returned {len(cpp_outs)} outputs for {stream_count} input streams")
+                for i, cpp_t in enumerate(cpp_outs):
+                    out_t = node.outputs[f"Y{i}"]
+                    tensor_map[out_t.uid] = cpp_t
+                    push_output_attrs(out_t, cpp_t)
+                continue
             elif node.node_type in _CAPTURED_BY_TYPE:
                 # Captured op (sdpa family): rebuild the original kwargs —
                 # tensor ports (port == C++ kwarg) map through tensor_map,
@@ -2939,6 +3031,110 @@ class pygraph:
 
         self._cpp_tensors = tensor_map
         return graph
+
+
+class _CustomReductionOutput(Tensor):
+    """A custom-reduction output. validate() derives its type from the input type until the caller sets one."""
+
+    data_type_assigned = False
+
+    def set_data_type(self, dtype: Any) -> "Tensor":
+        super().set_data_type(dtype)
+        self.data_type_assigned = True
+        return self
+
+
+def _custom_reduction(
+    self,
+    inputs,
+    reducer,
+    reducer_semantic_key,
+    reduction_dims,
+    identity_values,
+    *,
+    compute_data_types=None,
+    compute_data_type=None,
+    name="",
+):
+    """Define a variadic reduction using a callback-built scalar subgraph.
+
+    ``reducer`` receives ``(child_graph, lhs, rhs)`` while the cuDNN
+    operation graph is built and must return one child tensor per
+    input stream. The child graph proxy is intended for callback-scoped graph
+    construction. A retained reference remains memory-safe, but do not edit
+    the child graph after the callback returns: the frontend does not check
+    such an edit, and the edit can reach the reducer body that cuDNN gets.
+    ``reducer_semantic_key`` participates in the graph key and must change
+    whenever callback behavior changes. ``compute_data_types`` sets one compute
+    type per stream and ``compute_data_type`` sets one type for every stream;
+    give at most one of them. With neither, each stream computes in its own type.
+    """
+    input_values = list(inputs)
+    identities = list(identity_values)
+    dimensions = list(reduction_dims)
+    compute_types = None if compute_data_types is None else list(compute_data_types)
+
+    if not input_values:
+        raise ValueError("custom_reduction requires at least one input stream")
+    if not callable(reducer):
+        raise TypeError("custom_reduction reducer must be callable")
+    if len(identities) != len(input_values):
+        raise ValueError("custom_reduction identity_values must contain one identity per input stream")
+    if compute_types is not None and len(compute_types) != len(input_values):
+        raise ValueError("custom_reduction compute_data_types must contain one type per input stream")
+    if compute_types is not None and compute_data_type is not None:
+        raise ValueError("custom_reduction takes compute_data_types or compute_data_type, not both")
+
+    name_ = self._get_name("custom_reduction", name)
+    node = Node(name_, NodeType.CUSTOM_REDUCTION)
+    node.params.update(
+        reducer=reducer,
+        reducer_semantic_key=reducer_semantic_key,
+        reduction_dims=dimensions,
+        identity_values=identities,
+        compute_data_types=compute_types,
+        compute_data_type=compute_data_type,
+        _stream_count=len(input_values),
+    )
+
+    outputs = []
+    for i, value in enumerate(input_values):
+        if value is None:
+            raise ValueError(f"custom_reduction input stream {i} is not set")
+        input_tensor = self._ensure_tensor(value, name=f"{name_}::X{i}")
+        node.inputs[f"X{i}"] = input_tensor
+
+        output = _CustomReductionOutput(name=f"{name_}::Y{i}", is_virtual=True, uid=self._alloc_uid())
+        output.data_type = input_tensor.data_type
+        if output.data_type is None:
+            output.data_type = self._context.intermediate_data_type if input_tensor.is_virtual else self._context.io_data_type
+        if input_tensor.dim and all(0 <= dim < len(input_tensor.dim) for dim in dimensions):
+            output.dim = list(input_tensor.dim)
+            for dim in dimensions:
+                output.dim[dim] = 1
+            output.stride = _nhwc_stride(output.dim)
+
+        node.outputs[f"Y{i}"] = output
+        self._register_tensor(output)
+        outputs.append(output)
+
+    self._nodes.append(node)
+    return outputs
+
+
+def _custom_reduction_callback(reducer, lower_tensor):
+    """_wrap_callback for a reducer, which can also return a captured parent tensor: lower the returned tensors too."""
+    wrapped = _wrap_callback(reducer, lower_tensor)
+
+    def callback(*args):
+        return [lower_tensor(value) if isinstance(value, Tensor) else value for value in wrapped(*args)]
+
+    return callback
+
+
+_custom_reduction.__name__ = "custom_reduction"
+_custom_reduction.__qualname__ = "pygraph.custom_reduction"
+setattr(pygraph, "custom_reduction", _custom_reduction)
 
 
 def _install_pointwise_builders() -> None:

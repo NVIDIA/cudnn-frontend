@@ -91,7 +91,6 @@ from __future__ import annotations
 import math
 from functools import partial
 from typing import Any, cast
-import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -120,24 +119,8 @@ from cutlass.utils.blackwell_helpers import (
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
-from cudnn.api_base import WorkspaceCarver, ws_align
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.copy import cpasync_reduce_bulk_add_f32, red_global_add_f32x4
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-    torch_stream_context as _torch_stream_context,
-)
-from cudnn.frost.buffers import memset_zero_async
-
-from .deterministic_dk_sm100 import (
-    DEFAULT_DK_PLANES,
-    deterministic_dk_producer_ctas,
-    deterministic_dk_planes_bytes,
-    deterministic_dk_workspace_bytes,
-    compile_reduce_deterministic_dk,
-    reduce_deterministic_dk,
-    validate_deterministic_dk_plane_policy,
-)
 
 mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
@@ -722,7 +705,9 @@ class IndexerBackwardSm100:
         batch_size = cute.size(mQ.shape[3]) if cute.rank(mQ.shape) > 3 else 1
 
         if const_expr(self.deterministic):
-            launch_grid = (self.persistent_grid_size, 1, 1)
+            # One CTA per producer plane, never more CTAs than rows (deterministic_dk_producer_ctas): planes past the
+            # launched CTAs stay as the memset left them, and the reducer folds every plane in fixed order.
+            launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1)
         else:
             launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1) if self.use_persistent else (seqlen, batch_size, 1)
         self.kernel_gemm(
@@ -3347,13 +3332,19 @@ def indexer_backward_sm100(
     block_I=128,
     topk_indices_global: bool = True,
     deterministic: bool = False,
-    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
+    deterministic_dk_planes: int | None = None,
 ):
     """Build the SM100 backward pipeline for one plan signature.
 
     ``deterministic=True`` replaces the cross-CTA dK atomic target with
     fixed-owner CTA-private planes and a trailing fixed-order reduction.
+    ``deterministic_dk_planes=None`` selects ``DEFAULT_DK_PLANES``.
     """
+    # deterministic_dk_sm100 imports torch; keep it lazy so the JAX bindings import without torch.
+    from .deterministic_dk_sm100 import DEFAULT_DK_PLANES, validate_deterministic_dk_plane_policy
+
+    if deterministic_dk_planes is None:
+        deterministic_dk_planes = DEFAULT_DK_PLANES
     deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
     # ``batch``/``seqlen``/``seqlen_k`` are runtime extents (packed training
     # changes them every step, GitHub #1188). They only select the persistent
@@ -3660,6 +3651,9 @@ def _score_grad_inplace_cute(
     dIndexK_f32=None,
     current_stream=None,
 ):
+    # torch-dependent helpers are imported lazily so the JAX bindings can import the kernel classes without torch.
+    from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream as _resolve_stream
+
     # Kernel reads ``mGradLoss[0]`` so it must be at least 1-D. ``to_cute_tensor``
     # defaults ``leading_dim = ndim - 1`` which collapses to -1 for a 0-D scalar
     # and trips cute's layout validator. The public wrapper reshapes upstream;
@@ -3704,6 +3698,8 @@ def _score_grad_inplace(
     #   target = clip(log_target)
     # dL/dlog_predict = -exp(target) * I(log_predict >= -100)
     # dL/dlogits = g - predict * sum(g)
+    import torch  # lazy: see _score_grad_inplace_cute
+
     can_use_cute = (
         AttnScore.is_cuda
         and IndexScore.is_cuda
@@ -3748,7 +3744,7 @@ def _build_cute_dsl_kernel(
     block_I,
     topk_indices_global: bool = True,
     deterministic: bool = False,
-    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
+    deterministic_dk_planes: int | None = None,
 ):
     """Create score/GEMM runners for one launch policy.
 
@@ -3756,11 +3752,34 @@ def _build_cute_dsl_kernel(
     for that output dtype from fake operands (R11), so plan compile does the
     build; a direct ``gemm_only`` caller still compiles on first use.
     """
+    import torch  # lazy: the JAX bindings import this module without torch installed
+
+    from cudnn.api_base import WorkspaceCarver, ws_align
+    from cudnn.deepseek_sparse_attention.utils.runtime import (
+        resolve_stream as _resolve_stream,
+        torch_stream_context as _torch_stream_context,
+    )
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor
+    from cudnn.frost.buffers import memset_zero_async
+
+    from .deterministic_dk_sm100 import (
+        DEFAULT_DK_PLANES,
+        compile_reduce_deterministic_dk,
+        deterministic_dk_planes_bytes,
+        deterministic_dk_producer_ctas,
+        deterministic_dk_workspace_bytes,
+        reduce_deterministic_dk,
+    )
+
+    if deterministic_dk_planes is None:
+        deterministic_dk_planes = DEFAULT_DK_PLANES
 
     persistent_grid_size = None
     if deterministic:
-        persistent_grid_size = deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
+        # The plane count is the compiled bound and the launch takes min(rows, planes) at run time (as the ordinary persistent
+        # path does with the SM count), so a new packed B / S_q does not recompile; the row count is still validated here.
+        deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
+        persistent_grid_size = deterministic_dk_planes
     if persistent_grid_size is None:
         persistent_grid_size = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 

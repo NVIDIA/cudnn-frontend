@@ -50,6 +50,7 @@ import cudnn
 
 from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import (
+    DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
     DTYPE_E4M3,
     DTYPE_E5M2,
@@ -144,6 +145,8 @@ _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
 # causal walks take plain LPT (see _sched_points): 8 MiB sits between the measured
 # S=8K bf16 (4 MiB, LPT ahead) and S=32K bf16 (16 MiB, LPT_L2 ahead) points.
 _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
+# Per-KV-head K+V footprint below which the quantized d128 GQA causal arm of the 107 line proposes plain LPT first.
+_SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES = 2 * 1024 * 1024
 # Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
 # (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
@@ -152,7 +155,7 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # 256 = the 2-CTA flavors' q rows per cluster; measured on the 212-SM part (106 clusters).
 _SM107_CGA_Q_ROWS = 256
 _SM107_MEASURED_SMS = 212
-_SM107_NO_GQA_LPT_MAX_WAVES = 24
+_SM107_NO_GQA_LPT_MAX_WAVES = 8
 # Rubin half THD causal prefill on the d128 flavor without packing: LPT ahead of NATURAL up to ~10 waves (9.48 and 11.85
 # measured; 311 FI-path cells, ragged and paged, 2026-11-01). d256 measured mixed from 5 waves on and keeps NATURAL.
 _SM107_THD_LPT_MAX_WAVES = 10
@@ -162,6 +165,8 @@ _SM107_THD_LPT_MAX_WAVES = 10
 _SM100_D192_PAIR_ROWS = 512
 _SM100_MEASURED_SMS = 148
 _SM100_D192_LPT_MAX_WAVES = 12
+# GB10 (cc 12.1): its SM count, the fallback where the graph facts carry none (the causal NATURAL rule in _sched_points).
+_SM121_MEASURED_SMS = 48
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -657,7 +662,8 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # is the rule's host reading, the one the split model prices a launch's combine
 # by; it answers False off cc 10.7, where the module's own forms (measured on
 # B200 / B300 by their author) serve every launch.
-DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
+# DECODE_COMBINE_MAX_LEAN_BLOCKS is re-exported from the shared tile constants
+# so the reduction kernel can read the same bound without an adapter cycle.
 # The split-aware FORM rule the adapter pins a split launch's combine entry to
 # (decode_combine_grid_selected; the kernel module's own entry takes the
 # decode-grid kernel on every launch inside its bound, so the adapter forces the
@@ -741,8 +747,8 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     Blackwell line (cc 10.0 / 10.3), whose launches keep the module's own forms, and any line the rule was
     never measured on (``_DECODE_COMBINE_RULE_CC`` is the one line it holds for); ``None`` reads the cc 10.7
     rule (the model's direct callers; a plan always names its device).  The sparse adapter's LEAN plans on the Blackwell parts of
-    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0) evaluate this rule at the measured line's cc on purpose
-    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 class; the table sits there)."""
+    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0 / 10.3) evaluate this rule at the measured line's cc on purpose
+    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 and GB300 classes; the tables sit there)."""
     if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
         return False
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
@@ -1517,6 +1523,16 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # proposes LPT on cc 10.3, where LPT vs LPT_L2 is unmeasured; it follows the
         # existing B200-measured precedent of the decode-tile arm above, keyed the same way.
         primary = SCHED_LPT
+    elif (
+        causal_ish
+        and 107 <= caps.sm_lo < 120
+        and (facts.is_fp8 or facts.is_mxfp8)
+        and _selected_d_shape(caps, facts) == (128, 128)
+        and int(facts.h_q) != int(facts.h_kv)
+        and int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) < _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES
+    ):
+        # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
+        primary = SCHED_LPT
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -1551,6 +1567,24 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             # 1.04x vs 1.07x, S=32K packed 1.11x vs 1.07x (16 MiB/head: L2 wins);
             # e4m3 64/64 S=2K cga1 1.19x vs 1.33x, 64/8 S=2K/8K packed equal.
             primary = SCHED_LPT
+        if (
+            tuple(facts.device_cc or ()) == (12, 1)
+            and caps.sm_lo == 120
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and _selected_d_shape(caps, facts) in ((64, 64), (128, 128))
+            and facts.window_left is None
+            and int(facts.b) * int(facts.h_q) > int(facts.device_sm_count or _SM121_MEASURED_SMS)
+        ):
+            # GB10 (cc 12.1: 48 SMs, 24 MiB L2, LPDDR5X): with more (batch, head) streams than SMs the natural walk
+            # keeps each resident wave on a few heads' K/V, while both LPT walks spread it over as many heads as there
+            # are SMs -- the cc 10.3 d192 rule above, measured here on the d64 / d128 half kernels.  MEASURED on GB10
+            # (cuDNN 9.27.0.42, bf16, bottom-right causal dense prefill, every policy of the 128x128 tile timed
+            # round-robin): a 145-cell MHA grid (b 1-16, h 8-32, S 512-8192) and a 320-cell holdout off it (b 3-12,
+            # h 12-40, GQA 1 / 4 / 8, S 768-6144); against LPT_L2 first, NATURAL/LPT_L2 ran 0.49x at b*h = 512 and 1.08-1.11x
+            # at b*h <= 16, and the rule took the holdout's geomean regret from 1.384 to 1.005, two of 320 cells over 3 % slower
+            # (max 1.083x, within run-to-run spread).
+            # RTX 5060 Ti / PRO 6000 (cc 12.0) keep the L2-budget rule: LPT_L2 measured even or ahead there.
+            primary = SCHED_NATURAL
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
@@ -2081,6 +2115,8 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # The SM100 nonpaged D128 half THD graphs with one query head per KV head run the single-CTA two-slab prefill body
         # (engines.sm100_nonpaged_d128_thd_single_cta_leg); the pair tile stays a runner.
         return sched_policy, 1
+    if selected_shape == (128, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
+        return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
@@ -2099,6 +2135,8 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
+    if selected_shape == (192, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
+        return SCHED_LPT, 1
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)

@@ -217,7 +217,7 @@ PyGraph::instancenorm_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_att
 }
 
 void
-init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
+init_pygraph_norm_submodule(PyGraphClass& m) {
     m.def("batchnorm",
           &PyGraph::batchnorm,
           py::arg("input"),

@@ -46,11 +46,18 @@ qwen_3_5_gdn_block_verify = fi_block.qwen_3_5_gdn_block_verify
 from cudnn.linear_attention.frost import flashinfer_gdn_backend as backend  # noqa: E402  (the import registers "frost_fe")
 from cudnn.linear_attention.frost import gdn_decode_fused as entry  # noqa: E402
 from cudnn.linear_attention.frost import gdn_verify_fused as ventry  # noqa: E402
+from cudnn.linear_attention.frost.kernel import gdn_geometry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_verify_fused_config as kvcfg  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
 GEOMETRY = Qwen35GdnGeometry(**backend.GEOMETRY)
+# the per-rank geometries of the larger dense models in FlashInfer's field names: (K heads, V heads, d_model) at 16- / 8- / 4-way tensor
+# parallelism of a d_model-8192 model and at 4-way of a d_model-4096 one
+RANK_GEOMETRIES = [
+    Qwen35GdnGeometry(d_model=d, num_v_heads=v, num_k_heads=k, head_k_dim=128, head_v_dim=128, conv_kernel=4)
+    for k, v, d in ((1, 8, 8192), (2, 16, 8192), (4, 32, 8192), (4, 16, 4096))
+]
 CPU = torch.device("cpu")
 F32, BF16 = torch.float32, torch.bfloat16
 ROWS = [1, 2, 3, 4, 8, 16, 64]  # FlashInfer's decode rows (the last row a padding row from two rows on)
@@ -74,62 +81,66 @@ def _spec(device=CPU, rows=2, param_dtypes=(F32, BF16, BF16), form="decode", tok
     return fi_api.Qwen35GdnPlanSpec(backend.BACKEND, form, rows, tokens, GEOMETRY, torch.device(device), tuple(param_dtypes))
 
 
-def _tensors(rows, device, slots=None, seed=0):
-    """One decode call's tensors in FlashInfer's serving layout: ``qkv`` / ``z`` views of one QKVZ slab, the conv pool channel-innermost
-    (``[slots, 3, C]`` transposed to the ``[slots, C, 3]`` view), the kernel-native parameter dtypes."""
+def _tensors(rows, device, slots=None, seed=0, geometry=GEOMETRY):
+    """One decode call's tensors in FlashInfer's serving layout at ``geometry`` (the kernels' default when not given): ``qkv`` / ``z`` views
+    of one QKVZ slab, the conv pool channel-innermost (``[slots, 3, C]`` transposed to the ``[slots, C, 3]`` view), the kernel-native
+    parameter dtypes."""
     slots = rows + 1 if slots is None else slots
+    C, NV, D = geometry.conv_dim, geometry.num_v_heads, geometry.d_model
     g = torch.Generator().manual_seed(seed)
 
     def rn(*shape):
         return torch.randn(*shape, generator=g).to(device)
 
-    qkvz = (rn(rows, 16384) * 2).bfloat16()
+    qkvz = (rn(rows, C + geometry.value_dim) * 2).bfloat16()
     return dict(
-        qkv=qkvz[:, :10240],
-        z=qkvz[:, 10240:].view(rows, 48, 128),
-        hidden=rn(rows, 5120).bfloat16(),
-        ba_weight=(rn(96, 5120) / 5120**0.5).bfloat16(),
-        A_log=rn(48) * 0.5,
-        dt_bias=(rn(48) * 0.5).bfloat16(),
-        ssm_state=rn(slots, 48, 128, 128) * 0.1,
+        qkv=qkvz[:, :C],
+        z=qkvz[:, C:].view(rows, NV, 128),
+        hidden=rn(rows, D).bfloat16(),
+        ba_weight=(rn(2 * NV, D) / D**0.5).bfloat16(),
+        A_log=rn(NV) * 0.5,
+        dt_bias=(rn(NV) * 0.5).bfloat16(),
+        ssm_state=rn(slots, NV, 128, 128) * 0.1,
         state_indices=torch.arange(1, rows + 1, dtype=torch.int32).to(device),
         norm_weight=(1 + 0.2 * rn(128)).bfloat16(),
         out_scale=torch.tensor([0.02], device=device),
-        conv_state=rn(slots, 3, 10240).bfloat16().transpose(1, 2),
-        conv_weight=(0.3 * rn(10240, 4)).bfloat16(),
-        out=torch.empty(rows, 48, 128, dtype=torch.float8_e4m3fn, device=device),
+        conv_state=rn(slots, 3, C).bfloat16().transpose(1, 2),
+        conv_weight=(0.3 * rn(C, 4)).bfloat16(),
+        out=torch.empty(rows, NV, 128, dtype=torch.float8_e4m3fn, device=device),
     )
 
 
-def _verify_tensors(requests, tokens, device, seed=0):
-    """One verify call's tensors in FlashInfer's layout: ``state_indices`` ``[requests, T]``, the conv pool channel-innermost (``[slots, T + 2,
-    C]`` transposed to the ``[slots, C, T + 2]`` view), ``cu_seqlens`` / ``num_accepted_tokens`` int32, every request fully accepted."""
+def _verify_tensors(requests, tokens, device, seed=0, geometry=GEOMETRY):
+    """One verify call's tensors in FlashInfer's layout at ``geometry``: ``state_indices`` ``[requests, T]``, the conv pool
+    channel-innermost (``[slots, T + 2, C]`` transposed to the ``[slots, C, T + 2]`` view), ``cu_seqlens`` / ``num_accepted_tokens`` int32,
+    every request fully accepted."""
     rows = requests * tokens
-    t = _tensors(rows, device, slots=rows + 1, seed=seed)
+    t = _tensors(rows, device, slots=rows + 1, seed=seed, geometry=geometry)
     g = torch.Generator().manual_seed(seed + 1)
-    t["conv_state"] = torch.randn(rows + 1, tokens + 2, 10240, generator=g).to(device).bfloat16().transpose(1, 2)
+    t["conv_state"] = torch.randn(rows + 1, tokens + 2, geometry.conv_dim, generator=g).to(device).bfloat16().transpose(1, 2)
     t["state_indices"] = torch.arange(1, rows + 1, dtype=torch.int32).view(requests, tokens).to(device)
     t["cu_seqlens"] = torch.arange(0, rows + 1, tokens, dtype=torch.int32).to(device)
     t["num_accepted_tokens"] = torch.full((requests,), tokens, dtype=torch.int32).to(device)
     return t
 
 
-def _part_verify_form(readings, sms, requests, tokens_per_request):
-    """The verify form a part (``readings``, ``sms``) picks for a step shape, for a host without one: the module pick with that part's
-    readings, resolved (no requests count = the pick at one request, as the backend reads it)."""
+def _part_verify_form(readings, sms, requests, tokens_per_request, geometry=None):
+    """The verify form a part (``readings``, ``sms``) picks for a step shape at ``geometry`` (the kernels' default when None), for a host
+    without one: the module pick with that part's readings, resolved (no requests count = the pick at one request, as the backend reads it)."""
     requests = 1 if requests is None else int(requests)
-    cfg = kvcfg.default_cfg(requests, sms, readings["SMEM_PER_SM_BYTES"], readings["SMEM_OPTIN_BYTES"], tokens_per_request)
+    geometry = gdn_geometry.DEFAULT_GEOMETRY if geometry is None else geometry
+    cfg = kvcfg.default_cfg(requests, sms, readings["SMEM_PER_SM_BYTES"], readings["SMEM_OPTIN_BYTES"], tokens_per_request, geometry)
     return kvcfg.resolve_cfg(replace(cfg, **readings), requests)
 
 
-def _sm100_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+def _sm100_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
     """The verify form a cc 10.0 part with 148 SMs picks (``verify_form``'s twin for a host without one)."""
-    return _part_verify_form(SM100_READINGS, SM100_SMS, requests, tokens_per_request)
+    return _part_verify_form(SM100_READINGS, SM100_SMS, requests, tokens_per_request, geometry)
 
 
-def _sm120_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+def _sm120_verify_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
     """The verify form a 99 KB-opt-in part with 170 SMs (cc 12.0) picks for a step shape (``verify_form``'s twin for a host without one)."""
-    return _part_verify_form(SM120_READINGS, SM120_SMS, requests, tokens_per_request)
+    return _part_verify_form(SM120_READINGS, SM120_SMS, requests, tokens_per_request, geometry)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -194,13 +205,24 @@ def as_sm120(monkeypatch):
 
 
 @pytest.mark.parametrize("form", backend.FORMS)
-def test_other_geometries_are_declined_by_field_name(as_sm100, form):
+def test_geometries_outside_the_envelope_are_declined_by_field_name_and_rank_shards_are_served(as_sm100, form):
+    """A pinned field with another value (the head dims, the conv kernel) or a head count / ``d_model`` outside the kernels' envelope (more
+    than 16 K heads, more than 128 V heads, a ``d_model`` that is not a multiple of 1024) is kind ``geometry`` naming the field; the
+    default geometry and the per-rank shards of the larger dense models are served, each mapping onto the kernels' ``Geometry``."""
     kw = dict(tokens_per_request=6) if form == "verify" else {}
-    for field, value in (("d_model", 4096), ("num_v_heads", 32), ("num_k_heads", 8), ("head_k_dim", 64), ("head_v_dim", 64), ("conv_kernel", 3)):
+    for field, value in (("head_k_dim", 64), ("head_v_dim", 64), ("conv_kernel", 3), ("d_model", 5000), ("num_k_heads", 48), ("num_v_heads", 144)):
         g = Qwen35GdnGeometry(**dict(backend.GEOMETRY, **{field: value}))
-        assert backend.geometry_off(g) == {field: value}
+        assert backend.geometry_off(g) == {field: value}, field
         sup = qwen_3_5_gdn_block_support("cuda:0", g, form, backend.BACKEND, **kw)
         assert (sup.served, sup.kind) == (False, "geometry") and field in sup.reason and form in sup.reason, (field, sup)
+    two = Qwen35GdnGeometry(**dict(backend.GEOMETRY, head_k_dim=64, d_model=5000))
+    assert backend.geometry_off(two) == {"head_k_dim": 64, "d_model": 5000}, "every offending field is named"
+    assert backend.geometry_off(GEOMETRY) == {} and backend.geometry_of(GEOMETRY) is not None and backend.geometry_of(GEOMETRY) == gdn_geometry.DEFAULT_GEOMETRY
+    for g in RANK_GEOMETRIES + [Qwen35GdnGeometry(d_model=4096, num_v_heads=64, num_k_heads=16, head_k_dim=128, head_v_dim=128, conv_kernel=4)]:
+        assert backend.geometry_off(g) == {}, g
+        assert backend.geometry_of(g) == gdn_geometry.Geometry(g.num_k_heads, g.num_v_heads, g.d_model)
+        assert qwen_3_5_gdn_block_support("cuda:0", g, form, backend.BACKEND, **kw).served, (g, form)
+    assert backend.PINNED == dict(head_k_dim=128, head_v_dim=128, conv_kernel=4)
     assert _probe("cuda:0", form, **kw).served, "the kernels' geometry with another norm_eps is served (the epsilon is compiled into a plan)"
     assert qwen_3_5_gdn_block_support("cuda:0", Qwen35GdnGeometry(**backend.GEOMETRY, norm_eps=1e-5), form, backend.BACKEND, **kw).served
 
@@ -238,6 +260,10 @@ def test_dsl_gate_is_a_dsl_decline(monkeypatch, form):
 
 
 def test_row_envelope(as_sm100):
+    """The decode rows the probe serves: 65535 (CUDA's grid Y) at the default geometry and at every per-rank shard, and -- the same bound
+    the entry's ``check_binding`` applies on contiguous ``qkv`` / ``z`` -- fewer where the kernel's 32-bit row addresses bind first, once
+    ``d_model`` passes 32768 (``max_rows_for``: 63550 rows at 1 K / 8 V heads with ``d_model`` 33792), a ``shape`` decline naming the
+    geometry; the stride-dependent remainder (a fused QKVZ row view) is the entry's typed decline at ``prepare``, not the probe's."""
     assert backend.DECODE_MAX_ROWS == entry.MAX_ROWS == 65535, "one source: the entry's own bound (its check_support declines past it)"
     assert _probe("cuda:0").served and _probe("cuda:0", requests=1).served
     assert _probe("cuda:0", requests=backend.DECODE_MAX_ROWS, tokens_per_request=1).served
@@ -245,6 +271,20 @@ def test_row_envelope(as_sm100):
     assert (sup.served, sup.kind) == (False, "shape") and str(backend.DECODE_MAX_ROWS) in sup.reason, sup
     sup = _probe("cuda:0", requests=4, tokens_per_request=2)  # FlashInfer's own gate: decode takes one token per request
     assert (sup.served, sup.kind) == (False, "shape"), sup
+    for g in RANK_GEOMETRIES:  # the named shards: the grid-Y cap binds first (their widest row is at most 20480 elements)
+        assert qwen_3_5_gdn_block_support("cuda:0", g, "decode", backend.BACKEND, requests=backend.DECODE_MAX_ROWS).served, g
+        sup = qwen_3_5_gdn_block_support("cuda:0", g, "decode", backend.BACKEND, requests=backend.DECODE_MAX_ROWS + 1)
+        assert (sup.served, sup.kind) == (False, "shape") and "grid Y" in sup.reason and "65535" in sup.reason, (g, sup)
+    deep = Qwen35GdnGeometry(d_model=33792, num_v_heads=8, num_k_heads=1, head_k_dim=128, head_v_dim=128, conv_kernel=4)
+    bound = entry.max_rows_for(backend.geometry_of(deep).QKV_CHANNELS, backend.geometry_of(deep).OUT_ROW, backend.geometry_of(deep))
+    assert bound == (2**31 - 1) // 33792 == 63550 < backend.DECODE_MAX_ROWS
+    assert qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND, requests=bound).served
+    assert qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND).served, "without a requests count the geometry is served"
+    sup = qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND, requests=bound + 1)
+    assert (sup.served, sup.kind) == (False, "shape") and "32-bit arithmetic" in sup.reason and "at most 63550 rows" in sup.reason, sup
+    assert "hidden 33792" in sup.reason and "requests=63551" in sup.reason and "prepare" in sup.reason, sup
+    sup = qwen_3_5_gdn_block_support("cuda:0", deep, "decode", backend.BACKEND, requests=backend.DECODE_MAX_ROWS)
+    assert (sup.served, sup.kind) == (False, "shape") and "at most 63550 rows" in sup.reason, "65535 is past the geometry's bound"
 
 
 def test_verify_step_shape_envelope(as_sm100):
@@ -424,22 +464,25 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
     monkeypatch.setattr(ventry, "_dsl_version_error", lambda: None)
     seen = []
 
-    def form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
-        seen.append((device, requests, norm_eps, tokens_per_request))
-        return _sm100_verify_form(device, requests, norm_eps, tokens_per_request)
+    def form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
+        seen.append((device, requests, norm_eps, tokens_per_request, geometry))
+        return _sm100_verify_form(device, requests, norm_eps, tokens_per_request, geometry)
 
     monkeypatch.setattr(backend, "verify_form", form)
-    assert _probe("cuda:0", "verify", requests=2, tokens_per_request=6).served and seen == [("cuda:0", 2, GEOMETRY.norm_eps, 6)]
+    assert _probe("cuda:0", "verify", requests=2, tokens_per_request=6).served and seen == [("cuda:0", 2, GEOMETRY.norm_eps, 6, gdn_geometry.DEFAULT_GEOMETRY)]
     assert _probe("cuda:0", "verify", requests=2).served and len(seen) == 1, "no tokens count: no device reading needed"
+    shard = RANK_GEOMETRIES[0]
+    assert qwen_3_5_gdn_block_support("cuda:0", shard, "verify", backend.BACKEND, requests=2, tokens_per_request=6).served
+    assert seen[-1] == ("cuda:0", 2, shard.norm_eps, 6, gdn_geometry.Geometry(1, 8, 8192)), "the probe asks the pick at the plan's geometry"
 
-    def failing(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    def failing(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
         raise RuntimeError("cuDeviceGetAttribute failed")
 
     monkeypatch.setattr(backend, "verify_form", failing)
     sup = _probe("cuda:0", "verify", requests=2, tokens_per_request=6)
     assert (sup.served, sup.kind) == (False, "device") and "cuDeviceGetAttribute failed" in sup.reason, sup
 
-    def no_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    def no_form(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
         raise NotImplementedError("gdn_verify_fused: this part's 40000-byte shared-memory opt-in per CTA holds no verify form")
 
     monkeypatch.setattr(backend, "verify_form", no_form)
@@ -448,7 +491,7 @@ def test_verify_token_bound_reads_the_device_and_reports_a_failed_reading_as_a_d
         (sup.served, sup.kind) == (False, "device") and "40000-byte" in sup.reason and "has no form" in sup.reason
     ), sup  # the entry's typed decline of a part with no form, not the readers' failure
 
-    def regressed(device, requests=None, norm_eps=1e-6, tokens_per_request=None):
+    def regressed(device, requests=None, norm_eps=1e-6, tokens_per_request=None, geometry=None):
         raise ValueError("a config regression")
 
     monkeypatch.setattr(backend, "verify_form", regressed)
@@ -516,6 +559,40 @@ def test_verify_runner_maps_flashinfer_inputs_onto_the_entry_call_contract():
     assert runner.kernel.compiled is not backend._shared_compiled(_spec(rows=2))
     bf16 = fi_api.bind_inputs(spec, **dict(t, out_bf16=torch.empty(8, 48, 128, dtype=BF16)))
     assert runner._kwargs(bf16)["out_bf16"] is bf16.out_bf16
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=lambda g: f"k{g.num_k_heads}v{g.num_v_heads}d{g.d_model}")
+def test_runners_build_the_entries_with_the_plan_geometry(g):
+    """A plan at a per-rank geometry builds its entry with that geometry (``geometry_of(spec.geometry)``): the
+    entry's forms carry it, its buffers take the rank's V heads, its binding checks accept FlashInfer's operands of that geometry (and the
+    default geometry's checks refuse them), and plans of two geometries share one compiled table under distinct keys."""
+    geo = gdn_geometry.Geometry(g.num_k_heads, g.num_v_heads, g.d_model)
+    spec = fi_api.Qwen35GdnPlanSpec(backend.BACKEND, "decode", 2, 1, g, CPU, (F32, BF16, BF16))
+    runner = backend.FrostFeDecodeRunner(spec)
+    assert runner.kernel.geometry == geo == backend.geometry_of(g) and runner.kernel.cfg.GEOM == geo
+    assert tuple(runner.buffers["qout"].shape) == (2, g.num_v_heads, 128) and runner.buffers["counts"].shape == (2 * kvcfg.TICKET_STRIDE,)
+    x = fi_api.bind_inputs(spec, **_tensors(2, CPU, geometry=g))
+    args = runner._args(x)
+    entry.check_support(*args, device_cc=(10, 0), geometry=runner.kernel.geometry)
+    with pytest.raises(NotImplementedError, match="x as"):
+        entry.check_support(*args, device_cc=(10, 0))  # the default geometry's checks refuse the rank's shapes
+    with pytest.raises(RuntimeError, match="eagerly"):
+        runner.run(x)
+    default_runner = backend.FrostFeDecodeRunner(_spec(rows=2))
+    assert runner.kernel.compiled is default_runner.kernel.compiled, "one table per (form, device, epsilon); the key carries the geometry"
+    d = default_runner._args(fi_api.bind_inputs(_spec(rows=2), **_tensors(2, CPU)))
+    assert runner.kernel.key(args[0], args[1], args[2], args[6], args[8]) != default_runner.kernel.key(d[0], d[1], d[2], d[6], d[8])
+    assert runner.kernel.key(args[0], args[1], args[2], args[6], args[8])[1].GEOM == geo
+    vspec = fi_api.Qwen35GdnPlanSpec(backend.BACKEND, "verify", 2, 4, g, CPU, (F32, BF16, BF16))
+    vrunner = backend.FrostFeVerifyRunner(vspec)
+    assert vrunner.kernel.geometry == geo and tuple(vrunner.buffers["qout"].shape) == (8, g.num_v_heads, 128)
+    vx = fi_api.bind_inputs(vspec, **_verify_tensors(2, 4, CPU, geometry=g))
+    kw = vrunner._kwargs(vx)
+    ventry.check_support(**kw, device_cc=(10, 0), geometry=vrunner.kernel.geometry)
+    ventry.check_support(**kw, device_cc=(10, 0), cfg=vrunner.kernel.cfg_for(2, 4))
+    with pytest.raises(NotImplementedError, match="qkv as"):
+        ventry.check_support(**kw, device_cc=(10, 0))
+    assert vrunner.kernel.cfg_for(2, 4).GEOM == geo
 
 
 def test_runner_launch_re_checks_the_binding():
@@ -851,3 +928,139 @@ def test_verify_bitwise_with_the_built_in_frost_backend_on_the_bench_input_sets(
         assert not torch.equal(g["ssm_state"], base["ssm_state"]) and not torch.equal(g["conv_state"], base["conv_state"]), "the pools advanced"
         if arm != "all accepted" and requests > 1:
             assert not g["out"][-tokens:].view(torch.uint8).any() and not g["out_bf16"][-tokens:].any(), "the padding request's rows are zero"
+
+
+# --- the per-rank geometries through FlashInfer's plan API ---------------------------------------------------------------------------
+def _fgid(g):
+    return f"k{g.num_k_heads}v{g.num_v_heads}d{g.d_model}"
+
+
+def _fi_geometry_dict(g):
+    """A FlashInfer geometry as the dict its reference's ``make_case(..., g=)`` takes."""
+    return dict(
+        d_model=g.d_model, num_v_heads=g.num_v_heads, num_k_heads=g.num_k_heads, head_k_dim=g.head_k_dim, head_v_dim=g.head_v_dim, conv_kernel=g.conv_kernel
+    )
+
+
+def _rank_device_or_skip(g, form="decode", **kw):
+    """The device (gated by the default geometry's probe: compute capability, DSL) -- on which ``frost_fe`` MUST serve the rank geometry
+    (its envelope admits it: a decline there is a failure, never a skip)."""
+    dev = _device_or_skip(form, **kw)
+    sup = qwen_3_5_gdn_block_support(dev, g, form, backend.BACKEND, **kw)
+    assert sup.served, f"frost_fe serves the rank geometry {_fgid(g)} by its envelope; declined here: {sup.kind}: {sup.reason}"
+    return dev
+
+
+def _rank_outputs(g, rows, device):
+    return (
+        torch.empty(rows, g.num_v_heads, g.head_v_dim, dtype=torch.float8_e4m3fn, device=device),
+        torch.empty(rows, g.num_v_heads, g.head_v_dim, dtype=torch.bfloat16, device=device),
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 4, 16])
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_flashinfer_decode_reference_at_the_rank_geometries_passes_against_frost_fe(g, rows):
+    """FlashInfer's own FP64 reference (``make_case`` at the rank geometry's dict, ``_check`` with its tolerances) against ``frost_fe``
+    through the public entry point at a per-rank geometry: rows 1 (the pair pick), 4 and 16 (a padding row from two rows on)."""
+    dev = _rank_device_or_skip(g)
+    fi = _flashinfer_tests()
+    case = fi.ref.make_case(rows, 1, seed=300 + rows, device=dev, form="decode", g=_fi_geometry_dict(g))
+    ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
+    q, out = _rank_outputs(g, rows, dev)
+    assert qwen_3_5_gdn_block_decode(**fi.dec._tensors(case, ssm, conv), geometry=g, backend=backend.BACKEND, out=q, out_bf16=out) is q
+    torch.cuda.synchronize()
+    fi.dec._check(case, q, out, ssm, conv)
+
+
+@pytest.mark.parametrize("requests, tokens", [(1, 6), (2, 4), (4, 6)], ids=str)
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_flashinfer_verify_reference_at_the_rank_geometries_passes_against_frost_fe(g, requests, tokens):
+    """FlashInfer's own FP64 verify reference (random acceptance counts, a padding request from two requests on) against ``frost_fe``
+    through the public entry point at a per-rank geometry, its tolerances."""
+    dev = _rank_device_or_skip(g, "verify", requests=requests, tokens_per_request=tokens)
+    fi = _flashinfer_tests()
+    case = fi.ref.make_case(requests, tokens, seed=100 * requests + tokens, device=dev, form="verify", g=_fi_geometry_dict(g))
+    ssm, conv = case.ssm_state.clone(), case.conv_state.clone()
+    q, out = _rank_outputs(g, requests * tokens, dev)
+    assert qwen_3_5_gdn_block_verify(**fi.ver._tensors(case, ssm, conv), geometry=g, backend=backend.BACKEND, out=q, out_bf16=out) is q
+    torch.cuda.synchronize()
+    fi.ver._check(case, q, out, ssm, conv)
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_plan_api_is_bitwise_with_the_direct_entries_and_replays_at_the_rank_geometries(g):
+    """FlashInfer's plan API (``prepare`` + ``run``, then a CUDA-graph capture of the prepared binding) and the direct cuDNN Frontend
+    entries on identical inputs at a per-rank geometry, byte for byte (the fp8 output, every state slot, the conv pool): decode at rows 4,
+    verify at 2 requests x 4 tokens."""
+    dev = _rank_device_or_skip(g, "verify", requests=2, tokens_per_request=4)
+    geom = backend.geometry_of(g)
+    # decode: the plan vs the entry, then the plan under capture vs its eager run
+    plan = prepare_qwen_3_5_gdn_block("decode", geometry=g, device=dev, requests=4, backend=backend.BACKEND)
+    xa = _tensors(4, dev, seed=5, geometry=g)
+    assert plan.run(**xa) is xa["out"]
+    xb = _tensors(4, dev, seed=5, geometry=g)
+    k = entry.GdnDecodeFused(dev, 1e-6, geometry=geom)
+    qb = k(
+        4,
+        xb["qkv"],
+        xb["conv_state"],
+        xb["conv_weight"],
+        xb["A_log"],
+        xb["dt_bias"],
+        xb["ssm_state"],
+        xb["state_indices"],
+        xb["z"],
+        xb["norm_weight"],
+        xb["out_scale"],
+        xb["hidden"],
+        xb["ba_weight"],
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(xa["out"].view(torch.uint8), qb.view(torch.uint8)), f"{_fgid(g)} decode: fp8 out (plan API vs the entry)"
+    assert torch.equal(xa["ssm_state"], xb["ssm_state"]) and torch.equal(
+        xa["conv_state"].contiguous(), xb["conv_state"].contiguous()
+    ), f"{_fgid(g)} decode: the pools"
+    xc = _tensors(4, dev, seed=5, geometry=g)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(**xc)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(xc["out"].view(torch.uint8), xa["out"].view(torch.uint8)) and torch.equal(
+        xc["ssm_state"], xa["ssm_state"]
+    ), f"{_fgid(g)} decode: the graph replay"
+    assert torch.equal(xc["conv_state"].contiguous(), xa["conv_state"].contiguous())
+    # verify: the plan vs the entry
+    vplan = prepare_qwen_3_5_gdn_block("verify", geometry=g, device=dev, requests=2, tokens_per_request=4, backend=backend.BACKEND)
+    va = _verify_tensors(2, 4, dev, seed=9, geometry=g)
+    assert vplan.run(**va) is va["out"]
+    vb = _verify_tensors(2, 4, dev, seed=9, geometry=g)
+    kv = ventry.GdnVerifyFused(dev, 1e-6, geometry=geom)
+    qv = kv(**{name: vb[name] for name in ventry.OPERANDS})
+    torch.cuda.synchronize()
+    assert torch.equal(va["out"].view(torch.uint8), qv.view(torch.uint8)), f"{_fgid(g)} verify: fp8 out (plan API vs the entry)"
+    assert torch.equal(va["ssm_state"], vb["ssm_state"]) and torch.equal(
+        va["conv_state"].contiguous(), vb["conv_state"].contiguous()
+    ), f"{_fgid(g)} verify: the pools"
+
+
+@pytest.mark.parametrize("g", RANK_GEOMETRIES, ids=_fgid)
+def test_built_in_frost_backend_answers_the_rank_geometries_that_frost_fe_serves(g):
+    """The built-in ``frost`` backend's answer at a per-rank geometry, recorded: where it declines, by kind ``geometry`` (the kernels it
+    ships are written for the 27B geometry; a device decline would be another kind); where a FlashInfer serves it, bitwise with
+    ``frost_fe`` on one 4-row decode set."""
+    dev = _rank_device_or_skip(g)
+    sup = qwen_3_5_gdn_block_support(dev, g, "decode", "frost")
+    if not sup.served:
+        assert sup.kind == "geometry", (sup.kind, sup.reason)
+        return
+    got = {}
+    for name in ("frost", backend.BACKEND):
+        x = _tensors(4, dev, seed=17, geometry=g)
+        prepare_qwen_3_5_gdn_block("decode", geometry=g, device=dev, requests=4, backend=name).run(**x)
+        torch.cuda.synchronize()
+        got[name] = x
+    for key in ("out", "ssm_state", "conv_state"):
+        a, b = got["frost"][key], got[backend.BACKEND][key]
+        assert torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)), f"{_fgid(g)}: {key} differs between frost and frost_fe"

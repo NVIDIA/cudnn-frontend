@@ -6,10 +6,11 @@
 
 1. **Freeze a study.** Write the training grid and a seeded random holdout, record their sha256, and only then time anything. A study JSON names:
    - `id`, `row` (the FROST engine spec name), `device_cc`, `dtype` (`bf16` / `f16`);
-   - `adapter`: `inference` for the generation phase of `benchmark/attention_inference`, or `training` for `benchmark/attention_training`;
+   - `adapter`: `inference` for the generation phase of `benchmark/attention_inference`, `training` for `benchmark/attention_training`, or `recorded` when the driver stored the FE graph's own facts in each case (`case["facts"]`; e.g. a graph built by FlashInfer's cudnn path, whose declaration the case fields cannot reproduce);
    - head pair defaults (`d_qk`, `d_v`), an optional `layout` default;
    - the `train` / `holdout` JSONL paths.
-2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end.
+   Count the holdout's on- and off-tile cells from its final lengths before timing: a transform applied after aligning S_kv (e.g. unequal per-request lengths) moves the cell off the tile.
+2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end. Where the backend's first plan fails to finalize, the backend-only reference is the first backend plan that builds (the default leg, when it ran a backend plan); otherwise `load` drops those cells from the fit.
 3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class, every scalar in `placement_table.FEATURES` is fit (today: `cost`, the roofline proxy; `tiles`, the parallel tiles before a KV split; `rows`, the query rows b * h_q * s_q; `kv`, the KV tokens per request; `q`, the query tokens per request). Each fit is:
    - `always`;
    - `never`;

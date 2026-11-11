@@ -43,6 +43,7 @@ symbols_to_import = [
     "moe_grouped_matmul_mode",
     "scalar_type",
     "reshape_mode",
+    "custom_reduction_identity",
 ]
 
 for symbol_name in symbols_to_import:
@@ -170,6 +171,9 @@ def destroy_handle(handle):
 from .datatypes import _library_type, _is_torch_tensor
 
 __version__ = "1.33.0"
+# Keep in sync with the JAX dependency minimum in pyproject.toml.
+CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
+CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
 
 
 def _tensor(
@@ -294,6 +298,7 @@ from ._pygraph import pygraph, GraphContext
 from .nodes import Node
 
 from .graph import graph, jit, graph_cache
+from . import reduction_modifiers
 
 from typing import Any
 
@@ -326,6 +331,8 @@ _EAGER_PUBLIC_NAMES = (
     "Handle",
     "DeviceInfo",
     "__version__",
+    "CUTEDSL_MIN_JAX_VERSION",
+    "CUTEDSL_MIN_JAX_VERSION_STR",
     "NodeType",
     "Tensor",
     "pygraph",
@@ -334,6 +341,7 @@ _EAGER_PUBLIC_NAMES = (
     "graph",
     "jit",
     "graph_cache",
+    "reduction_modifiers",
     "sdpa_capabilities",
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
@@ -388,6 +396,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "gated_attention_block": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "GdnDecodeFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "GdnVerifyFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
@@ -402,6 +411,9 @@ _LAZY_OPTIONAL_IMPORTS = {
     # the explicit import of `cudnn.linear_attention.frost.flashinfer_gdn_backend`, never reached from here
     "GdnDecodeFused": (".linear_attention.frost.gdn_decode_fused", "GdnDecodeFused"),
     "GdnVerifyFused": (".linear_attention.frost.gdn_verify_fused", "GdnVerifyFused"),
+    # the shared-expert decode kernel pair (bf16 shared expert next to a routed MoE, SM100-class parts): a direct-call entry like the GDN
+    # steps (also `cudnn.moe.frost.SharedExpertDecode`)
+    "SharedExpertDecode": (".moe.frost.shared_expert_decode", "SharedExpertDecode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -794,7 +806,7 @@ def __getattr__(name: str) -> Any:
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
         # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax

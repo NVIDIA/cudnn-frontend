@@ -145,13 +145,16 @@ class IndexerBackwardSm90:
         # Public forward/topk returns global KV ids by default. Sparse mode
         # decodes them to local per-batch ids before indexing K/dK views.
         self.topk_indices_global = topk_indices_global
-        assert heads == 64, "the warpgroup GEMMs use the head count as WGMMA M, which must be 64"
+        assert heads == 64 or (heads == 32 and self.deterministic and not is_dense), "SM90 IndexerBackward requires H=64 or deterministic sparse H=32"
         assert is_dense or topk % block_I == 0
         self.num_topk_blocks = (topk + block_I - 1) // block_I
         self.grad_signal_smem_size = self.block_I if is_dense else self.topk
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-        self.heads_padded = int(math.ceil(heads / 8) * 8)
+        # WGMMA always consumes an M64 tile. The Q/dQ TMA descriptors retain
+        # the logical head extent: loads zero-fill and stores discard the
+        # out-of-bounds half of an H32 tile.
+        self.heads_padded = 64
 
         self.half_block_I = self.block_I // 2
         self.half_head_dim = self.head_dim_padded // 2
@@ -176,7 +179,7 @@ class IndexerBackwardSm90:
         # introducing another compile-key axis.
         self.use_deterministic_dw_quad = self.deterministic and self.topk >= 512
         self.dw_deterministic_slots = self.TOTAL_COMPUTE_THREADS * 2 if self.deterministic and not self.use_deterministic_dw_quad else 1
-        self.dw_deterministic_warp_partials = (self.TOTAL_COMPUTE_THREADS // self.WARP_SIZE) * self.heads if self.deterministic else 1
+        self.dw_deterministic_warp_partials = (self.TOTAL_COMPUTE_THREADS // self.WARP_SIZE) * self.heads_padded if self.deterministic else 1
 
         self.dk_staging_stride_n = self.head_dim_padded + 4  # 132: 16B-aligned + bank-conflict-free
         self.dk_staging_elems = self.dk_staging_stride_n * self.block_I
@@ -1200,9 +1203,9 @@ class IndexerBackwardSm90:
                     dw_warp_h0 += cute.arch.shuffle_sync(dw_h0, source_lane)
                     dw_warp_h1 += cute.arch.shuffle_sync(dw_h1, source_lane)
                 if lane_idx % 4 == 0:
-                    sDwWarpPartial[compute_warp_idx * self.heads + my_first_h] = dw_warp_h0
+                    sDwWarpPartial[compute_warp_idx * self.heads_padded + my_first_h] = dw_warp_h0
                     if my_second_h != my_first_h:
-                        sDwWarpPartial[compute_warp_idx * self.heads + my_second_h] = dw_warp_h1
+                        sDwWarpPartial[compute_warp_idx * self.heads_padded + my_second_h] = dw_warp_h1
             else:
                 # Small top-k keeps the lower-overhead private-slot fold.
                 slot = tidx * 2
@@ -1236,7 +1239,7 @@ class IndexerBackwardSm90:
                     contribution_idx = compute_warp_idx * slots_per_warp + local_slot_idx
                     if sDwHead[contribution_idx] == dw_partial_head:
                         dw_warp_sum += sDwContrib[contribution_idx]
-                sDwWarpPartial[compute_warp_idx * self.heads + dw_partial_head] = dw_warp_sum
+                sDwWarpPartial[compute_warp_idx * self.heads_padded + dw_partial_head] = dw_warp_sum
             cute.arch.fence_view_async_shared()
             nvvm.barrier_cta_sync(self.COMPUTE_SYNC_BARRIER_ID, thread_count=self.TOTAL_COMPUTE_THREADS)
 
@@ -1256,7 +1259,7 @@ class IndexerBackwardSm90:
                     if const_expr(self.deterministic):
                         dw_sum = Float32(0.0)
                         for partial_warp_idx in cutlass.range_constexpr(self.TOTAL_COMPUTE_THREADS // self.WARP_SIZE):
-                            dw_sum += sDwWarpPartial[partial_warp_idx * self.heads + dw_output_idx]
+                            dw_sum += sDwWarpPartial[partial_warp_idx * self.heads_padded + dw_output_idx]
                         mdW[seq_idx, dw_output_idx] = self.q_dtype(dw_sum)
                     else:
                         mdW[seq_idx, dw_output_idx] = self.q_dtype(sDwPartial[dw_output_idx])

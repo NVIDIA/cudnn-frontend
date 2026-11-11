@@ -29,6 +29,7 @@ The experimental API catalog includes:
 - [FLA Integration Shims](/operations/LinearAttention/fla)
 - [Kimi Delta Attention in JAX](/operations/LinearAttention/kda_jax)
 - [Fused GDN Decode / Verify Steps as a FlashInfer Backend (SM100 / SM120)](/operations/LinearAttention/gdn_decode_flashinfer_backend) — the fused Gated DeltaNet decode step and MTP verify step of a Qwen 3.5-architecture dense model's GDN sub-layer as one FROST launch each, registered as the `frost_fe` backend of FlashInfer's experimental Qwen 3.5 GDN block (bf16 operands, fp32 state, FP8 output)
+- [Shared-Expert Decode Pair (SM100-class)](/operations/MoeGroupedMatmul/shared_expert_decode) — the bf16 shared expert next to a routed MoE at decode-time token counts (1 .. 24) as two FROST launches (gate_up + SiLU-mul with the gate logit, down + sigmoid gate), bitwise repeatable and batch-invariant
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
 - [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) with the in-block indexer's decode and extend steps over the paged side caches, and write-through into a paged KV cache
@@ -53,6 +54,7 @@ The experimental API catalog includes:
 - [Grouped GEMM + Quant (Unified)](/operations/Matmul/gemm_fusions/grouped_gemm_quant_unified)
 - [Grouped GEMM + Wgrad](/operations/Matmul/gemm_fusions/grouped_gemm_wgrad)
 - [Block Sparse Attention (BSA)](/operations/sparse_attention/bsa)
+- [Simplified Sparse Attention: attention and trainable indexer](/operations/sparse_attention/simplified_sparse_attention)
 - [Query Sparse Attention (QSA): attention and indexer entry points](/operations/sparse_attention/qsa)
 - [QSA training from existing token indices](/operations/sparse_attention/qsa/qsa_indexed)
 - [DeepSeek Sparse Attention (DSA)](/operations/sparse_attention/dsa)
@@ -75,6 +77,15 @@ The experimental API catalog includes:
 - [NVFP4 Block-Scale Conversion](/operations/BlockScaling/nvfp4_block_scale_conversion)
 - [DSv4.1 mHC projection/RMS backward](/operations/Matmul/gemm_fusions/mhc_projection_bwd)
 
+- [Ragged grouped GEMM training](/operations/gemm_fusions/ragged_grouped_gemm)
+
+- [Cake dense GEMM training](/operations/gemm_fusions/cake_dense_gemm)
+
+- [SwiGLU + MXFP8 quantization](/operations/gemm_fusions/gated_act_mxfp8)
+- [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
+
+- [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
+
 ## Installation and setup
 
 All Frontend OSS APIs come installed with the `nvidia-cudnn-frontend` package. Except on Windows ARM64, `nvidia-cutlass-dsl[cu13]>=4.8.0` and `apache-tvm-ffi` are required dependencies, so the CuTeDSL runtime comes with the base install (and the DSL pulls `cuda-python` in transitively):
@@ -91,9 +102,16 @@ The Triton NVFP4 attention QAT backward API additionally requires the
 Those required dependencies are framework-neutral. Install your tensor framework separately — from a checkout, the PEP 735 dependency groups pin the right companion packages:
 ```bash
 pip install --group torch   # torch + torch-c-dlpack-ext
-pip install --group jax     # jax >= 0.5 (XLA entry points via cutlass.jax, shipped with nvidia-cutlass-dsl)
+pip install --group jax     # JAX entry points via cutlass.jax, shipped with nvidia-cutlass-dsl
 ```
-(For the published wheel, `pip install torch torch-c-dlpack-ext` or `pip install "jax>=0.5"` directly.)
+For the published wheel, install PyTorch with `pip install torch torch-c-dlpack-ext`.
+
+All CuTeDSL JAX entry points require **JAX >=0.9.1**. Install GPU-enabled JAX separately;
+for CUDA 13:
+
+```bash
+pip install 'jax[cuda13]>=0.9.1'
+```
 
 After installation, you can import the APIs directly from the `cudnn` package, i.e. `from cudnn import {your_operation}`
 
@@ -190,3 +208,6 @@ Methods:
 
 - All FE OSS APIs are implemented in the `python/cudnn` directory.
 - Correctness tests/samples are implemented under `test/python/<operation>/cutedsl` (JAX bindings under `test/python/<operation>/jax`).
+
+- [Cake GDN training](cake_gdn.md): opt-in packed BF16 forward and backward.
+- [Cake chunk-64 KDA training](cake_kda.md): opt-in serial forward and backward.

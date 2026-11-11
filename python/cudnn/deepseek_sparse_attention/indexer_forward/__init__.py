@@ -10,6 +10,7 @@ from ._compressed_top_k_sm100 import (
     compress_topk_cand_buffer_size,
     compress_topk_cand_buffer_size_thd,
 )
+from .prepared import IndexerForwardTopKPlan, prepare_indexer_forward_top_k
 
 __all__ = [
     "IndexerForward",
@@ -17,4 +18,6 @@ __all__ = [
     "indexer_forward_top_k_wrapper",
     "compress_topk_cand_buffer_size",
     "compress_topk_cand_buffer_size_thd",
+    "IndexerForwardTopKPlan",
+    "prepare_indexer_forward_top_k",
 ]

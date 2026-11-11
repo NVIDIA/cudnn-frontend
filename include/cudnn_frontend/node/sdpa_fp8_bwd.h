@@ -1180,47 +1180,16 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     override_heuristics_query() const {
         // MXFP8 d_qk == d_v == 256 (Blackwell) and per-tensor FP8 d_qk == d_v ==
         // 256 (Rubin) have no cuDNN backend plan at all -- only the opt-in
-        // frontend FROST engines serve them. Pinning a backend engine id here
-        // would bypass the heuristics query, and the pinned config then fails to
-        // finalize with CUDNN_STATUS_NOT_SUPPORTED, which surfaces as a generic
-        // backend-API error rather than "not supported". Decline the override and
-        // let heuristics run: it returns no configs and create_execution_plans
-        // reports GRAPH_NOT_SUPPORTED, which is what a caller (and every test
-        // harness) can act on. Same reasoning as the (256, 512] band of the
-        // half-precision backward node.
+        // frontend FROST engines serve them -- so the preferred config could only
+        // fail to create; skip it and let the heuristics report GRAPH_NOT_SUPPORTED.
+        // Same reasoning as the (256, 512] band of the half-precision backward node.
         if (is_d256_mxfp8_on_blackwell || is_d256_fp8_on_rubin) {
             return {-1, {}};
         }
-        int32_t const sm_version = context.get_sm_version();
-        bool const use_new_knobs = detail::get_backend_version() >= 92300;
-        // {128,128} bprop: tileM=3, tileN=2, kernelCfg=2(bprop warp), streamK=0, cgaM=0
-        if (sm_version > 103 && is_deterministic_algorithm_supported_on_blackwell) {
-            if (use_new_knobs) {
-                return {17,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, 2}}};
-            } else {
-                return {17, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
-            }
-        } else if (is_deterministic_algorithm_supported_on_blackwell) {
-            if (use_new_knobs) {
-                return {5,
-                        {{KnobType_t::TILE_M, 3},
-                         {KnobType_t::TILE_N, 2},
-                         {KnobType_t::KERNEL_CFG, 2},
-                         {KnobType_t::STREAM_K, 0},
-                         {KnobType_t::TILE_CGA_M, 0},
-                         {KnobType_t::STAGES, 2}}};
-            } else {
-                return {5, {{KnobType_t::KERNEL_CFG, 31}, {KnobType_t::STAGES, 2}}};
-            }
-        } else {
-            return {-1, {}};
+        if (is_deterministic_algorithm_supported_on_blackwell) {
+            return blackwell_deterministic_bprop_config(context.get_sm_version(), 2);
         }
+        return {-1, {}};
     }
 
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB

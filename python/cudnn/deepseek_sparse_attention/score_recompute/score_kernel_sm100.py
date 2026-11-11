@@ -123,10 +123,14 @@ class ScoreKernelSm100:
         self.mma_tiler_qk = (n_block_size, m_block_size, self.k_block_size)
         self.qk_acc_dtype = Float32
         self.load_warp_id, self.mma_warp_id, self.sched_warp_id = 0, 1, 2
-        self.num_clc_stage = 1
+        self.num_clc_stage = self._num_clc_stages()
         self.num_clc_response_bytes = 16
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
+
+    def _num_clc_stages(self) -> int:
+        """Depth of the CLC response ring (``num_clc_stage``): one stage unless a kernel deepens it."""
+        return 1
 
     def _set_register_split(self, num_math_wg: int):
         """Warps 0-3 (load / MMA / CLC / aux) plus ``num_math_wg`` math warpgroups, and their setmaxnreg split.
@@ -203,18 +207,48 @@ class ScoreKernelSm100:
         return valid, m_block, seqlen, batch_idx, q_causal_offset
 
     @cute.jit
-    def _sched_warp(self, work_tile, tile_sched, clc_pipeline, clc_consumer_state):
-        """CLC scheduler warp: request the next work tile while the current one runs."""
+    def _clc_response_slot(self, clc_response_ptr, clc_state):
+        """Slot ``clc_state.index`` of the ``num_clc_stage``-deep CLC response ring at ``clc_response_ptr`` (one
+        16-byte response per stage; the ring starts 16-byte aligned)."""
+        return cute.recast_ptr(clc_response_ptr, dtype=cutlass.Int128) + clc_state.index
+
+    @cute.jit
+    def _clc_work_tile(self, tile_sched, clc_response_ptr, clc_consumer_state):
+        """Work tile of the CLC response that ``clc_consumer_state`` points at (after its ``consumer_wait``)."""
+        return tile_sched.work_tile_info_from_clc_response(self._clc_response_slot(clc_response_ptr, clc_consumer_state))
+
+    @cute.jit
+    def _sched_warp(self, work_tile, tile_sched, clc_pipeline, clc_consumer_state, claim_mbar_ptr, clc_response_ptr):
+        """CLC scheduler warp: request the next work tile once the load warp has issued the current
+        tile's last K load (``_release_claim``), so its tail still overlaps the CLC round trip.
+
+        A work tile carries its whole KV range, so tile costs differ by orders of magnitude when long
+        rows follow short ones (packed THD).  Claiming at tile start let a CTA that had just begun a
+        long tile reserve a second one while idle CTAs found the queue empty, serialising long tiles
+        two per CTA on half the SMs.
+
+        A request writes its own slot of the ``num_clc_stage``-deep response ring at ``clc_response_ptr``,
+        so it waits only for every consumer to have read the response ``num_clc_stage`` requests back."""
         clc_producer_state = make_pipeline_state(PipelineUserType.ProducerConsumer, self.num_clc_stage)
+        claim_phase = Int32(0)
         while work_tile.is_valid_tile:
+            cute.arch.mbarrier_wait(claim_mbar_ptr, claim_phase)
+            claim_phase = claim_phase ^ Int32(1)
             clc_pipeline.producer_acquire(clc_producer_state)
-            tile_sched.advance_to_next_work(clc_pipeline.producer_get_barrier(clc_producer_state))
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(clc_pipeline.producer_get_barrier(clc_producer_state), self._clc_response_slot(clc_response_ptr, clc_producer_state))
             clc_producer_state.advance()
             clc_pipeline.consumer_wait(clc_consumer_state)
-            work_tile = tile_sched.get_current_work()
+            work_tile = self._clc_work_tile(tile_sched, clc_response_ptr, clc_consumer_state)
             clc_pipeline.consumer_release(clc_consumer_state)
             clc_consumer_state.advance()
         clc_pipeline.producer_tail(clc_producer_state)
+
+    @cute.jit
+    def _release_claim(self, claim_mbar_ptr):
+        """Load warp, once per work tile (invalid tiles too): every load of the tile is issued."""
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive(claim_mbar_ptr)
 
     @cute.jit
     def _stage_per_head(self, sBuf, off, mPerHead_cur, m_block, seqlen_q, lane_id, scale: cutlass.Constexpr = None):

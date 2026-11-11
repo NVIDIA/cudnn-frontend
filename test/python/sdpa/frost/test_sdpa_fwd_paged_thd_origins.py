@@ -71,9 +71,9 @@ def test_paged_thd_origins_rebind_and_capture(
     rubin = torch.cuda.get_device_capability() == (10, 7)
     if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
         pytest.skip(reason)
-    native_rubin_shape = (dim == 128 and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
+    native_rubin_shape = (dim in (64, 128) and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
     if rubin and (not native_rubin_shape or splits != 1):
-        pytest.skip("native SM107 paged origins: D128 CGA1/2 or D192/V128 CGA2, unsplit")
+        pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2, unsplit")
     engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
     if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
@@ -247,7 +247,7 @@ def test_paged_thd_origins_rebind_and_capture(
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
         assert api._k_mod.__file__.endswith("sm107/prefill_d256_f16.py" if single_q else "sm107/prefill_d128_f16.py")
-        assert api._k_mod.CFG.STAGES_KV == (2 if d_qk == 192 else 2 * cga)
+        assert api._k_mod.CFG.STAGES_KV == (4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
         if tile_n is not None:
             assert api._k_mod.CFG.TILE_N == tile_n

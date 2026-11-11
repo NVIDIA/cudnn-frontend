@@ -15,6 +15,21 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "dense_indexer_kl": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl"),
+    "simplified_sparse_attention": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention"),
+    "simplified_sparse_attention_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_jax"),
+    "SimplifiedSparseAttentionMetadata": ("cudnn.simplified_sparse_attention.api", "SimplifiedSparseAttentionMetadata"),
+    "simplified_sparse_attention_reserve": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention_reserve"),
+    "ragged_grouped_gemm_forward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_forward"),
+    "ragged_grouped_gemm_backward": ("cudnn.gemm.cake.grouped", "ragged_grouped_gemm_backward"),
+    "dense_gemm_forward": ("cudnn.gemm.cake.dense", "dense_gemm_forward"),
+    "dense_gemm_backward": ("cudnn.gemm.cake.dense", "dense_gemm_backward"),
+    "gated_act_mxfp8_forward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_forward"),
+    "gated_act_mxfp8_backward": ("cudnn.gemm.cake.gated_act_mxfp8", "gated_act_mxfp8_backward"),
+    "gated_rmsnorm_forward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_forward"),
+    "gated_rmsnorm_backward": ("cudnn.norm.cake.gated_rmsnorm", "gated_rmsnorm_backward"),
+    "zero_centered_rmsnorm_forward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_forward"),
+    "zero_centered_rmsnorm_backward": ("cudnn.norm.cake.zero_centered_rmsnorm", "zero_centered_rmsnorm_backward"),
     "qsa_select_forward": ("cudnn.QSA.selection", "qsa_select_forward"),
     "qsa_select_decode_forward": ("cudnn.QSA.selection", "qsa_select_decode_forward"),
     "qsa_select_decode_paged_forward": ("cudnn.QSA.selection_paged", "qsa_select_decode_paged_forward"),
@@ -40,12 +55,28 @@ _LAZY_EXPORTS = {
     "kimi_delta_attention_backward_jax": ("cudnn.linear_attention.jax_api", "kimi_delta_attention_bwd"),
     "block_sparse_attention_forward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_forward"),
     "block_sparse_attention_backward_jax": ("cudnn.block_sparse_attention.jax_api", "block_sparse_attention_backward"),
+    "hstu_attention_forward": ("cudnn.hstu.hstu_attention", "hstu_attention_forward"),
+    "hstu_attention_backward": ("cudnn.hstu.hstu_attention", "hstu_attention_backward"),
+    "hstu_lmsd_forward": ("cudnn.hstu.hstu_lmsd", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward": ("cudnn.hstu.hstu_lmsd", "hstu_lmsd_backward"),
+    "hstu_attention_forward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_forward"),
+    "hstu_attention_backward_jax": ("cudnn.hstu.hstu_attention.jax_api", "hstu_attention_backward"),
+    "hstu_lmsd_forward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_forward"),
+    "hstu_lmsd_backward_jax": ("cudnn.hstu.hstu_lmsd.jax_api", "hstu_lmsd_backward"),
 }
 
-__all__ = list(_LAZY_EXPORTS)
+# Op families are subpackages; they resolve lazily like the ops above.
+_FAMILIES = ("dsa", "nsa")
+
+__all__ = [*_LAZY_EXPORTS, *_FAMILIES]
 
 
 def __getattr__(name: str) -> Any:
+    if name in _FAMILIES:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+
     target = _LAZY_EXPORTS.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

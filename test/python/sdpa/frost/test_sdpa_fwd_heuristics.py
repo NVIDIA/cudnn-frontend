@@ -434,7 +434,8 @@ def _sm120_gqa6_facts(**over):
 def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     """Every SM120 template packs any GQA group up to the tile (the rows past (tile_m // G) * G are dead), at
     D=128, 256 and 512, and declines a group past the tile. An unset tile_m is the adapter's own Q tile: 64 rows on
-    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. Every other row requires divisibility."""
+    the D=512 templates, so 96 / 1 is declined there and 64 / 1 admitted. SM100/SM90 retain a divisor-based packing rule; SM80 packs consecutive query/head rows across tile boundaries.
+    """
     from cudnn.sdpa.fwd.config_sm100 import pack_gqa_supported
     from cudnn.sdpa.fwd.config_sm120 import tile_domain
 
@@ -464,8 +465,9 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
     assert caps.pack_gqa_requires_divisible is False
-    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm80"):
+    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90"):
         assert _sm120_spec(other).capabilities.pack_gqa_requires_divisible, other
+    assert _sm120_spec("sdpa_fwd_prefill_sm80").capabilities.pack_gqa_requires_divisible is False
 
 
 @pytest.mark.L0
@@ -904,8 +906,9 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     GQA 1 and 3, S=4K..32K, controls <= 0.35 %; O / Stats / Amax_O bitwise identical across policies).  The notch is
     an explicit oracle arm, not a domain effect (unlike d256: the d128 kernel serves LPT_L2), so the row's domain must
     still list all three.  Everything around it keeps the old proposal: the per-tensor FP8 d128 row measured
-    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor and the Rubin d128 MXFP8 row are unmeasured
-    and lead with LPT_L2 on a GQA graph; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
+    shape-dependent and leads with LPT_L2; the sm100 d192x128 MXFP8 flavor leads with LPT_L2 on a
+    GQA graph; the sm107 quantized d128 rows lead with plain LPT below _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES per KV
+    head on a GQA graph and keep the L2-budget arm above it; a mask-free d128 MXFP8 graph proposes NATURAL alone."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
@@ -931,7 +934,13 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     # Scope: d128 only, SM100 row only, causal only.
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
+    rubin_fp8 = caps[engines.engine_name(fp8=True, arch="sm107")]
     assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    for s in (2048, 4096):
+        short = {**quant, "s_q": s, "s_kv": s}
+        assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=8, device_cc=(10, 7), **short)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], s
+        assert _sched_points(rubin_fp8, _facts(is_fp8=True, h_kv=24, device_cc=(10, 7), **short))[0] != SCHED_LPT_L2, s
     assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, causal=False, **quant)) == [SCHED_NATURAL]
 
 
@@ -1698,8 +1707,8 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too). Partial
     groups (96/8) also run on native cga=2; shared cga=1 retains its divisibility rule. Dense d256 packs within its route
     (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
-    admits both native prefill widths and unsplit packing, and dense PAGED queries -- not wired on
-    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    admits both native prefill widths and unsplit packing, and dense PAGED queries admit native cga=1 and cga=2
+    since #2375 (the native D128 loader reads dense Q over page pools)."""
     from dataclasses import replace
 
     from cudnn.sdpa.fwd.engines import effective_cgas
@@ -1727,7 +1736,7 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     assert engines.mismatch(caps, thd, pack) is None
     assert engines.mismatch(caps, replace(thd, h_q=96), pack) is None
     assert engines.mismatch(caps, thd, replace(pack, split_kv=2)) is not None
-    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+    assert effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True)) == frozenset({1, 2})  # #2375
 
 
 @pytest.mark.L0
@@ -2414,3 +2423,102 @@ def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     assert paged_thd_split_choice(rubin, f)[0] > 1
     sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
     assert _prefer_thd_pack_gqa(sm100, _facts(**paged, s_q=4096, s_kv=4096, max_total_seq_len_q=4096, device_cc=(10, 0), device_sm_count=148))
+
+
+@pytest.mark.L0
+def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
+    """GB10 (cc 12.1, 48 SMs): a bf16 / f16 d64 / d128 causal dense prefill with more (batch, head) streams than SMs
+    leads with the NATURAL walk, the LPT variants behind it as runners; up to one stream per SM, a sliding window, an FP8
+    row and the cc 12.0 parts keep the L2-budget rule's LPT_L2."""
+    offered = {"sdpa_fwd_prefill_sm120": 20504}
+
+    def plans(**over):
+        facts = _facts(**{**dict(b=8, h_q=16, h_kv=16, s_q=2048, s_kv=2048, causal=True, bottom_right=True, device_cc=(12, 1), device_sm_count=48), **over})
+        out = recommend("A", facts, offered)
+        assert out
+        return out
+
+    many = plans()  # 128 streams on 48 SMs
+    assert many[0].knobs.sched_policy == SCHED_NATURAL, many[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in many}, [p.knobs for p in many]
+    assert plans(d_qk=64, d_v=64, h_kv=4)[0].knobs.sched_policy == SCHED_NATURAL  # GQA counts query-head streams
+    assert plans(b=3)[0].knobs.sched_policy == SCHED_LPT_L2  # 48 streams: one per SM
+    assert plans(device_cc=(12, 0), device_sm_count=188)[0].knobs.sched_policy == SCHED_LPT_L2
+    assert plans(device_cc=(12, 0), device_sm_count=36)[0].knobs.sched_policy == SCHED_LPT_L2
+
+
+def test_sm107_pt_fp8_d192_mha_causal_fp8_o_lists_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d192x128 row lists both widths for a dense unsplit MHA causal graph with an fp8 O inside the
+    K/V budget, and the auto pick takes the single CTA; a half-precision O, GQA, a mask-free graph or a larger K/V set keep cga2."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=64,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=192,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    assert effective_cgas(spec.capabilities, _facts(**base)) == frozenset({1, 2})
+    from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+
+    assert _auto_sched_cga(spec, _facts(**base), split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    for off in (dict(dtype_o=cudnn.data_type.BFLOAT16), dict(h_kv=8), dict(causal=False), dict(h_q=128, h_kv=128)):
+        assert effective_cgas(spec.capabilities, _facts(**{**base, **off})) == frozenset({2}), off
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_NATURAL) == (SCHED_LPT, 1)
+    assert effective_cgas(mx_spec.capabilities, _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "h_q": 128, "h_kv": 128})) == frozenset({2})
+
+
+@pytest.mark.L0
+def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target):
+    """The 107-line per-tensor FP8 d128 row lists both widths on dense unsplit graphs inside the K/V budget and the auto pick takes
+    the single CTA with the scheduler it was handed; THD and the larger K/V sets keep the pair."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd.engines import effective_cgas
+    from cudnn.sdpa.fwd.heuristics import _auto_sched_cga
+
+    fp8_name = engines.engine_name(fp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == fp8_name)
+    base = dict(
+        is_fp8=True,
+        b=2,
+        h_q=64,
+        h_kv=8,
+        s_q=2048,
+        s_kv=2048,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.FP8_E4M3,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    for over, sched in (
+        (dict(), SCHED_LPT),
+        (dict(causal=False), SCHED_NATURAL),
+        (dict(b=1, h_q=40, h_kv=40, s_q=7800, s_kv=7800, causal=False), SCHED_NATURAL),
+    ):
+        facts = _facts(**{**base, **over})
+        assert effective_cgas(spec.capabilities, facts) == frozenset({1, 2}), over
+        assert _auto_sched_cga(spec, facts, split_kv=1, sched_policy=sched) == (sched, 1), over
+    assert effective_cgas(spec.capabilities, _facts(**{**base, "b": 8, "h_kv": 64})) == frozenset({2})
+    mx_name = engines.engine_name(mxfp8=True, arch="sm107")
+    mx_spec = next(s for s in engines.ENGINE_SPECS if s.name == mx_name)
+    mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
+    assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
+    assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_LPT) == (SCHED_LPT, 1)

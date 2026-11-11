@@ -20,8 +20,23 @@ DECODE_Q_TILES = (16, 32)
 HEAD_TILE_GRANULE = 16
 SUPPORTED_HEAD_TILE_MIN = 16
 GENERAL_HEAD_TILE_MAX = 256
-SUPPORTED_HEAD_TILE_MAX = 512
+SUPPORTED_HEAD_TILE_MAX = 576
 GENERAL_HEAD_TILES = tuple(range(SUPPORTED_HEAD_TILE_MIN, GENERAL_HEAD_TILE_MAX + 1, HEAD_TILE_GRANULE))
+# The general half prefill loader addresses independent QK/V widths through
+# D128 directly. Decode serves the full general head-dim envelope through D256.
+PAGED_HEAD_TILE_MAX = 128
+PAGED_D_SHAPES = frozenset((q, v) for q in GENERAL_HEAD_TILES for v in GENERAL_HEAD_TILES) | {(512, 512), (576, 512)}
+
+
+def paged_head_dims_supported(d_qk: int, d_v: int, *, decode: bool = False, d512: bool = False, d576: bool = False) -> bool:
+    if d512 and all(GENERAL_HEAD_TILE_MAX < d <= D512_FLAVOR[0] and d % 8 == 0 for d in (d_qk, d_v)):
+        return True
+    if d576 and D512_FLAVOR[0] < d_qk <= D576_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D576_FLAVOR[1] and d_qk % 8 == d_v % 8 == 0:
+        return True
+    maximum = GENERAL_HEAD_TILE_MAX if decode else PAGED_HEAD_TILE_MAX
+    return all(0 < d <= maximum and d % 8 == 0 for d in (d_qk, d_v))
+
+
 FP8_HEAD_TILE_GRANULE = 32
 FP8_GENERAL_HEAD_TILE_MAX = 256
 FP8_GENERAL_HEAD_TILES = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_GENERAL_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
@@ -38,10 +53,19 @@ def mxfp8_sf_tile_bytes(head_dim: int) -> int:
 
 D256_FLAVOR = (256, 256)
 D512_FLAVOR = (512, 512)
+D576_FLAVOR = (576, 512)
+WIDE_F16_FLAVORS = frozenset({D512_FLAVOR, D576_FLAVOR})
+
+
+def wide_q_smem_frags(flavor: tuple[int, int]) -> int:
+    """Q MMA fragments kept in SMEM by each of the eight wide-head warps."""
+    return 3 if flavor == D576_FLAVOR else 4
+
+
 D512_TILE = (64, 32)
 FP8_D512_TILE = (64, 64)
 GENERAL_KV_TILES = (128, 64)
-F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR, D512_FLAVOR})
+F16_FLAVORS: frozenset[tuple[int, int]] = frozenset({D256_FLAVOR}) | WIDE_F16_FLAVORS
 FP8_FLAVORS: frozenset[tuple[int, int]] = frozenset({D512_FLAVOR})
 
 
@@ -59,6 +83,8 @@ def pick_flavor(d_qk: int, d_v: int, fp8: bool) -> Optional[tuple[int, int]]:
     """Select the fixed-tile flavor for the head dimensions, or the general template."""
     if GENERAL_HEAD_TILE_MAX < d_qk <= D512_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D512_FLAVOR[1]:
         return D512_FLAVOR
+    if not fp8 and D512_FLAVOR[0] < d_qk <= D576_FLAVOR[0] and GENERAL_HEAD_TILE_MAX < d_v <= D576_FLAVOR[1]:
+        return D576_FLAVOR
     tiles = head_tiles(d_qk, d_v, FP8_HEAD_TILE_GRANULE if fp8 else HEAD_TILE_GRANULE)
     return tiles if tiles in (FP8_FLAVORS if fp8 else F16_FLAVORS) else None
 
@@ -73,7 +99,7 @@ def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
     intersect their SMEM fit with this set, so no tile is proposed that
     declines at build.
     """
-    if pick_flavor(d_qk, d_v, fp8) == D512_FLAVOR:
+    if pick_flavor(d_qk, d_v, fp8) in WIDE_F16_FLAVORS:
         return frozenset({FP8_D512_TILE if fp8 else D512_TILE})
     domain = frozenset((m, n) for m in SEQ_Q_TILES for n in GENERAL_KV_TILES)
     tiles = head_tiles(d_qk, d_v, HEAD_TILE_GRANULE)
@@ -208,6 +234,9 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
     epilogue reuses that Q/exchange storage in two rounds, while the K/V slab
     receives the next Q tile. It needs a third TMA barrier for those Q loads.
     Every d512 envelope shape uses the full 512-wide storage on both sides.
+    D576/V512 uses direct Q loads, three resident Q fragments per warp and
+    stages O through the drained K/V slab. Both wide half flavors need 98328
+    bytes for their fixed M64/N32 tile.
     The FP8 D512 flavor keeps Q in registers and uses a 64-key tile, so its
     extra storage is the score exchange plus the three TMA barriers.
     MXFP8 (``mxfp8``) adds one 128-row K scale-factor tile and one V
@@ -232,17 +261,17 @@ def smem_bytes(d_qk: int, d_v: int, q_tile: int, kv_tile: int, itemsize: int = 2
             return SMEM_CAPACITY_BYTES + 1
         return stages * (decode_stage_bytes(hq, hv) + 16)
     flavor = pick_flavor(d_qk, d_v, fp8=itemsize == 1)
-    if flavor == D512_FLAVOR:
-        d_qk, d_v = D512_FLAVOR
+    if flavor in WIDE_F16_FLAVORS:
+        d_qk, d_v = flavor
     kv_or_o = max(kv_tile * (d_qk + d_v) * itemsize, q_tile * d_v * (itemsize if out_itemsize is None else out_itemsize))
     q_resident = 0
     exchange = 0
     if flavor == D256_FLAVOR:
         q_resident = q_tile * (flavor[0] // 2) * itemsize
-    elif flavor == D512_FLAVOR:
-        q_resident = q_tile * (flavor[0] // 4) * itemsize if itemsize == 2 else 0
+    elif flavor in WIDE_F16_FLAVORS:
+        q_resident = 8 * wide_q_smem_frags(flavor) * 32 * 4 * 4 if itemsize == 2 else 0
         exchange = q_tile * kv_tile * 4 * 2
-    barrier_bytes = 24 if flavor == D512_FLAVOR else 16
+    barrier_bytes = 24 if flavor in WIDE_F16_FLAVORS else 16
     scale_factors = 0
     if mxfp8 and flavor == D512_FLAVOR:
         # The d512 kernel keeps the V scale tile and the staged K scale words.
@@ -293,6 +322,10 @@ class TemplateParams:
     # attn_scale < 0: the kernel negates Q as it loads it and runs at |attn_scale|, so the raw-score row max still
     # bounds P (#1435). APPEND-ONLY, default False.
     negate_scores: bool = False
+    # Native dense-query page loads; zero retains the dense ABI.
+    page_size: int = 0
+    # Independent FP8 cache storage, widened by native paged half loaders.
+    dtype_kv: int = -1
 
 
 def validate_params(
@@ -301,6 +334,8 @@ def validate_params(
     allowed_o_dtypes: tuple[int, ...] = (DTYPE_BF16, DTYPE_FP16),
     allow_right_band: bool = True,
     decode_tile: bool = False,
+    allow_paged: bool = False,
+    allow_paged_split: bool = False,
 ) -> None:
     """Validate the SM120 template specialization.
 
@@ -315,6 +350,22 @@ def validate_params(
     ``DECODE_Q_TILES`` at its stage-width KV tile; every other template is
     built for the ``SEQ_Q_TILES``.
     """
+
+    if params.dtype_kv != -1:
+        if params.dtype_kv not in (DTYPE_E4M3, DTYPE_E5M2):
+            raise ValueError("SM120 mixed KV requires E4M3 or E5M2 cache storage")
+        if not params.page_size or params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+            raise NotImplementedError("SM120 mixed FP8 KV requires paged storage with FP16/BF16 Q/O")
+
+    if params.page_size:
+        if not allow_paged:
+            raise NotImplementedError("SM120 paged KV requires a page-capable half template")
+        if params.page_size % 8 or params.page_size < 8:
+            raise ValueError("SM120 paged KV requires a positive page size divisible by 8")
+        if params.thd_varlen or (params.split_kv != 1 and not (decode_tile or allow_paged_split)):
+            raise NotImplementedError("SM120 paged KV serves dense queries; split KV requires a decode or D512/D576 tile")
+        if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
+            raise NotImplementedError("SM120 paged KV serves FP16/BF16 only")
 
     if params.dtype_qkv not in allowed_dtypes:
         raise ValueError(f"SM120 SDPA: dtype_qkv must be one of {allowed_dtypes}; got {params.dtype_qkv}")
@@ -350,8 +401,8 @@ def validate_params(
         raise ValueError(f"SM120 SDPA: this template's q_tile must be one of {q_tiles}; got {params.q_tile}")
     if decode_tile:
         # The decode tile's KV tile is its stage width (decode_kv_stage), fixed by the head tiles.
-        if params.kv_tile not in (16, 32, 64):
-            raise ValueError(f"SM120 SDPA: the decode tile's kv_tile is its stage width (16, 32 or 64); got {params.kv_tile}")
+        if params.kv_tile not in (16, 32, 48, 64):
+            raise ValueError(f"SM120 SDPA: the decode tile's kv_tile is its stage width (16, 32, 48 or 64); got {params.kv_tile}")
         if params.thd_varlen:
             raise ValueError("SM120 SDPA: the decode tile is dense-only (THD keeps the prefill templates)")
         if params.sched_policy != SCHED_NATURAL:

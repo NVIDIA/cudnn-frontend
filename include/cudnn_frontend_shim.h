@@ -973,6 +973,10 @@ destroy_handle(cudnnHandle_t handle) {
 }
 
 #if CUDNN_VERSION >= 92200
+// Defined below. Built against cuDNN >= 9.22 but running on an older backend, the symbols below do not exist.
+inline size_t
+get_backend_version(void);
+
 inline cudnnStatus_t
 causal_conv1d_forward(cudaStream_t stream,
                       const void *x,
@@ -985,6 +989,9 @@ causal_conv1d_forward(cudaStream_t stream,
                       int kernel_size,
                       cudnnDataType_t data_type,
                       cudnnCausalConv1dActivation_t activation) {
+    if (get_backend_version() < 92200) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
     NV_FE_CALL_TO_BACKEND(causal_conv1d_forward,
                           cudnnCausalConv1dForward,
                           stream,
@@ -1016,6 +1023,9 @@ causal_conv1d_backward(cudaStream_t stream,
                        cudnnDataType_t data_type,
                        cudnnDataType_t dw_data_type,
                        cudnnCausalConv1dActivation_t activation) {
+    if (get_backend_version() < 92200) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
     NV_FE_CALL_TO_BACKEND(causal_conv1d_backward,
                           cudnnCausalConv1dBackward,
                           stream,

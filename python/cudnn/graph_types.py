@@ -74,6 +74,7 @@ class NodeType(Enum):
     MAMBA2_BWD = auto()
     MAMBA2_SUMMARY = auto()
     MAMBA2_SUMMARY_BWD = auto()
+    CUSTOM_REDUCTION = auto()
     GATHER = auto()
 
 

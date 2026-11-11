@@ -51,6 +51,7 @@ def test_independent_thd_origins_rebind_and_capture(
     cga=None,
     compact=False,
     heads_override=None,
+    batch_override=None,
 ):
     import cudnn
     import torch
@@ -60,6 +61,9 @@ def test_independent_thd_origins_rebind_and_capture(
     torch.manual_seed(117)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
     batch, heads, kv_heads, maximum = 4, (heads_override or (24 if d_qk == 576 else 8)), 2, 256
+    if batch_override is not None:
+        assert batch_override == 1
+        batch, maximum = 1, 512
     capacity = batch * maximum
     dtype = getattr(torch, dtype_name)
     ports = ("q", "k", "v", "o", "stats")
@@ -68,6 +72,7 @@ def test_independent_thd_origins_rebind_and_capture(
     qk_multiplier = 16 if d_qk in (64, 192, 576) else d_qk
     multipliers = (heads * qk_multiplier, qk_multiplier, 1, d_v, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
+    q_lengths, kv_lengths = q_lengths[:batch], kv_lengths[:batch]
     log2_stats = stats_layout == "head"
 
     def tensors(head_padding=0):
@@ -92,12 +97,12 @@ def test_independent_thd_origins_rebind_and_capture(
         return t.as_strided((capacity, t.shape[1], t.shape[-1]), (t.stride(2), t.stride(1), t.stride(3)))
 
     def fill(values, shift, short=False, empty=False):
-        ql = [97, 0, 49, 17] if short else q_lengths
+        ql = [97, 0, 49, 17][:batch] if short else q_lengths
         if empty:
             ql = [0] * batch
         # Replay also turns a live query sequence into a keyless row.
-        kl = [101, 0, 76, 0] if short else kv_lengths
-        origins = {name: [shift + port * 16 + x for x in (0, 176, 224, 384)] for port, name in enumerate(ports)}
+        kl = ([0] if batch_override == 1 else [101, 0, 76, 0]) if short else kv_lengths
+        origins = {name: [shift + port * 16 + x for x in (0, 176, 224, 384)[:batch]] for port, name in enumerate(ports)}
         if compact:
             from itertools import accumulate
 

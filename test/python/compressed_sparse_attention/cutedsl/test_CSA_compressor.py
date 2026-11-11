@@ -58,6 +58,8 @@ import gc
 import pytest
 import torch
 
+from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+
 
 def _import_compressor():
     """Import ``cudnn.csa.compressor``, skipping only on a missing cutedsl stack."""
@@ -80,6 +82,24 @@ def _require_csa_device(ratio=4):
             pytest.skip("ratio 2/4 requires SM90 or compute capability major >= 10")
     elif capability[0] < 10:
         pytest.skip(f"ratio {ratio} requires compute capability major >= 10")
+
+
+def _bwd_smem_need_and_limit(ratio, d, coff, total_comp):
+    """(per-CTA shared memory the ratio=128 backward needs, what the current device allows)."""
+    from cudnn._device import device_info
+    from cudnn.csa.compressor.compressor_sm100_r128 import bwd_smem_bytes_r128
+
+    return bwd_smem_bytes_r128(ratio, d, coff, total_comp), device_info(torch.cuda.current_device()).shared_memory_per_block_optin
+
+
+def _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp):
+    """Skip where the ratio=128 backward's CTA does not fit the device's per-CTA shared memory (for example d=512 coff=2
+    on cc 12.x): check_support() declines that plan with NotImplementedError instead of launching it."""
+    if ratio != 128:
+        return
+    need, limit = _bwd_smem_need_and_limit(ratio, d, coff, total_comp)
+    if need > limit:
+        pytest.skip(f"ratio=128 backward needs {need} B of shared memory per CTA; this device allows {limit} B")
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +242,228 @@ def _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go):
     )
 
 
+def _make_batch_invariance_sample(length, d, ratio, coff, ape, seed):
+    """Build one reusable sequence whose bytes survive every batch repacking."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    width = coff * d
+    blocks = length // ratio
+    return {
+        "kv": torch.randn(length, 1, width, generator=generator, dtype=torch.float32).to(torch.bfloat16).cuda(),
+        "score": (torch.randn(length, 1, width, generator=generator, dtype=torch.float32).mul_(1.5)).to(torch.bfloat16).cuda(),
+        "ape": ape,
+        "grad_out": torch.randn(blocks, 1, d, generator=generator, dtype=torch.float32).to(torch.bfloat16).cuda(),
+        "length": length,
+        "blocks": blocks,
+    }
+
+
+def _pack_batch_invariance_samples(samples, d, active_backward_position=None):
+    """Pack reusable samples, isolating one sequence's backward gradient source."""
+    lengths = [sample["length"] for sample in samples]
+    blocks = [sample["blocks"] for sample in samples]
+    token_prefix = [0]
+    comp_prefix = [0]
+    for length, count in zip(lengths, blocks):
+        token_prefix.append(token_prefix[-1] + length)
+        comp_prefix.append(comp_prefix[-1] + count)
+
+    kv = torch.cat([sample["kv"] for sample in samples])
+    score = torch.cat([sample["score"] for sample in samples])
+    cu = torch.tensor(token_prefix, dtype=torch.int32, device="cuda")
+    cuc = torch.tensor(comp_prefix, dtype=torch.int32, device="cuda")
+    grad_parts = [
+        sample["grad_out"] if position == active_backward_position else torch.zeros_like(sample["grad_out"]) for position, sample in enumerate(samples)
+    ]
+    grad_out = torch.cat(grad_parts) if comp_prefix[-1] else torch.empty(0, 1, d, dtype=torch.bfloat16, device="cuda")
+    return kv, score, cu, cuc, grad_out, token_prefix, comp_prefix
+
+
+def _run_batch_invariance_target(samples, target_position, d, ratio, coff, backward):
+    """Run one batch layout and return only the fixed target sequence's results."""
+    compressor = _import_compressor()
+    active = target_position if backward else None
+    kv, score, cu, cuc, grad_out, token_prefix, comp_prefix = _pack_batch_invariance_samples(samples, d, active)
+    total_tokens = token_prefix[-1]
+    total_comp = comp_prefix[-1]
+    ape = samples[target_position]["ape"]
+
+    if not backward:
+        out = compressor.csa_compressor_forward_wrapper(
+            kv.view(total_tokens, -1),
+            score.view(total_tokens, -1),
+            ape,
+            cu,
+            cuc,
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            total_comp=total_comp,
+        )["out"]
+        begin, end = comp_prefix[target_position : target_position + 2]
+        return snapshot({"out": out[begin:end]})
+
+    grads = compressor.csa_compressor_backward_wrapper(
+        kv.view(total_tokens, -1),
+        score.view(total_tokens, -1),
+        ape,
+        cu,
+        cuc,
+        grad_out.view(total_comp, d),
+        ratio=ratio,
+        head_dim=d,
+        coff=coff,
+        deterministic=True,
+    )
+    begin, end = token_prefix[target_position : target_position + 2]
+    return snapshot(
+        {
+            "grad_kv": grads["grad_kv"][begin:end],
+            "grad_score": grads["grad_score"][begin:end],
+            "grad_ape": grads["grad_ape"],
+        }
+    )
+
+
+_BATCH_INVARIANCE_CASES = [
+    pytest.param(2, 1, 128, 257, 1024, 1, id="r2-c1-d128"),
+    pytest.param(2, 2, 128, 257, 1024, 1, id="r2-c2-d128"),
+    pytest.param(2, 2, 65, 257, 1024, 1, id="r2-c2-d65-scalar"),
+    pytest.param(4, 1, 128, 513, 2048, 3, id="r4-c1-d128"),
+    pytest.param(4, 2, 128, 513, 2048, 3, id="r4-c2-d128"),
+    pytest.param(4, 1, 512, 513, 2048, 3, id="r4-c1-d512"),
+    # 128 compressed neighbor rows plus the target cross the dedicated forward's
+    # small/default schedule boundary without making this L0 probe resource-heavy.
+    pytest.param(128, 1, 128, 129, 16384, 127, id="r128-c1-d128-small-to-default"),
+    pytest.param(128, 2, 128, 129, 16384, 127, id="r128-c2-d128-small-to-default"),
+    pytest.param(128, 2, 512, 129, 16384, 127, id="r128-c2-d512-small-to-default"),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop-deterministic"])
+@pytest.mark.parametrize("ratio,coff,d,target_length,large_length,short_length", _BATCH_INVARIANCE_CASES)
+def test_batch_invariance(request, backward, ratio, coff, d, target_length, large_length, short_length):
+    """A fixed sequence has identical bytes alone, reordered, duplicated, or beside changed neighbors."""
+    _require_csa_device(ratio)
+    if not backward and (ratio, coff, d) == (128, 2, 512):
+        request.node.add_marker(
+            pytest.mark.xfail(
+                strict=False,
+                reason=(
+                    "known ratio-128 forward batch-size schedule boundary: the small and default "
+                    "buckets use different chunk/exp arithmetic; retain the bitwise detector"
+                ),
+            )
+        )
+    ape_generator = torch.Generator(device="cpu").manual_seed(20261110)
+    ape = torch.randn(ratio, coff * d, generator=ape_generator, dtype=torch.float32).mul_(0.25).cuda()
+    target = _make_batch_invariance_sample(target_length, d, ratio, coff, ape, 20261111)
+    large = _make_batch_invariance_sample(large_length, d, ratio, coff, ape, 20261112)
+    short = _make_batch_invariance_sample(short_length, d, ratio, coff, ape, 20261113)
+    expected = _run_batch_invariance_target([target], 0, d, ratio, coff, backward)
+
+    layouts = [
+        ([large, target, short], (1,)),
+        ([short, target, large], (1,)),
+        ([target, target], (0, 1)),
+    ]
+    for samples, positions in layouts:
+        for position in positions:
+            actual = _run_batch_invariance_target(samples, position, d, ratio, coff, backward)
+            assert_bitwise(actual, expected, f"ratio={ratio} coff={coff} batch position={position}")
+
+    changed_large = _make_batch_invariance_sample(large_length, d, ratio, coff, ape, 20261114)
+    changed_short = _make_batch_invariance_sample(short_length, d, ratio, coff, ape, 20261115)
+    actual = _run_batch_invariance_target([changed_large, target, changed_short], 1, d, ratio, coff, backward)
+    assert_bitwise(actual, expected, f"ratio={ratio} coff={coff} changed neighbors")
+
+
+_GOLDEN_CASES = [
+    pytest.param(2, 1, [17, 3], id="generic-r2-c1"),
+    pytest.param(4, 2, [17, 3], id="generic-r4-c2"),
+    pytest.param(128, 1, [257, 129], id="dedicated-r128-c1"),
+]
+
+
+def _run_golden_target(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward):
+    """Run one golden direction, selecting the opt-in deterministic backward contract."""
+    compressor = _import_compressor()
+    total = kv.shape[0]
+    if not backward:
+        out = compressor.csa_compressor_forward_wrapper(
+            kv.view(total, -1),
+            score.view(total, -1),
+            ape,
+            cu,
+            cuc,
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            total_comp=total_comp,
+        )["out"]
+        return {"out": out.view(total_comp, 1, d)}
+
+    grads = compressor.csa_compressor_backward_wrapper(
+        kv.view(total, -1),
+        score.view(total, -1),
+        ape,
+        cu,
+        cuc,
+        grad_out.view(total_comp, d),
+        ratio=ratio,
+        head_dim=d,
+        coff=coff,
+        deterministic=True,
+    )
+    return {
+        "grad_kv": grads["grad_kv"].view_as(kv),
+        "grad_score": grads["grad_score"].view_as(score),
+        "grad_ape": grads["grad_ape"],
+    }
+
+
+def _check_golden_reference(actual, kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward):
+    """Keep the numerical oracle separate from the byte-exact replay/golden checks."""
+    reference = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, mode="fp32")
+    if backward:
+        _assert_grads_vs_fp32(actual["grad_kv"], actual["grad_score"], reference[1], reference[2], ratio)
+        assert (actual["grad_ape"] - reference[3]).abs().max().item() <= 1e-3
+        return
+
+    difference = (actual["out"].float() - reference[0].float()).abs()
+    changed = (actual["out"] != reference[0]).sum().item()
+    assert changed <= max(1, int(0.001 * actual["out"].numel())), changed
+    assert difference.max().item() <= 1.6e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop-deterministic"])
+@pytest.mark.parametrize("ratio,coff,lens", _GOLDEN_CASES)
+def test_determinism_golden(backward, ratio, coff, lens):
+    """Replay, reference, then golden-check each generic/dedicated numerical path."""
+    _require_csa_device(ratio)
+    d = 128
+    kv, score, ape, cu, cuc, total_comp, grad_out = _make_inputs(lens, d, ratio, coff, seed=20261110)
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
+    inputs = {
+        "kv": kv,
+        "score": score,
+        "ape": ape,
+        "cu_seqlens": cu,
+        "cu_seqlens_comp": cuc,
+        "config": torch.tensor([ratio, d, coff, total_comp], dtype=torch.int64),
+    }
+    if backward:
+        inputs["grad_out"] = grad_out
+    original = snapshot(inputs)
+    run = lambda: _run_golden_target(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward)
+    actual = assert_replays(run, repeats=3)
+    assert_bitwise(inputs, original, "golden inputs mutated")
+    _check_golden_reference(actual, kv, score, ape, cu, cuc, total_comp, ratio, d, coff, grad_out, backward)
+    direction = "bprop-deterministic" if backward else "fprop"
+    assert_golden(f"csa-compressor-r{ratio}-c{coff}-{direction}", inputs, actual)
+
+
 def _assert_grads_vs_fp32(gkv, gs, ref_kv, ref_s, ratio):
     """dKV/dScore vs the fp32-intermediate eager reference, per the ratio's contract.
 
@@ -304,6 +546,7 @@ def test_numerics_vs_references(lens, d, ratio, coff):
     ratio=128), upstream eager, and fp64 oracle."""
     _require_csa_device(ratio)
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
 
     r_fused = _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go)
     r_fp32 = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp32")
@@ -547,6 +790,7 @@ def test_r128_envelope_execution(coff, d, nb_rows):
 
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs([nb_rows * ratio], d, ratio, coff)
     assert total_comp == nb_rows
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     r1 = _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go)
     r2 = _run_fused(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go)
     # Bitwise run-to-run determinism holds in EVERY bucket (incl. fast exp/two-phase).
@@ -572,16 +816,14 @@ def test_r128_envelope_execution(coff, d, nb_rows):
 
 _PADDING_SHAPES = [
     # (lens, head_dim, ratio, coff, pad); the first case has a LEADING segment shorter
-    # than ratio (0 compressed blocks), so padding rows gather tokens [0, ratio) that
-    # span a segment boundary -- exactly like the eager gather.
+    # than ratio (0 compressed blocks), proving capacity rows do not read across its
+    # boundary and are exact zeros.
     ([3, 515, 1024, 129], 128, 4, 2, 8),
     ([1023, 2048, 509], 128, 4, 2, 8),
     ([3, 515, 1024, 129], 128, 4, 1, 8),
     ([1023, 2048, 509], 128, 4, 1, 8),
-    # ratio=2: same classes; the leading 1-token segment keeps the padding-row gather
-    # spanning a segment boundary (seqlen < ratio at ratio=2). The [1, 1] pack isolates
-    # the padding-only path (nb_valid == 0 with a positive static capacity): every
-    # output row is a padding row gathering from token 0.
+    # ratio=2: same classes. The [1, 1] pack isolates the padding-only path
+    # (nb_valid == 0 with a positive static capacity).
     ([1, 515, 1024, 129], 128, 2, 2, 8),
     ([1023, 2048, 509], 128, 2, 2, 8),
     ([1, 1], 128, 2, 2, 8),
@@ -594,7 +836,7 @@ _PADDING_SHAPES = [
 @pytest.mark.L0
 @pytest.mark.parametrize("lens,d,ratio,coff,pad", _PADDING_SHAPES)
 def test_static_capacity_padding(lens, d, ratio, coff, pad):
-    """Static-capacity padding rows: eager-matching forward, ignored padding gradients."""
+    """Static-capacity rows are exact-zero forward outputs with ignored gradients."""
     _require_csa_device(ratio)
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     capacity = total_true + pad
@@ -607,11 +849,12 @@ def test_static_capacity_padding(lens, d, ratio, coff, pad):
     r_fused = _run_fused(kv, score, ape, cu, cuc, capacity, ratio, d, coff, go)
     r_fp32 = _run_eager(kv, score, ape, cu, cuc, capacity, ratio, d, coff, go_zero_pad, mode="fp32")
 
-    # Forward: padding rows replicate row 0's window exactly like the eager code, so the
-    # full padded output (valid + padding rows) obeys the same criteria as the unpadded
-    # comparison.
-    assert (r_fused[0] != r_fp32[0]).sum().item() <= max(1, int(0.001 * r_fused[0].numel()))
-    assert (r_fused[0].float() - r_fp32[0].float()).abs().max().item() <= 1.6e-2
+    # Valid rows preserve the existing numerical contract. Every capacity-only row is
+    # exactly zero, including the all-short nb_valid == 0 case.
+    if total_true:
+        assert (r_fused[0][:total_true] != r_fp32[0][:total_true]).sum().item() <= max(1, int(0.001 * r_fused[0][:total_true].numel()))
+        assert (r_fused[0][:total_true].float() - r_fp32[0][:total_true].float()).abs().max().item() <= 1.6e-2
+    assert torch.count_nonzero(r_fused[0][total_true:]).item() == 0
 
     # Backward: incoming gradients on padding rows are ignored by design -- the fused
     # gradients (computed with NONZERO padding-row grads) match the eager reference run
@@ -646,6 +889,52 @@ def test_empty_output(coff, deterministic):
     assert grads["grad_kv"].abs().sum().item() == 0
     assert grads["grad_score"].abs().sum().item() == 0
     assert grads["grad_ape"].abs().sum().item() == 0
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True], ids=["atomic", "deterministic"])
+@pytest.mark.parametrize("ratio,capacity", [(4, 5), (128, 3)], ids=["generic-r4", "dedicated-r128"])
+def test_all_short_static_capacity_is_zero(deterministic, ratio, capacity):
+    """A positive graph capacity is safe when the whole THD pack is shorter than ratio."""
+    _require_csa_device(ratio)
+    compressor = _import_compressor()
+    d, coff = 128, 1
+    total_tokens = ratio - 1
+    kv = torch.full((total_tokens, d), float("nan"), dtype=torch.bfloat16, device="cuda")
+    score = torch.full_like(kv, float("nan"))
+    ape = torch.full((ratio, d), float("nan"), dtype=torch.float32, device="cuda")
+    cu = torch.tensor([0, total_tokens], dtype=torch.int32, device="cuda")
+    cuc = torch.tensor([0, 0], dtype=torch.int32, device="cuda")
+    grad_out = torch.randn(capacity, d, device="cuda").to(torch.bfloat16)
+
+    out = compressor.csa_compressor_forward_wrapper(
+        kv,
+        score,
+        ape,
+        cu,
+        cuc,
+        ratio=ratio,
+        head_dim=d,
+        coff=coff,
+        total_comp=capacity,
+    )["out"]
+    grads = compressor.csa_compressor_backward_wrapper(
+        kv,
+        score,
+        ape,
+        cu,
+        cuc,
+        grad_out,
+        ratio=ratio,
+        head_dim=d,
+        coff=coff,
+        deterministic=deterministic,
+    )
+
+    assert torch.count_nonzero(out).item() == 0
+    assert torch.count_nonzero(grads["grad_kv"]).item() == 0
+    assert torch.count_nonzero(grads["grad_score"]).item() == 0
+    assert torch.count_nonzero(grads["grad_ape"]).item() == 0
 
 
 @pytest.mark.L0
@@ -767,6 +1056,7 @@ def test_backward_fills_uninitialized_buffers(lens, d, ratio, coff, pad, tok_pad
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_true, _ = _make_inputs(lens, d, ratio, coff)
     total_comp = total_true + pad
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     gen = torch.Generator(device="cpu").manual_seed(11)
     go = torch.randn(total_comp, d, generator=gen, dtype=torch.float32).to(torch.bfloat16).cuda()
     total = kv.shape[0] + tok_pad
@@ -1077,7 +1367,7 @@ def test_generic_compile_cache_ignores_packed_runtime_extents(monkeypatch):
     monkeypatch.setattr(compressor_sm100, "_compile_bwd", fake_compile_bwd)
     monkeypatch.setattr(compressor_sm100, "precompile_dape_reduce", fake_reduce)
 
-    ratio, d, coff = 4, 128, 2
+    ratio, d, coff = 4, 128, 1
     for lens in ([4], [5, 7], [129, 63, 1]):
         kv, score, ape, cu, cuc, total_comp, _ = _make_inputs(lens, d, ratio, coff)
         samples = dict(
@@ -1100,9 +1390,9 @@ def test_generic_compile_cache_ignores_packed_runtime_extents(monkeypatch):
             plan.compile()
 
     assert observed == [
-        ("fwd", 4, 128, 2),
-        ("bwd", 4, 128, 2, 8, False),
-        ("bwd", 4, 128, 2, 8, True),
+        ("fwd", 4, 128, 1),
+        ("bwd", 4, 128, 1, 8, False),
+        ("bwd", 4, 128, 1, 8, True),
         ("reduce", True),
     ]
 
@@ -1212,6 +1502,7 @@ def test_backward_deterministic_dape(lens, d, ratio, coff):
     _require_csa_device(ratio)
     compressor = _import_compressor()
     kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    _skip_if_bwd_smem_exceeds(ratio, d, coff, total_comp)
     r_fp32 = _run_eager(kv, score, ape, cu, cuc, total_comp, ratio, d, coff, go, mode="fp32")
 
     prev_det = torch.are_deterministic_algorithms_enabled()
@@ -1411,12 +1702,20 @@ def test_backward_atomic_rejects_workspace_before_launch(monkeypatch, lens):
 
 @pytest.mark.L0
 @pytest.mark.filterwarnings("ignore::UserWarning")
-@pytest.mark.parametrize("ratio", [2, 4, 128])
-def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
+@pytest.mark.parametrize(
+    "ratio,coff",
+    [
+        pytest.param(2, 2, id="r2-c2"),
+        pytest.param(4, 1, id="sm90-primary-r4-c1"),
+        pytest.param(4, 2, id="r4-c2"),
+        pytest.param(128, 2, id="r128-c2"),
+    ],
+)
+def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio, coff):
     """Class-API graph replays overwrite dAPE; no external zero-fill is required."""
     _require_csa_device(ratio)
     compressor = _import_compressor()
-    d, coff = 128, 2
+    d = 128
     kv, score, ape, cu, cuc, total_true, go = _make_inputs([1023, 509], d, ratio, coff)
     total_comp = total_true + 8
     go_capacity = torch.zeros(total_comp, 1, d, dtype=torch.bfloat16, device="cuda")
@@ -1444,15 +1743,21 @@ def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
 
     bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
     torch.cuda.synchronize()
-    reference = grad_ape.clone()
+    reference = {"grad_kv": grad_kv.clone(), "grad_score": grad_score.clone(), "grad_ape": grad_ape.clone()}
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
             bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+        workspace.fill_(0xA5)
+        grad_kv.fill_(float("nan"))
+        grad_score.fill_(float("nan"))
+        grad_ape.fill_(float("nan"))
         graph.replay()
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(grad_ape, reference)
+        assert torch.equal(grad_kv, reference["grad_kv"])
+        assert torch.equal(grad_score, reference["grad_score"])
+        assert torch.equal(grad_ape, reference["grad_ape"])
     finally:
         graph.reset()
 
@@ -1648,8 +1953,10 @@ def test_cuda_graph_capture(coff):
     # forward vs eager (contract tolerance), dAPE vs eager (atomics tolerance), and
     # the whole replay vs a direct (non-captured) fused call on the same mutated
     # inputs — bitwise on forward/dKV/dScore.
-    assert (out_c.view_as(r_fp32[0]) != r_fp32[0]).sum().item() <= max(1, int(0.001 * r_fp32[0].numel()))
-    assert (out_c.view_as(r_fp32[0]).float() - r_fp32[0].float()).abs().max().item() <= 1.6e-2
+    out_view = out_c.view_as(r_fp32[0])
+    assert (out_view[:total2] != r_fp32[0][:total2]).sum().item() <= max(1, int(0.001 * r_fp32[0][:total2].numel()))
+    assert (out_view[:total2].float() - r_fp32[0][:total2].float()).abs().max().item() <= 1.6e-2
+    assert torch.count_nonzero(out_view[total2:]).item() == 0
     assert (gape_c - r_fp32[3]).abs().max().item() <= 1e-3
     direct_out, direct_grads = _fused_fwd_bwd()
     torch.cuda.synchronize()
@@ -1762,8 +2069,10 @@ def test_cuda_graph_capture_r128():
     # forward vs eager (contract tolerance), dAPE vs eager (atomics tolerance), and
     # the whole replay vs a direct (non-captured) fused call on the same mutated
     # inputs — bitwise on forward/dKV/dScore.
-    assert (out_c.view_as(r_fp32[0]) != r_fp32[0]).sum().item() <= max(1, int(0.001 * r_fp32[0].numel()))
-    assert (out_c.view_as(r_fp32[0]).float() - r_fp32[0].float()).abs().max().item() <= 1.6e-2
+    out_view = out_c.view_as(r_fp32[0])
+    assert (out_view[:total2] != r_fp32[0][:total2]).sum().item() <= max(1, int(0.001 * r_fp32[0][:total2].numel()))
+    assert (out_view[:total2].float() - r_fp32[0][:total2].float()).abs().max().item() <= 1.6e-2
+    assert torch.count_nonzero(out_view[total2:]).item() == 0
     assert (gape_c - r_fp32[3]).abs().max().item() <= 1e-3
     direct_out, direct_grads = _fused_fwd_bwd()
     torch.cuda.synchronize()
@@ -1846,8 +2155,35 @@ def test_check_support_accepts_envelope_r128(d, coff):
     compressor = _import_compressor()
     for cls in (compressor.CSACompressorForward, compressor.CSACompressorBackward):
         api = cls(**_meta_samples(total=1024, d=d, ratio=128, coff=coff), ratio=128, coff=coff)
+        need, limit = _bwd_smem_need_and_limit(128, d, coff, 8)
+        if cls is compressor.CSACompressorBackward and need > limit:
+            # A device with less per-CTA shared memory than this schedule (cc 12.x for d=512 coff=2) declines it.
+            with pytest.raises(NotImplementedError, match="shared memory per CTA"):
+                api.check_support()
+            continue
         assert api.check_support() is True
         assert api.head_dim == d and api.total_tokens == 1024 and api.total_comp == 8
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("deterministic", [False, True], ids=["atomic", "deterministic"])
+def test_r128_backward_shared_memory_gate_spares_empty_output(monkeypatch, deterministic):
+    """On a device below the ratio=128 backward's per-CTA shared memory, a plan with compressed rows is declined, but an
+    empty output (every sequence shorter than the ratio) launches no kernel and still passes check_support."""
+    import types
+
+    _require_csa_device(128)
+    compressor = _import_compressor()
+    from cudnn.csa.compressor import api as csa_api
+    from cudnn.csa.compressor.compressor_sm100_r128 import bwd_smem_bytes_r128
+
+    need = bwd_smem_bytes_r128(128, 512, 2, 8)
+    monkeypatch.setattr(csa_api, "device_info", lambda index: types.SimpleNamespace(shared_memory_per_block_optin=need - 1))
+    empty = compressor.CSACompressorBackward(**_meta_samples(total=2, d=512, ratio=128, coff=2, total_comp=0), ratio=128, coff=2, deterministic=deterministic)
+    assert empty.check_support() is True
+    rows = compressor.CSACompressorBackward(**_meta_samples(total=1024, d=512, ratio=128, coff=2), ratio=128, coff=2, deterministic=deterministic)
+    with pytest.raises(NotImplementedError, match="shared memory per CTA"):
+        rows.check_support()
 
 
 @pytest.mark.L0
@@ -1901,8 +2237,6 @@ def test_check_support_rejects_ratio128_on_sm90(monkeypatch, cls_name):
         (dict(cuc_len=4), dict(), "B \\+ 1"),
         (dict(total=2**25, d=128), dict(), "int32 flat offsets"),
         (dict(total=4, d=8388482, total_comp=1), dict(), "head_dim"),
-        (dict(total=2, total_comp=1), dict(), "requires at least ratio"),
-        (dict(total=1, total_comp=1, ratio=2), dict(ratio=2), "requires at least ratio"),
         (dict(kv_stride=(512, 2)), dict(), "contiguous"),
         (dict(total=1024, d=96, ratio=128, coff=1), dict(ratio=128, coff=1), "ratio=128 is validated for head_dim"),
     ],

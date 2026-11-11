@@ -228,11 +228,23 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # mb_bias_ring_full per leader fill a padded / shorter chunk receives) and +1 IDLE wait (the TMA-LDG warp's end-of-kernel
     # mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 82 / 22.
     ("f16", (128, 128)): (True, 82, 22),
-    ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
-    ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
+    ("fp8", (128, 128)): (
+        False,
+        56,
+        12,
+    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait; +2: the tile-end S-read credit waits
+    ("mxfp8", (128, 128)): (
+        True,
+        38,
+        13,
+    ),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o); +1: the FP32 split-partial epilogue's mb_o_empty wait; +1: the P-slot hand-over wait
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
-    ("fp8", (192, 128)): (True, 43, 12),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
-    ("mxfp8", (192, 128)): (True, 35, 13),
+    ("fp8", (192, 128)): (
+        True,
+        54,
+        13,
+    ),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +9: the early-BMM1 mainloop arm; +1: the decoded-tile wait; +2: the tile-end S-read credit waits; the softmax tile-top wait is the idle mb_o_full[0] wait
+    ("mxfp8", (192, 128)): (True, 35, 14),  # +1 ring wait: the P-slot hand-over wait; the softmax tile-top wait is the idle mb_o_full[0] wait
     ("f16", (256, 256)): (False, 30, 11),  # FP32 split-partial epilogue adds one output-ring wait
     ("fp8", (256, 256)): (False, 30, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
     ("mxfp8", (256, 256)): (False, 29, 11),
@@ -253,7 +265,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
 # at 2/300 and the hint-less spin at 74/200 on such a barrier, the poll ran 200/200 + 300/300 (d512 bwd lane, 2026-10-01).
 # POLL_CROSS_PAIR_WAITS is a correctness constant pinned True by the module itself, never the SPIN_RING_WAITS perf lever:
 # (poll-site count, targets).
-_D512_2X2_CROSS_PAIR_WAITS = (10, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
+_D512_2X2_CROSS_PAIR_WAITS = (11, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
 _IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go", "mb_bias_full", "mb_bias_empty")
 
 
@@ -661,7 +673,7 @@ _D512_2X2_ARRIVE_SITE_PINS = {
     "mb_tmem_dealloc.arrive": 1,
     "mb_tmem_dealloc.arrive_on_peer": 1,
     "mb_q_empty.arrive": 1,
-    "mb_bmm1_done[": 1,
+    "mb_bmm1_done[": 2,  # mutually exclusive two-chunk D512 and three-chunk D576 final releases
     "mb_bmm2_done[": 2,  # per-iteration (last N-block) + empty-tile commit
 }
 
@@ -893,26 +905,22 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
 
 
 def test_sm107_f16_thd_is_served_on_every_flavor():
-    """FULLY INVERTED 2026-09-09: every f16 flavor of the 128..512 family serves THD.
+    """THD retains its exact validated shapes; dense D32 and D576 stay declined.
 
-    PARTIALLY RE-INVERTED with the small head-dim tiles (d32 / d64 on the d128 file): `thd_d_shapes` is now a STRICT
-    SUBSET of `d_shapes` -- the small tiles' bodies carry the THD contract in principle (the same file) but their THD leg is
-    unvalidated, so the row declines it TYPED (and the config factory refuses `thd_varlen` for the "sm107 d32" / "sm107 d64"
-    flavors) until a THD sweep lands.  The two halves pinned: every THD shape is a served shape with no kernel-less member,
-    and every small tile is a typed decline, never a KeyError in module loading.  Asserted on real facts objects.
-
-    This keeps `thd_d_shapes` as a named SET rather than collapsing to `True`, because that is what makes a partial arch
-    line expressible without reintroducing a boolean that cannot describe it."""
+    The capability set must describe a strict subset, so adding a dense flavor
+    never silently admits packed queries for an unwired kernel path.
+    """
     from cudnn.sdpa.fwd import engines
-    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_SMALL_D_SHAPES, SM107_F16_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.thd is True
     assert caps.thd_d_shapes is SM107_F16_THD_SHAPES
-    assert SM107_F16_THD_SHAPES < caps.d_shapes and caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32)}, "THD = every f16 shape except D32"
+    assert SM107_F16_THD_SHAPES < caps.d_shapes
+    assert caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32), (576, 512)}
     for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
         assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
-    for d_qk, d_v in sorted(SM107_F16_SMALL_D_SHAPES - SM107_F16_THD_SHAPES):
+    for d_qk, d_v in sorted(caps.d_shapes - SM107_F16_THD_SHAPES):
         why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
         assert why is not None and "THD" in why, (d_qk, d_v, why)
 
@@ -951,9 +959,9 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         facts = _f16_facts(d_qk=d, d_v=d, thd=True, padded=True, has_paged_kv=True, page_size=16)
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
+        assert (engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is None) == (d == 128)
         # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
-        # at every cluster width the leg admits -- while dense paged queries and sink x split-KV keep their declines.
+        # at every cluster width the leg admits; dense D128 uses its native page loader too.
         sink = dataclasses.replace(facts, has_sink=True)
         gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
         assert engines.mismatch(caps, sink, knobs) is None, d
@@ -961,7 +969,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         if d == 128:
             for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
                 assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
-        assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
+        assert (engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs) is None) == (d == 128)
         assert engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2)) is not None
 
 
@@ -1259,10 +1267,35 @@ def test_rubin_mxfp8_forward_row_exists():
     assert caps.thd_d_shapes is SM107_MXFP8_THD_SHAPES
     assert caps.thd_d_shapes == frozenset({(256, 256)}) and caps.thd_d_shapes < caps.d_shapes
     assert caps.thd_padded_stats is True and caps.cu_seq_len is True
-    # The machinery the ported kernels lack stays declined: split-KV and PackGQA.
-    assert caps.split_kv_supported is False
+    # PackGQA stays declined; split-KV is wired on the d128 body only.
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_SPLIT_SHAPES
+
+    assert caps.split_kv_supported is True
+    assert caps.split_d_shapes is SM107_MXFP8_SPLIT_SHAPES and caps.split_d_shapes == frozenset({(128, 128)})
     assert caps.pack_gqas == frozenset({False})
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
+
+
+@pytest.mark.L0
+def test_sm107_mxfp8_split_coverage():
+    """split_kv > 1 on the cc 10.7 MXFP8 row: the d128 body with half outputs, dense or causal; the rest declines typed."""
+    from cudnn import data_type as _dt
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_SPLIT_SHAPES
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    knobs = engines.SdpaFwdKnobs(split_kv=2)
+    for d_qk, d_v in sorted(caps.d_shapes):
+        why = engines.mismatch(caps, _mxfp8_facts(d_qk=d_qk, d_v=d_v, s_kv=4096), knobs)
+        assert (why is None) == ((d_qk, d_v) in SM107_MXFP8_SPLIT_SHAPES), (d_qk, d_v, why)
+    assert engines.mismatch(caps, _mxfp8_facts(s_kv=4096, causal=True), knobs) is None
+    assert engines.mismatch(caps, _f16_facts(dtype=_dt.FP8_E4M3, dtype_o=_dt.HALF, is_mxfp8=True, s_kv=4096), knobs) is None
+    for bad in (
+        dict(dtype=_dt.FP8_E4M3, dtype_o=_dt.FP8_E4M3, is_mxfp8=True, s_kv=4096),
+        dict(dtype=_dt.FP8_E4M3, dtype_o=_dt.BFLOAT16, is_mxfp8=True, s_kv=4096, thd=True, padded=True, d_qk=256, d_v=256),
+    ):
+        assert engines.mismatch(caps, _f16_facts(**bad), knobs) is not None, bad
+    assert engines.mismatch(caps, _mxfp8_facts(s_kv=4096)) is None
 
 
 def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
@@ -1270,8 +1303,8 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
     F8_128x4 descale pools paging with K/V, page_size % 128, the sink / causal / bottom-right / SWA / padding masks,
     Stats and the f16x2 exponent arm composed.  Declined, each by its own typed reason: page 64, THD queries over
     pools (stage 2), the d192x128 / d512 pools (stage 3), a block-scaled O over pools, the pre-folded scale over paged
-    KV, pools without a padding mask, and split_kv > 1 (also with a sink).  The half row keeps its THD requirement
-    and the per-tensor FP8 row serves no paged KV."""
+    KV, pools without a padding mask, and split_kv > 1 (also with a sink). The native half D128
+    row accepts dense queries, and the per-tensor FP8 row serves paged D512."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -1312,10 +1345,12 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
         reason = engines.mismatch(caps, paged(**kw))
         assert reason is not None and needle in reason, (kw, reason)
     assert engines.mismatch(caps, paged(has_sink=True), SdpaFwdKnobs(split_kv=2)) is not None
-    # The half row: dense paged queries stay declined on cc 10.7 (THD queries are its paged form).
+    # The half D128 row now admits dense queries through the native page loader.
     half = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
-    assert half is not None and "THD queries" in half, half
-    assert not _caps("sdpa_fwd_prefill_sm107_fp8").paged_kv
+    assert half is None, half
+    fp8 = _caps("sdpa_fwd_prefill_sm107_fp8")
+    assert fp8.paged_kv
+    assert fp8.paged_d_shapes == frozenset({(512, 512)})
 
 
 def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
@@ -1327,7 +1362,6 @@ def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
     The shape must land on the NATIVE (192, 128) kernel, not an envelope: the
     d256 flavor's floor (255) would otherwise swallow it onto a padded path
     nobody validated."""
-    import cudnn
     from cudnn.sdpa.fwd import engines
 
     for row, is_mx in (("sdpa_fwd_prefill_sm107_fp8", False), ("sdpa_fwd_prefill_sm107_mxfp8", True)):
@@ -1339,36 +1373,24 @@ def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
             assert engines._selected_d_shape(caps, facts) == (192, 128), (row, dt)
 
 
-def test_sm107_d192_mxfp8_is_cga2_only_because_of_the_descriptor_window():
-    """REJECT side, and the reason is a DESCRIPTOR constraint rather than taste.
-
-    At cga1 the K/V rings are not halved, so this flavor's four scale-factor
-    tiles start at 256-278 KiB -- past the 256 KiB version-0 tcgen05 descriptor
-    window, where ``start_address`` wraps to 0 and the UTCCP copies Q DATA bytes
-    into the SF TMEM columns (LSE=+inf, O=NaN on 100% of cells, at every shape).
-
-    Two independent guards, and this test pins BOTH: the row keeps (192, 128) on
-    the default ``cgas={2}`` so a graph cannot request cga1, and the kernel body
-    raises at import if it is ever handed one anyway.  INVERTS-WHEN DESC_VERSION
-    is derived from the layout and the version-1 SF path is validated on Rubin
-    -- which is not free: desc_version=1 on the d128/d256 MXFP8 tiles turned 21
-    green tests red (2026-09-08)."""
-    import pytest as _pytest
+def test_sm107_d192_mxfp8_single_cta_stays_inside_the_descriptor_window():
+    """The MXFP8 d192x128 kernel declares the O slab after the scale-factor slabs and the ones tile, so its single-CTA
+    build keeps every tcgen05 operand inside the version-0 window; the row lists cga1 for the dense unsplit MHA causal
+    leg and keeps the pair elsewhere."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
-    facts = _quant_facts(d_qk=192, d_v=128, is_mx=True)
-    # Guard 1 -- knob domain. cga2 is honored, cga1 makes the plan ineligible.
-    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=2)) is None
-    assert engines.mismatch(caps, facts, SdpaFwdKnobs(cga=1)) is not None
-    # SM100 serves the same shape at BOTH widths -- so this is Rubin-specific,
-    # which is what makes it worth pinning rather than assuming.
-    assert 1 in engines.effective_cgas(_caps("sdpa_fwd_prefill_sm100_mxfp8"), facts, 1)
+    dense = _quant_facts(d_qk=192, d_v=128, is_mx=True)
+    assert engines.mismatch(caps, dense, SdpaFwdKnobs(cga=2)) is None
+    assert engines.mismatch(caps, dense, SdpaFwdKnobs(cga=1)) is not None
+    causal = _quant_facts(d_qk=192, d_v=128, is_mx=True, causal=True)
+    assert engines.mismatch(caps, causal, SdpaFwdKnobs(cga=1)) is None
+    assert engines.mismatch(caps, _quant_facts(d_qk=192, d_v=128, is_mx=True, causal=True, h_q=8), SdpaFwdKnobs(cga=1)) is not None
+    assert 1 in engines.effective_cgas(_caps("sdpa_fwd_prefill_sm100_mxfp8"), dense, 1)
 
-    # Guard 2 -- the kernel body itself, so the constraint survives a row edit.
-    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
-        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+    mod = _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1)
+    assert mod._ONES_SMEM_OFFSET < mod._DESC_V0_WINDOW, (mod._ONES_SMEM_OFFSET, mod.CFG.CTA_MMA)
 
 
 def _quant_facts(**kw):
@@ -1423,19 +1445,14 @@ def test_sm107_ones_tile_stays_inside_the_v0_descriptor_window():
         ("d128-mx", (128, 128), 1, _BF16, False),
         ("d128-mx", (128, 128), 2, _E4M3_OUT, False),
         ("d128-mx", (128, 128), 2, _BF16, False),
+        ("d192-mx", (192, 128), 1, _E4M3_OUT, False),
+        ("d192-mx", (192, 128), 1, _BF16, False),
         ("d192-mx", (192, 128), 2, _E4M3_OUT, False),
         ("d192-mx", (192, 128), 2, _BF16, False),
     ]
     for _id, flavor, cta, dto, pertensor in safe:
         mod = _load(flavor, rubin=True, fp8=True, pertensor=pertensor, dtype_qkv=_E4M3, dtype_o=dto, cta_mma=cta)
         assert mod._ONES_SMEM_OFFSET < 256 * 1024, (_id, cta, dto, mod._ONES_SMEM_OFFSET)
-
-    # d192 MXFP8 x cga1 never reaches the ones guard: its own CTA_MMA raise
-    # fires first (the four SF tiles cross the window before the ones tile
-    # does).  Pin WHICH guard speaks, so a future reordering cannot silently
-    # swap a precise diagnostic for a vaguer one.
-    with _pytest.raises(ValueError, match="CTA_MMA must be 2"):
-        _load((192, 128), rubin=True, fp8=True, pertensor=False, dtype_qkv=_E4M3, dtype_o=_BF16, cta_mma=1)
 
     # The one unsafe combination: d192 x cga1 x half-precision O.
     with _pytest.raises(ValueError, match="version-0 tcgen05 descriptor window"):
@@ -1480,7 +1497,7 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
     # not narrowed (it has no quantized SF or ones tile to push over the line).
     assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 0)) == (1, 2)
     assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
-    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (1, 2)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)
     # ...while d256 MXFP8 admits the pair too (test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair pins where it is used)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
@@ -1739,8 +1756,8 @@ def _mxfp8_facts(**kw):
 def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
     """INVERTED 2026-09-14 (the row was NATURAL-only): d128 and d192x128 claim
     LPT and LPT_L2, d256 and d512 do not, the row-wide floor stays NATURAL --
-    and the claim REACHES the ranking: a causal GQA graph leads with LPT_L2, a
-    causal graph without GQA on a few-wave grid leads with LPT, dense stays
+    and the claim REACHES the ranking: a causal GQA graph leads with LPT_L2 (plain LPT on the d128 row's
+    short-K/V arm), a causal graph without GQA on a few-wave grid leads with LPT, dense stays
     NATURAL.  An accept AND a reject per shape (engine contract, Rule 9)."""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import engines, heuristics
@@ -1750,7 +1767,9 @@ def test_sm107_mxfp8_advertises_lpt_and_lpt_l2_per_d_shape():
     for shape in ((128, 128), (192, 128)):
         dom = engines.effective_sched_policies(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1]))
         assert dom == frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}), (shape, dom)
-        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True, h_kv=2)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], shape
+        gqa_first = SCHED_LPT if shape == (128, 128) else SCHED_LPT_L2
+        gqa_runner = SCHED_LPT_L2 if shape == (128, 128) else SCHED_LPT
+        assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True, h_kv=2)) == [gqa_first, gqa_runner, SCHED_NATURAL], shape
         assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1], causal=True)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], shape
         assert heuristics._sched_points(caps, _mxfp8_facts(d_qk=shape[0], d_v=shape[1])) == [SCHED_NATURAL], shape
     for shape in ((256, 256), (512, 512)):
@@ -1856,8 +1875,9 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
     LPT -6.5 / -13 / -7.9 % at S=8K/16K/32K, LPT_L2 within 1 % there; Llama
     d128 H64/8 (GQA) -- LPT_L2 +4.2..+7.6 % at every S.  So: without GQA
     LPT_L2 has nothing to group and is never proposed first; LPT leads while
-    the grid is at most 24 waves of 2-CTA clusters and NATURAL beyond; with
-    GQA the L2-budget rule (LPT_L2) stands.  SM100 keeps its own rule."""
+    the grid is at most eight waves of 2-CTA clusters and NATURAL beyond; with
+    GQA the L2-budget rule (LPT_L2) stands once one KV head's K+V reaches
+    2 MiB, plain LPT under it.  SM100 keeps its own rule."""
     import cudnn
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
     from cudnn.sdpa.fwd import heuristics
@@ -1865,13 +1885,13 @@ def test_sm107_causal_ranking_picks_the_policy_by_gqa_and_wave_count():
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True, causal=True, b=1)
     rubin = _caps("sdpa_fwd_prefill_sm107_fp8")
     dsv3 = dict(h_q=128, h_kv=128, d_qk=192, d_v=128, **fp8)
-    # 1 x 128 heads x 8 q-clusters / 106 clusters = 9.7 waves -> LPT; 19 waves at S=4K -> LPT; 39 waves at S=8K -> NATURAL.
-    assert heuristics._sched_points(rubin, _f16_facts(s_q=2048, s_kv=2048, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
-    assert heuristics._sched_points(rubin, _f16_facts(s_q=4096, s_kv=4096, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
-    for s in (8192, 16384, 32768):
+    # under the wave bound at S=1K -> LPT; from S=2K on -> NATURAL.
+    assert heuristics._sched_points(rubin, _f16_facts(s_q=1024, s_kv=1024, **dsv3)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    for s in (2048, 4096, 8192, 16384, 32768):
         assert heuristics._sched_points(rubin, _f16_facts(s_q=s, s_kv=s, **dsv3)) == [SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2], s
     llama = dict(h_q=64, h_kv=8, d_qk=128, d_v=128, **fp8)
-    for s in (2048, 8192, 32768):
+    assert heuristics._sched_points(rubin, _f16_facts(s_q=2048, s_kv=2048, **llama)) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
+    for s in (8192, 32768):
         assert heuristics._sched_points(rubin, _f16_facts(s_q=s, s_kv=s, **llama)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], s
     # The SM100 row is untouched by the Rubin rule: the L2-budget primary stays.
     sm100 = _caps("sdpa_fwd_prefill_sm100_fp8")
@@ -2200,8 +2220,11 @@ def test_sm107_gate_declines_the_interactions():
     assert why is not None and "dense-only" in why, why
     paged = dict(has_paged_kv=True, padded=True, page_size=128)
     # The half row serves ungated paged THD; the gate block must decline
-    # the interaction before paged layout admission. FP8 remains nonpaged.
-    assert f16.paged_kv and not fp8.paged_kv
+    # the interaction before paged layout admission. FP8 paging is limited to D512,
+    # which has no gate; the D256 gate flavor remains nonpaged.
+    assert f16.paged_kv and fp8.paged_kv
+    assert fp8.paged_d_shapes == frozenset({(512, 512)})
+    assert (256, 256) not in fp8.paged_d_shapes
     assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(f16, _gate_facts(**paged))
     assert why is not None and "paged" in why and "gate" in why, why
@@ -4514,7 +4537,7 @@ def _sm107a_sass_counts(dump, quant, d, dtype_o, mask, cands):
 # to per-cell compares adds >= 128 ISETP, so a slack of 32 still catches a single arm.
 _SM107_MASK_SASS_ROWS = [
     pytest.param("mxfp8", 512, _BF16_OUT, "causal_swa640", 108 + 32, 2 + 6, 0, id="mxfp8-d512-causal_swa640"),
-    pytest.param("fp8", 128, _E4M3, "causal_padded", 108 + 32, 0 + 6, 9, id="fp8-d128-causal_padded"),
+    pytest.param("fp8", 128, _E4M3, "causal_padded", 151 + 32, 0 + 6, 25, id="fp8-d128-causal_padded"),
 ]
 
 
@@ -4773,7 +4796,7 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    (cta_mma,) = supported_cgas_for((d_qk, d_v), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    cta_mma = max(supported_cgas_for((d_qk, d_v), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8")))
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma)
     mod = _load_sm100_kernel_module((d_qk, d_v), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     kw = dict(b=1, qh=128, kh=128, sq=8192, skv=8192, d_qk=d_qk, d_v=d_v, has_lse=True)
@@ -4809,10 +4832,11 @@ _SM107_WAIT_FORM_PROBE = textwrap.dedent("""
 _WAIT_FORM_SLACK = {"SYNCS_PHASECHK": 1, "USYNCS_PHASECHK": 0, "NANOSLEEP": 0}
 _SM107_WAIT_FORM_PIN_ROWS = [
     # (quant, d_qk, d_v, dtype_o, SPIN_RING_WAITS, divergent SYNCS.PHASECHK, uniform USYNCS.PHASECHK, NANOSLEEP)
-    # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31
-    pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 58, 117, 31, id="mxfp8-d192x128-spin"),
-    # == develop's 160 / 84 / 82: the opt-out must leave every wait opcode where it was
-    pytest.param("fp8", 128, 128, _E4M3, False, 160, 84, 82, id="fp8-d128-sleep"),
+    # develop (sleeping form everywhere): 142 / 75 / 73; 42 ring-wait instantiations flipped -> 58 / 117 / 31; the tile-start
+    # gate wait in place of the mb_o_empty ring wait -> 58 / 113 / 31
+    pytest.param("mxfp8", 192, 128, _BF16_OUT, True, 58, 113, 31, id="mxfp8-d192x128-spin"),
+    # the opt-out must leave every wait opcode where it was
+    pytest.param("fp8", 128, 128, _E4M3, False, 164, 86, 84, id="fp8-d128-sleep"),
 ]
 
 
@@ -8725,40 +8749,6 @@ def test_d256_pack_gqa_divisibility_rule_is_exempted_on_the_rubin_decode_tile_on
     a = api()
     assert a.check_support()
     assert a._decode_q_tile() == 16 and a._decode_q_tile_for(1, 15, 5) == 16
-
-
-class TestMixedFp8Kv:
-    """Native mixed K/V coverage in the architecture CI's selected entry."""
-
-    from mixed_kv_sm107_cases import (
-        graph_admission,
-        native_resources,
-        dense_paged,
-        paged_origins,
-        thd_origins,
-        thd_uniform_control,
-        thd_cga1_origins,
-        single_q,
-        single_q_unsplit,
-        single_q_sink,
-        compact_split,
-        dense_paged_decline,
-        uniform_control,
-    )
-
-    test_graph_admission = staticmethod(graph_admission)
-    test_native_resources = staticmethod(native_resources)
-    test_dense_paged = staticmethod(dense_paged)
-    test_paged_origins = staticmethod(paged_origins)
-    test_thd_origins = staticmethod(thd_origins)
-    test_thd_uniform_control = staticmethod(thd_uniform_control)
-    test_thd_cga1_origins = staticmethod(thd_cga1_origins)
-    test_single_q = staticmethod(single_q)
-    test_single_q_unsplit = staticmethod(single_q_unsplit)
-    test_single_q_sink = staticmethod(single_q_sink)
-    test_compact_split = staticmethod(compact_split)
-    test_dense_paged_decline = staticmethod(dense_paged_decline)
-    test_uniform_control = staticmethod(uniform_control)
 
 
 # Keep native stride coverage in the architecture-specific CI entry.

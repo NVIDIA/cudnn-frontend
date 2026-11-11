@@ -581,7 +581,8 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
             fr,
             fsmem,
         )
-        key = (params.io_dtype,) + ce
+        # dyn() specializes strides 0 and 1; larger strides are dynamic.
+        key = (params.io_dtype, min(gamma.stride(0), 2), min(mean.stride(0), 2), min(rstd.stride(0), 2)) + ce
         fn = _KCACHE.get(key)
         if fn is None:
             with dsl_compile_lock():

@@ -177,24 +177,17 @@ def ref_sparse_attention_forward_chunked(
     return torch.cat(out_chunks, dim=0), torch.cat(lse_chunks, dim=0)
 
 
-def check_ref_dsa_sparse_attention_backward(
+def ref_dsa_sparse_attention_backward(
     q,
     kv,
     attn_sink,
     topk_idxs,
-    out,
     dout,
-    lse,
-    dq_actual,
-    dkv_actual,
-    d_sink_actual,
     softmax_scale=None,
     topk_length=None,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
     query_chunk_size: int = _DEFAULT_SPARSE_ATTENTION_QUERY_CHUNK_SIZE,
 ):
-    """Run chunked autograd to compare ``dq`` / ``dkv`` / ``d_sink``."""
+    """Return the FP32 ``(dq, dkv, d_sink)`` of chunked autograd through the gather-based forward reference."""
     if query_chunk_size <= 0:
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
 
@@ -226,7 +219,30 @@ def check_ref_dsa_sparse_attention_backward(
             dkv_ref.add_(dkv_chunk)
             d_sink_ref.add_(d_sink_chunk)
         del out_chunk_r, dq_chunk, dkv_chunk, d_sink_chunk, q_chunk_r
+    return dq_ref, dkv_ref, d_sink_ref
 
+
+def check_ref_dsa_sparse_attention_backward(
+    q,
+    kv,
+    attn_sink,
+    topk_idxs,
+    out,
+    dout,
+    lse,
+    dq_actual,
+    dkv_actual,
+    d_sink_actual,
+    softmax_scale=None,
+    topk_length=None,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+    query_chunk_size: int = _DEFAULT_SPARSE_ATTENTION_QUERY_CHUNK_SIZE,
+):
+    """Run chunked autograd to compare ``dq`` / ``dkv`` / ``d_sink``."""
+    dq_ref, dkv_ref, d_sink_ref = ref_dsa_sparse_attention_backward(
+        q, kv, attn_sink, topk_idxs, dout, softmax_scale=softmax_scale, topk_length=topk_length, query_chunk_size=query_chunk_size
+    )
     torch.testing.assert_close(
         dq_actual.to(torch.float32),
         dq_ref,

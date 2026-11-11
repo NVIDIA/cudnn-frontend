@@ -469,7 +469,7 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     """The facts-level twin (engines.d256_decode_tile_selected) of the adapter's _decode_q_tile on the
     Rubin row: a decode-shaped half d256 graph is selected (paged or dense, sink or not); a gated,
     pre-folded, THD, quantized or wider graph is not -- and the row's paged rule admits exactly the
-    selected form while the paged PREFILL pipeline keeps its THD-only scope."""
+    selected D256 form; native D128 also serves dense-Q paging."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
@@ -492,10 +492,10 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     gated = SdpaGraphFacts(**{**base, "has_epilogue_gate": True, "epilogue_gate_dtype": cudnn.data_type.BFLOAT16})
     assert engines.d256_decode_tile_selected(caps, gated, 12) and engines.d256_decode_tile_selected(caps, gated, 12, split_kv=2)
     assert not engines.d256_decode_tile_selected(caps, gated, 12, split_kv=1)
-    for change in (dict(s_q=64), dict(d_qk=128, d_v=128)):
-        g = SdpaGraphFacts(**{**base, **change})
-        reason = engines.mismatch(caps, g, None)
-        assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
+    reason = engines.mismatch(caps, SdpaGraphFacts(**{**base, "s_q": 64}), None)
+    assert reason and "Rubin paged KV requires THD" in reason
+    # D128 has a native dense-Q page loader independently of the D256 decode tile.
+    assert engines.mismatch(caps, SdpaGraphFacts(**{**base, "d_qk": 128, "d_v": 128}), None) is None
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the 32-column tile, one unit
     # base is a PADDED, mask-free paged graph: the 64-column width's predicate declines it, so the (16, 32) table rules here
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units of the 32-column tile

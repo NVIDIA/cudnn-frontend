@@ -297,6 +297,12 @@ the kernel that reads it).
   fallback allocations, cached-dummy first use) inside
   `_torch_stream_context(current_stream, device)` — see the fp8/mxfp8 amax
   resets and both `_execute_thd` paths in `sdpa/fwd/api_dsl.py`.
+- **TVM-FFI can override an explicit stream from the producer's DLPack exchange API.**
+  `OperandBuffer.current_work_stream` reports the default stream. For Cake
+  launches, pass DLPack-only `DeviceView` wrappers over validated buffers and
+  enter `tvm_ffi.use_raw_stream` with the execution stream. Test capture and
+  replay with changed inputs on an explicit nondefault stream; an empty graph
+  exposes this failure even when eager output tests pass.
 - **Consumers too, not just producers**: anything reading what the kernel
   wrote (`amax_o.div_()`, an O scratch copy-back) belongs on the launch
   stream for the same reason.
@@ -304,6 +310,12 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **Stream order does not serialize host calls.** Two host threads can enqueue
+  A's producer, B's producer, then A's consumer on one stream. Cached scratch
+  needs a lock through the final queued read, including reserve/growth, or
+  storage owned by each call. Keep separate streams independent. Detector:
+  `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_host_threads_share_stream`
+  pauses between scratch writes and reads in the dense and filtered paths.
 - **The device is implicit state exactly like the stream.** A `torch.empty`
   (or any allocator call) without a device context silently allocates on the
   *current* GPU, not the input tensor's — wrap execute-path allocations in
@@ -381,6 +393,13 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- Pass an explicit kernel floor when qualification starts above the shared
+  helper floor. The package dependency floor and `CUTEDSL_MIN_VERSION` can
+  differ. `test_old_dsl_fails_before_kernel_import` in the simplified sparse
+  attention suite pins its 4.8 floor; a real 4.7.1 run exposed the missing
+  argument. Check PyTorch conditional-graph capability before allocating
+  filtered repair state; `test_filtered_runtime_declines_before_allocation`
+  covers a missing runtime entry.
 - A version floor does not guarantee target-architecture support. For example,
   public 4.7.0 lacks `sm_107a`; check the actual target capability before
   admitting SM107 plans. Test graph and standalone declines with the real
@@ -389,10 +408,10 @@ DSL satisfies your kernel.**
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
   the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; both
-  QSA backward entries decline that compiler for 12Q/1KV before JIT
-  compilation, and the tests exercise the decline rather than crashing or
-  silently skipping the gate.
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8. Both
+  QSA backward entries decline that compiler for every one-KV-head geometry
+  (12Q/1KV and 6Q/1KV) before JIT compilation, and the tests exercise the
+  decline rather than crashing or silently skipping the gate.
 - **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
   and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
   and cu13 in separate environments/processes and empty, separate caches.
@@ -737,8 +756,9 @@ treatment at the caller boundary.**
   -> False cell of the arch-aware probe. Renaming one means updating
   FlashInfer's fallbacks first; that test failing is the reminder. The runtime
   probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
-  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
-  cc 10.7 graph to the backend engine.
+  cc 10.7, and no DSL has a target below cc 8.0 (Rule 7): a device-blind
+  "available" is the blind spot that routes a cc 10.7 graph to the backend
+  engine.
 
 **Rule 10 — a kwarg that makes a graph ineligible for the python engines is
 read by the family's analyzer under the spelling of EVERY op that takes it.**
@@ -818,6 +838,23 @@ Keep helpers in the narrowest package shared by their users. For example,
 Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Widen operands before triangular workspace products, in both producer and
+consumer. Widening an already-overflowed offset cannot recover it. Derive tile
+decoder bounds from the input extent. `test_triangular_offsets.py` compiles the
+actual address expressions and checks large offsets without dereferencing them.
+
+An unused name can still hold a required shared-memory allocation. Preserve
+the allocation when a later operand aliases that storage; remove only the
+binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
+for its P operand. Its public forward/backward reference and byte-golden
+tests in `simplified_sparse_attention/cutedsl/` cover this layout.
+
+When sharing a kernel with JAX, match scratch flag storage to its native ABI.
+A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
+CuTe tensor can reject that store during lowering. The long-key cases in
+`simplified_sparse_attention/cutedsl/test_filtered_jax.py` compile and execute
+the selector and its repair loop to cover this boundary.
 
 Loaded integer vectors can infer `Int8` while retaining no signedness metadata.
 Set the declared integer dtype on the vector wrapper before widening to INT32.
@@ -917,6 +954,15 @@ unless padding is included in both the layout and resource accounting. Detector:
 `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py::test_moe_block_scale_narrow_n_routing`
 (`scatter-False-24`, including capture/replay), verified RED before the store gate.
 
+**`cute.arch.shuffle_sync_up` defaults to a clamp of 31 before CuTe DSL 4.7.0.**
+`shfl.sync.up` keeps a lane's own value when its source lane falls below the
+clamp operand, so with that default every lane reads back its own value and a
+warp prefix sum silently returns its input. Pass `mask_and_clamp=0` for a
+full-warp up-shuffle; 4.7.0 and later default to 0, so the explicit argument
+emits the same PTX there. Detector: the H128 D512 conflict-rank cases of
+`deepseek_sparse_attention/cutedsl/test_DSA_sparse_attention_backward.py` on the
+4.6.2 wheel, which give wrong dKV without the argument.
+
 For fractional-microsecond performance changes, repeat A/B with shared addresses,
 reversed construction order, and an independently compiled unchanged-source
 control. An A/A that shares one compiled kernel does not bound the variation
@@ -940,6 +986,21 @@ that warp. Keep the MoE scheduler's release arrives unless a separate ordering
 proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
+
+A TMA-store epilogue must not reuse an smem output buffer while a bulk store may
+still be reading it. Every `PipelineTmaStore.producer_commit()` needs a
+`producer_acquire()` (`cp.async.bulk.wait_group.read num_stages - 1`) in the
+issuing thread before the epilogue warps write that buffer again: right after the
+commit and before the barrier (the GLU and quant epilogues), or before the next
+write into the buffer (the dGLU epilogues, the GLU-Hadamard delayed acquire).
+`producer_tail()` waits only at kernel exit. Another pipeline's acquire, such as
+the C store's, can mask a missing one, so check every compile-time configuration
+that drops that other store. Without the acquire, the block-scaled GLU kernels' D
+store silently corrupted D codes on SM107 with `generate_c=False` (#2350); the race
+is intermittent on hardware. Detectors: `gemm/cutedsl/test_tma_store_buffer_reuse.py`
+(host-only: no committed TMA store under `gemm/cutedsl` lacks an acquire) and
+`gemm/cutedsl/test_grouped_gemm_glu.py::test_rubin_mxfp8_glu_without_c_matches_with_c`
+(SM107: `generate_c=False` writes the same D bytes as `generate_c=True`).
 
 Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
 graphs from override-enabled graphs. Only fixed shapes select token widths
@@ -1120,6 +1181,7 @@ key is nonfinite: a key valid for one query can be masked for its neighbor,
 and zero dS multiplied by that key still produces NaN. A union mask alone is
 insufficient, including across an unaligned packed sequence boundary. Keep any
 nonfinite fallback entirely on device and re-evaluate it on each graph replay.
-The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
-which changes finite/nonfinite inputs under one captured graph for both shared
-and separate packed sequences.
+The detectors are `QSA/cutedsl/test_qsa_backward_sm100.py::test_sparse_pair_isolates_a_nonfinite_key_row`
+for the sparse query pairs and `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`
+for the dense kernel's query groups, which changes finite/nonfinite inputs under
+one captured graph for both shared and separate packed sequences.

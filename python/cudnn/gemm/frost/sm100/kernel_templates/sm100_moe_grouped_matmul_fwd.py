@@ -47,6 +47,12 @@ from cuda.bindings import driver as _cuda
 
 moe_desc_slots = num_a_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
+# The scheduler warp of cluster rank 0 publishes each claimed tile into every
+# cluster CTA's broadcast slot through mapa and arrives on that CTA's barrier,
+# a cluster-scope release by a thread of another CTA. The waits on the
+# broadcast ring must acquire at cluster scope too, or the slot read (and
+# the producer's reuse of the slot) is not ordered against the peer's access.
+_SCHED_BCAST_SCOPE = nvvm.MBarrierScope.CLUSTER if cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1 else None
 
 
 # Scheduler ring depth.
@@ -409,6 +415,7 @@ def _kernel(
                     sched_bcast_empty_mbar_ptr.subview(bcast_stage),
                     bcast_empty_phase,
                     time_limit=10_000_000,
+                    scope=_SCHED_BCAST_SCOPE,
                 ):
                     pass
                 claimed = cutlass.Int32(0)
@@ -428,6 +435,7 @@ def _kernel(
                 sched_bcast_full_mbar_ptr.subview(bcast_stage),
                 bcast_full_phase,
                 time_limit=10_000_000,
+                scope=_SCHED_BCAST_SCOPE,
             ):
                 pass
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
@@ -535,6 +543,7 @@ def _kernel(
                     sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
                     last_bcast_empty_done_phase,
                     time_limit=10_000_000,
+                    scope=_SCHED_BCAST_SCOPE,
                 ):
                     pass
 

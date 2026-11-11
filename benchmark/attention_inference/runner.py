@@ -285,7 +285,7 @@ class InferenceBenchmarkRunner:
                 metric = f"{r.tflops:.0f} TFLOPS" if r.phase == "context" else f"{r.gbps:.0f} GB/s{sol}"
                 logger.info(f"  -> {r.time_ms:.3f} ms ({metric}) [{r.backend_detail}]")
             else:
-                logger.warning(f"  -> FAILED: {(r.error_message or '').splitlines()[-1][:140]}")
+                logger.warning(f"  -> FAILED: {((r.error_message or '').strip().splitlines() or ['(no error message)'])[-1][:140]}")
         return results
 
     def results_to_dataframe(self, results):

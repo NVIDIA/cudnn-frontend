@@ -16,6 +16,7 @@
 #include "variant_pack.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -46,9 +47,13 @@ namespace {
 constexpr int kTypeCacheSlots = 8;
 
 struct TypeCache {
+    py::ft_mutex mutex;
     PyTypeObject *types[kTypeCacheSlots]     = {};
     DLPackExchangeAPI *apis[kTypeCacheSlots] = {};
-    int count                                = 0;
+    // Entries are append-only and never modified or reclaimed after publication.
+    // A release store publishes both arrays; readers acquire the prefix length
+    // once and never inspect slots beyond that immutable prefix.
+    std::atomic<int> count{0};
 };
 
 TypeCache &
@@ -80,11 +85,14 @@ compatible_api(DLPackExchangeAPI *api) {
 // swallowed and the caller falls back to reading the buffer from python.
 DLPackExchangeAPI *
 exchange_api_for(PyObject *obj) {
-    PyTypeObject *type = Py_TYPE(obj);
-    TypeCache &cache   = type_cache();
-    for (int i = 0; i < cache.count; i++) {
+    PyTypeObject *type  = Py_TYPE(obj);
+    TypeCache &cache    = type_cache();
+    const int published = cache.count.load(std::memory_order_acquire);
+    for (int i = 0; i < published; i++) {
         if (cache.types[i] == type) return cache.apis[i];
     }
+    // Attribute lookup and capsule destruction can run Python and re-enter
+    // this function. Never hold the cache mutex across either operation.
     PyObject *capsule      = PyObject_GetAttrString(reinterpret_cast<PyObject *>(type), "__dlpack_c_exchange_api__");
     DLPackExchangeAPI *api = nullptr;
     if (capsule == nullptr) {
@@ -103,11 +111,19 @@ exchange_api_for(PyObject *obj) {
     // type that got collected could be replaced by a different type allocated
     // at the same address, and this would hand out its vtable. The cache never
     // evicts, so this pins at most kTypeCacheSlots types.
-    if (api != nullptr && cache.count < kTypeCacheSlots) {
-        Py_INCREF(reinterpret_cast<PyObject *>(type));
-        cache.types[cache.count] = type;
-        cache.apis[cache.count]  = api;
-        cache.count++;
+    if (api != nullptr) {
+        py::ft_lock_guard lock(cache.mutex);
+        const int count = cache.count.load(std::memory_order_relaxed);
+        // Another thread (or a reentrant lookup) may have published it first.
+        for (int i = 0; i < count; i++) {
+            if (cache.types[i] == type) return cache.apis[i];
+        }
+        if (count < kTypeCacheSlots) {
+            Py_INCREF(reinterpret_cast<PyObject *>(type));
+            cache.types[count] = type;
+            cache.apis[count]  = api;
+            cache.count.store(count + 1, std::memory_order_release);
+        }
     }
     return api;
 }

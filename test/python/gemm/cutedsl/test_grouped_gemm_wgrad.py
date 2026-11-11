@@ -3,7 +3,9 @@
 
 """Tests for grouped GEMM wgrad FE API."""
 
+import ast
 import inspect
+from pathlib import Path
 
 import pytest
 import torch
@@ -1249,3 +1251,31 @@ def test_grouped_gemm_wgrad_bf16_rejects_sf_fp8_dtype_override():
     cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs, sf_fp8_dtype_override=None)
     with pytest.raises(ValueError, match="BF16 forbids scale control sf_fp8_dtype_override"):
         cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs, sf_fp8_dtype_override="e5m3")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kernel", ["moe_grouped_gemm_wgrad.py", "moe_blockscaled_grouped_gemm_wgrad.py"])
+def test_wgrad_scheduler_advances_before_producer_tail(kernel):
+    """Without the advance, producer_tail's first wait reuses the END sentinel's parity and can hang the CTA forever."""
+
+    def calls(statement, receiver, method):
+        call = statement.value if isinstance(statement, ast.Expr) else None
+        return (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == method
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == receiver
+        )
+
+    source = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "gemm" / "cutedsl" / "grouped" / "wgrad" / kernel
+    tails = 0
+    for node in ast.walk(ast.parse(source.read_text())):
+        for block in (getattr(node, "body", None), getattr(node, "orelse", None)):
+            if not isinstance(block, list):
+                continue
+            for previous, statement in zip([None] + block, block):
+                if calls(statement, "sched_pipeline", "producer_tail"):
+                    tails += 1
+                    assert previous is not None and calls(previous, "sched_producer_state", "advance"), f"{source}:{statement.lineno}"
+    assert tails == 1

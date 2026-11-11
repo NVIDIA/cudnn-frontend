@@ -838,12 +838,13 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d256(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d128_mxfp8(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
     cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
     # Block-scaled Rubin cells still refuse split.
     unwired = [
-        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d192 mxfp8", cfg.make_cfg_d192_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d256 mxfp8", cfg.make_cfg_d256_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
     for name, make, params in unwired:
@@ -1928,6 +1929,12 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=False) == (1,)
+    # the per-tensor d192x128 kernel lists the single CTA on the 107 line with an fp8 O only
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True, fp8_o=True) == (1, 2)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (2,)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     # the row domain, narrowed per graph
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert dict(caps.cgas_by_d_shape)[(256, 256)] == frozenset({1, 2})
@@ -2330,3 +2337,187 @@ class TestNativeCausalZeroTail:
     from native_causal_zero_tail_sm107_checks import test_causal_tail_origins_and_replay
 
     test_causal_tail_origins_and_replay = staticmethod(test_causal_tail_origins_and_replay)
+
+
+@requires_rubin
+class TestNativeD512Fp8Paged:
+    """Native page loads retain split/pack, dynamic binding and replay contracts."""
+
+    from test_sdpa_fwd_paged_sm100 import (
+        test_paged_graph_fp8_d512_boundaries as _bounds,
+        test_paged_graph_fp8_d512_head_envelope as _envelope,
+    )
+    from test_sdpa_fp8_d512_paged_determinism import (
+        test_fp8_d512_paged_replay_and_batch_invariance as _repeat,
+        test_fp8_d512_paged_golden as _golden,
+    )
+    from sdpa_fp8_d512_paged_sm107 import paged_capture, native_paged_contract, paged_half_softmax, paged_half_golden
+
+    test_boundaries = staticmethod(_bounds)
+    test_head_envelope = staticmethod(_envelope)
+    test_replay_and_batch_invariance = staticmethod(_repeat)
+    test_golden = staticmethod(_golden)
+    test_strides_and_capture = staticmethod(paged_capture)
+    test_contract = staticmethod(native_paged_contract)
+    test_half_softmax = staticmethod(paged_half_softmax)
+    test_half_golden = staticmethod(paged_half_golden)
+
+
+# D512 backward is included by this explicitly selected SM107 CI file.
+import d512_fp8_bwd_checks as d512_checks
+
+
+@requires_rubin
+class TestD512Fp8Backward:
+    @pytest.fixture
+    def d512(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import test_sdpa_bwd_fp8_sm107 as fp8
+
+        monkeypatch.setattr(fp8, "_D", 512)
+        monkeypatch.setattr(fp8, "_ENGINE", "sdpa_bwd_d512_fp8")
+        return fp8
+
+    test_unsupported_graphs_decline = staticmethod(d512_checks.test_unsupported_graphs_decline)
+    test_graph_numerics = staticmethod(d512_checks.test_graph_numerics)
+    test_replay_batch_and_golden = staticmethod(d512_checks.test_replay_batch_and_golden)
+
+
+# Architecture CI entry for the shared exact-D512 block-scale contract.
+import d512_mxfp8_bwd_checks as d512_mx_checks
+
+
+@requires_rubin
+class TestD512Mxfp8Backward:
+    @pytest.fixture
+    def d512_mx(self, monkeypatch):
+        from cudnn.frost.buffers import cutedsl_state
+        from cudnn.sdpa.bwd.d512_fp8_contract import environment_error
+
+        error = environment_error(torch.cuda.get_device_capability(), cutedsl_state()[1])
+        if error is not None:
+            pytest.skip(error)
+        import test_sdpa_bwd_mxfp8_sm100 as mx
+
+        monkeypatch.setattr(mx, "_ENGINE", "sdpa_bwd_d512_mxfp8")
+        original = mx._plan_index
+        monkeypatch.setattr(mx, "_plan_index", lambda graph: original(graph, "sdpa_bwd_d512_mxfp8"))
+        return mx
+
+    test_graph_numerics = staticmethod(d512_mx_checks.test_graph_numerics)
+    test_declines_unsupported = staticmethod(d512_mx_checks.test_declines_unsupported)
+    test_replay_batch_and_golden = staticmethod(d512_mx_checks.test_replay_batch_and_golden)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestMixedFp8Kv:
+    """Native mixed K/V coverage in the architecture CI's selected entry."""
+
+    from mixed_kv_sm107_cases import (
+        d512_mqa,
+        d512_replay_batch_golden,
+        d512_admission,
+        d512_dense_paged,
+        d512_standalone,
+        d256_admission,
+        graph_admission,
+        d256_standalone,
+        d256_single_q,
+        d256_replay_batch_golden,
+        d256_dense_paged,
+        d64_admission,
+        d64_dense_paged,
+        d64_thd_origins,
+        d64_standalone,
+        d64_replay_batch_golden,
+        d64_thd_batch_golden,
+        d64_single_q,
+        native_resources,
+        dense_paged,
+        paged_origins,
+        thd_origins,
+        thd_uniform_control,
+        thd_cga1_origins,
+        single_q,
+        single_q_unsplit,
+        single_q_sink,
+        compact_split,
+        dense_paged_native,
+        uniform_control,
+    )
+
+    test_d512_mqa = staticmethod(d512_mqa)
+    test_d512_replay_batch_golden = staticmethod(d512_replay_batch_golden)
+    test_d512_admission = staticmethod(d512_admission)
+    test_d512_dense_paged = staticmethod(d512_dense_paged)
+    test_d512_standalone = staticmethod(d512_standalone)
+    test_d256_dense_paged = staticmethod(d256_dense_paged)
+    test_d256_single_q = staticmethod(d256_single_q)
+    test_d256_replay_batch_golden = staticmethod(d256_replay_batch_golden)
+    test_d256_admission = staticmethod(d256_admission)
+    test_d256_standalone = staticmethod(d256_standalone)
+    test_d64_admission = staticmethod(d64_admission)
+    test_d64_dense_paged = staticmethod(d64_dense_paged)
+    test_d64_thd_origins = staticmethod(d64_thd_origins)
+    test_d64_standalone = staticmethod(d64_standalone)
+    test_d64_replay_batch_golden = staticmethod(d64_replay_batch_golden)
+    test_d64_thd_batch_golden = staticmethod(d64_thd_batch_golden)
+    test_d64_single_q = staticmethod(d64_single_q)
+    test_graph_admission = staticmethod(graph_admission)
+    test_native_resources = staticmethod(native_resources)
+    test_dense_paged = staticmethod(dense_paged)
+    test_paged_origins = staticmethod(paged_origins)
+    test_thd_origins = staticmethod(thd_origins)
+    test_thd_uniform_control = staticmethod(thd_uniform_control)
+    test_thd_cga1_origins = staticmethod(thd_cga1_origins)
+    test_single_q = staticmethod(single_q)
+    test_single_q_unsplit = staticmethod(single_q_unsplit)
+    test_single_q_sink = staticmethod(single_q_sink)
+    test_compact_split = staticmethod(compact_split)
+    test_dense_paged_native = staticmethod(dense_paged_native)
+    test_uniform_control = staticmethod(uniform_control)
+
+
+import sdpa_bwd_fp8_d192_sm107 as _d192_bwd_checks
+
+ds_knob = _d192_bwd_checks.ds_knob
+test_stage3_tile_rule_fp8_d192 = _d192_bwd_checks.test_stage3_tile_rule_fp8_d192
+
+
+@requires_rubin
+class TestNativeFp8D192Bwd:
+    """Run the D192/V128 per-tensor fp8 backward pair checks in the native CI entry."""
+
+    test_native_stage3 = staticmethod(_d192_bwd_checks.test_d192_native_stage3_matches_the_oracle_and_the_d256_row)
+
+
+import d192_fp8_pair_checks as _d192_pair_checks
+
+
+@requires_rubin
+class TestNativeFp8D192Pair:
+    """Run the ``sdpa_bwd_sm100_d192_fp8`` kernel pair checks in the native CI entry."""
+
+    @pytest.fixture
+    def sm100_row(self, monkeypatch):
+        import test_sdpa_bwd_fp8_sm107 as fp8
+
+        monkeypatch.setattr(fp8, "_ENGINE", "sdpa_bwd_sm100_d192_fp8")
+        monkeypatch.setattr(fp8, "_D", 192)
+        return fp8
+
+    test_dense = staticmethod(_d192_pair_checks.test_dense)
+    test_causal = staticmethod(_d192_pair_checks.test_causal)
+    test_non_tile_multiple_seqlens = staticmethod(_d192_pair_checks.test_non_tile_multiple_seqlens)
+    test_amax_subsets = staticmethod(_d192_pair_checks.test_amax_subsets)
+    test_repeated_launches_are_bitwise = staticmethod(_d192_pair_checks.test_repeated_launches_are_bitwise)
+    test_causal_empty_kv_tiles = staticmethod(_d192_pair_checks.test_causal_empty_kv_tiles)
+    test_negative_scale_declined_at_check = staticmethod(_d192_pair_checks.test_negative_scale_declined_at_check)
+    test_explicit_attn_scale = staticmethod(_d192_pair_checks.test_explicit_attn_scale)

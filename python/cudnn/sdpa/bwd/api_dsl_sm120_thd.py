@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Native D128 MHA packed backward compiled for SM120.
+"""Native half packed backward through D256 compiled for SM120.
 
 Shares the row-predicated cp.async / mma.sync compute and prepared pointer ABI
 with SM80. One Q/dO stage and direct FP32 dQ atomics fit the SM120 shared-memory
@@ -11,7 +11,7 @@ the graph's public engine identity remains sdpa_bwd_sm120 (20600).
 """
 
 from .api_dsl import SdpaBwdDslSm80
-from .sm120_thd_contract import validate_bounds
+from .sm120_thd_contract import native_tiles, validate_bounds
 from .d128_contract import validate_accumulation_scale
 
 
@@ -19,12 +19,16 @@ class SdpaBwdDslSm120Thd(SdpaBwdDslSm80):
     _native_template_overrides = (("qo_stages", 1), ("dq_smem_coalesce", False))
 
     def _check_native_device(self, capability, device):
-        self._not_implemented_error_if(capability != (12, 0), f"SM120 THD backward requires cc 12.0; got {capability} on {device}")
+        self._not_implemented_error_if(capability not in ((12, 0), (12, 1)), f"SM120 THD backward requires cc 12.0 or 12.1; got {capability} on {device}")
 
     def _check_native_tiles(self):
-        self._not_implemented_error_if(
-            self.tile_m not in (None, 64) or self.tile_n not in (None, 64),
-            "SM120 THD backward requires the native 64x64 tile",
+        m, n = native_tiles(self.q_desc.shape[-1], self.v_desc.shape[-1], self.tile_m, self.tile_n)
+        self._native_template_overrides = (
+            ("qo_stages", 1),
+            ("dq_smem_coalesce", False),
+            ("tile_q", m),
+            ("tile_kv", n),
+            ("warps_per_sg", n // 16),
         )
 
     def _check_native_scale(self, scale):
@@ -34,7 +38,6 @@ class SdpaBwdDslSm120Thd(SdpaBwdDslSm80):
         self._not_implemented_error_if(not self.thd, "SM120 packed backward requires thd=True; dense graphs use the dense adapter")
         for enabled, label in (
             (self.deterministic, "deterministic"),
-            (self.causal_bottom_right, "bottom-right causal"),
             (self.window_size_left is not None or self.window_size_right is not None, "window"),
             (self.sink_desc is not None or self.dsink_desc is not None, "sink / dSink"),
             (self.bias_desc is not None or self.dbias_desc is not None or self._has_bias, "bias / dBias"),

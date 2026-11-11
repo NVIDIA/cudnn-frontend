@@ -231,14 +231,14 @@ class IndexerBackward(APIBase):
        is passed, before ``attn_score`` is touched.
     4. Kernel 2 — warp-specialized backward GEMM producing the gradients.
 
-    On SM100 the kernel accepts compact H32 inputs and outputs.
-    TCGEN05 still executes its minimum legal M64 tile internally: TMA
+    On SM100, and in deterministic mode on SM90, the kernel accepts compact H32
+    inputs and outputs. It executes an M64 tile internally: TMA
     zero-fills the out-of-bounds Q rows, the kernel zero-fills the matching
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
     ``deterministic=True`` is an SM90/SM100/SM103/SM107 request-or-fail policy for
-    H=64 on SM90 and H=32 or H=64 on SM100-family devices, D=128,
+    H=32 or H=64, D=128,
     block_I=128, and 128-multiple top-k in [128, 2048]. It allocates one
     CTA-private FP32 dK plane for each of up to ``deterministic_dk_planes``
     fixed producers. SM90 submits bounded one-row waves; SM100-family kernels
@@ -412,11 +412,10 @@ class IndexerBackward(APIBase):
         dsl_error = cutedsl_requirement_error("IndexerBackward") or cutedsl_arch_requirement_error(capability)
         self._runtime_error_if(dsl_error is not None, dsl_error)
         if major == 9:
-            # The SM90 warpgroup GEMMs use the head count as their M, and
-            # WGMMA's M is fixed at 64.
+            # The deterministic Hopper kernel can stage a compact H32 input in its M64 tile.
             self._value_error_if(
-                self.heads != 64,
-                f"SM90 IndexerBackward requires H=64, got H={self.heads}",
+                self.heads != 64 and not (self.deterministic and self.heads == 32),
+                f"SM90 IndexerBackward requires H=64 or deterministic H=32, got H={self.heads}",
             )
         else:
             # TCGEN05 takes M in {64, 128}; H128 exceeds the SMEM budget, so
@@ -962,7 +961,7 @@ def indexer_backward_wrapper(
             on SM90/SM100/SM103/SM107. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
             ``d_index_k``; SM90 also folds dW in fixed lane and warp order.
-            Requires H=64 on SM90 or H in {32, 64} on SM100-family devices,
+            Requires H in {32, 64},
             D=128, block_I=128, and topk % 128 == 0 with 128 <= topk <= 2048. A
             warmed plan with preallocated outputs
             and workspace remains CUDA Graph compatible. Valid top-k indices

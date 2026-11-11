@@ -5,10 +5,15 @@
 compile-time knobs of its one kernel body and the shared-memory budget per tokens-per-request count.  Importable without the
 CuTe DSL (the host entry validates a ``Cfg`` before the DSL version gate runs), so nothing here imports ``cutlass``.
 
-Geometry (the Qwen 3.5-architecture dense 27B GDN sub-layer at tensor-parallel rank 1, the same as the fused decode step's): 16 K heads,
-48 V heads (three per K head), head dim 128, causal-conv width 4, hidden 5120; the QKV slab is ``[rows, 10240]`` = Q (16 x 128) | K
-(16 x 128) | V (48 x 128); the fp32 recurrent state is ``[slots, 48, 128, 128]`` (one 64 KB slab per V head); the conv history of a
-verify slot holds ``T + 2`` columns of 10240 channels, stored channel-contiguous (``[slots, T + 2, 10240]`` viewed ``[slots, 10240, T + 2]``).
+Geometry: ``Cfg.GEOM``, a ``Geometry(K_HEADS, V_HEADS, HIDDEN)`` of ``gdn_geometry.py`` (the same geometry type as the fused decode
+step's) -- the head counts and hidden width of ONE tensor-parallel rank's GDN sub-layer; head dim 128 and causal-conv width 4 are
+pinned.  The default geometry (the Qwen 3.5-architecture dense 27B GDN sub-layer at tensor-parallel rank 1: 16 K heads, 48 V heads --
+three per K head -- hidden 5120) is the one every number in this file's docstrings is written for: its QKV slab is ``[rows, 10240]`` = Q
+(16 x 128) | K (16 x 128) | V (48 x 128); the fp32 recurrent state is ``[slots, 48, 128, 128]`` (one 64 KB slab per V head); the conv
+history of a verify slot holds ``T + 2`` columns of 10240 channels, stored channel-contiguous (``[slots, T + 2, 10240]`` viewed
+``[slots, 10240, T + 2]``).  Another geometry is the same kernel body compiled with its ``GEOM``: the slab, box, lane and bank maps, the
+norm exchange and the shared-memory budget per token count carry no head-count or hidden term; what moves is the grid (``V_HEADS`` CTAs
+per request), the QKV channel layout, the BA chunk count (and whether its last chunk is a half chunk) and the reader-ticket limit.
 
 The verify step: a request of ``T`` tokens (``T`` = the second extent of the slot-index table, a compile-time constant of the
 kernel: tokens per request of the serving plan) starts from the state of its last accepted token (slot ``indices[n, a - 1]``,
@@ -64,9 +69,10 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
   one CTA is pure cost (sm_120a: ``TWO_CTA_CFG`` spills 34).
 * ``CTAS_PER_SM``: 0 = natural shared memory, 1 / 2 = a dummy pad that caps the co-resident CTAs per SM at one / two, derived from
   ``SMEM_PER_SM_BYTES`` -- the DEVICE's shared memory per SM, which the host entry reads from the part.
-* ``BA_PREFETCH_CHUNKS``: how many of the three 2048-element chunks of the BA projection's ``hidden`` rows (all ``T`` tokens) are in
-  flight at once in the BA warpgroup (3 = one load latency, 20 registers per token per chunk; 1 = three latencies, a third of
-  the registers -- the register-capped forms).
+* ``BA_PREFETCH_CHUNKS``: how many of the 2048-element chunks of the BA projection's ``hidden`` rows (all ``T`` tokens; three chunks at
+  hidden 5120) are in flight at once in the BA warpgroup (3 = one load latency, 20 registers per token per chunk; 1 = three latencies, a
+  third of the registers -- the register-capped forms); the domain 1 / 2 / 3 is the register budget's cap, and the geometry's chunk count
+  bounds the depth below it (``Cfg.BA_PREFETCH_DEPTH``: 2 at hidden 4096; at hidden 8192 the fourth chunk streams behind the three in flight).
 * ``NORM_FORM``: the association of the gated norm's sum of squares, which the reference verify kernel fixes by its CTAs-per-head
   policy: ``"ctas2"`` (one request: two 64-row halves of 16 four-row chains each, summed last) or ``"ctas1"`` (sixteen eight-row
   chains); ``None`` = that policy for the compiled requests count.
@@ -94,10 +100,11 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
   read them BEFORE ``griddepcontrol.wait``, so a predecessor that writes them (the same layer launched twice in a row) races the
   slab / history copies against its stores: a wrong state, no error.  The serving chain satisfies it (the predecessor is the
   QKVZ projection, which writes ``x`` / ``z`` only); the entry cannot check it.
-* ``TWO_CTAS_PER_HEAD``: a cluster of two CTAs per V head (grid ``(96, requests)`` in clusters of 2 along x), CTA ``r`` of the pair owning
-  state rows ``64 r .. 64 r + 63`` (``CTA_ROWS`` 64: a 32 KB slab in, 32 KB of write-back per token, ``R = 64 TPR / 256`` rows per thread);
-  both CTAs recompute the BA (decay, beta) and the conv + RMS (q, k, v) of every token from the same inputs; each shifts the V-conv history
-  of its own 64 channels and the reader ticket wraps at 5 (six readers per K head).  The recurrence is row-local, so the T-token chain has
+* ``TWO_CTAS_PER_HEAD``: a cluster of two CTAs per V head (grid ``(2 x V_HEADS, requests)`` in clusters of 2 along x: ``(96, requests)`` at
+  the default geometry), CTA ``r`` of the pair owning state rows ``64 r .. 64 r + 63`` (``CTA_ROWS`` 64: a 32 KB slab in, 32 KB of
+  write-back per token, ``R = 64 TPR / 256`` rows per thread); both CTAs recompute the BA (decay, beta) and the conv + RMS (q, k, v) of
+  every token from the same inputs; each shifts the V-conv history of its own 64 channels and the reader ticket wraps at ``2 x VK_RATIO -
+  1`` (5: six readers per K head).  The recurrence is row-local, so the T-token chain has
   ONE cross-CTA datum per token: the gated norm's sum of squares.  The reference association (``NORM_FORM``) never straddles the CTA
   boundary (chains of 4 or 8 rows; 64 is a multiple of both), so each CTA's norm warp sums its ``NORM_CHAINS_CTA`` local chains, ships
   the values to the peer (``NORM_XFER_FLOATS`` lanes, one ``st.async ... mbarrier::complete_tx::bytes.f32`` each through ``mapa``, completing
@@ -126,30 +133,32 @@ Knobs (every one a ``cutlass.const_expr`` axis of the same kernel body):
 from dataclasses import dataclass, replace
 from typing import Optional
 
-# --- the served geometry (the model's constants; the host entry declines everything else) ---
-K_HEADS = 16
-V_HEADS = 48
-HEAD_DIM = 128
-CONV_WIDTH = 4
-HIDDEN = 5120
-QKV_CHANNELS = 2 * K_HEADS * HEAD_DIM + V_HEADS * HEAD_DIM  # 10240
-K_CHANNEL0 = K_HEADS * HEAD_DIM  # 2048: the first K channel of the QKV slab
-V_CHANNEL0 = 2 * K_HEADS * HEAD_DIM  # 4096: the first V channel
-OUT_ROW = V_HEADS * HEAD_DIM  # 6144 outputs per token row
+from .gdn_geometry import BA_VERIFY_CHUNK, CONV_WIDTH, DEFAULT_GEOMETRY, HEAD_DIM, Geometry
+
+# --- the DEFAULT geometry's constants (the kernel reads ``cfg.GEOM``; these name the default for callers, docs and tests) ---
+K_HEADS = DEFAULT_GEOMETRY.K_HEADS  # 16
+V_HEADS = DEFAULT_GEOMETRY.V_HEADS  # 48
+HIDDEN = DEFAULT_GEOMETRY.HIDDEN  # 5120
+QKV_CHANNELS = DEFAULT_GEOMETRY.QKV_CHANNELS  # 10240
+K_CHANNEL0 = DEFAULT_GEOMETRY.K_CHANNEL0  # 2048: the first K channel of the QKV slab
+V_CHANNEL0 = DEFAULT_GEOMETRY.V_CHANNEL0  # 4096: the first V channel
+OUT_ROW = DEFAULT_GEOMETRY.OUT_ROW  # 6144 outputs per token row
+TICKET_STRIDE = DEFAULT_GEOMETRY.TICKET_STRIDE  # 512 at every geometry: counts[request * 512 + kh * 32] is the per-(request, K head) reader ticket
 THREADS = 256
 WARPS = THREADS // 32
 WARPGROUP = 128
 TOKENS_MIN = 2  # one token per request is the decode step
 CONV_HIST_TAPS = CONV_WIDTH - 1  # the three history columns a - 1 .. a + 1 a token window starts in
-# the reference verify's BA partition: virtual thread v (0..255) sums elements c * 2048 + 8 v + j of the three 2048-element chunks
-# while c * 2048 + 8 v < 5120 (chunk 2 ends at v 128); every lane of the BA warpgroup carries virtual threads v = lane and v = lane + 128
+# the reference verify's BA partition: virtual thread v (0..255) sums elements c * 2048 + 8 v + j of the ceil(HIDDEN / 2048)
+# 2048-element chunks while c * 2048 + 8 v < HIDDEN (at the default hidden 5120: three chunks, chunk 2 ending at v 128 -- a HALF chunk,
+# ``Geometry.ba_verify_half_live``); every lane of the BA warpgroup carries virtual threads v = lane and v = lane + 128
 BA_VTHREADS = 256
-BA_CHUNK = 2048
-BA_CHUNKS = (HIDDEN + BA_CHUNK - 1) // BA_CHUNK  # 3
+BA_CHUNK = BA_VERIFY_CHUNK  # 2048
+BA_CHUNKS = DEFAULT_GEOMETRY.BA_CHUNKS_VERIFY  # 3 at the default geometry (``Geometry.BA_CHUNKS_VERIFY``)
 RMS_LANES = 16  # the reference RMS layout: lane l of a 16-lane group holds the 8 raw q / k values of columns 8 l .. 8 l + 7
 RMS_COLS = HEAD_DIM // RMS_LANES
-TICKET_STRIDE = 512  # counts[request * 512 + kh * 32]: the per-(request, K head) reader ticket of the conv history
-TICKET_LIMIT = V_HEADS // K_HEADS - 1  # 2: the third reader of a K head's conv history is the last
+# counts[request * 512 + kh * 32]: the per-(request, K head) reader ticket of the conv history (holds the envelope's 16 K heads)
+TICKET_LIMIT = DEFAULT_GEOMETRY.VK_RATIO - 1  # 2: the third reader of a K head's conv history is the last (``Cfg.TICKET_LIMIT`` per form)
 NORM_FORMS = ("ctas2", "ctas1")
 STATE_LOAD_PATHS = ("bulk",)
 STATE_STORE_PATHS = ("bulk", "stg")
@@ -229,6 +238,7 @@ class Cfg:
     DEBUG: bool = False
     SMEM_PER_SM_BYTES: int = SM100_SMEM_PER_SM_BYTES
     SMEM_OPTIN_BYTES: int = SM100_SMEM_OPTIN_BYTES
+    GEOM: Geometry = DEFAULT_GEOMETRY  # the rank's head counts and hidden width (``gdn_geometry.py``): in the compile key with the rest
 
     # --- derived (read-only) ---
     @property
@@ -285,8 +295,15 @@ class Cfg:
 
     @property
     def TICKET_LIMIT(self) -> int:
-        """The last reader ticket of a K head's conv history: ``3 x CTAS_PER_HEAD`` CTAs read it, the one that draws this value shifts it."""
-        return (V_HEADS // K_HEADS) * self.CTAS_PER_HEAD - 1
+        """The last reader ticket of a K head's conv history: ``VK_RATIO x CTAS_PER_HEAD`` CTAs read it (3 x at the default geometry), the
+        one that draws this value shifts it."""
+        return self.GEOM.VK_RATIO * self.CTAS_PER_HEAD - 1
+
+    @property
+    def BA_PREFETCH_DEPTH(self) -> int:
+        """The BA hidden chunks in flight at once: the knob ``BA_PREFETCH_CHUNKS`` bounded by the geometry's chunk count (a hidden width of two
+        2048-element chunks -- 4096 -- cannot have three in flight; 3 at hidden 5120 and 8192 with the default knob)."""
+        return min(self.BA_PREFETCH_CHUNKS, self.GEOM.BA_CHUNKS_VERIFY)
 
     @property
     def SLICE_PITCH(self) -> int:
@@ -407,6 +424,8 @@ class Cfg:
 
 def validate_cfg(cfg: Cfg) -> None:
     """Raise the typed error of every unexpressible knob combination (structural invariants raise here, never a module assert)."""
+    if not isinstance(cfg.GEOM, Geometry):
+        raise ValueError(f"gdn_verify_fused: GEOM must be a gdn_geometry.Geometry, got {type(cfg.GEOM).__name__}")
     if cfg.TPR not in (2, 4, 8, 16):
         raise ValueError(f"gdn_verify_fused: TPR must be 2, 4, 8 or 16, got {cfg.TPR}")
     if cfg.CTA_ROWS * cfg.TPR % THREADS or cfg.R < 1 or cfg.R * cfg.C * THREADS != cfg.CTA_ROWS * HEAD_DIM or cfg.C % 8 or cfg.BOX_ROWS != cfg.R * WARPS:
@@ -429,8 +448,11 @@ def validate_cfg(cfg: Cfg) -> None:
         raise ValueError(
             f"gdn_verify_fused: MIN_CTAS_PER_SM={cfg.MIN_CTAS_PER_SM} (the register cap aims at that many CTAs per SM) contradicts CTAS_PER_SM={cfg.CTAS_PER_SM} (the pad caps the SM at fewer)"
         )
-    if cfg.BA_PREFETCH_CHUNKS not in (1, 2, 3):
-        raise ValueError(f"gdn_verify_fused: BA_PREFETCH_CHUNKS must be 1, 2 or 3, got {cfg.BA_PREFETCH_CHUNKS}")
+    if cfg.BA_PREFETCH_CHUNKS not in (1, 2, 3):  # the register budget's cap (3 chunks x T tokens x 8 words in flight), not the chunk count's: a
+        # geometry with fewer chunks bounds the depth below it (BA_PREFETCH_DEPTH), one with more streams the rest
+        raise ValueError(
+            f"gdn_verify_fused: BA_PREFETCH_CHUNKS must be 1, 2 or 3 (the register budget's cap on the chunks in flight), got {cfg.BA_PREFETCH_CHUNKS}"
+        )
     if cfg.NORM_FORM is not None and cfg.NORM_FORM not in NORM_FORMS:
         raise ValueError(f"gdn_verify_fused: NORM_FORM must be one of {NORM_FORMS} or None (the reference policy per requests), got {cfg.NORM_FORM!r}")
     if cfg.STATE_LOAD_PATH not in STATE_LOAD_PATHS:
@@ -528,6 +550,16 @@ PAIR_FORMS = (PAIR_CFG, PAIR_NBUF2_CFG, PAIR_NBUF1_CFG)
 ONE_CTA_FORMS = (CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_SMALL_SMEM_ORDER = (PAIR_NBUF2_CFG, ONE_CTA_NBUF1_CFG, PAIR_NBUF1_CFG)
 BEYOND_FORMS = (TWO_CTA_CFG,) + BEYOND_SMALL_SMEM_ORDER
+# Past the one-CTA grid at a geometry OTHER than the default the register-capped two-CTAs-per-SM form is not picked -- the budget rule: a
+# form that spills off the default geometry is not picked there (a spill-free form keeps the default's ladder, as the decode capped forms
+# do).  It spills where the hidden width is 8192 -- on sm_100a and sm_103a alike it is spill-free at the default geometry (128 registers,
+# 0 stack, 0 STL / LDL; hidden 5120 = two full 2048-element BA chunks and a half) and at 4 / 16 / 4096 (two full chunks), but 128 registers
+# + 56 B stack + 14 STL / 14 LDL at 1 / 8 / 8192, 2 / 16 / 8192 and 4 / 32 / 8192: a hidden-width term (four full BA chunks live in the
+# role at 8192); it is also measured at the default geometry only.  The one-CTA form runs in two waves instead (the same kernel body,
+# bitwise), with the one-CTA token bound (8 on the cc 10.0 readings) -- the regime starts where ``requests x V_HEADS`` outgrows the SMs: 5
+# requests at 32 V heads, 10 at 16, 20 at 8 on 152 SMs (19 on 148); at 4 / 16 / 4096 the one off-default ladder is conservative (spill-free
+# there, unmeasured).  TWO_CTA_CFG stays available as an explicit form.
+BEYOND_FORMS_OFF_DEFAULT = (CFG,) + BEYOND_SMALL_SMEM_ORDER
 
 
 def part_readings(smem_per_sm: int, smem_optin: int) -> dict:
@@ -567,16 +599,30 @@ def first_fitting(forms, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin:
     raise _no_form(forms, smem_per_sm, smem_optin)
 
 
-def _ladder(requests: int, sm_count: int):
-    """The regime's ladder by the SM count: the pair forms while every CTA of the ``requests x 96`` cluster grid has an SM of its own, the
-    one-CTA forms while every CTA of the ``requests x 48`` grid has one, the beyond forms past that.  Plan-time facts, validated."""
+def with_geometry(form: Cfg, geometry: Geometry) -> Cfg:
+    """``form`` compiled for ``geometry`` (the same object when it already carries it, so a module form stays itself at the default)."""
+    if not isinstance(geometry, Geometry):
+        raise ValueError(f"gdn_verify_fused: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
+    return form if form.GEOM == geometry else replace(form, GEOM=geometry)
+
+
+def _ladder(requests: int, sm_count: int, geometry: Geometry = DEFAULT_GEOMETRY):
+    """The regime's ladder by the SM count for ``geometry``'s V heads per rank: the pair forms while every CTA of the ``requests x 2
+    V_HEADS`` cluster grid has an SM of its own (``requests x 96`` at the default geometry), the one-CTA forms while every CTA of the
+    ``requests x V_HEADS`` grid has one (``requests x 48``), the beyond forms past that -- ``BEYOND_FORMS`` (the two-CTAs-per-SM form first)
+    at the default geometry, ``BEYOND_FORMS_OFF_DEFAULT`` (the one-CTA form in two waves first) at any other, where that capped form is
+    unmeasured and, at hidden 8192, spills.  Plan-time facts, validated."""
     if not isinstance(requests, int) or requests < 1:
         raise ValueError(f"gdn_verify_fused: requests must be a positive int, got {requests!r}")
     if not isinstance(sm_count, int) or sm_count < 1:
         raise ValueError(f"gdn_verify_fused: the SM count must be a positive int, got {sm_count!r}")
-    if requests * V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
+    if not isinstance(geometry, Geometry):
+        raise ValueError(f"gdn_verify_fused: geometry must be a gdn_geometry.Geometry, got {type(geometry).__name__}")
+    if requests * geometry.V_HEADS * PAIR_CFG.CTAS_PER_HEAD <= sm_count:
         return PAIR_FORMS
-    return ONE_CTA_FORMS if requests * V_HEADS <= sm_count else BEYOND_FORMS
+    if requests * geometry.V_HEADS <= sm_count:
+        return ONE_CTA_FORMS
+    return BEYOND_FORMS if geometry == DEFAULT_GEOMETRY else BEYOND_FORMS_OFF_DEFAULT  # the capped form: unmeasured off the default, spills at hidden 8192
 
 
 def default_cfg(
@@ -585,9 +631,14 @@ def default_cfg(
     smem_per_sm: int = SM100_SMEM_PER_SM_BYTES,
     smem_optin: int = SM100_SMEM_OPTIN_BYTES,
     tokens: Optional[int] = None,
+    geometry: Geometry = DEFAULT_GEOMETRY,
 ) -> Cfg:
     """The pick per requests on a part (its SM count and shared-memory readings; the defaults are the cc 10.0 readings, so a two-argument
-    call is the measured cc 10.0 pick).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
+    call is the measured cc 10.0 pick) for ``geometry`` (the default geometry's 48 V heads per rank unless given; a rank with fewer V heads
+    moves the switches up by the same rule -- 8 V heads on 152 SMs: the pair to 9 requests, one CTA per SM to 19 -- the budget rule, with
+    the pair pick measured against the stock chain at 1 and 4 requests on the 8- and 16-V-head shards; past the one-CTA grid -- from 5
+    requests at 32 V heads, 10 at 16, 20 at 8 on 152 SMs (19 on 148) -- such a geometry takes the one-CTA form in two waves, never the
+    two-CTAs-per-SM form, which spills at hidden 8192 and is measured at the default geometry only: ``BEYOND_FORMS_OFF_DEFAULT``).  The regime by SM count selects the ladder: ``PAIR_CFG`` (two CTAs per head) while every CTA of
     the ``requests x 96`` cluster grid has an SM of its own (one request on a 148-, 152-, 170- or 188-SM part), ``CFG`` (one CTA
     per SM) while every CTA of the ``requests x 48`` grid has one, ``TWO_CTA_CFG`` (two CTAs per SM, one wave) once the grid outgrows the
     device's SMs -- on a 148- or 152-SM part the switches are between 1 request (96 cluster CTAs) and 2 (192 as a pair; 96 one-CTA CTAs),
@@ -603,28 +654,35 @@ def default_cfg(
     17; ``TWO_CTA_CFG`` never (one CTA per SM there, 34 spills).  The beyond-the-grid pair order was measured at four requests (T 4 and
     T 6) on a 170-SM part and applies by the budget rule, unmeasured, to the other beyond-the-grid cells (eight and more requests, 84- and
     188-SM parts, T 2 / 3 / 8).  All are plan-time facts (never a runtime value)."""
-    ladder = _ladder(requests, sm_count)
+    ladder = _ladder(requests, sm_count, geometry)
     if tokens is not None and (not isinstance(tokens, int) or tokens < 1):
         raise ValueError(f"gdn_verify_fused: tokens must be a positive int or None, got {tokens!r}")
     want = max(TOKENS_MIN, tokens or TOKENS_MIN)
     if admissible(ladder[0], smem_per_sm, smem_optin):
-        return ladder[0]
+        return with_geometry(ladder[0], geometry)
     rest = [form for form in ladder[1:] if admissible(form, smem_per_sm, smem_optin)]
     if not rest:
         raise _no_form(ladder, smem_per_sm, smem_optin)
     on = part_readings(smem_per_sm, smem_optin)
     for form in rest:
         if replace(form, **on).max_tokens() >= want:
-            return form
-    return max(rest, key=lambda form: replace(form, **on).max_tokens())
+            return with_geometry(form, geometry)
+    return with_geometry(max(rest, key=lambda form: replace(form, **on).max_tokens()), geometry)
 
 
-def max_tokens_served(requests: int, sm_count: int, smem_per_sm: int = SM100_SMEM_PER_SM_BYTES, smem_optin: int = SM100_SMEM_OPTIN_BYTES) -> int:
-    """The largest tokens-per-request count ``default_cfg`` serves for ``requests`` on the part: the primary form's bound where it is
-    admissible (35 / 8 / 45 on the cc 10.0 readings by regime), else the largest bound over the admissible rest of the ladder (17 on the
-    cc 12.0 readings at every requests count); the typed decline of a part with no form.  The one bound the entry, its ``check_support``
-    and FlashInfer's probe answer alike."""
-    ladder = _ladder(requests, sm_count)
+def max_tokens_served(
+    requests: int,
+    sm_count: int,
+    smem_per_sm: int = SM100_SMEM_PER_SM_BYTES,
+    smem_optin: int = SM100_SMEM_OPTIN_BYTES,
+    geometry: Geometry = DEFAULT_GEOMETRY,
+) -> int:
+    """The largest tokens-per-request count ``default_cfg`` serves for ``requests`` on the part (for ``geometry``'s V heads per rank, which
+    set the regime): the primary form's bound where it is admissible (35 / 8 / 45 on the cc 10.0 readings by regime at the default
+    geometry; 35 / 8 / 8 at any other, whose beyond-the-grid pick is the one-CTA form), else the largest
+    bound over the admissible rest of the ladder (17 on the cc 12.0 readings at every requests count); the typed decline of a part with no
+    form.  The one bound the entry, its ``check_support`` and FlashInfer's probe answer alike."""
+    ladder = _ladder(requests, sm_count, geometry)
     on = part_readings(smem_per_sm, smem_optin)
     if admissible(ladder[0], smem_per_sm, smem_optin):
         return replace(ladder[0], **on).max_tokens()

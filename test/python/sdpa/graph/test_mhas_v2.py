@@ -3871,20 +3871,12 @@ def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn
 
 @_cc107_only
 @pytest.mark.L0
-def test_sdpa_paged_sink_dense_queries_decline_cc107_L0(env_info, request, cudnn_handle):
-    """The lift is THD-only: dense (BSHD, padded) paged half queries with a sink on cc 10.7 keep a typed decline naming
-    the THD requirement (pinned by engine id through create_execution_plan, so the row -- not the walk -- answers)."""
+def test_sdpa_paged_sink_dense_queries_cc107_L0(env_info, request, cudnn_handle):
+    """Native D128 now serves dense padded paged queries with a sink. Pin and execute the FROST row,
+    checking O against the harness reference instead of retaining the former THD-only refusal."""
     _require_p2_env()
     cfg = _p2_cfg(dtype=torch.bfloat16, d=128, h_q=32, h_kv=8, b=4, s_q=8, seq_len_q=[1, 4, 8, 8], s_kv=4096, seq_len_kv=[4096, 2048, 129, 16], page=16, ragged=False, poison=False)
-    cfg.softmax_precision = cudnn.data_type.FLOAT
-    graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
-    from cudnn.engines.manifest import MANIFEST
-    engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("half")]
-    graph.create_execution_plan(engine_id, {})
-    graph.select_plan(graph.get_execution_plan_count() - 1)
-    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="Rubin paged KV requires THD queries") as decline:
-        graph.check_support()
-    print(f"@@@@ P2 dense decline: {decline.value}")
+    _p2_frost(cfg, request, cudnn_handle, cga=2, pin={"TILE_CGA_M": 2, "PACK_GQA": 0, "SPLIT_KV": 1})
 
 
 # The first MULT=4 sweep failure (test340): d256 64/8, one 4-token request in a packed batch of ONE, s_q 5, page 128,
@@ -4371,15 +4363,10 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
 @_cc107_only
 @pytest.mark.L0
 def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
-    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split -- on the sink-free graph
-    and on the sink graph alike, because the row wires no split (split_kv_supported=False: "not wired in this engine's
-    lowering"); and INDEPENDENTLY of that flag the sink-aware rule every row shares keeps a sink graph unsplit: with the
-    row's split flag flipped (dataclasses.replace -- the shape a cc 10.7 MXFP8 split-KV change would take) the sink graph
-    is still declined with the "sink-free" reason, so wiring split-KV on this row cannot silently split a sink graph."""
+    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split: the row's split-KV serves
+    dense graphs only, so the sink-free pool graph is declined by that clause and the sink graph by the shared sink rule."""
     engine = _cc107_engine("mxfp8")
     _require_frost_sm107(engine)
-    import dataclasses
-
     from cudnn.sdpa.fwd import engines
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
@@ -4392,16 +4379,12 @@ def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
             assert reason is None, (with_sink, reason)  # the unsplit graph IS served, with and without the sink
             served[with_sink] = facts
     split2 = engines.SdpaFwdKnobs(split_kv=2)
-    assert not spec.capabilities.split_kv_supported  # today's deciding clause is the row's flag ...
-    for with_sink, facts in served.items():
-        why = engines.mismatch(spec.capabilities, facts, split2)
-        assert why is not None and "split_kv > 1 is not wired in this engine's lowering" in why, (with_sink, why)
-    # ... and with that flag flipped the shared sink rule still refuses to split the sink graph (engines.mismatch: the
-    # per-split LSE is the combine weight; a sink graph produces no per-split partials until a sink-aware combine lands).
-    caps_split = dataclasses.replace(spec.capabilities, split_kv_supported=True)
-    why_sink = engines.mismatch(caps_split, served[True], split2)
+    assert spec.capabilities.split_kv_supported
+    why = engines.mismatch(spec.capabilities, served[False], split2)
+    assert why is not None and "serves dense graphs with half outputs only" in why, why
+    why_sink = engines.mismatch(spec.capabilities, served[True], split2)
     assert why_sink is not None and "sink-free" in why_sink, why_sink
-    print(f"@@@@ P6a split declines: row flag: {why}; sink rule: {why_sink}")
+    print(f"@@@@ P6a split declines: pools: {why}; sink: {why_sink}")
 
 
 # # =====================================================================
@@ -5288,7 +5271,7 @@ _P1_ROW_LAYOUT = "k: native dense forward"
 # THD-shape clause, which sits ahead of the row's own cc 10.7 clause in engines.mismatch.
 _P1_ROW_THD_LEG = "THD (ragged) rides the packed native-tile leg on this engine"
 _P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
-_P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
+_P1_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.0 / 10.3 / 10.7"
 _P1_GUARD_TAIL = "the backend is not consulted for this graph"
 _P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unread once the expectation is "frost")
     "paged_page64":  (dict(page=64, sq=8),                 "decline",      _P1_ROW_PAGE),  # pools page in 128-row atoms: 64 declines on the row AND the backend
@@ -5448,7 +5431,7 @@ for name, kwargs in {items!r}:
 """
 
 
-def _p1_crash_probe(items, timeout=2400):
+def _p1_crash_probe(items, timeout=2400, row=None):
     """Walk the (name, kwargs) contracts in child interpreters, resuming after every crash: {name: (rc, text, stage)} where rc
     is 0 (text = the RESULT line), 139 / -11 (the child died on this contract; text = the child's last lines, stage = the
     last STAGE it printed: "plan" when none, else "support" after "planned" or "build" after "supported") or the child's
@@ -5461,7 +5444,7 @@ def _p1_crash_probe(items, timeout=2400):
     start = 0
     while start < len(items):
         batch = items[start:]
-        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, row=_cc107_engine("mxfp8"))
+        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, row=row or _cc107_engine("mxfp8"))
         p = subprocess.run([sys.executable, "-c", script], cwd=paths[1], capture_output=True, text=True, timeout=timeout)
         lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip() and "RuntimeWarning" not in l and "AttrBuilder" not in l]
         seen, stage = 0, "plan"
@@ -5506,15 +5489,34 @@ def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     record (the re-measure procedure sits next to the constant).  At or above the recorded version no contract may crash,
     and the per-contract, per-stage record under "measured" in the run summary is the qualification of that record.
     cc 10.7 only; kept in the FULL tier because it is the tripwire that retires the guard."""
-    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
-
     if not _device_is_cc107():
         pytest.skip("the backend planning crash is a cc 10.7 measurement")
+    _assert_sq1_mxfp8_crash_guard_is_current(request, _cc107_engine("mxfp8"), "cc 10.7")
+
+
+@pytest.mark.L0
+def test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0(request):
+    """The cc 10.0 / 10.3 twin of the cc 10.7 detector: the same trigger matrix and version bound, with the SM100 MXFP8
+    row barred.  There the backend's plan build segfaults in the SM100 decode emitter."""
+    try:
+        cc = torch.cuda.get_device_capability()
+    except Exception:
+        cc = None
+    if cc not in ((10, 0), (10, 3)):
+        pytest.skip("the cc 10.0 / 10.3 single-query MXFP8 crash measurement")
+    from cudnn.sdpa.fwd.engines import engine_name
+
+    _assert_sq1_mxfp8_crash_guard_is_current(request, engine_name(arch="sm100", mxfp8=True), f"cc {cc[0]}.{cc[1]}")
+
+
+def _assert_sq1_mxfp8_crash_guard_is_current(request, row, device_label):
+    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
+
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
-    control = _p1_crash_probe([("sink_control", _P1_CRASH_CONTROL)])["sink_control"]
+    control = _p1_crash_probe([("sink_control", _P1_CRASH_CONTROL)], row=row)["sink_control"]
     assert control[0] == 0 and control[1].startswith("BUILT"), f"the sink control must plan and build on the backend (rc {control[0]}):\n{control[1]}"
-    results = _p1_crash_probe(list(_P1_CRASH_MATRIX.items()))
+    results = _p1_crash_probe(list(_P1_CRASH_MATRIX.items()), row=row)
     summary = {name: _p1_crash_verdict(rc, text.splitlines()[-1] if rc == 0 else text, stage) for name, (rc, text, stage) in results.items()}
     crashed = sorted(name for name, (rc, _, _) in results.items() if rc in (139, -11))
     errored = {name: text for name, (rc, text, _) in results.items() if rc not in (0, 139, -11)}
@@ -5524,7 +5526,7 @@ def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     # The per-contract record is the qualification of the constant: into the run's terminal summary (CI log) through
     # frost_routing.measured -- a passed test's captured stdout never reaches that log.
     frost_routing.measured(
-        f"cc 10.7 single-query MXFP8 backend plan / support / build with the guard disabled, cuDNN {version}",
+        f"{device_label} single-query MXFP8 backend plan / support / build with the guard disabled, cuDNN {version}",
         f"sink_control={_p1_crash_verdict(*control)} " + " ".join(f"{name}={verdict}" for name, verdict in summary.items()),
     )
     if fixed_in is None or cudnn.backend_version() < fixed_in:

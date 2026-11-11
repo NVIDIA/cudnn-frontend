@@ -68,6 +68,27 @@ def test_DSA_indexer_forward_api_is_split_from_top_k():
     assert "indexer_forward_top_k_wrapper" in dsa.__all__
     assert "indexer_forward_top_k_wrapper" in indexer_forward.__all__
     assert DSA.indexer_forward_top_k_wrapper is indexer_forward.indexer_forward_top_k_wrapper
+    assert "IndexerForwardTopKPlan" in dsa.__all__
+    assert "prepare_indexer_forward_top_k" in indexer_forward.__all__
+    assert DSA.IndexerForwardTopKPlan is indexer_forward.IndexerForwardTopKPlan
+    assert DSA.prepare_indexer_forward_top_k is indexer_forward.prepare_indexer_forward_top_k
+
+
+@pytest.mark.L0
+def test_DSA_prepared_indexer_plan_rejects_non_sm90_architecture():
+    """Keep the first prepared plan restricted to its validated architecture."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() == (9, 0):
+        pytest.skip("a non-SM90 CUDA device is required")
+    from cudnn import DSA
+
+    q = torch.empty((1, 64, 128), dtype=torch.bfloat16, device="cuda")
+    k = torch.empty((1, 1, 128), dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((1, 64), dtype=torch.bfloat16, device="cuda")
+    cu = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    offsets = torch.zeros(2, dtype=torch.int64, device="cuda")
+    plan = DSA.IndexerForwardTopKPlan(q, k, w, cu, cu, offsets, top_k=1, max_seqlen_q=1, max_seqlen_k=1, max_candidate_count=0)
+    with pytest.raises(RuntimeError, match="supports SM90 only"):
+        plan.check_support()
 
 
 def _allocate_inputs(cfg, weight_dtype=torch.bfloat16):
@@ -962,8 +983,9 @@ def test_DSA_indexer_forward_wrapper_mxfp4_scale_group_routing():
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=27)
-def test_DSA_indexer_forward_mxfp4_two_mmas_per_k_chunk(monkeypatch):
-    """128-wide K chunks issue two K=64 MXFP4 MMAs per chunk, each reading its own pair of E8M0 scale groups."""
+def test_DSA_indexer_forward_mxfp4_two_k_chunks(monkeypatch):
+    """64-wide K chunks split the 128 head dim in two: each chunk's K=64 MXFP4 MMA reads its own pair of E8M0 scale
+    groups, and the second chunk accumulates at its K-phase offset (the H64 forward builds 128-wide chunks by default)."""
     DSA = pytest.importorskip("cudnn.deepseek_sparse_attention", reason="Environment not supported: cudnn[cutedsl] not installed").DSA
     _require_mxfp4_indexer()
     from cudnn.deepseek_sparse_attention.indexer_forward import _interface
@@ -973,12 +995,12 @@ def test_DSA_indexer_forward_mxfp4_two_mmas_per_k_chunk(monkeypatch):
 
     constructed = []
 
-    class WideKChunk(IndexerScoreUnifiedSm100Mxfp4):
+    class NarrowKChunk(IndexerScoreUnifiedSm100Mxfp4):
         def __init__(self, *args, **kwargs):
             constructed.append(kwargs)
-            super().__init__(*args, **{**kwargs, "k_block_size": 128})
+            super().__init__(*args, **{**kwargs, "k_block_size": 64})
 
-    monkeypatch.setitem(_block_scaled.BLOCK_SCALED_FORMATS, "mxfp4", dataclasses.replace(_block_scaled.BLOCK_SCALED_FORMATS["mxfp4"], kernel_cls=WideKChunk))
+    monkeypatch.setitem(_block_scaled.BLOCK_SCALED_FORMATS, "mxfp4", dataclasses.replace(_block_scaled.BLOCK_SCALED_FORMATS["mxfp4"], kernel_cls=NarrowKChunk))
     monkeypatch.setattr(_interface, "_compile_cache", {})
 
     device = "cuda"
@@ -992,7 +1014,7 @@ def test_DSA_indexer_forward_mxfp4_two_mmas_per_k_chunk(monkeypatch):
 
     result = DSA.indexer_forward_wrapper(q, k, w, ratio=ratio, q_causal_offsets=q_causal_offsets, precision="mxfp4", q_scale=q_scale, k_scale=k_scale)
     torch.cuda.synchronize()
-    assert constructed, "the MXFP4 indexer did not build the 128-wide K-chunk kernel"
+    assert constructed, "the MXFP4 indexer did not build the 64-wide K-chunk kernel"
     check_ref_indexer_forward(q_ref, k_ref, w, result["scores"], ratio, q_causal_offsets=q_causal_offsets, atol=1e-3, rtol=1e-3)
 
 

@@ -66,6 +66,7 @@ import cuda.bindings.driver as cuda
 import torch
 
 from cudnn._torch_stream import as_torch_stream, stream_context
+from cudnn._device import device_info
 from cudnn.api_base import APIBase, TupleDict
 
 from .compressor_sm100 import (
@@ -80,6 +81,7 @@ from .compressor_sm100 import (
 )
 from .compressor_sm100_r128 import (
     bwd_dape_workspace_bytes_r128,
+    bwd_smem_bytes_r128,
     precompile_bwd_r128,
     precompile_fwd_r128,
     run_bwd_r128,
@@ -287,12 +289,6 @@ class _CSACompressorBase(APIBase):
                 head_dim not in (128, 512),
                 f"CSA compressor at ratio=128 is validated for head_dim in {{128, 512}} only, got head_dim={head_dim}",
             )
-        # Rows (including static-capacity padding rows) gather a window of `ratio`
-        # tokens; the eager gather has the same requirement.
-        self._value_error_if(
-            total_comp > 0 and total_tokens < self.ratio,
-            f"total_comp={total_comp} > 0 requires at least ratio={self.ratio} tokens, got {total_tokens}",
-        )
         for desc, name in (
             (self.kv_desc, "kv"),
             (self.score_desc, "score"),
@@ -333,7 +329,6 @@ class _CSACompressorBase(APIBase):
             capability == _SM90_CAPABILITY and self.ratio == 128,
             "CSA compressor ratio 128 is not yet supported on SM90; use ratio 2 or 4",
         )
-
         self.total_tokens = total_tokens
         self.total_comp = total_comp
         self.head_dim = head_dim
@@ -381,9 +376,8 @@ class CSACompressorForward(_CSACompressorBase):
     Ratio 2/4 plans support SM90 and compute-capability major >= 10. Ratio 128
     remains compute-capability major >= 10 only.
 
-    Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding (for
-    CUDA-graph static shapes) and are computed with first-in-segment semantics from
-    token 0, exactly like the eager gather.
+    Rows in ``[cu_seqlens_comp[-1], total_comp)`` are static-capacity padding and are
+    written as exact zeros on every supported architecture.
     """
 
     def compile(self) -> None:
@@ -500,6 +494,17 @@ class CSACompressorBackward(_CSACompressorBase):
         """Validate the common envelope plus deterministic workspace indexing."""
         super().check_support()
         self._is_supported = False
+        if self.ratio == 128 and self.total_comp > 0:
+            # The r128 schedule is sized against SM100's 227 KiB per-CTA ceiling; a device with less (cc 12.x has ~99 KiB)
+            # would reject the launch with CUDA_LAUNCH_INVALID_CONFIG, so decline here with the actual numbers. An empty
+            # output (every sequence shorter than the ratio) launches no kernel and stays supported.
+            smem_bytes = bwd_smem_bytes_r128(self.ratio, self.head_dim, self.coff, self.total_comp)
+            smem_limit = device_info(self.target_device.index).shared_memory_per_block_optin
+            self._not_implemented_error_if(
+                smem_bytes > smem_limit,
+                f"CSA compressor backward (ratio=128, head_dim={self.head_dim}, coff={self.coff}) needs {smem_bytes} B of shared "
+                f"memory per CTA; {self.target_device} allows {smem_limit} B",
+            )
         if self.ratio != 128:
             self._rows_per_cta = _bwd_rows(
                 self.ratio,
@@ -788,11 +793,13 @@ def csa_compressor_forward_wrapper(
             in {128, 512}).
         total_comp: output row count. Defaults to ``cu_seqlens_comp[-1]`` (synchronizes);
             pass it explicitly (e.g. a static CUDA-graph capacity, which must be
-            ``>= cu_seqlens_comp[-1]``) to stay capture-safe.
+            ``>= cu_seqlens_comp[-1]``) to stay capture-safe. Rows beyond the
+            device-side true count are written as exact zeros.
         stream: CUDA stream for allocation and kernel launch (None -> current stream).
 
     Returns:
-        ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm).
+        ``{'out': (total_comp, head_dim) BF16}`` pooled output (pre-RMSNorm), with
+        exact zeros in static-capacity padding rows.
     """
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if total_comp is None:
