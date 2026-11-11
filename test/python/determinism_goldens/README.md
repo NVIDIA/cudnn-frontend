@@ -618,9 +618,16 @@ commit with the three commands above, in the runtimes above:
   two-device case ran there: first call, warm calls with both output owners and a side stream of the entry's device, the bytes of the
   same call made with that device current, the caller's device unchanged; 35 passed, 0 skipped against the unchanged set in
   `d2a97fcefba4b867/`; 1 passed.
-- CuTe DSL 4.8.1 at that commit: cold compile only, on an x86 host (cc 8.0 device: every device case skips), both compiler flavours --
-  65 passed with CUDA 13.4, 64 passed and the `sm_107a` rendering case skipped with CUDA 12.9; the three rendering cases and the
-  launch-argument case are among them.  The 4.8.1 device runs recorded above predate that commit and were not repeated.
+- CuTe DSL 4.8.1 on the cc 10.3 part (the 4.8.1 wheels put first on the path of the same runtime, as in the 4.8.1 record above; these
+  two runs are one commit later, which changes this report's text only).  Compiling with CUDA 13.4: 149 passed, 1 skipped (the
+  two-device case); the determinism command WITHOUT the goldens variable 33 passed, 2 skipped (the golden cases: no set is committed for
+  that runtime key -- a coverage gap, as before); 1 passed.  With only the CUDA 12 toolchain libraries (CUDA 12.9): 148 passed, 2 skipped
+  (the `sm_107a` rendering case and the two-device case); 33 passed, 2 skipped; 1 passed.  A record into a new directory under each
+  flavour (2 passed, 33 deselected) holds the input and output hashes of the committed 4.8.0 set; it is not committed.  Not run on a
+  device: 4.8.1 on cc 10.7.
+- Cold compile on an x86 host at that commit (a cc 8.0 device: every device case skips), CuTe DSL 4.8.0 and 4.8.1: 65 passed with CUDA
+  13.4, 64 passed and the `sm_107a` rendering case skipped with CUDA 12.9, under either version; the three rendering cases and the
+  launch-argument case are among them.
 
 ### QSA: 42 cases
 
