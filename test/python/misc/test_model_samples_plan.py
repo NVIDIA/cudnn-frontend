@@ -271,11 +271,15 @@ def test_the_fallback_multiply_asks_for_the_fp32_accumulator_and_restores_the_se
     monkeypatch.setattr(library.torch, "matmul", matmul)
     qx = quantize_fp8(torch.tensor([[1.0, -2.0, 0.5, 4.0]]), 0.5)
     weight = Dequantized(torch.tensor([[2.0, 1.0, 0.0, -1.0], [1.0, 1.0, 1.0, 1.0]], dtype=torch.bfloat16), 0.25)
-    for allowed in (True, False):
-        monkeypatch.setattr(flags, "allow_bf16_reduced_precision_reduction", allowed)
-        out = library.matmul_bf16(qx, weight)
-        assert flags.allow_bf16_reduced_precision_reduction is allowed, "the caller's setting is restored"
-        assert out.dtype == torch.bfloat16 and out.tolist() == [[-1.0, 0.875]]
+    found = flags.allow_bf16_reduced_precision_reduction  # set and put back by hand: the flag is no attribute a patch can delete
+    try:
+        for allowed in (True, False):
+            flags.allow_bf16_reduced_precision_reduction = allowed
+            out = library.matmul_bf16(qx, weight)
+            assert flags.allow_bf16_reduced_precision_reduction is allowed, "the caller's setting is restored"
+            assert out.dtype == torch.bfloat16 and out.tolist() == [[-1.0, 0.875]]
+    finally:
+        flags.allow_bf16_reduced_precision_reduction = found
     assert seen == [False, False], "the partial sums stay in the fp32 accumulator during the call"
 
 

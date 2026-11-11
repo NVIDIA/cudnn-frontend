@@ -235,16 +235,30 @@ def _disk_tensors(model, source) -> dict:
     return out
 
 
-def _write_checkpoint(directory: Path, tensors: dict, config: dict, shards: int = 2) -> Path:
-    from safetensors.torch import save_file
+def _save_safetensors(path: Path, tensors: dict) -> None:
+    """One shard written from the format's definition -- eight bytes of little-endian header length, the JSON header, the
+    tensors' bytes in header order -- so that the test needs the ``safetensors`` package for what the helper layer uses it
+    for, the reading, and nothing else."""
+    spelling = {torch.bfloat16: "BF16", torch.float32: "F32", torch.float8_e4m3fn: "F8_E4M3", torch.uint8: "U8"}
+    header, blobs, offset = {"__metadata__": {"format": "pt"}}, [], 0
+    for name in sorted(tensors):
+        tensor = tensors[name].contiguous()
+        raw = bytes(tensor.reshape(-1).view(torch.uint8).tolist())
+        header[name] = {"dtype": spelling[tensor.dtype], "shape": list(tensor.shape), "data_offsets": [offset, offset + len(raw)]}
+        blobs.append(raw)
+        offset += len(raw)
+    text = json.dumps(header, separators=(",", ":")).encode()
+    text += b" " * (-len(text) % 8)  # the header is padded with spaces to a multiple of eight bytes
+    path.write_bytes(struct.pack("<Q", len(text)) + text + b"".join(blobs))
 
+
+def _write_checkpoint(directory: Path, tensors: dict, config: dict, shards: int = 2) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     for old in directory.glob("*.safetensors"):
         old.unlink()
     names = sorted(tensors)
     for index in range(shards):
-        part = {name: tensors[name].contiguous() for name in names[index::shards]}
-        save_file(part, str(directory / f"model-{index + 1:05d}-of-{shards:05d}.safetensors"), metadata={"format": "pt"})
+        _save_safetensors(directory / f"model-{index + 1:05d}-of-{shards:05d}.safetensors", {name: tensors[name] for name in names[index::shards]})
     (directory / "config.json").write_text(json.dumps(config))
     return directory
 
@@ -393,7 +407,7 @@ def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, mon
     with pytest.raises(NotImplementedError, match="has an attention layer without its output gate"):
         QwenDense.describe(described(config_change=lambda c: c["text_config"].update(attn_output_gate=False)))
     second = {
-        "draft." + name[len(PREFIX) :]: value.clone()
+        "draft." + name[len(PREFIX) :]: value
         for name, value in tensors.items()
         if name.startswith(PREFIX + "embed") or name.startswith(PREFIX + "layers.0.input")
     }
