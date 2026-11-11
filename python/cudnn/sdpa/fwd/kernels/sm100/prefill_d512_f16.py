@@ -1246,6 +1246,13 @@ def _compute_warp_group(
             final_ell = ell_addr.load()
             final_max = max_addr.load()
 
+            # One lane returns the Stats slot for the whole compute group.
+            # Every warp must finish both loads before that credit lets sg0
+            # refill the slot through its asynchronous cross-CTA bulk copy.
+            # The post-load proxy fence orders those reads against the refill;
+            # the group barrier joins all readers before the elected release.
+            nvvm.fence_proxy("async.shared", space="cta")
+            nvvm.barrier_cta_sync(barrier_id=8, thread_count=32 * CFG.SOFTMAX_WG_WARPS)
             bars.mb_stats_xfer_empty.arrive_on_peer(cross_sg_peer, pred=is_lead_warp & nvvm.elect_sync())
 
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
