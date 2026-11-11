@@ -343,6 +343,26 @@ def d128_causal_route(shape, bottom_right: bool, ctas: int) -> bool:
     return len(kv_tiles) * h_q * b <= ctas or sum(kv_tiles) >= D128_ROUTE_MAX_L * len(kv_tiles)
 
 
+# The causal claim counter of a persistent causal D128 record (TemplateParams.causal_claim): 0 runs the static
+# schedules (the stride, the paired walk), 1 hands every item after a CTA's first out from an Int32 counter in the
+# caller's workspace with the items numbered group-major and each (head, batch) group's Q tiles in NATURAL order. A
+# dynamic hand-out keeps a head's Q tiles running together at any plan size (Nsight Compute: K and V read 1.000 times
+# the read-once floor where a static schedule drifted to 1.24 to 1.46); the counter needs D128_CLAIM_WORKSPACE_BYTES of
+# caller workspace, zeroed on the launch stream before every launch. Handing out a group's heaviest Q tile first was
+# also timed: never faster than NATURAL (by 0 to 1.2%), so it is not built.
+D128_CLAIM_OFF = 0
+D128_CLAIM_NATURAL = 1
+D128_CLAIM_WORKSPACE_BYTES = 128
+
+
+def d128_claim_coords(item: int, q_tiles: int, heads: int) -> tuple[int, int, int]:
+    """``(Q tile, head, batch)`` of work item ``item`` on a causal claim-counter record (causal_claim 1): items are
+    numbered group-major, batch then head then Q tile, so a group's Q tiles are consecutive and are handed out within a
+    few claims of each other. The template's work_of decodes the same arithmetic in the kernel; this is its host form
+    for tests."""
+    return item % q_tiles, (item // q_tiles) % heads, item // (q_tiles * heads)
+
+
 def declared_features(*, thd=False, sink=False, window_left=None, window_right=None, lengths=False, pack_gqa=False, paged=False, split_kv=1) -> frozenset[str]:
     """The features one declaration names, in the vocabulary of ``NOT_SERVED``.
 
@@ -514,6 +534,14 @@ class TemplateParams:
     # default, 2), with sched_policy NATURAL unless the caller pins one, and clears it (with persistent) on a plan
     # api_dsl.D128_CAUSAL_WALK_ROUTE routes one tile per CTA. D512 refuses it.
     causal_walk: int = 0
+    # Causal claim counter of the D128 persistent loop, appended after the causal walk so every earlier specialization
+    # keeps its default (0, D128_CLAIM_OFF: the static schedules above). 1 (D128_CLAIM_NATURAL): CTA c's first item is
+    # c, and every later one is the CTA count plus a ticket the producer warp takes from an Int32 counter at the meta
+    # pointer (word 0 of the caller's workspace, which the launcher zeroes on the launch stream before every launch),
+    # the items numbered group-major (d128_claim_coords). It requires persistent and causal, causal_walk 0 and
+    # sched_policy NATURAL, and computes the one-tile-per-CTA overlap kernel's O and Stats bit for bit. No adapter sets
+    # it yet: a launch must first bind the counter's workspace. D512 refuses it.
+    causal_claim: int = 0
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -554,8 +582,9 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
     and causal walk switches. D128 first refuses its ``NOT_SERVED`` features (the
     declarations pick_flavor keeps on D512, so the adapter never reaches this refusal),
     then persistence without intra-warpgroup overlap, then a causal walk other than 0
-    and 1 and the paired walk outside a persistent causal record, then runs the same
-    checks under its own name.
+    and 1 and the paired walk outside a persistent causal record, then a claim counter
+    other than 0, 1 and 2 or outside a persistent causal NATURAL record without the
+    walk, then runs the same checks under its own name.
     """
     if flavor == D128_FLAVOR:
         declared = declared_features(
@@ -585,6 +614,17 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
         raise ValueError(f"SM90 D128 causal_walk must be 0 (the stride by the grid) or 1 (the paired walk); got {params.causal_walk!r}")
     if params.causal_walk and not (params.persistent and params.causal):
         raise ValueError("SM90 D128 causal_walk=1 requires persistent and causal: it orders a causal plan's persistent walk")
+    if flavor == D512_FLAVOR and params.causal_claim:
+        raise ValueError("SM90 D512 has no causal claim counter; it is a D128 template field")
+    if type(params.causal_claim) is not int or params.causal_claim not in (D128_CLAIM_OFF, D128_CLAIM_NATURAL):
+        raise ValueError(
+            f"SM90 D128 causal_claim must be {D128_CLAIM_OFF} (static) or {D128_CLAIM_NATURAL} (the counter, NATURAL); got {params.causal_claim!r}"
+        )
+    if params.causal_claim and not (params.persistent and params.causal and not params.causal_walk and params.sched_policy == SCHED_NATURAL):
+        raise ValueError(
+            "SM90 D128 causal_claim requires persistent and causal with causal_walk 0 and sched_policy NATURAL: the counter "
+            "replaces the static schedules of a causal plan's persistent walk and numbers its items itself"
+        )
     name = f"SM90 D{flavor[0]}"
     tile_m = FLAVOR_TILES[flavor][0]
     if type(params.page_size) is not int or params.page_size < 0:

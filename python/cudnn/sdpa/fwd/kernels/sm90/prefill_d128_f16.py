@@ -21,7 +21,10 @@ The kernel implements:
   or, under ``TemplateParams.persistent``, a grid of at most one CTA per SM
   whose CTAs walk the work items in that order, or a causal record's in pairs of
   equal KV work (``TemplateParams.causal_walk``): the producer loads the next item's
-  first K tile, Q and first V tile while the current item finishes.
+  first K tile, Q and first V tile while the current item finishes. A causal record may
+  instead hand each item after a CTA's first out from an Int32 counter in the caller's
+  workspace (``TemplateParams.causal_claim``), so the CTAs that are free take a head's Q
+  tiles together at any plan size.
 - Online softmax around an exact sign-aware row anchor, with lane-partial row sums
   quad-reduced only at finalization: the D512 template's arithmetic at 32 keys per lane
   and row.
@@ -38,7 +41,8 @@ The kernel implements:
 Storage: Q and each K and V ring stage are 128 x 128 tiles of two 128-row SW128 slabs; a
 compute warpgroup's QK reads rows 64*w .. 64*w+63 of the Q slabs. O stages through its own
 region as two 64-row halves of two slabs, one per compute warpgroup, so each stores its rows
-alone. 196,704 B in all.
+alone. 196,704 B in all, and 64 B more for a claim-counter record's two id slots and their
+four mbarriers.
 
 Constraints:
 - FP16/BF16 in, O in the input dtype, FP32 accumulation.
@@ -62,11 +66,13 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.base_dsl.typing import Pointer
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from cudnn.frost.compiled_cache import template_key as _template_key
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, MASK_CAUSAL, MASK_NONE, MASK_PADDED
 from cudnn.frost.tile_dsl.handles import GmemTileTmaSlice, SmemTile
 from cudnn.frost.tile_dsl.mask import compute_kv_loop_bounds
@@ -140,6 +146,10 @@ PERSISTENT: bool = PARAMS.persistent
 # Causal walk switch, read the same way: 0 is the stride by the grid, 1 the paired walk; validate_params above has
 # refused 1 outside a persistent causal record.
 CAUSAL_WALK: int = PARAMS.causal_walk
+# Causal claim counter switch, read the same way: 0 the static schedules, 1 the counter with a group's Q tiles in NATURAL
+# order, 2 with a group's heaviest Q tile first (config_sm90.d128_claim_coords); validate_params above has refused a
+# counter outside a persistent causal NATURAL record without the walk.
+CAUSAL_CLAIM: int = PARAMS.causal_claim
 
 # The plan-time rule of a persistent causal record (causal_walk_plan, and causal_stride_snake for the stride), its
 # seven constants (CAUSAL_WALK_LIGHT_ROWS, CAUSAL_WALK_L2_CAP, CAUSAL_WALK_PHI, CAUSAL_WALK_SNAKE, CAUSAL_WALK_MIN_TILES,
@@ -305,6 +315,16 @@ class Bars(NamedTuple):
 
     Consumers wait FULL from phase 0, producers EMPTY from phase 1, which passes at once
     on a fresh barrier.
+
+    A claim-counter record (causal_claim) adds the id ring, kernel's ``claim`` bundle beside
+    this record: ``full`` (CLAIM_SLOTS slots, init 1: the producer warp's lane 0 after it
+    stores the id) and ``empty`` (CLAIM_SLOTS slots, init 8: lane 0 of each compute warp,
+    the slot's only reader in that warp). Q, K and V are read by WGMMA only, so their EMPTY
+    arrives follow the wait that retires it. The id is read by an ordinary load, so its
+    EMPTY arrive goes through ``tile_dsl.consume`` (``consume_then_arrive``): the address
+    of lane 0's arrive is computed from the id lane 0 loaded, through the kernel's
+    release-zero argument (python/cudnn/AGENTS.md Rule 11, python/cudnn/sdpa/AGENTS.md
+    S15), and the id reaches the other lanes by a register shuffle after the release.
     """
 
     mb_tma_q_full: object
@@ -334,6 +354,11 @@ class SM90FusedMultiHeadAttentionForward:
     KV_STAGES = 2
     # setmaxnreg budgets per warpgroup: 128 * (24 + 240 + 240) fits the SM's 65,536.
     REG_BUDGETS = (24, 240, 240)
+    # A claim-counter record's id ring (causal_claim): two 16-byte slots, each with a FULL mbarrier (the producer warp's
+    # one arrival) and an EMPTY one (one arrival per compute warp), so the producer can publish the next item while the
+    # compute warpgroups still read the previous one.
+    CLAIM_SLOTS = 2
+    CLAIM_SLOT_WORDS = 4
 
     def __init__(
         self,
@@ -350,6 +375,7 @@ class SM90FusedMultiHeadAttentionForward:
         persistent: bool = False,
         persistent_ctas: int = 0,
         causal_walk: int = 0,
+        causal_claim: int = 0,
     ):
         """Initialize the SM90 D128 FMHA prefill kernel configuration.
 
@@ -377,6 +403,9 @@ class SM90FusedMultiHeadAttentionForward:
         :param persistent_ctas: The persistent grid's CTA cap (the SM count); 0 when not persistent.
         :param causal_walk: A persistent causal record's walk: 0 the stride by the grid, 1 the paired walk
             (causal_walk_plan, which may keep the stride).
+        :param causal_claim: A persistent causal record's claim counter (config_sm90.D128_CLAIM_*): 0 off, 1 every
+            item after a CTA's first from the workspace counter with a group's Q tiles in NATURAL order. Requires
+            causal_walk 0 and sched_policy NATURAL.
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -416,6 +445,12 @@ class SM90FusedMultiHeadAttentionForward:
         self.causal_walk = causal_walk
         if causal_walk and not (persistent and is_causal):
             raise ValueError(f"prefill_d128_f16_sm90: causal_walk={causal_walk} orders a persistent causal record's walk; got persistent={persistent}")
+        self.causal_claim = causal_claim
+        if causal_claim and not (persistent and is_causal and not causal_walk and sched_policy == SCHED_NATURAL):
+            raise ValueError(
+                f"prefill_d128_f16_sm90: causal_claim={causal_claim} hands out a persistent causal NATURAL record's items without "
+                f"the walk; got persistent={persistent}, causal={is_causal}, causal_walk={causal_walk}, sched_policy={sched_policy}"
+            )
         # Read by prepared_host.host; a D128 specialization never declares them (no THD, sink,
         # paged pool or KV split: validate_params refuses each).
         self.thd_varlen = False
@@ -1202,7 +1237,8 @@ class SM90FusedMultiHeadAttentionForward:
         then head, then batch, so a persistent grid's first round is that grid's first wave; LPT and LPT_L2 decode the
         linear id kernel decodes for them. Every divisor is a compile-time constant (PREPARED_FIXED_SHAPE), so the
         divisions strength-reduce. Under the paired walk ``item`` is a walk position, decoded through its unit
-        (walk_unit, walk_item).
+        (walk_unit, walk_item). A claim-counter record (causal_claim, sched_policy NATURAL) decodes NATURAL's
+        group-major numbering (config_sm90's d128_claim_coords is the host form).
         """
         if cutlass.const_expr(self.paired_walk):
             cta, _, _ = cute.arch.block_idx()
@@ -1270,6 +1306,86 @@ class SM90FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.stride_snake):
             return cute.arch.make_warp_uniform(stride_next(item, self.n_ctas, True))
         return cute.arch.make_warp_uniform(item + cutlass.Int32(self.n_ctas))
+
+    @cute.jit
+    def claim_issue(self, claim):
+        """Take a ticket for this CTA's next item (causal_claim): lane 0 of the producer warp increments the workspace
+        counter once per item and keeps the old value; the other lanes keep 0. The producer calls it at the start of an
+        item and reads the ticket only in publish_claim, after the item's last loads, so no load waits on the atomic's
+        return (an earlier version claimed before an item's last K and V loads, and its producer waited out the round
+        trip at the shuffle that followed). Lane 0, not elect_sync: elect_sync's lane is implementation-defined, and
+        publish_claim shuffles from lane 0.
+
+        The increment is atom.inc, not atom.add: ptxas turns a one-lane atom.add into a warp-aggregated atomic whose
+        broadcast reads the result inside this branch, so the whole warp would wait out the atomic here. atom.inc stores
+        ``old >= limit ? 0 : old + 1`` (unsigned) and ptxas does not aggregate it; with the limit at 2**31 - 1 it is
+        old + 1 for every count a zeroed counter reaches (at most the item count)."""
+        ticket = cutlass.Int32(0)
+        if cute.arch.lane_idx() == 0:
+            ticket = cutlass.Int32(prims.atomicrmw(prims.AtomicOp.INC, claim.ctr, cutlass.Int32(0x7FFFFFFF)))
+        return ticket
+
+    @cute.jit
+    def claim_cell(self, claim, idx):
+        """Slot ``idx`` of the id ring as a one-element shared-memory tensor, built as the single-CTA publish of
+        frost/tile_dsl/scheduler.py builds its slot (each slot 16-byte aligned, CLAIM_SLOT_WORDS apart)."""
+        base = claim.slot.subview(idx * cutlass.Int32(self.CLAIM_SLOT_WORDS)).data_ptr().toint(cutlass.Int32)
+        return cute.make_tensor(cute.make_ptr(cutlass.Int32, base, cutlass.AddressSpace.smem, assumed_align=16), cute.make_layout(1))
+
+    @cute.jit
+    def publish_claim(self, claim, ticket, n):
+        """The producer warp's side of the id ring (causal_claim). The CTA's next item is the CTA count plus lane 0's
+        ticket (claim_issue; a CTA's first item is its block index and the launcher zeroes the counter before every
+        launch), warp-uniform. Every lane waits the slot's EMPTY phase (both compute warpgroups read its previous id; a
+        fresh slot passes at once, the ring starting at phase 1 as every EMPTY state does); lane 0 writes the id and
+        arrives the slot's FULL barrier: mbarrier.arrive releases, so the store is visible to every compute thread
+        whose FULL wait, an acquire, passes. An id at or past the item count ends every role's walk on the same item.
+        ``n`` counts the ids this warp has published: slot n % 2, EMPTY phase the ring's from 1 (claim_ring_slot).
+        Returns the item and n + 1."""
+        idx, phase = self.claim_ring_slot(n, cutlass.Int32(1))
+        item = cute.arch.make_warp_uniform(cute.arch.shuffle_sync(ticket, 0) + cutlass.Int32(self.n_ctas))
+        claim.empty[idx].wait(phase)
+        # A local name for the slot: a staged branch rebinds the name it writes through (a write through an attribute of
+        # the shared bundle is an IR dominance error at trace).
+        cell = self.claim_cell(claim, idx)
+        if cute.arch.lane_idx() == 0:
+            cell[0] = item
+            claim.full[idx].arrive()
+        return item, cute.arch.make_warp_uniform(n + cutlass.Int32(1))
+
+    @cute.jit
+    def read_claim(self, claim, n):
+        """A compute warp's side of the id ring (causal_claim): every lane waits the slot's FULL phase; lane 0 alone
+        loads the id and arrives the slot's EMPTY barrier through tile_dsl.consume (one arrival per compute warp, eight
+        in all), then shuffles the id to the warp. The arrive's address is computed from the id lane 0 loaded, through
+        the kernel's release-zero argument (``claim.rz``), so that load is read in front of the release in the
+        generated code (python/cudnn/AGENTS.md Rule 11, python/cudnn/sdpa/AGENTS.md S15). Only lane 0 reads the slot:
+        with every lane loading and one elected lane releasing, the other lanes' loads are not ordered before the
+        release, and compute-sanitizer racecheck reports the producer's next store as a WAR hazard against them (H100,
+        CUDA 13.0 compute-sanitizer). The shuffle is register-to-register and follows the release.
+        ``n`` counts the ids this warp has read: slot n % 2, FULL phase the ring's from 0 (claim_ring_slot). Returns
+        the item, warp-uniform, and n + 1."""
+        idx, phase = self.claim_ring_slot(n, cutlass.Int32(0))
+        claim.full[idx].wait(phase)
+        cell = self.claim_cell(claim, idx)
+        lane0 = cute.arch.lane_idx() == cutlass.Int32(0)
+        item = cutlass.Int32(0)
+        if lane0:
+            item = cutlass.Int32(cell[0])
+        consume_then_arrive(claim.empty[idx], item, claim.rz, pred=lane0)
+        item = cute.arch.shuffle_sync(item, 0)
+        return cute.arch.make_warp_uniform(item), cute.arch.make_warp_uniform(n + cutlass.Int32(1))
+
+    @cute.jit
+    def claim_ring_slot(self, n, start_phase):
+        """The id ring's slot and phase for a warp's ``n``-th use (from 0): slot n % CLAIM_SLOTS, and the phase from
+        ``start_phase`` (0 for the compute warps' FULL waits, 1 for the producer's EMPTY waits), flipped once per lap.
+        One Int32 per role carried across the item loop instead of a PipelineState's two: profiling found the counter
+        build running 9% more instructions per KV tile than the static schedules on chunked prefill, the KV loops'
+        warp-uniform address arithmetic moved to per-thread registers with an R2UR back on every iteration (uniform
+        registers running out). Every value the counter keeps live across the KV loops costs there."""
+        slots = cutlass.Int32(self.CLAIM_SLOTS)
+        return n % slots, start_phase ^ ((n // slots) % cutlass.Int32(2))
 
     @cute.jit
     def uniform_state(self, state):
@@ -1410,7 +1526,7 @@ class SM90FusedMultiHeadAttentionForward:
                         lse.iterator[offset] = lse_out
 
     @cute.jit
-    def tmaldg_persistent(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc):
+    def tmaldg_persistent(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, claim):
         """Persistent producer: this CTA's items in turn, each K(i, 0), Q(i), V(i, 0), then the rest of its
         reverse walk as tmaldg_warp_group's.
 
@@ -1421,13 +1537,21 @@ class SM90FusedMultiHeadAttentionForward:
         (the constructor's precondition), so there is no liveness branch and the Q phase flips once per item, as the
         compute warpgroups' does. The closing waits take Q's last release, then walk the WHOLE K/V ring, from the carried
         states (python/cudnn/sdpa/AGENTS.md, the whole-ring drain lesson): no TMA payload is in flight at exit.
+
+        Under causal_claim the next item is claimed at the start of each item (claim_issue) and published to the compute
+        warpgroups after the item's last loads (publish_claim); the end-of-work id is published the same way, and the
+        closing waits are unchanged (an id slot holds no TMA payload).
         """
         tid = cute.arch.thread_idx()[0]
         if tid < cute.arch.WARP_SIZE:
             q_empty_phase = cutlass.Int32(1)
             kv_empty_state = PipelineState.start(phase=1)
             item = self.first_item()
+            if cutlass.const_expr(self.causal_claim):
+                claim_n = cutlass.Int32(0)
             while self.live(item):
+                if cutlass.const_expr(self.causal_claim):
+                    ticket = self.claim_issue(claim)
                 work = self.work_of(item)
                 first_seq_idx = (work.kv_right - 1) * self.KV_TILE
                 first_stage = kv_empty_state.idx
@@ -1448,7 +1572,10 @@ class SM90FusedMultiHeadAttentionForward:
                     self.load_one_kv_tile(sV[stage], tma_v_desc, bars.mb_tma_v_full[stage], work, kv_seq_idx, is_v=True)
                     kv_empty_state = advance(kv_empty_state, self.KV_STAGES)
                 kv_empty_state = self.uniform_state(kv_empty_state)
-                item = self.next_item(item)
+                if cutlass.const_expr(self.causal_claim):
+                    item, claim_n = self.publish_claim(claim, ticket, claim_n)
+                else:
+                    item = self.next_item(item)
             bars.mb_tma_q_empty.wait(q_empty_phase)
             for _ in cutlass.range_constexpr(self.KV_STAGES):
                 bars.mb_tma_k_empty[kv_empty_state.idx].wait(kv_empty_state.phase)
@@ -1460,12 +1587,17 @@ class SM90FusedMultiHeadAttentionForward:
         """This CTA's items in turn, each run as compute_warp_group runs its one tile, Q released in the walk.
 
         The loop body calls no method of ``cta`` itself: the DSL carries every object whose method a dynamic loop calls,
-        and ``cta`` holds the O tensor map, which cannot be carried. ``bars`` (frozen barrier records) can.
+        and ``cta`` holds the O tensor map, which cannot be carried. ``bars`` (frozen barrier records) can, and so can
+        ``claim`` (the id ring, causal_claim), which the walk reads at the bottom of every item (read_claim).
         """
         bars = cta.bars
         kv_full_state = PipelineState.start(phase=0)
         q_full_phase = cutlass.Int32(0)
         item = self.first_item()
+        if cutlass.const_expr(self.causal_claim):
+            # The id ring (causal_claim): FULL waits start at phase 0, as every consumer's do (claim_ring_slot).
+            claim = cta.claim
+            claim_n = cutlass.Int32(0)
         while self.live(item):
             work = self.work_of(item)
             basic_params, mma_params = self.item_params(cta, work)
@@ -1484,10 +1616,13 @@ class SM90FusedMultiHeadAttentionForward:
             row_sum_inv_values, row_lse_values = self.finalize_rows(cta)
             self.store_stats(cta, work, basic_params.row_base, row_lse_values)
             self.epilogue(bars, work, cta.tma_o_desc, cta.sO, cta.output, row_sum_inv_values, cta.local_tid, cta.w, basic_params.row_base, persistent=True)
-            item = self.next_item(item)
+            if cutlass.const_expr(self.causal_claim):
+                item, claim_n = self.read_claim(claim, claim_n)
+            else:
+                item = self.next_item(item)
 
     @cute.jit
-    def compute_persistent(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, w):
+    def compute_persistent(self, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, w, claim):
         """Run compute warpgroup ``w`` (0 for WG1, 1 for WG2) over every item of this CTA (the persistent walk).
 
         Built once per CTA, as compute_warp_group builds them per tile: the register Arrays, the operand descriptors, the
@@ -1499,8 +1634,14 @@ class SM90FusedMultiHeadAttentionForward:
         partial_sum = cutlass.Array(cutlass.Float32, 2, alignment=16)
         partial_sum.store((0.0, 0.0))
         alpha = cutlass.Array(cutlass.Float32, 2, alignment=8)
+        # The compute warpgroups read ids only: the id ring without the counter's global pointer (causal_claim), so the
+        # pointer is not live across their KV loops (claim_ring_slot's note: what the counter keeps live there costs).
+        ring = None
+        if cutlass.const_expr(self.causal_claim):
+            ring = SimpleNamespace(slot=claim.slot, full=claim.full, empty=claim.empty, rz=claim.rz)
         cta = SimpleNamespace(
             bars=bars,
+            claim=ring,
             local_tid=local_tid,
             w=w,
             lse=lse,
@@ -1521,17 +1662,18 @@ class SM90FusedMultiHeadAttentionForward:
             tma_store_wait(0)
 
     @cute.jit
-    def _run_persistent(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg):
+    def _run_persistent(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, claim, wg):
         """Persistent walk: _run_unit's register split, once per CTA, then the role over every item.
 
-        setmaxnreg is warpgroup-collective, so all four WG0 warps still run it before warps 1 to 3 go idle.
+        setmaxnreg is warpgroup-collective, so all four WG0 warps still run it before warps 1 to 3 go idle. ``claim`` is
+        the claim counter's bundle (kernel), None without causal_claim.
         """
         if wg == 0:
             prims.setmaxregister(self.REG_BUDGETS[0], prims.SetMaxRegisterAction.DECREASE)
-            self.tmaldg_persistent(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc)
+            self.tmaldg_persistent(sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, claim)
         else:
             prims.setmaxregister(self.REG_BUDGETS[1], prims.SetMaxRegisterAction.INCREASE)
-            self.compute_persistent(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg - 1)
+            self.compute_persistent(tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg - 1, claim)
 
     @cute.jit
     def _run_unit(self, tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg, tile, head, batch):
@@ -1574,13 +1716,22 @@ class SM90FusedMultiHeadAttentionForward:
         tma_o_desc: cutlass.GridConstant[cuda.TensorMap],
         lse,
         scale: cutlass.Float32,
+        claim_ctr,
+        release_zero_arg: cutlass.Int32,
     ):
         """Run one work tile per CTA, or under ``persistent`` every item of the CTA's stride (of its units, under the
-        paired walk): allocate, decode, then run the three roles.
+        paired walk; every item it claims, under causal_claim): allocate, decode, then run the three roles.
 
         Warp 0's elected lane initializes every barrier, and the default CTA barrier (id 0)
-        publishes them before any role runs.
+        publishes them before any role runs. ``claim_ctr`` is the meta pointer's Int32 view
+        (prepared_host's ``seq_kv_lens``), whose word 0 is a claim-counter record's work-item
+        counter in the caller's workspace; None on every other record. ``release_zero_arg`` is
+        tile_dsl.consume's release-zero, the last argument: the host passes the literal 0 and
+        its one use is ``release_zero`` below (python/cudnn/AGENTS.md Rule 11: a compare or a
+        branch on it lets the compiler fold the mask, and the claim ring's loads are unordered
+        again without any error).
         """
+        rz = release_zero(release_zero_arg)
         # One typed Array per region. The tiles align to 1024 B, one SW128 swizzle atom (8
         # rows x 128 B) and what every WGMMA descriptor assumes; each mbarrier array to 16 B,
         # with a ring's stages 8 B apart.
@@ -1626,6 +1777,28 @@ class SM90FusedMultiHeadAttentionForward:
                 producer=Producer.THREAD,
             ),
         )
+        # The claim counter's bundle (causal_claim): the workspace counter, the two-slot id ring and its FULL (the
+        # producer warp's lane 0) and EMPTY (lane 0 of each of the eight compute warps, through tile_dsl.consume)
+        # mbarriers, and the release-zero of that arrive. None otherwise.
+        claim = None
+        if cutlass.const_expr(self.causal_claim):
+            claim = SimpleNamespace(
+                rz=rz,
+                ctr=Pointer(claim_ctr.iterator.raw_ptr(), dtype=cutlass.Int32),
+                slot=cutlass.Array(cutlass.Int32, self.CLAIM_SLOTS * self.CLAIM_SLOT_WORDS, alignment=16, space=cutlass.AddressSpace.smem),
+                full=MBarrier(
+                    cutlass.Array(cutlass.Int64, self.CLAIM_SLOTS, alignment=16, space=cutlass.AddressSpace.smem),
+                    stages=self.CLAIM_SLOTS,
+                    init_count=1,
+                    producer=Producer.THREAD,
+                ),
+                empty=MBarrier(
+                    cutlass.Array(cutlass.Int64, self.CLAIM_SLOTS, alignment=16, space=cutlass.AddressSpace.smem),
+                    stages=self.CLAIM_SLOTS,
+                    init_count=2 * cute.arch.WARPS_PER_WARPGROUP,
+                    producer=Producer.THREAD,
+                ),
+            )
         # The TMA views, built once. Only their TMA fields are consumed: SmemTile.desc()
         # builds a tcgen05 descriptor, so the Hopper descriptors come from the raw Arrays
         # (compute_warp_group). O is indexed by warpgroup half, K and V by ring stage.
@@ -1680,12 +1853,16 @@ class SM90FusedMultiHeadAttentionForward:
                     bars.mb_tma_k_empty[stage].init()
                     bars.mb_tma_v_full[stage].init()
                     bars.mb_tma_v_empty[stage].init()
+                if cutlass.const_expr(self.causal_claim):
+                    for slot in cutlass.range_constexpr(self.CLAIM_SLOTS):
+                        claim.full[slot].init()
+                        claim.empty[slot].init()
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync()
         if cutlass.const_expr(self.persistent):
             # Persistent: every role walks this CTA's items (at most one CTA per SM, __call__).
             wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) // cute.arch.WARPS_PER_WARPGROUP
-            self._run_persistent(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, wg)
+            self._run_persistent(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, sQ, sK, sV, sO, bars, claim, wg)
         else:
             # One (Q tile, head, batch) work tile per CTA; the LPT policies unflatten the single
             # grid axis they launch.
@@ -1747,7 +1924,10 @@ class SM90FusedMultiHeadAttentionForward:
         before launch. ``sinks``, the length views, the THD arguments (lengths and the
         ``thd_ro_q`` .. ``thd_ro_lse`` ragged offsets, ``None`` while ``thd_origins`` is) and
         the page tables (``block_table``, ``block_table_v``, never passed while ``page_size``
-        is 0) are unread: a D128 specialization declares none of them.
+        is 0) are unread: a D128 specialization declares none of them. ``seq_kv_lens`` is read
+        only by a claim-counter record (causal_claim), as its work-item counter: word 0 of the
+        caller's workspace, which the launcher binds as ``meta_ptr`` and zeroes on the launch
+        stream before every launch.
 
         :param q: Query tensor ``(B, H_q, S_q, 128)`` over the caller's strides.
         :param k: Key tensor ``(B, H_kv, S_kv, 128)``.
@@ -1791,7 +1971,9 @@ class SM90FusedMultiHeadAttentionForward:
                 raise ValueError(f"prefill_d128_f16_sm90: {name} shape {tuple(tensor.shape)} disagrees with the declared (B, H, S) = {declared}")
         # min_blocks_per_mp=1 emits .minnctapersm 1, which keeps the setmaxnreg split live
         # (python/cudnn/AGENTS.md: without it ptxas may drop every setmaxnreg silently).
-        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale).launch(
+        claim_ctr = seq_kv_lens if cutlass.const_expr(self.causal_claim) else None
+        # The release-zero (tile_dsl.consume, kernel's last argument): the literal 0, the only value ever passed.
+        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, scale, claim_ctr, cutlass.Int32(0)).launch(
             grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream, min_blocks_per_mp=1
         )
 
@@ -1874,6 +2056,7 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         persistent=PARAMS.persistent,
         persistent_ctas=persistent_ctas,
         causal_walk=PARAMS.causal_walk,
+        causal_claim=PARAMS.causal_claim,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel

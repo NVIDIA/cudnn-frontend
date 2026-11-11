@@ -666,16 +666,17 @@ def _admitted(fields):
 
 
 def test_d128_switch_fields_are_appended_last():
-    """The overlap switch, the persistent switch, then the causal walk are appended after thd_origins, defaulting to
-    False, False and 0 (the stride by the grid): every earlier specialization keeps its defaults (the append-only
-    rule). The segment is pinned from its own first field, so a field appended after it later still passes."""
+    """The overlap switch, the persistent switch, the causal walk, then the claim counter are appended after
+    thd_origins, defaulting to False, False, 0 (the stride by the grid) and 0 (no counter): every earlier specialization
+    keeps its defaults (the append-only rule). The segment is pinned from its own first field, so a field appended after
+    it later still passes."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
     fields = dataclasses.fields(c.TemplateParams)
     names = [f.name for f in fields]
     start = names.index("intra_wg_overlap")
     assert start > names.index("thd_origins"), names
-    expected = [("intra_wg_overlap", False, bool), ("persistent", False, bool), ("causal_walk", 0, int)]
+    expected = [("intra_wg_overlap", False, bool), ("persistent", False, bool), ("causal_walk", 0, int), ("causal_claim", 0, int)]
     assert [(f.name, f.default, type(f.default)) for f in fields[start : start + len(expected)]] == expected
 
 
@@ -685,6 +686,7 @@ def test_d128_switch_fields_are_appended_last():
         pytest.param("intra_wg_overlap", True, {}, "SM90 D512 has no intra-warpgroup overlap switch", id="overlap"),
         pytest.param("persistent", True, dict(intra_wg_overlap=True), "SM90 D512 has no persistent switch", id="persistent"),
         pytest.param("causal_walk", 1, dict(causal=True, intra_wg_overlap=True, persistent=True), "SM90 D512 has no causal walk switch", id="causal-walk"),
+        pytest.param("causal_claim", 1, dict(causal=True, intra_wg_overlap=True, persistent=True), "SM90 D512 has no causal claim counter", id="causal-claim"),
     ],
 )
 def test_d512_refuses_the_d128_switches(switch, value, needs, why):
@@ -733,6 +735,89 @@ def test_d128_causal_walk_is_the_int_0_or_1_on_a_persistent_causal_record(fields
         c.validate_params(_record(**fields), flavor=c.D128_FLAVOR)
     for walk in (0, 1):
         c.validate_params(_record(**_CAUSAL_PERSISTENT, causal_walk=walk), flavor=c.D128_FLAVOR)
+
+
+@pytest.mark.parametrize(
+    ("fields", "why"),
+    [
+        pytest.param(dict(causal=True, intra_wg_overlap=True, causal_claim=1), "^SM90 D128 causal_claim requires persistent and causal", id="one-tile"),
+        pytest.param(dict(intra_wg_overlap=True, persistent=True, causal_claim=1), "^SM90 D128 causal_claim requires persistent and causal", id="dense"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_walk=1, causal_claim=1), "^SM90 D128 causal_claim requires .* causal_walk 0", id="with-walk"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, sched_policy=2, causal_claim=1), "^SM90 D128 causal_claim requires .* sched_policy NATURAL", id="lpt-l2"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_claim=2), "^SM90 D128 causal_claim must be 0", id="two"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_claim=3), "^SM90 D128 causal_claim must be 0", id="three"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_claim=-1), "^SM90 D128 causal_claim must be 0", id="negative"),
+        pytest.param(dict(_CAUSAL_PERSISTENT, causal_claim=True), "^SM90 D128 causal_claim must be 0", id="bool"),
+    ],
+)
+def test_d128_causal_claim_is_the_int_0_or_1_on_a_persistent_causal_natural_record(fields, why):
+    """causal_claim hands out a persistent causal record's items from the workspace counter: D128 refuses it on a
+    one-tile record, a dense one, beside the paired walk and on a pinned LPT/LPT_L2 order (the counter numbers its items
+    itself), and refuses any value but the ints 0 and 1 (2, a heaviest-first numbering no longer built, and a bool True
+    included); D512 refuses it outright. A persistent causal NATURAL record without the walk takes each value."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    with pytest.raises(ValueError, match=why):
+        c.validate_params(_record(**fields), flavor=c.D128_FLAVOR)
+    for claim in (c.D128_CLAIM_OFF, c.D128_CLAIM_NATURAL):
+        c.validate_params(_record(**_CAUSAL_PERSISTENT, causal_claim=claim), flavor=c.D128_FLAVOR)
+    with pytest.raises(ValueError, match="^SM90 D512 has no causal claim counter"):
+        c.validate_params(_record(causal_claim=1))
+    assert [f.name for f in dataclasses.fields(c.TemplateParams)][-2:] == ["causal_walk", "causal_claim"]
+    assert c.TemplateParams().causal_claim == c.D128_CLAIM_OFF == 0 and c.D128_CLAIM_WORKSPACE_BYTES == 128
+
+
+def test_d128_claim_coords_number_every_item_once_group_major():
+    """config_sm90.d128_claim_coords (work_of's decode of a claim-counter record, in host form) visits every (Q tile,
+    head, batch) exactly once for every item count, a group's T items consecutive (batch, then head, then Q tile) with
+    its Q tiles ascending (NATURAL)."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    for q_tiles, heads, b in itertools.product((1, 2, 3, 6, 8, 9, 17), (1, 3, 8), (1, 2, 5)):
+        coords = [c.d128_claim_coords(item, q_tiles, heads) for item in range(q_tiles * heads * b)]
+        assert sorted(coords) == sorted(itertools.product(range(q_tiles), range(heads), range(b))), (q_tiles, heads, b)
+        for group in range(heads * b):
+            run = coords[group * q_tiles : (group + 1) * q_tiles]
+            assert {(h, bb) for _, h, bb in run} == {(group % heads, group // heads)}
+            assert [t for t, _, _ in run] == list(range(q_tiles))
+
+
+def test_d128_claim_hand_out_runs_every_item_once_and_leaves_the_item_count():
+    """The claim counter's hand-out on plain ints, as the template runs it: CTA c's first item is c, every CTA claims its
+    next item (the CTA count plus the counter's old value) at the start of each item and stops after the item whose
+    claim reached the item count, in any interleaving of the CTAs. Every item runs exactly once, every CTA claims exactly
+    one end marker, and the counter reads the item count afterwards (the GPU tests read that word back)."""
+    import random
+
+    for items, ctas in ((1, 1), (5, 5), (6, 5), (40, 2), (264, 132), (1000, 132), (38976, 132)):
+        rng = random.Random(items * 1009 + ctas)
+        n = min(items, ctas)
+        counter, ran, ends = 0, [], 0
+        current = {cta: cta for cta in range(n)}
+        while current:
+            cta = rng.choice(sorted(current))
+            ran.append(current[cta])
+            nxt = n + counter
+            counter += 1
+            if nxt >= items:
+                ends += 1
+                del current[cta]
+            else:
+                current[cta] = nxt
+        assert sorted(ran) == list(range(items)) and ends == n and counter == items, (items, ctas)
+
+
+def test_each_causal_claim_is_its_own_module_and_digest():
+    """A persistent causal record's two claim values are two modules with two digests (two compile keys), each carrying
+    its value as CAUSAL_CLAIM; the record's default (0) is its static stride module."""
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    mods = [
+        _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT, causal_claim=claim), tag="claim_probe_sm90_d128") for claim in (0, 1)
+    ]
+    assert [mod.CAUSAL_CLAIM for mod in mods] == [0, 1]
+    assert len({id(m) for m in mods}) == len({m.FROST_SOURCE_DIGEST for m in mods}) == 2
+    assert _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT), tag="claim_probe_sm90_d128") is mods[0]
 
 
 def test_each_causal_walk_is_its_own_module_and_digest():
