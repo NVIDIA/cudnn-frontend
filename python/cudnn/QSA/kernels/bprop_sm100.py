@@ -60,6 +60,7 @@ BLK_SMEM = 4096
 SLAB = 1024
 HALF_BLK = 2048
 K_STAGE = CHB * BLK_SMEM  # blocks sit at the 8-row-group stride of the MMA operand
+PAIR_HALF = CHB * HALF_BLK + 512  # one query's boxes of a K / V stage plus 512 B: the two queries' rows take complementary SW128 phases
 # A zero pad, dO and Q separate the K stages, so the alien rows of a stage's last K-step never hold the next chunk's
 # K (a nonfinite block there would reach the previous chunk's pair). Every region stays 1024-aligned: a stage that
 # starts 512 B into its swizzle span is slower, and the budget holds one aligned pad, not three.
@@ -96,13 +97,18 @@ def _bf16_parts(x, n, parts):
     return words
 
 
-def _query_layout(parts):
-    # K stages and the dO, Q, V and dS offsets of the query-major kernel for the number of dS^T parts
+def _k_stage(pair):
+    return 2 * PAIR_HALF if pair else K_STAGE
+
+
+def _query_layout(parts, pair):
+    # K stage count and size, and the dO, Q, V and dS offsets of the query-major kernel
     nks = 3 if parts == 1 else 2
-    off_do = OFF_K + 2 * K_STAGE + GAP01
-    off_q = off_do + GAP12 + (nks - 2) * K_STAGE
+    ks = _k_stage(pair)
+    off_do = OFF_K + 2 * ks + GAP01
+    off_q = off_do + GAP12 + (nks - 2) * ks
     off_v = off_q + Q_BYTES
-    return nks, off_do, off_q, off_v, off_v + K_STAGE
+    return nks, ks, off_do, off_q, off_v, off_v + ks
 
 
 # tensor memory columns of the query-major kernel
@@ -210,9 +216,9 @@ def _chunk_bytes(nblk_0, nblk_1, c, PAIR: cutlass.Constexpr[bool]):
 
 
 @cute.jit
-def _koff(st):
-    # byte offset of K stage st from OFF_K: the regions between the stages differ in size
-    return st * K_STAGE + ((st + 1) >> 1) * GAP01 + (st >> 1) * GAP12
+def _koff(st, ks):
+    # byte offset of K stage st (of ks bytes) from OFF_K: the regions between the stages differ in size
+    return st * ks + ((st + 1) >> 1) * GAP01 + (st >> 1) * GAP12
 
 
 @cute.jit
@@ -292,7 +298,10 @@ def qsa_bwd_sparse_query_kernel(
 ):
     # An item is one sparse query (two KV heads) or two consecutive ones of the compacted list (one KV head), see the
     # SMEM layout note.
-    NKS, OFF_DO, OFF_Q, OFF_V, OFF_DS = _query_layout(DQ_PARTS)
+    NKS, KS, OFF_DO, OFF_Q, OFF_V, OFF_DS = _query_layout(DQ_PARTS, HKV == 1)
+    # slot stride and second-query offset inside a K / V stage
+    SLOT_B = cutlass.const_expr(HALF_BLK if HKV == 1 else BLK_SMEM)
+    HALF_B = cutlass.const_expr(PAIR_HALF if HKV == 1 else HALF_BLK)
     HQ = GH * HKV
     PAIR = HKV == 1
     QSTEP = 2 if PAIR else 1
@@ -460,7 +469,7 @@ def qsa_bwd_sparse_query_kernel(
                                 prims.mbarrier_arrive_expect_tx(b_kf.subview(st), tbytes)
                             prims.bar_warp_sync(0xFFFFFFFF)
                             if ok:
-                                _load_block(tma_k, sbase + (OFF_K + _koff(st) + jl * BLK_SMEM + hl * HALF_BLK) // 4, xcur, b_kf.subview(st), PAIR)
+                                _load_block(tma_k, sbase + (OFF_K + _koff(st, KS) + jl * SLOT_B + hl * HALF_B) // 4, xcur, b_kf.subview(st), PAIR)
                             if c + 1 < nchunks:
                                 okn = ((c + 1) * CHB + jl < nblk_l) & lane_ok
                                 if okn:
@@ -500,7 +509,7 @@ def qsa_bwd_sparse_query_kernel(
                                 prims.mbarrier_arrive_expect_tx(b_vf, tbytes)
                             prims.bar_warp_sync(0xFFFFFFFF)
                             if ok:
-                                _load_block(tma_v, sbase + (OFF_V + jl * BLK_SMEM + hl * HALF_BLK) // 4, xcur, b_vf, PAIR)
+                                _load_block(tma_v, sbase + (OFF_V + jl * SLOT_B + hl * HALF_B) // 4, xcur, b_vf, PAIR)
                             if c + 1 < nchunks:
                                 okn = ((c + 1) * CHB + jl < nblk_l) & lane_ok
                                 if okn:
@@ -669,7 +678,7 @@ def qsa_bwd_sparse_query_kernel(
         nq = I32(0)
         # dS^T row of this key inside its K-step, in the key order of the TMEM K^T columns (see the copy warps)
         if cutlass.const_expr(PAIR):
-            ds_off = (OFF_DS + jrow * 384 + ((trow >> 1) * 4 + hrow * 2 + (trow & 1)) * 16) // 4
+            ds_off = (OFF_DS + (jrow >> 1) * 768 + hrow * 384 + ((trow >> 1) * 4 + (jrow & 1) * 2 + (trow & 1)) * 16) // 4
         else:
             ds_off = (OFF_DS + (jrow >> 1) * 768 + (trow >> 1) * 384 + ((trow & 1) * 4 + (jrow & 1) * 2 + hrow) * 16) // 4
         for pp in cutlass.range(NP, unroll=1):
@@ -751,12 +760,12 @@ def qsa_bwd_sparse_query_kernel(
                             if bad:
                                 st_k = cgc % NKS
                                 if cutlass.const_expr(PAIR):
-                                    krow = sbase + (OFF_K + _koff(st_k) + jrow * BLK_SMEM + hrow * HALF_BLK + trow * 128) // 4
+                                    krow = sbase + (OFF_K + _koff(st_k, KS) + jrow * HALF_BLK + hrow * PAIR_HALF + trow * 128) // 4
                                     for s4 in cutlass.range_constexpr(4):
                                         for u in cutlass.range_constexpr(8):
                                             (krow + (s4 * 512) // 4 + u * 4).store(zero4, alignment=16)
                                 else:
-                                    krow = sbase + (OFF_K + _koff(st_k) + jrow * BLK_SMEM + (2 * trow + hrow) * 128) // 4
+                                    krow = sbase + (OFF_K + _koff(st_k, KS) + jrow * BLK_SMEM + (2 * trow + hrow) * 128) // 4
                                     for s4 in cutlass.range_constexpr(4):
                                         for u in cutlass.range_constexpr(8):
                                             (krow + (s4 * SLAB) // 4 + u * 4).store(zero4, alignment=16)
@@ -875,9 +884,10 @@ def qsa_bwd_sparse_query_kernel(
         group = (warp - 8) >> 2
         r = qd * 32 + lane
         if cutlass.const_expr(PAIR):
-            # row = 8 * slot + 4 * query + token at slot + query * 2 KB + slab * 512 B + token * 128 B
+            # row = 8 * slot + 4 * query + token at query * PAIR_HALF + slot * 2 KB + slab * 512 B + token * 128 B
             yr = r & 3
-            roff = (OFF_K + (r >> 3) * BLK_SMEM + ((r >> 2) & 1) * HALF_BLK + yr * 128) // 4
+            yq = ((r >> 2) & 1) * 4
+            roff = (OFF_K + (r >> 3) * HALF_BLK + ((r >> 2) & 1) * PAIR_HALF + yr * 128) // 4
             slab_w = 512 // 4
         else:
             # row = 8 * block + 2 * token + head at block + slab * 1 KB + row * 128 B
@@ -912,13 +922,12 @@ def qsa_bwd_sparse_query_kernel(
                             _wait(b_kf.subview(st), (cgc // NKS) & 1)
                             _wait(b_kte, (cgc & 1) ^ 1)
                             for sl4 in cutlass.range_constexpr(4):
-                                # with one KV head a slab's rows start 512 B x slab in, so odd slabs sit in the upper
-                                # half of their swizzle span
+                                # odd slabs and the second query's rows sit 512 B into their swizzle span, which flips the phase bit
                                 ys = yr
-                                if cutlass.const_expr(PAIR and sl4 % 2 == 1):
-                                    ys = yr + 4
+                                if cutlass.const_expr(PAIR):
+                                    ys = yr + (yq ^ (4 * (sl4 % 2)))
                                 if do_cp:
-                                    off = roff + _koff(st) // 4 + sl4 * slab_w
+                                    off = roff + _koff(st, KS) // 4 + sl4 * slab_w
                                     wv = []
                                     for cc in cutlass.range_constexpr(8):
                                         v4 = (sbase + (off + ((ys ^ cc) * 4))).load(count=4, alignment=16)
@@ -950,8 +959,8 @@ def qsa_bwd_sparse_query_kernel(
                             vb = sbase + (roff - OFF_K // 4 + OFF_V // 4)
                             for sl4 in cutlass.range_constexpr(4):
                                 ys = yr
-                                if cutlass.const_expr(PAIR and sl4 % 2 == 1):
-                                    ys = yr + 4
+                                if cutlass.const_expr(PAIR):
+                                    ys = yr + (yq ^ (4 * (sl4 % 2)))
                                 if do_cp:
                                     wv = []
                                     for cc in cutlass.range_constexpr(8):
@@ -981,25 +990,21 @@ def qsa_bwd_sparse_query_kernel(
                                 prims.mbarrier_arrive(b_ve)
                         gc = gc + nchunks
         else:
-            # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3. A tile's eight rows sit in distinct SW128 bank groups
-            # (the phase is the token): a pair tile takes one query of both slots of the K-step, a plain tile one block. One
-            # fragment is one 16x256b store, and the softmax writes the dS^T rows in the same key order.
+            # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3, and a tile is one slot's eight rows (eight SW128 bank
+            # groups). The softmax writes the dS^T rows in the same key order.
             ldm_tile = lane >> 3
             ldm_row = lane & 7
-            if cutlass.const_expr(PAIR):
-                kstep_row = 8 * (ldm_row >> 2) + 4 * (ldm_tile & 1) + (ldm_row & 3)
-            else:
-                kstep_row = 8 * (ldm_tile & 1) + ldm_row
+            kstep_row = 8 * (ldm_tile & 1) + ldm_row
             ldm_off = []
             for h2 in cutlass.range_constexpr(2):
                 dim_slab = 2 * h2 + (qd >> 1)
                 for half in cutlass.range_constexpr(2):
                     dim_chunk = (qd & 1) * 4 + half * 2 + (ldm_tile >> 1)
                     if cutlass.const_expr(PAIR):
-                        row_phase = (kstep_row & 3) + 4 * (dim_slab & 1)
+                        row_phase = (kstep_row & 3) + 4 * ((dim_slab + ((kstep_row >> 2) & 1)) & 1)
                         row_off = (
-                            (kstep_row >> 3) * BLK_SMEM
-                            + ((kstep_row >> 2) & 1) * HALF_BLK
+                            (kstep_row >> 3) * HALF_BLK
+                            + ((kstep_row >> 2) & 1) * PAIR_HALF
                             + dim_slab * 512
                             + (kstep_row & 3) * 128
                             + ((dim_chunk ^ row_phase) << 4)
@@ -1027,11 +1032,11 @@ def qsa_bwd_sparse_query_kernel(
                             _wait(b_kzf.subview(cgc & 1), (cgc >> 1) & 1)
                             _wait(b_dsf, (cgc & 1) ^ 1)
                             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                            kbase = sbase + (OFF_K + _koff(st)) // 4
+                            kbase = sbase + (OFF_K + _koff(st, KS)) // 4
                             for kk in cutlass.range_constexpr(CHB // 2):
                                 for h2 in cutlass.range_constexpr(2):
                                     for half in cutlass.range_constexpr(2):
-                                        frag = prims.ldmatrix(kbase + ((kk * 2 * BLK_SMEM) // 4 + ldm_off[h2 * 2 + half]), 4, prims.MMALayout.COL)
+                                        frag = prims.ldmatrix(kbase + ((kk * 2 * SLOT_B) // 4 + ldm_off[h2 * 2 + half]), 4, prims.MMALayout.COL)
                                         prims.tcgen05_st(
                                             "16x256b",
                                             prims.TmemAddr.from_row_col(tmem_row0 + qd * 32 + half * 16, tmem_col0 + TM_KT + h2 * 48 + kk * 8).as_ptr(I32),
