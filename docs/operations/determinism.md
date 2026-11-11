@@ -535,19 +535,3 @@ output are covered. The prepared and standalone graph routes agree.
 SM103 lowering compiles, but its GPU execution remains unverified. This
 suite does not qualify wider heads, MXFP8, SM107 or backward. See the
 coverage report for exact configurations and validation receipts.
-
-## SM100 D512 THD physical origins
-
-D512 forward preserves O/Stats bytes across repeat execution, batch
-reordering/duplication, an isolated sequence, changed neighbors and retained
-CUDA Graph replay on the tested SM100 runtime. Coverage pins both the
-role-split and 2x2 half kernels with FP16/BF16, and the per-tensor FP8
-kernel with E4M3/E5M2 and BF16 output. Each tested plan is unsplit and
-unpacked, with token/head-major Stats. The prepared and standalone graph
-routes agree; origins and strides can change between invocations while
-logical lengths independently determine live work. Both half implementations
-also cover the already-admitted D384/V448 and D264/V504 head envelopes.
-
-All six dtype/implementation lowerings compile for SM103, whose execution
-remains unverified. These results do not qualify MXFP8, SM107 or backward.
-See the coverage report for the exact cases and validation receipts.

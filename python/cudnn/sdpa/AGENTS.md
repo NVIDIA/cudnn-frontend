@@ -655,16 +655,6 @@ several KV tiles per Q tile (the slot must be refilled inside the launch; a
 one-tile or top-k-1 shape cannot fail).
 
 
-An elected slot release must join every reader warp first. D512 role-split
-correction reads the final sum/max with four warps but returns one Stats
-credit. Put a post-load async-proxy fence in every reader before their group
-barrier, then release the slot; the next fill is a cross-CTA bulk copy.
-`TestD512PhysicalOrigins.test_stats_slot_waits_for_all_warps` delays the
-nonleader readers in a private template and forces one persistent cluster.
-It fails numerically with the old elected-only release and retains changed
-bindings, batch invariance and live/empty capture replay. Racecheck can report
-zero hazards while these numerical checks fail.
-
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
