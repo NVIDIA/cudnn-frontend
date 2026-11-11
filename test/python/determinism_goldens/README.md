@@ -3395,3 +3395,42 @@ concurrent work and batch invariance pass before recording the four updated
 O hashes, then strict comparison passes in another process. No tolerance or
 skip was changed. The earlier pre-#2220 E5M2 edge and old golden mismatch
 remain historical evidence; neither is a failure on this integrated head.
+
+### Native SM107 D192/D256/D512 FP8 THD origins — 2026-11-11
+
+The selected architecture entry `test_sdpa_fp8_sm107.py` exposes
+`TestD192Fp8PhysicalOrigins` and `TestWideFp8PhysicalOrigins`: 30 L0 cases
+cover E4M3/E5M2 inputs with BF16 O and token/head-major Stats. The native
+D192/V128 CGA2, D256 CGA1 and D512 CTA-pair role-split bodies use independent
+Q/K/V/O/Stats physical offsets. Tests pin two persistent clusters, require
+the native template and prepared binder, compare independent references,
+and check retained live/empty captures, fresh addresses and strides, missing
+total hints, batch reorder/duplication/neighbor isolation and concurrent-work
+raw-byte replay. Twelve golden cases preserve fixed quantized inputs/scales.
+
+Initial D192 qualification under native SM107, actual CUDA13.4, DSL4.8.0,
+Torch2.14.1+cu130 and cuDNN9.24.0.43 passed10 strict cases,8 existing THD
+neighbors and four cases under each of memcheck/racecheck/synccheck. Two
+old-source controls fail because the prepared plan omits physical origins;
+this detector stops before GPU execution, so it is not an old-source numerical
+failure. All eight compact controls pass on that parent.
+
+Final D192/D256/D512 qualification, including the Q acquire fold, passes
+30 strict new cases plus22 existing compact THD neighbors,0fail/skip. The
+parent passes the same22 compact controls; six new-origin controls fail at
+the missing-binding assertion before GPU execution. Memcheck12, racecheck12
+and synccheck12 are clean with zero errors/hazards/warnings. All30 CUDA13.4
+offline variants compile: three widths, two encodings and token/head/padded/
+omitted Stats plus dense controls. Twelve new golden files pass a separate
+strict process; the four D192 files exactly match the initial qualification.
+Other GPUs, datatypes, backward, split, packing and paged routes are outside
+this added coverage.
+
+```bash
+cd test/python
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestD192Fp8PhysicalOrigins \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestWideFp8PhysicalOrigins
+```

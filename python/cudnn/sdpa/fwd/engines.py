@@ -3928,7 +3928,7 @@ def lower_dsl_prefill(
         or (
             facts.thd
             and spec.name == "sdpa_fwd_prefill_sm107_fp8"
-            and api.flavor == (128, 128)
+            and api.flavor in ((128, 128), (192, 128), (256, 256), (512, 512))
             and not facts.has_paged_kv
             and facts.epilogue_gate_t is None
             and api.split_kv == 1

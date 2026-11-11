@@ -9,14 +9,17 @@ from sdpa.frost.test_sdpa_fwd_thd_origins import test_independent_thd_origins_re
 from sdpa.frost.test_sdpa_fwd_thd_origins_fp8_sm120 import _check_routes_and_invariance
 
 
-def origin_checks(family):
-    engine = f"sdpa_fwd_prefill_sm100_{family}"
+def origin_checks(family, arch="sm100", shapes=None):
+    engine = f"sdpa_fwd_prefill_{arch}_{family}"
+    if shapes is None:
+        shapes = [((192, 128), 1), ((192, 128), 2), (256, 1)]
 
     def check_route(graph, nodes, values, state, workspace, overrides, flat, stats_layout):
         width = nodes["q"].get_dim()[-1]
-        flavor = "d192_d128" if width == 192 else "d256"
+        flavor = "d192_d128" if width == 192 else f"d{width}"
         plan = graph._compiled_plans[graph._plan_index]
         assert plan._compiled.kernel_template == f"prefill_{flavor}_{family}"
+        assert plan._compiled.kernel_module.__file__.endswith(f"{arch}/prefill_{flavor}_{family}.py")
         assert plan._prepared.spec.origin_specs is not None and plan._prepared.spec.native is not None
         _check_routes_and_invariance(graph, nodes, values, state, workspace, overrides, flat, stats_layout)
         pack = {nodes[name]: value for name, value in values.items()}
@@ -31,7 +34,9 @@ def origin_checks(family):
 
     def shape_dtype(fn):
         fn = pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float8_e5m2"])(fn)
-        return pytest.mark.parametrize("dims,cga", [((192, 128), 1), ((192, 128), 2), (256, 1)], ids=["d192-v128-cga1", "d192-v128-cga2", "d256-cga1"])(fn)
+        return pytest.mark.parametrize(
+            "dims,cga", shapes, ids=[f"d{dims[0]}-v{dims[1]}-cga{cga}" if isinstance(dims, tuple) else f"d{dims}-cga{cga}" for dims, cga in shapes]
+        )(fn)
 
     @shape_dtype
     @pytest.mark.parametrize("stats", ["token", "head"])
@@ -72,6 +77,6 @@ def origin_checks(family):
 
         _check_origins(dims, dtype, stats, True, False, 1, engine_name=engine, cga=cga, extra_checks=collect)
         shape = "192x128" if isinstance(dims, tuple) else str(dims)
-        assert_golden(f"sdpa-sm100-{family}-thd-origins-d{shape}-{dtype}-{stats}-cga{cga}", record["inputs"], record["outputs"])
+        assert_golden(f"sdpa-{arch}-{family}-thd-origins-d{shape}-{dtype}-{stats}-cga{cga}", record["inputs"], record["outputs"])
 
     return tuple(map(staticmethod, (test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden)))

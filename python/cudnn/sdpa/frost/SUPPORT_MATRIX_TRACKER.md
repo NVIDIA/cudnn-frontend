@@ -4982,3 +4982,19 @@ retained replay and batch invariance. Native SM107 passes all12 strict cases
 with four new byte goldens under CUDA 13.4. Directed memory, race and
 synchronization checks each pass four cases. Ten origin/dense variants also
 compile offline. Other native quantized widths are not qualified by this suite.
+
+### Native SM107 wider per-tensor FP8 THD physical addressing
+
+The existing unsplit, unpacked D192/V128, D256 and D512 FP8 THD routes now
+forward independent Q/K/V/O/Stats origins through their native prepared
+hosts. All four data descriptors are rank-4 on these SM107 bodies, including
+D192 K; the SM100 D192 rank-5 K geometry must not be transferred here.
+The existing setup launch writes sequence-local maps and logical prefixes;
+persistent loaders acquire the current sequence maps, and Stats keeps its
+own origin. Dead initial clusters exit before touching uninitialized maps.
+The public eligibility rows and knob domains are unchanged; split, packed
+and paged paths retain their existing contracts. The native architecture
+entry exposes30 reference/replay/batch/golden cases, all passing on native
+SM107 under CUDA13.4, alongside22 existing compact neighbors and12 golden
+files. Each of memcheck/racecheck/synccheck passes12 directed cases; all30
+offline variants compile. This is not a default placement or performance claim.

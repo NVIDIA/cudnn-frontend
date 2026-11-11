@@ -1403,8 +1403,10 @@ The SM90 D64/D512 controls in `test_band_capabilities.py` and
 
 
 For quantized THD physical origins, cover every admitted cluster width and
-force a small persistent grid so a CTA switches sequences. D192 uses a rank-5
-K map but rank-4 Q/V/O maps; D256 MXFP8 uses rank-5 Q/K/V and rank-4 O.
+force a small persistent grid so a CTA switches sequences. SM100 D192 uses a rank-5
+K map but rank-4 Q/V/O maps; SM100 D256 MXFP8 uses rank-5 Q/K/V and rank-4 O.
+Native SM107 D192/D256/D512 per-tensor FP8 uses rank-4 for all four ports.
+Inspect the actual host descriptor geometry before reusing origin-axis indices.
 Their token axes differ. Move data origins independently while preserving the
 logical MXFP8 scale-tile order, including a reordered or duplicated sequence.
 `TestMidwidthPhysicalOrigins` in both SM100 quantized architecture suites

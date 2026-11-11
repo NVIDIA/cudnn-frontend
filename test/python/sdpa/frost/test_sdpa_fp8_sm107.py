@@ -46,6 +46,24 @@ class TestD128Fp8PhysicalOrigins:
     test_origin_golden = staticmethod(_origins.test_origin_golden)
 
 
+@requires_rubin
+class TestD192Fp8PhysicalOrigins:
+    """Native rank-4 maps keep physical offsets separate from logical lengths."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [((192, 128), 2)])
+
+
+@requires_rubin
+class TestWideFp8PhysicalOrigins:
+    """D256 and role-split D512 use independent sequence-local rank-4 maps."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
