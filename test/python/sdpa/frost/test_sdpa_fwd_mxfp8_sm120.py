@@ -259,6 +259,8 @@ def _run(
     scale_o=None,
     sched_policy=None,
     qkv=None,
+    capture=None,
+    quantized_qkv=None,
 ):
     """Quantize, build the sdpa_mxfp8 graph, pin the SM120 MXFP8 engine (and ``split_kv``), execute.
     ``layout`` names the storage order (``_LAYOUTS``) of Q/K/V/O. ``sf_o_layout`` ("planes" / "token_major")
@@ -271,7 +273,9 @@ def _run(
     scale = d_qk**-0.5 if scale is None else scale
     sdpa_kwargs = sdpa_kwargs or {}
     fp8 = _FP8[in_key]
-    if qkv is None:
+    if quantized_qkv is not None:
+        q_op, k_op, v_op = quantized_qkv
+    elif qkv is None:
         q_op, k_op, v_op = _draw(B, H_q, H_kv, S_q, S_kv, d_qk, d_v, fp8)
     else:
         q_op, k_op, v_op = (_quantize(t, fp8, columnwise=i == 2) for i, t in enumerate(qkv))
@@ -373,7 +377,18 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    if quantized_qkv is None:
+        chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    else:
+        # Kernel qualification holds the plan fixed independently of ranked offerings.
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(
+            family_for(g).offered_ids()[_ENGINE],
+            {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
+        )
+        g.select_plan(len(g.plans) - 1)
+        chosen = g.plans[g._plan_index]
     if split_kv is not None and (chosen.knobs.split_kv or 1) != split_kv:
         # The ranked plans need not carry this split count: re-plan the engine's own knob set with it.
         g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv, sched_policy=0))
@@ -394,6 +409,14 @@ def _run(
         if sync_debug:
             torch.cuda.set_sync_debug_mode(prev)
     torch.cuda.synchronize()
+
+    if capture is not None:
+        assert with_stats and sf_o_layout is None
+        capture.update(
+            run=lambda: g.execute(vp, ws),
+            inputs=dict(q=Qb, k=Kb, v=Vb, sfq=sfq, sfk=sfk, sfv=sfv),
+            outputs=dict(o=Ob, stats=lse, amax=amax_buf),
+        )
 
     o_ref, lse_ref = _ref(
         q_op.dequant, k_op.dequant, v_op.dequant, scale=scale, sinks=sinks, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **_ref_kwargs(sdpa_kwargs)

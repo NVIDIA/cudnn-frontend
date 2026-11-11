@@ -44,6 +44,13 @@ For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
 bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
+Columnwise F8_128x4 scale atoms span all B*H scale rows along their column
+axis. A rank-4 carrier's physical B slices cannot simply be concatenated:
+unswizzle to logical bytes, rebatch, then reswizzle without requantizing.
+A single D128 row atom can hide the error; D512 exposes it. The CPU fixture
+control `test_v_tail_scale_repack` in `test_sdpa_fp8_v_tail_sync_sm120.py`
+compares this byte permutation with the canonical quantizer and rejects naive
+physical concatenation for the multi-atom case.
 Check against dequantized inputs and include a scale-only change. Keep SM90
 FP8 and SM100/SM103/SM107 MXFP8 results separate; an architecture skip is not
 a measured pass on that architecture.

@@ -460,6 +460,11 @@ class SM120FusedMultiHeadAttentionForward:
                 prims.cp_async_shared_global(dst + lane * 8, src, 8, "ca")
                 if cutlass.const_expr(self._qk_plane_present(half, 1)):
                     prims.cp_async_shared_global(dst + self.k_sf_stage_hi_off + lane * 4, src + SF_ATOM_BYTES, 4, "ca")
+            # Complete the producer's copy group before publishing its arrival,
+            # as in the native SM120 paged loader. The async-tracked arrival
+            # still publishes these writes to the other compute warps.
+            prims.cp_async_commit_group()
+            prims.cp_async_wait_group(0)
             prims.cp_async_mbarrier_arrive(mbar, noinc=True)
         if prims.elect_sync():
             if cutlass.const_expr(envelope):
@@ -1191,10 +1196,9 @@ class SM120FusedMultiHeadAttentionForward:
         Each warp publishes its partial scores in its own ``sX`` slots
         (``[warp][k_frag][lane][4]``, one 16-byte store per fragment), meets its
         partner on the slab's named barrier, and adds the partner's slots in
-        place. The buffer is single-buffered: the caller runs this after the V
-        tile's mbarrier wait, and the next V tile is issued only after every
-        warp has consumed the current one, so the partner has finished reading
-        this tile's partials before anyone writes the next tile's.
+        place. A second pair barrier completes both partners' reads before
+        either warp reuses the single buffer. The K/V asynchronous-copy
+        handoff does not release generic reads of these score slots.
 
         :param basic_params: Lane mapping, warp-pair indices, and ``sX``.
         :param s_regs: This warp's partial QK scores; the full scores on return.
@@ -1217,6 +1221,8 @@ class SM120FusedMultiHeadAttentionForward:
             partner = (partner_base + k_frag * 32 * 4).load(count=4, alignment=16).bitcast(cutlass.Float32)
             for i in cutlass.range_constexpr(4):
                 s_regs[s_off + i] = s_regs[s_off + i] + partner[i]
+        # Keep score ownership separate from the K/V copy completion protocol.
+        prims.barrier_cta_sync(self.bar_pair_base + basic_params.slab, thread_count=self.HEAD_SPLIT * cute.arch.WARP_SIZE)
 
     @cute.jit
     def compute_one_kv_tile(
@@ -1295,8 +1301,8 @@ class SM120FusedMultiHeadAttentionForward:
         while not prims.mbarrier_try_wait_parity(basic_params.v_tma_mbar, tma_phase):
             pass
 
-        # Full scores = this warp's head-dim half + the partner's. After the V
-        # wait on purpose: see exchange_partial_s for why that keeps sX race-free.
+        # Full scores combine both head-dim halves. The pair barriers own
+        # the shared score slots independently of the V-copy wait above.
         self.exchange_partial_s(basic_params, s_regs)
 
         p_regs = self.online_softmax(
@@ -1310,16 +1316,20 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+            # Shared V-tail zero stores have one owner and complete before
+            # any compute warp starts its PV ldmatrix reads.
+            if basic_params.compute_warp_idx == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs, kv_sf_row0, v_sf_valid_blocks)
         if basic_params.compute_warp_idx == 0:
             prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
