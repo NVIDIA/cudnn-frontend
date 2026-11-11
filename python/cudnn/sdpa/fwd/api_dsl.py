@@ -6418,6 +6418,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             lse_padded_rows=self.s_q_max if self.thd_stats_padded else 0,
             lse_stride=self._lse_stride if self.thd_stats_padded else None,
             prepared=True,
+            **({"thd_origin_specs": self._thd_origin_specs} if getattr(self, "_thd_origin_specs", None) is not None else {}),
             **(
                 {
                     "has_amax": self.has_amax_o,
@@ -6465,8 +6466,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         sf_o: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
         block_table_v: Optional[torch.Tensor] = None,
+        ragged_q: Optional[torch.Tensor] = None,
+        ragged_k: Optional[torch.Tensor] = None,
+        ragged_v: Optional[torch.Tensor] = None,
+        ragged_o: Optional[torch.Tensor] = None,
+        ragged_lse: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization.
+
+        ``ragged_q/k/v/o/lse`` bind the independent physical offsets of a
+        graph-lowered half THD specialization. The binder checks their declared
+        integer widths and presence; logical lengths remain separate operands.
 
         ``block_table`` / ``block_table_v``: paged plans bind int32
         ``(B, max_pages)`` tables (rank-4 graph carriers are accepted too).
@@ -6481,6 +6491,9 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         aligned and on the Q device. Graph callers use ``get_workspace_size()``.
         """
 
+        origins = (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)
+        if any(value is not None for value in origins) and getattr(self, "_thd_origin_specs", None) is None:
+            raise ValueError("physical offsets require a compiled half THD origin specialization")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
         from cudnn._torch_stream import _raw_current_stream, device_context
@@ -6594,6 +6607,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 lse_tensor=lse_tensor,
                 workspace=workspace,
                 current_stream=current_stream,
+                origins=origins,
             )
             return
         raise RuntimeError("SM120 forward has no compiled prepared launch")
@@ -6619,7 +6633,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
 
     def _execute_thd(
-        self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None
+        self, q_buf, k_buf, v_buf, o_buf, scale_softmax_log2, sinks, seq_kv_lens, seq_q_lens, lse_tensor=None, workspace=None, current_stream=None, origins=None
     ):
         """Execute every half THD plan through its prepared pointer binding."""
         if self._thd_spec is None:
@@ -6636,6 +6650,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             raise ValueError("cudnn.sdpa: THD workspace must be contiguous and on the Q tensor's CUDA device")
         ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm120 (THD)", spec.scratch_bytes)
         buffers = (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_kv_lens, lse_tensor, sinks)
+        if spec.origin_specs is not None:
+            buffers += (None, None) + (origins if origins is not None else (None,) * 5)
         execute_native_thd_tensors(spec, buffers, ws_ptr, current_stream, scale_softmax_log2)
         self._logger.debug("execute completed (prepared THD)")
 

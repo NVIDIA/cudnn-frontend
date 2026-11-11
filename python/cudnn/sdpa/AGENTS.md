@@ -113,6 +113,11 @@ and layout, not just its paged path. Assert the prepared THD spec contains
 `origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
 THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
 gaps, independent port origins, rebinding, and changed-length replay.
+The SM120 half host must also retain each port's physical capacity: a
+`max_total_seq_len_*` hint bounds live work, not the address span of a gapped
+buffer. Exercise both prepared graph binding and the graph's standalone-adapter
+fallback; forwarding offsets only through the prepared route leaves the fallback
+without required operands. The SM120 origin and prepared-rebind suites detect both.
 
 A test that changes a port's token pitch must update that port's physical
 ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
@@ -1525,7 +1530,8 @@ zero. The SM120 paged racecheck maps these accesses to `STS.128` tail stores
 and PV `LDSM` reads. Keep the TMA-only sanitizer on unpaged paths that need it.
 For dense runtime lengths and THD, give one warp ownership of that zero fill
 and synchronize all consuming warps before PV. The wide-head THD cases in
-`test_sdpa_fwd_d576_sm120.py` detect this write/read race under racecheck.
+`test_sdpa_fwd_d576_sm120.py` and the small/D256 cases in
+`test_sdpa_fwd_thd_origins_sm120.py` detect this write/read race under racecheck.
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
