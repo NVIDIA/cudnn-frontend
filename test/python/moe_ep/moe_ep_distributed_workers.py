@@ -437,8 +437,9 @@ def _distributed_inference_policy_mismatch_worker(
     rank: int,
     world_size: int,
     init_file: str,
+    mismatch: str = "drop_on_overflow",
 ) -> None:
-    """Reject a public overflow-policy mismatch before entering the kernel."""
+    """Reject a rank-mismatched overflow policy or forward tuning before entering the kernel."""
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -451,8 +452,14 @@ def _distributed_inference_policy_mismatch_worker(
         timeout=timedelta(seconds=180),
     )
     try:
-        from cudnn import MoeEp
+        from cudnn import MoeEp, MoeEpTuningConfig
 
+        if mismatch == "drop_on_overflow":
+            overrides = {"drop_on_overflow": bool(rank % 2)}
+        elif mismatch == "forward_tuning":
+            overrides = {"inference_tuning": MoeEpTuningConfig(scheduling="atomic" if rank % 2 else "static")}
+        else:
+            raise ValueError(f"unknown mismatch {mismatch!r}")
         args = make_distributed_forward_inputs(rank, world_size, device)
         op = MoeEp(
             _moe_ep_config(
@@ -460,7 +467,7 @@ def _distributed_inference_policy_mismatch_worker(
                     num_experts=2 * world_size,
                     ep_group=dist.group.WORLD,
                     max_tokens_per_rank=8,
-                    drop_on_overflow=bool(rank % 2),
+                    **overrides,
                 )
             )
         )
@@ -470,7 +477,7 @@ def _distributed_inference_policy_mismatch_worker(
             except RuntimeError as exc:
                 assert "must match on every expert-parallel rank" in str(exc)
             else:
-                raise AssertionError("rank-mismatched drop_on_overflow reached the kernel")
+                raise AssertionError(f"rank-mismatched {mismatch} reached the kernel")
         finally:
             op.close()
     finally:

@@ -285,11 +285,12 @@ def test_stateless_training_multinode_matches_independent_reference(
 _MIXED_CGA_PHASE_INTERLEAVE = {"mixed_cga": True, "scheduling": "phase_interleave"}
 
 
-def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world):
+@pytest.mark.parametrize("ep_size", [pytest.param(ep, id=f"ep{ep}") for ep in (8, 12, 16)])
+def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world, ep_size):
     world = torchrun_world
-    if world.world_size != 8 or world.local_world_size != 4:
+    if world.world_size != ep_size or world.local_world_size != 4:
         pytest.skip(
-            "EP8 mixed-CGA inference requires torchrun WORLD_SIZE=8, LOCAL_WORLD_SIZE=4; "
+            f"EP{ep_size} mixed-CGA inference requires torchrun WORLD_SIZE={ep_size}, LOCAL_WORLD_SIZE=4; "
             f"got WORLD_SIZE={world.world_size}, LOCAL_WORLD_SIZE={world.local_world_size}"
         )
     try:
@@ -297,8 +298,8 @@ def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world):
             device=world.device,
             ep_group=dist.group.WORLD,
             ep_rank=world.rank,
-            ep_size=8,
-            expected_global_ranks=tuple(range(8)),
+            ep_size=ep_size,
+            expected_global_ranks=tuple(range(ep_size)),
             tuning_kwargs=_MIXED_CGA_PHASE_INTERLEAVE,
         )
         dist.barrier()
@@ -311,16 +312,17 @@ def test_mxfp8_forward_multinode_mixed_cga_matches_reference(torchrun_world):
         dist.barrier()
 
 
-def test_stateless_training_multinode_mixed_cga_matches_independent_reference(torchrun_world):
+@pytest.mark.parametrize("ep_size", [pytest.param(ep, id=f"ep{ep}") for ep in (8, 16, 32)])
+def test_stateless_training_multinode_mixed_cga_matches_independent_reference(torchrun_world, ep_size):
     world = torchrun_world
-    if world.world_size != 8:
-        pytest.skip(f"EP8 mixed-CGA training requires torchrun WORLD_SIZE=8; got WORLD_SIZE={world.world_size}")
+    if world.world_size != ep_size:
+        pytest.skip(f"EP{ep_size} mixed-CGA training requires torchrun WORLD_SIZE={ep_size}; got WORLD_SIZE={world.world_size}")
 
     _run_backward_reference_case(
         device=world.device,
         ep_group=dist.group.WORLD,
         ep_rank=world.rank,
-        ep_size=8,
+        ep_size=ep_size,
         combine_format="bf16",
         forward_tuning_kwargs=_MIXED_CGA_PHASE_INTERLEAVE,
     )

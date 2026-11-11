@@ -1309,14 +1309,15 @@ def test_inference_ep_asymmetric_overflow_policy(
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-def test_inference_ep2_rejects_overflow_policy_mismatch(tmp_path):
+@pytest.mark.parametrize("mismatch", ["drop_on_overflow", "forward_tuning"])
+def test_inference_ep2_rejects_overflow_policy_mismatch(tmp_path, mismatch):
     world_size = 2
     _require_distributed_sm107(world_size)
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
     init_file = tmp_path / "overflow_policy_mismatch.init"
     mp.spawn(
         _distributed_inference_policy_mismatch_worker,
-        args=(world_size, str(init_file)),
+        args=(world_size, str(init_file), mismatch),
         nprocs=world_size,
         join=True,
     )
