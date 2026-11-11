@@ -82,6 +82,11 @@ def graph_measure(call, repeats, rounds):
 
 def run_case(args, case_name, seq_lengths, heads, checkpoint):
     """Construct one stable packed pretraining shape and measure both public paths."""
+    # Different cu_seqlens with the same declared tensors share a production
+    # graph-cache key.  Isolate benchmark cases so plan introspection below
+    # cannot accidentally report the previously inserted shape-equivalent plan.
+    fprop_cache.clear()
+    bprop_cache.clear()
     generator = torch.Generator().manual_seed(1234)
     dtype = getattr(torch, args.dtype)
     batch = len(seq_lengths)
