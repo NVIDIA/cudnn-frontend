@@ -49,7 +49,8 @@ def test_entries_are_well_formed_and_name_known_rows():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
-        assert phase in ("q1", "mtp", "prefill", "prefill_short_square") and layout in ("dense", "paged", "thd", "thd_ragged")
+        assert phase in ("q1", "mtp", "prefill", "prefill_short_square", "prefill_short_q")
+        assert layout.removesuffix("_bounded") in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked")
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
@@ -66,13 +67,21 @@ def test_class_key_ignores_bottom_right_causal_for_one_query_row():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize(
-    "feature", [dict(has_bias=True), dict(has_dropout=True), dict(right_band_widening=True), dict(is_fp8=True), dict(shape_overrides=True)]
-)
+@pytest.mark.parametrize("feature", [dict(has_bias=True), dict(has_dropout=True), dict(right_band_widening=True), dict(is_fp8=True)])
 def test_unmeasured_features_never_reach_the_table(feature):
     row = "sdpa_fwd_prefill_sm100"
     assert pt.lookup(row, _facts()) is not None, "the D576 decode entry should answer the plain graph"
     assert pt.lookup(row, _facts(**feature)) is None
+
+
+@pytest.mark.L0
+def test_bounded_declaration_is_its_own_class():
+    """A bounded declaration (``shape_overrides``) serves every live shape up to the declared one, so an exact graph's entry
+    never answers it: its class differs only in the layout, and it has no entry until a study measures it."""
+    row = "sdpa_fwd_prefill_sm100"
+    exact, bounded = pt.class_key(row, _facts()), pt.class_key(row, _facts(shape_overrides=True))
+    assert bounded[5] == exact[5] + "_bounded" and bounded[:5] + bounded[6:] == exact[:5] + exact[6:]
+    assert pt.lookup(row, _facts()) is not None and pt.lookup(row, _facts(shape_overrides=True)) is None
 
 
 @pytest.mark.L0
@@ -106,6 +115,8 @@ def test_kv_off_the_tile_is_its_own_class_with_its_own_entry():
         assert pt.class_key(row, _facts(s_kv=8191, **kw))[-1] is True
         assert pt.class_key(row, _facts(s_kv=8192, **kw))[-1] is False
     for key in pt.TABLE:
+        if key[5].endswith("_bounded"):
+            continue  # FlashInfer declares capacities on the tile (128, powers of two, 65536); an off-tile one keeps the hand rules
         assert key[:-1] + (not key[-1],) in pt.TABLE, key
     assert pt.lookup(row, _facts(s_kv=49151, h_q=16, b=1)) is True
 
@@ -411,7 +422,8 @@ def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
 @pytest.mark.parametrize("heads", [(32, 8), (32, 32)], ids=["gqa", "mha"])
 def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     """Study sm107_paged_prefill_20261109 (Rubin, FlashInfer's paged path): D192/V128 leads on the 128-key tile from 512 KV
-    tokens and always off it; D256 leads everywhere. D128, f16, a window, a mask-free graph and another part keep the hand rules."""
+    tokens and always off it; D256 leads everywhere. D128 belongs to study sm107_thd_prefill_20261111; f16, a window, a
+    mask-free D192 graph and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm107"
     h_q, h_kv = heads
 
@@ -429,7 +441,7 @@ def test_sm107_paged_prefill_entries_lead_their_classes(heads):
     for s_kv in (256, 257, 65536):
         assert pt.lookup(row, paged(d=(256, 256), s_kv=s_kv)) is True
         assert pt.matched_entry(row, paged(d=(256, 256), s_kv=s_kv)).study == "sm107_paged_prefill_20261109"
-    assert pt.lookup(row, paged(d=(128, 128))) is None
+    assert pt.matched_entry(row, paged(d=(128, 128))).study == "sm107_thd_prefill_20261111"
     assert pt.lookup(row, paged(dtype=cudnn.data_type.HALF)) is None
     assert pt.lookup(row, paged(window_left=128)) is None
     assert pt.lookup(row, paged(causal=False, bottom_right=False)) is None
@@ -485,3 +497,57 @@ def test_sm107_paged_mla_single_row_decode_has_no_entry(d):
     for s_kv in (131072, 131071, 1024, 1023):
         facts = _facts(b=128, h_q=16, h_kv=1, s_q=1, s_kv=s_kv, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
         assert pt.lookup(row, facts) is None
+
+
+def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):
+    """FlashInfer's ragged cudnn declaration on cc 10.7: the broad envelope (b 4096, S_q 128 or 65536) or a power-of-two
+    bounded class (b <= 4, with its packed-Q capacity), always with execute-time shape overrides."""
+    base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=d[0], d_v=d[1], causal=causal, bottom_right=causal)
+    base.update(thd=True, padded=True, has_paged_kv=False, max_total_seq_len_q=total, shape_overrides=True, device_cc=(10, 7))
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+def test_sm107_thd_prefill_bounded_declarations_follow_the_study():
+    """Study sm107_thd_prefill_20261111 answers FlashInfer's ragged declarations by what they declare. The short-row envelope
+    (S_q 128) leads at d64 / D192 causal / d256, where the backend's short-row engine ran 1.5-6.5x behind FROST; at d128 it
+    keeps the backend from 64 query heads (FROST runs that declaration unpacked) and leads on the small bounded classes. The long
+    envelope leads at d64; at d128 the holdout dropped the entry, so the hand rules decide. An exact graph of the same shape
+    is another class."""
+    row = "sdpa_fwd_prefill_sm107"
+    study = "sm107_thd_prefill_20261111"
+    for d in ((64, 64), (192, 128), (256, 256)):
+        assert pt.lookup(row, _fi_ragged(d, 32, 8)) is True, d
+        assert pt.matched_entry(row, _fi_ragged(d, 32, 8)).study == study
+    assert pt.class_key(row, _fi_ragged((256, 256), 32, 8))[4:6] == ("prefill_short_q", "thd_bounded")
+    assert pt.lookup(row, _fi_ragged((128, 128), 32, 8)) is True
+    assert pt.lookup(row, _fi_ragged((128, 128), 64, 8)) is False
+    assert pt.lookup(row, _fi_ragged((128, 128), 32, 8, b=2, s_kv=4096, total=256)) is True
+    assert pt.lookup(row, _fi_ragged((64, 64), 32, 8, s_q=65536)) is True
+    assert pt.lookup(row, _fi_ragged((128, 128), 32, 8, s_q=65536)) is None
+    exact = _fi_ragged((256, 256), 32, 8, b=4, s_q=96, s_kv=4000, total=384, shape_overrides=False)
+    assert pt.class_key(row, exact)[5] == "thd" and pt.lookup(row, exact) is None
+    assert pt.lookup(row, _fi_ragged((256, 256), 32, 8, dtype=cudnn.data_type.HALF)) is None
+
+
+@pytest.mark.L0
+def test_sm107_thd_prefill_paged_entries_follow_the_study():
+    """The same study's exact paged classes: d256 mask-free leads everywhere (0.38-0.80 of the default on the holdout), d128
+    mask-free GQA squares past the threshold keep the backend, and d128 mask-free MHA keeps the hand rules (the holdout dropped
+    both tile twins)."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def paged(d, h_q, h_kv, b=4, s_q=512, s_kv=4096, causal=False, **over):
+        base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=d[0], d_v=d[1], causal=causal, bottom_right=causal)
+        base.update(thd=True, padded=True, page_size=16, max_total_seq_len_q=b * s_q, device_cc=(10, 7))
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (4096, 4100):
+        assert pt.lookup(row, paged((256, 256), 32, 8, s_kv=s_kv)) is True
+        assert pt.matched_entry(row, paged((256, 256), 32, 8, s_kv=s_kv)).study == "sm107_thd_prefill_20261111"
+    assert pt.lookup(row, paged((128, 128), 32, 8, b=16, s_q=2688, s_kv=2688)) is False
+    assert pt.lookup(row, paged((128, 128), 32, 32)) is None
+    assert pt.lookup(row, paged((128, 128), 32, 32, s_kv=4100)) is None
+    assert pt.lookup(row, paged((128, 128), 32, 8, causal=True)) is True

@@ -61,6 +61,36 @@ def _time_region_ms(fn):
     return start.elapsed_time(end)
 
 
+_replay_handle = None
+
+
+def _time_graph_replay_ms(fn, n):
+    """Device milliseconds per call of fn(): n calls captured into one CUDA graph, its replay timed with CUDA events."""
+    global _replay_handle
+    if _replay_handle is None:
+        _replay_handle = cudnn.create_handle()
+    cudnn.set_stream(handle=_replay_handle, stream=torch.cuda.current_stream().cuda_stream)
+    fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        cudnn.set_stream(handle=_replay_handle, stream=torch.cuda.current_stream().cuda_stream)
+        for _ in range(n):
+            fn()
+    cudnn.set_stream(handle=_replay_handle, stream=torch.cuda.current_stream().cuda_stream)
+    for _ in range(3):
+        g.replay()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    g.replay()
+    end.record()
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end) / n
+    g.reset()
+    return ms
+
+
 def _run_forward_once():
     """One forward execution, used by both the profiled and the event-timed path.
 
@@ -69,7 +99,10 @@ def _run_forward_once():
     """
     global output
     if is_cudnn_fe:
-        graph_fwd.execute(variant_pack_fwd, workspace)
+        if _replay_handle is not None:
+            graph_fwd.execute(variant_pack_fwd, workspace, handle=_replay_handle)
+        else:
+            graph_fwd.execute(variant_pack_fwd, workspace)
     else:
         output = sdpa_function(query, key, value)
 
@@ -300,6 +333,12 @@ def parse_args():
         default=0,
         type=int,
         help="Number of warmup iterations to run before measuring performance",
+    )
+    parser.add_argument(
+        "--graph_replay",
+        default=0,
+        type=int,
+        help="Opt-in: time N executes captured in one CUDA graph by replaying it; rows are tagged [graph-replay xN]. cuDNN legs only.",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
@@ -1991,7 +2030,11 @@ else:
         l2_flush_buffer.zero_()
 
         # Run kernel with profiler for forward if requested, else run unprofiled to prep for backward
-        if run_fwd and _EVENT_TIMING:
+        if run_fwd and args.graph_replay > 0 and is_cudnn_fe:
+            fwd_time = _time_graph_replay_ms(_run_forward_once, args.graph_replay)
+            if i >= dry_run_iters:
+                forward_times.append(fwd_time)
+        elif run_fwd and _EVENT_TIMING:
             # CUPTI already known unavailable -> ONE execution, timed with events.
             fwd_time = _time_region_ms(_run_forward_once)
             if i >= dry_run_iters:
@@ -2098,7 +2141,11 @@ else:
                 or "(anonymous namespace)::" in item.key
                 or item.key.startswith("fmha_")
             ]
-            if len(matched_kernels) >= 1:
+            if args.graph_replay > 0 and is_cudnn_fe:
+                bwd_time = _time_graph_replay_ms(lambda: graph_bwd.execute(variant_pack_bwd, workspace, handle=_replay_handle), args.graph_replay)
+                if i >= dry_run_iters:
+                    backward_times.append(bwd_time)
+            elif len(matched_kernels) >= 1:
                 # device_time_total, NOT device_time: key_averages() aggregates by
                 # kernel name and device_time is the per-occurrence MEAN, so a
                 # kernel launched n times per pass was being counted once.
@@ -2246,11 +2293,13 @@ else:
                 _plan = _g.get_plan_name_at_index(_g._plan_index)
             except Exception:
                 _plan = "unknown"
+        if args.graph_replay > 0 and is_cudnn_fe:
+            _plan = f"{_plan} [graph-replay x{args.graph_replay}]"
         print(
             f"{args.case_tag},{args.sdpa_backend},{args.batch_size},{args.q_seqlen},{args.kv_seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{f'{_peak_mma_tflops:.0f}' if _peak_mma_tflops else ''},{_plan}"
         )
     else:
-        _tt = " [cuda-events]" if _EVENT_TIMING else ""
+        _tt = f" [graph-replay x{args.graph_replay}]" if (args.graph_replay > 0 and is_cudnn_fe) else (" [cuda-events]" if _EVENT_TIMING else "")
         if run_fwd and run_bwd:
             print(
                 f"{args.sdpa_backend}{_tt}:: Median (fwd, bwd) Execution Times: {fwd_median_time:.3f} ms ({fwd_tflops:.0f} TFLOPS{fwd_sol_str}), {bwd_median_time:.3f} ms ({bwd_tflops:.0f} TFLOPS{bwd_sol_str})"

@@ -180,3 +180,12 @@ def load_paged_half_tile(
         # Async-tracked arrivals publish cp.async writes; .noinc accounts
         # for the 32 lanes already counted by barrier initialization/rearm.
         prims.cp_async_mbarrier_arrive(mbar, noinc=True)
+
+
+@cute.jit
+def thd_row_origin(offsets, specs: cutlass.Constexpr, port: cutlass.Constexpr[int], batch, token_stride, prefix):
+    """Resolve one physical token origin without changing logical lengths."""
+    origin = cutlass.Int64(prefix)
+    if cutlass.const_expr(specs is not None and specs[port] is not None):
+        origin = cutlass.Int64(cutlass.make_array_view(offsets[port])[batch]) * cutlass.Int64(specs[port][1]) // cutlass.Int64(token_stride)
+    return origin
