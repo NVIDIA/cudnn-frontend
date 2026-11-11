@@ -21,9 +21,10 @@ def test_shared_physical_origins_mxfp8(dtype_name, width, request, cudnn_handle)
     _check_native_origins(dtype_name, width, request, cudnn_handle, mxfp8=True)
 
 
-def _check_native_origins(dtype_name, width, request, cudnn_handle, *, mxfp8=False):
+def _check_native_origins(dtype_name, width, request, cudnn_handle, *, mxfp8=False, engine=None):
     cfg = _physical_origin_cfg(dtype_name, width)
-    engine = "sdpa_fwd_prefill_sm120_mxfp8" if mxfp8 else "sdpa_fwd_prefill_sm120_fp8" if cfg.data_type.itemsize == 1 else "sdpa_fwd_prefill_sm120"
+    if engine is None:
+        engine = "sdpa_fwd_prefill_sm120_mxfp8" if mxfp8 else "sdpa_fwd_prefill_sm120_fp8" if cfg.data_type.itemsize == 1 else "sdpa_fwd_prefill_sm120"
     cfg.plan_pin = {"engine": engine, "knobs": {"PACK_GQA": 0, "SPLIT_KV": 1}}
     key = "frost:" + engine
     before = frost_routing.snapshot().get(key, 0)

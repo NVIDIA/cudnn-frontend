@@ -359,12 +359,12 @@ class SdpaThdBinder {
                                     integer(spec, "d_v") == 128 && splits_ > 1;
             const bool d576_split = !quantized_ && cga_tile_m_ == 128 && integer(spec, "d_qk") == 576 &&
                                     integer(spec, "d_v") == 512 && splits_ > 1;
-            if ((quantized_ && !nonpaged_fp8_origin_caps && (!paged_ || mx_scales_)) ||
+            if ((quantized_ && !nonpaged_fp8_origin_caps && mx_scales_) ||
                 (splits_ != 1 && !d64_split && !d128_split && !d192_split && !d576_split) || has_gate_)
                 invalid(
                     "physical THD origins require ungated half unsplit/D128 split/nonpaged D64/D192 split/native D576 "
                     "split or unsplit "
-                    "per-tensor FP8 paged or FP8/MXFP8 per-port-capacity pointer-origin plans");
+                    "per-tensor FP8 map or FP8/MXFP8 per-port-capacity pointer-origin plans");
             auto specs = py::cast<py::tuple>(spec.attr("origin_specs"));
             if (specs.size() != 5) invalid("physical THD origins require five ports");
             if (d64_split || d128_split || d192_split || d576_split) {
@@ -1092,6 +1092,7 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def_prop_ro_static("supports_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_physical_origin_caps", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_fp8_physical_origins", [](py::object) { return true; })
+        .def_prop_ro_static("supports_nonpaged_fp8_origin_maps", [](py::object) { return true; })
         .def_prop_ro_static("supports_nonpaged_mxfp8_physical_origins", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })

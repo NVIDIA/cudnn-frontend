@@ -2985,3 +2985,45 @@ CUDNN_DETERMINISM_RECORD=/tmp/new-mxfp8-goldens pytest -m L0 \
 CUDNN_DETERMINISM_GOLDENS=/tmp/new-mxfp8-goldens pytest -m L0 \
   sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py -k golden
 ```
+
+### SM100 FP8 D128 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` collects the
+shared `test_mhas_v2` E4M3/E5M2 D128 cases with a strict native engine pin,
+four token/head-major reference/rebind/replay cases, two no-total-hint
+cases, two half D128/D256 forwarding controls and four new strict goldens.
+All use the existing unsplit, unpacked CGA2 nonpaged THD contract.
+
+The four replay cases check mixed INT32/INT64 offsets and multipliers,
+independent Q/K/V/O/Stats gaps, NaN-filled input padding, output canaries,
+changed pitches and storage, retained captures with changed live lengths
+and offsets, and all-empty queries. Exact-byte checks cover repetitions,
+batch permutations/duplicates, a sequence alone and changed neighbors.
+The prepared graph and standalone graph routes produce the same bytes;
+execute retains its allocation-free, asynchronous behavior. The numerical
+reference and tolerances are unchanged.
+
+Measured on SM100 (148 SMs), driver 595.71.05, Torch 2.14.1+cu130,
+cuDNN 9.24.0.43, DSL 4.8.0 / compiler CUDA 12.9, tvm-ffi 0.1.14.post1:
+the 10 functional cases and four strict goldens pass. New hashes live under
+`361d6da48de8fd55`; no earlier golden is replaced. Twelve existing compact
+D128 / paged D128-D256 FP8 controls also pass. The original shared D128
+FP8 cases fail on the parent and pass on the repair. An exploratory CGA1
+selection was rejected by the existing graph contract before kernel launch;
+it is outside this unsplit nonpaged test domain.
+
+Four cases each pass memcheck, racecheck and synccheck with zero errors
+and zero race warnings. The initial memcheck run reported 20
+`cuGetProcAddress_v2` API errors; a Torch-initialization-only control with
+no FE import reproduced all 20. Initializing cuda-python before Torch in
+the private sanitizer launcher eliminates those diagnostics while retaining
+`--report-api-errors explicit`, all kernel instrumentation and error exits.
+SM103 E4M3/E5M2 physical-origin lowerings compile offline; GPU execution
+there is unverified. Wider heads, MXFP8, SM107 and backward are not qualified
+by these D128 results.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins
+```
