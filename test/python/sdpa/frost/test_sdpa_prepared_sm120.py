@@ -336,6 +336,7 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
 
     cu_q, cu_kv = lengths("cu_q"), lengths("cu_kv")
     off_q, off_k, off_v, off_o, off_lse = [lengths(n) for n in ("off_q", "off_k", "off_v", "off_o", "off_lse")]
+    off_o.set_data_type(cudnn.data_type.INT64)
 
     def operand(name, h, s, d, offset):
         return graph.tensor(dim=[b, h, s, d], stride=[s * h * d, d, h * d, 1], data_type=bf16, name=name).set_ragged_offset(offset)
@@ -392,7 +393,9 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
         off_q: cq * hq * d_qk,
         off_k: ck * hk * d_qk,
         off_v: ck * hk * d_v,
-        off_o: cq * hq * d_v,
+        # Offsets are physical element addresses under the current override.
+        # A compact prefix would address row zero after division by row_stride.
+        off_o: cq.to(torch.int64) * row_stride,
         off_lse: cq * hq,
     }
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
