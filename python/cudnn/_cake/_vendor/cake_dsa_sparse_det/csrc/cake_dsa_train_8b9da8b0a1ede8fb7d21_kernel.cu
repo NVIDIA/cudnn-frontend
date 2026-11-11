@@ -1,3 +1,4 @@
+// cuDNN Frontend modification: bound sparse indices by the logical key count.
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  *
@@ -87,7 +88,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_dsa_train_8b9da8b0a1ede8fb7d21(__nv_bfloat16* __restrict__ index_q, __nv_bfloat16* __restrict__ index_k, float* __restrict__ weights, int* __restrict__ topk_indices, float* __restrict__ grad_scores, __nv_bfloat16* __restrict__ d_index_q, float* __restrict__ d_weights, float* __restrict__ partial, int heads, int topk)
+kernel_cake_dsa_train_8b9da8b0a1ede8fb7d21(__nv_bfloat16* __restrict__ index_q, __nv_bfloat16* __restrict__ index_k, float* __restrict__ weights, int* __restrict__ topk_indices, float* __restrict__ grad_scores, __nv_bfloat16* __restrict__ d_index_q, float* __restrict__ d_weights, float* __restrict__ partial, int heads, int topk, long long num_keys)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -195,6 +196,7 @@ kernel_cake_dsa_train_8b9da8b0a1ede8fb7d21(__nv_bfloat16* __restrict__ index_q, 
     }
     if (tid_0 < 32) {
         int idx0 = topk_indices[idx_base + (long long)tid_0];
+        idx0 = (idx0 >= 0 && idx0 < num_keys) ? idx0 : -1;
         float grad0 = grad_scores[idx_base + (long long)tid_0];
         s_idx[tid_0] = idx0;
         s_grad[tid_0] = ((idx0 >= 0) ? grad0 : 0.0f);
@@ -224,6 +226,7 @@ kernel_cake_dsa_train_8b9da8b0a1ede8fb7d21(__nv_bfloat16* __restrict__ index_q, 
         if (num_blocks > blk + 1) {
             if (tid_0 < 32) {
                 int idx_n = topk_indices[idx_base + (long long)((blk + 1) * 32) + (long long)tid_0];
+                idx_n = (idx_n >= 0 && idx_n < num_keys) ? idx_n : -1;
                 float grad_n = grad_scores[idx_base + (long long)((blk + 1) * 32) + (long long)tid_0];
                 s_idx[nst * 32 + tid_0] = idx_n;
                 s_grad[nst * 32 + tid_0] = ((idx_n >= 0) ? grad_n : 0.0f);

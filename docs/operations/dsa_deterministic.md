@@ -11,6 +11,8 @@ engine. Native stages compile on first use; warm the exact stages before capture
 `kv[S,D]`, with H in {8,16,32,64} and D in {512,576}. The first 512 key
 channels also supply V. Int32 `indices[T,K]` contains global key rows;
 K is positive and divisible by 64. Negative and out-of-range slots are holes.
+Native forward and backward stages check each index against the logical key
+count before loading KV, including each prefetched index tile.
 Repeated indices contribute repeatedly. No causal mask or attention sink is
 added. Scale defaults to `1/sqrt(D)`.
 
@@ -37,7 +39,7 @@ negative-infinity scores.
 
 `dsa_indexer_backward(q,k,weights,indices,grad_scores,**groups)` differentiates
 selected scores. It returns BF16 `dq`, FP32 `dk`, and FP32 `dweights`.
-Indices are global int32 `[T,K]` with valid key IDs or -1 padding; K must be
+Indices are global int32 `[T,K]`; negative and out-of-range IDs are holes. K must be
 a multiple of 64 for H<=16 and 32 otherwise. `grad_scores[T,K]` is FP32.
 Use `dsa_prepare_segments(indices,S)` for this exact selected pattern.
 The fused indexer/top-k API is a separate entry point with its own scale and

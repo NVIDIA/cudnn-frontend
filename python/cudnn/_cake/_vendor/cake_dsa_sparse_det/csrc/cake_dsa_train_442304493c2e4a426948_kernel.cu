@@ -1,3 +1,4 @@
+// cuDNN Frontend modification: bound sparse indices by the logical key count.
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  *
@@ -89,7 +90,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_dsa_train_442304493c2e4a426948(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kv, float* __restrict__ sink, int* __restrict__ indices, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, int heads, int topk, float scale_log2)
+kernel_cake_dsa_train_442304493c2e4a426948(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kv, float* __restrict__ sink, int* __restrict__ indices, __nv_bfloat16* __restrict__ out, float* __restrict__ lse, int heads, int topk, float scale_log2, long long num_keys)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -205,7 +206,8 @@ kernel_cake_dsa_train_442304493c2e4a426948(__nv_bfloat16* __restrict__ q, __nv_b
     acc_o[62] = 0.0f;
     acc_o[63] = 0.0f;
     if (tid_0 < 64) {
-        s_idx[tid_0] = indices[idx_base + (long long)tid_0];
+        int key_idx = indices[idx_base + (long long)tid_0];
+        s_idx[tid_0] = (key_idx >= 0 && key_idx < num_keys) ? key_idx : -1;
     }
     __syncthreads();
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
@@ -305,7 +307,8 @@ kernel_cake_dsa_train_442304493c2e4a426948(__nv_bfloat16* __restrict__ q, __nv_b
         int nst = 1 - st;
         if (num_blocks > blk + 1) {
             if (tid_0 < 64) {
-                s_idx[nst * 64 + tid_0] = indices[idx_base + (long long)((blk + 1) * 64) + (long long)tid_0];
+                int key_idx = indices[idx_base + (long long)((blk + 1) * 64) + (long long)tid_0];
+                s_idx[nst * 64 + tid_0] = (key_idx >= 0 && key_idx < num_keys) ? key_idx : -1;
             }
         }
         __syncthreads();

@@ -2842,3 +2842,52 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
 ```
+
+### Cake DSA key bounds (2026-11-10)
+
+PR #2435, based on `17e10b09e`, adds logical key-count checks inside the
+register-MMA attention forward/backward and indexer-backward kernels. Invalid
+indices become negative holes before both initial and prefetched KV loads.
+The public API, caller workspace, and launch count are unchanged. Local source
+hashes and rebuilt cache keys are recorded in `_cake/VENDORED_DSA_DET.json`.
+
+On `cudnn-dev-equator-22-04` (SM100, 148 SMs), CUDA Toolkit 13.4.92,
+driver 610.11, Torch 2.11.0+cu128, and TVM-FFI 0.1.13.post3:
+
+- All four Cake attention suites: 46 passed, no skips, in 96.22 seconds.
+- Eight BF16 boundary cases cover H=8/16/32/64 and D=512/576, K=128,
+  the logical end index, oversized positive indices, int32 extremes, negative
+  holes, and a valid key in the second tile. A larger backing allocation holds
+  canary rows outside the logical KV view.
+- Independent FP64 references check O, LSE, dQ, and dKV. The cases check input
+  and guard-row preservation, all-hole rows, supplied scratch, no allocation or
+  host synchronization after warmup, and changed-index graph replay on a side
+  stream with refreshed grouping. Repeated results and an isolated live row
+  with fresh buffers match byte for byte. These small analytic cases do not
+  establish general batch invariance.
+- Compute Sanitizer 13.2 memcheck: eight boundary cases passed; zero errors.
+- Eight new golden files were recorded only after reference and replay checks.
+  They record the corrected invalid-index behavior; no existing golden changed.
+- The existing three indexer-gradient cases now include invalid positive IDs
+  in later tiles and compare all gradients against the independent reference.
+  SM103 and SM107 were not available for this qualification.
+
+The pre-fix H16/D576 probe failed with an illegal memory access in its isolated
+process. The patched case passed, followed by the complete suite and memcheck.
+
+Run from the repository root with the matching Python environment and CUDA
+Toolkit configured. `PYTHONPATH=python:test/python` must resolve this checkout:
+
+```bash
+python -m pytest --noconftest --import-mode=importlib -o addopts='' \
+  test/python/sdpa/cake/test_gqa_training.py \
+  test/python/deepseek_sparse_attention/cake/test_indexer_topk.py \
+  test/python/deepseek_sparse_attention/cake/test_sparse.py \
+  test/python/deepseek_sparse_attention/cake/test_deterministic.py -ra
+compute-sanitizer --tool memcheck --error-exitcode 99 python -m pytest \
+  --noconftest --import-mode=importlib -o addopts='' \
+  test/python/deepseek_sparse_attention/cake/test_deterministic.py -k key_bounds -x
+CUDNN_DETERMINISM_GOLDENS="$PWD/test/python/determinism_goldens" python -m pytest \
+  --noconftest --import-mode=importlib -o addopts='' \
+  test/python/deepseek_sparse_attention/cake/test_deterministic.py -k key_bounds -x
+```

@@ -12,7 +12,10 @@ Python host patch that makes backward saved-row selection explicit for CodeQL.
 Its `files` map retains upstream hashes; `local_modifications` records the patch.
 `VENDORED_GQA.json` also records a local Python host patch that assigns backward
 output buffers on every path. Its source hashes and local patch hash are separate.
-CUDA sources are unchanged.
+`VENDORED_DSA_DET.json` records local bounds checks in the deterministic DSA
+CUDA kernels and bindings. The binding passes the logical key count; each kernel
+converts invalid indices to holes before KV loads. Source and local hashes remain
+separate. Other imported CUDA sources are unchanged.
 
 The loader requires Linux, nvcc 13.4 or newer, and the installed TVM-FFI headers.
 It supports SM100a, SM103a, and SM107a. It imports neither Torch nor TVM-FFI

@@ -17,6 +17,7 @@ def test_vendor_files():
     root = Path(api.__file__).resolve().parents[2] / "_cake"
     for package, record in json.loads((root / "VENDORED_DSA_DET.json").read_text())["packages"].items():
         for name, expected in record["files"].items():
+            expected = record.get("local_modifications", {}).get(name, {}).get("blob", expected)
             data = (root / "_vendor" / package / name).read_bytes()
             assert hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() == expected
 
@@ -52,9 +53,11 @@ def _rand(shape, device):
 
 
 def _indices(device):
-    idx = torch.full((3, 64), -1, dtype=torch.int32, device=device)
+    idx = torch.full((3, 128), -1, dtype=torch.int32, device=device)
     idx[0, :5] = torch.tensor([0, 2, 2, 5, 7], device=device)
     idx[1, :4] = torch.tensor([1, 3, 8, 9], device=device)
+    idx[:, 64] = 11
+    idx[:, 127] = 2**31 - 1
     return idx
 
 
@@ -101,7 +104,7 @@ def test_attention_gradients_and_capture(gpu, heads, dim):
     groups = api.dsa_prepare_segments(idx, 11)
     out, lse = api.dsa_det_forward(q, kv, idx)
     grads = api.dsa_det_backward(q, kv, idx, out, lse, do, **groups)
-    scratch = torch.empty(max(256, api.dsa_det_workspace_size(3, heads, dim, 11, 64)), dtype=torch.uint8, device=gpu)
+    scratch = torch.empty(max(256, api.dsa_det_workspace_size(3, heads, dim, 11, idx.shape[1])), dtype=torch.uint8, device=gpu)
 
     def run():
         api.dsa_det_forward(q, kv, idx, out=out, lse=lse, workspace=scratch)
@@ -139,7 +142,7 @@ def test_indexer_logits_gradients_capture(gpu, heads):
     groups = api.dsa_prepare_segments(idx, 11)
     logits = api.dsa_indexer_logits(q, k, weights, starts, ends)["logits"]
     grads = api.dsa_indexer_backward(q, k, weights, idx, ds, **groups)
-    scratch = torch.empty(api.dsa_det_workspace_size(3, heads, 128, 11, 64, indexer=True), dtype=torch.uint8, device=gpu)
+    scratch = torch.empty(api.dsa_det_workspace_size(3, heads, 128, 11, idx.shape[1], indexer=True), dtype=torch.uint8, device=gpu)
 
     def run():
         api.dsa_indexer_logits(q, k, weights, starts, ends, logits=logits)
@@ -154,7 +157,7 @@ def test_indexer_logits_gradients_capture(gpu, heads):
         scores = (raw.relu() * wc[:, :, None]).sum(1)
         mask = (torch.arange(11)[None, :] >= starts.cpu()[:, None]) & (torch.arange(11)[None, :] < ends.cpu()[:, None])
         torch.testing.assert_close(logits.cpu().double(), scores.detach().masked_fill(~mask, -torch.inf), atol=2e-4, rtol=2e-4)
-        selected = scores.gather(1, ids.clamp(0, 10)) * (ids >= 0)
+        selected = scores.gather(1, ids.clamp(0, 10)) * ((ids >= 0) & (ids < 11))
         expected = torch.autograd.grad(selected, (qc, kc, wc), ds.cpu().double())
         for got, want in zip(grads.values(), expected):
             torch.testing.assert_close(got.cpu().double(), want, atol=2e-2, rtol=2e-2)
@@ -167,3 +170,66 @@ def test_indexer_logits_gradients_capture(gpu, heads):
         api.dsa_indexer_backward(q, k, weights, idx, ds, **groups, dq=q)
     with pytest.raises(ValueError, match="workspace"):
         api.dsa_indexer_backward(q, k, weights, idx, ds, **groups, workspace=scratch[:1])
+
+
+@pytest.mark.parametrize("heads,dim", [(8, 512), (8, 576), (16, 512), (16, 576), (32, 512), (32, 576), (64, 512), (64, 576)])
+def test_attention_key_bounds_and_replay(gpu, heads, dim):
+    from determinism_utils import assert_bitwise, assert_golden, snapshot
+
+    q = torch.zeros((2, heads, dim), dtype=torch.bfloat16, device=gpu)
+    backing = torch.full((4, dim), 7, dtype=torch.bfloat16, device=gpu)
+    backing[0].fill_(1)
+    kv = backing[:1]
+    indices = torch.full((2, 128), -1, dtype=torch.int32, device=gpu)
+    indices[:, [0, 63, 64, 127]] = torch.tensor([1, 3, 2**31 - 1, -(2**31)], dtype=torch.int32, device=gpu)
+    indices[1, 65] = 0
+    groups = api.dsa_prepare_segments(indices, 1)
+    out = torch.empty((2, heads, 512), dtype=torch.bfloat16, device=gpu)
+    lse = torch.empty((2, heads), dtype=torch.float32, device=gpu)
+    grad = torch.ones_like(out)
+    dq = torch.empty_like(q)
+    dkv_backing = torch.full_like(backing, 13)
+    dkv = dkv_backing[:1]
+    scratch = torch.empty(api.dsa_det_workspace_size(2, heads, dim, 1, 128), dtype=torch.uint8, device=gpu)
+    saved_indices = indices.clone()
+
+    def run():
+        api.dsa_det_forward(q, kv, indices, out=out, lse=lse, workspace=scratch)
+        api.dsa_det_backward(q, kv, indices, out, lse, grad, **groups, dq=dq, dkv=dkv, workspace=scratch)
+        return dict(out=out, lse=lse, dq=dq, dkv=dkv)
+
+    def check():
+        ref, ref_lse, grads = _attention_ref(q, kv, indices, grad)
+        torch.testing.assert_close(out.cpu().double(), ref, atol=0, rtol=0)
+        live = ((indices >= 0) & (indices < 1)).any(-1)
+        torch.testing.assert_close(lse[live].cpu().double(), ref_lse[live.cpu()], atol=0, rtol=0)
+        assert bool((lse[~live] < -1e6).all())
+        for actual, expected in zip((dq, dkv), grads):
+            torch.testing.assert_close(actual.cpu().double(), expected, atol=0, rtol=0)
+        assert torch.equal(backing[1:], torch.full_like(backing[1:], 7))
+        assert torch.equal(dkv_backing[1:], torch.full_like(dkv_backing[1:], 13))
+        assert torch.equal(indices, saved_indices)
+
+    def change():
+        indices.copy_(indices.flip(0))
+        saved_indices.copy_(indices)
+        for name, value in api.dsa_prepare_segments(indices, 1).items():
+            groups[name].copy_(value)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        _capture(run, change, check, gpu)
+        first = snapshot(run())
+        assert_bitwise(run(), first, "bounded attention replay")
+        one_q, one_indices = q[:1], indices[:1]
+        one_groups = api.dsa_prepare_segments(one_indices, 1)
+        one_out = api.dsa_det_forward(one_q, kv, one_indices)
+        one_grads = api.dsa_det_backward(one_q, kv, one_indices, *one_out.values(), grad[:1], **one_groups)
+        assert_bitwise(
+            dict(**one_out, **one_grads),
+            dict(out=first["out"][:1], lse=first["lse"][:1], dq=first["dq"][:1], dkv=first["dkv"]),
+            "isolated live row with fresh buffers",
+        )
+        assert_golden(f"cake_dsa_key_bounds_h{heads}_d{dim}", dict(q=q, kv=kv, indices=indices, grad=grad), first)
+    torch.cuda.current_stream().wait_stream(side)

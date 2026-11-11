@@ -1,3 +1,4 @@
+// cuDNN Frontend modification: bound sparse indices by the logical key count.
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  *
@@ -139,7 +140,7 @@ __device__ __forceinline__ float approx_exp2(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(2,1,1) void
-kernel_cake_dsa_train_ec4987f0492b1c232a5d(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kv, __nv_bfloat16* __restrict__ do_, int* __restrict__ indices, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ dq, float* __restrict__ partial, int heads, int topk, int num_head_blocks, float sm_scale, float scale_log2)
+kernel_cake_dsa_train_ec4987f0492b1c232a5d(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kv, __nv_bfloat16* __restrict__ do_, int* __restrict__ indices, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ dq, float* __restrict__ partial, int heads, int topk, int num_head_blocks, float sm_scale, float scale_log2, long long num_keys)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -324,7 +325,8 @@ kernel_cake_dsa_train_ec4987f0492b1c232a5d(__nv_bfloat16* __restrict__ q, __nv_b
         "mapa.shared::cluster.u32 %0, %1, %2;"
         : "=r"(_mapa_2) : "r"(rx_empty_addr), "r"(peer));
     if (tid_0 < 32) {
-        s_idx[tid_0] = indices[idx_base + (long long)tid_0];
+        int key_idx = indices[idx_base + (long long)tid_0];
+        s_idx[tid_0] = (key_idx >= 0 && key_idx < num_keys) ? key_idx : -1;
     }
     if (tid_0 < 32) {
         int stat_h = h0 + tid_0;
@@ -404,7 +406,8 @@ kernel_cake_dsa_train_ec4987f0492b1c232a5d(__nv_bfloat16* __restrict__ q, __nv_b
         int nst = 1 - st;
         if (num_blocks > blk + 1) {
             if (tid_0 < 32) {
-                s_idx[nst * 32 + tid_0] = indices[idx_base + (long long)((blk + 1) * 32) + (long long)tid_0];
+                int key_idx = indices[idx_base + (long long)((blk + 1) * 32) + (long long)tid_0];
+                s_idx[nst * 32 + tid_0] = (key_idx >= 0 && key_idx < num_keys) ? key_idx : -1;
             }
         }
         __syncthreads();

@@ -1,3 +1,4 @@
+// cuDNN Frontend modification: bound sparse indices by the logical key count.
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
  *
@@ -90,7 +91,7 @@ __device__ __forceinline__ float approx_exp2(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_dsa_train_9fd0d765700968122201(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kv, __nv_bfloat16* __restrict__ do_, int* __restrict__ indices, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ dq, float* __restrict__ partial, int heads, int topk, int num_head_blocks, float sm_scale, float scale_log2)
+kernel_cake_dsa_train_9fd0d765700968122201(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ kv, __nv_bfloat16* __restrict__ do_, int* __restrict__ indices, float* __restrict__ lse, float* __restrict__ delta, __nv_bfloat16* __restrict__ dq, float* __restrict__ partial, int heads, int topk, int num_head_blocks, float sm_scale, float scale_log2, long long num_keys)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -192,7 +193,8 @@ kernel_cake_dsa_train_9fd0d765700968122201(__nv_bfloat16* __restrict__ q, __nv_b
     acc_dq[30] = 0.0f;
     acc_dq[31] = 0.0f;
     if (tid_0 < 64) {
-        s_idx[tid_0] = indices[idx_base + (long long)tid_0];
+        int key_idx = indices[idx_base + (long long)tid_0];
+        s_idx[tid_0] = (key_idx >= 0 && key_idx < num_keys) ? key_idx : -1;
     }
     if (tid_0 < 16) {
         int stat_h = h0 + tid_0;
@@ -266,7 +268,8 @@ kernel_cake_dsa_train_9fd0d765700968122201(__nv_bfloat16* __restrict__ q, __nv_b
         int nst = 1 - st;
         if (num_blocks > blk + 1) {
             if (tid_0 < 64) {
-                s_idx[nst * 64 + tid_0] = indices[idx_base + (long long)((blk + 1) * 64) + (long long)tid_0];
+                int key_idx = indices[idx_base + (long long)((blk + 1) * 64) + (long long)tid_0];
+                s_idx[nst * 64 + tid_0] = (key_idx >= 0 && key_idx < num_keys) ? key_idx : -1;
             }
         }
         __syncthreads();
