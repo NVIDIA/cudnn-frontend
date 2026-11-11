@@ -23,6 +23,8 @@ chunking, the workspace carve, the standalone ``execute`` and every decline.  Th
 EXPLICITLY here -- ``api_dsl_sm107._stage3_cgrp_tile_mn`` keys on the Rubin line by design and is not widened -- and the
 stage-3 granularity comes from the 2x2 config's ``kv_pad_rows_2x2`` (the pair, NOT the 128-row block). D192 uses a
 single-CTA (128, 192) tile; D256 retains the (256, 256) pair. Both M tiles fit within one workspace write pair.
+Dense pairs with D_V in {192, 256} and D_V <= D_QK <= 256 compute on the D256 geometry; their tensor maps keep the
+real widths, so TMA zero-fills the loads past them and clips the stores.
 
 Native D192 folds dK into the main kernel, alongside dV; only dQ uses stage 3.
 The main kernel reuses dS in shared memory for dK and loads Q through its
@@ -107,6 +109,22 @@ class SdpaBwdDslSm100D256(SdpaBwdDslSm107):
             f"{self._NAME}: padding masks / per-batch kv lengths (seq_kv_lens) are not implemented on the 2x2 body (the cc 10.7 half row serves them)",
         )
         return super().check_support()
+
+    def _check_head_dims(self) -> None:
+        """Native (256, 256) and (192, 128), plus the dense envelope pairs that compute on the (256, 256) geometry with
+        the tensor maps at their real widths (``engines._sm100_d256_envelope``)."""
+        from cudnn.sdpa.bwd.engines import _sm100_d256_envelope
+
+        if self._native_half_d192():
+            return
+        dq, dv = self.head_dim_qk, self.head_dim_v
+        if (dq, dv) == (256, 256):
+            return
+        self._value_error_if(
+            not _sm100_d256_envelope(dq, dv),
+            f"{self._NAME}: head dims must be (256, 256), (192, 128), or d_v in {{192, 256}} with d_v <= d_qk <= 256 and d_qk a multiple of 8; got {dq} / {dv}",
+        )
+        self._value_error_if(self.thd, f"{self._NAME}: the head-pair envelope ({dq} / {dv}) is dense BSHD only")
 
     def _datapath_2x2_profile(self) -> int:
         """Profile 1 (one 64-row sub-block per CTA, 128-row kv block, 227 KiB, descriptor version 0) -- NOT the Rubin twin
