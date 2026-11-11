@@ -106,3 +106,43 @@ def test_origin_golden(monkeypatch, dtype, two_by_two, stats):
     _check_case(monkeypatch, dtype, two_by_two, stats, total_hints=True, collect=collect)
     arm = "2x2" if two_by_two else "role-split"
     assert_golden(f"sdpa-sm100-d512-thd-origins-{dtype}-{arm}-{stats}", record["inputs"], record["outputs"])
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn", "float8_e5m2"])
+def test_stats_slot_waits_for_all_warps(monkeypatch, tmp_path, dtype):
+    """Delay nonleader readers while the same persistent cluster reuses Stats."""
+    from pathlib import Path
+
+    from cudnn.sdpa.fwd import api_dsl
+    from frost_test_utils import process_watchdog
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "1")
+    original_load = api_dsl.load_template
+    served = []
+
+    def delayed(path, params, tag="template", **kwargs):
+        source_path = Path(path)
+        if source_path.parent.name == "sm100" and source_path.name in ("prefill_d512_f16.py", "prefill_d512_fp8.py"):
+            source = source_path.read_text()
+            anchor = "            ell_addr = sStats_xfer_raw.subview(tid_in_wg)\n"
+            assert source.count(anchor) == 1
+            delay = (
+                "            if ~is_lead_warp:\n"
+                "                stats_read_start = cute.arch.globaltimer()\n"
+                "                while cute.arch.globaltimer() - stats_read_start < cutlass.Int64(100_000):\n"
+                "                    pass\n"
+            )
+            target = tmp_path / source_path.name
+            target.write_text(source.replace(anchor, delay + anchor))
+            module = original_load(str(target), params, tag, **kwargs)
+            assert module.THD_PERSISTENT
+            served.append(source_path.name)
+            return module
+        return original_load(path, params, tag, **kwargs)
+
+    monkeypatch.setattr(api_dsl, "load_template", delayed)
+    # Existing helper checks independent origins, numerical O/Stats, bitwise
+    # batch invariance, changed bindings and retained live/empty graph replay.
+    with process_watchdog(120.0, "D512 Stats slot reader join"):
+        _check_case(monkeypatch, dtype, False, "token", total_hints=True)
+    assert served, "the delayed role-split template did not serve the graph"
