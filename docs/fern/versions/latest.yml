@@ -154,6 +154,9 @@ navigation:
               - page: Discrete Grouped GEMM + SwiGLU (SM100)
                 path: ../../operations/gemm_fusions/discrete_grouped_gemm_swiglu.md
                 slug: discrete_grouped_gemm_swiglu
+              - page: FP8 Projection for Decode Rows (SM100-class)
+                path: ../../operations/gemm_fusions/fp8_projection_decode.md
+                slug: fp8_projection_decode
               - page: GEMM + Amax (SM100)
                 path: ../../operations/gemm_fusions/gemm_amax.md
                 slug: gemm_amax
