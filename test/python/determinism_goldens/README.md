@@ -3141,3 +3141,48 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest -q -m L0 \
   sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins
 ```
+
+
+### SM100 D192/D256 quantized THD origins — 2026-11-11
+
+`TestMidwidthPhysicalOrigins` in both SM100 FP8/MXFP8 architecture suites
+collects60 L0 cases. It pins the native D192/V128 body at CGA1/CGA2 and the
+D256 body at CGA1; both E4M3/E5M2 inputs write BF16 O and token/head-major
+Stats. Tests cover independent mixed-width/multiplier offsets, poisoned gaps,
+changed pointers/pitches, omitted total hints, empty/keyless transitions,
+retained changed-input capture, raw-byte replay during concurrent work,
+batch reordering/duplication/neighbor isolation and graph fallback parity.
+Two persistent clusters force sequence and scheduler-slot reuse. MXFP8 data
+moves independently of the original packed logical scale tiles.
+
+The recorded runtime is SM100/148SM, driver595.71.05, Torch2.14.1+cu130,
+cuDNN9.24.0.43, DSL4.8.0 with actual CUDA13.4 compiler, bindings13.4.4 and
+toolkit13.4.92. Import root and native-extension hash are asserted. The
+unchanged parent extension is reused; this change does not edit its ABI.
+There are24 new baselines under `361d6da48de8fd55`; the earlier16 remain
+byte-identical after adding CGA1 and concurrent-work coverage. Existing
+repository goldens and numerical tolerances are unchanged.
+
+The immediate parent fails four independent-origin reference controls.
+Sanitizers also reproduce its dedicated D192 CGA1 schedulers' invalid DSMEM
+publication and its CGA2 MXFP8 V-scale peer lifetime. Persistent compact
+D192 FP8 CGA2 additionally reports scheduler field reuse hazards while its
+numerical reference passes. The repair publishes locally at CGA1, broadcasts
+every decoded field before returning slot credit, and retains the MXFP8 peer
+until V-scale tail accesses finish. Earlier positive logs are preserved.
+
+The final source passes all 60 cases with strict golden comparison and 38
+existing neighboring-path controls (98 passed, no skips). Directed memcheck,
+racecheck and synccheck each pass all 12 family/width/CGA/dtype cases, with
+zero sanitizer errors; racecheck also reports zero hazards or warnings.
+These sanitizer cases retain reference, rebinding and capture/replay checks;
+concurrent work and batch invariance are covered by the full 60-case suite.
+All 12 final SM103 lowerings compile with CUDA 13.4. SM103 execution, SM107
+and backward remain unverified by this suite.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestMidwidthPhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestMidwidthPhysicalOrigins
+```

@@ -515,5 +515,21 @@ bytes are retained across batch changes. Physical data gaps do not move the
 packed scale-tile prefixes. Prepared and standalone graph execution agree.
 
 All four admitted SM103 dtype/width lowerings compile offline; GPU execution
-there remains unverified. These results do not qualify D192/D256, SM107 or
-backward. See the coverage report for exact cases and validation receipts.
+there remains unverified. D192/D256 evidence is documented below; SM107 and
+backward remain unverified by these suites. See the coverage report for exact
+cases and validation receipts.
+
+
+## SM100 D192/D256 quantized THD physical origins
+
+Native D192/V128 (CGA1 and CGA2) and D256 (CGA1) per-tensor FP8 and
+MXFP8 forward preserve O/Stats bytes across repeat execution, concurrent
+GPU work, reordered/duplicated batches, an isolated sequence, changed neighbors
+and retained CUDA Graph replay on the tested SM100 runtime. The unsplit,
+unpacked cases cover E4M3/E5M2 inputs, BF16 output and token/head-major Stats.
+Independent physical Q/K/V/O/Stats origins and changed pitches retain the
+logical length and MXFP8 scale-tile coordinate systems. Prepared and standalone
+graph routes agree. A two-cluster grid exercises persistent sequence changes.
+
+SM103 execution, native SM107 and backward are not qualified by this suite.
+See the coverage report for exact configurations and measured validation.

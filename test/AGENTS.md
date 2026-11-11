@@ -1400,3 +1400,22 @@ matrix on a representative full-feature shape and retain separate native
 flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
 The SM90 D64/D512 controls in `test_band_capabilities.py` and
 `test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
+
+
+For quantized THD physical origins, cover every admitted cluster width and
+force a small persistent grid so a CTA switches sequences. D192 uses a rank-5
+K map but rank-4 Q/V/O maps; D256 MXFP8 uses rank-5 Q/K/V and rank-4 O.
+Their token axes differ. Move data origins independently while preserving the
+logical MXFP8 scale-tile order, including a reordered or duplicated sequence.
+`TestMidwidthPhysicalOrigins` in both SM100 quantized architecture suites
+checks these cases, retained captures and concurrent-work byte equality.
+Run racecheck on a bottom-right tail as well: the V-scale sanitizer can access
+a peer's shared memory after that peer finishes its masked query rows.
+
+For the predecoded THD scheduler, an elected slot-credit arrival must follow
+all lanes' reads of every decoded field. Broadcast fields from lane zero
+before returning credit, or match per-lane arrivals with the initialization
+count. Check persistent CGA2 as well as CGA1: DSMEM publication does not
+protect later generic-proxy field reads. The D192 quantized origin tests
+force two clusters to exercise slot reuse; their compact-parent racecheck
+controls reproduce this failure without independent offsets.
