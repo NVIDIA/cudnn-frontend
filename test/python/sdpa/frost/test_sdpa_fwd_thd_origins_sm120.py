@@ -80,7 +80,8 @@ def _check_invariance(graph, nodes, values, state, workspace, overrides, flat, s
         restore()
         for name in ("q", "k", "v"):
             length = ql[2] if name == "q" else kl[2]
-            flat(values[name])[origins[name][2] : origins[name][2] + length].mul_(0.5)
+            live_input = flat(values[name])[origins[name][2] : origins[name][2] + length]
+            live_input.copy_(live_input.float() * 0.5)
         run()
     finally:
         restore()

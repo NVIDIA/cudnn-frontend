@@ -3870,6 +3870,7 @@ def lower_dsl_prefill(
             and api.cga in (None, 2)
         )
         or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
+        or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120_fp8")
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
@@ -4104,7 +4105,10 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
-        if facts.thd and ("sample_ragged_q" in _ctor_params or (spec.name == "sdpa_fwd_prefill_sm120" and getattr(api, "_thd_origin_specs", None) is not None)):
+        if facts.thd and (
+            "sample_ragged_q" in _ctor_params
+            or (spec.name in ("sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8") and getattr(api, "_thd_origin_specs", None) is not None)
+        ):
             for name in ("q", "k", "v", "o", "stats"):
                 offsets = getattr(binding, "ragged_" + name)
                 execute_kwargs["ragged_" + ("lse" if name == "stats" else name)] = (

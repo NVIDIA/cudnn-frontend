@@ -57,7 +57,9 @@ def test_independent_thd_origins_rebind_and_capture(
     import cudnn
     import torch
 
-    arches = ((12, 0), (12, 1)) if engine_name.endswith("sm120") else (((10, 7),) if engine_name.endswith("sm107") else ((10, 0), (10, 3)))
+    sm120 = engine_name in ("sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8")
+    fp8 = engine_name == "sdpa_fwd_prefill_sm120_fp8"
+    arches = ((12, 0), (12, 1)) if sm120 else (((10, 7),) if engine_name.endswith("sm107") else ((10, 0), (10, 3)))
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in arches:
         pytest.skip(f"{engine_name} physical THD origin path")
     torch.manual_seed(117)
@@ -71,16 +73,23 @@ def test_independent_thd_origins_rebind_and_capture(
     ports = ("q", "k", "v", "o", "stats")
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
     # +16 head padding must represent integral compact and gapped token origins.
-    qk_multiplier = 16 if d_qk in (64, 192, 576) or engine_name.endswith("sm120") else d_qk
-    multipliers = (heads * qk_multiplier, qk_multiplier, 1, 16 if engine_name.endswith("sm120") else d_v, 1)
+    qk_multiplier = 16 if d_qk in (64, 192, 576) or sm120 else d_qk
+    multipliers = (heads * qk_multiplier, qk_multiplier, 1, 16 if sm120 else d_v, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
     q_lengths, kv_lengths = q_lengths[:batch], kv_lengths[:batch]
     log2_stats = stats_layout == "head"
 
+    scale_values = dict(descale_q=0.8, descale_k=0.9, descale_v=0.7, scale_s=1.0, descale_s=1.0, scale_o=1.3) if fp8 else {}
+
     def tensors(head_padding=0):
         result = {
             name: torch.empty(
-                batch, maximum, h, width + head_padding, device="cuda", dtype=getattr(torch, kv_dtype_name) if kv_dtype_name and name in ("k", "v") else dtype
+                batch,
+                maximum,
+                h,
+                width + head_padding,
+                device="cuda",
+                dtype=(torch.bfloat16 if fp8 and name == "o" else getattr(torch, kv_dtype_name) if kv_dtype_name and name in ("k", "v") else dtype),
             )[..., :width].transpose(1, 2)
             for name, h, width in (("q", heads, d_qk), ("k", kv_heads, d_qk), ("v", kv_heads, d_v), ("o", heads, d_v))
         }
@@ -93,6 +102,8 @@ def test_independent_thd_origins_rebind_and_capture(
         result["kl"] = torch.empty_like(result["ql"])
         for name, width in zip(ports, widths):
             result["ro_" + name] = torch.empty(batch + 1, 1, 1, 1, device="cuda", dtype=width)
+        for name, value in scale_values.items():
+            result[name] = torch.full((1, 1, 1, 1), value, device="cuda", dtype=torch.float32)
         return result
 
     def flat(t):
@@ -122,25 +133,32 @@ def test_independent_thd_origins_rebind_and_capture(
             view = flat(values[name])
             view.fill_(float("nan"))
             for start, length in zip(origins[name], ql if name == "q" else kl):
-                view[start : start + length].copy_(torch.randn(length, view.shape[1], view.shape[-1], device="cuda", dtype=dtype))
+                data = torch.randn(length, view.shape[1], view.shape[-1], device="cuda", dtype=torch.float32 if fp8 else dtype)
+                view[start : start + length].copy_(data * 0.4 if fp8 else data)
         return ql, kl, origins
 
     first = tensors()
-    dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
+    dt = {
+        "float16": cudnn.data_type.HALF,
+        "bfloat16": cudnn.data_type.BFLOAT16,
+        "float8_e4m3fn": cudnn.data_type.FP8_E4M3,
+        "float8_e5m2": cudnn.data_type.FP8_E5M2,
+    }[dtype_name]
     graph = cudnn.pygraph(
         io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True
     )
-    nodes = {name: graph.tensor_like(first[name]) for name in ("q", "k", "v", "ql", "kl")}
+    nodes = {name: graph.tensor_like(first[name]) for name in ("q", "k", "v", "ql", "kl", *scale_values)}
     for name, multiplier in zip(ports, multipliers):
         nodes["ro_" + name] = graph.tensor_like(first["ro_" + name])
         if name in ("q", "k", "v"):
             nodes[name].set_ragged_offset(nodes["ro_" + name]).set_ragged_offset_multiplier(multiplier)
     extra = dict(max_total_seq_len_q=sum(q_lengths), max_total_seq_len_kv=sum(kv_lengths)) if total_hints else {}
-    nodes["o"], nodes["stats"] = graph.sdpa(
+    extra.update({name: nodes[name] for name in scale_values})
+    extra.update(dict(generate_stats=True) if fp8 else dict(is_inference=False))
+    outputs = (graph.sdpa_fp8 if fp8 else graph.sdpa)(
         q=nodes["q"],
         k=nodes["k"],
         v=nodes["v"],
-        is_inference=False,
         attn_scale=d_qk**-0.5,
         diagonal_band_right_bound=0,
         use_padding_mask=True,
@@ -149,6 +167,9 @@ def test_independent_thd_origins_rebind_and_capture(
         stats_use_log2=log2_stats,
         **extra,
     )
+    nodes["o"], nodes["stats"] = outputs[:2]
+    if fp8:
+        nodes["o"].set_data_type(cudnn.data_type.BFLOAT16)
     nodes["o"].set_output(True).set_dim(first["o"].shape).set_stride(first["o"].stride()).set_ragged_offset(nodes["ro_o"]).set_ragged_offset_multiplier(
         multipliers[3]
     )
@@ -158,10 +179,10 @@ def test_independent_thd_origins_rebind_and_capture(
     )
     graph.validate()
     graph.build_operation_graph()
-    if engine_name.endswith("sm120"):
+    if sm120:
         from cudnn.engines.manifest import family_for
 
-        graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], {})
+        graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], {cudnn.knob_type.PACK_GQA: int(pack_gqa)} if fp8 else {})
         graph.select_plan(0)
     elif cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
         from cudnn.engines.manifest import family_for
@@ -209,13 +230,24 @@ def test_independent_thd_origins_rebind_and_capture(
             q = inputs["q"][origins["q"][b] : origins["q"][b] + nq].transpose(0, 1)
             k = inputs["k"][origins["k"][b] : origins["k"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
             v = inputs["v"][origins["v"][b] : origins["v"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
+            if fp8:
+                q = q * values["descale_q"].item()
+                k = k * values["descale_k"].item()
+                v = v * values["descale_v"].item()
             scores = (q @ k.transpose(-1, -2)) * d_qk**-0.5
             scores.masked_fill_(torch.arange(nk)[None, :] > torch.arange(nq)[:, None], float("-inf"))
             expected = (scores.softmax(-1) @ v).transpose(0, 1)
+            if fp8:
+                expected = expected * values["scale_o"].item()
             expected_stats = scores.logsumexp(-1).T * (math.log2(math.e) if log2_stats else 1)
             o_start, st_start = origins["o"][b], origins["stats"][b]
-            torch.testing.assert_close(output[o_start : o_start + nq].double(), expected, atol=0.025 if dtype_name == "bfloat16" else 0.004, rtol=0.02)
-            torch.testing.assert_close(stats[st_start : st_start + nq].double(), expected_stats, atol=0.003, rtol=0.003)
+            torch.testing.assert_close(
+                output[o_start : o_start + nq].double(),
+                expected,
+                atol=0.03 if fp8 else 0.025 if dtype_name == "bfloat16" else 0.004,
+                rtol=0.03 if fp8 else 0.02,
+            )
+            torch.testing.assert_close(stats[st_start : st_start + nq].double(), expected_stats, atol=0.01 if fp8 else 0.003, rtol=0.01 if fp8 else 0.003)
             written_o[o_start : o_start + nq] = True
             written_stats[st_start : st_start + nq] = True
         assert torch.all(output[~written_o] == -17)
@@ -246,6 +278,9 @@ def test_independent_thd_origins_rebind_and_capture(
         # Both captures survive a later pointer bind; mutate all metadata in place.
         for captured, values, shift in reversed(captures):
             state = fill(values, shift + 32, short=True)
+            if fp8:
+                values["descale_q"].mul_(0.5)
+                values["descale_v"].mul_(1.25)
             poison(values)
             captured.replay()
             torch.cuda.synchronize()

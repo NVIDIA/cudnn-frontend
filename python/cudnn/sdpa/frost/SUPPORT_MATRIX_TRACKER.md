@@ -264,6 +264,12 @@ SM120/SM121 per-tensor FP8 also supports prepared dense, dense split-KV and THD
 across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
+The nonpaged unsplit THD pointer host honors independent Q/K/V/O/Stats physical
+origins, INT32/INT64 offset tensors and per-port multipliers. Each buffer retains
+its own physical capacity, independently of live-token bounds. Prepared execution
+and the graph's standalone fallback bind the same offsets without staging copies.
+This requires a native extension with `supports_nonpaged_fp8_physical_origins`;
+the MXFP8 scale-layout contract is separate.
 SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry;
 a mask-free dense `S_kv` off the 128-key tile is served through the KV-tail mask like the f16 and per-tensor
 FP8 rows (#1425), the kernels replacing the tail tile's fully padded V scale blocks before BMM2.
