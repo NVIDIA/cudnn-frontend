@@ -1,5 +1,13 @@
 # FROST SDPA — support matrix
 
+**SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
+retain full groups that fit the 64-row tile, including nondividing groups.
+Larger groups use their greatest common divisor with 64 as a subgroup width;
+a width of one is declined. Native Q/O/Stats indexing follows the subgroup,
+while K/V addressing and runtime validation retain the full GQA ratio.
+Existing dense/paged, split, mask and sink eligibility remains in force;
+THD packing and quantized-query partial packing remain unsupported.
+
 **SM80 half PackGQA:** dense queries may pack heads sharing a KV head into
 native MMA rows, including groups that cross tile boundaries. Dense/paged KV,
 split-KV, masks, sinks, bias and independent Q/O/Stats strides use the existing
