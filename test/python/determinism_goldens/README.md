@@ -805,22 +805,23 @@ Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 direction without a separate lookup table. A test stops at its first mismatch;
 later checks in that case are not claimed as passes.
 
-### DSA: 97 cases
+### DSA: 101 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`:
-52 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
+56 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
 Each `TestDSA` case checks all returned forward tensors. Backward uses deterministic
 execution and checks dQ, the shared K/V latent gradient dKV, and dSink.
 The three `(heads, QK dimension, Top-K)` layouts are `(64,512,64)`,
-`(64,576,64)`, and `(128,512,128)`; `(96,576,64)` runs forward only. SM100
-H96 forward launches the H64 kernel on heads [0, 64) and [32, 96); H96
-backward is not in this suite. The 576-wide path uses all QK dimensions
+`(64,576,64)`, and `(128,512,128)`; `(96,576,64)` and `(128,576,64)` run
+forward only. SM100 H96 forward launches the H64 kernel on heads [0, 64) and
+[32, 96), and H128 D576 forward on [0, 64) and [64, 128); their backward is
+not in this suite. The 576-wide path uses all QK dimensions
 but only the first 512 KV dimensions for values.
 
 | Test method | Level | Parameters and purpose | Cases |
 | --- | --- | --- | ---: |
-| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts, and fprop × FP16/BF16 × H96; eight executions, input mutation check, numerical reference | 14 |
-| `test_batch_invariance` | L0 | Same fourteen combinations; each sequence alone, packed, reversed, and duplicated | 14 |
+| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts, and fprop × FP16/BF16 × H96 and H128 D576; eight executions, input mutation check, numerical reference | 16 |
+| `test_batch_invariance` | L0 | Same sixteen combinations; each sequence alone, packed, reversed, and duplicated | 16 |
 | `test_selection` | L0 | fprop/bprop × ragged lengths, invalid indices, empty rows, Top-K 65 tail, indexer prefix 512; replay, reference, batch checks | 10 |
 | `test_query_boundary` | L0 | fprop/bprop × H64 with 128/129/257 queries and H128 with 74/75 queries; four replays then batch checks | 10 |
 | `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring Q/KV values and Top-K selection while keeping the target fixed | 2 |
@@ -1087,6 +1088,20 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
 ```
+
+## SM100 H128 windowed sparse attention forward validation: 2026-11-11 (UTC)
+
+Change under test: `DSA.sparse_attention_forward_wrapper` accepts H128 D576,
+and H128 D512 with `indexer_topk=2048`, on SM100 by launching the H64 kernel
+on heads [0, 64) and [64, 128); `TestDSA` adds the forward-only
+`h128-d576-k64` layout (four cases). Source: this change on the H96 change
+above. Only the DSA suite was rerun.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| B300, SM103 (cc 10.3), 148 SMs | Torch `2.14.1+cu130`, CUDA `13.0`, driver API `13030`, cuDNN `92700`, CuTe DSL `4.8.1`, TVM FFI `0.1.15.post0`; key `55097120e8121c53` | **94 passed, 2 failed, 5 skipped**: the four H128 D576 and four H96 cases passed; five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+
+H128 D576 backward is outside this change and is not in this suite.
 
 ## SM100 H96 sparse attention forward validation: 2026-11-11 (UTC)
 

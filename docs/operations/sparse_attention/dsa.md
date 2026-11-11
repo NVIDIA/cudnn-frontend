@@ -26,7 +26,7 @@ operations.
 **Scope:** this module ships CuTe-DSL kernels for sparse-attention forward and
 backward, indexer scores/top-K, sparse/dense score recompute, and sparse/dense
 indexer backward. On SM90, sparse forward covers H16/H32/H64/H96/H128 Prefill;
-on SM100 it covers regular H64/H96 and small-top-k H128 Prefill. It does not
+on SM100 it covers regular H64/H96/H128 and small-top-k H128 Prefill. It does not
 include a decode or split-KV forward mode.
 
 The module packages the following operations:
@@ -193,6 +193,11 @@ attention sink participates only in the output denominator, not in any stats.
     both launches write identical bytes to heads `[32, 64)`.
   - SM100 H128 small-top-k Prefill: `D_qk=512`,
     `indexer_topk in {0, 512, 1024}`
+  - SM100 H128 otherwise (`D_qk=576`, or `D_qk=512` with `indexer_topk=2048`):
+    the H64 kernel runs twice, on the disjoint heads `[0, 64)` and `[64, 128)`,
+    and each head's bytes equal an H64 run on that window. For `D_qk=512`,
+    `indexer_topk=2048` therefore uses a different kernel than `{0, 512, 1024}`,
+    and results can differ in rounding between the two.
 - **Indexer prefix constraint** — `indexer_topk <= K`. When `topk_length` is
   present, a meaningful `lse_indexer` additionally requires
   `topk_length >= indexer_topk` for that row. Shorter rows retain the SM100
@@ -1502,8 +1507,8 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
 `DSA.sparse_attention` composes the existing native forward and backward
 wrappers, without FlashMLA. It accepts contiguous BF16 `q[S_q,H,D]`,
 `kv[S_kv,D]`, INT32 `indices[S_q,K]`, optional FP32 `attn_sink[H]`, and
-optional INT32 `topk_length[S_q]`, on one SM100 device. Supported pairs are
-H16/H32/H64 with D512/D576 and H128 with D512; output V dimension is 512.
+optional INT32 `topk_length[S_q]`, on one SM100 device. Supported heads are
+H16/H32/H64/H96/H128, each with D512 or D576; output V dimension is 512.
 H16/H32 forward explicitly pads heads to 64 and slices the result. This cost
 belongs to the semantic adapter and is included when benchmarking the call.
 Physical K and sequence extents must be positive. K is padded to 128 for launch.

@@ -13,8 +13,9 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import check_ref_dsa_sparse
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 ALLOWED_INF = {"max_logits": -torch.inf, "lse": torch.inf, "lse_indexer": torch.inf}
 SHAPES = {"h64-d512-k64": (64, 512, 64), "h64-d576-k64": (64, 576, 64), "h128-d512-k128": (128, 512, 128)}
-# SM100 H96 forward runs the H64 kernel on heads [0, 64) and [32, 96); this suite pins it forward only.
-FPROP_ONLY_SHAPES = {"h96-d576-k64": (96, 576, 64)}
+# SM100 H96 forward runs the H64 kernel on heads [0, 64) and [32, 96), and H128 D576 on [0, 64) and
+# [64, 128); this suite pins them forward only.
+FPROP_ONLY_SHAPES = {"h96-d576-k64": (96, 576, 64), "h128-d576-k64": (128, 576, 64)}
 
 
 def layout_cases():
