@@ -241,11 +241,15 @@ def test_independent_thd_origins_rebind_and_capture(
                 expected = expected * values["scale_o"].item()
             expected_stats = scores.logsumexp(-1).T * (math.log2(math.e) if log2_stats else 1)
             o_start, st_start = origins["o"][b], origins["stats"][b]
+            # P is also E5M2, with a two-bit mantissa. Match the existing
+            # test_fp8_sm120_e5m2 absolute budget. Compact parent/candidate and
+            # gapped candidate controls produce identical bytes and errors.
+            e5m2 = fp8 and dtype_name == "float8_e5m2"
             torch.testing.assert_close(
                 output[o_start : o_start + nq].double(),
                 expected,
-                atol=0.03 if fp8 else 0.025 if dtype_name == "bfloat16" else 0.004,
-                rtol=0.03 if fp8 else 0.02,
+                atol=0.1 if e5m2 else 0.03 if fp8 else 0.025 if dtype_name == "bfloat16" else 0.004,
+                rtol=0.0 if e5m2 else 0.03 if fp8 else 0.02,
             )
             torch.testing.assert_close(stats[st_start : st_start + nq].double(), expected_stats, atol=0.01 if fp8 else 0.003, rtol=0.01 if fp8 else 0.003)
             written_o[o_start : o_start + nq] = True
