@@ -37,7 +37,7 @@ from .common import (
     tf32,
     zero_fill,
 )
-from cudnn.frost.buffers import current_device_id, dtype_name as dtname
+from cudnn.frost.buffers import dtype_name as dtname
 
 ConstInt = ct.Constant[int]
 
@@ -2317,7 +2317,7 @@ def recompute_w_u_fwd(k, v, beta, A, g=None, cu_seqlens=None, chunk_indices=None
     ci_arg = chunk_indices
     autotuned_launch(
         recompute_w_u_fwd_kernel,
-        (H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), current_device_id()),
+        (H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype)),
         (NT, HV),
         (
             k,
@@ -2362,7 +2362,7 @@ def prepare_wy_repr_bwd(k, v, beta, A, dw, du, g=None, cu_seqlens=None, chunk_in
     ci_arg = chunk_indices
     autotuned_launch(
         prepare_wy_repr_bwd_kernel,
-        (H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype), current_device_id()),
+        (H, HV, K, V, BT, BK, BV, int(g is not None), str(k.dtype)),
         (NT, HV),
         (
             k,
@@ -2415,7 +2415,7 @@ def chunk_gated_delta_rule_fwd_intra(k, v, g=None, beta=None, cu_seqlens=None, c
     BC = 16
     autotuned_launch(
         chunk_gated_delta_rule_fwd_kkt_solve_kernel,
-        (H, HV, K, BT, BC, BK, int(g is not None), str(k.dtype), current_device_id()),
+        (H, HV, K, BT, BC, BK, int(g is not None), str(k.dtype)),
         (NT, HV),
         (
             k,
@@ -2517,7 +2517,6 @@ def chunk_gated_delta_rule_fwd_h(
             int(save_new_value),
             int(state_v_first),
             str(k.dtype),
-            current_device_id(),
         ),
         grid,
         (
@@ -2603,7 +2602,6 @@ def chunk_gated_delta_rule_bwd_dhu(
             int(gk is not None),
             int(state_v_first),
             str(q.dtype),
-            current_device_id(),
         ),
         grid,
         (
@@ -2691,7 +2689,6 @@ def chunk_fwd_o(
             int(g_gamma is not None),
             int(state_v_first),
             str(q.dtype),
-            current_device_id(),
         ),
         grid,
         (
@@ -2784,7 +2781,6 @@ def chunk_bwd_dqkwg(
             use_dw,
             int(state_v_first),
             str(q.dtype),
-            current_device_id(),
         ),
         grid,
         (
@@ -2863,7 +2859,6 @@ def chunk_bwd_dv_local(q, k, do, g=None, g_gamma=None, A=None, scale=None, cu_se
             int(g_gamma is not None),
             int(A is not None),
             str(q.dtype),
-            current_device_id(),
         ),
         grid,
         (
