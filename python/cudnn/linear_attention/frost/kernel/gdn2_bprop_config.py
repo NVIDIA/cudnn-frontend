@@ -44,8 +44,9 @@ class Cfg:
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_0: int = 128
-    NUM_REGS_COMPUTE_GROUP_1: int = 184
-    NUM_REGS_COMPUTE_GROUP_2: int = 144
+    NUM_REGS_COMPUTE_GROUP_1: int = 176
+    NUM_REGS_COMPUTE_GROUP_2: int = 152
+    NUM_REGS_SUMMARY_COMPUTE_GROUP_1: int = 184
     NUM_REGS_OTHER: int = 56
 
     THREADS_PER_WARP: int = 32

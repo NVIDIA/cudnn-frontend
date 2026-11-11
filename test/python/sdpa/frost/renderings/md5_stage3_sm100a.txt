@@ -1,0 +1,72 @@
+# PTX md5 of the SM100 d512 chain's stage-3 GEMM renderings (bwd/kernels/bprop_matmul_blackwell.py), CUTE_DSL_ARCH=sm_100a.
+# Consumed by test_sdpa_bwd_dsl_sm107.py::test_stage3_sm100_renderings_ptx_md5_match_the_recorded_develop_list, whose
+# `_SM100_PTX_PROBE` (S 1024, H 8, B 1, D 256; `MatmulTemplateParams(b_is_n_major=True, causal_gran=256, vec_bytes_epi=32,
+# **record)`) is the ONLY renderer this list is checked against: every md5 below was reproduced through that test in two
+# independent runs (the rendering is a host trace-compile; the test harness itself needs a CUDA device) -- the ten (512, 512)
+# MHA lines from the tree at d4b024671 (the base of every stage-3 edit on this branch, BEFORE any of them), every other line
+# from its first rendering on the branch that added it, as stated per kind below.
+#
+# Four kinds of line, stated separately because they prove different things:
+#   * the TEN base records (both operand majors x dense / causal / causal bottom-right 512 / THD bf16 + the dense fp16
+#     pair) are EXACTLY what `SdpaBwdDslSm100.compile` spells for its mm_lo / mm_hi records (no cgrp_tile_mn, no band
+#     field, b_head_group left at its default 1).  They pin the chain's DEFAULT renderings byte-for-byte: a source change
+#     that alters them changes what ships for every MHA backward.
+#   * the SIX `hi_*_gqa<g>` records (`b_head_group` = 4 / 8 / 16, dense and plain causal, causal_shift 0) are the
+#     template's `b_head_group > 1` arm rendered at the probe's constants.  That arm existed on develop (#1318, used by the
+#     cc 10.7 d256 chain); the SM100 adapter never spelled it before the port.  These six lines prove the arm renders
+#     deterministically for sm_100a at those constants and pin ITS text; they do NOT by themselves prove the chain's dQ
+#     record equals one of them -- the chain renders mm_hi with the stage-2 CFG's causal_gran, `vec_bytes_epi_for(d)` and
+#     the graph's causal_shift, so the GQA pins constrain the port only where it renders exactly this probe shape.  The
+#     chain-side proofs are test_sdpa_bwd_dsl_sm100.py's single-launch tests (record spy + bitwise twin + launch count).
+#   * the FOUR `*_thd_causal*` records are the THD causal K-trim renderings (`thd_varlen` with CAUSAL_K_LO / HI; the `_br`
+#     pair with `thd_causal_bottom_right`, the kernel reading each sequence's bottom-right diagonal from the metadata),
+#     which the SM100 chain renders for a packed causal graph since `api_dsl.THD_STAGE3_TRIM` (the template's THD arm,
+#     `_thd_causal_k_range`, is the cc 10.7 d256 chain's; the SM100 chain rendered THD untrimmed before).  Pinned from
+#     their first rendering on the tree that first produced them (two independent runs, identical), at the probe's
+#     constants.  The chain-side proofs are
+#     test_sdpa_bwd_thd_sm100.py's trim tests (record spy + bitwise untrimmed twin + per-sequence fp64 reference).
+#   * the `*_512x256` records are the (512, 256) row's renderings of the BSHD records the tile rule
+#     (`api_dsl._sm100_stage3_cgrp_tile_mn`) hands out by default at padded max(S_q, S_kv) <= 4096 on cc 10.0 .. 10.6 --
+#     the eight MHA ones rendered twice from the same tree + rule (identical; the ten (512, 512) lines re-rendered
+#     byte-identical alongside), the GQA `hi_*_gqa<g>_512x256` ones from their first (twice-identical) rendering on the
+#     integrated branch.  Which names must be here is DERIVED from the rule by
+#     test_stage3_md5_record_is_committed_and_complete (`_stage3_default_tiles`), not hand-kept.
+#
+# The PTX text is a function of the DSL build: the pin compares only when the installed DSL matches the `dsl=` line and
+# skips otherwise.  To refresh after a deliberate rendering change, run the consuming test with the new md5s written here
+# and state the provenance (tree, DSL, runs) in this header.
+dsl=nvidia-cutlass-dsl 4.7.0
+stage3_sm100 sm_100a lo_dense rc=0 ptx_md5=34bc834735dfa2216dd972bff483ff18
+stage3_sm100 sm_100a hi_dense rc=0 ptx_md5=e190516bf1e057043237b657b4772d86
+stage3_sm100 sm_100a lo_causal rc=0 ptx_md5=8c396e0f0fb56d706659027dd6c54e28
+stage3_sm100 sm_100a hi_causal rc=0 ptx_md5=558be611ef8a35c1ea7d3bf852c8618d
+stage3_sm100 sm_100a lo_causal_br512 rc=0 ptx_md5=bb13f7fa5cc5e610c425d44235b62934
+stage3_sm100 sm_100a hi_causal_br512 rc=0 ptx_md5=c8715d539b3a7f70cbf0656d6cb8c8b1
+stage3_sm100 sm_100a lo_thd rc=0 ptx_md5=2a72770425d4c3a3b4240e071b88a8c5
+stage3_sm100 sm_100a hi_thd rc=0 ptx_md5=df65855bb68092bd4d5c4610dae17748
+stage3_sm100 sm_100a lo_dense_fp16 rc=0 ptx_md5=55a9ed26ae049dd3b38e8607e025ecb8
+stage3_sm100 sm_100a hi_dense_fp16 rc=0 ptx_md5=5a205ffa0564265c03fef7d6762cd2d8
+stage3_sm100 sm_100a hi_dense_gqa4 rc=0 ptx_md5=07d9aea5e883b74270b0333ffa9a287a
+stage3_sm100 sm_100a hi_causal_gqa4 rc=0 ptx_md5=054cc75c5c119aa2c4042a94f551cd60
+stage3_sm100 sm_100a hi_dense_gqa8 rc=0 ptx_md5=9eeb2c299bd47e4a61056e96d3a46547
+stage3_sm100 sm_100a hi_causal_gqa8 rc=0 ptx_md5=316ba707d6e395f5a14ae4363a9178d5
+stage3_sm100 sm_100a hi_dense_gqa16 rc=0 ptx_md5=16533d02f933969bbde07093bc6b80c3
+stage3_sm100 sm_100a hi_causal_gqa16 rc=0 ptx_md5=98a15a9c8753ba176ca572744787d067
+stage3_sm100 sm_100a lo_thd_causal rc=0 ptx_md5=3be7a7af125294ca2f9400918cc3b8c3
+stage3_sm100 sm_100a hi_thd_causal rc=0 ptx_md5=92d93d164ce2a20579216226df10c92b
+stage3_sm100 sm_100a lo_thd_causal_br rc=0 ptx_md5=41ae7e90f365a984c367b70c277e409f
+stage3_sm100 sm_100a hi_thd_causal_br rc=0 ptx_md5=89424ae55d4d1ec4c7d6e9bb0c129951
+stage3_sm100 sm_100a lo_dense_512x256 rc=0 ptx_md5=a33a6f01a4a1a253cb967cab3dc8caae
+stage3_sm100 sm_100a hi_dense_512x256 rc=0 ptx_md5=0637284273b71c6eb5087d2946ca6aa2
+stage3_sm100 sm_100a lo_causal_512x256 rc=0 ptx_md5=39c6beb1c7d01a4bb3badfd711ab6c25
+stage3_sm100 sm_100a hi_causal_512x256 rc=0 ptx_md5=69088f92ac7ac7761c4663be2b569d9c
+stage3_sm100 sm_100a lo_causal_br512_512x256 rc=0 ptx_md5=e4d06a669b8bf26ec26052633b8877c0
+stage3_sm100 sm_100a hi_causal_br512_512x256 rc=0 ptx_md5=944eccd0a7991052c9d143e31848a1d5
+stage3_sm100 sm_100a lo_dense_fp16_512x256 rc=0 ptx_md5=a96d5f731334340db5d03747ce6404c5
+stage3_sm100 sm_100a hi_dense_fp16_512x256 rc=0 ptx_md5=692ad5656537cc45b7c601d3dfba930d
+stage3_sm100 sm_100a hi_dense_gqa4_512x256 rc=0 ptx_md5=7461d4029b665d50df90579884e96ec8
+stage3_sm100 sm_100a hi_causal_gqa4_512x256 rc=0 ptx_md5=f814f316c8ea84d74870274c17a01398
+stage3_sm100 sm_100a hi_dense_gqa8_512x256 rc=0 ptx_md5=c7f8edb03bd9ee0c1dc4eaa1db97861f
+stage3_sm100 sm_100a hi_causal_gqa8_512x256 rc=0 ptx_md5=7170e98732a9345826e6195b62c5ff5d
+stage3_sm100 sm_100a hi_dense_gqa16_512x256 rc=0 ptx_md5=2914e1abc2bbcfe1f4445f970a28a9a9
+stage3_sm100 sm_100a hi_causal_gqa16_512x256 rc=0 ptx_md5=72350e1625b578b6883aec4b9904877d

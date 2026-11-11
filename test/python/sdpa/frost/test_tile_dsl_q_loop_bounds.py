@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Pins ``tile_dsl.mask.compute_q_loop_bounds`` / ``swa_kv_lo_tile`` (the SM80
-backward's Q-loop bounds and deterministic-relay origin) against a host replica
-of the arithmetic they replaced, over every mask family, alignment and the
-bottom-right / right-band variants.  A probe kernel evaluates the helpers for
-every kv tile; the reference is plain Python on the same inputs."""
+backward's Q-loop bounds and the forward's KV-loop lower bound) against a host
+replica of the arithmetic they replaced, over every mask family, alignment and
+the bottom-right / right-band variants, and ``q_tile_kv_hi`` (the deterministic
+dQ relay's first visitor) against the brute-force visitor set those bounds
+imply.  Probe kernels evaluate the helpers; the reference is plain Python on the
+same inputs."""
 
 import pytest
 import torch
@@ -22,7 +24,7 @@ if _dsl_installed():
     from cutlass.base_dsl.typing import Pointer
     from cutlass.cute.runtime import from_dlpack
 
-    from cudnn.frost.tile_dsl.mask import compute_q_loop_bounds, swa_kv_lo_tile
+    from cudnn.frost.tile_dsl.mask import compute_q_loop_bounds, q_tile_kv_hi, swa_kv_lo_tile
 
     @cute.kernel
     def _probe_kernel(
@@ -54,6 +56,44 @@ if _dsl_installed():
             (base + cutlass.Int32(2)).store(kv_first, alignment=4)
 
     _probe_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.kernel
+    def _probe_kv_hi_kernel(
+        out_t: cute.Tensor,
+        seqlen_q: cutlass.Int32,
+        seq_kv_len: cutlass.Int32,
+        kv_last: cutlass.Int32,
+        window_right: cutlass.Int32,
+        mask_flags: cutlass.Constexpr[int],
+        tile_q: cutlass.Constexpr[int],
+        tile_kv: cutlass.Constexpr[int],
+        bottom_right: cutlass.Constexpr[bool],
+    ):
+        bx, _, _ = cute.arch.block_idx()
+        tidx, _, _ = cute.arch.thread_idx()
+        if tidx == cutlass.Int32(0):
+            hi = q_tile_kv_hi(bx, seqlen_q, seq_kv_len, kv_last, mask_flags, tile_q, tile_kv, bottom_right, window_right)
+            (Pointer(out_t.iterator.raw_ptr(), dtype=cutlass.Int32) + bx).store(hi, alignment=4)
+
+    _probe_kv_hi_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    @cute.jit
+    def _probe_kv_hi_host(
+        out_t,
+        seqlen_q,
+        seq_kv_len,
+        kv_last,
+        window_right,
+        n_q,
+        mask_flags: cutlass.Constexpr[int],
+        tile_q: cutlass.Constexpr[int],
+        tile_kv: cutlass.Constexpr[int],
+        bottom_right: cutlass.Constexpr[bool],
+        stream,
+    ):
+        _probe_kv_hi_kernel(out_t, seqlen_q, seq_kv_len, kv_last, window_right, mask_flags, tile_q, tile_kv, bottom_right).launch(
+            grid=(n_q, 1, 1), block=(32, 1, 1), stream=stream
+        )
 
     @cute.jit
     def _probe_host(
@@ -157,3 +197,60 @@ def test_q_loop_bounds_match_reference(case):
         assert max(g_hi - g_lo, 0) == n_iters, (kv_tile, g_hi, g_lo, n_iters)
         q_row0 = kv_tile * tile_q + ((s_kv - s_q) if bottom_right else 0)
         assert g_first == _ref_kv_first(q_row0, window_left=window_left, tile_kv=tile_kv), (kv_tile, g_first)
+
+
+@pytest.mark.parametrize("kv_cap", [0, 2], ids=["all_kv_live", "last_two_kv_skipped"])
+@pytest.mark.parametrize("case", _CASES, ids=[f"m{c[0]}-W{c[1]}-br{int(c[2])}-R{c[3]}-tq{c[4]}-{c[6]}x{c[7]}" for c in _CASES])
+def test_q_tile_kv_hi_is_the_highest_visitor(case, kv_cap):
+    """The deterministic relay hands each q tile's dQ slot down from
+    ``q_tile_kv_hi``; it must be the top of a CONTIGUOUS visitor set, or a
+    visitor waits for a turn that never comes.  ``kv_cap`` skips trailing kv
+    tiles the way THD skips tiles past a sequence's KV length."""
+    mask_flags, window_left, bottom_right, window_right, tile_q, tile_kv, s_q, s_kv = case
+    dev = torch.device("cuda")
+    n_kv = -(-s_kv // tile_kv)
+    n_q = -(-s_q // tile_q)
+    kv_last = n_kv - 1 - kv_cap
+    out = torch.full((n_q,), -7, dtype=torch.int32, device=dev)
+    stream = _cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
+    args = (
+        from_dlpack(out, assumed_align=16),
+        cutlass.Int32(s_q),
+        cutlass.Int32(s_kv),
+        cutlass.Int32(kv_last),
+        cutlass.Int32(window_right),
+        cutlass.Int32(n_q),
+        int(mask_flags),
+        int(tile_q),
+        int(tile_kv),
+        bool(bottom_right),
+        stream,
+    )
+    runtime = tuple(a for a in args if not isinstance(a, (int, bool)) or isinstance(a, cutlass.Int32))
+    cute.compile(_probe_kv_hi_host, *args)(*runtime)
+    torch.cuda.synchronize()
+    got = out.cpu().tolist()
+    bounds = [
+        _ref_bounds(
+            k * tile_kv,
+            s_q=s_q,
+            s_kv=s_kv,
+            n_q_tiles=n_q,
+            window_left=window_left,
+            mask_flags=mask_flags,
+            tile_q=tile_q,
+            tile_kv=tile_kv,
+            bottom_right=bottom_right,
+            window_right=window_right,
+        )
+        for k in range(kv_last + 1)
+    ]
+    checked = 0
+    for j in range(n_q):
+        visitors = [k for k, (lo, n_iters) in enumerate(bounds) if lo <= j < lo + n_iters]
+        if not visitors:
+            continue
+        assert visitors == list(range(visitors[0], visitors[-1] + 1)), (j, visitors)
+        assert got[j] == visitors[-1], (j, got[j], visitors)
+        checked += 1
+    assert checked, "no q tile had a visitor; the case does not exercise the relay"

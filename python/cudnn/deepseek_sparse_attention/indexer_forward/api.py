@@ -5,9 +5,10 @@
 
 ``indexer_forward_wrapper`` produces dense indexer scores Q @ K^T with
 per-head ReLU, weighted head reduction, and a ratio causal mask.
-``indexer_forward_top_k_wrapper`` is the SM100 combined path that generates
-compact scores, selects Top-K, and optionally computes Top-K softmax without
-materializing the dense score tensor.
+``indexer_forward_top_k_wrapper`` generates compact scores, selects Top-K, and
+optionally computes Top-K softmax without materializing the dense score tensor.
+SM90 currently serves the validated packed-THD ratio-4 configuration; SM100+
+retains its existing BSHD/THD and block-scaled paths.
 """
 
 from __future__ import annotations
@@ -19,12 +20,12 @@ import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
 
-from cudnn.deepseek_sparse_attention.utils.runtime import device_major
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability, device_major
+from cudnn.tensor_adapter import has_tcgen05
 
-from ._interface import indexer_fwd as indexer_fwd_sm100
+from ._interface import TMA_ALIGN_ELEMS, _indexer_fwd_bound, indexer_fwd as indexer_fwd_sm100
 from ._interface_sm90 import indexer_fwd as indexer_fwd_sm90
-
-TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
+from ._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
 
 
 class IndexerForward(APIBase):
@@ -32,6 +33,13 @@ class IndexerForward(APIBase):
 
     The backend interface owns lazy compilation and its kernel cache. Hopper
     dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
+
+    ``sample_out`` / the ``out`` passed to ``execute()`` is the contiguous
+    padded ``(B, S_q, S_k_padded)`` allocation (``S_k_padded % 4 == 0``);
+    ``execute()`` binds ``out[..., :S_k]`` to the kernel directly, so the row
+    stride stays ``S_k_padded`` and columns ``[S_k, S_k_padded)`` are never
+    written. Q/K/W must have a unit innermost stride; other layouts are
+    declined in ``check_support()`` (Rule 2 / R5) rather than copied.
     """
 
     def __init__(
@@ -39,7 +47,7 @@ class IndexerForward(APIBase):
         sample_q: torch.Tensor,  # (B, S_q, H_q, D) BF16
         sample_k: torch.Tensor,  # (B, S_k, H_kv, D) BF16
         sample_w: torch.Tensor,  # (B, S_q, H_q) BF16 or FP32
-        sample_out: torch.Tensor,  # (B, S_q, S_k_padded) FP32
+        sample_out: torch.Tensor,  # (B, S_q, S_k_padded) FP32, contiguous
         ratio: int = 4,
         qhead_per_kv_head: Optional[int] = None,
         m_block_size: int = 128,
@@ -101,6 +109,10 @@ class IndexerForward(APIBase):
             d != 128,
             f"IndexerForward is tuned for head_dim=128 only, got {d}",
         )
+        self._value_error_if(
+            self.m_block_size != 128,
+            f"IndexerForward packs a 128-row (token, head) tile for every head group; m_block_size must be 128, got {self.m_block_size}",
+        )
 
         qhpkv = self.qhead_per_kv_head if self.qhead_per_kv_head is not None else (h_q // h_kv)
         self._value_error_if(
@@ -108,8 +120,8 @@ class IndexerForward(APIBase):
             f"qhead_per_kv_head * h_kv != h_q ({qhpkv} * {h_kv} != {h_q})",
         )
         self._value_error_if(
-            qhpkv not in (32, 64),
-            f"qhead_per_kv_head must be 32 or 64, got {qhpkv}",
+            qhpkv not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
+            f"qhead_per_kv_head must be one of {SUPPORTED_QHEAD_PER_KV_HEAD_BF16}, got {qhpkv}",
         )
         self.qhead_per_kv_head = qhpkv
 
@@ -120,6 +132,16 @@ class IndexerForward(APIBase):
             raise NotImplementedError(f"FP32 W requires unit last stride, got strides {self.w_desc.stride}")
         self._check_dtype(self.o_desc, torch.float32, name="Out")
 
+        for desc, name in ((self.q_desc, "Q"), (self.k_desc, "K"), (self.w_desc, "W")):
+            self._not_implemented_error_if(
+                desc.stride[-1] != 1,
+                f"IndexerForward reads {name} with a unit innermost stride natively; got strides {desc.stride}",
+            )
+        # The padded allocation; execute() binds its [..., :S_k] view directly.
+        self._not_implemented_error_if(
+            not self.o_desc.is_contiguous(),
+            f"IndexerForward writes Out through a contiguous (B, S_q, S_k_padded) buffer; got strides {self.o_desc.stride}",
+        )
         self._value_error_if(
             s_k_padded_from_out % TMA_ALIGN_ELEMS != 0,
             f"Out seqlen_k dim must be a multiple of {TMA_ALIGN_ELEMS}, got {s_k_padded_from_out}",
@@ -131,8 +153,8 @@ class IndexerForward(APIBase):
 
         major = device_major()
         self._runtime_error_if(
-            major < 10,
-            f"IndexerForward requires SM100+ compute capability, found SM{major}",
+            not has_tcgen05(major),
+            f"IndexerForward requires SM100+ compute capability with tcgen05 (not cc 12.x), found SM{major}",
         )
 
         self.batch_size = b
@@ -166,12 +188,16 @@ class IndexerForward(APIBase):
             raise ValueError("IndexerForward kernel not compiled")
         self._check_dtype(w, self.w_desc.dtype, name="W")
 
-        # APIBase callers provide a TMA-aligned output allocation, while the
-        # shared interface describes only the logical K columns. Passing the
-        # logical view lets the interface manage any internal padded buffer
-        # without exposing padded columns as scores.
+        # `out` is the padded (B, S_q, S_k_padded) allocation the descriptor
+        # promised; the kernel binds the [..., :S_k] view with that row stride
+        # (no staging, no copy-back). _indexer_fwd_bound re-checks the live strides.
+        padded_shape = (self.batch_size, self.s_q, self.s_k_padded)
+        if tuple(out.shape) != padded_shape or not out.is_contiguous():
+            raise ValueError(
+                f"out must be the contiguous {padded_shape} fp32 allocation declared to IndexerForward; got shape {tuple(out.shape)}, strides {tuple(out.stride())}"
+            )
         logical_out = out[..., : self.s_k]
-        indexer_fwd_sm100(
+        _indexer_fwd_bound(
             q,
             k,
             w,
@@ -214,18 +240,46 @@ def indexer_forward_wrapper(
     sf_vec_size: int = 32,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
     With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
+    The block-scaled SM100 precisions take BF16 W and blockscaled-packed E8M0
+    ``q_scale`` / ``k_scale``, one scale per 32 head_dim values (``head_dim // 32``
+    per row): ``'mxfp8'`` (E4M3 Q/K) or ``'mxfp4'`` (``float4_e2m1fn_x2`` Q/K with
+    last dim ``head_dim // 2``, still ``head_dim // 32`` scales per row).
+    SM90 offers ``'fp8'`` with per-token scales instead.
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
     specify the global uncompressed token index for each batch/THD segment's
     local q[0].
+
+    ``block_table`` ((B, max_pages) int32) with ``kv_lens`` ((B,) int32) reads
+    ``k`` as a page pool ``(num_pages, page_size, 1, D)`` or
+    ``(num_pages, page_size, D)`` (SM100, BF16, ``page_size`` a multiple of 8
+    that divides 128 or is a multiple of it): sequence ``b`` owns pages
+    ``block_table[b, :ceil(kv_lens[b] / page_size)]`` and scores its first
+    ``kv_lens[b]`` keys; ``cu_seqlens_k`` must be ``None`` and the score width
+    is ``max_seqlen_k`` (default ``max_pages * page_size``).
+
+    On SM100 the kernel writes a ``(B, S_q, ceil4(S_k))`` (THD:
+    ``(total_q, ceil4(max_seqlen_k))``) padded buffer through its ``[..., :S_k]``
+    view. The wrapper keeps the torch-op contract on top of that: a returned
+    ``scores`` is contiguous (one copy when ``S_k % 4 != 0``), and a
+    caller-provided ``out`` of the logical shape is filled whatever its layout
+    (a padded-stride view is bound directly; anything else is staged and copied
+    back, so the caller's tensor keeps its identity). Strided ``q``/``k``/``w``/
+    scales are made contiguous here on the launch stream as a torch-op
+    convenience (one copy kernel each). ``IndexerForward`` itself declines all
+    of that in ``check_support()`` and binds only a padded-stride ``out``.
     """
     if device_major() == 9:
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
-            raise NotImplementedError("MXFP8 scale padded cu_seqlens are only supported on SM100+")
+            raise NotImplementedError("Block-scale padded cu_seqlens are only supported on SM100+")
+        if block_table is not None or kv_lens is not None:
+            raise NotImplementedError("paged K is only supported on SM100+")
         unsupported = []
         if m_block_size != 128:
             unsupported.append(f"m_block_size={m_block_size}")
@@ -270,10 +324,9 @@ def indexer_forward_wrapper(
     if return_lse or lse_out is not None:
         raise NotImplementedError("SM100 dense indexer forward does not expose LSE; " "LSE is produced by dense_indexer_score_recompute_wrapper")
 
-    # BSHD and THD both go through indexer_fwd (it branches on cu_seqlens
-    # internally): it owns output allocation + TMA padding and uses a single
-    # shape-agnostic compile cache. cu_seqlens_q/k / max_seqlen_q/k are None for
-    # BSHD; seqlen is then derived from the tensor shapes at runtime.
+    # indexer_fwd is the dense convenience entry: it normalises strided inputs,
+    # allocates / stages `out` and returns the torch-op layout, all on `stream`.
+    # BSHD and THD both go through it (it branches on cu_seqlens internally).
     scores = indexer_fwd_sm100(
         q,
         k,
@@ -298,6 +351,8 @@ def indexer_forward_wrapper(
         cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
         cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         sf_vec_size=sf_vec_size,
+        block_table=block_table,
+        kv_lens=kv_lens,
         current_stream=stream,
     )
     return TupleDict(scores=scores)
@@ -338,18 +393,30 @@ def indexer_forward_top_k_wrapper(
     out_logits: Optional[torch.Tensor] = None,
     cand_batch_offsets: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    kv_lens: Optional[torch.Tensor] = None,
 ) -> TupleDict:
-    """Combined SM100 indexer score generation and Top-K selection API.
+    """Combined indexer score generation and Top-K selection API.
 
-    With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
+    With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32;
+    ``'mxfp8'`` and ``'mxfp4'`` take block-scaled Q/K and BF16 W as in
+    :func:`indexer_forward_wrapper`.
     Returns ``{'indices', 'logits', 'softmax'}`` by default, plus ``'lse'``
     when requested. Set ``return_softmax=False`` to return only indices and
     logits. Unlike :func:`indexer_forward_wrapper`, this path never
     materializes the dense score tensor.
 
+    On SM90, the validated path is contiguous packed THD with ``ratio=4``,
+    ``head_dim=128``, one KV head, and 64 query heads. It accepts BF16 Q/K
+    with BF16 or FP32 W, or E4M3 FP8 Q/K with contiguous FP32 per-token/head
+    ``q_scale``/``k_scale`` and BF16 W. SM90 declines BSHD, MXFP8/MXFP4,
+    paged K, explicit microbatching, non-default tuning, and other SM9x
+    capabilities. Those restrictions do not change the SM100+ path.
+
     BSHD outputs have shape ``(B, S_q, top_k)`` and THD outputs have shape
-    ``(total_q, top_k)``. Caller-owned candidate and output buffers may be
-    supplied to avoid per-call allocation. Indices are global KV ids by
+    ``(total_q, top_k)``. Rows with fewer candidates pad indices with ``-1``,
+    logits with ``-inf``, and softmax with zero. Caller-owned candidate and
+    output buffers may be supplied to avoid per-call allocation. Indices are global KV ids by
     default; set ``topk_indices_global=False`` for local ids matching
     ``indexer_top_k_wrapper``, and use the same convention downstream. Local
     ids also avoid conversion temporaries when a fully preallocated CUDA-graph
@@ -360,48 +427,117 @@ def indexer_forward_top_k_wrapper(
     Set ``deterministic=True`` to resolve exact-value ties at the K-th boundary
     toward the smallest local KV indices. This makes the selected set
     reproducible, although output slot order remains unspecified.
-    """
-    if device_major() < 10:
-        raise NotImplementedError("compressed indexer forward is SM100-only; standalone IndexerTopK remains SM90+")
 
-    result = indexer_fwd_sm100(
-        q,
-        k,
-        w,
-        ratio=ratio,
-        qhead_per_kv_head=qhead_per_kv_head,
-        m_block_size=m_block_size,
-        n_block_size=n_block_size,
-        num_threads=384,
-        q_stage=q_stage,
-        kv_stage=kv_stage,
-        sm_scale=sm_scale,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        q_causal_offsets=q_causal_offsets,
-        precision=precision,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
-        cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
-        sf_vec_size=sf_vec_size,
-        is_compressed_logits=True,
-        topk=top_k,
-        microbatch_rows=microbatch_rows,
-        topk_indices_global=topk_indices_global,
-        cand_buffer=cand_buffer,
-        out_indices=out_indices,
-        out_logits=out_logits,
-        cand_batch_offsets=cand_batch_offsets,
-        return_lse=return_lse,
-        lse_out=lse_out,
-        return_softmax=return_softmax,
-        softmax_out=softmax_out,
-        deterministic=deterministic,
-        current_stream=stream,
-    )
+    SM90 CUDA Graph capture requires an eager warmup plus caller-owned
+    ``cand_batch_offsets``, ``cand_buffer``, output buffers, and any requested
+    softmax/LSE buffer; use ``topk_indices_global=False``. The capture body then
+    performs only the prepared score and Top-K launches: no JIT, allocation,
+    host synchronization, or device-prefix read. Size the candidate buffer with
+    :func:`compress_topk_cand_buffer_size_thd`; keep every input and output alive
+    through stream completion, provide contiguous outputs, and do not overlap
+    writable buffers with each other or with inputs. Allocations made by the
+    ordinary wrapper are ordered on ``stream``.
+
+    ``block_table`` ((B, max_pages) int32) with ``kv_lens`` ((B,) int32) reads
+    ``k`` as a page pool ``(num_pages, page_size, 1, D)`` or
+    ``(num_pages, page_size, D)`` (BF16, ``page_size`` a multiple of 8 that
+    divides 128 or is a multiple of it): sequence ``b`` owns pages
+    ``block_table[b, :ceil(kv_lens[b] / page_size)]`` and scores its first
+    ``kv_lens[b]`` keys. ``cu_seqlens_k`` must be ``None``, and the ids are
+    local, so pass ``topk_indices_global=False``.
+    """
+    capability = device_capability(q.device)
+    major = capability[0]
+    if capability == (9, 0):
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise NotImplementedError("SM90 compressed indexer forward currently supports packed THD only")
+        if max_seqlen_q is None or max_seqlen_k is None:
+            raise ValueError("SM90 packed THD compressed indexer forward requires max_seqlen_q and max_seqlen_k")
+        if (m_block_size, n_block_size, q_stage, kv_stage) != (128, 128, 2, 4):
+            raise NotImplementedError(
+                "SM90 compressed indexer forward supports the default tuning only: " "m_block_size=128, n_block_size=128, q_stage=2, kv_stage=4"
+            )
+        if microbatch_rows not in (-1, 0):
+            raise NotImplementedError("SM90 packed THD compressed indexer forward does not support microbatch_rows > 0")
+        if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
+            raise NotImplementedError("SM90 uses per-token FP8 scales and does not accept block-scale padded prefixes")
+        if sf_vec_size != 32:
+            raise NotImplementedError("sf_vec_size is a block-scaled SM100 option and must remain 32 on SM90")
+        if block_table is not None or kv_lens is not None:
+            raise NotImplementedError("paged K is not supported by the initial SM90 compressed indexer path")
+        from ._compressed_top_k_sm90 import indexer_fwd_compress_topk_sm90
+
+        result = indexer_fwd_compress_topk_sm90(
+            q,
+            k,
+            w,
+            top_k,
+            ratio,
+            qhead_per_kv_head,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            int(max_seqlen_q),
+            int(max_seqlen_k),
+            sm_scale=sm_scale,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            topk_indices_global=topk_indices_global,
+            cand_buffer=cand_buffer,
+            out_indices=out_indices,
+            out_logits=out_logits,
+            cand_batch_offsets=cand_batch_offsets,
+            q_causal_offsets=q_causal_offsets,
+            return_softmax=return_softmax,
+            softmax_out=softmax_out,
+            return_lse=return_lse,
+            lse_out=lse_out,
+            deterministic=deterministic,
+            stream=stream,
+        )
+    elif major < 10:
+        raise NotImplementedError(f"compressed indexer forward requires SM90 or SM100+, got compute capability {capability}")
+    else:
+        result = indexer_fwd_sm100(
+            q,
+            k,
+            w,
+            ratio=ratio,
+            qhead_per_kv_head=qhead_per_kv_head,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            num_threads=384,
+            q_stage=q_stage,
+            kv_stage=kv_stage,
+            sm_scale=sm_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+            sf_vec_size=sf_vec_size,
+            is_compressed_logits=True,
+            topk=top_k,
+            microbatch_rows=microbatch_rows,
+            topk_indices_global=topk_indices_global,
+            cand_buffer=cand_buffer,
+            out_indices=out_indices,
+            out_logits=out_logits,
+            cand_batch_offsets=cand_batch_offsets,
+            return_lse=return_lse,
+            lse_out=lse_out,
+            return_softmax=return_softmax,
+            softmax_out=softmax_out,
+            deterministic=deterministic,
+            block_table=block_table,
+            kv_lens=kv_lens,
+            current_stream=stream,
+        )
 
     want_softmax = (return_softmax is not False) or softmax_out is not None
     want_lse = return_lse or lse_out is not None

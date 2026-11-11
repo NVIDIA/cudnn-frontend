@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Prepared block-scaled outputs retain physical byte addressing."""
 
+import sdpa_binding_reference as binding_reference
+
 import math
 import json
 import os
@@ -83,14 +85,14 @@ print(json.dumps(dict(digest=expected, stats=compiled_cache.stats())))
 
 
 def _fp8_case(
-    block, *, plane_stride=None, mxfp8=False, stats=False, dtype=torch.float8_e4m3fn, scale_o=True, amax=True, b=2, h=1, sq=128, skv=128, staged=False
+    block, *, plane_stride=None, mxfp8=False, stats=False, dtype=torch.float8_e4m3fn, scale_o=True, amax=True, b=2, h=1, sq=128, skv=128, strided=False
 ):
     cc = torch.cuda.get_device_capability()
     arch = "sm107" if cc == (10, 7) else "sm100" if cc in ((10, 0), (10, 3)) else "sm120"
     if cc not in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
         pytest.skip("block-scaled output needs a supported Blackwell or Rubin GPU")
-    if mxfp8 and cc[0] == 12:
-        pytest.skip("SM120 has no MXFP8 input engine")
+    if mxfp8 and cc[0] == 12 and block == 16:
+        pytest.skip("SM120 MXFP8 serves the MXFP8 (32-element) O only; the NVFP4 O is per-tensor only")
     generator = torch.Generator(device="cuda").manual_seed(397)
     d = 128
     cols = d // block
@@ -100,8 +102,8 @@ def _fp8_case(
     vp, ts = {}, {}
     for name, seq in (("q", sq), ("k", skv), ("v", skv)):
         buf = (torch.randn(b, seq, h, d, device="cuda", generator=generator) * 0.4).to(dtype).transpose(1, 2)
-        if staged:
-            padded = torch.full((b, seq, h, d + 1), 12, device="cuda", dtype=dtype)
+        if strided:
+            padded = torch.full((b, seq, h, d + 16), 12, device="cuda", dtype=dtype)
             padded[..., :d].copy_(buf.transpose(1, 2))
             buf = padded[..., :d].transpose(1, 2)
         ts[name] = g.tensor_like(buf)
@@ -144,9 +146,9 @@ def _fp8_case(
     o.set_output(True).set_dim([b, h, sq, d]).set_stride([sq * h * d, d, h * d, 1])
     o.set_data_type(cudnn.data_type.FP4_E2M1 if block == 16 else cudnn.data_type.FP8_E4M3)
     output = torch.empty((b, sq, h, d // (2 if block == 16 else 1)), device="cuda", dtype=torch.uint8 if block == 16 else torch.float8_e4m3fn).transpose(1, 2)
-    if staged:
+    if strided:
         pack = 2 if block == 16 else 1
-        padded = torch.full((b, sq, h, d // pack + 1), 12, device="cuda", dtype=output.dtype)
+        padded = torch.full((b, sq, h, d // pack + 16), 12, device="cuda", dtype=output.dtype)
         output = padded[..., : d // pack].transpose(1, 2)
         o.set_stride([stride * pack if axis != 3 else 1 for axis, stride in enumerate(output.stride())])
     amax_buf = None
@@ -166,7 +168,7 @@ def _fp8_case(
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
-    assert (g._compiled_plans[g._plan_index]._prepared is None) == staged
+    assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     ts.update(o=o, sf_o=sf_t)
     return g, vp, ws, output.view(torch.uint8), sf, amax_buf, ts
@@ -285,7 +287,7 @@ def _sf_output_facts():
 @pytest.mark.L0
 @pytest.mark.parametrize("bad", ["short", "logical_only", "alignment", "null", "device", "width", "gap", "overlap", "missing", "alias"])
 def test_block_scaled_sf_rejects_bad_runtime_facts_after_cache_warmup(bad):
-    from cudnn.sdpa.fwd.prepared import _bind_block_output
+    from sdpa_binding_reference import _bind_block_output
 
     spec, facts = _sf_output_facts()
     assert _bind_block_output(spec, facts) == facts["sf_o"].ptr
@@ -313,7 +315,7 @@ def test_block_scaled_sf_rejects_bad_runtime_facts_after_cache_warmup(bad):
 @pytest.mark.L0
 @pytest.mark.parametrize("span", [3072, -1])
 def test_block_scaled_sf_token_major_uses_observed_capacity(span):
-    from cudnn.sdpa.fwd.prepared import _bind_block_output
+    from sdpa_binding_reference import _bind_block_output
 
     spec, facts = _sf_output_facts()
     sf = facts["sf_o"]
@@ -348,7 +350,8 @@ def test_block_scaled_graph_and_adapter_bind_same_frame(block, mxfp8, has_scale,
 @pytest.mark.L0
 @pytest.mark.parametrize("has_scale", [False, True])
 def test_block_scaled_mxfp8_scale_presence_matches_compilation(has_scale, monkeypatch):
-    from cudnn.sdpa.fwd.prepared import execute_quantized, facts_of_tensor
+    from cudnn.sdpa.fwd.prepared import facts_of_tensor
+    from sdpa_binding_reference import execute_quantized
 
     g, vp, ws, _, _, _, tensors = _fp8_case(32, mxfp8=True, scale_o=has_scale)
     spec = g._compiled_plans[g._plan_index]._prepared.spec
@@ -407,10 +410,10 @@ def test_block_output_workspace_rejects_sf_atom_padding_overlap(span, offset, mo
     def bind(*args, **kwargs):
         raise ReachedBinding
 
-    monkeypatch.setattr(prepared, "bind_dense", bind)
+    monkeypatch.setattr(binding_reference, "bind_dense", bind)
     # Adjacent workspace reaches binding; padded-region overlap is rejected
     # before any kernel/initialization is possible, for both raw and known spans.
     error = ReachedBinding if offset == 3072 else ValueError
     match = None if offset == 3072 else "workspace overlaps sf_o"
     with pytest.raises(error, match=match):
-        prepared.execute_quantized(spec, facts, facts["sf_o"].ptr + offset, None, 0)
+        binding_reference.execute_quantized(spec, facts, facts["sf_o"].ptr + offset, None, 0)

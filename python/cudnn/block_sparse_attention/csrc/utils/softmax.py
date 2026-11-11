@@ -12,6 +12,9 @@ from cudnn.block_sparse_attention.csrc.utils import layout_utils
 from . import kernel_utils as utils
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 
+# |max * c| below which the softmax FFMA stays max-centered to 2^-14.
+FFMA_MAX_SCALED_ABS = 2048.0
+
 
 @dataclass
 class Softmax(ParamsBase):
@@ -154,15 +157,27 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         row_max: Float32,
+        always_center: cutlass.Constexpr[bool] = False,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        row_max_scaled = row_max * self.scale_log2
-        for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
-            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
-                (self.scale_log2, self.scale_log2),
-                (-row_max_scaled, -row_max_scaled),
-            )
+        if cutlass.const_expr(always_center):
+            for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+                acc_S_row[i], acc_S_row[i + 1] = cute.arch.sub_packed_f32x2((acc_S_row[i], acc_S_row[i + 1]), (row_max, row_max))
+                acc_S_row[i], acc_S_row[i + 1] = cute.arch.mul_packed_f32x2((acc_S_row[i], acc_S_row[i + 1]), (self.scale_log2, self.scale_log2))
+        else:
+            row_max_scaled = row_max * self.scale_log2
+            neg_row_max_scaled = -row_max_scaled
+            # Beyond FFMA_MAX_SCALED_ABS the warp subtracts max first, exact at the max; the vote needs a converged warp.
+            if cute.arch.vote_any_sync(cute.math.absf(row_max_scaled) >= FFMA_MAX_SCALED_ABS):
+                neg_row_max_scaled = Float32(0.0)
+                for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+                    acc_S_row[i], acc_S_row[i + 1] = cute.arch.sub_packed_f32x2((acc_S_row[i], acc_S_row[i + 1]), (row_max, row_max))
+            for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
+                acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
+                    (acc_S_row[i], acc_S_row[i + 1]),
+                    (self.scale_log2, self.scale_log2),
+                    (neg_row_max_scaled, neg_row_max_scaled),
+                )
 
     @cute.jit
     def apply_exp2_convert(

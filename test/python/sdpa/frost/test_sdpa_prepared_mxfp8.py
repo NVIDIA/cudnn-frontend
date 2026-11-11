@@ -37,6 +37,7 @@ def _case(
     explicit_plan=False,
     gate=None,
     padded_stats=False,
+    independent_o_offsets=False,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -48,7 +49,7 @@ def _case(
     )
     buffers, tensors, vp = {}, {}, {}
     input_type = cudnn.data_type.FP8_E4M3 if dtype == torch.float8_e4m3fn else cudnn.data_type.FP8_E5M2
-    from sdpa.frost.test_sdpa_fwd_mxfp8_sm100 import _quantize, _quantize_seq
+    from mxfp8_test_reference import _quantize, _quantize_seq
 
     sf_args = {}
     for name, h, seq, dim in (("q", hq, sq, d), ("k", hk, skv, d), ("v", hk, skv, dv)):
@@ -123,12 +124,14 @@ def _case(
         buffers["o_storage"] = storage
         o.set_stride(out.stride())
     if thd:
-        if dv == d:
+        if dv == d and not independent_o_offsets:
             o.set_ragged_offset(tensors["off_q"])
         else:
-            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32, name="off_o")
+            offset_type = cudnn.data_type.INT64 if independent_o_offsets else cudnn.data_type.INT32
+            offset_dtype = torch.int64 if independent_o_offsets else torch.int32
+            off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=offset_type, name="off_o")
             o.set_ragged_offset(off_o)
-            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=torch.int32) * sq * hq * dv
+            tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=offset_dtype) * sq * hq * dv
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
@@ -159,7 +162,13 @@ def _case(
         family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
         caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
         cgas = dict(caps.cgas_by_d_shape).get((d, dv), caps.cgas)
-        knobs = SdpaFwdKnobs(tile_m=max(caps.tile_ms), tile_n=max(caps.tile_ns), cga=max(cgas), split_kv=split_kv, sched_policy=0, pack_gqa=False)
+        tile_m, tile_n = max(caps.tile_ms), max(caps.tile_ns)
+        if arch == "sm120":
+            # The SM120 kernel table narrows the row's tiles per head dims (the d512 flavor has one tile).
+            from cudnn.sdpa.fwd.config_sm120 import tile_domain
+
+            tile_m, tile_n = max(tile_domain(d, dv, fp8=True))
+        knobs = SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n, cga=max(cgas), split_kv=split_kv, sched_policy=0, pack_gqa=False)
         g.create_execution_plan(family.offered_ids()[name], knobs)
     else:
         g.create_execution_plans([cudnn.heur_mode.A])
@@ -260,6 +269,26 @@ def test_prepared_mxfp8_capture_reads_current_scales(thd, split, d, dv, output_d
         _check(bufs, thd=thd, skv=512)
 
 
+@pytest.mark.parametrize("hq,hk,sq", [(2, 1, 128), (4, 1, 64), (8, 1, 32)], ids=["g2-s128", "g4-s64", "g8-s32"])
+@pytest.mark.L0
+def test_prepared_mxfp8_packed_cluster_tail_rows(hq, hk, sq):
+    """PackGQA on the d128 flavor with the SECOND CTA of the cga2 pair entirely past S_q.
+
+    The grid is rounded up to whole clusters, so with G heads per tile the pair covers 2 * TILES_Q * (128 / G)
+    tokens; at these S_q the peer CTA's rows all lie past the sequence, and its loader's scale-factor gather
+    (plain global loads, not a bounds-checked TMA) must not address a Q scale-factor atom that was never
+    allocated -- Compute Sanitizer reported 4-byte out-of-bounds reads from that CTA before the gather
+    clamped dead rows and gave them the neutral scale.  The dead rows produce no O / LSE, so the check is the
+    ordinary one; the memory-safety part is what a sanitizer run of this case pins."""
+    g, vp, ws, bufs, _ = _case(thd=False, split_kv=1, d=128, dv=128, b=1, hq=hq, hk=hk, sq=sq, skv=128, output_dtype=torch.bfloat16)
+    knobs = g.plans[g._plan_index].knobs
+    if not knobs.pack_gqa or knobs.cga != 2:
+        pytest.skip(f"the heuristics did not pick a packed cga2 plan here ({knobs}); the cluster-tail rows need one")
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    _check(bufs, thd=False, b=1, sq=sq, skv=128)
+
+
 @pytest.mark.gpu_exclusive
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
@@ -269,12 +298,14 @@ def test_prepared_mxfp8_thd_output_stride_above_int32(dtype, d, dv):
     row_stride = 2**32 + 4 * dv
     if torch.cuda.mem_get_info()[0] < 2 * row_stride + 2**30:
         pytest.skip("physical row-stride regression needs 9 GiB free")
-    g, vp, ws, bufs, ts = _case(thd=True, override=True, dtype=dtype, d=d, dv=dv, sq=1, skv=64)
+    g, vp, ws, bufs, ts = _case(thd=True, override=True, dtype=dtype, d=d, dv=dv, sq=1, skv=64, independent_o_offsets=True)
     try:
         bufs["o"] = torch.empty_strided((2, 4, dv), (row_stride, dv, 1), dtype=torch.bfloat16, device="cuda")
     except torch.OutOfMemoryError:
         pytest.skip("physical row-stride storage unavailable")
     vp[ts["o"]] = bufs["o"]
+    # A wider output pitch needs its own physical offsets, independent of Q.
+    vp[ts["off_o"]] = torch.arange(3, device="cuda", dtype=torch.int64) * row_stride
     overrides = dict(override_uids=[ts["o"].get_uid()], override_shapes=[[2, 4, 1, dv]], override_strides=[[4 * dv, dv, row_stride, 1]])
     owner = g._compiled_plans[g._plan_index]._prepared.spec.owner
     bufs["o"].fill_(float("nan"))

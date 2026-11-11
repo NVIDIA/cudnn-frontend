@@ -380,6 +380,12 @@ def sum_OdO(
                 lse_bhq = lse[idx_q + offset, head_coord]
                 sum_OdO[idx_q, head_coord] = sum_OdO_scale * acc
                 scaled_lse[idx_q, head_coord] = lse_scale * lse_bhq
+        elif idx_q < sum_OdO.shape[0] and tidx == 0:
+            # dKdV loads the eight-aligned scratch extent through TMA. These
+            # physical tail rows are in bounds even though they are not queries;
+            # stale NaNs otherwise enter dS before its masked P is multiplied.
+            sum_OdO[idx_q, head_coord] = 0.0
+            scaled_lse[idx_q, head_coord] = -Float32.inf
 
 
 sum_OdO.set_name_prefix("cudnn", remove_cutlass_symbol=True)

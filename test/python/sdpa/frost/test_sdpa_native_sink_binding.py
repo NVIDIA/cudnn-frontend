@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native sink validation precedes all launches and observes every call's storage."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 import cudnn
@@ -18,7 +20,7 @@ def _fixture(thd, d=128, stats=True):
         binder = cudnn._pybind_module._SdpaThdBinder
         bind = lambda values: spec.native.bind(prep._native_pack_from_facts(values), prep._NATIVE_THD_INDICES, 0x30000, 17)
         execute = lambda values: spec.native.execute(prep._native_pack_from_facts(values), prep._NATIVE_THD_INDICES, 0x30000, 17)
-        reference = lambda values: prep._bind_thd_python(spec, values, 0x30000, 17, 17)
+        reference = lambda values: binding_reference._bind_thd_python(spec, values, 0x30000, 17, 17)
     else:
         import test_sdpa_native_dense_binding as fixture
 
@@ -26,7 +28,7 @@ def _fixture(thd, d=128, stats=True):
         binder = cudnn._pybind_module._SdpaDenseBinder
         bind = lambda values: fixture._native(spec, values)
         execute = lambda values: spec.native.execute(fixture._pack(values), prep._NATIVE_DENSE_INDICES, 17)
-        reference = lambda values: prep.bind_dense(spec, values, 17, 17)
+        reference = lambda values: binding_reference.bind_dense(spec, values, 17, 17)
     spec.has_sink = True
     spec.native = binder(spec)
     facts["sinks"] = prep.BufferFacts(0x70000, "float32", (2, 0), 8, (1, 8, 1, 1), (8, 1, 1, 1))
@@ -105,7 +107,7 @@ def test_thd_sink_native_graph_rebind_and_replay(d, monkeypatch):
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedThdLaunch) and launch.spec.native is not None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native graph rebuilt Python facts"))
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *a: pytest.fail("native graph used Python binding"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *a: pytest.fail("native graph used Python binding"), raising=False)
     buf = _buffers(b, sq, sk, h, hk, d)
     sinks = torch.linspace(-2, 6, h, device="cuda", dtype=torch.float32).view(1, h, 1, 1)
     ws = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
@@ -176,5 +178,5 @@ def test_thd_sink_native_standalone_rebind_and_replay(d, dv, cga, monkeypatch):
         pytest.skip("requires a supported Blackwell/Rubin half THD template")
     from test_sdpa_thd_tensormap_acquire import test_thd_tensormaps_rebind_and_replay as check
 
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *a: pytest.fail("native standalone used Python binding"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *a: pytest.fail("native standalone used Python binding"), raising=False)
     check(d, dv, cga, torch.bfloat16, has_sink=True)

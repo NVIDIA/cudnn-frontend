@@ -1,0 +1,28 @@
+# sm_107a PTX md5 PER KERNEL of the d128 grouped THD cta_group::2 chain rendered ON cc 10.7 with tmem_map = "dq_576" NAMED
+# (prepared_d128_host.compile_host_grouped_2cta with sm = 107, every other typed field unset; the part's DEFAULT map stays "s_tail" = the sm_100a
+# record: dq_576 is a neutral structural map, selectable by name -- the pair body of bprop_d128_f16.py with the INDEPENDENT dQ
+# TMEM image at columns [512, 576) of the 576-column carve (tcgen05.alloc.exclusive 576 on both CTAs, the same constant at the dealloc), the s_read /
+# s_tail_empty rows deleted with their sites; warp_roles 16w, mask_form fsel, dkv_accum bf16_partials, stats_form tma_ring, no probe, no stamps; host
+# trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in test_sdpa_bwd_d128_2cta_stail_sm100.py).  Only the MAIN
+# kernel's row differs from the s_tail record (md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt): the setup, delta-and-stats and cast kernels do
+# not read the map.  The s_tail map NAMED on sm_107a renders the sm_100a record's rows (per-kernel `.entry` md5s are target-independent; pinned by the
+# same test module).  Census vs s_tail at this geometry: mbarrier.arrive 42 -> 40, try_wait 70 -> 65, bar.warp.sync 69 -> 64,
+# tcgen05.fence::after_thread_sync 32 -> 27, mapa 17 -> 15, mbarrier.init 43 -> 41, tcgen05.fence::before_thread_sync 8 -> 7, the alloc spelled
+# `tcgen05.alloc.exclusive.cta_group::2`; every other row equal.
+# One row per kernel the chain OWNS: the md5 of that kernel's `.entry` region of the dumped module (frost_test_utils.ptx_kernel_md5s), so a row
+# moves only when the kernel it names changes.  The dK / dV group fold dkv_reduce_thd_origins_kernel is launched by this chain AND the one-CTA
+# grouped THD chain and is EXCLUDED here (frost_test_utils.D128_THD_SHARED_KERNELS).  Re-render deliberately on a protocol change and say so here.
+dsl=nvidia-cutlass-dsl 4.8.1
+d128_accum_grouped_2cta_stail_dq576 sm_107a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=824f5ab6c74347df9b7441ecac028820
+d128_accum_grouped_2cta_stail_dq576 sm_107a default kernel=delta_zero_stats_thd_d128_2cta_kernel rc=0 ptx_md5=1826f78e59b07a34dc67f398503e466e
+d128_accum_grouped_2cta_stail_dq576 sm_107a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=11df32113e3d85dc1d93bb6216d54bf4
+d128_accum_grouped_2cta_stail_dq576 sm_107a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=9621254b15c92badbdb00185d4efcb19
+# tmem_map = "dq_576" x stats_form = "ldg" (both NAMED on sm_107a; every other field unset): the previous stats default under the independent dQ image --
+# the softmax's per-tile global fetch of LSE / delta under the named-barrier pair, the compact delta launch, the setup kernel without the padded
+# row-offset pass.  The census is the s_tail x ldg rendering's minus the map's delta (the two levers commute: disjoint sites; pinned by
+# test_2cta_stail_host_renders_dq576_ldg_for_sm_107a_and_matches_its_record); the setup / compact delta / cast kernels hash to the ldg rows of the
+# sm_100a record (md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt, token _ldg); only the MAIN kernel is this cross's own.
+d128_accum_grouped_2cta_stail_dq576_ldg sm_107a default kernel=setup_thd_d128_2cta_kernel rc=0 ptx_md5=21bc43d2d7defa52651bef03fadcb27c
+d128_accum_grouped_2cta_stail_dq576_ldg sm_107a default kernel=delta_zero_thd_d128_kernel rc=0 ptx_md5=6abbda6bc300c53b48a7fe23ae01fab9
+d128_accum_grouped_2cta_stail_dq576_ldg sm_107a default kernel=bprop_d128_accum_grouped_2cta_stail_kernel rc=0 ptx_md5=d52764bfbc1985e40c9907dc7c5e38b5
+d128_accum_grouped_2cta_stail_dq576_ldg sm_107a default kernel=cast_dq_thd_d128_kernel rc=0 ptx_md5=9621254b15c92badbdb00185d4efcb19

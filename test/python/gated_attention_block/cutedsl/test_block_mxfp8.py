@@ -71,6 +71,9 @@ from gated_block_reference import (  # noqa: E402
 _SM107 = (10, 7)
 E4M3 = torch.float8_e4m3fn
 _SENTINEL = 1.5e30  # a finite magnitude no correct output cell can hold; survivors localize an unwritten region
+MX_COS_FLOOR = (
+    0.99  # the ONE cosine floor of every MXFP8 fake-quant oracle cell (the kernels' unit-scale e4m3 P is not replicated); the packed suite imports it
+)
 _FUSED = dict(fuse_norm_rope=True, fuse_gate=True)
 _GEOM = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 # The unfused MXFP8 stage list, in pipeline order (FROZEN: block_perf_table / block_fusion_table code against it).
@@ -82,6 +85,20 @@ def _cc():
 
 
 requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
+
+
+def _quant_part_row_first():
+    """Whether the BLOCK's part row speaks before any stage on this host: since the cc 10.0 admission of the dense bf16 / f16 forms
+    (2026-10-29) ``check_support`` on a served part other than Rubin declines ``quant`` by name ahead of every stage (the lift named),
+    so the stage-level texts these rows pin are read from the stage itself there.  Read the way the block reads its device (the
+    module's own device read), not torch's capability, so a simulated reading agrees with the block."""
+    from cudnn.gated_attention_block import api as _api
+
+    cc = _api._device_cc_of(torch.device("cuda")) if torch.cuda.is_available() else None
+    return cc is not None and cc != _SM107 and _api._dense_part_decline(cc) is None
+
+
+_QUANT_PART_ROW = r"quant=MxQuantSpec on cc \d+\.\d+: the FP8 / MXFP8 pipelines bind the Rubin"
 
 
 def _mxfp8_fork_missing():
@@ -499,8 +516,15 @@ def test_mxfp8_fused_declines_typed_when_the_fork_twin_is_missing(monkeypatch, w
     blk = _decl_block(**_FUSED)
     reason = _mxfp8_fork_missing()
     assert reason is not None
+    raiser = blk.check_support
+    if _quant_part_row_first():
+        # a served part other than Rubin: the block's quant part row precedes every stage; the fork's own check_support still says
+        # what is missing (its twin check precedes its cc gate)
+        with pytest.raises(NotImplementedError, match=_QUANT_PART_ROW):
+            blk.check_support()
+        raiser = blk._proj.check_support
     with pytest.raises(NotImplementedError, match="fork twin") as ei:
-        blk.check_support()
+        raiser()
     msg = str(ei.value)
     assert reason in msg
     assert ("run_fused_proj_gemm_mxfp8" in msg) if what == "runner" else ("proj_gemm_norm_rope_mxfp8" in msg)
@@ -532,7 +556,9 @@ def test_mxfp8_gated_sdpa_declines_typed_without_the_adapters_sample_gate(monkey
     # the UNGATED MXFP8 stage does not consult the gate hook at all
     st_plain = _Sdpa(g, batch=1, seq_len=256, dtype=E4M3, device=torch.device("cuda"), want_lse=False, mxfp8=True)
     if _cc() != _SM107:
-        with pytest.raises(NotImplementedError, match="SM107"):
+        # off Rubin: the dense part statement (an unserved part: "... SM107 ...") or, on a served part other than Rubin, the quantized
+        # stage's own gate ("binds the Rubin (cc 10.7) d256 MXFP8 row only") -- both typed, before the adapter
+        with pytest.raises(NotImplementedError, match=r"SM107|binds the Rubin \(cc 10\.7\) d256 MXFP8 row only"):
             st_plain.check_support()
 
 
@@ -601,7 +627,7 @@ def test_sf_swizzle_round_trips_and_pads_to_whole_atoms():
 @pytest.mark.parametrize("seq_len, causal", [(256, True), (1000, True), (256, False), (1024, False)])
 def test_mxfp8_block_matches_the_fake_quant_oracle(seq_len, causal):
     """Causal covers a KV tail (S=1000: the quantize stages write the pad rows' SF as 0x00 exactly like the
-    torch oracle pads); dense needs S % 128 == 0 (see the decline test).  B=2 so V's D-plane-major SF stride
+    torch oracle pads); a dense KV tail is masked in-kernel (see the dense-tail test).  B=2 so V's D-plane-major SF stride
     (B*KH*n_tiles*512) is exercised past the (b=0, h=0) coincidence."""
     out, ref, blk, _, spec = _run_mx_block({**_GEOM, "is_causal": causal}, batch=2, seq_len=seq_len, sentinel=True)
     assert [s.name for s in blk._stages] == _MX_STAGES
@@ -610,7 +636,7 @@ def test_mxfp8_block_matches_the_fake_quant_oracle(seq_len, causal):
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
     print(f"\nmxfp8 block S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e} scale_o={spec.scale_o:.4g} proj route={blk._proj._plan.route}")
-    assert c > 0.99, f"mxfp8 block cos {c}"
+    assert c > MX_COS_FLOOR, f"mxfp8 block cos {c}"
 
 
 @requires_rubin
@@ -623,7 +649,7 @@ def test_mxfp8_sf_order_s_sweep_does_not_degrade_with_s():
         out, ref, _, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=s)
         cs[s] = _cos(out, ref)
     print("\nmxfp8 SF-order S-sweep (B=1 dense): " + "  ".join(f"S={s}: cos={c:.6f}" for s, c in cs.items()))
-    assert all(c > 0.99 for c in cs.values()), cs
+    assert all(c > MX_COS_FLOOR for c in cs.values()), cs
     assert max(cs.values()) - min(cs.values()) < 5e-3, f"cosine drifts with S -- an SF layout bug: {cs}"
 
 
@@ -649,7 +675,7 @@ def test_mxfp8_dead_padded_entry_is_exactly_zero(kw):
     assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero (select, not residue * sigmoid); max|out[1]| = {out[1].abs().max().item()}"
     c = _cos(out[0], ref[0])
     print(f"\nmxfp8 {'fused' if kw else 'unfused'} block dead entry S={s}: live cos={c:.6f}")
-    assert c > 0.99, f"live entry cos {c}"
+    assert c > MX_COS_FLOOR, f"live entry cos {c}"
 
 
 @requires_rubin
@@ -669,19 +695,20 @@ def test_mxfp8_ragged_padded_entries_match_the_oracle():
     assert torch.isfinite(out.float()).all()
     cs = [_cos(out[i], ref[i]) for i in range(2)]
     print(f"\nmxfp8 block ragged padding S={s} seq_lens={seq_lens.tolist()}: cos per entry={[f'{c:.6f}' for c in cs]} scale_o={spec.scale_o:.4g}")
-    assert all(c > 0.99 for c in cs), f"ragged padded entries cos {cs}"
+    assert all(c > MX_COS_FLOOR for c in cs), f"ragged padded entries cos {cs}"
 
 
 @requires_rubin
-def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_cga1():
+def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_pair():
     """Same plan, fresh output + workspace, bit-identical (no per-execute compile / allocation; a cold-cache race
-    probe); the compiled record is the MXFP8 row's NATURAL policy at cta_mma 1 (the adapter's quantized d256 rule),
+    probe); the compiled record is the MXFP8 row's NATURAL policy at cta_mma 2 (a dense, unsplit d256 MXFP8 leg runs the
+    2-CTA pair on cc 10.7, config_sm100.d256_mxfp8_pair_leg, #1608),
     the block-scale kernel (pertensor False), amax folded out."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 
     out, _, blk, mx, _ = _run_mx_block(_GEOM, batch=1, seq_len=512)
     tp = blk._sdpa._impl.template_params()
-    assert tp.sched_policy == SCHED_NATURAL and tp.cta_mma == 1 and tp.epilogue_gate is False
+    assert tp.sched_policy == SCHED_NATURAL and tp.cta_mma == 2 and tp.epilogue_gate is False
     assert blk._sdpa._impl._pertensor is False and blk._sdpa._impl.has_amax_o is False
     # The compiled record folded the amax OUT (kernel carries `has_amax`, caller asked for none): the adapter then
     # binds None in the amax slot and issues NO per-execute `amax_o.zero_()` memset -- the CUPTI-free half of the
@@ -745,7 +772,7 @@ def test_mxfp8_fused_block_matches_the_fake_quant_oracle(seq_len, causal):
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
     print(f"\nmxfp8 FUSED block B={b} S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e}")
-    assert c > 0.99, f"fused mxfp8 block cos {c}"
+    assert c > MX_COS_FLOOR, f"fused mxfp8 block cos {c}"
     out2 = torch.full_like(out, _SENTINEL)
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
     _execute(blk, mx, out2, ws)
@@ -761,13 +788,24 @@ def test_mxfp8_fused_declines_ragged_s_at_b_gt_1():
     hsf = torch.zeros(sf_blob_bytes(2000, geom.d_model), dtype=torch.uint8, device="cuda")
     wsf = torch.zeros(sf_blob_bytes(geom.n_qkvg, geom.d_model), dtype=torch.uint8, device="cuda")
     b = GatedAttentionBlockFwd(*args, geom, quant=_SPEC, sample_h_sf=hsf, sample_w_qkvg_sf=wsf, **_FUSED)
+    raiser = b.check_support
+    if _quant_part_row_first():
+        # a served part other than Rubin: the block's quant part row speaks first; the fork's geometry rule is the fork's own word
+        with pytest.raises(NotImplementedError, match=_QUANT_PART_ROW):
+            b.check_support()
+        raiser = b._proj.check_support
     with pytest.raises(NotImplementedError, match="S % 128 == 0 when B > 1"):
-        b.check_support()
+        raiser()
 
 
 @requires_rubin
-def test_mxfp8_dense_kv_tail_is_declined_not_computed_wrong():
-    """The Rubin MXFP8 SDPA leaves a dense KV tail unmasked, so the adapter DECLINES S % 128 != 0 without a padding
-    mask or a causal mask -- the block surfaces that at check_support, typed."""
-    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
-        _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000)
+def test_mxfp8_dense_kv_tail_is_masked_not_computed_wrong():
+    """A dense S % 128 != 0 with no padding mask: the SDPA adapter compiles the padded mask against the scalar S_kv
+    (kv_tail_mask, #1520), so the block serves it and the KV tail stays out of the softmax -- the oracle, at the same
+    cosine floor as the matrix, and every output cell written."""
+    out, ref, _, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000, sentinel=True)
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = _cos(out, ref)
+    print(f"\nmxfp8 block dense KV tail S=1000: cos={c:.6f}")
+    assert c > MX_COS_FLOOR, f"mxfp8 dense KV tail cos {c}"

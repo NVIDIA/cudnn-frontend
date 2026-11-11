@@ -20,11 +20,14 @@ variant-pack resolution and TensorDesc construction.
 from __future__ import annotations
 
 import logging
+import numbers
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import cudnn
 from cudnn._sdpa_tail import GateTail, match_gate_tail
+from cudnn.sdpa import band
+from cudnn.sdpa.layout import dense_layout_ok
 
 _LOG = logging.getLogger(__name__)
 
@@ -40,10 +43,13 @@ _TORCH_FROM_CUDNN = {
     cudnn.data_type.FP8_E5M2: "float8_e5m2",
     cudnn.data_type.FLOAT: "float32",
     cudnn.data_type.INT32: "int32",
+    cudnn.data_type.INT64: "int64",
     # Block-scaled O of the per-tensor FP8 forward: two E2M1 per byte, and the
     # UE8M0 scale factors of its MXFP8 output.
     cudnn.data_type.FP4_E2M1: "float4_e2m1fn_x2",
     cudnn.data_type.FP8_E8M0: "float8_e8m0fnu",
+    # The per-key boolean mask (the python-only ``kv_mask`` sdpa input): one byte per key.
+    cudnn.data_type.BOOLEAN: "bool",
 }
 _KNOWN_DTYPES = frozenset(_TORCH_FROM_CUDNN)
 
@@ -178,36 +184,6 @@ def packed_layout_ok(dim: tuple, stride: tuple) -> bool:
     return act == exp
 
 
-def dense_layout_ok(dim: tuple, stride: tuple) -> bool:
-    """Relaxed DENSE layout soundness for a rank-4 (B, H, S, D) tensor: the
-    real requirement of the SM100 DSL lowering, which normalizes any such
-    layout to the kernel's canonical BSHD-compact buffers (zero-copy when the
-    tensor already is BSHD-compact, one gather/scatter copy otherwise) — so
-    the B/H/S physical stride ORDER is free, and strides may be padded
-    (oversized) arbitrarily. What must hold:
-
-      * head dim (axis 3) innermost-contiguous: stride 1 (size-1 wildcarded);
-      * no zero stride on a size>1 dim — a broadcast view aliases distinct
-        logical elements onto one address, which is ill-defined for the O
-        write-back and rejected uniformly;
-      * non-overlapping: visiting dims by ascending stride, each stride must
-        cover the span of every dim below it (dense == equality; padded is
-        larger; SMALLER than dense would alias, so it is rejected).
-
-    Size-1 dims are wildcards: any stride, 0 and garbage included (cuDNN's
-    own harnesses corrupt them deliberately).
-    """
-    if dim[3] != 1 and stride[3] != 1:
-        return False
-    active = sorted((int(st), int(sz)) for st, sz in zip(stride, dim) if sz != 1)
-    span = 1
-    for st, sz in active:
-        if st < span:  # st == 0 (broadcast) or overlapping / sub-dense
-            return False
-        span = st * sz
-    return True
-
-
 # Element widths of the facts vocabulary, for the 16-byte TMA stride rule below.
 # An unmapped dtype gets the STRICTEST width (1 B -> strides must be multiples
 # of 16 elements); the row's dtype check declines such a G before layout anyway.
@@ -222,28 +198,12 @@ _ELEM_BYTES = {
 
 
 def gate_layout_ok(dim: tuple, stride: tuple, elem_bytes: int) -> bool:
-    """Whether a rank-4 logical (B, H, S, D) tensor is one the fused-gate kernels
-    can TMA-load ZERO-COPY: BSHD-compact, or a declared BSHD layout TMA can
-    express. Uses the shared ``config_sm100.bshd_zero_copy_stride`` predicate,
-    distinguishing compact from inexpressible geometry so the row declines
-    what the adapter would reject:
-
-      * head dim innermost-contiguous (stride 1);
-      * every stepped batch, seq and head stride is a 16-byte multiple;
-      * the declaration COVERS the tensor (head >= d, seq >= h*head,
-        batch >= s*seq) -- an overlapping declaration aliases distinct rows.
-
-    Stricter than ``bshd_layout_ok`` + ``dense_layout_ok`` on purpose: size-1
-    dims are NOT wildcarded, because the adapter's TensorDesc keeps the IR's
-    unit-dim strides verbatim and its cover check reads them.  Unlike Q/K/V/O,
-    G has no normalisation-copy fallback in the lowering.
-    """
+    """Whether a dense gate has native TMA geometry, including B/H/S permutations."""
     if len(dim) != 4 or len(stride) != 4:
         return False
-    from cudnn.sdpa.fwd.config_sm100 import bshd_compact, bshd_zero_copy_stride
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
-    dim, stride = tuple(int(x) for x in dim), tuple(int(x) for x in stride)
-    return bshd_compact(dim, stride) or bshd_zero_copy_stride(dim, stride, max(1, int(elem_bytes))) is not None
+    return dense_bind_strides(tuple(int(x) for x in dim), tuple(int(x) for x in stride), max(1, int(elem_bytes))) is not None
 
 
 @dataclass(frozen=True)
@@ -393,6 +353,20 @@ class SdpaGraphFacts:
     block_mask_t: Any = None
     score_max_t: Any = None
     score_sum_exp_t: Any = None
+    # The additive bias's geometry, DESCRIBED for the rows that TMA-load it (the Rubin resident row-block): its rank-4
+    # dims (every legal bias is ``[1|B, 1|H_q, S_q, S_kv]`` -- anything else is ``invalid``), its element strides and
+    # its cudnn.data_type.  () / None without a bias.
+    bias_dim: tuple = ()
+    bias_stride: tuple = ()
+    bias_dtype: Optional[Any] = None
+    # The per-key boolean mask (the python-only ``kv_mask`` input of ``sdpa``: ``[1|B, 1, 1, S_kv]``, broadcast over the
+    # heads and the query rows; a key whose entry is False is masked like a padded one).  Described here, judged by the
+    # rows that fold it into their mask word (``Capabilities.kv_mask``).
+    has_kv_mask: bool = False
+    kv_mask_t: Any = None
+    kv_mask_dim: tuple = ()
+    kv_mask_stride: tuple = ()
+    kv_mask_dtype: Optional[Any] = None
     # Backward-only refs.
     do_t: Any = None
     dq_t: Any = None
@@ -439,9 +413,11 @@ class SdpaGraphFacts:
     descale_k_t: Any = None
     descale_v_t: Any = None
     scale_o_t: Any = None
-    # cuDNN's Scale_S/Descale_S: they quantize P, the softmax OUTPUT. SM120
-    # applies them; SM100 converts P unscaled (exact for a reciprocal pair) and
-    # declines a non-reciprocal one (api_dsl._require_reciprocal_s_scales).
+    # cuDNN's Scale_S/Descale_S: they quantize P, the softmax OUTPUT. The FROST
+    # per-tensor FP8 and MXFP8 rows never read them: each kernel casts P with its
+    # own fixed power-of-two bias (P_CAST_LOG2_SCALE) and cancels it exactly, which
+    # equals the graph for the reciprocal pair the docs prescribe. A non-reciprocal
+    # pair is device data, so it is not detected at plan time.
     descale_s_t: Any = None
     scale_s_t: Any = None
     amax_s_t: Any = None
@@ -451,6 +427,12 @@ class SdpaGraphFacts:
     # knob), None otherwise (= the f32 pipeline every row runs). Engines whose
     # capability row does not list the requested precision decline.
     softmax_precision: Optional[Any] = None
+    # The GRAPH's statement that Q already carries attn_scale * log2(e) (the
+    # python-only op attribute sdpa(attn_scale_prefolded=True)): the engine
+    # applies no softmax scale and the kernel's pre-folded arm runs exp2(S - m)
+    # on the raw QK^T.  A fact the capability rows gate on
+    # (attn_scale_prefolded_d_shapes); attn_scale must be unset alongside it.
+    attn_scale_prefolded: bool = False
 
     # Epilogue gate: the three-node tail ``sdpa(virtual O_v) -> sigmoid(G) ->
     # mul(O_v, s)`` (cudnn._sdpa_tail.match_gate_tail).  A FACT, not a verdict:
@@ -485,6 +467,26 @@ class SdpaGraphFacts:
     # the shared config_sm100 layout predicate (gate_layout_ok below).
     epilogue_gate_layout_ok: bool = True
     shape_overrides: bool = False  # graph permits execute-time geometry; the chosen plan must consume it
+    # caller replays execute under a CUDA graph (pygraph(is_cuda_graph_replay_expected=True)):
+    # per-execute host costs are paid once at capture, so heuristics may lead with the GPU-time optimum
+    cuda_graph_replay: bool = False
+    # Independent KV storage on a plain sdpa forward. Keep uniform_dtype's
+    # existing meaning for every other row and for backward.
+    kv_dtype: Optional[Any] = None  # shared K/V dtype; None when they differ
+    uniform_qo_dtype: bool = True  # actual O dtype equals Q
+    paged_pool_counts: tuple[int, int] = (0, 0)  # independent K/V physical page capacities
+
+    @property
+    def band(self) -> "band.BandFacts":
+        """This graph's mask band, in the canonical model (cudnn.sdpa.band).
+
+        A VIEW, not a second source: the raw resolved fields above stay the
+        facts every other consumer reads (heuristics, lowerings, configs) and
+        :meth:`cudnn.sdpa.band.BandFacts.from_sdpa_facts` is the one place they
+        are normalized into (left bound, right mode, anchor).  Engines decide
+        support by comparing this against their row's ``Capabilities.band``.
+        """
+        return band.BandFacts.from_sdpa_facts(self)
 
 
 _SDPA_NODE_TYPES = (
@@ -673,8 +675,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         _, h_kv, page_size, _ = k_dim
         if k_dim[3] != d_qk:
             return _invalid(f"paged K container head dim must equal Q's (q_dim={q_dim}, k_dim={k_dim})")
-        if v_dim[:3] != k_dim[:3]:
-            return _invalid(f"paged K/V containers must share [num_pages, H_kv, page_size] (k_dim={k_dim}, v_dim={v_dim})")
+        if v_dim[1:3] != k_dim[1:3] or k_dim[0] <= 0 or v_dim[0] <= 0:
+            return _invalid(f"paged K/V containers must share [H_kv, page_size] and have positive pool capacities (k_dim={k_dim}, v_dim={v_dim})")
         tables = [t for t in (table_k, table_v) if t is not None]
         for t in tables:
             td = tuple(t.get_dim())
@@ -691,8 +693,6 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         s_kv = int(declared_max) if declared_max is not None else max_pages * page_size
         if s_kv > max_pages * page_size:
             return _invalid(f"paged_attention_max_seq_len_kv ({s_kv}) exceeds what the block table addresses ({max_pages} pages x {page_size})")
-        if (k_stride[1] > k_stride[2]) != (v_stride[1] > v_stride[2]):
-            return _invalid("paged K and V containers must share an in-page layout (both HND or both NHD)")
         table_k = table_k if table_k is not None else table_v
         table_v = table_v if table_v is not None else table_k
     else:
@@ -717,6 +717,28 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         return _invalid("B/H/S/D must all be > 0")
     if h_q % h_kv != 0:
         return _invalid("H_q must be divisible by H_kv (GQA / MQA)")
+
+    # Additive bias: the forward's shape contract is ``[1|B, 1|H_q, S_q, S_kv]`` (the four broadcast forms the operation
+    # documents) -- a bias of another rank or with a score extent that is not (S_q, S_kv) is malformed for EVERY engine,
+    # so it is ``invalid`` here (not a per-row decline); the broadcast dims, strides and dtype are facts the rows judge.
+    bias = rec.get("bias")
+    bias_dim = tuple(int(x) for x in bias.get_dim()) if bias is not None else ()
+    bias_stride = tuple(int(x) for x in bias.get_stride()) if bias is not None else ()
+    bias_dtype = bias.get_data_type() if bias is not None else None
+    if bias is not None and not is_backward:
+        if len(bias_dim) != 4 or len(bias_stride) != 4:
+            return _invalid(f"bias must be rank-4 (1|B, 1|H_q, S_q, S_kv); got dims {bias_dim}")
+        if bias_dim[2:] != (s_q, s_kv) or bias_dim[0] not in (1, b) or bias_dim[1] not in (1, h_q):
+            return _invalid(f"bias dims {bias_dim} must be (1|B, 1|H_q, S_q, S_kv) = (1|{b}, 1|{h_q}, {s_q}, {s_kv})")
+    # Per-key boolean mask (python-only input): rank-4 like every graph tensor, (1|B, 1, 1, S_kv); malformed for everyone
+    # otherwise (no engine can read a mask whose key extent is not S_kv).
+    kv_mask = rec.get("kv_mask")
+    kv_mask_dim = tuple(int(x) for x in kv_mask.get_dim()) if kv_mask is not None else ()
+    kv_mask_stride = tuple(int(x) for x in kv_mask.get_stride()) if kv_mask is not None else ()
+    kv_mask_dtype = kv_mask.get_data_type() if kv_mask is not None else None
+    if kv_mask is not None:
+        if len(kv_mask_dim) != 4 or len(kv_mask_stride) != 4 or kv_mask_dim[1:3] != (1, 1) or kv_mask_dim[3] != s_kv or kv_mask_dim[0] not in (1, b):
+            return _invalid(f"kv_mask dims {kv_mask_dim} must be (1|B, 1, 1, S_kv) = (1|{b}, 1, 1, {s_kv})")
 
     # Epilogue gate (the sdpa -> sigmoid(G) -> mul tail).  G is described, never
     # judged: its shape / dtype / layout become facts the gate-claiming rows
@@ -832,23 +854,34 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     amax_dp = _real_output(rec.get("amax_dP")) if is_fp8_bwd else None
 
     # Masks: resolve cuDNN's several spellings to (causal, bottom_right, window_left).
+    # Conflicting spellings follow the Python binding (python/pygraph/sdpa.cpp): every
+    # entry point except sdpa_backward rejects them; sdpa_backward applies them in order,
+    # so the later setter (the explicit left / right bound) wins.
+    binding_rejects_conflicts = not (is_backward and not is_fp8_bwd and not is_mxfp8_bwd)
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
     # Left window (== length; window offset is length-1). The op family uses several
-    # spellings for the same knob: sdpa → sliding_window_length; sdpa_mxfp8 →
-    # diagonal_band_left_bound; sdpa_fp8 → left_bound / sliding_window.
-    left_bound = _first_not_none(
-        rec.get("sliding_window_length"),
-        rec.get("diagonal_band_left_bound"),
-        rec.get("left_bound"),
-        rec.get("sliding_window"),
-    )
+    # spellings for the same knob: sdpa / sdpa_backward → sliding_window_length or
+    # diagonal_band_left_bound; sdpa_mxfp8 → diagonal_band_left_bound; sdpa_fp8 →
+    # sliding_window or left_bound; fp8 / mxfp8 backward → left_bound.
+    window = _first_not_none(rec.get("sliding_window_length"), rec.get("sliding_window"))
+    explicit_left = _first_not_none(rec.get("diagonal_band_left_bound"), rec.get("left_bound"))
+    if window is not None and explicit_left is not None and binding_rejects_conflicts:
+        return _invalid("sliding window and left_bound cannot be set at the same time")
+    left_bound = explicit_left if explicit_left is not None else window
+    # Right band: diagonal_band_right_bound (sdpa/mxfp8) or right_bound (fp8).
+    explicit_right = _first_not_none(rec.get("diagonal_band_right_bound"), rec.get("right_bound"))
     if use_causal or use_causal_br:
-        resolved_right = 0
+        if binding_rejects_conflicts:
+            if use_causal and use_causal_br:
+                return _invalid("use_causal_mask and use_causal_mask_bottom_right cannot both be true")
+            if explicit_right is not None:
+                flag = "use_causal_mask" if use_causal else "use_causal_mask_bottom_right"
+                return _invalid(f"{flag} and diagonal_band_right_bound cannot be set at the same time")
+        resolved_right = 0 if explicit_right is None else explicit_right
         align_is_br = use_causal_br
     else:
-        # Right band: diagonal_band_right_bound (sdpa/mxfp8) or right_bound (fp8).
-        resolved_right = _first_not_none(rec.get("diagonal_band_right_bound"), rec.get("right_bound"))
+        resolved_right = explicit_right
         # Alignment is a property OF the diagonal band; with no band bound at all
         # there is no diagonal, so BOTTOM_RIGHT is inert — recording it as a fact
         # would make every engine reject an effectively-unmasked graph.
@@ -931,7 +964,9 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
 
     attn_scale = rec.get("attn_scale")
     dynamic_scale = attn_scale is not None and not isinstance(attn_scale, (int, float))
-    scale = float(attn_scale) if (attn_scale is not None and not dynamic_scale) else None
+    # An omitted attn_scale is no scaling (1.0), as the backend lowers it. None reaching an adapter selects its
+    # direct-API default (1/sqrt(d)), so a static graph scale is never None.
+    scale = None if dynamic_scale else (1.0 if attn_scale is None else float(attn_scale))
 
     return SdpaGraphFacts(
         b=b,
@@ -943,6 +978,8 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         d_v=d_v,
         dtype=q_dtype,
         uniform_dtype=uniform,
+        kv_dtype=k.get_data_type() if k.get_data_type() == v.get_data_type() else None,
+        uniform_qo_dtype=q_dtype == o_dtype,
         uniform_out_dtype=uniform_out,
         bshd_layout=bshd,
         packed_layout=packed,
@@ -963,8 +1000,14 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         has_dsink=rec.get("dSink_token") is not None,
         has_bias=rec.get("bias") is not None,
         has_dropout=rec.get("dropout") is not None,
-        has_score_mod=rec.get("fn") is not None,
+        # The callback's kwarg is ``score_mod`` on sdpa() / sdpa_backward() (plus
+        # ``score_mod_bprop`` on the backward) and ``fn`` on sdpa_fp8(); every
+        # spelling makes the graph FROST-ineligible (no row sets score_mod=True).
+        # Reading only ``fn`` let the SM100 prefill row serve TransformerEngine's
+        # flex-attention graphs and silently drop the user's score modifier.
+        has_score_mod=any(rec.get(key) is not None for key in ("score_mod", "score_mod_bprop", "fn")),
         has_paged_kv=paged,
+        paged_pool_counts=(int(k_dim[0]), int(v_dim[0])) if paged else (0, 0),
         page_size=page_size,
         paged_k_table_t=table_k,
         paged_v_table_t=table_v,
@@ -993,6 +1036,14 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
         o_t=o,
         stats_t=(stats if (wants_stats or is_backward) else None),
         bias_t=rec.get("bias"),
+        bias_dim=bias_dim,
+        bias_stride=bias_stride,
+        bias_dtype=bias_dtype,
+        has_kv_mask=kv_mask is not None,
+        kv_mask_t=kv_mask,
+        kv_mask_dim=kv_mask_dim,
+        kv_mask_stride=kv_mask_stride,
+        kv_mask_dtype=kv_mask_dtype,
         block_mask_t=rec.get("block_mask"),
         score_max_t=rec.get("score_max"),
         score_sum_exp_t=rec.get("score_sum_exp"),
@@ -1055,6 +1106,19 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     )
 
 
+def _as_bool_flag(value):
+    """A bool-valued op attribute as Python bool: bool, numpy bool (``numpy.bool_`` -- named ``bool`` on numpy 2),
+    or the 0 / 1 a config file carries.  None for None and for anything else (the caller reports the latter)."""
+    if value is None or isinstance(value, bool):
+        return value
+    t = type(value)
+    if t.__module__ == "numpy" and t.__name__ in ("bool", "bool_"):
+        return bool(value)
+    if isinstance(value, numbers.Integral) and int(value) in (0, 1):
+        return bool(int(value))
+    return None
+
+
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     """Facts for a single-SDPA graph -- optionally followed by the epilogue-gate
     tail ``O * sigmoid(G)`` -- or None if the graph is anything else.
@@ -1070,6 +1134,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     facts = _extract_facts(_record_from_node(node, tail))
     if getattr(graph, "_cpp_graph_kwargs", {}).get("is_override_shape_enabled", False):
         facts = replace(facts, shape_overrides=True)
+    if getattr(graph, "is_cuda_graph_replay_expected", False):
+        facts = replace(facts, cuda_graph_replay=True)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see
@@ -1077,11 +1143,39 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     # HALF asks for the f16 softmax accumulator arm. Numerics-changing, so it
     # is a fact the capability rows gate on, never a tuning knob.
     requested = node.params.get("softmax_precision")
-    if requested is None or requested == cudnn.data_type.FLOAT:
-        return facts
+    # attn_scale_prefolded: a bool, or a bool-like flag from a config file (0 / 1, a numpy bool); anything else is
+    # malformed.  Normalized ONCE here so every rule below (forward-only, the fold itself) sees the same value that
+    # _pygraph._python_only_attr_is_set saw -- a false-valued 0 / numpy False is the default, exactly like False.
+    prefolded_raw = node.params.get("attn_scale_prefolded")
+    prefolded = _as_bool_flag(prefolded_raw)
+    if prefolded_raw is not None and prefolded is None:
+        return replace(facts, invalid=f"cudnn.sdpa: attn_scale_prefolded must be a bool; got {prefolded_raw!r}")
+    if facts.is_backward and (requested is not None or prefolded):
+        # Both attributes describe the FORWARD softmax (its exponent arm, its scale contract); the backward
+        # recomputes P from the forward's unscaled contract and no backward engine carries either arm.
+        return replace(facts, invalid="cudnn.sdpa_backward: softmax_precision / attn_scale_prefolded are forward-only op attributes; leave them unset")
     if requested == cudnn.data_type.HALF:
-        return replace(facts, softmax_precision=cudnn.data_type.HALF)
-    return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
+        facts = replace(facts, softmax_precision=cudnn.data_type.HALF)
+    elif requested is not None and requested != cudnn.data_type.FLOAT:
+        return replace(facts, invalid=f"cudnn.sdpa: softmax_precision must be cudnn.data_type.FLOAT or HALF; got {requested}")
+    # sdpa(..., attn_scale_prefolded=True) is the second python-only op attribute:
+    # Q already carries attn_scale * log2(e), so the engine applies no softmax
+    # scale (the kernel's pre-folded arm traces no per-score multiply).  A
+    # contract on the graph's Q, hence a fact, never a knob; False / None is the
+    # default (the engine scales).  attn_scale set alongside it is a malformed
+    # request: the scale would be applied twice or silently dropped.
+    if not prefolded:
+        return facts
+    # "Unset" is the node's own record (no attn_scale kwarg, no attn_scale tensor port): facts.scale cannot
+    # tell, since an OMITTED attn_scale is reported as the backend's 1.0 (see _extract_facts).
+    if node.params.get("attn_scale") is not None or "attn_scale" in node.inputs or facts.dynamic_scale:
+        return replace(
+            facts,
+            invalid="cudnn.sdpa: attn_scale_prefolded=True: leave attn_scale unset -- Q already carries attn_scale * log2(e) and the engine applies no scale",
+        )
+    # scale=None here means "the engine applies no scale" (the adapters receive scale_softmax=None together with
+    # softmax_scale_prefolded=True); it is the one static-graph case where the fact is None rather than a float.
+    return replace(facts, attn_scale_prefolded=True, scale=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1218,8 @@ class SdpaBinding:
     block_mask: Any = None
     score_max: Any = None
     score_sum_exp: Any = None
+    # The per-key boolean mask (python-only ``kv_mask`` input): a bound operand of the rows that fold it.
+    kv_mask: Any = None
     do: Any = None
     dq: Any = None
     dk: Any = None
@@ -1156,12 +1252,19 @@ class SdpaBinding:
     # Epilogue gate G (the sdpa -> sigmoid(G) -> mul tail): a REQUIRED bound
     # operand of the fused kernel.  The tail's virtual O_v / s are never bound.
     gate: Any = None
-    # THD ragged-offset tensors of Q / O / Stats ((B+1,) int32): bound operands
-    # of the SM100 decode tile's ragged-Q leg, which reads them on device as the
-    # packed row bases.  Every other lowering leaves them unbound.
+    # THD ragged-offset tensors ((B+1,) int32 / int64): bound operands of the
+    # lowerings that read them on device -- Q / O / Stats for the SM100 decode
+    # tile's ragged-Q leg, every port for the SM80 backward (caller-buffer token
+    # origins).  Every other lowering leaves them unbound.
     ragged_q: Any = None
     ragged_o: Any = None
     ragged_stats: Any = None
+    ragged_k: Any = None
+    ragged_v: Any = None
+    ragged_do: Any = None
+    ragged_dq: Any = None
+    ragged_dk: Any = None
+    ragged_dv: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -1209,6 +1312,7 @@ class SdpaBinding:
                 self.block_mask,
                 self.score_max,
                 self.score_sum_exp,
+                self.kv_mask,
                 self.do,
                 self.dq,
                 self.dk,
@@ -1238,6 +1342,12 @@ class SdpaBinding:
                 self.ragged_q,
                 self.ragged_o,
                 self.ragged_stats,
+                self.ragged_k,
+                self.ragged_v,
+                self.ragged_do,
+                self.ragged_dq,
+                self.ragged_dk,
+                self.ragged_dv,
             )
             if t is not None
         ]

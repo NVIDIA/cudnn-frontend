@@ -94,6 +94,7 @@ class ExecConfig:
         'output_type': torch,
         'diag_align': cudnn.diagonal_alignment,
         'implementation': cudnn.attention_implementation,
+        'softmax_precision': cudnn.data_type,
     }
 
     data_type: torch.dtype = None
@@ -217,6 +218,53 @@ class ExecConfig:
 
     implementation: cudnn.attention_implementation = cudnn.attention_implementation.AUTO
 
+    # Forward softmax levers of the cc 10.7 FROST rows -- python-only op attributes of graph.sdpa /
+    # sdpa_fp8 / sdpa_mxfp8 (served domain: sdpa/softmax_knobs.py).  Appended here (after every
+    # existing field) so the seeded sweeps' RandomizationContext draw order is unchanged.
+    #   softmax_precision    None (= FLOAT, the f32 pipeline) or cudnn.data_type.HALF, the f16x2
+    #                        exponent arm of the quantized (FP8 / MXFP8) kernels.
+    #   attn_scale_prefolded the harness pre-multiplies Q by attn_scale * log2(e) -- in Q's dtype for
+    #                        half inputs, in fp32 before quantization for MXFP8 -- passes
+    #                        attn_scale=None to the op, and runs the reference on that same Q with
+    #                        attn_scale = ln 2 (softmax(ln2 * S_folded) = 2^S_folded).
+    softmax_precision: cudnn.data_type = None
+    attn_scale_prefolded: bool = False
+    # Forward Stats request independent of training.  None = the harness default (fp16: Stats are
+    # produced with the backward only; fp8 / mxfp8: always); True / False = request / omit the
+    # Stats output of an inference forward, so a sweep can draw the Stats and the stats-less
+    # kernel specializations without running a backward.  The backward always has Stats.
+    fwd_stats: bool = None
+    # MXFP8 dense forward only: declare Q/K/V/O BSHD-physical -- the layout the FROST MXFP8 rows
+    # serve.  None = the harness's legacy rule (BSHD for the block-scaled-O and paged draws, which
+    # only FROST serves; BHSD otherwise, which routes the plain draws to the backend); True = always,
+    # so a sweep that asserts FROST routing (the cc 10.7 sweeps) lands every case on the row.
+    # Inference only (the backward graph declares BHSD).
+    bshd_layout: bool = None
+    # Paged only (f16/bf16 forward harness): physical layout of the K/V page pools that
+    # sdpa.helpers.create_container_and_page_table carves from the dense (B, H, S, D) tensors.
+    # None / "hnd" = [pages, H, page, D] contiguous (today's layout); "nhd" = [pages, page, H, D]
+    # physical, declared through the same (pages, H, page, D) logical dims with permuted strides
+    # (the token-major pool layout serving frameworks also hand over).
+    paged_pool_layout: str = None
+    # Forward only: one sink logit on every head instead of the N(0, 0.5) draw (keyless-row pins at
+    # -120 / -5 / +3 / +10 exercise both far ends of the sink fold).
+    sink_token_value: float = None
+    # Forward only, Rule 9 diagnostics: pin ONE plan of the unified list instead of walking it.
+    # {"engine": "backend"} selects the first backend plan; {"engine": "<FROST engine name>",
+    # "knobs": {"TILE_CGA_M": 1, "PACK_GQA": 1, "SPLIT_KV": 1}} appends that knob set through
+    # graph.create_execution_plan and selects it.  A pin is strict: a decline of the pinned plan
+    # FAILS the case (it never degrades to another plan).  Plain dict, so --repro replays the pin.
+    plan_pin: dict = None
+    # Paged MXFP8 harness lever (sdpa/mxfp8.py, forward / inference; set AFTER the RandomizationContext so no seed
+    # moves): V pages live at a different pool permutation than K's and bind their OWN block table (proves per-page
+    # SF_V addressing rather than contiguous-pool luck).  The MXFP8 harness reads paged_pool_layout ("nhd") and
+    # sink_token_value above as the f16 harness does.
+    paged_distinct_v_table: bool = False
+    # Per-port B+1 physical row offsets, independent of logical sequence lengths.
+    # Missing ports retain compact prefixes. Serialized with --repro; these are
+    # storage rows, before each port's token stride and offset multiplier.
+    ragged_origin_rows: dict[str, list[int]] = None
+
     @property
     def is_train(self):
         return not self.is_infer
@@ -245,18 +293,30 @@ class ExecConfig:
         if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
+        assert not self.ragged_origin_rows or self.is_ragged, "physical origins require ragged storage"
+        assert not (self.is_paged and any(name in (self.ragged_origin_rows or {}) for name in ("k", "v"))), "paged pools have no ragged K/V origins"
+
         # Packed token capacities: default to the minimal packed capacity of
         # the drawn seq_lens (sum rounded up to 64). Explicit totals (e.g. a
         # slack-capacity fuzz) must cover the packed payload.
         if self.is_ragged:
             seq_len_q = self.seq_len_q or [self.s_q] * (self.batches or 1)
             seq_len_kv = self.seq_len_kv or [self.s_kv] * (self.batches or 1)
+            origins = self.ragged_origin_rows or {}
+            assert set(origins) <= {"q", "k", "v", "o", "stats"}, "unknown ragged origin port"
+            for name, rows in origins.items():
+                lengths = seq_len_kv if name in ("k", "v") else seq_len_q
+                assert len(rows) == len(lengths) + 1, f"{name}: physical origins need B+1 entries"
+                assert all(type(row) is int and row >= 0 for row in rows), f"{name}: invalid physical origin"
+                assert all(start + length <= end for start, end, length in zip(rows, rows[1:], lengths)), f"{name}: overlapping physical sequences"
+            minimum_q = max([sum(seq_len_q)] + [rows[-1] for name, rows in origins.items() if name in ("q", "o", "stats")])
+            minimum_kv = max([sum(seq_len_kv)] + [rows[-1] for name, rows in origins.items() if name in ("k", "v")])
             if self.total_q is None:
-                self.total_q = packed_token_capacity(seq_len_q)
+                self.total_q = packed_token_capacity([minimum_q])
             if self.total_kv is None:
-                self.total_kv = packed_token_capacity(seq_len_kv)
-            assert self.total_q >= sum(seq_len_q), f"total_q={self.total_q} < sum(seq_len_q)"
-            assert self.total_kv >= sum(seq_len_kv), f"total_kv={self.total_kv} < sum(seq_len_kv)"
+                self.total_kv = packed_token_capacity([minimum_kv])
+            assert self.total_q >= minimum_q, f"total_q={self.total_q} < required physical rows {minimum_q}"
+            assert self.total_kv >= minimum_kv, f"total_kv={self.total_kv} < required physical rows {minimum_kv}"
 
         # Compute strides if not provided (packed for ragged, default BHSD otherwise).
         # with_ragged_token_gap (default True): per-tensor token-stride gaps,
@@ -401,6 +461,17 @@ class RandomizationContext:
         randoms_.s_q, randoms_.s_kv = randoms["s_q_s_kv"]
         randoms_.d_qk, randoms_.d_v = randoms["d_qk_d_v"]
         randoms_.h_q, randoms_.h_k, randoms_.h_v = randoms["head_count"]
+
+        # Optional joint bound on b * h_q * s_q * s_kv. The backend's deterministic
+        # backward workspace and the dBias gradient are both (b, h_q, s_q, s_kv)-sized,
+        # so a suite that fuzzes long sequences shrinks the batch of a draw that
+        # would otherwise not fit, instead of lowering its sequence cap for every
+        # draw. Applied before the per-batch lengths, which are drawn per batch.
+        max_score_cells = randoms.get("max_score_cells")
+        if max_score_cells is not None:
+            per_batch = randoms_.h_q * randoms_.s_q * randoms_.s_kv
+            if per_batch > 0:
+                randoms_.batches = max(1, min(randoms_.batches, max_score_cells // per_batch))
 
         randoms_.is_ragged = randoms["is_ragged_or_padded_or_full"] in ("ragged", "cu_ragged", "ragged_mult", "cu_ragged_mult")
         randoms_.is_padding = randoms["is_ragged_or_padded_or_full"] in ("padded", "ragged", "cu_padded", "cu_ragged", "ragged_mult", "cu_ragged_mult")

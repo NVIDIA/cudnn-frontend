@@ -47,6 +47,7 @@ from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import (
     assume_tensor_aligned,
 )
 from cudnn.block_sparse_attention.csrc.utils.named_barrier import NamedBarrierFwdSm100
+from cudnn.block_sparse_attention.csrc.utils.subset_barrier import _SubsetNamedBarrier
 from cudnn.block_sparse_attention.csrc.utils.pack_gqa import PackGQA, pack_gqa_layout
 from cudnn.block_sparse_attention.csrc.utils.softmax import SoftmaxSm100
 from cudnn.block_sparse_attention.csrc.utils.tile_scheduler import (
@@ -551,7 +552,7 @@ class BlockSparseAttnForwardSm100Blk128:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_alloc_barrier = pipeline.NamedBarrier(
+        tmem_alloc_barrier = _SubsetNamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
@@ -620,7 +621,7 @@ class BlockSparseAttnForwardSm100Blk128:
             defer_sync=True,
         )
         # Should put the NamedBarrier inside the pipeline class so we'll just have pipeline_sm_stats
-        sm_stats_barrier = pipeline_custom.NamedBarrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2)
+        sm_stats_barrier = _SubsetNamedBarrier(barrier_id=int(NamedBarrierFwdSm100.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2)
         pipeline_o_epi = pipeline_custom.PipelineAsync.create(
             barrier_storage=storage.mbar_O_epi.data_ptr(),
             num_stages=self.s_stage,
@@ -751,7 +752,7 @@ class BlockSparseAttnForwardSm100Blk128:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.mma(
                 tiled_mma_qk,
@@ -797,7 +798,7 @@ class BlockSparseAttnForwardSm100Blk128:
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
@@ -829,7 +830,7 @@ class BlockSparseAttnForwardSm100Blk128:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
-            tmem.wait_for_alloc()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             self.correction_loop(
                 thr_mma_qk,
@@ -1457,7 +1458,8 @@ class BlockSparseAttnForwardSm100Blk128:
         # Notify correction wg that row_max is ready
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        # Here the guarded FFMA's branch costs more than the extra packed op
+        softmax.scale_subtract_rowmax(tSrS_t2r, row_max, always_center=True)
         tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32)
         tSrP_r2t = cute.make_tensor(cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout)
         softmax.apply_exp2_convert(

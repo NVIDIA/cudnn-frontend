@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The compiled-plan cache's rules, without a GPU or the DSL: identity is the
-whole manifest, an entry is only ever reused under its own embedded key, and
-anything doubtful is a miss."""
+whole manifest, an entry is only ever reused under its own embedded key,
+anything doubtful is a miss, and the in-process memo in front of the files
+hands one object per kernel per process."""
 
 import json
 import pathlib
@@ -14,6 +15,15 @@ import cudnn
 from cudnn.frost import compiled_cache as cc
 
 pytestmark = pytest.mark.L0
+
+
+@pytest.fixture(autouse=True)
+def _fresh_memo():
+    """Every test starts from an empty in-process memo: the fakes below compile under short
+    literal keys, and an object memoised by one test must not be served to the next."""
+    cc.clear_memo()
+    yield
+    cc.clear_memo()
 
 
 def test_manifest_names_every_dependency_and_is_deterministic():
@@ -143,6 +153,43 @@ def test_the_record_carries_the_in_process_calling_convention():
     assert cc._rebuild_wrapper(lambda *a: None, None) is None  # an entry from before the record carried a spec is a miss
 
 
+def test_constexpr_dataclasses_do_not_change_the_reloaded_runtime_abi():
+    import inspect
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    import cutlass
+    from cutlass.base_dsl.jit_executor import ExecutionArgs
+
+    @dataclass
+    class Config:
+        tile: int = 64
+
+    def host(config: cutlass.Constexpr, x: int, *, stream: int):
+        pass
+
+    def runtime_wrapper(x, *, stream):
+        pass
+
+    execution_args = ExecutionArgs(inspect.signature(host), "host")
+    if not hasattr(execution_args, "get_rectified_args_from_original_args"):
+        pytest.skip("this DSL executor cannot identify constexpr dataclass arguments")
+    compiled = SimpleNamespace(execution_args=execution_args, _kwargs_wrapper=runtime_wrapper)
+    spec = cc._wrapper_spec_of(compiled, (Config(), 7), {"stream": 11, "options": "--enable-tvm-ffi"})
+    assert spec == {"arg_names": ["x"], "arg_defaults": [], "kwonly_names": ["stream"], "kwonly_defaults": {}}
+    calls = []
+    reloaded = cc._rebuild_wrapper(lambda *args: calls.append(args), spec)
+    reloaded(7, stream=11)
+    assert calls == [(7, 11)]
+
+    def runtime_host(config, x: int, *, stream: int):
+        pass
+
+    compiled.execution_args = ExecutionArgs(inspect.signature(runtime_host), "runtime_host")
+    compiled._kwargs_wrapper = runtime_host
+    assert cc._wrapper_spec_of(compiled, (Config(), 7), {"stream": 11}) is None
+
+
 def test_template_key_joins_the_digest_with_plain_arguments_only():
     g = {"FROST_SOURCE_DIGEST": "abc123"}
     key = cc.template_key(g, {"b": 2, "qh": 8, "lse_stride": (1, 2, 3), "flag": True, "opt": None}, "compile")
@@ -268,3 +315,292 @@ def test_prune_retires_dead_environments_oldest_first_and_keeps_the_current_one(
     assert cc.max_bytes() == 0
     monkeypatch.setenv(cc._ENV_MAX_BYTES, "not-a-number")
     assert cc.max_bytes() == cc._DEFAULT_MAX_BYTES
+
+
+# ---------------------------------------------------------------------------
+# The in-process memo
+# ---------------------------------------------------------------------------
+
+
+def _fake_compile(monkeypatch, calls):
+    """``cute.compile`` replaced by a counter that mints a fresh object per call."""
+    import cutlass.cute as cute
+
+    monkeypatch.setattr(cute, "compile", lambda fn, *a, **k: calls.append((fn, a, k)) or object())
+
+
+def test_the_memo_hands_out_the_same_object_without_a_second_compile(monkeypatch):
+    """A second compile of the same (cache_key, symbol, options) in one process returns the
+    very object the first produced -- no trace, no compile -- with the on-disk cache OFF."""
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    cc.reset_stats()
+    first = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
+    second = cc.compile_cached(lambda: None, 2, cache_key="k", options="--enable-tvm-ffi")
+    assert second is first and len(calls) == 1
+    assert cc.stats()["memo_hits"] == 1 and cc.stats()["bypassed"] == 1
+    assert cc.memo_enabled()
+
+
+def test_refuse_compiles_raises_on_every_compile_path_but_serves_the_memo(monkeypatch, tmp_path):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    memo = cc.compile_cached(lambda: None, cache_key="memo", options="--enable-tvm-ffi")
+    with cc.refuse_compiles():
+        assert cc.compile_cached(lambda: None, cache_key="memo", options="--enable-tvm-ffi") is memo
+        for key, options in (("disabled", "--enable-tvm-ffi"), (None, "--enable-tvm-ffi"), ("k", "")):
+            with pytest.raises(cc.CompileRefused):
+                cc.compile_cached(lambda: None, cache_key=key, options=options)
+        monkeypatch.delenv(cc._ENV_DISABLE)
+        monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+        monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0"})
+        with pytest.raises(cc.CompileRefused):  # a miss on an enabled on-disk cache
+            cc.compile_cached(lambda: None, cache_key="miss", options="--enable-tvm-ffi")
+    assert len(calls) == 1
+    assert cc.compile_cached(lambda: None, cache_key="after", options="") is not None and len(calls) == 2
+
+
+def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_path):
+    """With the files ON, the second call never reaches them."""
+    calls, loads = [], []
+    _fake_compile(monkeypatch, calls)  # the fake object has no export_to_c: a miss stores nothing and returns it
+    monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.8.0"})
+    monkeypatch.setattr(cc, "_try_load", lambda entry, key, symbol: loads.append(entry) or None)
+    monkeypatch.delenv(cc._ENV_DISABLE, raising=False)
+    cc.set_cache_dir(tmp_path)
+    try:
+        cc.reset_stats()
+        first = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
+        loads_after_first = len(loads)
+        assert loads_after_first > 0
+        second = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
+    finally:
+        cc.set_cache_dir(None)
+    assert second is first and len(calls) == 1 and len(loads) == loads_after_first
+    assert cc.stats()["misses"] == 1 and cc.stats()["hits"] == 0 and cc.stats()["memo_hits"] == 1
+
+
+def test_the_memo_keys_on_cache_key_symbol_and_options(monkeypatch):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    cc.reset_stats()
+    f = lambda: None  # noqa: E731
+    cc.compile_cached(f, cache_key="k", options="--enable-tvm-ffi")
+    cc.compile_cached(f, cache_key="k2", options="--enable-tvm-ffi")  # another kernel
+    cc.compile_cached(f, cache_key="k", symbol="other", options="--enable-tvm-ffi")  # another exported symbol
+    cc.compile_cached(f, cache_key="k", options="--enable-tvm-ffi --opt-level 1")  # other compile options
+    cc.compile_cached(f, cache_key="k", options="")  # the options are part of the key even without tvm-ffi
+    assert len(calls) == 5 and cc.stats()["memo_hits"] == 0 and len(cc._MEMO) == 5
+    cc.compile_cached(f, cache_key="k", options="")  # memoised too: the memo needs no exportable object
+    assert len(calls) == 5 and cc.stats()["memo_hits"] == 1
+
+
+def test_the_memo_keys_on_the_device_a_build_targets(monkeypatch):
+    """A compiled object bakes device-derived constants (SM count, L2, SMEM budget): a build
+    scoped to another device is another kernel, exactly as the manifest names the device."""
+    from cudnn.frost import device as frost_device
+
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    monkeypatch.setattr(frost_device, "ambient_device", lambda: 0)  # the live device stays 0 throughout
+    with frost_device.build_device(0):
+        a = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    with frost_device.build_device(1):
+        b = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert b is not a and len(calls) == 2
+    with frost_device.build_device(0):
+        assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is a
+    assert len(calls) == 2 and {k[:2] for k in cc._MEMO} == {(0, 0), (1, 0)}
+
+
+def test_the_memo_keys_on_the_live_device_as_well_as_the_one_a_build_targets(monkeypatch):
+    """A ``build_device(1)`` scope entered while device 0 is the live CUDA device bakes device-1
+    constants into an object created under context 0 (where an engine that does not switch
+    device at execute launches it); the same build issued under device 1 is another object, as
+    a per-build compile always made it. One object per (target, live) pair, never per target."""
+    from cudnn.frost import device as frost_device
+
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    cc.reset_stats()
+    live = {"device": 0}
+    monkeypatch.setattr(frost_device, "ambient_device", lambda: live["device"])
+    with frost_device.build_device(1):
+        a = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")  # for device 1, issued under 0
+    live["device"] = 1
+    with frost_device.build_device(1):
+        b = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")  # for device 1, issued under 1
+    assert b is not a and len(calls) == 2
+    assert {k[:2] for k in cc._MEMO} == {(1, 0), (1, 1)}
+    # an unscoped build targets the live device: issued under 1 it is the (1, 1) object ...
+    assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is b and len(calls) == 2
+    live["device"] = 0
+    with frost_device.build_device(1):
+        assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is a
+    # ... and issued under 0 it is a third object, (0, 0): nothing bakes device-0 constants yet
+    c = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert c is not a and c is not b and len(calls) == 3
+    assert {k[:2] for k in cc._MEMO} == {(1, 0), (1, 1), (0, 0)} and cc.stats()["memo_hits"] == 2
+
+
+def test_a_kernel_without_a_key_is_never_memoised(monkeypatch):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    cc.reset_stats()
+    a = cc.compile_cached(lambda: None, cache_key=None, options="--enable-tvm-ffi")
+    b = cc.compile_cached(lambda: None, cache_key=None, options="--enable-tvm-ffi")
+    assert b is not a and len(calls) == 2 and not cc._MEMO
+    assert cc.stats()["bypassed"] == 2 and cc.stats()["memo_hits"] == 0
+
+
+def test_the_memo_switch_turns_it_off(monkeypatch):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    monkeypatch.setenv(cc._ENV_MEMO, "0")
+    assert not cc.memo_enabled()
+    cc.reset_stats()
+    a = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    b = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert b is not a and len(calls) == 2 and not cc._MEMO and cc.stats()["memo_hits"] == 0
+    for value in ("false", "no", " OFF "):
+        monkeypatch.setenv(cc._ENV_MEMO, value)
+        assert not cc.memo_enabled(), value
+    for value in ("1", "true", "yes", "on", ""):
+        monkeypatch.setenv(cc._ENV_MEMO, value)
+        assert cc.memo_enabled(), value
+    monkeypatch.delenv(cc._ENV_MEMO)
+    assert cc.memo_enabled()  # the default is on
+    c = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert c is cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") and len(calls) == 3
+
+
+def test_a_failed_compile_is_not_memoised(monkeypatch):
+    import cutlass.cute as cute
+
+    attempts = []
+
+    def flaky(fn, *a, **k):
+        attempts.append(fn)
+        if len(attempts) == 1:
+            raise RuntimeError("ptxas died")
+        return object()
+
+    monkeypatch.setattr(cute, "compile", flaky)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    with pytest.raises(RuntimeError, match="ptxas died"):
+        cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert not cc._MEMO
+    obj = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert len(attempts) == 2 and cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is obj and len(attempts) == 2
+
+
+def test_clear_memo_forgets_without_invalidating_what_callers_hold(monkeypatch):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    a = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    cc.clear_memo()
+    assert not cc._MEMO
+    b = cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi")
+    assert b is not a and len(calls) == 2  # a is still the object its caller holds; b is the memo's from now on
+    assert cc.compile_cached(lambda: None, cache_key="k", options="--enable-tvm-ffi") is b
+
+
+def test_the_memo_is_safe_under_concurrent_compiles(monkeypatch):
+    """Threads racing on an empty slot may each compile once, but every one of them leaves
+    with the one object the memo kept, and the memo holds exactly one object per key."""
+    import threading
+    import time
+
+    import cutlass.cute as cute
+
+    compiles = []
+
+    def slow_compile(fn, *a, **k):
+        time.sleep(0.01)  # long enough for the racers to overlap
+        compiles.append(fn)
+        return object()
+
+    monkeypatch.setattr(cute, "compile", slow_compile)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    keys = ["ka", "kb", "kc"]
+    results = {key: [] for key in keys}
+    errors = []
+    n_threads = 12
+    barrier = threading.Barrier(n_threads)
+
+    def worker(key):
+        try:
+            barrier.wait(timeout=30)
+            for _ in range(5):
+                results[key].append(cc.compile_cached(lambda: None, cache_key=key, options="--enable-tvm-ffi"))
+        except Exception as exc:  # noqa: BLE001 -- reported below, never swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(keys[i % len(keys)],)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not errors and not any(t.is_alive() for t in threads)
+    for key in keys:
+        assert len(results[key]) == 5 * (n_threads // len(keys)) and len({id(obj) for obj in results[key]}) == 1, key
+    assert len(cc._MEMO) == len(keys) and len(compiles) >= len(keys)
+    assert cc.stats()["memo_hits"] >= 5 * n_threads - len(compiles)
+
+
+def _fake_entry(root, manifest, key="k|kernel|--enable-tvm-ffi"):
+    entry = cc._entry_dir(root, manifest, key)
+    entry.mkdir(parents=True)
+    (entry.parent / cc._MANIFEST).write_text(json.dumps(manifest))
+    (entry / cc._OBJECT).write_bytes(b"\x7fELF object")
+    (entry / cc._ENTRY).write_text(json.dumps({"schema": cc._SCHEMA, "key": "k", "symbol": "kernel", "wrapper": {}}))
+    return entry
+
+
+def test_seed_installs_an_entry_only_under_an_identical_environment(tmp_path, monkeypatch):
+    manifest = {"schema": cc._SCHEMA, "cudnn_frontend": "1.0", "cuda_driver": "13020"}
+    monkeypatch.setattr(cc, "environment_manifest", lambda device=None: dict(manifest))
+    description, data = cc.read_entry(_fake_entry(tmp_path / "producer", manifest))
+    assert description["environment"] == manifest and data == b"\x7fELF object"
+    cc.reset_stats()
+
+    cc.set_cache_dir(tmp_path / "foreign")
+    try:
+        assert not cc.seed_entry(dict(description, environment=dict(manifest, cuda_driver="12090")), data)
+        assert not cc.seed_entry(dict(description, entry="../escape"), data)
+        assert cc.stats()["seed_rejected"] == 2 and not list((tmp_path / "foreign").rglob("*"))
+
+        cc.set_cache_dir(tmp_path / "consumer")
+        assert cc.seed_entry(description, data) and cc.stats()["seeded"] == 1
+        seeded = cc._entry_dir(tmp_path / "consumer", manifest, "k|kernel|--enable-tvm-ffi")
+        assert (seeded / cc._OBJECT).read_bytes() == data
+        assert json.loads((seeded / cc._ENTRY).read_text()) == description["record"]
+        assert cc.seed_entry(description, data) and cc.stats()["seeded"] == 1  # already present: not rewritten
+    finally:
+        cc.set_cache_dir(None)
+
+
+def test_record_entries_collects_only_persisted_entries(tmp_path, monkeypatch):
+    manifest = {"schema": cc._SCHEMA, "cudnn_frontend": "1.0"}
+    monkeypatch.setattr(cc, "environment_manifest", lambda device=None: dict(manifest))
+    cc.set_cache_dir(tmp_path)
+    try:
+        entry = _fake_entry(tmp_path, manifest)
+        with cc.record_entries() as outer:
+            cc._record("k", "kernel", "--enable-tvm-ffi")
+            cc._record("absent", "kernel", "--enable-tvm-ffi")
+            cc._record("k", "kernel", "")  # not exportable: never persisted
+            with cc.record_entries() as inner:
+                cc._record("k", "kernel", "--enable-tvm-ffi")
+            cc._record("k", "kernel", "--enable-tvm-ffi")
+        assert outer == [entry] and inner == [entry]
+        cc._record("k", "kernel", "--enable-tvm-ffi")  # outside any block: a no-op
+    finally:
+        cc.set_cache_dir(None)

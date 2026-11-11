@@ -28,6 +28,15 @@ def _scale_or_one(scale):
     return value
 
 
+@cute.jit
+def _descale_qk_negate_bit(descale_q, descale_k):
+    """tcgen05 a_negate (bit 13) when the device descale_q * descale_k is negative (#1435)."""
+    bit = cutlass.Int32(0)
+    if cutlass.Float32(cutlass.make_array_view(descale_q)[0]) * cutlass.Float32(cutlass.make_array_view(descale_k)[0]) < cutlass.Float32(0.0):
+        bit = cutlass.Int32(1 << 13)
+    return bit
+
+
 @cute.kernel
 def _reset_amax_kernel(amax: cute.Pointer):
     amax.store(cutlass.Float32(0.0))

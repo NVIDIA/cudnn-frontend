@@ -8,6 +8,8 @@ Tests the GroupedGemmDgluSm100 API which supports both dense (contiguous)
 and discrete weight modes, with dSwiGLU and dGeGLU activations.
 """
 
+import functools
+
 import torch
 import pytest
 import cudnn
@@ -168,7 +170,9 @@ def test_cudnn_all_excludes_module_implementation_helpers():
     ids=["bf16-dense", "bf16-discrete-k-major", "bf16-discrete-n-major"],
 )
 def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
 
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=discrete, b_major=b_major)
@@ -200,7 +204,9 @@ def test_grouped_gemm_dglu_wrapper_bf16(discrete, b_major):
 
 @pytest.mark.L0
 def test_grouped_gemm_dglu_class_bf16_rejects_single_group_runtime_offsets():
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
 
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
@@ -1419,6 +1425,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
     use_dynamic_sched=False,
     situ_beta1=4.0,
     situ_beta2=25.0,
+    deterministic=False,
 ):
     try:
         from cudnn import grouped_gemm_dglu_wrapper_sm100
@@ -1460,6 +1467,7 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
         b_major=cfg["b_major"],
     )
 
+    dprob_runs = []
     try:
         for _ in range(2):  # Run twice to test caching path
             inputs["dprob_tensor"].zero_()
@@ -1493,12 +1501,53 @@ def _test_grouped_gemm_dglu_discrete_wrapper(
                 situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 current_stream=stream,
+                deterministic=deterministic,
             )
+            dprob_runs.append(outputs["dprob_tensor"].clone())
     except (ValueError, NotImplementedError) as e:
+        if deterministic:
+            # The deterministic cases use configurations the default path supports, so a rejection
+            # here is the flag being refused (e.g. a dense-only gate), not an unsupported config.
+            raise
         pytest.skip(f"Unsupported testcase: {e}")
 
     torch.cuda.synchronize()
+    if deterministic:
+        assert torch.equal(bitwise_bits(dprob_runs[0]), bitwise_bits(dprob_runs[1]))
     check_ref_discrete_dswiglu(inputs, outputs, cfg, skip_ref=cfg["skip_ref"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@with_scheduler_modes
+@pytest.mark.parametrize("b_major", ["k", "n"])
+def test_grouped_gemm_dglu_deterministic_dprob_discrete(b_major, use_dynamic_sched, request):
+    """deterministic=True with discrete weights (MXFP8): bit-exact and reference-correct dprob on
+    SM100, and the explicit rejection on SM107."""
+    run = functools.partial(
+        _test_grouped_gemm_dglu_discrete_wrapper,
+        ab_dtype=torch.float8_e4m3fn,
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.float8_e4m3fn,
+        cd_major="n",
+        acc_dtype=torch.float32,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+        sf_vec_size=32,
+        sf_dtype=torch.float8_e8m0fnu,
+        vector_f32=False,
+        discrete_col_sfd=False,
+        act_func="dswiglu",
+        use_dynamic_sched=use_dynamic_sched,
+        request=request,
+        b_major=b_major,
+        deterministic=True,
+    )
+    if torch.cuda.get_device_capability() == (10, 7):
+        with pytest.raises(NotImplementedError, match=_DGLU_DETERMINISTIC_REJECTION):
+            run()
+        return
+    run()
 
 
 @pytest.mark.L0
@@ -2417,7 +2466,9 @@ def test_grouped_gemm_dglu_bf16_rejects_sf_fp8_dtype_override():
     The None case matters as much as the rejection: it pins down that merely
     adding the parameter did not break BF16 dispatch.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU BF16 kernel.")
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
     kwargs = dict(
@@ -2606,6 +2657,8 @@ def test_rubin_mxfp8_clamped_dgeglu_wrapper_quantization_cache(discrete, monkeyp
 # ---------------------------------------------------------------------------
 
 _DGLU_FP8_ARGS = (torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, False, True)
+# SM107 (Rubin) still rejects deterministic dprob; dense and discrete tests expect this message there.
+_DGLU_DETERMINISTIC_REJECTION = "deterministic dprob is implemented only for the SM100 kernel without dbias"
 
 
 def _build_dglu_case(request, ab_dtype, c_dtype, d_dtype, sf_vec_size, sf_dtype, vector_f32, discrete_col_sfd, overrides=None):
@@ -2705,7 +2758,7 @@ def test_grouped_gemm_dglu_deterministic_dprob(request, use_dynamic_sched):
     """Check deterministic dprob on SM100 and its explicit rejection on SM107."""
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
     if torch.cuda.get_device_capability() == (10, 7):
-        with pytest.raises(NotImplementedError, match="deterministic dprob is implemented only for the SM100 dense kernel without dbias"):
+        with pytest.raises(NotImplementedError, match=_DGLU_DETERMINISTIC_REJECTION):
             _run_dglu_case(case, use_dynamic_sched=use_dynamic_sched, deterministic=True)
         return
     _assert_dprob_deterministic(case, use_dynamic_sched)
@@ -2738,7 +2791,9 @@ def test_grouped_gemm_dglu_deterministic_dprob_at_scale(request, use_dynamic_sch
 @torch_fork_set_rng(seed=29)
 def test_grouped_gemm_dglu_deterministic_unsupported(request):
     """Configurations the flag does not cover raise instead of silently running the atomic path."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
     case = _build_dglu_case(request, *_DGLU_FP8_ARGS)
     with pytest.raises(NotImplementedError):
@@ -2773,7 +2828,9 @@ def test_grouped_gemm_dglu_dbias_init_on_launch_stream(request):
     """dbias must be zeroed on the launch stream. Keep torch's current stream busy and launch on
     another one: if the zero-fill is queued behind the busy stream, it lands after the kernel and
     wipes the result."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
     from cuda.bindings import driver as cuda
 
@@ -2793,7 +2850,9 @@ def test_grouped_gemm_dglu_dbias_init_on_launch_stream(request):
 def test_grouped_gemm_dglu_dbias_cache_keys_on_n(request, monkeypatch):
     """The compiled dbias descriptor bakes n, so under the default full-dynamic cache key a call
     with a new n must compile its own kernel instead of reusing the one built for another n."""
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM dGLU.")
     from cudnn.gemm.cutedsl.grouped.dglu import api as dglu_api
 

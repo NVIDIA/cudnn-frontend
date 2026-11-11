@@ -30,6 +30,10 @@ The float→key twiddle and bin extraction:
     bin2 =  key        & 0x3FF   # 1024 bins
 so a larger float maps to a larger key and the top-K largest values are the
 K highest keys.
+
+Deterministic ties use a scalar minimum when one index is needed, otherwise
+an index-ordered prefix scan of the original row. The unordered shrink buffer
+cannot establish the smallest-index tie order.
 """
 
 from __future__ import annotations
@@ -46,11 +50,13 @@ from cutlass._mlir.dialects import llvm
 from cudnn._cutlass_compat import SmemAllocator
 from .indexer_top_k_varlen_util import atomicAdd
 
-from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import device_major, resolve_stream
+from cudnn.deepseek_sparse_attention.utils.compiler import compile_options, gpu_arch_flag
+from cudnn.deepseek_sparse_attention.utils.runtime import device_capability, device_major, resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
+    fake_cute_tensor,
     to_cute_tensor as _to_cute_tensor,
 )
+from cudnn.frost.capture import is_capturing
 
 # Radix configuration.
 _NUM_BINS_11 = 2048  # 11-bit levels (bin0, bin1)
@@ -60,11 +66,6 @@ _NUM_BINS_10 = 1024  # 10-bit level (bin2)
 # re-scanning the full row.  If it overflows (rare; clustered distributions)
 # the refinement passes fall back to a full-row re-scan.  16 KB smem (val+idx).
 _SHRINK_MAX = 2048
-
-# Sentinel for the deterministic tie-break's running min-set. Local KV indices
-# are int32 and strictly smaller than this value, so CTA-scoped atomic_min treats
-# it as positive infinity.
-_INT32_MAX = 0x7FFFFFFF
 
 
 def _make_i64_cand_buffer_compile_tensor():
@@ -265,22 +266,6 @@ class CompressTopkStage2:
         cute.arch.barrier()
         return s_thr[0], s_thr[1]
 
-    @cute.jit
-    def _tie_min_insert(self, s_tie: cute.Tensor, count: Int32, new_idx: Int32):
-        """Insert ``new_idx`` into the running ``count`` smallest tie indices.
-
-        Each slot applies CTA-scoped atomic-min and carries the displaced larger
-        value forward. Concurrent insertions therefore converge to the same set
-        independent of thread arrival order.
-        """
-        carry = new_idx
-        j = Int32(0)
-        while j < count:
-            previous = cute.arch.atomic_min(s_tie.iterator + j, carry, sem="relaxed", scope="cta")
-            if previous > carry:
-                carry = previous
-            j = j + Int32(1)
-
     @cute.kernel
     def kernel(
         self,
@@ -294,6 +279,7 @@ class CompressTopkStage2:
         mCandBatchOffsets: cute.Tensor | None = None,
         mQCausalOffsets: cute.Tensor | None = None,
         mSoftmax: cute.Tensor | None = None,
+        mKvLens: cute.Tensor | None = None,
     ):
         BT = const_expr(self.block_threads)
         K = const_expr(self.topk)
@@ -312,16 +298,24 @@ class CompressTopkStage2:
             offset_q = mCuSeqlensQ[b]
             q = t - offset_q
             seqlen_q_eff = mCuSeqlensQ[b + Int32(1)] - offset_q
-            seqlen_k_eff = mCuSeqlensK[b + Int32(1)] - mCuSeqlensK[b]
+            if const_expr(mKvLens is None):
+                seqlen_k_eff = mCuSeqlensK[b + Int32(1)] - mCuSeqlensK[b]
             ob = t
             oq = Int32(0)
         else:
             q = cute.arch.block_idx()[0]
             b = cute.arch.block_idx()[1]
             seqlen_q_eff = seqlen_q
-            seqlen_k_eff = seqlen_k
+            if const_expr(mKvLens is None):
+                seqlen_k_eff = seqlen_k
             ob = b
             oq = q
+        # Paged K: the per-batch key count comes from kv_lens, not from cu_seqlens_k. It is
+        # bounded by the static key extent, like the score kernel bounds its writes.
+        if const_expr(mKvLens is not None):
+            seqlen_k_eff = mKvLens[b]
+            if seqlen_k_eff > seqlen_k:
+                seqlen_k_eff = seqlen_k
 
         # Per-batch causal offset (q_causal_offset; default 0 when mQCausalOffsets is
         # None) — same convention as the dense indexer.
@@ -380,15 +374,6 @@ class CompressTopkStage2:
             layout=cute.make_ordered_layout((_SHRINK_MAX,), order=(0,)),
             byte_alignment=128,
         )
-        if const_expr(self.deterministic):
-            # Only the deterministic specialization pays this shared-memory cost.
-            # Pass 4 uses the first thr_count2 slots as a running min-set.
-            s_tie_idx = smem.allocate_tensor(
-                element_type=Int32,
-                layout=cute.make_ordered_layout((const_expr(self.topk),), order=(0,)),
-                byte_alignment=128,
-            )
-
         if tidx == 0:
             s_ctl[0] = Int32(0)
             s_ctl[1] = Int32(0)
@@ -490,8 +475,8 @@ class CompressTopkStage2:
                     thr_bin2, thr_count2 = self._find_threshold(s_hist, _NUM_BINS_10, thr_count1, s_warp_sums, s_thr, tidx)
 
                     if const_expr(self.deterministic):
-                        for j in range(tidx, thr_count2, BT):
-                            s_tie_idx[j] = Int32(_INT32_MAX)
+                        if tidx == 0:
+                            s_ctl[1] = seg_len
                         cute.arch.barrier()
 
                     # ---- Pass 4: emit bin2 winners (gt) + exactly thr_count2 (eq) ----
@@ -510,7 +495,8 @@ class CompressTopkStage2:
                                         mIdx[ob, oq, dst] = idx
                                 elif b2 == thr_bin2:
                                     if const_expr(self.deterministic):
-                                        self._tie_min_insert(s_tie_idx, thr_count2, idx)
+                                        if thr_count2 == Int32(1):
+                                            cute.arch.atomic_min(s_ctl.iterator + Int32(1), idx, sem="relaxed", scope="cta")
                                     else:
                                         slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
                                         if slot < thr_count2:
@@ -534,7 +520,8 @@ class CompressTopkStage2:
                                             mIdx[ob, oq, dst] = Int32(i)
                                     elif b2 == thr_bin2:
                                         if const_expr(self.deterministic):
-                                            self._tie_min_insert(s_tie_idx, thr_count2, Int32(i))
+                                            if thr_count2 == Int32(1):
+                                                cute.arch.atomic_min(s_ctl.iterator + Int32(1), Int32(i), sem="relaxed", scope="cta")
                                         else:
                                             slot = atomicAdd(s_ctl.iterator + Int32(1), Int32(1))
                                             if slot < thr_count2:
@@ -544,15 +531,35 @@ class CompressTopkStage2:
                                                     mIdx[ob, oq, dst] = Int32(i)
                     cute.arch.barrier()
                     if const_expr(self.deterministic):
-                        # All collected ties have the exact threshold value. Emit
-                        # the selected smallest indices after the strict winners.
-                        for j in range(tidx, thr_count2, BT):
-                            tie_idx = s_tie_idx[j]
-                            if tie_idx != Int32(_INT32_MAX):
-                                dst = atomicAdd(s_ctl.iterator + Int32(0), Int32(1))
-                                if dst < Int32(K):
-                                    mVal[ob, oq, dst] = mCand[row_base + Int64(tie_idx)]
-                                    mIdx[ob, oq, dst] = tie_idx
+                        strict_count = s_ctl[0]
+                        cute.arch.barrier()
+                        if thr_count2 == Int32(1):
+                            tie_idx = s_ctl[1]
+                            if (tidx == 0) & (tie_idx < seg_len) & (strict_count < Int32(K)):
+                                mVal[ob, oq, strict_count] = mCand[row_base + Int64(tie_idx)]
+                                mIdx[ob, oq, strict_count] = tie_idx
+                                s_ctl[0] = strict_count + Int32(1)
+                        else:
+                            threshold_key = (cutlass.Uint32(thr_bin0) << 21) | (cutlass.Uint32(thr_bin1) << 10) | cutlass.Uint32(thr_bin2)
+                            tie_count = Int32(0)
+                            tile_start = Int32(0)
+                            while (tie_count < thr_count2) & (tile_start < seg_len):
+                                column = tile_start + tidx
+                                value = Float32(0.0)
+                                matching = Int32(0)
+                                if column < seg_len:
+                                    value = mCand[row_base + Int64(column)]
+                                    matching = Int32(self._twiddle(value) == threshold_key)
+                                rank = _block_scan_inclusive(matching, s_warp_sums, tidx, BT, self.num_warps)
+                                destination = strict_count + tie_count + rank - Int32(1)
+                                if (matching != Int32(0)) & (tie_count + rank <= thr_count2) & (destination < Int32(K)):
+                                    mVal[ob, oq, destination] = value
+                                    mIdx[ob, oq, destination] = Int32(column)
+                                tie_count = tie_count + s_warp_sums[self.num_warps - 1]
+                                cute.arch.barrier()
+                                tile_start = tile_start + Int32(BT)
+                            if tidx == 0:
+                                s_ctl[0] = strict_count + cutlass.min(tie_count, thr_count2)
                         cute.arch.barrier()
 
             # ---- Pad the unfilled tail ----
@@ -613,6 +620,7 @@ class CompressTopkStage2:
         mCandBatchOffsets: cute.Tensor | None = None,
         mQCausalOffsets: cute.Tensor | None = None,
         mSoftmax: cute.Tensor | None = None,
+        mKvLens: cute.Tensor | None = None,
     ):
         if const_expr(self.is_varlen):
             # grid = (total_q, 1): one block per global query token.
@@ -633,6 +641,7 @@ class CompressTopkStage2:
             mCandBatchOffsets,
             mQCausalOffsets,
             mSoftmax,
+            mKvLens,
         ).launch(
             grid=grid,
             block=(self.block_threads, 1, 1),
@@ -705,6 +714,11 @@ def _validate_out_buffer(t, name, out_shape, dtype, device):
     return t
 
 
+def _validate_i32_vector(t, name, device):
+    if not t.is_cuda or t.ndim != 1 or t.dtype != torch.int32 or t.stride(0) != 1 or t.device != device:
+        raise ValueError(f"{name} must be a contiguous 1D int32 CUDA tensor on the cand device")
+
+
 def compress_stage2_topk(
     cand_buffer: torch.Tensor,
     bs: int,
@@ -721,6 +735,7 @@ def compress_stage2_topk(
     out_softmax: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
     deterministic: bool = False,
+    kv_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Run the stage-2 radix top-k over a compact cand_buffer.
 
@@ -729,6 +744,9 @@ def compress_stage2_topk(
     ((bs+1,) int64 prefix sum of per-batch compact sizes) so each batch's slab base is
     exact (per-batch pbf is non-uniform); both None ⇒ uniform offset-0 (slab base =
     b * per_batch_floats).
+
+    ``kv_lens`` ((bs,) int32) replaces the uniform ``seqlen_k`` as each batch's visible
+    key count (paged K, where the pool holds more rows than any sequence uses).
 
     When ``out_indices``/``out_logits`` are given the kernel writes into them
     directly (allocation-free / CUDA-graph friendly) instead of allocating; they
@@ -773,6 +791,11 @@ def compress_stage2_topk(
         )
 
     device = cand_buffer.device
+    if kv_lens is not None:
+        # The kernel reads kv_lens[b] for every batch, so a short vector is an out-of-bounds read.
+        _validate_i32_vector(kv_lens, "kv_lens", device)
+        if kv_lens.numel() != bs:
+            raise ValueError(f"kv_lens must have shape ({bs},), got {tuple(kv_lens.shape)}")
     out_shape = (bs, seqlen_q, topk)
     out_indices = _validate_out_buffer(out_indices, "out_indices", out_shape, torch.int32, device)
     out_logits = _validate_out_buffer(out_logits, "out_logits", out_shape, torch.float32, device)
@@ -789,12 +812,13 @@ def compress_stage2_topk(
     softmax_cute = _out_cute(out_softmax) if want_softmax else None
     cbo_cute = _to_cute_tensor(cand_batch_offsets, leading_dim=0) if cand_batch_offsets is not None else None
     qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+    kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if kv_lens is not None else None
 
-    stream = resolve_stream(stream)
+    stream = resolve_stream(stream, device)
     compile_key = (
         bs,
         seqlen_q,
-        seqlen_k,
+        seqlen_k if kv_lens is None else None,  # paged: the key extent is a runtime bound
         topk,
         ratio,
         block_threads,
@@ -803,6 +827,8 @@ def compress_stage2_topk(
         want_softmax,
         bool(deterministic),
     )
+    if kv_lens is not None:
+        compile_key = ("paged", *compile_key)
     if compile_key not in _compile_cache:
         kernel_obj = CompressTopkStage2(topk=topk, ratio=ratio, block_threads=block_threads, deterministic=deterministic)
         _compile_cache[compile_key] = cute.compile(
@@ -818,6 +844,7 @@ def compress_stage2_topk(
             cbo_cute,
             qco_cute,
             softmax_cute,
+            kvl_cute,
             options=compile_options("--opt-level 3"),
         )
 
@@ -833,16 +860,144 @@ def compress_stage2_topk(
         cand_batch_offsets,
         q_causal_offsets,
         out_softmax,
+        kv_lens,
     )
     if want_softmax:
         return out_indices, out_logits, out_softmax
     return out_indices, out_logits
 
 
+def _compile_stage2_topk_varlen(
+    *,
+    device: torch.device,
+    topk: int,
+    ratio: int,
+    block_threads: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    stream,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    cand_batch_offsets: torch.Tensor,
+    q_causal_offsets: Optional[torch.Tensor],
+    kv_lens: Optional[torch.Tensor],
+    idx_cute,
+    val_cute,
+    softmax_cute,
+    deterministic: bool,
+):
+    """Compile/cache the varlen radix kernel without binding live output storage."""
+    device_index = device.index
+    assert device_index is not None
+    capability = device_capability(device)
+    want_softmax = softmax_cute is not None
+    compile_key = (
+        device_index,
+        capability,
+        "varlen" if kv_lens is None else "varlen_paged",
+        topk,
+        ratio,
+        block_threads,
+        q_causal_offsets is not None,
+        want_softmax,
+        bool(deterministic),
+    )
+    if compile_key not in _compile_cache:
+        if is_capturing(stream):
+            raise ValueError("compressed varlen Top-K is not prepared; call plan.compile() before execute() or warm up before CUDA Graph capture")
+        kernel_obj = CompressTopkStage2(
+            topk=topk,
+            ratio=ratio,
+            block_threads=block_threads,
+            is_varlen=True,
+            deterministic=deterministic,
+        )
+        gpu_arch = gpu_arch_flag(device)
+        qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
+        cu_k_cute = _to_cute_tensor(cu_seqlens_k, leading_dim=0) if cu_seqlens_k is not None else None
+        kvl_cute = _to_cute_tensor(kv_lens, assumed_align=4, leading_dim=0) if kv_lens is not None else None
+        with torch.cuda.device(device):
+            _compile_cache[compile_key] = cute.compile(
+                kernel_obj,
+                _make_i64_cand_buffer_compile_tensor(),
+                idx_cute,
+                val_cute,
+                cutlass.Int32(int(max_seqlen_q)),
+                cutlass.Int32(int(max_seqlen_k)),
+                stream,
+                _to_cute_tensor(cu_seqlens_q, leading_dim=0),
+                cu_k_cute,
+                _to_cute_tensor(cand_batch_offsets, leading_dim=0),
+                qco_cute,
+                softmax_cute,
+                kvl_cute,
+                options=compile_options("--opt-level 3", gpu_arch=gpu_arch),
+            )
+    return _compile_cache[compile_key]
+
+
+def precompile_compress_stage2_topk_varlen(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cand_batch_offsets: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    topk: int,
+    ratio: int,
+    *,
+    block_threads: int = 512,
+    stream: Optional[cuda.CUstream] = None,
+    q_causal_offsets: Optional[torch.Tensor] = None,
+    return_softmax: bool = False,
+    deterministic: bool = False,
+):
+    """Prepare the varlen stage-2 artifact from metadata only; launch nothing."""
+    device = cu_seqlens_q.device
+    if not cu_seqlens_q.is_cuda or not cu_seqlens_k.is_cuda or device != cu_seqlens_k.device:
+        raise ValueError("cu_seqlens_q/k must be CUDA tensors on one device")
+    bs = cu_seqlens_q.numel() - 1
+    for tensor, name in ((cu_seqlens_q, "cu_seqlens_q"), (cu_seqlens_k, "cu_seqlens_k")):
+        _validate_i32_vector(tensor, name, device)
+    if bs < 1 or cu_seqlens_k.numel() != bs + 1:
+        raise ValueError("cu_seqlens_q/k must have equal length bs+1 >= 2")
+    if (
+        not cand_batch_offsets.is_cuda
+        or cand_batch_offsets.device != device
+        or cand_batch_offsets.dtype != torch.int64
+        or cand_batch_offsets.ndim != 1
+        or cand_batch_offsets.numel() != bs + 1
+        or not cand_batch_offsets.is_contiguous()
+    ):
+        raise ValueError("cand_batch_offsets must be a contiguous CUDA int64 tensor of shape (bs+1,)")
+    if q_causal_offsets is not None:
+        _validate_i32_vector(q_causal_offsets, "q_causal_offsets", device)
+        if q_causal_offsets.numel() != bs:
+            raise ValueError(f"q_causal_offsets must have shape ({bs},)")
+    stream = resolve_stream(stream, device)
+    return _compile_stage2_topk_varlen(
+        device=device,
+        topk=int(topk),
+        ratio=int(ratio),
+        block_threads=int(block_threads),
+        max_seqlen_q=int(max_seqlen_q),
+        max_seqlen_k=int(max_seqlen_k),
+        stream=stream,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        cand_batch_offsets=cand_batch_offsets,
+        q_causal_offsets=q_causal_offsets,
+        kv_lens=None,
+        idx_cute=fake_cute_tensor(cutlass.Int32, 3, assumed_align=4),
+        val_cute=fake_cute_tensor(cutlass.Float32, 3, assumed_align=4),
+        softmax_cute=fake_cute_tensor(cutlass.Float32, 3, assumed_align=4) if return_softmax else None,
+        deterministic=bool(deterministic),
+    )
+
+
 def compress_stage2_topk_varlen(
     cand_buffer: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
     cand_batch_offsets: torch.Tensor,
     total_q: int,
     max_seqlen_q: int,
@@ -857,12 +1012,17 @@ def compress_stage2_topk_varlen(
     out_softmax: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
     deterministic: bool = False,
+    kv_lens: Optional[torch.Tensor] = None,
+    _compiled_kernel=None,
 ) -> tuple[torch.Tensor, ...]:
     """Native varlen/THD stage-2 top-k over the tight per-batch compact cand_buffer.
 
     ``q_causal_offsets`` ((bs,) int32, default None=0): per-batch causal offset (top-left
     convention, matching the dense indexer).  ``cand_batch_offsets`` must be the matching
     prefix sum (``compress_topk_cand_buffer_size_thd`` with the same offsets).
+
+    ``kv_lens`` ((bs,) int32) carries each batch's visible key count for paged K; it
+    replaces ``cu_seqlens_k``, which may then be ``None``.
 
     ONE launch (grid=(total_q, 1)); each block is a global query token, locates its
     batch by scanning ``cu_seqlens_q``, and reads its compact slab at
@@ -884,14 +1044,14 @@ def compress_stage2_topk_varlen(
     ``compress_topk_cand_buffer_size_thd`` (consistent with cu_seqlens / ratio).  The
     interface validates metadata only and never reads these device values back to
     the host."""
-    if device_major() < 9:
-        raise RuntimeError("CuTeDSL compress stage-2 topk requires SM90+")
     if not cand_buffer.is_cuda or cand_buffer.dtype != torch.float32:
         raise ValueError("cand_buffer must be a CUDA float32 tensor")
     if not cand_buffer.is_contiguous():
         raise ValueError("cand_buffer must be contiguous")
     cand_buffer = cand_buffer.view(-1)
     device = cand_buffer.device
+    if device_capability(device)[0] < 9:
+        raise RuntimeError("CuTeDSL compress stage-2 topk requires SM90+")
     bs = cu_seqlens_q.numel() - 1
     # int64 + contiguous so the .to(torch.int64) below is a guaranteed no-op (no
     # extra alloc / copy).
@@ -911,14 +1071,20 @@ def compress_stage2_topk_varlen(
     # stage-2 no-extra-allocation / graph contract (the public THD entry already
     # enforces int32/contiguous/same-device before calling here).  cand_batch_offsets
     # is int64-validated above, so all three are used directly — no copy.
-    for t, name in ((cu_seqlens_q, "cu_seqlens_q"), (cu_seqlens_k, "cu_seqlens_k")):
-        if not t.is_cuda or t.ndim != 1 or t.dtype != torch.int32 or t.stride(0) != 1 or t.device != device:
-            raise ValueError(f"{name} must be a contiguous 1D int32 CUDA tensor on the cand device")
+    if (cu_seqlens_k is None) == (kv_lens is None):
+        raise ValueError("compress_stage2_topk_varlen takes exactly one of cu_seqlens_k and kv_lens")
+    for t, name in ((cu_seqlens_q, "cu_seqlens_q"), (cu_seqlens_k, "cu_seqlens_k"), (kv_lens, "kv_lens")):
+        if t is not None:
+            _validate_i32_vector(t, name, device)
     # cu_seqlens_q/k must have the SAME length bs+1: bs is derived from
     # cu_seqlens_q, and the kernel reads mCuSeqlensK[b+1] for every such batch b,
     # so a shorter cu_seqlens_k is an out-of-bounds read.  (Structural, sync-free.)
-    if bs < 1 or cu_seqlens_k.numel() != cu_seqlens_q.numel():
+    if bs < 1:
+        raise ValueError(f"cu_seqlens_q must have length bs+1 >= 2; got numel {cu_seqlens_q.numel()}")
+    if cu_seqlens_k is not None and cu_seqlens_k.numel() != cu_seqlens_q.numel():
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have equal length bs+1 (>= 2); got " f"numel {cu_seqlens_q.numel()} and {cu_seqlens_k.numel()}")
+    if kv_lens is not None and kv_lens.numel() != bs:
+        raise ValueError(f"kv_lens must have shape ({bs},), got {tuple(kv_lens.shape)}")
     out_shape = (total_q, topk)
     out_indices = _validate_out_buffer(out_indices, "out_indices", out_shape, torch.int32, device)
     out_logits = _validate_out_buffer(out_logits, "out_logits", out_shape, torch.float32, device)
@@ -935,58 +1101,47 @@ def compress_stage2_topk_varlen(
 
     softmax3_cute = _out_cute(softmax3) if want_softmax else None
 
-    stream = resolve_stream(stream)
+    stream = resolve_stream(stream, device)
     # Layout is fully dynamic: grid (total_q, 1) and all per-batch geometry
     # (cu_seqlens, cand_batch_offsets) are read at runtime (mark_layout_dynamic),
-    # so one compile per (topk, ratio, block_threads) serves any total_q / bs /
-    # output layout — hence total_q/bs are not in the compile key
+    # so one compile per device/architecture and (topk, ratio, block_threads)
+    # serves any total_q / bs / output layout — hence total_q/bs are not in the compile key
     # (see test_indexer_fwd_dsl_compress_topk_thd_reuse).
-    qco_cute = _to_cute_tensor(q_causal_offsets, leading_dim=0) if q_causal_offsets is not None else None
-    compile_key = (
-        "varlen",
-        topk,
-        ratio,
-        block_threads,
-        q_causal_offsets is not None,
-        want_softmax,
-        bool(deterministic),
-    )
-    if compile_key not in _compile_cache:
-        kernel_obj = CompressTopkStage2(
+    compiled = _compiled_kernel
+    if compiled is None:
+        compiled = _compile_stage2_topk_varlen(
+            device=device,
             topk=topk,
             ratio=ratio,
             block_threads=block_threads,
-            is_varlen=True,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            stream=stream,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            cand_batch_offsets=cand_batch_offsets,
+            q_causal_offsets=q_causal_offsets,
+            kv_lens=kv_lens,
+            idx_cute=_out_cute(idx3),
+            val_cute=_out_cute(val3),
+            softmax_cute=softmax3_cute,
             deterministic=deterministic,
         )
-        _compile_cache[compile_key] = cute.compile(
-            kernel_obj,
-            _make_i64_cand_buffer_compile_tensor(),
-            _out_cute(idx3),
-            _out_cute(val3),
+    with torch.cuda.device(device):
+        compiled(
+            cand_buffer,
+            idx3,
+            val3,
             cutlass.Int32(int(max_seqlen_q)),
             cutlass.Int32(int(max_seqlen_k)),
             stream,
-            _to_cute_tensor(cu_seqlens_q, leading_dim=0),
-            _to_cute_tensor(cu_seqlens_k, leading_dim=0),
-            _to_cute_tensor(cand_batch_offsets, leading_dim=0),
-            qco_cute,
-            softmax3_cute,
-            options=compile_options("--opt-level 3"),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cand_batch_offsets,
+            q_causal_offsets,
+            softmax3,
+            kv_lens,
         )
-    _compile_cache[compile_key](
-        cand_buffer,
-        idx3,
-        val3,
-        cutlass.Int32(int(max_seqlen_q)),
-        cutlass.Int32(int(max_seqlen_k)),
-        stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        cand_batch_offsets,
-        q_causal_offsets,
-        softmax3,
-    )
     if want_softmax:
         return out_indices, out_logits, out_softmax
     return out_indices, out_logits

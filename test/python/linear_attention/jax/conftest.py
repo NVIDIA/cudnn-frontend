@@ -10,6 +10,8 @@ def cuda_device(request):
         return
     import jax
 
-    devices = jax.local_devices()
-    if len(devices) != 1 or devices[0].platform != "gpu" or str(getattr(devices[0], "compute_capability", "")) not in ("10.0", "10.3"):
-        pytest.skip("KDA requires one visible SM100/SM103 GPU")
+    # Other GPUs may be visible (CI exposes several). The first one is JAX's default
+    # device and the GPU CuTeDSL compiles for, so it has to be the supported one.
+    first = jax.local_devices()[0]
+    if first.platform != "gpu" or str(getattr(first, "compute_capability", "")) not in ("10.0", "10.3"):
+        pytest.skip("KDA requires the first visible GPU to be SM100/SM103")

@@ -400,6 +400,7 @@ def _run_thd_case(
     stats_layout: str = "token_major",
     cu_lens: bool = False,
     nan_capacity_tail: bool = False,
+    scale: float | None = None,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -418,7 +419,7 @@ def _run_thd_case(
     s_q_max = max(max(seq_q_lens), 1)
     s_kv_max = max(max(seq_kv_lens), 1)
     d_v = head_dim if head_dim_v is None else head_dim_v
-    scale = 1.0 / math.sqrt(head_dim)
+    scale = 1.0 / math.sqrt(head_dim) if scale is None else scale
     q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
     k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
     v_seqs = [_bhsd(1, h_kv, max(n, 1), d_v, dtype)[:, :, :n] for n in seq_kv_lens]
@@ -1249,21 +1250,24 @@ def test_dsl_sm120_thd_execute_cuda_graph_capture():
     api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
-    # Clobber O before each replay: the warm-up (and nothing else) has already
-    # produced the [200, 150] answer, so without this the first assertion
-    # would be satisfied by stale warm-up output even if replay did nothing.
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([200, 150])
-    # New lengths into the SAME device tensor — replay must honor them.
-    lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
-    o.zero_()
-    graph.replay()
-    torch.cuda.synchronize()
-    _check([64, 33])
+    try:
+        with torch.cuda.graph(graph):
+            api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=lens, seq_kv_lens=lens)
+        # Clobber O before each replay: the warm-up (and nothing else) has already
+        # produced the [200, 150] answer, so without this the first assertion
+        # would be satisfied by stale warm-up output even if replay did nothing.
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([200, 150])
+        # New lengths into the SAME device tensor — replay must honor them.
+        lens.copy_(torch.tensor([64, 33], dtype=torch.int32, device="cuda"))
+        o.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        _check([64, 33])
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L1
@@ -1385,8 +1389,8 @@ def test_dsl_sm120_flavor_routing():
         _api(512, 512, tile_m=128).check_support()  # the 128 x 512 O staging tile alone is 128 KiB
     with pytest.raises(NotImplementedError, match="no kernel"):
         _api(128, 128, tile_n=32).check_support()  # kv_tile 32 is the d512 flavor's alone
-    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (520, 512), (512, 520)):
-        with pytest.raises(ValueError, match="both head dimensions"):
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (584, 512), (512, 520)):
+        with pytest.raises(ValueError, match="head dimensions must fit a supported wide flavor"):
             _api(d_qk, d_v).check_support()
     # The general template still takes the knobs.
     api = _api(128, 128, tile_m=64, tile_n=64)
@@ -1408,7 +1412,7 @@ def test_dsl_sm120_d512_template_rejects_dims_and_tiles_outside_its_table():
 
     cc = torch.cuda.get_device_capability()
     module = api_dsl._load_sm120_kernel_module(D512_FLAVOR, TemplateParams(q_tile=64, kv_tile=32))
-    for d_qk, d_v in ((256, 256), (256, 512), (512, 256), (520, 512), (512, 520)):
+    for d_qk, d_v in ((256, 256), (256, 512), (512, 256), (584, 512), (512, 520)):
         with pytest.raises(ValueError, match="head dim"):
             module.compile(compute_capability=cc, b=1, qh=1, kh=1, sq=128, skv=128, d_qk=d_qk, d_v=d_v, has_lse=False)
     module = api_dsl._load_sm120_kernel_module(D512_FLAVOR, TemplateParams(q_tile=64, kv_tile=64))
@@ -1591,7 +1595,7 @@ def test_dsl_sm120_pack_gqa_tiles(s_q: int):
 @pytest.mark.L0
 @torch_fork_set_rng(seed=2)
 def test_dsl_sm120_pack_gqa_tile64():
-    """Packed at q_tile=64 (G must divide the smaller tile: 8/2 -> G=4)."""
+    """Packed at q_tile=64 with a group that divides it (8/2 -> G=4: 16 tokens in all 64 rows, no dead rows)."""
     _run_case(batch=2, h_q=8, h_kv=2, s_q=24, s_kv=192, head_dim=64, is_causal=True, q_tile=64, kv_tile=64, pack_gqa=True, check_stats=True)
 
 
@@ -1630,6 +1634,97 @@ def test_dsl_sm120_pack_gqa_features(mask: str):
 def test_dsl_sm120_pack_gqa_deep(dtype: torch.dtype, s_q: int, h_kv: int):
     """Packed multi-tile / odd-length row spaces, bf16."""
     _run_case(batch=1, h_q=64, h_kv=h_kv, s_q=s_q, s_kv=2048, head_dim=128, dtype=dtype, is_causal=True, pack_gqa=True)
+
+
+# --- PackGQA with tile_q % G != 0: q_tile // G tokens, the rows past them dead
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q,head_dim,tiles",
+    [
+        (24, 128, (128, 128)),  # G=6: 21 tokens in 126 live rows
+        (24, 128, (64, 64)),  # G=6: 10 tokens in 60 live rows; the tile at token 60 crosses key 64
+        (20, 128, (128, 64)),  # G=5: 25 tokens in 125 live rows; the tile at token 50 crosses key 64
+        (12, 128, (64, 64)),  # G=3: 21 tokens in 63 live rows
+        (24, 256, (128, 64)),  # G=6 on the D=256 template: 21 tokens in 126 live rows
+        (28, 256, (128, 64)),  # G=7 on the D=256 template: 18 tokens in 126 live rows; token 54 crosses key 64
+        (24, 512, (64, 32)),  # G=6 on the D=512 template (TMA Q); the tile at token 30 crosses key 32
+    ],
+    ids=["g6_128x128", "g6_64x64", "g5_128x64", "g3_64x64", "g6_d256", "g7_d256", "g6_d512"],
+)
+@torch_fork_set_rng(seed=5)
+def test_dsl_sm120_pack_gqa_tile_q_not_divisible(h_q: int, head_dim: int, tiles: tuple[int, int]):
+    """A group the tile does not divide packs on every template; its dead rows (zero Q) never store, or
+    they would land on the next tile's first token. Top-left causal over 70 tokens starts
+    packed tiles off the KV grid, so the diagonal can straddle one more KV tile than the token span."""
+    _run_case(batch=2, h_q=h_q, h_kv=4, s_q=70, s_kv=280, head_dim=head_dim, is_causal=True, q_tile=tiles[0], kv_tile=tiles[1], pack_gqa=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["decode", "mtp_causal_br_sink", "swa_sink", "padded_qtrim"])
+@torch_fork_set_rng(seed=6)
+def test_dsl_sm120_pack_gqa_tile_q_not_divisible_features(mask: str):
+    """GQA 6 packed x the decode shapes (the heuristics' packed plan, split or not) and the dense
+    mask / sink / trim envelope, stats checked."""
+    kw: dict = dict(batch=2, h_q=24, h_kv=4, s_q=40, s_kv=256, head_dim=128, pack_gqa=True, check_stats=True)
+    if mask == "decode":
+        kw.update(s_q=1, s_kv=4133)
+    elif mask == "mtp_causal_br_sink":
+        kw.update(s_q=4, s_kv=4133, is_causal=True, causal_bottom_right=True, window_size_right=0, with_sink=True)
+    elif mask == "swa_sink":
+        kw.update(is_causal=True, window_size_left=16, with_sink=True)
+    elif mask == "padded_qtrim":
+        kw.update(
+            seq_q_lens=torch.tensor([37, 13], dtype=torch.int32, device="cuda"),
+            seq_kv_lens=torch.tensor([180, 240], dtype=torch.int32, device="cuda"),
+        )
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
+    """Every template packs any group up to the tile, and declines a group past it."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    def api(h_q: int, h_kv: int, d: int, q_tile: int):
+        q = _bhsd(1, h_q, 8, d, torch.float16)
+        kv = _bhsd(1, h_kv, 64, d, torch.float16)
+        return SdpaFwdDslSm120(sample_q=q, sample_k=kv, sample_v=kv, sample_o=torch.empty_like(q), tile_m=q_tile, pack_gqa=True)
+
+    for d, q_tile in ((128, 64), (256, 128), (512, 64)):
+        assert api(24, 4, d, q_tile).check_support()
+        with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
+            api(2 * q_tile, 1, d, q_tile).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("head_dim,kv_tile", [(128, 64), (512, 32)], ids=["d128", "d512"])
+@torch_fork_set_rng(seed=7)
+def test_dsl_sm120_pack_gqa_dead_rows_never_store(head_dim: int, kv_tile: int):
+    """A packed tile's dead rows map onto the next tile's first token (row r -> token r // G). Under LPT every
+    head's last Q tile is dispatched before any first one, and 384 of them outlast one wave, so a dead-row store
+    would land after the next tile's live store and overwrite it."""
+    _require_dsl()
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    q = _bhsd(96, 24, 20, head_dim, torch.float16)
+    k = _bhsd(96, 4, 256, head_dim, torch.float16)
+    v = _bhsd(96, 4, 256, head_dim, torch.float16)
+    o = torch.empty_like(q)
+    lse = torch.empty(96, 24, 20, dtype=torch.float32, device="cuda")
+    # G = 6 at 64 rows: two tiles of 10 tokens per packed head, rows 60-63 dead.
+    api = SdpaFwdDslSm120(
+        sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, is_causal=True, tile_m=64, tile_n=kv_tile, pack_gqa=True, sched_policy=SCHED_LPT
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    api.execute(workspace=ws, q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+    torch.cuda.synchronize()
+    expected, expected_lse = _ref_sdpa_full(q, k, v, scale=1.0 / math.sqrt(head_dim), is_causal=True, return_stats=True)
+    torch.testing.assert_close(o.float(), expected, atol=0.1, rtol=5e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
@@ -1938,14 +2033,30 @@ def test_dsl_sm120_wide_stats(head_dim, stats_use_log2):
 
 
 # Keep the convenience-wrapper regression in the explicit SM120 CI entry.
-import test_sdpa_staged_forward_sm120 as _staged_forward_checks
+import native_forward_sm120_cases as _native_forward_checks
 
 
 @pytest.mark.L0
 @requires_dsl
-class TestStagedSm120Wrapper:
-    test_compiled_workspace_budget = staticmethod(_staged_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
-    test_conversion_workspace = staticmethod(_staged_forward_checks.test_sm120_wrapper_supplies_conversion_workspace)
+class TestNativeSm120Strides:
+    test_native_forward_uses_pointer_host = staticmethod(_native_forward_checks.test_native_forward_uses_pointer_host)
+    test_native_typed_workspace_uses_current_view_origin = staticmethod(_native_forward_checks.test_native_typed_workspace_uses_current_view_origin)
+    test_native_first_capture_rebinds_current_storage_and_stream = staticmethod(
+        _native_forward_checks.test_native_first_capture_rebinds_current_storage_and_stream
+    )
+    test_native_default_stream_is_resolved_for_q_device = staticmethod(_native_forward_checks.test_native_default_stream_is_resolved_for_q_device)
+    test_native_default_stream_with_another_device_current = staticmethod(_native_forward_checks.test_native_default_stream_with_another_device_current)
+    test_native_invalid_operand_is_rejected_before_any_launch = staticmethod(_native_forward_checks.test_native_invalid_operand_is_rejected_before_any_launch)
+    test_native_rejects_mxfp8_input_scales = staticmethod(_native_forward_checks.test_native_rejects_mxfp8_input_scales)
+    test_native_amax_alias_checks_original_operand = staticmethod(_native_forward_checks.test_native_amax_alias_checks_original_operand)
+    test_native_sf_alias_checks_original_operand = staticmethod(_native_forward_checks.test_native_sf_alias_checks_original_operand)
+    test_native_physical_wide_batch_stride = staticmethod(_native_forward_checks.test_native_physical_wide_batch_stride)
+    test_native_artifact_reloads_without_jit = staticmethod(_native_forward_checks.test_native_artifact_reloads_without_jit)
+    test_native_block_output_matches_native_graph = staticmethod(_native_forward_checks.test_native_block_output_matches_native_graph)
+    test_sm120_wrapper_supplies_workspace = staticmethod(_native_forward_checks.test_sm120_wrapper_supplies_workspace)
+    test_compiled_workspace_query_uses_prepared_budget = staticmethod(_native_forward_checks.test_compiled_workspace_query_uses_prepared_budget)
+    test_native_rejects_runtime_element_stride_and_broadcast = staticmethod(_native_forward_checks.test_native_rejects_runtime_element_stride_and_broadcast)
+    test_native_explicit_stream_with_another_device_current = staticmethod(_native_forward_checks.test_native_explicit_stream_with_another_device_current)
 
 
 @pytest.mark.L0
@@ -1957,3 +2068,75 @@ def test_dsl_sm120_thd_parallel_prefix_batches(batch, cu_lens):
     q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
     kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
     _run_thd_case(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, head_dim=128, cu_lens=cu_lens, nan_capacity_tail=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)], ids=["d64", "d128", "d192x128", "d256", "d512"])
+@pytest.mark.parametrize("mask", ["none", "causal", "padded_sink_bottom_right"])
+@torch_fork_set_rng(seed=31)
+def test_dsl_sm120_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale is folded into Q's sign so the raw-score row max still bounds P (#1435); before, every
+    masked case returned NaN. The KV length is not a tile multiple, so "none" also masks a tail."""
+    kw = dict(batch=2, h_q=4, h_kv=2, s_q=160, s_kv=200, head_dim=d_qk, head_dim_v=d_v, scale=-0.7 / math.sqrt(d_qk), check_stats=True)
+    if mask == "causal":
+        kw.update(is_causal=True)
+    elif mask == "padded_sink_bottom_right":
+        kw.update(
+            is_causal=True,
+            causal_bottom_right=True,
+            with_sink=True,
+            seq_q_lens=torch.tensor([150, 160], dtype=torch.int32, device="cuda").view(2, 1, 1, 1),
+            seq_kv_lens=torch.tensor([180, 200], dtype=torch.int32, device="cuda").view(2, 1, 1, 1),
+        )
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (256, 256), (512, 512)], ids=["d128", "d256", "d512"])
+@torch_fork_set_rng(seed=32)
+def test_dsl_sm120_thd_negative_attn_scale(d_qk, d_v):
+    """The packed path loads Q without TMA (the d512 kernel's register/shared-slot split included)."""
+    _run_thd_case(
+        seq_q_lens=[96, 0, 41],
+        seq_kv_lens=[130, 7, 41],
+        h_q=4,
+        h_kv=2,
+        head_dim=d_qk,
+        head_dim_v=d_v,
+        is_causal=True,
+        causal_bottom_right=True,
+        with_sink=True,
+        check_stats=True,
+        scale=-0.7 / math.sqrt(d_qk),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=33)
+def test_dsl_sm120_execute_scale_sign_must_match_the_plan():
+    """The scale's sign is compiled into the plan (negate_scores), so an execute-time scale of the other sign is refused."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 1, 2, 128, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    for planned in (d**-0.5, -(d**-0.5)):
+        api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=planned)
+        assert api.check_support()
+        api.compile()
+        with pytest.raises(ValueError, match="sign"):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=-planned)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=2 * planned)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o.float(), _ref_sdpa_full(q, k, v, scale=2 * planned), atol=0.1, rtol=5e-2)
+
+
+# Keep native stride coverage in the architecture-specific CI entry.
+from native_forward_stride_cases import check_native_dense_permutations as _native_dense_permutations
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeDenseStrides:
+    test_permutations = staticmethod(_native_dense_permutations)

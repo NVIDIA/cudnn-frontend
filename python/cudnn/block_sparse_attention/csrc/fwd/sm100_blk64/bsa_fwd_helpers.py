@@ -384,6 +384,106 @@ def tmem_combine_store_exchange_4x32dp32b32x(
 
 
 @cute.jit
+def tmem_combine_store_exchange_chunks(
+    tmem_o0_addr: Int32,
+    tmem_o1_addr: Int32,
+    exchange_smem_addr: Int32,
+    scale0: Float32,
+    scale1: Float32,
+    first_chunk: cutlass.Constexpr[int],
+    n_chunks: cutlass.Constexpr[int],
+) -> None:
+    """Like tmem_combine_store_exchange_4x32dp32b32x but for 32-column chunks [first_chunk, first_chunk + n_chunks);
+    chunk j of the call lands at exchange slot j (slot stride 32*32*4 bytes)."""
+    regs0 = ", ".join(f"a{i}" for i in range(32))
+    regs1 = ", ".join(f"b{i}" for i in range(32))
+    combine_ops = "\n\t".join(
+        f"mov.b64 la, {{a{i}, a{i + 1}}};\n\t"
+        f"mov.b64 lb, {{b{i}, b{i + 1}}};\n\t"
+        "mul.rn.f32x2 lb, lb, lscale1;\n\t"
+        "fma.rn.f32x2 la, la, lscale0, lb;\n\t"
+        f"mov.b64 {{o{i}, o{i + 1}}}, la;"
+        for i in range(0, 32, 2)
+    )
+    store_ops = "\n\t".join(
+        f"add.u32 store_addr, saddr_cur, {group * 32 * 4 * 4};\n\t"
+        f"st.shared.v4.b32 [store_addr], {{o{group * 4 + 0}, o{group * 4 + 1}, o{group * 4 + 2}, o{group * 4 + 3}}};"
+        for group in range(8)
+    )
+    chunk_ops = "\n\t".join(
+        "add.u32 taddr0_cur, taddr0, "
+        f"{(first_chunk + chunk) * 32};\n\t"
+        "add.u32 taddr1_cur, taddr1, "
+        f"{(first_chunk + chunk) * 32};\n\t"
+        "add.u32 saddr_cur, saddr, "
+        f"{chunk * 32 * 32 * 4};\n\t"
+        f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{regs0}}}, [taddr0_cur];\n\t"
+        f"tcgen05.ld.sync.aligned.32x32b.x32.b32 {{{regs1}}}, [taddr1_cur];\n\t"
+        f"{combine_ops}\n\t"
+        f"{store_ops}"
+        for chunk in range(n_chunks)
+    )
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(tmem_o0_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(tmem_o1_addr)).ir_value(),
+            Int32(exchange_smem_addr).ir_value(),
+            Float32(scale0).ir_value(),
+            Float32(scale1).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .b32 taddr0;\n\t"
+        ".reg .b32 taddr1;\n\t"
+        ".reg .b32 taddr0_cur;\n\t"
+        ".reg .b32 taddr1_cur;\n\t"
+        ".reg .b32 saddr;\n\t"
+        ".reg .b32 saddr_cur;\n\t"
+        ".reg .b32 store_addr;\n\t"
+        ".reg .b32 a<32>;\n\t"
+        ".reg .b32 b<32>;\n\t"
+        ".reg .b32 o<32>;\n\t"
+        ".reg .b64 la;\n\t"
+        ".reg .b64 lb;\n\t"
+        ".reg .b64 lscale0;\n\t"
+        ".reg .b64 lscale1;\n\t"
+        ".reg .f32 scale0;\n\t"
+        ".reg .f32 scale1;\n\t"
+        "mov.b32 taddr0, $0;\n\t"
+        "mov.b32 taddr1, $1;\n\t"
+        "mov.b32 saddr, $2;\n\t"
+        "mov.f32 scale0, $3;\n\t"
+        "mov.f32 scale1, $4;\n\t"
+        "mov.b64 lscale0, {scale0, scale0};\n\t"
+        "mov.b64 lscale1, {scale1, scale1};\n\t"
+        f"{chunk_ops}\n\t"
+        "}\n",
+        "r,r,r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def smem_zero_store_exchange_chunks(exchange_smem_addr: Int32, n_chunks: cutlass.Constexpr[int]) -> None:
+    store_ops = "\n\t".join(
+        f"add.u32 addr, saddr, {chunk * 32 * 32 * 4 + group * 32 * 4 * 4};\n\t" "st.shared.v4.b32 [addr], {z, z, z, z};"
+        for chunk in range(n_chunks)
+        for group in range(8)
+    )
+    llvm.inline_asm(
+        None,
+        [Int32(exchange_smem_addr).ir_value()],
+        "{\n\t" ".reg .b32 saddr;\n\t" ".reg .b32 addr;\n\t" ".reg .b32 z;\n\t" "mov.b32 saddr, $0;\n\t" "mov.u32 z, 0;\n\t" f"{store_ops}\n\t" "}\n",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def smem_zero_store_exchange_4x32dp32b32x(exchange_smem_addr: Int32) -> None:
     store_ops = "\n\t".join(
         f"add.u32 addr, saddr, {chunk * 32 * 32 * 4 + group * 32 * 4 * 4};\n\t" "st.shared.v4.b32 [addr], {z, z, z, z};"

@@ -1,5 +1,77 @@
 # test — Agent Guide
 
+For new numerical APIs and kernel paths, use the
+[determinism skill](../skills/determinism_tests/SKILL.md) to add/run L0 tests and update API support.
+For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
+and the [coverage table](python/determinism_goldens/README.md).
+The shared comparator checks bytes, tensor names, shapes, and dtypes. Clone each
+result before the next launch so reused storage cannot make replay pass.
+For backward batch checks, slice fixed upstream gradients with the inputs;
+do not use a batch-mean loss. GDP expands K/V/beta by `num_householder`, while
+Q/G remain on the token axis. QSA packing must shift token and block metadata
+and retain each sequence's selection mask. Validate these mappings with all
+gradients, not only dQ/dK.
+Name parameter IDs with direction, dtype, and shape where applicable. Report
+collected cases separately from replay executions. Include tile/routing
+boundaries, grouped-head reductions, duplicate sequences, changed neighbors,
+and isolated upstream-gradient sources when the operation supports them.
+Keep these determinism suites in L0, including stress cases.
+For DSA, shift valid Top-K indices with the KV offset and keep invalid indices
+invalid after packing. Use unique active indices for deterministic backward,
+except in cases pinned to an SM100/SM103 conflict-rank dKV layout (records,
+chain, H128 two-CTA), whose contract includes duplicates; assert the selected
+layout in such cases. dKV is not batch invariant once a batch spans several
+waves, on any layout (the shard layouts included): compare forward results, dQ
+and generic-kernel dSink across batch layouts and name the gap; H128 two-CTA
+dSink follows query positions. H128 D576 has no public forward kernel; feed
+reference forward results as fixed backward inputs.
+The sink gradient is shared across sequences: isolate the target's upstream
+gradient before comparing it across batches. Check DSA's signed infinity
+sentinels against the expected empty rows before byte comparison.
+For indexer backward, restore the score buffers that the API mutates. Keep
+`loss_coeff / query_count` and `grad_loss` fixed across batch layouts. Compare
+all three gradients and mutated scores; test BF16 and FP32 dK separately.
+Remap global Top-K IDs when batches move and preserve negative padding.
+Keep API-by-dtype/GPU support in [the status page](../docs/operations/determinism.md).
+Put test counts, commands, runtimes, and failure diagnostics in
+[the test report](python/determinism_goldens/README.md), not the status page.
+When a CUDA-graph check can select a backend plan, supply an explicit cuDNN handle and bind it to the same
+capture stream used by Torch. A Python-engine path may follow Torch's current stream while a backend handle
+stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
+evidence of a backend replay defect. Check the captured graph and changed-input replay before attributing it.
+
+For explicitly requested temporary skips, limit them to known failing cases,
+use a `skip until fix` reason, retain the failure report, and remove them with the fix.
+For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
+bytes across batch changes. Repack MXFP8 scale layouts without requantizing.
+Columnwise F8_128x4 scale atoms span all B*H scale rows along their column
+axis. A rank-4 carrier's physical B slices cannot simply be concatenated:
+unswizzle to logical bytes, rebatch, then reswizzle without requantizing.
+A single D128 row atom can hide the error; D512 exposes it. The CPU fixture
+control `test_v_tail_scale_repack` in `test_sdpa_fp8_v_tail_sync_sm120.py`
+compares this byte permutation with the canonical quantizer and rejects naive
+physical concatenation for the multi-atom case.
+Check against dequantized inputs and include a scale-only change. Keep SM90
+FP8 and SM100/SM103/SM107 MXFP8 results separate; an architecture skip is not
+a measured pass on that architecture.
+
+MXFP8 backward's element-count allowance needs the same magnitude cap as its
+row-count allowance: an isolated large error can preserve amax and still fit
+the element budget. `assert_close_mxfp8_grad` caps every extra mismatch;
+`sdpa/test_mxfp8_grad_budget.py` pins a non-maximum 0-to-8 rejection and bounded
+row acceptance. When emulating the backward exponent's FP32 FFMA, round the
+scalar multiplier and the separately formed Stats term before the final fused
+rounding. Keep the independent dS-policy recipe bitwise and pin the exponent
+before exp2 in `sdpa/test_mxfp8_ref_quantize_ds.py`.
+
+For deterministic DSA indexer backward, cover large TopK with more than twice
+as many query rows as producer planes, so persistent CTAs consume at least
+three rows. Restore score inputs and poison workspace/outputs before each run;
+use `assert_bitwise_runs` to compare raw bytes, including signed zero, and retain
+an independent gradient reference. The L1
+`test_DSA_indexer_backward_deterministic_topk2048_boundary` covers both backends
+at 193 rows, 96 planes, and TopK 896/2048.
+
 Recurrent FP64 autograd references can retain a K x V state for every token
 and head. When a production stress case scales heads with the GPU SM count,
 bound the reference by independent head chunks while keeping the full kernel
@@ -26,6 +98,11 @@ Two suites: `test/cpp` (Catch2, C++ graph API) and `test/python` (pytest). Both 
 - Catch2 v3 binary, target `tests`, built by the default CMake build (`CUDNN_FRONTEND_BUILD_TESTS=ON`) into `build/bin/tests`.
 - Run all: `./build/bin/tests`. List: `--list-tests`. One case: `./build/bin/tests "Validate conv node"`. Filter by tag: `./build/bin/tests "[serialize]"`.
 
+After changing shared graph validation, run the unfiltered `tests` and `samples` binaries;
+a feature-tagged sample run can miss existing graph callers. For pointwise arity
+changes, inspect shipped positive calls using each overload and preserve intentional
+negative tests. The INT8 convolution sample exercises unary IDENTITY.
+
 ### Plan failure diagnostics
 
 Match each rejected plan's name and position in the same diagnostic fragment.
@@ -46,7 +123,32 @@ a rejected prefix and an unbuilt suffix so pruning deterministically moves a
 valid plan to index zero; then replay its identity, append/build another config,
 and tune a serialized/reloaded plan whose engine-config list is absent.
 
+### Header and runtime version guards
+
+Keep header-version comparisons out of ordinary runtime `if` conditions. MSVC
+reports C4127 for a constant operand such as `CUDNN_VERSION < 92900` in a
+combined condition, and `/WX` makes it a build failure. Select the header
+case with `#if`/`#elif`, then check the loaded backend version in the applicable
+branch. Preserve both older-header and newer-header/older-runtime behavior,
+including the inverse guard of an old-backend refusal test. The custom-reduction
+tests and samples use this separation.
+
 ## Python tests (`test/python`)
+
+When changing direct CPython C API calls in the bindings, build with
+`CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` and import the resulting abi3 module.
+`PyFloat_AS_DOUBLE` is unavailable under `Py_LIMITED_API`; after successful
+`PyNumber_Float`, use the public `PyFloat_AsDouble` accessor. A small compile
+probe against the actual limited-API headers should fail with the old call and
+pass with the replacement. For build-flag qualification, inspect the compiler
+definitions: `CUDNN_FRONTEND_SKIP_JSON_LIB=ON` in a CMake cache alone does not
+prove that the Python module compiled with JSON disabled.
+
+When moving Python modules, build the validation wheel with fresh Python build
+output. Reusing `build/lib.*` can ship removed modules even when the source tree
+and its import tests are clean. Inspect the wheel's module paths, then run the
+API inventory against that wheel. QSA's package-move regression in
+`core/test_import_boundaries.py` also checks that removed imports do not resolve.
 
 Run from `test/python` so `pytest.ini` and `conftest.py` apply:
 
@@ -55,6 +157,8 @@ cd test/python
 pytest                       # pytest.ini addopts default to -m L0 (smoke) --tb=short --no-header
 pytest -m L1                 # levels L0..L4; higher = larger sweeps
 pytest -n 4                  # pytest-xdist; mind marker gpu_exclusive for tests that need the GPU alone
+pytest -m smoke sdpa/frost   # the SMOKE tier: one cell per code path, marked from tiers/smoke_<arch>.txt (tiers/README.md)
+pytest -m "L0 and not nightly_only" sdpa/frost   # the FULL local tier: L0 minus tiers/nightly_only.txt; CI stays -m L0
 pytest conv/graph/test_conv_fprop.py  # one file — note the default -m L0 filter still applies
 pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 ```
@@ -62,6 +166,22 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 **Read pytest's own summary line; do not post-process the output.** `... | grep -c "passed"` counts a collection error as a pass, and `cmd | tail` reports *tail's* exit status, so a failed build or a failed suite behind a pipe looks like success. Both have produced confidently wrong "all green" reports here. Requirements: `pip install -e .` plus `pytest pytest-xdist looseversion`. The `cutedsl/` directories additionally require an SM90/SM100-class GPU; tests skip (or should skip) on unsupported arch/dtype/backend-version combos rather than fail.
 
 ### conftest.py landmines — read before editing
+
+Before releasing Torch's cache, synchronize every device with reserved memory.
+Expandable-segment cleanup can synchronize a default-stream handle on the wrong
+current device, then unmap memory still used by another GPU. The later CuTe launch
+can report that fault. `test_empty_cache_waits_for_other_devices_default_stream`
+checks completion before the unsafe release, so its failing control stays safe.
+
+For a timed subprocess test, arm a child-side `faulthandler` dump before the
+parent deadline and surface `TimeoutExpired.stdout` / `.stderr` in the failure.
+The parent's watchdog shows only `subprocess.communicate()`, and pytest's
+ordinary timeout traceback does not display those captured child streams.
+`prepared_bwd_cache_utils.run_artifact_child` uses this for cold artifact checks.
+Validate with a deliberately blocked child that emits both streams; retain the
+original deadline and do not classify a compilation stall as a GPU hang without
+child-stage evidence.
+
 
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its
@@ -71,8 +191,17 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - `PYTORCH_CUDA_ALLOC_CONF` is set at the very top, **before any torch import** (torch reads it once at CUDA-allocator init). Don't move it, and don't import torch in a plugin that loads earlier.
 - `import transformer_engine` happens (in try/except) **before** `import cudnn` — TE and cuDNN conflict if loaded in the other order. Preserve this ordering.
 - Crash isolation (`# Crash isolation` block in `conftest.py`): `pytest_cmdline_main` injects `-n1 --max-worker-restart=100000`, so a segfault, a poisoned CUDA context, or a hang kills only one xdist worker, which the controller replaces before continuing. After every test `pytest_runtest_logfinish` probes the context with `torch.cuda.synchronize()`; a per-test `faulthandler.dump_traceback_later(exit=True)` deadline (`CUDNN_TEST_TIMEOUT`, default 1500 s, `0` disables) covers the probe too. It is faulthandler's C watchdog, not a Python thread or `SIGALRM`, because a hung CUDA driver call holds the GIL and parks the main thread. Not injected under `-n<N>`, `-s`, `--pdb`, `--collect-only`, or `CUDNN_TEST_NO_ISOLATION=1`; without a worker to restart, a dead context stops the run via `pytest.exit` and a hang still hard-exits. Killing a worker does **not** stop a kernel it left running -- the driver keeps that context until the kernel ends, and the next worker can block behind it.
+- **Several pytest processes on one tree or one GPU.** Two things in `conftest.py` make that safe. (1) The FROST routing tallies (`# FROST routing summary` block) are written to a PER-RUN directory, `test/python/.frost_routing_<host>_<run id>`: the controller (or the single process) mints the id in `pytest_configure` and exports it as `CUDNN_TEST_RUN_ID`, the xdist workers it spawns inherit it (a worker without it falls back to xdist's `PYTEST_XDIST_TESTRUNUID`), a child pytest spawned by a test is a run of its own (a real worker is marked by `config.workerinput`; a session that merely inherited a worker's `PYTEST_XDIST_*` / `CUDNN_TEST_RUN_ID` drops them in `pytest_cmdline_main`), and `pytest_sessionstart` sweeps a directory whose controller pid is gone only when its name carries THIS host (`_sweep_stale_routing_dirs`): the tree may be shared storage holding another machine's live run, and `os.kill(pid, 0)` answers for this machine's pids only, so another host's directory -- and one of the previous layout, `.frost_routing_<pid>_<uid>`, with no host in its name -- is left alone until it is a day old (`_ROUTING_LEFTOVER_TTL_S`); a directory of this host whose pid is alive is never removed, whatever its age, and a pid `os.kill` cannot represent counts as dead; the owner is the bare hostname, so two machines that report the same name and share a tree judge each other's pids as before. With ONE shared directory a second process's session start deleted the first one's worker files and a worker that lost the `makedirs` / `open` race died with `FileNotFoundError` at session finish -- a red run with every test green. The banner prints `Test run id: <id>`. (2) The GPU memory gate (`# GPU memory gate` block: wait for a floor of free device memory before each test, `torch.cuda.empty_cache()` after it, one retry on `torch.OutOfMemoryError`; `CUDNN_TEST_MEM_GATE_FRACTION`, default 0.2 of the device, and `CUDNN_TEST_MEM_GATE_TIMEOUT`, default 30 s) arms itself only under several xdist workers -- never in the injected `-n1` of a plain `pytest <module>`. K independent processes on one GPU hold their allocator high-water marks against each other in the same way, so set `CUDNN_TEST_SHARED_GPU=1` in each of them: the gate then arms (`[mem-gate] armed by CUDNN_TEST_SHARED_GPU=1` on stderr once per test process) and nothing else changes. Pins: `test_conftest_parallel.py`. (3) **A record a PASSING test wants in the CI job log** goes through `frost_routing.measured(key, text)`: the controller prints it under `measured` next to the routing tally, aggregated across workers the same way (`<worker>.measured.json` in the per-run directory). A passed test's captured stdout never reaches that log -- the lanes run without `-rA` -- so a measurement that qualifies a constant in the package (the cc 10.7 MXFP8 backend planning guard's version bound, `test_mhas_v2.py`'s guard-currency detector) was invisible there until it used the channel. Pin: `test_conftest_parallel.py::test_a_measurement_reaches_the_controllers_summary`. (4) **A host-only test of version-gated behaviour pins `cudnn.backend_version`** (a `monkeypatch` fixture, e.g. `crashing_backend` in `sdpa/frost/test_sdpa_backend_guard.py`): the login box and the board run cuDNN 9.26 / 9.27 while the CI lanes run 9.28, so a test that inherits the installed version passes locally and fails -- or passes vacuously -- in CI the moment the gate's threshold sits between them.
 - A side-stream test must order input production before consumption: call `stream.wait_stream(torch.cuda.current_stream())` after creating inputs on the current stream and before switching streams. Synchronizing the consumer afterward cannot repair a missing producer dependency; the GAT/GATv2 current-stream probes exposed this under concurrent CI load.
+- Raw `pygraph.execute` launches on the cuDNN handle's stream. For CUDA-graph capture, bind the handle to the capture stream and pass it to `execute`. Treat the empty-CUDA-graph warning as an error so a replay test cannot capture no work (`test_forward_state_alias_after_graph_warmup`).
+  A shared handle may already name stream zero: create a non-default capture
+  stream and restore the handle afterward. Side-stream dependencies must also
+  follow output initialization (including sentinel fills), not just input
+  creation. Detectors: `test_cuda_graph_retention_option` with a default-stream
+  handle, and QSA's `test_entry_points_select_the_tensors_device_with_another_device_current`
+  with delayed producer-stream fills.
 - A session-scoped autouse `cudnn_handle` fixture creates one handle bound to a dedicated stream; use it instead of creating handles per-test. Tests that rebind it must save `cudnn.get_stream(cudnn_handle)` before setup and restore that exact stream in `finally`, including setup failures/skips. Restoring `torch.cuda.current_stream()` instead leaks a different stream into later tests.
+  Eager graph calls using that handle also need producer-to-handle and handle-to-reference dependencies. Wrap its stream with `torch.cuda.ExternalStream`, wait for current-stream input updates before execution, then wait for its output before the current-stream reference. The SM80 `test_public_graph_geometry_rebind_replay` follows both edges; delaying the V update exposes the old unsynchronized eager call even when capture/replay itself is ordered correctly.
 - `pytest_configure` asserts `torch.cuda.is_available()` — there is no CPU-only mode.
 - Many custom CLI options exist (`--dryrun`, `--repro`, `--seed`, `--perf`, per-op dimension overrides like `--b/--s_q`, `--nsa-*`, `--dsa-*`); check `pytest_addoption` before adding new ones.
 - **Keep `sdpa/frost/` paths contiguous on the command line.** `sdpa/frost/conftest.py` sets `CUDNN_FRONTEND_ENABLE_FROST_ENGINES` through an autouse fixture, because the FROST manifest rows are opt-in. Interleaving a top-level path between two `sdpa/frost/` paths — `pytest sdpa/frost/test_a.py test_dispatch.py sdpa/frost/test_b.py` — silently drops that fixture for everything after the top-level file: `_frost_opt_in` is absent from `item.fixturenames` and no FROST row is offered. Any top-level file does it, not just `test_dispatch.py`, and both contiguous orders are fine. Tests that *pin* an engine then fail loudly, but a test that `pytest.skip`s when it finds no python plan goes **falsely green**. Detector, as its own plugin so no test file changes:
@@ -83,6 +212,30 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
       print(item.name, os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES"), "_frost_opt_in" in item.fixturenames)
       yield
   ```
+
+### Native flavor routing assertions
+
+PTX hash records also depend on imported helpers and the trace probe's fake
+tensor geometry. A scheduler or shared decoder change can invalidate a record
+even when the kernel file itself is unchanged. Before refreshing a record,
+render its historical source/probe and the current source/probe with the same
+recorded compiler distribution in separate processes, compare the PTX changes,
+and retain the existing SASS checks. Check distribution metadata as well as the
+import path: an internal build may print the public version in `cutlass.__version__`.
+`test_fork_rendering_ptx_md5_is_recorded` covers the SM107 D512 backward record;
+its dense scheduler and shared THD work-prefix changes require different attribution.
+A store-order optimization qualified for one width must not silently move the
+other widths of a shared body. Preserve their established lowering, and compare
+both the historical small-width cubins and the optimized width before landing.
+The SM107 bias/off/streamed records detect D32/D64 epilogue changes that D128
+functional coverage alone misses; keep their hashes and SASS assertions intact.
+
+When a native head-dimension flavor replaces an envelope, update the exact
+template expectation in existing end-to-end routing tests as well as adding
+new flavor tests. Keep the routing assertion, numerical comparisons and shape
+unchanged. The SM107 GPT-OSS D64 case in
+`test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
+prefill; a short query alone does not imply the D128 decode template.
 
 ### Layout
 
@@ -97,6 +250,26 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 
 ### Conventions for new tests
 
+- Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
+  for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
+  inputs. A flat (N,) fixture can be rejected before kernel execution. Preserve
+  the eligibility guard and numerical assertions; run both existing
+  `test_frost_norm_engines.py` and `test_frost_norm_engine_e2e.py` after tightening
+  graph-shape validation.
+
+- Host-only compile-cache tests that replace `cute.compile` must also isolate
+  architecture-dependent compiler options evaluated before that call. Mock
+  `compile_options()` when no compilation is intended, so an otherwise valid
+  test does not query the real GPU and fail on supported non-DSA CI hosts.
+  Detector: `test_DSA_sparse_attention_backward_sm100_d576_compile_cache_separates_address_width`
+  on A100 with CuTe DSL 4.6.2.
+
+- Source-routing regexes must handle long multiline non-matches without
+  exponential backtracking. A negated character class already includes newlines;
+  do not repeat an overlapping newline alternative under `*`.
+  `gemm/cutedsl/test_sm110_amax_reduction.py::test_direct_redux_scan_handles_multiline_call`
+  covers matching and non-matching reduction calls with long argument lists.
+
 - MXFP8 input does not imply three scale-factor buffers or one-byte V.
   The existing PV-BF16 specialization consumes only SF_Q/SF_K, keeps BF16
   V/O, and binds `sf_v_ptr=None` with a zero third SF tile count. Preserve
@@ -104,12 +277,27 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   `test_sdpa_native_pv_bf16_binding.py` compares actual host frames and checks
   BF16 V stride/product addresses beyond `2**32` against an independent oracle.
 
+- **Scope sync-debug to the tested launch inside the capture context.** Enter
+  `with torch.cuda.graph(...)` before enabling `set_sync_debug_mode("error")`,
+  and restore the previous mode in `finally` before leaving that context.
+  Torch capture setup can synchronize and some builds reject it under the guard
+  before the API under test runs. Keep the launch guarded and reset each graph
+  in cleanup; `test_native_d576_compact_thd_rebind_and_capture` exercises this
+  with rebinding, poisoned replay and empty inputs. A pass on a Torch build that
+  also accepts the old scope does not reproduce the CI-specific failure.
+
 - Mark with a level (`@pytest.mark.L0` ... `L4`): L0 must stay fast (default CI smoke); big parameter sweeps go to higher levels.
+- **Test tiers are lists, not markers in test files.** `conftest.py` marks cells `smoke` / `nightly_only` at collection from the committed node-id lists in `tiers/` (`smoke_<arch>.txt` per compute capability -- `CUDNN_TEST_TIER_ARCH=cc107` applies another arch's list on any host -- and `nightly_only.txt`); the rules a cell must satisfy, the kept twin of every demoted cell and the run lines are in `tiers/README.md`. CI keeps `-m L0`; the tiers are opt-in selections (`-m smoke`; `-m "L0 and not nightly_only"`). `test_tiers.py` asserts every listed id still collects and that the markers select exactly the listed cells -- when you rename or re-parametrize a listed test, edit the list in the same commit.
 - **Default L0 coverage is not sufficient if the CI target excludes the provider.** Check the actual CI path and `-k` filters. The general Python target excludes FROST cases, so representative shared-API FROST tests also need collection under `sdpa/frost/`; `test_sdpa_ordered_bindings.py` reuses the shared ordered-binding smoke logic. Verify both target collection and execution on a supported GPU.
 - **Check for a module-level `pytestmark` before adding per-test markers.** Many files apply a level or capability marker file-wide (`pytestmark = ...` near the top); duplicating it on each test is noise, and suggesting it in review wastes a round-trip (recurred on PRs #814, #811, #797).
 - Gate on capability, don't assume it: skip via `check_support()` failures, `cudnn.backend_version()`, and `torch.cuda.get_device_capability()`.
-- Large physical-stride tests must handle allocation-time memory pressure: another xdist worker can consume free memory after `mem_get_info()`. The `gpu_exclusive` marker alone does not serialize ordinary xdist scheduling. Catch `torch.OutOfMemoryError` only around the large test-storage allocation and skip for unavailable resources; never catch the launch or numerical assertions. Retain a successful physical run with sufficient memory.
+- If an optional import's `except ImportError` block ends before the test body, use `return pytest.skip(...)` to make the exit explicit. CodeQL can otherwise report the imported name as potentially uninitialized even though pytest raises a skip exception (PR #2042). Check the separate CodeQL alert result as well as the successful analysis workflow.
+- Test feature combinations through the support contract, not intersections of capability tables. The same head dimension can support gate and split on different paths while rejecting their combination. Assert acceptance/decline for concrete graph facts and requested knobs; avoid heuristic winner/order or timing goldens.
+- Shape-override windows and strict xfails measured on one native plan must also gate on the selected plan configuration. Negative geometry probes must allocate storage for every overridden row and use matching physical strides; an xfail does not contain an out-of-bounds GPU access.
+- Large physical-stride tests must handle allocation-time memory pressure: another xdist worker can consume free memory after `mem_get_info()`. The `gpu_exclusive` marker alone does not serialize ordinary xdist scheduling (the convention is the marker plus `@pytest.mark.xdist_group(name="gpu_exclusive")`, which `--dist loadgroup` runs on one worker; a test that deliberately wedges the GPU and the detector it is the control for must both carry it -- see the time-slicing lesson in python/cudnn/sdpa/AGENTS.md). Catch `torch.OutOfMemoryError` only around the large test-storage allocation and skip for unavailable resources; never catch the launch or numerical assertions. Retain a successful physical run with sufficient memory.
 - Compare against a reference implementation (see existing `*_ref.py` / `*_reference.py` patterns) with dtype-appropriate tolerances.
+- **Check reference GEMM rounding before relaxing a chained-kernel tolerance.** Save the failing inputs and compare the projection in FP64 before its BF16 cast. A small FP32 accumulation error can cross that cast's midpoint, then grow through normalization. The serving pool tests use the existing `acc_dtype=torch.float64` oracle option while retaining all intermediate dtype casts and tolerances; pipeline 74800620 exposed this at token 350, head 0, column 109 on a 212-SM Rubin GPU.
+- **Reference cache (opt-in).** `sdpa/ref_cache.py::cached_reference(name, key, compute)` stores an oracle's outputs on disk, keyed by the reference sources' content (`_REF_SOURCES`, `ref_cache.py` itself included; the list is closed under its own relative / `sdpa.` imports -- `sdpa/test_ref_cache.py::test_the_reference_sources_are_closed_under_their_own_imports` fails when a listed module imports an unlisted one), the WHOLE content of the recipe's files -- the file `compute` is defined in and every file on the call stack at the call that is not the interpreter's own: the recipe module, a shared wrapper that built the oracle closure, the test module (frames of pytest / pluggy / torch / the standard library are skipped, not stopped at); the draw order, the quantization call sites and the oracle wrapper are hashed as files, so an edit anywhere in them is a miss, never a stale hit -- the key names the inputs' recipe literally; a helper the recipe imports and has already returned from when the oracle is called is covered through `_REF_SOURCES` only, so list it there --, the device class (name, compute capability, SM count -- one seed is a different dataset on a different SM count), torch's version and the caller's key -- which names what the files' content does not pin because it arrives as a parameter: shape, seed, scale, mask, dtype; off unless `CUDNN_TEST_REF_CACHE=<node-local dir>` names a directory (never a cross-site network file system). Files are hashed as they are on disk at the call, so an edit made WHILE a cache-enabled run is in progress keys that run's later entries by the new content though the old code computed them: after such an edit run once with VERIFY on, or use a fresh directory. A hit returns a previous run's values bitwise, so tolerances are untouched; the point is `CUDNN_TEST_REF_CACHE_VERIFY=1` (`0` / `false` / `no` / `off` = off), which recomputes on every hit and fails the test if the reference drifted from its own past. Entries are read with torch's weights-only unpickler -- tensors and plain Python containers / scalars, all the cache ever stores -- so a pickle payload or a foreign file at an entry path is refused as a miss, never executed; still, keep the directory writable by the test account / CI job only, since whoever writes it decides what a run compares against. The fp8 d=256 backward suite (`sdpa/frost/test_sdpa_bwd_fp8_sm107.py::_run_fp8`) also memoizes its oracle in-process across the parametrizations of one case (the gradient dtype only casts the fp32 gradients), bounded by bytes; under VERIFY the memo stands aside so every repeat is verified too.
 - **Scale the tolerance to the tensor, not to the dtype alone.** A fixed absolute bound quietly becomes wrong when magnitudes grow: GQA dK/dV sum over `h_q/h_kv` query heads, so at a group size of 4 the *relative* error stays ~0.5% while `|dv|` peaks near 9.6 and blows a bound that passed at `h_kv == h_q`. Compare against `TOL * max(|ref|.max(), 1.0)`, or the next GQA ratio someone adds will look like a correctness regression.
 - Shape-override tests must cover a backend lowering decline as well as a lowered graph. Ragged-offset tensors are backend-only operands and can be absent from the Python-only layout; filter those auxiliary overrides against `_variant_pack_uids()` while requiring every Q/K/V/O, Stats and length operand. `test_thd_cache_shape_grid_tracks_runtime_capacity` exercises both layouts without weakening capture, launch-bound or replay checks.
 - **Plan selection must respect current filters.** When testing build-all after an
@@ -137,18 +325,45 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
   Exact expectations belong to semantic/API contracts, with the invariant stated
   in the test. Performance rankings and tuning boundaries belong in reproducible
   offline benchmarks with source/hardware attribution, not CI golden assertions.
+- Benchmark labels must describe the executed backend layout. Apply route-specific
+  page-size constraints before deduplicating cases, and check the subprocess
+  arguments against result metadata. The CPU-only tests in
+  `benchmark/attention_inference/tests/test_runner.py` cover b12x's distinct
+  paged, absorbed-MLA and contiguous routes without launching kernels.
+- Standalone benchmark summaries must reject non-finite or nonpositive timing
+  medians and non-finite derived measurements before replacing existing output.
+  Use explicit validation rather than `assert`, which Python `-O` removes.
+  Serialize with `allow_nan=False`. Check all expected numerical errors against
+  their tolerance instead of trusting a saved pass flag. Benchmark producers must
+  also use explicit checks for scheduler activation, finite tensors, profiler
+  activity, and numerical acceptance (`benchmark/linear_attention/steep_decay/`).
 - Memo-key regression tests should observe the actual lookup and the selected plan, rather than relying on positional offsets in private key tuples. Appending an independent cache axis must not break an unrelated test; keep the miss count, selected configuration, and A-B-A identity checks. `test_block_scaled_memo_respects_overlap_margin` records the lookup key through its test memo.
 - Workspace device checks compare storage with the declared launch device, not a fixed CUDA ordinal or the ambient current device. Match the diagnostic's actual expected/observed ordinals; the wrong-device message need not contain the word "device". `core/cutedsl/test_workspace_device.py` covers the diagnostic with one GPU and both storage-device directions when two are visible, including DLPack-only and CUDA-array-interface-only buffers.
+- **A dispatch fact that reads the device's SM count is asserted against the live resolver, never as a constant.** The small-M
+  projection route, the sparse decode split rule and the combine form all read `multi_processor_count`, so a host test that pins their
+  outcome for one shape (`not capture_safe`, `split == 16`, a tile name) encodes the part it was written on: the N 5760 band slab's
+  "graph route" expectation held on 212 and 108 SMs and failed six cells on a 68-SM device, where the slab's 90 64-row tiles overflow
+  a wave and the route names its 128-row tile (review on PR #1754). Compute the expectation from the resolver the API itself runs
+  (`proj_gemm._auto_tile_name`, `sparse_decode_split_choice(..., sm_count=sm)`) and assert the pinned branch only under the live SM
+  count that selects it; a declaration-time flag derived from such a resolver is re-read where it is consumed (the block re-reads
+  `capture_safe` at `compile()`), so the two cannot disagree across devices.
 - **A regression test must be seen RED.** Before trusting one, run it against the unfixed code — restore the old line, confirm it fails, restore the fix. `test_dsl_sm100_thd_interleaved_kv_views` and `test_varlen_backward_does_not_sync` were both checked this way, and both were genuinely red beforehand; a test written for a bug and never seen to fail is asserting an unknown.
+- **A two-launch equality check is not a race test; use the warm stress helper.** A kernel that hands a shared-memory stage back to its producer (Rule 11 in `python/cudnn/AGENTS.md`) can be wrong in a small fraction of launches, in no cold launch, or in every launch of one shape and none of another. "Launch 1 equals launch 2", a replay loop of a handful of launches and a tolerance-based numerics test all pass such a kernel. `warm_stress.assert_warm_stress(StressCase(...))` takes a ONE-launch callable on the launch path that ships and every tensor the kernel writes — the kernel's own storage, never a copy of it (`.contiguous()` of a strided view and a dtype cast return copies): an output that both cold launches leave at the sentinel fill is refused when the case has no reference, and fails against one. It builds a cold reference (two launches behind a cache flush must agree byte for byte, and equal the case's independent reference when it has one), then compares every output byte of N back-to-back launches and of N launches behind a launch that overwrites every SM's shared memory; outputs are refilled with a sentinel before each launch. A failure names the block, the launch index, the output, the first differing byte with the bytes got and expected, and the case's `locate()` text. Six rules. (1) The shape must refill the stage under test inside one launch: state `refills_per_launch`; zero is refused. (2) State `thread_blocks`: the report prints thread blocks per SM and flags fewer than two. The control shows that this GPU and driver expose the class in the test ring's geometry (three thread blocks per SM, every lane of a load in the same shared-memory banks); the same unsafe ring reads zero with one thread block per SM. A zero for another kernel is a rate bound for the shape that was launched — prefer a shape with at least two thread blocks per SM — and the disassembly reading of Rule 11 is the proof. (3) A zero count is reported as a pass only in a process where `stress_validation()` saw the unsafe twin of the test ring fail on this GPU; elsewhere the test is skipped with `warm stress not validated on <part>` and the record goes through `frost_routing.measured` — a coverage gap, neither a pass nor a failure. A mismatch fails in either case. (4) Byte equality only: no tolerance, no rounded metric, no float compare; a kernel whose outputs are not bit-reproducible by design cannot be tested this way and its test says so. (5) Give an independent `reference` whenever one exists: without it the helper tests stability across launches only, and an error that every launch repeats passes (the unsafe ring is wrong in its cold launches too); a case without one whose reference launches had no cache flush in front of them is skipped as incomplete. (6) The default 3,000 + 3,000 launches bound a per-launch rate at 0.1 %; larger counts are a local run of the same helper, never an L0 cell. The launch blocks have a wall-clock budget (60 s by default): a block that uses it up on a busy GPU ends early and the test is skipped as incomplete, so give the cell `gpu_exclusive` with its xdist group, and never raise a kernel timeout instead. A cell that guards its launches with `process_watchdog` calls `warm_stress.build_launchers()` and builds its own kernel in front of the watchdog: the first CuTe DSL import of a process can take minutes on a cold file system, and a watchdog that covers it reports a slow import as a hung kernel. `sdpa/frost/test_tile_dsl_consume_then_arrive.py` is the usage example and the helper's own control; `core/test_warm_stress.py` pins the report.
+- **Poison caller workspace, including physical padding.** A TMA descriptor can expose aligned scratch rows beyond the logical sequence. Initialize workspace bytes to both zero and `0xff`, poison outputs, and compare eager and captured results against the same reference. Numerically masked rows still need defined intermediates: `0 * NaN` remains NaN. A clean initcheck result is insufficient when the caller initialized those stale bytes itself (`test_delta_workspace_padding_does_not_feed_dkdv`).
+- **A harness mirror of an engine's admission rule includes the engine's DSL target gate.** `sdpa/mxfp8.py::block_scaled_o_draw` admits a block-scaled O draw where the FROST MXFP8 row would serve it, and an admitted draw the row then declines FAILS the test (the `sf_o` output has no backend lowering), so the mirror must agree with the row on every gate. When the cc 10.7 row became a default candidate (PR #1478) the mirror asked the manifest but not `cutedsl_arch_requirement_error`: on a cc 10.7 host with the public CuTe DSL 4.7.0 (no `sm_107a`) the row declines through that gate while the mirror admitted the draw, so every flag-less d128 block-scaled draw of `test_sdpa_mxfp8_fwd_L0` would have failed where develop ran the backend on the folded draw (verified host-side with the target modelled absent). Model the target on both sides: `sdpa/test_mxfp8_block_scaled_fold.py::test_cc107_default_admission_needs_the_sm_107a_dsl_target` pins the fold with `buffers._cutedsl_has_sm107` patched absent and present.
+- **A version-bounded backend workaround ships with the detector that re-measures it.** A constant such as `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN` is a measurement, and nothing in an ordinary test run would ever notice the backend getting fixed (the guard keeps it from being asked). `sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0` runs the trigger matrix one interpreter per contract with the guard disabled in the child (the constant set to 0 there; a crash is the child's rc 139, never the runner's) plus a control contract the backend is known to plan, and fails with the version to record once the installed backend plans the matrix cleanly -- or, above a recorded version, once it crashes again. Spawn the children with the test module's own directory and `test/python` on their `sys.path`; they inherit neither pytest's path setup nor its fixtures.
 - Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
 - **Poison unused attention storage.** Use independent indices; poison unused KV with NaN, infinities, and large finite values. Require unchanged valid gradients and zero unused gradients in eager execution and graph replay. Check `+inf` sinks against a finite dominant-sink control.
 - **Pair very negative LSE with large finite dO.** Exponent clamps can still overflow in dS. Use an analytic reference and confirm the test rejects masking after the product.
 - **FP8 attention references must mirror intermediate probability rounding.** Full-precision softmax times V is a different function from the kernel's FP8 P product and can exceed a fixed bound, especially with an amplified V tail. Use the shared `sdpa.fp8_ref.compute_ref` with the selected kernel's P scale and rescale threshold; keep output tolerances unchanged. `test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum` exercises this while checking 96/128/96 artifact reuse.
+- **Every declared quantized output is asserted -- `Amax_O` included.** The quantized harnesses bound `Amax_O` and only printed it: the dense MXFP8 compare checked `max|O|` against the reference's `max|O|` (never the `Amax_O` tensor) and the per-tensor FP8 compare checked nothing, so an engine that wrote 0 on a non-zero O, reported a value above the O it stored, or reduced dead query rows into it passed for months (the cuDNN 9.26.0.51 backend does all three: dense MXFP8 fprop with fp16/bf16 O, and paged FP8 with `seq_len_q = [0]`; found 2026-10-07 while the FROST engines were suspected). `sdpa.fp8.assert_amax_o` pins the output two ways: against the reference's **fp32 pre-cast, pre-scale** amax within one P code step of itself (a midpoint flip on the dominant key of the largest element; `compute_ref(..., output_type=torch.float32)` / the FP8 reference's `o_amax`), and against the kernel's **own stored O** within half a code spacing of O's dtype (an amax not taken from the stored values fails even inside the reference bound; per-tensor FP8 drops only the upper bound when the stored O saturated at the top code). Prefill the output with NaN, never zero, so "never written" and "wrote 0" stay distinguishable. A backend-served graph (`graph.selected_engine is None`) xfails that check with `BACKEND_AMAX_O_ISSUE`; a FROST-served graph fails. `sdpa/test_assert_amax_o.py` pins each rejection and the one accepted deviation.
+- **An empty live O still requires a finite, exactly zero Amax_O.** Avoid reducing an empty tensor, but keep the numerical assertions and poison-tail checks. `sdpa/test_assert_amax_o.py` accepts empty outputs and rejects nonzero or nonfinite Amax values, including small values below the ordinary absolute tolerance and the saturated-output path. The all-Q-empty case in `sdpa/graph/suites/context/test_context_mxfp8.py::test_context_mxfp8_thd` checks the native launch; do not skip it to work around a checker failure.
 - **Low-precision quantization needs exact midpoint tests.** Approximate reciprocal multiplication can move an exact E2M1 tie across its rounding boundary even when the native conversion uses round-to-nearest-even. Include signed midpoint values with non-power-of-two block scales, and compare the quantization stage itself before diagnosing amplified attention-gradient differences.
 - **Build the reference in fp64 when the bound is tighter than ~1e-3.** The DLFW CI containers run fp32 matmul in TF32 (`TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`; recent torch also defaults `fp32_precision` to `tf32` on Blackwell+), a ~3e-4 relative error per `Q @ K^T` logit. A 1024-column log-sum-exp averages it down to ~2e-5, a causal row with ONE valid column keeps it whole: `test_fp8_stats_is_the_exact_softmax_lse[causal]` read max|dLSE| 1.3e-4 against its 1e-4 bound on the sm107 lane (2026-09-15) with an exact kernel, and passed on a 208-SM node whose draws happened to be kinder. `sdpa/fp8_ref.compute_ref(dtype=torch.float64)` is the existing knob; in a hand-rolled reference `.double()` the operands before the matmul, not just the `logsumexp`.
 - **An fp8 midpoint flip is PROVED from the reference's intermediates, never inferred from the output's shape.** One flipped P/dS code moves one output d-row by `(c_alt - c_ref) x descale x operand_row` (Q for dK, K for dQ, dO for dV, V for O) -- but a power-of-two multiple of an operand row is not evidence of one: a masked key, another batch's or another head's row, two identical rows each one flip away, or a step no adjacent pair of codes has (8192 in e4m3) all fit that description (review on PR #1075). `assert_close_fp8_grad(..., operand=, flip_unit=, intermediates=, fp8_dtype=)` lifts the `4 * atol` row cap only when, at a VALID position of the row's own reduction (same batch, a q head of the same GQA group, unmasked), the reference's scaled fp32 intermediate -- `compute_ref(..., return_intermediates=)` / `compute_ref_backward(...)`, re-run on the bad rows only -- sits within 1/32 of a code spacing of the midpoint between its fp8 code and the adjacent one, and that single flip reproduces the row three ways: within the ordinary tolerance, per element within the output's own rounding (`atol` plus half an output code spacing from each side -- both sides are dequantized output codes; pass `out_dtype=torch_otype`), and as a whole (the least-squares number of flips fitted to the row is 1 within 1/2 -- two flips fit at 2, and on a row of large gradients `rtol * |expected|` is itself two flips wide, so the ordinary tolerance alone would take three flips for one). It prints the position, the two codes, the step and the three fits. Packed (ragged) outputs keep the plain cap, as does `h_k != h_v`. `sdpa/test_fp8_flip_budget.py` pins the accepted case and each of those rejections on a problem the reference itself built. The negative-score q rows have amplitude 8 at d192, so a legitimate flip moves a dK row by 0.5 -- the fixed cap (0.32) alone would call that a defect (sm107 212-SM lane, test310, 2026-09-15).
 - **Decode Stats must be tested independently of training.** The random SDPA harness uses `generate_stats=cfg.is_train`, so its `s_q == 1` inference sweep checks O without checking LSE. For ragged GQA decode, request Stats explicitly, initialize every head to NaN, and compare every head against the reference. Include padded-Stats, MHA, and `s_q > 1` controls; pin a backend plan when testing native codegen so FROST cannot mask it. `test_mhas_v2.py::test_sdpa_ragged_decode_stats` is the detector (NVBug 6783545); run with `--runxfail` when checking an affected older backend.
 - **Plan-specific xfails must check the selected plan.** A heuristic can start ranking a working engine first without fixing another engine's compiler bug. An architecture-only xfail then turns correct outputs into strict-XPASS failures. Inspect `get_engine_and_knobs_at_index()` for the selected plan and keep `strict=True` plus the expected exception type for the affected engine. `test_sdpa_ragged_decode_stats` distinguishes the affected native 10X/107 engines (10/18) from working engine 8.
+- **Match the softmax precision before budgeting FP8 rounding.** HALF rounds both the exponent input and its approximate result before the FP8 P cast; a FLOAT-only reference can report data-dependent midpoint flips. Use the documented exponent error propagated through P and V, plus an identical-input unpacked control for packing changes. For split-KV, derive P-rounding bounds at each partition's own maximum and combine them using independently computed softmax weights (including the sink). An unsplit allowance is not a split reference. Keep independent Stats/Amax and replay checks. Do not fit expected failures to one random tensor coordinate.
 - **Seed before you allocate.** `torch.manual_seed()` after constructing the inputs seeds nothing that matters. Two runs meant to be compared then differ by data, and the assertion fails (or worse, passes) for a reason unrelated to what is under test — if two runs must be comparable, build the inputs once and reuse them.
 - **Bound dense attention references independently of kernel memory.** A full
   `[B, H, S_q, S_kv]` FP32 score tensor and GQA `repeat_interleave` can exhaust a
@@ -178,6 +393,16 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Wide host strides must stay wide through device setup arguments.** An Int64 pointer host can still truncate a stride while launching a descriptor-setup kernel. Check casts at the launch site and the setup parameter, not just the host signature. Exercise two live sequences with a physical row stride above `2**32` and poisoned output; a singleton-axis or binder-only probe never steps the truncated address. `test_thd_output_row_stride_above_int32_reaches_device_descriptors` checks numerical output and replay. Cover every served arch/flavor: a pre-Rubin-only marker hid narrowing in all four SM107 half hosts. `test_mhas_v2.py::test_sdpa_thd_output_stride_int64` is collected by both CI arch selections and checks native and Python binding independently, including D192/D128.
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
+- **A standalone FROST adapter is compiled at plan time, so every test driver calls `compile()` before `execute()`.** The sparse d256 adapter refuses to compile on the execute path (plan-time keys only), and the helpers that still relied on an execute-time compile failed every GPU cell of two modules while the host tier, where those cells skip, stayed green — so a change to an adapter's execute contract re-runs the GPU tier of every suite that drives it, and the detector is an `.execute(` with no preceding `.compile(` in the same driver (`sdpa/frost/test_sdpa_fwd_sparse_sm107.py`, `sdpa/frost/sparse_item_sequences.py`).
+
+### Binding introspection
+
+Binding migrations can change introspection without changing the public API.
+Python Enum hides instance properties such as `name` and `value` from
+`dir(enum_class)`; the API-index scanner must inspect their descriptors without
+evaluating them (`api_index/test_api_index.py` covers Enum, IntEnum and aliases).
+Signature tests should accept both `object` and `object | None` for an argument
+defaulting to `None`, while retaining argument order and default checks.
 
 ### Confirm you are testing the code you edited
 
@@ -234,6 +459,11 @@ GREEN baseline. For RED/GREEN checks, copy only the new test changes into an
 isolated baseline worktree and collect there; verify the concrete operation
 module's `__file__` after conftest setup, not only `cudnn.__file__`.
 
+Read repository documentation relative to the test checkout, not `cudnn.__file__`.
+CI can load a wheel's package initializer while conftests overlay source modules;
+the wheel may omit Markdown files. The GEMM descriptor-order checks in
+`gemm/frost/test_block_scale_smem_layout_sm107.py` exercise this boundary.
+
 Import-regression subprocesses are separate interpreters: in-process
 `sys.path` or editable-finder changes do not automatically propagate. Carry
 the selected package/source setup into each child and verify its loaded path.
@@ -259,7 +489,51 @@ uint8 FP4 storage, strided views, optional outputs, and device pointer tables.
 Intercept the compiled consumer for negative tests so intentional aliasing never
 reaches a kernel; prove RED before the fix. Also exercise disjoint slices of one
 allocation so rejecting shared ownership does not substitute for checking overlap.
+For per-operand negative cases, keep other operand ranges clear of the tested
+workspace interval and match the rejection to that operand. Otherwise one
+overlapping fixture can hide missing checks for every other role.
 Device pointer-table contents remain a caller contract, not a reason for a D2H read.
+
+### fp32 operands and TF32 references
+
+Blackwell MMAs have no IEEE fp32 mode: fp32 operands run as TF32. Compute their
+torch reference with `torch.backends.cuda.matmul.fp32_precision = "tf32"` set
+explicitly in the test. Torch's default depends on the environment: NGC
+containers (CI) set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`, while pip torch uses
+IEEE fp32. A test that relies on the default passes in CI and fails locally,
+where `test_gemm_swiglu.py` had 64 such failures.
+
+### Clamp gradients at the boundary
+
+torch 2.14 changed `clamp`'s backward on the boundary itself: `x.clamp(-7, 7)`
+at `x = [-7, 0, 7]` gives `[0, 1, 0]`, while 2.11 / 2.13 give `[1, 1, 1]`. An
+autograd oracle that puts inputs exactly on a clamp limit therefore changes with
+the image's torch. State the kernel's convention with an explicit
+`torch.where(inside, x, x.detach().clamp(lo, hi))` instead
+(`test_grouped_dgeglu_autograd.py::clamp_closed`, #1522).
+
+### Sanitizer diagnostic controls
+
+Keep kernel-launch dumps separate from the pass/fail sanitizer invocation.
+Some Compute Sanitizer builds count each `--dump-kernel-launches` record in
+`ERROR SUMMARY` and apply `--error-exitcode` even to a valid kernel. Check a
+valid-memory control with and without that option before diagnosing a kernel
+error from the count alone. Use a known-bad memory/race canary to verify the
+detector, and retain a normal run of the real capture test without launch dumps.
+
+### Ragged physical-origin fixtures
+
+Token/head stride gaps do not vary sequence start addresses. Use
+`ExecConfig.ragged_origin_rows` for independent Q/K/V/O/Stats row starts,
+while sequence-length and cumulative-length tensors retain logical lengths.
+Packing, reference unpacking and output masks must all use the selected port's
+origins; masking everything after `sum(seq_lens)` drops valid gapped outputs.
+`test_mhas_v2.py::test_sdpa_physical_origins_L0` exercises the shared harness,
+and `frost/test_sdpa_physical_origins_shared.py` pins the native SM120 route so
+backend fallback cannot hide a missing kernel repair. The SM100 selected entry
+`test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
+FP8 D128 cases and checks both prepared and standalone graph execution.
+Default-provider passes alone cannot qualify an advertised native path.
 
 ### CUDA Graph test lifetimes
 
@@ -270,20 +544,33 @@ that capture. The SM120 FP8 prepared suite reproduced this when the D128
 strided-input graph was collected during the D384x320 case; tracing
 `CUDAGraph.__del__` identified both tests. Keep capture error mode unchanged and
 fix ownership instead of disabling GC or treating a retry as validation.
+`conftest.py` enforces this. After a test that leaves a captured, never-reset
+graph alive, it runs `gc.collect()` between tests and fails that test in
+teardown if the collector freed one. Whether a graph lands in a cycle can
+depend on test order, so a test that passes alone can still trip it in a
+suite.
+
+### Architecture test re-exports
+
+When an architecture test module re-exports shared checks, those checks must
+not import fixtures or reference math back from that architecture module,
+even inside a function. Move shared helpers into a non-`test_` module and
+import them from both sides. CodeQL's cyclic-import check catches the return
+edge; a successful import or collection alone may miss it because the edge
+is lazy. Preserve reference helper ASTs when moving them.
 
 ### Prepared quantized launch probes
 
-When testing a retained staging path, choose a declaration that the graph
-validator accepts but the native pointer layout declines. A nonunit D stride
-is rejected before SDPA lowering; unit D with an unaligned outer pitch reaches
-the existing dense conversion path. `test_staged_rebind_stream_capture` in
-`test_sdpa_bwd_staged_sm100.py` guards its row padding and forbids legacy tensor
-compilation/DLPack while checking changed allocations and replay.
+Native dense SDPA data ports use aligned pitches and must not acquire hidden
+layout copies. `test_native_rebind_stream_capture` in
+`test_sdpa_bwd_native_layouts_sm100.py` guards padding and forbids legacy tensor
+compilation/DLPack while checking changed allocations and replay. Unaligned
+outer pitches are negative admission cases, not a request for staging.
 
 Optional gradients copied from accumulators after a prepared launch still need
 presence, dtype and extent checks before any staging write. They can be absent
 from the pointer ABI, so the common binder cannot validate them. The detector
-is `test_staged_auxiliary_outputs_validate_before_writes` (SM80 backward):
+is `test_native_auxiliary_outputs_validate_before_writes` (SM80 backward):
 forbid copy/zero/launch and pass malformed or uncompiled dBias/dSink outputs.
 
 Test both graph prepared-plan admission and the standalone adapter's compiler
@@ -322,6 +609,13 @@ S_kv=113, reuses the artifact, and checks O and Stats. Keep head counts and
 dimensions as compile-time constants: the same binder fixes those per plan.
 
 ### Sparse score-recompute resource boundaries
+
+Metadata-only support tests must mock every architecture query reached by the
+public check. Sparse score support uses both `device_capability()` and
+`torch.cuda.get_device_capability()`; mocking just one leaves SM8 hosts failing
+before the intended boundary assertion. Run the existing `public_support`
+cases in `test_DSA_sparse_score_recompute.py` on an SM8 host as the detector.
+These tests allocate tensors but do not launch the modeled SM90/SM100 kernels.
 
 Exercise non-power-of-two TMEM slot counts and partial ring wraps across
 persistent query tiles; a full-ring single-tile case misses slot aliasing and
@@ -366,6 +660,11 @@ Dense V scale factors for D > 128 are plane-major; THD factors are packed
 per-sequence tiles per head. Reuse `_quantize_seq` when constructing THD test
 inputs; reshaping a dense buffer does not produce the THD contract. Rebind
 E8M0 exponent values as well as pointers and validate after graph replay.
+Both the shared graph harness and native fixtures use `pack_thd_columnwise_sf`
+to permute `[D-plane, H, tile, 512]` bytes into `[H, tile, D-plane * 512]`.
+`test_thd_columnwise_sf_matches_independent_atoms` compares that permutation
+with separately quantized per-head 128-token atoms. Keep D512 with multiple
+heads and token tiles: D128 alone cannot expose a misplaced D plane.
 The MXFP8 split combine has no per-tensor output scalar: specialize its
 scale pointer to None and remove Amax unscaling, rather than handing a NULL
 runtime address to the per-tensor unscale kernel. `test_prepared_mxfp8_capture_reads_current_scales`
@@ -387,23 +686,22 @@ After moving a wrapper to a prepared host, forbid the old tensor launcher
 after warmup and check fresh bindings plus changed-input graph replay. Keep
 physical stride and product-overflow probes on every native flavor, with
 wrapped addresses poisoned inside allocated guard storage.
-`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Removing
-THD tensor fakes must also preserve the dense off-flavor/RoPE fallback.
+`test_sdpa_sm80_thd_forward_prepared.py` exercises both properties. Dense padded widths retain native strides; unsupported RoPE declarations
+must decline before compilation.
 
 
-### SM80 staged pointer launches
+### SM80 native pointer launches
 
-A pointer host can follow existing layout staging without changing that
-staging's numerical contract. Keep off-flavor and RoPE references, mutate
-angle tables after capture, and forbid `cutlass.cute.runtime.from_dlpack`
-after warmup so a return to tensor launch plumbing fails independently of
-numerical output. `test_dense_staged_pointer_launch_and_rope_replay` was
-RED on the old tensor launcher for both dtypes and both template families.
+Aligned dense and packed layouts execute through native pointer chains. Before
+removing a staging fallback, make its entry points raise and run the SM80 suites.
+Retain gradient/output references, current-pointer rebinding, launch-count checks
+and fresh-process artifacts. RoPE declarations decline during preparation.
+`test_dense_native_replay_or_rope_decline` checks this boundary.
 
 Trailing-dimension and contiguity checks do not prove that a broadcast input
 has a live batch slice: `(0, H, SQ, SKV)` passes both for an empty bias. Reject
 it before workspace writes or pointer binding; the `bias_tensor-empty_batch`
-case in `test_dense_staged_rejects_invalid_operands_before_staging` is the
+case in `test_dense_native_rejects_invalid_operands_before_launch` is the
 RED-then-green detector. A compiler-memo test must also rebuild the wrapper
 on its second call: clear the wrapper cache while retaining the compiler memo,
 then forbid JIT. Reusing the same adapter cannot test compiler reuse.
@@ -424,6 +722,17 @@ memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
 SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
+A test that SPIES a trace-time call (a `monkeypatch` wrapper around a host-side
+helper that runs only while the kernel body is traced) must switch the in-process
+compile memo off as well as the on-disk cache: set
+`CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` next to
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` (both documented in
+`python/cudnn/frost/compiled_cache.py`). With the memo on, a plan this process has
+already built for the same (device, key, symbol, options) is handed out without a
+new trace, so the spy sees 0 calls instead of the 1 per trace it asserts; the plan
+need not be the test's own: when the arm's cell is the suite's default shape, an
+earlier test's plan serves it. `_bs_dq_arm` in
+`sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py` sets both and is the detector.
 
 A `None` compile sample may still occupy a positional TVM-FFI argument slot.
 When extending a prepared host with a staged-only operand, retain the native
@@ -431,7 +740,7 @@ entry signature and delegate internally; do not assume the absent operand is
 removed from the exported call ABI. Exercise both native and staged routes,
 including a fresh-process artifact reload. For staged THD output padding,
 test the bounded cast/fold with physical wide output strides as well as the
-input staging; `test_staged_packed_physical_stride` covers both stride and
+input staging; `test_native_packed_physical_stride` covers both stride and
 index-product overflow with allocated guard storage.
 
 Prepared host migrations must preserve persistent compiled artifacts as well as
@@ -468,9 +777,10 @@ failure and an output that was simultaneously required and forbidden.
 For fixed-geometry staged pointer hosts, validate Q/K/V/O shape, dtype and device,
 and all auxiliary bindings before workspace carving or any copy/fill. A tensor
 compiler previously checked some of these at dispatch; raw addresses cannot.
-The SM80 detector `test_dense_staged_rejects_invalid_operands_before_staging`
-replaces the workspace carver with a tripwire so an invalid short buffer fails
-safely before it can reach a GPU launch.
+The SM80 detector `test_dense_native_rejects_invalid_operands_before_launch`
+replaces the launch function with a tripwire to check invalid operands before
+launch. `test_sm80_revalidates_every_current_operand[short]` separately checks
+that a short backing-storage span is rejected.
 
 For a GEMM+GLU failure, compare the final output with both the stored GEMM
 intermediate and an independent dot product before attributing it to GEMM.
@@ -486,6 +796,26 @@ overwrites one output can hide an earlier corrupted store; retain distinct
 outputs and check every launch. `test_gemm_swiglu_retained_outputs_replay`
 covers multiple groups within a tile and persistent tile transitions, including
 one-group tiles that must advance the C ring at every tile boundary.
+
+For bulk MoE COMBINE, establish ownership from the per-CTA MMA slice, not the
+cluster-wide instruction shape: the normal 128-row slice gives each epilogue
+thread one complete feature row. Stage every register drain before submitting
+that row, and wait for async shared-memory reads before reusing it. Reserve
+staging ahead of the AB rings in both the SMEM budget and descriptor-root model.
+Bulk and atomic fallback predicates must agree for partial feature tiles and
+unaligned output rows. `gemm/frost/test_moe_combine_bulk.py` varies routed rows,
+features and scores independently, checks output padding, then changes scores
+under graph replay and rebinds the same artifact to a smaller token count.
+Its segmented-scale replay cases also change group boundaries and scale values
+in place. Normal 2-CTA configurations retain atomics pending qualification:
+the SM100 NVFP4-to-BF16 case at S/N/K=1026/512/1024 reported invalid shared
+writes under memcheck despite passing ordinary numerics. Keep the admission
+regression and run `test_two_cta_atomic_fallback` under compute-sanitizer on
+SM100 before widening that gate. SM107 swapped bulk uses a separate predicate
+and has its own native cases; passing those does not qualify normal 2-CTA bulk.
+The template barrier-parity detector permits the swapped bulk specialization's
+guard around the exact register-decrease prologue only. MMA operations and
+barrier calls, predicates and ordering still compare without that exception.
 
 Independent page tables need independent observed-span checks and Int64 stride
 slots in the prepared host. Test distinct K/V page values and layouts, then
@@ -529,6 +859,20 @@ prepared entry is called; import-only checks cannot catch this failure.
 
 ### Wrapper coverage after workspace migrations
 
+After a kernel consolidation, trace each public wrapper to the kernel it
+actually compiles before porting a correctness fix. A conflict-free change to
+an old kernel can leave the public route unfixed. Run the regression through
+the public wrapper and cover the shared kernel's other callers as well.
+
+AMAX reset probes must keep allocation synchronization from hiding a stream
+race. `test_swiglu_wrapper_outputs_and_amax_use_launch_stream` preallocates a
+live poisoned AMAX buffer, retains the real fill kernel, and delays the ambient
+stream before launching a warmed plan on a different stream. A misplaced late
+reset overwrites the actual reduction with `-inf`. Check cold/warm calls, side
+and default launch streams, output allocation streams, and caller restoration.
+Include workspace allocated during a cold compilation: moving output allocation
+to the launch stream alone can leave that new allocation on the ambient stream.
+
 When a prepared adapter starts requiring caller workspace for an existing
 layout, test every public convenience wrapper that constructs it. Adapter
 checks with explicit workspace cannot detect a wrapper that still omits it.
@@ -559,6 +903,14 @@ does not follow it. A subprocess-based GPU test must check architecture in the
 parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
 Keep genuine child failures failing on supported devices. The half SDPA artifact
 reload detector is re-exported through `TestStagedHalf` and covers this boundary.
+
+Cross-architecture compile probes must select their target explicitly, before
+the DSL is imported in a fresh subprocess, and override an inherited
+`CUTE_DSL_ARCH`. Otherwise a Blackwell/Rubin probe can lower for the runner's
+SM80 GPU and fail in NVVM despite a valid kernel. Disable the compiled cache
+so the probe really compiles. `test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic`
+can be run with `CUTE_DSL_ARCH=sm_80` to check target isolation; only its named
+missing-intrinsic error is a skip, while other compiler failures remain failures.
 
 Gate layout admission must share the adapter's TMA predicate, including batch
 stride alignment for B > 1. A valid head/sequence pitch cannot compensate for
@@ -685,10 +1037,45 @@ binding. `test_sdpa_native_prefill_binding.py` covers D192/V128 alongside the
 equal-width flavors, fresh storage, invalid current spans and physical wide
 output strides through both split and unsplit execution.
 
+For unequal-width dK/dV reductions, a vector rejected by the device row limit
+still belongs to its original output interval. Do not let a masked dK vector
+fall through to dV with a negative index. The compact cases in
+`test_sdpa_bwd_thd_d192_sm100.py` check live gradients and untouched capacity
+tails after changing lengths under capture, including an all-empty replay.
+
 A launch recorder must reconstruct the plan's actual native binder type after
 intercepting its entry. Hard-coding THD fails once dense prefill becomes native.
 Keep the existing KV-tail and fixed-shape rejection diagnostics, as exercised
 by `test_sdpa_prepared_thd.py`, when changing the binder implementation.
+
+Physical THD offsets are element addresses for each port. A fused K/V slab or
+wide O token stride requires matching offset values, with an independent Int64
+O offset when it exceeds Int32. Keep these fixtures consistent in
+`test_sdpa_prepared_thd.py` and `test_mhas_v2.py`. Compare graph execution with an
+independently prepared standalone API; clearing a graph's private prepared plan
+does not reproduce the standalone compact-prefix contract. Retain poisoned
+outputs and replay after rebinding for both public entry points.
+
+Keep `stream` last in private CuTe host signatures and preserve the
+`_positional_order` guard. Matching named binder slots and a Python wrapper
+signature does not qualify a reordered entry; exercise a real compiled launch
+after ABI changes before considering a change to that convention.
+
+Kernel host imports can also be dynamic module exports: prepared execution
+reads `_host_thd_split` through the loaded template module. Before removing an
+apparently unused import, inspect attribute consumers and compile a plan using
+that host. `test_native_d576_compact_thd_rebind_and_capture[split2_unpacked]`
+catches a missing D576 split-host export before launch; a source-only import
+check or binder fixture with a synthetic module does not exercise this boundary.
+
+AST-based host frame fixtures must retain unannotated runtime arguments;
+`ast.unparse(None)` fails before binding. Raw positional CuTe entries require
+every runtime slot, including optional `None` pointers and scalar defaults:
+Python signature defaults do not shorten the exported FFI frame. Keep the
+packed combine direct-call and fresh-process artifact tests synchronized with
+that frame. A graph-lowered adapter carrying physical origins is not a public
+standalone plan; construct the standalone API independently and retain its own
+workspace through capture replay, as in `test_paged_thd_split_capture_lengths_and_stats`.
 
 ### Native host ABI differences across architectures
 
@@ -709,6 +1096,20 @@ the actual host signature, then run output/Stats numerics and changed-input
 replay for FP16 and BF16; `test_sdpa_native_sm120_binding.py` is the detector.
 ### Native backward binding
 
+When sharing a native backward ABI with another architecture, retain its registered
+`BwdLaunchSpec.name` or extend every name-based native guard. The fixed backward
+binder uses that name to enable gradient-overlap checks. Pin the public engine
+identity separately, verify the emitted target, and keep a real overlapping-gradient
+negative control with unchanged output/workspace sentinels. The SM120 THD cases
+in `test_sdpa_bwd_thd_sm120.py` exercise this boundary.
+
+Exercise the actual standalone adapter as well as the prepared binder. A lower-level
+frame test can miss an incompatible metadata container built by the adapter.
+`test_shared_standalone_adapter_uses_current_native_storage` calls that boundary
+with the native and Python binders, optional external delta, changed storage and
+invalid current inputs; the native geometry transport must accept the adapter
+without falling back to Python.
+
 Derive the runtime frame from each actual host signature: SM80 has a partial
 that binds four launch bounds, SM107 dense and THD have different optional
 slots, and some chains use one scale while others use two. Compare native and
@@ -718,6 +1119,14 @@ storage after warmup. Keep producer shape separate from explicit overrides;
 only overrides must equal the fixed graph geometry. Run the existing prepared
 backward replay, auxiliary-output, artifact-cache and physical wide-address
 suites as well as the new native-route tests.
+
+For a fixed backward host, gradient overlap uses the declared address sets
+and current pointers, including when a graph carrier is a noncontiguous view.
+The host does not consume that carrier's strides. Reinterpreting its layout
+only in the overlap guard changes the graph contract and can reject legal
+interleaved outputs. `test_gradient_overlap_uses_declared_graph_addresses`
+checks both acceptance and rejection without overrides; explicit mismatched
+geometry overrides must still fail before launch.
 
 SM90 native binding retains the host's natural-unit scale slot, including zero
 and negative specializations. Its dense layout predicate covers permutations;
@@ -754,7 +1163,7 @@ SM80 graph operands are raw storage under graph declarations; standalone Stats
 may be flat, and bias uses the first contiguous [H,SQ,SKV] plane. Keep these
 contracts distinct from explicit geometry overrides. The actual-host frame and
 GPU detectors are `test_sdpa_native_sm80_binding.py`; the existing prepared SM80
-suite checks physical Int64 addressing and the staged/RoPE path stays separate.
+suite checks physical Int64 addressing and RoPE declarations decline before compilation.
 
 Per-tensor FP8 split binders must use the selected host's partial dtype, not the
 final output dtype: SM120 writes half partial slabs even when final O is FP8;
@@ -784,6 +1193,12 @@ Q. An empty Q still clears the current Amax_O word. Frame recorders must rebuild
 entries. `test_sdpa_native_thd_fp8_binding.py` checks these contracts against the
 actual host signature. When patching a newly allocated pybind tuple, move its
 unique ownership; an additional owning cast makes PyTuple_SetItem reject it.
+When an ordered graph test substitutes the independent Python binding oracle,
+also clear the plan's retained native ordered entry. Replacing `spec.native`
+alone does not change that entry and would silently compare native execution
+against itself. The measured-empty-workspace test exercises both transports.
+Keep launches and recorder consumption such as `frames.pop()` outside assertions;
+assert on their saved results so optimized Python cannot remove test state changes.
 
 MXFP8 split partials follow their own host ABI: SM100 D512 and SM107 MXFP8
 write half partials, even though other FP8 flavors on those architectures use
@@ -813,6 +1228,13 @@ physical wide stride/products with changed-input replay.
 that invalid metadata causes no initialization or attention launch.
 
 ### Automatic handle caches
+
+Indexed execution must preserve the graph's selected plan throughout binding,
+not just restore it after returning. Coordinate two prebuilt indexed calls at
+stream resolution and assert which plan each actually executes, plus the retained
+selection after both finish. `core/test_dispatch.py::test_indexed_execution_keeps_each_callers_plan`
+is a CPU-only detector; shared backend/FROST numerical and capture checks remain
+in `core/graph/test_execute_overload.py`.
 
 Automatic cuDNN handle caches must isolate both device and calling thread;
 re-streaming a process-global handle races otherwise. Check A→B→A device reuse,
@@ -851,3 +1273,145 @@ SDPA node. Compare both gate extremes after capture, and verify those ungated
 outputs stay unchanged. Rebind gate storage and physical layout independently
 of Q/O; cover actual >32-bit strides and batch-index products, with opposite
 gate values at the wrapped address so narrowing fails numerically.
+
+
+### Standalone prepared device contexts
+
+A valid default-stream handle (including zero) does not identify the operand
+GPU. Direct standalone adapters must select the plan device and establish its
+CUDA context before entering a prepared host, then restore the caller even on
+validation failure. Exercise both the default sentinel and a side stream with
+a different GPU current; include changed-input capture replay. The detector is
+`test_direct_standalone_with_another_device_current` in the SM100 backward
+staging suite; it exercises both standalone adapters with a real host. A test
+that intercepts entry before launch provides a safe RED control for this bug.
+
+FROST regression filenames must match the CI `-k frost` selection. Verify
+collection with that filter.
+
+When pinning append-only records, assert the historical field segment or a
+frozen positional prefix, written explicitly rather than derived from the
+current dataclass under test. A last-N-fields check over the entire current record
+rejects legal future appends. Source-call pins must distinguish positional
+operands from appended keyword arguments (use the AST); a final keyword does
+not move the last positional operand. The SDPA field-order and FP8 THD fold
+pins exercise these cases.
+
+
+### Native SM80 packed wrapper widths
+
+The covering MMA flavor and the logical QK/V widths are distinct. Keep each
+logical load bound when removing wrapper padding; marking a partial Q/K width
+as even reads poisoned head slack. `test_sdpa_sm80_thd_native_widths.py` checks
+independent widths, gapped strides, original input pointers, native kernel counts
+and changed-input/prefix replay. Its graph cases include QK<V in dense and THD.
+Compact head-major Stats pitch is the dynamic packed capacity; preserve that
+symbolic pitch when keying a compiled artifact. Fixed inter-head padding is a
+separate stride, not additional logical rows or required final-head storage.
+The wrapper capacity-reuse tests forbid compilation after capacities change;
+`test_sdpa_sm80_native_wrappers.py` retains fresh-process artifact checks while
+forbidding normalization and rejecting unsupported inner strides before launch.
+Its singleton-Stats case uses T=H=1 with zero, compact and padded head pitches:
+both packings classify the same element, but the token-major binder requires
+exact strides, so the wrapper must retain the head-major ABI for unused pitches.
+
+For Torch/JAX DLPack transfers, select the tensor's CUDA device during conversion
+and restore the caller's device afterward. Cover values, metadata, gradients and
+reverse transfers. The simplified sparse attention JAX suite checks the context
+guard and runs with another GPU current when two devices are available.
+
+For JAX device-target admission, test zero-argument JIT closures that capture every
+operand as well as fully and partially traced inputs. Concrete captured arrays do
+not pin execution placement; detect the active trace independently of operand
+types. BSA's `test_fully_captured_public_call_refuses_mixed_arch_under_jit` checks
+that a modeled mixed-architecture host is rejected before the FFI factory.
+
+When a template-loader signature gains an optional target or part argument,
+update every monkeypatched loader spy to accept and forward it while retaining
+route assertions. Exercise the actual spy with both the legacy call and the new
+keyword; architecture-skipped GPU cases can otherwise hide a host-call failure
+until another lane runs, before any kernel executes.
+
+For multistage native SDPA descriptors, check the end of the highest addressed
+stage, not only the first stage's start, against the descriptor address window.
+D576's P ring starts below256KiB while its second slot crosses that boundary;
+it still needs version1. `TestNativeD576Half.test_admission` and the existing
+SM107 descriptor/ledger tests cover this geometry. For absorbed MLA, exercise
+V as a512-column view of the576-wide K record so tests retain the real physical
+stride and alias, including changed-input capture replay.
+
+
+For a tiled large-head backward kernel, keep the contraction width separate
+from the output-column tile. Validate a nonzero gradient in every output
+chunk and include the full declared O/dO width in the delta pass. A small-head
+delta helper reused unchanged can make dV correct while corrupting dQ/dK.
+`test_sdpa_bwd_d512_fp8.py` checks all gradients and Amax through the graph,
+plus fixed quantized inputs under changed batch sizes and graph replay.
+
+Test sink logits at both infinities with a live Q and **zero KV iterations**.
+An all-masked tile whose loop still runs can seed different row state and miss
+`-inf - (-inf)` in the final fold. The disabled sink must retain O=0/LSE=-inf;
+a dominating +inf sink must produce O=0/LSE=+inf.
+`test_native_thd_paged_sink_endpoints` checks both in each native SM80 body.
+
+A graph sink descriptor can be strided while its variant-pack carrier is flat.
+Pass the declared head pitch to the native THD host; standalone views derive
+their own pitch. Validate current sink presence, dtype, device and storage span
+before length metadata writes. `test_native_thd_paged_sink_rebind_replay` keeps
+poisoned sink slack, fresh pointers and changed-input capture; the SM80 sink
+determinism suite checks unchanged outputs and scratch on rejected bindings.
+
+Paged vector loaders must derive row count and swizzle span from each operand's
+compiled head tile, while the live-vector guard uses its logical width. Fill
+padding beyond that width with NaNs and test independent QK/V widths; otherwise
+a D128-only copy loop can silently overrun the shared tile after admission is
+widened. `test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_widths` covers
+16/32/64-element swizzle spans, eight-aligned envelopes, fresh pool storage,
+independent HND/NHD tables and changed-input replay.
+
+SM120 decode stage width can be48 for unequal QK/V tiles (for example32/48).
+When adding a decode domain, intersect the capability row and template guard
+with `config_sm120.decode_kv_stage`, including48; rounding every stage to a
+power of two silently removes valid head-width pairs. The native paging suite
+covers D24/V40 at this stage width with split/unsplit execution.
+A paged ring-loader check must use more K/V stages per split than ring slots.
+Page-boundary tests shorter than the ring cannot detect missing producer waits
+on slot reuse; keep changed-table/length replay and racecheck on a multi-wrap case.
+
+When extending a native split kernel to paged KV, update the adapter's
+partial-format predicate together with route admission. The D256 mixed-KV
+host writes FP32 partials even when final O is half. Allocating or binding
+half partials can corrupt O while memcheck still reports zero errors.
+`TestMixedFp8Kv.test_d256_dense_paged` checks numerical O/Stats for split
+and unsplit paging, and `test_d256_standalone` pins the FP32 partial ABI.
+
+
+A raw-copy barrier reused across operand sub-chunks needs a phase invariant
+across calls and empty work items. Native mixed D512 issues exactly two K
+or two V chunks per call, so its local phase returns to zero. Keep the exact
+head-width and chunk-count guards when using that invariant: D576's three K
+chunks cannot reuse the same scheme. `TestMixedFp8Kv.test_d512_admission`
+checks the chunk counts and rejects that geometry; numerical/replay cases
+include empty KV and multiple scheduler waves.
+
+Capability-matrix fixtures must sample a shape that serves the feature under
+comparison. Adding a smaller native flavor can change sorted shape order
+without changing the larger envelope's band support. Keep the general band
+matrix on a representative full-feature shape and retain separate native
+flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
+The SM90 D64/D512 controls in `test_band_capabilities.py` and
+`test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
+
+Host-frame fixtures that derive runtime arguments from a Python AST must retain
+unannotated arguments. Check `argument.annotation is None` before calling
+`ast.unparse`; only an explicit `Constexpr` annotation removes a runtime slot.
+The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
+exercise appended untyped origin arguments and compare native frames with
+the independent Python reference.
+
+When a THD fixture changes O's physical row stride, give O independent Int64
+element offsets and update them with the stride; retaining Q's compact offsets
+describes a different output location. Head-major Stats offsets advance by one
+element per token, while token-major Stats offsets advance by the head count.
+The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
+numerical and replay checks for these contracts.

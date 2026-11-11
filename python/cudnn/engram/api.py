@@ -8,6 +8,7 @@ from functools import lru_cache
 import math
 
 from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
 
 
 def _require_cute():
@@ -131,7 +132,9 @@ class _SavedGate(APIBase):
             )
         self._runtime_error_if(self._device.type != "cuda", "Engram gate requires CUDA")
         self._capability = torch.cuda.get_device_capability(self._device)
-        self._not_implemented_error_if(self._capability != (10, 0), "Engram saved-state gate currently supports SM100")
+        self._not_implemented_error_if(
+            self._capability not in PORTABLE_ELEMENTWISE_CCS, f"Engram saved-state gate supports cc {PORTABLE_ELEMENTWISE_CCS}; got {self._capability}"
+        )
 
     def _validate(self, inputs, outputs, workspace=None):
         if self._compiled_kernel is None:

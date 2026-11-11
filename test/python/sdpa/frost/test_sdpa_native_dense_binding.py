@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native/Python binding contracts and bounded SM100 graph execution checks."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 from pathlib import Path
 
@@ -16,19 +18,32 @@ from cudnn.sdpa.fwd import prepared as prep
 pytestmark = [pytest.mark.L0]
 
 
-def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1):
+def _parts(cc):
+    """The parts a GPU case declared for ``cc`` runs on. The SM100 cases (the (10, 0) default) run on SM103 too, which serves the same sm100
+    bodies compiled for sm_103a; test_sdpa_native_arch_binding.py names its other cc 10.3 and cc 10.7 cases explicitly."""
+    return ((10, 0), (10, 3)) if cc == (10, 0) else (cc,)
+
+
+def _parts_label(cc):
+    return " or ".join(f"SM{major}{minor}" for major, minor in _parts(cc))
+
+
+def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d=128, sq=1, v_hnd=None, d_v=None):
+    d_v = d if d_v is None else d_v
     s = prep.DenseLaunchSpec()
-    s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, d, d
+    s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, d, d_v
     s.s_q_max, s.s_k_max, s.page_size, s.tile_n = sq, 128, 16, 128
     s.paged, s.paged_hnd, s.has_lse, s.has_sink = paged, hnd, lse, False
+    s.paged_v_hnd = hnd if v_hnd is None else v_hnd
     s.seq_kv_present, s.seq_q_present = lengths, lengths
     s.device_index, s.split, s.window_right = 0, 1, 0
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_path = Path(prep.__file__).parent / f"kernels/sm100/decode_d{256 if d == 256 else 128}_f16.py"
+    host_name = "prefill_d512_f16_2x2.py" if d > 512 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    host_path = Path(prep.__file__).parent / "kernels/sm100" / host_name
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
-    s.order = [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
+    s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
     s.template[s.index["seq_q_lens_addr"]] = 0
@@ -37,10 +52,12 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.fn = lambda *frame: frames.append(frame)
     facts = {}
     for i, (role, h, seq) in enumerate((("q", 8, sq), ("k", 2, 128), ("v", 2, 128), ("o", 8, sq))):
-        shape, strides = (4, h, seq, d), (seq * h * d, d, h * d, 1)
+        width = d if role in ("q", "k") else d_v
+        shape, strides = (4, h, seq, width), (seq * h * width, width, h * width, 1)
         if paged and role in ("k", "v"):
-            shape = (32, h, 16, d)
-            strides = (16 * h * d, 16 * d, d, 1) if hnd else (16 * h * d, d, h * d, 1)
+            shape = (32, h, 16, width)
+            pool_hnd = s.paged_v_hnd if role == "v" else hnd
+            strides = (16 * h * width, 16 * width, width, 1) if pool_hnd else (16 * h * width, width, h * width, 1)
         span = sum((n - 1) * st for n, st in zip(shape, strides)) + 1
         facts[role] = prep.BufferFacts(0x1000 * (i + 1), dtype, (2, 0), span, shape, strides)
     if lengths:
@@ -51,6 +68,8 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     if paged:
         for i, role in enumerate(("block_table", "block_table_v")):
             facts[role] = prep.BufferFacts(0x30000 + i * 0x1000, "int32", (2, 0), 32, (4, 8), (8, 1))
+    s.native_roles = prep._NATIVE_DENSE_ROLES
+    s.native_indices = prep._NATIVE_DENSE_INDICES
     s.native = cudnn._pybind_module._SdpaDenseBinder(s)
     return s, facts, frames
 
@@ -68,17 +87,17 @@ def _native(s, facts, stream=17):
 
 def _equal(s, facts, stream=17):
     actual = _native(s, facts, stream)
-    assert list(actual) == prep.bind_dense(s, facts, stream, stream)
+    assert list(actual) == binding_reference.bind_dense(s, facts, stream, stream)
     return actual
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("paged,hnd", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, False), (True, True, True), (True, False, True), (True, True, False)])
 @pytest.mark.parametrize("lse", [False, True])
 @pytest.mark.parametrize("lengths", [False, True])
 @pytest.mark.parametrize("d,sq", [(64, 1), (128, 1), (256, 1), (256, 4)])
-def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq):
-    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq)
+def test_native_dense_matches_python_and_rebinds(dtype, paged, hnd, lse, lengths, d, sq, v_hnd):
+    s, facts, _ = _fixture(dtype, paged, hnd, lse, lengths, d=d, sq=sq, v_hnd=v_hnd)
     first = _equal(s, facts)
     changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
     second = _equal(s, changed, stream=23)
@@ -107,7 +126,7 @@ def test_native_dense_rechecks_current_storage_after_warmup(role, change, d, sq)
     else:
         changed[role] = f._replace(**updates[change])
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
     with pytest.raises(ValueError):
         s.native.execute(_pack(changed), tuple(range(len(prep._NATIVE_DENSE_ROLES))), 17)
     assert frames == []
@@ -141,7 +160,7 @@ def test_native_dense_geometry_errors_match_python(role, updates):
     _equal(s, facts)
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
     with pytest.raises(ValueError):
         _native(s, changed)
 
@@ -177,7 +196,7 @@ def test_native_decode_query_overrides_respect_plan_specialization(fixed):
         with pytest.raises(ValueError):
             _native(s, changed)
         with pytest.raises(ValueError):
-            prep.bind_dense(s, changed, 17, 17)
+            binding_reference.bind_dense(s, changed, 17, 17)
     else:
         assert _equal(s, changed)[s.index["problem_size"]][3] == 2
     _equal(s, facts)
@@ -228,7 +247,7 @@ def test_native_dense_graph_hot_path_does_not_materialize_python_facts(monkeypat
     launch._indices = None
     launch._native_indices = None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph path rebuilt Python facts"))
-    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph path used Python binder"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph path used Python binder"), raising=False)
     launch.execute(SimpleNamespace(native=_pack(facts), index_of=launch._uids.index), 0, 17, 17)
     changed = dict(facts, q=facts["q"]._replace(span=1))
     with pytest.raises(ValueError):
@@ -257,14 +276,14 @@ def test_native_dense_optional_and_tail_contract():
         with pytest.raises(ValueError):
             _native(s, dict(facts, **{role: extra}))
         with pytest.raises(ValueError):
-            prep.bind_dense(s, dict(facts, **{role: extra}), 17, 17)
+            binding_reference.bind_dense(s, dict(facts, **{role: extra}), 17, 17)
     changed = dict(facts)
     for role in ("k", "v"):
         changed[role] = facts[role]._replace(shape=(4, 2, 127, 128))
     with pytest.raises(ValueError):
         _native(s, changed)
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
 
 
 @pytest.mark.parametrize("right", [-4, -1, 0, 1])
@@ -283,7 +302,7 @@ def test_native_dense_empty_geometry_and_observed_bytes():
     with pytest.raises(ValueError):
         _native(s, changed)
     with pytest.raises(ValueError):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
     pack = _pack(facts)
     q_index = prep._NATIVE_DENSE_ROLES.index("q")
     q = facts["q"]
@@ -303,7 +322,7 @@ def test_native_dense_shared_table_stride_host_contract():
     with pytest.raises(ValueError, match="matching K/V table strides"):
         _native(s, changed)
     with pytest.raises(ValueError, match="matching K/V table strides"):
-        prep.bind_dense(s, changed, 17, 17)
+        binding_reference.bind_dense(s, changed, 17, 17)
 
 
 @pytest.mark.parametrize("paged", [False, True])
@@ -327,8 +346,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
 ):
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != cc:
-        pytest.skip(f"native dense test requires SM{cc[0]}{cc[1]}")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in _parts(cc):
+        pytest.skip(f"native dense test requires {_parts_label(cc)}")
     from frost_test_utils import _dsl_installed
     from test_sdpa_fwd_decode_d128_sm100 import _SM100_ID, _gather_kv, _ref
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -426,8 +445,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     if paged:
         assert launch.spec.paged_hnd == hnd
     monkeypatch.setattr(prep, "facts_of_roles", lambda *args: pytest.fail("native graph rebuilt Python facts"))
-    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"))
-    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("native graph used Python split binding"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("native graph used Python binding"), raising=False)
+    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("native graph used Python split binding"), raising=False)
     workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     uids = tuple(range(1, len(inputs) + 1)) + (100, 101)
     completions = []
@@ -605,8 +624,8 @@ def test_native_dense_unknown_storage_contract_is_preserved():
 def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, splits=1, stats_mode="ln", d_v=None, prefill=False, has_sink=False, cc=(10, 0)):
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != cc:
-        pytest.skip(f"native standalone test requires SM{cc[0]}{cc[1]}")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in _parts(cc):
+        pytest.skip(f"native standalone test requires {_parts_label(cc)}")
     from frost_test_utils import _dsl_installed
 
     if not _dsl_installed():
@@ -651,8 +670,8 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
         return observe(tensor)
 
     monkeypatch.setattr(prep, "facts_of_tensor", workspace_only)
-    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("standalone native path used Python binding"))
-    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("standalone native path used Python split binding"))
+    monkeypatch.setattr(prep, "bind_dense", lambda *args: pytest.fail("standalone native path used Python binding"), raising=False)
+    monkeypatch.setattr(prep, "bind_dense_split", lambda *args: pytest.fail("standalone native path used Python split binding"), raising=False)
 
     def call(scale):
         api.execute(
@@ -757,3 +776,19 @@ def test_native_decode_standalone_rebinds_scale_and_capture(d, sq, monkeypatch, 
 @pytest.mark.parametrize("d", [64, 256])
 def test_native_decode_new_flavors_keep_int64_table_stride(d, monkeypatch, request):
     test_native_dense_graph_fresh_bindings_and_changed_replay(True, d, 1, "bfloat16", monkeypatch, request, wide_tables=True)
+
+
+@pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, True), (True, True, False)])
+@pytest.mark.parametrize("d,d_v", [(576, 512), (576, 504), (568, 512), (520, 264)])
+def test_native_d576_dense_binding(paged, hnd, v_hnd, d, d_v):
+    # The binder preserves accepted native widths; architecture-specific
+    # kernel eligibility is validated by the graph and adapter suites.
+    spec, facts, frames = _fixture(d=d, d_v=d_v, paged=paged, hnd=hnd, v_hnd=v_hnd)
+    _equal(spec, facts)
+    assert not frames
+
+
+@pytest.mark.parametrize("d,d_v", [(576, 576), (584, 512), (576, 256), (575, 512), (576, 510)])
+def test_native_d576_binding_rejects_outside_envelope(d, d_v):
+    with pytest.raises(ValueError, match="supported half attention head dimension pair"):
+        _fixture(d=d, d_v=d_v)

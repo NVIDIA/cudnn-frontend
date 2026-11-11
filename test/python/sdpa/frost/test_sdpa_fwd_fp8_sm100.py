@@ -27,7 +27,16 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import (
+    _SM,
+    assert_no_new_spills,
+    make_dense_stats,
+    requires_blackwell,
+    requires_dsl,
+    requires_pre_rubin_blackwell,
+    run_sass_probe,
+    sass_probe_source,
+)
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -38,19 +47,10 @@ pytestmark = [requires_blackwell, requires_dsl]
 # 100-106, sm107 = the Rubin line): pin the engine that serves the device
 # under test.  Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
-# -- so every flavor test below runs on both; the `_skip_*_on_rubin` markers
-# from the d128-only era are retired.  TWO Rubin declines are still true, each
-# kept as a marker with its real reason and pinned host-side in
-# test_sdpa_fwd_dsl_sm107.py:
-#   * the sm107 row packs GQA on d128 only (`pack_gqa_d_shapes = {(128, 128)}`,
-#     no PackGQA path in the wider siblings) -- a DECLARED decline
-#     (test_sm107_fp8_pack_gqa_is_d128_only); the packed d192 / d256 execute
-#     tests skip with that reason;
-# Per-tensor FP8 Stats strides are now runtime Int64 slots on all four flavors.
+# -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
+# serve PackGQA, as does the native D256 pipeline. D512 remains unpacked.
+# Per-tensor FP8 Stats strides are runtime Int64 slots on all four flavors.
 _D128_ARCH = "sm107" if _SM == 107 else "sm100"
-_skip_pack_gqa_wide_on_rubin = pytest.mark.skipif(
-    _SM == 107, reason="the Rubin per-tensor FP8 row packs GQA on d128 only (pack_gqa_d_shapes; pinned by test_sm107_fp8_pack_gqa_is_d128_only)"
-)
 # Five e5m2 ids read `max|O-ref|` 0.0404-0.0423 against the shared 4e-2 e5m2 bound
 # (`_half_atol`, tightened by #971) on the 204-SM Rubin part -- a DATASET edge
 # (torch's Philox lays draws out by SM count, so the cc 10.7 tensors are not the
@@ -78,11 +78,11 @@ def _known_e5m2_edge_scope(request):
 
 
 _D128_D256 = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
-_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin)]
+_D128_D256_PACK_GQA = [pytest.param(128, id="d128"), pytest.param(256, id="d256")]
 # test_fp8_pack_gqa_e5m2 only: its d128 combo is one of the five e5m2 edges.
 _D128_D256_PACK_GQA_E5M2 = [
     pytest.param(128, id="d128", marks=_known_e5m2_edge_on_rubin),
-    pytest.param(256, id="d256", marks=_skip_pack_gqa_wide_on_rubin),
+    pytest.param(256, id="d256"),
 ]
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
@@ -252,6 +252,9 @@ def _run(
     block_scaled_o=None,
     sf_o_layout="planes",
     scale_o=1.0,
+    negate_q: bool = False,
+    negative_descale_q: bool = False,
+    qkv_float=None,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -262,12 +265,20 @@ def _run(
     import cudnn
 
     dev = "cuda"
-    Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
-    Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
-    Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
+    if qkv_float is None:
+        Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+        Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
+        Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
+    else:
+        Qf, Kf, Vf = qkv_float
+    if negate_q:
+        Qf = -Qf
     Q8, dq = _quant(Qf, in_key)
     K8, dk = _quant(Kf, in_key)
     V8, dv = _quant(Vf, in_key)
+    if negative_descale_q:
+        # Same dequantized Q, with a negative descale_q * descale_k on the device.
+        Q8, dq = (-Q8.float()).to(Q8.dtype), -dq
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
@@ -789,27 +800,19 @@ def test_fp8_head_dim_envelope(dims, mask):
 
 
 @pytest.mark.L0
-def test_fp8_large_flavors_serve_exact_shapes_only():
-    """The d192xd128 and D256 per-tensor FP8 flavors serve ONLY their exact shapes.
-    With d_qk zero-padded into d192 (144/160/176) the output is wrong (test_mhas_v2
-    fp8 fwd: 4-19% of elements off by O(1)); the D256 padded envelope shows
-    run-to-run nondeterminism on long causal e5m2/GQA/sink graphs (a case passes
-    alone and fails in the battery). The engine row floors both (128 / 255), the
-    adapter mirrors the floors, and both flavor selections honour them, so the
-    inexact (128, 256) region is declined everywhere -- the classic backend verdict
-    applies -- while the d128 flavor's envelope and the d512 band are unchanged.
-    The floor table is arch-independent (contract rule 8b'), so both rows are pinned."""
+def test_fp8_d256_dense_envelope_matches_adapter():
+    """Pin the shared D256 dense-envelope domain on both native arch lines."""
     from cudnn.sdpa.fwd import engines as eng
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, _SM100_FP8_ENVELOPE_FLOORS, _fp8_envelope_covers
 
-    assert _SM100_FP8_ENVELOPE_FLOORS[(192, 128)] == 128 and _SM100_FP8_ENVELOPE_FLOORS[(256, 256)] == 255
+    assert _SM100_FP8_ENVELOPE_FLOORS == {(512, 512): 256}
     for arch in ("sm100", "sm107"):
         spec = next(sp for sp in eng.ENGINE_SPECS if sp.name == f"sdpa_fwd_prefill_{arch}_fp8")
-        assert dict(spec.capabilities.d_envelope_floors) == {(192, 128): 128, (256, 256): 255, (512, 512): 256}, arch
+        assert dict(spec.capabilities.d_envelope_floors) == {(512, 512): 256}, arch
     shapes = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
-    for d_qk, d_v in ((160, 96), (176, 128), (192, 96), (160, 160), (224, 208)):
-        assert not _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
-    for d_qk, d_v in ((96, 96), (128, 64), (320, 320)):
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
+        assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
+    for d_qk, d_v in ((96, 96), (128, 64), (160, 96), (176, 128), (192, 96), (320, 320)):
         assert _fp8_envelope_covers(d_qk, d_v, shapes), (d_qk, d_v)
 
     B, H, S, dev = 2, 4, 384, "cuda"
@@ -822,18 +825,14 @@ def test_fp8_large_flavors_serve_exact_shapes_only():
         lse = torch.empty(B, H, S, device=dev, dtype=torch.float32)
         return SdpaFwdDslSm100(sample_q=Q8, sample_k=K8, sample_v=V8, sample_o=out, sample_lse=lse, scale_softmax=1.0 / math.sqrt(d_qk), pertensor_fp8=True)
 
-    for d_qk, d_v, want in ((192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
+    for d_qk, d_v, want in ((160, 96, (192, 128)), (176, 128, (192, 128)), (192, 128, (192, 128)), (256, 256, (256, 256)), (96, 96, (128, 128))):
         api = _api(d_qk, d_v)
         assert api.check_support(), (d_qk, d_v)
         assert tuple(api.flavor) == want, (d_qk, d_v, api.flavor)
-    for d_qk, d_v in ((160, 96), (224, 208)):
+    for d_qk, d_v in ((16, 144), (224, 16), (160, 160), (224, 208)):
         api = _api(d_qk, d_v)
-        try:
-            supported = api.check_support()
-        except ValueError as exc:  # the adapter may surface the envelope gate as a raise
-            supported = False
-            assert "floors" in str(exc), str(exc)
-        assert not supported, (d_qk, d_v)
+        assert api.check_support(), (d_qk, d_v)
+        assert tuple(api.flavor) == (256, 256), (d_qk, d_v, api.flavor)
 
 
 @pytest.mark.L0
@@ -1293,7 +1292,6 @@ def test_fp8_pack_gqa_e5m2(d):
     _check(out, o_ref, torch.float16, "e5m2", a_o, a_ref)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("h_q,h_kv", [(8, 4), (8, 2), (16, 2)], ids=["g2", "g4", "g8"])
 @torch_fork_set_rng(seed=0)
@@ -1319,7 +1317,6 @@ def test_fp8_pack_gqa_d192_d128_ratios(h_q, h_kv):
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_grouped_lpt():
@@ -1347,7 +1344,6 @@ def test_fp8_pack_gqa_d192_d128_grouped_lpt():
     torch.testing.assert_close(lse_v, lse_ref, atol=5e-2, rtol=3e-2)
 
 
-@_skip_pack_gqa_wide_on_rubin
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 def test_fp8_pack_gqa_d192_d128_e5m2_sink():
@@ -2116,19 +2112,16 @@ def test_fp8_d512_head_dim_envelope(d_qk, d_v, mask):
 @pytest.mark.L0
 def test_fp8_d512_envelope_floor_declines_straddling_shapes():
     """The D512 flavor serves the (256, 512] band on both head dims; shapes
-    straddling its floor decline.  Below it the D256 flavor is exact-shape only
-    (its padded envelope is non-deterministic, see
-    test_fp8_large_flavors_serve_exact_shapes_only), so a shape such as
-    (160, 160) -- too wide for D192/128, not the D256 shape -- is declined too.
-    Both device lines carry the flavor, so both shape maps are pinned.
+    straddling its floor decline. Below it D256 serves aligned dense heads.
+    Both device lines carry the flavors, so both shape maps are pinned.
     """
     from cudnn.sdpa.fwd.api_dsl import _fp8_envelope_covers, _sm100_fp8_shapes
 
     for device_cc in ((10, 0), (10, 7)):
         shapes = _sm100_fp8_shapes(pertensor=True, device_cc=device_cc)
-        for d_qk, d_v in [(256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
+        for d_qk, d_v in [(160, 160), (256, 256), (384, 448), (464, 368), (272, 272), (512, 512)]:
             assert _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
-        for d_qk, d_v in [(160, 160), (272, 256), (384, 128), (512, 256)]:
+        for d_qk, d_v in [(272, 256), (384, 128), (512, 256)]:
             assert not _fp8_envelope_covers(d_qk, d_v, shapes), (device_cc, d_qk, d_v)
 
 
@@ -2398,3 +2391,269 @@ def test_fp8_thd_batched_setup(batch, cu_lens):
     kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
     out = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
     _check(out[0], out[1], torch.float16, "e4m3", out[2], out[3])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale| (#1435). FP8 negation is exact, so the
+    result must be bit-identical to the positive scale on -Q; this does not depend on the fp32 reference's edge."""
+    scale = 0.7 / math.sqrt(d_qk)
+    runs = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        runs.append(_run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=sign * scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negate_q=sign > 0))
+    neg, pos = runs
+    assert not neg.output.isnan().any()
+    assert torch.equal(neg.output, pos.output)
+    assert neg.amax == pos.amax
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not 100 <= _SM < 107, reason="the SM100 D192 FP8 template")
+def test_fp8_d192_causal_probability_rounding():
+    """A fixed two-key causal row straddles an E4M3 probability midpoint.
+
+    P[0] = 0.78075 must round to 0.75, below the 0.78125 midpoint.
+    The old exp2 approximation moved it above the midpoint and rounded to
+    0.8125 instead. Fixed inputs keep this independent of CUDA RNG layout.
+    """
+    q = torch.zeros(1, 1, 128, 192, device="cuda")
+    k = torch.zeros_like(q)
+    v = torch.zeros(1, 1, 128, 128, device="cuda")
+    q[..., 0] = 1.0
+    k[:, :, 1, 0] = 1.0
+    v[:, :, 0, :] = 4.0
+    result = _run(
+        1,
+        1,
+        1,
+        128,
+        128,
+        "e4m3",
+        torch.float16,
+        scale=-math.log(0.78075),
+        sdpa_kwargs=_MASKS["causal"],
+        d_qk=192,
+        d_v=128,
+        return_lse=True,
+        qkv_float=(q, k, v),
+    )
+    _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+    torch.testing.assert_close(result.stats, result.reference_stats, rtol=3e-2, atol=_half_atol("e4m3"))
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not 100 <= _SM < 107, reason="the SM100 D192 FP8 rotated-P template")
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("s_kv", [128, 256, 512])
+def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
+    """Delay the prior P1 consumer: the final synthetic score credit must wait
+    for its PV completion. Single-KV tiles have no prior P1 to protect.
+
+    The injected delay is a correctness stressor, never a timing assertion or
+    tuning knob. Before the repair, the two-KV dense case can lap the second
+    P-chunk readiness phase and hang, or consume the overwritten probability.
+    """
+    import hashlib
+    import importlib.util
+    from pathlib import Path
+
+    from cudnn.sdpa.fwd import api_dsl
+
+    original_loader = api_dsl.load_template
+    loaded = {}
+
+    def load_skewed(path, params, tag="template", extra_key=None):
+        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+            return original_loader(path, params, tag=tag, extra_key=extra_key)
+        key = (path, params, extra_key)
+        if key not in loaded:
+            # Include both specialization and test seam in the compiled key.
+            digest = hashlib.sha256(Path(path).read_bytes() + repr((params, extra_key, "p1-delay-100")).encode()).hexdigest()
+            spec = importlib.util.spec_from_file_location(f"cudnn.frost._templates.p1_skew_{digest}", path)
+            mod = importlib.util.module_from_spec(spec)
+            mod.FROST_TEMPLATE_PARAMS = params
+            mod.FROST_SOURCE_DIGEST = digest
+            mod.FROST_D192_FP8_DEBUG_MMA_P1_DELAY_US = 100
+            spec.loader.exec_module(mod)
+            loaded[key] = mod
+        return loaded[key]
+
+    monkeypatch.setattr(api_dsl, "load_template", load_skewed)
+    results = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        result = _run(
+            2,
+            8,
+            8,
+            256,
+            s_kv,
+            "e4m3",
+            torch.float16,
+            scale=sign * 0.7 / math.sqrt(192),
+            sdpa_kwargs=_MASKS[mask],
+            d_qk=192,
+            d_v=128,
+            negate_q=sign > 0,
+            return_lse=True,
+        )
+        _check(result.output, result.reference, torch.float16, "e4m3", result.amax, result.reference_amax)
+        torch.testing.assert_close(result.stats, result.reference_stats, rtol=3e-2, atol=_half_atol("e4m3"))
+        results.append(result)
+    assert loaded, "the intended skewed template must execute"
+    assert torch.equal(results[0].output, results[1].output)
+    assert torch.equal(results[0].stats, results[1].stats)
+    assert results[0].amax == results[1].amax
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_sign", [-1.0, 1.0], ids=["neg_scale", "pos_scale"])
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
+    """A negative device descale_q * descale_k flips BMM1's sign on the device, for either plan sign (#1435). The same
+    dequantized Q with a positive descale is the bit-exact reference."""
+    scale = scale_sign * 0.7 / math.sqrt(d_qk)
+    runs = []
+    for negative_descale_q in (True, False):
+        torch.manual_seed(0)
+        runs.append(
+            _run(1, 2, 1, 17, 65, "e4m3", torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negative_descale_q=negative_descale_q)
+        )
+    flipped, plain = runs
+    assert not flipped.output.isnan().any()
+    assert torch.equal(flipped.output, plain.output)
+    assert flipped.amax == plain.amax
+
+
+@pytest.mark.parametrize(
+    "d,dv,dtype,mask,pack",
+    [
+        (144, 128, "e4m3", "causal", False),
+        (144, 128, "e5m2", "causal_br", True),
+        (160, 112, "e4m3", "swa", True),
+        (160, 112, "e5m2", "causal", False),
+        (176, 64, "e4m3", "causal_br", False),
+        (176, 64, "e5m2", "swa", True),
+        (192, 16, "e4m3", "causal", True),
+        (192, 16, "e5m2", "causal_br", False),
+    ],
+)
+@torch_fork_set_rng(seed=827)
+def _check_fp8_d192_head_envelope_masks(d, dv, dtype, mask, pack):
+    known_edge = _SM == 107 and (d, dv, dtype, mask, pack) == (160, 112, "e5m2", "causal", False)
+    qkv = None
+    if known_edge:
+        qkv = [torch.randn(*shape, device="cuda") * 0.5 for shape in ((2, 8, 129, d), (2, 2, 256, d), (2, 2, 256, dv))]
+    result = _run(
+        2,
+        8,
+        2,
+        129,
+        256,
+        dtype,
+        torch.bfloat16,
+        scale=1 / math.sqrt(d),
+        sdpa_kwargs=_MASKS[mask],
+        d_qk=d,
+        d_v=dv,
+        pack_gqa=pack,
+        seq_lens_kv=[256, 217],
+        return_lse=True,
+        poison_tmem_before_execute=True,
+        qkv_float=qkv,
+    )
+    torch.testing.assert_close(result.stats, result.reference_stats, atol=_half_atol(dtype), rtol=3e-2)
+    try:
+        _check(result.output, result.reference, torch.bfloat16, dtype, result.amax, result.reference_amax)
+    except AssertionError:
+        error = (result.output.float() - result.reference).abs()
+        # One native E5M2 dataset has a 0.0407306 residual on BOTH padded and
+        # exact D192. Preserve the shared 0.04 bound: only this measured edge
+        # may xfail, after checking Stats, Amax and an exact-shape control.
+        if not (known_edge and 0.04 < error.max().item() <= 0.041 and (error > 0.04).sum().item() == 1 and abs(result.amax - result.reference_amax) <= 0.03):
+            raise
+        exact = _run(
+            2,
+            8,
+            2,
+            129,
+            256,
+            dtype,
+            torch.bfloat16,
+            scale=1 / math.sqrt(d),
+            sdpa_kwargs=_MASKS[mask],
+            d_qk=192,
+            d_v=128,
+            pack_gqa=False,
+            seq_lens_kv=[256, 217],
+            return_lse=True,
+            poison_tmem_before_execute=True,
+            qkv_float=[torch.nn.functional.pad(value, (0, (192 if i < 2 else 128) - value.shape[-1])) for i, value in enumerate(qkv)],
+        )
+        assert torch.equal(result.output, exact.output[..., :dv])
+        assert torch.equal(result.stats, exact.stats)
+        assert result.amax == exact.amax
+        pytest.xfail("known native D192 E5M2 output edge: one residual in (0.04, 0.041], bitwise identical to the exact-shape control (#1935)")
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD192Fp8HeadPadding:
+    """Collect the shared head-padding checks once on the SM100/SM103 line."""
+
+    from sdpa_fp8_d192_padding import test_fp8_d192_padded_heads_rebind_replay as _rebind
+
+    _masks = _check_fp8_d192_head_envelope_masks
+
+    test_rebind_and_replay = staticmethod(_rebind)
+    test_masks = staticmethod(_masks)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD256Fp8HeadPadding:
+    """Collect bounded dense and paged D256 cases in the selected CI entry."""
+
+    from sdpa_fp8_d256_padding import test_dense_rebind_replay as _dense, test_dense_masks as _masks, test_paged_rebind_replay as _paged
+
+    test_dense_rebind_replay = staticmethod(_dense)
+    test_dense_masks = staticmethod(_masks)
+    test_paged_rebind_replay = staticmethod(_paged)
+
+
+import native_forward_fp8_cases as _native_fp8_checks
+
+
+@pytest.mark.L0
+@requires_dsl
+class TestNativeFp8Strides:
+    test_fp8_native_uses_pointer_host_and_current_storage = staticmethod(_native_fp8_checks.test_fp8_native_uses_pointer_host_and_current_storage)
+    test_native_default_stream_is_resolved_for_q_device = staticmethod(_native_fp8_checks.test_native_default_stream_is_resolved_for_q_device)
+    test_native_default_stream_with_another_device_current = staticmethod(_native_fp8_checks.test_native_default_stream_with_another_device_current)
+    test_fp8_native_strided_stats = staticmethod(_native_fp8_checks.test_fp8_native_strided_stats)
+    test_native_physical_wide_batch_stride = staticmethod(_native_fp8_checks.test_native_physical_wide_batch_stride)
+    test_native_artifact_reloads_without_jit = staticmethod(_native_fp8_checks.test_native_artifact_reloads_without_jit)
+    test_native_block_output_matches_native_graph = staticmethod(_native_fp8_checks.test_native_block_output_matches_native_graph)
+    test_native_invalid_operand_is_rejected_before_any_launch = staticmethod(_native_fp8_checks.test_native_invalid_operand_is_rejected_before_any_launch)
+    test_native_amax_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_amax_alias_checks_original_operand)
+    test_native_sf_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_sf_alias_checks_original_operand)
+    test_native_paged_qo_preserves_kv_pool_views = staticmethod(_native_fp8_checks.test_native_paged_qo_preserves_kv_pool_views)
+    test_sm107_d256_strided_preserves_each_native_operand = staticmethod(_native_fp8_checks.test_sm107_d256_strided_preserves_each_native_operand)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD128Fp8PhysicalOrigins:
+    """Pin the repaired native route in the architecture-selected CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_thd_origins_fp8_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_half_origin_execution_routes = staticmethod(_origins.test_half_origin_execution_routes)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)

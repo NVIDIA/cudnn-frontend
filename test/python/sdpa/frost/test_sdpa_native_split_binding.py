@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native split binding preserves both launch frames and final storage contracts."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 import cudnn
@@ -32,7 +34,7 @@ def _split_fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=T
 
 
 def _equal(s, facts, workspace=0x100000, stream=17):
-    expected = prep.bind_dense_split(s, facts, workspace, stream, stream)
+    expected = binding_reference.bind_dense_split(s, facts, workspace, stream, stream)
     actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, stream)
     assert list(actual[0]) == expected[0]
     assert actual[1] == expected[1]
@@ -72,7 +74,7 @@ def test_native_split_rejects_before_either_launch_after_warmup(role, change):
     else:
         changed[role] = f._replace(**updates[change])
     with pytest.raises(ValueError):
-        prep.bind_dense_split(s, changed, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(s, changed, 0x100000, 17, 17)
     with pytest.raises(ValueError):
         s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
     assert frames == combined == []
@@ -88,12 +90,12 @@ def test_native_split_strided_outputs_wide_tables_and_fixed_query_geometry():
     for role in ("block_table", "block_table_v"):
         f = facts[role]
         facts[role] = f._replace(strides=(2**33, 3), span=(s.b - 1) * 2**33 + 22)
-    _equal(s, facts)
+    _equal(s, facts, workspace=2**48)
     for role in ("q", "o"):
         f = facts[role]
         changed = dict(facts, **{role: f._replace(shape=(s.b - 1, *f.shape[1:]))})
         with pytest.raises(ValueError):
-            s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
+            s.native.execute(_pack(changed), prep._NATIVE_DENSE_INDICES, 17, workspace=2**48)
     for workspace in (0, 0x100001, -16, 2**63 - 16):
         with pytest.raises(ValueError):
             s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
@@ -142,8 +144,8 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, sdpa_fwd_wrapper_dsl_sm100
     from cuda.bindings import driver
 
-    if torch.cuda.get_device_capability() != (10, 0) or not _dsl_installed():
-        pytest.skip("native split decode requires SM100 and CuTe DSL")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+        pytest.skip("native split decode requires SM100 or SM103 and CuTe DSL")
     torch.manual_seed(19)
     q = torch.randn(2, 1, 8, 64, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
     k = torch.randn(2, 128, 2, 64, device="cuda", dtype=q.dtype).transpose(1, 2)
@@ -155,7 +157,7 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
     api.compile()
     assert api._dense_spec.native is not None
     if not native:
-        object.__setattr__(api._dense_spec, "native", None)
+        binding_reference.use_reference(api._dense_spec)
     original = api._execute_dense_prepared_on_stream
     calls = []
 
@@ -194,29 +196,80 @@ def test_standalone_split_requires_caller_workspace_without_allocating(native, m
 
     check(o, lse)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", no_allocate)
-            api.execute(q, k, v, o, lse_tensor=lse, workspace=workspace)
-    q.mul_(0.5)
-    graph.replay()
-    torch.cuda.synchronize()
-    check(o, lse)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", no_allocate)
+                api.execute(q, k, v, o, lse_tensor=lse, workspace=workspace)
+        q.mul_(0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(o, lse)
 
-    # The public wrapper remains the allocation owner. Exercise its real body
-    # with a split plan, and reject any allocation inside the actual execute.
-    monkeypatch.setattr("cudnn.sdpa.fwd.api_dsl._get_or_create_api", lambda *a, **kw: api)
-    execute = api.execute
+        # The public wrapper remains the allocation owner. Exercise its real body
+        # with a split plan, and reject any allocation inside the actual execute.
+        monkeypatch.setattr("cudnn.sdpa.fwd.api_dsl._get_or_create_api", lambda *a, **kw: api)
+        execute = api.execute
 
-    def execute_without_allocation(*args, **kwargs):
-        assert kwargs["workspace"] is not None
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "empty", no_allocate)
-            return execute(*args, **kwargs)
+        def execute_without_allocation(*args, **kwargs):
+            assert kwargs["workspace"] is not None
+            with monkeypatch.context() as patch:
+                patch.setattr(torch, "empty", no_allocate)
+                return execute(*args, **kwargs)
 
-    monkeypatch.setattr(api, "execute", execute_without_allocation)
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        result = sdpa_fwd_wrapper_dsl_sm100(q, k, v)
-    stream.synchronize()
-    check(result["o_tensor"], result["lse_tensor"])
+        monkeypatch.setattr(api, "execute", execute_without_allocation)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            result = sdpa_fwd_wrapper_dsl_sm100(q, k, v)
+        stream.synchronize()
+        check(result["o_tensor"], result["lse_tensor"])
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("role", ["q", "k", "v", "o", "lse", "seq_q_lens", "seq_kv_lens", "block_table", "block_table_v"])
+@pytest.mark.parametrize("observed", [False, True])
+@pytest.mark.parametrize("offset", [0, -16])
+def test_native_split_workspace_alias_rejects_before_either_launch(role, observed, offset):
+    spec, facts, frames, combined = _split_fixture(paged=True)
+    # Leave each operand and its overlapping scratch interval isolated, so a
+    # different role cannot mask a missing check for the selected operand.
+    facts = {name: fact._replace(ptr=0x1000000 * (index + 1)) for index, (name, fact) in enumerate(facts.items())}
+    _equal(spec, facts)
+    if not observed:
+        facts = {name: fact._replace(span=-1) for name, fact in facts.items()}
+    workspace = facts[role].ptr + offset
+    native_role = "lse_tensor" if role == "lse" else role
+    with pytest.raises(ValueError, match=rf"workspace overlaps {native_role}$"):
+        spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    with pytest.raises(ValueError, match=rf"workspace overlaps {role}$"):
+        binding_reference.bind_dense_split(spec, facts, workspace, 17, 17)
+    assert frames == combined == []
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_native_split_disjoint_slices_of_one_allocation(paged):
+    import ctypes
+    from cudnn.frost.buffers import DTYPE_ITEMSIZE
+
+    spec, facts, frames, combined = _split_fixture(paged=paged)
+    sizes = {role: fact.span * DTYPE_ITEMSIZE[fact.dtype] for role, fact in facts.items()}
+    scratch = spec.combine.lse_offset + spec.combine.lse.numel * 4
+    offsets, cursor = {}, 0
+    for role, size in sizes.items():
+        offsets[role] = cursor
+        cursor += (size + 31) // 16 * 16
+    workspace_offset = cursor
+    owner = bytearray(cursor + scratch + 16)
+    base = ctypes.addressof(ctypes.c_char.from_buffer(owner))
+    origin = (-base) % 16
+    # These are real slices of one host allocation; only metadata is bound,
+    # and the fixture's entries record frames instead of launching a GPU kernel.
+    views = {role: memoryview(owner)[origin + offset : origin + offset + sizes[role]] for role, offset in offsets.items()}
+    facts = {role: fact._replace(ptr=ctypes.addressof(ctypes.c_char.from_buffer(views[role]))) for role, fact in facts.items()}
+    workspace = base + origin + workspace_offset
+    assert workspace + scratch <= base + len(owner)
+    assert all(base <= fact.ptr < fact.ptr + sizes[role] <= workspace for role, fact in facts.items())
+    _equal(spec, facts, workspace=workspace)
+    spec.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)
+    assert len(frames) == len(combined) == 1

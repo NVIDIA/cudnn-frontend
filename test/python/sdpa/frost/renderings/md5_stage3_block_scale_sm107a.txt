@@ -1,0 +1,32 @@
+# PTX md5 of the Rubin d=256 MXFP8 backward's BLOCK-SCALE stage-3 GEMM renderings (bwd/kernels/bprop_matmul_blackwell.py at
+# MatmulTemplateParams.block_scale=True, the fp8 (256, 256) row, EPI_NONE, e4m3 payloads with E8M0 scales), CUTE_DSL_ARCH=sm_107a.
+# Consumed by test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_renderings_ptx_md5_match_the_recorded_list, whose `_PROBE`
+# (S 1024, H 16, B 1, D 256; B and its scale-factor view sized to B's OWN head extent `H // b_head_group`; `_bs_record(cgrp_tile_mn=(256, 256),
+# **record)`) is the ONLY renderer this list is checked against: every md5 below was reproduced through that probe in two independent
+# runs (the rendering is a host trace-compile; a PTX md5, not a cubin one -- ptxas renames uniform registers run to run).
+#
+# Two kinds of line:
+#   * the FOUR default-`b_head_group` records (dK K-major / dQ M-major, dense and the trimmed CAUSAL_K_LO / CAUSAL_K_HI pair) are the
+#     renderings the P-b chain produced BEFORE the grouped block-scale dQ landed: rendered byte-identical from the pre-edit tree
+#     (origin/develop at the single-launch change's base) and from the tree that added the grouped dQ -- the single-launch dQ is a
+#     host-side change (the loop over `prepared_host._dq_launches`, the validator, the records), with NO kernel body edit.
+#   * the SIX `bs_dq_*_gqa<g>` records (`b_head_group` 2 / 4 / 16: the GQA groups of the row suites' cells (4/2, 8/2) and of the
+#     32/2 geometry; dense and CAUSAL_K_HI) are the template's `b_head_group > 1` arm on the block-scale rendering -- the dQ record a
+#     GQA graph of the MXFP8 row renders since its single-launch dQ.  Pinned from their first (twice-identical) rendering; the chain-side
+#     proofs are the row suites' bitwise twins (dense + THD) and launch-count pins.  The THD leg's grouped dQ is the same arm (the SF tile
+#     prefix is a token-side term) and is proven on the board by the THD suite's twin; the probe binds no THD operands, so it is not here.
+#
+# The PTX text is a function of the DSL build: the pin compares only when the installed DSL matches the `dsl=` line and skips
+# otherwise.  To refresh after a deliberate rendering change, run the consuming test with the new md5s written here and state the
+# provenance (tree, DSL, runs) in this header.
+dsl=nvidia-cutlass-dsl 4.8.0
+stage3_block_scale sm_107a bs_dk_dense rc=0 ptx_md5=2e7d52304d1cbfd2c0455042dd725013
+stage3_block_scale sm_107a bs_dq_dense rc=0 ptx_md5=d04c917750ad86ee083dadfed8858a3a
+stage3_block_scale sm_107a bs_dk_causal rc=0 ptx_md5=cd0bc607b92b1bc0ea3aa56f6ed2c9d3
+stage3_block_scale sm_107a bs_dq_causal rc=0 ptx_md5=731b73cfe04a2f74a1d90ae1c9c71a4f
+stage3_block_scale sm_107a bs_dq_dense_gqa2 rc=0 ptx_md5=c4f929cc442ee83bff884485d0f1584d
+stage3_block_scale sm_107a bs_dq_causal_gqa2 rc=0 ptx_md5=0ed76414bb088d10db9c921b2d6726a2
+stage3_block_scale sm_107a bs_dq_dense_gqa4 rc=0 ptx_md5=698689b6cdf662db1b416f3e8e78449e
+stage3_block_scale sm_107a bs_dq_causal_gqa4 rc=0 ptx_md5=1572886e97acfb63d2842e9f62d2fea9
+stage3_block_scale sm_107a bs_dq_dense_gqa16 rc=0 ptx_md5=c81ea72b472d72a0f20292f409d3ccbc
+stage3_block_scale sm_107a bs_dq_causal_gqa16 rc=0 ptx_md5=b268fabb69b52496a6b6b1f2e4993a6f

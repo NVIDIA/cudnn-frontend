@@ -10,12 +10,14 @@ attention call.
 
 from __future__ import annotations
 
-from typing import NamedTuple, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass import Boolean, Int32
+
+if TYPE_CHECKING:
+    import torch
 
 
 class HSTUBlockSparseTensors(NamedTuple):

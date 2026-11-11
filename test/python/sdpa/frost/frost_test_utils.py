@@ -10,13 +10,16 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from typing import NamedTuple
 
 import pytest
@@ -57,6 +60,23 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+
+
+def requires_bwd_engine_row(name):
+    """``skipif`` off the sm range the named FROST backward engine row DECLARES (``Capabilities.sm_lo`` / ``sm_hi`` in
+    sdpa/bwd/engines.py), read from the row at import -- never a per-file copy of the range.  For the rows whose bodies are
+    compiled per device (the ``sdpa_bwd_sm100_d128`` family: ``--gpu-arch sm_{cc}a`` from the device cc, cc 10.0 / 10.3 and,
+    since the Rubin admission, cc 10.7) a suite gated on ``requires_pre_rubin_blackwell`` would skip exactly the lane that
+    needs to run; this marker follows the row instead."""
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    caps = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+    return pytest.mark.skipif(
+        _SM is None or not (caps.sm_lo <= _SM <= caps.sm_hi),
+        reason=f"needs a GPU in the {name} row's range (SM{caps.sm_lo}-{caps.sm_hi}), have " + ("none" if _SM is None else f"sm_{_SM}"),
+    )
+
+
 # Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
 # sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
 # marker mirrors that range rather than pinning (10, 7)).
@@ -92,6 +112,31 @@ _DSL_OK, _DSL_WHY = _dsl_usable()
 requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
 
 
+@contextlib.contextmanager
+def process_watchdog(seconds: float, what: str):
+    """Kill THIS process (``os._exit(70)``) if the block runs longer than ``seconds``.
+
+    For a kernel that can wedge its CUDA context: a wedged launch never returns to Python, so neither a pytest timeout
+    plugin (not installed here) nor a signal handler (``torch.cuda.synchronize`` holds the GIL inside C++) can end the
+    test -- only a daemon timer thread can, and exiting the whole process is the only way to free the GPU.  Exit code 70
+    marks a watchdog kill (under xdist the worker crash is reported and the rest of the suite continues).  Wrap only the
+    arm that can wedge, with a budget well above its compile + execute time.
+    """
+
+    def _abort():
+        sys.stderr.write(f"\n[process_watchdog] {what} exceeded {seconds:.0f} s -- killing the test process (exit 70)\n")
+        sys.stderr.flush()
+        os._exit(70)
+
+    timer = threading.Timer(seconds, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
 def _dsl_installed() -> bool:
     """For the few call sites that gate inside a test body rather than on it."""
     return _DSL_OK
@@ -103,14 +148,14 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
-def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
+def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
     """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 
     The FIRST entry for that engine is the heuristics' own best guess for this
-    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` pin a different one, so a test can run a
-    config the best guess would not choose. Filters match the STRUCTURED knobs,
+    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` / ``sched_policy`` pin a different one, so a
+    test can run a config the best guess would not choose. Filters match the STRUCTURED knobs,
     not the rendered plan name: substring matching a name would let a request
     for tile_n=128 select a tile_n=1280 plan, and the test would pass having
     run something else. Every filter — and each ``tiles`` component — is
@@ -127,11 +172,13 @@ def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
             return False
         return all(
             want is None or getattr(graph.plans[i].knobs, field, None) == want
-            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv))
+            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv), ("sched_policy", sched_policy))
         )
 
     index = next((i for i in range(len(names)) if _wanted(i)), None)
-    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv}; plans={names}"
+    assert (
+        index is not None
+    ), f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv} sched_policy={sched_policy}; plans={names}"
     graph.select_plan(index)
     return graph.plans[index]
 
@@ -165,6 +212,18 @@ _CUTE_DTYPE = {
     "torch.float8_e4m3fn": "Float8E4M3FN",
     "torch.float8_e5m2": "Float8E5M2",
 }
+
+
+def check_decode_q_rows(host, sq):
+    """The direct driver's Q-row guard, the contract the production binder validates: a decode body WITHOUT the token-unit
+    axis covers ``S_q x HEADS_PER_TILE <= N_Q`` only and rejects more rows; a body that declares ``Q_TOKEN_UNITS`` serves
+    any ``S_q`` as ``ceil(S_q / Q_BOX_TOKENS)`` units per head group, so the guard yields.  ``host`` is the module's host
+    entry (its ``__globals__`` is the compiled module's namespace)."""
+    import inspect
+
+    namespace = inspect.unwrap(host).__globals__
+    if "N_Q" in namespace and not namespace.get("Q_TOKEN_UNITS", False) and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
+        raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
 
 
 def launch_f16(
@@ -211,8 +270,7 @@ def launch_f16(
         cfg = namespace["CFG"]
         if cfg.PACK_GQA and h != kh * cfg.QH_PER_KH:
             raise ValueError(f"PACK_GQA requires H_q == H_kv * {cfg.QH_PER_KH}; got H_q={h}, H_kv={kh}")
-        if "N_Q" in namespace and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
-            raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
+        check_decode_q_rows(host, sq)
     if paged:
         skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]
         k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))
@@ -247,12 +305,40 @@ def launch_f16(
         block_table_ptr=P(block_table_tensor, 4),
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
+        table_v_strides=(tuple(block_table_v_tensor.stride()) if block_table_v_tensor is not None else t_st) if paged else None,
         n_pages=n_pages,
         # The d128 decode tile's ragged-Q leg slots (dense launches leave them
         # dead: RAGGED_Q is off in every direct test's params); filtered out for
         # hosts that do not carry them.
         ragged_q_addr=0,
         ragged_q_div=1,
+        # The d256 half bodies' epilogue-gate slots (a pointer + a runtime stride triple, required by their host ABI): the gate is a
+        # module specialization no direct test enables, so this is the no-gate pair the binders fill; filtered out for hosts that
+        # do not carry them.
+        gate_ptr=None,
+        gate_strides=(0, 0, 0),
+        # The d128 prefill hosts' ten APPENDED operand slots (both arch trees): the score side outputs, the additive bias, the
+        # per-key kv_mask and the pre-scale bias divisor.  They are explicit on the production ABI (the prepared binder fills
+        # them from the frame, compile()'s fakes shape them; a Python default would leave the compiled host un-persistable), so
+        # a direct launch fills them too -- with the values of a plan WITHOUT the arms: None pointers, zero strides, unit
+        # broadcast extents, inv_scale 1.0 (CFG.BIAS_MODE / KV_MASK_FORM fold the paths out of every direct test's rendering;
+        # the stride / divisor slots are then unread).  Filtered out for hosts that do not carry them.
+        score_max_ptr=None,
+        score_sum_exp_ptr=None,
+        score_max_strides=(0, 0, 0),
+        score_sum_exp_strides=(0, 0, 0),
+        bias_ptr=None,
+        bias_strides=(0, 0, 0),
+        bias_extents=(1, 1),
+        kv_mask_ptr=None,
+        kv_mask_batch_stride=0,
+        inv_scale_softmax=1.0,
+        # Direct template tests request split partials, leaving the optional
+        # in-kernel final-output reduction disabled.
+        final_o_ptr=None,
+        final_lse_ptr=None,
+        final_o_strides=(0, 0, 0),
+        final_lse_strides=(0, 0, 0),
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
@@ -459,3 +545,174 @@ def cuda_launch_counts(*runs):
     The capture itself is ``cuda_launch_names``."""
     names = cuda_launch_names(*runs)
     return None if names is None else [len(n) for n in names]
+
+
+def run_d512_delayed_observer(tmp_path, engine):
+    """Delay a passive CTA before observing a reused empty slot; check liveness and gradients.
+
+    The delay belongs only to the test's private template copy. No production knob or
+    scheduling probability is involved. A child process bounds an unfixed kernel's hang.
+    """
+    from pathlib import Path
+
+    import cudnn
+
+    script = tmp_path / "delayed_observer.py"
+    script.write_text(textwrap.dedent(r"""
+        import hashlib, json, os, sys
+        from pathlib import Path
+        test_root, expected_fe, engine, work = sys.argv[1:]
+        sys.path.insert(0, test_root)
+        import conftest  # Preserve allocator setup and Transformer Engine import ordering.
+        sys.path.insert(0, str(Path(test_root) / "sdpa/frost"))
+        import torch
+        import cudnn
+        from cudnn.sdpa.bwd import api_dsl
+        from frost_test_utils import process_watchdog, select_engine
+        import test_sdpa_bwd_dsl_sm100 as ref
+
+        assert Path(cudnn.__file__).resolve() == Path(expected_fe).resolve()
+        api_dsl.STAGE2_2X2 = True
+        original = api_dsl.load_template
+        served = []
+
+        def delayed(path, params, tag="template"):
+            p = Path(path)
+            if p.name == "bprop_d512_f16_2x2.py":
+                assert p.parent.name == ("sm107" if engine == "sdpa_bwd_sm107_d512" else "sm100")
+                source = p.read_text()
+                begin = source.index("def _ldg_kv_tile(")
+                end = source.index("\n@cute.jit\ndef _tmaldg_warp_group(", begin)
+                section = source[begin:end]
+                anchor = "    for c in cutlass.range_constexpr(CFG.N_CHUNKS):\n"
+                assert section.count(anchor) == 1
+                # Chunk 0 of the second KV tile reuses slot 0 on both the four-
+                # and eight-stage rings. CTA 3 is passive on this even chunk.
+                delay = (
+                    "        if cutlass.const_expr(c == 0):\n"
+                    "            if (pair_id == cutlass.Int32(1)) & (is_leader == False) & (kv_loop == cutlass.Int32(1)) & (tile_no == cutlass.Int32(0)):\n"
+                    "                observer_start = cute.arch.globaltimer()\n"
+                    "                while cute.arch.globaltimer() - observer_start < cutlass.Int64(10_000_000):\n"
+                    "                    pass\n"
+                )
+                patched = source[:begin] + section.replace(anchor, anchor + delay) + source[end:]
+                target = Path(work) / (p.parent.name + "_delayed_observer.py")
+                target.write_text(patched)
+                served.append(dict(path=str(p), sha256=hashlib.sha256(source.encode()).hexdigest(), params=repr(params)))
+                path = str(target)
+            return original(path, params, tag)
+
+        api_dsl.load_template = delayed
+        torch.manual_seed(1519)
+        b, h, sq, skv, d = 1, 4, 256, 1024, 512
+        tensors = {n: ref._bshd(b, s, h, d) for n, s in (("q", sq), ("k", skv), ("v", skv), ("do", sq))}
+        o, lse, _, dq, dk, dv = ref._reference(*(tensors[n] for n in ("q", "k", "v", "do")))
+        expected = (dq, dk, dv)
+        tensors["o"] = torch.empty_like(tensors["q"]).copy_(o)
+        tensors["stats"] = lse.unsqueeze(-1).contiguous()
+        for n, like in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+            tensors[n] = torch.empty_like(tensors[like])
+        g, ports, outputs = ref._build_graph(b, h, h, sq, skv, d, d**-0.5)
+        select_engine(g, engine)
+        g.check_support()
+        g.build_plans()
+        ports.update(zip(("dq", "dk", "dv"), outputs))
+        pack = {ports[n]: t for n, t in tensors.items()}
+        workspace = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        assert served, "the delayed twin template did not serve the graph"
+        print("DELAYED_OBSERVER_SOURCE", json.dumps(served), flush=True)
+
+        def check():
+            for name, want in zip(("dq", "dk", "dv"), expected):
+                got = tensors[name].float()
+                cos = torch.nn.functional.cosine_similarity(got.flatten(), want.flatten(), dim=0).item()
+                rel = ((got - want).abs().max() / max(want.abs().max().item(), 1e-30)).item()
+                assert cos > ref._TOL_COS and rel < ref._TOL_REL, (name, cos, rel)
+
+        # Compilation is outside the execution watchdog; a slow compiler is not a hang.
+        with process_watchdog(45.0, "D512 delayed empty-phase observer"):
+            g.execute(pack, workspace)
+            torch.cuda.synchronize()
+            check()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                g.execute(pack, workspace)
+            for _ in range(8):
+                for name in ("dq", "dk", "dv"):
+                    tensors[name].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                check()
+        print("DELAYED_OBSERVER_PASS", flush=True)
+    """))
+    env = dict(os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "compiled"))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(Path(__file__).resolve().parents[2]), cudnn.__file__, engine, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    (tmp_path / "delayed_observer.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+    assert proc.returncode == 0 and "DELAYED_OBSERVER_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+
+
+# ------------------------------------------------------------------------------------------------------------ per-kernel PTX md5 records
+# A chain's dumped PTX module holds one `.visible .entry` per kernel it launches.  A rendering record pins each kernel the module under test
+# OWNS by the md5 of that kernel's entry region alone, so a change to a kernel SHARED with other chains (listed below) never reddens the rows
+# of every chain that launches it: #1925 changed the grouped THD dK / dV fold and reddened the chain-wide records of three unrelated modules.
+# The module preamble (compiler banner, `.version` / `.target`, the dynamic-SMEM declaration) is the DSL build's -- the record's ``dsl=``
+# line -- and is not a kernel: not recorded.  Record row: ``<token> <arch> <variant> kernel=<name> rc=0 ptx_md5=<32 hex>``.
+D128_THD_SHARED_KERNELS = ("dkv_reduce_thd_origins_kernel",)  # the dK / dV group fold launched by the one-CTA AND the pair grouped THD chains
+_PTX_ENTRY = re.compile(r"^(?:\.visible )?\.entry (\S+?)\(", re.M)
+_KERNEL_NAME = re.compile(r"^cudnn_kernel_(\w+?_kernel)(?:_|$)")
+_RECORD_ROW = re.compile(r"^(\S+) (sm_\w+) (\S+) kernel=(\S+) rc=0 ptx_md5=([0-9a-f]{32})$")
+
+
+def ptx_kernel_name(mangled: str) -> str:
+    """The DSL function's name from a mangled entry symbol: ``cudnn_kernel_<name>_kernel<type mangling>`` -> ``<name>_kernel``."""
+    m = _KERNEL_NAME.match(mangled)
+    return m.group(1) if m else mangled
+
+
+def ptx_kernel_md5s(text: str) -> dict:
+    """{kernel: md5} over the entry regions of ONE dumped PTX module (text), in entry order: a region runs from its ``.entry`` line to the next
+    entry (or the end of the module); the preamble before the first entry is not a kernel and is not hashed."""
+    entries = list(_PTX_ENTRY.finditer(text))
+    out = {}
+    for i, m in enumerate(entries):
+        end = entries[i + 1].start() if i + 1 < len(entries) else len(text)
+        name = ptx_kernel_name(m.group(1))
+        assert name not in out, f"two entries named {name} in one module"
+        out[name] = hashlib.md5(text[m.start() : end].encode()).hexdigest()
+    return out
+
+
+def read_kernel_record(path, token: str, arch: str = "sm_100a") -> tuple:
+    """(dsl line or None, {variant: {kernel: md5}}) of a per-kernel record file for ``token`` / ``arch``; `#` lines are comments."""
+    dsl, want = None, {}
+    with open(path) as f:
+        for ln in f.read().splitlines():
+            if ln.startswith("dsl="):
+                dsl = ln[len("dsl=") :].strip()
+                continue
+            m = _RECORD_ROW.match(ln)
+            if m and m.group(1) == token and m.group(2) == arch:
+                want.setdefault(m.group(3), {})[m.group(4)] = m.group(5)
+    return dsl, want
+
+
+def kernel_record_rows(token: str, variant: str, kernels: dict, excluded=(), arch: str = "sm_100a") -> list:
+    """The record rows of a rendering (every kernel outside ``excluded``, in entry order): what a deliberate re-pin pastes into the file."""
+    return [f"{token} {arch} {variant} kernel={k} rc=0 ptx_md5={v}" for k, v in kernels.items() if k not in excluded]
+
+
+def assert_kernel_record(kernels: dict, want: dict, *, token: str, variant: str, excluded=(), what: str = "the rendering") -> None:
+    """Every recorded kernel renders the recorded md5 and every rendered kernel outside ``excluded`` is recorded (a new launch in a chain is a
+    protocol change, re-pinned deliberately); a shared kernel in ``excluded`` is never compared.  The message names the moved / new / missing
+    kernels and carries the rows a deliberate re-pin pastes into the record."""
+    own = {k: v for k, v in kernels.items() if k not in excluded}
+    moved = {k: (want[k], own[k]) for k in want if k in own and own[k] != want[k]}
+    new, missing = sorted(set(own) - set(want)), sorted(set(want) - set(own))
+    rows = "\n".join(kernel_record_rows(token, variant, kernels, excluded))
+    assert not moved and not new and not missing, f"{what}: moved (record -> rendered) {moved}; new {new}; missing {missing}; rendered rows:\n{rows}"

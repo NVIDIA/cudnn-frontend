@@ -39,6 +39,14 @@ from sdpa.graph.suites.common import Fixed
 SW_FULL = dict(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10)
 SW_NONE = dict(no_mask=10)
 
+# Joint bound on b * h_q * s_q * s_kv for the bprop suites (#965). Their s_q / s_kv
+# caps went 8192 -> 16384; the backend's deterministic backward workspace and the
+# dBias gradient scale with (b, h_q, s_q, s_kv), so the largest draws of the old
+# caps (16 x 8 x 8192^2 for f16, 4 x 8 x 8192^2 for fp8 / mxfp8) are kept as the
+# memory ceiling: a longer draw shrinks its batch instead of being unrunnable.
+BPROP_SCORE_CELLS_F16 = 16 * 8 * 8192 * 8192
+BPROP_SCORE_CELLS_FP8 = 4 * 8 * 8192 * 8192
+
 DIAG_BOTH = {
     cudnn.diagonal_alignment.TOP_LEFT: 1,
     cudnn.diagonal_alignment.BOTTOM_RIGHT: 1,
@@ -79,8 +87,7 @@ def model_knobs(preset, phase):
             data_type=_f16(),
             with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
             diag_align=RandomChoice(DIAG_BOTH),
-            # THD and padded decode both; paging is drawn in the post hook and
-            # only when the layout is not ragged (paged+ragged is not a form).
+            # THD and padded decode both; paging is drawn independently in the post hook.
             is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1}),
             block_size=RandomBlockSize(min=16, max=256, with_high_probability=[16, 32, 128]),
             total_token_slack=RandomChoice({"packed": 1, "slack": 1}),
@@ -141,7 +148,7 @@ def model_knobs_fp8(preset, phase):
             output_type=RandomChoice({torch.float8_e4m3fn: 1, torch.float16: 2}),
             with_sliding_mask=SlidingWindowMaskGenerator(**SW_NONE),
             diag_align=RandomChoice(DIAG_BOTH),
-            # THD and padded decode both; paging only when not ragged (post hook).
+            # THD and padded decode both; paging is independent (post hook).
             is_ragged_or_padded_or_full=RandomChoice({"ragged": 1, "padded": 1} if thd_ok else {"padded": 1}),
             block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16, 32, 64]),
             total_token_slack=RandomChoice({"packed": 1, "slack": 1}),

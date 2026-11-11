@@ -9,6 +9,16 @@ The API to achieve the above is:
 graph.set_dynamic_shape_enabled(true)
 ```
 
+## Not the same as execute-time shape overrides
+
+`set_dynamic_shape_enabled` belongs to the **build** side: it lets a kernel cache
+reuse a compiled kernel across graphs of the same topology, and the shape is
+still part of what the graph is built for. Execute-time shape overrides
+(`pygraph(is_override_shape_enabled=True)` plus `override_uids` /
+`override_shapes` / `override_strides` on `execute`) are the **run** side: one
+built plan re-describes its operands per execution. See
+[Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
+
 ## Kernel Cache
 The kernel cache significantly reduces plan build time by re-using a previously compiled kernel for a given execution plan. Kernel caching is enabled only for dynamic shape graphs.
 
@@ -90,6 +100,6 @@ This runtime workspace query may return a different size than the workspace quer
 Where:
 - `override_uids`: list of tensor UIDs whose shapes are being overridden
 - `override_shapes`: new shape for each tensor in `override_uids` (each element is a `std::vector<int64_t>`)
-- `override_strides`: new stride for each tensor in `override_uids`
+- `override_strides`: new stride for each tensor in `override_uids`. SDPA forward does not use these and keeps the declared strides ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)); see [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
 
 The three vectors must have the same length. Tensors not listed in `override_uids` keep the shapes defined at graph build time.

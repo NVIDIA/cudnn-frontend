@@ -6,10 +6,22 @@ The header-only C++ library (CMake INTERFACE target `cudnn_frontend`, C++17). Um
 
 - **Header-only**: no `.cpp` files, no link-time dependencies beyond cuDNN/CUDA. New third-party code must be vendored under `thirdparty/` (currently only `nlohmann/json.hpp`, excludable via `CUDNN_FRONTEND_SKIP_JSON_LIB`).
 - Builds with `-Wall -Wextra -Wpedantic -Werror` (GCC/Clang) and `/W4 /WX` (MSVC) — code must be warning-clean on both.
-- C++17 only in `include/` (the pybind11 layer under `python/` is C++20).
+- C++17 only in `include/` (the nanobind layer under `python/` is C++20).
+- Validate integer kind/range before narrowing JSON fields, and tensor rank before fixed-array descriptor copies.
+  Ragged-offset walks must detect cycles and avoid input-controlled native recursion. Check the shared creation path
+  as well as public validation, including direct builds without an earlier `validate()`. Run `[boundary]` and
+  `[integer_schema]` with `-fsanitize=undefined,float-cast-overflow` and `NV_CUDNN_DISABLE_EXCEPTION`; that FE macro
+  does not disable exceptions from parsers or user callbacks. Keep the new test translation units in CMake's explicit
+  test source list, and show old-code failure plus valid sibling/retry controls.
+- When loading plan tensor metadata, build the complete UID table before resolving ragged-offset references and
+  recursively validating descriptors. Reject cycles before creating strong links. Test both tensor-record orders and
+  a real plan's default structural and plan-only round trips.
 - Guard anything needing a newer cuDNN with runtime `detail::get_backend_version()` checks (compare against `CUDNN_FRONTEND_VERSION`-style integers, e.g. 9.12.0 → 91200); the same headers must compile against older cuDNN 9.x. **Declare unconditionally, gate in the body**: an `#if`-conditional declaration bakes the build-time cuDNN version into the artifact, so a wheel built against 9.23 silently loses the symbol on a 9.24 system — declare the API always and return not-supported at runtime instead (review on PR #246).
 - **Guard new enum attributes with the header version, like the rest of the codebase.** Wrap the use of an attribute that only exists from cuDNN X.Y on in `#if (CUDNN_VERSION >= XY00)` with a not-supported `#else` branch, and keep the runtime backend version check (`NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION`) inside it. Only gate on a version whose released headers actually define the attribute; `#ifdef` cannot detect an enum constant, and guessing its integer value risks an ABI collision.
+- Native CUDA graph entry points retain the selected execution plan on the caller's CUDA graph after successful population and update. Cover graphExecs instantiated from clones after destroying both source graphs and the frontend Graph; the plan owns runtime-compiled kernel code.
 - clang-format (Google-based, indent 4, 120 cols, `SortIncludes: false`) via `pre-commit run`.
+- Windows shim loader errors: capture `GetLastError()` immediately after the primary load fails; preserve it only if the fallback also fails, and clear errors on success. Test with primary and fallback failures that return different codes.
+- Windows runtime validation must establish scoped ownership before diagnostics can throw and transfer ownership only on success. Allocation-failure tests must verify cleanup releases exactly the validator's reference.
 - A backend correctness workaround belongs to the affected native support surface, not an unrelated frontend engine's admission. For SDPA block masks, test `AUTO` and explicit `UNIFIED`, runtime versions below/at the fix, and unaffected architectures/no-mask controls. Mask contents are mutable device data; an all-visible validation sample cannot establish a safe reusable plan. `SDPA block-mask backend support boundary` is the descriptor-only detector; actual numerical qualification must identify the loaded released backend artifact, not just its version label.
 
 ## Layering

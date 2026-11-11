@@ -24,6 +24,7 @@ Three tiers (the ``test_quantize_mxfp8.py`` shape):
 """
 
 import glob
+import math
 import os
 import shutil
 import struct
@@ -55,6 +56,7 @@ sys.path.insert(0, _HERE)  # the block's oracle module (unique basename, see fa6
 
 from gated_block_reference import (  # noqa: E402
     E2M1_GRID,
+    E4M3_MIN_SUBNORMAL,
     e2m1_codes,
     fp4_dequant_rowwise_2d,
     fp4_quantize_rowwise_2d,
@@ -139,6 +141,8 @@ def _cc():
 requires_fp4_cvt = pytest.mark.skipif(
     _cc() is None or _cc() < (10, 0), reason=f"cvt.rn.satfinite.e2m1x2.f32 / ue8m0x2 need sm_100a+ (the block targets Rubin); found {_cc()}"
 )
+# The host-side contract tests that bind CUDA tensors to stand-in recipes (nothing compiled or launched) still need a device.
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 
 
 class _NamedFormat:
@@ -436,12 +440,12 @@ def test_stage_check_support_declines_before_compile():
 
 _SASS_PROBE = textwrap.dedent("""
     import glob, os, subprocess, sys
-    fmt, dump, cands = sys.argv[1], sys.argv[2], sys.argv[3:]
+    fmt, scale_in, dump, cands = sys.argv[1], sys.argv[2] == "1", sys.argv[3], sys.argv[4:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump  # read once, at the first cutlass import
     import torch
     from cudnn.gated_attention_block.kernels.quantize_fp4 import COMPILE_OPTIONS, compile_quantize_fp4
     # --keep-cubin, NOT --keep-sass: the latter runs the DSL's own wheel nvdisasm, which ICEs on sm_107a.
-    compile_quantize_fp4(dtype_in=torch.bfloat16, h=4, d=256, fmt=fmt, compile_options=COMPILE_OPTIONS + " --gpu-arch sm_107a --keep-cubin")
+    compile_quantize_fp4(dtype_in=torch.bfloat16, h=4, d=256, fmt=fmt, compile_options=COMPILE_OPTIONS + " --gpu-arch sm_107a --keep-cubin", scale_in=scale_in)
     print("COMPILED", fmt)
     cubins = glob.glob(os.path.join(dump, "*.sm_107a.cubin"))
     if not cubins:
@@ -470,16 +474,22 @@ _SASS_PROBE = textwrap.dedent("""
     print("MUFU_RCP", sum(1 for ln in sass if "MUFU.RCP" in ln))
     print("FMNMX3", sum(1 for ln in sass if "FMNMX3" in ln))
     print("SHFL", sum(1 for ln in sass if "SHFL" in ln))
+    print("FMUL", sum(1 for ln in sass if "FMUL" in ln))
+    print("LDG", sum(1 for ln in sass if "LDG" in ln))
     print("LINES", len(sass))
     """)
 
-_SASS_KEYS = ("SPILL", "E2M1", "E4M3", "E8M0", "FCHK", "MUFU_RCP", "FMNMX3", "SHFL", "LINES")
+_SASS_KEYS = ("SPILL", "E2M1", "E4M3", "E8M0", "FCHK", "MUFU_RCP", "FMNMX3", "SHFL", "FMUL", "LDG", "LINES")
 _PASSES = SF_TILE_ROWS // (DEFAULT_THREADS_PER_CTA // lanes_per_row(D))  # 8 row passes per lane at 256 threads / D=256
 
 
+@pytest.mark.parametrize("scale_in", [False, True], ids=["default", "scale_in"])
 @pytest.mark.parametrize("fmt", FORMAT_NAMES)
-def test_sm107_trace_compile_has_no_spills(fmt, tmp_path):
+def test_sm107_trace_compile_has_no_spills(fmt, scale_in, tmp_path):
     """Compile for Rubin here (no device match needed), decode with an nvdisasm that knows sm_107a: STL/LDL must be 0.
+
+    Both arms: the default artifact and the appended ``scale_in`` pre-scale (one slot load + one ``FMUL`` per element before the
+    abs-max tree, nothing else: the same cvt / FCHK / shuffle counts, no spill).
 
     Also pins the instruction shape (all LOWER bounds -- ptxas may duplicate): the codes come from the hardware
     ``F2FP...E2M1`` (8 per 16 elements per pass); NVFP4 scales are ``F2FP...E4M3.F32`` and every element is divided
@@ -494,9 +504,9 @@ def test_sm107_trace_compile_has_no_spills(fmt, tmp_path):
     if not _sm107a_known_to_the_dsl():
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
     cands = _nvdisasm_candidates()
-    dump = tmp_path / f"quantize_fp4_{fmt}"
+    dump = tmp_path / f"quantize_fp4_{fmt}_{int(scale_in)}"
     dump.mkdir()
-    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, fmt, str(dump), *cands], capture_output=True, text=True, timeout=600)
+    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, fmt, str(int(scale_in)), str(dump), *cands], capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, f"trace-compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     lines = proc.stdout.splitlines()
     assert f"COMPILED {fmt}" in lines, proc.stdout[-2000:]
@@ -506,8 +516,11 @@ def test_sm107_trace_compile_has_no_spills(fmt, tmp_path):
     if any(ln.startswith("SKIP") for ln in lines):
         pytest.skip(f"compiled; SASS half skipped: {[ln for ln in lines if ln.startswith(('SKIP', 'REJECT'))]}")
     stats = {k: int(v) for k, v in (ln.split() for ln in lines if ln.split() and ln.split()[0] in _SASS_KEYS)}
-    print(f"\n[{fmt}] sm_107a SASS: {stats} via {[ln for ln in lines if ln.startswith('NVDISASM')]}")
-    assert stats["SPILL"] == 0, f"{fmt}: {stats['SPILL']} STL/LDL in the sm_107a cubin"
+    print(f"\n[{fmt} scale_in={scale_in}] sm_107a SASS: {stats} via {[ln for ln in lines if ln.startswith('NVDISASM')]}")
+    assert stats["SPILL"] == 0, f"{fmt} (scale_in={scale_in}): {stats['SPILL']} STL/LDL in the sm_107a cubin"
+    if scale_in:
+        # the arm's whole cost: one fp32 multiply per element per pass (16 x 8 at D=256 / 256 threads) and the slot load
+        assert stats["FMUL"] >= _PASSES * ELEMS_PER_LANE and stats["LDG"] >= 1, f"{fmt}: the pre-scale multiply is missing -- {stats}"
     assert stats["E2M1"] >= _PASSES * ELEMS_PER_LANE // 2, f"{fmt}: fewer e2m1 cvts than the source issues -- {stats}"
     assert stats["FMNMX3"] > 0, stats
     if fmt == FMT_NVFP4:
@@ -669,6 +682,142 @@ def test_stage_class_matches_the_direct_run(fmt):
     torch.cuda.synchronize()
     d_ref, s_ref = _launch(fmt, x)
     assert torch.equal(dst4.view(torch.uint8), d_ref) and torch.equal(sf, s_ref)
+
+
+# ---------------------------------------------------------------------------
+# The appended pre-scale (`scale_in`): the two-level cast of a gradient
+# ---------------------------------------------------------------------------
+
+
+def _launch_scaled(fmt: str, src: torch.Tensor, scale_in: torch.Tensor):
+    """The ``scale_in=True`` artifact over ``src`` with the slot ``scale_in`` (sentinel-filled outputs, run, sync)."""
+    r = compile_quantize_fp4(dtype_in=src.dtype, h=H, d=D, fmt=fmt, scale_in=True)
+    assert r.scale_in is True
+    t = int(src.shape[0])
+    dst4 = torch.full((t, K // 2), 0xFF, dtype=torch.uint8, device="cuda")
+    sf = torch.full((sf_blob_bytes(t, K, r.block),), 0xFF, dtype=torch.uint8, device="cuda")
+    run_quantize_fp4(r, src, dst4, sf, stream=torch.cuda.current_stream().cuda_stream, scale_in=scale_in)
+    torch.cuda.synchronize()
+    return dst4, sf
+
+
+@requires_fp4_cvt
+@pytest.mark.parametrize("scale", [2.0**-13, 2.0**7, 3.0], ids=["2^-13", "2^7", "3.0"])
+@pytest.mark.parametrize("fmt", FORMAT_NAMES)
+def test_quantize_fp4_scale_in_is_bitwise_the_prescaled_cast(fmt, scale):
+    """The ``scale_in`` artifact over ``x`` with the slot at ``s`` == the default artifact over the PRE-SCALED ``bf16(x * s)``, codes and
+    blob bitwise, for the powers of two the block hands it (``bf16(x) * 2^k`` is exact: a power of two shifts the exponent, so every
+    block scale and every code is identical) -- and == the oracle ``fp4_quantize_rowwise_2d(fp32(x) * s)`` for ANY ``s`` (one fp32
+    multiply on both sides; ``3.0`` rounds once, bitwise too).  The value is READ from the tensor: writing the slot changes the bytes
+    without a recompile.  A unit-variance source at ``2^-13`` is the floor case the arm exists for.  NVFP4: every 16-block's
+    ``amax / 6`` (``amax <= 96`` here) is under the e4m3 floor, so every scale byte is ``0x01`` (``2^-9``) and the single-level codes
+    are ``e2m1_rne(x * 2^-13 / 2^-9) = e2m1_rne(x / 16)``: a code is LIVE only where ``|x| > 4`` (``x / 16`` past the ``0.25``
+    midpoint; the tie rounds to the even code 0) -- the exact set is pinned, under 0.1 % of a unit-variance source.  A dead code
+    KEEPS its sign nibble (``-0.2 -> -0.0`` = ``0x8``, ``cvt.rn.satfinite.e2m1x2`` and the oracle alike), so the detector reads
+    the VALUES (``unpack_e2m1(d) != 0.0``), never ``byte != 0`` (which fires on 75 % of the dead bytes).  MXFP4 has no floor: its
+    E8M0 exponent absorbs the 13 octaves and the single-level codes ARE the unit cell's.  Either way the two-level cast (the slot at
+    ``2^13`` over the SMALL source) restores the unit cell's codes AND blob bitwise."""
+    torch.manual_seed(11)
+    x = torch.randn(1000, H, D, device="cuda").to(torch.bfloat16)
+    slot = torch.tensor([scale], device="cuda", dtype=torch.float32)
+    d_arm, s_arm = _launch_scaled(fmt, x, slot)
+    # the oracle on fp32(x) * s (its own fp32 multiply) -- bitwise for every s
+    ref_codes, ref_blob = _oracle(x.float() * scale, fmt)
+    assert torch.equal(d_arm, ref_codes) and torch.equal(s_arm, ref_blob), f"{fmt} s={scale}: the arm differs from the oracle of the pre-scaled source"
+    if scale == 3.0:
+        return
+    # a power of two: bitwise the default artifact over the exactly pre-scaled bf16 source
+    xs = (x.float() * scale).to(torch.bfloat16)
+    assert torch.equal((xs.float() / scale).to(torch.bfloat16), x), "the pre-scale is exact in bf16 at this magnitude"
+    d_ref, s_ref = _launch(fmt, xs)
+    assert torch.equal(d_arm, d_ref) and torch.equal(s_arm, s_ref), f"{fmt} s={scale}: the arm differs from the default artifact over bf16(x * s)"
+    if scale < 1.0:
+        # The floor the arm remedies.  `d_ref` / `s_ref` IS the single-level cast of the small gradient `bf16(x * s)` (launched above).
+        # `unpack_e2m1(...) != 0.0` is the detector of a LIVE code: a dead code keeps its sign nibble (`-0.2 -> -0.0` = 0x8, kernel and
+        # oracle alike), so a byte-level `!= 0` fires on 75 % of the dead bytes (either nibble negative).
+        t = int(x.shape[0])
+        _, block, _ = fp4_format(fmt)
+        d_unit, s_unit = _launch(fmt, x)
+        live = unpack_e2m1(d_ref) != 0.0
+        sf_small = mx_unswizzle_sf_rowwise(s_ref, t, K, block)
+        sf_unit = mx_unswizzle_sf_rowwise(s_unit, t, K, block)
+        if fmt == FMT_NVFP4:
+            # every block's `amax / 6` is under the e4m3 floor (amax <= 96 here), so every scale byte is the floor 0x01 = 2^-9 ...
+            floor_byte = int(torch.tensor([E4M3_MIN_SUBNORMAL], dtype=torch.float32).to(torch.float8_e4m3fn).view(torch.uint8).item())
+            assert bool((sf_small == floor_byte).all()), f"{fmt}: a block of the 2^-13 source is not on the e4m3 scale floor 0x{floor_byte:02x}"
+            # ... and a code is e2m1_rne(x * s / 2^-9): LIVE iff |x| > 0.25 * 2^-9 / s (the 0.25 tie rounds to the even code 0) -- the EXACT
+            # set, under 0.1 % of a unit-variance source
+            live_bound = 0.25 * E4M3_MIN_SUBNORMAL / scale  # 4.0 at s = 2^-13
+            assert torch.equal(
+                live, x.reshape(t, K).float().abs() > live_bound
+            ), f"{fmt}: the live codes of the single-level cast are not exactly |x| > {live_bound}"
+            n_live = int(live.sum().item())
+            assert n_live < live.numel() // 1000, f"{fmt}: {n_live} live codes of {live.numel()} -- the e4m3 floor did not zero the 2^-13 source"
+        else:
+            # MXFP4 has no floor: the E8M0 exponent absorbs the octaves (every scale byte shifts by log2(s)) and the single-level codes ARE
+            # the unit cell's -- nothing to remedy, the arm is the same bitwise property
+            octaves = int(math.log2(scale))
+            assert torch.equal(d_ref, d_unit), f"{fmt}: the single-level cast of the 2^-13 source does not keep the unit cell's codes"
+            assert torch.equal(sf_small.int(), sf_unit.int() + octaves), f"{fmt}: the E8M0 scale bytes of the 2^-13 source are not the unit cell's {octaves:+d}"
+        # the two-level cast: the arm over the SMALL source with the slot at 1/s (the block's live power-of-two dY scale) restores the unit
+        # cell bitwise, codes AND blob, for both formats
+        d_two, s_two = _launch_scaled(fmt, xs, torch.tensor([1.0 / scale], device="cuda", dtype=torch.float32))
+        assert torch.equal(d_two, d_unit) and torch.equal(s_two, s_unit), f"{fmt}: the two-level cast of the 2^-13 source is not the unit cell"
+    # the slot is read at launch: a doubled value moves the bytes (the codes of bf16(x * 2s))
+    slot.fill_(scale * 2.0)
+    d2, s2 = _launch_scaled(fmt, x, slot)
+    d2_ref, s2_ref = _launch(fmt, (x.float() * scale * 2.0).to(torch.bfloat16))
+    assert torch.equal(d2, d2_ref) and torch.equal(s2, s2_ref), "the scale is not read from the tensor"
+
+
+@requires_cuda
+def test_quantize_fp4_scale_in_contract_is_typed():
+    """``scale_in`` BOTH ways against the recipe (Rule 1): a ``scale_in=True`` recipe refuses a launch without the slot, a default recipe
+    refuses a given one; the slot's contract (fp32, 1 element, CUDA, 4-byte aligned) by ``check_scalar_slot``; the recipe records the arm,
+    the default recipe is byte-identical to a request that never heard of the knob (one cache entry, the knob LAST in its key) and the arm
+    is a distinct artifact; the stage class ``_QuantizeFp4(scale_in=)`` forwards it and checks ``execute(scale_in=)`` the same two ways.
+    Pinned on stand-in artifacts: nothing is compiled or launched."""
+    from cudnn.gated_attention_block.kernels.quantize_fp4 import compiled_cache
+
+    t = 256
+    x = torch.zeros(t, H, D, dtype=torch.bfloat16, device="cuda")
+    dst4 = torch.zeros(t, K // 2, dtype=torch.uint8, device="cuda")
+    sf = torch.zeros(sf_blob_bytes(t, K, 16), dtype=torch.uint8, device="cuda")
+    slot = torch.zeros(1, dtype=torch.float32, device="cuda")
+    arm = QuantizeFp4Recipe(torch.bfloat16, H, D, FMT_NVFP4, compiled=object(), scale_in=True)
+    plain = QuantizeFp4Recipe(torch.bfloat16, H, D, FMT_NVFP4, compiled=object())
+    assert plain.scale_in is False and arm.scale_in is True
+    with pytest.raises(ValueError, match="WITH the pre-scale slot read"):
+        run_quantize_fp4(arm, x, dst4, sf, stream=0)
+    with pytest.raises(ValueError, match="WITHOUT the pre-scale slot read"):
+        run_quantize_fp4(plain, x, dst4, sf, stream=0, scale_in=slot)
+    with pytest.raises(ValueError, match="scale_in must be a 1-element fp32 CUDA tensor"):
+        run_quantize_fp4(arm, x, dst4, sf, stream=0, scale_in=torch.zeros(1, dtype=torch.float64, device="cuda"))
+    with pytest.raises(ValueError, match="scale_in must be a 1-element fp32 CUDA tensor"):
+        run_quantize_fp4(arm, x, dst4, sf, stream=0, scale_in=torch.zeros(2, dtype=torch.float32, device="cuda"))
+    with pytest.raises(ValueError, match="scale_in must be a 1-element fp32 CUDA tensor"):
+        run_quantize_fp4(arm, x, dst4, sf, stream=0, scale_in=torch.zeros(1, dtype=torch.float32))
+    # the stage class: the knob forwarded, execute checked both ways before the kernel's wrapper
+    geom = GatedAttentionBlockGeometry(**_GEOM)
+    st = _QuantizeFp4(geom, batch=1, seq_len=t, dtype_in=torch.bfloat16, heads=H, fmt=FMT_NVFP4, name="quantize_fp4_dy", scale_in=True)
+    st.check_support()
+    assert st.scale_in is True
+    st._recipe = arm
+    with pytest.raises(ValueError, match="quantize_fp4_dy: scale_in is required"):
+        st.execute(x, dst4, sf, current_stream=0)
+    st0 = _QuantizeFp4(geom, batch=1, seq_len=t, dtype_in=torch.bfloat16, heads=H, fmt=FMT_NVFP4, name="quantize_fp4_o")
+    assert st0.scale_in is False
+    st0._recipe = plain
+    with pytest.raises(ValueError, match="quantize_fp4_o: scale_in was given"):
+        st0.execute(x, dst4, sf, current_stream=0, scale_in=slot)
+    # the cache key: the default request is ONE entry whose key ends with the knob at False (an old-style request is that same key)
+    if _cc() is not None and _cc() >= (10, 0):
+        a = compile_quantize_fp4(dtype_in=torch.bfloat16, h=H, d=D, fmt=FMT_NVFP4)
+        b = compile_quantize_fp4(dtype_in=torch.bfloat16, h=H, d=D, fmt=FMT_NVFP4, scale_in=False)
+        c = compile_quantize_fp4(dtype_in=torch.bfloat16, h=H, d=D, fmt=FMT_NVFP4, scale_in=True)
+        assert a.compiled is b.compiled and a == b and c.compiled is not a.compiled and c.scale_in is True and a.scale_in is False
+        keys = [k for k, v in compiled_cache.items() if v is a.compiled]
+        assert len(keys) == 1 and keys[0][-1] is False and keys[0][:4] == ("torch.bfloat16", H, D, FMT_NVFP4), keys
 
 
 @requires_fp4_cvt

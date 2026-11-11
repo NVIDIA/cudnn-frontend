@@ -23,17 +23,25 @@ include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 add_executable(
     tests
 
+    custom_reduction.cpp
+    custom_reduction_backend.cpp
+    custom_reduction_boundary.cpp
+    custom_reduction_xla_hlo.cpp
     pointwise_tests.cpp
     plans.cpp
     serialize.cpp
     validate.cpp
     version.cpp
+    numerical_notes.cpp
     tensor.cpp
     autotune.cpp
     autotune_workspace.cpp
     get_engine_and_knobs.cpp
     kernel_cache.cpp
     plan_selection.cpp
+    legacy_slice.cpp
+    cuda_graph_lifetime.cpp
+    shared_memory_limit.cpp
 )
 
 if (MSVC)

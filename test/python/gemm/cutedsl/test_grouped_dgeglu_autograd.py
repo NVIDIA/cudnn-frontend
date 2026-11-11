@@ -25,6 +25,17 @@ def as_mkl(x):
     return x.as_strided((m, k, 1), (k, 1, m * k))
 
 
+def clamp_closed(x, minimum=None, maximum=None):
+    """clamp whose gradient passes on the closed interval, the kernel's convention; torch 2.14's clamp backward zeroes it on
+    the boundary itself (2.13 passed it), so torch.clamp alone makes this oracle depend on the torch version."""
+    inside = torch.ones_like(x, dtype=torch.bool)
+    if minimum is not None:
+        inside &= x >= minimum
+    if maximum is not None:
+        inside &= x <= maximum
+    return torch.where(inside, x, x.detach().clamp(minimum, maximum))
+
+
 def close(actual, expected):
     delta = actual.double() - expected.double()
     assert torch.isfinite(actual).all()
@@ -54,8 +65,8 @@ def test_grouped_dgeglu_autograd(vector, slope, minimum, maximum, offset):
     dprob = torch.zeros_like(probability)
     cr, pr = c.double().requires_grad_(), probability.double().requires_grad_()
     pair = cr.view(m, n // 32, 2, 32)
-    gate = pair[:, :, 0].reshape(m, n).clamp(max=maximum)
-    up = pair[:, :, 1].reshape(m, n).clamp(minimum, maximum)
+    gate = clamp_closed(pair[:, :, 0].reshape(m, n), maximum=maximum)
+    up = clamp_closed(pair[:, :, 1].reshape(m, n), minimum, maximum)
     activation = (gate * torch.sigmoid(slope * gate)) * (up + offset) * pr.view(m, 1)
     dact = torch.cat([F.linear(a[j * 256 : (j + 1) * 256].double(), b[j].double()) for j in range(e)])
     dc, dp = torch.autograd.grad(activation, (cr, pr), dact)

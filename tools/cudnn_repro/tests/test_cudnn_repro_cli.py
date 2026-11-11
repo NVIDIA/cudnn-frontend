@@ -108,3 +108,16 @@ def test_cli_debug_all_writes_indexed_files(tmp_path):
         assert (tmp_path / f"cudnn_repro_log_{idx}.txt").read_text().splitlines() == log_path.read_text().splitlines()
         assert "test/python/sdpa/graph/test_mhas_v2.py::test_repro" in (tmp_path / f"cudnn_repro_command_{idx}.txt").read_text()
         assert payload["gid"] == gid
+
+
+def test_cli_missing_log_file_exits_with_clean_error(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "cudnn_repro", str(tmp_path / "missing.log")],
+        cwd=PACKAGE_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "not found" in result.stderr
+    assert "Traceback" not in result.stderr

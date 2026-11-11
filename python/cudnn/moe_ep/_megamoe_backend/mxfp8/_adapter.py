@@ -510,6 +510,8 @@ class Mxfp8InputAdapter:
                 or pre_reduced_activation_sf_bytes_per_token != 0
             ):
                 raise ValueError("in-kernel top-k reduction must not receive a " "standalone pre-reduced activation workspace")
+            # The kernel accumulates every peer's routes straight into output_data, so each call starts from zero.
+            output_data[:token_count].zero_()
         else:
             if pre_reduced_activation_offset is None or pre_reduced_activation_bytes_per_token <= 0:
                 raise ValueError("standalone top-k reduction requires a pre-reduced " "activation workspace")

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native binding keeps the hybrid's two SF inputs and BF16 V byte width."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 import torch
 
@@ -32,7 +34,7 @@ def test_native_pv_bf16_actual_host_frame(d, amax):
     s, facts, frames, combined, roles = _fixture(d, amax)
     for offset in (0, 2**33):
         fresh = {name: f._replace(ptr=f.ptr + offset) if f is not None else None for name, f in facts.items()}
-        prep.execute_quantized(s, fresh, 0x50000000 + offset, 17, 17)
+        binding_reference.execute_quantized(s, fresh, 0x50000000 + offset, 17, 17)
         expected = frames.pop()
         _execute(s, fresh, roles, False, 0x50000000 + offset)
         actual = frames.pop()
@@ -101,7 +103,7 @@ def test_native_pv_bf16_rebind_and_replay(d, dtype, stats, amax, monkeypatch):
         return result
 
     monkeypatch.setattr(existing, "_case", native_case)
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("PV-BF16 entered Python binding"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("PV-BF16 entered Python binding"), raising=False)
     # Retain the established independent dequantized numerical oracle, changed
     # SF_Q/SF_K, fresh strided BF16 V, nondefault stream and allocation guards.
     existing.test_pv_bf16_prepared_rebind_and_replay(d, dtype, stats, amax, monkeypatch)

@@ -9,10 +9,25 @@ with ``jax.jit`` (and CUDA graph capture). :func:`cudnn.jax.call` is a thin wrap
 adding the conveniences the cuDNN kernels need — pre-initialized accumulator outputs
 and TensorSpec presets for the layouts the GEMM fusions use.
 
-Requires jax >= 0.5 and the CuTeDSL JAX extensions (shipped with nvidia-cutlass-dsl).
+Requires jax >= 0.9.1 and the CuTeDSL JAX extensions (shipped with nvidia-cutlass-dsl).
 """
 
 from importlib import import_module
+
+import jax as _jax
+
+from cudnn import CUTEDSL_MIN_JAX_VERSION, CUTEDSL_MIN_JAX_VERSION_STR
+
+if _jax.version.__version_info__ < CUTEDSL_MIN_JAX_VERSION:
+    raise ImportError(f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR}; found {_jax.__version__}")
+
+import cutlass.jax
+
+if not cutlass.jax.is_available():  # pragma: no cover - guarded import surface
+    raise ImportError(
+        f"cudnn.jax requires jax >= {CUTEDSL_MIN_JAX_VERSION_STR} and the CuTeDSL JAX extensions (cutlass.jax); "
+        "install/upgrade jax (`pip install --group jax` from a checkout)"
+    )
 
 from .call import (
     call,
@@ -24,7 +39,7 @@ from .call import (
 )
 from cutlass.jax import TensorSpec
 
-_BSA_EXPORTS = ("block_sparse_attention", "block_sparse_attention_forward", "block_sparse_attention_backward")
+_BSA_EXPORTS = ("block_sparse_attention",)
 
 
 __all__ = [
@@ -36,11 +51,7 @@ __all__ = [
     "sf_atom_spec",
     "zeros_init",
     "neg_inf_init",
-    "grouped_gemm_swiglu",
-    "grouped_gemm_dswiglu",
     "kimi_delta_attention",
-    "kimi_delta_attention_fwd",
-    "kimi_delta_attention_bwd",
 ]
 
 
@@ -49,18 +60,7 @@ def __getattr__(name):
         value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
         globals()[name] = value
         return value
-    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
-        from cudnn.frost.buffers import cutedsl_requirement_error
-
-        requirement = cutedsl_requirement_error(name)
-        if requirement:
-            raise ImportError(requirement)
-        operation = name.removeprefix("grouped_gemm_")
-        module = import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.jax_api")
-        value = getattr(module, name)
-        globals()[name] = value
-        return value
-    if name in ("kimi_delta_attention", "kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
+    if name == "kimi_delta_attention":
         from cudnn.linear_attention import jax_api as kda
 
         value = getattr(kda, name)

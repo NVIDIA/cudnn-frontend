@@ -8,7 +8,7 @@
 #include <memory>
 
 #include "../graph_helpers.h"
-#include "cudnn.h"
+#include <cudnn.h>
 
 namespace cudnn_frontend::detail {
 

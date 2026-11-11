@@ -13,8 +13,8 @@ import torch
 def mhc_api():
     pytest.importorskip("cuda.tile", minversion="1.5.0")
     pytest.importorskip("triton")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("mHC projection backward requires SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("mHC projection backward requires SM100 or SM103")
     from cudnn import MhcProjectionBackward
 
     return MhcProjectionBackward
@@ -171,6 +171,16 @@ def test_mhc_projection_prepared_graph_and_route(mhc_api, monkeypatch, tmp_path)
 
 
 @pytest.mark.L1
+def test_mhc_projection_reduction_compiles_for_the_device(mhc_api):
+    # Each part compiles its own kernels: an sm_100 cuTile cubin does not load on SM103, and Triton's cubin is architecture-specific.
+    import cudnn.gemm.mhc_projection_bwd._compile as compiler
+
+    major, minor = torch.cuda.get_device_capability()
+    _, reduction = compiler._binaries(torch.cuda.current_device())
+    assert f".target sm_{10 * major + minor}a" in reduction.asm["ptx"]
+
+
+@pytest.mark.L1
 def test_mhc_projection_wrapper(mhc_api):
     from cudnn import mhc_projection_backward
 
@@ -229,6 +239,12 @@ def test_mhc_projection_wrapper_normalizes_raw_stream(monkeypatch, stream_kind):
 
     monkeypatch.setattr(api, "_wrapper_plan", lambda device: Plan())
     with torch.cuda.stream(caller):
+        if stream_kind == "per_thread":
+            with pytest.raises(ValueError, match="cudaStreamPerThread"):
+                api.mhc_projection_backward(x, x, x, x, x, allow_tf32=True, current_stream=requested)
+            assert not allocations and not launches
+            assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
+            return
         result = api.mhc_projection_backward(x, x, x, x, x, allow_tf32=True, current_stream=requested)
         assert result["dx"].shape == x.shape
         assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream

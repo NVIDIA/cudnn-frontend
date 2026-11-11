@@ -79,8 +79,9 @@ def build_rowwise_sf_desc(sf_tensor, *, num_tiles, sf_smem_size: int, num_rows_b
     ``sf_tensor``: the packed uint8 SF tensor; ``num_tiles``: s-tiles per (b, h) (dense ``ceil(S / TILE)``) or the packed
     per-sequence-tile total with ``num_batches = 1`` (THD); ``sf_smem_size``: one tile's bytes (= ``TILE * ceil128(D) / 32``);
     ``num_rows_box``: the box height -- the whole slab for Q (:func:`sf_tma_rows`), a peer's share for K / V at cga2
-    (:func:`sf_peer_split`).  Strides are in 16-byte units, as TMA counts them.  (A paged-KV page base is NOT a parameter
-    here: no consumer passes one yet; append it, defaulted, with the consumer and its test -- never ahead of them.)"""
+    (:func:`sf_peer_split`).  Strides are in 16-byte units, as TMA counts them.  (Paged KV needs no page base: the Rubin
+    and SM100 forwards pass ``num_batches = n_pages``, ``num_tiles = page_size / 128`` and address the page as the batch
+    coordinate -- the K / V scale-factor POOLS page with K / V.)"""
     sf_base = cutlass.Int64(sf_tensor.iterator.toint())
     tile_stride_16 = sf_smem_size // 16
     return tmap.create_tensor_map_tiled(

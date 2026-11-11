@@ -8,8 +8,11 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _KERNEL_ROOTS = (
+    _REPO_ROOT / "python" / "cudnn" / "QSA",
+    _REPO_ROOT / "python" / "cudnn" / "attention_gate",
     _REPO_ROOT / "python" / "cudnn" / "conv",
     _REPO_ROOT / "python" / "cudnn" / "gemm",
+    _REPO_ROOT / "python" / "cudnn" / "norm",
     _REPO_ROOT / "python" / "cudnn" / "sdpa",
     _REPO_ROOT / "python" / "cudnn" / "engram",
     _REPO_ROOT / "python" / "cudnn" / "rope",
@@ -24,8 +27,12 @@ def _dotted_name(node: ast.AST) -> str:
     return ""
 
 
+# Both spellings of the device-kernel decorator: ``cute.kernel`` and the ``cute.experimental`` layer's own.
+_KERNEL_DECORATORS = ("cute.kernel", "cute.experimental.kernel")
+
+
 def _is_cute_kernel(node: ast.FunctionDef) -> bool:
-    return any(_dotted_name(decorator.func if isinstance(decorator, ast.Call) else decorator) == "cute.kernel" for decorator in node.decorator_list)
+    return any(_dotted_name(decorator.func if isinstance(decorator, ast.Call) else decorator) in _KERNEL_DECORATORS for decorator in node.decorator_list)
 
 
 def _is_cudnn_name_prefix(statement: ast.stmt, kernel_name: str) -> bool:
@@ -80,3 +87,24 @@ def test_frost_kernels_have_cudnn_name_prefix():
 def test_prefix_guard_covers_called_decorator_and_nested_kernel():
     tree = ast.parse("def outer():\n    @cute.kernel()\n    def missing():\n        pass\n")
     assert _missing_prefixes(tree) == ["3:outer.missing"]
+
+
+@pytest.mark.L0
+def test_prefix_guard_covers_the_experimental_layer_decorator_on_a_method():
+    """A kernel written on the ``cute.experimental`` layer is a method of its kernel class: the guard sees that decorator spelling and
+    takes the next statement of the CLASS body as the prefix call."""
+    missing = "class K:\n    @cute.experimental.kernel\n    def body(self):\n        pass\n"
+    assert _missing_prefixes(ast.parse(missing)) == ["3:K.body"]
+    prefixed = missing + '    body.set_name_prefix("cudnn", remove_cutlass_symbol=True)\n'
+    assert _missing_prefixes(ast.parse(prefixed)) == []
+    path = _REPO_ROOT / "python" / "cudnn" / "gemm" / "frost" / "projection_decode" / "kernel" / "fp8_projection_decode_e4m3.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert sum(isinstance(node, ast.FunctionDef) and _is_cute_kernel(node) for node in ast.walk(tree)) == 1
+    assert not _missing_prefixes(tree), "The FP8 projection decode kernel needs its cuDNN name prefix"
+
+
+@pytest.mark.L0
+def test_state_snapshot_has_cudnn_name_prefix():
+    path = _REPO_ROOT / "python" / "cudnn" / "linear_attention" / "frost" / "common" / "state_snapshot.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert not _missing_prefixes(tree), "The state snapshot kernel needs its cuDNN name prefix"

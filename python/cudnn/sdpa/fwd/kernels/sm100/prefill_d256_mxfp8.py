@@ -156,6 +156,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_d256_bars,
     row_max_for_exp2,
     make_sdpa_helpers,
+    sanitize_mxfp8_v_sf_padding_pair,
 )
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
@@ -207,7 +208,7 @@ _thd_sf_tile_bases = _sdpa_h.thd_sf_tile_bases
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
     build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel,
-    thd_decode_unit,
+    thd_decode_unit_prefix,
     TENSOR_MAP_QWORDS,
 )
 
@@ -217,9 +218,17 @@ _THD_REVERSE_CAUSAL_ROWS = CFG.THD_VARLEN and CFG.MASK_FLAGS == (MASK_CAUSAL | M
 
 @cute.jit
 def _thd_decode_causal(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
+    """THD unit decode for the padded top-left causal flavors.
+
+    The prefix decode with the rows reversed (the diagonal-heavy tiles of a
+    sequence come first); when a full group of four heads is available, the
+    (head, tile) pair is re-interleaved so consecutive units sweep that group's
+    diagonal tiles together.  Returns ``(q_super, head, batch)``; a unit past
+    the live total keeps ``batch == n_batch``.
+    """
     meta = cutlass.make_array_view(seq_kv_lens_t)
     unit = linear_cta // cutlass.Int32(CFG.CGA_M)
-    q_tile, batch, head = thd_decode_unit(
+    q_tile, batch, head = thd_decode_unit_prefix(
         meta,
         n_batch,
         unit,
@@ -283,6 +292,10 @@ _FP32_PARTIALS = SPLIT_KV > 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 
 PAGED_KV = bool(CFG.PAGED_KV)
+# Replace the tail tile's fully padded V scale blocks before BMM2: THD, and the padded mask compiled against the scalar
+# S_kv with no lengths buffer (kv_tail_mask).  The slab holds V_SF_PLANES F8_128x4 atoms, one per 128 columns of V.
+SANITIZE_V_SF_TAIL: bool = bool(CFG.THD_VARLEN) or ((CFG.MASK_FLAGS & MASK_PADDED) != 0 and not CFG.SEQ_KV_LENS_PRESENT)
+V_SF_PLANES = SF_SMEM_SIZE_V // 512
 PAGE_SIZE = CFG.PAGE_SIZE if PAGED_KV else 0
 if PAGED_KV and PAGE_SIZE % CFG.TILE_N != 0:
     # A page holds whole 128-row F8_128x4 SF atoms (config_sm100 cannot tell MXFP8 from per-tensor FP8).
@@ -950,6 +963,7 @@ def _kernel(
                     cta_in_pair=cta_in_pair,
                     mb_sf_reuse=mb_sf_reuse,
                     mb_qk_sf_reuse=mb_qk_sf_reuse,
+                    leader_cta_id=leader_cta_id,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -977,6 +991,7 @@ def _kernel(
                 cta_in_pair=cta_in_pair,
                 mb_sf_reuse=mb_sf_reuse,
                 mb_qk_sf_reuse=mb_qk_sf_reuse,
+                leader_cta_id=leader_cta_id,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1349,8 +1364,9 @@ def _tmaldg_warp_group(
             )
 
             kv_main_start = cute.math.min(kv_left + cutlass.Int32(2), kv_right)
+            # Not the prologue's names: quack-kernels rewrites `if const_expr(S) and D` process-wide and would carry them in maybe-unset
             for kv_loop in cutlass.range(kv_main_start, kv_right, 1, unroll=1):
-                k_row, k_page, k_sf_tile, v_row, v_page, v_sf_group = _kv_tile_coords(
+                k_row_loop, k_page_loop, k_sf_tile_loop, v_row_loop, v_page_loop, v_sf_group_loop = _kv_tile_coords(
                     kv_loop,
                     batch_idx,
                     tma_batch,
@@ -1371,7 +1387,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state.idx],
-                    tma_k(cutlass.Int32(0), k_row + K_ROW_OFFSET_PEER, cutlass.Int32(0), kv_head_idx, k_page),
+                    tma_k(cutlass.Int32(0), k_row_loop + K_ROW_OFFSET_PEER, cutlass.Int32(0), kv_head_idx, k_page_loop),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1379,7 +1395,7 @@ def _tmaldg_warp_group(
                 )
                 tma_load_tile(
                     sK_SF[kv_state.idx],
-                    tma_k_sf(cutlass.Int32(0), k_sf_tile, kv_head_idx, k_page, coord_0=cutlass.Int32(0)),
+                    tma_k_sf(cutlass.Int32(0), k_sf_tile_loop, kv_head_idx, k_page_loop, coord_0=cutlass.Int32(0)),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1392,7 +1408,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state.idx],
-                    tma_v(cutlass.Int32(0), v_row, cutlass.Int32(0), kv_head_idx, v_page),
+                    tma_v(cutlass.Int32(0), v_row_loop, cutlass.Int32(0), kv_head_idx, v_page_loop),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1400,7 +1416,7 @@ def _tmaldg_warp_group(
                 )
                 tma_load_tile(
                     sV_SF[kv_state.idx],
-                    tma_v_sf(cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), v_sf_group),
+                    tma_v_sf(cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), v_sf_group_loop),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1577,6 +1593,7 @@ def _mma_warp_group(
     cta_in_pair,
     mb_sf_reuse,
     mb_qk_sf_reuse,
+    leader_cta_id,
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
@@ -1590,6 +1607,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_MXFP8_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05MxInstrDesc.build(
         a_dtype=STORAGE_DTYPE,
@@ -1818,6 +1836,11 @@ def _mma_warp_group(
                     if nvvm.elect_sync():
                         _utccp_bmm2_p_sf(tmem_SF_P, desc_P_SF)
                 bars.mb_v_full[kv_state_V.idx].wait(kv_state_V.phase)
+                if cutlass.const_expr(SANITIZE_V_SF_TAIL):
+                    for _plane in cutlass.range_constexpr(V_SF_PLANES):
+                        sanitize_mxfp8_v_sf_padding_pair(
+                            sV_SF[kv_state_V.idx].shifted(_plane * 512), kv_loop, eff_seqlen_kv, leader_cta_id + cutlass.Int32(1), CFG.CTA_MMA
+                        )
                 desc_V = sV[kv_state_V.idx].desc()
                 desc_V_SF = sV_SF[kv_state_V.idx].desc()
                 if nvvm.elect_sync():
@@ -1909,6 +1932,11 @@ def _mma_warp_group(
                 if nvvm.elect_sync():
                     _utccp_bmm2_p_sf(tmem_SF_P, desc_P_SF)
             bars.mb_v_full[kv_state_V.idx].wait(kv_state_V.phase)
+            if cutlass.const_expr(SANITIZE_V_SF_TAIL):
+                for _plane in cutlass.range_constexpr(V_SF_PLANES):
+                    sanitize_mxfp8_v_sf_padding_pair(
+                        sV_SF[kv_state_V.idx].shifted(_plane * 512), kv_right - cutlass.Int32(1), eff_seqlen_kv, leader_cta_id + cutlass.Int32(1), CFG.CTA_MMA
+                    )
             desc_V = sV[kv_state_V.idx].desc()
             desc_V_SF = sV_SF[kv_state_V.idx].desc()
             if cutlass.const_expr(CFG.MASK_FLAGS != 0):

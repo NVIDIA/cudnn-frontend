@@ -77,6 +77,8 @@ For operation graphs that are not yet forward compatible, the library returns a 
 
 There are some known issues in forward-compatibility mode for the following cases within the generic runtime fusion engines:
 
+In this list, g<sub>1</sub> is the prologue pointwise subgraph before the primary operation, and g<sub>2</sub> is the epilogue pointwise subgraph after the primary operation, as defined in [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines).
+
 - Some convolution fusions involving the following patterns:
 
   - Convolution Forward operation or data gradient operation followed by operations of g<sub>2</sub> (in [Generic Runtime Fusion Engines](/developer/graph-api#generic-runtime-fusion-engines)) supports only broadcasting to full tensors and does not support broadcasting between vector or scalar tensors. Using the latter may produce incorrect results.

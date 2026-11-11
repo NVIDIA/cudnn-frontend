@@ -1148,10 +1148,12 @@ def test_sdpa_bwd_dsl_sm120_envelope_pad_compact_strides():
 @pytest.mark.L0
 @torch_fork_set_rng(seed=8)
 def test_sdpa_bwd_dsl_sm120_strided_io_rejects_unaligned():
-    """Non-16-byte-multiple strides decline at build and fall through to the
-    backend (Rule 2: never a copy)."""
+    """Non-16-byte-multiple strides decline at build (Rule 2: never a copy).
+    The backend refuses the same stride (#1571), so no plan builds."""
 
     _require_dsl()
+    import cudnn
+
     batch, h, s, d = 2, 4, 128, 64
     # head stride 68 elems: not a multiple of the 8-element fp16 quantum
     q = torch.randn(batch, s, h, d + 4, dtype=torch.float16, device="cuda").transpose(1, 2)[..., :d]
@@ -1161,8 +1163,9 @@ def test_sdpa_bwd_dsl_sm120_strided_io_rejects_unaligned():
     scale = 1.0 / math.sqrt(d)
     o, stats, _, _, _, _ = _ref_bwd(q, k, v, do, scale=scale)
     o = _bhsd(batch, h, s, d, torch.float16, empty=True).copy_(o)
-    plan_name = _run_bwd_graph(q, k, v, o, do, stats, scale=scale, select=False, build_only=True)[-1]
-    assert plan_name != ENGINE
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="not a multiple of the tensor's 16-byte alignment") as exc:
+        _run_bwd_graph(q, k, v, o, do, stats, scale=scale, select=False, build_only=True)
+    assert "cannot address natively" in str(exc.value)
 
 
 @pytest.mark.L0

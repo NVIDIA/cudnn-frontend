@@ -14,8 +14,10 @@ def supported_device():
 
     if cutedsl_too_old(cutedsl_state()[1]):
         pytest.skip("Frost tail RoPE requires CuTe DSL >=4.7.0")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("Frost tail RoPE requires SM100")
+    from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
+
+    if torch.cuda.get_device_capability() not in PORTABLE_ELEMENTWISE_CCS:
+        pytest.skip(f"Frost tail RoPE requires cc {PORTABLE_ELEMENTWISE_CCS}")
 
 
 def inputs(shape, generation=0):
@@ -188,7 +190,7 @@ def test_metadata_device_binding_is_stable(monkeypatch):
     calls = []
     with monkeypatch.context() as patch:
         patch.setattr(torch.cuda, "current_device", lambda: actual_device + 1)
-        patch.setattr(torch.cuda, "get_device_capability", lambda device: ((10, 0) if device.index == actual_device else (9, 0)))
+        patch.setattr(torch.cuda, "get_device_capability", lambda device: ((10, 0) if device.index == actual_device else (8, 0)))
         patch.setattr(tail, "_compile", lambda h, d, device, capability: calls.append((h, d, device, capability)) or object())
         plan.compile()
     assert calls == [(1, 128, actual_device, (10, 0))]
@@ -319,6 +321,12 @@ def test_tail_rope_wrapper_normalizes_raw_stream(monkeypatch, stream_kind):
 
     monkeypatch.setattr(api, "TailRoPEForward", Plan)
     with torch.cuda.stream(caller):
+        if stream_kind == "per_thread":
+            with pytest.raises(ValueError, match="cudaStreamPerThread"):
+                api.tail_rope(x, x, x, stream=requested)
+            assert not allocations and not launches
+            assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
+            return
         result = api.tail_rope(x, x, x, stream=requested)
         assert result["out"].shape == x.shape
         assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream

@@ -92,6 +92,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_FP32,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -108,6 +109,7 @@ from cudnn.sdpa.bwd.config_sm100 import TemplateParams as _BwdTemplateParams
 
 __all__ = [
     "TemplateParams",
+    "TemplateParamsFp8",
     "CfgBwdD256",
     "BufferElems",
     "TmemLayout",
@@ -358,10 +360,28 @@ class TemplateParams(_BwdTemplateParams):
     # under P-c), the dS ring depth and the payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
+    # --- the 2x2-datapath body (``kernels/bprop_d256_2x2_f16.py``, config ``bwd/config_d256_2x2``) ---------------
+    # 0 = the shipped 4x1 bodies (this module's ``make_cfg_d256_bwd``; REJECTED != 0 there -- a 4x1 body never
+    # reads it, so a non-zero value would be a claim it cannot honour); 1 = the SM100 profile (one 64-row sub-block per
+    # CTA, the ``sdpa_bwd_sm100_d256`` row); 2 = the Rubin interleaved profile (two sub-blocks per CTA, the
+    # ``api_dsl_sm107.BWD_D256_2X2`` twin).  Appended last so every positional caller keeps working; it rides
+    # ``repr(params)`` into the template digest, so the 4x1 renderings' PTX is unchanged while their compiled-plan
+    # cache key moves once.
+    datapath_2x2_profile: int = 0
+
+
+@dataclass(frozen=True)
+class TemplateParamsFp8(TemplateParams):
+    """Per-tensor FP8 geometry; legacy D256 records keep their original identity."""
+
+    head_dim_qk: int = 256
+    head_dim_v: int = 256
 
 
 def bpe(dtype: int) -> int:
-    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2."""
+    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2, the output-only DTYPE_FP32 4."""
+    if dtype == DTYPE_FP32:
+        return 4
     return 1 if dtype <= DTYPE_E5M2 else 2
 
 
@@ -565,6 +585,11 @@ class CfgBwdD256:
     # S_q % 128 != 0 and lets a 0xFF Q-side SF pad byte (E8M0 NaN) reach BMM2 (dV NaN on every kv row).
     MASK_Q_PAD: int = 0
 
+    @property
+    def dO_DV_SWZ_BYTES(self) -> int:
+        """The transposed dV consumer sees only its CTA's value columns."""
+        return min(self.dO_SWZ_BYTES, (self.TILE_O // self.CTA_MMA) * self.BPE)
+
 
 # Every MXFP8-only Cfg field that must read 0 on the f16 / per-tensor fp8 bodies (IS_MXFP8 first, so a message names it).
 _MXFP8_ZERO_FIELDS = (
@@ -690,6 +715,10 @@ class BufferElems:
     # field stays so an SMEM-gather twin can re-add the row without moving the others.
     rcpGatherElems: int = 0
 
+    @property
+    def SMEM_LAYOUT_dO_SG1(self) -> int:
+        return _SWZ_ENUM[self.STRIDE_BYTE_OFFSET_dO_SG1 // 8]
+
 
 _SWZ_ENUM = {128: 2, 64: 4, 32: 6}
 
@@ -704,7 +733,7 @@ def buffer_elems(cfg: CfgBwdD256) -> BufferElems:
     tma_qk_iters = (cfg.TILE_K * cfg.BPE) // cfg.Q_SWZ_BYTES
     tma_vo_iters = (cfg.TILE_O * cfg.BPE) // cfg.dO_SWZ_BYTES
     tma_qk_sg1_iters = ((cfg.TILE_K // cfg.CTA_MMA) * cfg.BPE) // cfg.Q_SWZ_BYTES
-    tma_vo_sg1_iters = ((cfg.TILE_O // cfg.CTA_MMA) * cfg.BPE) // cfg.dO_SWZ_BYTES
+    tma_vo_sg1_iters = ((cfg.TILE_O // cfg.CTA_MMA) * cfg.BPE) // cfg.dO_DV_SWZ_BYTES
     dv_d_block = cfg.dV_SWZ_BYTES // cfg.BPE_O
     p_tma_iters = (cfg.TILE_N * cfg.BPE_DS) // cfg.dS_SWZ_BYTES
     p_d_block = cfg.TILE_N // p_tma_iters
@@ -761,8 +790,8 @@ def buffer_elems(cfg: CfgBwdD256) -> BufferElems:
         STRIDE_BYTE_OFFSET_dV=8 * cfg.dV_SWZ_BYTES,
         LEADING_BYTE_OFFSET_Q_SG1=cfg.TILE_N * cfg.Q_SWZ_BYTES,
         STRIDE_BYTE_OFFSET_Q_SG1=8 * cfg.Q_SWZ_BYTES,
-        LEADING_BYTE_OFFSET_dO_SG1=cfg.TILE_N * cfg.dO_SWZ_BYTES,
-        STRIDE_BYTE_OFFSET_dO_SG1=8 * cfg.dO_SWZ_BYTES,
+        LEADING_BYTE_OFFSET_dO_SG1=cfg.TILE_N * cfg.dO_DV_SWZ_BYTES,
+        STRIDE_BYTE_OFFSET_dO_SG1=8 * cfg.dO_DV_SWZ_BYTES,
         SMEM_LAYOUT_Q=_SWZ_ENUM[cfg.Q_SWZ_BYTES],
         SMEM_LAYOUT_dO=_SWZ_ENUM[cfg.dO_SWZ_BYTES],
         SMEM_LAYOUT_K=_SWZ_ENUM[cfg.K_SWZ_BYTES],
@@ -943,7 +972,11 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
       Q ring 3 x 16 = 48 KiB | dO ring 48 | dO_dv ring 48 | K 32 + V 32 = 64
       (the dV staging ALIASES it post-loop: max(K + V, dV @ BPE_O)) | stats 2 |
       dS ring 3 x 16 (e4m3, the shipped DTYPE_DS) = 48  -> 258 KiB; the bf16-dS
-      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.
+      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.  At
+      ``DTYPE_O = FP32`` (the GQA fold's per-Q-head dV partial) the alias slab is
+      the 128 KiB fp32 dV staging: 322 KiB with the e4m3 ring (1 KiB under the
+      325 KiB usable), 370 with the bf16-dS twin's -- which is why the twin keeps
+      bf16 partials; the roots are unchanged (K / V sit at the slab's start).
 
     f16 body (``sQ | sdO | sCombined[sdOdv_s0 | K | V] | sStats | sdS``):
       Q ring 2 x 32 = 64 | dO ring 64 | dO_dv stage 0 32 + K 64 + V 64 = 160
@@ -1171,12 +1204,20 @@ def _check(preds) -> None:
             raise ValueError(msg)
 
 
-def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> None:
+def _validate_params(flavor: str, family: str, params: _BwdTemplateParams, datapath_2x2: bool = False) -> None:
     """Guard the record a Rubin d256 backward body can express.  Every raise
-    here must also be a Capabilities decline -- reaching it is an engine-row bug."""
+    here must also be a Capabilities decline -- reaching it is an engine-row bug.
+    ``datapath_2x2`` is passed by ``config_d256_2x2.make_cfg_d256_2x2`` alone (it validates the profile itself); the
+    4x1 families reject any non-zero ``datapath_2x2_profile``."""
     dtype_o = getattr(params, "dtype_o", -1)
     dtype_ds = getattr(params, "dtype_ds", -1)
     ds_sf_policy = getattr(params, "ds_sf_policy", -1)
+    profile_2x2 = getattr(params, "datapath_2x2_profile", 0)
+    if not datapath_2x2 and profile_2x2 != 0:
+        raise ValueError(
+            f"{flavor}: datapath_2x2_profile={profile_2x2} selects the 2x2-datapath body (kernels/bprop_d256_2x2_f16.py, config_d256_2x2.make_cfg_d256_2x2); "
+            f"the 4x1 bodies render profile 0 only and would silently ignore it"
+        )
     if params.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be a tile_dsl DTYPE_* code (E4M3=0 E5M2=1 BF16=2 FP16=3); got {params.dtype_qkv}")
     if family != FAMILY_MXFP8:
@@ -1240,10 +1281,11 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
                 f"{flavor}: the fp8 body is E4M3-only (dtype_qkv={DTYPE_E4M3}); got {params.dtype_qkv}"
                 + (" -- E5M2 is not implemented in this body" if params.dtype_qkv == DTYPE_E5M2 else " -- a half-precision io belongs to the f16 body")
             )
-        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16):
+        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32):
             raise ValueError(
                 f"{flavor}: dtype_o must be -1 (inherit -> E4M3, the fp8 graph contract), DTYPE_E4M3, DTYPE_BF16 or DTYPE_FP16 "
-                f"(the pre-quantization output for the bitwise A/B); got {dtype_o}"
+                f"(the pre-quantization output for the bitwise A/B) or DTYPE_FP32 (the per-Q-head dV_true partial a GQA fold sums in fp32 and "
+                f"rounds ONCE; fits the 327 KiB cap with the e4m3 dS ring only); got {dtype_o}"
             )
     else:
         if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
@@ -1399,8 +1441,8 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
         [
             (cfg.TILE_M == 128 and cfg.TILE_N == 128, f"{flavor}: TILE_M = TILE_N = 128 (kv rows per CTA, q cols per q-tile)"),
             (
-                cfg.TILE_K == 256 and cfg.TILE_O == 256,
-                f"{flavor}: d_qk = d_v = 256 (got TILE_K={cfg.TILE_K}, TILE_O={cfg.TILE_O}); the body is exact-d, no envelope",
+                (cfg.TILE_K, cfg.TILE_O) == (256, 256) or (cfg.IS_FP8 and not cfg.IS_MXFP8 and (cfg.TILE_K, cfg.TILE_O) == (192, 128)),
+                f"{flavor}: d_qk = d_v = 256, or per-tensor FP8 192/128 (got TILE_K={cfg.TILE_K}, TILE_O={cfg.TILE_O}); the body is exact-d, no envelope",
             ),
             (cfg.CGA_M == 2 and cfg.CGA_N == 1 and cfg.CTA_MMA == 2, f"{flavor}: single cga2 sub-group (CGA_M=2, CGA_N=1, CTA_MMA=2) only"),
             (cfg.TILES_Q == 1, f"{flavor}: TILES_Q == 1"),
@@ -1479,12 +1521,13 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                         f"DTYPE_DS={cfg.DTYPE_DS} -- a workspace dtype the GEMM arm does not read is silent garbage gradients",
                     ),
                     (
-                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16),
-                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract) or BF16/FP16 (pre-quantization output); got {cfg.DTYPE_O}",
+                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32),
+                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract), BF16/FP16 (pre-quantization output) or FP32 (the GQA fold's "
+                        f"per-Q-head dV_true partial, rounded once by the fold); got {cfg.DTYPE_O}",
                     ),
                     (
-                        cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == tm.TOTAL_COLS,
-                        f"{flavor}: the fp8 P ring is exactly 2 stages of {tm.P_COLS} cols filling TMEM [{tm.P_OFF}, {tm.TOTAL_COLS}) (got STAGES_TMEM_P={cfg.STAGES_TMEM_P}); "
+                        cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS <= tm.TOTAL_COLS,
+                        f"{flavor}: the fp8 P ring is exactly 2 stages of {tm.P_COLS} cols contained in TMEM [{tm.P_OFF}, {tm.TOTAL_COLS}) (got STAGES_TMEM_P={cfg.STAGES_TMEM_P}); "
                         f"the body indexes P_OFF + slot*P_COLS by the mb_p_ready PipelineState, so a deeper ring reads past the allocation and a shallower one breaks "
                         f"the 'store P[i+1] before dSoftmax[i]' overlap the missing p_empty relies on",
                     ),
@@ -1561,8 +1604,8 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"{flavor}: TMEM must be S | dP | dV back to back from column 0",
             ),
             (
-                tm.S_COLS + tm.dP_COLS + tm.dV_COLS + _tmem_tail_cols(cfg, tm) == tm.TOTAL_COLS,
-                f"{flavor}: TMEM column map must sum to {TMEM_TOTAL_COLS}: S {tm.S_COLS} + dP {tm.dP_COLS} + dV {tm.dV_COLS} + {_tmem_tail_desc(cfg, tm)}",
+                tm.S_COLS + tm.dP_COLS + tm.dV_COLS + _tmem_tail_cols(cfg, tm) + (128 if (cfg.TILE_K, cfg.TILE_O) == (192, 128) else 0) == tm.TOTAL_COLS,
+                f"{flavor}: TMEM column map plus any unused D192 tail must sum to {TMEM_TOTAL_COLS}: S {tm.S_COLS} + dP {tm.dP_COLS} + dV {tm.dV_COLS} + {_tmem_tail_desc(cfg, tm)}",
             ),
             (
                 tm.P_COLS == (cfg.TILE_N * cfg.BPE) // 4,
@@ -1574,8 +1617,9 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
     _check(
         [
             (
-                cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.dO_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128,
-                f"{flavor}: Q/K/dO/V swizzle must be 128 B (d=256 rows are 256 B fp8 / 512 B f16, and the bodies' subtile walks derive from 128)",
+                (cfg.Q_SWZ_BYTES, cfg.K_SWZ_BYTES, cfg.dO_SWZ_BYTES, cfg.V_SWZ_BYTES)
+                == ((64, 64, 128, 128) if (cfg.TILE_K, cfg.TILE_O) == (192, 128) else (128,) * 4),
+                f"{flavor}: Q/K/dO/V swizzle must be 128 B for D256; native FP8 D192 uses 64 B Q/K and 128 B dO/V, with a separate per-CTA dO swizzle for dV",
             ),
             (
                 cfg.P_SWZ_BYTES == cfg.dS_SWZ_BYTES == 128,
@@ -1883,7 +1927,13 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     # IS_FP8 = E4M3 payloads = the fp8-CLASS pipeline (K64 + k_dim=1, 3-deep rings, the lookahead MMA order): the
     # per-tensor fp8 body AND the MXFP8 one.
     is_fp8 = dtype_family in (FAMILY_FP8, FAMILY_MXFP8)
-    tile_m, tile_n, tile_k, tile_o = 128, 128, 256, 256
+    head_dims = (getattr(params, "head_dim_qk", 256), getattr(params, "head_dim_v", 256))
+    allowed = ((256, 256), (192, 128)) if dtype_family == FAMILY_FP8 else ((256, 256),)
+    if any(not isinstance(d, int) for d in head_dims) or head_dims not in allowed:
+        raise ValueError(f"{flavor}: native head dimensions must be one of {allowed}; got {head_dims}")
+    tile_m, tile_n = 128, 128
+    tile_k, tile_o = head_dims
+    operand_swizzle = 64 if head_dims == (192, 128) else 128
     cta_mma = 2  # the single cga2 pair: every collective MMA and every cga2 tensor TMA spans both CTAs
     ds_sf_policy = getattr(params, "ds_sf_policy", -1)
     if is_mxfp8:
@@ -1977,9 +2027,9 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         CGA_M=cta_mma,
         CGA_N=1,
         CTA_MMA=cta_mma,
-        Q_SWZ_BYTES=128,
+        Q_SWZ_BYTES=operand_swizzle,
         dO_SWZ_BYTES=128,
-        K_SWZ_BYTES=128,
+        K_SWZ_BYTES=operand_swizzle,
         V_SWZ_BYTES=128,
         P_SWZ_BYTES=128,
         dS_SWZ_BYTES=128,
@@ -2045,18 +2095,20 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
 # ---------------------------------------------------------------------------
 
 
-def validate_head_chunk(h_q: int, h_kv: int, qh_chunk: int) -> None:
+def validate_head_chunk(h_q: int, h_kv: int, qh_chunk: int, allow_subgroups: bool = False) -> None:
     """The dS workspace is head-chunked (``qh_chunk`` heads per launch, runtime
     ``head_base``).  A chunk must be a divisor of ``H_q`` AND whole GQA groups
     (a multiple of ``H_q // H_kv``), or the per-Q-head dK/dV partial fold over a
     chunk is incomplete and a KV head's gradient is summed from a partial
-    group."""
+    group. A dense chain that writes global per-Q-head partials and folds only
+    after ALL chunks may explicitly allow a chunk that evenly divides one group.
+    Other chains retain the whole-group requirement."""
     if h_kv < 1 or h_q < 1 or h_q % h_kv != 0:
         raise ValueError(f"sm107 bwd d256: H_q ({h_q}) must be a positive multiple of H_kv ({h_kv})")
     group = h_q // h_kv
     if qh_chunk < 1 or h_q % qh_chunk != 0:
         raise ValueError(f"sm107 bwd d256: qh_chunk ({qh_chunk}) must be a positive divisor of H_q ({h_q})")
-    if qh_chunk % group != 0:
+    if qh_chunk % group != 0 and not (allow_subgroups and group % qh_chunk == 0):
         raise ValueError(
             f"sm107 bwd d256: qh_chunk ({qh_chunk}) must be a multiple of the GQA group H_q/H_kv = {group}, or the dK/dV fold over a chunk is partial"
         )

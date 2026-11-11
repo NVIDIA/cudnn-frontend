@@ -7,12 +7,11 @@ layout copies, allocation, compilation or stream state belong to the spec.
 """
 
 from dataclasses import dataclass, field
-import math
 
 from cudnn.frost.compiled_cache import positional_entry
-from cudnn.sdpa.fwd.prepared import facts_of_roles
 
-ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope")
+ROLES = ("q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias")
+PAGED_ROLES = ROLES + ("paged_k", "paged_v")
 
 
 @dataclass(frozen=True)
@@ -32,26 +31,23 @@ class LaunchSpec:
     operands: tuple
     device_index: int
     scale: float
+    workspace_bytes: int = 0
     native: object = field(init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self):
         from cudnn import _pybind_module
 
-        if len(self.operands) == 9:
-            object.__setattr__(self, "native", _pybind_module._SdpaSm80FwdBinder(self))
+        object.__setattr__(self, "native", _pybind_module._SdpaSm80FwdBinder(self))
 
 
 def native_layouts(api):
     """Admit declarations the vector loads/stores can serve without staging."""
-    return (
-        not api._rope_max_s
-        and api.head_dim_v == api.flavor_d_v
-        and api.head_dim_qk % 8 == 0
-        and all(all(n == 1 or st % 8 == 0 for n, st in zip(desc.shape[:-1], desc.stride[:-1])) for desc in (api.q_desc, api.k_desc, api.v_desc, api.o_desc))
-    )
+    from cudnn.sdpa.native_sm80 import forward_adapter_mismatch
+
+    return forward_adapter_mismatch(api) is None
 
 
-def build_spec(api, *, compiler=None):
+def build_spec(api):
     from cudnn.frost.buffers import is_contiguous
     from cudnn.frost.compiled_cache import template_key
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_host
@@ -89,77 +85,57 @@ def build_spec(api, *, compiler=None):
     else:
         operands.append(None)
         geometry.append(None)
-    if api._rope_max_s:
-        add((api._rope_max_s, api.flavor_d_qk // 2, 2), (api.flavor_d_qk, 2, 1), "float32", 4)
+    if api.paged:
+        for shape, strides in api._sm80_paged_table_geometry:
+            add(shape, strides, "int32", 4)
     geometry = tuple(geometry)
+    from cudnn.sdpa.fwd.kernels.sm100.split_combine import FROST_SOURCE_DIGEST as combine_digest
+
     key = template_key(
         vars(api._k_mod),
-        dict(geometry=geometry, swa_window=api.swa_window_runtime, right_bound=api.right_bound_runtime),
+        dict(
+            geometry=geometry,
+            swa_window=api.swa_window_runtime,
+            right_bound=api.right_bound_runtime,
+            max_skv=api.s_k_max if api.paged else None,
+            combine_digest=combine_digest if api.split_kv > 1 else None,
+        ),
         "prepared_dense",
     )
-    artifact = (compile_host if compiler is None else compiler)(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key)
+    artifact = compile_host(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key, api.s_k_max if api.paged else None)
     fn = positional_entry(artifact)
     if fn is None:
         raise NotImplementedError("SM80 prepared forward requires a positional tvm-ffi entry")
-    return LaunchSpec(artifact, fn, tuple(operands), int(api.q_desc.device.index or 0), api.scale_softmax)
-
-
-def _same_geometry(actual, expected):
-    # Graph Stats and vector operands may carry extra singleton dimensions.
-    return tuple((n, st) for n, st in zip(*actual) if n != 1) == tuple((n, st) for n, st in zip(*expected) if n != 1)
+    return LaunchSpec(artifact, fn, tuple(operands), int(api.q_desc.device.index or 0), api.scale_softmax, api.scratch_workspace_bytes())
 
 
 def bind(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False):
-    frame = []
-    for name, op in zip(ROLES, spec.operands):
-        f = facts.get(name)
-        if op is None:
-            if f is not None:
-                raise ValueError(f"sdpa_fwd_sm80: {name} was not compiled into this specialization")
-            frame.append(None)
-            continue
-        if f is None:
-            raise ValueError(f"sdpa_fwd_sm80: {name} is required by this specialization")
-        if f.device not in ((2, spec.device_index), (-1, -1)):
-            raise ValueError(f"sdpa_fwd_sm80: {name} must be on CUDA device {spec.device_index}")
-        if f.dtype and f.dtype != op.dtype:
-            raise ValueError(f"sdpa_fwd_sm80: {name} must be {op.dtype}; got {f.dtype}")
-        if not f.ptr or f.ptr % op.alignment:
-            raise ValueError(f"sdpa_fwd_sm80: {name} base address must be {op.alignment}-byte aligned")
-        if f.span >= 0 and f.span < op.span:
-            raise ValueError(f"sdpa_fwd_sm80: {name} backing storage is too small for the declared strides")
-        if not raw_storage and name in ("seq_q", "seq_kv", "sink") and f.shape:
-            if not f.contiguous or f.numel != math.prod(op.shape):
-                raise ValueError(f"sdpa_fwd_sm80: {name} must be contiguous with {math.prod(op.shape)} elements")
-        elif not raw_storage and name == "stats" and f.shape:
-            # Preserve the standalone Stats storage contract: compact plans may
-            # bind a flat contiguous buffer; strided plans use declared strides.
-            if f.numel != math.prod(op.shape) or (op.contiguous and not f.contiguous):
-                raise ValueError("sdpa_fwd_sm80: Stats must match the declared element count and storage layout")
-        elif not raw_storage and name == "bias" and f.shape:
-            # The standalone ABI broadcasts the first contiguous [H,SQ,SKV]
-            # bias plane; retain that view semantics without constructing it.
-            if len(f.shape) != 4 or f.shape[0] < 1 or not _same_geometry((f.shape[1:], f.strides[1:]), (op.shape[1:], op.strides[1:])):
-                raise ValueError("sdpa_fwd_sm80: bias must have a contiguous [H,SQ,SKV] first plane")
-        elif (not raw_storage or (overridden is not None and name in overridden)) and f.shape:
-            if not _same_geometry((f.shape, f.strides), (op.shape, op.strides)):
-                raise ValueError(f"sdpa_fwd_sm80: {name} runtime geometry must match this fixed forward plan")
-        frame.append(f.ptr)
-    scale = spec.scale if scale is None or scale == 0 else float(scale)
-    frame.extend((scale * math.log2(math.e), 1.0 / scale, stream_int))
-    return frame
+    """Bind native metadata through the template's sole native contract."""
+    from .prepared import _native_pack_from_facts
+
+    roles = PAGED_ROLES[: len(spec.operands)]
+    pack = _native_pack_from_facts(facts, roles)
+    overridden_indices = tuple(i for i, role in enumerate(roles) if overridden is not None and role in overridden)
+    return list(spec.native.bind(pack, tuple(range(len(roles))), stream_int, scale, overridden_indices, raw_storage))
 
 
-def execute(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False):
-    spec.fn(*bind(spec, facts, stream_int, scale=scale, overridden=overridden, raw_storage=raw_storage))
+def execute(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False, workspace_ptr=0):
+    _check_workspace_pointer(spec, workspace_ptr)
+    frame = bind(spec, facts, stream_int, scale=scale, overridden=overridden, raw_storage=raw_storage)
+    spec.fn(*frame, *((workspace_ptr,) if spec.workspace_bytes else ()))
+
+
+def _check_workspace_pointer(spec, workspace_ptr):
+    if spec.workspace_bytes and (not workspace_ptr or workspace_ptr % 16):
+        raise ValueError("SM80 split-KV workspace must be non-null and 16-byte aligned")
 
 
 class PreparedSm80Launch:
     def __init__(self, spec, binding):
         self.spec = spec
-        attributes = ("q", "k", "v", "o", "stats", "seq_len_kv", "seq_len_q", "sink_token", "bias")
-        tensors = [getattr(binding, name) for name in attributes]
-        self._roles = [name for name, t in zip(ROLES, tensors) if t is not None]
+        attributes = ("q", "k", "v", "o", "stats", "seq_len_kv", "seq_len_q", "sink_token", "bias", "paged_k_table", "paged_v_table")
+        tensors = [getattr(binding, name) for name in attributes[: len(spec.operands)]]
+        self._roles = [name for name, t in zip(PAGED_ROLES, tensors) if t is not None]
         self._uids = [t.get_uid() for t in tensors if t is not None]
         self._indices = None
         self._native_indices = None
@@ -167,26 +143,34 @@ class PreparedSm80Launch:
     def execute(self, pack, workspace_ptr, stream, stream_int):
         if self._indices is None:
             self._indices = [pack.index_of(uid) for uid in self._uids]
-        if self.spec.native is not None:
-            if self._native_indices is None:
-                roles = dict(zip(self._roles, self._indices))
-                self._native_indices = tuple(roles.get(role, -1) for role in ROLES[: len(self.spec.operands)])
+        if self._native_indices is None:
+            roles = dict(zip(self._roles, self._indices))
+            self._native_indices = tuple(roles.get(role, -1) for role in PAGED_ROLES[: len(self.spec.operands)])
+        if self.spec.workspace_bytes:
+            _check_workspace_pointer(self.spec, workspace_ptr)
+            frame = self.spec.native.bind(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
+            self.spec.fn(*frame, workspace_ptr)
+        else:
             self.spec.native.execute(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
-            return
-        facts = dict(zip(self._roles, facts_of_roles(pack, self._indices)))
-        overridden = {role for role, index in zip(self._roles, self._indices) if index in pack.overridden}
-        execute(self.spec, facts, stream_int, overridden=overridden, raw_storage=True)
 
 
-def execute_tensors(spec, buffers, stream_int, *, scale=None):
+def execute_tensors(spec, buffers, stream_int, *, scale=None, workspace=None):
     """Observe current standalone carriers once; keep their stricter contract."""
     from cudnn import _pybind_module
     from cudnn.sdpa.fwd.prepared import _set_native_fact, facts_of_tensor
 
-    if spec.native is None:
-        facts = {role: facts_of_tensor(t) for role, t in zip(ROLES, buffers)}
-        return execute(spec, facts, stream_int, scale=scale)
+    workspace_ptr = 0
+    if spec.workspace_bytes:
+        ws = facts_of_tensor(workspace) if workspace is not None else None
+        if ws is None or ws.device != (2, spec.device_index) or not ws.contiguous or ws.numel * workspace.element_size() < spec.workspace_bytes:
+            raise ValueError(f"SM80 split-KV requires a contiguous {spec.workspace_bytes}-byte workspace on the plan device")
+        workspace_ptr = ws.ptr
+        _check_workspace_pointer(spec, workspace_ptr)
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
-    spec.native.execute(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)
+    if spec.workspace_bytes:
+        frame = spec.native.bind(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)
+        spec.fn(*frame, workspace_ptr)
+    else:
+        spec.native.execute(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)

@@ -119,8 +119,11 @@ The device tensors use `nv_bfloat16`. The host-side reference math uses `float` 
 
 ```cpp
 #include <iostream>
+#include <cmath>
+#include <memory>
 #include <random>
 #include <unordered_map>
+#include <vector>
 
 #include <cuda_runtime.h>   // from $CUDA_HOME/include
 #include <cudnn_frontend.h> // from $CUDNN_FRONTEND_HOME/include

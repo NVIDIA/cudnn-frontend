@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Geometry memoization must never reuse storage observations or launch bindings."""
 
+import sdpa_binding_reference as binding_reference
+
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +19,7 @@ def _facts(**changes):
 
 
 def _role(facts, *, b=2, heads=2, d=8, s_max=4, tma=True):
-    return prepared._dense_role(SimpleNamespace(b=b, device_index=0), {"q": facts}, "q", heads, d, s_max, "float16", tma=tma)
+    return binding_reference._dense_role(SimpleNamespace(b=b, device_index=0), {"q": facts}, "q", heads, d, s_max, "float16", tma=tma)
 
 
 def test_dense_geometry_reuses_validation_and_rebinds_storage(monkeypatch):
@@ -59,8 +61,8 @@ def test_dense_geometry_preserves_wide_strides_and_span():
 
 
 def test_dense_geometry_distinguishes_tma_from_plain_output():
-    f = _facts(strides=(64, 32, 8, 1))
-    assert _role(f, tma=False).strides == (64, 8, 32)
+    f = _facts(strides=(80, 36, 8, 1), span=148)
+    assert _role(f, tma=False).strides == (80, 8, 36)
     with pytest.raises(ValueError, match="zero-copy"):
         _role(f, tma=True)
 
@@ -68,7 +70,7 @@ def test_dense_geometry_distinguishes_tma_from_plain_output():
 def test_stats_geometry_keeps_current_pointer_device_span_and_alias_checks():
     spec = SimpleNamespace(qh=2, device_index=0)
     f = prepared.BufferFacts(4096, "float32", (2, 0), 16, (2, 2, 4), (8, 4, 1))
-    bind = lambda fact, b=2, sq=4: prepared._dense_lse(spec, fact, b, sq, required=True)
+    bind = lambda fact, b=2, sq=4: binding_reference._dense_lse(spec, fact, b, sq, required=True)
     assert bind(f)[0] == 4096
     assert bind(f._replace(ptr=8192))[0] == 8192
     for changed, error in (({"ptr": 4097}, "aligned"), ({"span": 15}, "spans"), ({"device": (2, 1)}, "device"), ({"strides": (8, 1, 1)}, "alias")):

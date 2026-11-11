@@ -532,6 +532,7 @@ CUTEDSL_MIN_VERSION = (4, 7, 0)
 _RELEASE_INT = _re.compile(r"^(\d+)")  # leading integer of one version component ("2rc1" -> 2)
 
 _DSL_STATE = None
+_DSL_PRIMITIVES = None
 
 
 def cutedsl_state():
@@ -568,10 +569,13 @@ def cutedsl_state():
     return _DSL_STATE
 
 
-def cutedsl_too_old(version):
-    """``(distribution, version)`` is the public wheel, below the floor.
+def cutedsl_too_old(version, floor=CUTEDSL_MIN_VERSION):
+    """``(distribution, version)`` is the public wheel, below ``floor``.
 
-    Absent, unparsable, or an internal RC counts as NOT too old: internal builds
+    ``floor`` is the library floor ``CUTEDSL_MIN_VERSION`` unless a kernel passes
+    its own, higher one (Rule 7: every floor through this one parser, never a
+    second copy of it).  Absent, unparsable, or an internal RC counts as NOT too
+    old: internal builds
     carry their own numbering ("0.3.0+2026...") that the public floor cannot
     judge, and refusing on a string we failed to read would decline on a machine
     that works.
@@ -597,7 +601,7 @@ def cutedsl_too_old(version):
     # A short public version ("4.6") means the omitted components are zero
     # ("4.6.0"), so it compares against the floor instead of slipping past it.
     parts += [0] * (3 - len(parts))
-    return tuple(parts) < CUTEDSL_MIN_VERSION
+    return tuple(parts) < tuple(floor)
 
 
 @lru_cache(maxsize=1)
@@ -610,7 +614,16 @@ def _cutedsl_has_sm107():
 
 
 def cutedsl_arch_requirement_error(device_cc):
-    """Reject a DSL without the target architecture before kernel compilation."""
+    """Reject a DSL without the target architecture before kernel compilation.
+
+    The TARGET half of the public probe :func:`cudnn.frost.cutedsl_runtime_available`: cc 10.7 needs a DSL whose
+    ``Arch`` knows ``sm_107a`` (the public 4.8.0 wheel is the first), so the floor is 4.7.0 everywhere and 4.8.0 on
+    cc 10.7. A part below cc 8.0 has no target in any CuTe DSL (its ``Arch`` starts at ``sm_80``; compiling for a
+    Turing part raises ``KeyError: 'sm_75'`` inside the DSL), so it is refused without importing the DSL. None when
+    the target is present; otherwise the message names the part or the installed DSL."""
+    if device_cc is not None and tuple(device_cc) < (8, 0):
+        major, minor = device_cc
+        return f"the CuTe DSL has no target below SM80 (its Arch starts at sm_80); found cc {major}.{minor}"
     if device_cc != (10, 7) or _cutedsl_has_sm107():
         return None
     _, version = cutedsl_state()
@@ -618,18 +631,58 @@ def cutedsl_arch_requirement_error(device_cc):
     return f"SM107 requires a CuTe DSL build supporting sm_107a; found {found} without that target"
 
 
-def cutedsl_requirement_error(what):
-    """Message naming the installed DSL version when it is below the floor, else None.
+def cutedsl_primitives_error(what):
+    """Message when the DSL is new enough but exports no ``cutlass.experimental.primitives``.
 
+    The kernels that call this import the primitive layer under the name public
+    wheels ship, ``cutlass.experimental.primitives`` (builds that also export
+    ``cutlass.primitives`` alias it to the same module). Clearing the version
+    floor does not imply that module is reachable, and it can be an alias with
+    no directory of its own -- so neither the version nor the filesystem answers
+    this. Only an import does.
+
+    That import executes the cutlass package (~1 s), which is why this is NOT
+    folded into :func:`cutedsl_requirement_error`: callers run it last, once an
+    engine would otherwise accept, where lowering is about to import the DSL
+    anyway. Declining here still beats the alternative, which is an ImportError
+    raised from inside the lowering with the plan already in the ranked list.
+    """
+    global _DSL_PRIMITIVES
+    if _DSL_PRIMITIVES is None:
+        import importlib
+
+        try:
+            importlib.import_module("cutlass.experimental.primitives")
+            _DSL_PRIMITIVES = False
+        except Exception:  # noqa: BLE001 - any failure to reach it is the same answer
+            _DSL_PRIMITIVES = True
+    if not _DSL_PRIMITIVES:
+        return None
+    _, version = cutedsl_state()
+    found = version[1] if version else "unknown"
+    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
+    return (
+        f"{what} lowers through the CuTe DSL primitive layer (cutlass.experimental.primitives), "
+        f"which the installed nvidia-cutlass-dsl ({found}) does not export. "
+        f"Install a build that provides it (>= {floor})."
+    )
+
+
+def cutedsl_requirement_error(what, floor=CUTEDSL_MIN_VERSION):
+    """Message naming the installed DSL version when it is below ``floor``, else None.
+
+    ``floor`` is the library floor unless a kernel passes its own, higher one.
     Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
-    version problem, not as a missing dependency: pyproject's floor is the
-    downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
+    version problem, not as a missing dependency, even when an environment
+    bypasses the package dependency floor (see AGENTS.md Rule 7).
     """
     installed, version = cutedsl_state()
-    if not installed or not cutedsl_too_old(version):
+    if not installed:
         return None
-    floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
-    return f"{what} requires nvidia-cutlass-dsl >= {floor}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor}'"
+    floor_text = ".".join(str(x) for x in floor)
+    if cutedsl_too_old(version, floor):
+        return f"{what} requires nvidia-cutlass-dsl >= {floor_text}; found {version[1]}. " f"Upgrade with: pip install -U 'nvidia-cutlass-dsl>={floor_text}'"
+    return None
 
 
 def current_device_id():

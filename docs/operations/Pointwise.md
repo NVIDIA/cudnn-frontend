@@ -2,7 +2,7 @@
 
 ## Pointwise
 
-The pointwise operation performs an elementwise operation between two tensors. The operation used is controlled by pointwise mode `cudnn_frontend::PointwiseMode_t`.   
+The pointwise operation performs an elementwise operation on one, two, or three tensors. The operation used is controlled by pointwise mode `cudnn_frontend::PointwiseMode_t`.
 
 ### C++ API
 

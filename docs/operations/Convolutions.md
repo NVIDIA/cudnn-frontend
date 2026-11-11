@@ -79,7 +79,7 @@ These APIs are not selected automatically by `cudnn.pygraph`.
   normalization-and-padding variant writes current frames and zeros but leaves
   existing-history interiors for the caller to fill.
 
-See the [fused Conv3D + post-operations API reference](../fe-oss-apis/conv3d_postops.md)
+See the [fused Conv3D + post-operations API reference](/operations/Convolutions/conv3d_postops)
 for the complete per-variant channel table, tensor shapes, normalization math,
 weight formats, and history/stream contracts.
 
@@ -90,8 +90,8 @@ Convolution dgrad computes data gradient during backpropagation.
 ### C++ API
 
 ```
-std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes> image,
-                                                  std::shared_ptr<Tensor_attributes> filter,
+std::shared_ptr<Tensor_attributes> conv_dgrad(std::shared_ptr<Tensor_attributes> dy,
+                                                  std::shared_ptr<Tensor_attributes> w,
                                                   Conv_dgrad_attributes);
 ```
 
@@ -129,6 +129,19 @@ set_convolution_mode(ConvolutionMode_t mode_)
     - compute_data_type
     - name
 
+`conv_dgrad` infers the dims of the returned dX from `loss`, `filter` and the padding/stride/dilation
+attributes; per spatial axis the inferred extent is
+`(S_loss - 1) * stride + (R - 1) * dilation + 1 - (pre_padding + post_padding)` (minus `2 * padding` for
+the symmetric-padding overload). With `stride > 1` the forward extent division loses the remainder, so
+the inferred dX can be smaller than the forward input even without padding: a 32x32 input with a 3x3
+filter infers a 31x31 dX at stride 2 and padding 0, while stride 1 with padding 1 infers 32x32. Set the
+dims and strides explicitly to get a dX shaped like the forward input:
+
+```python
+dX = graph.conv_dgrad(loss=dY, filter=W, padding=[1, 1], stride=[2, 2], dilation=[1, 1])
+dX.set_output(True).set_dim(list(X.get_dim())).set_stride(list(X.get_stride()))
+```
+
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.
 
 ## Convolution Wgrad
@@ -138,8 +151,8 @@ Convolution wgrad computes weight gradient during backpropagation.
 ### C++ API
 
 ```
-std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes> image,
-                                                  std::shared_ptr<Tensor_attributes> filter,
+std::shared_ptr<Tensor_attributes> conv_wgrad(std::shared_ptr<Tensor_attributes> dy,
+                                                  std::shared_ptr<Tensor_attributes> x,
                                                   Conv_wgrad_attributes);
 ```
 
@@ -176,5 +189,13 @@ set_convolution_mode(ConvolutionMode_t mode_)
     - convolution_mode
     - compute_data_type
     - name
+
+`conv_wgrad` cannot infer the dims of the returned dW from the graph inputs; set them explicitly
+(the filter dims/strides) before marking it an output, otherwise graph construction fails with `dims not set`:
+
+```python
+dW = graph.conv_wgrad(image=X, loss=dY, padding=[1, 1], stride=[2, 2], dilation=[1, 1])
+dW.set_output(True).set_dim(list(W.get_dim())).set_stride(list(W.get_stride()))
+```
 
 The symmetric-padding overload accepts `padding` in place of `pre_padding` and `post_padding`.

@@ -7,11 +7,12 @@
 #include <stdexcept>
 #include <string>
 
-#include "pybind11/pybind11.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
 
 #include "cudnn_frontend.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 

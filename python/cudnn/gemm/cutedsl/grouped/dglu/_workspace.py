@@ -20,10 +20,15 @@ def validate_workspace_aliases(workspace_ptr, workspace_bytes, **operands):
         if tensor is None:
             continue
         if is_torch_tensor(tensor):
-            if not tensor.numel():
+            nbytes = tensor.nbytes
+            if not nbytes:
                 continue
-            begin, itemsize = tensor.data_ptr(), tensor.element_size()
-            shape, strides = tensor.shape, None if tensor.is_contiguous() else tensor.stride()
+            begin = tensor.data_ptr()
+            if tensor.is_contiguous():
+                if workspace_ptr < begin + nbytes and begin < workspace_end:
+                    raise ValueError(f"workspace must not overlap {name}")
+                continue
+            itemsize, shape, strides = tensor.element_size(), tensor.shape, tensor.stride()
         elif is_jax_array(tensor):
             # JAX does not accept DLPack's stream=-1 sentinel. Read the same
             # host metadata used by the tensor adapter; never export/sync here.

@@ -67,6 +67,7 @@ def test_backend_mirror_values_are_frozen():
 
 
 def test_frontend_only_band():
+    """Keep frontend knob values stable and reject forwarding them to the backend."""
     kt = cudnn.knob_type
     assert cudnn.FRONTEND_KNOB_TYPE_BASE == 1000
     fe_only = {
@@ -80,6 +81,7 @@ def test_frontend_only_band():
         "CTA_GROUP": 1007,
         "WARPS_M": 1008,
         "WARPS_N": 1009,
+        "CLUSTER_K_REDUCE": 1010,
     }
     # The frontend band is persisted too: append-only, frozen here like the backend band.
     assert {name: int(member) for name, member in kt.__members__.items() if cudnn.is_frontend_knob_type(member)} == fe_only
@@ -89,7 +91,8 @@ def test_frontend_only_band():
     assert kt(1002) == kt.SPLIT_KV and int(kt(1002)) == 1002
 
 
-def test_frontend_only_knob_is_refused_by_a_backend_plan():
+@pytest.mark.parametrize("member,value", [("SPLIT_KV", 2), ("CLUSTER_K_REDUCE", 1)])
+def test_frontend_only_knob_is_refused_by_a_backend_plan(member, value):
     """A frontend-only knob has no backend counterpart; handing one to a
     backend engine must fail loudly rather than silently mis-map."""
     handle = cudnn.create_handle()
@@ -105,7 +108,7 @@ def test_frontend_only_knob_is_refused_by_a_backend_plan():
     # convert_to_backend_knob_type answers CUDNN_STATUS_NOT_SUPPORTED for the
     # frontend-only band; the binding surfaces that as a RuntimeError at replay.
     with pytest.raises(RuntimeError, match=r"convert_to_backend_knob_type.*CUDNN_STATUS_NOT_SUPPORTED"):
-        g.create_execution_plan(backend_id, {cudnn.knob_type.SPLIT_KV: 2})
+        g.create_execution_plan(backend_id, {getattr(cudnn.knob_type, member): value})
 
 
 def test_backend_plan_knobs_are_a_dict_never_none():
@@ -177,6 +180,9 @@ def test_sdpa_fwd_knobs_round_trip():
     # is the sdpa(softmax_precision=) op attribute, not a SdpaFwdKnobs field
     assert "softmax_precision" not in SdpaFwdKnobs.__dataclass_fields__
     assert not hasattr(kt, "SOFTMAX_PRECISION")
+    # ... nor is the pre-folded attention scale: sdpa(attn_scale_prefolded=True) is a contract on Q
+    assert "attn_scale_prefolded" not in SdpaFwdKnobs.__dataclass_fields__
+    assert not hasattr(kt, "ATTN_SCALE_PREFOLDED")
     # unset fields do not appear; integer keys (a persisted record) are accepted
     assert SdpaFwdKnobs(tile_m=64).to_public() == {kt.TILE_M: 64}
     assert SdpaFwdKnobs.from_public({int(kt.TILE_M): 64, int(kt.PACK_GQA): 0}) == SdpaFwdKnobs(tile_m=64, pack_gqa=False)

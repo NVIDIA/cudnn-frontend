@@ -97,16 +97,19 @@ def test_dglu_bf16_dactivation_rounding(discrete, vector_f32, act_func):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        run()
-    torch.cuda.current_stream().wait_stream(stream)
-    for scale in (1.0, -1.0):
-        p["a"][:, :2] = scale
-        p["prob"][::17] = 0
-        p["d"].fill_(float("nan"))
-        p["dprob"].fill_(float("nan"))
-        graph.replay()
-        check(p, p["d"], True)
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        for scale in (1.0, -1.0):
+            p["a"][:, :2] = scale
+            p["prob"][::17] = 0
+            p["d"].fill_(float("nan"))
+            p["dprob"].fill_(float("nan"))
+            graph.replay()
+            check(p, p["d"], True)
+    finally:
+        graph.reset()
 
 
 def test_dglu_wrapper_rounding_compile_identity():

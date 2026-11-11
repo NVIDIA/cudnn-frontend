@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: MIT
 """Native output gates retain current storage, full-width strides and ungated statistics."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 import torch
 
 import cudnn
 from cudnn.sdpa.fwd import prepared as prep
+from native_gate_cases import _case
 from test_sdpa_native_prefill_binding import _prefill_fixture
 from test_sdpa_native_fp8_binding import _fixture as _fp8_fixture
 from test_sdpa_native_mxfp8_binding import _fixture as _mx_fixture
@@ -40,11 +43,11 @@ def test_native_gate_actual_host_frames_and_changed_pointers(kind):
     for offset, stream in ((0, 17), (2**33, 23)):
         fresh = {name: f._replace(ptr=f.ptr + offset) if f is not None else None for name, f in facts.items()}
         if s.quant is None:
-            expected = tuple(prep.bind_dense(s, fresh, stream, stream))
+            expected = tuple(binding_reference.bind_dense(s, fresh, stream, stream))
         else:
             native, s.native = s.native, None
             try:
-                prep.execute_quantized(s, fresh, 0x50000000 + offset, stream, stream)
+                binding_reference.execute_quantized(s, fresh, 0x50000000 + offset, stream, stream)
             finally:
                 s.native = native
             expected = frames.pop()
@@ -82,49 +85,6 @@ def test_native_gate_rejects_current_storage_before_writes(kind, bad, monkeypatc
     assert frames == writes == []
 
 
-def _case(kind, gate, *, b=2):
-    if torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("existing fused SDPA output gate requires SM107")
-    if kind in ("fp8", "mx"):
-        from test_sdpa_prepared_quantized_gate import _helper
-
-        return _helper(kind == "mx")._case(d=256, arch="sm107", gate=gate, b=b)
-    from frost_test_utils import select_engine
-
-    torch.manual_seed(623)
-    dtype = getattr(torch, kind)
-    g = cudnn.pygraph(
-        io_data_type=cudnn.data_type.HALF if kind == "float16" else cudnn.data_type.BFLOAT16,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    bufs, ts, vp = {}, {}, {}
-    for name, heads in (("q", 4), ("k", 2), ("v", 2)):
-        bufs[name] = (torch.randn(b, 128, heads, 256, device="cuda") * 0.4).to(dtype).transpose(1, 2)
-        ts[name] = g.tensor_like(bufs[name])
-        vp[ts[name]] = bufs[name]
-    bufs["gate"], ts["gate"] = gate, g.tensor_like(gate)
-    vp[ts["gate"]] = gate
-    o, lse = g.sdpa(q=ts["q"], k=ts["k"], v=ts["v"], attn_scale=256**-0.5, generate_stats=True)
-    shape, strides = [b, 4, 128, 256], [128 * 4 * 256, 256, 4 * 256, 1]
-    o.set_dim(shape).set_stride(strides)
-    o = g.mul(a=o, b=g.sigmoid(input=ts["gate"]))
-    o.set_output(True).set_dim(shape).set_stride(strides)
-    lse.set_output(True).set_dim([b, 4, 128, 1]).set_stride([4 * 128, 128, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-    bufs["o"] = torch.empty((b, 128, 4, 256), device="cuda", dtype=dtype).transpose(1, 2)
-    bufs["lse"] = torch.empty((b, 4, 128), device="cuda")
-    ts.update(o=o, lse=lse)
-    vp.update({o: bufs["o"], lse: bufs["lse"]})
-    g.validate()
-    g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, "sdpa_fwd_prefill_sm107", pack_gqa=False)
-    g.check_support()
-    g.build_plans()
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    return g, vp, ws, bufs, ts
-
-
 def _same_outputs(bufs, expected):
     for name in ("o", "lse", "amax_o"):
         if name in bufs:
@@ -143,7 +103,7 @@ def test_native_gate_fresh_buffers_and_changed_replay(kind, ordered, monkeypatch
     ref, rvp, rws, rb, rt = _case(kind, gate.clone())
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None, "parent still binds the epilogue gate in Python"
-    ref._compiled_plans[ref._plan_index]._prepared.spec.native = None
+    binding_reference.use_reference(ref._compiled_plans[ref._plan_index]._prepared.spec)
     for name, t in ts.items():
         if name in bufs:
             bufs[name] = bufs[name].clone()
@@ -162,7 +122,7 @@ def test_native_gate_fresh_buffers_and_changed_replay(kind, ordered, monkeypatch
     try:
         with monkeypatch.context() as guard:
             guard.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native gate rebuilt Python facts"))
-            guard.setattr(prep, "execute_quantized", lambda *a, **kw: pytest.fail("native gate entered Python binding"))
+            guard.setattr(prep, "execute_quantized", lambda *a, **kw: pytest.fail("native gate entered Python binding"), raising=False)
             call()
             _same_outputs(bufs, rb)
             with torch.cuda.graph(capture):
@@ -199,7 +159,7 @@ def test_native_gate_physical_int64_stride_and_product(kind, product):
     g, vp, ws, bufs, ts = _case(kind, gate, b=batch)
     ref, rvp, rws, rb, _ = _case(kind, gate.transpose(1, 2).contiguous().transpose(1, 2), b=batch)
     assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
-    ref._compiled_plans[ref._plan_index]._prepared.spec.native = None
+    binding_reference.use_reference(ref._compiled_plans[ref._plan_index]._prepared.spec)
     ref.execute(rvp, rws)
     g.execute(vp, ws)
     _same_outputs(bufs, rb)

@@ -11,6 +11,31 @@ import sys
 import cudnn
 
 
+def run_artifact_child(child, args, *, env, cwd, timeout=300):
+    """Keep the child's stack and captured output when a cold-process check times out."""
+    # The parent watchdog otherwise shows only subprocess.communicate(), hiding
+    # whether the child is importing, compiling, executing or checking numerics.
+    preamble = f"import faulthandler\nfaulthandler.dump_traceback_later({timeout * 0.9!r})\n"
+    try:
+        return subprocess.run(
+            [sys.executable, "-u", "-c", preamble + child, *args],
+            env=env,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired carries bytes even with text=True; retain both streams.
+        def text(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+
+        raise AssertionError(
+            f"Artifact child timed out after {timeout}s; args={args!r}\n"
+            f"--- child stdout ---\n{text(exc.stdout)}\n--- child stderr / stack ---\n{text(exc.stderr)}"
+        ) from None
+
+
 def check_backward_artifact_reload(arch, route, dtype, cache_dir):
     child = r"""
 import json, sys
@@ -22,6 +47,11 @@ from cudnn.frost import compiled_cache
 tests, package, arch, route, dtype, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
+if route.endswith("_2x2"):
+    # The SM100 d512 chain's 2x2 stage-2 twin: a module constant read when the plan compiles, flipped before anything builds.
+    from cudnn.sdpa.bwd import api_dsl
+    api_dsl.STAGE2_2X2 = True
+    route = route[: -len("_2x2")]
 if reload == "1":
     def forbidden(*a, **kw):
         raise AssertionError("prepared backward plan invoked JIT in the second process")
@@ -86,6 +116,12 @@ elif arch == "sm107":
     g, vp, ws = case.graph, case.pack, case.workspace
     outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
     check = lambda: _check_prepared(case)
+elif arch == "sm100_d256":
+    from test_sdpa_bwd_d256_sm100 import _prepared_case, _check_prepared
+    case = _prepared_case(dt=dtype, causal=(route != "dense"))
+    g, vp, ws = case.graph, case.pack, case.workspace
+    outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
+    check = lambda: _check_prepared(case)
 elif route == "dense":
     from test_sdpa_bwd_dsl_sm100 import _prepared_case, _check_prepared
     case = _prepared_case(dtype=dtype, chunks=True)
@@ -125,13 +161,11 @@ print(json.dumps(compiled_cache.stats()))
     env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
     results = []
     for reload in (0, 1):
-        result = subprocess.run(
-            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, arch, route, dtype, str(reload)],
+        result = run_artifact_child(
+            child,
+            [str(Path(__file__).parent), cudnn.__file__, arch, route, dtype, str(reload)],
             env=env,
             cwd=cache_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,
         )
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-5000:]
         results.append(json.loads(result.stdout.strip().splitlines()[-1]))

@@ -1,0 +1,72 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "659da51fd77941888327e7c9b14de28ee126e4a411e56f664a37bbe775c701d0",
+      "shape": [
+        2,
+        257,
+        512
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "6c2023bf072676c747b705134ebaf3844da19711bd252e352aad6dca9b758105",
+      "shape": [
+        256,
+        17,
+        512
+      ]
+    },
+    "sink": {
+      "dtype": "torch.float32",
+      "sha256": "e449c3276b6147d4a72ff0b4e5dd3e8b3a7893b572414dddc282624af3caf0e7",
+      "shape": [
+        256
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "6a2af2d4b55d282ed6ea02bf47afae3667a93cf40fa0173f625fb90eebd342af",
+      "shape": [
+        2,
+        257,
+        512
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "907e8aeaf728d7d46b3560fc14029fa8f6cb9292bcc2ae7a51ccf8d336e38377",
+      "shape": [
+        256,
+        17
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "49384bf3f4cf6a113918bee817da637d8b509cee6faa739ef6106bd01a06e9e1",
+      "shape": [
+        256,
+        17,
+        512
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92800,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA H100 NVL",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

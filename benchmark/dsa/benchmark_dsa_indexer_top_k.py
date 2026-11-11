@@ -174,7 +174,7 @@ def main():
     if args.samples < 1 or args.warmup < 1:
         parser.error("samples and warmup must be positive")
     metadata = {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "cuda": torch.version.cuda, **vars(args)}
-    metadata.update(api_source=topk_api.__file__, kernel_source=topk_api._get_cute_dsl_topk_wrapper().__code__.co_filename)
+    metadata.update(api_source=topk_api.__file__, kernel_source=topk_api._kernel_module().__file__)
     print("# " + json.dumps(metadata), flush=True)
     print("# Zigzag CP-local FP32 scores; cold-L2 graph GPU milliseconds per local selector call; speedup<1 means tie_break=2 is slower.", flush=True)
     handle = open(args.csv, "x", newline="") if args.csv else None

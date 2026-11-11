@@ -44,7 +44,8 @@ SOFTWARE.
 
 Portions of the CuTe DSL attention kernels under
 python/cudnn/block_sparse_attention/ and
-python/cudnn/deepseek_sparse_attention/, along with selected low-level
+python/cudnn/deepseek_sparse_attention/ and
+python/cudnn/flex_attention/, along with selected low-level
 utilities under python/cudnn/hstu/hstu_attention/_kernels/, are derived from
 FlashAttention. Those files retain their original author copyright notices
 (Tri Dao; Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar,
@@ -200,14 +201,14 @@ system, for the Python bindings' tensor-exchange interface.
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 
 -------------------------------------------------------------------------------
-8. pybind11
-   https://github.com/pybind/pybind11
+8. nanobind
+   https://github.com/wjakob/nanobind
 
-Build-time dependency (v2.13.6) used to build the Python bindings.
+Build-time dependency (v3.0.1 or newer 3.x) used to build the Python bindings.
 
 License: BSD-style 3-Clause License
 
-Copyright (c) 2016 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.
+Copyright (c) 2022 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -281,7 +282,15 @@ b7643bd54521f563b839b98289b5cd048c062ba2:
 - python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head64.py
 - python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm100_head128_small_topk.py
 
-The derived kernel files retain the upstream copyright notice.
+The SM90 sparse-prefill CuTe DSL kernel is adapted primarily from FlashMLA's
+Hopper sparse-prefill implementation, pinned to commit
+4f38f29ef6793c228363e4af5be66d44e81167ba:
+
+- python/cudnn/deepseek_sparse_attention/sparse_attention_forward/dsa_fwd_sm90.py
+
+The derived kernel files retain the upstream copyright notice. The SM90 port
+adds wider H coverage, arbitrary logical K boundary handling, bounded symbolic
+compilation, and an allocation-free CUDA Graph prepared-execution contract.
 
 License: MIT License
 
@@ -346,3 +355,29 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+12. FlashInfer (flashinfer-ai/flashinfer)
+    https://github.com/flashinfer-ai/flashinfer
+
+The FP8 split-K projection kernel for decode rows in
+python/cudnn/gemm/frost/projection_decode/kernel/fp8_projection_decode_e4m3.py
+is derived from FlashInfer's cluster split-K dense GEMM kernel
+(flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py), pinned to
+flashinfer-python 0.7.2.post1 (commit beabf5004585b03da60e927bbb803acbaa62fe36).
+The derived file retains the upstream notice. The port replaces the BF16/FP16
+operands and the optional bias by FP8 E4M3 operands with a scalar FP32 scale and
+one BF16 cast, binds static shapes, reserves the shared memory the configuration
+uses, allocates the tensor-memory columns the accumulator needs, arms the
+cluster reduction barrier at the top of the epilogue role, offers an opt-in
+form that holds the tensor memory until the registers read from it are
+consumed, and adds the host entry with its typed declines and performance
+picks.
+
+FlashInfer's NOTICE:
+
+    FlashInfer
+    Copyright 2025-2026 NVIDIA
+    Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+License: Apache License 2.0 (same text as this repository's LICENSE.txt)

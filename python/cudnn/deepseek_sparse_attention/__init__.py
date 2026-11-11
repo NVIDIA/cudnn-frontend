@@ -15,6 +15,8 @@ _SYMBOLS = {
     "IndexerForward": (".indexer_forward", "IndexerForward"),
     "indexer_forward_wrapper": (".indexer_forward", "indexer_forward_wrapper"),
     "indexer_forward_top_k_wrapper": (".indexer_forward", "indexer_forward_top_k_wrapper"),
+    "IndexerForwardTopKPlan": (".indexer_forward", "IndexerForwardTopKPlan"),
+    "prepare_indexer_forward_top_k": (".indexer_forward", "prepare_indexer_forward_top_k"),
     "compress_topk_cand_buffer_size": (".indexer_forward", "compress_topk_cand_buffer_size"),
     "compress_topk_cand_buffer_size_thd": (".indexer_forward", "compress_topk_cand_buffer_size_thd"),
     "IndexerTopK": (".indexer_top_k", "IndexerTopK"),
@@ -33,6 +35,15 @@ _SYMBOLS = {
     "indexer_backward_wrapper": (".indexer_backward", "indexer_backward_wrapper"),
     "DenseIndexerBackward": (".indexer_backward", "DenseIndexerBackward"),
     "dense_indexer_backward_wrapper": (".indexer_backward", "dense_indexer_backward_wrapper"),
+    "pooled_keys_forward": (".pooled", "pooled_keys_forward"),
+    "unpool_backward": (".pooled", "unpool_backward"),
+    "pooled_indexer_target": (".pooled", "pooled_indexer_target"),
+    "pooled_indexer_backward": (".pooled", "pooled_indexer_backward"),
+    "pooled_indexer_select": (".pooled", "pooled_indexer_select"),
+    "pooled_expand_compact": (".pooled", "pooled_expand_compact"),
+    "pooled_sparse_attention_backward": (".pooled", "pooled_sparse_attention_backward"),
+    "pooled_sparse_attention_backward_with_teacher": (".pooled", "pooled_sparse_attention_backward_with_teacher"),
+    "pooled_teacher_recompute": (".pooled", "pooled_teacher_recompute"),
 }
 
 

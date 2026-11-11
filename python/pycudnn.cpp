@@ -6,14 +6,13 @@
 #include <stdexcept>
 #include <utility>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
 
 #include "cudnn_frontend.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend {
 
@@ -160,9 +159,11 @@ set_dlhandle_cudnn(std::intptr_t dlhandle) {
 #endif
 }
 
-PYBIND11_MODULE(_compiled_module, m) {
+NB_MODULE(_compiled_module, m) {
     m.def("backend_version", &detail::get_backend_version);
     m.def("backend_version_string", &detail::get_backend_version_string);
+    // Private. The header version can be older than backend_version(), and some features need both to be new enough.
+    m.attr("_compiled_cudnn_version") = CUDNN_VERSION;
 
     init_properties(m);
     init_pygraph_submodule(m);
@@ -171,7 +172,7 @@ PYBIND11_MODULE(_compiled_module, m) {
 
     m.def("_set_dlhandle_cudnn", &set_dlhandle_cudnn);
 
-    py::register_exception<cudnnGraphNotSupportedException>(m, "cudnnGraphNotSupportedError");
+    py::exception<cudnnGraphNotSupportedException>(m, "cudnnGraphNotSupportedError");
 
 #if CUDNN_VERSION >= 92200
     m.def("causal_conv1d_forward",

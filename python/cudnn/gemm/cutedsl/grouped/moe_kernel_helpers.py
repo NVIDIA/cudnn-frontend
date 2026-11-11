@@ -18,6 +18,7 @@ from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_helpers.warp_reduce import target_needs_shuffle_amax, warp_amax_with_nan
 from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -1129,6 +1130,11 @@ def get_tma_atom_kind(atom_sm_cnt: cutlass.Int32, mcast: cutlass.Boolean) -> Uni
 # ---------------------------------------------------------------------------
 
 
+def _target_needs_shuffle_amax():
+    """Preserve the grouped helper's original target-predicate entry point."""
+    return target_needs_shuffle_amax()
+
+
 @cute.jit
 def amax_reduction_per_thread(vec_fp32, amax_fp32):
     """Per-thread amax reduction over an FP32 register fragment."""
@@ -1216,10 +1222,10 @@ def quant_sfd_col(
     fp32_max = cutlass.Float32(3.40282346638528859812e38)
     tidx, _, _ = cute.arch.thread_idx()
     for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
-        max_value0 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
-        max_value1 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi + 1, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
-        max_value2 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi + 2, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
-        max_value3 = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi + 3, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+        max_value0 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
+        max_value1 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 1, 0]))
+        max_value2 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 2, 0]))
+        max_value3 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 3, 0]))
 
         scale = rcp_limit * norm_const
         max_value0, max_value1 = cute.arch.mul_packed_f32x2((max_value0, max_value1), (scale, scale), rnd="rn", ftz=False)

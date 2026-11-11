@@ -357,10 +357,12 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmGluHadamardQuantSm100 requires SM100+, found SM{compute_capability}")
+        if not has_tcgen05(major):
+            raise RuntimeError(f"GroupedGemmGluHadamardQuantSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         if not self._kernel.can_implement(
             _convert_to_cutlass_data_type(self.ab_dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2),
@@ -798,7 +800,51 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
     (2688/global_amax, or 1.0).
     """
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
+    from cudnn.tensor_adapter import detect_framework
 
+    if b_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_glu_hadamard_quant_jax_forward
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+            sf_vec_sizes=(16, 32),
+        )
+        for name, rejected in (("n", n is not None), ("b_dtype", b_dtype is not None)):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX block-scaled path")
+        return grouped_gemm_glu_hadamard_quant_jax_forward(
+            a_tensor,
+            b_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            padded_offsets,
+            alpha_tensor,
+            prob_tensor,
+            c_dtype=c_dtype if c_dtype is not None else cutlass.BFloat16,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            rht_rowwise_dtype=rht_rowwise_dtype,
+            rht_colwise_dtype=rht_colwise_dtype,
+            norm_const=norm_const,
+            rht_norm_const=rht_norm_const,
+            glu_alpha=glu_alpha,
+            glu_limit=glu_limit,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            sf_vec_size=sf_vec_size,
+            act_func=act_func,
+        )
     if a_tensor is not None:
         _require_torch_inputs(a_tensor, "grouped_gemm_glu_hadamard_quant_wrapper_sm100")
     import torch

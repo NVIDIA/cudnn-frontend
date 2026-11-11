@@ -1,0 +1,42 @@
+{
+  "repository": "https://github.com/radixark/miles-ext-kernels",
+  "commit": "f55fb99674be5edb0e1f6a0e4d6a911335da86ce",
+  "packages": {
+    "cake_gdn_det_train": {
+      "cake_revision": "ffade710ba0f2de1f73a1658a155c9564b6394b5",
+      "files": {
+        ".gitignore": "e5fd70b13ee2e116ccd3094d1035544ee7f627ed",
+        "build.json": "e8050d685f4426cf15fd2e6dc25de9be4b8410b3",
+        "cake_build.py": "00756137eb159e30a77907eda84fd245123d87ea",
+        "cake_jit.py": "59035228fc5839617e04452e49a7377d07c6293e",
+        "csrc/.clang-format": "47a38a93f2dbdd6d944f9dddc3465e3fb65aec29",
+        "csrc/cake_ffi_checks.h": "129288f9432e054dc51b77d93194fb0f2ec20d9c",
+        "csrc/cake_gdn_det_train_1d5927e5dc79d93aa80b_binding.cu": "1add9ed67721e06645587122e8eb4b2dab3955bf",
+        "csrc/cake_gdn_det_train_1d5927e5dc79d93aa80b_kernel.cu": "1a94ca5fa78f6a822deb914bd392c2cadcbd15ac",
+        "csrc/cake_gdn_det_train_3571aa28790b84013771_binding.cu": "71aeb18b34f193241f2c3a073b594cd98f6d0d21",
+        "csrc/cake_gdn_det_train_3571aa28790b84013771_kernel.cu": "d7f1df1084aeac682d0ceed865868bf088dd6332",
+        "csrc/cake_gdn_det_train_446adf6e2aa8ec228bc5_binding.cu": "ef5df7390f70ff28d839237019f764946822f15a",
+        "csrc/cake_gdn_det_train_446adf6e2aa8ec228bc5_kernel.cu": "f55e2842d3b8ed662eb4cd9179afb0985e0acc72",
+        "csrc/cake_gdn_det_train_4986279bc281c501d983_binding.cu": "86edc531d0c372d670a48692024111f668b9ead9",
+        "csrc/cake_gdn_det_train_4986279bc281c501d983_kernel.cu": "fab017e586aada8e6b8837d3f7dad169e38e9f9d",
+        "csrc/cake_gdn_det_train_969371cd5760127281dd_binding.cu": "f3cc86a88e7298049cff65d7c39c76dc95f6470b",
+        "csrc/cake_gdn_det_train_969371cd5760127281dd_kernel.cu": "f1838a87f1282a4560f12ba371ce4b0cbfde9508",
+        "csrc/cake_gdn_det_train_9a8bd9a7dff471f8a342_binding.cu": "d8bcf8ce8596c3133705e587896d68dbf612f5d0",
+        "csrc/cake_gdn_det_train_9a8bd9a7dff471f8a342_kernel.cu": "4009458747fef3a7eb29c8e52220b0d0ba014d6d",
+        "csrc/cake_gdn_det_train_cb4540bcd4f8b57b63fd_binding.cu": "61d30807b0ec79221e6f42e5bca90ea81679b181",
+        "csrc/cake_gdn_det_train_cb4540bcd4f8b57b63fd_kernel.cu": "b150ea9fa9975cbf141e0ffb2496e1eb5d86a87e",
+        "csrc/cake_gdn_det_train_fc6bd5c0f199747dda57_binding.cu": "c287672dcf885f3dc0d1ccb7e5df7ef0a5f6e6a0",
+        "csrc/cake_gdn_det_train_fc6bd5c0f199747dda57_kernel.cu": "38f4606df2f7545520ba4a9264348b4bf31215db"
+      },
+      "source": {
+        "commit": "f5ab85cc77edbd0257b0145eefe0113074dc6ee2",
+        "kind": "flashinfer",
+        "path": "flashinfer/experimental/cake/cake_gdn_det_train",
+        "repo": "https://github.com/flashinfer-ai/flashinfer"
+      },
+      "local_files": [
+        "__init__.py"
+      ]
+    }
+  }
+}

@@ -179,7 +179,8 @@ def setup_bwd(args, q, kv, topk_idxs, attn_sink, topk_length, softmax_scale):
     dout = torch.randn(s_q, num_heads, args.head_dim_vo, dtype=q.dtype, device=q.device).mul_(0.1)
     out, lse = reference_forward(q, kv, attn_sink, topk_idxs, softmax_scale, args.head_dim_vo)
     dq = torch.empty_like(q)
-    dkv = torch.zeros_like(kv)
+    dkv = torch.empty_like(kv)  # every route's finalizer overwrites all of dkv
+    d_sink = torch.empty_like(attn_sink)
 
     op = DSA.SparseAttentionBackward(
         q,
@@ -211,6 +212,7 @@ def setup_bwd(args, q, kv, topk_idxs, attn_sink, topk_length, softmax_scale):
             topk_idxs,
             dq=dq,
             dkv=dkv,
+            d_sink=d_sink,
             topk_length=topk_length,
             softmax_scale=softmax_scale,
             workspace=workspace,

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """The native record projection must preserve every observed and effective buffer fact."""
 
+import sdpa_binding_reference as binding_reference
+
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -90,7 +92,7 @@ def test_native_facts_still_reject_wrong_devices_and_short_observed_storage(devi
     fact = _project(native, [0])[0]
     assert fact == _accessor_projection(native, [0])[0]
     with pytest.raises(ValueError, match=match):
-        prep._dense_role(SimpleNamespace(b=2, device_index=0), {"q": fact}, "q", 8, 128, 1, "bfloat16")
+        binding_reference._dense_role(SimpleNamespace(b=2, device_index=0), {"q": fact}, "q", 8, 128, 1, "bfloat16")
 
 
 def test_native_facts_empty_unfilled_invalid_indices_and_constructor_errors():

@@ -37,13 +37,20 @@ def no_external_stream(monkeypatch):
     monkeypatch.setattr(torch.cuda, "ExternalStream", refuse)
 
 
-@pytest.mark.parametrize("handle", [0, 1, 2, "default"], ids=["null", "legacy", "per_thread", "torch_default"])
+@pytest.mark.parametrize("handle", [0, 1, "default"], ids=["null", "legacy", "torch_default"])
 def test_default_stream_handles_run_on_torch_default_stream(no_external_stream, handle):
     default = torch.cuda.default_stream()
     if handle == "default":
         handle = default.cuda_stream
     with marshal.stream_ctx(handle):
         assert torch.cuda.current_stream().cuda_stream == default.cuda_stream
+
+
+def test_per_thread_stream_handle_is_rejected(no_external_stream):
+    # cudaStreamPerThread is not the legacy default stream; cudnn._torch_stream refuses it (#1182).
+    with pytest.raises(ValueError, match="cudaStreamPerThread"):
+        with marshal.stream_ctx(2):
+            pass
 
 
 def test_side_stream_handle_selects_that_stream():

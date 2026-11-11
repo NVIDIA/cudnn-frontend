@@ -56,14 +56,18 @@ def _signature():
 @lru_cache(maxsize=None)
 def _binaries(device):
     import cuda.tile.compilation as compilation
+    import torch
     import triton
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
     from ._kernels import cudnn_mhc_projection_partial, cudnn_mhc_projection_reduce
 
+    # Both kernels compile for this device's own part: an sm_100 cuTile cubin does not load on SM103 (CUDA_ERROR_NO_BINARY_FOR_GPU),
+    # and Triton emits an architecture-specific cubin (sm_100a, sm_103a).
+    major, minor = torch.cuda.get_device_capability(device)
     cubin = io.BytesIO()
-    compilation.export_kernel(cudnn_mhc_projection_partial, [_signature()], cubin, gpu_code="sm_100", output_format="cubin")
+    compilation.export_kernel(cudnn_mhc_projection_partial, [_signature()], cubin, gpu_code=f"sm_{10 * major + minor}", output_format="cubin")
     reduction = triton.compile(
         ASTSource(
             cudnn_mhc_projection_reduce,
@@ -71,7 +75,7 @@ def _binaries(device):
             constexprs={"COUNT": 24 * 20480, "SPLITS": 8, "BLOCK": 1024},
             attrs={(0,): [["tt.divisibility", 16]], (1,): [["tt.divisibility", 16]]},
         ),
-        target=GPUTarget("cuda", 100, 32),
+        target=GPUTarget("cuda", 10 * major + minor, 32),
         options={"num_warps": 4, "enable_fp_fusion": False},
     )
     if (

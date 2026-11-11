@@ -25,9 +25,10 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.experimental import primitives as nvvm
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
@@ -36,6 +37,7 @@ from cudnn.deepseek_sparse_attention.utils.sm90 import mma as sm90_mma
 from cudnn.deepseek_sparse_attention.utils.sm90 import primitives as sm90_ops
 from cudnn.deepseek_sparse_attention.utils.sm90.mma import gemm_w_idx
 
+WEIGHTS_READY_BARRIER = 9
 LSE_BARRIER_STAGE0 = 10
 LSE_BARRIER_STAGE1 = 11
 
@@ -65,6 +67,7 @@ class IndexerForwardSm90:
         use_unchecked_qh64: bool = False,
         use_unchecked_qh64_masked: bool = False,
         compute_lse: bool = False,
+        is_compressed_logits: bool = False,
     ):
         assert head_dim == 128, f"SM90 direct forward supports head_dim=128, got {head_dim}"
         supported_qhpkv = (32, 64) if qk_dtype == cutlass.Float8E4M3FN else (16, 32, 64)
@@ -78,6 +81,8 @@ class IndexerForwardSm90:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.ratio = ratio
         self.is_varlen = is_varlen
+        self.is_compressed_logits = is_compressed_logits
+        assert not self.is_compressed_logits or self.is_varlen, "SM90 compact indexer forward currently supports packed THD only"
         self.use_split_q_wg = self.use_fp8_scales
         self.use_fp8_prescaled_w = self.use_fp8_scales and w_dtype == Float32
 
@@ -253,6 +258,14 @@ class IndexerForwardSm90:
         return cute.ceil_div(kv_limit, self.tile_n)
 
     @cute.jit
+    def _compact_prefix(self, n: Int64) -> Int64:
+        """Return ``sum_{m=0}^{n} floor(m / ratio)`` in 64-bit arithmetic."""
+        ratio = Int64(self.ratio)
+        q = n // ratio
+        s = n - q * ratio
+        return ratio * q * (q - Int64(1)) // Int64(2) + q * (s + Int64(1))
+
+    @cute.jit
     def _iter_n_block(self, iter_idx: Int32, n_block_max: Int32) -> Int32:
         if const_expr(self.use_fp8_scales):
             return n_block_max - Int32(1) - iter_idx
@@ -336,6 +349,7 @@ class IndexerForwardSm90:
         tWeights: cute.Tensor,
         rKScale: Optional[cute.Tensor],
         mOut: cute.Tensor,
+        cand_batch_base: Int64,
         m_block: Int32,
         n_block: Int32,
         apply_causal_mask: Boolean,
@@ -381,9 +395,12 @@ class IndexerForwardSm90:
 
         if t0 == 0:
             for qi in cutlass.range_constexpr(self.q_tokens_per_stage):
+                q_local = q_token_base + qi
+                if const_expr(self.is_compressed_logits):
+                    qgs = Int64(q_causal_offset)
+                    compact_row_base = cand_batch_base + self._compact_prefix(qgs + Int64(q_local)) - self._compact_prefix(qgs)
                 for mi in cutlass.range(kNRows, unroll_full=True):
                     kv_m = m_base + mi * 8
-                    q_local = q_token_base + qi
                     k_local = n_block * self.tile_n + kv_group_offset + kv_m
                     score = ps[mi, qi]
                     should_store = Boolean(True)
@@ -400,7 +417,9 @@ class IndexerForwardSm90:
                         score = score * rKScale[mi]
 
                     if should_store and q_local < seqlen_q and k_local < max_seqlen_k:
-                        if const_expr(self.is_varlen):
+                        if const_expr(self.is_compressed_logits):
+                            mOut[compact_row_base + Int64(k_local)] = score
+                        elif const_expr(self.is_varlen):
                             mOut[q_batch_offset + q_local, k_local] = score
                         else:
                             mOut[batch_idx, q_local, k_local] = score
@@ -416,12 +435,14 @@ class IndexerForwardSm90:
         tWeights: cute.Tensor,
         rKScale: cute.Tensor,
         mOut: cute.Tensor,
+        cand_batch_base: Int64,
         m_block: Int32,
         n_block: Int32,
         seqlen_q: Int32,
         max_seqlen_k: Int32,
         q_batch_offset: Int32,
         batch_idx: Int32,
+        q_causal_offset: Int32,
         lse_max: cute.Tensor = None,
         lse_sum: cute.Tensor = None,
     ):
@@ -453,6 +474,9 @@ class IndexerForwardSm90:
         k_local_pair = n_block * self.tile_n + kv_m_pair
         score_pair = ps[0] if mi_dyn == 0 else ps[1]
         score_pair = score_pair * rKScale[0]
+        if const_expr(self.is_compressed_logits):
+            qgs = Int64(q_causal_offset)
+            compact_row_base = cand_batch_base + self._compact_prefix(qgs + Int64(q_local)) - self._compact_prefix(qgs)
         if const_expr(self.use_unchecked_qh64_full):
             if const_expr(self.is_varlen):
                 mOut[q_batch_offset + q_local, k_local_pair] = score_pair
@@ -460,7 +484,9 @@ class IndexerForwardSm90:
                 mOut[batch_idx, q_local, k_local_pair] = score_pair
         else:
             if q_local < seqlen_q and k_local_pair < max_seqlen_k:
-                if const_expr(self.is_varlen):
+                if const_expr(self.is_compressed_logits):
+                    mOut[compact_row_base + Int64(k_local_pair)] = score_pair
+                elif const_expr(self.is_varlen):
                     mOut[q_batch_offset + q_local, k_local_pair] = score_pair
                 else:
                     mOut[batch_idx, q_local, k_local_pair] = score_pair
@@ -479,6 +505,7 @@ class IndexerForwardSm90:
         tWeights: cute.Tensor,
         rKScale: cute.Tensor,
         mOut: cute.Tensor,
+        cand_batch_base: Int64,
         m_block: Int32,
         n_block: Int32,
         seqlen_q: Int32,
@@ -519,6 +546,9 @@ class IndexerForwardSm90:
         k_local_pair = n_block * self.tile_n + kv_m_pair
         score_pair = ps[0] if mi_dyn == 0 else ps[1]
         score_pair = score_pair * rKScale[0]
+        if const_expr(self.is_compressed_logits):
+            qgs = Int64(q_causal_offset)
+            compact_row_base = cand_batch_base + self._compact_prefix(qgs + Int64(q_local)) - self._compact_prefix(qgs)
         should_store_pair = Boolean(True)
         should_accum_lse_pair = Boolean(True)
         if k_local_pair >= seqlen_k or k_local_pair >= col_lim:
@@ -531,7 +561,9 @@ class IndexerForwardSm90:
                 else:
                     mOut[batch_idx, q_local, k_local_pair] = score_pair
         elif should_store_pair and q_local < seqlen_q and k_local_pair < max_seqlen_k:
-            if const_expr(self.is_varlen):
+            if const_expr(self.is_compressed_logits):
+                mOut[compact_row_base + Int64(k_local_pair)] = score_pair
+            elif const_expr(self.is_varlen):
                 mOut[q_batch_offset + q_local, k_local_pair] = score_pair
             else:
                 mOut[batch_idx, q_local, k_local_pair] = score_pair
@@ -617,6 +649,12 @@ class IndexerForwardSm90:
                     self._load_weights(mW_cur, mQScale_cur, sW, m_block, seqlen.seqlen_q, sm_scale, lane_id)
                 else:
                     self._load_weights(mW_cur, None, sW, m_block, seqlen.seqlen_q, sm_scale, lane_id)
+                # All weight-loading lanes publish before either consumer WG
+                # reads sW. The Q TMA barrier tracks only its issuing lane.
+                nvvm.barrier_cta_arrive(
+                    barrier_id=WEIGHTS_READY_BARRIER,
+                    thread_count=32 + (256 if self.use_split_q_wg else 128),
+                )
                 cute.arch.fence_view_async_shared()
                 self._issue_tma(mQ_cur, sQ_0, self.q_stages * m_block, tma_atom_Q, mbar_Q0_ptr, self.tma_copy_bytes_Q, self.q_per_stage)
                 self._issue_tma(
@@ -639,8 +677,8 @@ class IndexerForwardSm90:
                         self._issue_tma(mK_cur, sKV_0, n_block, tma_atom_K, mbar_KV0_ptr, self.tma_copy_bytes_K, self.tile_n)
                         self._load_k_scales(mKScale_cur, sKScale, Int32(0), n_block, seqlen.seqlen_k, lane_id)
                         cute.arch.fence_view_async_shared()
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(mbar_KV0_ptr)
+                        # Each lane publishes its own scale stores.
+                        cute.arch.mbarrier_arrive(mbar_KV0_ptr)
                         iter_idx = iter_idx + Int32(2)
                 else:
                     while iter_idx < n_block_max:
@@ -675,8 +713,8 @@ class IndexerForwardSm90:
                         self._issue_tma(mK_cur, sKV_1, n_block, tma_atom_K, mbar_KV1_ptr, self.tma_copy_bytes_K, self.tile_n)
                         self._load_k_scales(mKScale_cur, sKScale, Int32(1), n_block, seqlen.seqlen_k, lane_id)
                         cute.arch.fence_view_async_shared()
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive(mbar_KV1_ptr)
+                        # Each lane publishes its own scale stores.
+                        cute.arch.mbarrier_arrive(mbar_KV1_ptr)
                         iter_idx = iter_idx + Int32(2)
 
                     if n_block_max >= Int32(2):
@@ -703,6 +741,7 @@ class IndexerForwardSm90:
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
         mQCausalOffsets: cute.Tensor,
+        mCandBatchOffsets: Optional[cute.Tensor],
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         sm_scale: Float32,
@@ -728,6 +767,7 @@ class IndexerForwardSm90:
             tile_n=self.tile_n,
         )
         q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+        cand_batch_base = Int64(mCandBatchOffsets[batch_idx]) if const_expr(self.is_compressed_logits) else Int64(0)
         num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
@@ -771,6 +811,7 @@ class IndexerForwardSm90:
 
             cute.arch.mbarrier_wait(mbar_Q0_ptr, q0_phase)
             cute.arch.mbarrier_wait(mbar_Q1_ptr, q1_phase)
+            nvvm.barrier_cta_sync(barrier_id=WEIGHTS_READY_BARRIER, thread_count=32 + 128)
 
             iter_idx = Int32(0)
             while iter_idx < n_block_max:
@@ -827,6 +868,7 @@ class IndexerForwardSm90:
                         tWeights0,
                         rKScale,
                         mOut,
+                        cand_batch_base,
                         m_block,
                         n_block,
                         apply_causal_mask,
@@ -847,6 +889,7 @@ class IndexerForwardSm90:
                         tWeights1,
                         rKScale,
                         mOut,
+                        cand_batch_base,
                         m_block,
                         n_block,
                         apply_causal_mask,
@@ -868,6 +911,7 @@ class IndexerForwardSm90:
                         tWeights0,
                         None,
                         mOut,
+                        cand_batch_base,
                         m_block,
                         n_block,
                         apply_causal_mask,
@@ -888,6 +932,7 @@ class IndexerForwardSm90:
                         tWeights1,
                         None,
                         mOut,
+                        cand_batch_base,
                         m_block,
                         n_block,
                         apply_causal_mask,
@@ -956,6 +1001,7 @@ class IndexerForwardSm90:
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
         mQCausalOffsets: cute.Tensor,
+        mCandBatchOffsets: Optional[cute.Tensor],
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         sm_scale: Float32,
@@ -981,6 +1027,7 @@ class IndexerForwardSm90:
             tile_n=self.tile_n,
         )
         q_causal_offset = Int32(0) if const_expr(mQCausalOffsets is None) else mQCausalOffsets[batch_idx]
+        cand_batch_base = Int64(mCandBatchOffsets[batch_idx]) if const_expr(self.is_compressed_logits) else Int64(0)
         num_m_blocks = cute.ceil_div(seqlen.seqlen_q * self.qhead_per_kvhead, self.tile_m)
         if block_x < num_m_blocks:
             m_block = num_m_blocks - Int32(1) - block_x
@@ -1011,6 +1058,7 @@ class IndexerForwardSm90:
                 lse_sum.fill(Float32(0.0))
 
             cute.arch.mbarrier_wait(mbar_Q_ptr, q_phase)
+            nvvm.barrier_cta_sync(barrier_id=WEIGHTS_READY_BARRIER, thread_count=32 + 256)
 
             iter_idx = Int32(0)
             while iter_idx < n_block_max:
@@ -1052,12 +1100,12 @@ class IndexerForwardSm90:
                         kv_m_lane_scale = m_base + mi * 8
                         rKScale[mi] = sKScale[stage * self.tile_n + kv_m_lane_scale]
 
+                # Every consumer lane must finish its scale reads before the
+                # producer can reuse this KV stage.
                 if stage == Int32(0):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(mbar_KVEmpty0_ptr, arrive_count=32)
+                    cute.arch.mbarrier_arrive(mbar_KVEmpty0_ptr)
                 else:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr, arrive_count=32)
+                    cute.arch.mbarrier_arrive(mbar_KVEmpty1_ptr)
 
                 if const_expr(self.use_fast_qh64_epilogue):
                     if iter_idx == Int32(0):
@@ -1067,6 +1115,7 @@ class IndexerForwardSm90:
                             tWeights,
                             rKScale,
                             mOut,
+                            cand_batch_base,
                             m_block,
                             n_block,
                             seqlen.seqlen_q,
@@ -1085,12 +1134,14 @@ class IndexerForwardSm90:
                             tWeights,
                             rKScale,
                             mOut,
+                            cand_batch_base,
                             m_block,
                             n_block,
                             seqlen.seqlen_q,
                             max_seqlen_k,
                             seqlen.offset_q,
                             batch_idx,
+                            q_causal_offset,
                             lse_max if const_expr(self.compute_lse) else None,
                             lse_sum if const_expr(self.compute_lse) else None,
                         )
@@ -1101,6 +1152,7 @@ class IndexerForwardSm90:
                         tWeights,
                         rKScale,
                         mOut,
+                        cand_batch_base,
                         m_block,
                         n_block,
                         Boolean(iter_idx == Int32(0)),
@@ -1150,6 +1202,7 @@ class IndexerForwardSm90:
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mQCausalOffsets: Optional[cute.Tensor],
+        mCandBatchOffsets: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         is_varlen = mCuSeqlensQ is not None
@@ -1171,6 +1224,11 @@ class IndexerForwardSm90:
             assert mLse.element_type == Float32
         else:
             assert mLse is None
+        if const_expr(self.is_compressed_logits):
+            assert mCandBatchOffsets is not None
+            assert mCandBatchOffsets.element_type == Int64
+        else:
+            assert mCandBatchOffsets is None
 
         def _assume_strides(t):
             divby = 128 // t.element_type.width
@@ -1258,6 +1316,7 @@ class IndexerForwardSm90:
             mCuSeqlensQ,
             mCuSeqlensK,
             mQCausalOffsets,
+            mCandBatchOffsets,
             max_seqlen_q,
             max_seqlen_k,
             sm_scale,
@@ -1288,6 +1347,7 @@ class IndexerForwardSm90:
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
         mQCausalOffsets: cute.Tensor,
+        mCandBatchOffsets: Optional[cute.Tensor],
         max_seqlen_q: Int32,
         max_seqlen_k: Int32,
         sm_scale: Float32,
@@ -1325,8 +1385,9 @@ class IndexerForwardSm90:
             cute.arch.mbarrier_init(mbar_Q0_ptr, 1)
             cute.arch.mbarrier_init(mbar_Q1_ptr, 1)
             if const_expr(self.use_fp8_scales):
-                cute.arch.mbarrier_init(mbar_KV0_ptr, 2)
-                cute.arch.mbarrier_init(mbar_KV1_ptr, 2)
+                # One TMA completion plus one arrival per scale-loading lane.
+                cute.arch.mbarrier_init(mbar_KV0_ptr, 33)
+                cute.arch.mbarrier_init(mbar_KV1_ptr, 33)
             else:
                 cute.arch.mbarrier_init(mbar_KV0_ptr, 1)
                 cute.arch.mbarrier_init(mbar_KV1_ptr, 1)
@@ -1423,6 +1484,7 @@ class IndexerForwardSm90:
                         mCuSeqlensQ,
                         mCuSeqlensK,
                         mQCausalOffsets,
+                        mCandBatchOffsets,
                         max_seqlen_q,
                         max_seqlen_k,
                         sm_scale,
@@ -1449,6 +1511,7 @@ class IndexerForwardSm90:
                         mCuSeqlensQ,
                         mCuSeqlensK,
                         mQCausalOffsets,
+                        mCandBatchOffsets,
                         max_seqlen_q,
                         max_seqlen_k,
                         sm_scale,
@@ -1476,6 +1539,7 @@ class IndexerForwardSm90:
                     mCuSeqlensQ,
                     mCuSeqlensK,
                     mQCausalOffsets,
+                    mCandBatchOffsets,
                     max_seqlen_q,
                     max_seqlen_k,
                     sm_scale,

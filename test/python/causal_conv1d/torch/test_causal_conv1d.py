@@ -207,7 +207,14 @@ def test_causal_conv1d_nwh_autograd(dtype, kernel_size, activation):
     x = x_data.detach().requires_grad_(True)
     weight = weight_data.detach().requires_grad_(True)
     bias = bias_data.detach().requires_grad_(True)
-    actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    try:
+        actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    except RuntimeError as error:
+        # CUDNN_STATUS_NOT_SUPPORTED_SHARED_MEMORY_INSUFFICIENT: the FP64 NWH kernel needs more shared memory per block than
+        # a ~99 KB device (SM86 / SM89 / SM120) offers; the backend declines it there.
+        if "status 3010" in str(error):
+            pytest.skip(f"cuDNN reports insufficient shared memory for this NWH case on this device: {error}")
+        raise
     actual.backward(grad_out)
 
     x_ref = x_data.double().detach().requires_grad_(True)

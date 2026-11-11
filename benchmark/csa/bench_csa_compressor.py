@@ -9,7 +9,7 @@ in a **single run** that emits two tables:
 
   * per-call    -- each variant timed with a pair of CUDA events and a synchronize,
                    launch/host overhead included (reproduces the methodology behind the
-                   per-call wall-clock table in docs/fe-oss-apis/csa.md).
+                   per-call wall-clock table in docs/operations/sparse_attention/csa.md).
   * graph       -- the SAME region captured into a CUDA graph and timed as a replay.
 
 Graph variants are captured **symmetrically** for eager and fused, as two directly
@@ -411,15 +411,14 @@ def main():
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--ratio", type=int, choices=(2, 4), default=4)
+    p.add_argument("--coff", type=int, choices=(1, 2), default=2)
+    p.add_argument("--head-dim", type=int, choices=(128, 512), action="append")
     args = p.parse_args()
 
-    shapes = [
-        ([8192], 128),
-        ([8192, 8192, 8192], 128),
-        ([8192], 512),
-        ([8192, 8192, 8192], 512),
-    ]
-    ratio, coff = 4, 2
+    head_dims = args.head_dim or [128, 512]
+    shapes = [(lens, d) for d in head_dims for lens in ([8192], [8192, 8192, 8192])]
+    ratio, coff = args.ratio, args.coff
 
     print(f"# CSA compressor benchmark -- ratio={ratio} coff={coff} " f"warmup={args.warmup} iters={args.iters} (median, CUDA events, us)")
     print(f"# GPU: {torch.cuda.get_device_name()} CC={torch.cuda.get_device_capability()}")

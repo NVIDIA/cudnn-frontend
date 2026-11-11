@@ -19,6 +19,7 @@ A stale extension (one built before the attribute existed) fails the signature p
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -228,24 +229,27 @@ def test_totals_on_a_dense_graph_are_refused_by_the_python_validator(row, monkey
         g.validate()
 
 
-# --------------------------------------------------------------------------- tier 2: the pybind signature (no device)
+# --------------------------------------------------------------------------- tier 2: the binding signature (no device)
 
 
 @pytest.mark.parametrize("method", ["sdpa_fp8_backward", "sdpa_mxfp8_backward"])
 def test_bindings_take_the_totals_as_trailing_keywords(method):
     """Append-only public signature: the two totals come LAST, after ``dSink_token``, defaulting to None -- positional callers
-    across C++, pybind and the python wrappers keep working.  Read off the signature pybind writes into the docstring; a
+    across C++, bindings and the python wrappers keep working.  Read off the signature the binding writes into the docstring; a
     stale extension built before the attribute existed fails here, with the fix named."""
     doc = getattr(cudnn._pybind_module.backend_graph, method).__doc__ or ""
     signature = doc.splitlines()[0]
     for name in ("max_total_seq_len_q", "max_total_seq_len_kv"):
-        assert (
-            f"{name}: object = None" in signature
-        ), f"{method} does not take {name}: the compiled extension predates the attribute -- rebuild python/cudnn/_compiled_module*.so\n{signature}"
+        assert re.search(
+            rf"\b{name}: object(?: \| None)? = None(?=,|\))", signature
+        ), f"{method} does not take optional {name}: check the compiled extension's signature and rebuild if stale\n{signature}"
     tail = signature.split("dSink_token", 1)[1]
     assert tail.index("max_total_seq_len_q") < tail.index("max_total_seq_len_kv") < tail.index(")"), signature
     # the half-precision backward binding is the precedent the quantized ones mirror
-    assert "max_total_seq_len_q: object = None" in (cudnn._pybind_module.backend_graph.sdpa_backward.__doc__ or "").splitlines()[0]
+    assert re.search(
+        r"\bmax_total_seq_len_q: object(?: \| None)? = None(?=,|\))",
+        (cudnn._pybind_module.backend_graph.sdpa_backward.__doc__ or "").splitlines()[0],
+    )
 
 
 # --------------------------------------------------------------------------- tier 3: the C++ node (lowering; needs a device)
