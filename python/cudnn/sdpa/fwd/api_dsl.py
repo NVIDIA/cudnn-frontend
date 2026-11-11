@@ -6208,9 +6208,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 "PackGQA is dense-only (THD/ragged runs unpacked)",
             )
             # Every SM120 template packs any GQA ratio up to the tile, tile_q % G != 0 included.
+            # Wide half templates also split a larger group into tile-sized subgroups.
+            partial_pack = not self._fp8 and self.flavor in _SM120_WIDE_F16_FLAVORS
             self._value_error_if(
-                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), requires_divisible=False),
-                f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), partial=partial_pack, requires_divisible=False),
+                (
+                    f"PackGQA needs a group that fits q_tile ({self.q_tile}) or a common subgroup of at least two heads"
+                    if partial_pack
+                    else f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile})"
+                )
+                + f"; got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
             )
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:

@@ -2448,9 +2448,10 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # When tile_q % G != 0 a packed tile holds tile_q // G tokens, its tail rows dead: packing wins only while it launches no
             # more Q tiles than the unpacked set (G per KV head here, since S_q < tile_q).  48/1 at S_q = 120 would
             # launch 60 two-token tiles against 48, 71/1 at S_q = 100 one-token tiles 100 against 71.  A group that
-            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.
-            g = facts.h_q // facts.h_kv
-            wins = _ceil_div(facts.s_q, tile_q // g) <= g
+            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.  Under partial PackGQA the tile holds the
+            # packed subgroup p, not G (96/1 at a 64-row tile packs 32): the same test per subgroup, G / p of them.
+            g = _pack_gqa_group(caps, facts, tile_m, True, split_kv)
+            wins = 1 < g <= tile_q and _ceil_div(facts.s_q, tile_q // g) <= g
         if (
             wins
             and rubin_dense_d128_shared_leg(caps, facts)

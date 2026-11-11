@@ -3622,6 +3622,7 @@ def _sm120_spec() -> EngineSpec:
             tile_ns=frozenset({16, 32, 48, 64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),

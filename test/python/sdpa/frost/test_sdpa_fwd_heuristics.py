@@ -404,8 +404,11 @@ def test_sm120_d512_sliding_window_packs_gqa():
     for d_qk, d_v in ((264, 512), (512, 264), (320, 384)):
         packed = primary(window_left=128, d_qk=d_qk, d_v=d_v)
         assert (packed.pack_gqa, packed.tile_m, packed.tile_n, packed.sched_policy) == (True, 64, 32, SCHED_LPT)
-    pro = primary(window_left=128, h_q=128, h_kv=1)  # G=128 does not divide the 64-row tile; windowed units still walk LPT
-    assert (pro.pack_gqa, pro.sched_policy) == (False, SCHED_LPT)
+    # G=128 does not fit the 64-row tile: a partial-PackGQA flavor packs a 64-head subgroup, the full contract stays unpacked;
+    # windowed units walk LPT either way.
+    pro = primary(window_left=128, h_q=128, h_kv=1)
+    partial = (512, 512) in (spec.capabilities.pack_gqa_partial_d_shapes or ())
+    assert (pro.pack_gqa, pro.sched_policy) == (partial, SCHED_LPT)
     assert primary(window_left=128, h_q=64, h_kv=64).pack_gqa is False  # MHA
     full_causal = primary()  # full causal prefill: decode rule only, L2 rule for the scheduler
     assert (full_causal.pack_gqa, full_causal.sched_policy) == (False, SCHED_LPT_L2)
@@ -451,14 +454,20 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
             assert reason(tile, d_qk=d, d_v=d) is None, (d, tile)
             assert reason(tile, d_qk=d, d_v=d, h_q=20) is None, (d, tile)  # G = 5
             refused = reason(tile, d_qk=d, d_v=d, h_q=2 * tile[0], h_kv=1)
-            assert refused is not None and f"does not pack at tile_m={tile[0]}" in refused, (d, tile, refused)
+            if (d, d) in (caps.pack_gqa_partial_d_shapes or ()):
+                assert refused is None, (d, tile, refused)  # partial PackGQA packs a tile-sized subgroup
+            else:
+                assert refused is not None and f"does not pack at tile_m={tile[0]}" in refused, (d, tile, refused)
 
     def unset(h_q, d):
         facts = _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=h_q, h_kv=1, d_qk=d, d_v=d)})
         return engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
 
     refused = unset(96, 512)
-    assert refused is not None and "does not pack at tile_m=64" in refused, refused
+    if engines.pack_gqa_partial(caps, _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=96, h_kv=1, d_qk=512, d_v=512)})):
+        assert refused is None, refused  # partial PackGQA packs a 32-head subgroup of the 96
+    else:
+        assert refused is not None and "does not pack at tile_m=64" in refused, refused
     assert unset(64, 512) is None
     assert unset(96, 256) is None  # 128 rows below D=512
     assert pack_gqa_supported(24, 4, 64, requires_divisible=False) and pack_gqa_supported(64, 1, 64, requires_divisible=False)
@@ -2522,6 +2531,30 @@ def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target)
     mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
     assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
     assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_LPT) == (SCHED_LPT, 1)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q", [2 * 66, 2 * 96, 2 * 128])
+def test_sm120_partial_pack_candidates_use_the_packed_subgroup(h_q):
+    """A partial-PackGQA SM120 half flavor packs a subgroup of a ratio larger than its 64-row tile (G 66 -> 2, 96 -> 32,
+    128 -> 64): candidate generation scores the subgroup the kernel packs, so G 66 / 96 / 128 list admissible sets instead
+    of dividing the tile by G (zero rows per head). Groups that fit the tile keep their full-ratio score."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.config_sm120 import WIDE_F16_FLAVORS
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_group, _pack_gqa_points
+
+    spec = _sm120_spec("sdpa_fwd_prefill_sm120")
+    caps = dataclasses.replace(spec.capabilities, pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS)
+    shape = dict(b=2, h_kv=2, s_q=3, s_kv=65, d_qk=512, d_v=512, dtype=cudnn.data_type.HALF, causal=True, device_cc=(12, 0), device_sm_count=188)
+    facts = SdpaGraphFacts(h_q=h_q, **shape)
+    p = _pack_gqa_group(caps, facts, 64, True)
+    assert 1 < p < h_q // 2 and (h_q // 2) % p == 0 and 64 % p == 0, p
+    assert True in _pack_gqa_points(caps, facts, 64, 1, 1)
+    for g in (6, 64):
+        assert _pack_gqa_points(caps, SdpaGraphFacts(h_q=2 * g, **shape), 64, 1, 1) == _pack_gqa_points(
+            spec.capabilities, SdpaGraphFacts(h_q=2 * g, **shape), 64, 1, 1
+        )
 
 
 def _sm100_paged_prefix(d, h_q, h_kv, **over):

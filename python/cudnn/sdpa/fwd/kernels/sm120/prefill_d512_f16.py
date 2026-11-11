@@ -72,6 +72,7 @@ Constraints:
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key
+from cudnn.sdpa.fwd.config_sm100 import pack_gqa_group_size
 from functools import lru_cache, partial
 from types import SimpleNamespace
 from typing import Callable, Optional, Type
@@ -268,21 +269,25 @@ class SM120FusedMultiHeadAttentionForward:
             constraint as ``head_tile_qk``.
         :param q_tile: Query sequence tile size.
         :param kv_tile: Key/value sequence tile size.
-        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile // qh_per_kh``
-            whole tokens x qh_per_kh query heads sharing one KV head, token-major
-            (row r ↔ token ``r // G``, head ``r % G``); rows past
+        :param pack_gqa: Enable PackGQA: each Q tile holds ``q_tile // G``
+            whole tokens x G query heads sharing one KV head, token-major.
+            G is the full GQA ratio when it fits the tile, otherwise their gcd.
+            Row r maps to token ``r // G`` and subgroup head ``r % G``; rows past
             ``(q_tile // G) * G`` are dead (zero Q, never stored).
-        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``; at most
-            ``q_tile`` when ``pack_gqa`` is enabled, and validated against
-            the runtime Q/K head extents at ``__call__``.
+        :param qh_per_kh: The graph's GQA ratio ``h_q // h_kv``, validated
+            against the runtime Q/K head extents at ``__call__``. Groups larger
+            than the tile are divided into packed subgroups sharing one KV head.
         """
 
         if out_dtype != in_dtype:
             raise ValueError("out_dtype must match in_dtype")
         if qh_per_kh < 1:
             raise ValueError(f"qh_per_kh ({qh_per_kh}) must be >= 1")
-        if pack_gqa and qh_per_kh > q_tile:
-            raise ValueError(f"qh_per_kh ({qh_per_kh}) must not exceed q_tile ({q_tile}) when pack_gqa is enabled")
+        self.gqa_ratio = qh_per_kh
+        if pack_gqa:
+            qh_per_kh = pack_gqa_group_size(qh_per_kh, q_tile, partial=True, requires_divisible=False)
+            if qh_per_kh == 1 and self.gqa_ratio != 1:
+                raise ValueError("PackGQA requires a subgroup with at least two heads")
         if pack_gqa and thd_varlen:
             raise ValueError("PackGQA is dense-only (THD keeps the unpacked path)")
         if thd_varlen and thd_batch < 1:
@@ -1183,7 +1188,8 @@ class SM120FusedMultiHeadAttentionForward:
     def _dense_unit_count(self, q: cute.Tensor, n_q_tiles: cutlass.Int32):
         """``(n_batch, n_heads, n_units)`` of the dense unit space, as the launch
         computed it: the head axis is the packed group count under PackGQA and
-        the full Q head count otherwise (``qh_per_kh`` is the GQA ratio either way)."""
+        the full Q head count otherwise. ``qh_per_kh`` is the packed subgroup
+        width; ``gqa_ratio`` retains the graph's full Q/K head ratio."""
         n_batch = cutlass.Int32(q.shape[0])
         n_qh = cutlass.Int32(q.shape[2] // self.qh_per_kh if self.pack_gqa else q.shape[2])
         return n_batch, n_qh, n_q_tiles * n_batch * cutlass.Int32(self.split_kv) * n_qh
@@ -2062,7 +2068,7 @@ class SM120FusedMultiHeadAttentionForward:
                 or _static_neq(q.shape[1], o.shape[1])
                 or _static_neq(q.shape[2], o.shape[2])
                 or q.shape[2] % k.shape[2] != 0
-                or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.qh_per_kh)
+                or (isinstance(q.shape[2], int) and isinstance(k.shape[2], int) and q.shape[2] != k.shape[2] * self.gqa_ratio)
             ):
                 raise ValueError("runtime Q/K/V/O batch, sequence, or head geometry mismatch")
             for name, tensor in (("Q", q), ("K", k), ("V", v), ("O", o)):
