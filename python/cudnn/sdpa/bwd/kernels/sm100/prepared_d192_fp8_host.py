@@ -19,14 +19,25 @@ from cudnn.sdpa.bwd.kernels.bprop_chain_common import dot_do_o_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_fp8_helpers import delta_d192_fp8_host as delta_host
 
 EXP2_FMA_SPLIT_SMS = frozenset((100,))
+K64_SMS = frozenset((107,))
+SM107_LINE_PARAMS = (64, 8, 1)  # MMA K step, scheduler L2 budget (MiB), dependent launch of the dQ kernel
 SPEC = globals().get("FROST_TEMPLATE_PARAMS")
 HEAD_DIMS = (192, 128) if SPEC is None else (int(SPEC[0]), int(SPEC[1]))
+
+
+def _sm107_line(spec):
+    return len(spec) > 5 and spec[5] == SM107_LINE_PARAMS[0]
+
+
+WIDE_DELTA = SPEC is not None and _sm107_line(SPEC)
 
 
 def _spec(dqk, dv, sm, mx, window):
     """(D_QK, D_V, exp2 FMA split, block-scale mode, window): the kernel pair a prepared host is bound to."""
     base = (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
-    return base + ("sm120",) if int(sm) in (120, 121) else base
+    if int(sm) in (120, 121):
+        return base + ("sm120",)
+    return base + (SM107_LINE_PARAMS if int(sm) in K64_SMS and (int(dqk), int(dv)) == (192, 128) else ())
 
 
 def _kernel_hosts(spec):
@@ -39,7 +50,7 @@ def _kernel_hosts(spec):
         fmt = "mxfp8" if spec[3] else "fp8"
         module = load_template(str(here.with_name(f"bprop_d512_{fmt}.py")), spec, tag=f"sdpa_bwd_d512_{fmt}_w{spec[4]}")
         return module.dkdv_host, module.dq_host
-    tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}"
+    tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}{'_k64_l2' + str(spec[6]) + ('_pdl' if spec[7] else '') if _sm107_line(spec) else ''}"
     dkdv = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), spec, tag=f"{tag}_dkdv").host
     dq = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), spec, tag=f"{tag}_dq").host
     return dkdv, dq
@@ -47,7 +58,11 @@ def _kernel_hosts(spec):
 
 def _specialized(spec):
     """The prepared-host module bound to ``spec``; its kernel bindings never change after import."""
-    return load_template(__file__, spec, tag=f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}_host")
+    return load_template(
+        __file__,
+        spec,
+        tag=f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_k64_l2' + str(spec[6]) + ('_pdl' if spec[7] else '') if _sm107_line(spec) else ''}_host",
+    )
 
 
 if SPEC is None:
@@ -187,7 +202,10 @@ def host(
     amax_dq, amax_dk, amax_dv, amax_dp = _optional_view(amax_dq_ptr), _optional_view(amax_dk_ptr), _optional_view(amax_dv_ptr), _optional_view(amax_dp_ptr)
     payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
     delta = _scratch(payload, regions[0])
-    delta_host(o, do, delta, descale_o, descale_do, amax_dq, amax_dk, amax_dv, amax_dp, stream)
+    if cutlass.const_expr(WIDE_DELTA):
+        delta_host(o, do, delta, descale_o, descale_do, amax_dq, amax_dk, amax_dv, amax_dp, stream, True)
+    else:
+        delta_host(o, do, delta, descale_o, descale_do, amax_dq, amax_dk, amax_dv, amax_dp, stream)
     dkdv_host(
         q,
         k,

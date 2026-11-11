@@ -1,5 +1,6 @@
 cudnn
 cudnn.AlignedHCABackward
+cudnn.AttentionGateQuantDecode
 cudnn.BSA
 cudnn.BlockScaledTensor
 cudnn.CSA

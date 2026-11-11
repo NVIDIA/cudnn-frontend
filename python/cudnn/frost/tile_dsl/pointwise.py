@@ -1400,3 +1400,41 @@ def quad_reduce_sum(val: cutlass.Float32) -> cutlass.Float32:
     val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY))
     val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY))
     return val
+
+
+def rcp_div_rn(s: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``div.rn.f32(1, s)`` -- the IEEE correctly-rounded fp32 reciprocal, as ONE opaque op.
+
+    For a static per-tensor DEQUANTIZATION scale ``s`` whose stored code is ``fp8(x * (1 / s))``: the conventions this
+    reproduces compute ``inv = 1 / s`` once with a correctly rounded division and multiply by it, so the reciprocal must be
+    ``div.rn`` -- an approximate ``rcp`` (``MUFU.RCP`` alone) or a ``fastmath`` division can land one fp32 ulp off and move
+    a code on a rounding boundary.  The numerator is a PTX immediate (``0f3F800000``), never a constant float asm OPERAND
+    (that ICEs libNVVM, :func:`opaque_f32_bits`); ``s`` must be a traced register.  :func:`div_rn_f32` is the two-register
+    form of the same instruction."""
+    r = nvvm.inline_ptx("div.rn.f32 $0, 0f3F800000, $1;", write_only_types=[cutlass.Float32], read_only_args=[s])
+    return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
+
+
+def fp32_times_inv_to_e4m3(value: cutlass.Float32, inv_scale: cutlass.Float32) -> cutlass.Uint8:
+    """ONE E4M3 code of ``value * inv_scale``: the static per-tensor quantization of a single fp32 value.
+
+    ``mul.f32`` then ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating at +-448) with a literal zero as
+    the convert's second value; the low byte is the code.  The multiply sits INSIDE the asm block, so no pass can contract
+    it into a neighbouring add or reassociate it: the byte is ``e4m3(fl32(value * inv_scale))`` by construction.
+    ``inv_scale`` is the reciprocal of the consumer's dequantization scale (:func:`rcp_div_rn`).  For a store of one byte
+    per element (``out[i] = fp32_times_inv_to_e4m3(v, inv)``); :func:`fp32_to_fp8x2` is the two-value form without the
+    multiply.  Both operands must be traced registers.  Spelled as a raw asm block with float-register (``f``) operand
+    constraints rather than through ``inline_ptx``: that wrapper stages every float operand through a ``mov.f32`` block of
+    its own, which changes nothing numerically but does change the register allocation of an eight-element body."""
+    from cutlass._mlir.dialects import llvm  # the one raw asm block of this module: imported where it is used
+
+    word = llvm.inline_asm(
+        T_.i32(),
+        [value.ir_value(), inv_scale.ir_value()],
+        "{ .reg .f32 v; .reg .b16 p; mul.f32 v, $1, $2; cvt.rn.satfinite.e4m3x2.f32 p, 0f00000000, v; cvt.u32.u16 $0, p; }",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(word).to(cutlass.Uint8)
