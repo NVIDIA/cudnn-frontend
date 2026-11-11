@@ -12,7 +12,8 @@ loop of a handful of launches pass such a kernel.  This helper is the run-time d
   reference when it has one;
 * ``warm`` launches back to back and ``poisoned`` launches each behind a launch that overwrites every SM's shared memory,
   every output byte compared after every launch; outputs are refilled with a sentinel pattern before each launch, so a
-  launch that wrote nothing differs from the reference;
+  launch that wrote nothing differs from the reference, and a listed output that neither cold launch wrote (a copy of the
+  kernel's tensor) is refused where there is no independent reference to differ from;
 * a positive control (:func:`stress_validation`): the unsafe twin of the self-test ring (``warm_stress_ring.py``) must be
   seen to fail in this process on this GPU.  A zero count is reported as a pass only then; elsewhere the test is skipped
   with ``warm stress not validated on <part>``.
@@ -22,6 +23,10 @@ GPU, behind this control.  The control shows that the GPU and driver expose the 
 blocks per SM, every lane of a load in the same shared-memory banks.  The same unsafe ring reads zero with one thread block
 per SM, so the report states the thread blocks per SM of the case and flags fewer than two.  The proof of the order is the
 disassembly of the rendering (Rule 11); :func:`assert_release_dependence` pins it in the generated PTX.
+
+A test that guards its launches with a process watchdog calls :func:`build_launchers` and builds its own kernel in front of
+the watchdog: the first CuTe DSL import of a process can take minutes on a cold file system, and only launches may be timed
+as launches.
 
 ``sdpa/frost/test_tile_dsl_consume_then_arrive.py`` is the usage example; ``core/test_warm_stress.py`` pins the report.
 """
@@ -48,6 +53,8 @@ class StressCase:
 
     ``launch``: ONE launch on the launch path that ships; it may return before the kernel finishes.
     ``outputs``: EVERY tensor the kernel writes, by name (contiguous).  A written tensor that is not listed is not compared.
+    List the storage the kernel writes, never a copy of it (``.contiguous()`` of a strided view and a dtype cast return
+    copies): an output that both cold launches leave at the sentinel fill is refused when there is no ``reference``.
     ``thread_blocks``: thread blocks of one launch (the grid's product).
     ``refills_per_launch``: how often the stage under test is refilled inside one launch; zero is refused, because a shape
     that never refills the stage cannot fail.
@@ -123,6 +130,7 @@ class StressReport:
     cold_stable: bool = True
     cold_equals_reference: Optional[bool] = None
     cold_mismatch: Optional[Mismatch] = None
+    cold_unwritten: List[str] = field(default_factory=list)  # outputs both cold launches left at the sentinel fill
     blocks: List[BlockResult] = field(default_factory=list)
     validation: Optional[Validation] = None
 
@@ -168,6 +176,9 @@ class StressReport:
         lines.append(cold)
         if self.cold_mismatch is not None:
             lines.append("    " + self.cold_mismatch.text())
+        if self.cold_unwritten:
+            names = ", ".join(repr(name) for name in self.cold_unwritten)
+            lines.append(f"    not written by either cold launch (still the sentinel fill): {names} -- list the tensor the kernel writes, not a copy")
         for b in self.blocks:
             if b.stopped.startswith("not run"):
                 lines.append(f"  {b.block}: {b.stopped}")
@@ -291,8 +302,43 @@ def _poison_launcher(device):
     return _POISON[key]
 
 
+def _control_ring(device, cluster: int):
+    """``(ring, why not)``: the unsafe twin of the test ring for this device and cluster size, built once per process."""
+    device = torch.device(device)
+    key = (device.index if device.index is not None else torch.cuda.current_device(), int(cluster))
+    if key not in _CONTROL:
+        try:
+            from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+            installed, version = cutedsl_state()
+            if not installed or cutedsl_too_old(version):
+                raise ImportError("the control ring needs the CuTe DSL at the FROST floor")
+            import warm_stress_ring
+
+            _CONTROL[key] = (warm_stress_ring.Ring("plain", device=device, cluster=cluster), "")
+        except Exception as exc:  # reported by stress_validation as "not validated ... could not be built"
+            _CONTROL[key] = (None, f"{type(exc).__name__}: {str(exc)[:160]}")
+    return _CONTROL[key]
+
+
 _POISON: Dict[int, tuple] = {}
+_CONTROL: Dict[tuple, tuple] = {}
 _VALIDATION: Dict[tuple, Validation] = {}
+
+
+def build_launchers(device=None, *, cluster: int = 1) -> None:
+    """Import the CuTe DSL and compile what the stress launches besides the case: the control ring and the poison kernel.
+
+    Both are cached per process and device.  Call this, and build the kernel under test, BEFORE entering a kernel watchdog:
+    the first DSL import of a process can take minutes on a cold file system, and a watchdog that also covers it reports a
+    slow import as a hung kernel.  It never raises; what could not be built is reported by :func:`stress_validation` and by
+    the poisoned block.
+    """
+    device = torch.device("cuda") if device is None else torch.device(device)
+    key = (device.index if device.index is not None else torch.cuda.current_device(), int(cluster))
+    if key not in _VALIDATION:  # a cached validation needs no ring
+        _control_ring(device, cluster)
+    _poison_launcher(device)
 
 
 def warm_stress(
@@ -306,7 +352,8 @@ def warm_stress(
     budget_s: Optional[float] = None,
     poison: Optional[Callable[[], None]] = None,
 ) -> StressReport:
-    """Run the stress and return the report; raises only for a case that cannot fail (``ValueError``).
+    """Run the stress and return the report; raises only for a case that cannot fail (``ValueError``): one refused up front, or
+    one without a reference whose listed output no cold launch wrote.
 
     ``budget_s``: wall-clock budget of the launch blocks.  A block that uses up its share ends at a check point and reports
     the launches it reached -- an incomplete block, never a longer run and never a kernel timeout.  ``stop_at_first=False``
@@ -349,6 +396,13 @@ def warm_stress(
         torch.cuda.synchronize(device)
         cold.append({name: view.clone() for name, view in views.items()})
     del flush
+    report.cold_unwritten = [name for name in views if all(bool((launch[name] == SENTINEL_BYTE).all().item()) for launch in cold)]
+    if report.cold_unwritten and reference is None:
+        raise ValueError(
+            f"warm stress '{case.name}': output(s) {report.cold_unwritten} still hold the sentinel fill after both cold launches -- the launch does not "
+            "write the listed tensor (list the kernel's own storage, never a copy made by `.contiguous()` or a cast); "
+            "without an independent reference every launch would equal that fill and pass"
+        )
     for name in views:
         if not torch.equal(cold[0][name], cold[1][name]):
             report.cold_stable = False
@@ -422,26 +476,19 @@ def stress_validation(device=None, *, cluster: int = 1, launches: int = CONTROL_
 
     ``cluster``: the cluster size of the control launch (1, or 2 for the control of a kernel launched in clusters of two).
     The result is cached and recorded through ``frost_routing.measured`` so that it reaches the job log on a pass too.
+    The control ring is built here unless :func:`build_launchers` built it already (in front of the caller's watchdog).
     """
     device = torch.device("cuda") if device is None else torch.device(device)
     key = (device.index if device.index is not None else torch.cuda.current_device(), int(cluster))
     if key in _VALIDATION:
         return _VALIDATION[key]
     part = _part(device)
-    try:
-        from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-
-        installed, version = cutedsl_state()
-        if not installed or cutedsl_too_old(version):
-            raise ImportError("the control ring needs the CuTe DSL at the FROST floor")
+    ring, why = _control_ring(device, cluster)
+    if ring is None:
+        validation = Validation(False, f"warm stress not validated on {part}: the control ring could not be built ({why})", available=False)
+    else:
         import warm_stress_ring
 
-        ring = warm_stress_ring.Ring("plain", device=device, cluster=cluster)
-    except Exception as exc:
-        validation = Validation(
-            False, f"warm stress not validated on {part}: the control ring could not be built ({type(exc).__name__}: {str(exc)[:160]})", available=False
-        )
-    else:
         case = StressCase(
             name=f"control: unsafe twin of the test ring (cluster {cluster})",
             launch=ring.launch,
@@ -459,6 +506,7 @@ def stress_validation(device=None, *, cluster: int = 1, launches: int = CONTROL_
             text = f"warm stress not validated on {part}: the unsafe twin read 0 of {done} ({ring.blocks} thread blocks, cluster {cluster})"
         validation = Validation(failures > 0, text, done, failures)
     _VALIDATION[key] = validation
+    _CONTROL.pop(key, None)  # the result is cached; the ring and its input are not kept
     try:
         import frost_routing
 
@@ -472,8 +520,9 @@ def assert_warm_stress(case: StressCase, *, validation: Optional[Validation] = N
     """The test entry: FAIL on any differing byte, SKIP where the stress is not validated or did not complete, else pass.
 
     A mismatch fails whether or not the control reproduced.  A zero count is a pass only when the control saw the unsafe
-    twin fail on this GPU in this process and every block ran its full count; otherwise the test is skipped -- a coverage
-    gap, neither a pass nor a failure.  The record goes through ``frost_routing.measured`` in every outcome.
+    twin fail on this GPU in this process, every block ran its full count, and the reference is independent or cold (a case
+    without ``reference`` whose reference launches ran without the cache flush has neither); otherwise the test is skipped
+    -- a coverage gap, neither a pass nor a failure.  The record goes through ``frost_routing.measured`` in every outcome.
     """
     import pytest
 
@@ -496,6 +545,8 @@ def assert_warm_stress(case: StressCase, *, validation: Optional[Validation] = N
         pytest.skip(text)
     if not report.complete:
         pytest.skip("warm stress incomplete (a coverage gap, not a pass)\n" + text)
+    if case.reference is None and not report.cold_flushed:
+        pytest.skip("warm stress incomplete (a coverage gap, not a pass): no independent reference and the reference launches were not cold\n" + text)
     return report
 
 

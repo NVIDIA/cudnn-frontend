@@ -368,6 +368,9 @@ def test_accepted_call_shapes_keep_the_dependence(renders, case):
 # Device tier: the ring under the warm stress, behind its positive control
 # ---------------------------------------------------------------------------
 
+# Each cell builds what it launches IN FRONT of its process watchdog (the first CuTe DSL import of the process, the control
+# ring, the poison kernel, the ring under test): the watchdog times launches only, so a slow import on a cold file system
+# cannot read as a hung kernel.
 device_tier = [requires_blackwell, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
 
@@ -389,6 +392,7 @@ def _ring_case(ring):
 def test_unsafe_twin_is_seen(cluster):
     """The positive control: the ring with a plain arrive fails on this GPU, alone and in clusters of two.  A part where it does not
     is reported as not validated and skipped -- the helper cells below then skip as well."""
+    warm_stress.build_launchers(cluster=cluster)
     with process_watchdog(300, f"the unsafe twin of the test ring (cluster {cluster})"):
         validation = warm_stress.stress_validation(cluster=cluster)
     print("\n" + validation.text)
@@ -403,8 +407,9 @@ def test_helper_ring_reads_zero(form):
     differing byte against the independent reference, in the process where the twin of the same launch shape failed."""
     import warm_stress_ring
 
+    ring = warm_stress_ring.Ring(form)
+    warm_stress.build_launchers(cluster=ring.cluster)
     with process_watchdog(420, f"the consume ring ({form})"):
-        ring = warm_stress_ring.Ring(form)
         validation = warm_stress.stress_validation(cluster=ring.cluster)
         report = warm_stress.assert_warm_stress(_ring_case(ring), validation=validation)
     print("\n" + report.text())
@@ -417,11 +422,12 @@ def test_the_stress_sees_a_lost_dependence(form):
     dependence that was lost without any error.  It passes or skips, never fails."""
     import warm_stress_ring
 
+    ring = warm_stress_ring.Ring(form)
+    warm_stress.build_launchers(cluster=1)
     with process_watchdog(300, f"the lost-dependence control ({form})"):
         validation = warm_stress.stress_validation(cluster=1)
         if not validation.reproduced:
             pytest.skip(validation.text)
-        ring = warm_stress_ring.Ring(form)
         report = warm_stress.warm_stress(_ring_case(ring), warm=warm_stress.CONTROL_LAUNCHES, poisoned=0, flush_mib=0, stop_at_first=False)
     print("\n" + report.text())
     if report.failures == 0:

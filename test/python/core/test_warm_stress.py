@@ -172,6 +172,60 @@ def test_without_an_independent_reference_only_stability_is_tested():
     assert "an error every launch repeats passes" in report.text()
 
 
+def test_a_listed_output_that_no_launch_writes_is_refused_without_a_reference():
+    """A copy of the kernel's output (what ``.contiguous()`` or a dtype cast returns) is never written.  Without an independent
+    reference both cold launches leave the sentinel fill, the cold reference becomes the sentinel and every launch equals it."""
+    kernel = FakeKernel()
+    copy = kernel.out.clone()
+    with pytest.raises(ValueError, match="still hold the sentinel fill after both cold launches"):
+        ws.warm_stress(kernel.case(outputs={"out": copy}, reference=None), warm=100, poisoned=0, flush_mib=0)
+    assert kernel.launches == 2, "refused behind the two cold launches, before any block"
+    # one written output beside one that is not: still refused, and the message names the unwritten one
+    kernel = FakeKernel()
+    with pytest.raises(ValueError, match=r"\['stale'\] still hold the sentinel fill"):
+        ws.warm_stress(kernel.case(outputs={"out": kernel.out, "stale": kernel.out.clone()}, reference=None), warm=4, poisoned=0, flush_mib=0)
+
+
+def test_an_unwritten_output_fails_against_a_reference_and_the_report_names_it():
+    kernel = FakeKernel()
+    case = kernel.case(outputs={"out": kernel.out.clone()})
+    report = ws.warm_stress(case, warm=10, poisoned=0, flush_mib=0)
+    assert report.wrong_cold and report.cold_equals_reference is False and report.cold_unwritten == ["out"] and report.launches == 0
+    assert "not written by either cold launch (still the sentinel fill): 'out'" in report.text()
+    with pytest.raises(AssertionError, match="not written by either cold launch"):
+        ws.assert_warm_stress(case, validation=VALIDATED, warm=10, poisoned=0, flush_mib=0)
+
+
+def test_without_a_reference_the_assert_needs_cold_reference_launches():
+    """No independent reference and no cache flush in front of the reference launches: the reference is two back-to-back
+    launches of the kernel under test.  The report says so; the assert skips it as incomplete instead of passing."""
+    report = ws.warm_stress(FakeKernel().case(reference=None), warm=4, poisoned=0, flush_mib=0)
+    assert report.failures == 0 and not report.cold_flushed and "reference not cold" in report.text()
+    with pytest.raises(pytest.skip.Exception, match="warm stress incomplete.*the reference launches were not cold"):
+        ws.assert_warm_stress(FakeKernel().case(reference=None), validation=VALIDATED, warm=4, poisoned=0, flush_mib=0)
+    # with a cache flush the same case is a pass
+    passed = ws.assert_warm_stress(FakeKernel().case(reference=None), validation=VALIDATED, warm=4, poisoned=0, flush_mib=1)
+    assert passed.cold_flushed and passed.failures == 0
+
+
+def test_build_launchers_never_raises_and_a_missing_control_is_reported(monkeypatch):
+    """``build_launchers`` is the setup step a test runs in front of its kernel watchdog; what it could not build is reported by
+    the validation (not validated, not available), never raised."""
+    import cudnn.frost.buffers as buffers
+
+    monkeypatch.setattr(ws, "_CONTROL", {})
+    monkeypatch.setattr(ws, "_VALIDATION", {})
+    monkeypatch.setattr(ws, "_poison_launcher", lambda device: (None, "no DSL here"))
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (False, None))
+    assert ws.build_launchers(DEVICE, cluster=2) is None
+    assert list(ws._CONTROL.values()) == [(None, "ImportError: the control ring needs the CuTe DSL at the FROST floor")]
+    validation = ws.stress_validation(DEVICE, cluster=2)
+    assert not validation.reproduced and not validation.available and "the control ring could not be built (ImportError" in validation.text
+    assert ws._CONTROL == {}, "the control ring is dropped once its validation is cached"
+    ws.build_launchers(DEVICE, cluster=2)
+    assert ws._CONTROL == {}, "and it is not built again behind a cached validation"
+
+
 @pytest.mark.parametrize(
     "overrides, message",
     [
