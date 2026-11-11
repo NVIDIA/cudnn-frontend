@@ -28,7 +28,8 @@ PyTorch autograd through the same API. The two fused GDN step entries
 (`GdnDecodeFused`, `GdnVerifyFused`) are imported from `cudnn` (lazily; also
 under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
 with no backward. `SharedExpertDecode` (the shared-expert decode pair, also
-under `cudnn.moe.frost`) is the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+under `cudnn.moe.frost`) and `Fp8ProjectionDecode` (the FP8 projection for
+decode rows, also under `cudnn.gemm`) are the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
@@ -42,6 +43,7 @@ arbitrary user callbacks.
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
+| `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in; BF16 out; FP32 accumulate | Unsupported | SM100: Unverified; SM103: Supported | Supported |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -165,6 +167,23 @@ a row alone and inside a batch under the entry's own picks.
   belong to one cc 10.3 runtime and one cc 10.7 runtime: on cc 10.0 the
   status rests on the replay and batch-invariance cells, and the golden
   comparison is not covered there. SM90 and SM120 are declined by type.
+- FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism
+  switch. The result bytes are a function of `(geometry, split_k)` on one
+  runtime: the number of K slices is fixed when the entry is built (given, or
+  a function of the geometry alone -- never of the row count or of the part),
+  and every other knob, including the measured pick per row count and part, is
+  a performance form that writes the same bytes. A row's bytes alone equal its
+  bytes among up to 32 rows at any position, across the 8- / 16- / 32-row
+  token tiles; the kernel is specialised on the row count, so replay and batch
+  invariance are verified at every row count 1 .. 32 of each served class
+  (`ProjectionGeometry(4608, 8192)` at split 4 and at split 2,
+  `ProjectionGeometry(8192, 2048)` at split 2). Another split is another byte
+  class and another entry; the status holds per entry. SM100/103 is verified
+  on cc 10.3 (a GB300, 152 SMs) only -- cc 10.0 is admitted by the entry and
+  unverified; SM107 on cc 10.7 (a VR200-class part, 212 SMs). The committed
+  goldens belong to one cc 10.3 runtime; on any other runtime the status rests
+  on the replay and batch-invariance cells and the golden comparison is not
+  covered. No backward entry point exists. SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
