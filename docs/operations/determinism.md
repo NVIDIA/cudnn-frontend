@@ -39,9 +39,9 @@ arbitrary user callbacks.
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Unverified |
-| `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Unverified |
-| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Unverified |
+| `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
+| `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
+| `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -146,7 +146,8 @@ a row alone and inside a batch under the entry's own picks.
   form's bytes, so the status holds under any knob and at every served
   geometry (`Geometry(K_HEADS, V_HEADS, HIDDEN)`; verified at the default
   27B-class geometry and five per-rank shards). SM100/103 is verified on
-  cc 10.0 and cc 10.3; SM90 is declined by type. The entries also serve
+  cc 10.0 and cc 10.3, SM107 on cc 10.7 (a VR200-class part, 212 SMs);
+  SM90 is declined by type. The entries also serve
   SM120-class parts (compute capability 12.x; verified on cc 12.0 with the
   forms a 99 KB per-CTA opt-in holds, at the default geometry and four of
   the five shards -- `Geometry(2, 8, 4096)` is unverified there) with the
@@ -159,11 +160,11 @@ a row alone and inside a batch under the entry's own picks.
   of up to 24 tokens, across the one- and two-m-tile forms and the one- and
   two-group forms; every other knob writes the default's bytes, and the first
   release's form (`v1_cfg`) keeps its own goldens as an A/B arm. SM100/103 is
-  verified on cc 10.0 (a GB200, 152 SMs) and cc 10.3 (a GB300, 152 SMs). The
-  committed goldens belong to one cc 10.3 runtime: on cc 10.0 the status
-  rests on the replay and batch-invariance cells, and the golden comparison
-  is not covered there. cc 10.7 runs the same admission, unverified; SM90
-  and SM120 are declined by type.
+  verified on cc 10.0 (a GB200, 152 SMs) and cc 10.3 (a GB300, 152 SMs),
+  SM107 on cc 10.7 (a VR200-class part, 212 SMs). The committed goldens
+  belong to one cc 10.3 runtime and one cc 10.7 runtime: on cc 10.0 the
+  status rests on the replay and batch-invariance cells, and the golden
+  comparison is not covered there. SM90 and SM120 are declined by type.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in

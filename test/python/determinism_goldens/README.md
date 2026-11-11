@@ -420,7 +420,7 @@ pool and the reader tickets.
 | Cross-form | `*_knob_arms_are_bitwise_*`, `test_pair_and_one_cta_forms_are_bitwise_at_one_request` | Every form family (cluster pair, register-capped, streamed, thread mappings, issue orders, ring depths) writes the bytes of the one-CTA form |
 | Reference-kernel bytes | `test_bitwise_with_the_reference_verify_kernel_outputs[*]` (with `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR`), the FlashInfer `frost` bitwise cells | The default geometry replays the saved reference-kernel output sets byte for byte; no committed goldens (the saved sets are the oracle) |
 
-GPU coverage: cc 10.0 (a GB200; the per-rank cells 2026-11-05), cc 10.3 (verified on a GB300, 2026-11-05: the same cells at the default and the four per-rank geometries, the saved reference-kernel sets byte for byte, the three register-capped default-geometry forms rendering the same `sm_103a` cubin as before the geometry change) and cc 12.0 (an RTX 5090, 99 KB per-CTA opt-in, 2026-11-05: the default geometry's cells and the per-rank cells -- the replay, batch-invariance and cross-form cells there compare against the landing-slab one-CTA form, the one this part holds; the arms the part does not hold skip by their typed decline); cc 10.7 unverified.  The fifth geometry's cells, (2, 8, 4096), were verified
+GPU coverage: cc 10.0 (a GB200; the per-rank cells 2026-11-05), cc 10.3 (verified on a GB300, 2026-11-05: the same cells at the default and the four per-rank geometries, the saved reference-kernel sets byte for byte, the three register-capped default-geometry forms rendering the same `sm_103a` cubin as before the geometry change) and cc 12.0 (an RTX 5090, 99 KB per-CTA opt-in, 2026-11-05: the default geometry's cells and the per-rank cells -- the replay, batch-invariance and cross-form cells there compare against the landing-slab one-CTA form, the one this part holds; the arms the part does not hold skip by their typed decline); cc 10.7 in the record of 2026-11-10 below.  The fifth geometry's cells, (2, 8, 4096), were verified
 on cc 10.3 (a GB300, 152 SMs, 2026-11-06, inside a vLLM container image: torch 2.14.0+cu130, nvidia-cutlass-dsl 4.8.0, cuDNN backend 9.24.0;
 `pytest linear_attention/frost/test_gdn_decode_fused.py -k k2v8h4096` 30 passed / 244 deselected, `pytest linear_attention/frost/test_gdn_verify_fused.py
 -k k2v8h4096` 37 passed / 306 deselected) and on cc 10.0 (a GB200, 152 SMs, in the repository's CI: torch 2.14.0a0+b2c75dd062.nv26.09, CUDA 13.4,
@@ -428,6 +428,30 @@ driver API 13040, cuDNN 92700, nvidia-cutlass-dsl 4.8.0; 16 pytest workers; the 
 at the head of the pull request that added the cells (#2319), and the scheduled run of 2026-11-09 on `develop` -- the CI log prints its selection, not a
 pytest command line, so the counts are read from the junit report of each run and are the same in both: the `k2v8h4096` cells of
 `test_gdn_decode_fused.py` 30 passed, of `test_gdn_verify_fused.py` 37 passed, none skipped or failed); on cc 12.0 those cells are unverified.
+
+cc 10.7 record (2026-11-10 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
+13050, cuDNN 92700, nvidia-cutlass-dsl 4.8.0, tvm-ffi 0.1.14.post0; one in-process pytest run (`CUDNN_TEST_NO_ISOLATION=1`) on one visible device,
+with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`, `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` and `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR` set to the 16
+saved reference-kernel sets, from a clean tree at `868b3cae4` (#2369); no file under `python/cudnn/linear_attention` or
+`test/python/linear_attention` differs between that commit and `8e31a5725`, the `develop` head this record was written on.  `cd test/python &&
+pytest linear_attention/frost/test_gdn_decode_fused.py linear_attention/frost/test_gdn_verify_fused.py
+linear_attention/frost/test_gdn_support_matrix_docs.py -v -ra --durations=15` -> 616 passed, 4 skipped, 0 failed in 590 s:
+`test_gdn_decode_fused.py` 273 passed / 1 skipped, `test_gdn_verify_fused.py` 340 passed / 3 skipped, `test_gdn_support_matrix_docs.py` 3 passed.
+Each of the five per-rank geometries: 30 passed (decode) and 37 passed (verify), none skipped.  Replay:
+`test_rank_geometry_matches_the_torch_model_and_replays_bitwise` 25, `test_rank_geometry_matches_the_torch_reference_and_replays_bitwise` 50,
+and at the default geometry `test_deterministic_and_matches_the_torch_model`, `test_graph_replay_over_distinct_layers_matches_eager` and
+`test_deterministic_and_graph_replay_over_distinct_layers_matches_eager`, 1 each.  Batch invariance:
+`test_rank_geometry_rows_are_batch_invariant` 5, `test_rank_geometry_requests_are_batch_invariant` 5 (the verify cells under one gated-norm
+association, as on the other parts).  Cross-form: `test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick_at_b4` 55 and
+`test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form` 95 (decode); `test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick`
+43, `test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form` 115 and `test_pair_and_one_cta_forms_are_bitwise_at_one_request` 2
+(verify).  Reference-kernel bytes: `test_bitwise_with_the_reference_verify_kernel_outputs` 14 passed, 2 skipped.  The 4 skips:
+`test_operands_on_another_cuda_device_are_rejected_before_any_launch` in both modules ("needs two CUDA devices") -- rerun in the same runtime
+with two devices visible and no reference directory, `pytest linear_attention/frost/test_gdn_decode_fused.py
+linear_attention/frost/test_gdn_verify_fused.py -v -ra -k another_cuda_device` -> 2 passed, 600 deselected; and the saved sets `r16t6_pad` and
+`r8t6_padskip` ("the reference kernel declined this set": their saved reference files hold a decline instead of outputs, so the two cells skip
+wherever these sets are used; the torch reference is their oracle).  Not run on cc 10.7: the FlashInfer plan-API twin
+(`test_flashinfer_gdn_backend.py`).
 
 ### Shared-expert decode pair: replay, batch invariance and goldens per geometry and form
 
@@ -458,8 +482,8 @@ under side-stream contention) and batch-invariant (every token of a T 6 step alo
 `test_order_arms_are_rounding_order_arms_within_the_band`; goldens exist for the default and the first release's form only; the
 graph-capture replay is bitwise with eager there too.
 
-GPU coverage: cc 10.3 (replay, batch invariance and goldens) and cc 10.0 (replay and batch invariance; the golden cells are not covered
-there).  Run of record on cc 10.3 (2026-11-06): a GB300 (cc 10.3, 152 SMs) with torch 2.14.0+cu130, CUDA 13.0, driver 13030,
+GPU coverage: cc 10.3 and cc 10.7 (replay, batch invariance and goldens) and cc 10.0 (replay and batch invariance; the golden cells are not
+covered there).  Run of record on cc 10.3 (2026-11-06): a GB300 (cc 10.3, 152 SMs) with torch 2.14.0+cu130, CUDA 13.0, driver 13030,
 cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (the goldens' `runtime` block); `cd test/python && pytest
 moe/frost/test_shared_expert_decode_determinism.py` -> 27 passed, 0 skipped, and `pytest moe/frost/test_shared_expert_decode.py` ->
 191 passed, both from a clean tree at the commit that carries the `ksplit8` goldens.  Another runtime stack (torch / CUDA / cuDNN / DSL
@@ -475,8 +499,35 @@ prints its selection, not a pytest command line; the counts are read from the ju
 `test_duplicated_token_and_neighbour_isolation` 2, `test_row_strided_views_write_the_contiguous_bytes_and_leave_the_inputs_unmodified` 4,
 `test_twenty_four_to_twenty_five_is_the_typed_decline` 1.  Skipped: every case of `test_golden` (4) and of
 `test_v1_arm_reproduces_the_v1_goldens` (4), each with "no golden for ..." -- no set is recorded for that runtime, so on cc 10.0 the golden
-comparison is a coverage gap, not a pass.  A cc 10.0 part with 148 SMs has no device run (the host cells pin the same forms for 148, 152
-and 212 SMs).  cc 10.7 unverified; cc 12.x declined by type.
+comparison is a coverage gap, not a pass.  A cc 10.0 part with 148 SMs (the host cells pin the same forms for 148, 152 and 212 SMs) has one
+device run (2026-11-10 UTC; x86 host, Python 3.10, torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0,
+tvm-ffi 0.1.13.post3; in-process with `CUDNN_TEST_NO_ISOLATION=1` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; on the tree of the pull request
+that added the cc 10.7 record below: the sources of `8e31a5725` with that pull request's comment, status-cell pin and documentation edits):
+`cd test/python && pytest
+moe/frost/test_shared_expert_decode.py moe/frost/test_shared_expert_decode_determinism.py linear_attention/frost/test_gdn_support_matrix_docs.py
+-v -ra --durations=10` -> `test_shared_expert_decode.py` 197 passed, 0 skipped; `test_shared_expert_decode_determinism.py` 19 passed, 8
+skipped, with the per-method counts of the 152-SM part (the 8 golden cases skip there too: no set for that runtime);
+`test_gdn_support_matrix_docs.py` 3 passed.  cc 12.x declined by type.
+
+cc 10.7 record (2026-11-10 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
+13050, cuDNN 92400, nvidia-cutlass-dsl 4.8.0, tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in `73840df1b366af2c/`); in-process
+pytest runs (`CUDNN_TEST_NO_ISOLATION=1`), one fresh process per command, with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` and
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, from a clean tree at `868b3cae4` (#2369); between that commit and `8e31a5725`, the `develop` head
+this record was written on, `python/cudnn/moe` and `test/python/moe` differ only in the comment and the status-cell pin of #2392.  From
+`test/python`: `pytest moe/frost/test_shared_expert_decode.py -v -ra --durations=15` -> 197 passed, 0 skipped.  `pytest
+moe/frost/test_shared_expert_decode_determinism.py -v -ra --durations=15` against the goldens committed at that commit -> 19 passed, 8 skipped:
+`test_replay` 6, `test_replay_on_a_fresh_entry_and_fresh_operands` 2, `test_batch_invariance` 4,
+`test_duplicated_token_and_neighbour_isolation` 2, `test_row_strided_views_write_the_contiguous_bytes_and_leave_the_inputs_unmodified` 4 and
+`test_twenty_four_to_twenty_five_is_the_typed_decline` 1 passed; every case of `test_golden` (4) and of
+`test_v1_arm_reproduces_the_v1_goldens` (4) skipped with "no golden for ..." (no set for this runtime key).  With the replay, batch-invariance
+and reference cases passed, the set was recorded into a new directory, `CUDNN_DETERMINISM_RECORD=<new directory> pytest
+moe/frost/test_shared_expert_decode_determinism.py -v -ra -k golden` -> 8 passed, 19 deselected, and checked strictly,
+`CUDNN_DETERMINISM_GOLDENS=<that directory> pytest moe/frost/test_shared_expert_decode_determinism.py -v -ra` -> 27 passed, 0 skipped.  The 8
+files are committed as `73840df1b366af2c/`.  Reason for the new set: a new runtime key (GPU name, compute capability, SM count and driver API
+version differ from the cc 10.3 set's), not a numerical change -- the input and output hashes of all 8 records (`y`, `act`, `gate_part`;
+`ksplit2` / `ksplit4` / `ksplit8`, one and two m-tiles, both geometries) equal those of the cc 10.3 set `6451c9d94a2d4210/`.  That equality is
+an observation on these two runtimes, not a contract across architectures.  A cc 10.7 part that reports another GPU name, SM count or software
+version hashes to another key, and the golden cells skip there.
 
 ### QSA: 35 cases
 
