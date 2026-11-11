@@ -36,6 +36,7 @@ from ..canonical import (
     normalize_prob,
 )
 from ..moe_utils import MoEWeightMode
+from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 from .hadamard_utils import HADAMARD_SIZE, hadamard_matrix
 from .moe_blockscaled_grouped_gemm_glu_hadamard import BlockScaledMoEGroupedGemmGluHadamardKernel
 
@@ -72,6 +73,10 @@ def _reinterpret_raw_grouped_fp4_tensor(tensor: torch.Tensor) -> torch.Tensor:
 class GroupedGemmGluHadamardSm100(APIBase):
     """Grouped GEMM GLU forward kernel with fused Hadamard transform."""
 
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("nvfp4",)
+    supports_gate_then_up_mma_tilers = ((256, 256),)
+
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -102,6 +107,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
         situ_beta2: float = 25.0,
         use_dynamic_sched: bool = False,
         use_tmem_post_rht_amax: bool = False,
+        glu_layout: str = "interleaved_32",
     ):
         if sample_a is not None:
             _require_torch_inputs(sample_a, "GroupedGemmGluHadamardSm100")
@@ -111,6 +117,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             acc_dtype = torch.float32
         super().__init__()
 
+        self.glu_layout = validate_glu_layout(glu_layout)
         self._warn_experimental_api()
         self._interpret_uint8_as_fp4x2 = True
         self._sample_a_tensor = sample_a
@@ -335,6 +342,21 @@ class GroupedGemmGluHadamardSm100(APIBase):
         if not has_tcgen05(major):
             raise RuntimeError(f"GroupedGemmGluHadamardSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
+        if self.glu_layout == "gate_then_up":
+            if compute_capability not in (100, 103):
+                raise NotImplementedError("gate_then_up requires SM100 or SM103")
+            if self.act_func != "swiglu" or n % 256:
+                raise NotImplementedError("gate_then_up requires SwiGLU and full N divisible by 256 (F divisible by 128)")
+            if self.mma_tiler_mn != (256, 256) or self.cluster_shape_mn != (2, 1):
+                raise NotImplementedError("gate_then_up Hadamard requires mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1)")
+            if self.sf_dtype != torch.float8_e4m3fn or self.sf_vec_size != 16 or self.c_dtype != torch.bfloat16 or self.d_dtype != torch.bfloat16:
+                raise NotImplementedError("gate_then_up Hadamard supports NVFP4 E2M1/E4M3, sf_vec_size=16, BF16 C/D")
+            if self.weight_mode == MoEWeightMode.DISCRETE and self.use_tmem_post_rht_amax:
+                raise NotImplementedError(
+                    "gate_then_up with discrete weights and use_tmem_post_rht_amax=True is unsupported by the current compiler; "
+                    "select use_tmem_post_rht_amax=False for the existing SMEM RHT path"
+                )
+
         if not self._kernel.can_implement(
             _convert_to_cutlass_data_type(self.ab_dtype, interpret_uint8_as_fp4x2=self._interpret_uint8_as_fp4x2),
             _convert_to_cutlass_data_type(self.sf_dtype),
@@ -381,6 +403,7 @@ class GroupedGemmGluHadamardSm100(APIBase):
             situ_beta1=self.situ_beta1,
             enable_bias=self.bias_desc is not None,
             use_tmem_post_rht_amax=self.use_tmem_post_rht_amax,
+            glu_layout=self.glu_layout,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -640,6 +663,15 @@ class GroupedGemmGluHadamardSm100(APIBase):
                 float(situ_beta1) != self.situ_beta1,
                 "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
             )
+        if self.glu_layout == "gate_then_up":
+            n_full = b_nkl(b_tensor)[0] if b_tensor is not None else self.b_shape[0]
+            expected_n = self.b_desc.shape[0] if self.b_desc is not None else self.b_shape[0]
+            if n_full % 256 or n_full != expected_n or c_tensor.shape[1] != n_full or d_tensor.shape[1] != n_full // 2:
+                raise ValueError("gate_then_up requires the compiled full N divisible by 256, matching C and D widths")
+            if hadamard_tensor is not None and (
+                hadamard_tensor.dtype != torch.bfloat16 or hadamard_tensor.device != a_tensor.device or not hadamard_tensor.is_contiguous()
+            ):
+                raise ValueError("gate_then_up requires a contiguous BF16 Hadamard tensor on the operand device")
         if a_tensor.shape[0] == 0:
             return
         if current_stream is None:
@@ -730,11 +762,15 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     use_dynamic_sched: bool = False,
     use_tmem_post_rht_amax: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    glu_layout: str = "interleaved_32",
 ) -> TupleDict:
     """High-level wrapper for grouped GEMM GLU + Hadamard forward fusion."""
     from cudnn.gemm.cutedsl.discrete_grouped.discrete_kernel_utils import _require_pointer_tensor
     from cudnn.tensor_adapter import detect_framework
 
+    glu_layout = validate_glu_layout(glu_layout)
+    if glu_layout == "gate_then_up" and detect_framework(a_tensor) != "torch":
+        raise NotImplementedError("gate_then_up Hadamard requires torch tensors")
     if b_tensor is not None and detect_framework(a_tensor) == "jax":
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_glu_hadamard_jax_forward
@@ -813,6 +849,8 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
         n_full = n
         k_logical = k_physical * 2 if b_dtype in (torch.float4_e2m1fn_x2, torch.uint8) else k_physical
         b_shape = (n_full, k_logical)
+    if glu_layout == "gate_then_up" and n_full % 256:
+        raise ValueError("gate_then_up requires full N divisible by 256 (F divisible by 128)")
     n_out = n_full if act_func == "srelu" else n_full // 2
 
     if cd_major != "n":
@@ -853,6 +891,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
     situ_beta1_cache_signature = float(situ_beta1) if act_func == "situglu" else None
     cache_key = (
         a_tensor.device,
+        glu_layout,
         weight_mode,
         act_func,
         situ_beta1_cache_signature,
@@ -916,6 +955,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
                 situ_beta2=situ_beta2,
                 use_dynamic_sched=use_dynamic_sched,
                 use_tmem_post_rht_amax=use_tmem_post_rht_amax,
+                glu_layout=glu_layout,
             )
             if is_dense:
                 api = GroupedGemmGluHadamardSm100(sample_b=b_tensor, sample_sfb=sfb_tensor, **common_kwargs)
@@ -971,3 +1011,7 @@ def grouped_gemm_glu_hadamard_wrapper_sm100(
 
 
 grouped_gemm_glu_hadamard_wrapper_sm100.supports_canonical_layouts = True
+
+grouped_gemm_glu_hadamard_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_glu_hadamard_wrapper_sm100.supports_gate_then_up_precisions = ("nvfp4",)
+grouped_gemm_glu_hadamard_wrapper_sm100.supports_gate_then_up_mma_tilers = ((256, 256),)

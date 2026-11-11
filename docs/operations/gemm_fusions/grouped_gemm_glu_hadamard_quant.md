@@ -22,7 +22,58 @@ This kernel performs:
 3. **Optional NVFP4 quantization** of the post-activation `D` output
 4. **Optional RHT output** in bf16 or NVFP4 form
 
-### Shapes
+### Gate/up branch storage
+
+Both the wrapper and class accept an append-only `glu_layout` option. The
+existing `"interleaved_32"` default keeps its 256x256 two-CTA geometry.
+`"gate_then_up"` accepts conventional `[gate | up]` weights, matching bias
+and saved C, without a persistent weight repack. It uses the existing kernel
+with a nested TMA view and a local scale-quarter permutation before MMA.
+D, RHT and their scale tensors retain their natural post-activation feature order.
+
+The canonical branch option currently requires Torch on SM100/SM103,
+`act_func="swiglu"`, NVFP4 E2M1 operands with E4M3 scales, `sf_vec_size=16`,
+K-major weights, BF16 saved C, and `N/2` divisible by 128. Set
+`mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)` for this option.
+Both dense and discrete expert weights are supported. The existing output
+modes remain available: BF16 or NVFP4 D, BF16/NVFP4 rowwise RHT, and NVFP4
+colwise RHT. Expert token offsets still require 256-row alignment.
+JAX, Rubin and UE5M3 input-scale overrides do not gain this branch option.
+
+Capability metadata is explicit:
+`supports_glu_layouts=("interleaved_32", "gate_then_up")`,
+`supports_gate_then_up_precisions=("nvfp4",)`, and
+`supports_gate_then_up_mma_tilers=((128, 256),)`.
+These branch-order capabilities are separate from tensor rank/stride support.
+
+### Natural tensor ranks (Torch)
+
+The wrapper and class advertise `supports_canonical_layouts=True` and accept
+contiguous A `(M, K/2)`, dense B `(L, N, K/2)`, and prob `(M,)` for packed NVFP4.
+The shapes use physical bytes for FP4; logical K is twice the last extent.
+Discrete weights keep the existing pointer-array contract.
+
+SFA and dense SFB can be contiguous buffers containing the **already MMA-packed
+scale bytes**, at any rank. Their lengths are respectively
+`512 * ceil_div(M, 128) * ceil_div(K, 4 * sf_vec_size)` and
+`512 * ceil_div(N, 128) * ceil_div(K, 4 * sf_vec_size) * L`.
+Flat storage does not mean logical row-major scale order: the caller must provide
+the same packed bytes as the legacy six-dimensional view. No scale repacking,
+weight permutation, or arithmetic change is performed by this adapter.
+
+For rank-two A, the wrapper returns C `(M, N)`, D and rowwise RHT `(M, N_out)`
+(or `(M, N_out/2)` for packed NVFP4), and flat contiguous rowwise scale buffers.
+Colwise RHT and its scales keep their existing flat per-expert representation.
+The class similarly accepts caller-owned natural-rank outputs; contiguous
+rowwise scale output buffers may have any rank. Trace-time views normalize
+these tensors for the existing kernel, without per-execution tensor reshapes.
+
+Natural tensor ranks work with both `glu_layout="interleaved_32"` and
+`glu_layout="gate_then_up"`. Colwise RHT scales use the same standard
+GEMM-blocked output order for either branch layout. Legacy input ranks and
+their wrapper output shapes remain supported.
+
+### Legacy kernel-facing shapes
 
 Let `N_out = N / 2` for `act_func="swiglu"` or `"geglu"` and `N_out = N` for `act_func="srelu"`. Let `SF(rows, cols)` denote the swizzled scale-factor layout `(32, 4, ceil_div(rows, 128), 4, ceil_div(ceil_div(cols, sf_vec_size), 4), 1)`.
 
@@ -48,7 +99,26 @@ Let `N_out = N / 2` for `act_func="swiglu"` or `"geglu"` and `N_out = N` for `ac
 
 For packed NVFP4 output tensors (`torch.float4_e2m1fn_x2`), the physical tensor stores two logical values per byte along the innermost dimension. The wrapper therefore allocates packed `D` and rowwise `RHT` tensors with physical second dimension `N_out / 2`. Raw `torch.uint8` tensors are not accepted as a packed FP4 container by this fusion.
 
-Colwise `RHT` is NVFP4-only. Its data tensor is a flat physical tensor of length `valid_m * N_out / 2`; after FP4 unpacking, each expert segment is logical `(N_out, expert_m)` with adjacent token values packed together. Expert segments are concatenated in expert order. `SFRHT colwise` is flat length `valid_m * N_out / sf_vec_size`; each expert segment is `SF(N_out, expert_m)` flattened in expert order, so the scale segment for an expert starts at `N_out * expert_m_prefix / sf_vec_size`.
+Colwise `RHT` is NVFP4-only. Its data tensor is a flat physical tensor of length `valid_m * N_out / 2`; after FP4 unpacking, each expert segment is logical `(N_out, expert_m)` with adjacent token values packed together. Expert segments are concatenated in expert order. `SFRHT colwise` is flat length `valid_m * N_out / sf_vec_size`; each expert segment contains standard GEMM-blocked scale bytes, starting at `N_out * expert_m_prefix / sf_vec_size`.
+
+For logical column scales `S[r, q]`, where `r` indexes features and `q`
+indexes 16-token blocks, let `C = expert_m / 64`. The byte offset within
+one expert's scale segment is:
+
+```text
+512 * ((r / 128) * C + q / 4) + 16 * (r % 32) + 4 * ((r / 32) % 4) + q % 4
+```
+
+Divisions are integer divisions. Physical row-major axes are
+`(N_out/128, expert_m/64, 32, 4, 4)`. Torch and JAX use this contract on both
+Blackwell and Rubin; the kernel writes these bytes directly without a repack.
+
+**Output-format migration:** earlier versions flattened the logical CuTe axes
+`(32, 4, N_out/128, 4, expert_m/64)` in row-major order. That format was
+decodable by its matching reference but differed from GEMM consumers' scale
+packing. Callers decoding that old order must now consume standard GEMM-blocked
+bytes. Public API signatures, tensor lengths, logical scale values, RHT data
+and rowwise outputs are unchanged.
 
 `L` is the expert count. `valid_m` is the `M` extent of `a_tensor`; by contract it must match the final cumulative padded offset in `padded_offsets`.
 
@@ -62,7 +132,10 @@ $$
 
 The `bias` term is omitted when `bias_tensor=None`. `C` stores this unclamped GEMM-plus-bias value.
 
-Split the `N` dimension into consecutive 32-column gate/up blocks:
+With the default `glu_layout="interleaved_32"`, split the `N` dimension into
+consecutive 32-column gate/up blocks. For `"gate_then_up"`, use the first
+`N/2` columns as gate and the remaining `N/2` columns as up; the activation
+equations below are unchanged. The default block indexing is:
 
 $$
 G_b = C[:, 2bG:(2b+1)G], \quad U_b = C[:, (2b+1)G:(2b+2)G], \quad G = 32
@@ -305,15 +378,15 @@ result = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
   - NVFP4 colwise `RHT` always requires `SFRHT colwise`
 - Output tensor **SFRHT colwise** (present with colwise `RHT`)
   - Shape: `(valid_m * N_out / sf_vec_size,)`
-  - Layout: flattened per-expert `SF(N_out, expert_m)` segments in expert order
+  - Layout: standard GEMM 128x4 blocked scale bytes per expert, concatenated in expert order; see the physical offset formula above
   - Dtype: `float8_e4m3fn`, independent of `SFA`/`SFB` dtype
 
 ### Configuration
 
 - `act_func`: `"swiglu"`, `"geglu"`, or `"srelu"`
 - `cd_major`: must be `"n"`
-- `mma_tiler_mn`: must be `(256, 256)`
-- `cluster_shape_mn`: cluster dimensions; for this fixed 2-CTA tiler, `cluster_shape_mn[0]` must be `2` and `cluster_shape_mn[1]` must be a positive power of two no larger than `4`
+- `mma_tiler_mn`: `(256, 256)` for the default `glu_layout="interleaved_32"`; `(128, 256)` for `"gate_then_up"`
+- `cluster_shape_mn`: for `"interleaved_32"`, the 2-CTA tiler requires the first dimension to be `2` and the second to be a positive power of two no larger than `4`; `"gate_then_up"` requires `(1, 1)`
 - `sf_vec_size`: must be `16`
 - `sf_fp8_dtype_override`: `None` uses the scale format implied by `SFA`/`SFB` dtype. `"e5m3"` reinterprets `torch.float8_e4m3fn` SFA/SFB storage as UE5M3 input scale factors; this is Rubin-only and does not convert tensor contents.
 - `m_aligned`: must be `256`

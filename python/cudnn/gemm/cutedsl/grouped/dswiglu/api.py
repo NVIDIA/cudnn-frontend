@@ -15,6 +15,8 @@ from .grouped_gemm_dswiglu_quant import (
 from cuda.bindings import driver as cuda
 from typing import Tuple, Optional
 
+from cudnn.gemm.cutedsl.grouped.glu_layout import GLU_LAYOUTS, validate_glu_layout
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_stream
@@ -65,6 +67,9 @@ class GroupedGemmDswigluSm100(APIBase):
         >>> api.execute(..., stream)
     """
 
+    supports_glu_layouts = GLU_LAYOUTS
+    supports_gate_then_up_precisions = ("nvfp4", "mxfp8")
+
     def __init__(
         self,
         sample_a: torch.Tensor,
@@ -93,6 +98,7 @@ class GroupedGemmDswigluSm100(APIBase):
         m_aligned: int = 256,
         discrete_col_sfd: bool = False,
         epilogue_op: Optional[str] = None,
+        glu_layout: str = "interleaved_32",
     ):
         """Initialize the GroupedGemmDswigluSm100 API.
 
@@ -120,7 +126,44 @@ class GroupedGemmDswigluSm100(APIBase):
         :param m_aligned: Alignment for group M dimension
         :param discrete_col_sfd: Boolean, True to generate discrete col-major scale factor tensor
         :param epilogue_op: Optional epilogue operation. Valid values: None, "none", "identity", "relu", "srelu"
+        :param glu_layout: "interleaved_32" (default), or "gate_then_up" for canonical gate/up halves.
         """
+        self.glu_layout = validate_glu_layout(glu_layout)
+        self._canonical_dglu = None
+        if glu_layout == "gate_then_up":
+            from cudnn.gemm.cutedsl.grouped.dglu.api import GroupedGemmDgluSm100
+
+            if detect_framework(sample_a) != "torch":
+                raise NotImplementedError("gate_then_up requires actual torch sample tensors; TensorDesc and other frameworks are unsupported")
+            super().__init__()
+            self._canonical_dglu = GroupedGemmDgluSm100(
+                sample_a=sample_a,
+                sample_c=sample_c,
+                sample_d_row=sample_d_row,
+                sample_d_col=sample_d_col,
+                sample_sfa=sample_sfa,
+                sample_padded_offsets=sample_padded_offsets,
+                sample_alpha=sample_alpha,
+                sample_beta=sample_beta,
+                sample_prob=sample_prob,
+                sample_dprob=sample_dprob,
+                sample_sfd_row=sample_sfd_row,
+                sample_sfd_col=sample_sfd_col,
+                sample_amax=sample_amax,
+                sample_norm_const=sample_norm_const,
+                acc_dtype=acc_dtype,
+                mma_tiler_mn=mma_tiler_mn,
+                cluster_shape_mn=cluster_shape_mn,
+                sf_vec_size=sf_vec_size,
+                vector_f32=vector_f32,
+                m_aligned=m_aligned,
+                discrete_col_sfd=discrete_col_sfd,
+                epilogue_op=epilogue_op,
+                glu_layout=glu_layout,
+                sample_b=sample_b,
+                sample_sfb=sample_sfb,
+            )
+            return
         framework = "torch" if isinstance(sample_a, TensorDesc) else detect_framework(sample_a)
         if sample_a is not None and framework != "torch":
             if framework == "jax":
@@ -209,6 +252,9 @@ class GroupedGemmDswigluSm100(APIBase):
 
         :return: True if supported, raises exception otherwise
         """
+        if self._canonical_dglu is not None:
+            self._is_supported = self._canonical_dglu.check_support()
+            return self._is_supported
         self._logger.debug("Entering check_support")
 
         all_none = all(x is None for x in [self.sfd_row_desc, self.sfd_col_desc, self.norm_const_desc])
@@ -387,6 +433,11 @@ class GroupedGemmDswigluSm100(APIBase):
 
     def compile(self) -> None:
         """Compile the kernel."""
+        if self._canonical_dglu is not None:
+            self._canonical_dglu.compile()
+            self._is_supported = self._canonical_dglu._is_supported
+            self._compiled_kernel = self._canonical_dglu._compiled_kernel
+            return
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
@@ -664,6 +715,10 @@ class GroupedGemmDswigluSm100(APIBase):
 
         self._logger.debug("Kernel compiled successfully")
 
+    def scratch_workspace_bytes(self) -> int:
+        """Caller-owned scratch required by the canonical layout; zero for the legacy kernel."""
+        return self._canonical_dglu.scratch_workspace_bytes() if self._canonical_dglu is not None else 0
+
     def execute(
         self,
         a_tensor: torch.Tensor,
@@ -683,6 +738,8 @@ class GroupedGemmDswigluSm100(APIBase):
         amax_tensor: Optional[torch.Tensor] = None,
         norm_const_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -703,7 +760,29 @@ class GroupedGemmDswigluSm100(APIBase):
         :param amax_tensor: Optional amax tensor
         :param norm_const_tensor: Optional normalization constant
         :param current_stream: CUDA stream
+        :param workspace: Caller-owned scratch from scratch_workspace_bytes(), required for gate_then_up.
         """
+        if self._canonical_dglu is not None:
+            return self._canonical_dglu.execute(
+                a_tensor=a_tensor,
+                c_tensor=c_tensor,
+                d_row_tensor=d_row_tensor,
+                d_col_tensor=d_col_tensor,
+                sfa_tensor=sfa_tensor,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                beta_tensor=beta_tensor,
+                prob_tensor=prob_tensor,
+                dprob_tensor=dprob_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                amax_tensor=amax_tensor,
+                norm_const_tensor=norm_const_tensor,
+                current_stream=current_stream,
+                workspace=workspace,
+                b_tensor=b_tensor,
+                sfb_tensor=sfb_tensor,
+            )
         self._logger.debug("Entering execute")
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
@@ -743,7 +822,7 @@ _logger = logging.getLogger(__name__)
 _cache_of_GroupedGemmDswigluSm100Objects = {}
 
 
-def grouped_gemm_dswiglu_wrapper_sm100(
+def _grouped_gemm_dswiglu_wrapper_impl(
     a_tensor: torch.Tensor,
     b_tensor: torch.Tensor,
     c_tensor: torch.Tensor,  # Intermediate from forward pass (required)
@@ -767,6 +846,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     dprob_tensor_buf: Optional[torch.Tensor] = None,
     amax_tensor_buf: Optional[torch.Tensor] = None,
+    glu_layout: str = "interleaved_32",
 ) -> TupleDict:
     """Convenience wrapper for grouped GEMM dSwiGLU backward operation.
 
@@ -776,6 +856,8 @@ def grouped_gemm_dswiglu_wrapper_sm100(
 
     This function creates the API, compiles, and executes in one call.
     Compiled kernels are cached for reuse when called with the same configuration.
+    ``glu_layout="gate_then_up"`` delegates to the unified dGLU kernel and keeps
+    caller-provided dprob/amax buffers; the wrapper owns scratch allocation.
 
     Canonical layouts (additive): each input is also accepted in its natural
     row-major form and normalized internally -- A as (valid_m, k), B as (l, n, k)
@@ -820,6 +902,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             - **sfd_row_tensor** (torch.Tensor or None): Row-wise scale factors for D
             - **sfd_col_tensor** (torch.Tensor or None): Column-wise scale factors for D
     """
+    validate_glu_layout(glu_layout)
+    if glu_layout == "gate_then_up" and detect_framework(a_tensor) != "torch":
+        raise NotImplementedError("gate_then_up dSwiGLU currently requires torch tensors")
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_dswiglu_wrapper_sm100; pass torch tensors or JAX arrays")
@@ -869,6 +954,9 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     else:
         n, _, l = b_tensor.shape
 
+    if glu_layout == "gate_then_up" and n % 128:
+        raise ValueError("gate_then_up dSwiGLU requires each gate/up half to be divisible by 128; padding is not implicit")
+
     # Canonical (sum_m, k) A selects natural-shaped outputs: (m, x) row-major D,
     # (m,) dprob, and dense C-contiguous SFD buffers.
     canonical_outputs = a_tensor.ndim == 2
@@ -887,6 +975,8 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         return tuple(i for i, s in sorted(enumerate(tensor.stride()), key=lambda x: x[1]))
 
     cache_key = (
+        glu_layout,
+        (str(a_tensor.device), l) if glu_layout == "gate_then_up" else None,
         use_full_dynamic,
         a_tensor.shape[1:] if not use_full_dynamic else None,
         b_tensor.shape if not use_full_dynamic else None,
@@ -940,7 +1030,10 @@ def grouped_gemm_dswiglu_wrapper_sm100(
     if valid_m == 0:
         amax_tensor = None
         if d_dtype in (cutlass.BFloat16, cutlass.Float16):
-            amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
+            if glu_layout == "gate_then_up" and amax_tensor_buf is not None:
+                amax_tensor = amax_tensor_buf.fill_(float("-inf"))
+            else:
+                amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=a_tensor.device)
         _logger.debug("grouped_gemm_dswiglu_wrapper_sm100: valid_m is zero, skipping kernel execution")
         return TupleDict(
             d_row_tensor=d_row_tensor,
@@ -1024,31 +1117,59 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             m_aligned=m_aligned,
             discrete_col_sfd=discrete_col_sfd,
             epilogue_op=epilogue_op,
+            glu_layout=glu_layout,
         )
 
         assert grouped_gemm_dswiglu.check_support(), "Unsupported configuration"
         grouped_gemm_dswiglu.compile()
         _cache_of_GroupedGemmDswigluSm100Objects[cache_key] = (grouped_gemm_dswiglu, cached_amax_tensor, cached_beta_tensor)
 
-    grouped_gemm_dswiglu.execute(
-        a_tensor=a_tensor,
-        b_tensor=b_tensor,
-        c_tensor=c_tensor,
-        d_row_tensor=d_row_tensor,
-        d_col_tensor=d_col_tensor,
-        sfa_tensor=sfa_tensor,
-        sfb_tensor=sfb_tensor,
-        padded_offsets=padded_offsets,
-        alpha_tensor=alpha_tensor,
-        beta_tensor=effective_beta,
-        prob_tensor=prob_tensor,
-        dprob_tensor=dprob_tensor,
-        sfd_row_tensor=sfd_row_tensor,
-        sfd_col_tensor=sfd_col_tensor,
-        amax_tensor=amax_tensor,
-        norm_const_tensor=norm_const_tensor,
-        current_stream=current_stream,
-    )
+    if glu_layout == "gate_then_up":
+        from ..backend_utils import wrapper_workspace
+
+        if amax_tensor is not None:
+            amax_tensor.fill_(float("-inf"))
+        with wrapper_workspace("torch", grouped_gemm_dswiglu.scratch_workspace_bytes(), a_tensor.device, current_stream) as workspace:
+            grouped_gemm_dswiglu.execute(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                c_tensor=c_tensor,
+                d_row_tensor=d_row_tensor,
+                d_col_tensor=d_col_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_tensor=sfb_tensor,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                beta_tensor=effective_beta,
+                prob_tensor=prob_tensor,
+                dprob_tensor=dprob_tensor,
+                sfd_row_tensor=sfd_row_tensor,
+                sfd_col_tensor=sfd_col_tensor,
+                amax_tensor=amax_tensor,
+                norm_const_tensor=norm_const_tensor,
+                current_stream=current_stream,
+                workspace=workspace,
+            )
+    else:
+        grouped_gemm_dswiglu.execute(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            d_row_tensor=d_row_tensor,
+            d_col_tensor=d_col_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=effective_beta,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+            amax_tensor=amax_tensor,
+            norm_const_tensor=norm_const_tensor,
+            current_stream=current_stream,
+        )
 
     return TupleDict(
         d_row_tensor=d_row_tensor,
@@ -1058,3 +1179,45 @@ def grouped_gemm_dswiglu_wrapper_sm100(
         sfd_row_tensor=sfd_row_tensor,
         sfd_col_tensor=sfd_col_tensor,
     )
+
+
+def grouped_gemm_dswiglu_wrapper_sm100(
+    a_tensor: torch.Tensor,
+    b_tensor: torch.Tensor,
+    c_tensor: torch.Tensor,  # Intermediate from forward pass (required)
+    sfa_tensor: torch.Tensor,
+    sfb_tensor: torch.Tensor,
+    padded_offsets: torch.Tensor,
+    alpha_tensor: torch.Tensor,
+    beta_tensor: Optional[torch.Tensor],
+    prob_tensor: torch.Tensor,
+    norm_const_tensor: Optional[torch.Tensor] = None,
+    acc_dtype: Optional[torch.dtype] = None,
+    d_dtype: Optional[torch.dtype] = None,
+    cd_major: str = "n",
+    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    cluster_shape_mn: Optional[Tuple[int, int]] = None,
+    sf_vec_size: int = 16,
+    vector_f32: bool = False,
+    m_aligned: int = 256,
+    discrete_col_sfd: bool = False,
+    epilogue_op: Optional[str] = None,
+    current_stream: Optional[cuda.CUstream] = None,
+    dprob_tensor_buf: Optional[torch.Tensor] = None,
+    amax_tensor_buf: Optional[torch.Tensor] = None,
+    glu_layout: str = "interleaved_32",
+) -> TupleDict:
+    kwargs = locals()
+    validate_glu_layout(glu_layout)
+    if glu_layout == "gate_then_up" and detect_framework(a_tensor) == "torch":
+        from ..backend_utils import _torch_stream_context
+
+        with _torch_stream_context(current_stream, a_tensor.device):
+            return _grouped_gemm_dswiglu_wrapper_impl(**kwargs)
+    return _grouped_gemm_dswiglu_wrapper_impl(**kwargs)
+
+
+grouped_gemm_dswiglu_wrapper_sm100.__doc__ = _grouped_gemm_dswiglu_wrapper_impl.__doc__
+
+grouped_gemm_dswiglu_wrapper_sm100.supports_glu_layouts = GLU_LAYOUTS
+grouped_gemm_dswiglu_wrapper_sm100.supports_gate_then_up_precisions = ("nvfp4", "mxfp8")

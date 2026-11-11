@@ -20,6 +20,7 @@ Discrete mode
 from __future__ import annotations
 
 
+from ..glu_layout import validate_glu_layout
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..backend_utils import rubin_single_group_offsets_kwarg
 from ..canonical import (
@@ -138,6 +139,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         use_single_group_runtime_offsets: bool = False,
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
+        glu_layout: str = "interleaved_32",
     ):
         """Initialize the GroupedGemmGluSm100 API.
 
@@ -255,6 +257,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
 
         # ---- Configuration ----
+        self.glu_layout = validate_glu_layout(glu_layout)
         self.acc_dtype = acc_dtype
         self.mma_tiler_mn = mma_tiler_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -679,6 +682,20 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 f"GroupedGemmGlu requires SM100+ compute capability with tcgen05 (not cc 12.x), " f"but found SM{compute_capability} on device {device}"
             )
 
+        if self.glu_layout == "gate_then_up":
+            is_mxfp8 = self.ab_dtype == torch.float8_e4m3fn and self.sfa_desc.dtype == torch.float8_e8m0fnu and self.sf_vec_size == 32
+            is_nvfp4 = self._is_fp4x2(self.ab_dtype) and self.sfa_desc.dtype == torch.float8_e4m3fn and self.sf_vec_size == 16
+            self._not_implemented_error_if(
+                compute_capability not in (100, 103) or not (is_mxfp8 or is_nvfp4),
+                "gate_then_up GLU requires MXFP8 E4M3/E8M0 or NVFP4 E2M1/E4M3 on SM100/103",
+            )
+            self._not_implemented_error_if(n % 256 != 0 or self.mma_tiler_mn[1] != 256, "gate_then_up GLU requires N divisible by 256 and tile_N=256")
+            self._not_implemented_error_if(self.b_major != "k", "gate_then_up GLU requires K-major weights")
+            self._not_implemented_error_if(self.act_func != "swiglu", "gate_then_up GLU currently supports swiglu only")
+            self._not_implemented_error_if(
+                self.c_desc.dtype != torch.bfloat16 or self.d_dtype != (torch.float8_e4m3fn if is_mxfp8 else torch.bfloat16),
+                "gate_then_up GLU requires BF16 saved C, E4M3 D for MXFP8, and BF16 D for NVFP4",
+            )
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
@@ -715,7 +732,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             act_func=self.act_func,
             enable_bias=self._has_bias,
             use_dynamic_sched=self.use_dynamic_sched,
-            **({"situ_beta1": self.situ_beta1} if not self._is_rubin_kernel else {}),
+            **({"situ_beta1": self.situ_beta1, "glu_layout": self.glu_layout} if not self._is_rubin_kernel else {}),
             **rubin_single_group_offsets_kwarg(self._is_rubin_kernel, self.use_single_group_runtime_offsets),
             # Only the Rubin kernel accepts sf_fp8_dtype_override, and check_support
             # rejects "e5m3" unless _is_rubin_kernel -- the same flag that selected
@@ -831,8 +848,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
         else:
             valid_m = cute.sym_int(divisibility=256)
-            n_sym = cute.sym_int()
-            n_2_sym = cute.sym_int()
+            n_sym = cute.sym_int(divisibility=256 if self.glu_layout == "gate_then_up" else 1)
+            n_2_sym = cute.sym_int(divisibility=128 if self.glu_layout == "gate_then_up" else 1)
             k_sym = cute.sym_int()
             l_sym = cute.sym_int()
 
@@ -852,7 +869,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             )
             c_cute_fake = self._make_fake_cute_compact_tensor(
                 dtype=self.c_desc.dtype,
-                shape=(valid_m, n_2_sym, 1),
+                shape=(valid_m, n_sym if self.glu_layout == "gate_then_up" else n_2_sym, 1),
                 stride_order=self.c_desc.stride_order,
                 dynamic_mode=self.c_desc.stride_order[0],
                 divisibility=8 if self._is_f16(self.c_desc.dtype) else 16,
@@ -1367,6 +1384,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         if (scheduler_counter_tensor is None) != (self.scheduler_counter_desc is None):
             raise ValueError("scheduler_counter_tensor presence must match sample_scheduler_counter at compilation")
         validate_scheduler_counter(scheduler_counter_tensor, a_tensor)
+        if self.glu_layout == "gate_then_up" and c_tensor.shape[1] % 256:
+            raise NotImplementedError("gate_then_up GLU requires each gate/up branch N divisible by 128; padding is not implicit")
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 

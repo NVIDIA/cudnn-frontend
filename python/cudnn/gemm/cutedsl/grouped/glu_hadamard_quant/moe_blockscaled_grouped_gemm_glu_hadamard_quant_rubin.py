@@ -82,6 +82,7 @@ from ..moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
+from ..canonical import kernel_facing_mx, kernel_facing_b, kernel_facing_prob, kernel_facing_rowwise_sf
 from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
@@ -743,6 +744,17 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
         Discrete mode: ``b`` and ``sfb`` are cute.Pointer to device int64[]
         arrays of per-expert base addresses.
         """
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        prob = kernel_facing_prob(prob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b)
+        sfd = kernel_facing_rowwise_sf(sfd, d.shape[0], d.shape[1], self.sf_vec_size)
+        if cutlass.const_expr(self.rht_rowwise):
+            rht = kernel_facing_mx(rht)
+            sfrht = kernel_facing_rowwise_sf(sfrht, d.shape[0], d.shape[1], self.sf_vec_size)
+
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
@@ -3021,7 +3033,6 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
                                         pitch16=rht_t_cnt // HADAMARD_SIZE,
                                         feat0=mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk_d[1],
                                         tok16=(_sf_row_h - epi_tidx) // HADAMARD_SIZE,
-                                        row_blocks=cute.ceil_div(mD_mnl.shape[1], 128),
                                         gSf=mSfRht_mnl,
                                     )
                                 elif cutlass.const_expr(self.rht_quant):

@@ -208,6 +208,36 @@ assert out["activation_tensor"] is activation
 
 ## Block-scaled contract
 
+### Gate/up storage order (BF16 and block-scaled)
+
+Set `glu_layout="gate_then_up"` on the Torch wrapper or class when saved C
+uses conventional `[gate | up]` channel order. D_row, D_col, their packed
+scale factors and dbias then use that same canonical order, allowing ordinary
+FC1 dgrad/wgrad GEMMs without a gradient permutation. B is the FC2 weight;
+its layout does not change. The default `glu_layout="interleaved_32"`
+preserves the existing contract below.
+
+This option requires SM100/SM103, Torch tensors, dSwiGLU, BF16 saved C,
+and N divisible by 128. It supports BF16 inputs with BF16 outputs; NVFP4
+E2M1 inputs with E4M3 block-16 scales and BF16 outputs; and MXFP8 E4M3
+inputs with E8M0 block-32 scales and E4M3 row/column outputs. Both packed and
+discrete FC2 weights are supported, subject to the existing weight-major
+restrictions, as is global/per-expert MXFP8 column-scale storage.
+`supports_gate_then_up_precisions` advertises the supported precision names
+(`"bf16"`, `"nvfp4"`, `"mxfp8"`). JAX and SM107 do not acquire canonical
+branch support from this option. The existing 256-row token-padding
+requirement remains. `supports_glu_layouts` advertises branch-order support;
+`supports_canonical_layouts` describes only tensor ranks and strides.
+
+The existing epilogue reads C and stores gradient payloads through nested
+TMA views, then maps scale and bias stores to their canonical addresses.
+No global intermediate repacking pass is inserted. Forward and backward
+must use the same `glu_layout` value. The option does not change the existing
+deterministic-dprob or atomic-dbias reduction guarantees.
+
+The remaining block-scaled examples use the default interleaved layout unless
+they explicitly select `gate_then_up`.
+
 The block-scaled backend performs:
 1. **Block-scaled grouped GEMM**: Low-precision GEMM (FP4, FP8) with per-block scale factors across multiple expert groups
 2. **dGLU backward epilogue**: Fused backward computation using the forward `C` tensor (input/gate interleaved)

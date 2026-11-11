@@ -94,6 +94,7 @@ def test_grouped_gemm_dglu_blockscaled_discrete_records_pointer_streams(monkeypa
     from cudnn.gemm.cutedsl.grouped.dglu import _blockscaled_api as blockscaled_module
 
     api = object.__new__(GroupedGemmDgluBlockScaledAPI)
+    api.glu_layout = "interleaved_32"
     api._logger = Mock()
     api._get_default_stream = lambda stream: stream
     api._runtime_error_if = lambda condition, message: None
