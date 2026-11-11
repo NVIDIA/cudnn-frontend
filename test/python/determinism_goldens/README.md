@@ -30,6 +30,7 @@ pytest core/test_determinism_utils.py
 | `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
 | `attention_gate/frost/test_gate_quant_decode_determinism.py` | `AttentionGateQuantDecode` (the attention gate + quantize decode step, rows 1 .. 160) | FP8 E4M3 output `out` | — (inference-only step kernel; no backward) |
+| `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
@@ -628,6 +629,97 @@ commit with the three commands above, in the runtimes above:
 - Cold compile on an x86 host at that commit (a cc 8.0 device: every device case skips), CuTe DSL 4.8.0 and 4.8.1: 65 passed with CUDA
   13.4, 64 passed and the `sm_107a` rendering case skipped with CUDA 12.9, under either version; the three rendering cases and the
   launch-argument case are among them.
+### FP8 projection for decode rows: replay and batch invariance at every row count, goldens per byte class and token tile
+
+`gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` pins `cudnn.Fp8ProjectionDecode` (an FP8 E4M3 weight times FP8 E4M3
+activations to bf16, 1 .. 32 rows, one launch) at its three served byte classes: `ProjectionGeometry(4608, 8192)` at `split_k` 4 and at
+`split_k` 2, and `ProjectionGeometry(8192, 2048)` at `split_k` 2.  Forward only: the entry is an inference step with no backward entry
+point, so there is no backward case.  Every comparison is raw bytes over the entry's one result (`out`, bf16); the independent fp64
+reference of the E4M3 operands is a separate check under a per-element bound (half a bf16 unit plus the fp32 accumulation term; the
+utilities module beside the suite), and operands whose partial sums are exact in fp32 are compared byte for byte with the host in
+`test_fp8_projection_decode.py`.  The kernel is specialised on the row count -- one rendering per row count -- so replay and batch
+invariance have one case per served row count, not a sampled set.  Operands come from a CPU generator, so an operand set has the same
+bytes on every device.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | class x rows 1 .. 32; eight executions on fresh output buffers under side-stream contention; then the fp64 reference under its bound | 96 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | class x rows 3 / 12 / 20 (one per token tile); two entries, two identical operand sets drawn afresh | 9 |
+| `test_batch_invariance` | L0 | class x R 2 .. 32; the R-row call replayed three times; every row equals the same row launched alone (one row: the 8-row token tile, accumulator column 0); the reversed batch and a shuffled batch | 93 |
+| `test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` | L0 | class x 8 / 16 / 31 rows; one new row inserted at the head, in the middle and at the tail (8 -> 9 and 16 -> 17 change the token tile, 31 -> 32 reaches the ceiling): the original rows keep their bytes, the inserted row writes its alone bytes; read from the larger batch it is the removal | 9 |
+| `test_duplicated_row_and_redrawn_neighbours` | L0 | class; a row twice in one batch (both copies = alone); the other rows redrawn around it at the head, middle and tail of 8-, 16- and 32-row batches | 3 |
+| `test_pick_arms_cover_other_ring_depths_at_every_class` | L0 | host only: the arms of the next case hold at least two other ring depths per class, none names a split, each validates on the reference part | 1 |
+| `test_pick_is_byte_neutral` | L0 | class; for every row count 1 .. 32, this part's pick against the form the pick returns on modelled parts (148, 212 and 64 SMs; 100 KB of shared memory per SM) and against every band of the pick's table, each run as the entry's `form` | 3 |
+| `test_inputs_are_not_modified` | L0 | class; every operand holds its bytes after six launches (the row-alone form and both sides of each token-tile boundary) | 3 |
+| `test_thirty_two_to_thirty_three_rows_is_the_typed_decline` | L0 | the row ceiling is a `NotImplementedError` at the launch and at the plan-time compile, never another provider | 1 |
+| `test_golden` | L0 | class x rows 3 / 12 / 20; three executions on a fresh entry, the reference, the saved hashes (`fp8-projection-decode-n<OUT>-k<IN>-split<S>-tile<T>`) | 9 |
+
+Collected: 227 cases (226 on a device, 1 host-only).  Replay executions: `test_replay` 96 x 8 = 768; `test_batch_invariance` 93 x 3 of the
+batch, 93 x 2 of the permuted batches and 3 x 32 of a row alone; `test_golden` 9 x 3.
+
+The remaining performance knobs (the 128-row weight tile, ring depths from two stages up, 64 / 128 tensor-memory columns, a token tile
+wider than the rows need, the weight loader waiting for the predecessor, the late tensor-memory release, the dependent-launch attribute
+and the release of the successor) are bitwise with the default in `test_fp8_projection_decode.py`
+(`test_performance_arms_write_the_default_bytes`, 45 cases at 8 row counts each), which also holds the CUDA-graph replay against eager,
+the warm-launch stress with byte references (2,016 launches per case, plainly and behind another kernel) and the cell that prints, without
+asserting, how many elements differ between split 4 and split 2 -- two byte classes, each replayed bitwise.
+
+Golden sets: 9 files, one per byte class and token tile, recorded on cc 10.3 after the replay, batch-invariance and reference cases
+passed, into the directory of the runtime that already holds the shared-expert decode pair's cc 10.3 set (`6451c9d94a2d4210/`).  A new
+set is owed with a stated reason when the split, the K tile (128 elements, four K-32 tensor-core instructions) or the cast changes.
+
+GPU coverage: cc 10.3 (replay, batch invariance, goldens) and cc 10.7 (replay and batch invariance; no golden set is committed for a
+cc 10.7 runtime, so the golden comparison is not covered there).  cc 10.0 was not run: the entry admits it and the status page reads
+"SM100: Unverified".  Every run below is one in-process pytest run per command (`-n 0`, or an environment without pytest-xdist), one
+visible device, with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`, `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, from `test/python` of a clean tree: the two runs before and during recording on the tree before the
+9 golden files and the cc 10.7 compiler gate were added, every other run on the tree that carries them; `<suite>` =
+`gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py`, `<module>` =
+`gemm/frost/projection_decode/test_fp8_projection_decode.py`.
+
+cc 10.3 record (2026-11-11 UTC): a GB300 (cc 10.3, 152 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
+13030, nvidia-cutlass-dsl 4.8.0 compiling with CUDA 13.4, in two environments.  (a) The goldens' runtime -- cuDNN 92400, tvm-ffi
+0.1.15.post1 (the `runtime` block of the files in `6451c9d94a2d4210/`): `pytest <suite> -m L0 -q -rsP` before any set existed -> 218
+passed, 9 skipped (the 9 `test_golden` cases, "no golden for ..."); `CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -k
+golden` -> 9 passed, 218 deselected; the 9 records were inspected (the runtime block equals the directory's; shapes and dtypes; the
+operand hashes equal those of the operands rebuilt on an x86 host from the suite's CPU generator in 9 of 9 files; the two splits of
+`ProjectionGeometry(4608, 8192)` share their operand hashes and differ in the result hash at all three token tiles) and copied;
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens pytest <suite> -m L0 -v -rs` -> 227 passed, 0 skipped: `test_replay` 96,
+`test_replay_on_a_fresh_entry_and_fresh_operands` 9, `test_batch_invariance` 93,
+`test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` 9, `test_duplicated_row_and_redrawn_neighbours` 3,
+`test_pick_arms_cover_other_ring_depths_at_every_class` 1, `test_pick_is_byte_neutral` 3, `test_inputs_are_not_modified` 3,
+`test_thirty_two_to_thirty_three_rows_is_the_typed_decline` 1, `test_golden` 9.  `test_pick_is_byte_neutral` compared 80 / 40 / 40 (row
+count, form) cells at the three classes -- ring depths 1, 2, 3, 4, 7 and 11 (one and two waves) at `(4608, 8192)` split 4, 5 and 7 at
+split 2, 3, 4 and 5 at `(8192, 2048)` -- all bitwise with the part's pick.  (b) cuDNN 92700, tvm-ffi 0.1.14.post0 (another runtime key:
+no golden set): `pytest <suite> -m L0 -q -rs -n 0` -> 218 passed, 9 skipped (the 9 golden cases); `pytest <module>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs -n 0 -k "not performance_arms"` -> 198 passed, 45 deselected, and `pytest <module>
+-m L0 -q -rs -n 0 -k performance_arms` -> 45 passed, 194 deselected: the module 239 passed, 0 skipped, the symbol-prefix test 4 passed.
+
+The other compiler flavor of the DSL on cc 10.3 (2026-11-11 UTC): nvidia-cutlass-dsl 4.8.0 bound to its CUDA 12.9 compiler flavor
+(`cutlass.base_dsl.version_info.CUDA_VERSION` = 12.9) inside environment (a), under the same CUDA 13 driver, torch and cuDNN -- a
+statement about the DSL's compiler flavor, not about a CUDA 12 deployment.  `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens pytest
+<suite> -m L0 -q -rs` -> 227 passed, 0 skipped: the kernels compiled by the CUDA 12.9 flavor write the bytes of the goldens recorded
+under the CUDA 13.4 flavor.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs` -> 243 passed, 0 skipped (the
+case that launches the kernels in a child interpreter, `test_launch_matrix_completes_in_a_child_process`, compiles there with the
+default flavor).
+
+cc 10.7 record (2026-11-11 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0,
+driver API 13050, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 compiling with CUDA 13.4, tvm-ffi 0.1.14.post0.  `pytest <suite> -m L0 -v -rs
+-n 0` -> 218 passed, 9 skipped (the 9 golden cases, "no golden for ...": no set for this runtime); `pytest <module>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs -n 0 -k "not performance_arms"` -> 198 passed, 45 deselected (`<module>` 194,
+the symbol-prefix test 4), and `pytest <module> -m L0 -q -rs -n 0 -k performance_arms` -> 45 passed, 194 deselected: the module 239
+passed, 0 skipped.  With cuDNN 92400 and tvm-ffi 0.1.15.post1 on the same part, a candidate set was recorded into a new directory (9
+passed, 218 deselected) and the suite was checked strictly against it (227 passed, 0 skipped); the operand and result hashes of its 9
+records equal those of the cc 10.3 set.  That equality is an observation on these two runtimes, not a contract across architectures;
+the candidate is not committed, so a cc 10.7 run of the suite skips its 9 golden cases.
+
+The other compiler flavor of the DSL on cc 10.7 is a DECLINE, not a lane: the DSL's CUDA 12.9 compiler has no target for the part (the
+DSL refuses it from inside the trace), so the entry declines it by name before any compile.  In the cuDNN 92400 environment bound to
+that flavor, `pytest <suite> <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -v -rs` -> 73 passed, 397 skipped: every case
+that needs a compiled kernel skips with the entry's message ("... on compute capability 10.7 needs a CuTe DSL that compiles with CUDA
+13.4 or newer ..."), `test_compile_follows_the_gate_on_this_device` passes on its declined branch (`compile` raises that message, nothing
+is traced), the host-only cases and the symbol-prefix test pass.  Before the gate existed the same command failed 394 cases inside the
+DSL; replay and batch invariance on cc 10.7 are therefore evidence for the CUDA 13.4 flavor only.
 
 ### QSA: 42 cases
 
