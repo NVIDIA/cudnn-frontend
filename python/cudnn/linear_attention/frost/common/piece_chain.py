@@ -70,6 +70,7 @@ DV_SPLIT_TILES = 2
 # piece table reads the actual cu_seqlens and leaves sequences of at most this
 # many tokens uncut.
 KDA_RAGGED_MAX_TILE_WAVES = 4
+KDA_RAGGED_MAX_PIECES = 4
 
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
@@ -166,9 +167,11 @@ def choose_kda_pieces(
     On the measured SM100 route, keep a bounded length-rule chain in that gap.
     Its device-built piece table reads ``cu_seqlens`` and cuts only sequences
     longer than :data:`LENGTH_RULE_PIECE_TOKENS`; no device value reaches the
-    host and balanced short sequences stay single-piece.  The caller controls
-    ``enable_ragged_fallback`` so unmeasured architectures preserve the prior
-    choice exactly.
+    host and balanced short sequences stay single-piece.  The fallback caps the
+    schedule at :data:`KDA_RAGGED_MAX_PIECES`: on SM100, four pieces were faster
+    than eight for the 64K skewed case while using less workspace.  The caller
+    controls ``enable_ragged_fallback`` so unmeasured architectures preserve
+    the prior choice exactly.
     """
     pieces, unit_chunks = choose_pieces(
         num_seqs=num_seqs,
@@ -191,7 +194,7 @@ def choose_kda_pieces(
     num_sm = max(1, int(num_sm))
     total_tokens = int(total_tokens)
     nominal_tiles = num_seqs * heads_out
-    length_pieces = min(-(-total_tokens // LENGTH_RULE_PIECE_TOKENS), CHAIN_MAX_PIECES)
+    length_pieces = min(-(-total_tokens // LENGTH_RULE_PIECE_TOKENS), KDA_RAGGED_MAX_PIECES)
 
     if not (num_sm <= nominal_tiles <= KDA_RAGGED_MAX_TILE_WAVES * num_sm):
         return 0, unit_chunks, False

@@ -5,7 +5,7 @@
 
 import pytest
 
-from cudnn.linear_attention.frost.common.piece_chain import choose_kda_pieces
+from cudnn.linear_attention.frost.common.piece_chain import KDA_RAGGED_MAX_PIECES, choose_kda_pieces
 
 pytestmark = pytest.mark.L0
 
@@ -30,7 +30,7 @@ def _choice(**overrides):
 def test_kda_ragged_fallback_keeps_a_device_length_rule():
     """An oversubscribed packed shape retains pieces for device-side length selection."""
     pieces, unit_chunks, length_rule = _choice()
-    assert 1 < pieces <= 16
+    assert 1 < pieces <= KDA_RAGGED_MAX_PIECES
     assert unit_chunks == 1
     assert length_rule
 
@@ -67,3 +67,11 @@ def test_kda_batch_invariant_selection_is_unchanged():
     disabled = _choice(batch_invariant=True, enable_ragged_fallback=False)
     assert enabled == disabled
     assert enabled[0] > 0 and enabled[2]
+
+
+def test_kda_ragged_fallback_caps_workspace_growth():
+    """Long packed capacities do not grow the automatic fallback past its measured cap."""
+    pieces, unit_chunks, length_rule = _choice(total_tokens=256 * 1024)
+    assert pieces == KDA_RAGGED_MAX_PIECES
+    assert unit_chunks == 1
+    assert length_rule
