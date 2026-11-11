@@ -323,6 +323,24 @@ include padding, a bottom-right causal window and sinks. This is fixed-plan,
 fixed-runtime forward qualification; THD batch invariance and backward remain
 outside this addition.
 
+## SM120 FP8 and MXFP8 forward tails
+
+Native per-tensor FP8 and block-scaled MXFP8 forward preserve per-sequence
+O/Stats bytes across repeated execution, retained CUDA Graph replay,
+reordered/duplicated batches and changed neighbors in the tested SM120
+D128/D512 configurations. The checks use E4M3/E5M2 inputs, BF16 output,
+runtime KV lengths with poisoned padding, and fixed split1/unpacked plans.
+Quantized payloads and logical scale bytes remain fixed across batch changes;
+columnwise MXFP8 scales are repacked into each batch's required swizzle.
+The global output Amax is repeatable for identical inputs and checked against
+the whole-batch reference when batch membership changes.
+
+Eight unchanged-parent runtime goldens accompany the independent numerical
+checks. SM120 RTX PRO 6000 execution passed functional, memcheck, racecheck
+and synccheck coverage, including separate multi-tile THD cases. This evidence
+does not establish SM121 or cross-runtime bit identity, independent physical
+THD origins for quantized inputs, or backward behavior.
+
 ## SM120 packed backward
 
 The native FP16/BF16 THD backward path through D256/GQA retains unordered
