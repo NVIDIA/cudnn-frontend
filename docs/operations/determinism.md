@@ -120,6 +120,10 @@ a row alone and inside a batch under the entry's own picks.
   counts, caller-normalized Q/K, FP32 log gates and activated FP32 beta/state.
   The direct FP32 recurrence has no cross-sequence reduction and supports
   `batch_invariant=True`, including empty spans and changed THD packing.
+  Its 16-token shared-memory staging preserves recurrence order; measured
+  outputs retain the original FP32 goldens without regeneration. There is
+  no global scratch buffer or data-dependent compilation. Physical wide
+  token strides, near-zero/strong/mixed gates and changed-gate replay are covered.
   Both H/G and transition are covered. These non-differentiable summary APIs
   do not provide dQ/dK/dV/dG/dBeta or a backward context; this qualification
   does not establish determinism of the ordinary SM90 KDA apply kernels.

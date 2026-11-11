@@ -2237,8 +2237,10 @@ def kimi_delta_attention_summary(
     outer strides with a unit innermost stride are supported, including empty
     sequences. Outputs must not overlap inputs or each other. No workspace is
     needed by the engine; compilation occurs when the graph plan is built.
-    The recurrence is sequential in tokens, so long spans may be slower than
-    tensor-core apply kernels. Warm the public op before CUDA Graph capture.
+    The engine stages 16 tokens of keys and decay factors in shared memory
+    for 16 state rows, preserving direct FP32 recurrence order without a
+    global scratch buffer. This is not a tensor-core apply kernel. Warm the
+    public op before CUDA Graph capture.
     The public wrapper allocates outputs; the graph engine only writes caller
     buffers, on the handle's execution stream. Keep all bindings alive until
     that stream finishes. Execute-time shape changes are rejected; offset
