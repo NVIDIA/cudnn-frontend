@@ -35,7 +35,7 @@ def _fixture(thd=False, d=128, dv=128, split=1, output="bfloat16", carrier="uint
     old = dict(zip(s.order, s.template))
     path = Path(prep.__file__).parent / "kernels/_mxfp8_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
-    s.order = [a.arg for a in host.args.args if "Constexpr" not in ast.unparse(a.annotation)]
+    s.order = [a.arg for a in host.args.args if a.annotation is None or "Constexpr" not in ast.unparse(a.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [old.get(name) for name in s.order]
     sizes = ((d + 127) // 128 * 512,) * 2 + ((dv + 127) // 128 * 512,)

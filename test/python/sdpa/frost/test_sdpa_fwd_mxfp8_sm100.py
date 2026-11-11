@@ -1803,8 +1803,8 @@ def _run_thd(
         else:
             if stats_layout == "head":
                 # Ragged Stats, packed HEAD-major: [h, head_stride] storage, the head stride a token capacity that
-                # covers the packed total (rounded up to 64 like the backward suite declares it); the kernel adds
-                # cu_q[b] itself, the ragged offsets keep the declaration a packed one (SDPA Rule S1).
+                # covers the packed total (rounded up to 64 like the backward suite declares it).
+                # Each sequence's physical element origin advances by one per token in this layout.
                 head_stride = max(64, _cdiv(T_q, 64) * 64)
                 stats_stor = torch.zeros(H_q * head_stride, dtype=torch.float32, device=dev)
                 stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((H_q * head_stride, head_stride, 1, 1))
@@ -1813,7 +1813,8 @@ def _run_thd(
                 # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
                 stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
                 stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-            stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
+            stats_token_stride = 1 if stats_layout == "head" else H_q
+            stats_ro_t = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * stats_token_stride).view(B + 1, 1, 1, 1)
             stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
             stats_t.set_ragged_offset(stats_ro)
             vp[stats_ro] = stats_ro_t
