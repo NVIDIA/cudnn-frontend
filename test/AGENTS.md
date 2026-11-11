@@ -1404,3 +1404,10 @@ unannotated arguments. Check `argument.annotation is None` before calling
 The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
 exercise appended untyped origin arguments and compare native frames with
 the independent Python reference.
+
+When a THD fixture changes O's physical row stride, give O independent Int64
+element offsets and update them with the stride; retaining Q's compact offsets
+describes a different output location. Head-major Stats offsets advance by one
+element per token, while token-major Stats offsets advance by the head count.
+The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
+numerical and replay checks for these contracts.
