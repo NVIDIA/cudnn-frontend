@@ -111,7 +111,7 @@ _BAR_SLOTS = (
 )
 
 
-def make_config(dqk, dv, mx=False):
+def make_config(dqk, dv, mx=False, k_hw=32):
     """The geometry and barrier layout for one (D_QK, D_V) pair; CPU only."""
     if (dqk, dv) not in ((64, 64), (128, 128), (192, 128)):
         raise ValueError("the dQ kernel serves (D_QK, D_V) in (64, 64), (128, 128), (192, 128)")
@@ -157,7 +157,7 @@ def make_config(dqk, dv, mx=False):
         N=n,
         DQK=dqk,
         DV=dv,
-        K_HW=32,
+        K_HW=k_hw,
         BPE=1,
         HEAD_BOX=128,
         QK_SWZ=qk_swz,
@@ -235,7 +235,7 @@ def make_config(dqk, dv, mx=False):
 
 def validate_config(cfg, bar_layout):
     """Fixed source geometry, lane counts and disjoint slab regions; CPU only."""
-    assert (cfg.M, cfg.N, cfg.K_HW, cfg.BPE, cfg.HEAD_BOX) == (128, 128, 32, 1, 128) and (cfg.DQK, cfg.DV) in ((64, 64), (128, 128), (192, 128))
+    assert (cfg.M, cfg.N, cfg.BPE, cfg.HEAD_BOX) == (128, 128, 1, 128) and cfg.K_HW in (32, 64) and (cfg.DQK, cfg.DV) in ((64, 64), (128, 128), (192, 128))
     assert (cfg.THREADS, cfg.TMEM_COLS, cfg.K_STAGES, cfg.KT_STAGES, cfg.V_STAGES, cfg.DS_STAGES, cfg.SCHED_STAGES) == (
         512,
         512,
