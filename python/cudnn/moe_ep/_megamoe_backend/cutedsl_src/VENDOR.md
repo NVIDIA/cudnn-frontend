@@ -10,10 +10,10 @@ documented in the parent backend `README.md`.
 - **Source tree**: `sources` at the repository root (formerly
   `next/sources`).
 - **Current synchronized commit**:
-  `914e0ec949f9db63453790ac2f6f57a6362f4f38`.
+  `72796e96cfdd4690b6af583302a3258bada40f27`.
 - **Discrete-weight implementation ancestor**:
   `7cc8d2eb2fb2fc9643ccd6244d6c810ed9f4341b`.
-- **Last synced**: 2026-11-05.
+- **Last synced**: 2026-11-11.
 - **Vendored subset**: the exact export closure produced for
   `RubinTrainingFwdGluMegaMoE` and `RubinTrainingBwdDgluMegaMoE`, including
   the materialized source copy
@@ -22,7 +22,7 @@ documented in the parent backend `README.md`.
 - **Raw exported source files**: 38 (plus 12 generated package markers).
 - **Expected vendored Python files**: 50 after the local overlay.
 - **Expected vendored Python tree SHA256**:
-  `f0643a62e5ad29cb2841d9463e91a8d8d430874cb3d1f01d371cd7cd719cebb6`.
+  `eb883900803f459a3fa55c620d9235396d1d03d532f73a759957b767dfba7146`.
   This uses the same relative-path-and-content algorithm as
   `_megamoe_backend.mxfp8._fingerprint.source_tree_sha256`.
 
@@ -64,6 +64,11 @@ The synchronized Python sources use BSD-3-Clause SPDX identifiers.
   padded requirement for the clamped logical limit.
 - The forward epilogue module docstring that referenced unavailable external
   design material is replaced with a self-contained description.
+- Code blocks that the vendored training closure never reaches are removed
+  from `helpers/dsl_helpers.py`, `helpers/ptx_helpers.py`, and
+  `kernel_src/rubin/custom_mix_cga_helpers.py`.
+- One comment in `kernel_src/schedulers/non_clc_mixed_cga.py` that named a
+  class outside the export closure is shortened.
 - Repository-required copyright and BSD-3-Clause SPDX headers are added to
   generated empty package markers.
 

@@ -27,12 +27,13 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
-from cutlass.cutlass_dsl import Float32, Int32, T
+from cutlass.cutlass_dsl import Float32, Int32, Int64, T
 from cutlass._mlir.dialects import llvm
 
 from ..quant_def import CombineFormat
 from .constants import Nvfp4E2M1RcpLimit
 from .dsl_helpers import mark_alignment
+from .ptx_helpers import nanosleep
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +148,27 @@ def cvt_e2m1_to_fp32_optimal_ptx(e2m1_reg: cute.Tensor, fp32_reg: cute.Tensor) -
             dst_words[w * 8 + i] = Int32(llvm.extractvalue(T.i32(), res, [i]))
 
 
+@cute.jit
+def ld_relaxed_sys_v2_b64(address):
+    """One strong 16-byte load (two 8-byte halves); never hoisted out of a polling loop."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i64(), T.i64()]),
+        [address.ir_value()],
+        "ld.relaxed.sys.global.v2.b64 {$0, $1}, [$2];",
+        "=l,=l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=0,
+    )
+    return Int64(llvm.extractvalue(T.i64(), res, [0])), Int64(llvm.extractvalue(T.i64(), res, [1]))
+
+
+@cute.jit
+def _zero_half_mask(word):
+    """Nonzero exactly when one of the word's four 16-bit halves is zero (exact for "any")."""
+    return (word - Int64(0x0001000100010001)) & (word ^ Int64(-1)) & Int64(-0x7FFF7FFF7FFF8000)
+
+
 def _mixed_add_bf16_asm(n: int):
     """PTX + constraint string for ``add_bf16_into_f32_ptx`` (plain Python: the
     DSL stages ``for`` loops inside ``@cute.jit`` bodies, so text is built here).
@@ -239,6 +261,7 @@ class TopkReduce:
         *,
         sm_arch: Optional[str] = None,
         num_experts: Optional[int] = None,
+        ll_encoded: bool = False,
         vector_bytes: Optional[int] = None,
         min_blocks_per_mp: Optional[int] = None,
         persistent: bool = False,
@@ -312,6 +335,22 @@ class TopkReduce:
                 raise ValueError(
                     "The internode node-partial reduce runs on the static path with the 16 B vector "
                     "on SM100+ only."
+                )
+        # bf16 cells stored as ``bits ^ 0xFFFF`` into a zeroed plane (see the FC2 UBLK
+        # store): the reduce polls each cell instead of waiting for the producer grid,
+        # and zeroes what it consumed for the next call. It skips top-k slots whose expert
+        # index is outside [0, num_experts): the comm drops such routes (padding rows are
+        # all -1), so no producer ever writes their cell.
+        self.ll_encoded = bool(ll_encoded)
+        if self.ll_encoded:
+            if self.num_experts is None or num_topk > 31:
+                raise ValueError("The polled bf16 reduce needs num_experts and at most 31 top-k slots.")
+            if combine_format.is_quantized:
+                raise ValueError("The self-validating combine plane is bf16 only.")
+            if persistent or internode is not None or self.use_scalar_math or self.vector_bytes != 16:
+                raise ValueError(
+                    "The polled bf16 reduce is a static-grid kernel with 16 B cells on SM100+ (no persistent "
+                    "scheduler, no internode partials)."
                 )
         # hidden must tile cleanly both into worker slices and into scale blocks.
         align = max(combine_format.scale_block or self.hidden_per_thread, self.hidden_per_thread)
@@ -450,6 +489,13 @@ class TopkReduce:
                 topk_score.iterator, cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride)
             )
 
+        if cutlass.const_expr(self.ll_encoded):
+            if cutlass.const_expr(topk_indices is None):
+                raise ValueError("The polled bf16 reduce needs topk_indices to skip dropped slots.")
+            self._reduce_bf16_ll(combine_quant, topk_score, reduced_output, topk_indices).launch(
+                grid=grid, block=block, stream=stream, use_pdl=True
+            )
+            return
         if cutlass.const_expr(self.internode is not None):
             if cutlass.const_expr(remote_partials is None or message_index is None or topk_indices is None or local_rank is None):
                 raise ValueError("The internode reduce needs remote_partials, message_index, topk_indices and local_rank.")
@@ -600,6 +646,150 @@ class TopkReduce:
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
 
+    @cute.kernel
+    def _reduce_bf16_ll(
+        self,
+        combine_output: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        topk_indices: cute.Tensor,
+    ):
+        """The bf16 ``_reduce_cell`` over the self-validating plane: poll, reduce, zero.
+
+        A slot whose expert index is outside ``[0, num_experts)`` (a padding row, a dropped
+        route) is never produced, so its cell stays zero forever: it is not waited for and
+        contributes an exact zero term, as it did when the reduce ran after the producer grid.
+
+        Started as a programmatic dependent but without ``griddepcontrol.wait``: a
+        cell is final once none of its 16-bit halves reads zero, so the reduce runs
+        alongside the producer's tail instead of after it, and may also end before
+        that tail; the next call's communication kernel waits for the tail itself. All loads of a worker
+        issue before any test; only a cell that is still in flight is loaded again.
+        The arithmetic is the bf16 ``_reduce_cell``'s (convert-then-FMA form), term for term.
+        """
+        threads = self._threads
+        hidden_per_thread = self.hidden_per_thread
+        hidden_tiles = self.hidden_tiles
+        num_topk: cutlass.Constexpr[int] = self.num_topk
+        needs_guard = self.require_predicate
+        prefetch = self.prefetch
+        out_dtype = reduced_output.element_type
+        if cutlass.const_expr(hidden_per_thread * cutlass.BFloat16.width != 128):
+            raise ValueError("The polled bf16 reduce reads one 16-byte cell per top-k slot.")
+
+        worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
+        token_idx = worker_idx // hidden_tiles
+        hidden_tile_idx = worker_idx % hidden_tiles
+
+        score_dtype = topk_score.dtype if cutlass.const_expr(topk_score is not None) else cutlass.Float32
+        score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
+
+        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+            terms = cute.zipped_divide(combine_output[token_idx, None, None], (num_topk, hidden_per_thread))[
+                (None, None), (0, hidden_tile_idx)
+            ]
+            dst = cute.zipped_divide(reduced_output[token_idx, None], (hidden_per_thread,))[(None,), (hidden_tile_idx,)]
+
+            if cutlass.const_expr(topk_score is not None):
+                if cutlass.const_expr(prefetch):
+                    cute.autovec_copy(topk_score[token_idx, None], score_reg)
+            else:
+                for k in cutlass.range_constexpr(num_topk):
+                    score_reg[k] = score_dtype(1)
+
+            # Every cell load is issued first and unconditionally, as before the slot test
+            # existed: the loads of one worker then overlap, and a dropped slot's cell (never
+            # written, all zero) is loaded harmlessly. Gating the loads on the indices
+            # serialized them behind the index loads and cost 2-3% on the last reduce waves.
+            words = cute.make_rmem_tensor((num_topk * 2,), Int64)
+            for k in cutlass.range_constexpr(num_topk):
+                low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
+                words[2 * k] = low
+                words[2 * k + 1] = high
+
+            # Bit k set: slot k routes to a real expert. Same unsigned test as the comm's
+            # ``_is_unowned_expert`` (so -1 is invalid too). A dropped slot's cell stays zero
+            # forever, so its words are replaced by the encoded zero (-1: both halves nonzero,
+            # decodes to 0.0) and it is neither waited for nor cleared.
+            if cutlass.const_expr(hidden_tiles % 32 == 0):
+                # The 32 lanes of a warp hold one token: lane k loads slot k and one ballot is the
+                # mask, instead of num_topk index loads per thread (which cost up to 16% of this
+                # load-bound kernel at top-k 10, tpr 1024).
+                lane_idx = cute.arch.lane_idx()
+                lane_valid = cutlass.Boolean(False)
+                if lane_idx < Int32(num_topk):
+                    index = topk_indices[token_idx, lane_idx]
+                    if cutlass.const_expr(topk_indices.element_type is cutlass.Int32):
+                        lane_valid = cutlass.Uint32(index) < cutlass.Uint32(self.num_experts)
+                    else:
+                        lane_valid = cutlass.Uint64(index) < cutlass.Uint64(self.num_experts)
+                valid_slots = Int32(cute.arch.vote_ballot_sync(lane_valid))
+            else:
+                valid_slots = Int32(0)
+                for k in cutlass.range_constexpr(num_topk):
+                    index = topk_indices[token_idx, Int32(k)]
+                    if cutlass.const_expr(topk_indices.element_type is cutlass.Int32):
+                        slot_valid = cutlass.Uint32(index) < cutlass.Uint32(self.num_experts)
+                    else:
+                        slot_valid = cutlass.Uint64(index) < cutlass.Uint64(self.num_experts)
+                    if slot_valid:
+                        valid_slots = valid_slots | Int32(1 << k)
+            for k in cutlass.range_constexpr(num_topk):
+                if (valid_slots >> Int32(k)) & Int32(1) == Int32(0):
+                    words[2 * k] = Int64(-1)
+                    words[2 * k + 1] = Int64(-1)
+            stale = Int64(0)
+            for k in cutlass.range_constexpr(num_topk):
+                stale = stale | _zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])
+            while stale != Int64(0):
+                # Launched while the producer's last tiles still stream: one short sleep
+                # per round, then every stale slot is reloaded at once (never one sleep
+                # per slot, which would serialize the latency over the top-k).
+                nanosleep(128)
+                for k in cutlass.range_constexpr(num_topk):
+                    if (_zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])) != Int64(0):
+                        low, high = ld_relaxed_sys_v2_b64(terms[k, None].iterator.toint())
+                        words[2 * k] = low
+                        words[2 * k + 1] = high
+                stale = Int64(0)
+                for k in cutlass.range_constexpr(num_topk):
+                    stale = stale | _zero_half_mask(words[2 * k]) | _zero_half_mask(words[2 * k + 1])
+            for i in cutlass.range_constexpr(num_topk * 2):
+                words[i] = words[i] ^ Int64(-1)
+            values = cute.recast_tensor(words, cutlass.BFloat16)
+
+            acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
+            for k in cutlass.range_constexpr(0, num_topk, 1):
+                if cutlass.const_expr(topk_score is not None and not prefetch):
+                    score_reg[k] = topk_score[token_idx, Int32(k)]
+                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    value_pair = (
+                        Float32(values[k * hidden_per_thread + i]),
+                        Float32(values[k * hidden_per_thread + i + 1]),
+                    )
+                    if cutlass.const_expr(k != 0):
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(value_pair, score_pair, (acc[i], acc[i + 1]))
+                    else:
+                        # Include the +0 seed: direct assignment/multiply preserves -0.
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                            value_pair, score_pair, (Float32(0.0), Float32(0.0))
+                        )
+
+            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+            out.store(acc.load().to(out_dtype))
+            vector_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128)
+            cute.copy(vector_store, out, mark_alignment(dst, hidden_per_thread * out_dtype.width // 8))
+
+            # Consumer reset: the next call's producers find zeroed cells. They write
+            # this rank's cells only for tokens this rank pushes after this launch.
+            cleared = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+            cleared.fill(0.0)
+            cell_store = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
+            for k in cutlass.range_constexpr(num_topk):
+                if (valid_slots >> Int32(k)) & Int32(1) != Int32(0):
+                    cute.copy(cell_store, cleared, mark_alignment(terms[k, None], hidden_per_thread * 2))
     @cute.kernel
     def _reduce_persistent(
         self,
