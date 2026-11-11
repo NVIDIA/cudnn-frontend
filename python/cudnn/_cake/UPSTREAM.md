@@ -7,7 +7,10 @@ commit `f55fb99674be5edb0e1f6a0e4d6a911335da86ce`, under Apache-2.0.
 The adapter removes Miles configuration and registry dependencies, uses a
 Frontend cache namespace, and makes the no-build guard local to each context.
 Operation PRs add their own pinned kernel packages and source records under
-`_vendor`. Keep imported sources unchanged and retain their license headers.
+`_vendor`. Retain imported license headers. `VENDORED_KDA.json` records a local
+Python host patch that makes backward saved-row selection explicit for CodeQL.
+Its `files` map retains upstream hashes; `local_modifications` records the patch.
+CUDA sources are unchanged.
 
 The loader requires Linux, nvcc 13.4 or newer, and the installed TVM-FFI headers.
 It supports SM100a, SM103a, and SM107a. It imports neither Torch nor TVM-FFI

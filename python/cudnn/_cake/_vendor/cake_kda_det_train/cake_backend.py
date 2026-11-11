@@ -13,6 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
+cuDNN Frontend modification: make backward saved-row selection explicit.
+
 Host backend of the Cake packed KDA chunked training kernels (SM100 / SM103 /
 SM107): the host plan, the workspace arena, the saved set, the forward and
 backward launch sequences and the autograd Function.
@@ -5088,11 +5090,10 @@ def _backward(
             ws.run("qk_apply", {**lv, "num_heads": H}, path=path)
         elif p.dispatched("qk_l2norm", path):
             ws.run("qk_l2norm", {**lv, "num_heads": H}, path=path)
-    # the version-4 rows the light paths read from the set (the groups of a batched option take their slices)
-    light_rows = not (replay or tape)
-    qg_saved = saved.qg if light_rows else None
-    w_saved = saved.w if light_rows else None
-    u_saved = saved.u if light_rows else None
+    # Only light mode reads saved WY rows.
+    qg_saved = w_saved = u_saved = None
+    if saved is not None and not tape:
+        qg_saved, w_saved, u_saved = saved.qg, saved.w, saved.u
     common: dict[str, Any] = {
         "path": path,
         "replay": replay,

@@ -76,7 +76,13 @@
         "table_v2",
         "wy_bwd_replay",
         "wy_fwd"
-      ]
+      ],
+      "local_modifications": {
+        "cake_backend.py": {
+          "blob": "4bc3afdf0fdb8482e01c56877d69f2b3dbed570c",
+          "reason": "Use an explicit saved-state guard for backward WY rows; preserve replay and tape behavior."
+        }
+      }
     }
   }
 }
