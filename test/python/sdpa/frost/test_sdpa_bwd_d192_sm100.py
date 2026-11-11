@@ -265,9 +265,13 @@ def test_stage3_native_width_stays_on_the_sm100_half_line(sm, d, dv):
         assert tile == (256, 256), "D256 and other architecture lines retain their existing stage3 tile"
 
 
-def test_stage3_native_width_keeps_fp8_on_its_validated_tile():
-    from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
-    from cudnn.sdpa.bwd.config_sm100 import EPI_QUANT, MatmulTemplateParams, validate_matmul_params
+def test_stage3_native_width_keeps_fp8_on_its_validated_tiles():
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+    from cudnn.sdpa.bwd.config_sm100 import EPI_NONE, EPI_QUANT, MatmulTemplateParams, validate_matmul_params
 
-    with pytest.raises(ValueError, match=r"\(256, 256\) row only"):
+    validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 192), epi_mode=EPI_QUANT))
+    with pytest.raises(ValueError, match="rows only"):
         validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(128, 192), epi_mode=EPI_QUANT))
+    with pytest.raises(ValueError, match=r"\(256, 256\) row only"):
+        validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 192), epi_mode=EPI_NONE, block_scale=True))
+    validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 192)))

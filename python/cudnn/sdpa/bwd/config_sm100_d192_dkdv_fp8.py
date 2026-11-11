@@ -128,7 +128,7 @@ _BAR_SLOTS = (
 )
 
 
-def make_config(dqk, dv, mx=False):
+def make_config(dqk, dv, mx=False, k_hw=32):
     """The geometry and barrier layout for one (D_QK, D_V) pair; CPU only."""
     if (dqk, dv) not in ((64, 64), (128, 128), (192, 128)):
         raise ValueError("the dK / dV kernel serves (D_QK, D_V) in (64, 64), (128, 128), (192, 128)")
@@ -183,7 +183,7 @@ def make_config(dqk, dv, mx=False):
         N=n,
         DQK=dqk,
         DV=dv,
-        K_HW=32,
+        K_HW=k_hw,
         BPE=1,
         HEAD_BOX=128,
         QK_SWZ=qk_swz,
@@ -226,8 +226,8 @@ def make_config(dqk, dv, mx=False):
         ONE_LANE=1,
         SCHED_CONSUMER_WARPS=15,
         SOFTMAX_REGS=160,
-        EPILOGUE_REGS=96,
-        SERVICE_REGS=96,
+        EPILOGUE_REGS=112 if k_hw == 64 else 96,
+        SERVICE_REGS=80 if k_hw == 64 else 96,
         DESC_VERSION=1,
         SWIZZLE_BYTES=128,
         SWIZZLE_LAYOUT=2,
@@ -274,7 +274,7 @@ def make_config(dqk, dv, mx=False):
 
 def validate_config(cfg, bar_layout):
     """Fixed source geometry, lane counts and disjoint slab regions; CPU only."""
-    assert (cfg.M, cfg.N, cfg.K_HW, cfg.BPE, cfg.HEAD_BOX) == (128, 128, 32, 1, 128) and (cfg.DQK, cfg.DV) in ((64, 64), (128, 128), (192, 128))
+    assert (cfg.M, cfg.N, cfg.BPE, cfg.HEAD_BOX) == (128, 128, 1, 128) and cfg.K_HW in (32, 64) and (cfg.DQK, cfg.DV) in ((64, 64), (128, 128), (192, 128))
     assert (cfg.THREADS, cfg.TMEM_COLS, cfg.Q_STAGES, cfg.QT_STAGES, cfg.DO_STAGES, cfg.P_STAGES, cfg.SCHED_STAGES) == (
         512,
         512,
@@ -294,7 +294,7 @@ def validate_config(cfg, bar_layout):
     assert cfg.TMEM_DK + cfg.DQK <= cfg.TMEM_P and cfg.P_COLS * 4 == cfg.N and cfg.TMEM_P + cfg.P_STAGES * cfg.P_COLS == cfg.TMEM_COLS
     assert all(c % 4 == 0 for c in (cfg.TMEM_DV, cfg.TMEM_DK))
     assert (cfg.SOFTMAX_LANES, cfg.EPILOGUE_LANES, cfg.STORE_LANES, cfg.ONE_LANE, cfg.SCHED_CONSUMER_WARPS) == (256, 128, 32, 1, 15)
-    assert (cfg.SOFTMAX_REGS, cfg.EPILOGUE_REGS, cfg.SERVICE_REGS) == (160, 96, 96)
+    assert (cfg.SOFTMAX_REGS, cfg.EPILOGUE_REGS, cfg.SERVICE_REGS) in ((160, 96, 96), (160, 112, 80))
     assert (cfg.SOFTMAX_LANES * cfg.SOFTMAX_REGS + cfg.EPILOGUE_LANES * cfg.EPILOGUE_REGS + 4 * 32 * cfg.SERVICE_REGS) == 65536
     groups = (cfg.DQK + 127) // 128
     ring_mx = cfg.MX and not cfg.T_SHARED
