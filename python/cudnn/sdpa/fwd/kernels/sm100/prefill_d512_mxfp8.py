@@ -208,7 +208,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 _thd_sf_tile_bases = _sdpa_h.thd_sf_tile_bases
 
-from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_map_ptr, origin_tensors, origin_tma_slice
+from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_map_ptr, origin_tensors
 from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster, thd_port_origin
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
