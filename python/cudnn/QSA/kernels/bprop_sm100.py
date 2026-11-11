@@ -888,6 +888,7 @@ def qsa_bwd_sparse_query_kernel(
         else:
             # row = 8 * block + 2 * token + head at block + slab * 1 KB + row * 128 B
             yr = r & 7
+            yq = 0  # no second query in this layout
             roff = (OFF_K + (r >> 3) * BLK_SMEM + yr * 128) // 4
             slab_w = SLAB // 4
         zw = []
