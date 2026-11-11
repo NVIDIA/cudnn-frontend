@@ -468,6 +468,15 @@ DSL satisfies your kernel.**
   kernel (a staged `if` is rejected as plain Python control flow; the jit function's code
   object is rejected for its free variables), so the layer's own decorators stay and
   `test_frost_kernel_name_prefix.py` recognises both spellings.
+- **A DSL that knows a target can be bound to a compiler that does not have it.**
+  `cutedsl_arch_requirement_error` checks that the DSL's `Arch` has `sm_107a`; it does not read
+  the compiler flavor. DSL 4.8.0 refuses a Rubin target on a compiler up to CUDA 13.3 from
+  inside the trace (`Unsupported GPU architecture 'sm_107a' with CUDA toolkit version ...`, an
+  internal DSL error), and a default install binds the CUDA 12.9 flavor even under a CUDA 13
+  driver. A kernel that admits cc 10.7 therefore also gates on `CUDA_VERSION` before JIT and
+  tests the decline (`fp8_projection_decode.DSL_COMPILER_FLOORS`, `dsl_compiler_error`; found by
+  running that entry's suites under the CUDA 12.9 flavor on a cc 10.7 part: 394 cells failed
+  inside the DSL before the gate existed).
 - **The PTX compiler's output depends on the kernel's symbol name.** Two renderings with
   byte-identical PTX apart from the entry symbol can differ in SASS (other move idioms, another
   block layout, a few instructions more or fewer): the cuDNN prefix of Rule 6 changes the

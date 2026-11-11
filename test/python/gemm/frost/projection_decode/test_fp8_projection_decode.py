@@ -436,7 +436,50 @@ def test_compile_declines_by_name_before_the_kernel_module_is_imported(monkeypat
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     with pytest.raises(NotImplementedError, match="sm_107a"):
         rubin.compile(1)
+    # the DSL knows the target but the compiler it is bound to does not (its CUDA 12 flavor on a cc 10.7 part)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setattr(entry, "dsl_compiler_version", lambda: (12, 9))
+    with pytest.raises(NotImplementedError, match=r"compute capability 10\.7 needs .* CUDA 13\.4 or newer.*4\.8\.0.*compiles with CUDA 12\.9"):
+        rubin.compile(1)
     assert not k.compiled and not rubin.compiled and k._kernel_module is None and rubin._kernel_module is None
+
+
+def test_compiler_gate_is_per_part_and_never_declines_on_a_value_it_cannot_read(monkeypatch):
+    """The compiler floor belongs to the part: the CUDA 12 flavor is declined on cc 10.7 only (cc 10.0 and cc 10.3 compile with it), a
+    compiler at or above the floor passes, and a DSL that does not report its compiler is not declined."""
+    assert entry.DSL_COMPILER_FLOORS == {(10, 7): (13, 4)}
+    monkeypatch.setattr(entry, "dsl_compiler_version", lambda: (12, 9))
+    assert entry.dsl_compiler_error((10, 0)) is None and entry.dsl_compiler_error((10, 3)) is None and entry.dsl_compiler_error(None) is None
+    msg = entry.dsl_compiler_error((10, 7))
+    assert "10.7" in msg and "13.4" in msg and "12.9" in msg and "nvidia-cutlass-dsl[cu13]" in msg
+    for compiler in ((13, 3), (13, 0)):
+        monkeypatch.setattr(entry, "dsl_compiler_version", lambda c=compiler: c)
+        assert entry.dsl_compiler_error((10, 7)) is not None
+    for compiler in ((13, 4), (13, 6), (14, 0), None):
+        monkeypatch.setattr(entry, "dsl_compiler_version", lambda c=compiler: c)
+        assert entry.dsl_compiler_error((10, 7)) is None, compiler
+
+
+def test_compile_follows_the_gate_on_this_device():
+    """On whatever cc 10.x device and DSL compiler this process has: when the gate passes, the plan-time compile succeeds; when it
+    declines (the DSL's CUDA 12 compiler on a cc 10.7 part), ``compile`` raises that message as a ``NotImplementedError`` and nothing
+    was traced -- the DSL's own refusal of the target is never what the caller sees."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    dev = torch.device("cuda", torch.cuda.current_device())
+    cc = torch.cuda.get_device_capability(dev)
+    if not entry.cc_supported(cc):
+        pytest.skip(f"the FP8 projection decode kernel serves cc 10.x; this device is {cc[0]}.{cc[1]}")
+    msg = entry.dsl_error(cc)
+    k = entry.Fp8ProjectionDecode(dev, G_OUT)
+    if msg is None:
+        k.compile(1)
+        assert k.cfg_for(1) in k.compiled
+        return
+    print(f"declined on this device: {msg}")
+    with pytest.raises(NotImplementedError) as declined:
+        k.compile(1)
+    assert str(declined.value) == msg and not k.compiled and k._kernel_module is None
 
 
 def test_host_entry_keeps_the_reference_readings_and_a_given_form_overrides_the_pick():

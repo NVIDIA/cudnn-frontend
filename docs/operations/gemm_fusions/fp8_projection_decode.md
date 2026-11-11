@@ -138,7 +138,7 @@ attribute is unaffected.
 | layouts | contiguous operands, 32-byte aligned storage (4-byte for `scale`), every operand on the entry's device; `out` exactly `[rows, OUT_FEATURES]` |
 | determinism | bitwise replay and batch invariance at every row count 1 .. 32 (the [status page](/operations/determinism)) |
 | backward | none: an inference step |
-| DSL | nvidia-cutlass-dsl >= 4.8.0 that provides the `cutlass.cute.experimental` layer the kernel is written on; the layer is probed by name before the kernel module is imported, and a DSL without it is declined by name |
+| DSL | nvidia-cutlass-dsl >= 4.8.0 that provides the `cutlass.cute.experimental` layer the kernel is written on; the layer is probed by name before the kernel module is imported, and a DSL without it is declined by name. On cc 10.7 the DSL must compile with CUDA 13.4 or newer (its cu13 flavor); its CUDA 12 flavor has no target for that part and is declined by name before any compile |
 
 Typed declines, all before any DSL import: `TypeError` for a non-tensor or a dtype, `ValueError` for a shape, an
 alignment, a device or a knob combination, `NotImplementedError` for a row count, a geometry, a split, a memory layout,

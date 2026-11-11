@@ -23,8 +23,9 @@ the same alone and among up to 32 rows.
 
 Served (declined otherwise, by name): the validated geometries and splits (``SERVED_CLASSES``), rows 1 .. 32, contiguous operands with
 32-byte aligned storage, every operand on the entry's device, a compute capability 10.x part, a CuTe DSL >= 4.8.0 that provides the
-``cutlass.cute.experimental`` layer the kernel is written on.  ``out`` must not overlap ``weight``, ``activation`` or ``scale`` (not
-checked).
+``cutlass.cute.experimental`` layer the kernel is written on and whose bound compiler has the part's target (on compute capability
+10.7 the DSL's CUDA 13.4 compiler or a newer one: its CUDA 12 flavor has no such target and is declined by name before any compile).
+``out`` must not overlap ``weight``, ``activation`` or ``scale`` (not checked).
 
 THE ROW COUNT IS A COMPILE KEY (a stated deviation from python/cudnn/AGENTS.md Rule 4, bounded and precedented).  The kernel is
 specialised on ``rows`` (its output bounds and token tile are trace-time constants), so there is one rendering per row count: at most
@@ -73,6 +74,11 @@ SUPPORTED_CC_RANGES = ((100, 109),)
 SUPPORTED_CC_TEXT = "10.x (SM100-class)"
 DSL_FLOOR = (4, 8, 0)
 DSL_FLOOR_TEXT = ".".join(str(x) for x in DSL_FLOOR)
+#: compute capability -> the oldest CUDA compiler of the DSL that has the part's target, where that is above the DSL's oldest flavor.
+#: The DSL binds one compiler flavor per process (its cu12 or its cu13 one, by the driver's CUDA major and what is installed) and
+#: refuses a Rubin target on a compiler up to CUDA 13.3 -- from inside the trace, as an internal error.  A default install binds the
+#: CUDA 12 flavor even under a CUDA 13 driver, so the combination is reachable on a real cc 10.7 part.
+DSL_COMPILER_FLOORS = {(10, 7): (13, 4)}
 #: the DSL names the kernel module binds at import or trace time, per module: probed before the kernel module is imported, so a DSL
 #: that clears the version floor but lacks the layer (a later release that folded it away, a differently numbered build) declines by
 #: name instead of raising from inside the DSL
@@ -119,10 +125,38 @@ def dsl_layer_error() -> Optional[str]:
     return None
 
 
+def dsl_compiler_version() -> Optional[Tuple[int, int]]:
+    """``(major, minor)`` of the CUDA compiler the installed CuTe DSL is bound to in this process, or None when the DSL does not report
+    one.  Imports the DSL's version module (callers run it after the version gate)."""
+    try:
+        from cutlass.base_dsl.version_info import CUDA_VERSION
+
+        return (int(CUDA_VERSION.major), int(CUDA_VERSION.minor))
+    except Exception:  # noqa: BLE001 - a DSL that does not report its compiler is not declined on a value we failed to read
+        return None
+
+
+def dsl_compiler_error(device_cc) -> Optional[str]:
+    """The compiler half of the target gate (:data:`DSL_COMPILER_FLOORS`): a part whose target the DSL's bound compiler does not have
+    is declined here, by name, instead of failing inside the trace.  None when the compiler has the target, when the part has no
+    floor of its own, or when the DSL does not report its compiler."""
+    floor = DSL_COMPILER_FLOORS.get(None if device_cc is None else tuple(device_cc))
+    compiler = dsl_compiler_version() if floor is not None else None
+    if compiler is None or compiler >= floor:
+        return None
+    _, version = cutedsl_state()
+    found = " ".join(version) if version else "unknown version"
+    return (
+        f"{NAME} on compute capability {device_cc[0]}.{device_cc[1]} needs a CuTe DSL that compiles with CUDA {floor[0]}.{floor[1]} or newer "
+        f"(its older compilers have no target for this part); the installed DSL ({found}) compiles with CUDA {compiler[0]}.{compiler[1]} -- "
+        f"install 'nvidia-cutlass-dsl[cu13]' and run under a CUDA 13 driver (the DSL binds its cu13 compiler only there)"
+    )
+
+
 def dsl_error(device_cc=None) -> Optional[str]:
     """The Rule-7 gate, in the order a caller can act on: the DSL is installed; its version clears the kernel's floor (4.8.0, through the
-    one version parser of :mod:`cudnn.frost.buffers`); it has the target of the part; it provides the layer the kernel is written on.
-    None when the kernel can be imported and compiled."""
+    one version parser of :mod:`cudnn.frost.buffers`); it has the target of the part, and so does the compiler it is bound to; it
+    provides the layer the kernel is written on.  None when the kernel can be imported and compiled."""
     installed, _ = cutedsl_state()
     if not installed:
         return f"{NAME} requires nvidia-cutlass-dsl >= {DSL_FLOOR_TEXT}; the CuTe DSL is not installed"
@@ -132,6 +166,9 @@ def dsl_error(device_cc=None) -> Optional[str]:
     msg = cutedsl_arch_requirement_error(None if device_cc is None else tuple(device_cc))
     if msg is not None:
         return f"{NAME}: {msg}"
+    msg = dsl_compiler_error(device_cc)
+    if msg is not None:
+        return msg
     return dsl_layer_error()
 
 
