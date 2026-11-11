@@ -345,26 +345,26 @@ def qsa_bwd_sparse_query_kernel(
             prims.mbarrier_init(b_qe, 1)
             for s in cutlass.range_constexpr(NKS):
                 prims.mbarrier_init(b_kf.subview(s), 1)
-                prims.mbarrier_init(b_ke.subview(s), 8)
+                prims.mbarrier_init(b_ke.subview(s), 4)
             for s in cutlass.range_constexpr(2):
                 prims.mbarrier_init(b_pf.subview(s), 4)
             prims.mbarrier_init(b_sf.subview(0), 1)
             prims.mbarrier_init(b_sf.subview(1), 1)
             prims.mbarrier_init(b_vf, 1)
-            prims.mbarrier_init(b_ve, 8)
+            prims.mbarrier_init(b_ve, 4)
             prims.mbarrier_init(b_dqf, 1)
             prims.mbarrier_init(b_dqe, 4)
             for s in cutlass.range_constexpr(2):
                 prims.mbarrier_init(b_sde.subview(s), 4)
             prims.mbarrier_init(b_dsf, 1)
             for s in cutlass.range_constexpr(4):
-                prims.mbarrier_init(b_ktf.subview(s), 8)
-                prims.mbarrier_init(b_vtf.subview(s), 8)
+                prims.mbarrier_init(b_ktf.subview(s), 4)
+                prims.mbarrier_init(b_vtf.subview(s), 4)
             prims.mbarrier_init(b_kte, 1)
             prims.mbarrier_init(b_vte, 1)
             for s in cutlass.range_constexpr(2):
                 prims.mbarrier_init(b_kzf.subview(s), 4)
-                prims.mbarrier_init(b_ktrf.subview(s), 8)
+                prims.mbarrier_init(b_ktrf.subview(s), 4)
     if warp == 2:
         prims.tcgen05_alloc(tmem_slot, TM_COLS, group="cta_1")
         prims.tcgen05_relinquish_alloc_permit(group="cta_1")
@@ -867,10 +867,11 @@ def qsa_bwd_sparse_query_kernel(
     else:
         # ================================================================ K/V copy warps (SMEM -> TMEM)
         # The K and V tiles of every chunk become TMEM A operands, slab by slab so S can start on the first slab.
-        # Lane = chunk row, column = packed bf16 dim pair. Warp pair hh of a lane quadrant moves 16-byte chunks
-        # 4hh..4hh+3 of each 128-byte SW128 row segment (chunk cc of a row at 128 B index y of its atom sits at cc ^ y).
+        # Warps 8-11 (group 0): K and V of every chunk as TMEM A operands, lane = chunk row, column = packed bf16 dim
+        # pair, all eight 16-byte chunks of each 128-byte SW128 row segment (chunk cc of a row at 128 B index y of its
+        # atom sits at cc ^ y). Warps 12-15 (group 1): K^T, lane = dim, column = packed key pair, by ldmatrix.trans.
         qd = warp % 4
-        hh = (warp - 8) >> 2
+        group = (warp - 8) >> 2
         r = qd * 32 + lane
         if cutlass.const_expr(PAIR):
             # row = 8 * slot + 4 * query + token at slot + query * 2 KB + slab * 512 B + token * 128 B
@@ -882,150 +883,162 @@ def qsa_bwd_sparse_query_kernel(
             yr = r & 7
             roff = (OFF_K + (r >> 3) * BLK_SMEM + yr * 128) // 4
             slab_w = SLAB // 4
-        # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3. Tiles 0 / 1 take the keys 4p + {0, 1} and tiles 2 / 3
-        # the keys 4p + {2, 3} of a 16-key K-step at this warp's dim chunks, so one fragment is one 16x256b store in key order.
-        ldm_tile = lane >> 3
-        ldm_row = lane & 7
-        kstep_row = 4 * (ldm_row >> 1) + 2 * (ldm_tile & 1) + (ldm_row & 1)
-        dim_slab = 2 * hh + (qd >> 1)
-        ldm_off = []
-        for half in cutlass.range_constexpr(2):
-            dim_chunk = (qd & 1) * 4 + half * 2 + (ldm_tile >> 1)
-            if cutlass.const_expr(PAIR):
-                row_phase = (kstep_row & 3) + 4 * (dim_slab & 1)
-                row_off = (
-                    (kstep_row >> 3) * BLK_SMEM + ((kstep_row >> 2) & 1) * HALF_BLK + dim_slab * 512 + (kstep_row & 3) * 128 + ((dim_chunk ^ row_phase) << 4)
-                )
-            else:
-                row_off = (kstep_row >> 3) * BLK_SMEM + dim_slab * SLAB + (kstep_row & 7) * 128 + ((dim_chunk ^ (kstep_row & 7)) << 4)
-            ldm_off.append(row_off // 4)
-        # zero every quadrant's K / V / K^T operand rows once, so rows a chunk does not copy keep finite data
         zw = []
-        for e in cutlass.range_constexpr(16):
+        for e in cutlass.range_constexpr(32):
             zw.append(I32(0))
-        for zb in cutlass.range_constexpr(2):
-            for sl4 in cutlass.range_constexpr(4):
-                prims.tcgen05_st(
-                    "32x32b",
-                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + zb * 128 + sl4 * 32 + hh * 16).as_ptr(I32),
-                    cutlass.Vector.from_elements(zw, I32),
-                )
-        for z3 in cutlass.range_constexpr(3):
-            prims.tcgen05_st(
-                "32x32b",
-                prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KT + hh * 48 + z3 * 16).as_ptr(I32),
-                cutlass.Vector.from_elements(zw, I32),
-            )
-        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-        gc = I32(0)
-        for pp in cutlass.range(NP, unroll=1):
-            for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
-                o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
-                o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
-                nblk, _, _ = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
-                if nblk > 0:
-                    nchunks = (nblk + (CHB - 1)) // CHB
-                    for c in cutlass.range(nchunks, unroll=1):
-                        cgc = gc + c
-                        st = cgc % NKS
-                        # the last chunk of an item may be partial, and quadrant qd holds slots 4qd..4qd+3
-                        nval_c = _chunk_valid(nblk, c)
-                        do_cp = qd * 4 < nval_c
-                        # K(c): SMEM stage st -> TMEM (single buffer, free once S(c-1) has completed)
-                        _wait(b_kf.subview(st), (cgc // NKS) & 1)
-                        _wait(b_kte, (cgc & 1) ^ 1)
-                        for sl4 in cutlass.range_constexpr(4):
-                            # with one KV head a slab's rows start 512 B x slab in, so odd slabs sit in the upper half
-                            # of their swizzle span
-                            ys = yr
-                            if cutlass.const_expr(PAIR and sl4 % 2 == 1):
-                                ys = yr + 4
-                            if do_cp:
-                                off = roff + _koff(st) // 4 + sl4 * slab_w
-                                wv = []
-                                for i4 in cutlass.range_constexpr(4):
-                                    cc = hh * 4 + i4
-                                    v4 = (sbase + (off + ((ys ^ cc) * 4))).load(count=4, alignment=16)
-                                    for e in cutlass.range_constexpr(4):
-                                        wv.append(v4[e])
-                                prims.tcgen05_st(
-                                    "32x32b",
-                                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + sl4 * 32 + hh * 16).as_ptr(I32),
-                                    cutlass.Vector.from_elements(wv, I32),
-                                )
-                            if cutlass.const_expr(sl4 == 0):
+        zero32 = cutlass.Vector.from_elements(zw, I32)
+        if group == 0:
+            # zero the quadrant's K / V operand rows once, so rows a chunk does not copy keep finite data
+            for zb in cutlass.range_constexpr(2):
+                for sl4 in cutlass.range_constexpr(4):
+                    prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + zb * 128 + sl4 * 32).as_ptr(I32), zero32)
+            prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+            gc = I32(0)
+            for pp in cutlass.range(NP, unroll=1):
+                for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
+                    o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
+                    o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
+                    nblk, _, _ = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
+                    if nblk > 0:
+                        nchunks = (nblk + (CHB - 1)) // CHB
+                        for c in cutlass.range(nchunks, unroll=1):
+                            cgc = gc + c
+                            st = cgc % NKS
+                            # the last chunk of an item may be partial, and quadrant qd holds slots 4qd..4qd+3
+                            nval_c = _chunk_valid(nblk, c)
+                            do_cp = qd * 4 < nval_c
+                            # K(c): SMEM stage st -> TMEM (single buffer, free once S(c-1) has completed)
+                            _wait(b_kf.subview(st), (cgc // NKS) & 1)
+                            _wait(b_kte, (cgc & 1) ^ 1)
+                            for sl4 in cutlass.range_constexpr(4):
+                                # with one KV head a slab's rows start 512 B x slab in, so odd slabs sit in the upper
+                                # half of their swizzle span
+                                ys = yr
+                                if cutlass.const_expr(PAIR and sl4 % 2 == 1):
+                                    ys = yr + 4
                                 if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_ktf.subview(0))
-                            elif cutlass.const_expr(sl4 == 3):
-                                # One wait retires the three outstanding stores for slabs 1-3.
+                                    off = roff + _koff(st) // 4 + sl4 * slab_w
+                                    wv = []
+                                    for cc in cutlass.range_constexpr(8):
+                                        v4 = (sbase + (off + ((ys ^ cc) * 4))).load(count=4, alignment=16)
+                                        for e in cutlass.range_constexpr(4):
+                                            wv.append(v4[e])
+                                    prims.tcgen05_st(
+                                        "32x32b",
+                                        prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KA + sl4 * 32).as_ptr(I32),
+                                        cutlass.Vector.from_elements(wv, I32),
+                                    )
+                                if cutlass.const_expr(sl4 == 0):
+                                    if do_cp:
+                                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                                    prims.bar_warp_sync(0xFFFFFFFF)
+                                    if prims.elect_sync():
+                                        prims.mbarrier_arrive(b_ktf.subview(0))
+                                elif cutlass.const_expr(sl4 == 3):
+                                    # One wait retires the three outstanding stores for slabs 1-3.
+                                    if do_cp:
+                                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                                    prims.bar_warp_sync(0xFFFFFFFF)
+                                    if prims.elect_sync():
+                                        prims.mbarrier_arrive(b_ktf.subview(1))
+                            # V(c): SMEM -> TMEM (free once dP(c-1) has completed), then release the V SMEM stage
+                            _wait(b_vf, cgc & 1)
+                            _wait(b_vte, (cgc & 1) ^ 1)
+                            vb = sbase + (roff - OFF_K // 4 + OFF_V // 4)
+                            for sl4 in cutlass.range_constexpr(4):
+                                ys = yr
+                                if cutlass.const_expr(PAIR and sl4 % 2 == 1):
+                                    ys = yr + 4
                                 if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_ktf.subview(1))
-                        # V(c): SMEM -> TMEM (free once dP(c-1) has completed), then release the V SMEM stage
-                        _wait(b_vf, cgc & 1)
-                        _wait(b_vte, (cgc & 1) ^ 1)
-                        vb = sbase + (roff - OFF_K // 4 + OFF_V // 4)
-                        for sl4 in cutlass.range_constexpr(4):
-                            ys = yr
-                            if cutlass.const_expr(PAIR and sl4 % 2 == 1):
-                                ys = yr + 4
-                            if do_cp:
-                                wv = []
-                                for i4 in cutlass.range_constexpr(4):
-                                    cc = hh * 4 + i4
-                                    v4 = (vb + (sl4 * slab_w + ((ys ^ cc) * 4))).load(count=4, alignment=16)
-                                    for e in cutlass.range_constexpr(4):
-                                        wv.append(v4[e])
-                                prims.tcgen05_st(
-                                    "32x32b",
-                                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_VA + sl4 * 32 + hh * 16).as_ptr(I32),
-                                    cutlass.Vector.from_elements(wv, I32),
-                                )
-                            if cutlass.const_expr(sl4 == 0):
-                                if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_vtf.subview(0))
-                            elif cutlass.const_expr(sl4 == 3):
-                                if do_cp:
-                                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                                prims.bar_warp_sync(0xFFFFFFFF)
-                                if prims.elect_sync():
-                                    prims.mbarrier_arrive(b_vtf.subview(1))
-                        if prims.elect_sync():
-                            prims.mbarrier_arrive(b_ve)
-                        # K^T(c): the chunk's K rows transposed into the TMEM A operand of dQ^T once softmax(c) has
-                        # zeroed its nonfinite rows in SMEM and dQ(c-1) has finished reading the previous K^T. The K
-                        # SMEM stage is free after this copy.
-                        _wait(b_kzf.subview(cgc & 1), (cgc >> 1) & 1)
-                        _wait(b_dsf, (cgc & 1) ^ 1)
-                        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                        kbase = sbase + (OFF_K + _koff(st)) // 4
-                        for kk in cutlass.range_constexpr(CHB // 2):
-                            for half in cutlass.range_constexpr(2):
-                                frag = prims.ldmatrix(kbase + ((kk * 2 * BLK_SMEM) // 4 + ldm_off[half]), 4, prims.MMALayout.COL)
-                                prims.tcgen05_st(
-                                    "16x256b",
-                                    prims.TmemAddr.from_row_col(tmem_row0 + qd * 32 + half * 16, tmem_col0 + TM_KT + hh * 48 + kk * 8).as_ptr(I32),
-                                    frag,
-                                )
-                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                        prims.bar_warp_sync(0xFFFFFFFF)
-                        if prims.elect_sync():
-                            prims.mbarrier_arrive(b_ktrf.subview(cgc & 1))
-                            prims.mbarrier_arrive(b_ke.subview(st))
-                    gc = gc + nchunks
+                                    wv = []
+                                    for cc in cutlass.range_constexpr(8):
+                                        v4 = (vb + (sl4 * slab_w + ((ys ^ cc) * 4))).load(count=4, alignment=16)
+                                        for e in cutlass.range_constexpr(4):
+                                            wv.append(v4[e])
+                                    prims.tcgen05_st(
+                                        "32x32b",
+                                        prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_VA + sl4 * 32).as_ptr(I32),
+                                        cutlass.Vector.from_elements(wv, I32),
+                                    )
+                                if cutlass.const_expr(sl4 == 0):
+                                    if do_cp:
+                                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                                    prims.bar_warp_sync(0xFFFFFFFF)
+                                    if prims.elect_sync():
+                                        prims.mbarrier_arrive(b_vtf.subview(0))
+                                elif cutlass.const_expr(sl4 == 3):
+                                    if do_cp:
+                                        prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                                    prims.bar_warp_sync(0xFFFFFFFF)
+                                    if prims.elect_sync():
+                                        prims.mbarrier_arrive(b_vtf.subview(1))
+                            if prims.elect_sync():
+                                prims.mbarrier_arrive(b_ve)
+                        gc = gc + nchunks
+        else:
+            # ldmatrix.x4.trans: lane L feeds row L & 7 of tile L >> 3. Tiles 0 / 1 take the keys 4p + {0, 1} and tiles 2 / 3
+            # the keys 4p + {2, 3} of a 16-key K-step at this warp's dim chunks, so one fragment is one 16x256b store in key order.
+            ldm_tile = lane >> 3
+            ldm_row = lane & 7
+            kstep_row = 4 * (ldm_row >> 1) + 2 * (ldm_tile & 1) + (ldm_row & 1)
+            ldm_off = []
+            for h2 in cutlass.range_constexpr(2):
+                dim_slab = 2 * h2 + (qd >> 1)
+                for half in cutlass.range_constexpr(2):
+                    dim_chunk = (qd & 1) * 4 + half * 2 + (ldm_tile >> 1)
+                    if cutlass.const_expr(PAIR):
+                        row_phase = (kstep_row & 3) + 4 * (dim_slab & 1)
+                        row_off = (
+                            (kstep_row >> 3) * BLK_SMEM
+                            + ((kstep_row >> 2) & 1) * HALF_BLK
+                            + dim_slab * 512
+                            + (kstep_row & 3) * 128
+                            + ((dim_chunk ^ row_phase) << 4)
+                        )
+                    else:
+                        row_off = (kstep_row >> 3) * BLK_SMEM + dim_slab * SLAB + (kstep_row & 7) * 128 + ((dim_chunk ^ (kstep_row & 7)) << 4)
+                    ldm_off.append(row_off // 4)
+            # zero the quadrant's K^T rows once: the columns of invalid slots meet zero dS^T rows and must be finite
+            for z3 in cutlass.range_constexpr(3):
+                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_KT + z3 * 32).as_ptr(I32), zero32)
+            prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+            gc = I32(0)
+            for pp in cutlass.range(NP, unroll=1):
+                for j in cutlass.range(QSTEP * bid, nsq, QSTEP * nctas, unroll=1):
+                    o0_0, nblk_0 = _item_meta(p_sparse_pass_offsets, j, pp)
+                    o0_1, nblk_1 = _pair_meta(p_sparse_pass_offsets, j, pp, nsq, PAIR)
+                    nblk, _, _ = _lane_meta(o0_0, nblk_0, o0_1, nblk_1, I32(0))
+                    if nblk > 0:
+                        nchunks = (nblk + (CHB - 1)) // CHB
+                        for c in cutlass.range(nchunks, unroll=1):
+                            cgc = gc + c
+                            st = cgc % NKS
+                            # K^T(c): once softmax(c) has zeroed the chunk's nonfinite K rows in SMEM and dQ(c-1) has
+                            # finished reading the previous K^T. The K SMEM stage is free after this copy.
+                            _wait(b_kzf.subview(cgc & 1), (cgc >> 1) & 1)
+                            _wait(b_dsf, (cgc & 1) ^ 1)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                            kbase = sbase + (OFF_K + _koff(st)) // 4
+                            for kk in cutlass.range_constexpr(CHB // 2):
+                                for h2 in cutlass.range_constexpr(2):
+                                    for half in cutlass.range_constexpr(2):
+                                        frag = prims.ldmatrix(kbase + ((kk * 2 * BLK_SMEM) // 4 + ldm_off[h2 * 2 + half]), 4, prims.MMALayout.COL)
+                                        prims.tcgen05_st(
+                                            "16x256b",
+                                            prims.TmemAddr.from_row_col(tmem_row0 + qd * 32 + half * 16, tmem_col0 + TM_KT + h2 * 48 + kk * 8).as_ptr(I32),
+                                            frag,
+                                        )
+                            prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            prims.bar_warp_sync(0xFFFFFFFF)
+                            if prims.elect_sync():
+                                prims.mbarrier_arrive(b_ktrf.subview(cgc & 1))
+                                prims.mbarrier_arrive(b_ke.subview(st))
+                        gc = gc + nchunks
 
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     prims.barrier_cta_sync(0)
