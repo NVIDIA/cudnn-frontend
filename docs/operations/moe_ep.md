@@ -686,11 +686,13 @@ new operator preparation; caller-address changes require recapture.
 - `num_experts` divisible by the expert-parallel group size.
 - An explicit positive `max_tokens_per_rank` no greater than 65536. The
   routing metadata stores the source token index in 16 bits.
+- An expert-parallel group size no greater than 256. The routing metadata
+  stores the source rank in 8 bits.
 
 The stateless training CUDA Graph path has hardware acceptance through EP32 when
-all ranks are in one direct-P2P MNNVL peer-access domain. The Python capability
-layer does not impose an EP-size ceiling; cross-MNNVL execution is not part of
-the validated support surface. This acceptance requires one identical total
+all ranks are in one direct-P2P MNNVL peer-access domain. Beyond the 256-rank
+routing-metadata bound, the Python capability layer does not impose an EP-size
+ceiling; cross-MNNVL execution is not part of the validated support surface. This acceptance requires one identical total
 device-execution order across all EP ranks. Unordered concurrent replay of
 graphs from one instance is unsupported and must not be used. When separate
 instances use separate streams, establish identical CUDA-event ordering on all

@@ -1447,6 +1447,44 @@ def test_megamoe_capability_bounds_tokens_by_routing_metadata():
 
 
 @pytest.mark.L0
+def test_megamoe_capability_bounds_ep_size_by_routing_metadata():
+    from cudnn import MoeEp
+    from cudnn.moe_ep._megamoe_backend._capability import (
+        _MAX_EP_SIZE,
+        validate_config,
+    )
+    from cudnn.moe_ep._megamoe_backend.cutedsl_src.communication.token_protocol import (
+        TokenSrcMetadata,
+    )
+
+    # The capability bound mirrors the vendored record's 8-bit rank field.
+    assert _MAX_EP_SIZE == TokenSrcMetadata.MAX_RANKS
+
+    with MoeEp(_moe_ep_config(**_forward_config())) as op:
+        resolved = op._execution_state.resolved_config
+
+    def with_ep_size(ep_size):
+        return replace(
+            resolved,
+            public_config=replace(
+                resolved.public_config,
+                model=replace(resolved.public_config.model, num_experts=ep_size),
+            ),
+            topology=replace(
+                resolved.topology,
+                experts_per_rank=1,
+                ep_size=ep_size,
+                ep_rank=ep_size - 1,
+                ep_global_ranks=tuple(range(ep_size)),
+            ),
+        )
+
+    validate_config(with_ep_size(_MAX_EP_SIZE))
+    with pytest.raises(NotImplementedError, match=f"expert-parallel size must be <= {_MAX_EP_SIZE}"):
+        validate_config(with_ep_size(_MAX_EP_SIZE + 1))
+
+
+@pytest.mark.L0
 def test_ep32_peer_mapping_selects_version_compatible_payload():
     import cutlass
     from cutlass._mlir import ir

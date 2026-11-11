@@ -21,6 +21,10 @@ from .._types import BlockScaledTensor, MoeFormat
 # source token index in 16 bits; its communication component rejects larger
 # per-rank token capacities when the kernel is constructed.
 _MAX_TOKENS_PER_RANK = 1 << 16
+# The same record packs the source rank into 8 bits without masking, so a
+# larger expert-parallel group would silently misroute; nothing in the vendored
+# training path checks this bound.
+_MAX_EP_SIZE = 1 << 8
 
 
 def _validate_operand(name, tensor) -> None:
@@ -58,6 +62,11 @@ def validate_config(config: ResolvedMoeEpConfig) -> None:
     model = config.public_config.model
     parallel = config.public_config.parallel
     data_path = config.public_config.data_path
+    if config.topology.ep_size > _MAX_EP_SIZE:
+        raise NotImplementedError(
+            "MoeEp SM107 MXFP8 routing metadata stores the source rank in 8 bits; "
+            f"the expert-parallel size must be <= {_MAX_EP_SIZE}, got {config.topology.ep_size}"
+        )
     if data_path.output_format is not MoeFormat.BF16:
         raise NotImplementedError("MoeEp training MegaMoE supports output_format='bf16' only")
     supported_combine_formats = {
