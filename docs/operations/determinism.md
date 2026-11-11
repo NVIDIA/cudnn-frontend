@@ -69,6 +69,8 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_quant_jax_forward`, JAX shared wrapper; colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales | Unsupported | SM100 replay verified; batch invariance and SM103 unverified | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `kimi_delta_attention_summary` | state / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
+| `kimi_delta_attention_summary_bwd` | state-gradient / transition summary | BF16 inputs, FP32 outputs | Supported | Unverified | Unverified |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -294,6 +296,14 @@ a row alone and inside a batch under the entry's own picks.
   saved C for BF16 and FP16 C/D. The clamped path's approximate `tanh` is not
   bitwise equal to a host `tanh`. Other activations and SM107 are not covered
   by this row.
+
+- SM90 KDA summaries: pin `kda_summary_hopper_cuda`; K=V=128, equal head
+  counts, caller-normalized Q/K, FP32 log gates and activated FP32 beta/state.
+  The direct FP32 recurrence has no cross-sequence reduction and supports
+  `batch_invariant=True`, including empty spans and changed THD packing.
+  Both H/G and transition are covered. These non-differentiable summary APIs
+  do not provide dQ/dK/dV/dG/dBeta or a backward context; this qualification
+  does not establish determinism of the ordinary SM90 KDA apply kernels.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
