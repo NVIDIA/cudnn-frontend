@@ -82,6 +82,9 @@ The experimental API catalog includes:
 - [Cake dense GEMM training](/operations/gemm_fusions/cake_dense_gemm)
 
 - [SwiGLU + MXFP8 quantization](/operations/gemm_fusions/gated_act_mxfp8)
+- [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
+
+- [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
 
 ## Installation and setup
 
