@@ -8864,3 +8864,17 @@ class TestD192LptContract:
 
     test_work_order = staticmethod(_checks.test_thd_work_order)
     test_admission = staticmethod(_checks.test_native_admission)
+
+
+# The SM107 CI lane selects this file explicitly; helpers are not separately collected.
+from frost_test_utils import requires_rubin
+from sdpa.frost import sdpa_fwd_thd_origins_d512_sm107 as _d512_origins
+
+
+@requires_rubin
+class TestD512HalfPhysicalOrigins:
+    test_shared_physical_origins = staticmethod(_d512_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_d512_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_d512_origins.test_origins_without_total_hints)
+    test_packed_origins_decline = staticmethod(_d512_origins.test_packed_origins_decline)
+    test_half_head_envelope_declines = staticmethod(_d512_origins.test_half_head_envelope_declines)
