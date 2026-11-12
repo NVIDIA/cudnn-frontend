@@ -303,22 +303,21 @@ def _producer(slab, bars, k_desc, v_desc, q_desc, do_desc, kv_tile, kv_head, bat
         g = outer % RATIO
         q_tile = _q_tile(start, i, causal)
         head = kv_head * RATIO + g
-        for _once in cutlass.range_constexpr(1):
-            _wait(bars.x_empty[state.idx], state.phase)
-            bars.x_full[state.idx].arrive(n_bytes=STEP_BYTES, pred=prims.elect_sync())
-            tma_load_tile(
-                _tile(slab, RING + state.idx * 2 * STEP_BYTES, dtype, STEP_ROWS),
-                GmemTileTma(q_desc)(0, q_tile * STEP_ROWS, head, batch),
-                bars.x_full[state.idx].smem_ptr,
-            )
-            _wait(bars.y_empty[state.idx], state.phase)
-            bars.y_full[state.idx].arrive(n_bytes=STEP_BYTES, pred=prims.elect_sync())
-            tma_load_tile(
-                _tile(slab, RING + state.idx * 2 * STEP_BYTES + STEP_BYTES, dtype, STEP_ROWS),
-                GmemTileTma(do_desc)(0, q_tile * STEP_ROWS, head, batch),
-                bars.y_full[state.idx].smem_ptr,
-            )
-            state = advance(state, STAGES)
+        _wait(bars.x_empty[state.idx], state.phase)
+        bars.x_full[state.idx].arrive(n_bytes=STEP_BYTES, pred=prims.elect_sync())
+        tma_load_tile(
+            _tile(slab, RING + state.idx * 2 * STEP_BYTES, dtype, STEP_ROWS),
+            GmemTileTma(q_desc)(0, q_tile * STEP_ROWS, head, batch),
+            bars.x_full[state.idx].smem_ptr,
+        )
+        _wait(bars.y_empty[state.idx], state.phase)
+        bars.y_full[state.idx].arrive(n_bytes=STEP_BYTES, pred=prims.elect_sync())
+        tma_load_tile(
+            _tile(slab, RING + state.idx * 2 * STEP_BYTES + STEP_BYTES, dtype, STEP_ROWS),
+            GmemTileTma(do_desc)(0, q_tile * STEP_ROWS, head, batch),
+            bars.y_full[state.idx].smem_ptr,
+        )
+        state = advance(state, STAGES)
 
 
 @cute.jit
@@ -331,18 +330,17 @@ def _stats_loader(slab, bars, lse, delta, kv_tile, kv_head, batch, sq, lane, cau
         g = outer % RATIO
         q0 = _q_tile(start, i, causal) * STEP_ROWS
         head = kv_head * RATIO + g
-        for _once in cutlass.range_constexpr(1):
-            _wait(bars.x_empty[state.idx], state.phase)
-            slot = STATS + state.idx * STATS_BYTES
-            for c in cutlass.range_constexpr(STEP_ROWS // cute.arch.WARP_SIZE):
-                column = c * cute.arch.WARP_SIZE + lane
-                qc = cute.math.min(q0 + column, sq - 1)
-                Pointer(slab.data_ptr() + slot + column * 4, dtype=cutlass.Float32).store(cutlass.Float32(lse[batch, head, qc]) * cutlass.Float32(LOG2E))
-                Pointer(slab.data_ptr() + slot + STEP_ROWS * 4 + column * 4, dtype=cutlass.Float32).store(cutlass.Float32(delta[batch, head, qc]))
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.s_full[state.idx].arrive()
-            state = advance(state, STAGES)
+        _wait(bars.x_empty[state.idx], state.phase)
+        slot = STATS + state.idx * STATS_BYTES
+        for c in cutlass.range_constexpr(STEP_ROWS // cute.arch.WARP_SIZE):
+            column = c * cute.arch.WARP_SIZE + lane
+            qc = cute.math.min(q0 + column, sq - 1)
+            Pointer(slab.data_ptr() + slot + column * 4, dtype=cutlass.Float32).store(cutlass.Float32(lse[batch, head, qc]) * cutlass.Float32(LOG2E))
+            Pointer(slab.data_ptr() + slot + STEP_ROWS * 4 + column * 4, dtype=cutlass.Float32).store(cutlass.Float32(delta[batch, head, qc]))
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if prims.elect_sync():
+            bars.s_full[state.idx].arrive()
+        state = advance(state, STAGES)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -372,28 +370,27 @@ def _relay(slab, bars, dq_desc, turns, kv_tile, kv_head, batch, sq, lane, causal
         g = outer % RATIO
         q_tile = _q_tile(start, i, causal)
         head = kv_head * RATIO + g
-        for _once in cutlass.range_constexpr(1):
-            slot = counters + (
-                cutlass.Int64(batch) * cutlass.Int64(turns.stride[0])
-                + cutlass.Int64(head) * cutlass.Int64(turns.stride[1])
-                + cutlass.Int64(q_tile) * cutlass.Int64(turns.stride[2])
-            )
-            _wait(bars.dq_full, phase)
-            if lane == 0:
-                _spin(slot, kv_tile)
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            for s in cutlass.range_constexpr(DQ_SLICES):
-                tma_reduce_add_subtile(tile, GmemTileTma(dq_desc)(0, q_tile * STEP_ROWS, head, batch), s)
-            tma_store_commit()
-            prims.cp_async_bulk_wait_group(0, read=True)
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if prims.elect_sync():
-                bars.dq_empty.arrive()
-            prims.cp_async_bulk_wait_group(0)
-            prims.bar_warp_sync(cute.arch.FULL_MASK)
-            if lane == 0:
-                prims.store_ext((kv_tile + cutlass.Int32(1)).ir_value(), slot, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
-            phase = phase ^ 1
+        slot = counters + (
+            cutlass.Int64(batch) * cutlass.Int64(turns.stride[0])
+            + cutlass.Int64(head) * cutlass.Int64(turns.stride[1])
+            + cutlass.Int64(q_tile) * cutlass.Int64(turns.stride[2])
+        )
+        _wait(bars.dq_full, phase)
+        if lane == 0:
+            _spin(slot, kv_tile)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        for s in cutlass.range_constexpr(DQ_SLICES):
+            tma_reduce_add_subtile(tile, GmemTileTma(dq_desc)(0, q_tile * STEP_ROWS, head, batch), s)
+        tma_store_commit()
+        prims.cp_async_bulk_wait_group(0, read=True)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if prims.elect_sync():
+            bars.dq_empty.arrive()
+        prims.cp_async_bulk_wait_group(0)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if lane == 0:
+            prims.store_ext((kv_tile + cutlass.Int32(1)).ir_value(), slot, order=prims.MemOrder.RELEASE, scope=prims.MemScope.GPU)
+        phase = phase ^ 1
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -521,38 +518,37 @@ def _consumer(
             g = outer % RATIO
             q_tile = _q_tile(start, i, causal)
             head = kv_head * RATIO + g
-            for _once in cutlass.range_constexpr(1):
-                buf = step % 2
-                dv, dk = _step(
-                    slab,
-                    bars,
-                    state,
-                    buf,
-                    dq_phase,
-                    tid,
-                    w,
-                    kd,
-                    vd,
-                    kdq,
-                    lse,
-                    delta,
-                    batch,
-                    head,
-                    kv_row0,
-                    q_tile * STEP_ROWS,
-                    sq,
-                    skv,
-                    scale,
-                    dv_acc.load(0, D // 2),
-                    dk_acc.load(0, D // 2),
-                    dtype,
-                    causal,
-                )
-                dv_acc.store(dv)
-                dk_acc.store(dk)
-                dq_phase = dq_phase ^ 1
-                step = step + 1
-                state = advance(state, STAGES)
+            buf = step % 2
+            dv, dk = _step(
+                slab,
+                bars,
+                state,
+                buf,
+                dq_phase,
+                tid,
+                w,
+                kd,
+                vd,
+                kdq,
+                lse,
+                delta,
+                batch,
+                head,
+                kv_row0,
+                q_tile * STEP_ROWS,
+                sq,
+                skv,
+                scale,
+                dv_acc.load(0, D // 2),
+                dk_acc.load(0, D // 2),
+                dtype,
+                causal,
+            )
+            dv_acc.store(dv)
+            dk_acc.store(dk)
+            dq_phase = dq_phase ^ 1
+            step = step + 1
+            state = advance(state, STAGES)
     # both consumer warpgroups have finished reading the ring before it is reused as the output staging
     prims.barrier_cta_sync(1, thread_count=2 * cute.arch.THREADS_PER_WARPGROUP)
     if w == 0:
