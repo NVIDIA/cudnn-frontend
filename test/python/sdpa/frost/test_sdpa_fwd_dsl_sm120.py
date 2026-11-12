@@ -1881,6 +1881,45 @@ def test_dsl_sm120_paged_vector_loop_warm(dtype):
 
 
 @pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group("gpu_exclusive")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_dsl_sm120_paged_decode_async_warm(dtype):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, decode_num_stages
+    from test_sdpa_fwd_paged_sm120 import _case, _check
+    from warm_stress import StressCase, assert_warm_stress
+
+    stage = decode_kv_stage(64, 64)
+    depth = decode_num_stages(64, 64, 16)
+    refills = math.ceil(1027 / stage) - depth
+    assert refills > 0
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(
+        dtype, 2, 1024, True, False, h=16, sq=512, dims=(64, 64), packed=True, tile_m=16, tile_n=stage, explicit_plan=True
+    )
+    pack = {nodes[name]: tensor for name, tensor in bufs.items()}
+
+    def execute():
+        g.execute(pack, workspace)
+
+    execute()
+    _check(bufs, 1024)
+    # GQA=8 gives two query tokens per M16 tile and two head groups.
+    # Request zero has 512 CTAs walking 33 stages through the 12-slot ring,
+    # reusing 21 slots; request one's 512 CTAs are the empty-KV control.
+    assert_warm_stress(
+        StressCase(
+            "SM120 paged D64 asynchronous decode copies",
+            execute,
+            {"o_storage": o_storage, "stats_storage": stats_storage},
+            thread_blocks=2 * 2 * (512 // 2),
+            refills_per_launch=refills,
+        ),
+        warm=256,
+        poisoned=256,
+    )
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("head_dim,kv_tile", [(128, 64), (512, 32)], ids=["d128", "d512"])
 @torch_fork_set_rng(seed=7)
 def test_dsl_sm120_pack_gqa_dead_rows_never_store(head_dim: int, kv_tile: int):
