@@ -644,6 +644,10 @@ Instruction counts alone cannot establish participation. Trace the emitted
 release guard's operand back to `tid.x` and check every service lane; a
 single-warp guard leaves the release count unchanged. The SM100 D128 FP8
 compile test also rejects a private single-warp-guard control without launching it.
+Identify expected entries by the template's named `cudnn_kernel__kernel_`
+symbol, independently of register instructions; reset/unscale helper entries
+do not redistribute registers. Check both SM100 D512 MXFP8 V-half entries,
+including negative controls that remove all redistribution from either half.
 
 
 **Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
