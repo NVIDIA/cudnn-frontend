@@ -3714,3 +3714,65 @@ cd test/python
 CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit
 ```
+
+### SM100 single-sequence physical-origin setup — 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSingleSequenceSetup` collects
+18 new L0 cases through the existing CI entry. The helper is intentionally
+not named `test_*`, so a directory sweep does not collect a second copy.
+The four dense D128 physical-origin cases cover FP16/BF16, packed/unpacked
+CGA2, independent element offsets, changed addresses/strides, token/head
+Stats, retained capture and empty/keyless replay. Four paged B1 cases cover
+D64/D128, CGA1/CGA2, HND/NHD/mixed KV layouts and independent Q/O/Stats
+origins. Ten FP16/BF16 byte cases cover dense D128 packed/unpacked, paged
+D64 CGA1/CGA2 and paged packed D128 CGA2, all with split count one.
+
+Each byte case uses fixed CPU-generated sequence payloads and independent
+CPU FP64 O/Stats references. It compares B1 with reordered, duplicated and
+changed-neighbor B3/B5/B129 bindings through one capacity-4096 plan, then
+returns to B1. Fresh buffers, concurrent GPU work, poisoned workspace,
+empty/keyless sequences and retained CUDA Graph replay remain checked.
+Paged payloads are copied once into finite-poisoned pools; unused page tails
+cannot change the reference. Input bytes, O bytes and FP32 Stats bytes are
+checked separately. Negative-infinity Stats is accepted only at keyless rows.
+There is no backward setup change or new backward qualification.
+
+On local SM100 (148 SM), actual CUDA 13.4 compiler/sanitizer, DSL4.8,
+Torch2.14.1+cu130, cuDNN9.24.0.43, driver API13020 and TVM FFI0.1.14.post1,
+the unchanged kernel parent `cb4c4e759873` passed all25 selected L0 cases
+(18 new, six existing D64 paged-origin controls, one compact B4 control),
+with one L1 case deselected, in68.41s. Ten new runtime goldens were recorded
+under `361d6da48de8fd55`; no existing golden was changed. The final candidate
+passed the same25 cases, zero failures/skips and one deselection, in70.12s
+with recording unset and every new golden checked against that baseline.
+Actual imports and native compatibility were asserted; all three compiled
+cache controls were disabled. The generic multi-sequence setup body and
+existing native source are unchanged.
+
+CUDA13.4 memcheck and synccheck each passed the packed BF16 dense-origin
+case and D64 CGA1 paged-origin case, with zero errors (10.93s and8.38s).
+Offline compilation passed six SM103 half variants (FP16/BF16 times paged
+D64 CGA1, dense D128 CGA2 and packed paged D128 CGA2), plus two SM107 dense
+D128 CGA2 controls of the shared helper's unchanged default. GPU execution
+on SM103 and new SM107 execution remain unverified; compilation is not a
+runtime pass. This setup-only optimization changes neither the attention
+arithmetic nor eligibility/ranking, and does not promise cross-plan bytes.
+
+From `test/python`, after checking that `cudnn` imports this checkout:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1 CUTE_DSL_NO_CACHE=1 CUTE_EXPERIMENTAL_DSL_NO_CACHE=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSingleSequenceSetup \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD64PhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_thd_origins.py::test_compact_thd_origins_use_single_load_maps
+```
+
+The first baseline attempt copied unsupported SM107 configurations and
+failed10 cases before candidate testing: dense D64 origins, dense D128 GQA
+CGA1 and unsplit packed D64 are outside these SM100 routes. The final suite
+uses supported dense D128 and paged D64/D128 routes; reference tolerances
+and byte assertions were not weakened. The earlier failed run is not counted
+as successful coverage.

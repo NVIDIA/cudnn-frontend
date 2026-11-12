@@ -3464,3 +3464,16 @@ class TestPagedD64PhysicalOrigins:
         from sdpa.frost.test_sdpa_fwd_paged_thd_origins import test_paged_thd_origins_rebind_and_capture as check
 
         check(64, dtype, layout, stats, 1, splits, packed, page_size=page, kv_bound=1024, cpu_reference=True, q_bound=q_bound)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64/D128 single-sequence setup on SM100/SM103")
+class TestSingleSequenceSetup:
+    """The one-sequence setup and generic batch path compute identical bytes."""
+
+    import sdpa_single_sequence_setup_sm100 as _checks
+
+    test_physical_origins = staticmethod(_checks.test_single_sequence_physical_origins)
+    test_batch_bytes = staticmethod(_checks.test_single_sequence_batch_bytes)
+    test_paged_origins = staticmethod(_checks.test_single_sequence_paged_origins)
