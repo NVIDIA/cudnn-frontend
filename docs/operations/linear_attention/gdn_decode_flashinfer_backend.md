@@ -134,11 +134,13 @@ argument list of the entry's own `cfg_for` -- `(rows)` on `GdnDecodeFused`, `(re
 | `form_for(...)` | the form as plain data: every field of the config `cfg_for` returns under the config's own field names (the pick or the caller's `cfg`, with the part's shared-memory readings, the geometry as a nested `dict` and the `pdl` / `pdl_release` knobs applied), plus `ROWS` and `EPS` (decode) or `REQUESTS`, `TOKENS` and `EPS` (verify). A fresh `dict` of `bool` / `int` / `float` / `str` values on every call |
 | `launch_shape_for(...)` | `(grid, block, shared_memory)`: grid `(V heads x CTAs per head, rows or requests, 1)`, block `(threads, 1, 1)`, and the bytes of shared memory one thread block holds (verify: growing with the tokens per request). A profiler's kernel record of the launch reads the same three values |
 
-The symbol is the kernel's name followed by the head of its config's text, cut at a fixed length: the launch knobs, the
-tokens per request and the operand layout sit behind the cut, so two forms can share a symbol. Compare the form, not
-the name. On a cc 10.0 part at the default geometry, one request: decode `((96, 1, 1), (256, 1, 1), 42112)`, verify at
-six tokens `((96, 1, 1), (256, 1, 1), 126512)`, with or without `pdl`. A row count the entry does not serve is its typed
-decline (`ValueError` / `NotImplementedError`), and none of the three compiles, launches or touches device memory.
+The symbol is the kernel's name followed by the head of its config's text, cut at a fixed length. What sits behind the
+cut is not in the name -- with CuTe DSL 4.8.0 the two-CTAs-per-head field, the geometry and the operand layout of both
+kernels, and the launch knobs and the tokens per request of the verify kernel -- so two forms can share a symbol.
+Compare the form, not the name. On a cc 10.0 part at the default geometry, one request: decode
+`((96, 1, 1), (256, 1, 1), 42112)`, verify at six tokens `((96, 1, 1), (256, 1, 1), 126512)`, with or without `pdl`. A
+row count the entry does not serve is its typed decline (`ValueError` / `NotImplementedError`), and none of the three
+compiles, launches or touches device memory.
 
 ## Validation
 
