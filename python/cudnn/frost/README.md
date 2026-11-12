@@ -299,6 +299,11 @@ python/cudnn/
   frost/                        kernel-authoring framework ONLY
     template_loader.py          (path, TemplateParams) -> uniquely-named
                                 kernel module
+    launch_facts.py             what a direct-call entry states about the
+                                kernel it launches per row count: the symbols
+                                of its compiled forms, the form as plain data,
+                                the launch shape (kernel_symbols_for /
+                                form_for / launch_shape_for on the entry)
     tile_dsl/                   shared CuTe-DSL primitives (barriers, TMA,
                                 MMA, softmax pieces, masks). Import by dotted
                                 path: cudnn.frost.tile_dsl.<module>
