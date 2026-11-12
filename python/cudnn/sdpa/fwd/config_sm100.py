@@ -475,6 +475,14 @@ class TemplateParams:
     dtype_kv: int = -1
 
 
+@dataclass(frozen=True)
+class TemplateParamsDecode(TemplateParams):
+    """Extra geometry for the new swap-AB route, without changing legacy records' cache keys."""
+
+    decode_head_dim: int = 128
+    decode_live_columns: int = 0
+
+
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
 # other flavor must reject it rather than silently reading K/V as dense.
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
@@ -1733,7 +1741,12 @@ def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D25
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b = bpe(params.dtype_qkv)
     softmax_warps = 4 * (int(params.decode_q_tile) // 16)
+    decode_head_dim = getattr(params, "decode_head_dim", 256)
+    if decode_head_dim not in (128, 256):
+        raise ValueError("swap-AB decode: head-dimension envelope must be 128 or 256")
     cfg = CfgD256Decode(
+        TILE_K=decode_head_dim,
+        TILE_O=decode_head_dim,
         N_Q=int(params.decode_q_tile),
         SOFTMAX_WARPS=softmax_warps,
         MMA_WARP_ID=softmax_warps,

@@ -3500,3 +3500,21 @@ class TestUnifiedSplitSetup:
     test_dense_origins = staticmethod(_checks.test_single_sequence_dense_origins)
     test_mixed_origins = staticmethod(_checks.test_single_sequence_mixed_origins)
     test_batch_bytes = staticmethod(_checks.test_runtime_batch_bytes)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D128 live-column decode on SM100/SM103")
+class TestDecodeLiveColumns:
+    """Numerical routes, retained replay, batch invariance and refill coverage."""
+
+    import test_sdpa_fwd_decode_live_columns_sm100 as _graph
+    import test_sdpa_fwd_decode_live_columns_determinism as _determinism
+
+    live_column_route = staticmethod(_graph.live_column_route)
+    test_graph = staticmethod(_graph.test_live_columns_graph)
+    test_features = staticmethod(_graph.test_live_columns_graph_features)
+    test_existing_routes = staticmethod(_graph.test_live_columns_keep_existing_routes)
+    test_replay_batch = staticmethod(_determinism.test_live_columns_replay_batch)
+    test_golden = staticmethod(_determinism.test_live_columns_golden)
+    test_warm_refill = staticmethod(_determinism.test_live_columns_warm_refill)
