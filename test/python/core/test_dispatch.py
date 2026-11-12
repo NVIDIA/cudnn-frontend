@@ -975,8 +975,13 @@ def test_sole_implementation_families_are_never_gated(monkeypatch):
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
     for name in ("gdn", "kda", "gdn2"):
         family = _family(name)
-        assert not any(s.opt_in for s in family.slots.values()), f"{name} is the only implementation of its op and must not be gated"
-        assert family.offered_ids(), f"{name} must be offered without the opt-in flag"
+        default_ids = {
+            engine_name: family.engine_id + slot.slot
+            for engine_name, slot in family.slots.items()
+            if not slot.opt_in
+        }
+        assert default_ids, f"{name} must retain a default implementation"
+        assert family.offered_ids() == default_ids, f"{name} must offer only default engines without the opt-in flag"
 
 
 @pytest.mark.parametrize("value,offered", [("1", True), ("true", True), ("on", True), ("0", False), ("", False), ("no", False)])
