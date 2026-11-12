@@ -492,18 +492,19 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "gqa", True): Entry("never", None, "sm80_dense_prefill_20261031"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", False): Entry("never", None, "sm80_dense_prefill_20261031"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", True): Entry("never", None, "sm80_dense_prefill_20261031"),
+    # study sm80_d192_gqa_r5_20261112 replaces this study's four D192/V128 GQA entries (ge 8.085 on q): after native split-KV,
+    # smaller tiles and packed GQA (#2399 / #2400 / #2403) FROST leads every short-q cell the threshold sent to the backend.
+    # A100 80GB PCIe, cuDNN 9.29.0.18 (this study's), 512 train cells (GQA 8/1 / 16/2 / 32/8 / 64/8, b 1-16, s_q 16-4096,
+    # S_kv 2k-16.5k on and off the tile, causal and mask-free) all FROST-first (backend-only regret 2.62 geomean, max 26x);
+    # a 96-cell seeded holdout scored once: 64 changed cells at 0.28-0.46 geomean per class, worst 0.75.
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "gqa", False): Entry(
-        "ge", 8.085, "sm80_dense_prefill_20261031", "q"
+        "always", None, "sm80_d192_gqa_r5_20261112"
     ),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "causal_br", False, "gqa", True): Entry(
-        "ge", 8.085, "sm80_dense_prefill_20261031", "q"
+        "always", None, "sm80_d192_gqa_r5_20261112"
     ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "gqa", False): Entry(
-        "ge", 8.085, "sm80_dense_prefill_20261031", "q"
-    ),
-    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "gqa", True): Entry(
-        "ge", 8.085, "sm80_dense_prefill_20261031", "q"
-    ),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "gqa", False): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
+    ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (192, 128), "prefill", "dense", "none", False, "gqa", True): Entry("always", None, "sm80_d192_gqa_r5_20261112"),
     ("sdpa_fwd_prefill_sm80", (8, 0), "bf16", (256, 256), "prefill", "dense", "causal_br", False, "mha", False): Entry(
         "ge", 6.293, "sm80_dense_prefill_20261031", "tiles"
     ),
