@@ -1,28 +1,54 @@
 # Dense Qwen 3.5-architecture model
 
 Samples for the dense model of the Qwen 3.5 architecture at its published 27B-class layer widths: hidden 5,120; 64 layers,
-three linear-attention (gated delta-rule) layers to one attention layer; linear attention with 16 key heads and 48 value heads
-of 128; attention with 24 query heads and 4 key/value heads of 256; MLP width 17,408; 8-bit projections, a 4-bit MLP and a
-4-bit output head. Area rules and the helper layer: [../README.md](../README.md).
+three linear-attention (gated delta-rule, GDN) layers to one attention layer; linear attention with 16 key heads and 48
+value heads of 128; attention with 24 query heads and 4 key/value heads of 256; MLP width 17,408; 8-bit projections, a
+4-bit MLP and a 4-bit output head. `nvidia/Qwen3.8-27B-NVFP4` is a checkpoint of this architecture, and the one this
+sample was last run with; the NVFP4 of its name is its 4-bit storage format (packed 4-bit codes with block scales and a
+global scale). Area rules, the helper layer and the words a run uses: [../README.md](../README.md).
 
 | script | what it runs | status |
 |---|---|---|
-| `00_decode.py` | plain greedy decode, token ids in and token ids out, on the reduced seeded model; self-checking | this page |
+| `00_decode.py` | plain greedy decode in one process: on the reduced seeded model, token ids in and out, self-checking; with `--model`, text in and text out on a checkpoint from local disk | this page |
 
 ```bash
 python samples/models/qwen_dense/00_decode.py                          # 2 layers, 1 and 4 sequences, 32 tokens each
 python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
+
+# A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
+# with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
+pip install -r samples/models/requirements.txt                         # tokenizers, jinja2, safetensors; brings the hf command
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages chat.json --dump-tokens ids.json
 ```
 
 | flag | default | meaning |
 |---|---|---|
-| `--sequences N[,N...]` | `1,4` | sequences per run, fixed before the first step; a list repeats the run per count |
-| `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer |
-| `--stack fe-cublas\|reference` | `fe-cublas` | explicit, never chosen by what is installed |
-| `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed |
-| `--force-tokens N` | `32` | decode exactly N tokens per sequence, ignoring the end token |
-| `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header |
+| `--model DIR` | -- | a checkpoint directory on local disk; never a hub name; nothing is downloaded |
+| `--prompt TEXT` | `Why is the sky blue?` with `--model` | one user message, rendered by the checkpoint's chat template; repeat the flag for several prompts, run one after the other in one process |
+| `--messages FILE` | -- | chat messages as JSON: a list of messages, or an object with `messages` and optionally `tools` (JSON tool schemas) and `chat_template_kwargs` (options the checkpoint's template understands); repeatable |
+| `--max-new-tokens N` | `256` | with `--model`: stop after N new tokens unless an end token comes first. Without `--model` the flag is an error: the seeded run decodes `--force-tokens` |
+| `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-new-tokens` |
+| `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt |
+| `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
+| `--stack fe-cublas\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
+| `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
+| `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header. `ieee-fp32` sets `torch.backends.cuda.matmul.fp32_precision` for the rest of the process, which ends with the run |
+| `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
+
+A `--messages` file (the `chat.json` of the last command above), here with a system turn and the reasoning switched off:
+
+```json
+{"messages": [{"role": "system", "content": "Answer in one short sentence."},
+              {"role": "user", "content": "What is 17 times 23?"}],
+ "chat_template_kwargs": {"enable_thinking": false}}
+```
+
+A list of messages alone is also a valid file, and `tools` takes JSON tool schemas. The options are those of the
+checkpoint's chat template: for `nvidia/Qwen3.8-27B-NVFP4`, `enable_thinking: false` leaves out the reasoning the model
+otherwise writes before its answer.
 
 ## What the default run is
 
@@ -39,6 +65,98 @@ every multiply runs on cuBLAS over a bf16 copy of the quantised weights, which m
 stored formats hold 1 or 0.56; the rest runs in PyTorch; and every launch is issued from Python, one block after the other.
 It exists to prove the loader, the loop, the state handling and the tie-out, and it is the correctness oracle of the stacks
 that follow. It claims no number.
+
+## A checkpoint from local disk
+
+`--model DIR` runs a checkpoint of this architecture in the build with 8-bit projections and a 4-bit MLP and output head.
+
+| you need | |
+|---|---|
+| GPU | compute capability 10.x or 12.x **and**, for the 27B checkpoint on the stack `fe-cublas`, about 57 GiB of free memory (about 60 GiB on compute capability 12.x, where the first launch of the fused step takes about 3 GiB more): in practice a data-center Blackwell GPU. A 32 GB card prints the memory sentence and exits 0. The checkpoint has run on compute capability 10.0 and 10.3 |
+| disk | 22 GB for the checkpoint |
+| packages | `pip install -r samples/models/requirements.txt` |
+| time | about two and a half minutes for the default prompt with 256 new tokens (the seconds are below) |
+
+The sample was last run with:
+
+| | |
+|---|---|
+| checkpoint | `nvidia/Qwen3.8-27B-NVFP4`: 3 shards, 2,194 tensors, 21.9 GB; licence field on its model card `apache-2.0`, not gated (card read 2026-11-10) |
+| manifest hash | `95049016a247`, printed in the first line of a run: a SHA-256 over every shard's name, size and header (tensor names, formats, shapes, offsets), not over the values |
+| packages | tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0; the lower bounds of `samples/models/requirements.txt` (0.21.1, 3.1.6, 0.4.3) pass the host tests of the text and weight readers |
+| run | 2026-11-12, compute capability 10.0 (aarch64), in two environments: PyTorch 2.14.0 with CuTe DSL 4.8.0, and a fresh environment built by the lines of this file with PyTorch 2.15.0 and CuTe DSL 4.8.1. Three prompts at one sequence (two plain user turns, one with a tool schema and the reasoning switched off) and one prompt at two sequences; text out, `[00] PASS` in every run, the token line reported. The run before it was on compute capability 10.3 (2026-11-11) |
+| provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0 and 2.15.0, the PyTorch chains |
+
+The sample downloads nothing. Fetching the checkpoint is your own step, for example
+`hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4` (the command comes with the packages of the
+requirement file); it needs 22 GB of free disk, and the weights carry their own licence, which is not this
+repository's. The files read: `config.json`, `tokenizer.json`,
+`chat_template.jinja` (or the template in `tokenizer_config.json`), `generation_config.json` for the end tokens, and the
+`*.safetensors` shards. A path that is not a directory is an `ERROR` that says nothing is downloaded; a directory that
+lacks one of the files, or holds one that is not what its name says, is an `ERROR` that names the file; so is a copy
+that is not whole: a shard that the index file (`model.safetensors.index.json`) or the shards' numbering asks for and
+that is not there, or a shard that does not hold the bytes its header describes (a download that was cut). A checkpoint of
+another architecture or in other storage formats is a `SKIP` that names the first tensor that does not fit.
+
+What happens, in order: the tokenizer, the template and the shard headers are read (no weights); every prompt is rendered
+and encoded; the plan is resolved and printed with the memory the run needs, and a GPU with less free memory is a `SKIP`
+with exit code 0 before a tensor is read; then the weights are read, merged (query, key and value; `qkv` and `z`; the
+beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, the fused step is compiled, and each prompt
+is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
+printed; reasoning the model writes before its answer is part of that text.
+
+How long it takes, as orientation values of one run (compute capability 10.3, the default prompt, 256 new tokens, the
+checkpoint in the page cache): about two and a half minutes. About 6 s until the first step (import, read, merge,
+dequantise, compile, warm-up); 14 s for the 58 prompt tokens; 54 s for 225 new tokens, a quarter of a second per token on
+this stack; 12 s for the traced pass; and about a minute for the checks. The text is not streamed: it is printed after
+the report, so that printing is not part of a timed step. A run prints one line before the prompt and the decode loop
+(`[00] decoding: ...`) and one before the checks (`[00] checks on ...`), and nothing while either of the two runs.
+
+Memory, in GiB (2^30 bytes), as the memory lines of a run print it: the stack `fe-cublas`
+holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 56.7 GiB free with one
+sequence and the default prompt: the copies, the state and working memory, which is an eighth of the copies for a model
+of this size (2 GiB for the default run). A run with this checkpoint held 51.5 GiB in PyTorch at its peak, reserved
+55.2 GiB from the device, and the device grew by 55.4 GiB. A GPU with less free memory than the 56.7 GiB is a `SKIP`
+before a tensor is read. A 32 GB GPU cannot run this stack with a checkpoint of this size; it prints the
+memory sentence and exits 0. A stack on the stored formats, which needs less than half, arrives with the next step of
+this area.
+
+The prompt goes through the decode step, one step per token (the `first token` line says so), and a step issues 484 block
+calls from Python: on the run above about twelve thousand kernel launches and a thousand small copies per step, with the
+GPU busy for about a quarter of the period. That is what this stack is: it reads 51.6 GB per step where the model in its
+stored formats needs 17.9 GB, and it is bound by the launch path, not by the GPU. The timings a run prints are orientation
+values of that run and no more; no rate of this stack is a number to quote.
+
+The checks of a run with a checkpoint cover the first 16 steps of every prompt: replay, every provider block
+teacher-forced against the fp64-accumulated reference with the bands below, the tokens, and with more than one sequence
+the batch invariance. The block check is what verifies the providers, and it holds on trained weights with the same bands
+as on seeded ones.
+
+The token line of a checkpoint is `REPORTED`: it fails on a logit that is not finite and is judged against no band. The
+model quantises its MLP inputs to 4 bits and its projection inputs to 8, so a difference of one bf16 rounding in a
+multiply becomes a different code in the next quantiser, 64 layers deep. Two reference stacks that differ only in their
+accumulation precision (fp64 against IEEE fp32) were up to 52 bf16 units of the largest logit (13.0 logits) apart over 80
+steps of one prompt and chose another greedy token at 13 of them; the provider stack was up to 54 units (13.5 logits)
+from the fp64 reference over the same steps. In the three 16-step windows the runs above checked, the provider stack was
+8.7 to 10.3 logits from the reference and a second reference 7.5 to 11.4. No declared band separates a correct stack
+from a failed one here. A band in bf16 units of the largest logit is 8, 16 or 32 logits wide by that logit's binade, and
+the distance of two correct stacks does not follow the binade: 128 units, beyond which a stack that returns zeros
+passes, are 8 logits where a window's largest logit is below 16, which is less than two correct stacks were apart. And a
+greedy token is decidable only where its margin exceeds twice the band, which no step of these runs reached. So the line
+prints what it measured (the provider stack's distance, the number of greedy tokens equal to the reference's, and the
+same two figures for a second reference with the other accumulation precision) and gates on finite logits only. A
+defect of a provider shows in the block check. A defect in what both stacks share, the reading of the checkpoint
+included, shows in neither: the area README says what verifies that.
+
+Which steps are checked: the first 16 of the prompt. This checkpoint's chat template opens a conversation that has no
+system turn with a fixed one of its own, and a plain `--prompt` reaches the text of the prompt only after it, at token 45 of
+the 58 of the default prompt. The checked window of every plain prompt is therefore the same 16 tokens of that
+preamble. A `--messages` file with its own system turn or with tool schemas has another window. The runs above cover
+three distinct windows (the preamble, a system turn, a tool schema), not one per prompt, and none of them reaches a
+decode step.
+
+Comparing the produced ids with a serving engine is not part of this sample; `--dump-tokens` writes them for a
+comparison made elsewhere, and greedy decoding is not the checkpoint's own default (its generation settings sample).
 
 ## Who serves each block (stack `fe-cublas`)
 
@@ -73,7 +191,7 @@ Against the plain-PyTorch reference of every block, which keeps the chain's cast
 |---|---|
 | replay | the same inputs from a fresh state give byte-identical ids and logits |
 | blocks, teacher-forced | every value finite; every multiply within one bf16 rounding of the reference, element by element; the linear-attention step inside its band (below) |
-| tokens | the logits of the two stacks, each run end to end on its own state, are finite and within the declared logits band (4 bf16 units of the run's largest reference logit, `configs.py`); the greedy token equals the reference stack's at every step whose margin exceeds twice that band; steps below it are counted and printed as near-ties |
+| tokens | the logits of the two stacks, each run end to end on its own state, are finite. On the reduced seeded model they are also within the declared logits band (`configs.py`: 4 bf16 units of the run's largest reference logit), and the greedy token equals the reference stack's at every step whose margin exceeds twice that band; steps below it are counted and printed as near-ties. On a checkpoint no band is declared and the line is `REPORTED` (the section on checkpoints says why). The largest logit distance and the number of equal greedy tokens are printed either way |
 | batch invariance | one sequence alone gives the bytes it has among 4; the sequence that runs alone rotates with the step, so every row of the batch is covered: a gate for the linear-attention step on compute capability 10.0, 10.3 and 12.0, a printed fact for every other block and class |
 
 The band of the linear-attention step is judged twice. Over the whole run: more than 99.9 % of its 8-bit output bytes
@@ -97,7 +215,8 @@ The token check has a declared band because a band taken from the run's own logi
 weights it guards the path, not the layers: the layers move the logits by little (the two stacks are 1.0 to 1.4 units apart
 with two to eight layers, and a fused step with its two gate rows exchanged moved that by a third of a unit), so a
 defect of one block shows in the block check, and the token check catches what breaks the run as a whole: the state between
-steps, the position, the output head, the token choice. The band is declared for the reduced seeded model.
+steps, the position, the output head, the token choice. That band, 4 units, is declared for the reduced seeded model; a
+checkpoint declares none, and the section on checkpoints above says why its token line is reported.
 
 The multiplies of this stack ask cuBLAS for the fp32 accumulator throughout: `model_samples/providers/library.py` switches
 `torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction` off for its call and restores it. With PyTorch's
@@ -119,25 +238,27 @@ written from the format definitions.
 `cudnn.GdnDecodeFused` serves compute capability 10.x and 12.x and declines elsewhere; the sample then prints
 `[00] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is <cc>` and exits 0. The entry is
 validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention/gdn_decode_flashinfer_backend.md`).
+`nvidia-smi --query-gpu=name,compute_cap --format=csv` prints the compute capability of a GPU.
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell) | not run with the checks as they are now; `[00] PASS` with the first version of the checks (before the bands were held per value head, asked for finite values and the logits band was declared) |
-| 10.3 | not run |
-| 10.7 | runs (`[00] PASS`), unverified: batch invariance of the fused step is reported on this class, not gated |
-| 12.0 | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal |
-| any other | `[00] SKIP`, by design |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
+| 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
+| 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
+| 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |
+| any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
 A class the current checks have not run on is uncovered, not passing.
 
-Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GB at its peak and
-reserved 3.7 GB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GB free there. On compute capability 12.x
-it adds an allowance of 3 GiB and asks for about 6.7 GB: the first launch of the fused step reserves device memory outside
+Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
+reserved 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
+it adds an allowance of 3 GiB and asks for about 6.7 GiB: the first launch of the fused step reserves device memory outside
 PyTorch's pool on that class. The need is stated once, for every sequence count of the run, before anything is loaded: the
 copies, the working memory and the first launch are counted once, the state per count. The run measures that launch and
 prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
-6.9 GB of growth on the device over the whole run.
+6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
-Blackwell GPU: about 5 s to draw the weights, 1 to 2 s to compile the fused step per sequence count, the rest for the decode
-and its checks. These are orientation values of one run, not measurements of record.
+Blackwell GPU: about 5 s to draw the weights, about a second to compile the fused step for the first sequence count (0.5
+to 2.4 s in the runs so far) and 0.3 to 0.4 s for the next, the rest for the decode and its checks. These are orientation
+values of single runs, not measurements of record.
