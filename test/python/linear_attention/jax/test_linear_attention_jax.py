@@ -182,7 +182,11 @@ def test_forward_and_jitted_gradients(kind, dtype, fused, chain):
     actual = jax.jit(jax.grad(loss))(values)
     for name, got in actual.items():
         assert got.dtype == values[name].dtype
-        assert_close(got, expected_grads[name], 0.06 if name == "initial_state" else 0.04 if dtype == jnp.bfloat16 else 0.03)
+        if kind == "mamba2" and chain and name == "dt_bias":
+            # Match test_la.py's native contract for this cancellation-sensitive sum; per-token ddt still uses FP64.
+            assert_close(got, np.asarray(actual["g"], dtype=np.float64).sum(axis=0), 1e-3)
+        else:
+            assert_close(got, expected_grads[name], 0.06 if name == "initial_state" else 0.04 if dtype == jnp.bfloat16 else 0.03)
     for index in empty_sequences:
         np.testing.assert_array_equal(actual["initial_state"][index], ds[index])
     _, _, residual = jax.jit(partial(invoke, kind, explicit=True, **options))(values, cu)
@@ -194,6 +198,39 @@ def test_forward_and_jitted_gradients(kind, dtype, fused, chain):
     changed_expected, _ = reference(kind, changed, bounds, do, ds, **options)
     for name, got in zip(("out", "final_state"), run(changed, cu)):
         assert_close(got, changed_expected[name], 0.02 if dtype == jnp.bfloat16 else 0.01)
+
+
+def test_mamba2_matches_torch_chain(cuda_device):
+    from cudnn.linear_attention import mamba2
+
+    values, cu, options = inputs("mamba2", fused=True, bounds=(0, 1537), heads=(1, 1, 1), value_dim=64)
+    options["batch_invariant"] = False
+    do, ds = upstream(values)
+    run = jax.jit(partial(invoke, "mamba2", **options))
+    result = run(values, cu)
+    actual = jax.jit(jax.grad(lambda args: sum(jnp.sum(x.astype(jnp.float32) * dy) for x, dy in zip(run(args, cu), (do, ds)))))(values)
+    with torch.cuda.device(cuda_device.local_hardware_id):
+        native = {name: torch_array(value).cuda().requires_grad_() for name, value in values.items()}
+        expected = mamba2(
+            native["v"],
+            native["g"],
+            native["a"],
+            native["k"],
+            native["q"],
+            torch_array(cu).cuda(),
+            D=native["d"],
+            dt_bias=native["dt_bias"],
+            z=native["z"],
+            initial_state=native["initial_state"],
+            output_final_state=True,
+            plan_name="mamba2_frost",
+            **options,
+        )[:2]
+        native_grads = torch.autograd.grad(expected, tuple(native.values()), (torch_array(do).cuda(), torch_array(ds).cuda()))
+    for name, got, want in zip(("out", "final_state"), result, expected):
+        torch.testing.assert_close(torch_array(got), want.detach().cpu(), rtol=0, atol=0, msg=name)
+    for name, want in zip(native, native_grads):
+        torch.testing.assert_close(torch_array(actual[name]), want.detach().cpu(), rtol=0, atol=0, msg=name)
 
 
 @pytest.mark.parametrize("kind", OPERATIONS)
