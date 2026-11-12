@@ -312,7 +312,7 @@ class Checkpoint:
         ``ValueError`` when the directory is not a checkpoint.  ``manifest_hash`` identifies the checkpoint's layout: a
         SHA-256 over every shard's name, size and header bytes (tensor names, dtypes, shapes, offsets), not over its values."""
         try:
-            import safetensors  # noqa: F401  the reader of ``load``; imported here so that its absence declines before the plan
+            from safetensors import safe_open  # noqa: F401  the reader of ``_read``; imported here so that its absence declines before the plan
         except ImportError as error:
             raise NotImplementedError(f"a checkpoint is read through the safetensors package ({error}): pip install -r {REQUIREMENTS}") from error
         shown = os.path.basename(os.path.normpath(directory)) or "."

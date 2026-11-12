@@ -172,7 +172,7 @@ def trace_steps(step: Callable[[int], None], count: int) -> Tuple[Optional[Trace
         try:
             profiler.__exit__(None, None, None)
         except RuntimeError:
-            pass
+            pass  # the step's error is the one to raise; a profiler that cannot stop adds nothing to it
         raise
     try:
         profiler.__exit__(None, None, None)

@@ -154,13 +154,15 @@ def test_the_synthetic_tokenizer_round_trips_and_streams_what_it_decodes():
         assert ids.dtype == torch.int32 and ids.numel() == len(sample.encode("utf-8")), "ids 0..255 are the bytes of the text"
         assert text.decode(ids.tolist()) == sample
         stream = text.decoder()
-        pushed = [stream.push(i) for i in ids.tolist()]
-        assert "".join(pushed) + stream.close() == sample, "the streamed pieces add up to the full decode"
+        streamed = "".join(stream.push(i) for i in ids.tolist()) + stream.close()
+        assert streamed == sample, "the streamed pieces add up to the full decode"
     stream = text.decoder()
-    assert [stream.push(i) for i in "é".encode("utf-8")] == ["", "é"], "an open multi-byte character gives no text yet"
+    pieces = [stream.push(i) for i in "é".encode("utf-8")]
+    assert pieces == ["", "é"], "an open multi-byte character gives no text yet"
     produced = [70, 260, 280, 299]  # a byte, two seeded pieces, the end token
     stream = text.decoder()
-    assert "".join(stream.push(i) for i in produced) + stream.close() == text.decode(produced) and text.decode(produced).endswith("<|end|>")
+    streamed = "".join(stream.push(i) for i in produced) + stream.close()
+    assert streamed == text.decode(produced) and text.decode(produced).endswith("<|end|>")
     assert TextIO.synthetic(300, seed=3).decode(produced) == text.decode(produced) != TextIO.synthetic(300, seed=4).decode(produced)
     chat = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yes"}]
     assert text.render_chat(chat) == "<user>\nhi\n<assistant>\nyes\n<assistant>\n"
@@ -244,7 +246,8 @@ def test_a_checkpoints_chat_template_renders_tools_reasoning_and_several_turns(t
         '{"type": "function", "function": {"name": "weather", "description": "Weather of a <city> & its sky", "parameters": {"type": "object"}}}\n'
         "</tools>\n\nBe brief.<|im_end|>\n"
         "<|im_start|>user\nWeather in Paris?<|im_end|>\n"
-        "<|im_start|>assistant\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>assistant\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n"
+        "<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
         '<|im_start|>user\n<tool_response>\n{"sky": "clear"}\n</tool_response>\n<tool_response>\n{"wind": "calm"}\n</tool_response><|im_end|>\n'
         "<|im_start|>assistant\n<think>\n"
     ), "tool schemas, a tool call and two tool results in one turn: all of it is text by the time it is encoded"
@@ -311,16 +314,19 @@ def test_a_checkpoints_tokenizer_encodes_decodes_and_streams(tmp_path):
     for sample in ("the sky is blue", "naïve café 日本 🙂", "<think>\nscatter\n</think>\n\nblue"):
         produced = text.encode(sample).tolist()
         stream = text.decoder(ids)
-        pushed = [stream.push(i) for i in produced]
-        assert "".join(pushed) + stream.close() == text.decode(produced) == sample, "the streamed pieces add up to the full decode"
+        streamed = "".join(stream.push(i) for i in produced) + stream.close()
+        assert streamed == text.decode(produced) == sample, "the streamed pieces add up to the full decode"
     stream = text.decoder()
-    assert [stream.push(i) for i in text.encode("é").tolist()] == ["", "é"], "an open multi-byte character gives no text yet"
+    pieces = [stream.push(i) for i in text.encode("é").tolist()]
+    assert pieces == ["", "é"], "an open multi-byte character gives no text yet"
     stream = text.decoder()
-    assert stream.push(end) == "" and stream.push(int(text.encode("blue")[0])) != "", "the end token adds nothing to the text"
+    pieces = [stream.push(end), stream.push(int(text.encode("blue")[0]))]
+    assert pieces[0] == "" and pieces[1] != "", "the end token adds nothing to the text"
     cut = text.encode("sky 🙂").tolist()[:-1]  # generation stopped inside a character: its last byte never came
     stream = text.decoder()
     pushed = "".join(stream.push(i) for i in cut)
-    assert pushed == "sky " and stream.close() != "" and pushed + stream.close() == text.decode(cut), "close() hands over what the full decode writes for it"
+    rest, again = stream.close(), stream.close()
+    assert pushed == "sky " and rest != "" and rest == again and pushed + rest == text.decode(cut), "close() hands over what the full decode writes for it"
     marked = TextIO.from_checkpoint(str(_text_directory(tmp_path / "marked", opens_with_a_marker=True)))
     assert marked._tokenizer.encode("the sky").ids[0] == start, "this tokenizer adds a turn marker by itself when asked to"
     assert marked.encode("the sky").tolist() == text.encode("the sky").tolist(), "a rendered prompt is encoded as it is: the template wrote its markers"
