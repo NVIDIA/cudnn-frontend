@@ -50,7 +50,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
         (128, "bfloat16", 1, True, 64),
     ],
 )
-def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engine_name="sdpa_fwd_prefill_sm107", paged=False):
+def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engine_name="sdpa_fwd_prefill_sm107", paged=False, splits=1):
     import cudnn
     from cudnn.engines.manifest import family_for
 
@@ -72,7 +72,10 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
     preserved = snapshot(source)
     qlens, klens = [129, 17, 0, 1], [257, 33, 0, 0]
     plans = {}
-    declared_batch = 4096
+    # Split workspace scales with the declared token capacity. Keep an
+    # oversized envelope while bounding the test allocation. Both paths
+    # execute runtime B1/B3/B5/B129 through one plan.
+    declared_batch = 256 if splits > 1 else 4096
 
     def run(order):
         b = len(order)
@@ -122,6 +125,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
                 seq_len_q=nodes["ql"],
                 seq_len_kv=nodes["kl"],
                 use_causal_mask=True,
+                **({"max_total_seq_len_q": declared_batch * max(qlens)} if splits > 1 else {}),
                 **paged_options,
             )
             nodes["o"].set_output(True).set_dim(values["o"].shape).set_stride(values["o"].stride()).set_ragged_offset(nodes["off_o"])
@@ -143,7 +147,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
                 {
                     cudnn.knob_type.TILE_CGA_M: cga,
                     cudnn.knob_type.PACK_GQA: int(packed),
-                    cudnn.knob_type.SPLIT_KV: 1,
+                    cudnn.knob_type.SPLIT_KV: splits,
                     cudnn.knob_type.TILE_N: tile_n,
                 },
             )
@@ -153,7 +157,8 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
             compiled = graph._compiled_plans[0]
             assert compiled._prepared.spec.origin_specs is not None
             mod = compiled._compiled.kernel_module
-            assert mod.__file__.endswith(engine_name.rsplit("_", 1)[1] + "/prefill_d128_f16.py")
+            body = "decode_d128_f16.py" if splits > 1 else "prefill_d128_f16.py"
+            assert mod.__file__.endswith(engine_name.rsplit("_", 1)[1] + "/" + body)
             assert compiled._prepared.spec.b == declared_batch
             plans["shared"] = graph, nodes
         graph, nodes = plans["shared"]
@@ -226,7 +231,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
     preserved = snapshot(source)
     assert_bitwise(run([0]), alone, "single sequence after multi-sequence bindings")
     arch = engine_name.rsplit("_", 1)[1]
-    suffix = "-paged" if paged else ""
+    suffix = ("-paged" if paged else "") + (f"-split{splits}" if splits > 1 else "")
     assert_golden(
         f"sdpa-{arch}-single-sequence-d{dim}-{dtype_name}-cga{cga}-pack{int(packed)}-n{tile_n}{suffix}", source, alone, allowed_inf={"stats": -torch.inf}
     )
