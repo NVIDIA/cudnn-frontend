@@ -19,6 +19,15 @@ from frost_test_utils import select_engine as _select_engine  # noqa: F401
 
 pytestmark = requires_blackwell
 
+
+@pytest.mark.L0
+@requires_dsl
+class TestServiceRegisterRelease:
+    from service_register_release_checks import test_sm100_service_register_release as _release
+
+    test_service_register_release = staticmethod(_release)
+
+
 # ONE engine per arch line: pin the row that serves the device under test.
 # ``engine_name(arch=_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
 # unqualified pin fails on Rubin with "no plan for engine" for routing reasons

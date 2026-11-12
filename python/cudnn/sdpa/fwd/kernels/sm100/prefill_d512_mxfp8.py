@@ -875,6 +875,11 @@ def _kernel(
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
 
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
@@ -987,7 +992,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -1045,7 +1049,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1088,7 +1091,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -1106,7 +1108,6 @@ def _kernel(
         )
 
     else:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
         _scheduler_warp_loop_predecode(
             sched,

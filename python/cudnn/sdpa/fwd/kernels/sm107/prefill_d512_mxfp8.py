@@ -1098,6 +1098,11 @@ def _kernel(
     #   TMA-STG   (warp 6): sg1 only — O + LSE.  sg0 does not enter the scheduler loop.
     #   Scheduler (warp 7): try_cancel; both sgs.
     # ------------------------------------------------------------------
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= cutlass.Int32(CFG.SOFTMAX_WG0_BASE) and warp_idx < cutlass.Int32(CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS):
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _compute_warp_group(
@@ -1130,7 +1135,6 @@ def _kernel(
         )
 
     elif warp_idx == cutlass.Int32(CFG.MMA_WARP_ID):
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # cga2 non-leader paths fork — sg0 non-leader is quiet, sg1 non-leader
         # forwards mb_p_xfer_full to leader (P12) in a persistent loop.
         if is_leader:
@@ -1178,7 +1182,6 @@ def _kernel(
             )
 
     elif warp_idx == cutlass.Int32(CFG.TMALDG_WARP_ID):
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1217,7 +1220,6 @@ def _kernel(
         )
 
     elif warp_idx == cutlass.Int32(CFG.TMASTG_WARP_ID):
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             is_sg1=is_sg1,
             tma_o_desc=tma_o_desc,
@@ -1234,7 +1236,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         scheduler_warp_loop(sched, CFG.SCHEDULER_STAGES, is_cga_first_cta, CGA_SIZE)
 
 

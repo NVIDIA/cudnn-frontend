@@ -632,6 +632,23 @@ and counts the two common release sites (correction and service groups).
 The selected SM107 CI entry collects these checks; they also cross-compile
 from other architectures when the installed tools support the target.
 
+`TestServiceRegisterRelease` in the selected SM100 and SM107 entry files
+also compiles every remaining half, FP8 and MXFP8 service-role template.
+It checks each generated PTX entry for a common service release before the
+role-local acquisitions, accounting separately for the correction group
+(which can share the same budget). Dense D512 is included; previously only
+its paged specialization converged. D512 MXFP8 emits separate V-half entries.
+These compile checks do not establish native execution or performance on
+the target architecture; retain numerical, replay and sanitizer coverage.
+Instruction counts alone cannot establish participation. Trace the emitted
+release guard's operand back to `tid.x` and check every service lane; a
+single-warp guard leaves the release count unchanged. The SM100 D128 FP8
+compile test also rejects a private single-warp-guard control without launching it.
+Identify expected entries by the template's named `cudnn_kernel__kernel_`
+symbol, independently of register instructions; reset/unscale helper entries
+do not redistribute registers. Check both SM100 D512 MXFP8 V-half entries,
+including negative controls that remove all redistribution from either half.
+
 
 **Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
 

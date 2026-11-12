@@ -711,6 +711,11 @@ def _kernel(
     scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
@@ -796,7 +801,6 @@ def _kernel(
 
     # cga2 non-leader runs quiet body (alloc+dealloc only); cga1 folds to full path.
     elif warp_idx == CFG.MMA_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -848,7 +852,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # Warm descriptor cache.
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
@@ -880,7 +883,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -898,7 +900,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only CGA's (0,0,0) CTA issues.
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
         if cutlass.const_expr(CFG.THD_VARLEN):
