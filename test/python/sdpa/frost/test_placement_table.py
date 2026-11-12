@@ -381,6 +381,27 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "mask_free"])
+@pytest.mark.parametrize("s_kv", [2048, 2049], ids=["on_tile", "off_tile"])
+def test_sm80_d192_gqa_prefill_leads_at_every_query_length(causal, s_kv):
+    """Study sm80_d192_gqa_r5_20261112 replaces the q >= 271 threshold of the D192/V128 GQA classes: with packed GQA and split-KV
+    FROST leads from 16 query tokens up (the old b1 64/8 q192 loss is gone). MHA and another Ampere part keep their own answers."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def prefill(s_q, **over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=s_q, s_kv=s_kv, d_qk=192, d_v=128, causal=causal, bottom_right=causal)
+        base.update(has_paged_kv=False, device_cc=(8, 0))
+        base.update(over)
+        return _facts(**base)
+
+    for s_q in (16, 192, 1024):
+        assert pt.lookup(row, prefill(s_q)) is True, s_q
+        assert pt.matched_entry(row, prefill(s_q)).study == "sm80_d192_gqa_r5_20261112"
+    assert getattr(pt.matched_entry(row, prefill(192, h_q=8)), "study", None) != "sm80_d192_gqa_r5_20261112"
+    assert pt.lookup(row, prefill(192, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
 def test_a100_sxm_dense_prefill_entries_lead_only_their_classes():
     """MHA d64 windowed context leads on cc 8.0 from their own study; a class whose fit kept a threshold, whose tile
     twin did not fit `always`, or that failed qualification has no entry, and another Ampere part keeps the hand rules."""
