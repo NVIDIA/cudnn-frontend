@@ -1,0 +1,161 @@
+{
+  "inputs": {
+    "descale_k": {
+      "dtype": "torch.float32",
+      "sha256": "1bf98badfd842b101b70df904d1021b365f7f24e6da2e47c93eaeb185aefc4d8",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "descale_q": {
+      "dtype": "torch.float32",
+      "sha256": "c777b63e5c14665f108bb95a312e2a7a169f660647b860c37f43328d6380f1c3",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "descale_v": {
+      "dtype": "torch.float32",
+      "sha256": "7de5945849cf35992bddd241dad952be4cae1fc8c1ffc88247b60bbe39f99d1f",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "k": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "1cae0d8541dc8ac763d86bf386b718f2fa16f2aa60cee35fbf55045dcf86d695",
+      "shape": [
+        165,
+        2,
+        8,
+        128
+      ]
+    },
+    "k_table": {
+      "dtype": "torch.int32",
+      "sha256": "d6ecf139bb040cb13bca582c6dbe81cb8e610ec9c38700cf0140f6a095ab1618",
+      "shape": [
+        5,
+        1,
+        32,
+        1
+      ]
+    },
+    "q": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "c1228dfbbdeebab4ebd927cc4e93b2381b855a5669e87bd65ede0e68da4e0cfc",
+      "shape": [
+        5,
+        4,
+        4,
+        128
+      ]
+    },
+    "scale_o": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "seq_kv": {
+      "dtype": "torch.int32",
+      "sha256": "6bb73669d4ed90ae98f18e0964ed67e57b49c433406298a3a50913a72e21b0cd",
+      "shape": [
+        5,
+        1,
+        1,
+        1
+      ]
+    },
+    "seq_q": {
+      "dtype": "torch.int32",
+      "sha256": "999e397c77c9a23fab5d512f96b8d121bc880fd7712ef8e2e3cb68a340163e71",
+      "shape": [
+        5,
+        1,
+        1,
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "1f0bbe784e8036518e0b73f205761753393c91b2213c7d4d0eee9b3cfb207feb",
+      "shape": [
+        165,
+        2,
+        8,
+        128
+      ]
+    },
+    "v_table": {
+      "dtype": "torch.int32",
+      "sha256": "a0d49977f2596d90428887608baa7ddba93178b7cd85d9e8aa8640a1c950fe28",
+      "shape": [
+        5,
+        1,
+        32,
+        1
+      ]
+    }
+  },
+  "outputs": {
+    "amax_o": {
+      "dtype": "torch.float32",
+      "sha256": "fa55b4c4a4f3cbdd4f4ec5c6b3aefcd53e356cedd148bfe9b2dacbf1c632998a",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "d579bfa2da59aeb8e21646785b5d23a68749e2f934413961a01b3d7ab6fc3579",
+      "shape": [
+        3,
+        4,
+        4,
+        1
+      ]
+    },
+    "o": {
+      "dtype": "torch.float16",
+      "sha256": "be86b43970928eb768453b684363f724bee0ff8e135c3603885eab66612e5b51",
+      "shape": [
+        3,
+        4,
+        4,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13040,
+    "cudnn": 93000,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "sm": [
+      10,
+      3
+    ],
+    "sm_count": 148,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

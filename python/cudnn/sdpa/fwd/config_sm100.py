@@ -475,6 +475,14 @@ class TemplateParams:
     dtype_kv: int = -1
 
 
+@dataclass(frozen=True)
+class TemplateParamsDecode(TemplateParams):
+    """Extra geometry for the new swap-AB route, without changing legacy records' cache keys."""
+
+    decode_head_dim: int = 128
+    decode_live_columns: int = 0
+
+
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
 # other flavor must reject it rather than silently reading K/V as dense.
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
@@ -513,7 +521,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
         and thd
         and not padded_stats
         and (
-            (d_shape == (64, 64) and max_q > 0 and (not paged or device_cc in ((10, 0), (10, 3))))
+            (d_shape == (64, 64) and max_q > 0)
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (d_shape == (256, 256) and max_q > 0)
@@ -561,7 +569,15 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """The shared D256 packed-head path serves paged half THD on SM100/103/107."""
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+    return (
+        device_cc in ((10, 0), (10, 3), (10, 7))
+        and d_shape == (256, 256)
+        and not fp8
+        and thd
+        and paged
+        and cga in (None, 2)
+        and (split_kv == 1 or (device_cc in ((10, 0), (10, 3)) and split_kv > 1))
+    )
 
 
 def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
@@ -700,7 +716,7 @@ def _validate_params(
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
             (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and not fp8)
-            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
+            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and (not k.pack_gqa or k.paged_kv))
             or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
                 flavor == "d128"
@@ -732,13 +748,12 @@ def _validate_params(
                         or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
                     )
                 )
-                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2)
                 or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2)
             )
         ):
             raise ValueError(
-                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, "
-                "paged half d256 cga2 unsplit, or native half d576 cga2"
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, " "paged half d256 cga2, or native half d576 cga2"
             )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
@@ -933,6 +948,26 @@ def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -
         return None
     bs, hs, ss, _es = st
     return (bs, ss, hs)
+
+
+@lru_cache(maxsize=256)
+def paged_pool_layout(shape, strides, elem_bytes, hnd, kh, page_size, d):
+    """Cache pure geometry only; addresses and observed storage are checked per call."""
+    if len(shape) != 4 or any(n <= 0 for n in shape) or shape[1] != kh or shape[2] != page_size or shape[3] != d:
+        raise ValueError(f"a page pool is (n_pages, {kh}, {page_size}, {d}); got {shape}")
+    if strides[3] != 1:
+        raise ValueError("the page pool's head dim must be contiguous")
+    if (strides[1] > strides[2]) != hnd:
+        raise ValueError(f"this artifact was compiled for {'HND' if hnd else 'NHD'} page pools; got strides {strides}")
+    # Match dense TMA admission in storage order, including singleton axes.
+    ordered_shape = (shape[0], shape[2], shape[1], shape[3]) if hnd else shape
+    ordered_strides = (strides[0], strides[2], strides[1], strides[3]) if hnd else strides
+    bound = dense_bind_strides(ordered_shape, ordered_strides, elem_bytes)
+    if bound is None:
+        raise ValueError(f"page-pool strides must be covering and 16-byte aligned; got {shape} / {strides}")
+    bs, ss, hs = (bound[0], bound[2], bound[1]) if hnd else bound
+    need = (shape[0] - 1) * bs + (page_size - 1) * ss + (kh - 1) * hs + d
+    return (bs, ss, hs), need
 
 
 def rescale_threshold(dtype_qkv: int) -> float:
@@ -1706,7 +1741,12 @@ def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D25
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b = bpe(params.dtype_qkv)
     softmax_warps = 4 * (int(params.decode_q_tile) // 16)
+    decode_head_dim = getattr(params, "decode_head_dim", 256)
+    if decode_head_dim not in (128, 256):
+        raise ValueError("swap-AB decode: head-dimension envelope must be 128 or 256")
     cfg = CfgD256Decode(
+        TILE_K=decode_head_dim,
+        TILE_O=decode_head_dim,
         N_Q=int(params.decode_q_tile),
         SOFTMAX_WARPS=softmax_warps,
         MMA_WARP_ID=softmax_warps,

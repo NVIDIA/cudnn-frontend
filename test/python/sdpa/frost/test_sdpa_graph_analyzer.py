@@ -1090,8 +1090,8 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     # the two together so the gate cannot drift: the f16 SM100 row declares
     # exactly the adapter's flavors. Native SM107 admits D64, paged D192/V128, D512 and D576/V512;
     # native SM107 D128 uses a shared route predicate because dense CGA1 still
-    # requires whole groups. Native SM90 D512 admits gcd-based subgroups.
-    # Quantized and SM120 routes retain their gates.
+    # requires whole groups. Native SM90 D128/D256/D512 admit gcd-based subgroups.
+    # SM120 wide half flavors admit larger groups as subgroups; quantized gates are unchanged.
     from cudnn.sdpa.fwd.api_dsl import _SM100_PARTIAL_PACK_GQA_FLAVORS
 
     by_name = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
@@ -1100,8 +1100,12 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     native_sm107 = engines.engine_name(arch="sm107")
     assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512), (576, 512)})
     native_sm90 = engines.engine_name(arch="sm90")
-    assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(512, 512)})
-    others = {name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107, native_sm90)}
+    assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
+    native_sm120 = engines.engine_name(arch="sm120")
+    assert by_name[native_sm120].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})
+    others = {
+        name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107, native_sm90, native_sm120)
+    }
     assert all(v is None for v in others.values()), others
 
 
@@ -1897,8 +1901,32 @@ def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
     for d_qk in range(264, 513, 8):
         for d_v in range(264, 513, 8):
             assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
-    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (520, 512), (512, 520)):
+    for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (584, 512), (512, 520)):
         assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+
+
+def test_sm120_probe_d576_envelope_pairs(monkeypatch):
+    """D576/V512 is a half-only extension; independent eight-aligned widths."""
+    from cudnn.sdpa.fwd.config_sm120 import pick_flavor, smem_bytes
+    from types import SimpleNamespace
+
+    native = cudnn._pybind_module._SdpaDenseBinder
+    flags = {name: getattr(native, name) for name in dir(native) if name.startswith("supports_")}
+    flags["supports_d576_envelope"] = True
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
+    monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
+    for d_qk in range(520, 577, 8):
+        for d_v in range(264, 513, 8):
+            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+            assert pick_flavor(d_qk, d_v, False) == (576, 512)
+            assert pick_flavor(d_qk, d_v, True) is None
+            assert smem_bytes(d_qk, d_v, 64, 32) == 98328
+    for d_qk, d_v in ((576, 256), (584, 512), (576, 520), (516, 512)):
+        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+    flags.pop("supports_d576_envelope")
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
+    assert _SM120 not in _eligible(_mk_sm120_graph(d=520, d_v=504))
+    assert _SM120 in _eligible(_mk_sm120_graph(d=576, d_v=512))
 
 
 def test_sm120_probe_accepts_right_band_widening(monkeypatch):
@@ -2372,10 +2400,12 @@ def test_bwd_probe_gqa(monkeypatch):
 
 
 def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
-    # Envelope: any multiple of 8 up to 256 (adapter pads); reject the rest.
+    # Eight-aligned native envelopes cover widths through 512.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert not _bwd_eligible(_mk_bwd_graph(d=100))
-    assert not _bwd_eligible(_mk_bwd_graph(d=264))
+    assert not _bwd_eligible(_mk_bwd_graph(d=520))
+    for width in (264, 504, 512):
+        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=width))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
@@ -3225,14 +3255,14 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
     if accepted:
         for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
             assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
-    # The Rubin row's prepared MXFP8 contract, on every row of the table: the executor is device cc 10.7 only;
-    # it serves fixed dense plans (a dense shape override is declined) or bounded THD (the override rides the
-    # per-sequence lengths, as on SM100); split-KV is declined dense and THD alike.  So on cc 10.7 the row
-    # accepts exactly what the SM100 row accepts at split 1.
+    # The Rubin row's prepared MXFP8 contract: device cc 10.7 only; on cc 10.7 it accepts exactly what the
+    # SM100 row accepts (dense split rides the d128 body with half outputs; THD split declines).
     rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
     rubin_facts = replace(facts, device_cc=rubin_cc)
-    rubin_accepts = rubin_cc == (10, 7) and split == 1 and (thd or not override)
-    assert rubin_accepts == (rubin_cc == (10, 7) and accepted and split == 1)
+    rubin_accepts = rubin_cc == (10, 7) and accepted
+    if rubin_accepts and split > 1:
+        for changed in (dict(d_qk=192), dict(dtype_o=cudnn.data_type.FP8_E4M3)):
+            assert engines._prepared_decline_reason(rubin, replace(rubin_facts, **changed), split) is not None, changed
     rubin_reason = engines._prepared_decline_reason(rubin, rubin_facts, split)
     assert (rubin_reason is None) == rubin_accepts, (thd, override, split, rubin_cc, rubin_reason)
 
@@ -3483,16 +3513,14 @@ def test_fp8_bwd_dtype_facts():
 
 @pytest.mark.parametrize("cc", [(10, 7), (10, 0), (12, 0), (8, 0)], ids=["sm107", "sm100", "sm120", "sm80"])
 def test_fp8_bwd_every_other_row_declines_by_message(monkeypatch, cc):
-    """Exactly ONE backward row serves sdpa_fp8_backward -- ``sdpa_bwd_sm107_fp8``
-    (d = 256 E4M3) on the Rubin line -- and every OTHER backward row (and every
-    forward row) declines it with a REASON on every arch.  A row in the device's
-    SM range must fall through to the quantization-family gate, not raise.
-    (Written as "no row serves it yet" in 3a816a02; the sm107 arm inverted when
-    the row registered in 54ad0710.)"""
+    """The native Rubin and SM120 rows serve D256 per-tensor FP8 backward;
+    every other backward row and every forward row declines with a reason.
+    A row in the device's SM range reaches the quantization-family gate.
+    """
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     g, _ = _mk_fp8_bwd_graph(use_causal_mask=True)
     facts = _facts(g)
-    served = {"sdpa_bwd_sm107_fp8"} if cc == (10, 7) else set()
+    served = {(10, 7): {"sdpa_bwd_sm107_fp8"}, (12, 0): {"sdpa_bwd_sm120_fp8"}}.get(cc, set())
     assert _bwd_eligible(g) == served and not _eligible(g)
     sm = cc[0] * 10 + cc[1]
     for spec in bwd_engines.ENGINE_SPECS:

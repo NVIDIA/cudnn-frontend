@@ -18,7 +18,7 @@ from sm107_half_test_utils import _rubin_only
         ("bfloat16", 1, True, 64),
     ],
 )
-def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n, kv_name=None):
+def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n, kv_name=None, split_kv=1):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _rubin_only()
@@ -66,25 +66,38 @@ def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n, kv_name=None):
                 is_causal=True,
                 causal_bottom_right=True,
                 window_size_left=73,
-                has_sink=True,
+                has_sink=split_kv == 1,
                 seq_kv_lens_present=True,
                 paged_page_size=page,
                 paged_max_seq_len_kv=page * blocks,
                 cga=cga,
-                split_kv=1,
+                split_kv=split_kv,
                 pack_gqa=packed,
                 tile_n=tile_n,
             )
             api.check_support()
             api.compile()
             assert api.flavor == (64, 64)
-            assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+            expected = "sm100/decode_d128_f16.py" if split_kv > 1 else "sm107/prefill_d128_f16.py"
+            assert api._k_mod.__file__.endswith(expected)
             assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.THD_VARLEN
             plans[b] = api
         api = plans[b]
         ws = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
         qb_before = qb.clone()
-        api.execute(qbind, k, v, obind, lflat, sinks=sink, seq_q_lens=ql, seq_kv_lens=kl, block_table=tables[0], block_table_v=tables[1], workspace=ws)
+        api.execute(
+            qbind,
+            k,
+            v,
+            obind,
+            lflat,
+            sinks=sink if split_kv == 1 else None,
+            seq_q_lens=ql,
+            seq_kv_lens=kl,
+            block_table=tables[0],
+            block_table_v=tables[1],
+            workspace=ws,
+        )
         assert torch.all(oflat[total:] == -123), "packed output capacity tail was written"
         assert torch.all(lflat[total:] == -123), "packed Stats capacity tail was written"
         assert_bitwise({"q": qb}, {"q": qb_before}, "packed Q bytes")
@@ -100,8 +113,8 @@ def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n, kv_name=None):
             diagonal = torch.arange(nq)[:, None] + nk - nq
             keys = torch.arange(nk)[None, :]
             scores.masked_fill_((keys > diagonal) | (keys < diagonal - 73), -torch.inf)
-            all_scores = torch.cat([scores, sink.cpu().double().view(h, 1, 1).expand(h, nq, 1)], -1)
-            ref_o = (all_scores.softmax(-1)[..., :nk] @ vv).transpose(0, 1)
+            all_scores = torch.cat([scores, sink.cpu().double().view(h, 1, 1).expand(h, nq, 1)], -1) if split_kv == 1 else scores
+            ref_o = (all_scores.softmax(-1)[..., :nk].nan_to_num() @ vv).transpose(0, 1)
             ref_lse = all_scores.logsumexp(-1).t()
             torch.testing.assert_close(oflat[offset : offset + nq].cpu().double(), ref_o, atol=0.003, rtol=0.02)
             torch.testing.assert_close(lflat[offset : offset + nq].cpu().double(), ref_lse, atol=0.0006, rtol=0)
@@ -119,4 +132,11 @@ def test_thd_batch_and_golden(dtype_name, cga, packed, tile_n, kv_name=None):
             offset += nq
     actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
     storage = f"-{kv_name}" if kv_name is not None else ""
-    assert_golden(f"sdpa-half-d64-thd-paged-{dtype_name}{storage}-cga{cga}-pack{int(packed)}-n{tile_n}", inputs, actual)
+    split_tag = f"-split{split_kv}" if split_kv > 1 else ""
+    assert_golden(f"sdpa-half-d64-thd-paged-{dtype_name}{storage}-cga{cga}-pack{int(packed)}-n{tile_n}{split_tag}", inputs, actual)
+
+
+@pytest.mark.parametrize("dtype_name,packed,split_kv", [("float16", False, 2), ("bfloat16", True, 9)])
+def test_thd_split_batch_and_golden(dtype_name, packed, split_kv):
+    """Fixed split counts preserve O/Stats bytes across ragged batch changes."""
+    test_thd_batch_and_golden(dtype_name, 1, packed, 128, split_kv=split_kv)

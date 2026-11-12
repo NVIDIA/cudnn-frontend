@@ -12,11 +12,7 @@ jax = pytest.importorskip("jax")
 ml_dtypes = pytest.importorskip("ml_dtypes")
 torch = pytest.importorskip("torch")
 import jax.numpy as jnp
-from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
-
-requirement_error = cutedsl_requirement_error("JAX grouped GEMM tests")
-if requirement_error:
-    pytest.skip(requirement_error, allow_module_level=True)
+from cudnn.frost.buffers import cutedsl_arch_requirement_error
 
 from cudnn.gemm.cutedsl.grouped.dswiglu.jax_api import grouped_gemm_dswiglu
 from cudnn.gemm.cutedsl.grouped.swiglu.jax_api import grouped_gemm_swiglu

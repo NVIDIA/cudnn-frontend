@@ -44,9 +44,19 @@ def test_native_d64_admission_and_backend_first_placement(causal, h_kv):
     assert place(spec, facts) == TRAIL
 
 
-@pytest.mark.parametrize("head", [(8, 8), (56, 64), (64, 56), (128, 128), (256, 512)])
+@pytest.mark.parametrize("head", [(8, 8), (56, 64), (64, 56), (256, 512)])
 def test_d64_admission_does_not_remove_d512_envelope_floor(head):
     assert engines.mismatch(_caps(), _facts(d_qk=head[0], d_v=head[1], device_cc=(9, 0))) is not None
+
+
+@pytest.mark.parametrize("head,tile", [((128, 128), 128), ((120, 72), 128), ((256, 256), 256), ((192, 128), 256), ((248, 136), 256)])
+def test_native_head_admission_retains_backend_first_placement(head, tile):
+    facts = _facts(d_qk=head[0], d_v=head[1])
+    caps = _caps()
+    assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=False)) is None
+    assert engines._selected_d_shape(caps, facts) == (tile, tile)
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
+    assert place(spec, facts) == TRAIL
 
 
 @pytest.mark.parametrize(
@@ -135,10 +145,10 @@ def test_standalone_d64_retains_existing_feature_routes(monkeypatch, dtype, extr
     assert selected == [f"sm90/prefill_{flavor}_f16.py"]
 
 
-@pytest.mark.skipif(_SM != 90, reason="standalone D512-envelope execution requires actual Hopper SM90")
+@pytest.mark.skipif(_SM != 90, reason="standalone head-envelope execution requires actual Hopper SM90")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("feature", ["sink", "window", "lengths", "pack-gqa"])
-def test_standalone_d64_d512_envelope_reference_and_replay(dtype, feature):
+def test_standalone_d64_head_envelope_reference_and_replay(dtype, feature):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     extra = {
@@ -160,6 +170,7 @@ def test_standalone_d64_d512_envelope_reference_and_replay(dtype, feature):
             api = SdpaFwdDslSm90(q, k, v, o, sample_lse=stats, **extra)
             api.compile()
             assert Path(api._k_mod.__file__).name == "prefill_d512_f16.py"
+            assert api._k_mod.SM90FusedMultiHeadAttentionForward.HEAD_TILE == 128
 
         def execute():
             api.execute(q, k, v, o, lse_tensor=stats, sinks=sinks, seq_q_lens=q_lens, seq_kv_lens=kv_lens)

@@ -22,8 +22,9 @@ as the runner-up plan; a small batch splits) plus forced splits with empty
 ranges, CUDA-graph replay under ``set_sync_debug_mode("error")`` (Rule 3), the
 32-column tile (N_Q = 32: compiled and driven at the template level, NOT routed
 -- see the routing-boundary tests, which pin S_q x G in (16, 32] on the prefill
-tile), and the routing boundary: larger S_q x G, THD queries and d128 stay on
-the prefill tiles.
+tile), and the routing boundary: larger S_q x G and THD queries stay on
+the prefill tiles. D128 paged units with at most eight live query rows use
+this body's physical D128 envelope and half-width softmax group.
 """
 
 import math
@@ -547,7 +548,7 @@ def test_decode_graph_wide_tile_routed_launch(page, sink):
         dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 0, 2048, 4096, 300, 77], q_lens=[1, 0, 1, 1, 1, 1, 1, 1], page=16, sink=0.7),
         dict(B=4, H=16, KH=2, s_q=2, lens=[4096, 600, 0, 129], q_lens=[2, 1, 0, 2], page=16, causal_br=True, sink=True),
         dict(B=2, H=32, KH=2, s_q=3, lens=[16384, 9000], q_lens=[3, 1], page=16, causal_br=True, sink=0.7, expect=PREFILL),
-        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect="decode_d128_f16", split_kv=2),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect=DECODE, split_kv=2),
         dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=64, expect="decode_d128_f16", split_kv=2),
     ],
     ids=["d256_decode_empty_batch", "d256_decode_mtp2_trim", "d256_prefill_tile_trim", "d128_decode_split2", "d64_decode_split2"],
@@ -574,9 +575,9 @@ def test_decode_routing_boundary():
     _run_graph(B=2, H=16, KH=2, s_q=4, lens=[700, 130], page=16, causal_br=True, expect=PREFILL)  # 32 packed rows at 8:1
     _run_graph(B=2, H=4, KH=4, s_q=17, lens=[700, 130], page=16, expect=PREFILL)  # 17 MHA rows
     _run_graph(B=2, H=32, KH=2, s_q=3, lens=[700, 130], page=16, expect=PREFILL)  # 48 packed rows
-    # d128 is another flavor: its decode-shaped graphs ride the d128 flavor's own
-    # decode tile (sm100/decode_d128_f16.py, TILE_CGA_M=1, PR #1094), never this one.
-    _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect="decode_d128_f16")
+    # D128 paged units with at most eight live rows share the swap-AB body,
+    # with native D128 geometry and half-width softmax work.
+    _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect=DECODE)
     _run_graph(B=2, H=64, KH=1, s_q=1, lens=[300, 130], page=16, expect=PREFILL)  # 64 packed rows
 
 
@@ -596,7 +597,7 @@ def test_decode_kernel_two_column_groups(splits):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
-    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+    from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     B, H, KH, P, s_q = 3, 32, 2, 16, 2
     lens = [700, 130, 5]

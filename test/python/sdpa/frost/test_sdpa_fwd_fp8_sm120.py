@@ -141,20 +141,25 @@ def _run(
     qkv=None,
     sched_policy=None,
     split_kv=None,
+    capture=None,
+    quantized_qkv=None,
 ):
     import cudnn
 
     dev = "cuda"
     D_v = D if D_v is None else D_v
-    if qkv is None:
-        Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
-        Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
-        Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
+    if quantized_qkv is None:
+        if qkv is None:
+            Qf = torch.randn(B, H_q, S_q, D, device=dev) * 0.5
+            Kf = torch.randn(B, H_kv, S_kv, D, device=dev) * 0.5
+            Vf = torch.randn(B, H_kv, S_kv, D_v, device=dev) * 0.5
+        else:
+            Qf, Kf, Vf = qkv
+        Q8, dq = _quant(Qf, io_dtype)
+        K8, dk = _quant(Kf, io_dtype)
+        V8, dv = _quant(Vf, io_dtype)
     else:
-        Qf, Kf, Vf = qkv
-    Q8, dq = _quant(Qf, io_dtype)
-    K8, dk = _quant(Kf, io_dtype)
-    V8, dv = _quant(Vf, io_dtype)
+        (Q8, dq), (K8, dk), (V8, dv) = quantized_qkv
     if negative_descale_q:
         # Same dequantized Q, with a negative descale_q * descale_k on the device.
         Q8, dq = (-Q8.float()).to(io_dtype), -dq
@@ -279,7 +284,18 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    if quantized_qkv is None:
+        chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    else:
+        # Kernel qualification holds the plan fixed independently of ranked offerings.
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(
+            family_for(g).offered_ids()[engine_name(arch="sm120", fp8=True)],
+            {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
+        )
+        g.select_plan(len(g.plans) - 1)
+        chosen = g.plans[g._plan_index]
     if split_kv is not None and (chosen.knobs.split_kv or 1) != split_kv:
         # The ranked plans need not carry this split count: re-plan the engine's own knob set with it.
         g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv, sched_policy=0))
@@ -304,6 +320,14 @@ def _run(
         if sync_debug:
             torch.cuda.set_sync_debug_mode(prev_sync_mode)
     torch.cuda.synchronize()
+
+    if capture is not None:
+        assert with_stats and not blk
+        capture.update(
+            run=lambda: g.execute(vp, ws),
+            inputs=dict(q=Qb, k=Kb, v=Vb, dq=dqt, dk=dkt, dv=dvt, ds=dst, ss=sst, so=sot),
+            outputs=dict(o=Ob, stats=lse, amax=amax_o),
+        )
 
     ref_kw = _ref_kwargs(sdpa_kwargs)
     o_ref, lse_ref = _ref(Q8.float() * dq, K8.float() * dk, V8.float() * dv, scale=scale, seq_lens_kv=seq_lens_kv, seq_lens_q=seq_lens_q, sinks=sinks, **ref_kw)

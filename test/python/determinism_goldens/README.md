@@ -9,6 +9,8 @@ These suites check six attention families and the DSA indexer APIs. Run from `te
 ```bash
 pytest linear_attention/frost/test_*_determinism.py QSA/cutedsl/test_qsa_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA*determinism.py -m L0
+pytest compressed_sparse_attention/cutedsl/test_CSA_compressor.py -m L0 \
+  -k 'batch_invariance or replay_determinism or determinism_golden'
 pytest core/test_determinism_utils.py
 ```
 
@@ -19,14 +21,382 @@ pytest core/test_determinism_utils.py
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
+| `TestQSABackwardEngine` | `qsa_backward`, `qsa_indexed_backward` | — | dQ, dK, dV |
+| CSA compressor focused cases | `CSA.csa_compressor_forward_wrapper`, `CSA.csa_compressor_backward_wrapper` | BF16 pooled output, including exact-zero capacity rows | BF16 dKV/dScore, FP32 dAPE |
 | `TestDSA` | `sparse_attention_forward_wrapper`, `sparse_attention_backward_wrapper` | output, max logits, LSE, optional indexer LSE | dQ, dKV, dSink |
 | `TestDSADeterministicDKV` | `sparse_attention_backward_wrapper` dKV layouts (`deterministic_dkv_mode`, SM100/SM103) | output, max logits, LSE (H128 D576: reference inputs) | dQ, dKV, dSink |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
 | `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
+| `attention_gate/frost/test_gate_quant_decode_determinism.py` | `AttentionGateQuantDecode` (the attention gate + quantize decode step, rows 1 .. 160) | FP8 E4M3 output `out` | — (inference-only step kernel; no backward) |
+| `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
+
+### D128 paged live-column decode — qualification, 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py` covers FP16/BF16
+O and FP32 Stats for the eight-live-row swap-AB lowering, with fixed packing
+and split counts. Cases include Q1/G8, Q2/G4, split1/4 and D80/V120 inside
+the D128 envelope. Replay uses fresh buffers and concurrent work; batch
+changes include isolation, insertion, reordering, duplication and more than
+one device wave. Retained graphs change V, query/KV lengths and independent
+K/V page maps, then restore and compare bytes. Numerical checks use CPU FP64.
+The refill stress uses four blocks per SM, warm/poisoned runs and the unsafe
+ring control. Backward uses other kernels and is outside this suite.
+
+B200 native qualification (CUDA compiler/NVRTC 13.4, CuTeDSL 4.8,
+cuDNN 9.30.0.4, Torch 2.14.1+cu130): four replay/batch cases and two warm
+stress cases pass. Four new golden records were created after the numerical
+and replay checks, then all four pass in a separate strict process. Existing
+goldens are unchanged; the new records baseline the swap-AB reduction order.
+The stress uses 592 blocks (4 per SM), 256 warm and 256 poisoned launches per
+dtype, with no mismatches; the unsafe control fails 200/200. No skipped cases.
+
+Unfiltered Compute Sanitizer memcheck, synccheck and racecheck each pass the
+four golden cases. Memcheck/synccheck report 0 errors; racecheck reports 0
+hazards, errors or warnings. CUDA API error reporting is disabled. Under
+instrumentation FE reports cuDNN 93000 and Torch 92400; the explicit standalone
+FROST path executes no backend attention. No new SM103 sanitizer run is claimed.
+The separate public graph suite passes 28 cases, including legacy D256
+wide-tile controls. The source/import and runtime library hashes are verified.
+
+The B200 run used base revision `a736a06c6d8dfde1b4322eee0430f93bae78178c`
+with the frozen D128 overlays subsequently committed in `fd911361d886b60a083464b6b3e790ba302c7733`.
+The three production modules have identical executable ASTs to PR revision
+`73bcd50c6166a574fab360136a76c90f6f3ea012`; the determinism test is byte-identical.
+The base revision alone does not contain this lowering. The frozen source
+manifest also verifies 134 native-extension build inputs.
+
+The actual sanitizer invocations below ran in separate processes. Here
+`sanitizer134` denotes the installed CUDA 13.4 `compute-sanitizer` executable,
+`python312` the qualification environment's Python, and `run_root` the frozen
+run directory (`/tmp/yanxu-d128-determinism-5882703`). No kernel-name filter,
+launch limit, or launch-dump option was used:
+
+```bash
+"$sanitizer134" --tool memcheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" memcheck
+"$sanitizer134" --tool synccheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" synccheck
+"$sanitizer134" --tool racecheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" racecheck
+```
+
+The wrapper verifies source/library hashes, the import path, GPU and runtime,
+then calls `pytest.main` from the frozen `source/test/python` directory with
+the following arguments (plus a result-recording plugin):
+
+```text
+sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py::test_live_columns_golden
+-m L0 -q -rs --tb=short --junitxml=<run_root>/results/<tool>/pytest.xml
+```
+
+For all three tools, `CUDNN_DETERMINISM_RECORD` was unset and
+`CUDNN_DETERMINISM_GOLDENS=<run_root>/goldens` selected the four records from
+the preceding record phase. The wrapper used `CUDNN_TEST_NO_ISOLATION=1`,
+`CUDNN_TEST_TIMEOUT=240`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` and
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, with CUDA 13.4 NVRTC preloaded,
+the cuDNN 9.30.0.4 library directory, and isolated source/cache paths.
+
+Native B300 SXM6 AC (cc10.3, 148 SMs, same compiler/runtime versions) passes 40
+checks through `TestDecodeLiveColumns` in the actual SM100/SM103 CI entry,
+including the older sink, routing, wide-tile and Int64 page-table-stride cases.
+Its four new golden records pass a separate strict process. Both dtype stress
+cases report 0 mismatches in 256 warm and 256 poisoned launches at 592 CTAs; the
+unsafe-ring control fails 200/200. No skips. The B300 job's subsequent
+performance phase failed during FlashInfer import before any measurements;
+that harness failure does not change these completed qualification results.
+
+Run from `test/python` with `CUDNN_DETERMINISM_RECORD` unset:
+
+```bash
+python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py
+python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_sm100.py
+```
+
+
+### Native SDPA service register release — validation, 2026-11-12 (UTC)
+
+Twenty-six SM100/SM107 forward templates now release the unchanged service
+register budget at one common warpgroup instruction before role dispatch.
+`TestServiceRegisterRelease` in the SM100 DSL and SM107 FP8 CI entry files
+compiles every changed template and checks the actual PTX, including both
+entries of D512 MXFP8 and the separate correction-group release. Three old
+template controls fail this detector; all 26 candidate templates pass without
+skips. SM107 results in this compile run are cross-compilation only.
+
+B200 (SM100, 148 SMs), Torch 2.14.1+cu130, cuDNN 9.30.0.4 and CuTe DSL 4.8.0
+using actual CUDA 13.4 and NVRTC 13.4: 127 native cases pass. They cover 72
+dense half/FP8/MXFP8 physical-stride permutations across D128/D192/D256/D512,
+24 half storage/rebind cases, four D192 cases, five D512 half datapath cases,
+one FP8 D512 multi-tile case, two MXFP8 D512 multi-wave cases, and 19 existing
+paged FP8 determinism cases. The latter include nine strict unchanged-parent
+goldens, nine repeatability/batch-invariance cases and one warm case. No
+tracked golden or numerical tolerance changes. The warm case has only four
+CTAs and is not a several-waves stress qualification.
+
+Racecheck, memcheck and synccheck each pass 12 dense stride/replay cases
+(three input families and four widths), with zero errors or hazards. Only
+racecheck filters instrumentation to `kns=cudnn_kernel_`; memcheck and
+synccheck are unfiltered. CUDA API error reporting is disabled, so these
+results qualify the selected memory/synchronization tools only. Earlier
+private harness failures are retained: simultaneous golden record/check
+settings, counting two L1 cases before pytest marker deselection, and a
+rejected sanitizer filter argument. None changed production bytes or relaxed
+an assertion; completed numerical cases were retained, and only missing
+phases were rerun. Native SM103 and performance are not measured here.
+This forward-only change makes no new backward determinism claim.
+
+Native SM107, Torch 2.14.0+cu130, cuDNN 9.30.0.4 and CuTe DSL 4.8.0 with
+CUDA 13.4/NVRTC 13.4: 104 candidate cases pass without skips or failures.
+They reuse the 72 dense stride permutations, 12 split1 half storage/rebind
+cases, four D512 FP8 strict goldens and four repeatability/batch-invariance
+cases, eight D576/V512 half nonpaged cases and four half determinism/golden
+cases. Eight parent goldens are recorded in a separate process and checked
+without recording by the candidate. The common half fixture's twelve
+pre-existing SM107 split exclusions are deselected before execution; this
+run does not qualify those split configurations. Native SM107 sanitizers
+remain unmeasured. The initial private runner used a CPython 3.12 extension
+in a 3.10 container and failed before GPU tests; the corrected run uses a
+matching extension whose native build inputs equal the frozen source.
+
+From `test/python`, the generated-instruction detector is:
+
+```bash
+python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestServiceRegisterRelease \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestServiceRegisterRelease -q -rs
+```
+
+The existing strict paged suite uses the normal golden workflow below;
+record its nine golden cases from the unchanged parent into a separate
+directory, then run the candidate with recording disabled. Dense sanitizer
+selection is `test_sdpa_fwd_dsl_sm100.py::TestNativeDenseStrides -m L0 -k order0`.
+The additional multi-wave selection is
+`test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d512_dense_multi_wave_alias -m L1`.
+The frozen validation base is `7c6ea67c633a8509ba976cbf3b0bb0c32473b606`;
+source and library hashes and the actual import path were checked.
+
+### SM120 cooperative paged prefill — validation, 2026-11-12 (UTC)
+
+The paged half-MMA prefill loader partitions the same vector copies across
+all four existing service warps. Half K/V retains per-thread async-copy
+completion before publication; FP8 K/V retains ordinary release publication
+after widening stores. Full-barrier arrivals and named-barrier participation
+include all 128 producer threads. CTA size, register budgets, shared-memory
+layout and attention arithmetic are unchanged. Dense, decode and wide-head
+producer counts retain their existing values.
+
+The initial candidate on parent `b2c5270751eeab2213d85eb3103e0ef507937901`
+passed 78 existing cases with zero failures/skips, including eight unchanged
+strict parent O/Stats goldens, explicit-plan rebind/capture, reordered and
+duplicated batches, changed neighbors, width/mixed-KV controls and half refill
+stress. Racecheck, memcheck and synccheck each passed three selected cases
+with zero errors: one affected small-page half prefill case and two unchanged
+decode-ring controls. These runs used Compute Sanitizer 2026.4 (CUDA 13.5),
+with API error reporting disabled; the zero-error result applies to the
+selected memory/synchronization tools.
+
+`test_dsl_sm120_paged_vector_loop_warm` additionally covers FP16/E4M3 and
+BF16/E5M2 K/V, retaining both half cases. The M128/N128 shape has 512 live
+CTAs plus 512 empty-sequence controls, rather than 1,024 active CTAs. Each
+live CTA reads three KV tiles and refills twice. Independent numerical checks
+precede byte stress. The initial half checks pass 256 warm and 256 poisoned
+launches per dtype, with zero differing output-storage bytes; the unsafe
+control fails 200/200 launches. This corrects the interpretation of the
+total launch grid in the earlier records without changing those measurements.
+
+The supplemental run passes all four half/FP8 warm cases with the same
+256 warm and 256 poisoned launches and the 200/200 unsafe control, plus the
+two FP8 small-page strict-golden cases under each sanitizer, with zero
+errors. Together the runs cover 80 distinct cases and five cases per
+sanitizer; the repeated half controls are not counted as new coverage.
+An initial supplemental allocation exited during GPU inventory before
+testing. The successful replacement preserves the one-GPU/architecture/idle
+checks. Generated PTX confirms that service warps 8 through 11 reach one
+common register-release instruction, with 128 full-barrier arrivals and
+384 participants in the tested M128 tile's K/V reuse barriers.
+
+Measured on RTX PRO 6000 Blackwell Server Edition, 188 SMs, Torch
+2.14.1+cu130, cuDNN 9.30.0.4, CuTe DSL 4.8.0 with actual CUDA 13.4 and
+NVRTC 13.4. Source/import locations and runtime library hashes were checked.
+No golden, tolerance or skip changed. This is forward-only, fixed-runtime
+qualification; SM121 and cross-runtime identity remain unverified.
+
+From `test/python`, with recording disabled:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k 'small_page_cache_determinism or paged_vector_loop' -q -rs
+```
+
+### SM120 warp-cached page tables — validation, 2026-11-12 (UTC)
+
+The common paged loader now loads a tile's live page IDs across a producer
+warp and selects them with shuffles before the vector live predicate. Tiles
+whose worst-case page span exceeds 32 retain the scalar lookup. The rolled
+copy loop, payload operations, physical Int64 offsets, waits, arrivals and
+arithmetic order are unchanged. This changes only forward kernels.
+
+`test_dsl_sm120_small_page_cache_determinism` adds four L0 cases to the
+selected architecture entry: FP16/BF16 Q/O with half K/V or E4M3/E5M2 K/V.
+D128 M128/N128 packed plans use eight-token pages and KV lengths
+`[257, 129, 0, 247, 1]`: sixteen-page full tiles, one-row tails, empty
+neighbors and independent K/V page order. The existing helper checks CPU-built
+fixed inputs, O/FP32 Stats bytes, numerical references, source/canary integrity,
+fresh buffers, isolated/reordered/duplicated/changed-neighbor batches,
+129-sequence scheduling stress and CUDA Graph replay.
+
+The unchanged parent loader recorded eight goldens after reference/replay
+checks; all eight passed strict comparison in a fresh candidate process.
+Four existing records were byte-identical to the committed files, and only
+four new `page8-blocks35` records are added under `c36345d9c3841d69`.
+The targeted candidate selection passed **78 cases, zero skips/failures**:
+the existing 14 vector-loop cases, four new small-page cases, eight native
+rebind cases, 24 width cases, 20 mixed-KV cases, six partial-GQA decode cases
+and two decode-ring cases. Memcheck and synccheck each passed three selected
+page8/reused-ring cases with zero errors. Racecheck passed the page8 case
+unfiltered and both ring cases with `--kernel-name kns=cudnn_kernel_`, with
+zero hazards. The original unfiltered attempt exceeded its 32 GiB host-memory
+limit; a 128 GiB retry passed page8 but hit the 180-second test watchdog in
+the first ring case's Torch numerical comparison. Both ring cases then passed
+with FROST-only instrumentation and unchanged numerical references (7.30s
+and 4.81s). Those interrupted attempts are not counted as passing runs.
+CUDA API error reporting was disabled for these sanitizer runs, so their
+zero-error counts describe the selected memory/synchronization tools only.
+
+The two warm cases retain 1,024 CTAs (5.45 per SM), two refills per launch,
+256 warm and 256 shared-memory-poisoned launches per dtype with zero differing
+output-storage bytes. Their unsafe control failed 200/200 launches. Each
+256-launch block bounds per-launch failure below 1.16% at 95% confidence;
+this is not the helper's 3,000-launch 0.1% bound.
+
+Measured on RTX PRO 6000 Blackwell Server Edition, 188 SMs, Torch
+2.14.1+cu130, cuDNN 9.30.0.4 and CuTe DSL 4.8.0 compiled with CUDA 13.4;
+NVRTC 13.4 was loaded explicitly. Actual imports, source and library hashes
+were checked. The frozen parent SM120 runtime source matches develop
+`9be74f4d7f748ebbf14febe6a9c624f61e9355c4`. SM121 is unverified; this makes
+no cross-runtime or backward determinism claim.
+
+From `test/python`, with recording disabled:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k 'small_page_cache_determinism or paged_vector_loop' -q -rs
+```
+
+### SM120 paged vector-copy loop — validation, 2026-11-12 (UTC)
+
+The selected architecture entry `sdpa/frost/test_sdpa_fwd_dsl_sm120.py`
+adds 14 L0 cases under `paged_vector_loop`: eight explicit-plan rebind/capture
+cases for half D128 prefill, D512, D128 decode and half-Q/FP8-KV prefill; four
+D128 M128/N128 repeatability/batch-invariance cases for FP16/BF16 with packed
+or unpacked GQA; and two sustained refill checks. The production change rolls
+the page-copy vector loop without changing its register budget, synchronization
+or arithmetic. It changes no backward path.
+
+The four byte cases preserve O and FP32 Stats across replay, fresh buffers,
+isolated/reordered/duplicated batches, 129-sequence scheduling stress and
+changed neighbors under capture. Inputs are built on CPU and reused across
+batch variants; numerical reference and canary checks are separate. Four
+new runtime records are committed under `c36345d9c3841d69`; no existing golden
+is replaced. Recording followed successful reference and byte checks, then a
+fresh process passed all four with recording disabled. Parent/candidate A/B
+measurements separately preserve identical FROST output bytes on all three
+measured BF16 shapes; no numerical change is intended.
+
+RTX PRO 6000 Blackwell Server Edition (SM120, 188 SMs), Torch 2.14.1+cu130,
+cuDNN 9.30.0.4, CuTe DSL 4.8.0 using CUDA 13.4 and NVRTC 13.4:
+**14 passed, 364 deselected, one warning in 72.47s**; fresh strict goldens:
+**4 passed, 374 deselected, one warning in 24.26s**. The warning is Torch's
+prototype synchronization-debug mode. The frozen source derives from
+`b1034fa93283627d0619685bf7ef93fdaa0d09cd`; source/test hashes and the actual
+import location were checked. SM121 is unverified. GPU-exclusive scheduling
+markers were added after this serial qualification; test bodies are unchanged.
+
+The warm cases use 1,024 CTAs (5.45 per SM), three KV tiles and two refills per
+launch. Each dtype passed 256 warm and 256 shared-memory-poisoned launches
+with zero differing output-storage bytes. The unsafe control failed 200/200
+launches on this GPU. Each block bounds a per-launch failure rate below 1.16%
+at 95% confidence; this is not the helper's 3,000-launch 0.1% bound. The stress
+helper compares a cold byte reference, while an independent numerical check
+runs before stress. This addition has no new sanitizer measurement.
+
+From `test/python`, with recording disabled:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k paged_vector_loop -q -x
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k paged_vector_loop_determinism -q -x
+```
+
+### SM120 wide partial PackGQA — validation, 2026-11-11 (UTC)
+
+The new L0 cases qualify explicit native forward plans for D512/V512 and
+D576/V512 with GQA ratios 96 and 128, two KV heads, and FP16/BF16 queries.
+There are 16 dense and 16 paged half cases across split counts 1 and 3,
+plus 16 paged mixed-KV cases across E4M3/E5M2 storage at split count 3.
+They preserve O and FP32 Stats bytes across repeat, isolated/reordered/
+duplicated/changed-neighbor batches and CUDA Graph replay. The stress batch
+has 33 sequences; numerical references, empty/tail/keyless rows, source
+immutability and output canaries remain independent checks. KV quantization
+is fixed across batch variants. This is forward-only coverage; no backward
+API or arithmetic is changed.
+
+Measured on RTX PRO 6000 Blackwell Server Edition (SM120, 188 SMs), driver
+595.84.01, Torch 2.14.0+cu130, cuDNN backend 9.24.0.43, CuTe DSL 4.8.0 with
+its CUDA 13.4 compiler, and the original image's cuda-bindings 13.0.3.
+The frozen source derives from `3c6a485cd3b9`; all 2,547 source/binary files
+per arm were hash-checked and the imported `cudnn` path was verified before
+each run. The compatible extension's binding/build inputs are unchanged.
+SM121 and other runtimes are unverified.
+
+The immutable parent recorded 14 existing wide dense/THD/paged controls;
+the candidate passed all 14 against those unchanged hashes. The 48 new
+subgroup cases passed numerical/batch/replay checks before recording, then
+all 48 passed a separate strict comparison with recording disabled. These
+62 records are added under runtime fingerprint `812f98809d9324c5`; no existing
+record is replaced. An additional 18 new functional cases and one admission
+case pass. Memcheck, racecheck and synccheck each pass the same 24-case subset:
+all 18 functional cases plus six representative D576 half/mixed subgroup
+cases. Memcheck reports zero errors, racecheck zero errors/warnings, and
+synccheck zero errors. Racecheck/synccheck filter to `cudnn_kernel_` symbols;
+memcheck is unfiltered and CUDA API errors remain enabled. All allocations
+were released.
+
+From `test/python`, the strict new-golden selection is:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -v -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  sdpa/frost/test_sdpa_fwd_d576_sm120.py sdpa/frost/test_sdpa_fwd_paged_sm120.py \
+  -k wide_subgroup
+```
+
+The old controls select `test_d576_dense_thd_determinism` and
+`test_d576_paged_determinism` in `test_sdpa_fwd_d576_sm120.py`. The functional
+selection is `wide_partial_pack or pack_gqa_admits_any_ratio_up_to_the_tile`.
+The sanitizer selection on the same three files is
+`wide_partial_pack or (wide_subgroup and 3-96-dims1-dtype1) or (wide_subgroup_mixed and 96-dims1)`.
+Host graph-analysis checks pass 629 cases, and four variants compile offline;
+neither substitutes for the target results above.
+
+Earlier attempts are retained as failures: the first runner stopped before
+collection because xdist was absent; the second recorded 18 failures before
+interruption (10 ordinary-generator division-by-zero errors, eight reference
+cache permission errors) and 15 passes. After setting a writable Triton cache
+and using explicit legal plans, the remaining 53 cases passed, followed by
+the strict 48 and the three sanitizer passes. The ordinary candidate-generator
+failure is a separate integration blocker; these explicit-plan results do
+not claim it is fixed. Existing measurements below are retained, not rerun
+as part of this addition.
 
 ### Prepared SM90 Indexer Forward + Top-K plan — validation, 2026-11-10
 
@@ -190,10 +560,50 @@ and arbitrary reducers remain unverified.
 The four linear-attention suites live in `linear_attention/frost/test_*_determinism.py`.
 They pin FROST and set `batch_invariant=True`. They cover FP16 and BF16 with
 nonzero initial state and fixed output/final-state gradients. QSA lives in
-`QSA/cutedsl/test_qsa_determinism.py`; its public API has no determinism switch.
+`QSA/cutedsl/test_qsa_determinism.py` and enables `deterministic=True` on
+backward; the forward has no switch.
 It covers BF16 with 12:1, 24:2, and 6:1 query/KV head counts.
 DSA uses FP16/BF16 and enables `deterministic=True` on backward;
 `TestDSADeterministicDKV` also pins each SM100/SM103 dKV layout.
+
+CSA compressor coverage currently lives in
+`compressed_sparse_attention/cutedsl/test_CSA_compressor.py`. It checks repeated
+forward/dKV/dScore bytes, `deterministic=True` dAPE, strict torch deterministic mode,
+poisoned caller workspace/output CUDA Graph replay, ragged and empty segments, and
+exact-zero static-capacity rows for the generic and ratio-128 forward families. The
+focused determinism set has 29 L0 cases: five replay cases; eighteen forward/deterministic-
+backward batch cases spanning ratios 2, 4, and 128, both `coff` values, scalar and
+wide generic layouts, and both supported ratio-128 head dimensions; and six
+replay-plus-reference goldens for generic ratio-2, generic ratio-4 overlap, and the
+dedicated ratio-128 path. Batch cases compare a fixed sequence alone, before and after
+different-size neighbors, duplicated, and beside changed neighbor data. The ratio-128
+case crosses its small/default forward schedule boundary. The ratio-128 `coff=2`,
+head-dimension-512 forward boundary remains a non-strict xfail with its raw-byte
+assertion intact because CI observed a batch-size-dependent byte; all other cases remain
+ordinary assertions. Backward isolates the fixed sequence's upstream gradient and checks
+BF16 dKV/dScore plus FP32 dAPE bytes.
+
+At revision `dcb7bddaa358`, the new SM100 run (CUDA 13.0, cuDNN 9.24, PyTorch
+2.14.1, CUTLASS DSL 4.8.1) reported 18/18 batch cases, 5/5 replay cases, and 6/6
+golden/reference cases passed. The SM103 run (CUDA 13.0, cuDNN 9.20, PyTorch
+2.12.1, CUTLASS DSL 4.7.1) reported the same 29 passes. The two committed runtime
+baselines use keys `842e0ee8788d6de6` and `4e05d04e8e72ed1b`; identical inputs
+produced identical output hashes across the two recorded runtimes. Current-head CI pipeline
+80937667 later observed one of 1024 BF16 output bytes differ in
+`r128-c2-d512-small-to-default-fprop` when the target moved from the standalone small
+schedule into a default-schedule batch. A fresh local rerun passed, so the failure is
+environment-sensitive but still disproves the broader forward batch-invariance claim; the
+raw-byte assertion is retained as a non-strict xfail. Forward is Replay only in the combined
+SM100/103 column. All nine deterministic-backward batch cases passed on both recorded
+runtimes, so opt-in deterministic backward remains Supported. The earlier capacity-zero and
+poisoned replay cases passed on SM90, but SM90 batch invariance and goldens remain
+unverified; SM107 is also unverified. The default atomic dAPE path remains Not guaranteed
+by contract.
+
+At revision `bca6dcd50b81`, the requested `@cudnn-ci-bot run python/misc` pipeline
+reported 147 passed / 71 skipped / 0 failed CSA cases on SM90, 218 passed / 0 skipped /
+0 failed on SM100, and 218 passed / 0 skipped / 0 failed on SM107. The separate SM100
+ratio-128 contract gate passed all 21 cases and every shipped forward/backward schedule.
 
 Replay checks use fresh inputs and side-stream contention. Batch
 checks reuse exact sequence data and upstream gradients while removing,
@@ -378,7 +788,7 @@ pool and the reader tickets.
 | Cross-form | `*_knob_arms_are_bitwise_*`, `test_pair_and_one_cta_forms_are_bitwise_at_one_request` | Every form family (cluster pair, register-capped, streamed, thread mappings, issue orders, ring depths) writes the bytes of the one-CTA form |
 | Reference-kernel bytes | `test_bitwise_with_the_reference_verify_kernel_outputs[*]` (with `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR`), the FlashInfer `frost` bitwise cells | The default geometry replays the saved reference-kernel output sets byte for byte; no committed goldens (the saved sets are the oracle) |
 
-GPU coverage: cc 10.0 (a GB200; the per-rank cells 2026-11-05), cc 10.3 (verified on a GB300, 2026-11-05: the same cells at the default and the four per-rank geometries, the saved reference-kernel sets byte for byte, the three register-capped default-geometry forms rendering the same `sm_103a` cubin as before the geometry change) and cc 12.0 (an RTX 5090, 99 KB per-CTA opt-in, 2026-11-05: the default geometry's cells and the per-rank cells -- the replay, batch-invariance and cross-form cells there compare against the landing-slab one-CTA form, the one this part holds; the arms the part does not hold skip by their typed decline); cc 10.7 unverified.  The fifth geometry's cells, (2, 8, 4096), were verified
+GPU coverage: cc 10.0 (a GB200; the per-rank cells 2026-11-05), cc 10.3 (verified on a GB300, 2026-11-05: the same cells at the default and the four per-rank geometries, the saved reference-kernel sets byte for byte, the three register-capped default-geometry forms rendering the same `sm_103a` cubin as before the geometry change) and cc 12.0 (an RTX 5090, 99 KB per-CTA opt-in, 2026-11-05: the default geometry's cells and the per-rank cells -- the replay, batch-invariance and cross-form cells there compare against the landing-slab one-CTA form, the one this part holds; the arms the part does not hold skip by their typed decline); cc 10.7 in the record of 2026-11-10 below.  The fifth geometry's cells, (2, 8, 4096), were verified
 on cc 10.3 (a GB300, 152 SMs, 2026-11-06, inside a vLLM container image: torch 2.14.0+cu130, nvidia-cutlass-dsl 4.8.0, cuDNN backend 9.24.0;
 `pytest linear_attention/frost/test_gdn_decode_fused.py -k k2v8h4096` 30 passed / 244 deselected, `pytest linear_attention/frost/test_gdn_verify_fused.py
 -k k2v8h4096` 37 passed / 306 deselected) and on cc 10.0 (a GB200, 152 SMs, in the repository's CI: torch 2.14.0a0+b2c75dd062.nv26.09, CUDA 13.4,
@@ -386,6 +796,30 @@ driver API 13040, cuDNN 92700, nvidia-cutlass-dsl 4.8.0; 16 pytest workers; the 
 at the head of the pull request that added the cells (#2319), and the scheduled run of 2026-11-09 on `develop` -- the CI log prints its selection, not a
 pytest command line, so the counts are read from the junit report of each run and are the same in both: the `k2v8h4096` cells of
 `test_gdn_decode_fused.py` 30 passed, of `test_gdn_verify_fused.py` 37 passed, none skipped or failed); on cc 12.0 those cells are unverified.
+
+cc 10.7 record (2026-11-10 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
+13050, cuDNN 92700, nvidia-cutlass-dsl 4.8.0, tvm-ffi 0.1.14.post0; one in-process pytest run (`CUDNN_TEST_NO_ISOLATION=1`) on one visible device,
+with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`, `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` and `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR` set to the 16
+saved reference-kernel sets, from a clean tree at `868b3cae4` (#2369); no file under `python/cudnn/linear_attention` or
+`test/python/linear_attention` differs between that commit and `8e31a5725`, the `develop` head this record was written on.  `cd test/python &&
+pytest linear_attention/frost/test_gdn_decode_fused.py linear_attention/frost/test_gdn_verify_fused.py
+linear_attention/frost/test_gdn_support_matrix_docs.py -v -ra --durations=15` -> 616 passed, 4 skipped, 0 failed in 590 s:
+`test_gdn_decode_fused.py` 273 passed / 1 skipped, `test_gdn_verify_fused.py` 340 passed / 3 skipped, `test_gdn_support_matrix_docs.py` 3 passed.
+Each of the five per-rank geometries: 30 passed (decode) and 37 passed (verify), none skipped.  Replay:
+`test_rank_geometry_matches_the_torch_model_and_replays_bitwise` 25, `test_rank_geometry_matches_the_torch_reference_and_replays_bitwise` 50,
+and at the default geometry `test_deterministic_and_matches_the_torch_model`, `test_graph_replay_over_distinct_layers_matches_eager` and
+`test_deterministic_and_graph_replay_over_distinct_layers_matches_eager`, 1 each.  Batch invariance:
+`test_rank_geometry_rows_are_batch_invariant` 5, `test_rank_geometry_requests_are_batch_invariant` 5 (the verify cells under one gated-norm
+association, as on the other parts).  Cross-form: `test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick_at_b4` 55 and
+`test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form` 95 (decode); `test_knob_arms_the_part_holds_are_bitwise_with_the_default_pick`
+43, `test_rank_geometry_knob_arms_are_bitwise_with_the_one_cta_form` 115 and `test_pair_and_one_cta_forms_are_bitwise_at_one_request` 2
+(verify).  Reference-kernel bytes: `test_bitwise_with_the_reference_verify_kernel_outputs` 14 passed, 2 skipped.  The 4 skips:
+`test_operands_on_another_cuda_device_are_rejected_before_any_launch` in both modules ("needs two CUDA devices") -- rerun in the same runtime
+with two devices visible and no reference directory, `pytest linear_attention/frost/test_gdn_decode_fused.py
+linear_attention/frost/test_gdn_verify_fused.py -v -ra -k another_cuda_device` -> 2 passed, 600 deselected; and the saved sets `r16t6_pad` and
+`r8t6_padskip` ("the reference kernel declined this set": their saved reference files hold a decline instead of outputs, so the two cells skip
+wherever these sets are used; the torch reference is their oracle).  Not run on cc 10.7: the FlashInfer plan-API twin
+(`test_flashinfer_gdn_backend.py`).
 
 ### Shared-expert decode pair: replay, batch invariance and goldens per geometry and form
 
@@ -416,8 +850,8 @@ under side-stream contention) and batch-invariant (every token of a T 6 step alo
 `test_order_arms_are_rounding_order_arms_within_the_band`; goldens exist for the default and the first release's form only; the
 graph-capture replay is bitwise with eager there too.
 
-GPU coverage: cc 10.3 (replay, batch invariance and goldens) and cc 10.0 (replay and batch invariance; the golden cells are not covered
-there).  Run of record on cc 10.3 (2026-11-06): a GB300 (cc 10.3, 152 SMs) with torch 2.14.0+cu130, CUDA 13.0, driver 13030,
+GPU coverage: cc 10.3 and cc 10.7 (replay, batch invariance and goldens) and cc 10.0 (replay and batch invariance; the golden cells are not
+covered there).  Run of record on cc 10.3 (2026-11-06): a GB300 (cc 10.3, 152 SMs) with torch 2.14.0+cu130, CUDA 13.0, driver 13030,
 cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (the goldens' `runtime` block); `cd test/python && pytest
 moe/frost/test_shared_expert_decode_determinism.py` -> 27 passed, 0 skipped, and `pytest moe/frost/test_shared_expert_decode.py` ->
 191 passed, both from a clean tree at the commit that carries the `ksplit8` goldens.  Another runtime stack (torch / CUDA / cuDNN / DSL
@@ -433,10 +867,225 @@ prints its selection, not a pytest command line; the counts are read from the ju
 `test_duplicated_token_and_neighbour_isolation` 2, `test_row_strided_views_write_the_contiguous_bytes_and_leave_the_inputs_unmodified` 4,
 `test_twenty_four_to_twenty_five_is_the_typed_decline` 1.  Skipped: every case of `test_golden` (4) and of
 `test_v1_arm_reproduces_the_v1_goldens` (4), each with "no golden for ..." -- no set is recorded for that runtime, so on cc 10.0 the golden
-comparison is a coverage gap, not a pass.  A cc 10.0 part with 148 SMs has no device run (the host cells pin the same forms for 148, 152
-and 212 SMs).  cc 10.7 unverified; cc 12.x declined by type.
+comparison is a coverage gap, not a pass.  A cc 10.0 part with 148 SMs (the host cells pin the same forms for 148, 152 and 212 SMs) has one
+device run (2026-11-10 UTC; x86 host, Python 3.10, torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0,
+tvm-ffi 0.1.13.post3; in-process with `CUDNN_TEST_NO_ISOLATION=1` and `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; on the tree of the pull request
+that added the cc 10.7 record below: the sources of `8e31a5725` with that pull request's comment, status-cell pin and documentation edits):
+`cd test/python && pytest
+moe/frost/test_shared_expert_decode.py moe/frost/test_shared_expert_decode_determinism.py linear_attention/frost/test_gdn_support_matrix_docs.py
+-v -ra --durations=10` -> `test_shared_expert_decode.py` 197 passed, 0 skipped; `test_shared_expert_decode_determinism.py` 19 passed, 8
+skipped, with the per-method counts of the 152-SM part (the 8 golden cases skip there too: no set for that runtime);
+`test_gdn_support_matrix_docs.py` 3 passed.  cc 12.x declined by type.
 
-### QSA: 35 cases
+cc 10.7 record (2026-11-10 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
+13050, cuDNN 92400, nvidia-cutlass-dsl 4.8.0, tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in `73840df1b366af2c/`); in-process
+pytest runs (`CUDNN_TEST_NO_ISOLATION=1`), one fresh process per command, with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` and
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, from a clean tree at `868b3cae4` (#2369); between that commit and `8e31a5725`, the `develop` head
+this record was written on, `python/cudnn/moe` and `test/python/moe` differ only in the comment and the status-cell pin of #2392.  From
+`test/python`: `pytest moe/frost/test_shared_expert_decode.py -v -ra --durations=15` -> 197 passed, 0 skipped.  `pytest
+moe/frost/test_shared_expert_decode_determinism.py -v -ra --durations=15` against the goldens committed at that commit -> 19 passed, 8 skipped:
+`test_replay` 6, `test_replay_on_a_fresh_entry_and_fresh_operands` 2, `test_batch_invariance` 4,
+`test_duplicated_token_and_neighbour_isolation` 2, `test_row_strided_views_write_the_contiguous_bytes_and_leave_the_inputs_unmodified` 4 and
+`test_twenty_four_to_twenty_five_is_the_typed_decline` 1 passed; every case of `test_golden` (4) and of
+`test_v1_arm_reproduces_the_v1_goldens` (4) skipped with "no golden for ..." (no set for this runtime key).  With the replay, batch-invariance
+and reference cases passed, the set was recorded into a new directory, `CUDNN_DETERMINISM_RECORD=<new directory> pytest
+moe/frost/test_shared_expert_decode_determinism.py -v -ra -k golden` -> 8 passed, 19 deselected, and checked strictly,
+`CUDNN_DETERMINISM_GOLDENS=<that directory> pytest moe/frost/test_shared_expert_decode_determinism.py -v -ra` -> 27 passed, 0 skipped.  The 8
+files are committed as `73840df1b366af2c/`.  Reason for the new set: a new runtime key (GPU name, compute capability, SM count and driver API
+version differ from the cc 10.3 set's), not a numerical change -- the input and output hashes of all 8 records (`y`, `act`, `gate_part`;
+`ksplit2` / `ksplit4` / `ksplit8`, one and two m-tiles, both geometries) equal those of the cc 10.3 set `6451c9d94a2d4210/`.  That equality is
+an observation on these two runtimes, not a contract across architectures.  A cc 10.7 part that reports another GPU name, SM count or software
+version hashes to another key, and the golden cells skip there.
+
+### Attention gate + quantize decode step: replay, batch invariance and goldens
+
+`attention_gate/frost/test_gate_quant_decode_determinism.py` pins `cudnn.AttentionGateQuantDecode` (the sigmoid output gate of an attention
+block fused with the static E4M3 quantization of the following projection's input: bf16 `attn` / `gate` `[rows, width]`, one fp32 scale,
+E4M3 `out`; rows 1 .. 160, one launch).  Every comparison is raw bytes over the one output `out`; the step has no backward, no state and no
+scratch.  The independent reference is a separate check (`gate_quant_utils.assert_reference`: every byte is the code of one of the two bf16
+values that bracket the fp64 gated value, and of the nearest one outside a 2.5-fp32-unit margin around the bracket's midpoint; then the
+torch model of the rounding chain, bitwise) and gates the goldens.  The kernel has no reduction, so there is no split or association to
+hold fixed across batch layouts; the cells build one operand set and slice or permute it.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | rows 1 / 17 / 160 x width 2048 / 6144, and 160 x 32768 (2,560 CTAs of 256 threads: several waves); eight executions into fresh buffers under side-stream contention; reference check | 7 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | width 2048 / 1032; two entries, two fresh identical operand sets | 2 |
+| `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | the same call under a side stream (ordered after the operands' producer stream) vs the current stream | 1 |
+| `test_batch_invariance` | L0 | width 2048 / 6144 / 1032 / 1536 x `THREADS` 128 / 256; one 160-row operand set: every row alone (a one-row call) vs inside the 160-row call, vs the first 2 / 3 / 8 / 16 / 17 / 24 / 32 / 64 rows as one call, vs the reversed batch.  At 2048 / 6144 a row is whole CTAs; at 1536 rows share CTAs, at 1032 also warps | 8 |
+| `test_insertion_removal_and_reordering` | L0 | width 2048 / 1032 x `THREADS`; a 24-row call, then a row inserted at position 5, rows 3 / 11 / 23 removed, a permutation: every row keeps its bytes | 4 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | width 2048 / 6144 / 1032 / 1536 x `THREADS`; a row twice in one call (both copies = alone); the row among 63 redrawn neighbours | 8 |
+| `test_pick_function_moves_no_byte` | L0 | every served thread count vs the default pick; then a pick table that depends on the row count (128 threads up to 8 rows, 256 above): both configs are compiled at plan time, and every row alone writes the bytes it writes inside 2 .. 160 rows on either side of the pick boundary | 1 |
+| `test_inputs_are_unmodified` | L0 | `attn`, `gate`, `scale` bytes before and after twelve launches (caller-owned and entry-owned output, the release arm included) | 1 |
+| `test_one_sixty_to_one_sixty_one_and_the_empty_call_are_typed_declines` | L0 | 161 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch, never another provider | 1 |
+| `test_golden` | L0 | width 2048 x 3 rows (scale 0.01) and width 6144 x 19 rows (scale 1.0): three executions, the reference, the three knob arms on the same operands, the saved hashes | 2 |
+
+Golden sets: `attention-gate-quant-decode-w2048-rows3` and `attention-gate-quant-decode-w6144-rows19`, the first goldens of this API,
+recorded after the replay, batch-invariance and reference cells passed -- in `6451c9d94a2d4210/` for the cc 10.3 runtime below and in
+`d2a97fcefba4b867/` for the cc 10.7 runtime below.  The knob arms (`THREADS` 128, `PDL_RELEASE`, both) write the default's bytes inside
+`test_golden` and, on more shapes, in `test_gate_quant_decode.py` (`test_bit_neutral_knob_arms_write_the_default_bytes`), so the one set
+holds for every served config.  The release arm is compared with no dependent grid on the stream; a chain with a dependent launched under
+the programmatic-stream-serialization attribute is not covered here.  The graph-capture replay (bitwise with eager, operands changed in
+place) is in `test_gate_quant_decode.py`.  The input and output hashes of the two records are equal between the cc 10.3 and the cc 10.7
+set: an observation on these two runtimes, not a contract across architectures.
+
+GPU coverage: cc 10.3 and cc 10.7 (replay, batch invariance and goldens); cc 10.0 has not been run on a device (unverified); cc 9.0 and
+cc 12.x are declined by type.  Every run below is an in-process pytest run (`CUDNN_TEST_NO_ISOLATION=1`), one fresh process per command
+with empty CuTe DSL and driver compile caches, from `test/python` of a clean tree at the commit that carries the goldens.
+
+cc 10.3 record (2026-11-11 UTC): a GB300 (cc 10.3, 152 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API 13030,
+cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in
+`6451c9d94a2d4210/`).  `pytest attention_gate/frost/test_gate_quant_decode.py core/frost/test_frost_kernel_name_prefix.py -q -ra` -> 147
+passed, 0 skipped.  `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest attention_gate/frost/test_gate_quant_decode_determinism.py
+-q -ra` -> 35 passed, 0 skipped (the case counts of the table).  `pytest -m L2 attention_gate/frost/test_gate_quant_decode_census.py -q -s`
+-> 1 passed.  Before the set existed the same determinism command without the goldens variable read 33 passed, 2 skipped (both
+`test_golden` cases, "no golden for ..."); the set was then recorded into a new directory, `CUDNN_DETERMINISM_RECORD=<new directory> pytest
+attention_gate/frost/test_gate_quant_decode_determinism.py -q -ra -k golden` -> 2 passed, 33 deselected.
+
+CUDA 12.9 compiler flavour on the same part and runtime (2026-11-11 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
+libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL compatibility
+and is not a deployment that uses CUDA 12 throughout): the same three commands -> 146 passed, 1 skipped (`test_rendering_pins_the_convention`
+for `sm_107a`: that compiler rejects the target, and the cell skips with the entry's own decline); 35 passed, 0 skipped -- the golden cases
+pass against the SAME set, whose runtime key does not name the compiler flavour, so the two flavours write the same bytes for those cases;
+1 passed.
+
+CuTe DSL 4.8.1 on the same part (2026-11-11 UTC; the 4.8.1 wheels put first on the path of the same runtime, compiling with CUDA 13.4):
+the functional command -> 147 passed, 0 skipped; the determinism command WITHOUT the goldens variable -> 33 passed, 2 skipped (both
+`test_golden` cases: the DSL version is part of the runtime key and no set is committed for that key, so the golden comparison is a
+coverage gap there, not a pass); the census -> 1 passed.  A record into a new directory under that runtime (2 passed, 33 deselected) holds
+the input and output hashes of the committed 4.8.0 set; it is not committed.  With only the CUDA 12 toolchain libraries of 4.8.1
+(`CUDA_VERSION` 12.9): 146 passed, 1 skipped (the `sm_107a` rendering cell, as under 4.8.0); 33 passed, 2 skipped (the golden cases, same
+reason); 1 passed; its record holds the same hashes (that run's tree differed from the commit in this report's text only).  Cold compile on an x86 host (fake tensors, empty caches): under 4.8.0 and under
+4.8.1 the kernel's four arms render byte-identical cubins for `sm_100a`, `sm_103a` and `sm_107a` with the CUDA 13.4 compiler and for
+`sm_100a` / `sm_103a` with the CUDA 12.9 compiler; `sm_107a` does not compile under CUDA 12.9 in either version (the entry's typed
+decline).  Not run on a device: 4.8.1 on cc 10.7.
+
+cc 10.7 record (2026-11-11 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver
+API 13050, cuDNN 92400, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi 0.1.15.post1 (the `runtime` block of the goldens in
+`d2a97fcefba4b867/`).  The same three commands -> 147 passed, 0 skipped; 35 passed, 0 skipped; 1 passed.  Before its set existed the
+determinism command read 33 passed, 2 skipped, and the set was recorded the same way (2 passed, 33 deselected).  Reason for the second set:
+a new runtime key (GPU name, compute capability, SM count and driver API version differ), not a numerical change.  A part that reports
+another GPU name, SM count or software version hashes to another key, and the golden cases skip there -- a coverage gap, not a pass.
+
+Host-entry change, re-run record (2026-11-11 UTC).  A later commit binds the entry's slab operands with a runtime extent and scopes its
+compile and its launch to the entry's device.  The kernel source is unchanged; the compiled kernel's parameter block changes (a pointer
+and an extent per slab), and from that commit on the kernel the entry compiles on a device is the rendering the functional module pins,
+byte for byte, whatever the first call's row count is.  The functional module gains three cases (147): the declared extents of the
+entry's views, the entry's own launch arguments compiled against the pinned rendering, and an entry on a device that is not the caller's
+current one (needs two CUDA devices).  The determinism suite and both golden sets are unchanged.  Re-run from a clean tree at that
+commit with the three commands above, in the runtimes above:
+
+- cc 10.3 (the GB300 runtime, one visible device), CuTe DSL 4.8.0 compiling with CUDA 13.4: 149 passed, 1 skipped (the two-device case:
+  "needs two CUDA devices" -- not covered on cc 10.3); 35 passed, 0 skipped against the unchanged set in `6451c9d94a2d4210/`; 1 passed.
+- the same part with the CUDA 12.9 compiler flavour of 4.8.0: 148 passed, 2 skipped (the `sm_107a` rendering case, as before, and the
+  two-device case); 35 passed, 0 skipped against the same set; 1 passed.
+- cc 10.7 (the VR200-class runtime) with TWO devices visible, CuTe DSL 4.8.0 compiling with CUDA 13.4: 150 passed, 0 skipped -- the
+  two-device case ran there: first call, warm calls with both output owners and a side stream of the entry's device, the bytes of the
+  same call made with that device current, the caller's device unchanged; 35 passed, 0 skipped against the unchanged set in
+  `d2a97fcefba4b867/`; 1 passed.
+- CuTe DSL 4.8.1 on the cc 10.3 part (the 4.8.1 wheels put first on the path of the same runtime, as in the 4.8.1 record above; these
+  two runs are one commit later, which changes this report's text only).  Compiling with CUDA 13.4: 149 passed, 1 skipped (the
+  two-device case); the determinism command WITHOUT the goldens variable 33 passed, 2 skipped (the golden cases: no set is committed for
+  that runtime key -- a coverage gap, as before); 1 passed.  With only the CUDA 12 toolchain libraries (CUDA 12.9): 148 passed, 2 skipped
+  (the `sm_107a` rendering case and the two-device case); 33 passed, 2 skipped; 1 passed.  A record into a new directory under each
+  flavour (2 passed, 33 deselected) holds the input and output hashes of the committed 4.8.0 set; it is not committed.  Not run on a
+  device: 4.8.1 on cc 10.7.
+- Cold compile on an x86 host at that commit (a cc 8.0 device: every device case skips), CuTe DSL 4.8.0 and 4.8.1: 65 passed with CUDA
+  13.4, 64 passed and the `sm_107a` rendering case skipped with CUDA 12.9, under either version; the three rendering cases and the
+  launch-argument case are among them.
+### FP8 projection for decode rows: replay and batch invariance at every row count, goldens per byte class and token tile
+
+`gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` pins `cudnn.Fp8ProjectionDecode` (an FP8 E4M3 weight times FP8 E4M3
+activations to bf16, 1 .. 32 rows, one launch) at its three served byte classes: `ProjectionGeometry(4608, 8192)` at `split_k` 4 and at
+`split_k` 2, and `ProjectionGeometry(8192, 2048)` at `split_k` 2.  Forward only: the entry is an inference step with no backward entry
+point, so there is no backward case.  Every comparison is raw bytes over the entry's one result (`out`, bf16); the independent fp64
+reference of the E4M3 operands is a separate check under a per-element bound (half a bf16 unit plus the fp32 accumulation term; the
+utilities module beside the suite), and operands whose partial sums are exact in fp32 are compared byte for byte with the host in
+`test_fp8_projection_decode.py`.  The kernel is specialised on the row count -- one rendering per row count -- so replay and batch
+invariance have one case per served row count, not a sampled set.  Operands come from a CPU generator, so an operand set has the same
+bytes on every device.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | class x rows 1 .. 32; eight executions on fresh output buffers under side-stream contention; then the fp64 reference under its bound | 96 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | class x rows 3 / 12 / 20 (one per token tile); two entries, two identical operand sets drawn afresh | 9 |
+| `test_batch_invariance` | L0 | class x R 2 .. 32; the R-row call replayed three times; every row equals the same row launched alone (one row: the 8-row token tile, accumulator column 0); the reversed batch and a shuffled batch | 93 |
+| `test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` | L0 | class x 8 / 16 / 31 rows; one new row inserted at the head, in the middle and at the tail (8 -> 9 and 16 -> 17 change the token tile, 31 -> 32 reaches the ceiling): the original rows keep their bytes, the inserted row writes its alone bytes; read from the larger batch it is the removal | 9 |
+| `test_duplicated_row_and_redrawn_neighbours` | L0 | class; a row twice in one batch (both copies = alone); the other rows redrawn around it at the head, middle and tail of 8-, 16- and 32-row batches | 3 |
+| `test_pick_arms_cover_other_ring_depths_at_every_class` | L0 | host only: the arms of the next case hold at least two other ring depths per class, none names a split, each validates on the reference part | 1 |
+| `test_pick_is_byte_neutral` | L0 | class; for every row count 1 .. 32, this part's pick against the form the pick returns on modelled parts (148, 212 and 64 SMs; 100 KB of shared memory per SM) and against every band of the pick's table, each run as the entry's `form` | 3 |
+| `test_inputs_are_not_modified` | L0 | class; every operand holds its bytes after six launches (the row-alone form and both sides of each token-tile boundary) | 3 |
+| `test_thirty_two_to_thirty_three_rows_is_the_typed_decline` | L0 | the row ceiling is a `NotImplementedError` at the launch and at the plan-time compile, never another provider | 1 |
+| `test_golden` | L0 | class x rows 3 / 12 / 20; three executions on a fresh entry, the reference, the saved hashes (`fp8-projection-decode-n<OUT>-k<IN>-split<S>-tile<T>`) | 9 |
+
+Collected: 227 cases (226 on a device, 1 host-only).  Replay executions: `test_replay` 96 x 8 = 768; `test_batch_invariance` 93 x 3 of the
+batch, 93 x 2 of the permuted batches and 3 x 32 of a row alone; `test_golden` 9 x 3.
+
+The remaining performance knobs (the 128-row weight tile, ring depths from two stages up, 64 / 128 tensor-memory columns, a token tile
+wider than the rows need, the weight loader waiting for the predecessor, the late tensor-memory release, the dependent-launch attribute
+and the release of the successor) are bitwise with the default in `test_fp8_projection_decode.py`
+(`test_performance_arms_write_the_default_bytes`, 45 cases at 8 row counts each), which also holds the CUDA-graph replay against eager,
+the warm-launch stress with byte references (2,016 launches per case, plainly and behind another kernel) and the cell that prints, without
+asserting, how many elements differ between split 4 and split 2 -- two byte classes, each replayed bitwise.
+
+Golden sets: 9 files, one per byte class and token tile, recorded on cc 10.3 after the replay, batch-invariance and reference cases
+passed, into the directory of the runtime that already holds the shared-expert decode pair's cc 10.3 set (`6451c9d94a2d4210/`).  A new
+set is owed with a stated reason when the split, the K tile (128 elements, four K-32 tensor-core instructions) or the cast changes.
+
+GPU coverage: cc 10.3 (replay, batch invariance, goldens) and cc 10.7 (replay and batch invariance; no golden set is committed for a
+cc 10.7 runtime, so the golden comparison is not covered there).  cc 10.0 was not run: the entry admits it and the status page reads
+"SM100: Unverified".  Every run below is one in-process pytest run per command (`-n 0`, or an environment without pytest-xdist), one
+visible device, with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`, `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, from `test/python` of a clean tree: the two runs before and during recording on the tree before the
+9 golden files and the cc 10.7 compiler gate were added, every other run on the tree that carries them; `<suite>` =
+`gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py`, `<module>` =
+`gemm/frost/projection_decode/test_fp8_projection_decode.py`.
+
+cc 10.3 record (2026-11-11 UTC): a GB300 (cc 10.3, 152 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0, driver API
+13030, nvidia-cutlass-dsl 4.8.0 compiling with CUDA 13.4, in two environments.  (a) The goldens' runtime -- cuDNN 92400, tvm-ffi
+0.1.15.post1 (the `runtime` block of the files in `6451c9d94a2d4210/`): `pytest <suite> -m L0 -q -rsP` before any set existed -> 218
+passed, 9 skipped (the 9 `test_golden` cases, "no golden for ..."); `CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -k
+golden` -> 9 passed, 218 deselected; the 9 records were inspected (the runtime block equals the directory's; shapes and dtypes; the
+operand hashes equal those of the operands rebuilt on an x86 host from the suite's CPU generator in 9 of 9 files; the two splits of
+`ProjectionGeometry(4608, 8192)` share their operand hashes and differ in the result hash at all three token tiles) and copied;
+`CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens pytest <suite> -m L0 -v -rs` -> 227 passed, 0 skipped: `test_replay` 96,
+`test_replay_on_a_fresh_entry_and_fresh_operands` 9, `test_batch_invariance` 93,
+`test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` 9, `test_duplicated_row_and_redrawn_neighbours` 3,
+`test_pick_arms_cover_other_ring_depths_at_every_class` 1, `test_pick_is_byte_neutral` 3, `test_inputs_are_not_modified` 3,
+`test_thirty_two_to_thirty_three_rows_is_the_typed_decline` 1, `test_golden` 9.  `test_pick_is_byte_neutral` compared 80 / 40 / 40 (row
+count, form) cells at the three classes -- ring depths 1, 2, 3, 4, 7 and 11 (one and two waves) at `(4608, 8192)` split 4, 5 and 7 at
+split 2, 3, 4 and 5 at `(8192, 2048)` -- all bitwise with the part's pick.  (b) cuDNN 92700, tvm-ffi 0.1.14.post0 (another runtime key:
+no golden set): `pytest <suite> -m L0 -q -rs -n 0` -> 218 passed, 9 skipped (the 9 golden cases); `pytest <module>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs -n 0 -k "not performance_arms"` -> 198 passed, 45 deselected, and `pytest <module>
+-m L0 -q -rs -n 0 -k performance_arms` -> 45 passed, 194 deselected: the module 239 passed, 0 skipped, the symbol-prefix test 4 passed.
+
+The other compiler flavor of the DSL on cc 10.3 (2026-11-11 UTC): nvidia-cutlass-dsl 4.8.0 bound to its CUDA 12.9 compiler flavor
+(`cutlass.base_dsl.version_info.CUDA_VERSION` = 12.9) inside environment (a), under the same CUDA 13 driver, torch and cuDNN -- a
+statement about the DSL's compiler flavor, not about a CUDA 12 deployment.  `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens pytest
+<suite> -m L0 -q -rs` -> 227 passed, 0 skipped: the kernels compiled by the CUDA 12.9 flavor write the bytes of the goldens recorded
+under the CUDA 13.4 flavor.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs` -> 243 passed, 0 skipped (the
+case that launches the kernels in a child interpreter, `test_launch_matrix_completes_in_a_child_process`, compiles there with the
+default flavor).
+
+cc 10.7 record (2026-11-11 UTC): a VR200-class part (cc 10.7, 212 SMs; aarch64 host, Python 3.12) with torch 2.14.0+cu130, CUDA 13.0,
+driver API 13050, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 compiling with CUDA 13.4, tvm-ffi 0.1.14.post0.  `pytest <suite> -m L0 -v -rs
+-n 0` -> 218 passed, 9 skipped (the 9 golden cases, "no golden for ...": no set for this runtime); `pytest <module>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs -n 0 -k "not performance_arms"` -> 198 passed, 45 deselected (`<module>` 194,
+the symbol-prefix test 4), and `pytest <module> -m L0 -q -rs -n 0 -k performance_arms` -> 45 passed, 194 deselected: the module 239
+passed, 0 skipped.  With cuDNN 92400 and tvm-ffi 0.1.15.post1 on the same part, a candidate set was recorded into a new directory (9
+passed, 218 deselected) and the suite was checked strictly against it (227 passed, 0 skipped); the operand and result hashes of its 9
+records equal those of the cc 10.3 set.  That equality is an observation on these two runtimes, not a contract across architectures;
+the candidate is not committed, so a cc 10.7 run of the suite skips its 9 golden cases.
+
+The other compiler flavor of the DSL on cc 10.7 is a DECLINE, not a lane: the DSL's CUDA 12.9 compiler has no target for the part (the
+DSL refuses it from inside the trace), so the entry declines it by name before any compile.  In the cuDNN 92400 environment bound to
+that flavor, `pytest <suite> <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -v -rs` -> 73 passed, 397 skipped: every case
+that needs a compiled kernel skips with the entry's message ("... on compute capability 10.7 needs a CuTe DSL that compiles with CUDA
+13.4 or newer ..."), `test_compile_follows_the_gate_on_this_device` passes on its declined branch (`compile` raises that message, nothing
+is traced), the host-only cases and the symbol-prefix test pass.  Before the gate existed the same command failed 394 cases inside the
+DSL; replay and batch invariance on cc 10.7 are therefore evidence for the CUDA 13.4 flavor only.
+
+### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
 must match even when the BF16 output rounds to the same value.
@@ -445,33 +1094,37 @@ must match even when the BF16 output rounds to the same value.
 | --- | --- | --- | ---: |
 | `test_replay` | L0 | fprop/bprop × Q:KV heads 12:1, 24:2, 6:1; eight executions; input mutation check | 6 |
 | `test_batch_invariance` | L0 | Same six combinations; lengths 65, 3, 17; removal/reorder with masks preserved | 6 |
-| `test_golden` | L0 | fprop/bprop; lengths 17, 3; three executions, reference, saved hashes | 2 |
+| `test_golden` | L0 | fprop/bprop; lengths 17, 3; three executions, reference, saved hashes; the backward runs its default path | 2 |
 | `test_sparse_batch_invariance` | L0 | fprop/bprop; lengths 2057, 3; four executions then standalone comparison | 2 |
 | `test_dispatch_boundary` | L0 | fprop/bprop × total tokens 512/513; a fixed 3-token target before/after a neighbor | 4 |
 | `test_mask_replay` | L0 | fprop/bprop × all selected, every seventh row empty, all masked; reference and eight executions | 6 |
 | `test_mask_batch_invariance` | L0 | Same six combinations; each sequence alone, reversed batch, duplicate sequence | 6 |
-| `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring values, masks, and upstream gradients | 2 |
+| `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring values, masks, and upstream gradients; the backward keeps the packed layout | 2 |
 | `test_zero_upstream_gradient_bprop` | L0 | Eight executions with zero dO; all gradients must be zero | 1 |
+| `TestQSABackwardEngine::test_replay` | L0 | bitmap and indexed entries with `deterministic=True`; multi-tile dense, sparse record windows, packed sparse; four executions and reference | 7 |
 
 Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 `test_dispatch_boundary[total513-fprop]` identifies the routing boundary and
 direction without a separate lookup table. A test stops at its first mismatch;
 later checks in that case are not claimed as passes.
 
-### DSA: 93 cases
+### DSA: 101 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`:
-48 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
+56 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
 Each `TestDSA` case checks all returned forward tensors. Backward uses deterministic
 execution and checks dQ, the shared K/V latent gradient dKV, and dSink.
 The three `(heads, QK dimension, Top-K)` layouts are `(64,512,64)`,
-`(64,576,64)`, and `(128,512,128)`. The 576-wide path uses all QK dimensions
+`(64,576,64)`, and `(128,512,128)`; `(96,576,64)` and `(128,576,64)` run
+forward only. SM100 H96 forward launches the H64 kernel on heads [0, 64) and
+[32, 96), and H128 D576 forward on [0, 64) and [64, 128); their backward is
+not in this suite. The 576-wide path uses all QK dimensions
 but only the first 512 KV dimensions for values.
 
 | Test method | Level | Parameters and purpose | Cases |
 | --- | --- | --- | ---: |
-| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts; eight executions, input mutation check, numerical reference | 12 |
-| `test_batch_invariance` | L0 | Same twelve combinations; each sequence alone, packed, reversed, and duplicated | 12 |
+| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts, and fprop × FP16/BF16 × H96 and H128 D576; eight executions, input mutation check, numerical reference | 16 |
+| `test_batch_invariance` | L0 | Same sixteen combinations; each sequence alone, packed, reversed, and duplicated | 16 |
 | `test_selection` | L0 | fprop/bprop × ragged lengths, invalid indices, empty rows, Top-K 65 tail, indexer prefix 512; replay, reference, batch checks | 10 |
 | `test_query_boundary` | L0 | fprop/bprop × H64 with 128/129/257 queries and H128 with 74/75 queries; four replays then batch checks | 10 |
 | `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring Q/KV values and Top-K selection while keeping the target fixed | 2 |
@@ -690,17 +1343,17 @@ the checklist is a review safeguard.
 
 ## Temporary skips
 
-The 26 cases below use `skip until fix` reasons, as requested. They remain L0.
+The 21 cases below use `skip until fix` reasons, as requested. They remain L0.
 The set is the union of failures recorded on SM100, SM103, and SM107. A pass
 on one run does not clear a nondeterministic case that failed on another GPU.
 Passing parameters, golden checks, and all FP8/MXFP8 cases remain active.
 
 | Suite | Temporarily skipped parameters | Cases |
 | --- | --- | ---: |
-| QSA | Backward replay and basic batch checks, all three head layouts | 6 |
+| QSA | Backward batch checks, all three head layouts | 3 |
 | QSA | Sparse batch checks, both directions | 2 |
 | QSA | Dispatch boundary at total513, both directions | 2 |
-| QSA | Backward mask replay/batch checks, all-selected and empty-rows | 4 |
+| QSA | Backward mask batch checks, all-selected and empty-rows | 2 |
 | DSA attention | H128/D512/Top-K128 BF16 backward batch check | 1 |
 | DSA attention | Backward query boundaries H64 Q129/Q257 and H128 Q74/Q75 | 4 |
 | DSA indexer | Dense H64 replay/batch checks, BF16 and FP32 dK | 4 |
@@ -737,6 +1390,45 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest QSA/cutedsl/test_qsa_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
+```
+
+## SM100 H128 windowed sparse attention forward validation: 2026-11-11 (UTC)
+
+Change under test: `DSA.sparse_attention_forward_wrapper` accepts H128 D576,
+and H128 D512 with `indexer_topk=2048`, on SM100 by launching the H64 kernel
+on heads [0, 64) and [64, 128); `TestDSA` adds the forward-only
+`h128-d576-k64` layout (four cases). Source: this change on the H96 change
+above. Only the DSA suite was rerun.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| B300, SM103 (cc 10.3), 148 SMs | Torch `2.14.1+cu130`, CUDA `13.0`, driver API `13030`, cuDNN `92700`, CuTe DSL `4.8.1`, TVM FFI `0.1.15.post0`; key `55097120e8121c53` | **94 passed, 2 failed, 5 skipped**: the four H128 D576 and four H96 cases passed; five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+
+H128 D576 backward is outside this change and is not in this suite.
+
+## SM100 H96 sparse attention forward validation: 2026-11-11 (UTC)
+
+Change under test: `DSA.sparse_attention_forward_wrapper` accepts H96 with
+D512/D576 on SM100 by launching the H64 kernel on heads [0, 64) and [32, 96),
+and `TestDSA` adds the forward-only `h96-d576-k64` layout (four cases). Source:
+this change on `develop` `17e10b09e`. `cudnn` resolved to a package whose
+Python modules link to this checkout, with the installed pybind module. Only
+the DSA suite was rerun.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| B200, SM100, 148 SMs | Torch `2.14.0a0+b2c75dd062.nv26.09`, CUDA `13.4`, driver API `13040`, cuDNN `92600`, CuTe DSL `4.8.0` (CUDA 13.4 compiler), TVM FFI `0.1.14`; key `5c945a33b1699e7e` | **90 passed, 2 failed, 5 skipped** in 177 s: the four H96 cases passed; five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+| B300, SM103 (cc 10.3), 148 SMs | Same software runtime; key `b28819ca225d3a0b` | **90 passed, 2 failed, 5 skipped** in 289 s: the four H96 cases passed; five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+| SM107 (cc 10.7, `NVIDIA Graphics Device`), 208 SMs | Same software runtime; key `1c7a6611734bfd74` | **45 passed, 2 failed, 50 skipped** in 23 s: the four H96 cases passed; five temporary skips and 45 `TestDSADeterministicDKV` cases that run only on SM100/SM103; both goldens failed with `no golden` (no baseline for this runtime) |
+
+H96 backward is outside this change and is not in this suite.
+
+From `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -q -rs
 ```
 
 ## Deterministic dKV storage validation: 2026-11-06 (UTC)
@@ -1202,7 +1894,6 @@ python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py 
 
 The CUDA 12 compiler flavor was unavailable and remains unverified.
 
-
 ### 2026-11-09: native SM107 per-tensor FP8 paged D512
 
 `TestNativeD512Fp8Paged` in `sdpa/frost/test_sdpa_fp8_sm107.py` exercises
@@ -1291,7 +1982,7 @@ Other GPU results are not inferred from this native SM107 qualification.
 
 ### Native SM107 half D64 dense/THD paging (2026-11-10)
 
-`test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged` qualifies physical D64
+`test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged` qualifies physical D64
 operands/MMA/output on the native D128-family kernel file. Parent D64 dense
 paging selects the D128 envelope; parent THD D64 paging is declined. The new
 route supports matching FP16/BF16 Q/K/V/O, CGA1/2, packed/unpacked execution,
@@ -1926,6 +2617,1976 @@ Final shared-loader regression:36 passed,303 deselected, no failures/skips in
 rebinding/replay and decode ring reuse. The old half baselines are unchanged.
 The owned SM120 allocation completed normally after these checks.
 
+## SM120 THD D256/GQA backward qualification
+
+`test_sdpa_bwd_thd_sm120_gqa.py` compares dQ/dK/dV with independent CPU FP64
+autograd, including per-port origins, GQA, bottom-right quiet rows and empty
+sequences. Its L0 single-KV-tile byte checks preserve fixed inputs/upstream
+gradients across fresh storage, concurrent work, B1/B3/B129, duplicates,
+reordering and changed-neighbor capture. On GB10/SM121 (driver 580.142,
+Torch 2.9.0a0+50eac811a6.nv25.09/cu130, cuDNN 9.13.0, DSL 4.8.0/compiler 12.9),
+both FP16/BF16 cases pass recording and fresh-process strict checks, using
+runtime key `d2d1094fc872ddba`. All three gradients match their independent
+reference. SM120 remains unverified.
+Final combined execution passes 73 cases (40 new and 33 existing D128),
+including the two strict goldens; 123 host checks pass. Five cases each pass
+memcheck, racecheck and synccheck using CUDA 13.4 sanitizer 2026.3.0 with
+API-query reporting disabled (CUDA Python 13.2 probes newer APIs than the
+CUDA 13.0 driver). Racecheck reports zero errors and zero warnings.
+General deterministic backward remains unsupported because multiple KV tiles
+accumulate dQ with unordered FP32 atomics; admission tests retain that decline.
+
+SM120-family wide half backward (`sdpa-sm120-wide-bwd-d512-gqa-swa-*`):
+D512, GQA 6:2, Q17/KV19 crossing two native KV tiles, bottom-right SWA,
+FP16/BF16. The deterministic relay is exercised under fresh allocations,
+repeated calls, CUDA Graph replay, changed neighbors, duplicate/reordered
+sequences and batches 1/3/129. dQ/dK/dV are checked against independent CPU
+FP64 autograd before strict raw-byte comparison. Recorded on SM121 GB10;
+this fingerprint does not qualify SM120 hardware or low-precision backward.
+
+### SM120 native per-tensor FP8 backward
+
+`sdpa/frost/test_sdpa_bwd_fp8_sm120.py::test_replay_batch_and_golden` adds six
+SM121/GB10 runtime-keyed records for D192/D512 and E4M3/FP16/BF16 gradients.
+Each checks dQ/dK/dV and amax_dQ/dK/dV/dP with fixed scalar scales and payloads
+across batch reorder/duplication, fresh pointers, changed-dO capture replay,
+and repeated calls. The independent FP8 numerical oracle is checked first.
+SM120 hardware and cross-runtime bit identity are not covered.
+
+
+### SM120 native MXFP8 backward
+
+`test_sdpa_bwd_mxfp8_sm120.py::test_replay_batch_and_golden` adds four
+SM121/GB10 records for D128/D512 with FP16/BF16 gradients. Input payloads
+and all seven canonical SF tensors are reordered together, including the
+D-plane-major transposed atoms. The checks cover B1/3/4/129, fresh storage,
+repeated calls, changed-payload capture and live SF mutation. The independent
+MXFP8 numerical oracle passes before byte comparisons. SM120 hardware and
+cross-runtime identity remain unverified.
+
+Qualification on 2026-11-10: GB10 SM121, driver 580.126.20, Torch
+2.9.0a0+50eac811a6.nv25.09/cu130, cuDNN 9.13, DSL 4.8/compiler 12.9.
+The full new suite passes **55 tests, zero skips**, including the four goldens
+in a fresh strict-check process; the existing per-tensor FP8 suite passes
+**79 tests**, with all six committed hashes unchanged. The numerical oracle
+also independently requires finite dQ/dK/dV and relative L2 error below 0.05.
+Eleven representative cases pass each of memcheck, racecheck and synccheck.
+From `test/python`, with the isolated checkout verified:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -q -n0 sdpa/frost/test_sdpa_bwd_mxfp8_sm120.py
+```
+
+This change adds no forward kernel; existing forward coverage is unchanged.
+
+#### Optional MXFP8 gradient amax outputs — 2026-11-10
+
+`test_sdpa_bwd_mxfp8_sm120_amax.py` adds fourteen L0 cases: all eight
+subsets of amax_dQ/dK/dV, two standalone binding cases, and four D128/D512
+FP16/BF16 batch/replay goldens. Each requested scalar is the global maximum
+absolute FP32 gradient accumulator before conversion to the gradient dtype.
+The independent MXFP8 numerical reference passes before byte comparisons;
+the amax comparison bounds only the final FP16/BF16 rounding.
+
+The four records under runtime key `d2d1094fc872ddba` preserve all parent
+MXFP8 input and gradient hashes, adding the three FP32 maxima. Coverage
+includes B1/3/4/129, reorder/duplication, fresh pointers, NaN/Inf output
+poisoning, workspace poisoning and changed-dO capture replay. Global amax
+must compose as the maximum of singleton values; it is not a per-sequence
+output invariant to adding arbitrary neighbors. Standalone checks also
+require invalid optional bindings to leave outputs and workspace untouched,
+followed by successful execution on the same plan.
+
+Recorded on GB10 SM121, driver 580.126.20, Torch
+2.9.0a0+50eac811a6.nv25.09/cu130, cuDNN9.13, DSL4.8/compiler12.9 and
+tvm-ffi0.1.14.post1. SM120 hardware and cross-runtime bit identity remain
+unverified. This extension changes no forward kernel or existing golden.
+Fresh-process strict qualification passes all 148 cases: 14 in this extension,
+55 existing MXFP8 cases and 79 existing per-tensor FP8 cases, with no skips.
+All four new records retain the parent's input and gradient hashes. Host
+admission/specialization checks pass 95 cases; 12 native SM100 D128/D192/D512
+controls also pass with the shared prepared ABI. The amax-enabled D128 and
+D512 kernels cross-compile for SM120; this is not hardware qualification.
+Twelve representative cases pass each of memcheck, racecheck and synccheck,
+with zero device errors or race warnings. Compute Sanitizer 2026.3.0 instruments
+all kernels; API-query reporting is disabled for the recorded CUDA Python
+13.2/driver13.0 startup mismatch. The first standalone fixture incorrectly
+equated graph `left_bound=9` with `window_size_left=9`; it now uses eight
+positions to the left plus the diagonal. No kernel change or golden rerecording
+was needed for that fixture correction.
+
+From `test/python`, after verifying the isolated import path:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -q -n0 sdpa/frost/test_sdpa_bwd_mxfp8_sm120_amax.py
+```
+
+### SM120-family D576/V512 forward — SM121 qualification, 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_d576_sm120.py` adds eighteen L0 replay/batch cases:
+eight uniform-half paged, four mixed-FP8 paged, and six dense/split/THD.
+They hold split and packing fixed, preserve CPU-seeded inputs, compare O/Stats
+against FP64, and check duplicated/reordered batches up to B129 and changed
+neighbors under capture. Compact THD repacks inputs and declared offsets as
+a neighbor changes between empty and live; independent physical gaps are not
+part of this existing path's contract. Backward is unsupported by this addition.
+
+GB10 (SM121,48SMs), driver580.142/CUDA13.0, Torch2.9.0a0+50eac811a6.nv25.09,
+cuDNN9.13.0, CuTeDSL4.8.0/compiler12.9, tvm-ffi0.1.14.post1, matching native
+FE extension and verified isolated import: **18 passed,35 deselected** when
+recording into a fresh directory (178.53s), followed by **18 passed,35
+deselected** in a new strict-check process (5.15s). The18 new JSON baselines
+live under runtime key `d2d1094fc872ddba`; all16 hashes recorded before the THD
+fixture correction are unchanged. The independent reference and batch checks
+run before each baseline is recorded. Command from `test/python`:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -q -n0 sdpa/frost/test_sdpa_fwd_d576_sm120.py -k determinism
+```
+
+The first recording passed16 and failed2 THD cases because the fixture changed
+lengths while leaving later sequences at old physical addresses. That failure
+is retained separately from the successful compact replay. An earlier expanded
+feature run stopped at4pass/3fail because the native binder rejected asymmetric
+widths before launch; after its envelope and extension-gate correction, all
+**35 feature cases pass** (275.33s). The full host analyzer passes629checks.
+SM120 D576 hardware execution, other runtimes and performance remain unverified.
+Targeted sanitizer and existing D512 regression results are recorded separately
+when complete; no completed result is implied by this golden qualification.
+
+
+### SM90 native D128/D256 forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_native_heads_sm90.py` adds eight L0 forward
+bytewise cases at D128 and D256, FP16/BF16, unsplit unpacked and split3
+PackGQA. A fixed CPU payload and FP64 O/Stats reference precede recording.
+The checks cover fresh storage, concurrent work, B1 versus B129, duplicated
+and reordered sequences, changed-neighbor isolation, empty neighbors and
+CUDA Graph replay, with padding, a bottom-right window and sinks. Eight new
+JSON records under `6521230c64ce3d35` were recorded into a new directory,
+then copied and strictly checked with `CUDNN_DETERMINISM_RECORD` unset.
+
+H100 NVL cc9.0, driver595.71.05, Torch2.14.1+cu130, cuDNN9.28.0.38 and
+DSL4.8/compiler12.9: all 88 new feature/strict cases pass without skips.
+The initial 64 cover numerical/mask/layout/split contracts; the final 24
+add the eight strict goldens, partial groups G12/G128, all three schedulers,
+independent THD offsets with both packed Stats layouts, and offset replay.
+Forty existing controls pass, including all eight unchanged D512 goldens,
+D64 prepared execution and standalone D64 feature envelopes.
+
+Memcheck, native-attention/combine racecheck and synccheck each pass the same
+22 cases with zero errors or race warnings. The selection is
+`thd_origin_replay or thd_physical_origins or partial_pack_replay or
+multiple_stages or (split_replay and bf16)`, under Compute Sanitizer13.4.
+Memcheck is unfiltered; the other tools use `--kernel-name kns=cudnn_kernel_`.
+The first memcheck run passed all22 tests but reported40 startup API-query
+errors: CUDA Python13.3 requested newer symbols than the13.2 driver API.
+The clean run uses cached CUDA Python13.2 with API-error reporting retained;
+no device diagnostic was suppressed. This is H100 forward qualification,
+not a backward, H200 performance, cross-runtime or cross-plan byte guarantee.
+
+Commands run from `test/python` with the isolated checkout verified:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -n0 sdpa/frost/test_sdpa_fwd_native_heads_sm90.py -m L0
+```
+
+The measured execution split this command into the initial64 feature cases
+and the final24 cases; together they cover the complete88-case collection.
+
+### Native SM90 paged KV forward — 2026-11-10
+
+`sdpa/frost/test_sdpa_fwd_paged_sm90.py` adds 31 L0 cases for dense-query
+FP16/BF16 paging through the native D128/D256/D512 bodies. Coverage includes
+page sizes 8/16/32/64/128/192/256, independent K/V pool layouts and table
+pitches, fresh pointers, changed-table CUDA Graph replay, poisoned padding,
+base-2 Stats, sinks, split3, all three schedulers and partial GQA groups
+G12/G128. Standalone head boundaries include D8/V512 and D512/V8; graph
+head envelopes retain their existing limits. THD paging and Hopper backward
+remain unsupported.
+
+Six new golden records under `6521230c64ce3d35` cover D128, D192/V128 and
+D512 in both dtypes. Each compares O and Stats with an independent FP64
+reference, then checks raw bytes across fresh storage, concurrent work,
+B1/B129, reordered/duplicated sequences, changed neighbors and captured
+replay. Recording into a new directory passed all six cases; the subsequent
+strict run left recording unset and used the committed files.
+
+H100 NVL cc9.0, driver 595.71.05, Torch 2.14.1+cu130, cuDNN 9.28.0.38 and
+DSL 4.8/compiler 12.9: the strict run passed 172 cases, 68 deselected,
+zero failures/skips, in 266.05 seconds. These are 23 new paging cases and
+149 existing native binding/head controls. The six standalone head-boundary
+cases and two partial-PackGQA cases also passed under each sanitizer,
+completing all 31 new cases.
+
+Memcheck, racecheck and synccheck each passed 24 selected cases with zero
+errors or hazards: eight BF16 page-replay cases, six standalone boundaries,
+two partial groups and eight existing D64 graph controls. The runs were
+split into 22 cases and the final two partial groups. Memcheck was unfiltered;
+racecheck and synccheck used `--kernel-name kns=cudnn_kernel_`. CUDA Python
+13.2 matched the driver API and API-error reporting stayed enabled.
+
+The first two control runs exposed a prototype nonpaged host-ABI mismatch:
+the common frame binds K table strides as `(0, 0)` and V table strides as
+`None`. The final host specialization preserves that distinction. A first
+recording command incorrectly combined recording and checking modes and
+stopped before writing; the clean recording and strict run above supersede it.
+These results qualify H100 forward correctness and per-plan determinism;
+H200 execution, other runtimes and performance remain unmeasured.
+
+Reproduction commands from `test/python` (the measured runs split the suite
+between strict and sanitizer selections):
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -n0 sdpa/frost/test_sdpa_fwd_paged_sm90.py -m L0
+
+compute-sanitizer --tool memcheck --error-exitcode 91 \
+  python -m pytest -q -n0 \
+    sdpa/frost/test_sdpa_fwd_paged_sm90.py \
+    sdpa/frost/test_sdpa_native_d64_sm90.py \
+    -k '(paged_replay and bf16) or standalone_page_head_boundaries or paged_partial_pack_groups or graph_uses_prepared_native_body'
+```
+
+### SM107 single-sequence physical-origin setup — 2026-11-10
+
+`sdpa/frost/test_sdpa_single_sequence_setup_sm107.py` adds14 L0 cases for
+uniform FP16/BF16 D64/D128, nonpaged and unsplit. Eight physical-origin cases
+exercise both CTA group sizes, packing, independent INT32/INT64 element
+origins and multipliers, token/head-major Stats, changed token strides,
+rebound addresses, retained CUDA Graph replay, keyless rows and empty work.
+Four byte tests use fixed CPU payloads and independent CPU FP64 O/Stats
+references before recording. They compare fresh storage/concurrent work,
+poisoned-workspace replay, B1 against B3/B5/B129, duplicate/reordered/empty
+sequences and changed-neighbor isolation. Each byte test now reuses one
+capacity-4096 plan through public shape overrides, then returns to B1 after
+multi-sequence bindings. Two additional tests use runtime B4 and check the
+generic setup branch without forcing a specialization.
+Stats negative infinity is permitted only as the keyless-row sentinel; the
+reference and canaries still check its location and all other output values.
+
+SM107 / driver620.62 / Torch2.14.1+cu130 / cuDNN9.30.0.2 /
+DSL4.8 compiler13.4:14new cases passed, four new runtime goldens under
+`aa97de087283f297` were recorded, then all42 strict/control cases passed
+(14new+20dead-subtile+8existing D64 physical-origin controls), without skips.
+The strict run had recording unset and used the copied golden directory.
+The final capacity-4096 qualification repeated all42strict/control cases
+(63.83s). Memcheck/racecheck/synccheck each passed all14new cases
+with zero errors or hazards. Memcheck was unfiltered; race/sync used
+`--kernel-name kns=cudnn_kernel_`; API-error reporting remained enabled.
+The generic multi-sequence setup body is AST-identical to the prior source.
+This qualifies the setup path, not new arithmetic, other GPUs, split/paged
+specializations or cross-runtime/cross-plan byte invariance.
+
+From `test/python`, after asserting the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q sdpa/frost/test_sdpa_single_sequence_setup_sm107.py \
+  sdpa/frost/test_sdpa_thd_dead_subtile_sm107.py \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD64Half::test_independent_origins
+```
+
+The initial collection attempt used an unavailable xdist option and performed
+no tests. The first byte-test attempt rejected the legitimate keyless Stats
+sentinel under the name `stats`; explicitly declaring its allowed negative
+infinity fixed the harness, with no kernel or tolerance change. All14 cases
+then completed and were checked again in the42-case strict run.
+
+## Simplified sparse attention — 2026-11-09
+
+The new suite is
+`simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py`.
+It tests the public `cudnn.ops.simplified_sparse_attention` call. There is no
+mode that guarantees determinism. All cases are L0 and use BF16 input,
+BF16 output/gradients, and FP32 loss. Tests check output, indexer loss,
+dQ, dK, dV, dIndexerQ, and dIndexerK. They do not expose or compare saved
+internal statistics. There are no gate or recurrent-state gradients.
+
+The initial SM100 run expanded to 16 cases: **9 passed, 7 failed, 0 skipped**.
+Forward passed all eight cases. Backward passed one small golden case and
+failed the other seven cases. Each failure stopped at dK, so it does not
+establish the status of later gradient comparisons. No backward golden is
+approved from that run. The three forward baselines passed the independent
+FP64 reference and eight fresh-allocation replays before recording. Golden
+names include the loaded DSL compiler's CUDA flavor.
+
+| Check | Shapes / variation | Result |
+| --- | --- | --- |
+| Replay | Packed lengths 65/3/17; Hq16/top-k512, Hq32/top-k1024, Hq96/top-k2048 | Forward passes; backward dK differs by 3, 1, and 1 bytes in 43,520 bytes on replay 1. |
+| Scheduling boundary | 297 queries, Hq16, top-k512; 148 SMs | Forward passes; backward dK differs by 13 of 152,064 bytes. |
+| Batch changes | Hq16/top-k512; target length65; neighbor length17; insertion, removal, reordering, duplication, changed neighbor | Forward passes; backward stops at first insertion, with 3 of 33,280 dK bytes changed. Later layouts are unmeasured for backward. |
+| Golden | Length17; same three Hq/top-k pairs | All forward cases pass. Hq16 backward passes locally; Hq32/Hq96 dK each differ by 1 of 8,704 bytes during replay. |
+
+Inputs and upstream gradients are generated once on CPU, then packed without
+new draws. Invalid rows include empty key intervals. The scalar loss uses a
+fixed denominator of 257, and batch checks isolate the target's loss and
+upstream gradient. Full empty Q/K streams are unsupported. Concurrent GPU
+work and fresh allocations vary scheduling without changing the inputs.
+
+Runtime: SM100, 148 SMs, driver 610.11 (CUDA driver API 13.3), PyTorch
+2.13.0+cu130, cuDNN 9.27.0, CuTe DSL 4.8.0 with the CUDA 13.4 native compiler,
+TVM FFI 0.1.13.post2. The integration starts from Frontend revision
+`cb5f9e54bbb1f64b9b3af2992dc5dbe95f831888`. The printed import path was the
+integration checkout, verified before testing. SM103 and long filtered-path
+determinism are unverified.
+
+Initial measurement, from `test/python`, with the runtime library path set:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=/tmp/ssa-new-goldens \
+  python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py -m L0 -q -s
+```
+
+Use a new recording directory. Inspect hashes and reference results before
+copying baselines. Normal checks leave `CUDNN_DETERMINISM_RECORD` unset:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py -m L0 -q
+```
+
+The expanded suite has 20 cases. Adding Hq32/top-k1024 and Hq96/top-k2048
+batch checks exposed two forward failures: each changes 1 of 4 scalar-loss
+bytes when the target moves to packed slot 1. The output bytes match before
+the loss comparison fails. Loss accumulation groups physical rows into warps,
+so moving a sequence can change FP32 rounding. The expanded strict forward
+run was **8 passed, 2 failed, 10 deselected**.
+
+At the requester's direction, retain kernel behavior and scope expected
+failures on SM100 to the measured dK byte mismatches and those two packed-loss
+cases. Each replay passes its numerical reference before byte comparison. Shape/dtype changes,
+non-finite results, other tensors, and other loss mismatches still fail.
+Backward golden cases remain expected failures until replay is stable and
+a baseline can be approved; an intermittent replay pass is insufficient.
+Remove these exceptions with the corresponding reduction fixes.
+
+The final installed-wheel L0 run on the same SM100 runtime reported
+**106 passed, 12 xfailed, 4 deselected, 0 failed, 0 skipped**. Of these,
+the determinism suite accounts for **8 passed and 12 xfailed**. Nine xfails
+stop at a dK byte mismatch, two at the packed scalar loss, and one at the
+unapproved backward golden after its small replay passes. Later tensor and
+layout comparisons after each mismatch remain unmeasured. Forward status
+is **Replay only**; backward is **Not guaranteed**. Expected failures do
+not improve those support claims.
+
+A final 20-case rerun with the FP64 reference checked on every replay also
+reported **8 passed, 12 xfailed**. Eight cases stopped at dK, two at packed
+loss, and two at unapproved backward goldens. Hq32's small backward replay
+passed in this run despite failing earlier; no new baseline was recorded.
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m L0 -q -s -rxX
+```
+
+The installed wheel contains all 32 Python operation modules and its source
+notice. Separate CuTe DSL 4.8.0 CUDA 12.9 compiler testing passed 17 public API
+cases, including all nine Hq/top-k forward/backward reference combinations,
+selected-support numerics, tails, invalid configurations, and capture rejection.
+This used PyTorch/cuDNN built for CUDA 13; it qualifies the DSL compiler
+flavor, not a deployment using CUDA 12 throughout. The loaded native libraries
+were the cu12 and cu13 compiler extensions under `cutlass/_mlir/_mlir_libs/`
+in separate environments. SM103, long-path CUDA 12 compilation, and newer DSL
+versions remain unverified. The actual DSL 4.7.1 runtime rejects this API before
+kernel import. A missing PyTorch conditional-graph entry also rejects before
+filtered-state allocation; bypassing that guard makes its regression test fail.
+
+The installed-wheel L1 run passed **4 cases, 118 deselected, 0 skipped**:
+cold exact repair through the public API, changed addresses/bounds/extents,
+reserved capacity at its maxima, sampler diagnostics, and a 16,384-query
+structured-score stress case. These are numerical and storage-reuse checks,
+not bytewise determinism qualification of the long path.
+
+```sh
+python -m pytest simplified_sparse_attention/cutedsl -m L1 -q -s
+```
+
+Compute Sanitizer `synccheck` passed all three Hq16/top-k512,
+Hq32/top-k1024, and Hq96/top-k2048 public forward/backward reference cases:
+**3 passed, 15 deselected; 0 sanitizer errors**. This covers those short
+packed numerical paths, not the long filtered repair graph.
+
+```sh
+compute-sanitizer --tool synccheck --error-exitcode 86 python -m pytest \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py -m L0 -q -s \
+  -k 'public_forward_backward_reference and ((k512 and bf16-h16) or (k1024 and bf16-h32) or (k2048 and bf16-h96))'
+```
+
+## Simplified sparse attention JAX — 2026-11-09
+
+The JAX suite is
+`simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism_jax.py`.
+It exercises the public native-FFI API under `jax.jit` and `jax.vjp`, using
+JAX/JAXlib 0.11.0 on the SM100 runtime above. The source base remains
+`cb5f9e54bbb1f64b9b3af2992dc5dbe95f831888`, with this integration applied.
+
+| Suite | Forward results | Backward results | Cases |
+| --- | --- | --- | --- |
+| PyTorch determinism | BF16 output, FP32 indexer loss | BF16 dQ/dK/dV/dIndexerQ/dIndexerK | 20 |
+| JAX determinism | BF16 output, FP32 indexer loss | BF16 dQ/dK/dV/dIndexerQ/dIndexerK | 20 |
+
+Both suites check the independent FP64 reference on every replay, then compare
+raw bytes with fresh result buffers and concurrent GPU work. The JAX suite
+uses the same fixed packed data, ragged tails, insertion/removal/reordering,
+duplication, changed neighbors, and 297-query scheduling boundary. Internal
+LSE, teacher distributions, and long filtered-path determinism remain unverified.
+
+The JAX recording run reported **8 passed, 12 xfailed, 0 skipped**. Nine
+cases stopped at atomic dK, two at the known packed loss, and one at the
+unapproved backward golden. The three new forward JSON records passed their
+references and replay checks. All input and output hashes match the existing
+PyTorch goldens. Their filenames also pin JAX 0.11.0 and compiler CUDA 13.4.
+No backward baseline was recorded.
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=/tmp/ssa-jax-new-goldens \
+  python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism_jax.py -m L0 -q -s -rxX
+```
+
+A combined installed-wheel run reached three additional byte mismatches after
+dK happened to match: PyTorch H96/top-k2048 packed backward dV (1/33280 bytes),
+its backward golden replay dV (1/8704 bytes), and JAX H32/top-k1024 replay dV
+(2/43520 bytes). Each passed its independent numerical reference first. These
+are the same already-excepted backward cases; both dK and dV use FP32 atomic
+reductions. The scoped SM100 backward exception now names both gradients.
+Other tensors, non-finite values, shapes, dtypes, and reference failures still
+fail. The interrupted diagnostic run reported **104 passed, 3 failed,
+13 xfailed, 6 deselected**; it is not a qualification pass.
+
+The two JAX L1 numerical cases passed at top-k512 and top-k2048 with 129
+queries and 131,329 keys. All 129 tied rows force two exact-repair chunks;
+a second call changes indexer inputs and key bounds and includes invalid
+rows. The tests check selected scores against full FP32 top-k and compare
+output, loss, and all five gradients with an independent FP64 reference
+using the selection from that same public call. Tied selections may differ
+between calls, so a separate selector execution cannot supply its reference.
+
+Near-uniform KL is about 2.5e-6 in the tied top-k2048 case. A pure 1% relative
+loss check exposed about 2.6e-8 absolute error. A shared native attention
+probe also showed FP32 teacher-mass rounding (up to 5.3e-7), contributing
+about 1.5e-8 of loss error. The new long-path loss check uses 1% relative
+error plus an absolute budget of `16 * FP32_epsilon * loss_coeff * valid_rows /
+loss_denominator`; output and gradient tolerances remain unchanged. This
+budget applies equally to both compiler flavors. No kernel arithmetic changed.
+
+The final combined installed-wheel L0 run reported **135 passed, 24 xfailed,
+6 deselected, 0 failed, 0 skipped**. Each framework's determinism suite
+contributes 8 passes and 12 expected failures. Across both suites, 16 cases
+stop at atomic gradient differences, four at packed scalar loss, and four at
+unapproved backward goldens after small replays pass. Later comparisons after
+a mismatch remain unmeasured. The 21 JAX public API cases cover all nine
+head/top-k forward/backward combinations, selected support, tails, triangular
+metadata, zero loss coefficient, input ownership, invalid inputs, captured-input
+JIT, rejection of mixed GPU architectures, and the dense workspace index limit.
+
+```sh
+CUTE_DSL_CACHE_DIR=/tmp/ssa-cu13-cache CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m L0 -q -s -rxX
+```
+
+In a separate installed-wheel environment, CuTe DSL 4.8.0's CUDA 12.9 compiler
+passed **23 JAX cases, 0 failed, 0 skipped**: all 21 public cases plus both long
+Hq16 filtered-repair cases. The loaded native libraries under `cutlass/_mlir/_mlir_libs/` used the cu12
+and cu13 flavors, respectively. Each flavor used a fresh
+process and its own initially empty DSL cache. PyTorch, JAX, and cuDNN still
+use CUDA 13 packages, so this is compiler compatibility, not a full CUDA 12
+deployment. CUDA 12 bytewise determinism and SM103 execution remain unverified.
+
+```sh
+CUTE_DSL_CACHE_DIR=/tmp/ssa-cu12-cache python -m pytest \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py \
+  simplified_sparse_attention/cutedsl/test_filtered_jax.py -m 'L0 or L1' -q -s
+```
+
+The final wheel includes 34 Python operation modules, its Apache-2.0 notice,
+and `contributors.md`. The inventory was compared byte for byte with the
+checkout. The final rebuild changes only the JAX docstring's description of
+the XLA repair loop relative to the full L0 run; the CUDA 12 run uses that
+rebuild. Source copyright notices remain in the released files.
+
+Compute Sanitizer **memcheck and synccheck each passed 1 JAX L1 case,
+1 deselected, with 0 reported errors** on the final rebuilt wheel. The case
+covers top-k512 cold repair in two chunks, changed inputs/bounds, selected
+scores, and all five gradients. This does not qualify every head/top-k route.
+
+```sh
+compute-sanitizer --tool memcheck --report-api-errors explicit \
+  --suppressions /tmp/cuda-binding-probe-suppression.xml --error-exitcode 86 \
+  python -m pytest simplified_sparse_attention/cutedsl/test_filtered_jax.py -m L1 -q -s -k 512
+# Repeat with --tool synccheck.
+```
+
+The initial memcheck run completed its numerical test and reported only seven
+CUDA-binding feature-probe failures, plus seven extended diagnostics: the
+bindings request CUDA API version 13041 against driver API 13030. A separate
+lazy-import test reproduced the API errors without running these kernels.
+The final run uses explicit API-error reporting and suppresses only
+`cuGetProcAddress_v2` returning `CUDA_ERROR_INVALID_VALUE` (result 1) from
+`cuda/bindings/_internal/driver*.so`. The XML record came from that import
+control and retains its binding-module stack constraint. All memory-access
+checks and other explicit API errors remain enabled; no device-access or
+barrier error was suppressed.
+
+JAX installed-wheel benchmarks (three warmups, 20 timed calls, synchronized
+wall time) measured 2.951 ms forward and 3.441 ms training at
+Tq1024/Tk4096/H16/top-k512, and 6.914 ms filtered forward at
+Tq1024/Tk131072/H32/top-k2048. These shared-GPU samples include host dispatch
+and completion waits; they are not direct speed comparisons with the earlier
+PyTorch CUDA-event measurements.
+
+### CodeQL follow-up — 2026-11-09
+
+The follow-up to `40d2377` adds explicit lazy-export declarations, rejects
+invalid GEMM layouts before allocation, and initializes top-k settings in
+the base constructor. Removing unused names preserves the Hq16 kernel's
+shared-memory reservation and arithmetic. No golden or expected-failure
+rule changed.
+
+The source-checkout L0 run on SM100 reported **148 passed, 24 xfailed,
+6 deselected, 0 failed, 0 skipped**. This includes 13 new host cases for
+invalid layouts and explicit/automatic top-k settings. The lazy-import test
+also checks all four package exports against `cudnn.ops`. Both frameworks'
+forward/backward reference, replay, batch-invariance, and golden checks ran
+with the existing scoped exceptions. Support classifications remain unchanged;
+SM103 and long-path bytewise determinism remain unverified.
+
+Runtime: Python 3.12, PyTorch 2.13.0+cu130, JAX 0.11.0, cuDNN 9.27,
+and CuTe DSL 4.8.0 with its CUDA 13.4 compiler. Imports resolved to the
+edited checkout. From `test/python`:
+
+```sh
+XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m L0 -q -s -rxX
+```
+
+CodeQL 2.27.4 with `codeql/python-queries@1.9.0` scanned all 34 operation
+modules using `python-security-and-quality.qls`. None of the 14 inline
+findings on PR #2370 remains. The scan still reports 239 other package
+diagnostics; no query or path was excluded by this fix. Pre-commit passed.
+Fern reported zero errors and one existing warning.
+
+The subsequent L1 run reported **6 passed, 172 deselected, 0 failed,
+0 skipped**. It covers PyTorch repair-state reuse, reservation, sampling,
+and diagnostics, plus both JAX long-key repair cases and their gradients.
+
+```sh
+XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+  python -m pytest simplified_sparse_attention/cutedsl -m L1 -q -s
+```
+
+### Host concurrency and export follow-up — 2026-11-09
+
+The follow-up to `80de1aa` serializes each stream's shared-scratch enqueue
+sequence for dense indexing, filtered indexing/reservation, and H16 backward.
+Filtered-state retirement also protects its shared host list. No kernel
+arithmetic, golden, or expected-failure rule changed.
+
+The six new public-API cases pause a host thread after writing shared scores
+or filtered inputs. Another thread then enters with opposite indexer queries.
+They cover default, shared side, and separate streams at Tq8/Hq16/top-k512,
+with Tk1024 and Tk131072. The independent expected attention outputs are all
+ones and all zeros. Concurrent output and scalar-loss bytes must match the
+sequential results; separate-stream calls must complete while the first is
+paused.
+
+With the original `80de1aa` kernels, these cases reported **4 failed,
+2 passed, 31 deselected**: both shared-stream modes corrupted all 32,768
+output elements in the first call, on both indexer paths. With the fix,
+the six cases and the Torch-only import check reported **7 passed,
+30 deselected, 0 failed, 0 skipped**. The import check blocks JAX in a fresh
+interpreter; the JAX export assertion now lives in the optional JAX suite.
+
+```sh
+python -m pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py \
+  -m L0 -q -s -k 'host_threads_share_stream or lazy_imports'
+```
+
+The rebuilt `nvidia_cudnn_frontend-1.33.0-cp312-cp312-linux_x86_64.whl`
+has SHA256 `55db69c2370f8bdc0fdd294c7a8352790011c0d54cd8ee1c71c6ada153a8eade`.
+All 35 operation Python modules, `NOTICE`, and `contributors.md` match the
+edited checkout byte for byte. The installed-wheel API-index check reported
+**11 passed**, including the runtime baseline with six intentional additions
+and no removals.
+
+The installed-wheel L0 and L1 run reported **161 passed, 24 xfailed,
+0 failed, 0 skipped, 0 deselected** in 750.39 seconds. It includes all six
+concurrency cases, both frameworks' numerical and determinism suites, and
+all six long-sequence cases. Existing expected failures and goldens are
+unchanged. SM100 forward remains replay-only and backward remains not
+guaranteed; SM103, long-path batch invariance, and saved internal statistics
+remain unverified.
+
+Runtime: SM100 (148 SMs), driver 610.11, Python 3.12.12,
+PyTorch 2.13.0+cu130, JAX/JAXlib 0.11.0, cuDNN 9.27.0, CuTe DSL 4.8.0
+with the CUDA 13.4 compiler, and TVM FFI 0.1.13.post2. Imports resolved to
+the installed wheel. From `test/python`:
+
+```sh
+XLA_PYTHON_CLIENT_PREALLOCATE=false CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest simplified_sparse_attention/cutedsl -m 'L0 or L1' -q -s -rxX
+```
+
+## Phase 1 dense indexer KL public exports (2026-11-09)
+
+Revision `b1a9c4a`, based on `55b9180`. The installed wheel exposes
+`dense_indexer_kl` through both `cudnn.ops` and
+`cudnn.simplified_sparse_attention`. The API retains the scalar loss and
+indexer-only autograd contract. `use_kf=False` selects chunked PyTorch;
+`use_kf=True` selects the supplied-LSE CuTe kernel. Both reject external
+CUDA graph capture. No kernel arithmetic or deterministic mode was added.
+
+The new suites collect 64 L0 cases: 32 numerical/contract cases and 32
+forward/backward determinism cases. Numerical coverage uses an independent
+FP64 full-softmax teacher and autograd for the student. It checks all three
+head counts, query/key tails (3/17, 65/257), and split-key work (33/4097).
+The loss uses coefficient 0.17 and fixed denominator 71; backward uses a
+fixed upstream gradient of 0.7. Loss tolerance is `rtol=2e-4, atol=2e-7`;
+BF16 gradient tolerance is `rtol=0.02, atol=2e-6`.
+
+Replay compares raw bytes of the loss, BF16 indexer gradients, and saved
+FP32 gradients with fresh allocations and concurrent GPU work. The stress
+case has `32 * (SM_count + 1)` query rows (4,768 here), crossing CTA scheduling
+waves. Packed checks preserve inputs, scaling, and upstream gradients across
+neighbor insertion/removal, reordering, duplication, and changed neighbors.
+Only the target contributes to the scalar loss. Inputs are checked for
+mutation, outputs for finiteness, and teacher Q/K for absent gradients.
+Contract tests cover invalid metadata, chunk sizes, fused dtype/head/scale/LSE
+requirements, old-DSL rejection before kernel import, capture rejection, and
+side-stream forward/backward without host synchronization.
+
+Before exceptions, the initial runs reported **40 passed, 10 failed,
+8 deselected**, followed by **6 passed, 2 failed, 24 deselected** for stress
+and golden recording. All numerical checks passed. The 12 bytewise failures
+were approved as scoped expected failures:
+
+- Fused H32 tail forward/backward replay: scalar loss differs by one byte.
+- Fused H96 split-key backward replay: saved FP32 indexer gradients differ.
+- Fused scheduling stress, both directions: scalar loss differs by one byte.
+- Packed PyTorch backward at H16/H32/H96 and fused backward at H32/H96:
+  loss or saved gradient bytes differ.
+- Packed H96 forward, both paths: scalar loss differs by one byte.
+
+Exceptions match only these named cases on SM100 and raw-byte mismatch
+messages for loss/indexer gradients. Numerical, non-finite, mutation,
+shape/dtype, and unrelated failures remain strict. A case stops at its first
+byte mismatch; later comparisons in that case are unmeasured. Remove each
+exception when its replay and batch checks are fixed. Intermittent passes do
+not establish determinism.
+
+Runtime: SM100, 148 SMs, driver 610.11 / CUDA driver API 13.3; Python 3.12.12,
+frontend 1.33.0, PyTorch 2.13.0+cu130, cuDNN 9.27.0, CuTe DSL 4.8.0,
+TVM FFI 0.1.13.post2. Separate environments loaded native compiler extensions from
+`cutlass/_mlir/_mlir_libs/`: the cu13 flavor reported compiler CUDA 13.4
+and the cu12 flavor reported compiler CUDA 12.9.
+Each installed-wheel lane used a fresh process and separate empty DSL/driver
+cache directories. Imports resolved to the corresponding environment's
+`site-packages/cudnn`, not the editable checkout.
+
+| Check | Result |
+| --- | --- |
+| Installed wheel, CUDA 13.4, Phase 1 plus nine Phase 2 numerical cases and both framework export checks | 63 passed, 12 xfailed; 0 failed/skipped/deselected, 102.49 s |
+| Installed wheel, CUDA 12.9, all Phase 1 cases | 54 passed, 10 xfailed; 0 failed/skipped/deselected, 43.82 s |
+| Editable source, Phase 1, lazy exports, and three kernel-prefix checks | 56 passed, 12 xfailed; 0 failed/skipped/deselected, 54.12 s |
+| Installed-wheel API inventory | 11 passed; one added name, no removals |
+| Wheel contents | All 35 operation Python modules, NOTICE, and contributors.md match the checkout bytes |
+| Formatting / docs | Pre-commit passed; Fern: 0 errors, 1 existing warning |
+
+The two H32 fused replay cases passed in the CUDA 12 run; their known
+exceptions remain. Four one-row forward/backward goldens were recorded in a
+new directory for each compiler flavor after reference and replay checks.
+The eight committed files have identical input and output hashes across
+flavors for the same backend/direction. No existing golden was replaced.
+These tiny cases cover the scalar oracle and PyTorch path; the fused fast
+path has no stable golden because larger reductions fail replay.
+
+Wheel: `nvidia_cudnn_frontend-1.33.0-cp312-cp312-linux_x86_64.whl`.
+SHA256: `4a3bb8627750be8121c8436647dd4ff5d9b8dd10803f6603cf6fe3e745871208`.
+The CUDA 12 compiler lane uses CUDA 13 framework/backend packages; it does
+not qualify a full CUDA 12 deployment. SM103, other GPUs, newer DSL releases,
+and multi-device execution remain unverified. Phase 1 has no JAX entry point.
+Phase 2's earlier full-suite results above remain historical measurements.
+
+Commands from `test/python`, with the installed cuDNN library directory on
+`LD_LIBRARY_PATH` and separate fresh `CUTE_DSL_CACHE_DIR`/`CUDA_CACHE_PATH`
+values per compiler lane:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl.py \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_lazy_imports \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_public_forward_backward_reference \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py::test_public_jax_export \
+  -m L0 -q -s -rxX --tb=short
+
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl.py \
+  simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  -m L0 -q -s -rxX --tb=short
+```
+
+## Simplified sparse attention: offset and CI regressions (2026-11-10)
+
+The triangular score producer and top-k consumer now widen operands before
+workspace products. The tile decoder derives its upper bound from the query
+extent. `test_triangular_offsets.py` extracts the production expressions and
+checks them with fixed-width host scalars and native CuTe probes. Rows span
+0 through 262143, including the 64K overflow boundary; decoder cases cover
+1, 512, 1024, 1025 and 2048 blocks. The probes write offsets to small output
+arrays and never dereference the large addresses.
+
+The unfixed code produced **13 failed, 12 passed** in the 25-case regression
+selection. The fixed code produced **25 passed** on SM100 with the CUDA 13.4
+compiler. This selection also checks that public JAX exports remain inspectable
+with a modeled DSL 4.7.1 while execution still rejects before kernel import,
+and that all Torch/JAX test transfers enter the tensor's device context.
+Three public triangular cases additionally passed numerical forward/backward
+checks and forward replay across two tiles, for H16/K512, H32/K1024 and
+H96/K2048. These checks do not establish backward determinism.
+
+CI also measured a one-byte scalar-loss mismatch for packed H16/K512 forward
+on SM100 with PyTorch 2.14.0a0 and CUDA 13.4. It passed numerical checks before
+failing byte comparison. The earlier local H16 pass does not establish batch
+invariance; the support page retains the replay-only status.
+
+The installed-wheel API-index suite passed all 11 tests with actual DSL 4.7.1
+and all 11 with DSL 4.8.0. Direct execution under 4.7.1 still raises the
+4.8 requirement before loading SSA kernel modules. No API baseline names were
+removed. The guard-word scan passed all 214 rules on the tracked source tree.
+The rebuilt wheel contains all 35 operation Python modules, NOTICE and
+contributors.md with bytes identical to the checkout.
+
+The full installed-wheel CUDA 13.4 run reported **242 passed, 1 failed,
+1 skipped, 34 xfailed** in 833.79 s. Its sole failure was a test-side stream
+race in `test_reserved_state_at_its_maxima`: the side stream consumed zero
+queries before the caller stream finished producing them. The test now waits
+on the producer and delays that producer to expose a missing dependency.
+It passed in 23.69 s; removing only the wait failed again in 24.52 s. No
+kernel, tolerance or expected-failure rule changed for this test repair.
+The skipped case needs two GPUs; its device-context control passed on this
+single-GPU host. All existing goldens remain unchanged. The H16 CI packed-loss
+case remained strict in this run; the approved exception is recorded below.
+
+Runtime: SM100, 148 SMs, driver 610.11, frontend 1.33.0, Python 3.12.12,
+PyTorch 2.13.0+cu130, JAX/JAXlib 0.11.0, cuDNN 9.27.0, CuTe DSL 4.8.0
+and TVM FFI 0.1.13.post2. Imports resolved to the installed wheel. Its SHA256
+is `52b1d3f198e09e6ece095ceb454b9469666643c870249becf01f676137c03a86`.
+SM103 and actual multi-GPU execution remain unverified. External CUDA graph
+capture remains unsupported; the existing rejection tests still pass.
+
+Code revision: `a8300fe`. The separate installed-wheel CUDA 12.9 compiler run
+passed **62 tests, with 1 two-GPU skip**, in 336.19 s: all address/decoder
+probes, nine public Torch numerical cases, three triangular numerical/replay
+cases, the JAX version guard, all public JAX tests, both long-key JAX cases,
+and the delayed-producer reservation test. This lane uses CUDA 13 framework
+and backend packages; it does not qualify a full CUDA 12 deployment or CUDA
+12 bytewise batch invariance. Pre-commit passed. Fern reported 0 errors and
+1 existing warning.
+
+Commands from `test/python`, with the installed wheel environment active,
+`LD_LIBRARY_PATH` pointing to cuDNN 9.27, and separate DSL/driver cache paths:
+
+```sh
+# CUDA 13.4: full suite, before correcting the test's stream dependency.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest simplified_sparse_attention/cutedsl \
+  -m 'L0 or L1' -q -s -rxX --tb=short
+
+# CUDA 13.4: corrected delayed-producer test and its missing-wait control.
+python -m pytest \
+  simplified_sparse_attention/cutedsl/test_filtered_contract_cuda.py::test_reserved_state_at_its_maxima \
+  -m L1 -q -s --tb=short
+
+# CUDA 12.9: changed paths and numerical compatibility.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+python -m pytest \
+  simplified_sparse_attention/cutedsl/test_triangular_offsets.py \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_public_forward_backward_reference \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_triangular_tiles_reference_and_replay \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_jax_old_dsl_allows_inspection_but_rejects_execution \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py \
+  simplified_sparse_attention/cutedsl/test_filtered_jax.py \
+  simplified_sparse_attention/cutedsl/test_filtered_contract_cuda.py::test_reserved_state_at_its_maxima \
+  -m 'L0 or L1' -q -s --tb=short
+```
+
+From the repository root, in each DSL 4.7.1/4.8.0 environment, with
+`CUDNN_API_INDEX_PACKAGE_ROOT` set to the installed `cudnn` directory:
+
+```sh
+CUDA_VISIBLE_DEVICES='' python -m unittest discover \
+  -s test/python/api_index -p test_api_index.py -v
+```
+
+### Approved H16 packed-loss exception (2026-11-10)
+
+Extend the existing byte-mismatch exception to PyTorch BF16 forward at
+H16/top-k512 on SM100, as approved. It matches only
+`packed slot 1 indexer_loss: 1/4 bytes differ`. Numerical checks still run
+before byte comparison. H16 backward loss, replay, other tensors, other byte
+counts, SM103, and the JAX H16 case remain outside this new exception. Remove
+it when the scalar-loss reduction is batch invariant. The replay-only support
+status is unchanged.
+
+On the same installed wheel and CUDA 13.4 runtime recorded above, the six
+Torch batch cases reported **1 passed, 5 xfailed** in 33.32 s. H16 forward
+passed locally; its CI failure remains recorded above. Seven injected-failure
+controls confirmed the previous code rejects the observed diagnostic, the
+approved forward case reports an expected failure, and backward loss, SM103,
+two-byte loss, other-output, and numerical failures still raise assertions.
+No kernel, numerical tolerance or golden changed.
+
+```sh
+# From test/python, with the installed wheel environment active.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m pytest \
+  simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_determinism.py::test_batch_invariance \
+  -m L0 -q -s -rxX --tb=short
+```
+
+### SM107 D512/D576 FP32 split partial stores — 2026-11-10
+
+Aligned, D-contiguous partial rows now use 16-byte global stores. The scalar
+fallback retains per-element bounds and dead-row zero selection. Two added
+L0 paged boundary cases exercise V480 and empty V264 inside the D512 envelope.
+The independent references, rebinding and changed-input replay stay unchanged.
+
+SM107,216SM, driver620.62, Torch2.14.1+cu130, cuDNN9.30.0.3, DSL4.8.0
+with compiler13.4:98 native cases passed in158.35s, without skips. These cover
+dense/paged KV, FP16/BF16, D512/D576, packed/unpacked splits, masks/sinks,
+optional/natural/log2 Stats, physical layouts and D512 mixed E4M3/E5M2 KV.
+The12 half/mixed runtime goldens under `d634113bbc56110d` were recorded from
+the unchanged parent after its independent references and byte checks passed
+(12cases,31.06s). The candidate passed strict comparison against all12 with
+recording unset. No existing golden was replaced. An initial candidate run
+passed34 cases before stopping on the missing runtime-specific golden; it
+reported no numerical mismatch. Other GPU/runtime execution is unverified.
+
+From `test/python`, after asserting the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_d512_pack_split_sm107.py \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD576Half \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_dense_paged \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_standalone \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestMixedFp8Kv::test_d512_replay_batch_golden
+```
+
+### SM120 half THD physical origins — 2026-11-10
+
+`test_sdpa_fwd_thd_origins_sm120.py` adds 24 L0 functional cases covering
+FP16/BF16, token/head Stats, D64/D128/D192-V128/D256/D512/D576-V512.
+Each compares against an independent FP64 reference, protects padding
+canaries and checks mixed-width/multiplier origins, fresh pitches/pointers,
+empty and keyless transitions under retained capture. Exact-byte checks
+cover repeat execution, batch reorder/duplication, a sequence alone and
+changed neighbors. Twelve separate golden cases finish those checks before
+recording. No prior golden or tolerance is replaced.
+
+RTX PRO 6000 SM120 (188 SMs), driver 595.84.01, Torch 2.14.0+cu130,
+cuDNN 9.24.0.43, DSL 4.8.0 / compiler 13.4, cuda-bindings 13.0.3:
+51 functional cases passed, including6 native/reference adapter-fallback,
+3 bounded-batch and18 dense half/per-tensor-FP8 host controls. All 12 new
+goldens under `812f98809d9324c5` recorded and strictly checked. Six memcheck
+cases passed with 0 errors. Racecheck then reported 628 errors in V-tail
+sanitization; synccheck did not run. The follow-up gives one warp ownership and synchronizes the compute group.
+Complete compact D64/D256 controls report 88/226 race errors on the original
+source and zero on the repair; their reference and retained replay checks
+pass in both arms. The final run passes 73 functional/golden cases in 183.14 s
+and 15 memcheck cases in 6.97 s with zero errors, preserving all 12 golden
+hashes. Racecheck passes the same 15 cases in 62.93 s with zero errors/warnings;
+synccheck passes 15 in 3.79 s with zero errors. The original FlashInfer issue
+regression also passes all three default FROST cases and all three backend
+controls after the synchronization repair. Earlier script quoting, fixture
+multiplier, cache-directory and node-local-reuse failures happened outside
+this successful final run; they are not counted as GPU passes.
+SM121 and other runtimes remain unverified for independent physical gaps.
+
+```bash
+# From test/python after checking the isolated import path.
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -m L0 sdpa/frost/test_sdpa_fwd_thd_origins_sm120.py
+```
+
+
+### SM107 coalesced packed split partials — 2026-11-11
+
+`test_coalesced_split_replay_batch_golden` adds four L0 cases for FP16/BF16
+and packing groups32/64 at split4. It checks standalone/reordered/duplicated
+and changed-neighbor batches through33members, repeated raw bytes, numerical
+references and changed-input CUDA Graph replay. Existing graph/standalone
+boundary coverage now includes groups16and32, alongside64/128, partial groups,
+keyless rows, masks and sinks.
+
+On SM107 with driver620.62, Torch2.14.1+cu130, cuDNN9.24.0.43 and
+DSL4.8.0/compiler13.4,106native functional/strict-golden cases passed without
+skips.20cases each passed Compute Sanitizer2026.3 memcheck, racecheck and
+synccheck, with zero errors and zero race warnings. Memcheck was unfiltered;
+race/sync used the attention-kernel name filter with API errors enabled.
+All16records under `de01ba4cf30a4c9b` were recorded from unchanged parent
+`8e31a5725` after its references and replay/batch checks passed, then checked
+strictly by the candidate. No previous baseline or tolerance changed.
+
+From `test/python`, use the preceding D512/D576 qualification command and add
+`sdpa/frost/test_sdpa_fp8_sm107.py::test_coalesced_split_replay_batch_golden`.
+The four coalesced cases live in that explicit SM107 CI entry, so the architecture
+lane retains the new coverage without duplicate collection in directory sweeps.
+The sanitizer subset is
+`test_sdpa_fwd_native_paged_sm107.py::TestNativeD512HalfPaged::test_boundaries`
+plus `test_sdpa_d512_pack_split_sm107.py`, selected with
+`test_boundaries or g64_split or g128_split or g32_split or g16_split or keyless`.
+Earlier runs stopped before tests on a missing interpreter target and a DSL
+package path; the final execution used the explicitly verified imports above.
+
+### SM120 FP8/MXFP8 shared-memory synchronization — 2026-11-11
+
+`test_sdpa_fp8_v_tail_sync_sm120.py` adds eight replay/batch cases, eight
+runtime goldens and four CPU scale-layout controls. Coverage is per-tensor
+FP8 and MXFP8, D128/D512, E4M3/E5M2, BF16 output, Q33 with KV capacity80
+and live length17, and poisoned padding. Exact split1/unpacked plans retain
+quantized payloads and logical scales across standalone, reordered, duplicated
+and changed-neighbor batches. O/Stats are compared bytewise; global Amax is
+checked for identical-input replay and against each whole-batch reference.
+
+RTX PRO 6000 Blackwell Server Edition (SM120,188SM), driver595.84.01,
+Torch2.14.0+cu130, cuDNN9.24.0.43, DSL4.8.0/compiler13.4 and
+cuda-bindings13.0.3: **45 functional/strict checks passed** in76.38s without
+skips. The existing dense/THD cases include multiple KV tiles and persistent
+work units. **19 cases each passed memcheck, racecheck and synccheck**
+in22.48s/16.95s/4.05s, with zero errors and zero race warnings. Memcheck
+was unfiltered; race/sync used the `cudnn_kernel_` name filter with API errors
+enabled, under Compute Sanitizer2026.3.0.
+
+All eight goldens under `812f98809d9324c5` were recorded from unchanged parent
+`8e31a5725` after independent references and byte checks passed, then checked
+strictly by the candidate with recording unset. No existing baseline or
+numerical tolerance changed. The parent passes four selected numerical cases
+but reports924race errors; this negative control prevents numerical success
+from hiding the synchronization defect. Earlier fixture and sanitizer failures
+were retained during development. The supplemental performance script stopped
+after qualification on a missing test-helper import; its failure did not
+produce a performance result or bypass any qualification check.
+
+From `test/python`, after checking that `cudnn.__file__` names the intended
+checkout, the functional qualification command is:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -v -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_fp8_v_tail_sync_sm120.py \
+  sdpa/frost/test_sdpa_fwd_fp8_sm120.py \
+  sdpa/frost/test_sdpa_fwd_mxfp8_sm120.py \
+  -k 'v_tail or thd_poisoned_pad or d512_thd or thd_multi_unit_per_cta or padded_kv_poisoned_tail or d512_persistent_units or thd_head_dims'
+```
+
+For the sanitizer subset, replace the selection with
+`(replay_and_batch and e4m3) or thd_poisoned_pad or d512_thd or thd_multi_unit_per_cta`.
+SM121 execution, cross-runtime identity and independent physical THD origins
+for quantized inputs remain unverified by this addition.
+
+### SM120 per-tensor FP8 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_thd_origins_fp8_sm120.py` adds 28 L0 functional cases and
+eight golden cases. E4M3/E5M2 inputs and BF16 output cover independent
+Q/K/V/O/Stats physical origins, mixed INT32/INT64 offsets and multipliers,
+token/head-major Stats, changed pitches/pointers, empty/keyless transitions,
+and retained capture with changed lengths, origins and scalar scales. Head
+shapes are D64, D128, D192/V128, D256, D512 and D384/V512. Numerical
+checks use an independent CPU FP64 reference; raw-byte checks cover repeat
+execution, batch reorder/duplication, a sequence alone and changed neighbors.
+The prepared and standalone fallback routes are checked within their existing
+contracts. The hot-path check rejects host synchronization and CUDA allocations.
+
+RTX 5090 SM120 (170 SMs), driver 620.62, Torch 2.14.0+cu130, cuDNN
+9.24.0.43, DSL 4.8.0/compiler 13.4: **30 functional cases passed**, including
+the existing D512 dense-split and interleaved standalone THD controls. The
+candidate strictly preserves **12 unchanged-parent goldens** (eight FP8/MXFP8
+V-tail and four FP16/BF16 origin controls). **Eight new origin goldens** under
+`dee7499a23a43ab6` were recorded only after reference and byte checks passed,
+then strictly checked with recording unset. No existing baseline was replaced.
+The qualified runtime/test source is `b971af997`; the subsequent commit adds
+only these records and documentation.
+
+The unchanged combined parent `5196c9c35` fails all four D128/D512 E4M3/E5M2
+poisoned-gap detectors while the candidate passes; all eight compact controls
+pass. A separate E5M2 attribution run compares parent compact, candidate
+compact and candidate gapped layouts: all 48 input/output/reference/error
+records match exactly across the three arms, including nine identical failures
+of the initially proposed 0.03 budget (maximum absolute error 0.05463). The new
+E5M2 cases therefore use the existing SM120 E5M2 absolute 0.1 budget, with
+zero relative tolerance, accounting for the two-mantissa-bit P cast. Existing
+tests, E4M3/Stats tolerances and strict byte checks are unchanged.
+
+**Four cases each passed memcheck, racecheck and synccheck**, with zero
+errors and zero race warnings under Compute Sanitizer 2026.3.0. No kernel
+filter was used. API reporting was `--report-api-errors explicit`, retaining
+errors returned by explicitly called CUDA APIs. The default extended mode
+first exited 91 after a `Selective device code recompilation in progress`
+API warning; an independent `torch.full()` control, without importing FE,
+reproduced that same warning and passed under explicit reporting. The original
+warning is retained as a tool/runtime diagnostic, not counted as a clean run.
+Earlier missing-dependency, fallback-override, unsupported-packing and
+provisional E5M2-budget failures were resolved before these passing results.
+
+From `test/python`, after checking the isolated import path:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -v -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_fwd_thd_origins_fp8_sm120.py \
+  sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_d512_split_kv \
+  sdpa/frost/test_sdpa_fwd_fp8_sm120.py::test_fp8_sm120_thd_fused_record_slices
+```
+
+The sanitizer subset selects independent-origin token/E4M3/D128 and
+head/E5M2/D512, plus omitted-total-bound E5M2/D128 and E4M3/D512. Each
+uses fixed split1/unpacked execution. SM121, MXFP8 physical gaps, backward
+and cross-runtime byte identity remain outside this qualification.
+
+### SM120 MXFP8 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_thd_origins_mxfp8_sm120.py` adds28 L0 functional cases and
+eight golden cases. E4M3/E5M2 inputs with BF16 output cover independent
+Q/K/V/O/Stats origins, mixed INT32/INT64 offsets and multipliers,
+token/head-major Stats, fresh pointers/pitches, empty/keyless transitions
+and retained capture. Head shapes are D64,D128,D192/V128,D256,D512 and
+D384/V512, with fixed split1/unpacked plans. An independent CPU FP64
+reference checks values; exact-byte comparisons cover replay, batch
+reordering/duplication, a sequence alone and changed neighbors. Batch
+changes preserve raw payloads and repack existing logical scale bytes.
+The fallback-adapter and hot-path checks retain their existing contracts.
+
+RTX5090 SM120 (170SMs), driver620.62, Torch2.14.0+cu130, cuDNN9.24.0.43,
+DSL4.8.0/compiler13.4:28 functional cases and12 unchanged-parent strict
+controls pass on source288043149. Runtime sources are unchanged since
+49c628af6. Four shared default MXFP8 cases and four native-route twins
+also pass; the FP8-fixed/MXFP8-old parent fails all four origin detectors.
+The combined shared suite passes10 native and11 public cases, including
+retained half/FP8 and explicit BF16 backend controls.
+
+The shared D512 V-scale fixture previously reshaped plane-major scales.
+Both fixtures now use a byte permutation checked against independent
+per-head/128-token quantization:8 controls pass, with4 old D512 failures
+and4 old D128 passes. The production scale-load arithmetic is unchanged.
+An earlier replay test doubled V without scaling its absolute reference
+budget and failed15 cases with1–2 mismatches each. The final test first
+checks the exact replay inputs at the original scale, then requires doubled
+O and unchanged Stats/padding bytewise. It compares the doubled result in
+original V units using the same reference error constants. All28 cases
+pass; no existing tolerance or golden is replaced.
+
+All eight new records under `dee7499a23a43ab6` were recorded after the
+reference/replay/batch checks, then strictly verified with recording unset.
+Four cases each pass memcheck, racecheck and synccheck in20.98s/285.20s/13.63s,
+with zero errors and zero race warnings. These include D128/E4M3 and
+D512/E5M2 full replay plus D128/E5M2 and D512/E4M3 without total hints.
+No kernel-name filter is used. API diagnostics use `--report-api-errors explicit`;
+the extended-mode runtime warning was independently reproduced by a Torch-only
+control in the preceding per-tensor qualification. The first recording attempt
+set both record/check variables and failed their mutual-exclusion precondition;
+it produced no records and was corrected before the successful strict run.
+SM121, backward, other runtimes and performance remain unverified here.
+
+```bash
+# From test/python with the isolated import path verified.
+CUBLAS_WORKSPACE_CONFIG=:4096:8 pytest -m L0 \
+  sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py \
+  -k 'not golden'
+# Record only after reference/replay checks; then run with RECORD unset.
+CUDNN_DETERMINISM_RECORD=/tmp/new-mxfp8-goldens pytest -m L0 \
+  sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py -k golden
+CUDNN_DETERMINISM_GOLDENS=/tmp/new-mxfp8-goldens pytest -m L0 \
+  sdpa/frost/test_sdpa_fwd_thd_origins_mxfp8_sm120.py -k golden
+```
+
+### SM100 FP8 D128 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` collects the
+shared `test_mhas_v2` E4M3/E5M2 D128 cases with a strict native engine pin,
+four token/head-major reference/rebind/replay cases, two no-total-hint
+cases, two half D128/D256 forwarding controls and four new strict goldens.
+All use the existing unsplit, unpacked CGA2 nonpaged THD contract.
+
+The four replay cases check mixed INT32/INT64 offsets and multipliers,
+independent Q/K/V/O/Stats gaps, NaN-filled input padding, output canaries,
+changed pitches and storage, retained captures with changed live lengths
+and offsets, and all-empty queries. Exact-byte checks cover repetitions,
+batch permutations/duplicates, a sequence alone and changed neighbors.
+The prepared graph and standalone graph routes produce the same bytes;
+execute retains its allocation-free, asynchronous behavior. The numerical
+reference and tolerances are unchanged.
+
+Measured on SM100 (148 SMs), driver 595.71.05, Torch 2.14.1+cu130,
+cuDNN 9.24.0.43, DSL 4.8.0 / compiler CUDA 12.9, tvm-ffi 0.1.14.post1:
+the 10 functional cases and four strict goldens pass. New hashes live under
+`361d6da48de8fd55`; no earlier golden is replaced. Twelve existing compact
+D128 / paged D128-D256 FP8 controls also pass. The original shared D128
+FP8 cases fail on the parent and pass on the repair. An exploratory CGA1
+selection was rejected by the existing graph contract before kernel launch;
+it is outside this unsplit nonpaged test domain.
+
+Four cases each pass memcheck, racecheck and synccheck with zero errors
+and zero race warnings. The initial memcheck run reported 20
+`cuGetProcAddress_v2` API errors; a Torch-initialization-only control with
+no FE import reproduced all 20. Initializing cuda-python before Torch in
+the private sanitizer launcher eliminates those diagnostics while retaining
+`--report-api-errors explicit`, all kernel instrumentation and error exits.
+SM103 E4M3/E5M2 physical-origin lowerings compile offline; GPU execution
+there is unverified. Wider heads, MXFP8, SM107 and backward are not qualified
+by these D128 results.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins
+```
+
+### SM100 MXFP8 D128/D512 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins` collects 24 L0 cases:
+4 shared `test_mhas_v2` regressions, 8 reference/rebind/replay/batch cases,
+4 no-total-hint cases and 8 new goldens. Both E4M3/E5M2 types run the
+existing public THD configurations: D128 CGA2 and D512 CGA1. The initial
+expanded probe also requested D128 CGA1 and D512 CGA2; those twelve cases
+were existing planning declines, not numerical failures. The suite now
+states the admitted pairs explicitly, with no capability or ranking change.
+Every expanded case asserts its actual native kernel template.
+
+The shared fixture retains quantized payload and scale bytes across batch
+changes, poisons physical data gaps with NaNs, and checks output canaries.
+It covers independent mixed-width offsets and multipliers, FP64 references,
+new pointers/strides, live/empty retained replay, scale-only replay changes,
+batch reorder/duplication/isolation and prepared/standalone graph parity.
+The D512 maps use token dimension 1 for Q/K/V and dimension 2 for O;
+D128 maps retain dimension 2 for every port. Scale map coordinates continue
+to use compact logical prefixes.
+
+Current measured runtime: SM100, 148 SMs; driver 595.71.05;
+Torch 2.14.1+cu130; cuDNN 9.24.0.43; DSL 4.8.0 with its CUDA 13.4
+compiler; cuda-bindings 13.4.4; tvm-ffi 0.1.14.post1. The runner asserts
+`cutlass.CUDA_VERSION`, uses a fresh compiler cache, and checks the imported
+checkout and native-extension hashes. The native C++ extension is rebuilt
+against toolkit 13.4.92.
+
+On this runtime all four shared cases fail on the immediate parent and pass
+after repair. The full strict matrix passes all 24 cases, including eight
+unchanged goldens; 30 neighboring MXFP8 cases also pass. No case is skipped.
+The new baselines use `361d6da48de8fd55`; older goldens and all tolerances
+are unchanged. The historical CUDA 12.9 run passed the 16 functional cases
+and eight new golden-record cases with independent references and exact-byte
+checks before recording. Its later strict run also passed all 24 cases.
+Compiler-version equality is asserted separately because the current golden
+runtime key records the DSL package version, not its CUDA compiler flavor.
+
+CUDA 13.4 memcheck additionally reproduced pre-existing single-CTA THD
+scheduler errors on the unchanged D256/D512 parent. Local publication fixes
+those errors; D256 broadcasts all predecoded fields before an elected warp
+returns slot credit, while D512 retains its per-lane credits and matching count.
+The six directed memcheck cases then pass with zero errors.
+
+Racecheck also reproduced the existing D128 CGA2 V-scale tail helper's access
+to an exited peer: a compact causal-tail parent control reports 2400 errors.
+The tail path now keeps both CTAs alive through a cluster exit barrier. Both
+origin replay dtype cases pass racecheck with zero hazards, errors or warnings;
+the remaining four D256/D512 racecheck cases also pass in a separate run,
+and the six-case synccheck suite passes with zero errors. The final repaired
+source passes strict24 with unchanged goldens and all30 MXFP8 neighbors. The earlier failed
+sanitizer runs remain in the private qualification report.
+
+All six SM103 D128/D256/D512 x E4M3/E5M2 lowerings compile with CUDA 13.4.
+The shared origin helper also compiles in the SM107 half D128 consumer,
+including its single-batch fast path. This is compile coverage only;
+SM103 execution and SM107 MXFP8 execution remain unverified.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins
+```
+
+
+### SM100 D192/D256 quantized THD origins — 2026-11-11
+
+`TestMidwidthPhysicalOrigins` in both SM100 FP8/MXFP8 architecture suites
+collects60 L0 cases. It pins the native D192/V128 body at CGA1/CGA2 and the
+D256 body at CGA1; both E4M3/E5M2 inputs write BF16 O and token/head-major
+Stats. Tests cover independent mixed-width/multiplier offsets, poisoned gaps,
+changed pointers/pitches, omitted total hints, empty/keyless transitions,
+retained changed-input capture, raw-byte replay during concurrent work,
+batch reordering/duplication/neighbor isolation and graph fallback parity.
+Two persistent clusters force sequence and scheduler-slot reuse. MXFP8 data
+moves independently of the original packed logical scale tiles.
+
+The recorded runtime is SM100/148SM, driver595.71.05, Torch2.14.1+cu130,
+cuDNN9.24.0.43, DSL4.8.0 with actual CUDA13.4 compiler, bindings13.4.4 and
+toolkit13.4.92. Import root and native-extension hash are asserted. The
+unchanged parent extension is reused; this change does not edit its ABI.
+There are24 new baselines under `361d6da48de8fd55`; the earlier16 remain
+byte-identical after adding CGA1 and concurrent-work coverage. Existing
+repository goldens and numerical tolerances are unchanged.
+
+The immediate parent fails four independent-origin reference controls.
+Sanitizers also reproduce its dedicated D192 CGA1 schedulers' invalid DSMEM
+publication and its CGA2 MXFP8 V-scale peer lifetime. Persistent compact
+D192 FP8 CGA2 additionally reports scheduler field reuse hazards while its
+numerical reference passes. The repair publishes locally at CGA1, broadcasts
+every decoded field before returning slot credit, and retains the MXFP8 peer
+until V-scale tail accesses finish. Earlier positive logs are preserved.
+
+The final source passes all 60 cases with strict golden comparison and 38
+existing neighboring-path controls (98 passed, no skips). Directed memcheck,
+racecheck and synccheck each pass all 12 family/width/CGA/dtype cases, with
+zero sanitizer errors; racecheck also reports zero hazards or warnings.
+These sanitizer cases retain reference, rebinding and capture/replay checks;
+concurrent work and batch invariance are covered by the full 60-case suite.
+All 12 final SM103 lowerings compile with CUDA 13.4. SM103 execution, SM107
+and backward remain unverified by this suite.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestMidwidthPhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::TestMidwidthPhysicalOrigins
+```
+
+### Native SM107 D128 FP8 THD origins — 2026-11-11
+
+`test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins` collects 12 L0 cases:
+two shared public-graph regressions, four independent-origin replay cases,
+two missing-total-hint cases and four golden cases. Both E4M3/E5M2 inputs
+write BF16 O and token/head-major Stats. The expanded cases pin two persistent
+clusters, the native SM107 module and the prepared binder, then check references,
+independent address/stride rebinding, retained live/empty capture, batch
+reordering/duplication/neighbor isolation and raw-byte replay with concurrent work.
+
+All ten offline CUDA 13.4 variants compile: two encodings with token, head,
+padded or omitted Stats under physical origins, plus their dense controls.
+Native SM107 under actual CuTe DSL CUDA13.4, DSL4.8.0, Torch2.14.1+cu130
+and cuDNN9.24.0.43 passes all12 strict cases with zero failures/skips and
+four new byte goldens. Functional checks pass before recording; recording
+and strict comparison run in separate processes. Directed memcheck4,
+racecheck4 and synccheck4 pass with zero errors/hazards/warnings. The native
+binder is rebuilt with CUDA13.4.92 and Python3.12.12. Production source is
+identical to the tested snapshot; the parent stack's later test-only optional
+reference initialization does not change numerical operations.
+
+The two shared regressions fail against the unfixed parent at the Stats
+comparison, then pass with this change. The four existing `test_fp8_thd`
+neighbors report three passes and one existing causal E5M2 numerical failure
+on this SM107 part (`0.043079853 > 0.04`). A same-device parent/candidate
+comparison records identical quantized input payloads/scales, O/reference
+bytes and Amax for all four cases, including that failure. Its tolerance and
+existing device-specific edge marker are unchanged; it is not counted as a
+passing case. Other native SM107 widths and backward remain unverified here.
+
+```bash
+cd test/python
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 sdpa/frost/test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins
+```
+
+#### Refresh after the #2220 develop merge
+
+The integrated native D128 implementation passes12 strict cases plus all four
+compact THD neighbors, with zero failures/skips. Its memcheck4, racecheck4
+and synccheck4 runs are clean; all ten offline CUDA13.4 variants still compile.
+The comparison control contains the same develop schedule with only this
+D128 physical-origin change reverted. Its four compact neighbor cases also
+pass, with byte-identical inputs/scales, O/reference and Amax.
+
+The incoming #2220 `_E11` schedule normalizes O with the unquantized FP32
+row sum instead of the earlier quantized-P ones-MMA denominator. Replaying
+the original source reproduces its four old golden files exactly; comparing
+against the integrated source preserves input/runtime and Stats hashes while
+changing O. Maximum O changes are0.01171875 for E4M3 and0.0234375 for E5M2,
+identical for token/head Stats layouts. Independent references, byte replay,
+concurrent work and batch invariance pass before recording the four updated
+O hashes, then strict comparison passes in another process. No tolerance or
+skip was changed. The earlier pre-#2220 E5M2 edge and old golden mismatch
+remain historical evidence; neither is a failure on this integrated head.
+
+### Native SM107 D192/D256/D512 FP8 THD origins — 2026-11-11
+
+The selected architecture entry `test_sdpa_fp8_sm107.py` exposes
+`TestD192Fp8PhysicalOrigins` and `TestWideFp8PhysicalOrigins`: 30 L0 cases
+cover E4M3/E5M2 inputs with BF16 O and token/head-major Stats. The native
+D192/V128 CGA2, D256 CGA1 and D512 CTA-pair role-split bodies use independent
+Q/K/V/O/Stats physical offsets. Tests pin two persistent clusters, require
+the native template and prepared binder, compare independent references,
+and check retained live/empty captures, fresh addresses and strides, missing
+total hints, batch reorder/duplication/neighbor isolation and concurrent-work
+raw-byte replay. Twelve golden cases preserve fixed quantized inputs/scales.
+
+Initial D192 qualification under native SM107, actual CUDA13.4, DSL4.8.0,
+Torch2.14.1+cu130 and cuDNN9.24.0.43 passed10 strict cases,8 existing THD
+neighbors and four cases under each of memcheck/racecheck/synccheck. Two
+old-source controls fail because the prepared plan omits physical origins;
+this detector stops before GPU execution, so it is not an old-source numerical
+failure. All eight compact controls pass on that parent.
+
+Final D192/D256/D512 qualification, including the Q acquire fold, passes
+30 strict new cases plus22 existing compact THD neighbors,0fail/skip. The
+parent passes the same22 compact controls; six new-origin controls fail at
+the missing-binding assertion before GPU execution. Memcheck12, racecheck12
+and synccheck12 are clean with zero errors/hazards/warnings. All30 CUDA13.4
+offline variants compile: three widths, two encodings and token/head/padded/
+omitted Stats plus dense controls. Twelve new golden files pass a separate
+strict process; the four D192 files exactly match the initial qualification.
+Other GPUs, datatypes, backward, split, packing and paged routes are outside
+this added coverage.
+
+```bash
+cd test/python
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestD192Fp8PhysicalOrigins \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestWideFp8PhysicalOrigins
+```
+
+### Native SM107 D256 MXFP8 THD origins — 2026-11-11
+
+`test_sdpa_fp8_sm107.py::TestD256Mxfp8PhysicalOrigins` exposes10 L0 cases
+for E4M3/E5M2 inputs, E8M0 block scales, BF16 O and token/head-major Stats.
+CGA1 nonpaged, unsplit, unpacked plans bind independent Q/K/V/O/Stats
+origins. The data maps select each physical sequence while scale descriptors
+retain packed batch zero and logical per-sequence tile prefixes. Fixed
+quantized values and scale tiles survive batch reorder/duplication/isolation,
+changed addresses/pitches and retained live/empty CUDA Graph capture. The
+suite independently checks numerical references and concurrent-work raw bytes.
+
+Native SM107 with actual CUDA13.4, DSL4.8.0, Torch2.14.1+cu130 and
+cuDNN9.24.0.43 passes all10 strict cases,0fail/skip, after four golden cases
+pass recording and separate strict processes. The two old-source controls
+stop at the missing-origin-binding assertion before GPU execution. All ten
+offline variants compile: both formats with token/head/padded/omitted Stats
+and dense controls. All24 compact prepared neighbors pass on both parent
+and candidate, including changed scale bindings, all four output dtypes,
+optional Stats/Amax, SF carriers and no-allocation/no-sync checks.
+Memcheck4, racecheck4 and synccheck4 pass with zero errors/hazards/warnings.
+Other widths, GPUs, backward, split, packing and paging remain outside this
+new suite; their existing admission is unchanged.
+
+```bash
+cd test/python
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 sdpa/frost/test_sdpa_fp8_sm107.py::TestD256Mxfp8PhysicalOrigins
+```
+
+### SM100 half / per-tensor FP8 D512 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins` collects 42 L0 cases:
+4 shared `test_mhas_v2` regressions, 12 reference/rebind/replay/batch cases,
+6 no-total-hint cases, 8 half head-envelope cases and 12 goldens. FP16/BF16
+each run both the role-split and 2x2 half implementations; E4M3/E5M2 run
+the FP8 implementation. Every
+expanded case asserts the actual kernel template, so a sibling implementation
+cannot satisfy its check. All plans retain the existing unsplit/unpacked
+contract and cover token/head-major Stats.
+
+Independent Q/K/V/O/Stats origins use mixed INT32/INT64 buffers and element
+multipliers. The fixture poisons input gaps with NaNs and checks output
+canaries, independent FP64 references, fresh pointer/stride bindings and
+retained capture after changing live lengths, origins and scalar scales.
+All-empty query work must leave output padding untouched. Exact-byte checks
+cover repeats, batch reorder/duplication, an isolated sequence and changed
+neighbors. Prepared and standalone graph execution must agree. D512 uses
+16-element Q/K multipliers so its +16 head-padding variant still represents
+whole physical token rows exactly. Eight additional half cases cover
+D384/V448 and D264/V504 in both implementations and dtypes; the latter
+uses an 8-element origin unit that divides its declared token stride.
+
+Measured runtime: SM100, 148 SMs; driver 595.71.05; Torch 2.14.1+cu130;
+cuDNN 9.24.0.43; DSL 4.8.0/compiler CUDA 12.9; tvm-ffi 0.1.14.post1.
+The final suite passes all 42 cases in 52.62 seconds, with zero failures or
+skips, including strict checks of twelve new goldens under
+`361d6da48de8fd55`. These were recorded after their references and byte
+comparisons passed; earlier goldens and tolerances are unchanged. The
+paired-host ABI detector passes separately. All 23 neighbor controls pass:
+compact D512 FP8 THD, dense output/amax, existing half dense/THD and D576
+physical-origin packed/split paths.
+The immediate parent fails all three shared D512 dtype cases. The first
+expanded candidate exposed seven 2x2 declines caused by an obsolete D576-only
+origin compile guard; removing it enables the existing D512 origin body.
+All six SM103 lowerings compile offline; execution there remains unverified.
+
+Compute Sanitizer memcheck, racecheck and synccheck each pass eight cases:
+the six token-major replay legs and both BF16 D264/V504 implementations.
+All report zero errors; racecheck reports zero hazards and warnings. Runtimes
+are 6.64, 341.42 and 4.67 seconds respectively. The private launcher initializes
+cuda-python before Torch for the procedure-lookup issue documented above;
+API reporting remains explicit, with all kernels instrumented and error exit
+code 86. No sanitizer diagnostics are suppressed.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
+```
+
+### SM100 D256 paged THD packed split — 2026-11-11
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit` is collected
+by the existing SM100 CI entry, with all six cases marked L0. Four public graph
+cases cover FP16/BF16, CGA2, split2/3/5/9, unpacked and packed heads (including
+partial GQA6), HND/NHD/mixed page pools, page8/16/128/256, independent physical
+Q/O/Stats offsets and token/head Stats. They compare an independent CPU FP64
+reference, preserve poisoned gaps and inputs, rebind fresh storage, and replay
+changed data/offsets/tables/lengths through retained CUDA Graphs. Route assertions
+pin the D256 native body and native binder.
+
+The two standalone dtype cases hold split5 and packing fixed while comparing
+raw O/FP32 Stats bytes across fresh-buffer replay with concurrent work, sequence
+alone/batched/reordered/duplicated, changed-neighbor Q and129 requests. Lengths
+include zero and fully masked query rows. Independent references check both
+outputs and signed infinity sentinels before two small runtime-keyed goldens
+are recorded. These tests cover forward only; no backward capability is added.
+
+New measurement: six recording cases pass; the subsequent strict run passes all
+50 cases (six public/golden cases,36 native binding cases, eight existing
+paged controls), zero failures/skips. Both goldens match unchanged. The four
+public origin cases pass memcheck, racecheck and synccheck with zero sanitizer
+errors/hazards/warnings. Four SM103 half dtype/packing variants compile offline;
+this is not execution evidence. Runtime:
+SM100/148SM, driver595.71.05, cuDNN9.24.0.43, Torch2.14.1+cu130,
+CuTe DSL4.8.0 with actual compiler CUDA13.4, cuda-bindings13.4.4 and toolkit13.4.92.
+The Torch wheel's CUDA13.0 tag is separate from the asserted DSL compiler.
+The two JSON records were inspected after reference/replay passed. Strict
+comparison must leave `CUDNN_DETERMINISM_RECORD` unset. SM103 execution is
+unverified; this evidence does not establish cross-runtime bitwise stability.
+
+```bash
+cd test/python
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit
+```
+
+### SM100 D512 TMEM reader lifetime — 2026-11-12
+
+`TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers` adds three
+L0 cases (BF16, E4M3, E5M2). A temporary template delays one output warp and
+records completion of each warp's final TMEM load and the deallocation.
+It uses the existing synthetic physical-origin fixture, including reference,
+batch-invariance, changed-binding and retained live/empty graph checks. The
+assertion compares event order; it has no duration threshold. No production
+debug argument is added.
+
+Before the terminal reader join, all three cases fail the lifetime assertion
+in 10.96 seconds, although their numerical checks pass. With the join, the
+full D512 class passes all 48 cases in 94.30 seconds, with no failures/skips.
+This includes the twelve unchanged committed goldens and the existing Stats
+reader checks. Runtime: SM100/148SM, Torch 2.14.1+cu130, cuDNN 9.24.0.43,
+DSL 4.8.0 with actual compiler CUDA 13.4; all three artifact caches disabled.
+The same native extension is reused because no native source changed.
+
+The three new cases also pass Compute Sanitizer 13.4 memcheck and synccheck
+(12.46 and 12.29 seconds), with zero errors. The retained four-case selection
+passes racecheck 13.2 in 179.45 seconds, with zero hazards/errors/warnings;
+kernel compilation remains CUDA 13.4. These are local candidate results.
+
+This establishes and repairs a TMEM lifetime violation. It does not by itself
+attribute or clear the separately retained instrumented numerical failure.
+SM103 execution remains unverified; no golden or tolerance is changed.
+
+```bash
+cd test/python
+python -m pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
+```
+
+### D512 paired-CTA reader completion — 2026-11-12 follow-up
+
+The terminal four-warp join above still allowed an MMA warp to proceed
+before its own CTA's readers finished: its barrier counted only the peer
+CTA's completion. The role-split half/FP8 paths now send one elected local
+credit and one elected peer credit after each four-warp join. Each MMA warp
+waits for both reader groups. This retains the existing 2x2 path's
+local-plus-peer completion requirement and adds no mainloop synchronization.
+
+The lifetime regression now has nine cases: BF16/E4M3/E5M2 crossed with a
+delay in both output CTAs, only the even CTA, or only the odd CTA. It checks
+both CTAs' final TMEM loads against each deallocation. On unchanged
+`b70a558b4ea2`, the three symmetric cases pass but all six one-sided cases
+fail the event-order assertion (28.34s); output numerics still pass there.
+With the two-credit protocol, all nine pass (29.28s). A separate synthetic
+racecheck control removes only the local credit and its count from the
+candidate's temporary template: the even-CTA BF16 case fails the same
+ordering assertion, with zero reported hazards. That control is not a
+reproduction of the reviewer's numerical failure.
+
+The current-head reviewer still observed numerical/repeatability failures on
+`b70a558b4ea2` after the earlier join. Those results remain valid; this new
+local evidence does not by itself clear the reviewer's original setup.
+No seed, reference tolerance or golden is changed.
+
+The expanded full D512 class passes 54 cases, zero failures/skips, in 101.85s
+on the same SM100/148SM runtime, including all 12 unchanged committed
+goldens. All artifact caches remain disabled. Four changed SM103 variants
+(FP16/BF16 half and E4M3/E5M2 per-tensor FP8) compile offline with CUDA 13.4;
+SM103 execution remains unverified. The 2x2 and native binding sources are
+unchanged.
+
+CUDA 13.4 memcheck and synccheck each pass all nine lifetime variants with
+zero errors (34.04s and 30.95s). The separate racecheck runs pass the
+original four-case selection/order (182.94s) and an even-CTA BF16 lifetime
+case (56.87s), with zero hazards/errors/warnings. Kernel compilation remains
+CUDA 13.4 when using the available 13.2 racecheck tool. These local passes
+do not replace requalification in the original reviewer environment.
+
+### SM100 single-sequence physical-origin setup — 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSingleSequenceSetup` collects
+18 new L0 cases through the existing CI entry. The helper is intentionally
+not named `test_*`, so a directory sweep does not collect a second copy.
+The four dense D128 physical-origin cases cover FP16/BF16, packed/unpacked
+CGA2, independent element offsets, changed addresses/strides, token/head
+Stats, retained capture and empty/keyless replay. Four paged B1 cases cover
+D64/D128, CGA1/CGA2, HND/NHD/mixed KV layouts and independent Q/O/Stats
+origins. Ten FP16/BF16 byte cases cover dense D128 packed/unpacked, paged
+D64 CGA1/CGA2 and paged packed D128 CGA2, all with split count one.
+
+Each byte case uses fixed CPU-generated sequence payloads and independent
+CPU FP64 O/Stats references. It compares B1 with reordered, duplicated and
+changed-neighbor B3/B5/B129 bindings through one capacity-4096 plan, then
+returns to B1. Fresh buffers, concurrent GPU work, poisoned workspace,
+empty/keyless sequences and retained CUDA Graph replay remain checked.
+Paged payloads are copied once into finite-poisoned pools; unused page tails
+cannot change the reference. Input bytes, O bytes and FP32 Stats bytes are
+checked separately. Negative-infinity Stats is accepted only at keyless rows.
+There is no backward setup change or new backward qualification.
+
+On local SM100 (148 SM), actual CUDA 13.4 compiler/sanitizer, DSL4.8,
+Torch2.14.1+cu130, cuDNN9.24.0.43, driver API13020 and TVM FFI0.1.14.post1,
+the unchanged kernel parent `cb4c4e759873` passed all25 selected L0 cases
+(18 new, six existing D64 paged-origin controls, one compact B4 control),
+with one L1 case deselected, in68.41s. Ten new runtime goldens were recorded
+under `361d6da48de8fd55`; no existing golden was changed. The final candidate
+passed the same25 cases, zero failures/skips and one deselection, in70.12s
+with recording unset and every new golden checked against that baseline.
+Actual imports and native compatibility were asserted; all three compiled
+cache controls were disabled. The generic multi-sequence setup body and
+existing native source are unchanged.
+
+CUDA13.4 memcheck and synccheck each passed the packed BF16 dense-origin
+case and D64 CGA1 paged-origin case, with zero errors (10.93s and8.38s).
+Offline compilation passed six SM103 half variants (FP16/BF16 times paged
+D64 CGA1, dense D128 CGA2 and packed paged D128 CGA2), plus two SM107 dense
+D128 CGA2 controls of the shared helper's unchanged default. GPU execution
+on SM103 and new SM107 execution remain unverified; compilation is not a
+runtime pass. This setup-only optimization changes neither the attention
+arithmetic nor eligibility/ranking, and does not promise cross-plan bytes.
+
+From `test/python`, after checking that `cudnn` imports this checkout:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1 CUTE_DSL_NO_CACHE=1 CUTE_EXPERIMENTAL_DSL_NO_CACHE=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSingleSequenceSetup \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD64PhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_thd_origins.py::test_compact_thd_origins_use_single_load_maps
+```
+
+The first baseline attempt copied unsupported SM107 configurations and
+failed10 cases before candidate testing: dense D64 origins, dense D128 GQA
+CGA1 and unsplit packed D64 are outside these SM100 routes. The final suite
+uses supported dense D128 and paged D64/D128 routes; reference tolerances
+and byte assertions were not weakened. The earlier failed run is not counted
+as successful coverage.
+
+### SM100 unified D64/D128 split setup — 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestUnifiedSplitSetup` adds18 L0
+cases through the existing SM100/SM103 CI entry, with a helper that is not
+independently collected. Eight B1 paged-origin cases cover D64/D128,
+FP16/BF16, packed split5 and unpacked split3, HND/NHD pools and token/head
+Stats. Two nonpaged D128 split3 cases cover both half types. Two D128
+mixed-KV cases cover FP16/E4M3 paged and BF16/E5M2 nonpaged split3.
+They retain independent origins, changed storage/strides, numerical O/Stats
+checks and changed-input capture replay, including empty/keyless queries.
+
+Six split5 byte cases cover packed paged D64/D128 and unpacked nonpaged
+D128 for FP16/BF16. One declared-capacity256 plan alternates through runtime
+B1/B3/B5/B129 and back to B1, including reordered/duplicated sequences,
+changed neighbors, concurrent work, independent physical origins, poisoned
+workspace and CUDA Graph replay. Fixed CPU-generated payloads and CPU FP64
+references remain unchanged from the unsplit fixture. Split count and packing
+stay fixed; there is no assertion of cross-plan equality. The appended
+`splits=1` helper default preserves the existing unsplit tests and golden names.
+
+On local SM100 (148 SM), actual CUDA13.4 compiler, DSL4.8,
+Torch2.14.1+cu130 and cuDNN9.24.0.43, parent `21abdcc482a1` passed all18
+cases in50.89s and recorded six new goldens under `361d6da48de8fd55`.
+The candidate passed the same18 in50.09s, zero failures/skips, with recording
+unset and all six O/Stats hashes checked against the parent. No existing
+golden changed; the new input hashes also match the existing unsplit fixtures.
+All three compiled cache controls were disabled and source imports asserted.
+Earlier candidate qualification on local SM100 (68 SM), with the same compiler
+and library versions, passed13 existing physical-origin cases in35.75s and
+24 mixed-KV cases in70.21s, including unsplit and multisequence controls.
+
+CUDA13.4 memcheck and synccheck each passed three focused cases in12.43s
+and10.83s, with zero errors: packed B1 BF16 D64 paging, B1 FP16/E4M3 D128
+paging, and BF16 nonpaged D128 B1/B3/B5/B129 byte comparisons. Offline
+SM103 compilation passed ten split-host variants: both half types times
+paged D64, paged/nonpaged D128 and paged E4M3/nonpaged E5M2 KV.
+This is compilation evidence only; SM103 execution remains unverified.
+The change affects setup only and adds no backward qualification.
+Four existing unsplit controls also passed in13.60s, retaining their original
+goldens. CI-style collection with `-m L0 -k frost` finds all18 new cases.
+
+From `test/python`, after checking the actual imported checkout:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1 CUTE_DSL_NO_CACHE=1 CUTE_EXPERIMENTAL_DSL_NO_CACHE=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestUnifiedSplitSetup
+```
+
+The first parent-only attempt failed15 cases before kernel launch: the paged
+B1 fixture retained a packed-total hint above `B*S_q`, and the shape-override
+byte fixture omitted its required split packed-total bound. The corrected
+fixtures declare valid bounds; no numerical tolerance or byte assertion was
+relaxed. Those failures are retained separately from passing qualification.
+
+### Native SM107 D64 paged THD split forward — 2026-11-12
+
+`TestNativeD64Paged` in the CI-selected `test_sdpa_fwd_dsl_sm107.py` covers
+matching FP16/BF16 paged THD at CGA1/N128,
+with fixed split counts and packed or unpacked GQA. The shared physical-D64
+single-Q body is compiled for SM107 and writes FP32 partials; the final
+combine retains independent O/Stats origins. Mixed FP8 KV, split sinks and
+padded Stats retain their existing declines. No backward path is added.
+
+On SM107, cuDNN 9.30.0.2, CuTe DSL 4.8.0 compiled with CUDA 13.4 and
+Torch 2.14.0+cu130, 20 distinct focused cases pass: eight split origin/replay
+cases, eight existing unsplit controls, one admission case, one partial-GQA
+multi-wrap case and two replay/batch/golden cases. The two new goldens also
+pass strict comparison in a fresh process. No existing golden is replaced.
+
+The batch cases preserve fixed Q/K/V payloads across sequence insertion,
+reordering and duplication, including empty sequences, fresh output/workspace
+allocations and concurrent GPU work. Both O and Stats retain identical raw
+bytes under the same plan; independent FP64 checks remain separate. The graph
+cases check HND/NHD/mixed pools, physical origins and strides, changed-input
+capture replay and empty replay. The six-head sharing group exercises partial
+packing with more KV iterations than ring slots. The initial three-head-group
+fixture was correctly declined by the existing packing contract; the final
+case uses a supported group without widening that contract.
+
+```bash
+cd test/python
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_admission \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd_split_partial_pack \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd_split_determinism
+```
+
+These new measurements qualify the SM107 extension only. Existing SM100/103
+paged-split support is unchanged and receives no new hardware coverage here.
+
+### SM107 D128 per-tensor FP8 single-CTA dense splits — 2026-11-12 (UTC)
+
+`test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split` exposes12 L0 cases
+through the selected Rubin CI entry: one graph-domain check, six functional
+rebind/capture cases, two replay/batch cases, two golden cases and one
+refilled-ring stress. E4M3/E5M2 input, BF16/FP16/E4M3/E5M2 output, packed
+and unpacked groups, splits2/3/9, dense/causal/bottom-right/SWA/sink,
+optional Stats and D112/V96 plus D80/V112 envelopes are exercised.
+Every functional check uses the shared FP64 FP8 probability-cast reference
+and checks Amax_O separately. Native template, single-CTA geometry,
+four-stage KV ring, K64 MMA and FP32 combine are asserted.
+
+On SM107216SMs, driver620.62, fullcuDNN9.30.0.4, CuTeDSL4.8.0 compiled
+with CUDA13.4 and Torch2.14.0+cu130, all12 cases passed in25.88s.
+The two new goldens also passed strict comparison in a fresh process
+(2 cases,3.21s). No previous golden was changed. The stress recorded zero
+wrong bytes in512 warm and512 poisoned launches; its unsafe control failed
+200/200 launches. The stress shape launches512 blocks and refills its ring
+four times per launch; numerical correctness is checked separately first.
+
+Fixed-payload batch checks compare the target alone, reordered, duplicated,
+with changed neighbors and among129 sequences. O/Stats are per-sequence;
+Amax_O is a whole-batch maximum, checked numerically after rebatching and
+bitwise during replay. New byte guarantees cover E4M3/BF16 packed split3
+and E5M2/FP16 unpacked split2. Other GPU lines are unmeasured by this suite;
+this change adds no backward or THD path.
+
+From `test/python`, with the correct checkout imported:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split
+```
+
+### SM100/103 FP8 coalesced paged loads — validation, 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py` now also covers D64/D128
+paging, preserving its existing D512 defaults. Five new configurations each
+have a repeatability/batch-invariance test and a strict golden test:
+
+| D | Page | CGA | Split | Layout | Input / output |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 8 | 1 | 1 | NHD | E4M3 / BF16 |
+| 128 | 16 | 1 | 2 | HND | E4M3 / E4M3 |
+| 128 | 8 | 2 | 1 | HND | E5M2 / FP16 |
+| 64 | 64 | 1 | 4 | NHD | E5M2 / E5M2 |
+| 128 | 128 | 1 | 4 | NHD | E4M3 / BF16 |
+
+The suite fixes quantized payloads and scales, uses independent K/V page
+orders, and checks O, FP32 Stats and Amax numerically. Replay compares all
+three outputs bytewise with fresh buffers and concurrent work. The per-row
+O/Stats checks cover isolated, reordered, duplicated and changed-neighbor
+sequences plus a 129-sequence batch; Amax is a whole-batch reduction.
+
+Both B200 (SM100, 148 SMs) and B300 SXM6 AC (SM103, 148 SMs) pass
+**37 cases, 16 deselected, no failures or skips**: the ten new byte cases,
+one refilled-ring stress, twelve existing page-boundary cases extended to
+page8, five two-KV-stream paged cases, eight D128 prepared-stride/capture
+cases and one existing D512 helper control. Runtime was 100.58s on B200 and
+127.37s on B300. The single warning is Torch's synchronization-debug mode.
+
+Five goldens per GPU were recorded from the unchanged parent kernel only
+after independent reference/replay checks, then strictly matched by the
+candidate in a fresh process with recording disabled. The ten new JSON
+records live under `c8aefc970ef3af15` and `98a778ce33bb9402`; no existing
+record is replaced. The initial fixture requested an unsupported D64/CGA2
+combination and was corrected to the existing CGA1 domain before this run;
+no production admission or numerical tolerance was changed.
+
+The stress case traverses eight KV tiles and refills its four-stage ring,
+checking 256 warm and 256 shared-memory-poisoned launches. Both GPUs record
+zero wrong bytes; their unsafe controls fail 200/200 launches. The tested
+kernel grid has only four blocks (0.03 per SM), so this is a low-occupancy
+rate bound, not a saturated-scheduling race qualification. An independent
+numerical check precedes the stability stress. GPU-exclusive scheduling
+markers were added after serial qualification; test bodies are identical.
+
+B200 also passes Compute Sanitizer 2026.3 memcheck and synccheck on the
+page8/HND/E4M3 mixed-length case, one case each, with 0 errors. No new racecheck
+measurement is claimed. The sanitizer processes report FE cuDNN 93000 while
+Torch's cuDNN query reports 92400; this explicit FROST case does not execute
+backend attention. The normal qualification uses full cuDNN 9.30.0.4,
+Torch 2.14.1+cu130, CuTe DSL 4.8.0 and actual compiler/NVRTC 13.4; driver API 13040.
+Source/import hashes were verified against parent
+`32d4554e93f2564be0a005d305e458e72551e1c9` plus the loader/test patch.
+The relevant kernel/test files are unchanged on subsequent develop
+`f013a9d1e`. SM90/SM107/SM120 are unmeasured by this suite. This modifies
+forward paging only; no paged-KV backward API is added.
+
+From `test/python`, with the qualified checkout imported and recording unset:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 -q -rs \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py \
+  -k 'small_paged or paged_loader_warm_stress'
+python -m pytest -n0 -m L0 -q \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_matches_reference \
+  sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_two_kv_streams_match_the_reference
+python -m pytest -n0 -m L0 -q \
+  sdpa/frost/test_sdpa_prepared_fp8_paged.py::test_prepared_fp8_paged_strides_and_capture -k128
+python -m pytest -n0 -m L0 -q \
+  'sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_d512_paged_replay_and_batch_invariance[fwd-d512-e4m3-bf16-split1-NHD]'
+```
+
+
+### SM100 FP8 interleaved two-KV-stream schedule — validation, 2026-11-12 (UTC)
+
+The SMEM-P dual-stream loop issues QK(A), PV(previous A), QK(B), then
+PV(previous B). Each stream retains its previous arithmetic order, all waits,
+arrivals, credits and ring phases. SM103 uses the unchanged TMEM-P branch.
+No eligibility, tuning domain, ranking, or backward path changes.
+
+B200 and B300 SXM6 AC (148 SMs each) both pass **62 cases, 16 deselected,
+no failures or skips**. This reuses the preceding coalesced-page qualification
+and runs the entire 30-case `test_sdpa_fwd_fp8_dual_kv_sm100.py` suite in place
+of its five paged cases. Coverage includes dense and paged KV, odd tails,
+empty splits, persistent scheduler waves, deliberately delayed MMA,
+independent K/V strides, changed-input capture, replay and batch invariance.
+Candidate runtimes were 132.38s on B200 and 95.96s on B300.
+
+Each GPU also passes five parent golden checks (38.64s and 39.82s), recorded
+in an isolated directory from the coalesced parent and strictly matched by
+the candidate in a fresh process with recording disabled. All ten parent
+JSON records are byte-identical to the committed baselines; none is updated.
+The existing refilled-ring stress reports zero mismatches in 256 warm and
+256 poisoned launches on each GPU, with unsafe controls failing 200/200.
+Its four-block geometry remains a limited-occupancy measurement; separate
+numerical tests provide the reference checks.
+
+B200 Compute Sanitizer 2026.3 synccheck and racecheck each pass the existing
+`page16-unaligned` dual-stream test: two sequences, Q1/H64:8/D128, live KV
+lengths 1024/777, eight/seven KV tiles, and repeated ring reuse. Synccheck
+reports 0 errors; racecheck reports 0 hazards (0 errors, 0 warnings). Each
+sanitizer invocation runs one case, four deselected. The sanitizer processes
+report FE cuDNN 93000 and Torch cuDNN 92400; the tested explicit FROST path does
+not execute backend attention. Normal tests use full cuDNN 9.30.0.4.
+
+Both GPUs use Torch 2.14.1+cu130, CuTe DSL 4.8.0 and actual compiler/NVRTC 13.4.
+Imports and source/library hashes are checked. The runner disables the
+editable-install finder and gives child interpreters the same source path.
+The shared runner has no pytest-xdist; tests run serially with
+`CUDNN_TEST_NO_ISOLATION=1`. Its two warnings are the unavailable
+`xdist_group` marker and Torch synchronization-debug mode.
+The kernel and test files on landed parent `9be74f4d7` match those qualified
+here. After qualification, only the phantom-step explanatory docstrings
+changed; the executable kernel AST is identical. SM90/SM107/SM120 are not
+measured by this follow-up.
+
+Reproduce the preceding qualification commands, replacing the selected
+`test_paged_two_kv_streams_match_the_reference` node with the complete
+`sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py` file. Omit `-n0` when xdist is
+not installed. Run the sanitizer on the following case, then repeat with
+`--tool racecheck`:
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode 91 --report-api-errors no \
+  python -m pytest -m L0 -q \
+  'sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_two_kv_streams_match_the_reference[page16-unaligned]'
+```
+
+
+### SM100 paged FP8 separate Q/K and V producers — validation, 2026-11-12 (UTC)
+
+The existing SM100 D128 paged dual-stream body gives V production to the
+O-store warp while the loader produces Q/K. V retains its own ring index and
+phase across persistent work items, using the existing MMA empty credits.
+Arithmetic, barrier counts, plan knobs and graph eligibility are unchanged.
+SM103 retains the existing producer path; no backward path changes.
+
+B200 and B300 SXM6 AC (148 SMs each) pass **43 cases, six deselected, no
+failures or skips**. Two D128/CGA1 parent golden cases per GPU are recorded
+into a fresh directory and strictly compared by the candidate with recording
+disabled. All four parent records equal the committed baselines. Two existing
+fixed-plan batch-invariance cases retain O/Stats bytes through reordered,
+duplicated, changed-neighbor and multiple-wave batches.
+
+The suite also runs all 30 existing dual-stream cases and eight new capture
+cases with an assertion on the actual producer flag (enabled on SM100,
+disabled on SM103). The new cases cover HND/NHD, independent V page tables,
+packing on/off, split 1/4, scheduling policies 0/1/2, causal bounds, odd tails,
+empty splits and persistent work. Each retained graph replays shorter, empty
+and restored live lengths 16 times each; restored O and Amax compare raw bytes
+with snapshots from the original execution. Independent numerical checks keep
+the original quantization bounds. No committed golden or tolerance changes.
+
+The existing four-block refilled-ring stress is included, with 256 warm and
+256 poisoned launches and the unsafe control. Both GPUs report zero mismatches
+and their unsafe controls fail 200/200. Its four-block geometry remains a
+limited-occupancy measurement, not a full-device stress claim.
+
+B200 Compute Sanitizer 2026.3 racecheck, memcheck and synccheck each pass all
+eight new capture cases. Racecheck reports zero hazards/errors/warnings;
+memcheck and synccheck report zero errors. Racecheck filters
+`kns=cudnn_kernel_`; the other tools are unfiltered. CUDA API error reporting
+is disabled. These B200 processes report FE cuDNN 93000 and Torch cuDNN 92400;
+the explicit FROST attention path does not execute backend attention.
+B300 has no new sanitizer result in this follow-up.
+
+Actual compiler/NVRTC 13.4 and CuTe DSL 4.8 are checked separately from the
+Torch 2.14.1+cu130 build label. Explicit FROST plans are required; source/import
+and library hashes are checked. Other architectures are unmeasured by this
+follow-up. The only postqualification kernel change removes experiment
+wording from a comment; the executable AST is identical.
+
+Reproduce from `test/python`, with the candidate checking the isolated parent
+golden directory through `CUDNN_DETERMINISM_GOLDENS` and recording disabled:
+
+```bash
+python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py
+python -m pytest -m L0 -q -k 'd128 and cga1' \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_small_paged_golden \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_small_paged_replay_and_batch_invariance
+python -m pytest -m L0 -q \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_paged_loader_warm_stress
+compute-sanitizer --tool memcheck --error-exitcode 91 --report-api-errors no \
+  python -m pytest -m L0 -q \
+  sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_split_producer_lengths_replay
+```
+
+Repeat the final command with `--tool synccheck`, and with
+`--tool racecheck --kernel-name kns=cudnn_kernel_`.
+
+### 2026-11-12 — service-register CI follow-up and FP8 scale lifetime
+
+On parent `e2fbd4f69`, converging the service register releases exposed an
+extra output-scale spill in native SM107 D128 FP8. The follow-up computes
+that scale in the correction role, retaining the multiply order and the
+common service release. Existing spill ceilings and numerical tolerances
+are unchanged. No output golden is replaced.
+
+Native SM107, CUDA compiler/NVRTC 13.4, CuTeDSL 4.8.0, cuDNN 9.30.0.4:
+the unchanged parent records four E4M3/E5M2 token/head-Stats origin goldens
+after their references and replay checks pass (**4 passed, 36 deselected**).
+The candidate then passes **40 cases, no skips**, including those four strict
+parent records, all D128 origin checks, D64/D128 masks, D64 GPT-OSS shapes
+and the D128 output-dtype cases. O/Stats batch invariance and changed-storage
+replay retain their existing scope; Amax_O is checked numerically by the
+dense cases. Backward, new sanitizer coverage and performance are unmeasured
+by this follow-up.
+
+Run the same selected L0 suites with `CUBLAS_WORKSPACE_CONFIG=:4096:8`:
+
+```bash
+python -m pytest -m L0 -q \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_masks \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d64_masks \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d64_gptoss_shape \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_output_dtypes
+```
+
+For the parent phase add `-k origin_golden` and record into a fresh directory.
+The candidate uses that directory through `CUDNN_DETERMINISM_GOLDENS`, with
+recording disabled. Both phases load Python and matching native bindings
+from the isolated source package; the reused bindings have identical native
+build inputs to this source.
+
+B200 with CUDA compiler/NVRTC 13.4 and CuTeDSL 4.8.0 passes **61 cases, no
+skips**: the complete dual-KV suite (including the delayed-MMA subprocess),
+six D576 SASS cases, the THD/paged gate cubin records, both masked-softmax
+pins, all four epilogue/scheduler pins, six score-off records, both score-on
+store checks and the SM107 D128 service-release guard. Cross-compiling
+SM103/SM107 instructions on B200 is not native execution on those targets.
+The fresh child receives no inherited test-root path; an isolated CPU
+control fails its import before the fix and passes afterward.
+
+All 19 old cubin records are reproduced with the pre-convergence kernel
+sources and the same DSL 4.8.0/CUDA 13.4 compiler. Sixteen change with the
+common-release fix and are refreshed; the three SM107 score-off records stay
+byte-identical. PTX and SASS are retained for attribution, and the existing
+spill and score-store detectors remain active. CUDA 13.5 disassembles the
+SM107 cubins. Native SM103 execution is unverified by this follow-up.
 
 ## 2026-11-10 — JAX grouped SiTU integration
 

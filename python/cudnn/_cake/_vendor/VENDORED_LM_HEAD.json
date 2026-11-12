@@ -1,0 +1,51 @@
+{
+  "repository": "https://github.com/radixark/miles-ext-kernels",
+  "commit": "f55fb99674be5edb0e1f6a0e4d6a911335da86ce",
+  "packages": {
+    "cake_lm_head_det_train": {
+      "cake_revision": "16e6b657d9171934b5e18415a840d3420357bd15",
+      "files": {
+        ".gitignore": "e5fd70b13ee2e116ccd3094d1035544ee7f627ed",
+        "build.json": "06d7c3103de8e704457dfc1f6e1e8b5812b0026d",
+        "cake_backend.py": "88914c29d846ccd203999502a784f99e27263aec",
+        "cake_build.py": "00756137eb159e30a77907eda84fd245123d87ea",
+        "cake_jit.py": "b8c65db005d542af63e04ce11fba40cc7f6502b9",
+        "csrc/cake_ffi_checks.h": "129288f9432e054dc51b77d93194fb0f2ec20d9c",
+        "csrc/cake_lm_head_det_loss/.clang-format": "47a38a93f2dbdd6d944f9dddc3465e3fb65aec29",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_050b6664af7d3db672c8_binding.cu": "405812bdcf82efefc7e4b903823c49af6cf39b6b",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_074c355c5fc9d8b80f4c_binding.cu": "f30246b93fd8fb1439772621dbfa427db97959f0",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_1f06a34c8f3bae873636_kernel.cu": "367768e24ee3e18bff5cedab2af9b70adcd89cc8",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_2ea71b605b0ba9f4999e_binding.cu": "c621fb01e320589cfca42e859902f94e5479c897",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_5d3dbf4fbe18c2482cc4_kernel.cu": "2a0eafcade206a4303a5f131065a55b77f0f6102",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_61ea8de378a85bd5c55c_binding.cu": "738aa8259516a942680b3a8434c89eeb24c1005e",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_61ea8de378a85bd5c55c_kernel.cu": "7fb9c59caed7fce1425ad6374646b76ee1ce7d2b",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_6d8eadbd70c6fdd0670f_kernel.cu": "46384eaef8f1758ad7f48d925e9c15b0a177b6cd",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_8eccf1c4d61d3cd4f354_binding.cu": "94ddee7bb18cadaf86bff64bf42b0db8824d5f58",
+        "csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_8eccf1c4d61d3cd4f354_kernel.cu": "4f66d7771a95f712f97c4a7742f2a064d250f4c3"
+      },
+      "source": {
+        "commit": "f5ab85cc77edbd0257b0145eefe0113074dc6ee2",
+        "kind": "flashinfer",
+        "path": "flashinfer/experimental/cake/cake_lm_head_det_train",
+        "repo": "https://github.com/flashinfer-ai/flashinfer"
+      },
+      "local_files": [
+        "__init__.py"
+      ],
+      "selected_stages": [
+        "gemm_logits",
+        "row_finalize",
+        "gemm_logits_nostats",
+        "row_grad",
+        "gemm_dx",
+        "gemm_dw_acc"
+      ],
+      "local_modifications": {
+        "cake_backend.py": {
+          "blob": "1bf364ff59e7bcb98f3a0f518c76d896b5987ea7",
+          "reason": "Initialize host temporaries explicitly for CodeQL; preserve chunk views and gradient finalization."
+        }
+      }
+    }
+  }
+}

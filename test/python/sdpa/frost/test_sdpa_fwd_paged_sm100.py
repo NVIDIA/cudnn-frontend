@@ -893,7 +893,7 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
     # The pools' strides in the kernel's [num_pages, page_size, H_kv, d] order carry the layout (HND vs NHD).
     fn = mod.compile(d_qk=d, d_v=d_v, has_lse=True, lse_kind="dense", paged_hnd=k_view.stride(1) < k_view.stride(2))
     # Split partials are fp32 on SM100 (#891); the combine must be compiled for that width.
-    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+    from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     o_p = torch.zeros(splits * B, 1, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, 1, device=dev, dtype=torch.float32)
@@ -1746,7 +1746,7 @@ def _run_graph_fp8(
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 128])
+@pytest.mark.parametrize("page_size", [8, 16, 128])
 def test_paged_graph_fp8_matches_reference(in_key, hnd, page_size):
     """FP8 twin of test_paged_graph_matches_reference: mixed lengths incl. 0 and 1
     (partial last pages, dead pages NaN-filled), GQA 8:2 (PackGQA), a tile-unaligned

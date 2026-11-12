@@ -40,7 +40,7 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_name = "prefill_d512_f16_2x2.py" if d == 576 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    host_name = "prefill_d512_f16_2x2.py" if d > 512 else f"decode_d{256 if d == 256 else 128}_f16.py"
     host_path = Path(prep.__file__).parent / "kernels/sm100" / host_name
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
@@ -779,13 +779,16 @@ def test_native_decode_new_flavors_keep_int64_table_stride(d, monkeypatch, reque
 
 
 @pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, True), (True, True, False)])
-def test_native_d576_dense_binding(paged, hnd, v_hnd):
-    spec, facts, frames = _fixture(d=576, d_v=512, paged=paged, hnd=hnd, v_hnd=v_hnd)
+@pytest.mark.parametrize("d,d_v", [(576, 512), (576, 504), (568, 512), (520, 264)])
+def test_native_d576_dense_binding(paged, hnd, v_hnd, d, d_v):
+    # The binder preserves accepted native widths; architecture-specific
+    # kernel eligibility is validated by the graph and adapter suites.
+    spec, facts, frames = _fixture(d=d, d_v=d_v, paged=paged, hnd=hnd, v_hnd=v_hnd)
     _equal(spec, facts)
     assert not frames
 
 
-@pytest.mark.parametrize("d,d_v", [(576, 504), (568, 512), (576, 576), (584, 512)])
-def test_native_d576_binding_keeps_exact_geometry(d, d_v):
+@pytest.mark.parametrize("d,d_v", [(576, 576), (584, 512), (576, 256), (575, 512), (576, 510)])
+def test_native_d576_binding_rejects_outside_envelope(d, d_v):
     with pytest.raises(ValueError, match="supported half attention head dimension pair"):
         _fixture(d=d, d_v=d_v)

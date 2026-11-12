@@ -980,6 +980,7 @@ def _paged_graph(
     table_batch_stride=None,
     require_prepared=False,
     sink=None,
+    expected_template="decode_d128_f16",
 ):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
@@ -1054,7 +1055,7 @@ def _paged_graph(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
 
         compiled = g._compiled_plans[g._plan_index]
-        assert compiled._compiled.kernel_template == "decode_d128_f16"
+        assert compiled._compiled.kernel_template == expected_template
         assert isinstance(compiled._prepared, PreparedDenseLaunch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
@@ -1094,7 +1095,7 @@ def _paged_graph(
 def test_graph_decode_prepared_keeps_int64_page_table_batch_stride():
     """A singleton table's unused batch stride must not narrow at the pointer ABI.
     B=1 keeps the valid allocation small while a stride over 2**31 catches int32 fakes."""
-    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True)
+    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True, expected_template="decode_d256_f16")
 
 
 @pytest.mark.L0
@@ -1696,7 +1697,9 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.CGA_TILE_M == 128 and api._k_mod.CFG.TILES_Q == 1, "cga=1 must have loaded the decode tile"
+    mod = api._k_mod
+    assert mod.__file__.endswith("sm100/decode_d256_f16.py"), "the short paged D128 graph must load the swap-AB decode tile"
+    assert mod.CFG.TILE_K == mod.CFG.TILE_O == 128 and mod.N_Q == 16 and mod.COLS == 8
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):

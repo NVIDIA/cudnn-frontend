@@ -188,15 +188,13 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     exec_params = list(inspect.signature(api_cls.execute).parameters)
     tail = exec_params[exec_params.index("sf_o") :]
     if api_cls is SdpaFwdDslSm120:
-        assert tail == ["sf_o", "block_table", "block_table_v"], tail
-        assert params["block_table"].default is None
-        assert params["block_table_v"].default is None
+        # Physical origins follow the existing sf_o / paged-table prefix.
+        assert tail[:8] == ["sf_o", "block_table", "block_table_v", "ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_lse"], tail
+        for name in tail[1:8]:
+            assert params[name].default is None
     else:
         # SM100 appends ragged-Q offsets, score side outputs and resident-block operands.
-        assert tail in (
-            ["sf_o"],
-            ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"],
-        ), tail
+        assert tail[:8] == ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"], tail
 
 
 @pytest.mark.L0

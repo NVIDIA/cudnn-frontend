@@ -6,7 +6,7 @@
 The frozen ``TemplateParams`` record contains only graph declarations and
 selected tuning knobs. Runtime lengths, pointers, and packed token totals stay
 out of compile keys. Graph-adapter declaration logic lives with the adapter;
-this module keeps the small interface consumed by the native D64 and D512 kernels.
+this module keeps the small interface consumed by the native D64/D128/D256/D512 kernels.
 """
 
 from __future__ import annotations
@@ -21,16 +21,13 @@ SCALE_ZERO = 0
 SCALE_NEGATIVE = -1
 
 
-# The legacy D512 envelope. Its WGMMA descriptors and SMEM regions span 512 columns, so any
-# head dim up to that tile is computed on it: the GMEM descriptors carry the actual
-# extent, loads past it zero-fill and O stores past it clip. 8 is the TMA 16-byte
-# global-stride rule at 2 bytes per element. A small D pays the full D512 tile cost;
-# this is envelope coverage. Exact dense D64 selects its separate native body;
-# these constants and head_dims_mismatch still describe the legacy D512 template.
+# Maximum envelope. The adapter selects native 128/256/512-column storage and
+# contraction; exact dense D64 keeps its separate body. GMEM maps carry the actual
+# extents, with zero-filled loads and clipped stores at head tails. Eight elements
+# satisfy the TMA 16-byte global-stride rule for both half types.
 D_TILE = 512
 D_ALIGN = 8
-# Fixed SM90 D512 instruction geometry, matching the FFPA donor. QK is
-# m64n64k512 and each PV half is m64n256k64; these are not tuning axes.
+# Sequence tile geometry shared by the native head widths.
 TILE_M = 64
 TILE_N = 64
 
@@ -117,6 +114,10 @@ class TemplateParams:
     # sequences, TE's cu_seqlens_padded) is read and written where the caller put it.
     thd_origins: tuple | None = None
     split_kv: int = 1
+    # Native contraction/storage envelope; independent of runtime lengths.
+    head_tile: int = 512
+    # Dense queries with native TMA loads from independently mapped K/V pages.
+    page_size: int = 0
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -151,6 +152,16 @@ BAND_COORDINATE_LIMIT = 2**30
 
 def validate_params(params: TemplateParams) -> None:
     """Validate the immutable specialization before constructing a kernel."""
+    if type(params.page_size) is not int or params.page_size < 0:
+        raise ValueError("SM90 page_size must be a nonnegative integer")
+    if params.page_size:
+        p = params.page_size
+        if p % 8 or (p < TILE_N and TILE_N % p) or (p >= TILE_N and p % TILE_N):
+            raise ValueError("SM90 page_size must be divisible by 8 and divide 64 or be a multiple of 64")
+        if params.thd_varlen or not params.seq_kv_lens_present:
+            raise ValueError("SM90 paged KV requires dense Q and device KV lengths")
+    if type(params.head_tile) is not int or params.head_tile not in (128, 256, 512):
+        raise ValueError("SM90 head_tile must be 128, 256 or 512")
     if type(params.split_kv) is not int or not 1 <= params.split_kv <= 65535:
         raise ValueError("SM90 split_kv must be an integer in [1, 65535]")
     if params.thd_varlen and params.split_kv > 1:
