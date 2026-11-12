@@ -361,6 +361,12 @@ batch and captured-replay checks, plus sustained stage-refill stress. This
 extends the tested forward configurations; SM121 and cross-runtime identity
 remain unverified, and no paged backward path is qualified by these checks.
 
+The warp-cached page-table loader also preserves strict parent O/Stats goldens
+for D128 M128/N128 with eight-token pages, including half and FP8 K/V,
+sixteen-page full tiles, a one-row final tile and empty sequences. These
+RTX PRO 6000 checks retain fixed packing and split choices across batch
+changes and CUDA Graph replay. SM121 remains unverified.
+
 The SM120 paged16/32-row decode tiles additionally have eight fixed-runtime
 replay/batch goldens for FP16/BF16 D64/V64 and D120/V88 with split1/3.
 The split count is held fixed across batch changes; the common fixed-order

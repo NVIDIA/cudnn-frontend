@@ -121,8 +121,9 @@ def copy_paged_half_tile(
     """One producer warp fills a half MMA tile from half or FP8 page storage.
 
     The caller owns publication: cp.async arrivals for half copies, ordinary
-    release arrivals for the FP8 widening stores. Dead rows/columns read no
-    table or payload. Eight-element chunks fit the half SMEM swizzle.
+    release arrivals for the FP8 widening stores. Page lookups stay within
+    live rows; dead vectors read no payload. Eight-element chunks fit the
+    half SMEM swizzle.
     """
     # Read the caller's table in the attention CTA. Each half vector lands
     # directly in the existing MMA tile; dead rows never read a table entry
@@ -130,6 +131,18 @@ def copy_paged_half_tile(
     src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
     lane = cute.arch.lane_idx()
     vectors_per_row = head_tile // 8
+    # One warp caches the tile's live page IDs before walking its vectors.
+    # Include a possible unaligned first page; retain the scalar walk when
+    # the largest possible span would exceed the warp's shuffle sources.
+    cache_pages = (kv_tile + page_size - 2) // page_size + 1 <= 32
+    if cutlass.const_expr(cache_pages):
+        first_page = seq_coord // page_size
+        lane_page = cutlass.Int32(0)
+        if seq_coord < seqlen_k:
+            live_rows = cute.math.min(cutlass.Int32(kv_tile), seqlen_k - seq_coord)
+            last_page = (seq_coord + live_rows - 1) // page_size
+            table_col = first_page + cute.math.min(lane, last_page - first_page)
+            lane_page = cutlass.Int32(page_table[batch_idx, table_col])
     # Keep the generated loader bounded as the tile grows. Fully unrolling
     # dozens of vectors per lane duplicates the page-table/address machinery
     # and makes large paged prefill tiles much slower than the rolled walk.
@@ -138,13 +151,19 @@ def copy_paged_half_tile(
         row = chunk // vectors_per_row
         col = (chunk % vectors_per_row) * 8
         logical_row = seq_coord + row
+        if cutlass.const_expr(cache_pages):
+            # All lanes shuffle before the per-vector live predicate diverges.
+            page_id = cute.arch.shuffle_sync(lane_page, logical_row // page_size - first_page)
         # The logical width is an eight-element multiple. A complete
         # 16-byte vector is either live or zero-filled; head padding
         # must never read the next head or poisoned storage slack.
         live = cutlass.Int32((logical_row < seqlen_k) & (col < pool.shape[3]))
         offset = cutlass.Int64(0)
         if live != 0:
-            page = cutlass.Int64(page_table[batch_idx, logical_row // page_size])
+            if cutlass.const_expr(cache_pages):
+                page = cutlass.Int64(page_id)
+            else:
+                page = cutlass.Int64(page_table[batch_idx, logical_row // page_size])
             offset = page * cutlass.Int64(pool.stride[0])
             offset += cutlass.Int64(logical_row % page_size) * cutlass.Int64(pool.stride[1])
             offset += cutlass.Int64(head_idx) * cutlass.Int64(pool.stride[2]) + cutlass.Int64(col)
