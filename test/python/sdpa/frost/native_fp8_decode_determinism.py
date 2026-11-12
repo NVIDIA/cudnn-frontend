@@ -223,7 +223,7 @@ def test_warm_refill(dtype):
     launch()
     expected = {name: value if name == "amax" else value.expand((b,) + value.shape[1:]).contiguous() for name, value in reference.items()}
     assert_bitwise(outputs(t), expected, "stress batch invariance")
-    # Five visited KV tiles issue ten alternating K/V loads, refilling the
+    # Five visited KV tiles issue five K loads and five V loads, refilling the
     # five-slot ring within one CTA. Four CTA waves exercise the reuse order.
     assert_warm_stress(
         StressCase("FP8 D128 five-slot decode", launch, outputs(t), thread_blocks=b, refills_per_launch=5, reference=expected), warm=256, poisoned=256
