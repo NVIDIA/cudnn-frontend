@@ -36,6 +36,31 @@ pytest core/test_determinism_utils.py
 
 ### SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
+
+Review follow-up on `6536a9d4226ced931c8c41886e72c6c2ac9cd5cc`, B200 with
+that same runtime: score-slot credit now consumes all eight TMEM score words
+through the release-zero dependency; the existing wait/fence and arrival counts
+stay in place. Capture cleanup covers errors, and sync-debug mode wraps execute
+rather than PyTorch capture setup. Four production PTX renderings pin the full
+eight-word dependency. The detector's full core suite passes 29 checks.
+
+Jobs 5887863 and 5887949 together pass 30 native functional cases, eight existing
+dual-stream cases, four PTX checks, four replay/batch cases, two warm/poisoned
+stress cases and six strict **unchanged** pre-review goldens. All three sanitizer
+tools pass four cases each with zero errors/hazards, using the same unfiltered
+commands below. CUDA API error reporting remains disabled. No numerical
+threshold or golden changed for the synchronization fix. New runtime evidence
+is SM100-only; the unchanged SM103 route keeps its prior qualification.
+
+The first runner passed 29 core and 38 functional checks but four PTX checks
+could not create its nested pytest temporary directory. The second runner
+creates the missing parent and runs only those four checks plus the remaining
+phases; source bytes are identical. This setup failure remains separate from
+the passing results. Its run root is
+`/tmp/yanxu-fp8-native-review-b200-v2-5887949`; strict/sanitizer phases set
+`CUDNN_DETERMINISM_GOLDENS=<run_root>/source/test/python/determinism_goldens`
+and leave recording unset. The earlier source/record history below is retained.
+
 `TestNativeFp8Decode` and `TestNativeFp8DecodeDeterminism` in
 `sdpa/frost/test_sdpa_fwd_fp8_sm100.py` exercise the native five-stage KV ring
 and eight-live-column swap-AB lowering through the actual architecture CI
