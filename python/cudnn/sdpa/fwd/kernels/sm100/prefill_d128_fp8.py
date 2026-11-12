@@ -404,6 +404,10 @@ _partial_batch = _split_h.partial_batch
 # the f16 kernel: the box geometry is in ROWS, the 128 B swizzle atom is 8 rows
 # at every BPE, and TMA_*_GRANU_ELEMS (128 at BPE=1) rides through unchanged.
 PAGED_KV = bool(CFG.PAGED_KV)
+# The O-store warp produces V while the loader produces Q/K.
+# Restrict this scheduling change to the existing SM100 paged dual-stream body.
+SPLIT_PAGE_V = bool(PAGED_KV and DUAL_KV and not CFG.THD_VARLEN and not FUSED_LDTM_STAT)
+assert not SPLIT_PAGE_V or (CFG.CTA_MMA == 1 and CFG.MASK_FLAGS != 0)
 PAGE_SIZE = CFG.PAGE_SIZE if PAGED_KV else 0
 _K_TILE_ROWS = CFG.TILE_N // CFG.CTA_MMA
 K_BOX_ROWS = min(PAGE_SIZE, _K_TILE_ROWS) if PAGED_KV else _K_TILE_ROWS
@@ -835,6 +839,12 @@ def _kernel(
             o_desc_words=o_desc_words,
             qh_per_kh=qh_per_kh,
             seqlen_kv=seqlen_kv,
+            tma_v_desc=tma_v_desc,
+            sV=sV,
+            block_table_v_tensor=block_table_v_tensor,
+            seqlen_q=seqlen_q,
+            tma_mcast_mask=tma_mcast_mask,
+            paged_hnd=paged_hnd,
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
@@ -1137,37 +1147,38 @@ def _tmaldg_warp_group(
                 )
             q_empty_phase = q_empty_phase ^ 1
 
-            bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-            if cutlass.const_expr(CFG.CTA_MMA == 2):
-                bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
-            else:
-                bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
-            if cutlass.const_expr(PAGED_KV):
-                _paged_load_tile(
-                    sV[kv_state.idx],
-                    tma_v,
-                    block_table_v_tensor,
-                    batch_idx,
-                    kv_head_idx,
-                    n_pages_b,
-                    kv_left,
-                    cutlass.Int32(0),
-                    V_COL_OFFSET_PEER,
-                    bars.mb_v_full[kv_state.idx].smem_ptr,
-                    tma_mcast_mask,
-                    V_BOX_ROWS,
-                    V_BOXES,
-                    TMA_VO_GRANU_ELEMS,
-                )
-            else:
-                tma_load_tile(
-                    sV[kv_state.idx],
-                    tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
-                    bars.mb_v_full[kv_state.idx].smem_ptr,
-                    cta_group=CFG.CTA_MMA,
-                    mcast_mask=tma_mcast_mask,
-                    acquire=not CFG.THD_VARLEN,
-                )
+            if cutlass.const_expr(not SPLIT_PAGE_V):
+                bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
+                if cutlass.const_expr(CFG.CTA_MMA == 2):
+                    bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+                else:
+                    bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
+                if cutlass.const_expr(PAGED_KV):
+                    _paged_load_tile(
+                        sV[kv_state.idx],
+                        tma_v,
+                        block_table_v_tensor,
+                        batch_idx,
+                        kv_head_idx,
+                        n_pages_b,
+                        kv_left,
+                        cutlass.Int32(0),
+                        V_COL_OFFSET_PEER,
+                        bars.mb_v_full[kv_state.idx].smem_ptr,
+                        tma_mcast_mask,
+                        V_BOX_ROWS,
+                        V_BOXES,
+                        TMA_VO_GRANU_ELEMS,
+                    )
+                else:
+                    tma_load_tile(
+                        sV[kv_state.idx],
+                        tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                        bars.mb_v_full[kv_state.idx].smem_ptr,
+                        cta_group=CFG.CTA_MMA,
+                        mcast_mask=tma_mcast_mask,
+                        acquire=not CFG.THD_VARLEN,
+                    )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
             for kv_loop in cutlass.range(kv_left + cutlass.Int32(1), kv_right, 1, unroll=1):
@@ -1205,37 +1216,38 @@ def _tmaldg_warp_group(
                         acquire=not CFG.THD_VARLEN,
                     )
 
-                bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-                if cutlass.const_expr(CFG.CTA_MMA == 2):
-                    bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
-                else:
-                    bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
-                if cutlass.const_expr(PAGED_KV):
-                    _paged_load_tile(
-                        sV[kv_state.idx],
-                        tma_v,
-                        block_table_v_tensor,
-                        batch_idx,
-                        kv_head_idx,
-                        n_pages_b,
-                        kv_loop,
-                        cutlass.Int32(0),
-                        V_COL_OFFSET_PEER,
-                        bars.mb_v_full[kv_state.idx].smem_ptr,
-                        tma_mcast_mask,
-                        V_BOX_ROWS,
-                        V_BOXES,
-                        TMA_VO_GRANU_ELEMS,
-                    )
-                else:
-                    tma_load_tile(
-                        sV[kv_state.idx],
-                        tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
-                        bars.mb_v_full[kv_state.idx].smem_ptr,
-                        cta_group=CFG.CTA_MMA,
-                        mcast_mask=tma_mcast_mask,
-                        acquire=not CFG.THD_VARLEN,
-                    )
+                if cutlass.const_expr(not SPLIT_PAGE_V):
+                    bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
+                    if cutlass.const_expr(CFG.CTA_MMA == 2):
+                        bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
+                    else:
+                        bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
+                    if cutlass.const_expr(PAGED_KV):
+                        _paged_load_tile(
+                            sV[kv_state.idx],
+                            tma_v,
+                            block_table_v_tensor,
+                            batch_idx,
+                            kv_head_idx,
+                            n_pages_b,
+                            kv_loop,
+                            cutlass.Int32(0),
+                            V_COL_OFFSET_PEER,
+                            bars.mb_v_full[kv_state.idx].smem_ptr,
+                            tma_mcast_mask,
+                            V_BOX_ROWS,
+                            V_BOXES,
+                            TMA_VO_GRANU_ELEMS,
+                        )
+                    else:
+                        tma_load_tile(
+                            sV[kv_state.idx],
+                            tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                            bars.mb_v_full[kv_state.idx].smem_ptr,
+                            cta_group=CFG.CTA_MMA,
+                            mcast_mask=tma_mcast_mask,
+                            acquire=not CFG.THD_VARLEN,
+                        )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1307,11 +1319,25 @@ def _tmastg_warp_group(
     o_desc_words,
     seqlen_kv,
     qh_per_kh,
+    tma_v_desc,
+    sV,
+    block_table_v_tensor,
+    seqlen_q,
+    tma_mcast_mask,
+    paged_hnd: cutlass.Constexpr[bool] = False,
 ):
     """Persistent O-store warp; tiles claimed via scheduler's try_cancel.async."""
     o_full_phase = cutlass.Int32(0)
 
     tma_o = GmemTileTma(tma_o_desc)
+    v_state = PipelineState.start(phase=1)
+    if cutlass.const_expr(SPLIT_PAGE_V):
+        nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
+        if cutlass.const_expr(paged_hnd):
+            v_map = GmemTileTma(tma_v_desc)
+            tma_v = lambda d, h, r, p: v_map(d, r, h, p)  # noqa: E731
+        else:
+            tma_v = GmemTileTma(tma_v_desc)
 
     q_super_idx, head_idx, batch_idx, split_idx = _decode_initial_split(
         sched.bidx_init,
@@ -1330,6 +1356,36 @@ def _tmastg_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+
+        if cutlass.const_expr(SPLIT_PAGE_V):
+            # Match the Q/K producer's work interval and preserve V's own ring
+            # phase across persistent tiles. The same MMA V-empty credits
+            # protect each refill; no barrier count or consumer changes.
+            live_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, batch_idx, seqlen_kv)
+            live_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
+            v_bounds = _bounds_for_tile_split(q_super_idx, live_q, live_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
+            n_pages = (live_kv + cutlass.Int32(PAGE_SIZE - 1)) // cutlass.Int32(PAGE_SIZE)
+            kv_head = cute.arch.make_warp_uniform(head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // qh_per_kh)
+            for v_tile in cutlass.range(v_bounds.left, v_bounds.right, 1, unroll=1):
+                bars.mb_v_empty[v_state.idx].wait(v_state.phase, spin=SPIN_RING_WAITS)
+                bars.mb_v_full[v_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
+                _paged_load_tile(
+                    sV[v_state.idx],
+                    tma_v,
+                    block_table_v_tensor,
+                    batch_idx,
+                    kv_head,
+                    n_pages,
+                    v_tile,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    bars.mb_v_full[v_state.idx].smem_ptr,
+                    tma_mcast_mask,
+                    V_BOX_ROWS,
+                    V_BOXES,
+                    TMA_VO_GRANU_ELEMS,
+                )
+                v_state = advance(v_state, CFG.STAGES_KV)
 
         q_row_base = q_super_idx * cutlass.Int32(Q_TILES_LIVE * TOKENS_PER_TILE)
         q_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE)

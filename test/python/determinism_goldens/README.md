@@ -4390,3 +4390,65 @@ compute-sanitizer --tool synccheck --error-exitcode 91 --report-api-errors no \
   python -m pytest -m L0 -q \
   'sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_two_kv_streams_match_the_reference[page16-unaligned]'
 ```
+
+
+### SM100 paged FP8 separate Q/K and V producers — validation, 2026-11-12 (UTC)
+
+The existing SM100 D128 paged dual-stream body gives V production to the
+O-store warp while the loader produces Q/K. V retains its own ring index and
+phase across persistent work items, using the existing MMA empty credits.
+Arithmetic, barrier counts, plan knobs and graph eligibility are unchanged.
+SM103 retains the existing producer path; no backward path changes.
+
+B200 and B300 SXM6 AC (148 SMs each) pass **43 cases, six deselected, no
+failures or skips**. Two D128/CGA1 parent golden cases per GPU are recorded
+into a fresh directory and strictly compared by the candidate with recording
+disabled. All four parent records equal the committed baselines. Two existing
+fixed-plan batch-invariance cases retain O/Stats bytes through reordered,
+duplicated, changed-neighbor and multiple-wave batches.
+
+The suite also runs all 30 existing dual-stream cases and eight new capture
+cases with an assertion on the actual producer flag (enabled on SM100,
+disabled on SM103). The new cases cover HND/NHD, independent V page tables,
+packing on/off, split 1/4, scheduling policies 0/1/2, causal bounds, odd tails,
+empty splits and persistent work. Each retained graph replays shorter, empty
+and restored live lengths 16 times each; restored O and Amax compare raw bytes
+with snapshots from the original execution. Independent numerical checks keep
+the original quantization bounds. No committed golden or tolerance changes.
+
+The existing four-block refilled-ring stress is included, with 256 warm and
+256 poisoned launches and the unsafe control. Both GPUs report zero mismatches
+and their unsafe controls fail 200/200. Its four-block geometry remains a
+limited-occupancy measurement, not a full-device stress claim.
+
+B200 Compute Sanitizer 2026.3 racecheck, memcheck and synccheck each pass all
+eight new capture cases. Racecheck reports zero hazards/errors/warnings;
+memcheck and synccheck report zero errors. Racecheck filters
+`kns=cudnn_kernel_`; the other tools are unfiltered. CUDA API error reporting
+is disabled. These B200 processes report FE cuDNN 93000 and Torch cuDNN 92400;
+the explicit FROST attention path does not execute backend attention.
+B300 has no new sanitizer result in this follow-up.
+
+Actual compiler/NVRTC 13.4 and CuTe DSL 4.8 are checked separately from the
+Torch 2.14.1+cu130 build label. Explicit FROST plans are required; source/import
+and library hashes are checked. Other architectures are unmeasured by this
+follow-up. The only postqualification kernel change removes experiment
+wording from a comment; the executable AST is identical.
+
+Reproduce from `test/python`, with the candidate checking the isolated parent
+golden directory through `CUDNN_DETERMINISM_GOLDENS` and recording disabled:
+
+```bash
+python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py
+python -m pytest -m L0 -q -k 'd128 and cga1' \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_small_paged_golden \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_small_paged_replay_and_batch_invariance
+python -m pytest -m L0 -q \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_paged_loader_warm_stress
+compute-sanitizer --tool memcheck --error-exitcode 91 --report-api-errors no \
+  python -m pytest -m L0 -q \
+  sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_split_producer_lengths_replay
+```
+
+Repeat the final command with `--tool synccheck`, and with
+`--tool racecheck --kernel-name kns=cudnn_kernel_`.
