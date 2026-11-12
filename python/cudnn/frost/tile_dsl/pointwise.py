@@ -1438,3 +1438,102 @@ def fp32_times_inv_to_e4m3(value: cutlass.Float32, inv_scale: cutlass.Float32) -
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     return cutlass.Uint32(word).to(cutlass.Uint8)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 under a GLOBAL scale, and the SiLU of the same decode chains.  A third NVFP4 scale
+# convention of this module -- :func:`e4m3_scale_from_amax` and :func:`e4m3_scale_rcp` are the
+# other two, each with OTHER bytes: here the block scale is ``e4m3(global_scale * (amax *
+# fp32(1/6)))`` with no floor, and the codes are ``e2m1(x * encode_scale)`` where
+# ``encode_scale`` comes from two APPROXIMATE reciprocals and is zero for a zero block scale.
+# Every spelling below is a rounding CONVENTION that a decode step reproduces byte for byte;
+# none may be swapped for a neighbour that computes "the same" quantity.
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def rcp_approx_ftz(x: cutlass.Float32) -> cutlass.Float32:
+    """PTX ``rcp.approx.ftz.f32`` -- the hardware's APPROXIMATE fp32 reciprocal, as ONE opaque op.
+
+    NOT :func:`rcp_div_rn` / :func:`div_rn_f32` (the IEEE division): the result is ``1 / x`` exactly for a power of two and at
+    most one unit in the last place from the correctly rounded reciprocal otherwise (normal operand, normal result).  ``.ftz``:
+    a zero or subnormal operand gives the infinity of its sign; an operand whose reciprocal would be subnormal, or an infinite
+    one, the zero of its sign.
+
+    ``cute.arch.rcp_approx`` is the same instruction as a compiler intrinsic and the same function of ``x``; the spelling
+    decides the instruction stream only.  The compiler may speculate an intrinsic out of a run-time guard: the zero rule of
+    :func:`nvfp4_block_scale_global` then renders as two unconditional reciprocals and a select, where this opaque statement
+    stays inside the guarded region.  Use this spelling where a rendering is pinned.  It is opaque to the DSL's optimizer, not
+    to the assembler, which applies its own identities to approximate instructions: a constant operand is folded to an
+    immediate, a reciprocal of this reciprocal is cancelled.  ``x`` must be a traced register (a folded float immediate on an
+    asm operand ICEs libNVVM, :func:`opaque_f32_bits`)."""
+    return inline_ptx("rcp.approx.ftz.f32 $0, $1;", write_only_types=[cutlass.Float32], read_only_args=[x])
+
+
+@cute.jit
+def e4m3_round(x: cutlass.Float32):
+    """``(byte, value)``, in that order: ``x`` rounded to E4M3 (round-to-nearest-even, saturating at +-448) as an ``Int32`` in
+    ``[0, 255]``, and that code widened EXACTLY to fp32 (e4m3 -> f16 -> f32, both conversions exact).
+
+    The plain pair: no multiply, no floor, no reciprocal.  ``|x| <= 2^-10`` rounds to the zero code, whose value is a signed
+    zero.  (:func:`e4m3_scale_from_amax` is this convert behind ``amax * fp32(1/6)`` and a ``2^-9`` floor and returns
+    ``(value, byte)``; :func:`e4m3_scale_rcp` returns ``(byte, 1 / value)`` with an IEEE division.)
+
+    The block's instruction order is part of the spelling: the convert takes a ZERO upper operand (the 16-bit pair is then the
+    code itself, no mask selects the byte) and the widen reads the code back from the 32-bit output register -- convert,
+    16-bit mask, widen.  That is the instruction sequence of the reference chain of this convention, so a kernel that
+    reproduces the chain renders its block-scale instructions unchanged.  Two other blocks return the same pair from another
+    stream: converting ``(x, x)`` and masking the low byte changes the convert's operand and drops an instruction; widening
+    the convert's own 16-bit register moves the mask behind the widen.  ``x`` must be a traced register."""
+    byte, value = inline_ptx(
+        "{ .reg .b16 p, q, lo, hi; .reg .b32 w; .reg .f32 z; "
+        "mov.f32 z, 0f00000000; "
+        "cvt.rn.satfinite.e4m3x2.f32 p, z, $2; "
+        "cvt.u32.u16 $0, p; "
+        "cvt.u16.u32 q, $0; "
+        "cvt.rn.f16x2.e4m3x2 w, q; "
+        "mov.b32 {lo, hi}, w; "
+        "cvt.f32.f16 $1, lo; }",
+        write_only_types=[cutlass.Int32, cutlass.Float32],
+        read_only_args=[x],
+    )
+    return byte, value
+
+
+@cute.jit
+def silu_ex2_div_approx(x: cutlass.Float32) -> cutlass.Float32:
+    """``x / (1 + 2^(x * fp32(-log2 e)))`` as ONE opaque block of four instructions: ``mul.f32`` by ``0xBFB8AA3B``,
+    ``ex2.approx.ftz.f32``, ``add.f32`` of 1, ``div.approx.f32``.
+
+    A rounding CONVENTION (the SiLU of an activation-then-quantize decode chain), not a general SiLU: :func:`sigmoid` is
+    ``tanh.approx``, the GEMM families multiply ``x`` by a sigmoid, and the fused linear-attention steps spell ``ex2.approx``
+    (no ``.ftz``) with ``div.full`` -- other bytes each; do not unify them.  The block is opaque, so no pass contracts the
+    multiply or the add into a neighbour.  The divide is approximate: where ``1 + 2^(-x log2 e)`` exceeds ``2^126`` (``x`` in
+    about (-88.73, -87.33)) its operand is outside the instruction's documented accuracy range; below that window the
+    exponential overflows and the result is ``-0``; at the positive end the exponential is flushed to zero and the result is
+    ``x``.  ``x`` must be finite and a traced register."""
+    return inline_ptx(
+        "{ .reg .f32 t, e, d; mul.f32 t, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 e, t; add.f32 d, e, 0f3F800000; div.approx.f32 $0, $1, d; }",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[x],
+    )
+
+
+@cute.jit
+def nvfp4_block_scale_global(amax: cutlass.Float32, global_scale: cutlass.Float32):
+    """``(byte, encode_scale)`` of one NVFP4 block under a GLOBAL scale.
+
+    ``byte, value = e4m3_round(global_scale * (amax * fp32(1/6)))`` -- the association is ``amax * fp32(1/6)`` FIRST, two
+    fp32 multiplies, the 1/6 as the bits of :func:`opaque_fp4_max_rcp` -- and ``encode_scale = 0`` when ``value`` is zero,
+    else ``rcp_approx_ftz(value * rcp_approx_ftz(global_scale))``.  The block's codes are ``fp32_to_e2m1x2`` of
+    ``x * encode_scale``; ``byte`` is the stored block scale (``Int32`` in ``[0, 255]``).
+
+    NOT :func:`e4m3_scale_from_amax` (no global scale, a ``2^-9`` floor, an IEEE division): another convention with other
+    bytes.  A zero block scale gives a ZERO multiplier, never an infinite one, so an all-zero or underflowing block encodes
+    as zeros.  The guard is a run-time branch around two opaque reciprocals (see :func:`rcp_approx_ftz`).  ``amax`` is the
+    block's non-negative maximum magnitude; a ``global_scale`` in ``[2^-100, 2^100]`` keeps both reciprocals normal."""
+    byte, value = e4m3_round(global_scale * (amax * opaque_fp4_max_rcp()))
+    encode_scale = cutlass.Float32(0)
+    if value != cutlass.Float32(0):
+        encode_scale = rcp_approx_ftz(value * rcp_approx_ftz(global_scale))
+    return byte, encode_scale
