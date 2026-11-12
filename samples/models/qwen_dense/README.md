@@ -106,11 +106,11 @@ is fed through the decode step and decoded greedily to an end token or to `--max
 printed; reasoning the model writes before its answer is part of that text.
 
 How long it takes, as orientation values of one run (compute capability 10.3, the default prompt, 256 new tokens, the
-checkpoint in the page cache): about two and a half minutes. About 6 s to read, merge, dequantise and compile; 14 s for the
-58 prompt tokens; 54 s for 225 new tokens, a quarter of a second per token on this stack; 12 s for the traced pass; and
-about a minute for the checks. The text is not streamed: it is printed after the report, so that printing is not part of
-a timed step. A run prints one line before the prompt and the decode loop (`[00] decoding: ...`) and one before the
-checks (`[00] checks on ...`), and nothing in between.
+checkpoint in the page cache): about two and a half minutes. About 6 s until the first step (import, read, merge,
+dequantise, compile, warm-up); 14 s for the 58 prompt tokens; 54 s for 225 new tokens, a quarter of a second per token on
+this stack; 12 s for the traced pass; and about a minute for the checks. The text is not streamed: it is printed after
+the report, so that printing is not part of a timed step. A run prints one line before the prompt and the decode loop
+(`[00] decoding: ...`) and one before the checks (`[00] checks on ...`), and nothing while either of the two runs.
 
 Memory, in GiB (2^30 bytes), as the memory lines of a run print it: the stack `fe-cublas`
 holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 56.7 GiB free with one
@@ -260,5 +260,5 @@ capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence fo
 6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
 Blackwell GPU: about 5 s to draw the weights, about a second to compile the fused step for the first sequence count (0.5
-to 2.4 s in the runs so far) and 0.3 s for the next, the rest for the decode and its checks. These are orientation values
-of single runs, not measurements of record.
+to 2.4 s in the runs so far) and 0.3 to 0.4 s for the next, the rest for the decode and its checks. These are orientation
+values of single runs, not measurements of record.
