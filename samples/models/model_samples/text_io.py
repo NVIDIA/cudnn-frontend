@@ -14,7 +14,8 @@ packages are imported here and nowhere else in the helper layer.  The template e
 library of these checkpoints sets up its own: an immutable sandbox with ``trim_blocks`` and ``lstrip_blocks``, the
 loop-controls extension, a ``tojson`` filter that does not escape HTML, ``raise_exception`` and ``strftime_now``.  Chat
 messages, tool schemas and tool results are all text by the time they are encoded: the template renders them, the
-tokenizer encodes the rendered prompt as it is (the template writes the special tokens itself).  Text comes back through
+tokenizer encodes the rendered prompt as it is (the template writes the special tokens itself), whole and unpadded
+whatever truncation or padding the ``tokenizer.json`` was saved with.  Text comes back through
 the library's incremental decoder, one per sequence, with special tokens left out.
 """
 
@@ -163,6 +164,10 @@ class TextIO:
             tokenizer = tokenizers.Tokenizer.from_file(os.path.join(directory, "tokenizer.json"))
         except Exception as error:  # the library raises a plain Exception for a file it cannot parse
             raise ValueError(f"--model {shown}: tokenizer.json is not a tokenizer the tokenizers package reads ({str(error)[:160]})") from None
+        # a tokenizer.json can carry the truncation and padding of the call it was last saved after; a prompt is encoded
+        # whole and unpadded, as the reference library encodes a chat prompt
+        tokenizer.no_truncation()
+        tokenizer.no_padding()
         settings = read_object("tokenizer_config.json")
         source = read("chat_template.jinja", required=False) or settings.get("chat_template")
         if not isinstance(source, str):

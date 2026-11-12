@@ -116,10 +116,11 @@ def helper_layer():
         del sys.modules[name]
 
 
-def _text_directory(directory: Path, template: str = TEMPLATE, opens_with_a_marker: bool = False) -> Path:
+def _text_directory(directory: Path, template: str = TEMPLATE, opens_with_a_marker: bool = False, saved_cut_and_padded: bool = False) -> Path:
     """The text files of a checkpoint directory, built here: a byte-level BPE tokenizer trained on a few sentences, with the
     turn markers as special tokens and the reasoning markers as ordinary added tokens; a chat template; the end tokens.
-    ``opens_with_a_marker`` gives the tokenizer a post-processor that puts a turn marker in front of what it encodes."""
+    ``opens_with_a_marker`` gives the tokenizer a post-processor that puts a turn marker in front of what it encodes;
+    ``saved_cut_and_padded`` saves it as after a call that truncated to 3 ids and padded to 8."""
     tokenizers = pytest.importorskip("tokenizers")
     from tokenizers import decoders, models, pre_tokenizers, processors, trainers
 
@@ -135,6 +136,9 @@ def _text_directory(directory: Path, template: str = TEMPLATE, opens_with_a_mark
         tokenizer.post_processor = processors.TemplateProcessing(
             single="<|im_start|> $A", special_tokens=[("<|im_start|>", tokenizer.token_to_id("<|im_start|>"))]
         )
+    if saved_cut_and_padded:
+        tokenizer.enable_truncation(max_length=3)
+        tokenizer.enable_padding(length=8, pad_id=tokenizer.token_to_id("<|endoftext|>"), pad_token="<|endoftext|>")
     directory.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(directory / "tokenizer.json"))
     (directory / "chat_template.jinja").write_text(template, encoding="utf-8")
@@ -330,6 +334,13 @@ def test_a_checkpoints_tokenizer_encodes_decodes_and_streams(tmp_path):
     marked = TextIO.from_checkpoint(str(_text_directory(tmp_path / "marked", opens_with_a_marker=True)))
     assert marked._tokenizer.encode("the sky").ids[0] == start, "this tokenizer adds a turn marker by itself when asked to"
     assert marked.encode("the sky").tolist() == text.encode("the sky").tolist(), "a rendered prompt is encoded as it is: the template wrote its markers"
+    saved = _text_directory(tmp_path / "saved", saved_cut_and_padded=True)
+    settings = json.loads((saved / "tokenizer.json").read_text())
+    assert settings["truncation"]["max_length"] == 3 and settings["padding"]["strategy"] == {"Fixed": 8}, "this tokenizer.json cuts and pads when asked nothing"
+    whole = TextIO.from_checkpoint(str(saved))
+    for sample in ("why is the sky blue", "the sky"):  # longer than the saved limit, shorter than the saved padding
+        assert whole.encode(sample).tolist() == text.encode(sample).tolist(), "a prompt is encoded whole and unpadded, whatever the file was saved with"
+    assert whole.encode_chat([{"role": "user", "content": "why is the sky blue"}]).tolist() == ids.tolist()
     (directory / "generation_config.json").unlink()
     (directory / "config.json").write_text(json.dumps({"text_config": {"eos_token_id": 7}}))
     assert TextIO.from_checkpoint(str(directory)).eos_ids == (7,), "without a generation config the end token is the model config's"
