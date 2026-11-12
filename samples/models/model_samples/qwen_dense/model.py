@@ -320,9 +320,12 @@ class QwenDense:
         return state
 
     def memory_bytes(self, sequences: int, capacity: int) -> int:
-        """What a run needs on the GPU besides a kernel's own reservation: the copies, the state and 2 GiB of working memory
-        (load-time temporaries, activations, the reference's fp64 temporaries during the checks, the allocator's slack)."""
-        return self.copy_bytes() + self.state_bytes(sequences, capacity) + 2 * GIB
+        """What a run needs on the GPU besides a kernel's own reservation: the copies, the state and working memory
+        (load-time temporaries, activations, the reference's fp64 temporaries during the checks, the allocator's slack):
+        2 GiB, or an eighth of the copies where that is more.  The slack grows with what the pool holds: with the published
+        checkpoint (50.1 GiB of copies) PyTorch reserved 55.2 GiB and the device grew by 55.4 GiB, 5.3 GiB beyond the copies."""
+        copies = self.copy_bytes()
+        return copies + self.state_bytes(sequences, capacity) + max(2 * GIB, copies // 8)
 
     def bytes_per_step(self, sequences: int, positions: int) -> Dict[str, int]:
         """What one decode step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a

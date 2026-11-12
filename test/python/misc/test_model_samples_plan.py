@@ -846,18 +846,23 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     assert 0.30e9 < step["state"] < 0.36e9, "48 recurrent states read and written, 16 key/value caches read"
     assert model.bytes_per_step(4, 343)["state"] == 4 * step["state"] and model.bytes_per_step(4, 343)["copies"] - step["copies"] == 3 * 2 * 5120
     need = model.memory_bytes(sequences=1, capacity=343)
-    assert 52 * GIB < need < 53 * GIB, "50.1 GiB of bf16 copies incl. the embedding table, the state of one sequence, 2 GiB of working memory"
+    copies = model.copy_bytes()
+    assert 50.0 * GIB < copies < 50.2 * GIB, "the bf16 copies incl. the embedding table"
+    assert need == copies + model.state_bytes(1, 343) + copies // 8, "working memory: an eighth of the copies where that is more than 2 GiB"
+    assert 56.5 * GIB < need < 57 * GIB, "above the 55.4 GiB a run with this checkpoint took from the device: a GPU with less is a SKIP, not an exception"
+    small = QwenDense.reduced(2)
+    assert small.memory_bytes(4, 64) == small.copy_bytes() + small.state_bytes(4, 64) + 2 * GIB, "the default run: 2 GiB, as before"
     text = model_samples.TextIO.synthetic(model.geometry.vocab)
     free = [31 * GIB]
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, free[0])))
-    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 55\.\d GiB on this GPU; 31.0 GiB are free: free memory on this GPU"):
+    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 59\.\d GiB on this GPU; 31.0 GiB are free: free memory on this GPU"):
         model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
     card = blocks.plan(model.provider_table, model.regimes, blocks.DeviceFacts((12, 0), "stated device", 170, int(31.84 * GIB), 31 * GIB), 1, model=model)
-    with pytest.raises(NotImplementedError, match=r"needs about 55\.\d GiB on this GPU; this GPU has 31.8 GiB in total: the run does not fit on it"):
+    with pytest.raises(NotImplementedError, match=r"needs about 59\.\d GiB on this GPU; this GPU has 31.8 GiB in total: the run does not fit on it"):
         card.memory(need)  # the same card with its total stated: the sentence says that no freeing helps
     free[0] = 80 * GIB
     table = model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
-    assert "this stack needs about 55." in table and "80.0 GiB are free" in table and "add_norm_quantize        129" in table and "48 / 16" in table
+    assert "this stack needs about 59." in table and "80.0 GiB are free" in table and "add_norm_quantize        129" in table and "48 / 16" in table
 
 
 def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_reference():

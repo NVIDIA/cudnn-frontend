@@ -78,11 +78,11 @@ is fed through the decode step and decoded greedily to an end token or to `--max
 printed; reasoning the model writes before its answer is part of that text.
 
 Memory, in GiB (2^30 bytes), as the memory lines of a run print it: the stack `fe-cublas`
-holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 52.4 GiB free with one
-sequence: the copies, the state and 2 GiB of working memory. For a checkpoint of this size that allowance is about 3 GiB
-short: on the run above PyTorch held 51.5 GiB at its peak, reserved 55.2 GiB from the device, and the device grew by
-55.4 GiB. A GPU with between 52.4 and about 56 GiB free therefore passes the plan and can run out of memory after the
-load, which is an exception, not a `SKIP`. A 32 GB GPU cannot run this stack with a checkpoint of this size; it prints the
+holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 56.7 GiB free with one
+sequence and the default prompt: the copies, the state and working memory, which is an eighth of the copies for a model
+of this size (2 GiB for the default run). A run with this checkpoint held 51.5 GiB in PyTorch at its peak, reserved
+55.2 GiB from the device, and the device grew by 55.4 GiB. A GPU with less free memory than the 56.7 GiB is a `SKIP`
+before a tensor is read. A 32 GB GPU cannot run this stack with a checkpoint of this size; it prints the
 memory sentence and exits 0. A stack on the stored formats, which needs less than half, arrives with the next step of
 this area.
 
