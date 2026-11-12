@@ -111,8 +111,8 @@ The entry states what a row count launches without launching it: three read-only
 | `form_for(rows)` | the form as plain data: `{"THREADS": ..., "PDL_RELEASE": ...}`, the fields of the config `cfg_for` returns with the launch knob applied. The compile key is the config alone, so nothing else is part of it. A fresh `dict` on every call |
 | `launch_shape_for(rows)` | `(grid, block, shared_memory)`: a flat grid of `ceil(rows x width / 8 / THREADS)` thread blocks, `THREADS` threads, no shared memory -- `((3, 1, 1), (256, 1, 1), 0)` for one row of width 6144. A profiler's kernel record of the launch reads the same three values |
 
-A row count outside 1 .. 160 is the entry's typed decline, and none of the three compiles, launches or touches device
-memory.
+A row count outside 1 .. 160 is a typed decline (`ValueError` for one that is not a positive `int`,
+`NotImplementedError` past 160), and none of the three compiles, launches or touches device memory.
 
 ## Support matrix
 

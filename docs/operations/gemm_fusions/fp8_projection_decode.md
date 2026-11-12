@@ -138,8 +138,9 @@ The entry states what a row count launches without launching it: three read-only
 | `launch_shape_for(rows)` | `(grid, block, shared_memory)`: grid `(OUT_FEATURES / MMA_M, split_k, 1)`, block `(256, 1, 1)` and the shared memory the launch reserves per thread block (the "shared memory per CTA" column of the pick table above) -- `((72, 4, 1), (256, 1, 1), 107904)` for one row of `ProjectionGeometry(4608, 8192)` at split 4 under the pick above. A profiler's kernel record of the launch reads the same three values |
 
 The symbol names the weight's shape and nothing of the split, the form or the row count: every rendering of one
-geometry shares it. Compare the form, not the name. A row count outside 1 .. 32 is the entry's typed decline, and none
-of the three compiles, launches or touches device memory.
+geometry shares it. Compare the form, not the name. A row count outside 1 .. 32 is a typed decline (`ValueError` for
+one that is not a positive `int`, `NotImplementedError` past 32), and none of the three compiles, launches or touches
+device memory.
 
 ## Support matrix
 

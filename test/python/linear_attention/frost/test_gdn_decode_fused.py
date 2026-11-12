@@ -910,21 +910,29 @@ def test_launch_shape_of_the_three_default_forms_on_the_cc100_readings():
 
 def test_launch_facts_are_plain_fresh_and_decline_an_unserved_rows_count():
     """The facts are plain data (ints, a JSON-serialisable form), a fresh object per call (a caller's edit reaches nothing of the entry)
-    and the entry's typed declines for a rows count it does not serve: ``ValueError`` below one or off the integers,
-    ``NotImplementedError`` past the grid's limit."""
+    and typed declines for a rows count no launch of the entry serves: ``ValueError`` below one or off the integers (a ``bool``
+    included), ``NotImplementedError`` past the grid's limit and past the 32-bit row-address bound of the entry's geometry (below the
+    grid's limit only on a hidden width past 32768: the bound every launch at that geometry has, whatever its operand strides)."""
     k = entry.GdnDecodeFused("cpu", 1e-6, pdl=True)
     form = k.form_for(3)
     assert json.loads(json.dumps(form)) == form and type(form) is dict and type(form["GEOM"]) is dict
     form["PDL"], form["GEOM"]["V_HEADS"] = "edited", 0
     assert k.form_for(3)["PDL"] is True and k.form_for(3)["GEOM"]["V_HEADS"] == kcfg.V_HEADS and k.cfg_for(3).GEOM.V_HEADS == kcfg.V_HEADS
-    assert _plain_ints(k.launch_shape_for(True)) and k.form_for(True)["ROWS"] == 1 and type(k.form_for(True)["ROWS"]) is int
+    assert _plain_ints(k.launch_shape_for(3)) and type(k.form_for(3)["ROWS"]) is int
     for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
-        for rows in (0, -1, 1.0, "1", None):
+        for rows in (0, -1, 1.0, "1", None, True):
             with pytest.raises(ValueError, match="rows must be a positive int"):
                 fact(rows)
         with pytest.raises(NotImplementedError, match="at most 65535"):
             fact(entry.MAX_ROWS + 1)
         fact(entry.MAX_ROWS)
+    wide = entry.GdnDecodeFused("cpu", 1e-6, geometry=gdn_geometry.Geometry(16, 48, 33792))
+    bound = entry.max_rows_for(0, 0, wide.geometry)
+    assert bound == 63550 < entry.MAX_ROWS, "the widest row of this geometry is its hidden width: 2^31 / 33792"
+    for fact in (wide.kernel_symbols_for, wide.form_for, wide.launch_shape_for):
+        fact(bound)
+        with pytest.raises(NotImplementedError, match="32-bit arithmetic: at most 63550 rows at .*hidden 33792; got rows=63551"):
+            fact(bound + 1)
 
 
 class _CompiledStandIn:

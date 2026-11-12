@@ -140,8 +140,11 @@ cut is not in the name -- with CuTe DSL 4.8.0 the two-CTAs-per-head field, the g
 kernels, and the launch knobs and the tokens per request of the verify kernel -- so two forms can share a symbol.
 Compare the form, not the name. On a cc 10.0 part at the default geometry, one request: decode
 `((96, 1, 1), (256, 1, 1), 42112)`, verify at six tokens `((96, 1, 1), (256, 1, 1), 126512)`, with or without `pdl`. A
-row count the entry does not serve is its typed decline (`ValueError` / `NotImplementedError`), and none of the three
-compiles, launches or touches device memory.
+step no launch of the entry serves is a typed decline: `ValueError` for a count that is not a positive `int` (or a
+`tokens` that is not an `int`), `NotImplementedError` past the grid's limit, past the 32-bit row-address bound of the
+decode entry's geometry, or for a tokens count outside the verify form's bounds on the part. A call's operand strides
+can bound the decode rows lower still; that decline is the call's. None of the three compiles, launches or touches
+device memory.
 
 ## Validation
 

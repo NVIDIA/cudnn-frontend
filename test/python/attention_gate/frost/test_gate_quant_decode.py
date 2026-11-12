@@ -388,8 +388,8 @@ def test_launch_shape_of_the_served_configs_at_the_recorded_slabs():
 
 def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
     """The facts are plain data, a fresh object per call (a caller's edit reaches nothing of the entry) and the entry's typed declines
-    for a row count outside 1 .. 160; a row count that is not an ``int`` is a ``TypeError`` that says so (never the per-row table's
-    index error)."""
+    for a row count outside 1 .. 160; a row count that is not an ``int`` is a ``ValueError`` that says so, as on every entry's launch
+    facts (never the per-row table's index error)."""
     k = entry.AttentionGateQuantDecode("cpu", 2048, pdl_release=True)
     form = k.form_for(7)
     assert json.loads(json.dumps(form)) == form == dict(THREADS=256, PDL_RELEASE=True) and type(form) is dict
@@ -402,7 +402,7 @@ def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
         with pytest.raises(NotImplementedError, match="at most 160 rows.*got 161"):
             fact(161)
         for rows in (1.0, "1", None, True):
-            with pytest.raises(TypeError, match="rows must be an int"):
+            with pytest.raises(ValueError, match="rows must be an int"):
                 fact(rows)
         fact(160)
 

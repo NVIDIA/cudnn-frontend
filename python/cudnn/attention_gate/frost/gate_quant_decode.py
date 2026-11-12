@@ -278,10 +278,11 @@ class AttentionGateQuantDecode:
 
     # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served row count ----
     def _fact_cfg(self, rows) -> Cfg:
-        """The config of the row count a launch fact is asked for: ``TypeError`` for a ``rows`` that is not an ``int`` (a float or a
-        string would otherwise reach the per-row table as an index), then the typed declines of :meth:`cfg_for`."""
+        """The config of the row count a launch fact is asked for: ``ValueError`` for a ``rows`` that is not an ``int`` (a float or a
+        string would otherwise reach the per-row table as an index; the decline every entry's launch facts give a malformed row
+        count), then the typed declines of :meth:`cfg_for`."""
         if isinstance(rows, bool) or not isinstance(rows, int):
-            raise TypeError(f"{NAME}: rows must be an int, got {type(rows).__name__}")
+            raise ValueError(f"{NAME}: rows must be an int, got {rows!r}")
         return self.cfg_for(rows)
 
     def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:

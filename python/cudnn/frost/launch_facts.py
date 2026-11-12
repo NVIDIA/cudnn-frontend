@@ -25,7 +25,12 @@ assumed one:
   shared memory per thread block) reads the same three values; every entry's device test holds that equality on compiled forms.
 
 The three are answers about a plan: none of them compiles, launches, allocates or reads device memory, and none changes what an entry
-compiles or launches.  A row count the entry does not serve is the entry's own typed decline.
+compiles or launches.  They decline alike on every entry: ``ValueError`` for a malformed argument (not an ``int``, a ``bool``, a row or
+request count below one), ``NotImplementedError`` for a well-formed one that no launch of the entry serves on this part (past the grid
+or the entry's row limit, a tokens count outside the form's bounds).
+
+They describe an entry whose call is ONE kernel launch, as each entry that states them is.  An entry that launches several kernels per
+call cannot state its launches with one shape and does not use these names for them.
 
 Importable without torch and without the CuTe DSL (python/cudnn/AGENTS.md, the import-time rules)."""
 
@@ -39,7 +44,8 @@ class LaunchShape(NamedTuple):
     """What one launch asks of the device.  ``grid`` and ``block`` are the ``(x, y, z)`` extents of the launch in thread blocks and in
     threads; ``shared_memory`` is the bytes of shared memory one thread block of the launch holds -- the kernel's static allocations plus
     what the launch reserves -- which is the figure a profiler's kernel record reports.  A plain tuple of plain values: it compares equal
-    to ``((gx, gy, gz), (bx, by, bz), shared_memory)`` and serialises as that."""
+    to ``((gx, gy, gz), (bx, by, bz), shared_memory)``.  JSON writes it as nested lists, which do not compare equal to a tuple: a reader
+    of a saved shape rebuilds ``LaunchShape(tuple(grid), tuple(block), shared_memory)`` before it compares."""
 
     grid: Tuple[int, int, int]
     block: Tuple[int, int, int]

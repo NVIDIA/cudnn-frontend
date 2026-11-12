@@ -389,25 +389,41 @@ class GdnDecodeFused:
         return self.forms[form]
 
     # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served rows count ----
+    def _fact_cfg(self, rows) -> Cfg:
+        """The config of the rows count a launch fact is asked for, behind the typed declines of a rows count NO launch of this entry
+        serves: ``ValueError`` for a ``rows`` that is not a positive ``int`` (a ``bool`` included), ``NotImplementedError`` past the
+        grid's limit (:func:`check_rows`) and past the 32-bit row-address bound of the entry's geometry (:func:`max_rows_for` at the
+        geometry's own row widths: below the grid's limit only on a hidden width past 32768).  A call's operand strides can bound the
+        rows count lower still; that decline belongs to the call (:func:`check_binding`)."""
+        if isinstance(rows, bool):
+            raise ValueError(f"{NAME}: rows must be a positive int, got {rows!r}")
+        check_rows(rows)
+        row_max = max_rows_for(0, 0, self.geometry)
+        if rows > row_max:
+            raise NotImplementedError(
+                f"{NAME} forms its row addresses in 32-bit arithmetic: at most {row_max} rows at {self.geometry.describe()}; got rows={rows}"
+            )
+        return self.cfg_for(rows)
+
     def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
         """The symbols of the kernels this entry has compiled for ``rows`` in the form :meth:`cfg_for` names: without repeats, in compile
         order, empty until a form of that rows count is compiled.  One rows count compiles once per operand layout (the row strides are
         compile-time constants), so several compiled kernels can stand behind it; they share one symbol wherever the layout sits behind
         the symbol's cut.  The symbol carries the head of the config's text only: it never proves a form (:meth:`form_for` states it)."""
-        cfg = self.cfg_for(check_rows(rows))
+        cfg = self._fact_cfg(rows)
         return kernel_symbols((fn for key, fn in self.compiled.items() if key[0] == rows and key[1] == cfg), NAME)
 
     def form_for(self, rows: int) -> Dict[str, Any]:
         """The form of ``rows`` as plain data: every field of the config :meth:`cfg_for` returns (the pick or the caller's ``cfg``, with
         this part's readings, the geometry as a nested ``dict`` and the launch knobs applied) plus ``ROWS`` and ``EPS``, the two facts of
         the compile key the config does not hold.  The operand strides a compile is also keyed on belong to a call, not to a rows count."""
-        return plain_form(self.cfg_for(check_rows(rows)), ROWS=int(rows), EPS=self.eps)
+        return plain_form(self._fact_cfg(rows), ROWS=int(rows), EPS=self.eps)
 
     def launch_shape_for(self, rows: int) -> LaunchShape:
         """``(grid, block, shared memory)`` of the launch of ``rows``: one thread block per (V head, request row) -- two per V head on the
         two-CTAs-per-head form -- so grid ``(V_HEADS x CTAS_PER_HEAD, rows, 1)``; ``THREADS`` threads; ``SMEM_BYTES`` of shared memory
         per thread block (the kernel's buffers plus the occupancy pad of the form)."""
-        cfg = self.cfg_for(check_rows(rows))
+        cfg = self._fact_cfg(rows)
         return LaunchShape((cfg.GEOM.V_HEADS * cfg.CTAS_PER_HEAD, int(rows), 1), (cfg.THREADS, 1, 1), cfg.SMEM_BYTES)
 
     @property

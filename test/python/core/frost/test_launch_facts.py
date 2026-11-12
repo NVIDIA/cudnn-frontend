@@ -53,7 +53,9 @@ class _Compiled:
 def test_a_launch_shape_is_a_plain_tuple_of_plain_values():
     shape = lf.LaunchShape((96, 1, 1), (256, 1, 1), 42112)
     assert shape == ((96, 1, 1), (256, 1, 1), 42112) and (shape.grid, shape.block, shape.shared_memory) == ((96, 1, 1), (256, 1, 1), 42112)
-    assert json.loads(json.dumps(shape)) == [[96, 1, 1], [256, 1, 1], 42112]
+    saved = json.loads(json.dumps(shape))
+    assert saved == [[96, 1, 1], [256, 1, 1], 42112] and saved != shape, "JSON writes nested lists: not equal to the tuple"
+    assert lf.LaunchShape(tuple(saved[0]), tuple(saved[1]), saved[2]) == shape, "a reader rebuilds the shape before it compares"
     grid, block, shared_memory = shape
     assert (grid, block, shared_memory) == shape
 
