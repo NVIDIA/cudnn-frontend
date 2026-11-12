@@ -277,22 +277,29 @@ class AttentionGateQuantDecode:
         return (self.cfg_for(rows),)
 
     # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served row count ----
+    def _fact_cfg(self, rows) -> Cfg:
+        """The config of the row count a launch fact is asked for: ``TypeError`` for a ``rows`` that is not an ``int`` (a float or a
+        string would otherwise reach the per-row table as an index), then the typed declines of :meth:`cfg_for`."""
+        if isinstance(rows, bool) or not isinstance(rows, int):
+            raise TypeError(f"{NAME}: rows must be an int, got {type(rows).__name__}")
+        return self.cfg_for(rows)
+
     def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
         """The symbol of the kernel this entry has compiled for the config of ``rows``: a one-element tuple, empty until that config is
         compiled.  One compiled kernel serves every row count that shares the config (neither the row count nor the width enters it)."""
-        fn = self.compiled.get(self.key(rows))
+        fn = self.compiled.get((self._fact_cfg(rows),))
         return kernel_symbols(() if fn is None else (fn,), NAME)
 
     def form_for(self, rows: int) -> Dict[str, Any]:
         """The form of ``rows`` as plain data: the fields of the config :meth:`cfg_for` returns (the pick or the caller's ``cfg``, the
         launch knob applied).  The compile key is the config alone, so nothing else is part of it: the row count and the width are
         runtime facts of a launch (:meth:`launch_shape_for`)."""
-        return plain_form(self.cfg_for(rows))
+        return plain_form(self._fact_cfg(rows))
 
     def launch_shape_for(self, rows: int) -> LaunchShape:
         """``(grid, block, shared memory)`` of the launch of ``rows``: a flat grid of ``ceil(rows x width / 8 / THREADS)`` thread blocks
         (eight elements per thread: the launcher's own arithmetic, ``blocks_for``), ``THREADS`` threads, no shared memory."""
-        cfg = self.cfg_for(rows)
+        cfg = self._fact_cfg(rows)
         return LaunchShape((blocks_for(rows * self.width, cfg.THREADS), 1, 1), (cfg.THREADS, 1, 1), 0)
 
     def _default_out(self):
