@@ -2700,6 +2700,7 @@ class TestNativeFp8Decode:
     test_packed_g3_decline = staticmethod(_decode.test_native_fp8_decode_keeps_packed_g3_decline)
     test_optional_outputs = staticmethod(_decode.test_native_fp8_decode_optional_outputs)
     test_direct_partial_log_base = staticmethod(_decode.test_native_fp8_decode_direct_partial_log_base)
+    test_score_release = staticmethod(_decode.test_native_fp8_decode_score_release)
 
 
 @pytest.mark.L0

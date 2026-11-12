@@ -139,53 +139,56 @@ def test_native_fp8_decode_graph(in_key, out_dtype, sq, group, split, stats, hnd
 
     original = check("eager")
     capture = torch.cuda.CUDAGraph()
-    # Warm the exact public binder, then use its current-stream resolution in capture.
-    torch.cuda.set_sync_debug_mode("error")
     try:
-        before = torch.cuda.memory_stats()["allocation.all.allocated"]
-        execute()
-        assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-        with torch.cuda.graph(capture):
+        # Warm the exact public binder, then use its current-stream resolution in capture.
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
             execute()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+            with torch.cuda.graph(capture):
+                execute()
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+        def poison():
+            buf["o"].view(torch.uint8).fill_(127)
+            buf["amax_o"].fill_(999)
+            if stats:
+                buf["lse"].fill_(torch.nan)
+
+        poison()
+        capture.replay()
+        assert check("retained") == original
+        changed_names = ("descale_q", "descale_k", "descale_v", "scale_o", "v")
+        saved = {n: buf[n].clone() for n in changed_names}
+        buf["descale_q"].mul_(-0.7)
+        buf["descale_k"].mul_(1.3)
+        poison()
+        capture.replay()
+        changed = check("first_changed_qk_scales")
+        assert changed[0] != original[0]
+        buf["descale_v"].mul_(0.6)
+        buf["scale_o"].fill_(1.9)
+        poison()
+        capture.replay()
+        next_changed = check("first_changed_vo_scales")
+        assert next_changed[0] != changed[0] and next_changed[1] != changed[1]
+        v_before = digest(buf["v"])
+        buf["v"].copy_((-buf["v"].float()).to(buf["v"].dtype))
+        assert digest(buf["v"]) != v_before, "V negative control must change encoded inputs"
+        poison()
+        capture.replay()
+        assert check("first_changed_v")[0] != next_changed[0]
+        for n, v in saved.items():
+            buf[n].copy_(v)
+        poison()
+        capture.replay()
+        assert check("restored") == original
+        assert prepared.spec.owner is owner
     finally:
-        torch.cuda.set_sync_debug_mode("default")
-
-    def poison():
-        buf["o"].view(torch.uint8).fill_(127)
-        buf["amax_o"].fill_(999)
-        if stats:
-            buf["lse"].fill_(torch.nan)
-
-    poison()
-    capture.replay()
-    assert check("retained") == original
-    changed_names = ("descale_q", "descale_k", "descale_v", "scale_o", "v")
-    saved = {n: buf[n].clone() for n in changed_names}
-    buf["descale_q"].mul_(-0.7)
-    buf["descale_k"].mul_(1.3)
-    poison()
-    capture.replay()
-    changed = check("first_changed_qk_scales")
-    assert changed[0] != original[0]
-    buf["descale_v"].mul_(0.6)
-    buf["scale_o"].fill_(1.9)
-    poison()
-    capture.replay()
-    next_changed = check("first_changed_vo_scales")
-    assert next_changed[0] != changed[0] and next_changed[1] != changed[1]
-    v_before = digest(buf["v"])
-    buf["v"].copy_((-buf["v"].float()).to(buf["v"].dtype))
-    assert digest(buf["v"]) != v_before, "V negative control must change encoded inputs"
-    poison()
-    capture.replay()
-    assert check("first_changed_v")[0] != next_changed[0]
-    for n, v in saved.items():
-        buf[n].copy_(v)
-    poison()
-    capture.replay()
-    assert check("restored") == original
-    assert prepared.spec.owner is owner
-    capture.reset()
+        capture.reset()
 
 
 @pytest.mark.parametrize("feature", ["g3_unpacked", "mha", "q8_mha", "page8", "page256", "head_padding", "d80v112", "causal_window", "sink"])
@@ -302,9 +305,9 @@ def test_native_fp8_decode_optional_outputs(in_key, stats, amax, log2, split, mo
     names = ("o",) + (("lse",) if stats else ()) + (("amax_o",) if amax else ())
     baseline = snapshot({name: buf[name] for name in names})
     capture = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(capture):
-        graph.execute(vp, ws)
     try:
+        with torch.cuda.graph(capture):
+            graph.execute(vp, ws)
         buf["o"].fill_(torch.nan)
         if stats:
             buf["lse"].fill_(torch.nan)
@@ -314,8 +317,10 @@ def test_native_fp8_decode_optional_outputs(in_key, stats, amax, log2, split, mo
         if not amax:
             assert buf["amax_o"].item() == 999
     finally:
-        torch.cuda.synchronize()
-        capture.reset()
+        try:
+            torch.cuda.synchronize()
+        finally:
+            capture.reset()
 
 
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
@@ -368,3 +373,53 @@ def check_architecture_route(monkeypatch):
     assert checked
     expected = "decode_d128_fp8.py" if _SM == 100 else "prefill_d128_fp8.py"
     assert loaded[-1].__file__.endswith("sm100/" + expected)
+
+
+@pytest.mark.parametrize("dtype_qkv,dtype_o,split", [(0, 0, 1), (1, 2, 4), (0, 3, 4), (1, 0, 1)])
+def test_native_fp8_decode_score_release(tmp_path, dtype_qkv, dtype_o, split):
+    """The production score-credit address must depend on all eight TMEM words."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import textwrap
+
+    import warm_stress
+
+    source = textwrap.dedent("""
+        import faulthandler, sys
+        faulthandler.dump_traceback_later(150, exit=True)
+        sys.meta_path[:] = [f for f in sys.meta_path if "editable" not in str(f).lower()]
+        sys.path[:0] = sys.argv[1:3]
+        from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+        from cudnn.sdpa.fwd.config_sm100 import TemplateParamsDecode
+        params = TemplateParamsDecode(
+            dtype_qkv=int(sys.argv[3]), dtype_o=int(sys.argv[4]), split_kv=int(sys.argv[5]),
+            cta_mma=1, paged_kv=True, page_size=16, seq_kv_lens_present=True,
+            decode_q_tile=16, decode_live_columns=8,
+        )
+        mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=True)
+        assert mod.__file__.endswith("decode_d128_fp8.py")
+        mod.compile_prepared()
+    """)
+    test_root = Path(__file__).resolve().parents[2]
+    source_root = test_root.parents[1] / "python"
+    env = dict(
+        os.environ,
+        CUTE_DSL_DUMP_DIR=str(tmp_path),
+        CUTE_DSL_KEEP="ptx,cubin",
+        CUTE_DSL_ARCH="sm_100a",
+        CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1",
+        CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO="0",
+    )
+    argv = [sys.executable, "-c", source, str(source_root), str(test_root), str(dtype_qkv), str(dtype_o), str(split)]
+    try:
+        result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"score release compile timed out:\n{exc.stdout}\n{exc.stderr}")
+    assert result.returncode == 0, result.stdout + result.stderr
+    bodies = [p.read_text() for p in tmp_path.glob("*.ptx") if "tcgen05.mma" in p.read_text()]
+    assert len(bodies) == 1, f"expected one attention PTX, found {len(bodies)}"
+    sites = warm_stress.assert_release_dependence(bodies[0], sites=1, words=8)
+    (site,) = [site for site in sites if site.dependent]
+    assert site.loads == 1 and site.loaded_registers == 8

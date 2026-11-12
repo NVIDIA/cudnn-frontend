@@ -161,12 +161,12 @@ def _runner(dtype, out_dtype, sq, h, d, dv, split, amax, stats, log2):
             torch.cuda.set_sync_debug_mode(mode)
         result = reference(t)
         if capture:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                launch()
             baseline = snapshot(result)
             saved_v = v.clone()
+            graph = torch.cuda.CUDAGraph()
             try:
+                with torch.cuda.graph(graph):
+                    launch()
                 v.copy_((-v.float()).to(dtype))
                 t["o"].view(torch.uint8).fill_(127)
                 ws.fill_(255)
@@ -176,9 +176,11 @@ def _runner(dtype, out_dtype, sq, h, d, dv, split, amax, stats, log2):
                 graph.replay()
                 assert_bitwise(reference(t), baseline, "restored retained capture")
             finally:
-                torch.cuda.synchronize()
-                graph.reset()
-                v.copy_(saved_v)
+                try:
+                    torch.cuda.synchronize()
+                finally:
+                    graph.reset()
+                    v.copy_(saved_v)
         assert_bitwise(inputs, before, "input mutation")
         return result
 

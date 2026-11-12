@@ -47,6 +47,7 @@ CFG, _TMA = make_cfg_d128_fp8_decode(PARAMS)
 FP8 = True
 
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance, launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import tma_load_tile
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
@@ -594,6 +595,7 @@ def _softmax_warp_group(
     descale_v_t: cute.Tensor,
     scale_o_t: Optional[cute.Tensor],
     amax_o_tensor: Optional[cute.Tensor],
+    rz,
     use_pdl: cutlass.Constexpr[bool] = False,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
@@ -651,7 +653,8 @@ def _softmax_warp_group(
         s_raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + s_off + col0, cutlass.Float32), num=COLS)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-        bars.mb_s_empty[par].arrive()
+        # Every score word contributes to the release address before the slot is reused.
+        consume_then_arrive(bars.mb_s_empty[par], s_raw, rz)
 
         key_abs = kv_tile * cutlass.Int32(TILE_N) + lane
         # Per-column (= per Q row) mask in the transposed orientation: the key
@@ -925,7 +928,9 @@ def _kernel(
     # Programmatic dependent launch (the launch attribute is set by the host entry under the same flag): each role waits on the
     # dependent grid right after its own prologue and before its first global read, and the TMA role releases the dependent grid.
     use_pdl: cutlass.Constexpr[bool] = False,
+    rz_arg: cutlass.Int32 = 0,
 ) -> None:
+    rz = release_zero(rz_arg)
     # The following combine owns the reduction; one producer initializes it.
     if cutlass.const_expr(SPLIT_KV > 1 and amax_o_tensor is not None):
         _initialize_split_amax(amax_o_tensor)
@@ -1065,6 +1070,7 @@ def _kernel(
             descale_v_t=descale_v_t,
             scale_o_t=scale_o_t,
             amax_o_tensor=amax_o_tensor,
+            rz=rz,
             use_pdl=use_pdl,
         )
     elif warp_idx == MMA_WARP_ID:
@@ -1195,7 +1201,7 @@ def _host(
         n_tok_units,
     )
 
-    _kernel(*kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, False).launch(
+    _kernel(*kernel_args, block_table_tensor, block_table_v_tensor, paged_hnd, False, cutlass.Int32(0)).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
         stream=stream,
