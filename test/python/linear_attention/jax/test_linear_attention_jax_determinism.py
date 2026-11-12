@@ -104,16 +104,25 @@ def target_result(kind, result, selected, slot):
     return target
 
 
-@pytest.mark.parametrize("kind", OPERATIONS, ids=lambda kind: kind + "-bf16-fprop-bprop")
-def test_batch_invariance(kind):
-    selected, options = samples(kind, (65, 0, 17, 17))
+@pytest.mark.parametrize("kind", OPERATIONS)
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bf16-fprop-bprop", "fp16-fprop-bprop"])
+def test_batch_invariance(kind, dtype):
+    selected, options = samples(kind, (65, 0, 17, 17), dtype=dtype)
     target, empty, neighbor, changed = selected
-    expected = execute(kind, pack([target]), options)
+    packed_target = pack([target])
+    values, cu, do, ds = packed_target
+    _, expected_grads = reference(kind, values, np.asarray(cu), do, ds, **options)
+    shared = ("da", "dd", "ddt_bias") if kind == "mamba2" else ("da_log", "ddt_bias")
+    expected = {name: value for name, value in execute(kind, packed_target, options).items() if name not in shared}
     for layout, slot in (([target, empty, neighbor], 0), ([neighbor, target, empty], 1), ([target, target], 1), ([changed, empty, target], 2)):
         # Parameter gradients sum over sequences. Isolate the target's fixed loss.
         isolated = [(values, do if i == slot else jnp.zeros_like(do), ds if i == slot else jnp.zeros_like(ds)) for i, (values, do, ds) in enumerate(layout)]
         actual = target_result(kind, execute(kind, pack(isolated), options), isolated, slot)
-        assert_bitwise(actual, expected, f"target slot {slot}, lengths {[x[0]['q'].shape[0] for x in layout]}")
+        sequence_results = {name: value for name, value in actual.items() if name not in shared}
+        assert_bitwise(sequence_results, expected, f"target slot {slot}, lengths {[x[0]['q'].shape[0] for x in layout]}")
+        # Shared reductions repeat for fixed shapes; repacking can change their summation order.
+        for name in shared:
+            assert_close(actual[name].float().numpy(), expected_grads[name[1:]], 0.04 if dtype == jnp.bfloat16 else 0.03)
 
 
 @pytest.mark.parametrize("kind", OPERATIONS, ids=lambda kind: kind + "-bf16-fprop-bprop")
