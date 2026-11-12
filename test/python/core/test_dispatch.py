@@ -975,11 +975,7 @@ def test_sole_implementation_families_are_never_gated(monkeypatch):
     monkeypatch.delenv(manifest._ENABLE_ENV, raising=False)
     for name in ("gdn", "kda", "gdn2"):
         family = _family(name)
-        default_ids = {
-            engine_name: family.engine_id + slot.slot
-            for engine_name, slot in family.slots.items()
-            if not slot.opt_in
-        }
+        default_ids = {engine_name: family.engine_id + slot.slot for engine_name, slot in family.slots.items() if not slot.opt_in}
         assert default_ids, f"{name} must retain a default implementation"
         assert family.offered_ids() == default_ids, f"{name} must offer only default engines without the opt-in flag"
 
