@@ -46,8 +46,9 @@ from typing import Any, Dict, Optional, Tuple
 
 from cudnn._torch_stream import device_context  # imports no framework at module level
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
-from .kernel.gate_quant_decode_config import MAX_ROWS, Cfg, default_cfg, validate_cfg, validate_rows, validate_width
+from .kernel.gate_quant_decode_config import MAX_ROWS, Cfg, blocks_for, default_cfg, validate_cfg, validate_rows, validate_width
 
 #: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts only.
 SUPPORTED_CC_RANGES = ((100, 109),)
@@ -232,7 +233,9 @@ class AttentionGateQuantDecode:
     the config as a whole, without it the entry takes the pick for each row count on this part (``default_cfg``: one config today);
     ``pdl_release`` is the launch knob (None = the config's own field; the default: off).  The device is resolved to a concrete CUDA
     ordinal at construction, and every operand of every compile / launch must live on exactly it.  An entry built for a non-CUDA device
-    (host tests) runs every decline; its compile raises the typed decline of the device."""
+    (host tests) runs every decline; its compile raises the typed decline of the device.  What a row count launches is readable without
+    a launch: :meth:`kernel_symbols_for`, :meth:`form_for` and :meth:`launch_shape_for` (the launch facts of
+    :mod:`cudnn.frost.launch_facts`)."""
 
     def __init__(self, device, width: int, cfg: Optional[Cfg] = None, *, pdl_release: Optional[bool] = None):
         self.device = resolve_device(device)
@@ -272,6 +275,25 @@ class AttentionGateQuantDecode:
         enters the compiled kernel: the slabs bind with a dynamic extent (:func:`_flat`) and the element count is a runtime argument, so
         the kernel compiled at the first call is the one the suite's rendering cell pins, whatever that call's shape was."""
         return (self.cfg_for(rows),)
+
+    # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served row count ----
+    def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
+        """The symbol of the kernel this entry has compiled for the config of ``rows``: a one-element tuple, empty until that config is
+        compiled.  One compiled kernel serves every row count that shares the config (neither the row count nor the width enters it)."""
+        fn = self.compiled.get(self.key(rows))
+        return kernel_symbols(() if fn is None else (fn,), NAME)
+
+    def form_for(self, rows: int) -> Dict[str, Any]:
+        """The form of ``rows`` as plain data: the fields of the config :meth:`cfg_for` returns (the pick or the caller's ``cfg``, the
+        launch knob applied).  The compile key is the config alone, so nothing else is part of it: the row count and the width are
+        runtime facts of a launch (:meth:`launch_shape_for`)."""
+        return plain_form(self.cfg_for(rows))
+
+    def launch_shape_for(self, rows: int) -> LaunchShape:
+        """``(grid, block, shared memory)`` of the launch of ``rows``: a flat grid of ``ceil(rows x width / 8 / THREADS)`` thread blocks
+        (eight elements per thread: the launcher's own arithmetic, ``blocks_for``), ``THREADS`` threads, no shared memory."""
+        cfg = self.cfg_for(rows)
+        return LaunchShape((blocks_for(rows * self.width, cfg.THREADS), 1, 1), (cfg.THREADS, 1, 1), 0)
 
     def _default_out(self):
         """The entry-owned output buffer ``[160, width]`` E4M3 (see the module docstring for its lifetime)."""
