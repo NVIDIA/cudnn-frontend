@@ -2736,9 +2736,9 @@ def test_sm100_paged_d64_d256_prefix_defaults_to_the_packed_split(d, h_q, h_kv, 
         dict(causal=False, bottom_right=False),
         dict(device_cc=(10, 7), device_sm_count=208),
         dict(s_kv=512),
-        dict(dtype=cudnn.data_type.HALF),
+        dict(dtype=cudnn.data_type.FP8_E4M3),
     ],
-    ids=["full-grid", "mha", "mask-free", "rubin", "short-kv", "f16"],
+    ids=["full-grid", "mha", "mask-free", "rubin", "short-kv", "fp8"],
 )
 def test_sm100_paged_packed_split_stays_inside_its_domain(over):
     from cudnn.sdpa.fwd.heuristics import sm100_paged_packed_split_choice
@@ -2798,10 +2798,10 @@ def test_sm100_paged_d256_mha_prefix_leads_unsplit():
         dict(b=17),
         dict(s_kv=65537),
         dict(s_q=8),
-        dict(dtype=cudnn.data_type.HALF),
+        dict(dtype=cudnn.data_type.FP8_E4M3),
         dict(window_left=128),
     ],
-    ids=["rubin", "total_q", "b17", "kv_past_64k", "q8", "f16", "window"],
+    ids=["rubin", "total_q", "b17", "kv_past_64k", "q8", "fp8", "window"],
 )
 def test_sm100_paged_tail_split_stays_inside_its_study(over):
     from cudnn.sdpa.fwd import heuristics, placement
