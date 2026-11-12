@@ -3678,6 +3678,57 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest -q -m L0 sdpa/frost/test_sdpa_fp8_sm107.py::TestD256Mxfp8PhysicalOrigins
 ```
 
+### SM100 half / per-tensor FP8 D512 THD physical origins — 2026-11-11
+
+`test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins` collects 42 L0 cases:
+4 shared `test_mhas_v2` regressions, 12 reference/rebind/replay/batch cases,
+6 no-total-hint cases, 8 half head-envelope cases and 12 goldens. FP16/BF16
+each run both the role-split and 2x2 half implementations; E4M3/E5M2 run
+the FP8 implementation. Every
+expanded case asserts the actual kernel template, so a sibling implementation
+cannot satisfy its check. All plans retain the existing unsplit/unpacked
+contract and cover token/head-major Stats.
+
+Independent Q/K/V/O/Stats origins use mixed INT32/INT64 buffers and element
+multipliers. The fixture poisons input gaps with NaNs and checks output
+canaries, independent FP64 references, fresh pointer/stride bindings and
+retained capture after changing live lengths, origins and scalar scales.
+All-empty query work must leave output padding untouched. Exact-byte checks
+cover repeats, batch reorder/duplication, an isolated sequence and changed
+neighbors. Prepared and standalone graph execution must agree. D512 uses
+16-element Q/K multipliers so its +16 head-padding variant still represents
+whole physical token rows exactly. Eight additional half cases cover
+D384/V448 and D264/V504 in both implementations and dtypes; the latter
+uses an 8-element origin unit that divides its declared token stride.
+
+Measured runtime: SM100, 148 SMs; driver 595.71.05; Torch 2.14.1+cu130;
+cuDNN 9.24.0.43; DSL 4.8.0/compiler CUDA 12.9; tvm-ffi 0.1.14.post1.
+The final suite passes all 42 cases in 52.62 seconds, with zero failures or
+skips, including strict checks of twelve new goldens under
+`361d6da48de8fd55`. These were recorded after their references and byte
+comparisons passed; earlier goldens and tolerances are unchanged. The
+paired-host ABI detector passes separately. All 23 neighbor controls pass:
+compact D512 FP8 THD, dense output/amax, existing half dense/THD and D576
+physical-origin packed/split paths.
+The immediate parent fails all three shared D512 dtype cases. The first
+expanded candidate exposed seven 2x2 declines caused by an obsolete D576-only
+origin compile guard; removing it enables the existing D512 origin body.
+All six SM103 lowerings compile offline; execution there remains unverified.
+
+Compute Sanitizer memcheck, racecheck and synccheck each pass eight cases:
+the six token-major replay legs and both BF16 D264/V504 implementations.
+All report zero errors; racecheck reports zero hazards and warnings. Runtimes
+are 6.64, 341.42 and 4.67 seconds respectively. The private launcher initializes
+cuda-python before Torch for the procedure-lookup issue documented above;
+API reporting remains explicit, with all kernels instrumented and error exit
+code 86. No sanitizer diagnostics are suppressed.
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
+```
+
 ### SM100 D256 paged THD packed split — 2026-11-11
 
 `sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit` is collected
@@ -3714,6 +3765,78 @@ cd test/python
 CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit
 ```
+
+### SM100 D512 TMEM reader lifetime — 2026-11-12
+
+`TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers` adds three
+L0 cases (BF16, E4M3, E5M2). A temporary template delays one output warp and
+records completion of each warp's final TMEM load and the deallocation.
+It uses the existing synthetic physical-origin fixture, including reference,
+batch-invariance, changed-binding and retained live/empty graph checks. The
+assertion compares event order; it has no duration threshold. No production
+debug argument is added.
+
+Before the terminal reader join, all three cases fail the lifetime assertion
+in 10.96 seconds, although their numerical checks pass. With the join, the
+full D512 class passes all 48 cases in 94.30 seconds, with no failures/skips.
+This includes the twelve unchanged committed goldens and the existing Stats
+reader checks. Runtime: SM100/148SM, Torch 2.14.1+cu130, cuDNN 9.24.0.43,
+DSL 4.8.0 with actual compiler CUDA 13.4; all three artifact caches disabled.
+The same native extension is reused because no native source changed.
+
+The three new cases also pass Compute Sanitizer 13.4 memcheck and synccheck
+(12.46 and 12.29 seconds), with zero errors. The retained four-case selection
+passes racecheck 13.2 in 179.45 seconds, with zero hazards/errors/warnings;
+kernel compilation remains CUDA 13.4. These are local candidate results.
+
+This establishes and repairs a TMEM lifetime violation. It does not by itself
+attribute or clear the separately retained instrumented numerical failure.
+SM103 execution remains unverified; no golden or tolerance is changed.
+
+```bash
+cd test/python
+python -m pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
+```
+
+### D512 paired-CTA reader completion — 2026-11-12 follow-up
+
+The terminal four-warp join above still allowed an MMA warp to proceed
+before its own CTA's readers finished: its barrier counted only the peer
+CTA's completion. The role-split half/FP8 paths now send one elected local
+credit and one elected peer credit after each four-warp join. Each MMA warp
+waits for both reader groups. This retains the existing 2x2 path's
+local-plus-peer completion requirement and adds no mainloop synchronization.
+
+The lifetime regression now has nine cases: BF16/E4M3/E5M2 crossed with a
+delay in both output CTAs, only the even CTA, or only the odd CTA. It checks
+both CTAs' final TMEM loads against each deallocation. On unchanged
+`b70a558b4ea2`, the three symmetric cases pass but all six one-sided cases
+fail the event-order assertion (28.34s); output numerics still pass there.
+With the two-credit protocol, all nine pass (29.28s). A separate synthetic
+racecheck control removes only the local credit and its count from the
+candidate's temporary template: the even-CTA BF16 case fails the same
+ordering assertion, with zero reported hazards. That control is not a
+reproduction of the reviewer's numerical failure.
+
+The current-head reviewer still observed numerical/repeatability failures on
+`b70a558b4ea2` after the earlier join. Those results remain valid; this new
+local evidence does not by itself clear the reviewer's original setup.
+No seed, reference tolerance or golden is changed.
+
+The expanded full D512 class passes 54 cases, zero failures/skips, in 101.85s
+on the same SM100/148SM runtime, including all 12 unchanged committed
+goldens. All artifact caches remain disabled. Four changed SM103 variants
+(FP16/BF16 half and E4M3/E5M2 per-tensor FP8) compile offline with CUDA 13.4;
+SM103 execution remains unverified. The 2x2 and native binding sources are
+unchanged.
+
+CUDA 13.4 memcheck and synccheck each pass all nine lifetime variants with
+zero errors (34.04s and 30.95s). The separate racecheck runs pass the
+original four-case selection/order (182.94s) and an even-CTA BF16 lifetime
+case (56.87s), with zero hazards/errors/warnings. Kernel compilation remains
+CUDA 13.4 when using the available 13.2 racecheck tool. These local passes
+do not replace requalification in the original reviewer environment.
 
 ### SM100 single-sequence physical-origin setup — 2026-11-12 (UTC)
 
