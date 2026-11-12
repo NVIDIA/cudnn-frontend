@@ -252,6 +252,7 @@ def _run_dsl_graph(
     return_stats: bool = False,
     stats_use_log2: bool = False,
     stats_layout: str = "contiguous",
+    explicit_plan: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Build, select, and execute the SM120 FROST graph engine.
 
@@ -332,8 +333,18 @@ def _run_dsl_graph(
 
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A])
-    plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
+    if explicit_plan:
+        from cudnn.engines.manifest import engines_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        selected = next(engine for engine in engines_for(graph) if engine.name == engine_name(arch="sm120"))
+        knobs = SdpaFwdKnobs(cga=1, tile_m=q_tile, tile_n=kv_tile, sched_policy=0, split_kv=1, pack_gqa=pack_gqa)
+        graph.create_execution_plan(selected.engine_id, knobs)
+        graph.select_plan(0)
+        plan = graph.plans[0]
+    else:
+        graph.create_execution_plans([cudnn.heur_mode.A])
+        plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Native dense plans have no dummy LSE scratch. Split plans add the
@@ -1682,7 +1693,7 @@ def test_dsl_sm120_pack_gqa_tile_q_not_divisible_features(mask: str):
 
 @pytest.mark.L0
 def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
-    """Every template packs any group up to the tile, and declines a group past it."""
+    """Every template packs groups up to its tile; wide half also packs larger subgroups."""
     _require_dsl()
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -1693,8 +1704,229 @@ def test_dsl_sm120_pack_gqa_admits_any_ratio_up_to_the_tile():
 
     for d, q_tile in ((128, 64), (256, 128), (512, 64)):
         assert api(24, 4, d, q_tile).check_support()
-        with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
-            api(2 * q_tile, 1, d, q_tile).check_support()
+        if d == 512:
+            assert api(2 * q_tile, 1, d, q_tile).check_support()
+            assert api(3 * q_tile, 2, d, q_tile).check_support()
+            with pytest.raises(ValueError, match="common subgroup"):
+                api(q_tile + 1, 1, d, q_tile).check_support()
+        else:
+            with pytest.raises(ValueError, match=rf"h_q/h_kv <= q_tile \({q_tile}\)"):
+                api(2 * q_tile, 1, d, q_tile).check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dq,dv,group", [(512, 512, 128), (512, 512, 96), (384, 320, 66), (576, 512, 128), (576, 512, 96)])
+@torch_fork_set_rng(seed=83417)
+def test_dsl_sm120_wide_partial_pack_dense(dtype, dq, dv, group):
+    """Subgroups preserve full KV-head sharing, causal positions, sinks and Stats."""
+    q = _bhsd(2, 2 * group, 3, dq, dtype)
+    k = _bhsd(2, 2, 65, dq, dtype)
+    v = _bhsd(2, 2, 65, dv, dtype)
+    sinks = torch.linspace(-0.5, 0.5, 2 * group, device="cuda").view(1, 2 * group, 1, 1)
+    out, stats = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=dq**-0.5,
+        is_causal=True,
+        causal_bottom_right=True,
+        sinks=sinks,
+        q_tile=64,
+        kv_tile=32,
+        pack_gqa=True,
+        return_stats=True,
+        explicit_plan=True,
+    )
+    qc, kc, vc = (t.cpu().double() for t in (q, k, v))
+    want = torch.empty(out.shape, dtype=torch.float64)
+    want_stats = torch.empty(stats.shape, dtype=torch.float64)
+    mask = torch.arange(65)[None, :] > torch.arange(3)[:, None] + 62
+    for batch in range(2):
+        for kv_head in range(2):
+            for first in range(kv_head * group, (kv_head + 1) * group, 16):
+                last = min(first + 16, (kv_head + 1) * group)
+                scores = (qc[batch, first:last].reshape(-1, dq) @ kc[batch, kv_head].T) * dq**-0.5
+                scores.masked_fill_(mask.repeat(last - first, 1), -torch.inf)
+                sink = sinks.flatten()[first:last].cpu().double().repeat_interleave(3).view(-1, 1)
+                full = torch.cat((scores, sink), dim=1)
+                want[batch, first:last] = (full.softmax(-1)[:, :65] @ vc[batch, kv_head]).reshape(last - first, 3, dv)
+                want_stats[batch, first:last] = full.logsumexp(-1).reshape(last - first, 3, 1)
+    torch.testing.assert_close(out.cpu().double(), want, atol=0.004, rtol=0.004)
+    torch.testing.assert_close(stats.cpu().double(), want_stats, atol=0.0006, rtol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group,split_kv", [(96, 1), (96, 3), (128, 1), (128, 3)])
+def test_dsl_sm120_wide_partial_pack_paged(dtype, group, split_kv, monkeypatch):
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_native_rebind_replay as run
+
+    run(
+        dtype,
+        2,
+        True,
+        False,
+        16,
+        monkeypatch,
+        dims=(512, 512),
+        h=2 * group,
+        sq=5,
+        tile_m=64,
+        tile_n=32,
+        packed=True,
+        split_kv=split_kv,
+        mask="br_swa",
+        sink=True,
+        explicit_plan=True,
+        capture_adapter=True,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode", ["prefill", "wide", "decode", "mixed"])
+def test_dsl_sm120_paged_vector_loop_rebind(dtype, mode, monkeypatch):
+    """The shared page-copy loop covers large tiles and its smaller callers."""
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_native_rebind_replay as run
+
+    d = 512 if mode == "wide" else 128
+    tile_m = 32 if mode == "decode" else 64 if mode == "wide" else 128
+    tile_n = 16 if mode == "decode" else 32 if mode == "wide" else 128
+    run(
+        dtype,
+        2,
+        True,
+        False,
+        256,
+        monkeypatch,
+        dims=(d, d),
+        sq=7 if mode in ("decode", "wide") else 129,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        packed=True,
+        split_kv=3 if mode in ("decode", "wide") else 1,
+        mask="br_swa",
+        sink=True,
+        explicit_plan=True,
+        capture_adapter=True,
+        kv_dtype=(torch.float8_e4m3fn if dtype == torch.float16 else torch.float8_e5m2) if mode == "mixed" else None,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed", [False, True])
+def test_dsl_sm120_paged_vector_loop_determinism(dtype, packed):
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_width_determinism as run
+
+    run(dtype, (128, 128), packed, tile_m=128, tile_n=128)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "dtype,kv_dtype",
+    [
+        pytest.param(torch.float16, None, id="f16-half-kv"),
+        pytest.param(torch.bfloat16, None, id="bf16-half-kv"),
+        pytest.param(torch.float16, torch.float8_e4m3fn, id="f16-e4m3-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-e5m2-kv"),
+    ],
+)
+def test_dsl_sm120_small_page_cache_determinism(dtype, kv_dtype):
+    """A full KV tile spans sixteen pages; the next tile has one live row."""
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_width_determinism as run
+
+    run(
+        dtype,
+        (128, 128),
+        True,
+        tile_m=128,
+        tile_n=128,
+        kv_dtype=kv_dtype,
+        page=8,
+        blocks=35,
+        kv_lengths=[257, 129, 0, 247, 1],
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group("gpu_exclusive")
+@pytest.mark.parametrize(
+    "dtype,kv_dtype",
+    [
+        pytest.param(torch.float16, None, id="fp16-half-kv"),
+        pytest.param(torch.bfloat16, None, id="bf16-half-kv"),
+        pytest.param(torch.float16, torch.float8_e4m3fn, id="fp16-e4m3-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-e5m2-kv"),
+    ],
+)
+def test_dsl_sm120_paged_vector_loop_warm(dtype, kv_dtype):
+    from test_sdpa_fwd_paged_sm120 import _case, _check
+    from warm_stress import StressCase, assert_warm_stress
+
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(
+        dtype, 2, 256, True, False, h=16, sq=4096, tile_m=128, tile_n=128, explicit_plan=True, kv_dtype=kv_dtype
+    )
+    pack = {nodes[name]: tensor for name, tensor in bufs.items()}
+
+    def execute():
+        g.execute(pack, workspace)
+
+    execute()
+    _check(bufs, 256)
+    # The live K length is 259: three K/V tiles, two refills in each CTA.
+    assert_warm_stress(
+        StressCase(
+            "SM120 paged D128 cooperative half copies or FP8 widening",
+            execute,
+            {"o_storage": o_storage, "stats_storage": stats_storage},
+            thread_blocks=2 * 16 * (4096 // 128),
+            refills_per_launch=2,
+        ),
+        warm=256,
+        poisoned=256,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group("gpu_exclusive")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_dsl_sm120_paged_decode_async_warm(dtype):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, decode_num_stages
+    from test_sdpa_fwd_paged_sm120 import _case, _check
+    from warm_stress import StressCase, assert_warm_stress
+
+    stage = decode_kv_stage(64, 64)
+    depth = decode_num_stages(64, 64, 16)
+    refills = math.ceil(1027 / stage) - depth
+    assert refills > 0
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(
+        dtype, 2, 1024, True, False, h=16, sq=512, dims=(64, 64), packed=True, tile_m=16, tile_n=stage, explicit_plan=True
+    )
+    pack = {nodes[name]: tensor for name, tensor in bufs.items()}
+
+    def execute():
+        g.execute(pack, workspace)
+
+    execute()
+    _check(bufs, 1024)
+    # GQA=8 gives two query tokens per M16 tile and two head groups.
+    # Request zero has 512 CTAs walking 33 stages through the 12-slot ring,
+    # reusing 21 slots; request one's 512 CTAs are the empty-KV control.
+    assert_warm_stress(
+        StressCase(
+            "SM120 paged D64 asynchronous decode copies",
+            execute,
+            {"o_storage": o_storage, "stats_storage": stats_storage},
+            thread_blocks=2 * 2 * (512 // 2),
+            refills_per_launch=refills,
+        ),
+        warm=256,
+        poisoned=256,
+    )
 
 
 @pytest.mark.L0

@@ -23,7 +23,7 @@ import torch
 from cudnn._torch_stream import stream_context
 from cuda.bindings import driver as cuda
 
-from cudnn.api_base import APIBase, TensorDesc, TupleDict
+from cudnn.api_base import APIBase, TensorDesc, TupleDict, ws_align
 from cudnn._device import ensure_current_context as _ensure_current_context
 from cudnn.frost.buffers import cutedsl_arch_requirement_error
 from cudnn.frost.template_loader import load_template
@@ -398,7 +398,6 @@ _SM120_DTYPE_QKV_CODE = {
 # used so the per-sequence O TMA descriptors carved for the THD path satisfy
 # the cuTensorMap GMEM alignment (64 B) with margin. torch storage bases are
 # 512 B aligned, so 128 B-multiple offsets stay 128 B aligned absolutely.
-_WS_ALIGN = 128
 
 
 @contextmanager
@@ -455,11 +454,6 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
-
-
-def ws_align(nbytes: int) -> int:
-    """Round a scratch-chunk size up to the carve alignment (128 B)."""
-    return -(-int(nbytes) // _WS_ALIGN) * _WS_ALIGN
 
 
 class WorkspaceCarver:
@@ -760,7 +754,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and params.cta_mma == 1
         and (params.split_kv > 1 or params.decode_tile)
         and (not params.thd_varlen or params.split_kv > 1)
-        and not params.paged_kv
+        and (not params.paged_kv or (params.thd_varlen and params.split_kv > 1))
         and params.tile_n == 128
     ):
         # The single-Q body also serves physical D64 on SM107. A second Q slab
@@ -1580,7 +1574,9 @@ class SdpaFwdDsl(APIBase):
             self.thd or self.paged or self.split_kv > 1 or self.pack_gqa or self.gate_desc is not None or getattr(self, "pv_bf16", False)
         )
 
-    def _execute_fp8_prepared(self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream, block_table=None, block_table_v=None):
+    def _execute_fp8_prepared(
+        self, q, k, v, o, lse, sinks, q_lens, kv_lens, scales, scale, workspace, stream, block_table=None, block_table_v=None, origins=None
+    ):
         """Prepared FP8 always uses caller scratch, including omitted scales / amax.
 
         Standalone callers allocate scratch_workspace_bytes() before execute;
@@ -1617,6 +1613,8 @@ class SdpaFwdDsl(APIBase):
                 raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
             buffers = (q, k, v, o, q_lens, kv_lens, lse, sinks, block_table, block_table_v)
             buffers += tuple(scales.get(role) for role in _native_quant_roles(spec.quant))
+            if spec.origin_specs is not None:
+                buffers += origins if origins is not None else (None,) * 5
             with device_context(q.device):
                 _ensure_current_context(stream_int, q.device.index)
                 launched = execute_native_thd_tensors(spec, buffers, ws.ptr, stream, scale * math.log2(math.e))
@@ -2768,6 +2766,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Even compact standalone THD uses sequence-local maps. Graph lowering
             # replaces these absent offsets with the caller's per-port declarations.
             self._thd_origin_specs = (None,) * 5
+        if self.packed_thd_split and self.paged and self.flavor == (256, 256) and self._device_cc in ((10, 0), (10, 3)):
+            # The split body reads physical Q origins; only the final combine
+            # addresses caller O/Stats. Standalone THD supplies compact prefixes.
+            self._thd_origin_specs = (None,) * 5
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
@@ -2815,7 +2817,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and self.split_kv == 1
                 ),
                 "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
-                "Rubin paged D128 cga1 unsplit, or SM100/103/107 paged D256 cga2 unsplit",
+                "Rubin paged D128 cga1 unsplit, SM100/103 paged D256 cga2, or SM107 paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in SM100 d128 / d256 half and the qualified Rubin
@@ -3542,7 +3544,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._not_implemented_error_if(
             self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
-            "native D64 THD requires half inputs; paged plans are unsplit and nonpaged splits require one CTA",
+            "native D64 THD requires half inputs; split plans require one CTA",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`
@@ -3851,14 +3853,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         128-row tile -- S_q = 1 decode and MTP. Explicit THD split
         plans use the same tile across multiple Q blocks. Other THD, larger
         dense S_q and an explicit cga2 stay on the prefill tile. SM107 uses
-        this specialization for dense unsplit N128 without prefolded scale.
+        this specialization for explicit THD splits and dense unsplit N128
+        without prefolded scale.
         d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
         if self._fp8 or getattr(self, "_mixed_fp8_kv", False) or self.flavor != (64, 64):
             return False
-        if self.thd and self.packed_thd_split and not self.paged:
-            return True  # D64 nonpaged split uses the same physical-width single-Q body.
+        if self.thd and self.packed_thd_split:
+            return True  # D64 split uses the same physical-width single-Q body for either KV layout.
         if self._device_cc == (10, 7) and (self.thd or self.paged or self.split_kv != 1 or self.softmax_scale_prefolded or self._effective_tile_n() != 128):
             # Native THD, paged/envelope and prefolded-scale contracts keep
             # their existing bodies. Dense split selection is handled by the
@@ -4707,6 +4710,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         score_sum_exp_tensor: Optional[torch.Tensor] = None,
         bias_tensor: Optional[torch.Tensor] = None,
         kv_mask_tensor: Optional[torch.Tensor] = None,
+        ragged_k: Optional[torch.Tensor] = None,
+        ragged_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
 
@@ -4719,9 +4724,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``(B, H_q, S_q[, 1])`` buffers bound as the declared (B, H_q, S_q) view, written through (never
         copied), required iff the matching sample was given (the strict presence contract of the LSE).
 
-        ``ragged_q`` / ``ragged_o`` / ``ragged_lse`` (the decode tile's ragged-Q
-        leg only, ``thd_decode_leg``): the graph's (B+1,) int32 or int64 ragged-offset
-        tensors of Q, O and Stats; the kernel reads them on device (Rule 3).
+        ``ragged_q/k/v/o/lse``: independent physical offsets of a graph-lowered
+        THD origin specialization, read on device each execute/replay. The
+        decode tile's ``thd_decode_leg`` accepts Q, O and Stats offsets only.
 
         ``gate``: the fused epilogue gate ``G`` of a specialization built with
         ``sample_gate`` -- logical BHSD, O's shape, bound as a zero-copy BSHD
@@ -4886,6 +4891,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self._value_error_if(_desc is None and _t is not None, f"this specialization was compiled without a {_name}; construct the API with sample_{_name}")
 
+        origins = (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)
+        if any(value is not None for value in origins) and getattr(self, "_thd_origin_specs", None) is None:
+            self._value_error_if(
+                not self.thd_decode_leg or ragged_k is not None or ragged_v is not None,
+                "physical offsets require a compiled THD origin specialization",
+            )
         if getattr(self, "_prepared_fp8", False):
             self._execute_fp8_prepared(
                 q_tensor,
@@ -4902,6 +4913,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 current_stream,
                 block_table=block_table,
                 block_table_v=block_table_v,
+                origins=origins,
             )
             return
         if getattr(self, "_prepared_mxfp8", False):
@@ -4920,6 +4932,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 current_stream,
                 block_table=block_table,
                 block_table_v=block_table_v,
+                origins=origins,
             )
             return
         if self.thd and not self.thd_decode_leg:
@@ -4938,6 +4951,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 block_table=block_table,
                 block_table_v=block_table_v,
                 gate=gate,
+                origins=origins,
             )
             return
 
@@ -5154,6 +5168,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         block_table=None,
         block_table_v=None,
         gate=None,
+        origins=None,
     ):
         """THD / varlen execute (f16 kernels): shared packing + launch.
 
@@ -5187,9 +5202,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             with _torch_stream_context(current_stream, q_buf.device):
                 scratch = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device=q_buf.device)
             ws_ptr = scratch.data_ptr()
+        buffers = (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks, block_table, block_table_v)
+        if spec.origin_specs is not None:
+            buffers += origins if origins is not None else (None,) * 5
         launched = execute_native_thd_tensors(
             spec,
-            (q_buf, k_buf, v_buf, o_buf, seq_q_lens, seq_len_kv, lse_tensor, sinks, block_table, block_table_v),
+            buffers,
             ws_ptr,
             current_stream,
             scale_softmax_log2,
@@ -5417,7 +5435,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
 
 
 class SdpaFwdDslSm90(SdpaFwdDsl):
-    """Compile native dense D64 or dense/packed D512 SM90 forward attention.
+    """Compile native-width SM90 forward attention over dense, packed or paged KV.
 
     Q, K, V and O keep their declared strides: the kernel binds native TMA
     views over caller storage, with no BSHD gather. Dtype, shape, band,
@@ -5466,8 +5484,31 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         for label, value in (("B", b), ("H_q", h_q), ("H_kv", h_kv), ("S_q", s_q), ("S_kv", s_kv), ("D_QK", d_qk), ("D_V", d_v)):
             self._value_error_if(value <= 0, f"{label} must be > 0; got {value}")
         self._value_error_if(h_q % h_kv != 0, f"H_q ({h_q}) must be divisible by H_kv ({h_kv}) for GQA / MQA")
-        self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
-        self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
+        if self.paged:
+            self._not_implemented_error_if(self.thd, "SM90 paged KV currently requires dense Q")
+            self._not_implemented_error_if(not self.seq_kv_lens_present, "SM90 paged KV requires device KV lengths")
+            self._value_error_if(
+                self.paged_max_seq_len_kv is None or not 0 < self.paged_max_seq_len_kv < 2**31,
+                "SM90 paged KV requires a positive int32 paged_max_seq_len_kv",
+            )
+            p = self.paged_page_size
+            self._not_implemented_error_if(
+                p % 8 != 0 or (p < 64 and 64 % p != 0) or (p >= 64 and p % 64 != 0),
+                "SM90 paged KV requires a page size divisible by 8 that divides 64 or is a multiple of 64",
+            )
+            self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, p, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (self.k_desc.shape[0], h_kv, p, d_v), name="V")
+            from cudnn.sdpa.fwd.config_sm100 import paged_pool_layout as _paged_pool_layout
+
+            for desc in (self.k_desc, self.v_desc):
+                strides = self._paged_pool_stride(desc)
+                _paged_pool_layout(tuple(desc.shape), tuple(desc.stride), desc.dtype.itemsize, strides[1] < strides[2], h_kv, p, desc.shape[3])
+            # The fixed launch envelope is the page-table capacity; device lengths
+            # retain the exact live end, including a partly populated final page.
+            s_kv = ((int(self.paged_max_seq_len_kv) + p - 1) // p) * p
+        else:
+            self._check_tensor_shape(self.k_desc, (b, h_kv, s_kv, d_qk), name="K")
+            self._check_tensor_shape(self.v_desc, (b, h_kv, s_kv, d_v), name="V")
         self._check_tensor_shape(self.o_desc, (b, h_q, s_q, d_v), name="O")
         self._check_tensor_shape(self.lse_desc, (b, h_q, s_q), name="Stats")
         for desc in descs[1:]:
@@ -5484,7 +5525,6 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
 
         # Well-formed declarations this engine does not serve.
         refusals = (
-            (self.paged, "paged KV"),
             (self.gate_desc is not None, "epilogue gate fusion (served by the SM107 d256 SDPA engines only)"),
             (self._pertensor or self.pv_bf16, "FP8 or PV BF16 inputs"),
             # has_amax_o is a quantized-path flag; inert here, so only the declared output is refused.
@@ -5615,9 +5655,10 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             scale_mode=scale_mode,
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
+            page_size=self.paged_page_size,
         )
         self._native_d64 = False
-        if (d_qk, d_v) == (64, 64):
+        if (d_qk, d_v) == (64, 64) and not self.paged:
             from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
             why = native_d64_mismatch(
@@ -5708,6 +5749,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         scale_softmax: Optional[float] = None,
         workspace: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        block_table: Optional[torch.Tensor] = None,
+        block_table_v: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute tensors matching the compiled specialization, on the plan's device: the launcher only checks that operands agree."""
         self._logger.debug("Entering execute")
@@ -5718,6 +5761,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             not self.has_sink and sinks is not None, "this specialization was compiled without sink support; construct the API with has_sink=True"
         )
         self._check_seq_lens_contract(seq_q_lens, seq_kv_lens)
+        self._value_error_if(self.paged and (block_table is None or block_table_v is None), "SM90 paged KV requires both K and V page tables")
+        self._value_error_if(not self.paged and (block_table is not None or block_table_v is not None), "SM90 page tables require a paged specialization")
         self._value_error_if(self.lse_desc is not None and lse_tensor is None, "lse_tensor is required by this compiled specialization")
         self._value_error_if(
             self.lse_desc is None and lse_tensor is not None, "this specialization was compiled without an LSE output; construct the API with sample_lse"
@@ -5751,7 +5796,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # SM90's host consumes natural scale units, including literal zero.
             execute_native_thd_tensors(spec, buffers, ws_ptr, stream, scale, lse_bhs_geometry=lse_geometry)
         else:
-            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, None, None, None)
+            buffers = (q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, sinks, seq_kv_lens, seq_q_lens, block_table, block_table_v, None)
             ws_ptr = 0
             if self.split_kv > 1:
                 if workspace is None:
@@ -6020,7 +6065,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.paged:
             self._check_tensor_shape(self.k_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_q), name="K")
             self._check_tensor_shape(self.v_desc, (self.k_desc.shape[0], h_kv, self.paged_page_size, d_v), name="V")
-            from cudnn.sdpa.fwd.prepared import _paged_pool_layout
+            from cudnn.sdpa.fwd.config_sm100 import paged_pool_layout as _paged_pool_layout
 
             for desc in (self.k_desc, self.v_desc):
                 strides = self._paged_pool_stride(desc)
@@ -6164,9 +6209,16 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 "PackGQA is dense-only (THD/ragged runs unpacked)",
             )
             # Every SM120 template packs any GQA ratio up to the tile, tile_q % G != 0 included.
+            # Wide half templates also split a larger group into tile-sized subgroups.
+            partial_pack = not self._fp8 and self.flavor in _SM120_WIDE_F16_FLAVORS
             self._value_error_if(
-                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), requires_divisible=False),
-                f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile}); got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
+                not pack_gqa_supported(int(h_q), int(h_kv), int(self.q_tile), partial=partial_pack, requires_divisible=False),
+                (
+                    f"PackGQA needs a group that fits q_tile ({self.q_tile}) or a common subgroup of at least two heads"
+                    if partial_pack
+                    else f"PackGQA needs h_q/h_kv <= q_tile ({self.q_tile})"
+                )
+                + f"; got h_q/h_kv = {int(h_q)}/{int(h_kv)}",
             )
         for desc in (self.k_desc, self.v_desc, self.o_desc):
             if self._fp8 and desc is self.o_desc:
@@ -6475,7 +6527,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         """Execute tensors matching the compiled specialization.
 
         ``ragged_q/k/v/o/lse`` bind the independent physical offsets of a
-        graph-lowered half THD specialization. The binder checks their declared
+        graph-lowered half or per-tensor FP8 THD specialization. The binder checks their declared
         integer widths and presence; logical lengths remain separate operands.
 
         ``block_table`` / ``block_table_v``: paged plans bind int32
@@ -6493,7 +6545,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
 
         origins = (ragged_q, ragged_k, ragged_v, ragged_o, ragged_lse)
         if any(value is not None for value in origins) and getattr(self, "_thd_origin_specs", None) is None:
-            raise ValueError("physical offsets require a compiled half THD origin specialization")
+            raise ValueError("physical offsets require a compiled THD origin specialization")
         if self._compiled_kernel is None:
             raise RuntimeError("SdpaFwdDslSm120 kernel is not compiled")
         from cudnn._torch_stream import _raw_current_stream, device_context
@@ -6566,6 +6618,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 scale_val,
                 workspace,
                 current_stream,
+                origins=origins,
             )
             self._logger.debug("execute (SM120 MXFP8) completed" if mxfp8 else "execute (SM120 FP8 per-tensor) completed")
             return

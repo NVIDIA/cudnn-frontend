@@ -69,6 +69,7 @@ The experimental API catalog includes:
 - [DSv4.1 Vision RoPE Backward](/operations/RoPE/vision_rope_backward)
 - [Engram Saved-State Gate](/operations/Pointwise/engram_saved_gate)
 - [RMSNorm + RHT + Amax](/operations/Normalizations/rmsnorm_rht_amax)
+- [Ahead-of-time attention for SM120 (C/C++ API)](/operations/Attention/aot_sm120_attention)
 - [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](/operations/Attention/sdpa_bwd_sm100_d128)
 - [SDPA Backward (SM120)](/operations/Attention/sdpa_bwd_sm120)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](/operations/Attention/sdpa_bwd_sm107)
@@ -87,6 +88,11 @@ The experimental API catalog includes:
 - [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
 
 - [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
+- [Cake LM-head log-probabilities](/operations/cake_lm_head): prepared execution and JAX JIT/gradients.
+
+- [Cake MoK training](/operations/cake_mok)
+
+- [Cake mHC training](/operations/mhc_training): explicit stages and JAX branch composition/gradients.
 
 ## Installation and setup
 

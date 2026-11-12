@@ -34,6 +34,45 @@ class TestNativeHalfRegisterRelease:
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
 
 
+@requires_rubin
+class TestD128Fp8PhysicalOrigins:
+    """Exercise native data maps and independent Stats through the CI entry."""
+
+    from sdpa.frost import native_fp8_origins_sm107_checks as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@requires_rubin
+class TestD192Fp8PhysicalOrigins:
+    """Native rank-4 maps keep physical offsets separate from logical lengths."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [((192, 128), 2)])
+
+
+@requires_rubin
+class TestWideFp8PhysicalOrigins:
+    """D256 and role-split D512 use independent sequence-local rank-4 maps."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
+
+
+@requires_rubin
+class TestD256Mxfp8PhysicalOrigins:
+    """Physical data maps retain the original logical scale-tile coordinates."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("mxfp8", "sm107", [(256, 1)])
+
+
 @pytest.fixture(autouse=True)
 def _mock_target_for_cross_arch_contracts(monkeypatch):
     # This module tests Rubin metadata on non-Rubin hosts too. Match its fake
@@ -2012,6 +2051,25 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
         assert err <= 0.1 * scale, f"cga {cga}: max err {err} vs fp32 reference (scale {scale})"
     assert torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1]), "O / LSE must be bit-identical across the CTA widths"
     assert torch.equal(outs[None][0], outs[2][0]) and torch.equal(outs[None][1], outs[2][1]), "the unset knob must be the pair"
+
+
+@requires_rubin
+class TestNativeD128Fp8Cga1Split:
+    """Single-CTA dense split coverage through the selected Rubin CI entry."""
+
+    from native_fp8_cga1_split_sm107_checks import (
+        test_dense_split_domain as _domain,
+        test_rebind_and_capture as _capture,
+        test_replay_and_batch_invariance as _bytes,
+        test_golden as _golden,
+        test_warm_refilled_ring as _warm,
+    )
+
+    test_rebind_and_capture = staticmethod(_capture)
+    test_dense_split_domain = staticmethod(_domain)
+    test_replay_and_batch_invariance = staticmethod(_bytes)
+    test_golden = staticmethod(_golden)
+    test_warm_refilled_ring = staticmethod(_warm)
 
 
 @requires_rubin

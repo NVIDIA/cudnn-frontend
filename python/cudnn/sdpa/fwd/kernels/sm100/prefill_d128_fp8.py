@@ -353,7 +353,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # (issue #552) — no length ever reaches the host — and publishes the live unit
 # total + claim counter, so the adapter launches a MACHINE-sized grid rather
 # than the plan-time envelope (issue #618).
-from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_map_ptr, origin_tensors, origin_tma_slice
 from cudnn.frost.tile_dsl.thd import thd_port_origin, exit_if_dead_thd_cluster
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
@@ -903,11 +903,21 @@ def _paged_load_tile(
     """
     bt = cutlass.make_array_view(block_table_tensor)
     last_live = cute.math.max(n_pages_b - cutlass.Int32(1), cutlass.Int32(0))
+    if cutlass.const_expr(n_boxes > 1):
+        # Match the half loader: one coalesced page-table read supplies all
+        # row boxes. Extra lanes repeat the last box, retaining the live clamp.
+        lane_box = cute.math.min((cute.arch.thread_idx()[0] % cutlass.Int32(32)), cutlass.Int32(n_boxes - 1))
+        lane_row = kv_tile * cutlass.Int32(CFG.TILE_N) + row_off + lane_box * cutlass.Int32(box_rows)
+        lane_slot = lane_row // cutlass.Int32(PAGE_SIZE)
+        lane_page = cutlass.Int32(bt[batch_idx, cute.math.min(lane_slot, last_live)])
     for j in cutlass.range_constexpr(n_boxes):
         g = kv_tile * cutlass.Int32(CFG.TILE_N) + row_off + cutlass.Int32(j * box_rows)
         slot = g // cutlass.Int32(PAGE_SIZE)
         row_in_page = g % cutlass.Int32(PAGE_SIZE)
-        page_live = cutlass.Int32(bt[batch_idx, cute.math.min(slot, last_live)])
+        if cutlass.const_expr(n_boxes > 1):
+            page_live = cute.arch.shuffle_sync(lane_page, j)
+        else:
+            page_live = cutlass.Int32(bt[batch_idx, cute.math.min(slot, last_live)])
         in_range = slot < n_pages_b
         page = cutlass.Int32(arith.select(in_range.ir_value(), page_live.ir_value(), cutlass.Int32(-1).ir_value()))
         tma_load_tile(
@@ -959,7 +969,10 @@ def _tmaldg_warp_group(
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)  # noqa: E731
     else:
         tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
+    if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
+        tma_k = lambda d, h, r, b: origin_tma_slice(o_desc_words, 2, n_batch, b, d, h, r)  # noqa: E731
+        tma_v = lambda d, h, r, b: origin_tma_slice(o_desc_words, 3, n_batch, b, d, h, r)  # noqa: E731
+    elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         # THD: K/V ride the setup kernel's RUNTIME descriptors (o_desc_words
         # slots n_batch+1 / n_batch+2), whose seq extent is clamped to the
         # packed KV total cu_k[B]. The last sequence's tile steps past that
@@ -1037,9 +1050,11 @@ def _tmaldg_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(thd_origins is not None):
-            # A persistent unit can switch batches; acquire its current Q map.
-            q_map = o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1) + batch_idx) * cutlass.Int32(_TENSOR_MAP_QWORDS)
-            tma_tensormap_acquire(q_map.tospace(cutlass.AddressSpace.generic))
+            # Persistent work can switch sequences, so acquire every current map.
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 1, n_batch, batch_idx))
+            if cutlass.const_expr(not PAGED_KV):
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, batch_idx))
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, batch_idx))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -1543,13 +1558,14 @@ def _mma_dual_kv_tile(
         not_first = cutlass.Boolean(step != cutlass.Int32(1))
         if cutlass.const_expr(P_IN_SMEM):
             # Early QK^T (P in SMEM frees the S slot once the softmax has S and the
-            # correction has the stats): this step's BMM1s, then the previous pair's PVs.
+            # correction has the stats). Issue each stream's previous PV before
+            # waiting for the other stream's stats slot; preserve its own order.
             bars.mb_stat_empty[0].wait(stat_empty_mma_phase, spin=SPIN_RING_WAITS)
             _mma_dual_bmm1(bars, sK, tmem_raw, bmm1_desc, desc_Q0, 0, a_state, live, mcast_mask)
+            _mma_dual_pv(bars, sV, sP, tmem_raw, bmm2_desc, 0, prev_a, live, not_first, bmm2_ready_phase, mcast_mask)
             bars.mb_stat_empty[1].wait(stat_empty_mma_phase, spin=SPIN_RING_WAITS)
             _mma_dual_bmm1(bars, sK, tmem_raw, bmm1_desc, desc_Q0, 1, b_state, b_live, mcast_mask)
             stat_empty_mma_phase = stat_empty_mma_phase ^ 1
-            _mma_dual_pv(bars, sV, sP, tmem_raw, bmm2_desc, 0, prev_a, live, not_first, bmm2_ready_phase, mcast_mask)
             _mma_dual_pv(bars, sV, sP, tmem_raw, bmm2_desc, 1, prev_b, prev_b_live, not_first, bmm2_ready_phase, mcast_mask)
         else:
             # P in TMEM at the S tail: PV before the next QK^T of the same stream.
@@ -2020,9 +2036,9 @@ def _softmax_phantom_step(sub_tile_id: cutlass.Constexpr[int], bars, tmem_base, 
     statistics are left alone (the MMA issues no BMM1 / PV for it).
 
     The ready credits wait for this stream's PREVIOUS PV first, as a real step's P store does:
-    that completion proves the MMA consumed the previous step's credits.  The MMA issues the
-    next pair's BMM1 (which arrives the bmm1_done that releases this step) before the previous
-    pair's PVs, and mb_bmm2_ready chunk 1 counts softmax lanes only -- no correction arrival
+    that completion proves the MMA consumed the previous step's credits.  With P in SMEM,
+    the MMA issues this stream's next BMM1 (which releases this step) before its previous PV,
+    and mb_bmm2_ready chunk 1 counts softmax lanes only -- no correction arrival
     bounds it -- so a phantom publishing at once could complete a second phase of that barrier
     before the MMA's parity wait for the first, and the wait would never see a flip."""
     stats_addr = tmem_base + cutlass.Int32(LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE)
@@ -3371,7 +3387,7 @@ def _host(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
-                paged=True,
+                paged=PAGED_KV,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         elif cutlass.const_expr(PAGED_KV):
             # Compact standalone THD keeps page-pool maps intact as well.
@@ -3497,8 +3513,8 @@ def compile_prepared(
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd and not PARAMS.paged_kv:
         raise ValueError("paged_hnd requires a paged-KV specialization")
-    if thd_origin_specs is not None and (not CFG.THD_VARLEN or not PAGED_KV or CFG.SPLIT_KV != 1 or len(thd_origin_specs) != 5):
-        raise ValueError("physical origins require unsplit paged THD and five port specifications")
+    if thd_origin_specs is not None and (not CFG.THD_VARLEN or CFG.SPLIT_KV != 1 or len(thd_origin_specs) != 5):
+        raise ValueError("physical origins require unsplit THD and five port specifications")
     return compile_host(
         _host,
         CFG,
