@@ -1558,13 +1558,14 @@ def _mma_dual_kv_tile(
         not_first = cutlass.Boolean(step != cutlass.Int32(1))
         if cutlass.const_expr(P_IN_SMEM):
             # Early QK^T (P in SMEM frees the S slot once the softmax has S and the
-            # correction has the stats): this step's BMM1s, then the previous pair's PVs.
+            # correction has the stats). Issue each stream's previous PV before
+            # waiting for the other stream's stats slot; preserve its own order.
             bars.mb_stat_empty[0].wait(stat_empty_mma_phase, spin=SPIN_RING_WAITS)
             _mma_dual_bmm1(bars, sK, tmem_raw, bmm1_desc, desc_Q0, 0, a_state, live, mcast_mask)
+            _mma_dual_pv(bars, sV, sP, tmem_raw, bmm2_desc, 0, prev_a, live, not_first, bmm2_ready_phase, mcast_mask)
             bars.mb_stat_empty[1].wait(stat_empty_mma_phase, spin=SPIN_RING_WAITS)
             _mma_dual_bmm1(bars, sK, tmem_raw, bmm1_desc, desc_Q0, 1, b_state, b_live, mcast_mask)
             stat_empty_mma_phase = stat_empty_mma_phase ^ 1
-            _mma_dual_pv(bars, sV, sP, tmem_raw, bmm2_desc, 0, prev_a, live, not_first, bmm2_ready_phase, mcast_mask)
             _mma_dual_pv(bars, sV, sP, tmem_raw, bmm2_desc, 1, prev_b, prev_b_live, not_first, bmm2_ready_phase, mcast_mask)
         else:
             # P in TMEM at the S tail: PV before the next QK^T of the same stream.
@@ -2035,9 +2036,9 @@ def _softmax_phantom_step(sub_tile_id: cutlass.Constexpr[int], bars, tmem_base, 
     statistics are left alone (the MMA issues no BMM1 / PV for it).
 
     The ready credits wait for this stream's PREVIOUS PV first, as a real step's P store does:
-    that completion proves the MMA consumed the previous step's credits.  The MMA issues the
-    next pair's BMM1 (which arrives the bmm1_done that releases this step) before the previous
-    pair's PVs, and mb_bmm2_ready chunk 1 counts softmax lanes only -- no correction arrival
+    that completion proves the MMA consumed the previous step's credits.  With P in SMEM,
+    the MMA issues this stream's next BMM1 (which releases this step) before its previous PV,
+    and mb_bmm2_ready chunk 1 counts softmax lanes only -- no correction arrival
     bounds it -- so a phantom publishing at once could complete a second phase of that barrier
     before the MMA's parity wait for the first, and the wait would never see a flip."""
     stats_addr = tmem_base + cutlass.Int32(LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE)

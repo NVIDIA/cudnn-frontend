@@ -4219,3 +4219,59 @@ python -m pytest -n0 -m L0 -q \
 python -m pytest -n0 -m L0 -q \
   'sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_d512_paged_replay_and_batch_invariance[fwd-d512-e4m3-bf16-split1-NHD]'
 ```
+
+
+### SM100 FP8 interleaved two-KV-stream schedule — validation, 2026-11-12 (UTC)
+
+The SMEM-P dual-stream loop issues QK(A), PV(previous A), QK(B), then
+PV(previous B). Each stream retains its previous arithmetic order, all waits,
+arrivals, credits and ring phases. SM103 uses the unchanged TMEM-P branch.
+No eligibility, tuning domain, ranking, or backward path changes.
+
+B200 and B300 SXM6 AC (148 SMs each) both pass **62 cases, 16 deselected,
+no failures or skips**. This reuses the preceding coalesced-page qualification
+and runs the entire 30-case `test_sdpa_fwd_fp8_dual_kv_sm100.py` suite in place
+of its five paged cases. Coverage includes dense and paged KV, odd tails,
+empty splits, persistent scheduler waves, deliberately delayed MMA,
+independent K/V strides, changed-input capture, replay and batch invariance.
+Candidate runtimes were 132.38s on B200 and 95.96s on B300.
+
+Each GPU also passes five parent golden checks (38.64s and 39.82s), recorded
+in an isolated directory from the coalesced parent and strictly matched by
+the candidate in a fresh process with recording disabled. All ten parent
+JSON records are byte-identical to the committed baselines; none is updated.
+The existing refilled-ring stress reports zero mismatches in 256 warm and
+256 poisoned launches on each GPU, with unsafe controls failing 200/200.
+Its four-block geometry remains a limited-occupancy measurement; separate
+numerical tests provide the reference checks.
+
+B200 Compute Sanitizer 2026.3 synccheck and racecheck each pass the existing
+`page16-unaligned` dual-stream test: two sequences, Q1/H64:8/D128, live KV
+lengths 1024/777, eight/seven KV tiles, and repeated ring reuse. Synccheck
+reports 0 errors; racecheck reports 0 hazards (0 errors, 0 warnings). Each
+sanitizer invocation runs one case, four deselected. The sanitizer processes
+report FE cuDNN 93000 and Torch cuDNN 92400; the tested explicit FROST path does
+not execute backend attention. Normal tests use full cuDNN 9.30.0.4.
+
+Both GPUs use Torch 2.14.1+cu130, CuTe DSL 4.8.0 and actual compiler/NVRTC 13.4.
+Imports and source/library hashes are checked. The runner disables the
+editable-install finder and gives child interpreters the same source path.
+The shared runner has no pytest-xdist; tests run serially with
+`CUDNN_TEST_NO_ISOLATION=1`. Its two warnings are the unavailable
+`xdist_group` marker and Torch synchronization-debug mode.
+The kernel and test files on landed parent `9be74f4d7` match those qualified
+here. After qualification, only the phantom-step explanatory docstrings
+changed; the executable kernel AST is identical. SM90/SM107/SM120 are not
+measured by this follow-up.
+
+Reproduce the preceding qualification commands, replacing the selected
+`test_paged_two_kv_streams_match_the_reference` node with the complete
+`sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py` file. Omit `-n0` when xdist is
+not installed. Run the sanitizer on the following case, then repeat with
+`--tool racecheck`:
+
+```bash
+compute-sanitizer --tool synccheck --error-exitcode 91 --report-api-errors no \
+  python -m pytest -m L0 -q \
+  'sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_two_kv_streams_match_the_reference[page16-unaligned]'
+```
