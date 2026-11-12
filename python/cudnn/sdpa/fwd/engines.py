@@ -2234,7 +2234,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             cga=knobs.cga if knobs is not None else None,
             thd=facts.thd,
         ):
-            return "native D64 THD requires half inputs; paged plans are unsplit and nonpaged splits require one CTA"
+            return "native D64 THD requires half inputs; split plans require one CTA"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
         from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
@@ -2906,7 +2906,7 @@ def _sm107_spec() -> EngineSpec:
             # SM107_F16_THD_SHAPES is the single definition, shared with the
             # standalone adapter's gate so the two cannot drift (rule 8b').  It
             # covers the native D64 and larger f16 flavors. D32 remains dense;
-            # D64 THD additionally requires nonpaged, unsplit plans.
+            # D64 THD splits require the single-CTA N128 body.
             thd=True,
             thd_padded_stats=True,
             padded_stats=True,

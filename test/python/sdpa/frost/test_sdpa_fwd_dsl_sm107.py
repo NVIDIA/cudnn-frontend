@@ -1040,8 +1040,10 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(blackwell_caps, blackwell, knobs) is None
         for changed in (dict(has_paged_kv=False), dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3)):
             assert engines.mismatch(blackwell_caps, dataclasses.replace(blackwell, **changed), knobs) is not None, (cc, changed)
-        for changed in (dict(cga=1), dict(split_kv=2)):
-            assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, **changed)) is not None, (cc, changed)
+        # SM100/103 also support the packed THD split path; the native SM107
+        # row above still declines it. Neither row admits CGA1 for this D256 plan.
+        assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, split_kv=2)) is None
+        assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, cga=1)) is not None
 
 
 @pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
@@ -2548,8 +2550,15 @@ def test_sm107_gate_kernel_signatures_are_append_only():
         stream_slot = host.index("stream")
         assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
         tail = ["prepared", "o_partial_f32"] if mod is fp8 else ["prepared"]
-        assert host[stream_slot + 2 :] == tail, (mod.__name__, host[stream_slot:])
-        assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
+        tail_end = stream_slot + 2 + len(tail)
+        assert host[stream_slot + 2 : tail_end] == tail, (mod.__name__, host[stream_slot:])
+        # Appending defaulted origin operands preserves existing callers. Keep
+        # the old order pinned, and reject any newly required argument.
+        params = inspect.signature(mod._host).parameters
+        for name in host[tail_end:]:
+            assert params[name].default is not inspect.Parameter.empty, (mod.__name__, name)
+            assert params[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        assert params["gate_tensor"].default is None
     assert inspect.signature(fp8._host).parameters["o_partial_f32"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
@@ -8878,3 +8887,27 @@ class TestD512HalfPhysicalOrigins:
     test_origins_without_total_hints = staticmethod(_d512_origins.test_origins_without_total_hints)
     test_packed_origins_decline = staticmethod(_d512_origins.test_packed_origins_decline)
     test_half_head_envelope_declines = staticmethod(_d512_origins.test_half_head_envelope_declines)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD64Paged:
+    import native_d64_paged_sm107_checks as _checks
+
+    def test_admission(self):
+        self._checks.check_admission(_caps, _f16_facts)
+
+    test_boundaries = staticmethod(_checks.test_boundaries)
+    test_dense = staticmethod(_checks.test_dense)
+    test_thd = staticmethod(_checks.test_thd)
+    test_thd_split_partial_pack = staticmethod(_checks.test_thd_split_partial_pack)
+    test_dense_determinism = staticmethod(_checks.test_dense_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_batch_and_golden as _thd_determinism
+
+    test_thd_determinism = staticmethod(_thd_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_split_batch_and_golden as _thd_split_determinism
+
+    test_thd_split_determinism = staticmethod(_thd_split_determinism)

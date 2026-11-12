@@ -2924,6 +2924,13 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1, prefer_pack: boo
     return 1, False
 
 
+# Paged D128 GQA prefix envelope on the parts its study timed, sm103_paged_d128_envelope_20261112: pages 32 / 64, b <= 16, s_q 16-63
+# and S_kv to 131072 split too (holdout new / old 0.113 geomean on B300, 0.126 on B200).
+SM100_PAGED_D128_WIDE_CCS = frozenset({(10, 0), (10, 3)})
+SM100_PAGED_D128_WIDE_PAGES = (16, 32, 64, 128)
+SM100_PAGED_D128_WIDE_MAX_B = 16
+SM100_PAGED_D128_WIDE_MIN_Q = 16
+SM100_PAGED_D128_WIDE_MAX_KV = 131072
 SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 GQA (group >= 4) split budget past one Q tile, in waves of SMs
 
 
@@ -2938,29 +2945,31 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
     listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
-    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed).
+    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed). On cc 10.3 the D128 envelope also
+    admits pages 32 / 64, s_q from 16, S_kv to 131072 and b to 16 (``SM100_PAGED_D128_WIDE_*``).
     """
     sm100_splits = sm100_paged_packed_split_choice(caps, facts)
     if sm100_splits > 1:
         return sm100_splits, True
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
+    wide = caps.sm_lo == 100 and facts.device_cc in SM100_PAGED_D128_WIDE_CCS
     if not (
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
         and facts.dtype == cudnn.data_type.BFLOAT16
-        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
+        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else SM100_PAGED_D128_WIDE_MAX_B if wide else 4)
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
-        and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
+        and facts.page_size in (SM100_PAGED_D128_WIDE_PAGES if wide else (16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
         and facts.window_left is None
-        and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= 32768
+        and (SM100_PAGED_D128_WIDE_MIN_Q if wide else 64) <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= (SM100_PAGED_D128_WIDE_MAX_KV if wide else 32768)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):

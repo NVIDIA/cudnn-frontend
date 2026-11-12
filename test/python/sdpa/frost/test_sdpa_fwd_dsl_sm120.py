@@ -1784,6 +1784,76 @@ def test_dsl_sm120_wide_partial_pack_paged(dtype, group, split_kv, monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mode", ["prefill", "wide", "decode", "mixed"])
+def test_dsl_sm120_paged_vector_loop_rebind(dtype, mode, monkeypatch):
+    """The shared page-copy loop covers large tiles and its smaller callers."""
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_native_rebind_replay as run
+
+    d = 512 if mode == "wide" else 128
+    tile_m = 32 if mode == "decode" else 64 if mode == "wide" else 128
+    tile_n = 16 if mode == "decode" else 32 if mode == "wide" else 128
+    run(
+        dtype,
+        2,
+        True,
+        False,
+        256,
+        monkeypatch,
+        dims=(d, d),
+        sq=7 if mode in ("decode", "wide") else 129,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        packed=True,
+        split_kv=3 if mode in ("decode", "wide") else 1,
+        mask="br_swa",
+        sink=True,
+        explicit_plan=True,
+        capture_adapter=True,
+        kv_dtype=(torch.float8_e4m3fn if dtype == torch.float16 else torch.float8_e5m2) if mode == "mixed" else None,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("packed", [False, True])
+def test_dsl_sm120_paged_vector_loop_determinism(dtype, packed):
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_width_determinism as run
+
+    run(dtype, (128, 128), packed, tile_m=128, tile_n=128)
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group("gpu_exclusive")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_dsl_sm120_paged_vector_loop_warm(dtype):
+    from test_sdpa_fwd_paged_sm120 import _case, _check
+    from warm_stress import StressCase, assert_warm_stress
+
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(dtype, 2, 256, True, False, h=16, sq=4096, tile_m=128, tile_n=128, explicit_plan=True)
+    pack = {nodes[name]: tensor for name, tensor in bufs.items()}
+
+    def execute():
+        g.execute(pack, workspace)
+
+    execute()
+    _check(bufs, 256)
+    # The live K length is 259: three K/V tiles, two refills in each CTA.
+    assert_warm_stress(
+        StressCase(
+            "SM120 paged D128 rolled copies",
+            execute,
+            {"o_storage": o_storage, "stats_storage": stats_storage},
+            thread_blocks=2 * 16 * (4096 // 128),
+            refills_per_launch=2,
+        ),
+        warm=256,
+        poisoned=256,
+    )
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("head_dim,kv_tile", [(128, 64), (512, 32)], ids=["d128", "d512"])
 @torch_fork_set_rng(seed=7)
 def test_dsl_sm120_pack_gqa_dead_rows_never_store(head_dim: int, kv_tile: int):
