@@ -687,6 +687,19 @@ def _line(checks, start):
     return next(line for line in checks.lines if line.strip().startswith(start))
 
 
+def _sample_script(monkeypatch):
+    """The sample script as a module, for its own functions; what loading it changes in the process leaves with the test."""
+    import importlib.util
+    import os
+
+    monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
+    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
+    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_functions", MODELS / "qwen_dense" / "00_decode.py")
+    sample = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sample)
+    return sample
+
+
 def test_the_checks_of_a_run_hold_on_exact_stand_ins_and_fail_on_a_nan():
     clean = _checked_run(2)
     assert clean.ok, clean.text()
@@ -716,9 +729,6 @@ def test_a_run_that_judged_no_provider_block_is_reported_and_never_a_pass(monkey
     """``--provider`` can put every judged block on its reference row.  Such a run compares the reference with itself: its
     blocks line is ``REPORTED`` and its last line ``RAN``, as for ``--stack reference``.  ``PASS`` is kept for a run in
     which provider blocks were judged and held."""
-    import importlib.util
-    import os
-
     import model_samples
     from model_samples import blocks, tie_out
 
@@ -749,15 +759,41 @@ def test_a_run_that_judged_no_provider_block_is_reported_and_never_a_pass(monkey
         assert "no provider block to judge" in line and line.endswith("REPORTED") and "PASS" not in line, line
     assert _checked_run(2).judged == 6, "the stack's own rows: six provider blocks are judged"
 
-    monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
-    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
-    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_verdict", MODELS / "qwen_dense" / "00_decode.py")
-    sample = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(sample)
+    sample = _sample_script(monkeypatch)
     assert sample._verdict("fe-cublas", True, 6) == "PASS"
     assert sample._verdict("fe-cublas", True, 0) == "RAN (no provider block was judged)", "nothing was compared: not a pass"
     assert sample._verdict("fe-cublas", False, 0) == sample._verdict("fe-cublas", False, 6) == "FAIL", "a failed replay or token line fails either way"
     assert sample._verdict("reference", True, 0) == "RAN reference stack (no provider checked)"
+
+
+def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_nothing(monkeypatch, capsys):
+    """The sample's own loop function on a CPU session of the tiny geometry: one line before the prompt and the decode loop,
+    one before the checks; the report and the text stand between them, so a reader of a long run knows what it waits for."""
+    import model_samples
+    from model_samples import tie_out
+
+    sample = _sample_script(monkeypatch)
+    session, text = _tiny_session(sequences=2)
+    prompts = [text.encode("ab" + str(s)) for s in range(2)]
+    capsys.readouterr()
+    forced = model_samples.StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
+    ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
+    out = capsys.readouterr().out.splitlines()
+    assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
+    first = (
+        "[00] decoding: 3 prompt tokens through the decode step, then 5 new tokens and a traced pass; the report and the text follow, the text is not streamed"
+    )
+    assert out[0] == first, out[0]
+    at = out.index("[00] checks on every step against the fp64-accumulated reference (replay, every provider block, the tokens)")
+    assert any(line.startswith("first token ") for line in out[1:at]) and out[at - 1].startswith("text out "), "the report and the text come before the checks"
+    assert out[at + 1] == "checks (2 sequences, 7 steps: 3 prompt + 4 decode)", out[at + 1]
+    session.reset(fresh=True)
+    session.new_report()
+    open_end = model_samples.StopRule(text.eos_ids, max_new_tokens=4)
+    ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
+    out = capsys.readouterr().out
+    assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
+    assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 
 
 def test_batch_invariance_covers_every_sequence_of_the_batch():

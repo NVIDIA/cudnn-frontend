@@ -129,7 +129,16 @@ def _verdict(stack: str, passed: bool, judged: int) -> str:
 
 def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
     """One prompt set: prefill, the decode loop (the one host read of a step is here), the traced pass, the report and the
-    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``."""
+    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.
+
+    Two lines say what comes next before the phases that print nothing for a while (the prompt and the decode loop; the
+    checks).  They are printed outside every timed interval, and flushed, so a run through a pipe shows them too."""
+    new_tokens = f"{rule.limit} new tokens" if rule.force_tokens is not None else f"up to {rule.limit} new tokens"
+    print(
+        f"{TAG} decoding: {int(prompts[0].numel())} prompt tokens through the decode step, then {new_tokens} and a traced pass; "
+        "the report and the text follow, the text is not streamed",
+        flush=True,
+    )
     next_ids = session.prefill(prompts)
     tokens = session.read(next_ids)  # the first new token of every sequence
     produced = [[] for _ in prompts]
@@ -160,6 +169,8 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
         print("\n".join("  | " + line for line in (pieces[0] + streams[0].close()).splitlines()))
     if not check:
         return True, 0, produced
+    steps = "every step" if checked_steps is None else f"the first {checked_steps} steps"
+    print(f"{TAG} checks on {steps} against the {session.reference_precision}-accumulated reference (replay, every provider block, the tokens)", flush=True)
     checks = tie_out.run_checks(session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None)
     print(checks.text())
     return checks.ok, checks.judged, produced
@@ -183,7 +194,7 @@ def main(argv=None) -> int:
         return 0
     device = torch.device("cuda", torch.cuda.current_device())
     real = args.model is not None
-    checkpoint, requests = None, []
+    checkpoint, requests, described = None, [], 0.0
     try:
         overrides = parse_overrides(args.provider)
         if args.dump_tokens:  # a file that cannot be written is an error before the run, not after it
@@ -192,6 +203,7 @@ def main(argv=None) -> int:
             if os.path.isdir(target) or not os.access(target if there else os.path.dirname(target), os.W_OK):
                 raise ValueError(f"--dump-tokens {os.path.basename(os.path.normpath(args.dump_tokens))}: cannot be written there")
         if real:  # the text side and the description of the checkpoint: config and shard headers, no weights
+            describing = time.perf_counter()
             text = model_samples.TextIO.from_checkpoint(args.model)
             checkpoint = model_samples.Checkpoint.describe(args.model)
             model = QwenDense.describe(checkpoint)
@@ -203,6 +215,7 @@ def main(argv=None) -> int:
             requests = [([{"role": "user", "content": prompt}], None, {}, f"--prompt {n + 1}") for n, prompt in enumerate(args.prompt)]
             requests += [(*text_io.load_messages(path), f"--messages {os.path.basename(path)}") for path in args.messages]
             requests = requests or [([{"role": "user", "content": DEFAULT_PROMPT}], None, {}, "the default prompt")]
+            described = time.perf_counter() - describing
         else:
             model = QwenDense.reduced(layers=args.layers)
             text = model_samples.TextIO.synthetic(model.geometry.vocab)
@@ -286,7 +299,9 @@ def main(argv=None) -> int:
     except ValueError as error:
         print(f"{TAG} ERROR {error}")
         return 1
-    first.stages.add("import", started - _START)
+    first.stages.add("import", started - _START - described)
+    if real:  # the tokenizer, the chat template, config.json, the shard headers and the request files: no weights
+        first.stages.add("describe", described)
     first.stages.add("plan", time.perf_counter() - planning)
     try:  # after the plan: a GPU this sample does not serve skips, whatever is installed
         environment = model_samples.check_environment()
