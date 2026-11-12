@@ -34,6 +34,67 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### Native SDPA service register release — validation, 2026-11-12 (UTC)
+
+Twenty-six SM100/SM107 forward templates now release the unchanged service
+register budget at one common warpgroup instruction before role dispatch.
+`TestServiceRegisterRelease` in the SM100 DSL and SM107 FP8 CI entry files
+compiles every changed template and checks the actual PTX, including both
+entries of D512 MXFP8 and the separate correction-group release. Three old
+template controls fail this detector; all 26 candidate templates pass without
+skips. SM107 results in this compile run are cross-compilation only.
+
+B200 (SM100, 148 SMs), Torch 2.14.1+cu130, cuDNN 9.30.0.4 and CuTe DSL 4.8.0
+using actual CUDA 13.4 and NVRTC 13.4: 127 native cases pass. They cover 72
+dense half/FP8/MXFP8 physical-stride permutations across D128/D192/D256/D512,
+24 half storage/rebind cases, four D192 cases, five D512 half datapath cases,
+one FP8 D512 multi-tile case, two MXFP8 D512 multi-wave cases, and 19 existing
+paged FP8 determinism cases. The latter include nine strict unchanged-parent
+goldens, nine repeatability/batch-invariance cases and one warm case. No
+tracked golden or numerical tolerance changes. The warm case has only four
+CTAs and is not a several-waves stress qualification.
+
+Racecheck, memcheck and synccheck each pass 12 dense stride/replay cases
+(three input families and four widths), with zero errors or hazards. Only
+racecheck filters instrumentation to `kns=cudnn_kernel_`; memcheck and
+synccheck are unfiltered. CUDA API error reporting is disabled, so these
+results qualify the selected memory/synchronization tools only. Earlier
+private harness failures are retained: simultaneous golden record/check
+settings, counting two L1 cases before pytest marker deselection, and a
+rejected sanitizer filter argument. None changed production bytes or relaxed
+an assertion; completed numerical cases were retained, and only missing
+phases were rerun. Native SM103 and performance are not measured here.
+This forward-only change makes no new backward determinism claim.
+
+Native SM107, Torch 2.14.0+cu130, cuDNN 9.30.0.4 and CuTe DSL 4.8.0 with
+CUDA 13.4/NVRTC 13.4: 104 candidate cases pass without skips or failures.
+They reuse the 72 dense stride permutations, 12 split1 half storage/rebind
+cases, four D512 FP8 strict goldens and four repeatability/batch-invariance
+cases, eight D576/V512 half nonpaged cases and four half determinism/golden
+cases. Eight parent goldens are recorded in a separate process and checked
+without recording by the candidate. The common half fixture's twelve
+pre-existing SM107 split exclusions are deselected before execution; this
+run does not qualify those split configurations. Native SM107 sanitizers
+remain unmeasured. The initial private runner used a CPython 3.12 extension
+in a 3.10 container and failed before GPU tests; the corrected run uses a
+matching extension whose native build inputs equal the frozen source.
+
+From `test/python`, the generated-instruction detector is:
+
+```bash
+python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestServiceRegisterRelease \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestServiceRegisterRelease -q -rs
+```
+
+The existing strict paged suite uses the normal golden workflow below;
+record its nine golden cases from the unchanged parent into a separate
+directory, then run the candidate with recording disabled. Dense sanitizer
+selection is `test_sdpa_fwd_dsl_sm100.py::TestNativeDenseStrides -m L0 -k order0`.
+The additional multi-wave selection is
+`test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d512_dense_multi_wave_alias -m L1`.
+The frozen validation base is `7c6ea67c633a8509ba976cbf3b0bb0c32473b606`;
+source and library hashes and the actual import path were checked.
+
 ### SM120 warp-cached page tables — validation, 2026-11-12 (UTC)
 
 The common paged loader now loads a tile's live page IDs across a producer

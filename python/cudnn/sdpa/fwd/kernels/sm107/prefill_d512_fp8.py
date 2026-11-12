@@ -1012,11 +1012,10 @@ def _kernel(
     #   TMA-STG   (warp 6): sg1 only — O + LSE.  sg0 does not enter the scheduler loop.
     #   Scheduler (warp 7): try_cancel; both sgs.
     # ------------------------------------------------------------------
-    # The paged launch enables the register split. All four service warps
+    # All layouts share the register split. All four service warps
     # release at one warpgroup-uniform instruction before dispatching roles.
-    if cutlass.const_expr(PAGED_KV):
-        if warp_idx >= cutlass.Int32(CFG.MMA_WARP_ID):
-            nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+    if warp_idx >= cutlass.Int32(CFG.MMA_WARP_ID):
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
 
     if warp_idx >= cutlass.Int32(CFG.SOFTMAX_WG0_BASE) and warp_idx < cutlass.Int32(CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS):
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
@@ -1053,8 +1052,6 @@ def _kernel(
         )
 
     elif warp_idx == cutlass.Int32(CFG.MMA_WARP_ID):
-        if cutlass.const_expr(not PAGED_KV):
-            nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # cga2 non-leader paths fork — sg0 non-leader is quiet, sg1 non-leader
         # forwards mb_p_xfer_full to leader (P12) in a persistent loop.
         if is_leader:
@@ -1100,8 +1097,6 @@ def _kernel(
             )
 
     elif warp_idx == cutlass.Int32(CFG.TMALDG_WARP_ID):
-        if cutlass.const_expr(not PAGED_KV):
-            nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1135,8 +1130,6 @@ def _kernel(
         )
 
     elif warp_idx == cutlass.Int32(CFG.TMASTG_WARP_ID):
-        if cutlass.const_expr(not PAGED_KV):
-            nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             is_sg1=is_sg1,
             tma_o_desc=tma_o_desc,
@@ -1153,8 +1146,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        if cutlass.const_expr(not PAGED_KV):
-            nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
             # THD: persistent grid + the device claim counter in the 4B+4
             # metadata's last two slots.  The dense CLC path hands out tiles

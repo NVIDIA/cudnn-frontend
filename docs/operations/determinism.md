@@ -413,6 +413,23 @@ outside this addition.
 
 
 
+## SM100/SM107 forward register redistribution
+
+The native half, FP8 and MXFP8 forward templates release the service
+warpgroup's register budget at one common instruction before the MMA, load,
+store and scheduler roles diverge. This preserves their arithmetic and
+register budgets. On SM100, the existing D64/D128/D512 paged FP8 cases retain
+their documented repeatability and batch invariance against unchanged-parent
+goldens; dense half, FP8 and MXFP8 D128/D192/D256/D512 also retain numerical
+and changed-buffer replay coverage. Dense replay alone does not establish
+batch invariance. Native SM107 also retains strict parent goldens and
+repeatability/batch invariance for paged D512 FP8 and D576/V512 half,
+alongside dense half/FP8/MXFP8 numerical and changed-buffer replay coverage.
+Qualification of this update on SM103 remains unverified; compiling an
+architecture's instructions is not an execution result.
+Backward kernels and their support statuses are unchanged. See the
+[coverage report](../../test/python/determinism_goldens/README.md).
+
 ## SM120 FP8 and MXFP8 forward tails
 
 Native per-tensor FP8 and block-scaled MXFP8 forward preserve per-sequence

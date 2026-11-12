@@ -632,6 +632,15 @@ and counts the two common release sites (correction and service groups).
 The selected SM107 CI entry collects these checks; they also cross-compile
 from other architectures when the installed tools support the target.
 
+`TestServiceRegisterRelease` in the selected SM100 and SM107 entry files
+also compiles every remaining half, FP8 and MXFP8 service-role template.
+It checks each generated PTX entry for a common service release before the
+role-local acquisitions, accounting separately for the correction group
+(which can share the same budget). Dense D512 is included; previously only
+its paged specialization converged. D512 MXFP8 emits separate V-half entries.
+These compile checks do not establish native execution or performance on
+the target architecture; retain numerical, replay and sanitizer coverage.
+
 
 **Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
 

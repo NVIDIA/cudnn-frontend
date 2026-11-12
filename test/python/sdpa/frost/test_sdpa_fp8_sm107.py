@@ -26,6 +26,12 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestServiceRegisterRelease:
+    from service_register_release_checks import test_sm107_service_register_release as _release
+
+    test_service_register_release = staticmethod(_release)
+
+
 class TestNativeHalfRegisterRelease:
     """Cross-compile the half kernel through the selected SM107 CI entry."""
 
