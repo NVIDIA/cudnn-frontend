@@ -1665,7 +1665,7 @@ a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (
 harness xfails them), their heuristics crash the process while planning any
 single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
 9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
-planning there on every known build -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = None`: cuDNN 9.28.0's heuristics
+planning there below cuDNN 9.30.0 -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 93000`, the 9.30.0.5 nightly measured clean on cc 10.0 / 10.3 / 10.7, 2026-11-12: cuDNN 9.28.0's heuristics
 plan the 21-contract matrix but building the backend's BHSD single-query plan killed the test process on the cc
 10.7 CI lane (2026-10-08), and the detector re-measures the matrix through plan, check_support and build on
 every run of that lane; the same guard covers cc 10.0 / 10.3, where the SM100 decode emitter crashes the same 18 of
