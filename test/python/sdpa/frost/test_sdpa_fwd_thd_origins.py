@@ -53,6 +53,7 @@ def test_independent_thd_origins_rebind_and_capture(
     heads_override=None,
     batch_override=None,
     extra_checks=None,
+    origin_element_unit=None,
 ):
     import cudnn
     import torch
@@ -75,8 +76,11 @@ def test_independent_thd_origins_rebind_and_capture(
     ports = ("q", "k", "v", "o", "stats")
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
     # +16 head padding must represent integral compact and gapped token origins.
-    qk_multiplier = 16 if d_qk in (64, 192, 576) or sm120 else d_qk
-    multipliers = (heads * qk_multiplier, qk_multiplier, 1, 16 if sm120 else d_v, 1)
+    qk_multiplier = 16 if d_qk in (64, 192, 512, 576) or sm120 else d_qk
+    o_multiplier = 16 if sm120 else d_v
+    if origin_element_unit is not None:
+        qk_multiplier = o_multiplier = origin_element_unit
+    multipliers = (heads * qk_multiplier, qk_multiplier, 1, o_multiplier, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
     q_lengths, kv_lengths = q_lengths[:batch], kv_lengths[:batch]
     log2_stats = stats_layout == "head"
