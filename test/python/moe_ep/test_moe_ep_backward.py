@@ -2345,29 +2345,43 @@ def test_discrete_training_multi_gpu_matches_reference(world_size, tmp_path):
     )
 
 
+_TRAINING_MIXED_CGA_TUNINGS = {
+    "phase-mixed": {"mixed_cga": True, "scheduling": "phase_interleave"},
+    "phase-mixed-standalone": {"mixed_cga": True, "scheduling": "phase_interleave", "token_back_mode": "standalone_warps"},
+}
+
+
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("world_size", [2, 4], ids=["ep2", "ep4"])
-@pytest.mark.parametrize("storage_mode", ["contiguous", "discrete"])
-def test_training_multi_gpu_mixed_cga_matches_reference(world_size, storage_mode, tmp_path):
-    """Mixed-CGA acceptance G2: upstream CI covers mixed CGA only at EP1."""
+@pytest.mark.parametrize("world_size", [4], ids=["ep4"])
+@pytest.mark.parametrize("tuning_name", sorted(_TRAINING_MIXED_CGA_TUNINGS))
+def test_training_multi_gpu_mixed_cga_matches_reference(world_size, tuning_name, tmp_path):
+    """Mixed-CGA acceptance G2: upstream CI covers mixed CGA only at EP1.
 
+    Discrete storage only: mixed CGA keeps one weight-descriptor set per cluster role there, and the multi-node
+    mixed-CGA cases already cover contiguous storage. EP4 covers EP2's single-node transport.
+    """
+
+    storage_mode = "discrete"
     _require_distributed_sm107(world_size)
     os.environ.setdefault("NVIDIA_IMEX_CHANNELS", "0")
-    init_file = tmp_path / f"mixed_cga_training_{storage_mode}_ep{world_size}.init"
+    init_file = tmp_path / f"mixed_cga_training_{tuning_name}_{storage_mode}_ep{world_size}.init"
     context = mp.spawn(
         _distributed_backward_worker,
-        args=(world_size, str(init_file), storage_mode, {"mixed_cga": True, "scheduling": "phase_interleave"}),
+        args=(world_size, str(init_file), storage_mode, _TRAINING_MIXED_CGA_TUNINGS[tuning_name]),
         nprocs=world_size,
         join=False,
     )
-    _join_spawned_with_deadline(context, what=f"EP{world_size} mixed-CGA training ({storage_mode})")
+    _join_spawned_with_deadline(context, what=f"EP{world_size} mixed-CGA training {tuning_name} ({storage_mode})")
 
 
 _TRAINING_FORWARD_TUNING_CASES = {
     "bulk-auto": {"fc2_bulk_store": "auto"},
     "atomic": {"scheduling": "atomic"},
     "phase-mixed": {"scheduling": "phase_interleave", "mixed_cga": True},
+    # atomic and phase_interleave switch token-back to atomic-counter claiming; standalone warps then claim that way too.
+    "atomic-standalone": {"scheduling": "atomic", "token_back_mode": "standalone_warps"},
+    "phase-mixed-standalone": {"scheduling": "phase_interleave", "mixed_cga": True, "token_back_mode": "standalone_warps"},
 }
 
 
@@ -2933,6 +2947,80 @@ def test_training_forward_in_kernel_topk_reduce_does_not_accumulate_across_calls
         # BF16 atomics make the reduction order-dependent: check each call against the reference, not against call 1.
         _assert_matches_reference(run(), expected[0])
         _assert_matches_reference(run(), expected[0])
+
+
+# In-kernel top-k reduction composes with the forward scheduling knobs (only bulk store excludes it).
+_TRAINING_IN_KERNEL_REDUCE_TUNING_CASES = {
+    "atomic": {"scheduling": "atomic"},
+    "phase-mixed": {"scheduling": "phase_interleave", "mixed_cga": True},
+}
+
+
+def _training_in_kernel_reduce_tuning_worker(case_name: str) -> None:
+    from cudnn import MoeEpTuningConfig
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    base_args = make_forward_inputs(device)
+    args = (
+        base_args[0].dequantize(torch.bfloat16).contiguous(),
+        base_args[1],
+        base_args[2],
+        base_args[3],
+        base_args[4].float().contiguous(),
+    )
+    token_count = args[0].shape[0]
+    grad_output = _grad_output(device, token_count, seed=20260902)
+    expected = _fixed_training_reference(
+        args,
+        grad_output,
+        combine_format="bf16",
+        gate_up_clamp=None,
+        max_tokens_per_rank=token_count,
+        physical_recv_pool_rows=256,
+    )
+    source_weights = _fixed_training_weights(args)
+
+    def forward_outputs(tuning, calls):
+        # In-kernel top-k reduction needs BF16 combine and output, apply_topk_in_fc1 and token_back_mode="epi_warps".
+        with MoeEp(
+            _training_public_config(
+                top_k=args[3].shape[1],
+                max_tokens_per_rank=token_count,
+                physical_recv_pool_rows=256,
+                combine_format="bf16",
+                output_format="bf16",
+                apply_topk_in_fc1=True,
+                training_forward_tuning=tuning,
+            )
+        ) as op:
+            requirements = op.prepare_training(device=device)
+            forward_staging, _ = _allocate_training_weight_staging(source_weights)
+            native_forward = op.pack_forward_weights(source_weights[0], out=forward_staging)
+            forward_out, _ = _allocate_stateless_training_outputs(requirements, device, op.training_symmetric_buffers())
+            results = [op.training_forward(args[0], args[3], args[4], weights=native_forward, out=forward_out).clone() for _ in range(calls)]
+            torch.cuda.synchronize(device)
+            return results
+
+    (static_output,) = forward_outputs(MoeEpTuningConfig(reduce_topk_in_kernel=True), 1)
+    outputs = forward_outputs(MoeEpTuningConfig(reduce_topk_in_kernel=True, **_TRAINING_IN_KERNEL_REDUCE_TUNING_CASES[case_name]), 3)
+    # BF16 atomics make the reduction order-dependent: check each call against the reference.
+    for output in outputs:
+        _assert_matches_reference(output, expected[0])
+    identical = all(torch.equal(output.view(torch.int16), static_output.view(torch.int16)) for output in outputs)
+    print(f"in-kernel reduce training forward {case_name}: byte-identical to static scheduling: {identical}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("case_name", sorted(_TRAINING_IN_KERNEL_REDUCE_TUNING_CASES))
+def test_training_forward_in_kernel_topk_reduce_with_forward_scheduling_matches_reference(case_name):
+    _sm107_device()
+    _run_isolated(
+        _training_in_kernel_reduce_tuning_worker,
+        (case_name,),
+        what=f"training in-kernel top-k reduce case {case_name}",
+    )
 
 
 @pytest.mark.L1

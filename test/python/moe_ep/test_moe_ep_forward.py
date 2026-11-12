@@ -1167,6 +1167,12 @@ _FORWARD_TUNING_CASES = {
     "bulk-8-dispatch": ({"fc2_bulk_store": 8, "token_back_mode": "standalone_warps"}, "bf16"),
     "atomic": ({"scheduling": "atomic"}, "bf16"),
     "phase-mixed-bulk": ({"scheduling": "phase_interleave", "mixed_cga": True, "fc2_bulk_store": "auto"}, "bf16"),
+    # atomic and phase_interleave switch token-back to atomic-counter claiming; standalone warps then claim that way too.
+    "atomic-standalone": ({"scheduling": "atomic", "token_back_mode": "standalone_warps"}, "bf16"),
+    "phase-mixed-standalone": (
+        {"scheduling": "phase_interleave", "mixed_cga": True, "token_back_mode": "standalone_warps"},
+        "bf16",
+    ),
 }
 
 
@@ -1231,15 +1237,61 @@ def test_forward_kernel_tuning_inference_matches_reference_and_replays(case_name
     )
 
 
+# In-kernel top-k reduction composes with the forward scheduling knobs (only bulk store excludes it).
+_IN_KERNEL_REDUCE_TUNING_CASES = {
+    "atomic": {"scheduling": "atomic"},
+    "phase-mixed": {"scheduling": "phase_interleave", "mixed_cga": True},
+}
+
+
+def _in_kernel_reduce_tuning_inference_worker(case_name: str) -> None:
+    from cudnn import MoeEp, MoeEpTuningConfig
+
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+    args = make_forward_inputs(device)
+    expected = _reference_forward(args)
+
+    with MoeEp(_moe_ep_config(**_forward_config(), inference_tuning=MoeEpTuningConfig(reduce_topk_in_kernel=True))) as op:
+        static_output = op(*args).clone()
+        torch.cuda.synchronize(device)
+
+    tuning = MoeEpTuningConfig(reduce_topk_in_kernel=True, **_IN_KERNEL_REDUCE_TUNING_CASES[case_name])
+    with MoeEp(_moe_ep_config(**_forward_config(), inference_tuning=tuning)) as op:
+        outputs = [op(*args).clone() for _ in range(3)]
+        torch.cuda.synchronize(device)
+        # BF16 atomics make the reduction order-dependent: check each call against the reference.
+        for output in outputs:
+            _assert_matches_reference(output, expected)
+        prepared = op._execution_state.backend._prepared_kernel
+        assert prepared.config.cluster_shape_mnk == ((4, 1, 1) if tuning.mixed_cga else (2, 1, 1))
+    identical = all(torch.equal(output.view(torch.int16), static_output.view(torch.int16)) for output in outputs)
+    print(f"in-kernel reduce inference {case_name}: byte-identical to static scheduling: {identical}")
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("case_name", sorted(_IN_KERNEL_REDUCE_TUNING_CASES))
+def test_in_kernel_topk_reduce_with_forward_scheduling_matches_reference(case_name):
+    _sm107_device()
+    _run_isolated(
+        _in_kernel_reduce_tuning_inference_worker,
+        (case_name,),
+        what=f"in-kernel top-k reduce inference case {case_name}",
+    )
+
+
 _MIXED_CGA_INFERENCE_TUNINGS = {
     "mixed": {"mixed_cga": True},
     "mixed-phase-bulk": {"mixed_cga": True, "scheduling": "phase_interleave", "fc2_bulk_store": "auto"},
+    "mixed-phase-standalone": {"mixed_cga": True, "scheduling": "phase_interleave", "token_back_mode": "standalone_warps"},
 }
 
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("world_size", [2, 4])
+# EP4 covers EP2's single-node transport; the multi-node cases cover EP8 and above.
+@pytest.mark.parametrize("world_size", [4])
 @pytest.mark.parametrize("tuning_name", sorted(_MIXED_CGA_INFERENCE_TUNINGS))
 def test_mxfp8_forward_multi_gpu_mixed_cga_matches_reference(world_size, tuning_name, tmp_path):
     """Mixed-CGA acceptance G1: upstream CI covers mixed CGA only at EP1."""
@@ -1258,7 +1310,8 @@ def test_mxfp8_forward_multi_gpu_mixed_cga_matches_reference(world_size, tuning_
 
 @pytest.mark.L1
 @pytest.mark.gpu_exclusive
-@pytest.mark.parametrize("world_size", [2, 4])
+# EP4 covers EP2's single-node transport; the multi-node cases cover EP8 and above.
+@pytest.mark.parametrize("world_size", [4])
 @pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
 def test_mxfp8_forward_multi_gpu_fc2_bulk_store_matches_reference(world_size, token_back_mode, tmp_path):
     _require_distributed_sm107(world_size)
