@@ -857,7 +857,9 @@ def _ldg_kv_tile(
             tma_load_tile(
                 sRingK[ring_state.idx],
                 (
-                    tma_slice_runtime_desc(_rt_desc(desc_words, _seq_slot(K_SLOT, n_batch, seq_slot, physical_origins)), d_col, kv_head_g, kv_row_thd, cutlass.Int32(0))
+                    tma_slice_runtime_desc(
+                        _rt_desc(desc_words, _seq_slot(K_SLOT, n_batch, seq_slot, physical_origins)), d_col, kv_head_g, kv_row_thd, cutlass.Int32(0)
+                    )
                     if cutlass.const_expr(_THD)
                     else tma_k(d_col, kv_head_g, kv_row, batch_g)
                 ),
@@ -869,7 +871,9 @@ def _ldg_kv_tile(
             tma_load_tile(
                 sRingV[ring_state.idx],
                 (
-                    tma_slice_runtime_desc(_rt_desc(desc_words, _seq_slot(V_SLOT, n_batch, seq_slot, physical_origins)), d_col, kv_head_g, kv_row_thd, cutlass.Int32(0))
+                    tma_slice_runtime_desc(
+                        _rt_desc(desc_words, _seq_slot(V_SLOT, n_batch, seq_slot, physical_origins)), d_col, kv_head_g, kv_row_thd, cutlass.Int32(0)
+                    )
                     if cutlass.const_expr(_THD)
                     else tma_v(d_col, kv_head_g, kv_row, batch_g)
                 ),
@@ -980,7 +984,9 @@ def _tmaldg_warp_group(
         tma_load_tile(
             sQ[0],
             (
-                tma_slice_runtime_desc(_rt_desc(desc_words, _seq_slot(Q_SLOT, n_batch, seq_slot, physical_origins)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
+                tma_slice_runtime_desc(
+                    _rt_desc(desc_words, _seq_slot(Q_SLOT, n_batch, seq_slot, physical_origins)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0)
+                )
                 if cutlass.const_expr(_THD)
                 else tma_q(cutlass.Int32(0), head_g, q_row_base, batch_g)
             ),
@@ -992,7 +998,9 @@ def _tmaldg_warp_group(
         tma_load_tile(
             sdO[0],
             (
-                tma_slice_runtime_desc(_rt_desc(desc_words, _seq_slot(DO_SLOT, n_batch, seq_slot, physical_origins)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
+                tma_slice_runtime_desc(
+                    _rt_desc(desc_words, _seq_slot(DO_SLOT, n_batch, seq_slot, physical_origins)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0)
+                )
                 if cutlass.const_expr(_THD)
                 else tma_do(cutlass.Int32(0), head_g, q_row_base, batch_g)
             ),
@@ -1608,16 +1616,25 @@ def _compute_warp_group(
             _row_pk = q_tok + q_row_safe
             # Stats is the caller's: under independent origins its rows start at the Stats port's own token origin.
             # do_dot is the chain's compact scratch and stays at the packed prefix.
-            _row_lse = _row_pk
             if cutlass.const_expr(thd_origins is not None):
-                _row_lse = (
-                    cutlass.Int32(thd_port_origin(thd_origins, stats_origin_row, cute.math.min(batch_idx, n_batch - cutlass.Int32(1)), q_tok)) + q_row_safe
-                )
-            if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                lse_q_log2e = lse_tensor[_row_lse, head_g] * cutlass.Float32(LOG2E)
+                # Dead initial units have no scalar row. Clamping their batch to the last sequence is unsafe:
+                # an empty final sequence may place its Stats origin exactly at the allocation's end.
+                # Predicate the reads, keeping every role in the existing barrier protocol.
+                lse_q_log2e = cutlass.Float32(0.0)
+                scaled_do_dot_q = cutlass.Float32(0.0)
+                if batch_idx < n_batch and seqlen_q > cutlass.Int32(0):
+                    _row_lse = cutlass.Int32(thd_port_origin(thd_origins, stats_origin_row, batch_idx, q_tok)) + q_row_safe
+                    if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                        lse_q_log2e = lse_tensor[_row_lse, head_g] * cutlass.Float32(LOG2E)
+                    else:
+                        lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_lse] * cutlass.Float32(LOG2E)
+                    scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
             else:
-                lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_lse] * cutlass.Float32(LOG2E)
-            scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
+                if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                    lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
+                else:
+                    lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
+                scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
         else:
             lse_q_log2e = lse_tensor[batch_g, head_g, q_row_safe] * cutlass.Float32(LOG2E)
             scaled_do_dot_q = do_dot_tensor[batch_g, head_g, q_row_safe] * attn_scale_in

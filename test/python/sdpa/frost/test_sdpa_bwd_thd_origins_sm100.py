@@ -124,3 +124,56 @@ def test_compact_standalone_plan_is_unchanged_by_the_origin_contract():
     thd.run(api, p)
     torch.cuda.synchronize()
     thd.check(p)
+
+
+@pytest.mark.parametrize("surface", ["standalone", "graph"])
+@pytest.mark.parametrize("token_major", [True, False], ids=["token-stats", "head-stats"])
+@pytest.mark.parametrize(
+    "at_capacity,initialize_guard",
+    [
+        pytest.param(True, False, id="end-uninitialized", marks=pytest.mark.L0),
+        pytest.param(True, True, id="end-initialized-control", marks=pytest.mark.L1),
+        pytest.param(False, False, id="interior-control", marks=pytest.mark.L1),
+    ],
+)
+def test_empty_final_origin_stats_guard(stage2_datapath, surface, token_major, at_capacity, initialize_guard):
+    """Run under Compute Sanitizer initcheck: numerics alone cannot see a dead-unit Stats read.
+
+    Retain uninitialized storage past the logical Stats view, so the unfixed kernel's read is observable without
+    leaving an allocated block. The initialized-guard and interior-origin cases discriminate the boundary read
+    from unrelated uninitialized accesses. Both stage-2 variants and the public graph binding are exercised.
+    """
+    p = thd.make_payload(torch.bfloat16, token_major, (257, 93, 0), (383, 129, 0), 0, False, hq=2, hkv=2, causal=False, bottom_right=False, d=512, d_v=512)
+    if at_capacity:
+        for port, tensor in p["data"].items():
+            cap = 1500 if port in ("k", "v", "dk", "dv") else 1000
+            stride = (2 if token_major else 1) if port == "stats" else tensor.stride(1)
+            multiplier = p["spec"][port][1]
+            p["starts"][port][-1] = cap
+            p["offsets"][port][-2:] = cap * stride // multiplier
+
+    stats = p["data"]["stats"]
+    backing = torch.empty(stats.numel() + 256 * 2, dtype=stats.dtype, device=stats.device)
+    if initialize_guard:
+        backing.zero_()
+    # Keep the original strides for both token-major and head-major Stats.
+    p["data"]["stats"] = backing[: stats.numel()].view(stats.shape)
+    p["data"]["stats"].copy_(stats)
+    p["stats_guard_backing"] = backing
+
+    if surface == "graph":
+        graph, execute = thd.make_graph(p, token_major, engine=_ENGINE)
+        workspace_size = graph.get_workspace_size()
+    else:
+        api = thd.make_adapter(p, token_major, api_type=SdpaBwdDslSm100)
+        workspace_size = api.scratch_workspace_bytes()
+
+        def execute(payload):
+            thd.run(api, payload)
+
+    p["ws"] = torch.empty(workspace_size, dtype=torch.uint8, device="cuda")
+    p["snapshots"] = thd.snapshots(p)
+    thd.poison(p)
+    execute(p)
+    torch.cuda.synchronize()
+    thd.check(p)
