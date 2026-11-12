@@ -239,6 +239,12 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Cache-key decorators preserve `None`.** `template_key()` returns `None`
+  when a specialization cannot be identified safely. Appending a suffix must
+  leave it uncacheable; formatting it as a string lets unrelated kernels share
+  the first compiled object even with the disk cache disabled. Detector:
+  `test_uncacheable_fp8_hosts_do_not_reuse_another_kernel` in the SDPA API
+  contract suite runs through the real in-process memo with compilation mocked.
 - **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
   when compiling storage-free declarations; compile and execute under that device,
   and reject differently placed bindings before lowering pointers. An outer
