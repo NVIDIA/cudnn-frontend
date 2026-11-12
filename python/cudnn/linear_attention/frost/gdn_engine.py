@@ -363,6 +363,7 @@ class CompiledGdn:
             if not self.has_k_normalized:
                 regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
@@ -853,6 +854,7 @@ class CompiledGdnBwd:
         self.recompute_orders = self.needs_recompute and not self.coarse_checkpoints
         self.bwd_orders = not self.recompute_orders
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 

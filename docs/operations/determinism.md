@@ -23,8 +23,10 @@ unverified status does not imply an unavailable API.
 
 ## API support by GPU
 
-The four linear-attention APIs are in `cudnn.linear_attention.ops`; bprop uses
-PyTorch autograd through the same API. The two fused GDN step entries
+The four PyTorch linear-attention APIs are in `cudnn.linear_attention.ops`;
+bprop uses PyTorch autograd through the same API. The JAX entries are in
+`cudnn.jax`, with explicit forward/backward counterparts in `cudnn.ops`.
+The two fused GDN step entries
 (`GdnDecodeFused`, `GdnVerifyFused`) are imported from `cudnn` (lazily; also
 under `cudnn.linear_attention.frost`): inference-only direct-call step kernels
 with no backward. `SharedExpertDecode` (the shared-expert decode pair, also
@@ -42,6 +44,10 @@ arbitrary user callbacks.
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `cudnn.jax.gated_delta_net` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
+| `cudnn.jax.gated_delta_net_v2` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
+| `cudnn.jax.gated_delta_product` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
+| `cudnn.jax.mamba2` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
@@ -180,6 +186,11 @@ a row alone and inside a batch under the entry's own picks.
   other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
+- JAX GDN, GDN2, GDP, and Mamba-2: set `batch_invariant=True`; these APIs use
+  FROST directly. Repeatability and batch invariance remain unverified on
+  SM100/103 pending GPU measurements. See the
+  [JAX linear-attention guide](/operations/LinearAttention/linear_attention_jax)
+  for supported shapes, state dtypes, and differentiation options.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
