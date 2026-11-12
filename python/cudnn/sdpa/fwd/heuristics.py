@@ -2913,6 +2913,7 @@ def _sm100_paged_packed_wave_split(caps: Capabilities, facts) -> int:
 # tile at D <= 128, one at D256, more). Count = argmin PARTIAL_COST x waves x s + KV tiles / s (a partial's setup and combine vs
 # the loop's tail).
 SM100_PAGED_TAIL_SPLIT_CGA = {(64, 64): 1, (128, 128): 1, (256, 256): 2}
+SM100_PAGED_TAIL_SPLIT_CCS = {64: frozenset({(10, 0), (10, 3)}), 128: frozenset({(10, 0)}), 256: frozenset({(10, 0), (10, 3)})}  # D128 failed the B300 transfer
 SM100_PAGED_TAIL_SPLIT_MAX_B = 16
 SM100_PAGED_TAIL_SPLIT_Q = (16, 1024)  # declared S_q range measured
 SM100_PAGED_TAIL_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
@@ -2925,12 +2926,12 @@ def sm100_paged_tail_split_domain(caps: Capabilities, facts) -> bool:
     """FlashInfer's exact paged bf16 prefix on cc 10.0 / 10.3 as study sm100_paged_split_v2_20261112 declared it."""
     return (
         caps.sm_lo == 100
-        and facts.device_cc in SM100_PAGED_PACKED_SPLIT_WAVE_CCS
+        and facts.d_qk == facts.d_v
+        and (facts.d_qk, facts.d_v) in SM100_PAGED_TAIL_SPLIT_CGA
+        and facts.device_cc in SM100_PAGED_TAIL_SPLIT_CCS[facts.d_qk]
         and paged_thd_split_domain(caps, facts)
         and not facts.shape_overrides
         and facts.max_total_seq_len_q is None
-        and facts.d_qk == facts.d_v
-        and (facts.d_qk, facts.d_v) in SM100_PAGED_TAIL_SPLIT_CGA
         and facts.dtype == cudnn.data_type.BFLOAT16
         and 1 <= facts.b <= SM100_PAGED_TAIL_SPLIT_MAX_B
         and facts.h_kv > 0

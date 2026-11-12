@@ -2771,6 +2771,10 @@ def test_sm100_paged_tail_split(d, h_q, h_kv, over, choice, cc):
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
     facts = _sm100_paged_prefix(d, h_q, h_kv, max_total_seq_len_q=None, device_cc=cc, **over)
+    if d == 128 and cc == (10, 3):
+        # D128 failed the B300 transfer: B300 keeps the measured choosers' answer
+        assert not heuristics.sm100_paged_tail_split_domain(spec.capabilities, facts)
+        return
     assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == choice
     if choice[0] > 1:
         assert placement.place(spec, facts) == placement.LEAD
