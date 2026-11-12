@@ -597,7 +597,7 @@ def test_decode_kernel_two_column_groups(splits):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
-    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+    from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     B, H, KH, P, s_q = 3, 32, 2, 16, 2
     lens = [700, 130, 5]
