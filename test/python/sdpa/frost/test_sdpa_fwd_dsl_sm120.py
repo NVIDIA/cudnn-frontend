@@ -1853,12 +1853,22 @@ def test_dsl_sm120_small_page_cache_determinism(dtype, kv_dtype):
 @pytest.mark.L0
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group("gpu_exclusive")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dsl_sm120_paged_vector_loop_warm(dtype):
+@pytest.mark.parametrize(
+    "dtype,kv_dtype",
+    [
+        pytest.param(torch.float16, None, id="fp16-half-kv"),
+        pytest.param(torch.bfloat16, None, id="bf16-half-kv"),
+        pytest.param(torch.float16, torch.float8_e4m3fn, id="fp16-e4m3-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-e5m2-kv"),
+    ],
+)
+def test_dsl_sm120_paged_vector_loop_warm(dtype, kv_dtype):
     from test_sdpa_fwd_paged_sm120 import _case, _check
     from warm_stress import StressCase, assert_warm_stress
 
-    g, nodes, bufs, workspace, o_storage, stats_storage = _case(dtype, 2, 256, True, False, h=16, sq=4096, tile_m=128, tile_n=128, explicit_plan=True)
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(
+        dtype, 2, 256, True, False, h=16, sq=4096, tile_m=128, tile_n=128, explicit_plan=True, kv_dtype=kv_dtype
+    )
     pack = {nodes[name]: tensor for name, tensor in bufs.items()}
 
     def execute():
@@ -1869,11 +1879,50 @@ def test_dsl_sm120_paged_vector_loop_warm(dtype):
     # The live K length is 259: three K/V tiles, two refills in each CTA.
     assert_warm_stress(
         StressCase(
-            "SM120 paged D128 rolled copies",
+            "SM120 paged D128 cooperative half copies or FP8 widening",
             execute,
             {"o_storage": o_storage, "stats_storage": stats_storage},
             thread_blocks=2 * 16 * (4096 // 128),
             refills_per_launch=2,
+        ),
+        warm=256,
+        poisoned=256,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group("gpu_exclusive")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+def test_dsl_sm120_paged_decode_async_warm(dtype):
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage, decode_num_stages
+    from test_sdpa_fwd_paged_sm120 import _case, _check
+    from warm_stress import StressCase, assert_warm_stress
+
+    stage = decode_kv_stage(64, 64)
+    depth = decode_num_stages(64, 64, 16)
+    refills = math.ceil(1027 / stage) - depth
+    assert refills > 0
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(
+        dtype, 2, 1024, True, False, h=16, sq=512, dims=(64, 64), packed=True, tile_m=16, tile_n=stage, explicit_plan=True
+    )
+    pack = {nodes[name]: tensor for name, tensor in bufs.items()}
+
+    def execute():
+        g.execute(pack, workspace)
+
+    execute()
+    _check(bufs, 1024)
+    # GQA=8 gives two query tokens per M16 tile and two head groups.
+    # Request zero has 512 CTAs walking 33 stages through the 12-slot ring,
+    # reusing 21 slots; request one's 512 CTAs are the empty-KV control.
+    assert_warm_stress(
+        StressCase(
+            "SM120 paged D64 asynchronous decode copies",
+            execute,
+            {"o_storage": o_storage, "stats_storage": stats_storage},
+            thread_blocks=2 * 2 * (512 // 2),
+            refills_per_launch=refills,
         ),
         warm=256,
         poisoned=256,
