@@ -12,10 +12,12 @@ from cudnn._torch_stream import stream_context
 from cudnn.api_base import APIBase, TupleDict
 from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
 
+CUTEDSL_MIN_VERSION = (4, 8, 0)
+
 
 def _require_dsl():
-    if cutedsl_too_old(cutedsl_state()[1]):
-        raise RuntimeError(cutedsl_requirement_error("Pooled DSA"))
+    if cutedsl_too_old(cutedsl_state()[1], CUTEDSL_MIN_VERSION):
+        raise RuntimeError(cutedsl_requirement_error("Pooled DSA", floor=CUTEDSL_MIN_VERSION))
 
 
 @lru_cache(maxsize=64)

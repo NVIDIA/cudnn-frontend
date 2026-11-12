@@ -4,9 +4,10 @@
 """Pooled DSA public functions."""
 
 from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+from .indices import CUTEDSL_MIN_VERSION
 
-if cutedsl_too_old(cutedsl_state()[1]):
-    raise RuntimeError(cutedsl_requirement_error("Pooled DSA"))
+if cutedsl_too_old(cutedsl_state()[1], CUTEDSL_MIN_VERSION):
+    raise RuntimeError(cutedsl_requirement_error("Pooled DSA", floor=CUTEDSL_MIN_VERSION))
 
 from .cache import pool_cache_update_wrapper as pooled_cache_update_forward
 from .forward import indexer_forward_wrapper as pooled_indexer_forward
