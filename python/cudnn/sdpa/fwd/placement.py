@@ -115,7 +115,8 @@ runs 0.16-0.70 of the backend over b 1-128 and KV 2k-131k, and 0.16-0.37 on two 
 128-row tile holds with rows to spare stay TRAIL: 96/1 won the train lattice (0.26-0.78), but 112/1 at b 96 and KV 49k-100k
 ran 1.27-1.30x (split 4-8 there; split 1 at KV 20k ran 0.79).
 
-Paged K/V on the prefill body (no 16 / 32-row decode tile) TRAILs: on the RTX PRO 6000 (cuDNN 9.30.0.4, profiler kernel time)
+The SM120 hand rule TRAILs paged K/V on the prefill body (no 16 / 32-row decode tile); generated table entries still answer
+first for the classes they measured. On the RTX PRO 6000 (cuDNN 9.30.0.4, profiler kernel time)
 paged d128 runs 15-27x behind the backend at s_q 8-2048 (b1 q2048 kv2048 32/8: 2.92 ms vs 0.159 ms, against 0.133 ms on FROST's
 dense body), and a 72-cell seeded holdout's verify rows came out 0.04-0.09x of today's default with the backend. Paged
 decode-shaped graphs that fit the decode tile keep the rules below and study sm120_decode_20261112's entries.
