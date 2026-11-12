@@ -59,21 +59,47 @@ def kernel_records(launch: Callable[[], object]) -> List[KernelRecord]:
     return records
 
 
+def _measured(rows, text: str) -> None:
+    """One line in the run's "measured" section (``frost_routing.measured``: the terminal summary of the run, from xdist workers too)
+    for the comparison the running test makes at ``rows``.  A job log shows neither a passed test's output nor a skip's reason, so
+    without this line a lane whose cells all skipped reads like one whose cells compared.  The key is the test's own id and the row
+    count: a later outcome of one cell replaces its line, two row counts of one cell are two lines."""
+    import frost_routing
+
+    path, _, test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" ", 1)[0].partition("::")
+    frost_routing.measured(f"launch facts {os.path.basename(path)}::{test} at {rows}", text)
+
+
 def assert_facts_equal_the_launch(entry, launch: Callable[[], object], *rows, what: str = "") -> KernelRecord:
-    """One launch of ``entry`` at the row count ``rows`` (the argument list of its ``cfg_for``) is ONE kernel whose profiler record equals
+    """One launch of ``entry`` at the row count ``rows`` (the arguments of its launch facts) is ONE kernel whose profiler record equals
     the entry's launch facts: the name is the entry's symbol of the compiled form, and grid, block and shared memory are its launch
     shape.  ``launch`` is a zero-argument call of the entry on device operands.  Skips, naming the reason, where the profiler records no
-    kernel or no launch arguments (the symbol is still compared in the second case); returns the record."""
+    kernel or no launch arguments (the symbol is still compared in the second case); returns the record.  EVERY outcome -- compared and
+    equal, not compared and why, failed and on what -- is also one line of the run's "measured" section (:func:`_measured`), so the
+    log of a lane says by itself whether its part's launches were compared."""
     label = f"{what or type(entry).__name__} at {rows}"
+
+    def fail(text: str):
+        _measured(rows, f"FAILED: {text}")
+        raise AssertionError(f"{label}: {text}")
+
+    def skip(text: str):
+        _measured(rows, f"NOT COMPARED: {text}")
+        pytest.skip(f"{label}: {text}")
+
     records = kernel_records(launch)
     if not records:
-        pytest.skip(f"{label}: torch.profiler recorded no kernel launch on this node (no CUPTI): the launch facts were not compared with a launch")
-    assert len(records) == 1, f"{label}: one call launched {len(records)} kernels: {[r.name for r in records]}"
+        skip("torch.profiler recorded no kernel launch on this node (no CUPTI): the launch facts were not compared with a launch")
+    if len(records) != 1:
+        fail(f"one call launched {len(records)} kernels: {[r.name for r in records]}")
     record = records[0]
     symbols = entry.kernel_symbols_for(*rows)
-    assert symbols == (record.name,), f"{label}: the entry names {symbols}, the profiler recorded {record.name!r}"
+    if symbols != (record.name,):
+        fail(f"the entry names {symbols}, the profiler recorded {record.name!r}")
     if record.grid is None or record.block is None or record.shared_memory is None:
-        pytest.skip(f"{label}: the profiler's kernel record carries no grid / block / shared memory here ({record}); the symbol matched")
+        skip(f"the profiler's kernel record carries no grid / block / shared memory here ({record}); the symbol matched")
     shape = entry.launch_shape_for(*rows)
-    assert (record.grid, record.block, record.shared_memory) == shape, f"{label}: the entry states {shape}, the profiler recorded {record}"
+    if (record.grid, record.block, record.shared_memory) != shape:
+        fail(f"the entry states {shape}, the profiler recorded {record}")
+    _measured(rows, f"COMPARED, equal: {record.name} grid {record.grid} block {record.block} shared memory {record.shared_memory} B")
     return record

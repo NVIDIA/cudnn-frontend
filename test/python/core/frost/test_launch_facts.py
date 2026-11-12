@@ -4,8 +4,9 @@
 """The shared pieces of the entries' launch facts (``cudnn.frost.launch_facts``), host-only: the launch shape is a plain tuple, a form is
 plain data built from a config's fields (never its derived properties), the symbols are read from compiled objects and never guessed,
 and the module needs neither torch nor the CuTe DSL.  Also the device comparison every entry suite shares
-(``launch_records.assert_facts_equal_the_launch``), on stubbed profiler records: it fails on each field it compares and skips, naming
-the reason, where the profiler gives nothing to compare.  What each entry states with these pieces is pinned in the entry's own suite."""
+(``launch_records.assert_facts_equal_the_launch``), on stubbed profiler records: it fails on each field it compares, skips, naming
+the reason, where the profiler gives nothing to compare, and writes every outcome into the run's "measured" section.  What each entry
+states with these pieces is pinned in the entry's own suite."""
 
 import json
 import subprocess
@@ -15,6 +16,7 @@ from dataclasses import dataclass
 
 import pytest
 
+import frost_routing
 import launch_records
 from cudnn.frost import launch_facts as lf
 
@@ -133,6 +135,7 @@ def test_the_device_comparison_fails_on_each_field_and_skips_where_nothing_is_re
     shape = lf.LaunchShape((96, 1, 1), (256, 1, 1), 42112)
     recorded = [record]
     monkeypatch.setattr(launch_records, "kernel_records", lambda launch: recorded)
+    monkeypatch.setattr(frost_routing, "MEASURED", {})  # the stubbed outcomes stay out of this run's own "measured" section
     check = launch_records.assert_facts_equal_the_launch
     assert check(_Entry(("k_a",), shape), None, 1) == record
     for symbols in ((), ("k_b",), ("k_a", "k_b")):
@@ -152,3 +155,47 @@ def test_the_device_comparison_fails_on_each_field_and_skips_where_nothing_is_re
         check(_Entry(("k_a",), shape), None, 1)
     with pytest.raises(AssertionError, match="the entry names"):
         check(_Entry(("k_b",), shape), None, 1)
+
+
+def test_the_device_comparison_records_every_outcome_in_the_runs_measured_section(monkeypatch):
+    """A job log shows neither a passed cell's output nor a skipped cell's reason, so a lane where every device cell skipped (no
+    CUPTI, or kernel records without launch arguments) would read like one where they were compared.  Each comparison therefore
+    writes ONE line through ``frost_routing.measured`` -- the channel the run's terminal summary prints -- in every outcome: what was
+    compared (name, grid, block, shared memory), why nothing was, or what differed.  One key per test and row count, so two calls of
+    one cell at two row counts are two lines."""
+    record = launch_records.KernelRecord("k_a", (96, 1, 1), (256, 1, 1), 42112)
+    shape = lf.LaunchShape((96, 1, 1), (256, 1, 1), 42112)
+    recorded = [record]
+    lines = {}
+    monkeypatch.setattr(launch_records, "kernel_records", lambda launch: recorded)
+    monkeypatch.setattr(frost_routing, "MEASURED", lines)
+    check = launch_records.assert_facts_equal_the_launch
+
+    def line(rows=1):
+        keys = [key for key in lines if key.startswith("launch facts ") and key.endswith(f" at ({rows},)")]
+        assert len(keys) == 1 and "test_the_device_comparison_records_every_outcome" in keys[0], sorted(lines)
+        return lines[keys[0]]
+
+    check(_Entry(("k_a",), shape), None, 1)
+    assert line() == "COMPARED, equal: k_a grid (96, 1, 1) block (256, 1, 1) shared memory 42112 B"
+    check(_Entry(("k_a",), shape), None, 17)
+    assert len(lines) == 2 and line(17) == line(1), "one line per row count of a cell"
+    with pytest.raises(AssertionError):
+        check(_Entry(("k_a",), shape._replace(shared_memory=42128)), None, 1)
+    assert line().startswith("FAILED: the entry states ") and "42128" in line() and "42112" in line()
+    with pytest.raises(AssertionError):
+        check(_Entry(("k_b",), shape), None, 1)
+    assert line().startswith("FAILED: the entry names ('k_b',), the profiler recorded 'k_a'")
+    recorded = [record, record._replace(name="k_b")]
+    with pytest.raises(AssertionError):
+        check(_Entry(("k_a",), shape), None, 1)
+    assert line().startswith("FAILED: one call launched 2 kernels")
+    recorded = []
+    with pytest.raises(pytest.skip.Exception):
+        check(_Entry(("k_a",), shape), None, 1)
+    assert line().startswith("NOT COMPARED: torch.profiler recorded no kernel launch")
+    recorded = [launch_records.KernelRecord("k_a", None, None, None)]
+    with pytest.raises(pytest.skip.Exception):
+        check(_Entry(("k_a",), shape), None, 1)
+    assert line().startswith("NOT COMPARED: the profiler's kernel record carries no grid / block / shared memory here") and "the symbol matched" in line()
+    assert len(lines) == 2, "a later outcome of one cell replaces its line; nothing else is written"
