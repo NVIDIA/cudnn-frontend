@@ -253,7 +253,8 @@ if __name__ == "__main__":
             print("FAIL", helper, "expected one new ptx and one new cubin in", dump, "got", new)
             sys.exit(3)
         print("COMPILED", helper, arch)
-        ptx = open(ptxs[0]).read()
+        with open(ptxs[0]) as handle:
+            ptx = handle.read()
         for key, text in PTX_KEYS.items():
             print("PIN", helper, key, ptx.count(text))
         sass = None
