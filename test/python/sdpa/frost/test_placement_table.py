@@ -51,7 +51,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
         assert phase in ("q1", "mtp", "prefill", "prefill_short_square", "prefill_short_q")
         assert layout.removesuffix("_bounded") in ("dense", "paged", "thd", "thd_ragged")
-        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked")
+        assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
         assert isinstance(kv_off_tile, bool)
         assert entry.direction in ("always", "never", "ge", "le") and entry.study
         assert (entry.log2_work is None) == (entry.direction in ("always", "never"))
@@ -551,3 +551,48 @@ def test_sm107_thd_prefill_paged_entries_follow_the_study():
     assert pt.lookup(row, paged((128, 128), 32, 32)) is None
     assert pt.lookup(row, paged((128, 128), 32, 32, s_kv=4100)) is None
     assert pt.lookup(row, paged((128, 128), 32, 8, causal=True)) is True
+
+
+def _sm100_paged(d, h_q, h_kv, b, s_q, s_kv, **over):
+    """FlashInfer's exact paged prefill declaration on a 148-SM cc 10.0 part (head-major page pool, page 16)."""
+    from types import SimpleNamespace
+
+    base = dict(b=b, h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=s_kv, d_qk=d, d_v=d, causal=True, bottom_right=True, thd=True, padded=True)
+    base.update(page_size=16, max_total_seq_len_q=b * s_q, device_sm_count=148, k_t=SimpleNamespace(get_stride=lambda: (16 * d * h_kv, 16 * d, d, 1)))
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+def test_sm100_paged_packed_split_classes_follow_their_study():
+    """The SM100 row's packed split is its own group (``gqa_split``) and, at D64, one Q tile per request its own phase
+    (``prefill_short_q``): study sm100_paged_d64_d256_prefill_20261111 leads the split and short-Q D64 graphs, keeps the backend
+    for a long-Q D64 graph over a long cache, and leaves D256 unsplit graphs to sm100_d256_paged_context_20261030. cc 10.3 does
+    not borrow the new study (its B300 holdout did not qualify the transfer): the split still leads there through the row's
+    hand rule, and the unsplit D64 graphs keep the backend."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    row = "sdpa_fwd_prefill_sm100"
+    study = "sm100_paged_d64_d256_prefill_20261111"
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    split64 = _sm100_paged(64, 32, 8, 1, 64, 32768)
+    assert pt.class_key(row, split64)[4] == "prefill_short_q" and pt.class_key(row, split64)[8] == "gqa_split"
+    split256 = _sm100_paged(256, 16, 8, 1, 128, 32768)
+    assert pt.class_key(row, split256)[4] == "prefill" and pt.class_key(row, split256)[8] == "gqa_split"
+    short_unsplit = _sm100_paged(64, 16, 8, 16, 64, 16384)
+    for facts in (split64, split256, short_unsplit):
+        assert pt.lookup(row, facts) is True
+        assert pt.matched_entry(row, facts).study == study
+    assert pt.lookup(row, _sm100_paged(64, 32, 8, 16, 512, 32768)) is False
+    unsplit256 = _sm100_paged(256, 32, 8, 16, 512, 8192)
+    assert pt.class_key(row, unsplit256)[8] == "gqa"
+    assert pt.matched_entry(row, unsplit256).study == "sm100_d256_paged_context_20261030"
+    exact_d128 = _sm100_paged(128, 32, 8, 1, 64, 32768)
+    assert pt.class_key(row, exact_d128)[4] == "prefill" and pt.class_key(row, exact_d128)[8] == "gqa"
+    b300 = dict(device_cc=(10, 3))
+    for d, h_q, s_q in ((64, 32, 64), (256, 16, 128)):
+        facts = _sm100_paged(d, h_q, 8, 1, s_q, 32768, **b300)
+        assert pt.lookup(row, facts) is None and placement.place(spec, facts) == placement.LEAD
+    assert pt.lookup(row, _sm100_paged(64, 16, 8, 16, 64, 16384, **b300)) is None
+    assert pt.matched_entry(row, _sm100_paged(256, 32, 8, 16, 512, 8192, **b300)).study == "sm100_d256_paged_context_20261030"
