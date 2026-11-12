@@ -2315,8 +2315,8 @@ def compile(  # noqa: A001
     """Compile the host entry for one layout kind (same key surface as sm100/prefill_d512_f16.py: the
     head-dim ENVELOPE, whether the Stats store exists, the Stats layout kind)."""
     if thd_origin_specs is not None:
-        if not CFG.THD_VARLEN or SPLIT_KV != 1 or CFG.TILE_K != 576:
-            raise ValueError("physical origins require native unsplit D576 THD")
+        if not CFG.THD_VARLEN or SPLIT_KV != 1:
+            raise ValueError("physical origins require native unsplit THD")
         if len(thd_origin_specs) != 5:
             raise ValueError("physical THD origins require five port declarations")
     if paged_v_hnd is None:

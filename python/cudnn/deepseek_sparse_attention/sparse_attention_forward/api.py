@@ -15,9 +15,13 @@ from cudnn.api_base import APIBase, TupleDict
 from . import _interface_sm100 as _iface_sm100
 from ._support_sm90 import sm90_dsa_cutedsl_requirement_error
 
+# SM100 (H, D_qk) -> supported indexer_topk. H96 runs the H64 kernel on two
+# overlapping 64-head windows (see ``_interface_sm100._HEAD64_WINDOW_STARTS``).
 _SUPPORTED_VARIANTS = {
     (64, 512): (0, 512, 1024, 2048),
     (64, 576): (0, 512, 1024, 2048),
+    (96, 512): (0, 512, 1024, 2048),
+    (96, 576): (0, 512, 1024, 2048),
     (128, 512): (0, 512, 1024),
 }
 _SM90_SUPPORTED_HEADS = (16, 32, 64, 96, 128)

@@ -60,6 +60,9 @@ def test_paged_thd_origins_rebind_and_capture(
     key_growth=1.0,
     independent_table_strides=False,
     single_q=False,
+    heads_override=None,
+    q_bound=None,
+    batch_override=None,
 ):
     import cudnn
     import torch
@@ -87,8 +90,15 @@ def test_paged_thd_origins_rebind_and_capture(
         page_size,
         (1024 if d_qk == 576 else 8192),
     )
+    if batch_override is not None:
+        assert batch_override == 1
+        batch = 1
+    if q_bound is not None:
+        maximum = q_bound
     if kv_bound is not None:
         kv_max = kv_bound
+    if heads_override is not None:
+        heads = heads_override
     scale = d_qk**-0.5 if attention_scale is None else attention_scale
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
@@ -137,9 +147,10 @@ def test_paged_thd_origins_rebind_and_capture(
 
     def fill(values, shift, replay=False, keyless=False, empty=False):
         ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
-        kl = [kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max]
+        ql = [min(length, maximum) for length in ql[:batch]]
+        kl = ([kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max])[:batch]
         if keyless:
-            kl[1] = 0
+            kl[-1] = 0
         # shift=0 is the integration reproducer's shared [0,320,512] Q slots.
         # Subsequent bindings/replays also separate the three physical origins.
         starts = {
@@ -147,6 +158,7 @@ def test_paged_thd_origins_rebind_and_capture(
             "o": [shift + (16 if shift else 0), 320 + shift + (32 if shift else 0)],
             "stats": [shift + (32 if shift else 0), 320 + shift + (64 if shift else 0)],
         }
+        starts = {name: rows[:batch] for name, rows in starts.items()}
         for name, lengths in (("ql", ql), ("kl", kl)):
             values[name].copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32).view(batch, 1, 1, 1))
         for name in ("q", "o", "stats"):
@@ -216,7 +228,7 @@ def test_paged_thd_origins_rebind_and_capture(
         paged_attention_k_table=nodes["kt"],
         paged_attention_v_table=nodes["vt"],
         paged_attention_max_seq_len_kv=kv_max,
-        max_total_seq_len_q=477,
+        max_total_seq_len_q=min(477, batch * maximum),
         stats_use_log2=stats_layout == "head",
     )
     nodes["o"].set_output(True).set_dim((batch, heads, maximum, d_v)).set_stride((maximum * heads * d_qk, d_qk, heads * d_qk, 1)).set_ragged_offset(
@@ -242,6 +254,13 @@ def test_paged_thd_origins_rebind_and_capture(
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
+        plan = graph._compiled_plans[graph._plan_index]
+        decode_tile = splits > 1 or (cga != 2 and maximum * (heads // kv_heads if pack_gqa else 1) <= 128)
+        expected_template = ("decode_d128_f16" if decode_tile else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
+        assert plan._compiled.kernel_template == expected_template
+        assert plan._prepared.spec.native is not None
+        assert plan._prepared.spec.origin_specs is not None
     if rubin:
         import inspect
 

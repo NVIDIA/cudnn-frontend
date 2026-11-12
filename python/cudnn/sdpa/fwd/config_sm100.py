@@ -561,7 +561,15 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """The shared D256 packed-head path serves paged half THD on SM100/103/107."""
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+    return (
+        device_cc in ((10, 0), (10, 3), (10, 7))
+        and d_shape == (256, 256)
+        and not fp8
+        and thd
+        and paged
+        and cga in (None, 2)
+        and (split_kv == 1 or (device_cc in ((10, 0), (10, 3)) and split_kv > 1))
+    )
 
 
 def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
@@ -700,7 +708,7 @@ def _validate_params(
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
             (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and not fp8)
-            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
+            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and (not k.pack_gqa or k.paged_kv))
             or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
                 flavor == "d128"
@@ -732,13 +740,12 @@ def _validate_params(
                         or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
                     )
                 )
-                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2)
                 or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2)
             )
         ):
             raise ValueError(
-                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, "
-                "paged half d256 cga2 unsplit, or native half d576 cga2"
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, " "paged half d256 cga2, or native half d576 cga2"
             )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid

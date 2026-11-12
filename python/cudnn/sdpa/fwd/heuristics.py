@@ -2448,9 +2448,10 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # When tile_q % G != 0 a packed tile holds tile_q // G tokens, its tail rows dead: packing wins only while it launches no
             # more Q tiles than the unpacked set (G per KV head here, since S_q < tile_q).  48/1 at S_q = 120 would
             # launch 60 two-token tiles against 48, 71/1 at S_q = 100 one-token tiles 100 against 71.  A group that
-            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.
-            g = facts.h_q // facts.h_kv
-            wins = _ceil_div(facts.s_q, tile_q // g) <= g
+            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.  Under partial PackGQA the tile holds the
+            # packed subgroup p, not G (96/1 at a 64-row tile packs 32): the same test per subgroup, G / p of them.
+            g = _pack_gqa_group(caps, facts, tile_m, True, split_kv)
+            wins = 1 < g <= tile_q and _ceil_div(facts.s_q, tile_q // g) <= g
         if (
             wins
             and rubin_dense_d128_shared_leg(caps, facts)
@@ -2828,6 +2829,53 @@ def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaun
     return launch if units <= resident else None
 
 
+SM100_PAGED_PACKED_SPLIT_CGA = {(64, 64): 1, (256, 256): 2}  # SM100/103 paged half packed split: D64 decode tile, D256 pair
+SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
+SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
+SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
+
+
+def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
+    """SM100/103 paged bf16 D64 / D256 GQA prefix: the packed split count, 1 outside the domain.
+
+    The packed launch (b x KV heads x packed Q tiles) underfills the part on these short-Q / long-KV graphs; split the KV
+    loop over the idle clusters (four KV tiles per partition at least, 16 partials at most). The declaration bounds the
+    launch: live lengths are never read."""
+    d_shape = (facts.d_qk, facts.d_v)
+    cga = SM100_PAGED_PACKED_SPLIT_CGA.get(d_shape)
+    if not (
+        cga is not None
+        and caps.sm_lo == 100
+        and facts.device_cc in ((10, 0), (10, 3))
+        and paged_thd_split_domain(caps, facts)
+        and facts.dtype == cudnn.data_type.BFLOAT16  # the measured dtype, as the D128 split rule
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in SM100_PAGED_PACKED_SPLIT_GROUPS
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and SM100_PAGED_PACKED_SPLIT_Q[0] <= facts.s_q <= SM100_PAGED_PACKED_SPLIT_Q[1]
+        and SM100_PAGED_PACKED_SPLIT_KV[0] <= facts.s_kv <= SM100_PAGED_PACKED_SPLIT_KV[1]
+        and facts.s_kv >= SM100_PAGED_PACKED_SPLIT_KV_PER_Q * facts.s_q
+        and facts.device_sm_count
+    ):
+        return 1
+    pack_g = _pack_gqa_group(caps, facts, 128, True, split_kv=2)
+    if pack_g <= 1:
+        return 1
+    launch = _split_launch(caps, facts, 128, 128, cga, pack_g, split_kv=2)
+    units = facts.b * launch.heads_q * launch.q_tiles
+    budget = min(16, (facts.device_sm_count // launch.ctas_per_tile) // max(1, units), launch.kv_tiles // 4)
+    if budget < 2:
+        return 1
+    splits = _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+    knobs = SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=splits)
+    return splits if mismatch(caps, facts, knobs) is None else 1
+
+
 def _paged_d256_thd_split_choice(caps: Capabilities, facts) -> int:
     launch = paged_d256_prefix_launch(caps, facts)
     if launch is None:
@@ -2890,7 +2938,11 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
     listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
+    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed).
     """
+    sm100_splits = sm100_paged_packed_split_choice(caps, facts)
+    if sm100_splits > 1:
+        return sm100_splits, True
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
     if not (
@@ -3198,7 +3250,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
                 cga=_sole(effective_cgas(caps, facts, splits)),
                 pack_gqa=packed,
                 split_kv=splits,
-                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
+                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 or (facts.d_qk, facts.d_v) in SM100_PAGED_PACKED_SPLIT_CGA else SCHED_LPT,
             ),
         )
         first_splits, first_packed = paged_thd_split_choice(caps, facts, first_wave=True) if caps.sm_lo == 107 else (1, False)

@@ -427,6 +427,15 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         and s.quant is not None
         and not s.paged
         and s.quant.sf_sizes
+        and "thd_origin_caps" not in s.index
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_mxfp8_origin_maps", False)
+    ):
+        raise NotImplementedError("nonpaged MXFP8 physical THD tensor maps require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.quant is not None
+        and not s.paged
+        and s.quant.sf_sizes
         and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_mxfp8_physical_origins", False)
     ):
         raise NotImplementedError("nonpaged MXFP8 physical THD origins require rebuilding the native extension")
@@ -436,6 +445,22 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_physical_origins", False)
     ):
         raise NotImplementedError("paged split physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and s.paged
+        and (s.d_qk, s.d_v) == (64, 64)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_d64_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged D64 split physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and s.paged
+        and (s.d_qk, s.d_v) == (256, 256)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_d256_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged D256 split physical THD origins require rebuilding the native extension")
     if (
         s.origin_specs is not None
         and s.split_workspace is not None

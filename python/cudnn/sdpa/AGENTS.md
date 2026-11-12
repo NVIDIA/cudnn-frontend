@@ -130,6 +130,21 @@ as offsets. Data origins do not move the logically packed scale-tile prefixes.
 physical gaps, unchanged quantized payloads and repacked scale bytes across
 batch changes, then modifies scale exponents during retained replay.
 
+Tensor-map token dimensions need not match across ports or match the source
+tensor's axis number. SM100 D512 MXFP8 uses rank-5 Q/K/V maps with token
+dimension 1, while O retains dimension 2. Pass each map's token dimension to
+`build_thd_origins`; keep byte origins based on the source tensor's token
+stride. Data-map sequence selection must not change the logically packed SF
+batch/tile coordinates. `TestPhysicalOrigins` in
+`test_sdpa_fwd_mxfp8_sm100.py` pins D128 CGA2 and D512 CGA1, rebinds every
+port and checks changed-length and scale-only retained replay.
+
+MXFP8 V-scale tail sanitization in the leader MMA warp can access its peer's
+shared slab even when that peer has no live query rows. Keep the peer CTA
+alive until those cluster-memory accesses finish; role-local completion alone
+does not establish peer lifetime. The D128 CGA2 `TestPhysicalOrigins` replay
+cases in `test_sdpa_fwd_mxfp8_sm100.py` detect the unsafe exit with racecheck.
+
 A test that changes a port's token pitch must update that port's physical
 ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
 an SDPA output's generated name need not be `o`. A prefix-only kernel can mask
@@ -175,6 +190,12 @@ A graph-only test misses a direct-API operand silently dropped by that flag.
   default is `True`, which otherwise admits `S_q == 1` before the adapter
   rejects it. `test_sdpa_bwd_d192_sm107.py::test_decode_declines_before_lowering`
   checks real dense/THD graph declarations at that boundary.
+- When enabling partial PackGQA, test ordinary candidate generation as well
+  as explicit plans at groups `tile_q`, `tile_q + 2` and `2 * tile_q`.
+  `create_execution_plan` alone does not exercise `_pack_gqa_points`: its
+  packed token span must use the effective subgroup width. Dividing a tile
+  by the full sharing ratio can produce zero before any kernel launches.
+  Keep the full Q/K ratio separately for KV-head mapping and validation.
 
 **Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
 that stores into columns another warpgroup still has to read must be
@@ -584,6 +605,9 @@ production kernels gain no debug knob or timing-dependent assertion.
 
   Draw holdouts OFF the training lattice (odd head counts, batches, off-tile lengths), and add a key field only when it
   follows the kernel (`_unpacked_decode` reads the row's own pack decision).
+- A new FROST capability that changes a class's plan (e.g. the SM100 packed split) makes that class's entries stale where
+  the plan changed. Key the new regime from the row's own decision (`gqa_split`) and fit it; keep an older study's
+  entries for the unchanged regime instead of refitting it over a narrower grid than that study measured.
 
 
 **Rule S13 — Register redistribution must converge at warpgroup scope.**
@@ -654,6 +678,37 @@ uses the helper; at run time `warm_stress.assert_warm_stress` on a shape with
 several KV tiles per Q tile (the slot must be refilled inside the launch; a
 one-tile or top-k-1 shape cannot fail).
 
+
+An elected slot release must join every reader warp first. D512 role-split
+correction reads the final sum/max with four warps but returns one Stats
+credit. Put a post-load async-proxy fence in every reader before their group
+barrier, then release the slot; the next fill is a cross-CTA bulk copy.
+`TestD512PhysicalOrigins.test_stats_slot_waits_for_all_warps` delays the
+nonleader readers in a private template and forces one persistent cluster.
+It fails numerically with the old elected-only release and retains changed
+bindings, batch invariance and live/empty capture replay. Racecheck can report
+zero hazards while these numerical checks fail.
+
+**Rule S16 — TMEM deallocation joins every reader warp.**
+
+A single elected release credit cannot stand in for multiple independent
+TMEM readers. Each reader must complete its `tcgen05.wait::ld`, and the
+release must join all readers before allowing the MMA pair to deallocate.
+The D512 role-split half and FP8 bodies use a non-aligned, 128-thread named
+barrier before their elected local and peer credits. Each MMA warp's barrier
+counts both credits, so neither starts deallocation before both reader groups
+finish. A peer-only credit leaves the issuing CTA's readers unguarded. Keep
+this terminal join outside the persistent loop.
+
+Freed TMEM can retain readable bytes, so a numerical pass alone does not
+verify its lifetime. `TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers`
+delays one output warp and records final-load/deallocation event order in
+a temporary template, using synthetic inputs. Its old-kernel control fails
+for BF16, E4M3 and E5M2 even when output values remain correct. The test
+checks event order, not a hardware-dependent duration threshold. Delay only
+the even CTA and only the odd CTA as well as both: symmetric delays can hide
+a missing local completion credit. Check both CTAs' final loads against each
+deallocation; the 2x2 body's local-plus-peer protocol is the existing control.
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
@@ -1477,6 +1532,12 @@ Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
 the original response before returning a slot credit. A vector response read
 alone leaves scalar field loads racing with the next local publication; the
 D256 multiwave racecheck catches the output-store warp reading a reused slot.
+The D256/D512 MXFP8 custom schedulers also publish single-CTA payloads
+locally. D256 uses the same field broadcasts with elected warp credits;
+D512 retains per-lane credits and the matching 32-times arrival count.
+Their compact THD multi-unit cases and
+`test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins` cover both the existing
+compact contract and independent data origins under memcheck/racecheck.
 
 The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
 publication and reuse, with matching barrier counts. Keep elected warp
