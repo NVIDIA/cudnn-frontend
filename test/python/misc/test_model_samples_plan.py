@@ -705,6 +705,54 @@ def test_the_checks_of_a_run_hold_on_exact_stand_ins_and_fail_on_a_nan():
     assert not checks.ok and "NON-FINITE VALUES" in _line(checks, "linear_attention.step"), checks.text()
 
 
+def test_a_run_that_judged_no_provider_block_is_reported_and_never_a_pass(monkeypatch):
+    """``--provider`` can put every judged block on its reference row.  Such a run compares the reference with itself: its
+    blocks line is ``REPORTED`` and its last line ``RAN``, as for ``--stack reference``.  ``PASS`` is kept for a run in
+    which provider blocks were judged and held."""
+    import importlib.util
+    import os
+
+    import model_samples
+    from model_samples import blocks, tie_out
+
+    reference_rows = blocks.parse_overrides(
+        [
+            "projection.fp8.in=torch_ref.linear",
+            "linear_attention.step=torch_ref.gdn_decode_step",
+            "projection.fp8.out=torch_ref.linear",
+            "mlp.gate_up=torch_ref.linear+torch_ref.silu_mul_quantize",
+            "mlp.down=torch_ref.linear",
+            "output_head=torch_ref.linear",
+        ]
+    )
+    model = _tiny_model()
+    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    for sequences, declares_a_band in ((1, True), (2, False)):  # the seeded model's logits band, and a checkpoint's reported token line
+        if not declares_a_band:
+            model.logits_band_units = None
+        session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, overrides=reference_rows)
+        session.plan_table()
+        session.load()
+        ids = session.prefill([text.encode("ab" + str(s)) for s in range(sequences)])
+        for _ in range(3):
+            ids = session.step(ids)
+        checks = tie_out.run_checks(session, prompt_tokens=3)
+        line = _line(checks, "blocks")
+        assert checks.ok and checks.judged == 0, checks.text()
+        assert "no provider block to judge" in line and line.endswith("REPORTED") and "PASS" not in line, line
+    assert _checked_run(2).judged == 6, "the stack's own rows: six provider blocks are judged"
+
+    monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
+    monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # and sets a default for the profiler's log level
+    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_verdict", MODELS / "qwen_dense" / "00_decode.py")
+    sample = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sample)
+    assert sample._verdict("fe-cublas", True, 6) == "PASS"
+    assert sample._verdict("fe-cublas", True, 0) == "RAN (no provider block was judged)", "nothing was compared: not a pass"
+    assert sample._verdict("fe-cublas", False, 0) == sample._verdict("fe-cublas", False, 6) == "FAIL", "a failed replay or token line fails either way"
+    assert sample._verdict("reference", True, 0) == "RAN reference stack (no provider checked)"
+
+
 def test_batch_invariance_covers_every_sequence_of_the_batch():
     """The sequence that runs alone rotates with the step, so a row other than the first that reads its neighbour is seen."""
 

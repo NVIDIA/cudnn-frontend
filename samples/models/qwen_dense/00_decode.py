@@ -116,9 +116,20 @@ def _arguments(argv):
     return args
 
 
+def _verdict(stack: str, passed: bool, judged: int) -> str:
+    """The last line of a run.  ``PASS`` says that provider blocks were judged against the reference and held.  A run on the
+    reference stack, or one whose ``--provider`` flags put every judged block on its reference row, compared the reference
+    with itself: it reports ``RAN``."""
+    if stack == "reference":
+        return "RAN reference stack (no provider checked)"
+    if not passed:
+        return "FAIL"
+    return "PASS" if judged else "RAN (no provider block was judged)"
+
+
 def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
     """One prompt set: prefill, the decode loop (the one host read of a step is here), the traced pass, the report and the
-    checks.  Returns ``(passed, tokens per sequence)``."""
+    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``."""
     next_ids = session.prefill(prompts)
     tokens = session.read(next_ids)  # the first new token of every sequence
     produced = [[] for _ in prompts]
@@ -148,10 +159,10 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
         print(f"text out              sequence 0, {len(produced[0])} tokens, {ended}:")
         print("\n".join("  | " + line for line in (pieces[0] + streams[0].close()).splitlines()))
     if not check:
-        return True, produced
+        return True, 0, produced
     checks = tie_out.run_checks(session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None)
     print(checks.text())
-    return checks.ok, produced
+    return checks.ok, checks.judged, produced
 
 
 def main(argv=None) -> int:
@@ -283,7 +294,7 @@ def main(argv=None) -> int:
     print(f"{TAG} {environment.header()}")
     print(f"{TAG} clock not locked: timings are for orientation only | reference precision {args.reference_precision}")
 
-    passed, digest, dumped = True, hashlib.sha256(), []
+    passed, judged, digest, dumped = True, 0, hashlib.sha256(), []
     for (session, prompt_sets), table in zip(runs, tables):
         print()
         print(table)
@@ -299,8 +310,10 @@ def main(argv=None) -> int:
                 )
             session.new_report()
             session.report().text_path.update(seconds)
-            ok, produced = _decode(session, text, rule, prompts, tie_out, check=args.stack != "reference", checked_steps=CHECKED_STEPS if real else None)
-            passed = passed and ok
+            ok, blocks_judged, produced = _decode(
+                session, text, rule, prompts, tie_out, check=args.stack != "reference", checked_steps=CHECKED_STEPS if real else None
+            )
+            passed, judged = passed and ok, judged + blocks_judged
             for ids in produced:
                 digest.update(b"".join(int(i).to_bytes(4, "little") for i in ids))
             dumped.append({"sequences": session.sequences, "prompt": index, "prompt_ids": [int(i) for i in prompts[0]], "ids": produced})
@@ -330,7 +343,7 @@ def main(argv=None) -> int:
         print(f"{TAG} checkpoint weights, greedy decoding; ids hash {digest.hexdigest()[:12]}")
     else:
         print(f"{TAG} seeded weights: the output is not language; ids hash {digest.hexdigest()[:12]}")
-    verdict = "RAN reference stack (no provider checked)" if args.stack == "reference" else ("PASS" if passed else "FAIL")
+    verdict = _verdict(args.stack, passed, judged)
     if unwritten:  # the run is done and its verdict stands, but what was asked for is not there
         print(f"{TAG} ERROR {unwritten} (the run itself: {verdict})")
         return 1

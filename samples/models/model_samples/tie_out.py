@@ -10,6 +10,8 @@ Four checks, run after the timed loop on the ids the loop produced:
    the reference block on the SAME operands and the same state, so an error cannot accumulate and a wiring error is told apart
    from rounding.  The band of a block is named in its provider row (``BANDS``) and is never widened here.  Every band is
    judged element by element and asks for finite values first: a NaN is a failure of the block that produced it, never a tie.
+   A run in which no block is a provider's (every judged block selected onto its reference row) has nothing to judge: the
+   line is then REPORTED, ``Checks.judged`` is 0, and a sample does not print ``PASS`` for it.
 3. **tokens** -- end to end: the reference stack runs the same inputs with its own state.  The largest distance between the
    logits of the two stacks must be finite and inside the logits band, which the family declares beforehand in bf16 units of
    the run's largest reference logit (``logits_band_units``); and the greedy token must equal the reference's at every step
@@ -347,6 +349,7 @@ def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tenso
 class Checks:
     lines: List[str]
     ok: bool
+    judged: int = 0  # provider blocks compared with the reference; 0: every block of the run was the reference chain itself
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -440,10 +443,13 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     ]
     lines.append(f"  replay            ids and logits byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     inside = sum(s.ok for s in judged.values())
-    lines.append(
-        f"  blocks            {inside} of {len(judged)} provider blocks inside their bands against the {session.reference_precision}-accumulated "
-        f"reference, teacher-forced    {_verdict(blocks_ok)}"
-    )
+    if judged:
+        lines.append(
+            f"  blocks            {inside} of {len(judged)} provider blocks inside their bands against the {session.reference_precision}-accumulated "
+            f"reference, teacher-forced    {_verdict(blocks_ok)}"
+        )
+    else:  # a line that compares nothing cannot fail: it is not printed as a pass
+        lines.append("  blocks            no provider block to judge: every block of this run is the reference chain itself    REPORTED")
     for name, s in judged.items():
         lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {BANDS[s.band]}]  {_verdict(s.ok)}")
     lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
@@ -467,4 +473,4 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
     session.reset(fresh=True)
-    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok)
+    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok, len(judged))

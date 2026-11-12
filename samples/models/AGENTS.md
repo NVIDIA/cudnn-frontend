@@ -36,7 +36,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
    the tests generate what they read.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `--stack
-   reference` reports `[NN] RAN reference stack (no provider checked)`, never `PASS`.
+   reference` reports `[NN] RAN reference stack (no provider checked)`, never `PASS`. So does a run whose `--provider`
+   flags leave no provider block to judge (`[NN] RAN (no provider block was judged)`, the blocks line `REPORTED`):
+   `PASS` is kept for a run in which provider blocks were compared with the reference and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
    classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. To add a provider: add its
    key to `providers.KEYS` with its factory, add its row above the rows it should win against, name its tie-out band, and

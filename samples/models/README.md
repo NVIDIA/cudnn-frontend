@@ -64,6 +64,7 @@ the run at once: a `SKIP` comes before the first load or not at all. It ends in 
 | `[00] PASS` | 0 | every check of the run held |
 | `[00] SKIP <requirement>` | 0 | this GPU, library version or free-memory budget is not served; the sentence names the fix |
 | `[00] RAN reference stack (no provider checked)` | 0 | `--stack reference`: every block ran on the reference, so nothing was verified |
+| `[00] RAN (no provider block was judged)` | 0 | `--provider` flags put every judged block on its reference row: the run compared the reference with itself, and its blocks line is `REPORTED` |
 | `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key; a `--model` path that is not a directory (a hub name is not fetched), or a directory with a file that is missing or is not what its name says; a `--messages` file that cannot be read or is not JSON; messages the checkpoint's chat template refuses; a `--dump-tokens` file that cannot be written; or an installed distribution that disagrees with the imported `cudnn`. A file is named by its own name, never by its path |
 | `[00] FAIL` | 1 | a check did not hold; the check lines above it say which |
 
