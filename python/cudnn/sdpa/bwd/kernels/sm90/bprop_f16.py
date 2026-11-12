@@ -72,12 +72,12 @@ _BAR_SLOTS = (
     ("b_full", 1, 1, "tma"),  # the resident V tile
     ("x_full", STAGES, 1, "tma"),  # streamed Q
     ("y_full", STAGES, 1, "tma"),  # streamed dO
-    ("s_full", STAGES, 1, "thread"),  # the stats loader warp
-    ("x_empty", STAGES, 2, "thread"),
-    ("y_empty", STAGES, 2, "thread"),
-    ("dq_full", 1, 4, "thread"),  # one lane per warp of the folding warpgroup, once per step
-    ("dq_empty", 1, 1, "thread"),  # the relay warp, once per step
-    ("fold_full", 1, 4, "thread"),  # d64: warpgroup 0 staged its partial
+    ("s_full", STAGES, 32, "thread"),  # every lane of the stats loader warp
+    ("x_empty", STAGES, 2 * cute.arch.THREADS_PER_WARPGROUP, "thread"),  # every consumer thread, once per step
+    ("y_empty", STAGES, 2 * cute.arch.THREADS_PER_WARPGROUP, "thread"),
+    ("dq_full", 1, 128, "thread"),  # every thread of the folding warpgroup, once per step
+    ("dq_empty", 1, 32, "thread"),  # every lane of the relay warp, once per step
+    ("fold_full", 1, 128, "thread"),  # every thread of warpgroup 0 once its partial is staged
 )
 BAR_BYTES = 8 * sum(slots for _, slots, _, _ in _BAR_SLOTS)
 TICKET = BARS + BAR_BYTES  # the claimed key tile index
@@ -337,9 +337,7 @@ def _stats_loader(slab, bars, lse, delta, kv_tile, kv_head, batch, sq, lane, cau
             qc = cute.math.min(q0 + column, sq - 1)
             Pointer(slab.data_ptr() + slot + column * 4, dtype=cutlass.Float32).store(cutlass.Float32(lse[batch, head, qc]) * cutlass.Float32(LOG2E))
             Pointer(slab.data_ptr() + slot + STEP_ROWS * 4 + column * 4, dtype=cutlass.Float32).store(cutlass.Float32(delta[batch, head, qc]))
-        prims.bar_warp_sync(cute.arch.FULL_MASK)
-        if prims.elect_sync():
-            bars.s_full[state.idx].arrive()
+        bars.s_full[state.idx].arrive()
         state = advance(state, STAGES)
 
 
@@ -383,9 +381,7 @@ def _relay(slab, bars, dq_desc, turns, kv_tile, kv_head, batch, sq, lane, causal
             tma_reduce_add_subtile(tile, GmemTileTma(dq_desc)(0, q_tile * STEP_ROWS, head, batch), s)
         tma_store_commit()
         prims.cp_async_bulk_wait_group(0, read=True)
-        prims.bar_warp_sync(cute.arch.FULL_MASK)
-        if prims.elect_sync():
-            bars.dq_empty.arrive()
+        bars.dq_empty.arrive()
         prims.cp_async_bulk_wait_group(0)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if lane == 0:
@@ -468,11 +464,8 @@ def _step(
     prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
     dk = _mma_rs(dk, ds_words, qdt, dtype)
     prims.wgmma_wait_group_sync_aligned(0)
-    prims.bar_warp_sync(cute.arch.FULL_MASK)
-    if tid < cute.arch.WARP_SIZE:
-        if prims.elect_sync():
-            bars.x_empty[state.idx].arrive()
-            bars.y_empty[state.idx].arrive()
+    bars.x_empty[state.idx].arrive()
+    bars.y_empty[state.idx].arrive()
     prims.barrier_cta_sync(4 + w, thread_count=cute.arch.THREADS_PER_WARPGROUP)
     dq = _mma_dq(_desc(ds_region, 64, mn_major=True), kdq, dtype)
     prims.wgmma_wait_group_sync_aligned(0)
@@ -480,16 +473,12 @@ def _step(
     if w == 0:
         _wait(bars.dq_empty, dq_phase)
         _stage_dq(dq, slab, tid)
-        prims.bar_warp_sync(cute.arch.FULL_MASK)
-        if tid % cute.arch.WARP_SIZE == 0:
-            bars.fold_full.arrive()
+        bars.fold_full.arrive()
     else:
         _wait(bars.fold_full, dq_phase ^ 1)
         _fold_dq(dq, slab, tid)
         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-        prims.bar_warp_sync(cute.arch.FULL_MASK)
-        if tid % cute.arch.WARP_SIZE == 0:
-            bars.dq_full.arrive()
+        bars.dq_full.arrive()
     return dv, dk
 
 

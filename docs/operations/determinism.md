@@ -144,6 +144,7 @@ The refactor retains the existing arithmetic and support conclusions above.
 Its fresh-graph replay and parent-output comparisons are bounded correctness
 checks, not a new general determinism qualification. Backward is unchanged.
 See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+| `pygraph.sdpa_backward`, FROST dense D64 / D128 key-owner kernel with the ordered dQ relay (`sdpa_bwd_sm90`, opt-in) | bprop | FP16/BF16 Q/K/V/O/dO and gradients; FP32 Stats | Supported (tested configurations) | Unsupported | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -545,6 +546,14 @@ duplicated and129-request batches, then mutate dO and a canonical scale
 atom after CUDA Graph capture. Four runtime goldens cover SM100 and SM107;
 SM103 execution remains unverified. The deterministic flag does not select
 a different reduction. THD and other unsupported graph forms are unchanged.
+
+The SM90 D64 / D128 half-precision backward chain (`sdpa_bwd_sm90`) owns dK and
+dV per key tile and reduces every query tile's dQ over its key tiles in index
+order through per-tile turn counters, so the deterministic flag and the default
+request run the same arithmetic. Its suite compares dQ / dK / dV bytes across
+repeated executions with a poisoned workspace, CUDA Graph replay, reordered and
+duplicated batches and the same sequence declared alone, on unmasked and causal
+MHA / GQA graphs at D64 and D128, including grids beyond one CTA wave.
 
 ## Split-combine zero-weight qualification
 
