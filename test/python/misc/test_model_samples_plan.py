@@ -9,6 +9,7 @@ tiny geometry on the reference stack, replayed byte for byte), and the tie-out i
 of a multiply accept and refuse on stated tensors, the token check against its declared band, and the checks of a whole run
 through stand-in providers with deliberate defects.  No GPU, no weights."""
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -146,6 +147,46 @@ def test_an_older_package_without_the_decode_step_is_a_skip_that_names_the_fix(m
         _plan()
     monkeypatch.undo()
     assert hasattr(cudnn, "GdnDecodeFused")
+
+
+def test_a_pre_release_of_the_dsl_is_read_by_its_numbers(monkeypatch):
+    """The fused step states a floor for the CuTe DSL.  A version is compared by the leading digits of its first three
+    fields: a release candidate of a later version serves, one of the floor itself does not, and the SKIP names what it read."""
+    import importlib.metadata as metadata
+
+    from model_samples.providers import fe
+
+    assert fe.DSL_FLOOR == (4, 8, 0)
+    installed = metadata.version
+    for version, serves in (
+        ("4.8.0", True),
+        ("4.8.1rc1", True),  # was read as 4.8, below the floor: a SKIP on a GPU the sample serves
+        ("4.8.1", True),
+        ("4.9", True),
+        ("4.10.0", True),
+        ("5.0.0.dev1", True),
+        ("4.8.0.post1", True),
+        ("4.8.0+local", True),
+        ("4.8.0rc1", False),
+        ("4.8.0.dev5", False),
+        ("4.7.9", False),
+        ("4.7", False),
+        ("3.99.99", False),
+    ):
+        assert fe.serves_floor(version, fe.DSL_FLOOR) is serves, version
+        monkeypatch.setattr(metadata, "version", lambda name, version=version: version if name == "nvidia-cutlass-dsl" else installed(name))
+        if serves:
+            assert _plan().rows["linear_attention.step"].key == "fe.gdn_decode_fused"
+        else:
+            with pytest.raises(NotImplementedError, match=rf"cudnn.GdnDecodeFused needs nvidia-cutlass-dsl >= 4.8.0; this is {re.escape(version)}$"):
+                _plan()
+
+    def absent(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", absent)
+    with pytest.raises(NotImplementedError, match="needs nvidia-cutlass-dsl >= 4.8.0; this is not installed"):
+        _plan()
 
 
 def test_memory_sentence_on_stated_device_facts():
