@@ -197,15 +197,25 @@ def test_both_requests_take_the_chain_bitwise(deterministic):
     [(torch.bfloat16, 128, False, 2, 4, 4, 512, 4096), (torch.float16, 64, True, 3, 8, 4, 1536, 1536)],
     ids=["d128-dense-256cta", "d64-causal-144cta"],
 )
-def test_multiwave_grid_matches_fp64(dt, d, causal, b, hq, hkv, sq, sk):
+def test_multiwave_grid_matches_fp64_and_repeats(dt, d, causal, b, hq, hkv, sq, sk):
     assert (sk + 127) // 128 * hkv * b > torch.cuda.get_device_properties(0).multi_processor_count
-    _case(dt, d, causal, b, hq, hkv, sq, sk)
+    case = _case(dt, d, causal, b, hq, hkv, sq, sk)
+    expected = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
+    case.workspace.fill_(0x5A)
+    for name in expected:
+        case.tensors[name].fill_(float("nan"))
+    case.graph.execute(case.pack, case.workspace)
+    torch.cuda.synchronize()
+    for name, bits in expected.items():
+        assert torch.equal(
+            case.tensors[name].contiguous().view(torch.uint8), bits.contiguous().view(torch.uint8)
+        ), f"{name} changed across identical executions"
 
 
 @requires_hopper
-@pytest.mark.parametrize("dt,d,causal", [(torch.bfloat16, 128, True), (torch.float16, 64, False)], ids=["d128-causal", "d64-dense"])
-def test_batch_invariance(dt, d, causal):
-    b, hq, hkv, sq, sk = 3, 4, 2, 320, 257
+@pytest.mark.parametrize("dt,d,causal,hq,hkv", [(torch.bfloat16, 128, True, 4, 2), (torch.float16, 64, False, 4, 4)], ids=["d128-causal-gqa", "d64-dense-mha"])
+def test_batch_invariance(dt, d, causal, hq, hkv):
+    b, sq, sk = 3, 320, 257
     case = _case(dt, d, causal, b, hq, hkv, sq, sk)
     inputs = {name: case.tensors[name].clone() for name in ("q", "k", "v", "o", "do", "stats")}
     grads = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
