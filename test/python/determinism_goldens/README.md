@@ -34,6 +34,62 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM120 warp-cached page tables — validation, 2026-11-12 (UTC)
+
+The common paged loader now loads a tile's live page IDs across a producer
+warp and selects them with shuffles before the vector live predicate. Tiles
+whose worst-case page span exceeds 32 retain the scalar lookup. The rolled
+copy loop, payload operations, physical Int64 offsets, waits, arrivals and
+arithmetic order are unchanged. This changes only forward kernels.
+
+`test_dsl_sm120_small_page_cache_determinism` adds four L0 cases to the
+selected architecture entry: FP16/BF16 Q/O with half K/V or E4M3/E5M2 K/V.
+D128 M128/N128 packed plans use eight-token pages and KV lengths
+`[257, 129, 0, 247, 1]`: sixteen-page full tiles, one-row tails, empty
+neighbors and independent K/V page order. The existing helper checks CPU-built
+fixed inputs, O/FP32 Stats bytes, numerical references, source/canary integrity,
+fresh buffers, isolated/reordered/duplicated/changed-neighbor batches,
+129-sequence scheduling stress and CUDA Graph replay.
+
+The unchanged parent loader recorded eight goldens after reference/replay
+checks; all eight passed strict comparison in a fresh candidate process.
+Four existing records were byte-identical to the committed files, and only
+four new `page8-blocks35` records are added under `c36345d9c3841d69`.
+The targeted candidate selection passed **78 cases, zero skips/failures**:
+the existing 14 vector-loop cases, four new small-page cases, eight native
+rebind cases, 24 width cases, 20 mixed-KV cases, six partial-GQA decode cases
+and two decode-ring cases. Memcheck and synccheck each passed three selected
+page8/reused-ring cases with zero errors. Racecheck passed the page8 case
+unfiltered and both ring cases with `--kernel-name kns=cudnn_kernel_`, with
+zero hazards. The original unfiltered attempt exceeded its 32 GiB host-memory
+limit; a 128 GiB retry passed page8 but hit the 180-second test watchdog in
+the first ring case's Torch numerical comparison. Both ring cases then passed
+with FROST-only instrumentation and unchanged numerical references (7.30s
+and 4.81s). Those interrupted attempts are not counted as passing runs.
+CUDA API error reporting was disabled for these sanitizer runs, so their
+zero-error counts describe the selected memory/synchronization tools only.
+
+The two warm cases retain 1,024 CTAs (5.45 per SM), two refills per launch,
+256 warm and 256 shared-memory-poisoned launches per dtype with zero differing
+output-storage bytes. Their unsafe control failed 200/200 launches. Each
+256-launch block bounds per-launch failure below 1.16% at 95% confidence;
+this is not the helper's 3,000-launch 0.1% bound.
+
+Measured on RTX PRO 6000 Blackwell Server Edition, 188 SMs, Torch
+2.14.1+cu130, cuDNN 9.30.0.4 and CuTe DSL 4.8.0 compiled with CUDA 13.4;
+NVRTC 13.4 was loaded explicitly. Actual imports, source and library hashes
+were checked. The frozen parent SM120 runtime source matches develop
+`9be74f4d7f748ebbf14febe6a9c624f61e9355c4`. SM121 is unverified; this makes
+no cross-runtime or backward determinism claim.
+
+From `test/python`, with recording disabled:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k 'small_page_cache_determinism or paged_vector_loop' -q -rs
+```
+
 ### SM120 paged vector-copy loop — validation, 2026-11-12 (UTC)
 
 The selected architecture entry `sdpa/frost/test_sdpa_fwd_dsl_sm120.py`

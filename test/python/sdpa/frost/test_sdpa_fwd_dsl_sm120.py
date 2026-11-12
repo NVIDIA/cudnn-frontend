@@ -1824,6 +1824,33 @@ def test_dsl_sm120_paged_vector_loop_determinism(dtype, packed):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "dtype,kv_dtype",
+    [
+        pytest.param(torch.float16, None, id="f16-half-kv"),
+        pytest.param(torch.bfloat16, None, id="bf16-half-kv"),
+        pytest.param(torch.float16, torch.float8_e4m3fn, id="f16-e4m3-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-e5m2-kv"),
+    ],
+)
+def test_dsl_sm120_small_page_cache_determinism(dtype, kv_dtype):
+    """A full KV tile spans sixteen pages; the next tile has one live row."""
+    from test_sdpa_fwd_paged_sm120 import test_sm120_frost_paged_width_determinism as run
+
+    run(
+        dtype,
+        (128, 128),
+        True,
+        tile_m=128,
+        tile_n=128,
+        kv_dtype=kv_dtype,
+        page=8,
+        blocks=35,
+        kv_lengths=[257, 129, 0, 247, 1],
+    )
+
+
+@pytest.mark.L0
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group("gpu_exclusive")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
