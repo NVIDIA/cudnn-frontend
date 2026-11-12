@@ -357,6 +357,30 @@ def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
 
 
 @pytest.mark.L0
+def test_sm120_decode_entries_follow_their_study():
+    """Study sm120_decode_20261112 (RTX PRO 6000): paged d256 and D576 single-row decode keep the backend, dense D576 and long paged
+    d512 single-row decode lead; dense d512 s_q 1 has no entry (the hand rule decides, #2497); sink-only d64 MTP has no entry."""
+    row = "sdpa_fwd_prefill_sm120"
+
+    def f(**over):
+        base = dict(b=8, h_q=32, h_kv=2, s_q=1, s_kv=32768, d_qk=256, d_v=256, page_size=16, padded=True, device_cc=(12, 0), device_sm_count=188)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (32768, 32767):
+        assert pt.lookup(row, f(s_kv=s_kv)) is False
+        assert pt.matched_entry(row, f(s_kv=s_kv)).study == "sm120_decode_20261112"
+    assert pt.lookup(row, f(h_q=96, h_kv=1, d_qk=576, d_v=512, page_size=32)) is False
+    assert pt.lookup(row, f(h_q=96, h_kv=1, d_qk=576, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is True
+    assert pt.lookup(row, f(b=64, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is True  # 2^12 query rows past 2^11
+    assert pt.lookup(row, f(b=8, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is False
+    assert pt.lookup(row, f(h_q=128, h_kv=1, d_qk=512, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is None
+    sink = dict(h_q=64, h_kv=8, d_qk=64, d_v=64, s_q=2, has_sink=True, causal=True, bottom_right=True)
+    assert pt.lookup(row, f(**sink)) is None
+    assert pt.matched_entry(row, f(window_left=127, **sink)).study == "sm120_decode_20261112"
+
+
+@pytest.mark.L0
 def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     """The A100 f16 dense prefill classes answer from their own study (sm80_f16_dense_prefill_20261106), not the bf16 one, and
     another Ampere part has no entry: the hand rules decide there."""
