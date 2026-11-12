@@ -678,7 +678,7 @@ def test_the_traced_pass_tells_a_failure_of_the_profiler_from_a_failure_of_a_ste
         monkeypatch.setattr(torch.profiler, "profile", lambda activities=None, fail=fail: Profile(fail=fail))
         trace, reason = timing.trace_steps(lambda i: None, 2)
         assert trace is None and reason == f"the profiler failed (the tracing library could not {fail})", reason
-    monkeypatch.setattr(torch.profiler, "supported_activities", lambda: set())
+    monkeypatch.setattr(torch.profiler, "supported_activities", set)
     assert timing.trace_steps(out_of_memory, 1) == (None, "this PyTorch build records no kernel activity")
 
 
@@ -777,8 +777,7 @@ def test_a_run_that_judged_no_provider_block_is_reported_and_never_a_pass(monkey
     """``--provider`` can put every judged block on its reference row.  Such a run compares the reference with itself: its
     blocks line is ``REPORTED`` and its last line ``RAN``, as for ``--stack reference``.  ``PASS`` is kept for a run in
     which provider blocks were judged and held."""
-    import model_samples
-    from model_samples import blocks, tie_out
+    from model_samples import Session, TextIO, blocks, tie_out
 
     reference_rows = blocks.parse_overrides(
         [
@@ -791,11 +790,11 @@ def test_a_run_that_judged_no_provider_block_is_reported_and_never_a_pass(monkey
         ]
     )
     model = _tiny_model()
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     for sequences, declares_a_band in ((1, True), (2, False)):  # the seeded model's logits band, and a checkpoint's reported token line
         if not declares_a_band:
             model.logits_band_units = None
-        session = model_samples.Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, overrides=reference_rows)
+        session = Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, overrides=reference_rows)
         session.plan_table()
         session.load()
         ids = session.prefill([text.encode("ab" + str(s)) for s in range(sequences)])
@@ -817,14 +816,13 @@ def test_a_run_that_judged_no_provider_block_is_reported_and_never_a_pass(monkey
 def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_nothing(monkeypatch, capsys):
     """The sample's own loop function on a CPU session of the tiny geometry: one line before the prompt and the decode loop,
     one before the checks; the report and the text stand between them, so a reader of a long run knows what it waits for."""
-    import model_samples
-    from model_samples import tie_out
+    from model_samples import StopRule, tie_out
 
     sample = _sample_script(monkeypatch)
     session, text = _tiny_session(sequences=2)
     prompts = [text.encode("ab" + str(s)) for s in range(2)]
     capsys.readouterr()
-    forced = model_samples.StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
+    forced = StopRule(text.eos_ids, max_new_tokens=256, force_tokens=5)
     ok, judged, produced = sample._decode(session, text, forced, prompts, tie_out, check=True, checked_steps=None)
     out = capsys.readouterr().out.splitlines()
     assert ok and judged == 0 and [len(ids) for ids in produced] == [5, 5], "the reference stack: nothing to judge; 5 forced tokens per sequence"
@@ -837,7 +835,7 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     assert out[at + 1] == "checks (2 sequences, 7 steps: 3 prompt + 4 decode)", out[at + 1]
     session.reset(fresh=True)
     session.new_report()
-    open_end = model_samples.StopRule(text.eos_ids, max_new_tokens=4)
+    open_end = StopRule(text.eos_ids, max_new_tokens=4)
     ok, judged, produced = sample._decode(session, text, open_end, prompts, tie_out, check=False, checked_steps=16)
     out = capsys.readouterr().out
     assert ok and judged == 0 and max(len(ids) for ids in produced) == 4
@@ -997,8 +995,7 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     """The published geometry by arithmetic on its tensor list: what a step reads in the stored formats, what this stack
     moves instead, and the memory sentence of a run with every weight held as a bf16 copy -- on a GPU that has less, a
     SKIP before anything is loaded."""
-    import model_samples
-    from model_samples import blocks
+    from model_samples import Session, TextIO, blocks
     from model_samples.qwen_dense import QwenDense
 
     model = QwenDense()
@@ -1014,22 +1011,21 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     assert 56.5 * GIB < need < 57 * GIB, "above the 55.4 GiB a run with this checkpoint took from the device: a GPU with less is a SKIP, not an exception"
     small = QwenDense.reduced(2)
     assert small.memory_bytes(4, 64) == small.copy_bytes() + small.state_bytes(4, 64) + 2 * GIB, "the default run: 2 GiB, as before"
-    text = model_samples.TextIO.synthetic(model.geometry.vocab)
+    text = TextIO.synthetic(model.geometry.vocab)
     free = [31 * GIB]
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, free[0])))
     with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 59\.\d GiB on this GPU; 31.0 GiB are free: free memory on this GPU"):
-        model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
+        Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
     card = blocks.plan(model.provider_table, model.regimes, blocks.DeviceFacts((12, 0), "stated device", 170, int(31.84 * GIB), 31 * GIB), 1, model=model)
     with pytest.raises(NotImplementedError, match=r"needs about 59\.\d GiB on this GPU; this GPU has 31.8 GiB in total: the run does not fit on it"):
         card.memory(need)  # the same card with its total stated: the sentence says that no freeing helps
     free[0] = 80 * GIB
-    table = model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
+    table = Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
     assert "this stack needs about 59." in table and "80.0 GiB are free" in table and "add_norm_quantize        129" in table and "48 / 16" in table
 
 
 def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_reference():
-    import model_samples
-    from model_samples import tie_out
+    from model_samples import Session, tie_out
 
     session, text = _tiny_session(sequences=1)
     ids = session.prefill([text.encode("abcd")])
@@ -1041,8 +1037,8 @@ def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_refer
     tokens = _line(checks, "tokens").strip()
     assert tokens.startswith("tokens            3 of 3 greedy tokens equal to the reference stack's; ") and tokens.endswith("PASS")
     assert "for scale, the reference stack with ieee-fp32 accumulation is " in tokens and "agrees with it on " in tokens and "(printed, not gated)" in tokens
-    bounded = model_samples.Session(session.model, text, sequences=1, stack="reference", device="cpu", capacity=32, record_steps=5)
+    bounded = Session(session.model, text, sequences=1, stack="reference", device="cpu", capacity=32, record_steps=5)
     bounded.load()
     assert bounded.record.inputs.shape[0] == 5 and bounded.record.logits.shape[0] == 5, "a long run keeps the ids and logits of its first steps only"
-    ids = bounded.prefill([text.encode("abcdefg")])
+    bounded.prefill([text.encode("abcdefg")])
     assert bounded.record.count == 7 and tie_out.run_checks(bounded, prompt_tokens=7).lines[0] == "checks (1 sequence, the first 5 steps: 5 prompt + 0 decode)"

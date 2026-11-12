@@ -328,20 +328,20 @@ def test_a_safetensors_header_is_read_without_its_tensors(tmp_path):
 
 def test_a_checkpoint_on_disk_is_described_bound_and_read_bit_for_bit(tmp_path):
     pytest.importorskip("safetensors")
-    import model_samples
+    from model_samples import Checkpoint, Session, TextIO
     from model_samples.qwen_dense import QwenDense, configs
     from model_samples.tie_out import bytes_equal
     from model_samples.weights import BlockScaledTensor, ScaledTensor
 
     tiny = _tiny_model()
-    seeded = model_samples.Checkpoint.synthetic(tiny, seed=5)
+    seeded = Checkpoint.synthetic(tiny, seed=5)
     directory = _write_checkpoint(tmp_path / "tiny-checkpoint", _disk_tensors(tiny, seeded), _config(tiny.geometry))
 
-    disk = model_samples.Checkpoint.describe(str(directory))
+    disk = Checkpoint.describe(str(directory))
     assert not disk.synthetic_weights and disk.specs == {}, "a description binds nothing by itself"
     assert disk.summary().startswith("checkpoint tiny-checkpoint (local): 2 shards, ") and str(tmp_path) not in disk.summary()
     assert len(disk.manifest_hash) == 12 and disk.summary().endswith(f"manifest hash {disk.manifest_hash}")
-    assert model_samples.Checkpoint.describe(str(directory)).manifest_hash == disk.manifest_hash
+    assert Checkpoint.describe(str(directory)).manifest_hash == disk.manifest_hash
     assert disk._open == {}, "a description opens no shard for reading"
 
     model = QwenDense.describe(disk)
@@ -371,11 +371,11 @@ def test_a_checkpoint_on_disk_is_described_bound_and_read_bit_for_bit(tmp_path):
         disk.load("layers.9.mlp.down_proj.weight", "cpu")
 
     # the reference stack on the CPU, from disk and from memory: the same tensors through the name map, the merges and the loop
-    text = model_samples.TextIO.synthetic(tiny.geometry.vocab)
+    text = TextIO.synthetic(tiny.geometry.vocab)
     prompts = [text.encode("ab" + str(s)) for s in range(2)]
 
     def decode(model, checkpoint):
-        session = model_samples.Session(model, text, sequences=2, stack="reference", device="cpu", capacity=16, checkpoint=checkpoint)
+        session = Session(model, text, sequences=2, stack="reference", device="cpu", capacity=16, checkpoint=checkpoint)
         session.plan_table()
         session.load()
         ids = session.prefill(prompts)
@@ -393,13 +393,13 @@ def test_a_checkpoint_on_disk_is_described_bound_and_read_bit_for_bit(tmp_path):
 
 def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, monkeypatch):
     pytest.importorskip("safetensors")
-    import model_samples
+    from model_samples import Checkpoint
     from model_samples.qwen_dense import QwenDense
 
     tiny = _tiny_model()
-    tensors = _disk_tensors(tiny, model_samples.Checkpoint.synthetic(tiny, seed=5))
+    tensors = _disk_tensors(tiny, Checkpoint.synthetic(tiny, seed=5))
     config = _config(tiny.geometry)
-    reference = model_samples.Checkpoint.describe(str(_write_checkpoint(tmp_path / "good", tensors, config))).manifest_hash
+    reference = Checkpoint.describe(str(_write_checkpoint(tmp_path / "good", tensors, config))).manifest_hash
 
     def described(change=None, config_change=None, name="other"):
         changed, settings = dict(tensors), json.loads(json.dumps(config))
@@ -407,7 +407,7 @@ def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, mon
             change(changed)
         if config_change is not None:
             config_change(settings)
-        return model_samples.Checkpoint.describe(str(_write_checkpoint(tmp_path / name, changed, settings)))
+        return Checkpoint.describe(str(_write_checkpoint(tmp_path / name, changed, settings)))
 
     assert described().manifest_hash == reference, "the same shards under another directory name: the same manifest"
     down = PREFIX + "layers.1.mlp.down_proj.weight"
@@ -415,7 +415,7 @@ def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, mon
     assert described(lambda t: t.update({"extra.weight": torch.zeros(3)})).manifest_hash != reference
     last = PREFIX + "norm.weight"  # the last name of the last shard: renamed to a name of the same length, every size and offset stays
     renamed = described(lambda t: t.update({last[:-8] + "n.weight": t.pop(last)}), name="renamed")
-    good = model_samples.Checkpoint.describe(str(tmp_path / "good"))
+    good = Checkpoint.describe(str(tmp_path / "good"))
     assert renamed.files == good.files and renamed.manifest_hash != reference, "the manifest pins the header bytes, not only shard names and sizes"
 
     with pytest.raises(NotImplementedError, match=rf"checkpoint other \(local\) has no tensor '{down}_scale_2' \(the 4-bit global scale\)"):
@@ -443,21 +443,21 @@ def test_a_checkpoint_the_family_does_not_read_is_declined_by_name(tmp_path, mon
     empty = tmp_path / "empty"
     empty.mkdir()
     with pytest.raises(ValueError, match="--model empty: no config.json there; pass a checkpoint directory on local disk"):
-        model_samples.Checkpoint.describe(str(empty))
+        Checkpoint.describe(str(empty))
     (empty / "config.json").write_text("{}")
     with pytest.raises(ValueError, match=r"--model empty: no \*.safetensors shard there"):
-        model_samples.Checkpoint.describe(str(empty))
+        Checkpoint.describe(str(empty))
     for content, sentence in (
         ("{not json", "--model empty: config.json is not a JSON file"),
         ("[1]", "--model empty: config.json does not hold a JSON object"),
     ):
         (empty / "config.json").write_text(content)
         with pytest.raises(ValueError, match=re.escape(sentence)) as refusal:
-            model_samples.Checkpoint.describe(str(empty))
+            Checkpoint.describe(str(empty))
         assert str(tmp_path) not in str(refusal.value)
     monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
     with pytest.raises(NotImplementedError, match=r"safetensors package .*: pip install -r samples/models/requirements.txt"):
-        model_samples.Checkpoint.describe(str(tmp_path / "good"))
+        Checkpoint.describe(str(tmp_path / "good"))
 
 
 def _sample_on_stated_facts(tmp_path, monkeypatch, free):
@@ -470,12 +470,11 @@ def _sample_on_stated_facts(tmp_path, monkeypatch, free):
     pytest.importorskip("cudnn")
     import importlib.util
 
-    import model_samples
-    from model_samples import blocks
+    from model_samples import Checkpoint, Environment, Session, blocks
     from tokenizers import models, pre_tokenizers
 
     tiny = _tiny_model()
-    directory = _write_checkpoint(tmp_path / "tiny-checkpoint", _disk_tensors(tiny, model_samples.Checkpoint.synthetic(tiny, seed=5)), _config(tiny.geometry))
+    directory = _write_checkpoint(tmp_path / "tiny-checkpoint", _disk_tensors(tiny, Checkpoint.synthetic(tiny, seed=5)), _config(tiny.geometry))
     words = {word: index for index, word in enumerate(["[unk]", "why", "is", "the", "sky", "blue", "?", "<|im_end|>"])}
     tokenizer = tokenizers.Tokenizer(models.WordLevel(words, unk_token="[unk]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
@@ -492,9 +491,9 @@ def _sample_on_stated_facts(tmp_path, monkeypatch, free):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, free[0])))
-    monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
-    monkeypatch.setattr(model_samples.Checkpoint, "_read", no_read)
-    monkeypatch.setattr(model_samples.Session, "load", no_load)
+    monkeypatch.setattr("model_samples.check_environment", lambda: Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
+    monkeypatch.setattr(Checkpoint, "_read", no_read)
+    monkeypatch.setattr(Session, "load", no_load)
     monkeypatch.setattr(sys, "path", list(sys.path))  # the script puts samples/models on the path
     monkeypatch.setenv("KINETO_LOG_LEVEL", os.environ.get("KINETO_LOG_LEVEL", "6"))  # the script sets a default for the profiler's log level
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_with_a_checkpoint", MODELS / "qwen_dense" / "00_decode.py")
