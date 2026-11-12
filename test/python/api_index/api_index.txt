@@ -737,7 +737,10 @@ cudnn.gemm
 cudnn.gemm.Fp8ProjectionDecode
 cudnn.gemm.Fp8ProjectionDecode.cfg_for
 cudnn.gemm.Fp8ProjectionDecode.compile
+cudnn.gemm.Fp8ProjectionDecode.form_for
+cudnn.gemm.Fp8ProjectionDecode.kernel_symbols_for
 cudnn.gemm.Fp8ProjectionDecode.key
+cudnn.gemm.Fp8ProjectionDecode.launch_shape_for
 cudnn.gemm.MhcProjectionBackward
 cudnn.gemm.MhcProjectionBackward.check_support
 cudnn.gemm.MhcProjectionBackward.compile

@@ -48,6 +48,7 @@ device read; the launch goes onto torch's current stream of the entry's device.
 from typing import Any, Dict, Optional, Tuple
 
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
 from .kernel.fp8_projection_decode_config import (
     MAX_ROWS,
@@ -56,6 +57,7 @@ from .kernel.fp8_projection_decode_config import (
     SM100_SM_COUNT,
     SM100_SMEM_OPTIN_BYTES,
     SM100_SMEM_PER_SM_BYTES,
+    THREADS_PER_CTA,
     Cfg,
     Form,
     Geometry,
@@ -283,7 +285,10 @@ class Fp8ProjectionDecode:
     entry built for a non-CUDA device (host tests) keeps the SM100-class reference readings; it validates and picks, and declines to
     compile.  Construction resolves and validates the form of EVERY served row count, so a row count the entry admits never declines on
     the execute path: a part that cannot hold a form is a ``NotImplementedError`` (a part fact), a given ``form`` no SM100-class part
-    can run a ``ValueError`` (a knob combination) -- either raised here."""
+    can run a ``ValueError`` (a knob combination) -- either raised here.
+
+    What a row count launches is readable without a launch: :meth:`kernel_symbols_for`, :meth:`form_for` and :meth:`launch_shape_for`
+    (the launch facts of :mod:`cudnn.frost.launch_facts`)."""
 
     def __init__(
         self,
@@ -345,6 +350,29 @@ class Fp8ProjectionDecode:
     def key(self, rows: int) -> tuple:
         """The compile key: plan-time facts only -- the rendering of the row count (geometry, split, rows, form, launch knobs)."""
         return (self.cfg_for(rows),)
+
+    # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served row count ----
+    def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
+        """The symbol of the kernel this entry has compiled for ``rows``: a one-element tuple, empty until that row count is compiled.
+        The symbol names the weight's shape and nothing of the split, the form or the row count -- every rendering of one geometry
+        shares it -- so it never proves a form (:meth:`form_for` states it)."""
+        fn = self.compiled.get(self.cfg_for(rows))
+        return kernel_symbols(() if fn is None else (fn,), NAME)
+
+    def form_for(self, rows: int) -> Dict[str, Any]:
+        """The form of ``rows`` as plain data: every field of the rendering :meth:`cfg_for` returns -- the geometry as a nested
+        ``dict``, the split, the row count, the performance form resolved for it (weight tile, stages, token tile, tensor-memory
+        columns, the weight stream ahead of the wait, the tensor-memory release), the launch knobs and this part's readings.  The
+        rendering is the whole compile key, so nothing else is part of it."""
+        return plain_form(self.cfg_for(rows))
+
+    def launch_shape_for(self, rows: int) -> LaunchShape:
+        """``(grid, block, shared memory)`` of the launch of ``rows``: one cluster of ``SPLIT_K`` thread blocks along y per ``MMA_M``
+        weight rows along x, so grid ``(OUT_FEATURES / MMA_M, SPLIT_K, 1)`` (the one token tile holds every served row count); 256
+        threads; ``SMEM_BYTES`` of shared memory per thread block (the two operand rings, the barriers and the reduction mailbox: what
+        the launch reserves)."""
+        cfg = self.cfg_for(rows)
+        return LaunchShape((cfg.N // cfg.MMA_M, cfg.SPLIT_K, 1), (THREADS_PER_CTA, 1, 1), cfg.SMEM_BYTES)
 
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan-time compile: one row count, or every served one when ``rows`` is None.  Typed declines first (the row count, the device,
