@@ -27,11 +27,11 @@ DELTA_GRADIENTS = dict(q="dq", k="dk", v="dv", g="dg", beta="dbeta", w="dw", ini
 MAMBA_GRADIENTS = dict(q="dc", k="db", v="dx", g="ddt", a="da", initial_state="d_initial_state", d="dd", dt_bias="d_dt_bias", z="dz")
 
 
-def inputs(kind, *, dtype=jnp.bfloat16, bounds=(0, 17, 17, 35), fused=False, seed=3, heads=None):
+def inputs(kind, *, dtype=jnp.bfloat16, bounds=(0, 17, 17, 35), fused=False, seed=3, heads=None, value_dim=64):
     rng = np.random.default_rng(seed)
     total, sequences = bounds[-1], len(bounds) - 1
     hq, hk, hv = heads or ((1, 1, 2) if kind == "mamba2" or fused else (2, 1, 1))
-    ho, dk, dv = max(hq, hv), 128 if kind == "mamba2" or fused else 64, 64
+    ho, dk, dv = max(hq, hv), 128 if kind == "mamba2" or fused else 64, value_dim
     n = 3 if kind == "gdp" else 1
 
     def normal(shape, dtype=dtype, scale=0.15, offset=0):
@@ -153,10 +153,18 @@ def upstream(values, seed=8):
 
 
 @pytest.mark.parametrize("kind", OPERATIONS)
-@pytest.mark.parametrize("dtype,fused", [(jnp.bfloat16, False), (jnp.float16, True)], ids=["bf16-packed", "fp16-fused-checkpoint"])
-def test_forward_and_jitted_gradients(kind, dtype, fused):
-    bounds = (0, 17, 17, 146 if fused else 35)
-    values, cu, options = inputs(kind, dtype=dtype, bounds=bounds, fused=fused)
+@pytest.mark.parametrize(
+    "dtype,fused,chain",
+    [(jnp.bfloat16, False, False), (jnp.float16, True, False), (jnp.bfloat16, True, True)],
+    ids=["bf16-packed", "fp16-fused-checkpoint", "bf16-default-chain"],
+)
+def test_forward_and_jitted_gradients(kind, dtype, fused, chain):
+    bounds = (0, 1537) if chain else (0, 17, 17, 146 if fused else 35)
+    values, cu, options = inputs(
+        kind, dtype=dtype, bounds=bounds, fused=fused, heads=(1, 1, 1) if chain else None, value_dim=128 if chain and kind != "mamba2" else 64
+    )
+    options["batch_invariant"] = not chain
+    empty_sequences = np.flatnonzero(np.diff(bounds) == 0)
     do, ds = upstream(values)
     run = jax.jit(partial(invoke, kind, **options))
     result = run(values, cu)
@@ -164,7 +172,8 @@ def test_forward_and_jitted_gradients(kind, dtype, fused):
     expected, expected_grads = reference(kind, values, bounds, do, ds, **options)
     for name, got in zip(("out", "final_state"), result):
         assert_close(got, expected[name], 0.02 if dtype == jnp.bfloat16 else 0.01)
-    np.testing.assert_array_equal(result[1][1], values["initial_state"][1])
+    for index in empty_sequences:
+        np.testing.assert_array_equal(result[1][index], values["initial_state"][index])
 
     def loss(args):
         out, state = run(args, cu)
@@ -174,7 +183,8 @@ def test_forward_and_jitted_gradients(kind, dtype, fused):
     for name, got in actual.items():
         assert got.dtype == values[name].dtype
         assert_close(got, expected_grads[name], 0.06 if name == "initial_state" else 0.04 if dtype == jnp.bfloat16 else 0.03)
-    np.testing.assert_array_equal(actual["initial_state"][1], ds[1])
+    for index in empty_sequences:
+        np.testing.assert_array_equal(actual["initial_state"][index], ds[index])
     _, _, residual = jax.jit(partial(invoke, kind, explicit=True, **options))(values, cu)
     backward = getattr(cudnn.ops, OPERATIONS[kind] + "_backward_jax")
     explicit = gradients(kind, jax.jit(lambda r, do, ds: backward(r, do, d_final_state=ds))(residual, do, ds), values)
@@ -203,6 +213,20 @@ def test_optional_state_and_output_only_gradient(kind):
     assert_close(out, expected["out"], 0.02)
     for name in actual:
         assert_close(actual[name], expected_grads[name], 0.04)
+
+
+@pytest.mark.parametrize("kind", OPERATIONS)
+def test_state_only_gradient(kind):
+    values, cu, options = inputs(kind, fused=True)
+    do, ds = upstream(values)
+    run = jax.jit(partial(invoke, kind, **options))
+    actual = jax.jit(jax.grad(lambda args: jnp.sum(run(args, cu)[1].astype(jnp.float32) * ds)))(values)
+    _, expected = reference(kind, values, (0, 17, 17, 35), jnp.zeros_like(do), ds, **options)
+    for name, got in actual.items():
+        assert got.dtype == values[name].dtype
+        assert_close(got, expected[name], 0.06 if name == "initial_state" else 0.04)
+    for name in ("q", "d", "z") if kind == "mamba2" else ("q",):
+        np.testing.assert_array_equal(actual[name], jnp.zeros_like(values[name]))
 
 
 @pytest.mark.parametrize("kind", ["gdn", "gdn2", "gdp"])
@@ -258,7 +282,9 @@ def test_independent_process_and_nondefault_device(monkeypatch, cuda_device):
     run = jax.jit(partial(invoke, "gdn", **options))
     run(values, cu)[0].block_until_ready()
     devices = [device for device in jax.local_devices() if device.platform == "gpu" and str(getattr(device, "compute_capability", "")) in ("10.0", "10.3")]
-    target = next((device for device in devices if device != cuda_device), cuda_device)
+    if len(devices) < 2:
+        pytest.skip("requires two supported GPUs for nondefault-device placement")
+    target = next(device for device in devices if device != cuda_device)
     changed = jax.tree.map(lambda x: jax.device_put(x * 0.7, target), values)
     other_cu = jax.device_put(cu, target)
     with jax.default_device(target):

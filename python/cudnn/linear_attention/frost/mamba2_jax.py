@@ -7,7 +7,6 @@ import inspect
 import math
 
 import cutlass as ct
-import cutlass.cute as cute
 
 from .common import gate_bwd, head_reduce, split_k
 from .kda_jax import contiguous_view, workspace_views
@@ -145,7 +144,6 @@ def make_launcher(plan, names):
     scalar_types = {name: p.annotation for name, p in parameters.items() if p.annotation in (ct.Int32, ct.Float32)}
     regions = plan.workspace_regions
 
-    @cute.jit
     def launch(stream, *buffers):
         ports = dict(zip(names, buffers[:-1]))
         w = workspace_views(buffers[-1], regions)

@@ -167,7 +167,7 @@ a single-process job. The initial public target set is SM100/SM103.
 The JAX tests check raw-byte replay and sequence isolation, including all
 parameter and state gradients, separately from the FP64 numerical reference.
 GPU numerical, determinism, and heterogeneous-device qualification for these
-new bindings is pending; see the [determinism support page](../determinism.md).
+new bindings is pending; see the [determinism support page](/operations/determinism).
 
 These bindings cover the four recurrent forward/backward operations. Summary
 and context-parallel composition, paged/in-place state, and dedicated decode
