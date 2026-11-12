@@ -21,7 +21,15 @@
 //     compiles device code only, and the launch is reproduced in cuda_host.py;
 //   * kda_fused is given C linkage so it can be looked up by plain name;
 //   * the two host-only includes are replaced (see below).
-// The device code itself is unmodified.
+// With KDA_FUSED_SCALAR_GATE unset (the default) the device code is equivalent
+// to the campaign's but not textually identical: shared lines read the gate
+// through an identity wrapper and aliases.
+//
+// Added since, outside the campaign and written with an AI coding assistant,
+// all under #if KDA_FUSED_SCALAR_GATE: the scalar-gate
+// build that hopper/gdn_cuda_engine.py runs for Gated DeltaNet. It is NOT
+// covered by the campaign verification above; test_gdn_sm90_cuda.py is what
+// covers it.
 
 // "kda.cuh" declared only kda_launch/kda_workspace_bytes, both removed above,
 // and <cstdint> is a host C++ header NVRTC does not ship. NVRTC gets the two
@@ -386,6 +394,58 @@ cp_wait() {
 #define KDA_FUSED_GQA 0
 #endif
 
+// Scalar gate: `gg` is [T, H], one log-decay per (token, head), instead of the
+// per-key-channel [T, H, 128]. That is Gated DeltaNet's contract -- the same
+// recurrence with a channel-constant gate -- and it is a -D for the same reason
+// the flags are: the equal-gate path must not cost the per-channel one anything.
+// The sixteen gates of a chunk are staged in the first sixteen words of Raw::g,
+// so the shared-memory layout (and KDA_FUSED_SMEM_BYTES) is unchanged, and the
+// kernel reads 4 B of gate per token where the per-channel form reads 512 B.
+//
+// The scalar build also changes HOW the chunk factors are formed. The
+// per-channel kernel factors the decay as W = k*A and U = beta*k/A with
+// A_t = exp(sum_{i<=t} g_i), which is exact only while 1/A fits a bf16: fine for
+// KDA, whose gate is floored at -5 per token (16 * 5 = 80 nats), and an
+// overflow for GDN, whose gate is unbounded (-A*softplus(.) with A up to 16 is
+// routine). A scalar gate commutes with the key contraction, so here the Gram
+// products are taken on the RAW operands and the decay is applied to the 16x16
+// results as exp(c_r - c_j), r >= j -- every exponent is <= 0 and the worst
+// case is an underflow to an exactly-negligible term:
+//     M[r][j]  = beta_j (k_r . k_j) exp(c_r - c_j)            (j <  r)
+//     Z[t][j]  = s beta_j (q_t . k_j) exp(c_t - c_j)          (j <= t)
+//     kg_t     = beta_t k_t exp(c_15 - c_t)
+//     Tinv W   = (Tinv diag(A)) K                              (A folded into Tinv's columns)
+// q' = s A q is kept as is: it only meets the carried state, where an underflow
+// of A_t is the right answer. Raw::g holds the working set: [0,16) the gates,
+// [16,32) the prefix sums c_t in log2 units, [64,256) the bf16 tile Tinv diag(A).
+#ifndef KDA_FUSED_SCALAR_GATE
+#define KDA_FUSED_SCALAR_GATE 0
+#endif
+#if KDA_FUSED_SCALAR_GATE && (KDA_FUSED_FLAGS & KDA_FLAG_SAFE_GATE)
+#error "the scalar-gate kernel takes the log-space gate directly; safe_gate is per-channel only"
+#endif
+
+// The decays above are formed from differences of in-chunk prefix sums, and a
+// prefix sum cannot carry an arbitrarily large term: one gate of -1e8 (a hard
+// reset, which GDN allows) absorbs every later gate of its chunk in fp32 and
+// the differences come out 0. exp(g) is exactly zero in fp32 below about -104,
+// so a gate below kGateFloor is READ as kGateFloor: the result is unchanged,
+// -inf becomes representable, and the prefix of a chunk stays under 2^12, where
+// fp32 still resolves about 1e-3 (the spacing at the bound, not a bound on the
+// error the serial prefix adds accumulate). A NaN gate stays NaN. Scalar build only.
+#if KDA_FUSED_SCALAR_GATE
+constexpr float kGateFloor = -128.0f;
+__device__ __forceinline__ float
+gate_in(float g) {
+    return g < kGateFloor ? kGateFloor : g;
+}
+#else
+__device__ __forceinline__ float
+gate_in(float g) {
+    return g;
+}
+#endif
+
 __device__ __forceinline__ float
 kda_safe_gate(float raw, float ea, float dtb, float lb) {
     // lower_bound * sigmoid(exp(a_log) * (g + dt_bias)), the differentiable
@@ -459,6 +519,10 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
     auto load_raw = [&](int chunk, int rb) {
         Raw& R       = sm.raw[rb];
         const int tb = s0 + chunk * kChunk;
+#if KDA_FUSED_SCALAR_GATE
+        // g : one fp32 per token
+        if (tid < kChunk) cp4(&R.g[tid], gg + static_cast<long>(tb + tid) * H + head, tb + tid < s1);
+#else
         // g : 16 rows x 512 B, four 16 B lanes-chunks per row
 #pragma unroll
         for (int it = 0; it < 4; ++it) {
@@ -466,6 +530,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             const int tk = tb + i;
             cp16(&R.g[i * kDim + d], gg + static_cast<long>(tk) * HD + head * kDim + d, tk < s1);
         }
+#endif
 #pragma unroll
         for (int it = 0; it < 2; ++it) {
             const int i = (tid >> 4) + 8 * it, d = 8 * (tid & 15);
@@ -500,15 +565,22 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             load_raw(c0 - 1, (c0 - 1) % kNR);
             cp_wait<0>();
             __syncthreads();
-            const float* gp = sm.raw[(c0 - 1) % kNR].g + tid;
-            float su        = 0.0f;
+#if KDA_FUSED_SCALAR_GATE
+            // Every channel decays alike, so the max over channels is the value itself.
+            const float* gp     = sm.raw[(c0 - 1) % kNR].g;
+            constexpr int gstep = 1;
+#else
+            const float* gp     = sm.raw[(c0 - 1) % kNR].g + tid;
+            constexpr int gstep = kDim;
+#endif
+            float su = 0.0f;
             // Read-only, so the transform is applied here rather than in place:
             // prep() transforms this same tile later, and doing it twice would
             // gate an already-gated value.
             const float db_t = f_gate ? g_db[tid] : 0.0f;
 #pragma unroll
             for (int i = 0; i < kChunk; ++i) {
-                const float gv = gp[i * kDim];
+                const float gv = gate_in(gp[i * gstep]);
                 su += f_gate ? kda_safe_gate(gv, g_ea, db_t, gate_lb) : gv;
             }
 #pragma unroll
@@ -519,12 +591,18 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             w   = 1;
         }
         while (c0 - w > 0 && acc > kLogEps) {
-            const long gb    = static_cast<long>(s0 + (c0 - w - 1) * kChunk) * HD + head * kDim + tid;
+#if KDA_FUSED_SCALAR_GATE
+            const long gb = static_cast<long>(s0 + (c0 - w - 1) * kChunk) * H + head;
+            const long gh = H;
+#else
+            const long gb = static_cast<long>(s0 + (c0 - w - 1) * kChunk) * HD + head * kDim + tid;
+            const long gh = HD;
+#endif
             float su         = 0.0f;
             const float db_t = f_gate ? g_db[tid] : 0.0f;
 #pragma unroll
             for (int i = 0; i < kChunk; ++i) {
-                const float gv = gg[gb + static_cast<long>(i) * HD];
+                const float gv = gate_in(gg[gb + static_cast<long>(i) * gh]);
                 su += f_gate ? kda_safe_gate(gv, g_ea, db_t, gate_lb) : gv;
             }
 #pragma unroll
@@ -627,6 +705,26 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
         // whole 16x128 bf16 staging tile from shared memory.
         const int cp = tid & 63, oc = tid >> 6;
         const int dd0 = 2 * cp, t0 = 8 * oc;
+        // The gate of token i for this thread's channel pair.
+#if KDA_FUSED_SCALAR_GATE
+        auto gate2 = [&](int i) {
+            const float gi = gate_in(R.g[i]);
+            return make_float2(gi, gi);
+        };
+#else
+        auto gate2 = [&](int i) { return *reinterpret_cast<const float2*>(&R.g[i * kDim + dd0]); };
+#endif
+#if KDA_FUSED_SCALAR_GATE
+        // c_t in log2 units for the difference-form scalings below. One thread per
+        // token; published by the same barrier that publishes W, q' and u.
+        if (tid < kChunk) {
+            float c = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kChunk; ++i)
+                if (i <= tid) c += gate_in(R.g[i]);
+            R.g[kChunk + tid] = c * kLog2E;
+        }
+#endif
         float c0 = 0.0f, c1 = 0.0f;
         if (oc) {
             // Upper-octet threads re-read the lower octet's eight g pairs to build
@@ -636,7 +734,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             // warp stalls).
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                const float2 gg2 = *reinterpret_cast<const float2*>(&R.g[i * kDim + dd0]);
+                const float2 gg2 = gate2(i);
                 c0 += gg2.x;
                 c1 += gg2.y;
             }
@@ -652,7 +750,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
         // on a shared round trip; issuing the loads first breaks that chain and
         // costs three registers.  NCU put the g load at the top of this kernel's
         // short-scoreboard stalls.
-        float2 gg2        = *reinterpret_cast<const float2*>(&R.g[t0 * kDim + dd0]);
+        float2 gg2        = gate2(t0);
         __nv_bfloat162 k2 = *reinterpret_cast<const __nv_bfloat162*>(&R.k[t0 * kDim + dd0]);
         __nv_bfloat162 q2 = *reinterpret_cast<const __nv_bfloat162*>(&R.q[t0 * kDim + dd0]);
 #pragma unroll
@@ -662,24 +760,40 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             const __nv_bfloat162 kc = k2, qc = q2;
             if (i < 7) {
                 const int tn = t + 1;
-                gg2          = *reinterpret_cast<const float2*>(&R.g[tn * kDim + dd0]);
+                gg2          = gate2(tn);
                 k2           = *reinterpret_cast<const __nv_bfloat162*>(&R.k[tn * kDim + dd0]);
                 q2           = *reinterpret_cast<const __nv_bfloat162*>(&R.q[tn * kDim + dd0]);
             }
             c0 += gc.x;
             c1 += gc.y;
-            d0              = exp2f(c0 * kLog2E);
-            d1              = exp2f(c1 * kLog2E);
+            d0 = exp2f(c0 * kLog2E);
+#if KDA_FUSED_SCALAR_GATE
+            d1 = d0;  // c1 == c0: one exp2 per token instead of two
+#else
+            d1 = exp2f(c1 * kLog2E);
+#endif
             const float kx0 = __bfloat162float(kc.x), kx1 = __bfloat162float(kc.y);
-            const float b                                        = bet[i];
+            const float b = bet[i];
+#if KDA_FUSED_SCALAR_GATE
+            // Raw k for the Gram product, and raw q into the output staging tile,
+            // which is idle here: the scan drained it before this prep was issued
+            // and refills it only after prep returns.
+            *reinterpret_cast<uint32_t*>(&sm.wq[t * kLdA + dd0])  = *reinterpret_cast<const uint32_t*>(&kc);
+            *reinterpret_cast<uint32_t*>(&sm.ost[t * kLdA + dd0]) = *reinterpret_cast<const uint32_t*>(&qc);
+#else
             *reinterpret_cast<uint32_t*>(&sm.wq[t * kLdA + dd0]) = pack2(kx0 * d0, kx1 * d1);
+#endif
             // q' is published ONLY into its GMMA B tile.  An 8-channel group of that
             // tile is a contiguous [16 tok][8 ch] block with row stride 8, i.e. an
             // ldmatrix-addressable tile in its own right, so the Z product reads it
             // straight from there and the second [token][channel] copy disappears.
             *reinterpret_cast<uint32_t*>(&rec.qg[(dd0 >> 3) * kQgG + t * 8 + (dd0 & 7)]) =
                 pack2(__bfloat162float(qc.x) * d0 * q_scale, __bfloat162float(qc.y) * d1 * q_scale);
+#if KDA_FUSED_SCALAR_GATE
+            *reinterpret_cast<uint32_t*>(&sm.u[t * kLdA + dd0]) = pack2(b * kx0, b * kx1);
+#else
             *reinterpret_cast<uint32_t*>(&sm.u[t * kLdA + dd0]) = pack2(b * kx0 / d0, b * kx1 / d1);
+#endif
         }
         if (oc) {
             rec.av[dd0]     = d0;
@@ -715,8 +829,13 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 ap   = &sm.wq[lrow * kLdA + lcol];
                 astr = kChunk;
             } else {
+#if KDA_FUSED_SCALAR_GATE
+                ap   = &sm.ost[lrow * kLdA + lcol];  // raw q, same form as W
+                astr = kChunk;
+#else
                 ap   = &rec.qg[(lane >> 4) * kQgG + lrow * 8];
                 astr = 2 * kQgG;
+#endif
             }
             float acc[8];
 #pragma unroll
@@ -732,10 +851,23 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             if (warp == 0) {
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int row                = lg + 8 * (e & 1);
-                    const int col                = 8 * (e >> 1) + 2 * tg;
+                    const int row = lg + 8 * (e & 1);
+                    const int col = 8 * (e >> 1) + 2 * tg;
+#if KDA_FUSED_SCALAR_GATE
+                    // Only the strict lower triangle is read by the inverse below.
+                    const float* cs_ = &R.g[kChunk];
+                    const float cr   = cs_[row];
+                    // The mask is applied to the EXPONENT as well as to the product, so a
+                    // masked entry never forms exp2 of a large positive number (--use_fast_math
+                    // may evaluate both arms of the select), while a live entry is not clamped:
+                    // a positive gate (alpha > 1) is out of contract but still exact.
+                    const bool m0 = col < row, m1 = col + 1 < row;
+                    sm.prod[row * kPS + col]     = m0 ? acc[2 * e] * exp2f(m0 ? cr - cs_[col] : 0.0f) : 0.0f;
+                    sm.prod[row * kPS + col + 1] = m1 ? acc[2 * e + 1] * exp2f(m1 ? cr - cs_[col + 1] : 0.0f) : 0.0f;
+#else
                     sm.prod[row * kPS + col]     = acc[2 * e];
                     sm.prod[row * kPS + col + 1] = acc[2 * e + 1];
+#endif
                 }
                 __syncwarp();
             } else {
@@ -744,10 +876,18 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 // the whole 16x16 masked transpose is four conflict-free 4 B stores.
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int tq   = lg + 8 * (e & 1);
-                    const int tr   = 8 * (e >> 1) + 2 * tg;
+                    const int tq = lg + 8 * (e & 1);
+                    const int tr = 8 * (e >> 1) + 2 * tg;
+#if KDA_FUSED_SCALAR_GATE
+                    const float* cs_ = &R.g[kChunk];
+                    const float cq   = cs_[tq];
+                    const bool m0 = tr <= tq, m1 = tr + 1 <= tq;  // masked in the exponent too, as for M
+                    const float v0 = m0 ? acc[2 * e] * q_scale * exp2f(m0 ? cq - cs_[tr] : 0.0f) : 0.0f;
+                    const float v1 = m1 ? acc[2 * e + 1] * q_scale * exp2f(m1 ? cq - cs_[tr + 1] : 0.0f) : 0.0f;
+#else
                     const float v0 = (tr <= tq) ? acc[2 * e] : 0.0f;
                     const float v1 = (tr + 1 <= tq) ? acc[2 * e + 1] : 0.0f;
+#endif
                     *reinterpret_cast<uint32_t*>(&rec.z[(e >> 1) * 128 + tq * 8 + 2 * tg]) = pack2(v0, v1);
                 }
             }
@@ -762,6 +902,18 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             float na           = rec.av[dd_first];
             float nu0          = __bfloat162float(sm.u[i0 * kLdA + dd_first]);
             float nu1          = __bfloat162float(sm.u[(i0 + 1) * kLdA + dd_first]);
+#if KDA_FUSED_SCALAR_GATE
+            // exp(c_15 - c_t) for the four tokens this lane republishes.
+            float kf[4];
+            {
+                const float* cs_ = &R.g[kChunk];
+                const float ce   = cs_[kChunk - 1];
+                kf[0]            = exp2f(ce - cs_[i0]);
+                kf[1]            = exp2f(ce - cs_[i0 + 1]);
+                kf[2]            = exp2f(ce - cs_[i0 + 8]);
+                kf[3]            = exp2f(ce - cs_[i0 + 9]);
+            }
+#endif
 #pragma unroll
             for (int it = 0; it < 16; ++it) {
                 const int idx = (warp & 1) * 16 + it;
@@ -776,8 +928,14 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                     nu0            = __bfloat162float(sm.u[ni * kLdA + nd]);
                     nu1            = __bfloat162float(sm.u[(ni + 1) * kLdA + nd]);
                 }
+#if KDA_FUSED_SCALAR_GATE
+                (void)a;
+                *reinterpret_cast<uint32_t*>(&rec.kg[(dd >> 6) * 1024 + (i >> 3) * 512 + (dd & 63) * 8 + (i & 7)]) =
+                    pack2(u0 * kf[(idx & 1) * 2], u1 * kf[(idx & 1) * 2 + 1]);
+#else
                 *reinterpret_cast<uint32_t*>(&rec.kg[(dd >> 6) * 1024 + (i >> 3) * 512 + (dd & 63) * 8 + (i & 7)]) =
                     pack2(u0 * a, u1 * a);
+#endif
             }
         }
         if (warp == 0) {
@@ -803,6 +961,15 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             if (col < kChunk) {
 #pragma unroll
                 for (int r = 0; r < kChunk; ++r) sm.tib[r * kLdT + col] = __float2bfloat16_rn(ti[r]);
+#if KDA_FUSED_SCALAR_GATE
+                // Tinv diag(A): column j carries A_j, so Tinv W becomes this tile
+                // times the raw keys. Tinv is lower triangular, so A_j >= A_r on every
+                // non-zero entry and an underflowing A_j drops a negligible term.
+                bf16* tw          = reinterpret_cast<bf16*>(&R.g[4 * kChunk]);
+                const float a_col = exp2f(R.g[kChunk + col]);
+#pragma unroll
+                for (int r = 0; r < kChunk; ++r) tw[r * kLdT + col] = __float2bfloat16_rn(ti[r] * a_col);
+#endif
             }
         }
         __syncthreads();
@@ -811,6 +978,12 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             const int lcol = 8 * (lane >> 4);
             uint32_t ti[4];
             ldm4(ti, &sm.tib[lrow * kLdT + lcol]);
+#if KDA_FUSED_SCALAR_GATE
+            uint32_t tiw[4];
+            ldm4(tiw, reinterpret_cast<const bf16*>(&R.g[4 * kChunk]) + lrow * kLdT + lcol);
+#else
+            const uint32_t* tiw = ti;
+#endif
 #pragma unroll
             uint32_t bwv[2][2][4];
 #pragma unroll
@@ -829,8 +1002,8 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 }
                 const uint32_t* bw = bwv[blk][0];
                 const uint32_t* bv = bwv[blk][1];
-                mma16816(cw, ti, bw[0], bw[1]);
-                mma16816(cw + 4, ti, bw[2], bw[3]);
+                mma16816(cw, tiw, bw[0], bw[1]);
+                mma16816(cw + 4, tiw, bw[2], bw[3]);
                 mma16816(cv, ti, bv[0], bv[1]);
                 mma16816(cv + 4, ti, bv[2], bv[3]);
                 // Publish both 16x16 tiles straight out of the accumulators.  Element

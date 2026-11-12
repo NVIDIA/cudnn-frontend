@@ -51,7 +51,7 @@ SMEM_BYTES = 94464
 _SMEM_DEFINE = (f"-DKDA_FUSED_SMEM_BYTES={SMEM_BYTES}",)
 
 
-def _defines(flags: int, gqa: bool = False):
+def _defines(flags: int, gqa: bool = False, scalar_gate: bool = False):
     """Compile options for one fusion combination.
 
     The flags are fixed per graph node, so they are baked in rather than
@@ -59,7 +59,10 @@ def _defines(flags: int, gqa: bool = False):
     compile_cubin keys its on-disk cache on the option list, so each combination
     gets its own cubin and they cannot collide.
     """
-    return (*_SMEM_DEFINE, f"-DKDA_FUSED_FLAGS={int(flags)}", f"-DKDA_FUSED_GQA={int(bool(gqa))}")
+    defines = (*_SMEM_DEFINE, f"-DKDA_FUSED_FLAGS={int(flags)}", f"-DKDA_FUSED_GQA={int(bool(gqa))}")
+    # Appended only when set, so the per-channel kernels keep the option list they have always
+    # had (the cache key also hashes the source, so they recompile once after any source edit).
+    return (*defines, "-DKDA_FUSED_SCALAR_GATE=1") if scalar_gate else defines
 
 
 # The campaign kernel targets ~264 resident CTAs; a launch splits each sequence
@@ -87,12 +90,12 @@ def _arch_for_device(device: int) -> str:
     return "sm_90a"
 
 
-def _library(device: int, flags: int = 0, gqa: bool = False) -> "compiler.KernelLibrary":
-    key = (KERNEL_BODY, int(device), int(flags), bool(gqa))
+def _library(device: int, flags: int = 0, gqa: bool = False, scalar_gate: bool = False) -> "compiler.KernelLibrary":
+    key = (KERNEL_BODY, int(device), int(flags), bool(gqa), bool(scalar_gate))
     with _LOCK:
         lib = _LIBRARIES.get(key)
         if lib is None:
-            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device), _defines(flags, gqa))
+            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device), _defines(flags, gqa, scalar_gate))
             _LIBRARIES[key] = lib
         return lib
 
@@ -130,15 +133,17 @@ def launch(
     flags: int = 0,
     q_scale: float = DEFAULT_Q_SCALE,
     n_qk_heads: int = 0,
+    scalar_gate: bool = False,
 ) -> None:
     """One ``kda_fused`` launch. All tensor arguments are device addresses.
 
     ``flags`` selects the in-kernel input fusions (see ``FLAG_*``); ``a_log`` and
     ``dt_bias`` are read only when ``FLAG_SAFE_GATE`` is set and may be 0
-    otherwise.
+    otherwise. ``scalar_gate`` selects the kernel built for a ``[T, H]`` gate
+    (Gated DeltaNet) in place of the per-channel ``[T, H, 128]`` one.
     """
     smem = SMEM_BYTES
-    func = _library(device, flags, (n_qk_heads or n_heads) != n_heads).function(KERNEL_NAME, dynamic_smem=smem)
+    func = _library(device, flags, (n_qk_heads or n_heads) != n_heads, scalar_gate).function(KERNEL_NAME, dynamic_smem=smem)
     p = pieces_per_sequence(total_tokens, n_seqs, n_heads)
 
     params = compiler.Params()
