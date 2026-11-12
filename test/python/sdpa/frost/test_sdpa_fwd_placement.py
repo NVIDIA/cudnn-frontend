@@ -1314,13 +1314,14 @@ def test_square_causal_places_the_same_from_either_corner():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("s_q", [1, 5, 1024])
-def test_sm90_paged_d512_stays_backend_first(s_q):
-    """The SM90 row's d512 lead was measured on dense K/V only. Paged K/V reaches the row now, unmeasured, so a sink-free paged
-    d512 graph keeps the backend first while its dense twin still leads."""
+@pytest.mark.parametrize("s_q, paged", [(1, placement.LEAD), (5, placement.TRAIL), (1024, placement.TRAIL)])
+def test_sm90_paged_d512_follows_its_measurement(s_q, paged):
+    """The SM90 row's dense d512 lead holds at every s_q. Paged d512 leads where study sm90_decode_20261112 measured it (s_q 1-4,
+    incl. GQA over 2 KV heads at page 16: 0.26-0.94 at s_q 1) and keeps the backend first where nothing measured it (verify
+    rows, prefill)."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
     shape = dict(b=64, h_q=8, h_kv=2, s_q=s_q, s_kv=4096, d_qk=512, d_v=512, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132)
     assert placement.place(spec, _facts(**shape)) == placement.LEAD
-    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == placement.TRAIL
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == paged

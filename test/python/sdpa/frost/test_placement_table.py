@@ -49,7 +49,7 @@ def test_entries_are_well_formed_and_name_known_rows():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
         assert isinstance(cc, tuple) and len(cc) == 2 and dtype in ("bf16", "f16") and len(heads) == 2
-        assert phase in ("q1", "mtp", "prefill", "prefill_short_square", "prefill_short_q")
+        assert phase in ("q1", "mtp", "verify", "prefill", "prefill_short_square", "prefill_short_q")
         assert layout.removesuffix("_bounded") in ("dense", "paged", "thd", "thd_ragged")
         assert mask in ("none", "window", "causal_br", "causal_tl") and isinstance(sink, bool) and group in ("mha", "gqa", "gqa_unpacked", "gqa_split")
         assert isinstance(kv_off_tile, bool)
@@ -354,6 +354,30 @@ def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
     )
     assert pt.lookup(row, facts) is None
     assert placement.place(spec, facts) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("row, cc", [("sdpa_fwd_prefill_sm80", (8, 0)), ("sdpa_fwd_prefill_sm90", (9, 0))], ids=["a100", "h200"])
+def test_sm80_sm90_decode_shaped_gqa_follows_the_decode_studies(row, cc):
+    """Studies sm80_decode_20261112 / sm90_decode_20261112: GQA decode-shaped rows -- s_q 2-4 (mtp) and 5-16 (verify, a row-local
+    phase on SM80 / SM90) -- are their own classes and lead; MHA and s_q > 16 stay in the prefill class, and other rows keep theirs.
+    d128 single-row dense decode is non-monotone: no entry."""
+    study = "sm80_decode_20261112" if cc == (8, 0) else "sm90_decode_20261112"
+
+    def f(**over):
+        base = dict(b=8, h_q=32, h_kv=2, s_q=4, s_kv=32768, d_qk=256, d_v=256, causal=True, bottom_right=True)
+        base.update(has_paged_kv=False, padded=False, page_size=0, device_cc=cc)
+        base.update(over)
+        return _facts(**base)
+
+    for s_q in (2, 4, 8, 16):
+        assert pt.lookup(row, f(s_q=s_q)) is True, s_q
+        assert pt.matched_entry(row, f(s_q=s_q)).study == study
+    assert pt.class_key(row, f(s_q=8))[4] == "verify"
+    assert pt.class_key(row, f(s_q=17))[4] == "prefill"
+    assert pt.class_key(row, f(s_q=8, h_q=2))[4] == "prefill"
+    assert pt.class_key("sdpa_fwd_prefill_sm100", f(s_q=8, device_cc=(10, 0)))[4] == "prefill"
+    assert pt.lookup(row, f(s_q=1, d_qk=128, d_v=128, h_q=64, h_kv=8, causal=False, bottom_right=False)) is None
 
 
 @pytest.mark.L0
