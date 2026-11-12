@@ -79,8 +79,9 @@ class PoolCacheKernel:
 
         page, offset = slot // self.page_size, slot % self.page_size
         base = cache.iterator + page * cache.stride[0]
+        address = base.toint()
         if cutlass.const_expr(self.cache_dtype == "bf16"):
-            output = cute.make_tensor(cute.recast_ptr(base, dtype=BFloat16), cute.make_layout((self.page_size * 128,)))
+            output = cute.make_tensor(cute.make_ptr(BFloat16, address, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout((self.page_size * 128,)))
             for j in cutlass.range_constexpr(4):
                 output[offset * 128 + lane + j * 32] = values[j].to(BFloat16)
         elif cutlass.const_expr(self.cache_dtype == "fp8"):
@@ -100,7 +101,9 @@ class PoolCacheKernel:
                     for j in cutlass.range_constexpr(4):
                         scale_out[offset * 4 + j] = Uint8(exponent + 127)
                 else:
-                    scale_out = cute.make_tensor(cute.recast_ptr(base + self.page_size * 128, dtype=Float32), cute.make_layout((self.page_size,)))
+                    scale_out = cute.make_tensor(
+                        cute.make_ptr(Float32, address + self.page_size * 128, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout((self.page_size,))
+                    )
                     scale_out[offset] = scale
         else:
             output = cute.make_tensor(base, cute.make_layout((self.page_size * 68,)))
