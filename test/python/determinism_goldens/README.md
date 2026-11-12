@@ -46,28 +46,67 @@ K/V page maps, then restore and compare bytes. Numerical checks use CPU FP64.
 The refill stress uses four blocks per SM, warm/poisoned runs and the unsafe
 ring control. Backward uses other kernels and is outside this suite.
 
-B200 native qualification (CUDA compiler/NVRTC13.4, CuTeDSL4.8,
-cuDNN9.30.0.4, Torch2.14.1+cu130): four replay/batch cases and two warm
+B200 native qualification (CUDA compiler/NVRTC 13.4, CuTeDSL 4.8,
+cuDNN 9.30.0.4, Torch 2.14.1+cu130): four replay/batch cases and two warm
 stress cases pass. Four new golden records were created after the numerical
 and replay checks, then all four pass in a separate strict process. Existing
 goldens are unchanged; the new records baseline the swap-AB reduction order.
-The stress uses592 blocks (4 per SM),256 warm and256 poisoned launches per
-dtype, with no mismatches; the unsafe control fails200/200. No skipped cases.
+The stress uses 592 blocks (4 per SM), 256 warm and 256 poisoned launches per
+dtype, with no mismatches; the unsafe control fails 200/200. No skipped cases.
 
 Unfiltered Compute Sanitizer memcheck, synccheck and racecheck each pass the
-four golden cases. Memcheck/synccheck report0 errors; racecheck reports0
+four golden cases. Memcheck/synccheck report 0 errors; racecheck reports 0
 hazards, errors or warnings. CUDA API error reporting is disabled. Under
-instrumentation FE reports cuDNN93000 and Torch92400; the explicit standalone
+instrumentation FE reports cuDNN 93000 and Torch 92400; the explicit standalone
 FROST path executes no backend attention. No new SM103 sanitizer run is claimed.
-The separate public graph suite passes28 cases, including legacy D256
+The separate public graph suite passes 28 cases, including legacy D256
 wide-tile controls. The source/import and runtime library hashes are verified.
 
-Native B300 SXM6 AC (cc10.3,148SMs, same compiler/runtime versions) passes40
+The B200 run used base revision `a736a06c6d8dfde1b4322eee0430f93bae78178c`
+with the frozen D128 overlays subsequently committed in `fd911361d886b60a083464b6b3e790ba302c7733`.
+The three production modules have identical executable ASTs to PR revision
+`73bcd50c6166a574fab360136a76c90f6f3ea012`; the determinism test is byte-identical.
+The base revision alone does not contain this lowering. The frozen source
+manifest also verifies 134 native-extension build inputs.
+
+The actual sanitizer invocations below ran in separate processes. Here
+`sanitizer134` denotes the installed CUDA 13.4 `compute-sanitizer` executable,
+`python312` the qualification environment's Python, and `run_root` the frozen
+run directory (`/tmp/yanxu-d128-determinism-5882703`). No kernel-name filter,
+launch limit, or launch-dump option was used:
+
+```bash
+"$sanitizer134" --tool memcheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" memcheck
+"$sanitizer134" --tool synccheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" synccheck
+"$sanitizer134" --tool racecheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" racecheck
+```
+
+The wrapper verifies source/library hashes, the import path, GPU and runtime,
+then calls `pytest.main` from the frozen `source/test/python` directory with
+the following arguments (plus a result-recording plugin):
+
+```text
+sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py::test_live_columns_golden
+-m L0 -q -rs --tb=short --junitxml=<run_root>/results/<tool>/pytest.xml
+```
+
+For all three tools, `CUDNN_DETERMINISM_RECORD` was unset and
+`CUDNN_DETERMINISM_GOLDENS=<run_root>/goldens` selected the four records from
+the preceding record phase. The wrapper used `CUDNN_TEST_NO_ISOLATION=1`,
+`CUDNN_TEST_TIMEOUT=240`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` and
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, with CUDA 13.4 NVRTC preloaded,
+the cuDNN 9.30.0.4 library directory, and isolated source/cache paths.
+
+Native B300 SXM6 AC (cc10.3, 148 SMs, same compiler/runtime versions) passes 40
 checks through `TestDecodeLiveColumns` in the actual SM100/SM103 CI entry,
 including the older sink, routing, wide-tile and Int64 page-table-stride cases.
 Its four new golden records pass a separate strict process. Both dtype stress
-cases report0 mismatches in256 warm and256 poisoned launches at592 CTAs; the
-unsafe-ring control fails200/200. No skips. The B300 job's subsequent
+cases report 0 mismatches in 256 warm and 256 poisoned launches at 592 CTAs; the
+unsafe-ring control fails 200/200. No skips. The B300 job's subsequent
 performance phase failed during FlashInfer import before any measurements;
 that harness failure does not change these completed qualification results.
 
