@@ -490,13 +490,37 @@ def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask, on_tile, off
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d", [(512, 512), (576, 512)], ids=["d512", "d576"])
-def test_sm107_paged_mla_single_row_decode_has_no_entry(d):
-    """Study sm107_paged_mtp_20261110 measured absorbed-MLA s_q == 1 but ships no entry for it: d512 lost 1.32x on the holdout at
-    h_kv 2, and D576 was not measured at h_kv > 1. The hand rules keep deciding these graphs."""
+@pytest.mark.parametrize("h_kv", [1, 2])
+def test_sm107_paged_mla_single_row_decode_follows_the_q1_study(d, h_kv):
+    """Study sm107_decode_q1_20261112 leads paged d512 / D576 s_q == 1 at every length on and off the tile, h_kv 1 and 2 (FROST
+    0.12-0.83 of the backend). f16 and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm107"
     for s_kv in (131072, 131071, 1024, 1023):
-        facts = _facts(b=128, h_q=16, h_kv=1, s_q=1, s_kv=s_kv, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
-        assert pt.lookup(row, facts) is None
+        facts = _facts(b=128, h_q=16 * h_kv, h_kv=h_kv, s_q=1, s_kv=s_kv, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
+        assert pt.lookup(row, facts) is True
+        assert pt.matched_entry(row, facts).study == "sm107_decode_q1_20261112"
+    facts = dict(b=8, h_q=64, h_kv=1, s_q=1, s_kv=8192, d_qk=d[0], d_v=d[1], page_size=64, padded=True)
+    assert pt.lookup(row, _facts(device_cc=(10, 7), dtype=cudnn.data_type.HALF, **facts)) is None
+    assert pt.lookup(row, _facts(device_cc=(10, 3), **facts)) is None
+
+
+@pytest.mark.L0
+def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
+    """Study sm107_decode_q1_20261112: dense d256 s_q == 1 leads past a cost threshold on the KV tile and a tile-count threshold off
+    it; small launches keep the backend. d128 single-row decode has no entry (its holdout moved no cell)."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def q1(**over):
+        base = dict(b=32, h_q=32, h_kv=2, s_q=1, s_kv=131072, d_qk=256, d_v=256, device_cc=(10, 7), has_paged_kv=False, padded=False, page_size=0)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (131072, 131071):
+        assert pt.lookup(row, q1(s_kv=s_kv)) is True
+        assert pt.matched_entry(row, q1(s_kv=s_kv)).study == "sm107_decode_q1_20261112"
+    assert pt.lookup(row, q1(b=1, s_kv=2048)) is False
+    assert pt.lookup(row, q1(b=1, h_q=8, h_kv=1, s_kv=2049)) is False
+    assert getattr(pt.matched_entry(row, q1(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_decode_q1_20261112"
 
 
 def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):

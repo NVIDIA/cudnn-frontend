@@ -547,6 +547,24 @@ def test_sm107_fp8_placement_trails_outside_the_measured_domain(over):
 
 
 @pytest.mark.L0
+def test_sm107_fp8_d64_sink_decode_placement_structure():
+    """cc 10.7 FP8 d64 decode with a sink: s_q 2-4 leads; s_q == 1 leads from the module's KV-unit floor; a window, paging, or
+    no sink keeps the backend. Bounds come from the module, so this pins the gate's structure, not a measured boundary."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    units = placement.SM107_FP8_D64_SINK_DECODE_MIN_UNITS
+    base = {**_SM107_FP8_QUANT, "d_qk": 64, "d_v": 64, "h_q": 64, "h_kv": 8, "s_kv": 131072, "has_sink": True, "device_cc": (10, 7)}
+    mtp = {**base, "b": 1, "s_q": 4, "causal": True, "bottom_right": True}
+    q1 = {**base, "s_q": 1, "causal": False, "bottom_right": False}
+    assert placement.place(spec, _facts(**mtp)) == placement.LEAD
+    assert placement.place(spec, _facts(**{**q1, "b": units // 8})) == placement.LEAD
+    assert placement.place(spec, _facts(**{**q1, "b": units // 8 - 1})) == placement.TRAIL
+    for over in (dict(window_left=127), dict(has_paged_kv=True), dict(has_sink=False), dict(device_cc=(10, 0))):
+        assert placement.place(spec, _facts(**{**mtp, **over})) == placement.TRAIL, over
+
+
+@pytest.mark.L0
 def test_sm107_fp8_placement_trails_one_kv_tile_with_few_q_tiles():
     """The launch-bound floor reads its bounds from the module, so it pins the gate's structure, not a measured boundary."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
@@ -941,7 +959,6 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     [
         None,
         dict(device_cc=(10, 0)),
-        dict(has_paged_kv=False, page_size=0, padded=False),  # a dense d256 cache at s_q == 1 was measured against the prefill body only
         dict(padded=False),  # a paged decode WITHOUT per-request KV lengths: every band cell carried the padding mask -> unmeasured
         dict(s_q=2),  # two query tokens WITHOUT the diagonal: not FlashInfer's MTP graph, unmeasured (the MTP band keys on the diagonal)
         dict(h_q=64, b=4, s_kv=8192),  # group 32 one step below its band (2**16 tokens in flight holds the parity cell)
@@ -965,7 +982,6 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     ids=[
         "inside",
         "sm100",
-        "dense",
         "unpadded",
         "q2_no_diagonal",
         "g32_below_band",
@@ -1002,6 +1018,8 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
     assert placement.place(spec, _sm107_paged_d256_decode_facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
     if outside is None:
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, s_q=2, causal=True, bottom_right=True)) == placement.LEAD  # the MTP rows (table)
+        # dense K/V leaves the shard: study sm107_decode_q1_20261112 (table) leads this cell
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, has_paged_kv=False, page_size=0, padded=False)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64)) == placement.LEAD  # group 32 inside its band (64 units x 8k)
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64, dtype=cudnn.data_type.HALF)) == placement.LEAD  # its f16 twin
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, dtype=cudnn.data_type.HALF)) == placement.LEAD
