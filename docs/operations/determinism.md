@@ -103,6 +103,11 @@ The coalesced page-table loader preserves strict parent-output goldens on
 SM100 and SM103. The interleaved SM100 two-KV-stream schedule retains these
 checks, including refilled-ring stress and delayed-MMA odd tails; SM103 keeps
 its existing TMEM-P schedule. This adds no paged-KV backward path.
+The separate SM100 paged D128 Q/K and V producers preserve the tested fixed-plan
+O/Stats batch invariance and parent output bytes. HND/NHD capture checks use
+independent K/V page tables and restore exact O/Amax bytes after switching live
+KV lengths through shorter, empty and original batches. SM103 retains its
+existing producer path and passes the same contract checks.
 
 The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,

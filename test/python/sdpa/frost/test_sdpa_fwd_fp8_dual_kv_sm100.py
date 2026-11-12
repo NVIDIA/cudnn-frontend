@@ -28,6 +28,7 @@ import cudnn.sdpa  # noqa: F401  -- registers the FROST engines
 from cudnn.sdpa.fwd import config_sm100
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+from determinism_utils import assert_bitwise, snapshot
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
@@ -220,21 +221,27 @@ def test_dense_two_kv_streams_match_the_reference(routed, name, b, h, kh, s_q, s
     assert abs(amax - ref.abs().max().item()) <= 0.08 * ref.abs().max().item() + 1e-3, (name, amax, ref.abs().max().item())
 
 
-def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br):
+def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br, split=None, sched_policy=0, pack_gqa=True, hnd=True, replay=False):
+    assert len(lens) == b and all(0 <= length <= max_pages * page for length in lens)
     npages = b * max_pages
     k_pool = _rand((npages, kh, page, D), seed=4)
     v_pool = _rand((npages, kh, page, D), seed=5)
+    if not hnd:
+        k_pool = k_pool.transpose(1, 2).contiguous().transpose(1, 2)
+        v_pool = v_pool.transpose(1, 2).contiguous().transpose(1, 2)
     bt = torch.randperm(npages, device="cuda", dtype=torch.int32).view(b, max_pages)
+    bt_v = bt.roll(1, dims=1) if replay else bt
     q = _rand((b, s_q, h, D), seed=6).transpose(1, 2)
     o = torch.empty(b, s_q, h, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
     amax_o = torch.zeros(1, 1, 1, 1, device="cuda", dtype=torch.float32)
     ones = {n: torch.ones(1, 1, 1, 1, device="cuda", dtype=torch.float32) for n in ("dq", "dk", "dv", "ds", "ss", "so")}
     bt4 = bt.view(b, 1, max_pages, 1)
+    btv4 = bt_v.view(b, 1, max_pages, 1)
     slk = torch.tensor(lens, dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
     slq = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
     g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     tq, tk, tv = g.tensor_like(q), g.tensor_like(k_pool), g.tensor_like(v_pool)
-    tbk, tbv = g.tensor_like(bt4), g.tensor_like(bt4)
+    tbk, tbv = g.tensor_like(bt4), g.tensor_like(btv4)
     tsq, tsk = g.tensor_like(slq), g.tensor_like(slk)
     sc = {n: g.tensor_like(t) for n, t in ones.items()}
     kw = dict(use_causal_mask_bottom_right=True) if causal_br else {}
@@ -266,18 +273,51 @@ def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.OPENSOURCE])
     plan = select_engine(g, ENGINE)
+    if split is not None:
+        g.create_execution_plan(ENGINE_ID, SdpaFwdKnobs(sched_policy=sched_policy, tile_m=128, tile_n=128, cga=1, pack_gqa=pack_gqa, split_kv=split))
+        g.select_plan(len(g.plans) - 1)
+        plan = g.plans[g._plan_index]
     assert plan.knobs.cga in (None, 1), plan.knobs
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    vp = {tq: q, tk: k_pool, tv: v_pool, tbk: bt4, tbv: bt4, tsq: slq, tsk: slk, to: o, ta: amax_o}
+    vp = {tq: q, tk: k_pool, tv: v_pool, tbk: bt4, tbv: btv4, tsq: slq, tsk: slk, to: o, ta: amax_o}
     vp.update({sc[n]: ones[n] for n in ones})
-    g.execute(vp, ws, handle=cudnn.create_handle())
-    torch.cuda.synchronize()
     # gather the pages into dense [B, KH, S, D] for the reference
     k_d = k_pool[bt.long()].permute(0, 2, 1, 3, 4).reshape(b, kh, max_pages * page, D)
-    v_d = v_pool[bt.long()].permute(0, 2, 1, 3, 4).reshape(b, kh, max_pages * page, D)
+    v_d = v_pool[bt_v.long()].permute(0, 2, 1, 3, 4).reshape(b, kh, max_pages * page, D)
     ref = _reference(q, k_d, v_d, lens, s_q, causal_br)
+    handle = cudnn.create_handle()
+    try:
+
+        def execute():
+            cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
+            g.execute(vp, ws, handle=handle)
+
+        execute()
+        torch.cuda.synchronize()
+        if replay:
+            first = snapshot({"o": o, "amax_o": amax_o})
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                execute()
+            changed = [max(0, length - 129) for length in lens]
+            for live in (changed, [0] * b, lens):
+                slk.copy_(torch.tensor(live, device="cuda", dtype=torch.int32).view_as(slk))
+                o.fill_(torch.nan)
+                amax_o.zero_()
+                for _ in range(16):
+                    graph.replay()
+                torch.cuda.synchronize()
+                expected = _reference(q, k_d, v_d, live, s_q, causal_br)
+                assert torch.isfinite(o).all() and torch.isfinite(amax_o).all()
+                if any(live):
+                    assert (o.float() - expected).abs().max() <= 0.04 * expected.abs().max()
+                else:
+                    assert torch.count_nonzero(o) == 0
+            assert_bitwise({"o": o, "amax_o": amax_o}, first, "restore lengths after captured replay")
+    finally:
+        cudnn.destroy_handle(handle)
     return o.float(), ref
 
 
@@ -298,6 +338,37 @@ def test_paged_two_kv_streams_match_the_reference(routed, name, b, s_q, page, ma
     assert not torch.isnan(o).any()
     err = (o - ref).abs().max().item() / ref.abs().max().item()
     assert err < 0.04, (name, err)
+
+
+@pytest.mark.parametrize("hnd", [False, True], ids=["nhd", "hnd"])
+@pytest.mark.parametrize(
+    "b,h,kh,s_q,page,max_pages,lens,split,sched,packed,causal",
+    [
+        (40, 64, 8, 1, 16, 72, [1152, 777, 0, 40] * 10, 4, 0, True, False),
+        (4, 64, 8, 4, 8, 33, [264, 129, 40, 0], 4, 1, True, True),
+        (2, 8, 8, 64, 128, 9, [1152, 1000], 4, 2, False, False),
+        (4, 64, 8, 4, 8, 33, [264, 129, 40, 0], 1, 0, True, True),
+    ],
+    ids=["persistent-empty-splits", "causal-lpt", "unpacked-lpt-l2", "unsplit"],
+)
+def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh, s_q, page, max_pages, lens, split, sched, packed, causal):
+    """Pin the actual producer, independent V pages and live/empty persistent phases."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    modules = []
+    original_load = api_dsl._load_kernel_template
+
+    def load(*args, **kwargs):
+        module = original_load(*args, **kwargs)
+        if hasattr(module, "SPLIT_PAGE_V"):
+            modules.append(module)
+        return module
+
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", load)
+    o, ref = _run_paged(b, h, kh, s_q, page, max_pages, lens, causal_br=causal, split=split, sched_policy=sched, pack_gqa=packed, hnd=hnd, replay=True)
+    assert modules and all(m.CFG.PAGED_KV and m.DUAL_KV and not m.CFG.THD_VARLEN for m in modules)
+    assert all(m.SPLIT_PAGE_V == (torch.cuda.get_device_capability() == (10, 0)) for m in modules)
+    assert torch.isfinite(o).all() and (o - ref).abs().max() <= 0.04 * ref.abs().max()
 
 
 _PHANTOM_CHILD = textwrap.dedent(r"""
