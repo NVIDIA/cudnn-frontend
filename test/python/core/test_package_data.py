@@ -47,10 +47,7 @@ def test_every_runtime_data_file_is_package_data():
     shipped = [
         p.resolve()
         for p in (_PKG_ROOT / "cudnn").rglob("*")
-        if p.is_file()
-        and p.suffix not in _NOT_DATA
-        and p.name not in _NOT_DATA_NAMES
-        and "__pycache__" not in p.parts
+        if p.is_file() and p.suffix not in _NOT_DATA and p.name not in _NOT_DATA_NAMES and "__pycache__" not in p.parts
     ]
     missing = sorted(str(p.relative_to(_PKG_ROOT)) for p in shipped if p not in covered)
     assert not missing, f"add these to [tool.setuptools.package-data] in pyproject.toml: {missing}"
