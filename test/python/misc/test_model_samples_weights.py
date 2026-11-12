@@ -552,7 +552,8 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
         assert str(tmp_path) not in out and "served by" not in out, out
         return code, out.splitlines()[-1]
 
-    nothing = "not a directory on local disk; pass a checkpoint directory (a hub name is not fetched: nothing is downloaded)"
+    nothing = "not a directory on local disk; pass a checkpoint directory (a hub name is not fetched: nothing is downloaded; "
+    nothing += "the README beside the sample says where its checkpoint comes from)"
     assert last(["--model", str(tmp_path / "nowhere")]) == (1, f"[00] ERROR --model nowhere: {nothing}")
     assert last(["--model", "some-org/Some-Model"]) == (1, f"[00] ERROR --model Some-Model: {nothing}")
     assert last(model + ["--messages", str(tmp_path / "missing.json")]) == (1, "[00] ERROR --messages missing.json: cannot be read (No such file or directory)")
@@ -565,6 +566,10 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
     (tmp_path / "number.json").write_text(json.dumps([{"role": "user", "content": 3}]))  # the template adds text to the content
     code, line = last(model + ["--messages", str(tmp_path / "number.json")])
     assert code == 1 and line.startswith("[00] ERROR the checkpoint's chat template refused the messages: unsupported operand"), line
+    (tmp_path / "blank.json").write_text(json.dumps([{"role": "user", "content": ""}]))  # rendered to a space, encoded to nothing
+    nothing_to_feed = "the checkpoint's chat template and tokenizer turn it into no token; there is nothing to decode from"
+    assert last(model + ["--messages", str(tmp_path / "blank.json")]) == (1, f"[00] ERROR --messages blank.json: {nothing_to_feed}")
+    assert last(model + ["--prompt", "why ?", "--prompt", " "]) == (1, f"[00] ERROR --prompt 2: {nothing_to_feed}")
     for target in (tmp_path / "no-such-folder" / "ids.json", tmp_path / "folder"):
         (tmp_path / "folder").mkdir(exist_ok=True)
         for arguments in (model, []):  # with a checkpoint and for the default run
@@ -581,11 +586,33 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
     (directory / "generation_config.json").write_text("{not json")
     code, line = last(model)
     assert code == 1 and line.startswith("[00] ERROR --model tiny-checkpoint: generation_config.json is not a JSON file ("), line
+    (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": "7"}))  # a string would be read letter by letter
+    wrong_kind = "eos_token_id in generation_config.json is '7' where a token id or a list of token ids is expected"
+    assert last(model) == (1, f"[00] ERROR --model tiny-checkpoint: {wrong_kind}")
     (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": 7}))
+    # an entry of config.json that holds something else than what it stands for: the file and the entry, not a traceback
+    config = (directory / "config.json").read_text()
+    for change, sentence in (
+        (lambda c: c.update(text_config=None), "config.json has a text_config that is not a JSON object"),
+        (lambda c: c["text_config"].update(head_dim=None), "config.json has head_dim = None where a whole number is expected"),
+        (lambda c: c["text_config"].update(hidden_size="large"), "config.json has hidden_size = 'large' where a whole number is expected"),
+        (lambda c: c["text_config"].update(hidden_size=64.5), "config.json has hidden_size = 64.5 where a whole number is expected"),
+        (lambda c: c["text_config"].update(rms_norm_eps=True), "config.json has rms_norm_eps = True where a number is expected"),
+        (lambda c: c["text_config"].update(layer_types=3), "config.json has layer_types = 3 where a list of layer names is expected"),
+        (lambda c: c["text_config"].update(rope_parameters=[1]), "config.json has rope_parameters that are not a JSON object"),
+        (lambda c: c["text_config"].update(linear_key_head_dim="8"), "config.json has linear_key_head_dim = '8' where a whole number is expected"),
+    ):
+        changed = json.loads(config)
+        change(changed)
+        (directory / "config.json").write_text(json.dumps(changed))
+        assert last(model) == (1, f"[00] ERROR checkpoint tiny-checkpoint (local): {sentence}")
+    (directory / "config.json").write_text(config)
     template = (directory / "chat_template.jinja").read_text()
     (directory / "chat_template.jinja").write_text("{% generation %}{{ messages[0].content }}{% endgeneration %}")  # a tag this environment does not have
     code, line = last(model)
     assert code == 1 and line.startswith("[00] ERROR --model tiny-checkpoint: the chat template does not compile ("), line
+    (directory / "chat_template.jinja").write_bytes(template.encode() + b"\xff")
+    assert last(model) == (1, "[00] ERROR --model tiny-checkpoint: chat_template.jinja is not UTF-8 text")
     (directory / "chat_template.jinja").write_text(template)
     shard = sorted(directory.glob("*.safetensors"))[0]
     kept = shard.read_bytes()

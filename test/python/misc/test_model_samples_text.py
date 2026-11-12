@@ -344,6 +344,22 @@ def test_a_checkpoints_tokenizer_encodes_decodes_and_streams(tmp_path):
     (directory / "generation_config.json").unlink()
     (directory / "config.json").write_text(json.dumps({"text_config": {"eos_token_id": 7}}))
     assert TextIO.from_checkpoint(str(directory)).eos_ids == (7,), "without a generation config the end token is the model config's"
+    for wrong in ("248046", True, 7.0, [], [7, "8"], -1):  # a string would be read letter by letter, true as the id 1
+        (directory / "config.json").write_text(json.dumps({"eos_token_id": wrong}))
+        with pytest.raises(ValueError, match=r"--model checkpoint: eos_token_id in config.json is .* where a token id or a list of token ids is expected"):
+            TextIO.from_checkpoint(str(directory))
+        (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": wrong}))
+        with pytest.raises(ValueError, match="--model checkpoint: eos_token_id in generation_config.json is "):
+            TextIO.from_checkpoint(str(directory))
+        (directory / "generation_config.json").unlink()
+    (directory / "config.json").write_text(json.dumps({"text_config": [1]}))
+    with pytest.raises(ValueError, match="no end-token id there"):
+        TextIO.from_checkpoint(str(directory))
+    (directory / "config.json").write_text(json.dumps({"eos_token_id": 7}))
+    (directory / "chat_template.jinja").write_bytes(b"{{ messages[0].content }}\xff")
+    with pytest.raises(ValueError, match="--model checkpoint: chat_template.jinja is not UTF-8 text") as refusal:
+        TextIO.from_checkpoint(str(directory))
+    assert str(tmp_path) not in str(refusal.value)
 
 
 def test_a_directory_without_its_text_files_and_a_missing_package_are_told_apart(tmp_path, monkeypatch):
@@ -378,14 +394,15 @@ def test_a_directory_without_its_text_files_and_a_missing_package_are_told_apart
         TextIO.from_checkpoint(str(directory))
     assert str(tmp_path) not in str(refusal.value)
     (directory / "tokenizer.json").unlink()
-    with pytest.raises(ValueError, match="--model checkpoint: no tokenizer.json there"):
+    with pytest.raises(ValueError, match="--model checkpoint: no tokenizer.json there; a checkpoint directory holds config.json, tokenizer.json, a chat"):
         TextIO.from_checkpoint(str(directory))
     for missing in (tmp_path / "nowhere", directory / "generation_config.json", "some-org/Some-Model"):
         with pytest.raises(
-            ValueError, match=r"not a directory on local disk; pass a checkpoint directory \(a hub name is not fetched: nothing is downloaded\)"
+            ValueError, match=r"not a directory on local disk; pass a checkpoint directory \(a hub name is not fetched: nothing is downloaded; "
         ) as refusal:
             TextIO.from_checkpoint(str(missing))
         assert str(tmp_path) not in str(refusal.value) and f"--model {Path(str(missing)).name}:" in str(refusal.value)
+        assert str(refusal.value).endswith("the README beside the sample says where its checkpoint comes from)")
     monkeypatch.setitem(sys.modules, "tokenizers", None)  # as if the package were not installed
     with pytest.raises(NotImplementedError, match=r"tokenizers and jinja2 packages .*: pip install -r samples/models/requirements.txt"):
         TextIO.from_checkpoint(str(directory))

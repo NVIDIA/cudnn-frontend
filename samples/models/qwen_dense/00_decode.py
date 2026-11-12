@@ -200,9 +200,9 @@ def main(argv=None) -> int:
                     f"--model {os.path.basename(os.path.normpath(args.model)) or '.'}: the tokenizer has {text.vocab_size:,} ids, the model's "
                     f"embedding table {model.geometry.vocab:,} rows: not the tokenizer of this checkpoint"
                 )
-            requests = [([{"role": "user", "content": prompt}], None, {}) for prompt in args.prompt]
-            requests += [text_io.load_messages(path) for path in args.messages]
-            requests = requests or [([{"role": "user", "content": DEFAULT_PROMPT}], None, {})]
+            requests = [([{"role": "user", "content": prompt}], None, {}, f"--prompt {n + 1}") for n, prompt in enumerate(args.prompt)]
+            requests += [(*text_io.load_messages(path), f"--messages {os.path.basename(path)}") for path in args.messages]
+            requests = requests or [([{"role": "user", "content": DEFAULT_PROMPT}], None, {}, "the default prompt")]
         else:
             model = QwenDense.reduced(layers=args.layers)
             text = model_samples.TextIO.synthetic(model.geometry.vocab)
@@ -224,12 +224,14 @@ def main(argv=None) -> int:
     started = time.perf_counter()
     try:  # every prompt of the run is rendered and encoded before anything is planned: the longest one sizes the state
         sets = []  # per prompt set: (prompt ids, the seconds of the text path)
-        for messages, tools, options in requests:
+        for messages, tools, options, shown in requests:
             render = time.perf_counter()
             rendered = text.render_chat(messages, tools, **options)
             tokenize = time.perf_counter()
             ids = text.encode(rendered)
             seconds = {"render": tokenize - render, "tokenize": time.perf_counter() - tokenize}
+            if not int(ids.numel()):  # before the plan and the load, not as an exception of the loop after both
+                raise ValueError(f"{shown}: the checkpoint's chat template and tokenizer turn it into no token; there is nothing to decode from")
             again = []  # the same two calls repeated: the first call of a process pays for caches the libraries build
             for _ in range(3):
                 render = time.perf_counter()
@@ -239,7 +241,7 @@ def main(argv=None) -> int:
                 again.append((tokenize - render, time.perf_counter() - tokenize))
             seconds.update(render_repeated=min(a for a, _ in again), tokenize_repeated=min(b for _, b in again))
             sets.append((ids, seconds))
-    except ValueError as error:  # a template that refuses its messages
+    except ValueError as error:  # a template that refuses its messages, or renders them to nothing
         print(f"{TAG} ERROR {error}")
         return 1
     longest = max((int(ids.numel()) for ids, _ in sets), default=0)

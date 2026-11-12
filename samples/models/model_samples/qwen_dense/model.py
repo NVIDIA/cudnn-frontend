@@ -147,36 +147,53 @@ class QwenDense:
     def describe(cls, checkpoint) -> "QwenDense":
         """The model of a checkpoint on local disk (``Checkpoint.describe``): the geometry from its ``config.json``, this
         family's tensor list bound to its tensors.  Nothing is loaded.  ``NotImplementedError`` (a SKIP) when the checkpoint
-        is not of this family or not in the storage formats this sample reads."""
+        is not of this family or not in the storage formats this sample reads; ``ValueError`` (an ERROR) when an entry of
+        its ``config.json`` holds something else than the number, list or object it stands for."""
         config = checkpoint.config.get("text_config", checkpoint.config)
+        if not isinstance(config, dict):
+            raise ValueError(f"{checkpoint.label}: config.json has a text_config that is not a JSON object")
         kind = config.get("model_type")
         if kind not in ("qwen3_5", "qwen3_5_text"):
             raise NotImplementedError(f"{checkpoint.label} is a model of type {kind!r}; this sample reads the dense Qwen 3.5 architecture")
+        rope = config.get("rope_parameters") or {}
+        if not isinstance(rope, dict):
+            raise ValueError(f"{checkpoint.label}: config.json has rope_parameters that are not a JSON object")
+
+        def number(key, kind=int, source=config, **default):
+            """One entry of the config as a number; a ``ValueError`` that names the entry where it holds something else."""
+            value = source.get(key, default["default"]) if default else source[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or (kind is int and isinstance(value, float) and not value.is_integer()):
+                raise ValueError(f"{checkpoint.label}: config.json has {key} = {value!r} where {'a whole number' if kind is int else 'a number'} is expected")
+            return kind(value)
+
         try:
-            kinds = tuple(config["layer_types"])
-            rope = config.get("rope_parameters") or {}
-            head_dim = int(config["head_dim"])
+            kinds = config["layer_types"]
+            if not isinstance(kinds, list) or not all(isinstance(name, str) for name in kinds):
+                raise ValueError(f"{checkpoint.label}: config.json has layer_types = {kinds!r} where a list of layer names is expected")
+            kinds = tuple(kinds)
+            head_dim = number("head_dim")
             geometry = Geometry(
                 layer_kinds=kinds,
-                hidden=int(config["hidden_size"]),
-                vocab=int(config["vocab_size"]),
-                mlp=int(config["intermediate_size"]),
-                la_key_heads=int(config["linear_num_key_heads"]),
-                la_value_heads=int(config["linear_num_value_heads"]),
-                la_head_dim=int(config["linear_value_head_dim"]),
-                la_conv_width=int(config["linear_conv_kernel_dim"]),
-                attn_heads=int(config["num_attention_heads"]),
-                attn_kv_heads=int(config["num_key_value_heads"]),
+                hidden=number("hidden_size"),
+                vocab=number("vocab_size"),
+                mlp=number("intermediate_size"),
+                la_key_heads=number("linear_num_key_heads"),
+                la_value_heads=number("linear_num_value_heads"),
+                la_head_dim=number("linear_value_head_dim"),
+                la_conv_width=number("linear_conv_kernel_dim"),
+                attn_heads=number("num_attention_heads"),
+                attn_kv_heads=number("num_key_value_heads"),
                 attn_head_dim=head_dim,
-                rotary_dim=int(head_dim * float(rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0)))),
-                rope_theta=float(rope.get("rope_theta", config.get("rope_theta", 10000.0))),
-                norm_eps=float(config["rms_norm_eps"]),
+                rotary_dim=int(head_dim * number("partial_rotary_factor", float, rope, default=config.get("partial_rotary_factor", 1.0))),
+                rope_theta=number("rope_theta", float, rope, default=config.get("rope_theta", 10000.0)),
+                norm_eps=number("rms_norm_eps", float),
             )
         except KeyError as error:
             raise NotImplementedError(f"{checkpoint.label}: config.json has no {error.args[0]!r}; not a checkpoint this sample reads") from None
+        key_head_dim = number("linear_key_head_dim", default=geometry.la_head_dim)
         unread = [
             ("layer types other than linear_attention and full_attention", set(kinds) - set(PATTERN)),
-            ("a key head width that differs from the value head width", int(config.get("linear_key_head_dim", geometry.la_head_dim)) != geometry.la_head_dim),
+            ("a key head width that differs from the value head width", key_head_dim != geometry.la_head_dim),
             ("an attention layer without its output gate", not config.get("attn_output_gate", True)),
             (f"activation {config.get('hidden_act')!r}", config.get("hidden_act", "silu") != "silu"),
         ]

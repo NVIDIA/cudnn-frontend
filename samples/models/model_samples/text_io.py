@@ -138,16 +138,25 @@ class TextIO:
             ) from error
         shown = os.path.basename(os.path.normpath(directory)) or "."
         if not os.path.isdir(directory):
-            raise ValueError(f"--model {shown}: not a directory on local disk; pass a checkpoint directory (a hub name is not fetched: nothing is downloaded)")
+            raise ValueError(
+                f"--model {shown}: not a directory on local disk; pass a checkpoint directory (a hub name is not fetched: nothing is downloaded; "
+                "the README beside the sample says where its checkpoint comes from)"
+            )
 
         def read(name, required=True):
             path = os.path.join(directory, name)
             if not os.path.isfile(path):
                 if required:
-                    raise ValueError(f"--model {shown}: no {name} there")
+                    raise ValueError(
+                        f"--model {shown}: no {name} there; a checkpoint directory holds config.json, tokenizer.json, a chat template, "
+                        "generation_config.json and *.safetensors shards"
+                    )
                 return None
-            with open(path, encoding="utf-8") as f:
-                return f.read()
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                raise ValueError(f"--model {shown}: {name} is not UTF-8 text") from None
 
         def read_object(name):
             body = read(name, required=False)
@@ -173,12 +182,16 @@ class TextIO:
         if not isinstance(source, str):
             raise ValueError(f"--model {shown}: no chat template there (chat_template.jinja, or chat_template in tokenizer_config.json)")
         generation = read_object("generation_config.json")
-        eos = generation.get("eos_token_id")
+        eos, eos_file = generation.get("eos_token_id"), "generation_config.json"
         if eos is None:
             config = read_object("config.json")
-            eos = config.get("eos_token_id", (config.get("text_config") or {}).get("eos_token_id"))
+            nested = config.get("text_config")
+            eos, eos_file = config.get("eos_token_id", nested.get("eos_token_id") if isinstance(nested, dict) else None), "config.json"
         if eos is None:
             raise ValueError(f"--model {shown}: no end-token id there (eos_token_id in generation_config.json or config.json)")
+        eos_ids = eos if isinstance(eos, list) else [eos]
+        if not eos_ids or not all(type(i) is int and i >= 0 for i in eos_ids):  # a string would be read letter by letter, true as id 1
+            raise ValueError(f"--model {shown}: eos_token_id in {eos_file} is {eos!r} where a token id or a list of token ids is expected")
 
         def raise_exception(message):
             raise jinja2.exceptions.TemplateError(message)
@@ -201,7 +214,7 @@ class TextIO:
             raise ValueError(f"--model {shown}: the chat template does not compile ({error})") from None
         self = cls(
             (),
-            [eos] if isinstance(eos, int) else eos,
+            eos_ids,
             f"tokenizer and chat template of checkpoint {shown} (tokenizers {tokenizers.__version__}, jinja2 {jinja2.__version__})",
         )
         self.synthetic_text, self._tokenizer, self._template = False, tokenizer, template
