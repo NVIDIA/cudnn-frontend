@@ -25,7 +25,62 @@ class TensorRef:
     offset: int = 0
 
 
+@dataclass(frozen=True)
+class ExternalTensorRef:
+    """A view into caller-owned, address-stable CUDA storage."""
+
+    address: int
+    shape: tuple
+    dtype: str
+    nbytes: int
+    offset: int = 0
+
+    def __post_init__(self):
+        size = math.prod(self.shape) * np.dtype(self.dtype).itemsize
+        if not 0 < self.address < 2**63 or not 0 <= self.offset <= self.nbytes < 2**63 or size > self.nbytes - self.offset:
+            raise ValueError("external CUDA tensor exceeds its allocation")
+        if len(self.shape) > 8 or any(d < 0 for d in self.shape):
+            raise ValueError("invalid external CUDA tensor shape")
+
+
 _TARGET = "cudnn_cake_launch_" + uuid.uuid4().hex
+_contexts = {}
+
+
+class LaunchContext:
+    """Own stable allocations and serialize plans sharing their CUDA scratch.
+
+    Close collectively after the final execution. Compiled functions reject
+    later calls rather than accessing allocations released by their owner.
+    """
+
+    def __init__(self, device, owners=()):
+        self.device = int(device)
+        self._owners = tuple(owners)
+        self._library = _library()
+        self._handle = self._library.cake_jax_context(self.device)
+        if not self._handle:
+            raise RuntimeError("could not create the native JAX launch context")
+        self._closed = False
+        _contexts[self._handle] = self
+
+    def close(self):
+        if self._closed:
+            return
+        status = self._library.cake_jax_context_close(self._handle)
+        if status:
+            raise RuntimeError(f"could not close the native JAX launch context: CUDA error {status}")
+        self._closed = True
+        _contexts.pop(self._handle, None)
+        self._owners = ()
+
+    def __enter__(self):
+        if self._closed:
+            raise RuntimeError("the JAX launch context is closed")
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 class _Argument(ctypes.Structure):
@@ -35,6 +90,7 @@ class _Argument(ctypes.Structure):
         ("bits", ctypes.c_int64),
         ("integer", ctypes.c_int64),
         ("floating", ctypes.c_double),
+        ("capacity", ctypes.c_int64),
     ]
 
 
@@ -88,17 +144,35 @@ def _library():
                 raise RuntimeError("Cake JAX bridge build failed:\n" + result.stderr)
             os.replace(temporary, path)
     library = ctypes.CDLL(str(path))
-    library.cake_jax_plan.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.POINTER(_Stage), ctypes.c_int, ctypes.POINTER(_Argument)]
+    library.cake_jax_context.argtypes = [ctypes.c_int]
+    library.cake_jax_context.restype = ctypes.c_void_p
+    library.cake_jax_context_close.argtypes = [ctypes.c_void_p]
+    library.cake_jax_context_close.restype = ctypes.c_int
+    library.cake_jax_plan.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(_Stage),
+        ctypes.c_int,
+        ctypes.POINTER(_Argument),
+        ctypes.c_void_p,
+    ]
     library.cake_jax_plan.restype = ctypes.c_void_p
     jax.ffi.register_ffi_target(_TARGET, jax.ffi.pycapsule(library.cake_jax_launch), platform="CUDA")
     return library
 
 
 def _argument(value):
-    if isinstance(value, TensorRef):
+    if isinstance(value, (TensorRef, ExternalTensorRef)):
         dtype = np.dtype(value.dtype)
         code = 4 if dtype.name == "bfloat16" else {"f": 2, "i": 0, "u": 1}[dtype.kind]
-        if value.index < 0 or len(value.shape) > 8 or value.offset < 0 or any(d < 0 for d in value.shape) or math.prod(value.shape) * dtype.itemsize >= 2**63:
+        if len(value.shape) > 8 or value.offset < 0 or any(d < 0 for d in value.shape) or math.prod(value.shape) * dtype.itemsize >= 2**63:
+            raise ValueError("invalid Cake tensor reference")
+        if isinstance(value, ExternalTensorRef):
+            return _Argument(
+                7, -1, value.offset, len(value.shape), (ctypes.c_int64 * 8)(*value.shape), code, dtype.itemsize * 8, value.address, 0, value.nbytes
+            )
+        if value.index < 0:
             raise ValueError("invalid Cake tensor reference")
         return _Argument(7, value.index, value.offset, len(value.shape), (ctypes.c_int64 * 8)(*value.shape), code, dtype.itemsize * 8, 0, 0)
     arg = _Argument()
@@ -113,18 +187,28 @@ def _argument(value):
     return arg
 
 
-def make_call(stages, input_count, output_shape_dtype, device, zero_buffers=()):
+def make_call(stages, input_count, output_shape_dtype, device, zero_buffers=(), *, context=None, has_side_effect=False):
     """Prepare a native launch sequence; input buffers precede output buffers."""
     total = input_count + len(output_shape_dtype)
-    if input_count < 0 or any(ref.index < input_count or ref.index >= total for ref in zero_buffers):
+    if any(not isinstance(ref, (TensorRef, ExternalTensorRef)) for ref in zero_buffers):
+        raise TypeError("zero buffers must be tensor references")
+    if input_count < 0 or any(isinstance(ref, TensorRef) and not input_count <= ref.index < total for ref in zero_buffers):
         raise ValueError("zero buffers must refer to outputs")
+    refs = [arg for _, args in stages for arg in args] + list(zero_buffers)
+    if any(isinstance(ref, ExternalTensorRef) for ref in refs) and context is None:
+        raise ValueError("external CUDA buffers require an owning launch context")
+    if context is not None and (context._closed or context.device != device):
+        raise ValueError("the launch context must be open on the plan device")
     for _, args in stages:
         if any(isinstance(arg, TensorRef) and not 0 <= arg.index < total for arg in args):
             raise ValueError("Cake tensor reference is outside the call buffers")
     library = _library()
+    stages = tuple((fn.__tvm_ffi_object__() if hasattr(fn, "__tvm_ffi_object__") else fn, args) for fn, args in stages)
     arguments = [(_Argument * len(args))(*map(_argument, args)) for _, args in stages]
     records = (_Stage * len(stages))(*(_Stage(fn.__chandle__(), len(args), args) for (fn, _), args in zip(stages, arguments)))
     zeros = (_Argument * len(zero_buffers))(*map(_argument, zero_buffers))
-    plan = library.cake_jax_plan(device, input_count, len(stages), records, len(zeros), zeros)
-    invoke = jax.ffi.ffi_call(_TARGET, output_shape_dtype)
+    plan = library.cake_jax_plan(device, input_count, len(stages), records, len(zeros), zeros, None if context is None else context._handle)
+    if not plan:
+        raise RuntimeError("could not prepare the native JAX launch plan")
+    invoke = jax.ffi.ffi_call(_TARGET, output_shape_dtype, has_side_effect=has_side_effect or context is not None)
     return lambda *args: invoke(*args, plan=np.int64(plan))

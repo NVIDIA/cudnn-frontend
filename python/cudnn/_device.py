@@ -181,6 +181,13 @@ class DeviceInfo:
         return int(_ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, _device_handle(self.ordinal))))
 
     @functools.cached_property
+    def shared_memory_per_multiprocessor(self) -> int:
+        drv = _driver()
+        return int(
+            _ck(*drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, _device_handle(self.ordinal)))
+        )
+
+    @functools.cached_property
     def oversized_shared_memory_per_block(self) -> int:
         """Per-CTA SMEM ceiling in the *oversized* carveout (327 KiB vs the 227 KiB
         opt-in limit on SM 10.7), which the part gives by shrinking L1 to 8 kB —

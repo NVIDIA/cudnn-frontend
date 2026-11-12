@@ -13,26 +13,7 @@ from typing import Tuple, Union
 import torch
 
 from ._math import ceil_div
-
-
-class MoeFormat(str, Enum):
-    """Data formats supported by the MoE+EP interface."""
-
-    BF16 = "bf16"
-    MXFP8 = "mxfp8"
-    NVFP4 = "nvfp4"
-
-
-def parse_format(value: Union[MoeFormat, str]) -> MoeFormat:
-    """Normalize a public format value."""
-
-    if isinstance(value, MoeFormat):
-        return value
-    try:
-        return MoeFormat(value.lower())
-    except (AttributeError, ValueError) as exc:
-        choices = ", ".join(item.value for item in MoeFormat)
-        raise ValueError(f"unsupported format {value!r}; expected one of: {choices}") from exc
+from ._metadata import MoeEpNativeWeightStorageMode, MoeFormat, parse_format, parse_native_weight_storage_mode
 
 
 def _normalize_axis(axis: int, ndim: int) -> int:
@@ -197,27 +178,6 @@ class MoeEpNativeWeightLayout(str, Enum):
     BACKWARD_W1_TRANSPOSE_GATE_UP_INTERLEAVED_32_V1 = "mxfp8.backward_w1_transpose.gate_up_interleaved_32.blocked_sf.v1"
     BACKWARD_W2_DGRAD_NK_ROW_MAJOR_V1 = "mxfp8.backward_w2_dgrad.nk_row_major.blocked_sf.v1"
     BACKWARD_W1_DGRAD_GATE_UP_INTERLEAVED_32_NK_ROW_MAJOR_V1 = "mxfp8.backward_w1_dgrad.gate_up_interleaved_32.nk_row_major.blocked_sf.v1"
-
-
-class MoeEpNativeWeightStorageMode(str, Enum):
-    """Addressing mode used by kernel-native training weights."""
-
-    CONTIGUOUS = "contiguous"
-    DISCRETE = "discrete"
-
-
-def parse_native_weight_storage_mode(
-    value: Union[MoeEpNativeWeightStorageMode, str],
-) -> MoeEpNativeWeightStorageMode:
-    """Normalize a native training-weight storage mode."""
-
-    if isinstance(value, MoeEpNativeWeightStorageMode):
-        return value
-    try:
-        return MoeEpNativeWeightStorageMode(value.lower())
-    except (AttributeError, ValueError) as exc:
-        choices = ", ".join(mode.value for mode in MoeEpNativeWeightStorageMode)
-        raise ValueError(f"unsupported native weight storage mode {value!r}; " f"expected one of: {choices}") from exc
 
 
 @dataclass(frozen=True)

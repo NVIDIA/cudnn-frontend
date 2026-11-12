@@ -15,6 +15,9 @@ from typing import Any
 _OPTIONAL_DEPENDENCY_INSTALL_HINT = "Install with 'pip install nvidia-cudnn-frontend[cutedsl]'"
 
 _LAZY_EXPORTS = {
+    "shared_expert_decode_forward_jax": ("cudnn.moe.frost.jax_api", "shared_expert_decode_forward_jax"),
+    "fp8_projection_decode_forward_jax": ("cudnn.gemm.frost.projection_decode.jax_api", "fp8_projection_decode_forward_jax"),
+    "prepare_moe_ep_jax": ("cudnn.moe_ep.jax_api", "prepare_moe_ep_jax"),
     "dense_indexer_kl": ("cudnn.simplified_sparse_attention.api", "dense_indexer_kl"),
     "simplified_sparse_attention": ("cudnn.simplified_sparse_attention.api", "simplified_sparse_attention"),
     "simplified_sparse_attention_jax": ("cudnn.simplified_sparse_attention.jax_api", "simplified_sparse_attention_jax"),

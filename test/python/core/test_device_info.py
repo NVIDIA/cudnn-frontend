@@ -49,5 +49,6 @@ def test_frost_facts_are_shims_onto_the_common_device_info():
     assert F.compute_capability(0) == d.compute_capability
     assert F.multiprocessor_count(0) == d.sm_count
     assert F.shared_memory_per_block_optin(0) == d.shared_memory_per_block_optin
+    assert F.shared_memory_per_multiprocessor(0) == d.shared_memory_per_multiprocessor
     assert F.l2_cache_bytes(0) == d.l2_cache_bytes
     assert F.device_name(0) == d.device_name

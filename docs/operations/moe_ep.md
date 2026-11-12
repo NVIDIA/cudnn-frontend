@@ -25,7 +25,7 @@ MoeEP is distinct from the cuDNN graph
 pip install "nvidia-cudnn-frontend[cutedsl,comm]" torch torch-c-dlpack-ext
 ```
 
-The `comm` extra supplies NVSHMEM and is only needed for EP2+. See
+The `comm` extra supplies NVSHMEM and is needed for PyTorch EP2+ and all JAX plans. See
 [Execution support](#execution-support) for the hardware and DSL floor, and
 [Expert-parallel communication](#expert-parallel-communication) for what EP2+
 requires at runtime.
@@ -570,6 +570,11 @@ hold unspecified data and scale values. Consumers must use both metadata
 tensors: `expert_offsets` locates each physical segment and
 `valid_route_counts` limits the rows read from it.
 
+The saved `fc1_preact` uses the same receiver-domain pool and valid-row
+intervals. Its padded rows are also unspecified: forward may store a complete
+TMA tile, and backward masks invalid rows before its reductions. Retain the
+whole saved tensor for backward, but inspect or compare only valid rows.
+
 The existing grouped WGrad API derives its GEMM K extent from adjacent
 `expert_offsets` and therefore reads complete padded segments. Under this
 validity contract MoeEP operands are **not** guaranteed to be directly
@@ -669,10 +674,120 @@ configured capacity.
 Private instance resources cannot grow during replay. Capacity changes require a
 new operator preparation; caller-address changes require recapture.
 
+## JAX API
+
+The JAX native FFI bridge requires a C++17 compiler and CUDA toolkit on first
+use. Set `CUDA_HOME` if the toolkit is not on `PATH`.
+
+`cudnn.moe_ep.prepare_moe_ep_jax` prepares the same SM107 MXFP8 kernels for
+JAX inference and explicit training. Install the `jax` dependency group and
+the `comm` extra. Preparation requires an already initialized NVSHMEM world;
+the frontend neither bootstraps nor finalizes it. NVSHMEM's public UID or MPI
+initializers can establish this world independently of `jax.distributed`.
+
+```python
+import jax
+from cudnn.moe_ep import (
+    MoeEpConfig, MoeEpDataPathConfig, MoeEpFc1WeightLayout,
+    MoeEpModelConfig, MoeEpParallelConfig, prepare_moe_ep_jax,
+)
+
+config = MoeEpConfig(
+    model=MoeEpModelConfig(num_experts=E, hidden_size=H, intermediate_size=I, top_k=K),
+    parallel=MoeEpParallelConfig(max_tokens_per_rank=capacity),
+    data_path=MoeEpDataPathConfig(fc1_weight_layout=MoeEpFc1WeightLayout.GATE_UP_INTERLEAVED_32),
+)
+
+# Every NVSHMEM PE prepares and closes a matching plan collectively.
+with prepare_moe_ep_jax(config, device=device, rank=pe_rank, world_size=pe_count) as plan:
+    result = jax.jit(plan.inference)(x, topk_indices, topk_scores, forward_weights)
+    saved = jax.jit(plan.training_forward)(x, topk_indices, topk_scores, forward_weights)
+    grads = jax.jit(plan.training_backward)(dy, topk_indices, topk_scores, backward_weights, saved)
+    jax.block_until_ready(grads)
+```
+
+`device` is a local JAX CUDA device bound to the initialized NVSHMEM PE.
+`rank` and `world_size` describe that NVSHMEM world and must match its runtime
+values. Set `config.parallel.ep_group=None`. Each PE owns a contiguous slice
+of global experts in NVSHMEM PE order. Any number of devices can be visible
+to JAX, and JAX process count need not equal NVSHMEM world size. Every peer
+must be directly addressable in the same NVLink/MNNVL peer-access domain.
+
+Operands are local JAX arrays: BF16 or FP32 `x[T,H]` and `dy[T,H]`, Int32
+`topk_indices[T,K]`, and FP32 `topk_scores[T,K]`. Tokens may vary from zero
+through the prepared capacity. The native compiled adapter uses a symbolic
+token count and is reused across those extents. Outputs and saved tensors
+belong to XLA; later calls cannot overwrite a retained result. Symmetric
+communication scratch belongs to the prepared plan and is released only by
+its explicit collective `close()`.
+
+Weights are prepacked native byte carriers. No implicit quantization,
+transpose, or layout packing is performed on them:
+
+| Bundle | Payload carriers (`uint8` E4M3 bits) | Scale carriers (`uint8` E8M0 bits) |
+| --- | --- | --- |
+| `MoeEpJaxForwardWeights` | `fc1[E_local,2I,H]`, `fc2[E_local,H,I]` | `fc1_scale[E_local,2I*H/32]`, `fc2_scale[E_local,H*I/32]` |
+| `MoeEpJaxBackwardWeights` | `w2_transpose[E_local,H,I]`, `w1_transpose[E_local,2I,H]` | `w2_transpose_scale[E_local,I*H/32]`, `w1_transpose_scale[E_local,H*2I/32]` |
+
+All carriers use physical row-major storage. FC1 gate/up stripes and W1's
+backward reduction stripes are interleaved in groups of 32. Scales retain the
+native 128x4 blocked layout described by the existing
+`MoeEpNativeForwardWeights` and `MoeEpNativeBackwardWeights` contracts. Only
+contiguous native weight storage is accepted; discrete pointer tables and
+plain source-weight packing are outside this JAX entry point.
+Set `config.data_path.fc1_weight_layout=GATE_UP_INTERLEAVED_32` to declare that
+native gate/up order explicitly.
+
+Inference returns `MoeEpJaxForwardResult(output, status)`. Training forward
+returns `MoeEpJaxTrainingForwardResult` with `output`, `status`, `fc1_preact`,
+`fc1_a`, `fc1_sfa`, `valid_route_counts`, and inclusive padded
+`expert_offsets`. Pass that saved result, matching routing, and backward
+weights to `training_backward`. It returns BF16 `grad_activation[T,H]`, FP32
+`dprob[T,K]`, `status`, and a `MoeEpJaxWgradOperands` bundle. The bundle
+contains the same native grouped-WGrad operands as the PyTorch training API,
+including all data/scale planes and expert metadata. Its `fc2_b` carrier is
+physical `[H,pool_rows]`; scale planes remain blocked bytes. Completed weight
+gradients and automatic `jax.grad`/`vmap` rules are not supplied.
+Saved preactivations and WGrad carriers follow the valid-row contract above;
+their physical padding is unspecified even when a fresh output starts at zero.
+
+Every result contains Int32 `status[2]`: receive overflow, then invalid
+expert-ID detection. Zero means success. Inspect the status before consuming
+the result; a nonzero value means the numerical result is incomplete. The
+kernel finishes its collective protocol before reporting a failure. This
+device-status contract applies to both `validation_mode` settings and both
+`drop_on_overflow` settings; these JAX methods do not read device values back
+to raise a Python exception. Omitting `physical_recv_pool_rows` reserves the
+full-topology receive capacity.
+
+Every PE must execute the same phase order and dependency chain. Forward to
+backward is ordered by the saved tensors. For independent calls inside a
+compiled computation, pass the previous result's `status` as the next call's
+`dependency` keyword to establish XLA dataflow:
+
+```python
+first = plan.inference(x1, indices1, scores1, weights)
+second = plan.inference(x2, indices2, scores2, weights, dependency=first.status)
+```
+
+The plan serializes its native CUDA launches, including concurrent callers.
+Separate plans require matching explicit device-execution ordering on every
+PE. Block on the final JAX result on every PE before closing the plan.
+Calls compiled before `close()` reject execution after it; close every plan
+before finalizing the caller-owned NVSHMEM runtime.
+
+The JAX path inherits the hardware, format and geometry limits below.
+Native EP2 numerical tests pass on SM107 with JAX 0.9.1 and 0.10.2,
+BF16 activations, FP32 upstream gradients and BF16 combine. They cover
+activation/routing gradients, the dense weight gradients represented by the
+returned operands, changed routing and retained forward state. Other EP
+sizes, input precision combinations and tuning profiles remain unqualified.
+See [determinism](/operations/determinism) for replay coverage.
+
 ## Execution support
 
 - NVIDIA Rubin SM107 GPUs (compute capability 10.7).
-- CUDA and PyTorch execution.
+- CUDA execution through PyTorch, with an experimental JAX binding described above.
 - `nvidia-cutlass-dsl[cu13]>=4.8.0`, provided by the package-wide required
   dependency except on Windows ARM64. The CuTe DSL and TVM-FFI runtime dependencies
   are excluded from the base installation on Windows ARM64, so the base install

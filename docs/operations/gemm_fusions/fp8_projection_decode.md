@@ -51,6 +51,32 @@ row count the same way. `compile(rows)` is the plan-time site -- after it a laun
 compiles nothing. A launch at a row count that was never compiled compiles it on first use; a serving path should not
 rely on that. `entry.cfg_for(rows)` returns the rendering of a row count and `entry.key(rows)` its compile key.
 
+## JAX
+
+```python
+import jax
+from cudnn.ops import fp8_projection_decode_forward_jax
+
+with jax.default_device(device):
+    (out,) = jax.jit(fp8_projection_decode_forward_jax)(weight, activation, alpha)
+```
+
+The JAX entry accepts `float8_e4m3fn` weight `[N,K]` and activation `[T,K]`,
+plus FP32 `alpha` with shape `()` or `[1]`. It returns a fresh BF16 `[T,N]`
+array owned by XLA. Geometry, row-count and split restrictions match the native
+entry. Pass `split_k` as a static keyword, for example by closing over it in
+the jitted function. The default split depends only on geometry.
+
+Original operands reach the native kernel without a framework conversion or
+input reshape. Execution uses XLA's CUDA stream with dependent launch disabled.
+Eager calls select the operands' GPU; tracing uses `jax.default_device` for
+architecture-specific planning. Unrelated visible GPUs and JAX process count
+do not restrict local calls. Automatic differentiation and `vmap` are
+unsupported. JAX coverage is in
+`test/python/gemm/jax/test_fp8_projection_decode_jax.py`.
+The JAX entry builds a native FFI bridge on first use and requires a C++17
+compiler and CUDA toolkit. Set `CUDA_HOME` if the toolkit is not on `PATH`.
+
 ## Numerics contract
 
 The output bytes are a function of `(geometry, split_k)` on one runtime, and of nothing else:

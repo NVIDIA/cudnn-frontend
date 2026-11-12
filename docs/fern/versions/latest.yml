@@ -224,6 +224,9 @@ navigation:
           - page: Shared-Expert Decode Pair (SM100-class)
             path: ../../operations/moe/shared_expert_decode.md
             slug: shared_expert_decode
+      - page: Mixture of Experts with Expert Parallelism
+        path: ../../operations/moe_ep.md
+        slug: operations/moe_ep
       - section: Normalizations
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations

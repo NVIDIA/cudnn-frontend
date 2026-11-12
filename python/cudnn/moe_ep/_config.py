@@ -9,12 +9,13 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from numbers import Real
-from typing import Literal
-
-import torch.distributed as dist
+from typing import TYPE_CHECKING, Literal
 
 from ._tuning import MoeEpTuningConfig
-from ._types import MoeEpNativeWeightStorageMode, MoeFormat
+from ._metadata import MoeEpNativeWeightStorageMode, MoeFormat
+
+if TYPE_CHECKING:
+    import torch.distributed as dist
 
 _PHYSICAL_RECV_POOL_ALIGNMENT = 128
 _MAX_KERNEL_ROUTE_INDEX = (1 << 31) - 1
@@ -65,8 +66,11 @@ class MoeEpParallelConfig:
     sf_padding_size: int = 128
 
     def __post_init__(self) -> None:
-        if self.ep_group is not None and not isinstance(self.ep_group, dist.ProcessGroup):
-            raise ValueError("ep_group must be a torch.distributed.ProcessGroup or None, " f"got {type(self.ep_group).__name__}")
+        if self.ep_group is not None:
+            import torch.distributed as dist
+
+            if not isinstance(self.ep_group, dist.ProcessGroup):
+                raise ValueError("ep_group must be a torch.distributed.ProcessGroup or None, " f"got {type(self.ep_group).__name__}")
         if self.max_tokens_per_rank is not None and (
             isinstance(self.max_tokens_per_rank, bool) or not isinstance(self.max_tokens_per_rank, int) or self.max_tokens_per_rank < 0
         ):
@@ -369,6 +373,8 @@ def resolve_moe_ep_config(config: MoeEpConfig) -> ResolvedMoeEpConfig:
         ep_rank = 0
         ep_global_ranks: tuple[int, ...] = ()
     else:
+        import torch.distributed as dist
+
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("ep_group requires an initialized torch.distributed process group")
         ep_size = dist.get_world_size(group)

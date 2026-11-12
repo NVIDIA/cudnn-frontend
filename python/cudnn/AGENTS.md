@@ -1248,6 +1248,15 @@ hiding other GPUs. Cover tracing with unrelated hardware properties and reuse
 jitted functions on non-default devices with changed inputs and gradients (see
 `test/python/norm/jax/test_norm_jax.py`).
 
+Symmetric communication storage must retain its address outside XLA buffer
+assignment. Bind it through an owning native launch context, close explicitly,
+and chain distributed calls through array dependencies in the same order on
+every PE. `has_side_effect=True` prevents elimination but does not order calls.
+The MoeEP JAX EP2 tests cover this lifecycle and saved-state reuse.
+For side-effecting FFI calls, verify reuse with `jax.jit(fn).lower(...).compile()`.
+`jax.no_tracing` on the Python JIT wrapper rejects its required slow dispatch
+before checking the compilation cache, even when no compilation is needed.
+
 ## Adding a new frontend-only API — required checklist
 
 1. Kernel package under the closest existing family (layout above).

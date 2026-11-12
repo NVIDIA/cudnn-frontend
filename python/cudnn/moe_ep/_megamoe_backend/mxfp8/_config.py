@@ -6,12 +6,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
-from ..._config import ResolvedMoeEpConfig
-from ._formats import combine_wire_format
+    from ..._config import ResolvedMoeEpConfig
 
 _PHYSICAL_POOL_ALIGNMENT = 128
 MXFP8_CLUSTER_SHAPE_MNK = (2, 1, 1)
@@ -105,6 +105,8 @@ class Mxfp8KernelConfig:
         launch_cluster_count: int,
         weight_storage_mode: str,
     ) -> "Mxfp8KernelConfig":
+        from ._formats import combine_wire_format
+
         topology = config.topology
         public = config.public_config
         model = public.model
@@ -250,6 +252,8 @@ class Mxfp8KernelConfig:
         layout_signature: tuple,
     ) -> tuple:
         """Return a pointer/stream-independent in-process JIT cache key."""
+
+        import torch
 
         canonical_device = torch.device(device)
         return (

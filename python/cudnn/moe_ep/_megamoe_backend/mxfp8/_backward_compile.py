@@ -22,6 +22,7 @@ from ._compile import (
 from ._compile_common import _compile_kernel
 from ._config import Mxfp8KernelConfig
 from ._launch import _to_cute, _to_cute_ptr, _to_discrete_ptr_table
+from ._native_kernel import _dgrad_selector_kwargs, _validate_resolved_dgrad_profile
 
 
 @dataclass(frozen=True)
@@ -80,43 +81,6 @@ _COMPILE_LOCK = threading.RLock()
 _COMPILE_CACHE: dict[tuple, CompiledMxfp8BackwardKernel] = {}
 
 
-def _dgrad_selector_kwargs(
-    config: Mxfp8KernelConfig,
-) -> dict[str, object]:
-    """Map the public MoeEP profile to upstream selector flags."""
-
-    return {
-        "enable_dgrad_optimizations": (config.dgrad_optimization == "ds3_ep4_pattern"),
-        "dgrad_schedule": ("optimized" if config.dgrad_optimization == "rolling" else None),
-    }
-
-
-def _validate_resolved_dgrad_profile(
-    config: Mxfp8KernelConfig,
-    kernel: Any,
-) -> None:
-    """Reject drift between the MoeEP profile and upstream resolution."""
-
-    resolved_dgrad = kernel.resolved_dgrad_config
-    expected_upstream_profile = {
-        "baseline": "explicit",
-        "rolling": "optimized",
-        "ds3_ep4_pattern": "ds3_ep4_v1",
-    }[config.dgrad_optimization]
-    actual_upstream_profile = resolved_dgrad["dgrad_optimization_profile"]
-    if actual_upstream_profile != expected_upstream_profile:
-        raise RuntimeError(
-            "Rubin dgrad profile resolution drifted from the MoeEP "
-            f"integration contract: requested {config.dgrad_optimization!r}, "
-            f"resolved {actual_upstream_profile!r}, expected "
-            f"{expected_upstream_profile!r}"
-        )
-    if config.dgrad_optimization == "ds3_ep4_pattern" and resolved_dgrad["dgrad_optimization_overrides"]:
-        raise RuntimeError(
-            "Rubin ds3_ep4_v1 profile for ds3_ep4_pattern resolved with " f"unexpected downstream overrides: {resolved_dgrad['dgrad_optimization_overrides']!r}"
-        )
-
-
 def prepare_backward_kernel(
     resolved_config: ResolvedMoeEpConfig,
     config: Mxfp8KernelConfig,
@@ -126,55 +90,9 @@ def prepare_backward_kernel(
 ) -> PreparedMxfp8BackwardKernel:
     """Instantiate the fixed Rubin dGLU specialization."""
 
-    import cutlass
+    from ._native_kernel import make_backward_kernel
 
-    from ..cutedsl_src.kernel_src.rubin.training.mega.bwd_dglu.dglu_mxfp8_mega_moe_kernel import (
-        Sm107MegaMoEMxfp8DgluKernel,
-    )
-    from ..cutedsl_src.quant_def import CombineFormat
-
-    kernel = Sm107MegaMoEMxfp8DgluKernel.from_kwargs(
-        mma_tiler_mnk=config.mma_tiler_mnk,
-        cluster_shape_mnk=config.cluster_shape_mnk,
-        use_2cta_instrs=config.use_2cta_instrs,
-        group_hint=config.group_hint,
-        token_padding_block=config.token_padding_block,
-        sf_padding_block=config.sf_padding_block,
-        load_balance_mode=config.load_balance_mode,
-        static_expert_shape=(
-            config.num_experts,
-            config.intermediate,
-            config.hidden,
-        ),
-        force_static_sched=config.force_static_sched,
-        clc_bundle_size=config.clc_bundle_size,
-        num_sched_stages=config.num_sched_stages,
-        ab_dtype=cutlass.Float8E4M3FN,
-        sf_vec_size=config.sf_vec_size,
-        world_size=config.world_size,
-        local_rank=0,
-        num_topk=config.top_k,
-        max_tokens_per_rank=config.max_tokens_per_rank,
-        max_recv_size_per_rank=config.max_recv_size_per_rank,
-        data_token_capacity=config.physical_recv_pool_size,
-        hidden=config.hidden,
-        launch_cluster_count=config.launch_cluster_count,
-        drop_on_overflow=config.kernel_drop_on_overflow,
-        fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
-        token_back_mode=config.token_back_mode,
-        epi_flag_batch=config.epi_flag_batch,
-        flag_batch=config.flag_batch,
-        combine_format=CombineFormat.parse(config.combine_format),
-        act_func=config.act_func,
-        gate_up_clamp=config.gate_up_clamp,
-        dfc2_recompute=config.dfc2_recompute,
-        dfc2_col_output=config.dfc2_col_output,
-        enable_grad_y2_col_quant=config.enable_grad_y2_col_quant,
-        num_ctas_grad_y2_col_quant=config.col_quant_num_ctas,
-        weight_storage_mode=config.weight_storage_mode,
-        **_dgrad_selector_kwargs(config),
-    )
-    _validate_resolved_dgrad_profile(config, kernel)
+    kernel = make_backward_kernel(config)
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     local_zero, shared_zero = kernel.require_zero_workspace_leading_bytes
     device_workspace = kernel._mega_device_workspace
