@@ -108,6 +108,16 @@ block-scaled O, and THD split/PackGQA remain governed by their existing gates.
 `test_sdpa_fwd_paged_thd_fp8.py` covers independent origins, pool layouts,
 rebinding, retained capture, changed scales/tables/lengths and empty work.
 
+SM100/SM103 half D256 paged THD also supports **combined PackGQA and split-KV**
+at CGA2, including partial head groups. The setup retains physical Q origins,
+while partial O/Stats use compact FP32 scratch and the final combine applies
+independent caller O/Stats origins. HND/NHD K/V pools and independent page
+tables retain their existing contract. Standalone compact THD uses the same
+sequence-local maps. This does not widen SM107 or quantized packing admission,
+and candidate generation/ranking remain separate from native capability.
+`TestPagedD256PackedSplit` covers FP16/BF16 origins, capture replay, batch
+invariance and page tails; native frame tests check workspace separation.
+
 Prepared scalar-output MXFP8 dense plans can specialize their declared Stats strides
 at compilation and retain a generic compiled host branch for other valid runtime
 Stats layouts. THD and split partials retain their existing binding contract.

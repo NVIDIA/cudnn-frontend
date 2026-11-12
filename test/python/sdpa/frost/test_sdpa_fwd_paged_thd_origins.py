@@ -60,6 +60,8 @@ def test_paged_thd_origins_rebind_and_capture(
     key_growth=1.0,
     independent_table_strides=False,
     single_q=False,
+    heads_override=None,
+    q_bound=None,
 ):
     import cudnn
     import torch
@@ -87,8 +89,12 @@ def test_paged_thd_origins_rebind_and_capture(
         page_size,
         (1024 if d_qk == 576 else 8192),
     )
+    if q_bound is not None:
+        maximum = q_bound
     if kv_bound is not None:
         kv_max = kv_bound
+    if heads_override is not None:
+        heads = heads_override
     scale = d_qk**-0.5 if attention_scale is None else attention_scale
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
@@ -137,6 +143,7 @@ def test_paged_thd_origins_rebind_and_capture(
 
     def fill(values, shift, replay=False, keyless=False, empty=False):
         ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
+        ql = [min(length, maximum) for length in ql]
         kl = [kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max]
         if keyless:
             kl[1] = 0
@@ -242,6 +249,13 @@ def test_paged_thd_origins_rebind_and_capture(
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
+        plan = graph._compiled_plans[graph._plan_index]
+        decode_tile = splits > 1 or (cga != 2 and maximum * (heads // kv_heads if pack_gqa else 1) <= 128)
+        expected_template = ("decode_d128_f16" if decode_tile else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
+        assert plan._compiled.kernel_template == expected_template
+        assert plan._prepared.spec.native is not None
+        assert plan._prepared.spec.origin_specs is not None
     if rubin:
         import inspect
 

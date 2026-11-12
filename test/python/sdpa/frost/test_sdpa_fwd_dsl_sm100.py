@@ -3428,3 +3428,39 @@ class TestNativeScalarTailSplit:
 
     test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
     test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D256 paged packed split on SM100/SM103")
+class TestPagedD256PackedSplit:
+    """Combined packing/splitting, physical origins and standalone replay."""
+
+    import sdpa_d256_paged_split_checks as _checks
+
+    test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
+    test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64 paged origins on SM100/SM103")
+class TestPagedD64PhysicalOrigins:
+    """Paged queries keep physical row origins distinct from valid lengths."""
+
+    @pytest.mark.parametrize(
+        "dtype,layout,stats,splits,packed,page,q_bound",
+        [
+            ("bfloat16", "hnd", "token", 1, False, 16, None),
+            ("bfloat16", "hnd", "token", 1, False, 16, 64),
+            ("float16", "nhd", "head", 1, False, 64, 64),
+            ("bfloat16", "hnd", "head", 2, True, 16, None),
+            ("float16", "nhd", "token", 3, False, 128, None),
+            ("float16", "mixed", "head", 9, True, 256, None),
+        ],
+        ids=["bf16-unsplit", "bf16-short-unsplit", "fp16-short-unsplit", "bf16-packed-split2", "fp16-unpacked-split3", "fp16-packed-split9"],
+    )
+    def test_origins_and_replay(self, dtype, layout, stats, splits, packed, page, q_bound):
+        from sdpa.frost.test_sdpa_fwd_paged_thd_origins import test_paged_thd_origins_rebind_and_capture as check
+
+        check(64, dtype, layout, stats, 1, splits, packed, page_size=page, kv_bound=1024, cpu_reference=True, q_bound=q_bound)
