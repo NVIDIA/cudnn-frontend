@@ -2126,7 +2126,7 @@ def _sm100_d128_spec() -> EngineSpec:
 
 def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
-    from .d128_contract import validate_dense_bounds
+    from .d128_contract import validate_dense_bounds, validate_relay_launch
 
     if facts.thd or facts.padded:
         return "the SM90 backward chain serves dense graphs without padding masks"
@@ -2143,6 +2143,7 @@ def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
         return "the SM90 backward chain requires a positive finite attn_scale"
     try:
         validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, None)
+        validate_relay_launch(facts.b, facts.h_q)
     except ValueError as error:
         return "the SM90 backward chain: " + str(error)
     return None
@@ -2151,8 +2152,8 @@ def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
 def _sm90_spec() -> EngineSpec:
     """Hopper dense d64 / d128 backward: the key-owner kernel with the ordered dQ relay (cc 9.0 only).
 
-    Every request runs the same ordered chain, so the row claims ``deterministic`` for free; placement trails the backend
-    (``heuristics.TRAIL_ONLY_ROWS``).
+    Every request runs the same ordered chain, so the row claims ``deterministic`` for free; the row is opt-in
+    (``EngineSlot.opt_in``).
     """
     return EngineSpec(
         name="sdpa_bwd_sm90",
@@ -2161,7 +2162,7 @@ def _sm90_spec() -> EngineSpec:
             sm_hi=90,
             d=frozenset({64, 128}),
             causal=True,
-            deterministic=True,  # two kernels, each owning its output tiles with a fixed summation order
+            deterministic=True,
             compact_bshd=True,
             gqa=True,
             declaration_check=_sm90_declaration_mismatch,

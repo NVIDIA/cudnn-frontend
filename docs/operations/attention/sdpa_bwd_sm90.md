@@ -10,10 +10,10 @@ consumes the forward activations (`Q/K/V/O`), the loss gradient `dO` and the for
 produces `dQ/dK/dV`.
 
 The engine (`sdpa_bwd_sm90`, see `cudnn.sdpa.bwd.engines`) serves single-node `sdpa_backward()` graphs
-built with `cudnn.pygraph`. It is a default candidate ranked behind the backend, so the default dispatch
-uses it when the backend declines a graph; select it explicitly from the ranked plan list
-(`graph.plans` / `graph.select_plan(i)`), or set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` to rank it
-first. The standalone adapter is `cudnn.sdpa.bwd.api_dsl_sm90.SdpaBwdDslSm90`.
+built with `cudnn.pygraph`. It is an opt-in row: set `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` to offer it
+(ranked first), then let the default dispatch take it or select it from the ranked plan list
+(`graph.plans` / `graph.select_plan(i)`). The standalone adapter is
+`cudnn.sdpa.bwd.api_dsl_sm90.SdpaBwdDslSm90`.
 
 The kernel lives in `python/cudnn/sdpa/bwd/kernels/sm90/bprop_f16.py`; the pointer entry that chains
 the launches is `prepared_host.py` beside it.
@@ -41,7 +41,8 @@ Every reduction has a fixed summation order, so repeated executions return ident
 `use_deterministic_algorithm=True` and the default request run the same chain. The workspace holds the
 fp32 dQ accumulator and the fp32 delta rows over the 128-row-rounded `S_q`, then one int32 turn counter
 per (batch, query head, 64-row query tile) and one ticket per (batch, query head)
-(`d128_contract.relay_workspace_layout`); always query the plan's size.
+(`d128_contract.relay_workspace_layout`); always query the plan's size. Repeatability and batch
+invariance are recorded in `docs/operations/determinism.md`.
 
 ## Supported declarations
 
@@ -50,10 +51,11 @@ per (batch, query head, 64-row query tile) and one ticket per (batch, query head
 * `D_QK = D_V` in {64, 128}; BF16 or FP16 throughout;
 * MHA, or GQA / MQA with an integral head ratio (the kernel walks the group's query heads);
 * unmasked or top-left causal attention, any sequence lengths (tail tiles zero-fill, tail stores clip);
+* batch and query-head counts of at most 65535;
 * a positive finite `attn_scale`.
 
 Declined by name: packed THD / ragged offsets, padding masks, bottom-right causal, sliding windows,
-bias / dBias, sinks / dSink, dropout, other head dimensions and dtypes.
+bias / dBias, sinks / dSink, dropout, larger batch or query-head counts, other head dimensions and dtypes.
 
 ## Execution contract
 

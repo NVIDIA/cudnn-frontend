@@ -181,6 +181,12 @@ def pair_workspace_layout(batch, heads, sq, split=1, heads_kv=0, skv=0, d=0):
     return tuple(regions), total
 
 
+def validate_relay_launch(batch, heads):
+    """The relay chain's launches place the batch and the query heads on grid.y / grid.z."""
+    if batch > 65535 or heads > 65535:
+        raise ValueError("relay chain batch and query-head counts must be at most 65535")
+
+
 def relay_workspace_layout(batch, heads, sq, d):
     """The ordered-relay chain's scratch: the fp32 dQ accumulator and delta rows over the 128-row-rounded S_q, then one
     int32 turn counter per (batch, query head, 64-row query tile) and one key-tile ticket per (batch, query head)."""

@@ -8,7 +8,7 @@ from contextlib import nullcontext
 import torch
 
 from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
-from .d128_contract import RELAY, relay_workspace_layout, validate_dense_bounds
+from .d128_contract import RELAY, relay_workspace_layout, validate_dense_bounds, validate_relay_launch
 
 SM90_CC = (9, 0)
 SM90_DSL_FLOOR = (4, 8, 0)
@@ -130,6 +130,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
         require(b == bk and hk > 0 and h % hk == 0, "Q and KV require equal batch counts and an integral head ratio")
         try:
             validate_dense_bounds(b, h, sq, sk, None)
+            validate_relay_launch(b, h)
         except ValueError as error:
             require(False, str(error))
         self.dtype = self.q_desc.dtype

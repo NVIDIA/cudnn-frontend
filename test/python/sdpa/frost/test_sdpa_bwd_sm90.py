@@ -31,7 +31,7 @@ def test_geometry():
         load_template(kernel.__file__, (96, 1), tag="test_sm90_bad_head_dim")
 
 
-def test_engine_row_and_placement():
+def test_engine_row_and_placement(monkeypatch):
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS
     from cudnn.sdpa.bwd.heuristics import TRAIL_ONLY_ROWS
@@ -47,9 +47,28 @@ def test_engine_row_and_placement():
         and not caps.swa
         and not caps.thd
     )
-    assert _ENGINE in TRAIL_ONLY_ROWS
+    assert _ENGINE not in TRAIL_ONLY_ROWS
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
-    assert _ENGINE in family.slots
+    assert family.slots[_ENGINE].opt_in
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    assert _ENGINE not in family.offered_ids()
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    assert _ENGINE in family.offered_ids()
+
+
+@pytest.mark.parametrize("b,hq,hkv", [(65536, 1, 1), (1, 65536, 65536)], ids=["batch", "heads"])
+def test_declaration_declines_grid_limits(b, hq, hkv):
+    import cudnn
+    from cudnn.sdpa.bwd.engines import _sm90_declaration_mismatch
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    def facts(**over):
+        base = dict(is_backward=True, b=b, h_q=hq, h_kv=hkv, s_q=2, s_kv=2, d_qk=64, d_v=64, dtype=cudnn.data_type.BFLOAT16, causal=True, device_cc=(9, 0))
+        return SdpaGraphFacts(**{**base, **over})
+
+    version = ("nvidia-cutlass-dsl", "4.8.0")
+    assert "65535" in _sm90_declaration_mismatch(facts(), version)
+    assert _sm90_declaration_mismatch(facts(b=min(b, 65535), h_q=min(hq, 65535), h_kv=min(hkv, 65535)), version) is None
 
 
 def _tensors(dt, d, causal, b, hq, hkv, sq, sk, seed=729):
@@ -173,6 +192,54 @@ def test_both_requests_take_the_chain_bitwise(deterministic):
 
 
 @requires_hopper
+@pytest.mark.parametrize(
+    "dt,d,causal,b,hq,hkv,sq,sk",
+    [(torch.bfloat16, 128, False, 2, 4, 4, 512, 4096), (torch.float16, 64, True, 3, 8, 4, 1536, 1536)],
+    ids=["d128-dense-256cta", "d64-causal-144cta"],
+)
+def test_multiwave_grid_matches_fp64(dt, d, causal, b, hq, hkv, sq, sk):
+    assert (sk + 127) // 128 * hkv * b > torch.cuda.get_device_properties(0).multi_processor_count
+    _case(dt, d, causal, b, hq, hkv, sq, sk)
+
+
+@requires_hopper
+@pytest.mark.parametrize("dt,d,causal", [(torch.bfloat16, 128, True), (torch.float16, 64, False)], ids=["d128-causal", "d64-dense"])
+def test_batch_invariance(dt, d, causal):
+    b, hq, hkv, sq, sk = 3, 4, 2, 320, 257
+    case = _case(dt, d, causal, b, hq, hkv, sq, sk)
+    inputs = {name: case.tensors[name].clone() for name in ("q", "k", "v", "o", "do", "stats")}
+    grads = {name: case.tensors[name].clone() for name in ("dq", "dk", "dv")}
+
+    def bits(tensor):
+        return tensor.contiguous().view(torch.uint8)
+
+    for order in ([2, 0, 1], [0, 0, 2], [1, 1, 1]):
+        for name, source in inputs.items():
+            case.tensors[name].copy_(source[order])
+        for name in grads:
+            case.tensors[name].fill_(float("nan"))
+        case.graph.execute(case.pack, case.workspace)
+        torch.cuda.synchronize()
+        for name, expected in grads.items():
+            assert torch.equal(bits(case.tensors[name]), bits(expected[order])), f"{name} depends on the batch order {order}"
+    # the same sequence declared alone
+    graph, refs, outputs = _build_graph(
+        b=1, hq=hq, hkv=hkv, sq=sq, skv=sk, d=d, dt=dt, use_causal_mask=causal, scale="default", use_deterministic_algorithm=True
+    )
+    select_engine(graph, _ENGINE)
+    graph.check_support()
+    graph.build_plans()
+    refs.update(zip(("dq", "dk", "dv"), outputs))
+    single = {name: _bshd_empty(1, grads[name].shape[2], grads[name].shape[1], d, dt, fill=float("nan")) for name in grads}
+    pack = {refs[name]: inputs[name][1:2].clone() for name in inputs}
+    pack.update({refs[name]: single[name] for name in single})
+    graph.execute(pack, torch.empty(graph.get_workspace_size(), dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    for name, expected in grads.items():
+        assert torch.equal(bits(single[name]), bits(expected[1:2])), f"{name} depends on the batch size"
+
+
+@requires_hopper
 def test_three_launches_without_allocation_or_sync():
     case = _case(torch.bfloat16, 64, True, 2, 3, 3, 257, 385)
     torch.cuda.synchronize()
@@ -191,23 +258,10 @@ def test_three_launches_without_allocation_or_sync():
         assert expected in name, names[0]
 
 
-@requires_hopper
-@pytest.mark.parametrize(
-    "kw,token",
-    [
-        (dict(window_size_left=128), "sliding"),
-        (dict(causal_bottom_right=True, is_causal=True), "bottom-right"),
-        (dict(hkv=3), "integral head ratio"),
-        (dict(d=256), "64 or 128"),
-        (dict(scale_softmax=-0.125), "positive"),
-    ],
-)
-def test_adapter_declines_by_name(kw, token):
+def _adapter(b, hq, hkv, s, d, **kw):
     from cudnn.sdpa.bwd.api_dsl_sm90 import SdpaBwdDslSm90
 
-    d = kw.pop("d", 128)
-    hkv = kw.pop("hkv", 4)
-    dt, b, hq, s = torch.bfloat16, 1, 4, 128
+    dt = torch.bfloat16
 
     def empty(h):
         return _bshd_empty(b, s, h, d, dt)
@@ -223,6 +277,29 @@ def test_adapter_declines_by_name(kw, token):
         dk=empty(hkv),
         dv=empty(hkv),
     )
-    api = SdpaBwdDslSm90(**{"sample_" + name: value for name, value in tensors.items()}, deterministic=True, **kw)
+    return SdpaBwdDslSm90(**{"sample_" + name: value for name, value in tensors.items()}, deterministic=True, **kw)
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "kw,token",
+    [
+        (dict(window_size_left=128), "sliding"),
+        (dict(causal_bottom_right=True, is_causal=True), "bottom-right"),
+        (dict(hkv=3), "integral head ratio"),
+        (dict(d=256), "64 or 128"),
+        (dict(scale_softmax=-0.125), "positive"),
+        (dict(b=65536, hq=1, hkv=1, s=2, d=64), "65535"),
+        (dict(hq=65536, hkv=65536, s=2, d=64), "65535"),
+    ],
+)
+def test_adapter_declines_by_name(kw, token):
+    kw = dict(kw)
+    api = _adapter(kw.pop("b", 1), kw.pop("hq", 4), kw.pop("hkv", 4), kw.pop("s", 128), kw.pop("d", 128), **kw)
     with pytest.raises(NotImplementedError, match=token):
         api.check_support()
+
+
+@requires_hopper
+def test_adapter_accepts_the_grid_limit():
+    _adapter(65535, 1, 1, 2, 64).check_support()
