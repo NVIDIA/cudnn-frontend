@@ -221,7 +221,7 @@ def test_dense_two_kv_streams_match_the_reference(routed, name, b, h, kh, s_q, s
     assert abs(amax - ref.abs().max().item()) <= 0.08 * ref.abs().max().item() + 1e-3, (name, amax, ref.abs().max().item())
 
 
-def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br, split=None, sched_policy=0, pack_gqa=True, hnd=True, replay=False):
+def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br, split=None, sched_policy=0, pack_gqa=True, hnd=True, replay=False, generator=None):
     assert len(lens) == b and all(0 <= length <= max_pages * page for length in lens)
     npages = b * max_pages
     k_pool = _rand((npages, kh, page, D), seed=4)
@@ -229,7 +229,7 @@ def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br, split=None, s
     if not hnd:
         k_pool = k_pool.transpose(1, 2).contiguous().transpose(1, 2)
         v_pool = v_pool.transpose(1, 2).contiguous().transpose(1, 2)
-    bt = torch.randperm(npages, device="cuda", dtype=torch.int32).view(b, max_pages)
+    bt = torch.randperm(npages, device="cuda", dtype=torch.int32, generator=generator).view(b, max_pages)
     bt_v = bt.roll(1, dims=1) if replay else bt
     q = _rand((b, s_q, h, D), seed=6).transpose(1, 2)
     o = torch.empty(b, s_q, h, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
@@ -365,7 +365,10 @@ def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh,
         return module
 
     monkeypatch.setattr(api_dsl, "_load_kernel_template", load)
-    o, ref = _run_paged(b, h, kh, s_q, page, max_pages, lens, causal_br=causal, split=split, sched_policy=sched, pack_gqa=packed, hnd=hnd, replay=True)
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    o, ref = _run_paged(
+        b, h, kh, s_q, page, max_pages, lens, causal_br=causal, split=split, sched_policy=sched, pack_gqa=packed, hnd=hnd, replay=True, generator=generator
+    )
     assert modules and all(m.CFG.PAGED_KV and m.DUAL_KV and not m.CFG.THD_VARLEN for m in modules)
     assert all(m.SPLIT_PAGE_V == (torch.cuda.get_device_capability() == (10, 0)) for m in modules)
     assert torch.isfinite(o).all() and (o - ref).abs().max() <= 0.04 * ref.abs().max()
