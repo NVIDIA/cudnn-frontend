@@ -721,10 +721,11 @@ def qsa_bwd_sparse_query_kernel(
                         st = cgc & 1
                         _wait(b_sf.subview(cgc & 1), (cgc >> 1) & 1)
                         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                        t_s = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_S + (cgc & 1) * 48).as_ptr(F32)
-                        t_dp = prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + TM_DP + (cgc & 1) * 48).as_ptr(F32)
-                        sv = prims.tcgen05_ld("32x32b", t_s, num=32)
-                        dpv = prims.tcgen05_ld("32x32b", t_dp, num=32)
+                        # S^T and dP^T are 24 columns each at a 48-column pitch. Two 32-column loads that start at S^T and 8
+                        # columns before dP^T stay inside this chunk's own S^T / dP^T pair, which b_sf has completed.
+                        col_s = tmem_col0 + TM_S + (cgc & 1) * 48
+                        sv = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, col_s).as_ptr(F32), num=32)
+                        dpv = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, col_s + 16).as_ptr(F32), num=32)
                         prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                         prims.bar_warp_sync(0xFFFFFFFF)
@@ -744,10 +745,10 @@ def qsa_bwd_sparse_query_kernel(
                             tnx = (trow_pp + mpf).load()
                         tk = tcur + trow
                         score_v = sv[0:GQ]
-                        dot_v = dpv[0:GQ]
+                        dot_v = dpv[8 : 8 + GQ]
                         if hrow == 1:
                             score_v = sv[GQ : 2 * GQ]
-                            dot_v = dpv[GQ : 2 * GQ]
+                            dot_v = dpv[8 + GQ : 8 + 2 * GQ]
                         # a nonfinite K row makes every head's score nonfinite, so one head tells
                         bad = valid & (~cute.math.isfinite(score_v[0]))
                         if cute.arch.vote_any_sync(bad):
