@@ -307,7 +307,7 @@ def test_paged_d576_mla_decode_leads_past_its_work_floor():
         None,
         {"has_paged_kv": False},
         {"wants_stats": True},
-        {"dtype": cudnn.data_type.HALF},
+        {"dtype": cudnn.data_type.FP8_E4M3},
         {"d_qk": 192},
         {"s_q": 63},
         {"s_kv": 257},
