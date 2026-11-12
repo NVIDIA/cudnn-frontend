@@ -108,6 +108,31 @@ class PageSizeTest(unittest.TestCase):
         self.assertEqual((cmd[cmd.index("--kv_layout") + 1], cmd[cmd.index("--kv_min_fill") + 1]), ("paged", "0.25"))
         self.assertEqual((result.kv_layout, result.kv_min_fill), ("paged", 0.25))
 
+    def test_serving_prefill_cases(self):
+        """context_cases expand per layout with their fills and pages; the cudnn paged prefill legs record the total-Q
+        declaration and pass it, with the Q fill, to the subprocess; pinned FlashInfer legs sweep kv_layouts."""
+        from benchmark.attention_inference.configs.serving_prefill import CONFIG as SP
+
+        cases = list(self.runner.expand_config(SP))
+        self.assertEqual(len(cases), len(SP.models) * len(SP.backends) * len(SP.context_cases) * len(SP.kv_layouts))
+        self.assertTrue(all(c["phase"] == "context" and c["kv_layout"] == "paged" for c in cases))
+        self.assertIn(64, {c["page_size"] for c in cases})
+        case = next(c for c in cases if c["backend"] == "cudnn_auto" and c["q_min_fill"] < 1)
+        with patch(
+            "benchmark.attention_inference.runner.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="RESULT,1,2,3,,test-device,cudnn plan=x\n"),
+        ) as run:
+            result = self.runner.run_single(case, cc=(10, 0))
+        cmd = run.call_args.args[0]
+        self.assertEqual((cmd[cmd.index("--q_min_fill") + 1], cmd[cmd.index("--cudnn_total_q") + 1]), ("0.5", "none"))
+        self.assertEqual((result.q_min_fill, result.cudnn_total_q), (0.5, "none"))
+        fi = next(c for c in cases if c["backend"] == "flashinfer_cudnn")
+        with patch(
+            "benchmark.attention_inference.runner.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="RESULT,1,2,3,,test-device,flashinfer\n"),
+        ):
+            self.assertIsNone(self.runner.run_single(fi, cc=(10, 0)).cudnn_total_q)
+
     def test_b12x_sliding_window_generation_is_dense(self):
         swa = replace(QWEN35.models[0], sliding_window_size=128)
         cases = list(self.runner.expand_config(replace(QWEN35, models=[swa], backends=["b12x"], context_seqlens=[], context_chunked_shapes=[])))
@@ -127,8 +152,14 @@ class RequestLensTest(unittest.TestCase):
         self.assertGreater(len(set(kv.tolist())), 1)
         _, kv_full = request_lens(SimpleNamespace(**{**vars(args), "kv_min_fill": 1.0}))
         self.assertTrue(bool((kv_full == 8192).all()))
-        q_ctx, kv_ctx = request_lens(SimpleNamespace(batch_size=2, q_tokens=4096, kv_len=4096, phase="context", kv_min_fill=0.25))
-        self.assertTrue(bool((q_ctx == 4096).all()) and bool((kv_ctx == 4096).all()))  # fill is a generation axis
+        q_ctx, kv_ctx = request_lens(SimpleNamespace(batch_size=8, q_tokens=4096, kv_len=4096, phase="context", kv_min_fill=0.25))
+        # a serving prefill of mixed length: each full prefill is a square of its own length
+        self.assertTrue(bool((q_ctx == kv_ctx).all()) and bool(((kv_ctx >= 1024) & (kv_ctx <= 4096)).all()))
+        q_p, kv_p = request_lens(SimpleNamespace(batch_size=16, q_tokens=128, kv_len=8192, phase="context", kv_min_fill=0.5, q_min_fill=0.5))
+        self.assertTrue(bool(((q_p >= 64) & (q_p <= 128)).all()) and bool((kv_p >= q_p).all()) and bool((kv_p <= 8192).all()))
+        self.assertGreater(len(set(q_p.tolist())), 1)
+        q_eq, kv_eq = request_lens(SimpleNamespace(batch_size=2, q_tokens=4096, kv_len=4096, phase="context", kv_min_fill=1.0))
+        self.assertTrue(bool((q_eq == 4096).all()) and bool((kv_eq == 4096).all()))
 
 
 if __name__ == "__main__":
