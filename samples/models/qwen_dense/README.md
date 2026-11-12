@@ -17,7 +17,7 @@ python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
 
 # A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
-# with about 57 GiB free; about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
+# with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
 pip install -r samples/models/requirements.txt                         # tokenizers, jinja2, safetensors; brings the hf command
 hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
@@ -72,7 +72,7 @@ that follow. It claims no number.
 
 | you need | |
 |---|---|
-| GPU | compute capability 10.x or 12.x **and**, for the 27B checkpoint on the stack `fe-cublas`, about 57 GiB of free memory: in practice a data-center Blackwell GPU. A 32 GB card prints the memory sentence and exits 0. Run so far on compute capability 10.3 only |
+| GPU | compute capability 10.x or 12.x **and**, for the 27B checkpoint on the stack `fe-cublas`, about 57 GiB of free memory (about 60 GiB on compute capability 12.x, where the first launch of the fused step takes about 3 GiB more): in practice a data-center Blackwell GPU. A 32 GB card prints the memory sentence and exits 0. The checkpoint has run on compute capability 10.0 and 10.3 |
 | disk | 22 GB for the checkpoint |
 | packages | `pip install -r samples/models/requirements.txt` |
 | time | about two and a half minutes for the default prompt with 256 new tokens (the seconds are below) |
@@ -84,8 +84,8 @@ The sample was last run with:
 | checkpoint | `nvidia/Qwen3.8-27B-NVFP4`: 3 shards, 2,194 tensors, 21.9 GB; licence field on its model card `apache-2.0`, not gated (card read 2026-11-10) |
 | manifest hash | `95049016a247`, printed in the first line of a run: a SHA-256 over every shard's name, size and header (tensor names, formats, shapes, offsets), not over the values |
 | packages | tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0; the lower bounds of `samples/models/requirements.txt` (0.21.1, 3.1.6, 0.4.3) pass the host tests of the text and weight readers |
-| run | 2026-11-11, compute capability 10.3 (aarch64, PyTorch 2.14.0, CuTe DSL 4.8.0): four prompts at one sequence (two plain user turns, one with a system turn and the reasoning switched off, one with a tool schema) and one prompt at two sequences; text out, `[00] PASS` in every run, the token line reported in the later ones |
-| provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0, the PyTorch chains |
+| run | 2026-11-12, compute capability 10.0 (aarch64), in two environments: PyTorch 2.14.0 with CuTe DSL 4.8.0, and a fresh environment built by the lines of this file with PyTorch 2.15.0 and CuTe DSL 4.8.1. Three prompts at one sequence (two plain user turns, one with a tool schema and the reasoning switched off) and one prompt at two sequences; text out, `[00] PASS` in every run, the token line reported. The run before it was on compute capability 10.3 (2026-11-11) |
+| provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0 and 2.15.0, the PyTorch chains |
 
 The sample downloads nothing. Fetching the checkpoint is your own step, for example
 `hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4` (the command comes with the packages of the
@@ -123,7 +123,7 @@ this area.
 
 The prompt goes through the decode step, one step per token (the `first token` line says so), and a step issues 484 block
 calls from Python: on the run above about twelve thousand kernel launches and a thousand small copies per step, with the
-GPU busy for less than a fifth of the period. That is what this stack is: it reads 51.6 GB per step where the model in its
+GPU busy for about a quarter of the period. That is what this stack is: it reads 51.6 GB per step where the model in its
 stored formats needs 17.9 GB, and it is bound by the launch path, not by the GPU. The timings a run prints are orientation
 values of that run and no more; no rate of this stack is a number to quote.
 
@@ -242,10 +242,10 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
-| 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
+| 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
 | 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
-| 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
+| 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |
 | any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
 A class the current checks have not run on is uncovered, not passing.
