@@ -44,7 +44,10 @@ pip install --group torch
 pip install -e .                                   # the decode entries are newer than the last released wheel
 python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint, no extra package
 
-pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors: only for a checkpoint
+# A checkpoint is your own download: the samples fetch nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
+# with about 57 GiB free; about two and a half minutes for the run below (qwen_dense/README.md has the details).
+pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors: only for a checkpoint; brings the hf command
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
 ```
 
@@ -65,7 +68,7 @@ the run at once: a `SKIP` comes before the first load or not at all. It ends in 
 | `[00] SKIP <requirement>` | 0 | this GPU, library version or free-memory budget is not served; the sentence names the fix |
 | `[00] RAN reference stack (no provider checked)` | 0 | `--stack reference`: every block ran on the reference, so nothing was verified |
 | `[00] RAN (no provider block was judged)` | 0 | `--provider` flags put every judged block on its reference row: the run compared the reference with itself, and its blocks line is `REPORTED` |
-| `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key; a `--model` path that is not a directory (a hub name is not fetched), or a directory with a file that is missing or is not what its name says; a `--messages` file that cannot be read or is not JSON; messages the checkpoint's chat template refuses; a `--dump-tokens` file that cannot be written; or an installed distribution that disagrees with the imported `cudnn`. A file is named by its own name, never by its path |
+| `[00] ERROR <reason>` | 1 | a contract was violated: an unknown provider key; a `--model` path that is not a directory (a hub name is not fetched), or a directory with a file that is missing or is not what its name says, or a copy of a checkpoint that is not whole (a shard missing, or shorter than its header describes); a `--messages` file that cannot be read or is not JSON; messages the checkpoint's chat template refuses or turns into no token; a `--dump-tokens` file that cannot be written; or an installed distribution that disagrees with the imported `cudnn`. A file is named by its own name, never by its path |
 | `[00] FAIL` | 1 | a check did not hold; the check lines above it say which |
 
 The first lines of a run state the environment: the `cudnn` version, whether it is an editable checkout or a wheel, a hash of

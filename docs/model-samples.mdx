@@ -24,10 +24,11 @@ python samples/models/qwen_dense/00_decode.py
 
 The default run needs no checkpoint and no extra package. It ends in `[00] PASS`, or in `[00] SKIP` followed by the requirement, with exit code 0, on a GPU, a library version or a free-memory budget it does not serve. The fused linear-attention step serves compute capability 10.x and 12.x.
 
-To run a checkpoint from local disk, install the sample-only packages and pass the directory. Nothing is downloaded: fetching a checkpoint is your own step, and its weights carry their own licence.
+To run a checkpoint from local disk, install the sample-only packages, fetch the checkpoint and pass its directory. The sample downloads nothing: fetching a checkpoint is your own step, and its weights carry their own licence. The checkpoint the sample was last run with is `nvidia/Qwen3.8-27B-NVFP4` on the Hugging Face hub, a checkpoint of this architecture: 22 GB of disk, and on the stack `fe-cublas` a GPU of compute capability 10.x or 12.x with about 57 GiB of free memory. The run below takes about two and a half minutes.
 
 ```bash
-pip install -r samples/models/requirements.txt
+pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safetensors; brings the hf command
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
 ```
 

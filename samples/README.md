@@ -87,11 +87,12 @@ python samples/frost/linear_attention/01_gdn_prefill.py
 
 ## Model Samples
 End-to-end samples of open-weight model families in [samples/models](models/): one process, a printed table of which provider serves every block of the model, and a self-check against a plain-PyTorch reference. They are not a serving engine and carry no performance table; see [models/README.md](models/README.md).
-* [models/qwen_dense](models/qwen_dense/): the dense Qwen 3.5-architecture model. `00_decode.py` runs a plain greedy decode on the reduced seeded model (2 layers at the published widths, no checkpoint, no extra package), token ids in and token ids out, with the linear-attention step on `cudnn.GdnDecodeFused`. Needs a GPU of compute capability 10.x or 12.x; elsewhere it prints `[00] SKIP <requirement>` and exits 0. With `--model DIR` it runs a checkpoint from local disk, text in and text out, with the checkpoint's own tokenizer and chat template; that needs the packages of `samples/models/requirements.txt` and a GPU with room for a bf16 copy of every weight. Nothing is downloaded.
+* [models/qwen_dense](models/qwen_dense/): the dense Qwen 3.5-architecture model. `00_decode.py` runs a plain greedy decode on the reduced seeded model (2 layers at the published widths, no checkpoint, no extra package), token ids in and token ids out, with the linear-attention step on `cudnn.GdnDecodeFused`. Needs a GPU of compute capability 10.x or 12.x; elsewhere it prints `[00] SKIP <requirement>` and exits 0. With `--model DIR` it runs a checkpoint from local disk, text in and text out, with the checkpoint's own tokenizer and chat template; that needs the packages of `samples/models/requirements.txt`, the checkpoint on local disk (your own download: the sample fetches nothing) and a GPU with room for a bf16 copy of every weight, about 57 GiB free for the 27B checkpoint.
 
 ```
 python samples/models/qwen_dense/00_decode.py
 pip install -r samples/models/requirements.txt
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?"
 ```
 

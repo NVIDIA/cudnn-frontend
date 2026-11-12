@@ -14,7 +14,10 @@ python samples/models/qwen_dense/00_decode.py                          # 2 layer
 python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
 
-pip install -r samples/models/requirements.txt                         # only for a checkpoint
+# A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
+# with about 57 GiB free; about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
+pip install -r samples/models/requirements.txt                         # tokenizers, jinja2, safetensors; brings the hf command
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --messages chat.json --dump-tokens ids.json
 ```
@@ -32,6 +35,18 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed |
 | `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header |
 | `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
+
+A `--messages` file (the `chat.json` of the last command above), here with a system turn and the reasoning switched off:
+
+```json
+{"messages": [{"role": "system", "content": "Answer in one short sentence."},
+              {"role": "user", "content": "What is 17 times 23?"}],
+ "chat_template_kwargs": {"enable_thinking": false}}
+```
+
+A list of messages alone is also a valid file, and `tools` takes JSON tool schemas. The options are those of the
+checkpoint's chat template: for `nvidia/Qwen3.8-27B-NVFP4`, `enable_thinking: false` leaves out the reasoning the model
+otherwise writes before its answer.
 
 ## What the default run is
 
@@ -52,6 +67,14 @@ that follow. It claims no number.
 ## A checkpoint from local disk
 
 `--model DIR` runs a checkpoint of this architecture in the build with 8-bit projections and a 4-bit MLP and output head.
+
+| you need | |
+|---|---|
+| GPU | compute capability 10.x or 12.x **and**, for the 27B checkpoint on the stack `fe-cublas`, about 57 GiB of free memory: in practice a data-center Blackwell GPU. A 32 GB card prints the memory sentence and exits 0. Run so far on compute capability 10.3 only |
+| disk | 22 GB for the checkpoint |
+| packages | `pip install -r samples/models/requirements.txt` |
+| time | about two and a half minutes for the default prompt with 256 new tokens (the seconds are below) |
+
 The sample was last run with:
 
 | | |
@@ -63,11 +86,14 @@ The sample was last run with:
 | provider rows | every row of the stack `fe-cublas` ran in that run: `cudnn.GdnDecodeFused` of cuDNN Frontend 1.33.0 from this checkout, cuBLAS through PyTorch 2.14.0, the PyTorch chains |
 
 The sample downloads nothing. Fetching the checkpoint is your own step, for example
-`hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4`; it needs 22 GB of free disk, and the weights
-carry their own licence, which is not this repository's. The files read: `config.json`, `tokenizer.json`,
+`hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4` (the command comes with the packages of the
+requirement file); it needs 22 GB of free disk, and the weights carry their own licence, which is not this
+repository's. The files read: `config.json`, `tokenizer.json`,
 `chat_template.jinja` (or the template in `tokenizer_config.json`), `generation_config.json` for the end tokens, and the
 `*.safetensors` shards. A path that is not a directory is an `ERROR` that says nothing is downloaded; a directory that
-lacks one of the files, or holds one that is not what its name says, is an `ERROR` that names the file; a checkpoint of
+lacks one of the files, or holds one that is not what its name says, is an `ERROR` that names the file; so is a copy
+that is not whole: a shard that the index file (`model.safetensors.index.json`) or the shards' numbering asks for and
+that is not there, or a shard that does not hold the bytes its header describes (a download that was cut). A checkpoint of
 another architecture or in other storage formats is a `SKIP` that names the first tensor that does not fit.
 
 What happens, in order: the tokenizer, the template and the shard headers are read (no weights); every prompt is rendered
@@ -76,6 +102,13 @@ with exit code 0 before a tensor is read; then the weights are read, merged (que
 beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, the fused step is compiled, and each prompt
 is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
 printed; reasoning the model writes before its answer is part of that text.
+
+How long it takes, as orientation values of one run (compute capability 10.3, the default prompt, 256 new tokens, the
+checkpoint in the page cache): about two and a half minutes. About 6 s to read, merge, dequantise and compile; 14 s for the
+58 prompt tokens; 54 s for 225 new tokens, a quarter of a second per token on this stack; 12 s for the traced pass; and
+about a minute for the checks. The text is not streamed: it is printed after the report, so that printing is not part of
+a timed step. A run prints one line before the prompt and the decode loop (`[00] decoding: ...`) and one before the
+checks (`[00] checks on ...`), and nothing in between.
 
 Memory, in GiB (2^30 bytes), as the memory lines of a run print it: the stack `fe-cublas`
 holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 56.7 GiB free with one
