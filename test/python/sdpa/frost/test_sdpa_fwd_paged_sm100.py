@@ -1746,7 +1746,7 @@ def _run_graph_fp8(
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 128])
+@pytest.mark.parametrize("page_size", [8, 16, 128])
 def test_paged_graph_fp8_matches_reference(in_key, hnd, page_size):
     """FP8 twin of test_paged_graph_matches_reference: mixed lengths incl. 0 and 1
     (partial last pages, dead pages NaN-filled), GQA 8:2 (PackGQA), a tile-unaligned
