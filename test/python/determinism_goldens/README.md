@@ -4452,3 +4452,54 @@ compute-sanitizer --tool memcheck --error-exitcode 91 --report-api-errors no \
 
 Repeat the final command with `--tool synccheck`, and with
 `--tool racecheck --kernel-name kns=cudnn_kernel_`.
+
+### 2026-11-12 — service-register CI follow-up and FP8 scale lifetime
+
+On parent `e2fbd4f69`, converging the service register releases exposed an
+extra output-scale spill in native SM107 D128 FP8. The follow-up computes
+that scale in the correction role, retaining the multiply order and the
+common service release. Existing spill ceilings and numerical tolerances
+are unchanged. No output golden is replaced.
+
+Native SM107, CUDA compiler/NVRTC 13.4, CuTeDSL 4.8.0, cuDNN 9.30.0.4:
+the unchanged parent records four E4M3/E5M2 token/head-Stats origin goldens
+after their references and replay checks pass (**4 passed, 36 deselected**).
+The candidate then passes **40 cases, no skips**, including those four strict
+parent records, all D128 origin checks, D64/D128 masks, D64 GPT-OSS shapes
+and the D128 output-dtype cases. O/Stats batch invariance and changed-storage
+replay retain their existing scope; Amax_O is checked numerically by the
+dense cases. Backward, new sanitizer coverage and performance are unmeasured
+by this follow-up.
+
+Run the same selected L0 suites with `CUBLAS_WORKSPACE_CONFIG=:4096:8`:
+
+```bash
+python -m pytest -m L0 -q \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestD128Fp8PhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_masks \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d64_masks \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d64_gptoss_shape \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_output_dtypes
+```
+
+For the parent phase add `-k origin_golden` and record into a fresh directory.
+The candidate uses that directory through `CUDNN_DETERMINISM_GOLDENS`, with
+recording disabled. Both phases load Python and matching native bindings
+from the isolated source package; the reused bindings have identical native
+build inputs to this source.
+
+B200 with CUDA compiler/NVRTC 13.4 and CuTeDSL 4.8.0 passes **61 cases, no
+skips**: the complete dual-KV suite (including the delayed-MMA subprocess),
+six D576 SASS cases, the THD/paged gate cubin records, both masked-softmax
+pins, all four epilogue/scheduler pins, six score-off records, both score-on
+store checks and the SM107 D128 service-release guard. Cross-compiling
+SM103/SM107 instructions on B200 is not native execution on those targets.
+The fresh child receives no inherited test-root path; an isolated CPU
+control fails its import before the fix and passes afterward.
+
+All 19 old cubin records are reproduced with the pre-convergence kernel
+sources and the same DSL 4.8.0/CUDA 13.4 compiler. Sixteen change with the
+common-release fix and are refreshed; the three SM107 score-off records stay
+byte-identical. PTX and SASS are retained for attribution, and the existing
+spill and score-store detectors remain active. CUDA 13.5 disassembles the
+SM107 cubins. Native SM103 execution is unverified by this follow-up.

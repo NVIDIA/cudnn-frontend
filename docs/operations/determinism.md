@@ -689,6 +689,10 @@ work and exact-byte batch transformations. Native SM107 execution preserves
 O/Stats bytes for the tested configurations, including changed physical
 origins and persistent sequence transitions. The qualification uses CUDA 13.4;
 backward and other native SM107 quantized widths remain outside this suite.
+These O/Stats guarantees also hold after moving the output-scale fold into
+the correction role: the existing origin tests retain their parent output
+bytes. Dense D64/D128 mask and output-dtype checks provide numerical coverage;
+they do not extend the THD suite's batch-invariance claim to dense plans.
 
 ## Native SM107 wider FP8 THD physical origins
 

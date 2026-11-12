@@ -3111,12 +3111,14 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 # Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (the dense CLC path reads the tile id through one scheduler publisher,
 # `read_tile_id_arrive_on_leader`, under `not CFG.THD_VARLEN`): the dense gated arm moved with that body change; both THD arms
 # re-rendered byte-identical to their records, as the `THD_VARLEN` guard predicts.
+# Re-recorded after #2527: the service warps now converge at one register release.
+# Same-toolchain parent renders reproduce all three prior records; all three bodies change.
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
-    "thd_ungated_bf16_head": "0ef74afd0cc3bf72ed771a4ae7af936c",  # re-recorded: THD unit decode through the work prefix
+    "dense_gated_bf16_lse": "a1793a682026b79c9b009bccc38a4bfe",
+    "thd_ungated_bf16_head": "1051866fef374ab0d09e1cf1f6659b13",  # re-recorded: THD unit decode through the work prefix
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
-    "thd_gated_bf16_head": "f90bfeac779eb29ca384ea3dfe817e4e",  # re-recorded with the ungated twin (same decode change)
+    "thd_gated_bf16_head": "c7aa88d4d04ef90f4dcac786e8209393",  # re-recorded with the ungated twin (same decode change)
 }
 _THD_GATE_CUBIN_RENDERINGS = {
     # (TemplateParams fields the adapter derives on cc 10.7 for the bf16 causal cga2 d256 plan, compile kwargs)
@@ -3541,18 +3543,20 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # probe does not select the separate native SM107 dense body.
 # Re-recorded after #2064: fused dense P1 register math overlaps the previous PV. Both dense cubins change;
 # the eight THD / paged / gated renderings remain byte-identical.
+# Re-recorded after #2527: one common service-warpgroup register release replaces
+# four role-local releases. All ten old records reproduce on the parent with DSL 4.8.0 / CUDA 13.4.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "89b5cba5c546804bc16ca9934226111c",
-    "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
-    "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
-    "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
-    "sm_107a_dense": "48b8f362d864ec60c670ef51ba88f588",
-    "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
-    "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
-    "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
-    "sm_107a_gated_paged_thd": "d62622a3ced6820bc54c34296c933e37",
-    "sm_107a_gated_paged_thd_pack": "76d2d9014cc9be46a002141c6ce59a4d",
+    "sm_100a_dense": "af6dae54a94b94a1d880dbff0e8e46a0",
+    "sm_100a_thd": "82638fa370bd24241dc0b03cbe365a92",
+    "sm_100a_paged_thd": "e819cb77bd06ccff1988e76ad0df7d78",
+    "sm_100a_paged_thd_pack": "4d6c1c236b0f6dda01c79d41b91596ff",
+    "sm_107a_dense": "a6e4bd715d87b2df34ac02e571228961",
+    "sm_107a_thd": "0dc6aa6da3a9da3af7d8668a7e26349f",
+    "sm_107a_paged_thd": "df6c5e7013b4be3a9c56e72047dcf4bf",
+    "sm_107a_paged_thd_pack": "5a57e4691a552098bb66248f3dd4f9e4",
+    "sm_107a_gated_paged_thd": "ce088438638826674c6339211dd1837f",
+    "sm_107a_gated_paged_thd_pack": "6064db80300d651676ae3dd3fb35bd5a",
 }
 _PAGED_GATE_BASE = dict(dtype_qkv=2, dtype_o=2, window_right=0, qh_per_kh=4, cta_mma=2)
 _PAGED_GATE_PAGED = dict(_PAGED_GATE_BASE, bottom_right=True, thd_varlen=True, seq_kv_lens_present=True, paged_kv=True, page_size=16)
