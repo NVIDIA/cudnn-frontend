@@ -138,8 +138,7 @@ def test_boundaries(dims, page, sq, cga, split, packed, policy, empty, monkeypat
     test_page_boundaries(dims, page, sq, cga, split, packed, policy, empty, monkeypatch)
 
 
-def test_admission():
-    from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
+def check_admission(_caps, _f16_facts):
     from cudnn.sdpa.fwd import engines
 
     caps = _caps("sdpa_fwd_prefill_sm107")

@@ -1679,7 +1679,7 @@ Other GPU results are not inferred from this native SM107 qualification.
 
 ### Native SM107 half D64 dense/THD paging (2026-11-10)
 
-`test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged` qualifies physical D64
+`test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged` qualifies physical D64
 operands/MMA/output on the native D128-family kernel file. Parent D64 dense
 paging selects the D128 envelope; parent THD D64 paging is declined. The new
 route supports matching FP16/BF16 Q/K/V/O, CGA1/2, packed/unpacked execution,
@@ -3974,7 +3974,8 @@ relaxed. Those failures are retained separately from passing qualification.
 
 ### Native SM107 D64 paged THD split forward — 2026-11-12
 
-`TestNativeD64Paged` now covers matching FP16/BF16 paged THD at CGA1/N128,
+`TestNativeD64Paged` in the CI-selected `test_sdpa_fwd_dsl_sm107.py` covers
+matching FP16/BF16 paged THD at CGA1/N128,
 with fixed split counts and packed or unpacked GQA. The shared physical-D64
 single-Q body is compiled for SM107 and writes FP32 partials; the final
 combine retains independent O/Stats origins. Mixed FP8 KV, split sinks and
@@ -4000,10 +4001,10 @@ case uses a supported group without widening that contract.
 cd test/python
 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest -q -m L0 -k frost \
-  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_admission \
-  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_thd \
-  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_thd_split_partial_pack \
-  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_thd_split_determinism
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_admission \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd_split_partial_pack \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd_split_determinism
 ```
 
 These new measurements qualify the SM107 extension only. Existing SM100/103
