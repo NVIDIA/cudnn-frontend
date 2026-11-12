@@ -29,11 +29,16 @@ class TestNativeD64Paged:
     test_boundaries = staticmethod(_checks.test_boundaries)
     test_dense = staticmethod(_checks.test_dense)
     test_thd = staticmethod(_checks.test_thd)
+    test_thd_split_partial_pack = staticmethod(_checks.test_thd_split_partial_pack)
     test_dense_determinism = staticmethod(_checks.test_dense_determinism)
 
     from native_d64_paged_thd_determinism import test_thd_batch_and_golden as _thd_determinism
 
     test_thd_determinism = staticmethod(_thd_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_split_batch_and_golden as _thd_split_determinism
+
+    test_thd_split_determinism = staticmethod(_thd_split_determinism)
 
 
 @pytest.mark.L0

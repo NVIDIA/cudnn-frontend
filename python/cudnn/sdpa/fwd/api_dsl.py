@@ -754,7 +754,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         and params.cta_mma == 1
         and (params.split_kv > 1 or params.decode_tile)
         and (not params.thd_varlen or params.split_kv > 1)
-        and not params.paged_kv
+        and (not params.paged_kv or (params.thd_varlen and params.split_kv > 1))
         and params.tile_n == 128
     ):
         # The single-Q body also serves physical D64 on SM107. A second Q slab
@@ -3544,7 +3544,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._not_implemented_error_if(
             self.thd and self._device_cc == (10, 7) and not self._fp8 and (int(d_qk), int(d_v)) == (64, 64) and not self._rubin_native_d64_pack_leg(),
-            "native D64 THD requires half inputs; paged plans are unsplit and nonpaged splits require one CTA",
+            "native D64 THD requires half inputs; split plans require one CTA",
         )
         if self.gate_desc is not None:
             # STANDALONE twin of the rows' `epilogue_gate` / `epilogue_gate_d_shapes`
@@ -3853,14 +3853,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         128-row tile -- S_q = 1 decode and MTP. Explicit THD split
         plans use the same tile across multiple Q blocks. Other THD, larger
         dense S_q and an explicit cga2 stay on the prefill tile. SM107 uses
-        this specialization for dense unsplit N128 without prefolded scale.
+        this specialization for explicit THD splits and dense unsplit N128
+        without prefolded scale.
         d128 keys the same
         tile off cga1; d64 cannot, because cga1 IS its prefill width.
         """
         if self._fp8 or getattr(self, "_mixed_fp8_kv", False) or self.flavor != (64, 64):
             return False
-        if self.thd and self.packed_thd_split and not self.paged:
-            return True  # D64 nonpaged split uses the same physical-width single-Q body.
+        if self.thd and self.packed_thd_split:
+            return True  # D64 split uses the same physical-width single-Q body for either KV layout.
         if self._device_cc == (10, 7) and (self.thd or self.paged or self.split_kv != 1 or self.softmax_scale_prefolded or self._effective_tile_n() != 128):
             # Native THD, paged/envelope and prefolded-scale contracts keep
             # their existing bodies. Dense split selection is handled by the

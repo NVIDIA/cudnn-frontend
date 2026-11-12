@@ -35,7 +35,11 @@ heads selecting D512 retain the envelope. THD paging remains declined.
 64-wide Q/K/V/MMA/output specialization of `sm107/prefill_d128_f16.py`.
 FP16/BF16 matching Q/K/V/O, independent table contents, HND/NHD pool layouts,
 page8-1024, masks/windows/sinks, CGA1/2, N64/N128 and partial PackGQA compose.
-Dense plans support split-KV; paged THD remains unsplit. Smaller aligned dense
+Dense plans support split-KV. Exact-D64 paged THD also supports explicit
+CGA1/N128 splits, with or without PackGQA, using the shared physical-64
+single-Q body compiled for SM107. Those partials are FP32 with compact
+workspace; the final combine preserves independent O/Stats origins. Split
+THD sinks and padded Stats retain their existing declines. Smaller aligned dense
 heads use the D64 envelope; THD retains its exact-width rule. Exact D64 also supports E4M3/E5M2 K/V with half Q/O: converted loads use the
 native physical-64 prefill body, including CGA1 dense splits. Unsplit THD
 retains independent origins and packed Stats; mixed D64 THD splits decline
@@ -959,7 +963,7 @@ never name two kernels. `SdpaFwdDslSm100._d64_decode_tile` sets it, mirroring
 `_decode_q_tile` for the d256 tile, and only with the cga knob unset or 1: the
 tile is cga1-only (`make_cfg_d64_decode`), so an explicit `cga=2` selects the
 prefill pipeline instead. Explicit paged THD FP16/BF16 split plans also use
-this native D64 tile on SM100/SM103, with cga1, with or without packed GQA. The shared
+this native D64 tile on SM100/SM103/SM107, with cga1, with or without packed GQA. The shared
 packed partial/combine host supports packed token/head-major Stats; padded
 Stats, sinks and other architectures retain their prior admission. Default
 selection is unchanged.
@@ -4789,8 +4793,8 @@ and TILE_N 64 or 128. Attention sinks are excluded from the partials and
 folded exactly once by the shared combine; final Stats can use natural or
 base-2 logarithms. Graph and standalone APIs use the same feature domain.
 Existing mask, scalar-tail and per-request padding restrictions still apply.
-Native D64 THD remains nonpaged; explicit split plans use the single-CTA
-N128 body described below. Paged plans retain their existing flavor selection. Automatic split/packing policy is a separate workstream.
+Native D64 THD supports dense or paged KV; explicit split plans use the single-CTA
+N128 body described below. Automatic split/packing policy is a separate workstream.
 
 The physical D64 dense split uses the shared single-Q half body at CGA1/N128,
 compiled for SM107, and native SM107 prefill at CGA2 or N64. Both store FP32

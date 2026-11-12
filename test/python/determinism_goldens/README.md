@@ -3971,3 +3971,40 @@ B1 fixture retained a packed-total hint above `B*S_q`, and the shape-override
 byte fixture omitted its required split packed-total bound. The corrected
 fixtures declare valid bounds; no numerical tolerance or byte assertion was
 relaxed. Those failures are retained separately from passing qualification.
+
+### Native SM107 D64 paged THD split forward — 2026-11-12
+
+`TestNativeD64Paged` now covers matching FP16/BF16 paged THD at CGA1/N128,
+with fixed split counts and packed or unpacked GQA. The shared physical-D64
+single-Q body is compiled for SM107 and writes FP32 partials; the final
+combine retains independent O/Stats origins. Mixed FP8 KV, split sinks and
+padded Stats retain their existing declines. No backward path is added.
+
+On SM107, cuDNN 9.30.0.2, CuTe DSL 4.8.0 compiled with CUDA 13.4 and
+Torch 2.14.0+cu130, 20 distinct focused cases pass: eight split origin/replay
+cases, eight existing unsplit controls, one admission case, one partial-GQA
+multi-wrap case and two replay/batch/golden cases. The two new goldens also
+pass strict comparison in a fresh process. No existing golden is replaced.
+
+The batch cases preserve fixed Q/K/V payloads across sequence insertion,
+reordering and duplication, including empty sequences, fresh output/workspace
+allocations and concurrent GPU work. Both O and Stats retain identical raw
+bytes under the same plan; independent FP64 checks remain separate. The graph
+cases check HND/NHD/mixed pools, physical origins and strides, changed-input
+capture replay and empty replay. The six-head sharing group exercises partial
+packing with more KV iterations than ring slots. The initial three-head-group
+fixture was correctly declined by the existing packing contract; the final
+case uses a supported group without widening that contract.
+
+```bash
+cd test/python
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_admission \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_thd \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_thd_split_partial_pack \
+  sdpa/frost/test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged::test_thd_split_determinism
+```
+
+These new measurements qualify the SM107 extension only. Existing SM100/103
+paged-split support is unchanged and receives no new hardware coverage here.
