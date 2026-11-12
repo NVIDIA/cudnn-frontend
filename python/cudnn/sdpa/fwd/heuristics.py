@@ -2913,7 +2913,9 @@ def _sm100_paged_packed_wave_split(caps: Capabilities, facts) -> int:
 # tile at D <= 128, one at D256, more). Count = argmin PARTIAL_COST x waves x s + KV tiles / s (a partial's setup and combine vs
 # the loop's tail).
 SM100_PAGED_TAIL_SPLIT_CGA = {(64, 64): 1, (128, 128): 1, (256, 256): 2}
-SM100_PAGED_TAIL_SPLIT_CCS = {64: frozenset({(10, 0), (10, 3)}), 128: frozenset({(10, 0)}), 256: frozenset({(10, 0), (10, 3)})}  # D128 failed the B300 transfer
+SM100_PAGED_TAIL_SPLIT_CCS = frozenset({(10, 0), (10, 3)})
+# B300 D128 more-than-one-Q-tile break-even (study sm103_paged_d128_tail_split_20261112; the B200 value failed the B300 transfer)
+SM103_PAGED_D128_TAIL_SPLIT_BREAK_EVEN_MULTI = 148
 SM100_PAGED_TAIL_SPLIT_MAX_B = 16
 SM100_PAGED_TAIL_SPLIT_Q = (16, 1024)  # declared S_q range measured
 SM100_PAGED_TAIL_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
@@ -2928,7 +2930,7 @@ def sm100_paged_tail_split_domain(caps: Capabilities, facts) -> bool:
         caps.sm_lo == 100
         and facts.d_qk == facts.d_v
         and (facts.d_qk, facts.d_v) in SM100_PAGED_TAIL_SPLIT_CGA
-        and facts.device_cc in SM100_PAGED_TAIL_SPLIT_CCS[facts.d_qk]
+        and facts.device_cc in SM100_PAGED_TAIL_SPLIT_CCS
         and paged_thd_split_domain(caps, facts)
         and not facts.shape_overrides
         and facts.max_total_seq_len_q is None
@@ -2964,6 +2966,8 @@ def sm100_paged_tail_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]
     slots = facts.device_sm_count // cga
     kv_tiles = _ceil_div(facts.s_kv, 128)
     one, one_d256, multi = SM100_PAGED_TAIL_SPLIT_BREAK_EVEN
+    if facts.device_cc == (10, 3) and d_shape == (128, 128):
+        multi = SM103_PAGED_D128_TAIL_SPLIT_BREAK_EVEN_MULTI
     break_even = (one if facts.d_qk <= 128 else one_d256) if q_tiles == 1 else multi
     if not (q_tiles == 1 and units <= slots) and kv_tiles * slots <= 2 * break_even * units:
         return 1, False
