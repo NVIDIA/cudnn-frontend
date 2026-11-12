@@ -297,7 +297,10 @@ class SM120FusedMultiHeadAttentionForward:
             self.empty_warp_ids = (5, 6, 7)
             self.num_warps = 8
         self.num_compute_warps = len(self.compute_warp_ids)
-        self.num_load_warps = 1
+        # Paged copies use the otherwise idle service warps. Dense TMA keeps
+        # its elected single-warp producer and unchanged launch geometry.
+        self.num_load_warps = 4 if self.page_size else 1
+        assert self.load_warp_id % self.num_load_warps == 0
         self.load_regs, self.compute_regs = register_budgets(self.q_tile)
 
         self.bar_compute_sync = 1
@@ -397,6 +400,7 @@ class SM120FusedMultiHeadAttentionForward:
                 self.kv_tile,
                 self.head_tile_v if is_v else self.head_tile_qk,
                 self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
+                producer_warps=self.num_load_warps,
             )
         else:
             chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
@@ -1001,7 +1005,7 @@ class SM120FusedMultiHeadAttentionForward:
         # /////////////////////////////////////////////////////////////////////////////
         #  LOAD K/V
         # /////////////////////////////////////////////////////////////////////////////
-        if warp == self.load_warp_id:
+        if warp >= self.load_warp_id and warp < self.load_warp_id + self.num_load_warps:
             prims.setmaxregister(self.load_regs, prims.SetMaxRegisterAction.DECREASE)
 
             # THD collapses the packed view's batch coordinate to 0; the
@@ -1473,8 +1477,8 @@ class SM120FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(self.page_size == 0):
                     prims.prefetch_tensormap(tma_k_desc.get_ptr())
                     prims.prefetch_tensormap(tma_v_desc.get_ptr())
-                prims.mbarrier_init(k_tma_mbar, 32 if self.page_size else 1)
-                prims.mbarrier_init(v_tma_mbar, 32 if self.page_size else 1)
+                prims.mbarrier_init(k_tma_mbar, self.threads_load if self.page_size else 1)
+                prims.mbarrier_init(v_tma_mbar, self.threads_load if self.page_size else 1)
         prims.fence_mbarrier_init()
         prims.barrier_cta_sync(0)
 

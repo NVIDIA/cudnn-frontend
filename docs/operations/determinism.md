@@ -369,6 +369,12 @@ sixteen-page full tiles, a one-row final tile and empty sequences. These
 RTX PRO 6000 checks retain fixed packing and split choices across batch
 changes and CUDA Graph replay. SM121 remains unverified.
 
+Using all four service warps for the paged prefill loader preserves those
+fixed-plan O/Stats bytes for half and FP8 K/V on RTX PRO 6000. The producer
+warps retain their copy completion waits, and publication/reuse barriers
+count every participating thread. The coverage report records refill stress
+and sanitizer results; backward and SM121 remain unverified by these checks.
+
 The SM120 paged16/32-row decode tiles additionally have eight fixed-runtime
 replay/batch goldens for FP16/BF16 D64/V64 and D120/V88 with split1/3.
 The split count is held fixed across batch changes; the common fixed-order
