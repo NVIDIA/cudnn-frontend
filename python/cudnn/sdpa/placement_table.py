@@ -659,6 +659,24 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "dense", "window", True, "gqa", True): Entry(
         "always", None, "sm107_d64_sink_prefill_20261112"
     ),
+    # study sm120_decode_20261112 (RTX PRO 6000 Server, cuDNN 9.30.0.4; benchmark/attention_inference's generation graph, s_q 1-4:
+    # paged d128 / d256 GQA page 16, d512 / D576xV512 absorbed MLA dense and paged, d64 sink (and window 128) paged MTP; b 1-64, S_kv
+    # 8k-131k on and off the tile; 333 train cells + a seeded holdout scored once per class: 0.34-0.67 geomean of the measured default,
+    # worst 0.65. The sink-only d64 MTP class lost 1.21x on the holdout and dense d512 s_q 1 stays with the #2497 rule: no entry)
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry("le", 28.0, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry("le", 29.0, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "q1", "paged", "none", False, "gqa", False): Entry("never", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (128, 128), "q1", "paged", "none", False, "gqa", True): Entry("never", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("never", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("never", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 11.0, "sm120_decode_20261112", "rows"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("ge", 32.998, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", False): Entry("always", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", True): Entry("always", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", False): Entry("never", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (576, 512), "q1", "paged", "none", False, "gqa", True): Entry("never", None, "sm120_decode_20261112"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", False): Entry("ge", 5.0, "sm120_decode_20261112", "tiles"),
+    ("sdpa_fwd_prefill_sm120", (12, 0), "bf16", (64, 64), "mtp", "paged", "window", True, "gqa", True): Entry("ge", 28.501, "sm120_decode_20261112"),
     # study sm107_decode_q1_20261112 (208-SM Rubin, cuDNN 9.30.0.4; benchmark/attention_inference's generation graph, s_q == 1:
     # dense d256 GQA 4-16 and paged d512 / D576xV512 absorbed MLA over one KV head, page 64 / 32; b 1-128, S_kv 2k-131k on and off
     # the tile; 309 train cells + a 48-cell seeded holdout scored once per class (new / measured default 0.20-0.48 geomean, worst

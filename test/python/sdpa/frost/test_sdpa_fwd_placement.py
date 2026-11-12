@@ -232,6 +232,21 @@ def test_sm120_d512_decode_wide_group_leads_when_it_fills_the_tile(b, s_kv):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_q", [8, 16, 128, 2048])
+def test_sm120_paged_prefill_body_trails(s_q):
+    """SM120 paged K/V on the prefill body (no 16 / 32-row decode tile) keeps the backend first: it ran 15-27x behind on the RTX PRO
+    6000 (module docstring); the same graph on dense K/V still leads, and a paged graph that fits the decode tile keeps its rules."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    shape = dict(b=1, h_q=8, h_kv=1, s_q=s_q, s_kv=8192, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(12, 0), device_sm_count=188)
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == placement.TRAIL
+    assert placement.place(spec, _facts(**shape)) == placement.LEAD
+    decode_tile = dict(shape, h_q=32, h_kv=8, s_q=8)  # 8 x group 4 = 32 rows
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **decode_tile)) == placement.LEAD
+
+
+@pytest.mark.L0
 def test_paged_d512_decode_follows_the_generated_entry_and_trails_without_one():
     """Paged d512 at s_q == 1 on cc 10.0 follows the generated entry (study sm100_d512_paged_decode_b100_20261030): it
     leads past the cost threshold and trails tiny launches. Without an entry (an SM100-row part no study or transfer check covers) the hand rule's
