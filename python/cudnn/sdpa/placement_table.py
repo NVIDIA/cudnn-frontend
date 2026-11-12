@@ -144,6 +144,14 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
     # an on-tile study never answers.
     kv_off_tile = facts.s_kv % 128 != 0
+    if row == "sdpa_fwd_prefill_sm90" and (facts.d_qk, facts.d_v) == (128, 128) and layout == "dense" and phase in ("prefill", "verify"):
+        # The row's own decision (Rule S12: a key follows the kernel): the D128 template's entries answer the graphs it serves;
+        # a graph it declines (per-batch lengths, unpadded bottom-right S_q > S_kv, ...) runs the 64 x 64 tile, which no
+        # study of these classes timed, so it keeps the hand-written rules.
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm90_d128_tile_mismatch
+
+        if _sm90_d128_tile_mismatch(facts, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)) is not None:
+            return None
     return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, kv_off_tile)
 
 
@@ -230,6 +238,9 @@ def matched_entry(row: str, facts) -> Optional[Entry]:
 
 
 DTYPE_TRANSFERS: Dict[Tuple[str, str], Tuple[str, FrozenSet[str]]] = {
+    # study sm90_d128_h100_refit_20261114: 24 f16 cells of its classes timed against the bf16 entries, none slower than the measured
+    # default beyond the noise band.
+    ("sdpa_fwd_prefill_sm90", "f16"): ("bf16", frozenset({"sm90_d128_h100_refit_20261114"})),
     # study sm100_paged_f16_transfer_20261112: FlashInfer's exact paged f16 prefill timed against these studies' bf16 verdicts.
     ("sdpa_fwd_prefill_sm100", "f16"): ("bf16", frozenset({"sm100_paged_d64_d256_prefill_20261111", "sm100_d256_paged_context_20261030"})),
 }
@@ -701,8 +712,6 @@ TABLE: Dict[Tuple, Entry] = {
     # D576, which the SM90 row does not serve, plus d512 absorbed MLA dense and paged page 64; 820 train cells + an 88-cell holdout:
     # mtp / verify 0.01-0.20 geomean, d512 q1 0.25-0.33, d256 paged q1 0.94. Dense verify d128 lost 1.08-1.14x at 40/8 b24-96
     # (group 5) and d256 q1 1.74-1.83x (group 12): no entry for those classes)
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", False): Entry("always", None, "sm90_decode_20261112"),
-    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", True): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", False): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "paged", "causal_br", False, "gqa", True): Entry("always", None, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "q1", "paged", "none", False, "gqa", False): Entry("never", None, "sm90_decode_20261112"),
@@ -727,6 +736,40 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (512, 512), "q1", "dense", "none", False, "gqa", True): Entry("ge", 23.505, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", False): Entry("ge", 24.5, "sm90_decode_20261112"),
     ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (512, 512), "q1", "paged", "none", False, "gqa", True): Entry("always", None, "sm90_decode_20261112"),
+    # study sm90_d128_h100_refit_20261114 (1x H100 SXM (Lambda), cuDNN 9.27.0): exact dense d128 bf16 graphs the SM90 D128
+    # template serves; 356 training cells from an earlier frozen sweep on the same part, the FROST time the plan this tree
+    # ships, qualified on a fresh 136-cell holdout off the training lattice (odd heads and batches, off-tile lengths); legs
+    # backend-only, FROST-first and default dispatch, profiler kernel time after an L2 flush. No entry (the fresh holdout failed
+    # the generated entry or its twin's); _place_sm90_d128 answers them: mtp/gqa_unpacked/causal_br/off,
+    # mtp/gqa_unpacked/causal_br/on, mtp/mha/none/off, mtp/mha/none/on, prefill/gqa/causal_br/off, prefill/gqa/causal_br/on,
+    # prefill/gqa/none/off, prefill/gqa/none/on, prefill/mha/causal_br/off, prefill/mha/causal_br/on, prefill/mha/causal_tl/off,
+    # prefill/mha/causal_tl/on, prefill/mha/none/off, prefill/mha/none/on, verify/gqa/causal_br/off, verify/gqa/causal_br/on,
+    # verify/gqa/none/off, verify/gqa/none/on. Replaces an older study's entries for the same keys, refit here under this
+    # tree's plan order: mtp/gqa/causal_br/on, mtp/gqa/causal_br/off.
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", False): Entry(
+        "always", None, "sm90_d128_h100_refit_20261114"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", True): Entry(
+        "always", None, "sm90_d128_h100_refit_20261114"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", False): Entry(
+        "le", 26.006, "sm90_d128_h100_refit_20261114"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", True): Entry("le", 27.97, "sm90_d128_h100_refit_20261114"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", False): Entry("always", None, "sm90_d128_h100_refit_20261114"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", True): Entry("always", None, "sm90_d128_h100_refit_20261114"),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa_unpacked", False): Entry(
+        "never", None, "sm90_d128_h100_refit_20261114"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa_unpacked", True): Entry(
+        "le", 23.977, "sm90_d128_h100_refit_20261114"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", False): Entry(
+        "ge", 8.293, "sm90_d128_h100_refit_20261114", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", True): Entry(
+        "always", None, "sm90_d128_h100_refit_20261114"
+    ),
     # study sm107_dense_decode_20261031 (cuDNN 9.29.0.18; cc 10.7, 216 SMs; dense bf16 decode and MTP, s_q 1-4: d64 with the gpt-oss
     # masks (sink, window + sink, neither), GQA 4 / 8; d256 without a sink, GQA 4-16; b 1-128, S_kv 3k-128k on and off the tile;
     # 396 train + 52 scored random holdout cells incl. groups 5, 6, 12; d256 single-row decode keeps the hand order: its

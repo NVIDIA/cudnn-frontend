@@ -1385,6 +1385,86 @@ def test_square_causal_places_the_same_from_either_corner():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, want",
+    [
+        pytest.param(dict(h_q=32, h_kv=8, s_q=1024, s_kv=1024), placement.LEAD, id="gqa-causal-s1024"),
+        pytest.param(dict(h_q=24, h_kv=1, s_q=640, s_kv=640), placement.LEAD, id="mqa-causal-s640"),
+        pytest.param(dict(h_q=32, h_kv=32, s_q=1024, s_kv=1024), placement.LEAD, id="mha-causal-s1024"),
+        pytest.param(dict(h_q=32, h_kv=32, s_q=640, s_kv=640, causal=False, bottom_right=False), placement.LEAD, id="mha-dense-s640"),
+        pytest.param(dict(h_q=32, h_kv=32, s_q=640, s_kv=640), placement.TRAIL, id="mha-causal-s640"),
+        pytest.param(dict(h_q=32, h_kv=32, s_q=768, s_kv=768, bottom_right=False), placement.TRAIL, id="mha-causal-tl-s768"),
+        pytest.param(dict(h_q=32, h_kv=32, s_q=896, s_kv=896), placement.LEAD, id="mha-causal-s896"),
+        pytest.param(dict(h_q=24, h_kv=24, s_q=128, s_kv=8192), placement.TRAIL, id="mha-sq128"),
+        pytest.param(dict(h_q=24, h_kv=24, s_q=128, s_kv=8192, causal=False, bottom_right=False), placement.TRAIL, id="mha-sq128-dense"),
+        pytest.param(dict(h_q=24, h_kv=24, s_q=384, s_kv=3072), placement.LEAD, id="mha-chunked-sq384"),
+        pytest.param(dict(h_q=40, h_kv=8, s_q=128, s_kv=8192), placement.LEAD, id="gqa-sq128"),
+        pytest.param(dict(h_q=32, h_kv=8, s_q=1, s_kv=8192), placement.TRAIL, id="decode-s_q1"),
+        pytest.param(dict(h_q=32, h_kv=8, s_q=1024, s_kv=1024, has_sink=True), placement.TRAIL, id="sink"),
+    ],
+)
+def test_sm90_d128_follows_its_measurement(over, want):
+    """The SM90 row's exact dense d128 graphs (#378's D128 template, module docstring): every GQA and MQA graph the
+    template serves leads, and MHA leads outside its two measured regions (s_q <= 128; causal with at most 3.5 KV tiles
+    per Q tile, square S <= 768 from either corner); a graph the template does not serve (decode, a sink) trails, as
+    the 64 x 64 tile runs it."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    shape = dict(b=8, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132, causal=True, bottom_right=True)
+    assert placement.place(spec, _facts(**{**shape, **over})) == want
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, want",
+    [
+        pytest.param(dict(h_q=32, h_kv=8, s_q=2048, s_kv=1024), placement.TRAIL, id="bottom-right-sq-over-skv"),
+    ],
+)
+def test_sm90_d128_declined_graphs_trail(monkeypatch, over, want):
+    """A d128 graph the D128 template declines runs the 64 x 64 tile, which no study of these classes timed: the backend
+    stays first. Default placement: the FROST flag unset in the body (Rule S12)."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    shape = dict(b=8, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132, causal=True, bottom_right=True)
+    assert placement.place(spec, _facts(**{**shape, **over})) == want
+
+
+@pytest.mark.L0
+def test_sm90_d128_default_placement_reads_its_study(monkeypatch):
+    """Study sm90_d128_h100_refit_20261114: the SM90 row's exact dense d128 graphs the D128 template serves are placed by their class's generated
+    entry (placement_table answers first), square causal from either corner alike; a class without an entry (mtp/gqa_unpacked/causal_br/off, mtp/gqa_unpacked/causal_br/on, mtp/mha/none/off, mtp/mha/none/on, prefill/gqa/causal_br/off, prefill/gqa/causal_br/on, prefill/gqa/none/off, prefill/gqa/none/on, prefill/mha/causal_br/off, prefill/mha/causal_br/on, prefill/mha/causal_tl/off, prefill/mha/causal_tl/on, prefill/mha/none/off, prefill/mha/none/on, verify/gqa/causal_br/off, verify/gqa/causal_br/on, verify/gqa/none/off, verify/gqa/none/on)
+    keeps the backend first. Default placement: the FROST flag unset in the body (Rule S12)."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    from cudnn.sdpa import placement_table as pt
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    row = spec.name
+    shape = dict(d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132)
+    for over in (
+        dict(b=8, h_q=32, h_kv=8, s_q=1024, s_kv=1024, causal=True, bottom_right=True),
+        dict(b=8, h_q=32, h_kv=32, s_q=1024, s_kv=1024, causal=True, bottom_right=True),
+        dict(b=8, h_q=32, h_kv=32, s_q=640, s_kv=640, causal=False, bottom_right=False),
+        dict(b=16, h_q=24, h_kv=24, s_q=128, s_kv=8192, causal=True, bottom_right=True),
+        dict(b=16, h_q=40, h_kv=8, s_q=384, s_kv=3072, causal=True, bottom_right=False),
+    ):
+        f = _facts(**{**shape, **over})
+        answer = pt.lookup(row, f)
+        if answer is None and pt.class_key(row, f) in getattr(placement, "SM90_D128_HAND_RULE_CLASSES", frozenset()):
+            want = placement._place_sm90_d128(f)  # a NON-MONOTONE class: its hand rule decides
+        else:
+            want = placement.TRAIL if answer is None else (placement.LEAD if answer else placement.TRAIL)
+        assert placement.place(spec, f) == want, over
+        if over["causal"] and over["s_q"] == over["s_kv"]:
+            flipped = _facts(**{**shape, **over, "bottom_right": not over["bottom_right"]})
+            assert placement.place(spec, flipped) == placement.place(spec, f)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("s_q, paged", [(1, placement.LEAD), (5, placement.TRAIL), (1024, placement.TRAIL)])
 def test_sm90_paged_d512_follows_its_measurement(s_q, paged):
     """The SM90 row's dense d512 lead holds at every s_q. Paged d512 leads where study sm90_decode_20261112 measured it (s_q 1-4,

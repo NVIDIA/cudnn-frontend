@@ -126,6 +126,25 @@ SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): pre
 with ``b * h_q >= 512`` query rows in flight (0.25-0.95); 256 rows are parity (0.96-1.11) and fewer
 lose up to 33x. THD, sliding window, sinks and envelope widths below 512 were not measured -> TRAIL.
 
+SM90 f16/bf16 row, exact dense d128 (#378's D128 template, the row's 128 x 128 tile): generated ``placement_table``
+entries, study ``sm90_d128_h100_refit_20261114`` (1x H100 SXM, cuDNN 9.27.0; benchmark/placement_gen), answer the
+classes where they qualified on the study's fresh holdout: mtp/gqa/causal_br/on always; mtp/gqa/causal_br/off always;
+mtp/mha/causal_br/on le (cost 26.006); mtp/mha/causal_br/off le (cost 27.97); mtp/gqa/none/on always; mtp/gqa/none/off
+always; mtp/gqa_unpacked/none/on never; mtp/gqa_unpacked/none/off le (cost 23.977); prefill/gqa/causal_tl/on ge (kv
+8.293); prefill/gqa/causal_tl/off always. The hand rule ``_place_sm90_d128`` answers exactly the other classes the study
+fitted (``SM90_D128_HAND_RULE_CLASSES``): on this study's fresh holdout the rule (the default placement there) beat the
+generated single-threshold entries of these classes, worst case per class: prefill by 4 to 18%, mtp by 6 to 11%, verify
+by 2.1 to 3.6x; and the table's features (cost, tiles, rows, kv, q) do not carry what it reads (the mean KV tiles per Q
+tile of a causal plan, MHA S_q 128). Its own measurements:
+(the row's 128 x 128 tile; H100 SXM against cuDNN 9.27,
+189 causal and mask-free results from three sessions, 2026-11-11/12): 0.80-1.04 of the backend's time, median 0.944,
+on every GQA and MQA graph and on MHA outside two regions -> LEAD. MHA with ``s_q <= 128`` (memory-bound) and causal MHA
+with at most 3.5 KV tiles per Q tile (square S <= 768) ran 1.00-1.06, median 1.03, with no win among them -> TRAIL.
+The one loss left in LEAD is causal MHA h24 S 1280 at b9 (1.04), where S 1280 at b54-b77 runs 0.97. A d128 graph the
+template does not serve (THD, paged KV, split, packed, sink, window, ``s_q == 1``, unpadded bottom-right
+``s_q > s_kv``) runs the 64 x 64 tile, the D512 body at head_tile 128 (about 2.3x the backend's time at the median)
+-> TRAIL.
+
 SM100 per-tensor FP8 row (B200, E4M3 Q/K/V/O, Amax_O; FROST does not produce Amax_S, so graphs
 requesting it keep the backend): prefill d256 0.47-0.58 and d512 0.34-0.49 -> LEAD; d192 0.92-0.99 and
 d128 0.98-1.03 squares -> TRAIL. ``s_q == 1``: d128 loses 1.3-2.7x; for d192-d512 the backend has no
@@ -540,6 +559,8 @@ SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a wider group leads when it is a
 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
+SM90_D128_MHA_TRAIL_MAX_SQ = 128  # exact dense d128, MHA with s_q <= 128 (memory-bound): 1.03 of the backend's time
+SM90_D128_MHA_TRAIL_MAX_L = 3.5  # exact dense d128, causal MHA with at most 3.5 KV tiles per Q tile: 1.00-1.06
 D512_SWA_MIN_S_Q = 128  # d512 sliding-window prefill: measured from this query length ...
 D512_SWA_MIN_KV = 1024  # ... and this cache length (B200 / H100 / Rubin 0.18-0.97, module docstring)
 
@@ -1040,7 +1061,65 @@ def _place_sm120_fp8(facts) -> str:
     return LEAD  # d64 0.47-0.84, d128 0.67-1.03, decode-shaped 0.28-0.34; the backend plans no s_q == 1 or d > 128 graph
 
 
+SM90_D128_HAND_RULE_CLASSES = frozenset(
+    {
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa_unpacked", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa_unpacked", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "gqa", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "causal_br", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "causal_br", False, "gqa", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "none", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "none", False, "gqa", False),
+    }
+)
+"""The exact dense d128 classes study ``sm90_d128_h100_refit_20261114`` fitted without a qualifying entry: its fresh
+holdout failed the generated entry there, or its on/off-tile twin's (keyed bf16; an f16 graph of the class reads the
+same rule, as the study's f16 transfer check qualified the bf16 entries for f16). :func:`_place_sm90_d128` answers
+exactly these (Rule S12)."""
+
+
+def _place_sm90_d128(facts) -> str:
+    """An exact dense d128 graph on the SM90 row: #378's D128 template (the 128 x 128 tile) leads where it serves the
+    graph, except MHA with short or memory-bound work (module docstring); a graph it does not serve runs the
+    64 x 64 tile, which trails the backend. On study ``sm90_d128_h100_refit_20261114``'s fresh holdout the rule
+    (the default placement there) beat the generated single-threshold entries of the classes
+    ``SM90_D128_HAND_RULE_CLASSES`` names, worst case per class: prefill by 4 to 18%, mtp by 6 to 11%, verify by
+    2.1 to 3.6x; and the table's features (cost, tiles, rows, kv, q) do not carry what it reads (the mean KV
+    tiles per Q tile of a causal plan, MHA S_q 128)."""
+    from cudnn.sdpa.fwd.config_sm90 import d128_causal_kv_tiles
+
+    from .engines import SdpaFwdKnobs, _sm90_d128_tile_mismatch
+
+    if _sm90_d128_tile_mismatch(facts, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)) is not None:
+        return TRAIL
+    if facts.h_q == facts.h_kv:
+        if facts.s_q <= SM90_D128_MHA_TRAIL_MAX_SQ:
+            return TRAIL
+        if facts.causal:
+            kv_tiles = d128_causal_kv_tiles((facts.b, facts.h_q, facts.h_kv, facts.s_q, facts.s_kv), bool(facts.bottom_right))
+            if sum(kv_tiles) <= SM90_D128_MHA_TRAIL_MAX_L * len(kv_tiles):
+                return TRAIL
+    return LEAD
+
+
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
+    if (facts.d_qk, facts.d_v) == (128, 128):
+        from cudnn.sdpa import placement_table
+
+        key = placement_table.class_key("sdpa_fwd_prefill_sm90", facts)
+        if key is not None and key[:2] + ("bf16",) + key[3:] in SM90_D128_HAND_RULE_CLASSES:
+            return _place_sm90_d128(facts)
     # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else, paged KV included
     # (unmeasured since the row admits it), stays backend-first.
     if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):

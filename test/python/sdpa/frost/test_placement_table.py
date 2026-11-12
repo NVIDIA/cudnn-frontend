@@ -6,6 +6,8 @@ between table-decided and hand-rule graphs."""
 
 import math
 
+import dataclasses
+
 import pytest
 
 import cudnn
@@ -728,3 +730,195 @@ def test_sm100_paged_packed_split_classes_follow_their_study():
         assert pt.lookup(row, facts) is None and placement.place(spec, facts) == placement.LEAD
     assert pt.lookup(row, _sm100_paged(64, 16, 8, 16, 64, 16384, **b300)) is None
     assert pt.matched_entry(row, _sm100_paged(256, 32, 8, 16, 512, 8192, **b300)).study == "sm100_d256_paged_context_20261030"
+
+
+_SM90_D128_STUDY = "sm90_d128_h100_refit_20261114"
+_SM90_D128_ENTRIES = [
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", False),
+        "always",
+        None,
+        "cost",
+        id="mtp-gqa-causal_br-on",
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa", True),
+        "always",
+        None,
+        "cost",
+        id="mtp-gqa-causal_br-off",
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", False), "le", 26.006, "cost", id="mtp-mha-causal_br-on"
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "mha", True), "le", 27.97, "cost", id="mtp-mha-causal_br-off"
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", False), "always", None, "cost", id="mtp-gqa-none-on"
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa", True), "always", None, "cost", id="mtp-gqa-none-off"
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa_unpacked", False),
+        "never",
+        None,
+        "cost",
+        id="mtp-gqa_unpacked-none-on",
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "gqa_unpacked", True),
+        "le",
+        23.977,
+        "cost",
+        id="mtp-gqa_unpacked-none-off",
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", False),
+        "ge",
+        8.293,
+        "kv",
+        id="prefill-gqa-causal_tl-on",
+    ),
+    pytest.param(
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "gqa", True),
+        "always",
+        None,
+        "cost",
+        id="prefill-gqa-causal_tl-off",
+    ),
+]
+
+
+def _sm90_d128_candidates(key):
+    """Graphs of the SM90 exact dense d128 class ``key``: the class lattice the study timed, searched in a fixed order."""
+    phase, layout, mask, has_sink, group, off = key[4], key[5], key[6], key[7], key[8], key[9]
+    heads = [(16, 16), (32, 32), (24, 24)] if group == "mha" else [(32, 8), (64, 8), (32, 4), (16, 2), (32, 1), (40, 8), (24, 8), (56, 8), (28, 4), (12, 4)]
+    s_qs = {"prefill": [32, 64, 128, 256, 512, 1024, 2048, 4096], "mtp": [2, 3, 4], "verify": [5, 8, 12, 16]}[phase]
+    for s_q in s_qs:
+        for ratio in (1, 2, 4, 8, 32):
+            s_kv = s_q * ratio if s_q * ratio >= 128 else 128 * ratio
+            s_kv = s_kv + 64 if off else s_kv
+            if mask == "causal_tl" and s_kv == s_q:
+                continue
+            for b in (1, 4, 16, 64):
+                for h_q, h_kv in heads:
+                    yield _facts(
+                        b=b,
+                        h_q=h_q,
+                        h_kv=h_kv,
+                        s_q=s_q,
+                        s_kv=s_kv,
+                        d_qk=128,
+                        d_v=128,
+                        dtype=cudnn.data_type.BFLOAT16,
+                        causal=mask != "none",
+                        bottom_right=mask == "causal_br",
+                        has_sink=has_sink,
+                        has_paged_kv=False,
+                        padded=False,
+                        page_size=0,
+                        device_cc=(9, 0),
+                        device_sm_count=132,
+                    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("key, direction, threshold, feature", _SM90_D128_ENTRIES)
+def test_sm90_d128_classes_follow_their_study(key, direction, threshold, feature):
+    """Study sm90_d128_h100_refit_20261114 (Rule S12): each SM90 exact dense d128 class the D128 template serves answers from its own entry, on both
+    sides of a threshold; the on- and off-tile classes are each their own and a long off-tile length stays in its class."""
+    row = "sdpa_fwd_prefill_sm90"
+    found = [f for f in _sm90_d128_candidates(key) if pt.class_key(row, f) == key]
+    assert found, key
+    for f in found[:8]:
+        entry = pt.matched_entry(row, f)
+        assert entry is not None and entry.study == _SM90_D128_STUDY, (key, entry)
+    if direction in ("always", "never"):
+        assert all(pt.lookup(row, f) is (direction == "always") for f in found)
+    else:
+        values = sorted(((pt.FEATURES[feature](f), f) for f in found), key=lambda vf: vf[0])
+        below = [f for v, f in values if (v < threshold if direction == "ge" else v > threshold)]
+        above = [f for v, f in values if (v >= threshold if direction == "ge" else v <= threshold)]
+        assert below and above, (key, threshold, [v for v, _ in values][:3], [v for v, _ in values][-3:])
+        assert pt.lookup(row, below[-1]) is False and pt.lookup(row, above[0]) is True
+    # the twin class across the first placement tile, and a long off-tile control in the off-tile class
+    f = found[0]
+    twin = dataclasses.replace(f, s_kv=f.s_kv - 64 if key[9] else f.s_kv + 64)
+    assert pt.class_key(row, twin)[9] is (not key[9])
+    if key[9]:
+        long = dataclasses.replace(f, s_kv=65535)
+        assert pt.class_key(row, long) == key and pt.matched_entry(row, long).study == _SM90_D128_STUDY
+
+
+@pytest.mark.L0
+def test_sm90_d128_square_causal_reads_bottom_right():
+    """A square causal mask reads causal_br from either corner; top-left is its own class only with S_q != S_kv."""
+    row = "sdpa_fwd_prefill_sm90"
+    base = dict(
+        b=4,
+        h_q=32,
+        h_kv=8,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        has_paged_kv=False,
+        padded=False,
+        page_size=0,
+        device_cc=(9, 0),
+        device_sm_count=132,
+    )
+    assert pt.class_key(row, _facts(s_q=1024, s_kv=1024, bottom_right=False, **base))[6] == "causal_br"
+    assert pt.class_key(row, _facts(s_q=1024, s_kv=1024, bottom_right=True, **base))[6] == "causal_br"
+    assert pt.class_key(row, _facts(s_q=512, s_kv=1024, bottom_right=False, **base))[6] == "causal_tl"
+
+
+_SM90_D128_HAND_RULE_CLASSES = frozenset(
+    {
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa_unpacked", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "causal_br", False, "gqa_unpacked", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "mtp", "dense", "none", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "gqa", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "gqa", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_br", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "causal_tl", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "prefill", "dense", "none", False, "mha", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "causal_br", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "causal_br", False, "gqa", False),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "none", False, "gqa", True),
+        ("sdpa_fwd_prefill_sm90", (9, 0), "bf16", (128, 128), "verify", "dense", "none", False, "gqa", False),
+    }
+)
+
+
+@pytest.mark.L0
+def test_sm90_d128_hand_rule_answers_exactly_its_classes(monkeypatch):
+    """Study sm90_d128_h100_refit_20261114: _place_sm90_d128 answers exactly the exact dense d128 classes whose generated entries did not qualify on
+    the fresh holdout (Rule S12's allowed case, its reason in the rule); every other class the study fitted is answered by
+    its table entry. Default placement: the FROST flag unset in the body."""
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    row = spec.name
+    assert placement.SM90_D128_HAND_RULE_CLASSES == _SM90_D128_HAND_RULE_CLASSES
+    for key in sorted(_SM90_D128_HAND_RULE_CLASSES, key=repr):
+        found = [f for f in _sm90_d128_candidates(key) if pt.class_key(row, f) == key]
+        assert found, key
+        for f in found[:4]:
+            assert pt.lookup(row, f) is None, key
+            assert placement.place(spec, f) == placement._place_sm90_d128(f), key
+    for param in _SM90_D128_ENTRIES:
+        key = param.values[0]
+        assert key not in _SM90_D128_HAND_RULE_CLASSES
+        f = next(f for f in _sm90_d128_candidates(key) if pt.class_key(row, f) == key)
+        assert placement.place(spec, f) == (placement.LEAD if pt.lookup(row, f) else placement.TRAIL), key
