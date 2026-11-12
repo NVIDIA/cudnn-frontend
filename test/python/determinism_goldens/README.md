@@ -4092,3 +4092,74 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest -q -m L0 -k frost \
   sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split
 ```
+
+### SM100/103 FP8 coalesced paged loads — validation, 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py` now also covers D64/D128
+paging, preserving its existing D512 defaults. Five new configurations each
+have a repeatability/batch-invariance test and a strict golden test:
+
+| D | Page | CGA | Split | Layout | Input / output |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 8 | 1 | 1 | NHD | E4M3 / BF16 |
+| 128 | 16 | 1 | 2 | HND | E4M3 / E4M3 |
+| 128 | 8 | 2 | 1 | HND | E5M2 / FP16 |
+| 64 | 64 | 1 | 4 | NHD | E5M2 / E5M2 |
+| 128 | 128 | 1 | 4 | NHD | E4M3 / BF16 |
+
+The suite fixes quantized payloads and scales, uses independent K/V page
+orders, and checks O, FP32 Stats and Amax numerically. Replay compares all
+three outputs bytewise with fresh buffers and concurrent work. The per-row
+O/Stats checks cover isolated, reordered, duplicated and changed-neighbor
+sequences plus a 129-sequence batch; Amax is a whole-batch reduction.
+
+Both B200 (SM100, 148 SMs) and B300 SXM6 AC (SM103, 148 SMs) pass
+**37 cases, 16 deselected, no failures or skips**: the ten new byte cases,
+one refilled-ring stress, twelve existing page-boundary cases extended to
+page8, five two-KV-stream paged cases, eight D128 prepared-stride/capture
+cases and one existing D512 helper control. Runtime was 100.58s on B200 and
+127.37s on B300. The single warning is Torch's synchronization-debug mode.
+
+Five goldens per GPU were recorded from the unchanged parent kernel only
+after independent reference/replay checks, then strictly matched by the
+candidate in a fresh process with recording disabled. The ten new JSON
+records live under `c8aefc970ef3af15` and `98a778ce33bb9402`; no existing
+record is replaced. The initial fixture requested an unsupported D64/CGA2
+combination and was corrected to the existing CGA1 domain before this run;
+no production admission or numerical tolerance was changed.
+
+The stress case traverses eight KV tiles and refills its four-stage ring,
+checking 256 warm and 256 shared-memory-poisoned launches. Both GPUs record
+zero wrong bytes; their unsafe controls fail 200/200 launches. The tested
+kernel grid has only four blocks (0.03 per SM), so this is a low-occupancy
+rate bound, not a saturated-scheduling race qualification. An independent
+numerical check precedes the stability stress. GPU-exclusive scheduling
+markers were added after serial qualification; test bodies are identical.
+
+B200 also passes Compute Sanitizer 2026.3 memcheck and synccheck on the
+page8/HND/E4M3 mixed-length case, one case each, with 0 errors. No new racecheck
+measurement is claimed. The sanitizer processes report FE cuDNN 93000 while
+Torch's cuDNN query reports 92400; this explicit FROST case does not execute
+backend attention. The normal qualification uses full cuDNN 9.30.0.4,
+Torch 2.14.1+cu130, CuTe DSL 4.8.0 and actual compiler/NVRTC 13.4; driver API 13040.
+Source/import hashes were verified against parent
+`32d4554e93f2564be0a005d305e458e72551e1c9` plus the loader/test patch.
+The relevant kernel/test files are unchanged on subsequent develop
+`f013a9d1e`. SM90/SM107/SM120 are unmeasured by this suite. This modifies
+forward paging only; no paged-KV backward API is added.
+
+From `test/python`, with the qualified checkout imported and recording unset:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 -q -rs \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py \
+  -k 'small_paged or paged_loader_warm_stress'
+python -m pytest -n0 -m L0 -q \
+  sdpa/frost/test_sdpa_fwd_paged_sm100.py::test_paged_graph_fp8_matches_reference \
+  sdpa/frost/test_sdpa_fwd_fp8_dual_kv_sm100.py::test_paged_two_kv_streams_match_the_reference
+python -m pytest -n0 -m L0 -q \
+  sdpa/frost/test_sdpa_prepared_fp8_paged.py::test_prepared_fp8_paged_strides_and_capture -k128
+python -m pytest -n0 -m L0 -q \
+  'sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py::test_fp8_d512_paged_replay_and_batch_invariance[fwd-d512-e4m3-bf16-split1-NHD]'
+```
