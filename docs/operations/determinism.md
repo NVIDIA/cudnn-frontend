@@ -83,6 +83,7 @@ arbitrary user callbacks.
 | FROST native D128 dense-Q paged forward (standalone qualification) | fprop | FP16/BF16 Q/O; matching half or E4M3/E5M2 KV | Unsupported | Unverified | Supported (tested configurations) |
 | FROST D128 paged forward with at most eight live query rows per packed unit (fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported for this lowering | Supported (tested configurations) | Unsupported for this lowering |
 | `pygraph.sdpa_fp8`, FROST D512 paged KV with dense Q | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_fp8`, FROST D128 paged decode with at most eight live query rows per packed unit (fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | SM100: Supported (tested configurations); SM103 retains its existing lowering | Unsupported for this lowering |
 | `pygraph.sdpa_fp8`, FROST D64/D128 paged KV with dense Q (fixed CTA width, packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or matching FP8 O | Unsupported | Supported (tested configurations) | Unverified by this suite |
 | `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D128 dense single-CTA splits (fixed split count and packing) | fprop | E4M3 to BF16; E5M2 to FP16; FP32 tensor scales | Unsupported | Unverified by this suite | Supported (tested configurations) |
@@ -109,6 +110,16 @@ O/Stats batch invariance and parent output bytes. HND/NHD capture checks use
 independent K/V page tables and restore exact O/Amax bytes after switching live
 KV lengths through shorter, empty and original batches. SM103 retains its
 existing producer path and passes the same contract checks.
+
+The SM100 eight-live-row FP8 decode lowering preserves quantized payloads and
+per-tensor scales during batch changes. Its fixed-plan checks cover E4M3/E5M2,
+FP8 and half outputs, optional Amax/Stats, natural-log and log2 final Stats,
+and padded/strided storage. O and Stats are batch invariant; Amax is compared
+bitwise for a repeated batch and numerically after rebatching. Split partial
+Stats always use natural logarithms. This lowering changes the reduction order
+and FP8 probability conversion relative to the older implementation, so it does
+not preserve that implementation's output bytes. SM103 retains its existing
+FP8 lowering. No backward entry point is added.
 
 The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,

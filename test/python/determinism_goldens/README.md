@@ -34,6 +34,113 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
+
+`TestNativeFp8Decode` and `TestNativeFp8DecodeDeterminism` in
+`sdpa/frost/test_sdpa_fwd_fp8_sm100.py` exercise the native five-stage KV ring
+and eight-live-column swap-AB lowering through the actual architecture CI
+entry. It serves dense Q with paged KV, CGA1, per-tensor E4M3/E5M2 and at most
+eight packed query rows. FP16/BF16 and FP8 O, optional Amax/Stats, final log2
+Stats, independent K/V maps, padded head dimensions, and strided Stats are
+covered. There is no separate determinism switch and no new backward path.
+
+The four replay/batch cases fix packing and split count, quantize each payload
+once, and preserve scales across isolation, insertion, reordered/duplicated
+sequences and B513. Fresh allocations, concurrent GPU work, retained-graph V
+sign changes and exact restoration are checked. O/Stats are byte invariant;
+whole-batch Amax is checked numerically after rebatching and bitwise on replay.
+CPU FP64 numerical thresholds are unchanged: O 0.04 (or three times the FP8
+quantization floor), Amax 0.03, Stats 0.0006. Padding canaries and input bytes
+are checked independently.
+
+B200 (SM100, 148 SMs), CUDA compiler and loaded NVRTC 13.4, CuTeDSL 4.8,
+cuDNN 9.30.0.4, Torch 2.14.1+cu130:
+
+- 30 functional cases pass across the incremental runs: 10 graph cases each
+  make six reference/replay checks, plus feature, route, config, optional-output
+  and direct-template Stats-base cases. No functional skips.
+- Four new replay/batch cases and both affected older D128/CGA1 replay/batch
+  cases pass. Two warm-refill cases each use 592 CTAs, five KV tiles and five
+  ring refills; 256 warm and 256 poisoned launches have zero mismatches. The
+  unsafe-ring control fails 200/200. The warm harness uses actual compact
+  output allocations; separate replay tests retain padded/strided outputs.
+- Four new golden records and two updated old D128/CGA1 records pass in a fresh
+  strict process. The two old records retain identical input/runtime hashes;
+  O, Stats and Amax hashes change with the new swap-AB reduction and FP8 P
+  conversion. Independent numerical and batch checks pass before these updates.
+  No other existing golden is changed.
+- Unfiltered CUDA 13.4 memcheck, synccheck and racecheck each pass all four new
+  goldens. Memcheck/synccheck report zero errors; racecheck reports zero hazards,
+  errors and warnings. CUDA API error reporting is disabled.
+
+Final architecture routing checks pass on both B200 and B300. Each also passes
+the two affected D128/CGA1 strict goldens: updated SM100 records and unchanged
+SM103 parent records. This verifies the final SM100-only selection after the
+candidate's two-GPU qualification.
+
+The earlier warm-stress run stopped at the harness's contiguous-output
+precondition after all four replay/batch cases passed. The correction allocates
+compact output storage before prepare; it does not copy a kernel result or
+change the kernel. A separate old-template control with log2 split-partial
+Stats fails both E4M3/E5M2 numerical checks, and the corrected natural-log
+partial guard passes both. These expected RED failures are separate from the
+passing qualification counts.
+
+SM103 candidate qualification also passed the 30 functional cases, four new
+replay/batch cases, two affected older replay/batch cases, both refill stress
+cases and six fresh-process goldens. All six candidate input/output hashes
+match SM100. However, its measured performance did not justify replacing the
+existing SM103 schedule, so the final route selects this body only on SM100.
+The SM103 candidate goldens are not committed; SM103's existing records stay
+unchanged. No new SM103 sanitizer result is claimed.
+
+Source: base `5c99b2c8b2e05b6b3f414cf9fbeb782954faa3cd` with the native FP8
+changes in this PR. The frozen source/library manifests verify the actual
+import root and native-extension inputs. The B200 V2 qualification ran from
+`/tmp/yanxu-fp8-native-qual-b200-v2-5886831`. Final edits limit FP8 selection to
+SM100 and correct comments; the qualified kernel's executable AST is unchanged.
+The previous functional/batch checks used identical routed kernel arithmetic;
+the only earlier AST correction guards final log2 Stats with `SPLIT_KV == 1`
+(the normal adapter already cleared that flag on split partials).
+
+Run from `test/python`, with `CUDNN_DETERMINISM_RECORD` unset:
+
+```bash
+python -m pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py \
+  -k 'TestNativeFp8Decode or test_native_fp8_decode_architecture_route' -m L0 -q -rs
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" python -m pytest \
+  sdpa/frost/test_sdpa_fp8_d512_paged_determinism.py \
+  -k 'd128 and cga1' -m L0 -q -rs
+```
+
+The sanitizer commands below use the CUDA 13.4 executable, qualification
+Python, and frozen run root named above. There is no kernel-name or launch
+filter. Each tool runs a separate process:
+
+```bash
+"$sanitizer134" --tool memcheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" memcheck
+"$sanitizer134" --tool synccheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" synccheck
+"$sanitizer134" --tool racecheck --error-exitcode 91 --report-api-errors no \
+  "$python312" -u "$run_root/probe.py" racecheck
+```
+
+The wrapper verifies source/library hashes and runtime, then calls `pytest.main`
+with a result-recording plugin and these arguments:
+
+```text
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism::test_golden
+-o addopts= -m L0 -q -rs --tb=short --junitxml=<run_root>/results/<tool>/pytest.xml
+```
+
+`CUDNN_DETERMINISM_RECORD` is unset; `CUDNN_DETERMINISM_GOLDENS=<run_root>/goldens`
+selects the preceding record phase. The environment sets
+`CUDNN_TEST_NO_ISOLATION=1`, `CUDNN_TEST_TIMEOUT=240`,
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`,
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, preloads CUDA 13.4 NVRTC, and uses
+the cuDNN 9.30.0.4 library directory with isolated source/cache paths.
+
 ### D128 paged live-column decode — qualification, 2026-11-12 (UTC)
 
 `sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py` covers FP16/BF16
