@@ -1697,7 +1697,9 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.CGA_TILE_M == 128 and api._k_mod.CFG.TILES_Q == 1, "cga=1 must have loaded the decode tile"
+    mod = api._k_mod
+    assert mod.__file__.endswith("sm100/decode_d256_f16.py"), "the short paged D128 graph must load the swap-AB decode tile"
+    assert mod.CFG.TILE_K == mod.CFG.TILE_O == 128 and mod.N_Q == 16 and mod.COLS == 8
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
