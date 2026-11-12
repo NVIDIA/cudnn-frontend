@@ -246,6 +246,7 @@ class CompiledMamba2:
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
@@ -637,6 +638,7 @@ class CompiledMamba2Bwd:
             regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 

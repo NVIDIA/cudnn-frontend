@@ -1003,8 +1003,12 @@ cudnn.jax
 cudnn.jax.TensorSpec
 cudnn.jax.block_sparse_attention
 cudnn.jax.call
+cudnn.jax.gated_delta_net
+cudnn.jax.gated_delta_net_v2
+cudnn.jax.gated_delta_product
 cudnn.jax.gemm_operand_spec
 cudnn.jax.kimi_delta_attention
+cudnn.jax.mamba2
 cudnn.jax.neg_inf_init
 cudnn.jax.row_major_desc
 cudnn.jax.sf_atom_spec
@@ -1485,6 +1489,12 @@ cudnn.ops.dsa.sparse_attention_forward_jax
 cudnn.ops.dsa.top_k_forward
 cudnn.ops.dsa.top_k_forward_jax
 cudnn.ops.fft_causal_conv1d
+cudnn.ops.gated_delta_net_backward_jax
+cudnn.ops.gated_delta_net_forward_jax
+cudnn.ops.gated_delta_net_v2_backward_jax
+cudnn.ops.gated_delta_net_v2_forward_jax
+cudnn.ops.gated_delta_product_backward_jax
+cudnn.ops.gated_delta_product_forward_jax
 cudnn.ops.hstu_attention_backward
 cudnn.ops.hstu_attention_backward_jax
 cudnn.ops.hstu_attention_forward
@@ -1497,6 +1507,8 @@ cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
 cudnn.ops.kpage_prepare_layout
 cudnn.ops.layer_norm_forward_jax
+cudnn.ops.mamba2_backward_jax
+cudnn.ops.mamba2_forward_jax
 cudnn.ops.nsa
 cudnn.ops.nsa.compression_attention_forward
 cudnn.ops.nsa.compression_attention_forward_jax

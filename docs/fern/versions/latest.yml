@@ -141,6 +141,9 @@ navigation:
           - page: Kimi Delta Attention in JAX
             path: ../../operations/linear_attention/kda_jax.md
             slug: kda_jax
+          - page: Linear Attention in JAX
+            path: ../../operations/linear_attention/linear_attention_jax.md
+            slug: linear_attention_jax
           - page: Fused GDN Decode / Verify Steps (FlashInfer Backend)
             path: ../../operations/linear_attention/gdn_decode_flashinfer_backend.md
             slug: gdn_decode_flashinfer_backend

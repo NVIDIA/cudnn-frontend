@@ -34,6 +34,23 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### JAX linear attention — pending qualification, 2026-11-12 (UTC)
+
+`linear_attention/jax/test_linear_attention_jax_determinism.py` covers
+GDN, GDN2, GDP, and Mamba-2 forward and backward with `batch_invariant=True`.
+It checks FP16/BF16 results against the existing FP64 references, raw-byte
+replay with fresh inputs and concurrent GPU work, empty sequences, packed
+batch changes, and a scheduling-boundary workload. Comparisons include output,
+final state, and every returned input, initial-state, and optional-parameter
+gradient. Shared-parameter gradients use a fixed target sequence's loss when
+its batch changes.
+
+GPU execution and golden recording are pending. No new golden results are
+claimed: SM100/103 determinism remains unverified, and these JAX APIs reject
+SM90 and SM107. The companion numerical/API suite is
+`linear_attention/jax/test_linear_attention_jax.py`; record goldens only after
+the reference and replay checks pass on the target GPU.
+
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
 Twenty-six SM100/SM107 forward templates now release the unchanged service

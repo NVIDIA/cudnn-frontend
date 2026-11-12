@@ -45,10 +45,12 @@ from .call import (
 from cutlass.jax import TensorSpec
 
 _BSA_EXPORTS = ("block_sparse_attention",)
+_LINEAR_ATTENTION_EXPORTS = ("gated_delta_net", "gated_delta_net_v2", "gated_delta_product", "mamba2")
 
 
 __all__ = [
     *_BSA_EXPORTS,
+    *_LINEAR_ATTENTION_EXPORTS,
     "call",
     "row_major_desc",
     "TensorSpec",
@@ -61,6 +63,10 @@ __all__ = [
 
 
 def __getattr__(name):
+    if name in _LINEAR_ATTENTION_EXPORTS:
+        value = getattr(import_module("cudnn.linear_attention.scan_jax"), name)
+        globals()[name] = value
+        return value
     if name in _BSA_EXPORTS:
         value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
         globals()[name] = value

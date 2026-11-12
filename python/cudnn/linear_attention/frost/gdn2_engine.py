@@ -291,6 +291,7 @@ class CompiledGdn2:
                 seed_name, seed_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(seed.get_data_type().name, ("float32", 4))
                 regions.append(("state_snapshot", layout.add(B * HO * V * K * seed_bytes, align=128), seed_name, (B, HO, V, K)))
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
@@ -765,6 +766,7 @@ class CompiledGdn2Bwd:
             regions.append(("dstate_snapshot", layout.add(B * HO * V * K * d_bytes, align=128), d_name, (B, HO, V, K)))
         self.order_in_recompute = not self.has_state_checkpoints
         self.workspace_size = layout.size
+        self.workspace_regions = tuple(regions)
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
 
