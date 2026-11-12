@@ -149,12 +149,18 @@ from cudnn.causal_conv1d_cake.api import _validator
 arch = loader.device_arch()
 validate = _validator(arch, loader.find_nvcc(), loader.check_toolkit(arch, "test"))
 cu = torch.tensor(PREFIX, dtype=torch.int32, device="cuda")
+with tvm_ffi.use_torch_stream():
+    validate(cu, 4)
 try:
-    with tvm_ffi.use_torch_stream():
-        validate(cu, 4)
     torch.cuda.synchronize()
 except RuntimeError as error:
-    if "illegal instruction" in str(error) or "device-side assert" in str(error):
+    message = str(error).lower()
+    if (
+        "illegal instruction" in message
+        or "device-side assert" in message
+        or "cuda_error_launch_failed" in message
+        or "unspecified launch failure" in message
+    ):
         os._exit(0)
     raise
 os._exit(3)

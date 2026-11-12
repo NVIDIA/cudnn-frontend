@@ -1319,6 +1319,11 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         return frozenset({2})
     if sm100_nonpaged_d128_thd_single_cta_leg(capabilities, facts, cga=cga, split_kv=split_kv):
         return frozenset({1, 2})
+    if capabilities.sm_lo == 107 and capabilities.is_fp8 and selected == (128, 128) and not facts.thd and not facts.has_paged_kv and (split_kv or 1) > 1:
+        # Native per-tensor D128 has single-CTA FP32 partial stores as well
+        # as the collective path. The split domain is independent of the
+        # unsplit small-working-set policy below; ranking chooses between them.
+        return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
         and (capabilities.is_fp8 or capabilities.is_mxfp8)

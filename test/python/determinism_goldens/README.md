@@ -4009,3 +4009,38 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 
 These new measurements qualify the SM107 extension only. Existing SM100/103
 paged-split support is unchanged and receives no new hardware coverage here.
+
+### SM107 D128 per-tensor FP8 single-CTA dense splits — 2026-11-12 (UTC)
+
+`test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split` exposes12 L0 cases
+through the selected Rubin CI entry: one graph-domain check, six functional
+rebind/capture cases, two replay/batch cases, two golden cases and one
+refilled-ring stress. E4M3/E5M2 input, BF16/FP16/E4M3/E5M2 output, packed
+and unpacked groups, splits2/3/9, dense/causal/bottom-right/SWA/sink,
+optional Stats and D112/V96 plus D80/V112 envelopes are exercised.
+Every functional check uses the shared FP64 FP8 probability-cast reference
+and checks Amax_O separately. Native template, single-CTA geometry,
+four-stage KV ring, K64 MMA and FP32 combine are asserted.
+
+On SM107216SMs, driver620.62, fullcuDNN9.30.0.4, CuTeDSL4.8.0 compiled
+with CUDA13.4 and Torch2.14.0+cu130, all12 cases passed in25.88s.
+The two new goldens also passed strict comparison in a fresh process
+(2 cases,3.21s). No previous golden was changed. The stress recorded zero
+wrong bytes in512 warm and512 poisoned launches; its unsafe control failed
+200/200 launches. The stress shape launches512 blocks and refills its ring
+four times per launch; numerical correctness is checked separately first.
+
+Fixed-payload batch checks compare the target alone, reordered, duplicated,
+with changed neighbors and among129 sequences. O/Stats are per-sequence;
+Amax_O is a whole-batch maximum, checked numerically after rebatching and
+bitwise during replay. New byte guarantees cover E4M3/BF16 packed split3
+and E5M2/FP16 unpacked split2. Other GPU lines are unmeasured by this suite;
+this change adds no backward or THD path.
+
+From `test/python`, with the correct checkout imported:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split
+```

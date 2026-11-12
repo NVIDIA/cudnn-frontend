@@ -88,6 +88,11 @@ The experimental API catalog includes:
 - [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
 
 - [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
+- [Cake LM-head log-probabilities](/operations/cake_lm_head): prepared execution and JAX JIT/gradients.
+
+- [Cake MoK training](/operations/cake_mok)
+
+- [Cake mHC training](/operations/mhc_training): explicit stages and JAX branch composition/gradients.
 
 ## Installation and setup
 
