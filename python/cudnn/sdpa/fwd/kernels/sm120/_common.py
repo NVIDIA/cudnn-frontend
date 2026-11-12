@@ -130,7 +130,10 @@ def copy_paged_half_tile(
     src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
     lane = cute.arch.lane_idx()
     vectors_per_row = head_tile // 8
-    for wave in cutlass.range_constexpr(kv_tile * vectors_per_row // 32):
+    # Keep the generated loader bounded as the tile grows. Fully unrolling
+    # dozens of vectors per lane duplicates the page-table/address machinery
+    # and makes large paged prefill tiles much slower than the rolled walk.
+    for wave in cutlass.range(kv_tile * vectors_per_row // 32, unroll=1):
         chunk = wave * 32 + lane
         row = chunk // vectors_per_row
         col = (chunk % vectors_per_row) * 8

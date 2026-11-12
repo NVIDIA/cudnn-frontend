@@ -346,6 +346,13 @@ replays, reordered/duplicated batches and changed neighbors under capture.
 This is a fixed-GPU/runtime result; SM121 execution and cross-GPU bitwise
 identity are unverified. The determinism report records the exact coverage.
 
+The D128 M128/N128 paged prefill path also preserves O and Stats bytes on
+RTX PRO 6000 for FP16/BF16 with fixed packed or unpacked plans. The rolled
+page-copy loop passes replay, fresh-buffer, reordered/duplicated/changed-neighbor
+batch and captured-replay checks, plus sustained stage-refill stress. This
+extends the tested forward configurations; SM121 and cross-runtime identity
+remain unverified, and no paged backward path is qualified by these checks.
+
 The SM120 paged16/32-row decode tiles additionally have eight fixed-runtime
 replay/batch goldens for FP16/BF16 D64/V64 and D120/V88 with split1/3.
 The split count is held fixed across batch changes; the common fixed-order
