@@ -3622,6 +3622,7 @@ def _compile_cached(
     *,
     tile_config: ConvTileConfig,
     epilogue_attrs: tuple[tuple[str, float], ...] = (),
+    enable_tvm_ffi: bool = True,
     device: int = 0,
     gpu_arch: str = "sm_100a",
 ):  # noqa: A001
@@ -3706,6 +3707,9 @@ def _compile_cached(
         raster_along=_RASTER_ALONG,
     )
     with device_context(device):
+        compile_options = f"--gpu-arch {gpu_arch}"
+        if enable_tvm_ffi:
+            compile_options += " --enable-tvm-ffi"
         return cute.compile(
             conv_op,
             fake_a,
@@ -3735,7 +3739,7 @@ def _compile_cached(
             cutlass.Int32(1),
             cutlass.Int32(1),
             make_fake_stream(),
-            options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+            options=compile_options,
         )
 
 
@@ -3750,6 +3754,7 @@ def compile(
     d_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     tile_config: ConvTileConfig | None = None,
     epilogue_attrs: tuple[tuple[str, float], ...] = (),
+    enable_tvm_ffi: bool = True,
 ):  # noqa: A001
     """Resolve and compile an SM100 NVFP4 convolution tile at plan time."""
     n, c, d, h, w = ncdhw
@@ -3783,6 +3788,7 @@ def compile(
         d_dtype,
         tile_config=tile_config,
         epilogue_attrs=epilogue_attrs,
+        enable_tvm_ffi=enable_tvm_ffi,
         device=device,
         gpu_arch=gpu_arch,
     )

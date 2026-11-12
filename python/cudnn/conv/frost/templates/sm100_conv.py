@@ -1655,8 +1655,6 @@ def _dense_config_violation(tile_config: ConvTileConfig, channel_bytes: int) -> 
     """Return why a tile cannot implement dense convolution, if anything."""
     if tile_config.cta_tile_k_bytes != 128:
         return f"CTA K must be 128 bytes, got {tile_config.cta_tile_k_bytes}"
-    if channel_bytes <= 0:
-        return f"channel_bytes must be positive, got {channel_bytes}"
     if channel_bytes % tile_config.cta_tile_k_bytes:
         return f"channel_bytes={channel_bytes} must be divisible by CTA K={tile_config.cta_tile_k_bytes} bytes"
     if tile_config.cta_tile_m == 64 and tile_config.cta_group == 2 and tile_config.cta_tile_n % 64:
@@ -1687,6 +1685,7 @@ def compile(
     ab_dtype: Type[Numeric] = _DEFAULT_DTYPE,
     c_dtype: Type[Numeric] = _DEFAULT_DTYPE,
     tile_config: ConvTileConfig | None = None,
+    enable_tvm_ffi: bool = True,
 ):  # noqa: A001
     """Select a tile and compile a convolution artifact with runtime geometry.
 
@@ -1719,7 +1718,7 @@ def compile(
             f"lower_padding_dhw={lower_padding_dhw}, stride_dhw={stride_dhw}, dilation_dhw={dilation_dhw}"
         )
     device, gpu_arch = build_target()
-    return _compile_cached(epilogue, epilogue_attrs, ab_dtype, c_dtype, tile_config, device=device, gpu_arch=gpu_arch)
+    return _compile_cached(epilogue, epilogue_attrs, ab_dtype, c_dtype, tile_config, enable_tvm_ffi, device=device, gpu_arch=gpu_arch)
 
 
 @lru_cache(maxsize=None)
@@ -1729,6 +1728,7 @@ def _compile_cached(
     ab_dtype: Type[Numeric],
     c_dtype: Type[Numeric],
     tile_config: ConvTileConfig,
+    enable_tvm_ffi: bool,
     *,
     device: int,
     gpu_arch: str,
@@ -1750,6 +1750,10 @@ def _compile_cached(
         runtime_tuple = (cutlass.Int32(0),) * 3
 
         max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+
+        compile_options = f"--gpu-arch {gpu_arch}"
+        if enable_tvm_ffi:
+            compile_options += " --enable-tvm-ffi"
         return cute.compile(
             fprop_op,
             fake_a,
@@ -1762,5 +1766,5 @@ def _compile_cached(
             runtime_tuple,
             runtime_tuple,
             epilogue_op,
-            options=f"--enable-tvm-ffi --gpu-arch {gpu_arch}",
+            options=compile_options,
         )
