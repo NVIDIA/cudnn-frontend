@@ -7,15 +7,15 @@ import cuda.bindings.driver as cuda
 import pytest
 import torch
 
-import cudnn
 from cudnn.deepseek_sparse_attention import pooled
+from cudnn.deepseek_sparse_attention.pooled.indices import CUTEDSL_MIN_VERSION
 from cudnn.ops import dsa
 from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
 pytestmark = [
     pytest.mark.L0,
     pytest.mark.skipif(torch.cuda.get_device_capability() not in ((10, 0), (10, 3)), reason="Pooled DSA requires Blackwell"),
-    pytest.mark.skipif(cutedsl_too_old(cutedsl_state()[1]), reason="Pooled DSA requires a supported CuTe DSL version"),
+    pytest.mark.skipif(cutedsl_too_old(cutedsl_state()[1], CUTEDSL_MIN_VERSION), reason="Pooled DSA requires a supported CuTe DSL version"),
 ]
 
 

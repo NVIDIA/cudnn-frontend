@@ -151,5 +151,5 @@ class PooledSelectKernel(IndexerTopKKernelVarlenDecode):
                     token = Int64(completed) * self.pool_size + tail
             output[row, col] = Int32(token)
 
-    prefill.set_name_prefix("cudnn_pooled_select", remove_cutlass_symbol=True)
-    decode.set_name_prefix("cudnn_pooled_select", remove_cutlass_symbol=True)
+    prefill.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+    decode.set_name_prefix("cudnn", remove_cutlass_symbol=True)
