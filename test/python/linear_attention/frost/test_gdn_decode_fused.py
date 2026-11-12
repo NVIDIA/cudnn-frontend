@@ -1455,8 +1455,9 @@ def test_rank_geometry_rows_are_batch_invariant(g):
 def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, pdl):
     """On the device: one launch of the entry's pick for ``rows`` on THIS part (the plain pick at three rows counts, and the PDL form at
     rows 1) is ONE kernel whose profiler record -- name, grid, block, shared memory -- equals the entry's launch facts; nothing is named
-    before the first compile, and the form states the launch knob the symbol does not.  The helper synchronises between its warm launch
-    and the recorded one, so the PDL form's predecessor has completed (the config docstring's obligation)."""
+    before the first compile, and the form states what sits behind the cut of this kernel's symbol (the two-CTAs-per-head field, the
+    geometry) beside the launch knob the symbol does carry.  The helper synchronises between its warm launch and the recorded one, so
+    the PDL form's predecessor has completed (the config docstring's obligation)."""
     dev = _device_or_skip()
     k = entry.GdnDecodeFused(dev, 1e-6, pdl=pdl)
     ops = make_operands(rows=rows, device=dev, slots=rows + 1)
@@ -1465,3 +1466,29 @@ def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, pdl):
     assert record.name.startswith("cudnn_kernel_frost_gdn_decode_fused_"), record.name
     form = k.form_for(rows)
     assert form == {**asdict(k.cfg_for(rows)), "ROWS": rows, "EPS": 1e-6} and (form["PDL"], form["PDL_RELEASE"]) == (bool(pdl), bool(pdl))
+
+
+def test_launch_facts_of_a_form_no_pick_returns_equal_the_profilers_record():
+    """On the device: a form no pick returns, given as an explicit ``cfg`` at four rows -- the register state path
+    (``STATE_LOAD_PATH="ldg128"``, ``TPR=8``), whose shared-memory figure is the config's ledger of a build without the state slabs
+    plus that form's occupancy pad.  ONE kernel whose profiler record equals the entry's launch facts: the cell above compares the
+    picks, this one holds the ledger to a launch record off them.  A part whose shared memory does not hold the form is a skip that
+    says so (the typed decline at construction, as in the knob-arm cell)."""
+    dev = _device_or_skip()
+    cfg = kcfg.make_cfg(STATE_LOAD_PATH="ldg128", TPR=8)
+    try:
+        kcfg.validate_cfg(replace(cfg, **_on(entry.device_shared_memory(dev))))
+    except ValueError as exc:
+        assert "do not fit the SM" in str(exc), exc
+        pytest.skip(f"this part's shared memory does not hold the form (declined by type at construction): {exc}")
+    rows = 4
+    k = entry.GdnDecodeFused(dev, 1e-6, cfg=cfg)
+    ops = make_operands(rows=rows, device=dev, slots=rows + 1)
+    assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
+    record = assert_facts_equal_the_launch(k, lambda: _run(k, ops), rows, what=entry.NAME)
+    assert record.name.startswith("cudnn_kernel_frost_gdn_decode_fused_"), record.name
+    form = k.form_for(rows)
+    assert (form["STATE_LOAD_PATH"], form["TPR"]) == ("ldg128", 8) and k.cfg_for(rows) not in (
+        entry.GdnDecodeFused(dev, 1e-6).cfg_for(r) for r in (1, 2, 4, 64)
+    )
+    assert record.shared_memory == k.cfg_for(rows).NATURAL_SMEM_BYTES + k.cfg_for(rows).SMEM_PAD_BYTES
