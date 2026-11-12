@@ -1152,11 +1152,14 @@ def _sm100_paged_d128_prefix(facts) -> bool:
 
 
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice, sm100_paged_tail_split_domain
 
     # The prepared single-CTA split removes the underfilled paged D128 launch, and the packed split the underfilled
     # D64 / D256 one. Placement and the concrete split share one bounded rule.
     if paged_thd_split_choice(caps, facts)[0] > 1:
+        return LEAD
+    if facts.d_qk == 256 and facts.h_q == facts.h_kv and sm100_paged_tail_split_domain(caps, facts):
+        # Unsplit too: FROST's D256 pair tile ran 0.45-0.51 of the backend on every MHA prefix of study sm100_paged_split_v2_20261112.
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD

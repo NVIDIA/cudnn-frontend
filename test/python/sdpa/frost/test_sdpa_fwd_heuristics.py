@@ -2655,10 +2655,10 @@ def test_sm100_paged_d128_prefix_envelope_splits(over, cc):
         (64, 16, 32, 8, 32, 4095, 2),
         (256, 12, 64, 8, 128, 32768, 4),
         (64, 8, 64, 8, 128, 8192, 1),  # D64 at 128 rows over 64 KV tiles: no split
-        (64, 4, 32, 8, 256, 65536, 1),  # long queries keep the unpacked default
+        (64, 4, 32, 8, 256, 65536, 4),  # past the wave rule, the tail split (study sm100_paged_split_v2_20261112)
         (256, 4, 16, 2, 256, 8192, 1),
     ],
-    ids=["d64_case102", "d64_q32", "d256_q128", "d64_q128_short_kv", "d64_q256", "d256_q256"],
+    ids=["d64_case102", "d64_q32", "d256_q128", "d64_q128_short_kv", "d64_q256_tail", "d256_q256"],
 )
 def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv, splits):
     """Study sm100_paged_packed_split_waves_20261112: with no first-wave room the packed split still leads short queries."""
@@ -2748,3 +2748,66 @@ def test_sm100_paged_packed_split_stays_inside_its_domain(over):
     heads.update({k: over.pop(k) for k in ("h_q", "h_kv") if k in over})
     for d in (64, 256):
         assert sm100_paged_packed_split_choice(spec.capabilities, _sm100_paged_prefix(d, heads["h_q"], heads["h_kv"], **over)) == 1, (d, over)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, h_q, h_kv, over, choice",
+    [
+        (64, 32, 32, dict(b=8, s_q=32, s_kv=32768), (3, False)),
+        (128, 64, 64, dict(b=8, s_q=64, s_kv=4095), (2, False)),
+        (128, 32, 16, dict(b=16, s_q=64, s_kv=4095), (2, True)),
+        (256, 16, 16, dict(b=4, s_q=32, s_kv=16384), (3, False)),
+        (128, 64, 32, dict(b=2, s_q=256, s_kv=8191), (1, False)),  # four Q tiles over 64 KV tiles: unsplit
+        (64, 32, 4, dict(b=2, s_q=512, s_kv=16383), (1, False)),  # equal-length batches ran 1.30x slower split
+    ],
+    ids=["mha_d64", "mha_d128", "g2_d128_b16", "mha_d256", "g2_d128_q256", "d64_q512"],
+)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["b200", "b300"])
+def test_sm100_paged_tail_split(d, h_q, h_kv, over, choice, cc):
+    """Study sm100_paged_split_v2_20261112: a prefix the measured choosers leave unsplit still splits when its KV loop is long
+    next to the wave load (MHA, group 2, several waves of units); the split leads and is the first FROST plan."""
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(d, h_q, h_kv, max_total_seq_len_q=None, device_cc=cc, **over)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == choice
+    if choice[0] > 1:
+        assert placement.place(spec, facts) == placement.LEAD
+        first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id == _OFFERED[_F16])
+        assert (first.knobs.split_kv, bool(first.knobs.pack_gqa)) == choice
+
+
+@pytest.mark.L0
+def test_sm100_paged_d256_mha_prefix_leads_unsplit():
+    """Study sm100_paged_split_v2_20261112: the D256 pair tile ran 0.45-0.51 of the backend on every MHA prefix, split or not."""
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(256, 16, 16, b=2, s_q=1024, s_kv=4096, max_total_seq_len_q=None)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == (1, False)
+    assert placement.place(spec, facts) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(device_cc=(10, 7), device_sm_count=208),
+        dict(max_total_seq_len_q=8 * 64),  # a total-Q declaration was not measured
+        dict(b=17),
+        dict(s_kv=65537),
+        dict(s_q=8),
+        dict(dtype=cudnn.data_type.HALF),
+        dict(window_left=128),
+    ],
+    ids=["rubin", "total_q", "b17", "kv_past_64k", "q8", "f16", "window"],
+)
+def test_sm100_paged_tail_split_stays_inside_its_study(over):
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    values = dict(b=8, s_q=64, s_kv=4095, max_total_seq_len_q=None)
+    values.update(over)
+    assert heuristics.sm100_paged_tail_split_choice(spec.capabilities, _sm100_paged_prefix(128, 64, 64, **values)) == (1, False), over
+    assert not heuristics.sm100_paged_tail_split_domain(spec.capabilities, _sm100_paged_prefix(256, 16, 16, **values)), over
