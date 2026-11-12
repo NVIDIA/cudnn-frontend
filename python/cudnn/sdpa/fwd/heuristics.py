@@ -2834,14 +2834,21 @@ SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
 SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
 SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
 SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
+# Past the first wave (study sm100_paged_packed_split_waves_20261112; B200, B300 transfer): the parts timed, the declared S_q up to which the
+# packed split still leads, D64 also to 128 rows over at least this many KV tiles, and at most this many partitions.
+SM100_PAGED_PACKED_SPLIT_WAVE_CCS = frozenset({(10, 0), (10, 3)})
+SM100_PAGED_PACKED_SPLIT_WAVE_Q = {(64, 64): 64, (256, 256): 128}
+SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES = 128
+SM100_PAGED_PACKED_SPLIT_WAVE_MAX = 4
 
 
 def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
     """SM100/103 paged bf16 D64 / D256 GQA prefix: the packed split count, 1 outside the domain.
 
     The packed launch (b x KV heads x packed Q tiles) underfills the part on these short-Q / long-KV graphs; split the KV
-    loop over the idle clusters (four KV tiles per partition at least, 16 partials at most). The declaration bounds the
-    launch: live lengths are never read."""
+    loop over the idle clusters (four KV tiles per partition at least, 16 partials at most). With no idle cluster, short
+    queries still split two to four ways (``SM100_PAGED_PACKED_SPLIT_WAVE_*``). The declaration bounds the launch: live
+    lengths are never read."""
     d_shape = (facts.d_qk, facts.d_v)
     cga = SM100_PAGED_PACKED_SPLIT_CGA.get(d_shape)
     if not (
@@ -2868,10 +2875,24 @@ def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
         return 1
     launch = _split_launch(caps, facts, 128, 128, cga, pack_g, split_kv=2)
     units = facts.b * launch.heads_q * launch.q_tiles
-    budget = min(16, (facts.device_sm_count // launch.ctas_per_tile) // max(1, units), launch.kv_tiles // 4)
-    if budget < 2:
-        return 1
-    splits = _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+    slots = facts.device_sm_count // launch.ctas_per_tile
+    budget = min(16, slots // max(1, units), launch.kv_tiles // 4)
+    if budget >= 2:
+        splits = _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+    else:
+        # No first-wave room: on short queries the packed split still beats the unpacked unsplit default (a THD graph has no
+        # packed unsplit plan) -- two to four partitions, the fewest waves x loop tiles.
+        if facts.device_cc not in SM100_PAGED_PACKED_SPLIT_WAVE_CCS:
+            return 1
+        short_q = facts.s_q <= SM100_PAGED_PACKED_SPLIT_WAVE_Q[d_shape] or (
+            d_shape == (64, 64) and facts.s_q <= 128 and launch.kv_tiles >= SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES
+        )
+        if not short_q:
+            return 1
+        loop = lambda s: (_ceil_div(units * s, slots) * _ceil_div(launch.kv_tiles, s), s)
+        splits = min(range(2, min(SM100_PAGED_PACKED_SPLIT_WAVE_MAX, launch.kv_tiles // 4) + 1), key=loop, default=1)
+        if splits < 2:
+            return 1
     knobs = SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=splits)
     return splits if mismatch(caps, facts, knobs) is None else 1
 
