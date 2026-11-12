@@ -17,6 +17,7 @@ pytest core/test_determinism_utils.py
 | Suite | API | Forward results | Backward results |
 | --- | --- | --- | --- |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
+| `hopper/test_kda_sm90_local_precision.py` | `kimi_delta_attention`, pinned `kda_hopper_cuda` | output, FP32 final state | BF16 dQ/dK/dV; FP32 dG/dBeta/dInitialState |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
@@ -33,6 +34,63 @@ pytest core/test_determinism_utils.py
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
+
+### SM90 BT64 KDA local-derivative precision — validation, 2026-11-12
+
+Based on upstream `7ab3ffd75681651ad5b5feb36a3e7e63341f1ef8`, with the
+local derivative fix only. The state-gradient P buffer remains BF16; the
+separate FP32-P and experimental BT16 changes are not part of this result.
+Measured on H20-3e, driver 570.133.20, Torch 2.9.1+cu128, CUDA toolkit 12.8,
+cuDNN 9.10.2, and CuTe DSL 4.8.1. The selected body is CUDA C++ compiled
+by NVRTC. The imported package path was verified against the candidate.
+Kernel source SHA256: `ed36efb0a2213e97fc8d6d73f2d37b72bb7bfe1d3b3599cc3b6619714ae6c182`.
+Other GPU parts/runtimes are unverified by this addition; existing FROST
+SM100/103/107 results are retained and were not rerun.
+
+The new suite has 19 passing L0 cases. It pins the public CUDA provider with
+`batch_invariant=True`, BF16 Q/K/V/dO, K=V=128, and FP32 activated log gates,
+beta, states and their gradients. Six reference/replay cases cover H=2/8,
+full/tail tiles and ragged lengths 0/1/15/16/17/63/64/65. Four batch-invariance
+cases include up to 17,001 tokens, splitting/reordering/duplication and changed
+neighbors while preserving the target sequence and upstream gradient bytes.
+Long concurrent replay, a golden, six FP64 correlated-key regressions, and a
+warm/poisoned stress case complete the suite. O, final state and all six
+gradients are checked, with numerical references separate from byte checks.
+
+All six correlated regressions fail on the unchanged baseline and pass on
+the candidate; their dG relative-L2 bound is 2%, with a nontrivial FP64 reference
+norm. A separate 52-case FP64 recurrent benchmark measures every gradient;
+see [precision and performance report](../../../benchmark/linear_attention/sm90_bt64_precision.md).
+This is not full precision parity with SM100 or a claim that every gradient
+improves in every case. The unchanged BF16 P boundary is outside this fix.
+
+Warm stress: 0/3000 warm and 0/3000 poisoned failures, 256 CTAs and 14 stage
+refills per launch; unsafe control: 200/200 failures. Memcheck and synccheck
+report zero errors, racecheck zero errors/warnings for raw backward with
+full/tail/ragged/empty cases and scratch/output poisoning.
+
+The new golden `32cb2f58db95235f/kda-sm90-bt64-local-fwd-bwd-bf16.json`
+was recorded into a fresh directory after reference/replay checks, then
+checked with recording disabled. An independently recorded upstream control
+has identical runtime/inputs and O/final-state/dV/dInitialState hashes. Only
+dQ/dK/dG/dBeta hashes change, as expected from the local derivative rounding
+change. No existing golden is overwritten.
+
+From `test/python` (CUDA_HOME points at the CUDA 12.8 toolkit):
+
+```bash
+PYTHONPATH="$PWD/../../python" CUDNN_TEST_NO_ISOLATION=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -o addopts= -q -rs \
+  linear_attention/hopper/test_kda_sm90_local_precision.py \
+  linear_attention/hopper/test_kda_sm90_cuda.py \
+  linear_attention/hopper/test_hopper_marshal_stream.py
+```
+
+Final result: **43 passed, 1 skipped, 5 warnings in 11.26s**. The skip is the
+existing optional cuTile-provider comparison because `cuda.tile` is absent;
+the five warnings are existing unknown `xdist_group` marks. The candidate's
+CUDA provider, regression cases and strict golden were all executed.
 
 ### SM120 wide partial PackGQA — validation, 2026-11-11 (UTC)
 

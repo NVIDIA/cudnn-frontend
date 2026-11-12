@@ -1380,17 +1380,11 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
     const size_t gs   = (size_t)H * DH;
     const size_t base = (size_t)t0 * gs + (size_t)h * DH;
 
-    // Per-thread walks over a 64x128 tile.  The row step (32 for 16B units, 16
-    // for 8B units) is a multiple of 8, so the xor swizzle term is invariant and
-    // both shared and global offsets advance by a constant.
+    // Per-thread 16B walks over a 64x128 tile. The row step of 32 is a
+    // multiple of 8, so both shared and global offsets advance by a constant.
     const int e8r = tid >> 4, e8c = (tid & 15) << 3;
     const int e8o    = swz(e8r, e8c, 128);
     const size_t e8g = (size_t)e8r * gs + e8c;
-    const int e4r = tid >> 5, e4c = (tid & 31) << 2;
-    const int e4o    = swz(e4r, e4c, 128);
-    const int e4G    = e4r * GST + e4c;
-    const size_t e4g = (size_t)e4r * gs + e4c;
-
     extern __shared__ char smem[];
     bf16* sQ     = reinterpret_cast<bf16*>(smem + OFF_Q);
     bf16* sK     = reinterpret_cast<bf16*>(smem + OFF_K);
@@ -1415,7 +1409,11 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
     bf16* sV    = sScr + 64 * 128;                        // 16 K (-> sScr2)
     bf16* sDqS  = sV + 64 * 128;                          // 16 K
     // region Y / Z
-    bf16* sDW   = reinterpret_cast<bf16*>(smem + OFF_Y);
+    bf16* sDW = reinterpret_cast<bf16*>(smem + OFF_Y);
+    // The upper half of region Y is free after the phase-A state products.
+    // Reuse it for the BF16 rounding residuals of dM and dC (8 KiB each).
+    bf16* sMlo  = sDW + 8192;
+    bf16* sClo  = sMlo + 4096;
     float* sDG2 = reinterpret_cast<float*>(smem + OFF_Z);
     float* sQ4  = sDG2;  // [4][128] scratch
     // Region Y is idle until dW is produced, so prefetch the second half of
@@ -1496,6 +1494,9 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
     cpasync_wait<1>();
     __syncthreads();
 
+    // Retain dC's packed residual until region Y's state operands are released.
+    // hi + lo approximates the FP32 coefficient without widening MMA operands.
+    uint32_t clo[TA::TPW][2];
     // =================== phase A : dAqk ===================
     {
         float dAq[TA::TPW][4];
@@ -1514,6 +1515,8 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
                 const float v0 = dAq[j][r] * scale, v1 = dAq[j][r + 1] * scale;
                 *reinterpret_cast<uint32_t*>(sdAqk + o0 + rp * (8 * 64)) =
                     bf2((c0 < i) ? v0 : 0.f, (c0 + 1 < i) ? v1 : 0.f);
+                const float2 hi = un2(*reinterpret_cast<const uint32_t*>(sdAqk + o0 + rp * (8 * 64)));
+                clo[j][rp]      = bf2(c0 < i ? v0 - hi.x : 0.f, c0 + 1 < i ? v1 - hi.y : 0.f);
                 if (c0 == i) sDiag[i] = v0;
                 if (c0 + 1 == i) sDiag[i] = v1;
             }
@@ -1661,28 +1664,22 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
     cpasync_wait<0>();
     __syncthreads();
 
-    float dAacc[TA::TPW][4];
-    zero_acc<TA::TPW>(dAacc);
     const bool lower_tile = TA::ni(warp, 0) < 2 * (TA::mi(warp, 0) + 1);
     const int row64       = T64::mi(warp, 0) * 16 + (lane >> 2);
 
-    // ---- B5.  beta_j scales the whole column j of BOTH dA products, so it is
-    // applied once on the accumulator instead of being baked into each B
-    // operand: the v*beta staging pass (a 16 KB read plus a 16 KB write of the
-    // whole tile) and the barrier that published it both disappear, and v feeds
-    // the product straight from its own tile.
-    if (lower_tile) gemm_acc<64, 64, 128, BNW, 0, 0, 128, 128>(dAacc, sDV2, sV, warp, lane);
-    // The second operand no longer carries beta either; building it here (nobody
-    // reads sScr until the barrier below) overlaps it with the dv product.
+    // The phase-A state readers have released the upper half of region Y.
+    // Publish the dC residual here; B5's following barriers fence its consumers.
 #pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        const int o = e4o + m * (16 * 128);
-        const F4 g  = ld4f(sG + e4G + m * (16 * GST));
-        F4 x        = ld4bf(sK + o);
+    for (int j = 0; j < TA::TPW; ++j) {
+        const int o = swz(TA::mi(warp, j) * 16 + (lane >> 2), TA::ni(warp, j) * 8 + ((lane & 3) << 1), 64);
 #pragma unroll
-        for (int t = 0; t < 4; ++t) x.v[t] *= ex2(g.v[t]);
-        st4bf(sScr + o, x);
+        for (int rp = 0; rp < 2; ++rp) *reinterpret_cast<uint32_t*>(sClo + o + rp * (8 * 64)) = clo[j][rp];
     }
+    // Direct solve derivative: dM = -strict_lower(Y Z^T), Y = A^T dU.
+    // This reuses the dV solve and avoids differentiating the stored inverse
+    // through two extra matrix products and their BF16 intermediate roundings.
+    // Y=A^T dV2 is shared by dV, dBeta and dM=-Y Z^T. Preserve the existing
+    // FP32 dV/dBeta accumulators; materialize BF16 Y only for the dM MMA.
     {
         float acc[T64::TPW][4];
         zero_acc<T64::TPW>(acc);
@@ -1702,16 +1699,16 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
             }
         }
         red_flush(sPart, row64, r0, r1, lane);
-        // dv is staged in the dq tile, which is idle until B6 needs it as an
-        // operand buffer.  Not recycling sScr here lets the dv store and the
-        // next operand build share one barrier region instead of three.
+        // Stage dV separately from Y: B6 will reuse the dV tile, while
+        // sScr must retain Y for the direct dM product below.
 #pragma unroll
         for (int j = 0; j < T64::TPW; ++j) {
             const int i0 = T64::mi(warp, j) * 16 + (lane >> 2);
             const int o0 = swz(i0, T64::ni(warp, j) * 8 + ((lane & 3) << 1), 128);
 #pragma unroll
             for (int rp = 0; rp < 2; ++rp) {
-                const float b = sBeta[i0 + rp * 8];
+                *reinterpret_cast<uint32_t*>(sScr + o0 + rp * (8 * 128)) = bf2(acc[j][rp * 2], acc[j][rp * 2 + 1]);
+                const float b                                            = sBeta[i0 + rp * 8];
                 *reinterpret_cast<uint32_t*>(sDqS + o0 + rp * (8 * 128)) =
                     bf2(acc[j][rp * 2] * b, acc[j][rp * 2 + 1] * b);
             }
@@ -1724,49 +1721,28 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
             *reinterpret_cast<uint4*>(dvo + base + e8g + (size_t)(m * 32) * gs) =
                 *reinterpret_cast<const uint4*>(sDqS + e8o + m * (32 * 128));
     }
-    if (lower_tile) gemm_acc<64, 64, 128, BNW, 0, 0, 128, 128>(dAacc, sDW, sScr, warp, lane);
+    // The dBeta reduction stores consume the original V; the preceding
+    // barrier releases its tile for the saved value-update operand.
+    load_tile<64, 128>(sV, vnewg + base, gs, L, tid, BNT);
+    cpasync_commit();
+    cpasync_wait<0>();
     __syncthreads();
-    {  // dAkk = -strict( A^T * strict(dA) * A^T )
-        bf16* sdAb = sScr;
-        bf16* sXb  = sScr + 64 * 64;
+    {
+        float dm[TA::TPW][4];
+        zero_acc<TA::TPW>(dm);
+        if (lower_tile) gemm_acc<64, 64, 128, BNW, 0, 0, 128, 128>(dm, sScr, sV, warp, lane);
 #pragma unroll
         for (int j = 0; j < TA::TPW; ++j) {
-            const int i0 = TA::mi(warp, j) * 16 + (lane >> 2);
-            const int c0 = TA::ni(warp, j) * 8 + ((lane & 3) << 1);
-            const int o0 = swz(i0, c0, 64);
-            // beta_j, factored out of both dA products, enters here
-            const float2 bc = *reinterpret_cast<const float2*>(sBeta + c0);
-#pragma unroll
-            for (int rp = 0; rp < 2; ++rp) {
-                const int i = i0 + rp * 8;
-                *reinterpret_cast<uint32_t*>(sdAb + o0 + rp * (8 * 64)) =
-                    bf2((c0 < i) ? dAacc[j][rp * 2] * bc.x : 0.f, (c0 + 1 < i) ? dAacc[j][rp * 2 + 1] * bc.y : 0.f);
-            }
-        }
-        __syncthreads();
-        float xacc[TA::TPW][4];
-        zero_acc<TA::TPW>(xacc);
-        if (lower_tile) gemm_acc64_range<1, 1>(xacc, sAb, sdAb, warp, lane, TA::mi(warp, 0), 4);
-#pragma unroll
-        for (int j = 0; j < TA::TPW; ++j) {
-            const int o0 = swz(TA::mi(warp, j) * 16 + (lane >> 2), TA::ni(warp, j) * 8 + ((lane & 3) << 1), 64);
-#pragma unroll
-            for (int rp = 0; rp < 2; ++rp)
-                *reinterpret_cast<uint32_t*>(sXb + o0 + rp * (8 * 64)) = bf2(xacc[j][rp * 2], xacc[j][rp * 2 + 1]);
-        }
-        __syncthreads();
-        zero_acc<TA::TPW>(xacc);
-        if (lower_tile) gemm_acc64_range<0, 0>(xacc, sXb, sAb, warp, lane, 0, TA::ni(warp, 0) / 2 + 1);
-#pragma unroll
-        for (int j = 0; j < TA::TPW; ++j) {
-            const int i0 = TA::mi(warp, j) * 16 + (lane >> 2);
-            const int c0 = TA::ni(warp, j) * 8 + ((lane & 3) << 1);
+            const int i0 = TA::mi(warp, j) * 16 + (lane >> 2), c0 = TA::ni(warp, j) * 8 + ((lane & 3) << 1);
             const int o0 = swz(i0, c0, 64);
 #pragma unroll
             for (int rp = 0; rp < 2; ++rp) {
                 const int i = i0 + rp * 8;
                 *reinterpret_cast<uint32_t*>(sdAkk + o0 + rp * (8 * 64)) =
-                    bf2((c0 < i) ? -xacc[j][rp * 2] : 0.f, (c0 + 1 < i) ? -xacc[j][rp * 2 + 1] : 0.f);
+                    bf2(c0 < i ? -dm[j][rp * 2] : 0.f, c0 + 1 < i ? -dm[j][rp * 2 + 1] : 0.f);
+                const float2 hi = un2(*reinterpret_cast<const uint32_t*>(sdAkk + o0 + rp * (8 * 64)));
+                *reinterpret_cast<uint32_t*>(sMlo + o0 + rp * (8 * 64)) =
+                    bf2(c0 < i ? -dm[j][rp * 2] - hi.x : 0.f, c0 + 1 < i ? -dm[j][rp * 2 + 1] - hi.y : 0.f);
             }
         }
     }
@@ -1876,7 +1852,9 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
     {  // row sweep: t ascending, anchor moves 16t -> 16(t+1)
         const LdA A1      = a0_addr<64>(sdAqk, lane);
         const uint32_t dA = sad(sdAkk) - sad(sdAqk);
-        const LdA B       = b1_addr_p<128>(sScr, lane);
+        // Accumulate each coefficient's rounding residual before its high part.
+        const uint32_t dClo = sad(sClo) - sad(sdAqk), dMlo = sad(sMlo) - sad(sdAqk);
+        const LdA B = b1_addr_p<128>(sScr, lane);
         float2 gp[TB::TPW];
 #pragma unroll
         for (int j = 0; j < TB::TPW; ++j) gp[j] = *reinterpret_cast<const float2*>(sG + bd0[j]);
@@ -1897,16 +1875,22 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
                     a2[j][3] *= f1;
                 }
             }
-            uint32_t af1[4], af2[4], bf_[4];
+            uint32_t al1[4], al2[4], af1[4], af2[4], bf_[4];
             const uint32_t ao = A1.base + bmi * (32u * 64) + ((t << 5) ^ A1.x);
             ldm_x4(af1, ao);
             ldm_x4(af2, ao + dA);
+            ldm_x4(al1, ao + dClo);
+            ldm_x4(al2, ao + dMlo);
 #pragma unroll
             for (int j = 0; j < TB::TPW; j += 2) {
                 ldm_x4t(bf_, B.base + t * (32u * 128) + ((bni[j] ^ B.x) << 4));
+                mma16816p(a1[j], al1, bf_[0], bf_[1]);
                 mma16816p(a1[j], af1, bf_[0], bf_[1]);
+                mma16816p(a2[j], al2, bf_[0], bf_[1]);
                 mma16816p(a2[j], af2, bf_[0], bf_[1]);
+                mma16816p(a1[j + 1], al1, bf_[2], bf_[3]);
                 mma16816p(a1[j + 1], af1, bf_[2], bf_[3]);
+                mma16816p(a2[j + 1], al2, bf_[2], bf_[3]);
                 mma16816p(a2[j + 1], af2, bf_[2], bf_[3]);
             }
         }
@@ -1915,6 +1899,8 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
         // Both products land in one accumulator; only their sum is ever used.
         const LdA A1      = a1_addr<64>(sdAqk, lane);
         const uint32_t dA = sad(sdAkk) - sad(sdAqk);
+        // Accumulate each coefficient's rounding residual before its high part.
+        const uint32_t dClo = sad(sClo) - sad(sdAqk), dMlo = sad(sMlo) - sad(sdAqk);
         const LdA B1      = b1_addr_p<128>(sQcb, lane);
         const uint32_t dB = sad(sScr2) - sad(sQcb);
         float2 gp[TB::TPW];
@@ -1933,18 +1919,24 @@ __launch_bounds__(BNT, 1) void k_bwd(const bf16* __restrict__ q,
                     bb[j][3] *= f1;
                 }
             }
-            uint32_t af1[4], af2[4], bf_[4], bg_[4];
+            uint32_t al1[4], al2[4], af1[4], af2[4], bf_[4], bg_[4];
             const uint32_t ao = A1.base + u * (32u * 64) + a1x<0>(A1.x, bmi);
             ldm_x4t(af1, ao);
             ldm_x4t(af2, ao + dA);
+            ldm_x4t(al1, ao + dClo);
+            ldm_x4t(al2, ao + dMlo);
 #pragma unroll
             for (int j = 0; j < TB::TPW; j += 2) {
                 const uint32_t bo = B1.base + u * (32u * 128) + ((bni[j] ^ B1.x) << 4);
                 ldm_x4t(bf_, bo);
                 ldm_x4t(bg_, bo + dB);
+                mma16816p(bb[j], al1, bf_[0], bf_[1]);
                 mma16816p(bb[j], af1, bf_[0], bf_[1]);
+                mma16816p(bb[j], al2, bg_[0], bg_[1]);
                 mma16816p(bb[j], af2, bg_[0], bg_[1]);
+                mma16816p(bb[j + 1], al1, bf_[2], bf_[3]);
                 mma16816p(bb[j + 1], af1, bf_[2], bf_[3]);
+                mma16816p(bb[j + 1], al2, bg_[2], bg_[3]);
                 mma16816p(bb[j + 1], af2, bg_[2], bg_[3]);
             }
         }

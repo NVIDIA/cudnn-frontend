@@ -38,7 +38,8 @@ arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
-| `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `kimi_delta_attention` (KDA) | fprop, bprop | FP16 | Unverified | Supported | Supported |
+| `kimi_delta_attention` (KDA) | fprop, bprop | BF16 | Supported for the CUDA K=V=128 path below | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -154,6 +155,13 @@ a row alone and inside a batch under the entry's own picks.
   other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
+- SM90 KDA: select `plan_name="kda_hopper_cuda"` with `batch_invariant=True`.
+  The qualified path uses packed THD, K=V=128, BF16 Q/K/V and their gradients,
+  and FP32 activated log gates, beta, states and their gradients. Repeatability
+  and batch invariance include ragged/empty sequences and partial chunks,
+  with initial and final states enabled. Optional input normalization and
+  gate-activation modes, other head dimensions, and other SM90 providers
+  remain unverified. This does not promise equal bytes across architectures.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
