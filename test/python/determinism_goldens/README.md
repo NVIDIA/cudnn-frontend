@@ -34,6 +34,54 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM120 paged vector-copy loop — validation, 2026-11-12 (UTC)
+
+The selected architecture entry `sdpa/frost/test_sdpa_fwd_dsl_sm120.py`
+adds 14 L0 cases under `paged_vector_loop`: eight explicit-plan rebind/capture
+cases for half D128 prefill, D512, D128 decode and half-Q/FP8-KV prefill; four
+D128 M128/N128 repeatability/batch-invariance cases for FP16/BF16 with packed
+or unpacked GQA; and two sustained refill checks. The production change rolls
+the page-copy vector loop without changing its register budget, synchronization
+or arithmetic. It changes no backward path.
+
+The four byte cases preserve O and FP32 Stats across replay, fresh buffers,
+isolated/reordered/duplicated batches, 129-sequence scheduling stress and
+changed neighbors under capture. Inputs are built on CPU and reused across
+batch variants; numerical reference and canary checks are separate. Four
+new runtime records are committed under `c36345d9c3841d69`; no existing golden
+is replaced. Recording followed successful reference and byte checks, then a
+fresh process passed all four with recording disabled. Parent/candidate A/B
+measurements separately preserve identical FROST output bytes on all three
+measured BF16 shapes; no numerical change is intended.
+
+RTX PRO 6000 Blackwell Server Edition (SM120, 188 SMs), Torch 2.14.1+cu130,
+cuDNN 9.30.0.4, CuTe DSL 4.8.0 using CUDA 13.4 and NVRTC 13.4:
+**14 passed, 364 deselected, one warning in 72.47s**; fresh strict goldens:
+**4 passed, 374 deselected, one warning in 24.26s**. The warning is Torch's
+prototype synchronization-debug mode. The frozen source derives from
+`b1034fa93283627d0619685bf7ef93fdaa0d09cd`; source/test hashes and the actual
+import location were checked. SM121 is unverified. GPU-exclusive scheduling
+markers were added after this serial qualification; test bodies are unchanged.
+
+The warm cases use 1,024 CTAs (5.45 per SM), three KV tiles and two refills per
+launch. Each dtype passed 256 warm and 256 shared-memory-poisoned launches
+with zero differing output-storage bytes. The unsafe control failed 200/200
+launches on this GPU. Each block bounds a per-launch failure rate below 1.16%
+at 95% confidence; this is not the helper's 3,000-launch 0.1% bound. The stress
+helper compares a cold byte reference, while an independent numerical check
+runs before stress. This addition has no new sanitizer measurement.
+
+From `test/python`, with recording disabled:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k paged_vector_loop -q -x
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k paged_vector_loop_determinism -q -x
+```
+
 ### SM120 wide partial PackGQA — validation, 2026-11-11 (UTC)
 
 The new L0 cases qualify explicit native forward plans for D512/V512 and
