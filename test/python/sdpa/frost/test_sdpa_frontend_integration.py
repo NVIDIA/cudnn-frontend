@@ -210,17 +210,6 @@ def test_envelope_serves_small_dims_through_one_family_engine():
     torch.testing.assert_close(o_gpu, ref, atol=5e-2, rtol=3e-2)
 
 
-@pytest.mark.skip(
-    reason="graph.set_engine_knobs() was removed with the monkey-patch dispatch layer and has no replacement in this MR. "
-    "Knobs now ride on the plan (engines.base.PlanConfig.knobs) — an engine proposes one entry per knob set and the "
-    "caller picks with select_plan(); re-enable once the SDPA fwd family proposes its SdpaFwdKnobs domain as plans."
-)
-@_SM100
-def test_knob_request_gates_selection():
-    """An unsupported knob request must not silently degrade: the plan carrying
-    it should simply not be in the list (or decline when pinned)."""
-
-
 @_SM100
 def test_no_magic_import_required():
     """Discovery is the library's job: a fresh process that only imports cudnn
