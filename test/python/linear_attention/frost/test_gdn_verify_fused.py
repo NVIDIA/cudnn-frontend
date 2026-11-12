@@ -1207,6 +1207,8 @@ def test_launch_facts_follow_the_part_the_geometry_and_the_launch_knobs(monkeypa
     pair_requests, one_requests = sm_count // (2 * g.V_HEADS), sm_count // g.V_HEADS  # the last requests count of the pair / one-CTA grid
     for requests in sorted({1, 2, 3, 4, 8, 16, max(pair_requests, 1), pair_requests + 1, max(one_requests, 1), one_requests + 1, entry.MAX_REQUESTS}):
         top = k.max_tokens_for(requests)
+        assert k.launch_shape_for(requests) == k.launch_shape_for(requests, kcfg.TOKENS_MIN), "tokens None is the minimum on every part"
+        assert k.form_for(requests) == k.form_for(requests, kcfg.TOKENS_MIN)
         for tokens in sorted({kcfg.TOKENS_MIN, min(6, top), min(9, top), top}):
             cfg = k.cfg_for(requests, tokens)
             shape = k.launch_shape_for(requests, tokens)
