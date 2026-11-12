@@ -529,11 +529,12 @@ def _make_distributed_backward_inputs(
     ep_rank: int,
     ep_size: int,
     device: torch.device,
+    hidden: int = 128,
 ):
     """Build a minimal local/remote/drop case with one empty local expert."""
 
     generator = torch.Generator(device=device).manual_seed(20260828 + ep_rank)
-    local_experts, token_count, hidden, intermediate = 2, 2, 128, 256
+    local_experts, token_count, intermediate = 2, 2, 256
     activation = (
         torch.randn(
             token_count,
@@ -581,6 +582,7 @@ def _make_distributed_backward_inputs(
         device,
         token_count,
         seed=20260901 + ep_rank,
+        hidden_size=hidden,
     )
     return (
         activation,
@@ -636,6 +638,7 @@ def _run_backward_reference_case(
     native_weight_storage_mode: str = "contiguous",
     uneven_token_input: bool = False,
     forward_tuning_kwargs: dict | None = None,
+    hidden: int = 128,
 ) -> None:
     """Run stateless training after the independent distributed oracle."""
 
@@ -647,6 +650,8 @@ def _run_backward_reference_case(
     )
 
     if uneven_token_input:
+        if hidden != 128:
+            raise ValueError("uneven-token training inputs have hidden 128")
         args, grad_output = _make_distributed_uneven_backward_inputs(
             ep_rank,
             ep_size,
@@ -671,6 +676,7 @@ def _run_backward_reference_case(
             ep_rank,
             ep_size,
             device,
+            hidden=hidden,
         )
         max_tokens_per_rank = int(args[0].shape[0])
         physical_recv_pool_rows = 128
@@ -702,7 +708,7 @@ def _run_backward_reference_case(
     op = MoeEp(
         _moe_ep_config(
             num_experts=num_experts,
-            hidden_size=128,
+            hidden_size=hidden,
             intermediate_size=256,
             top_k=2,
             ep_group=ep_group,

@@ -356,6 +356,24 @@ def test_mxfp8_forward_multinode_fc2_bulk_store_matches_reference(torchrun_world
         dist.barrier()
 
 
+@pytest.mark.parametrize("combine_format", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "standalone_warps"])
+def test_stateless_training_multinode_fc2_bulk_store_matches_independent_reference(torchrun_world, token_back_mode, combine_format):
+    world = torchrun_world
+    if world.world_size != 8:
+        pytest.skip(f"EP8 FC2 bulk-store training requires torchrun WORLD_SIZE=8; got WORLD_SIZE={world.world_size}")
+
+    _run_backward_reference_case(
+        device=world.device,
+        ep_group=dist.group.WORLD,
+        ep_rank=world.rank,
+        ep_size=8,
+        combine_format=combine_format,
+        forward_tuning_kwargs={"fc2_bulk_store": "auto", "token_back_mode": token_back_mode},
+        hidden=256,
+    )
+
+
 def test_stateless_training_ep32_uneven_tokens_forward_backward_matches_reference(
     torchrun_world,
 ):
