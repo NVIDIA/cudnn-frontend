@@ -22,10 +22,11 @@ the device, the torch reference and determinism per step shape, every form famil
 each of those geometries."""
 
 import importlib.util
+import json
 import os
 import re
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ cudnn = pytest.importorskip("cudnn")
 from cudnn.linear_attention.frost import gdn_verify_fused as entry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_geometry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_verify_fused_config as kcfg  # noqa: E402
+from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
@@ -1148,6 +1150,149 @@ def test_torch_reference_conditioning_and_padding_bookkeeping():
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
+# host-only: the launch facts (cudnn.frost.launch_facts) -- the symbols of the compiled forms, the form as plain data, the launch shape
+# ---------------------------------------------------------------------------------------------------------------------------
+def _launch_arithmetic(cfg, requests, tokens):
+    """The launch of ``kernel/gdn_verify_fused_f16.py`` restated from the config's FIELDS and its shared-memory ledger: one thread block
+    per (V head, request), two per V head on the two-CTAs-per-head form; 256 threads; the per-token buffers and the ring plus the
+    occupancy pad, at ``tokens`` per request."""
+    grid = (cfg.GEOM.V_HEADS * (2 if cfg.TWO_CTAS_PER_HEAD else 1), requests, 1)
+    return (grid, (kcfg.THREADS, 1, 1), cfg.natural_smem_bytes(tokens) + cfg.smem_pad_bytes(tokens))
+
+
+def _plain_ints(shape):
+    return all(type(v) is int for v in (*shape.grid, *shape.block, shape.shared_memory))
+
+
+def test_launch_facts_equal_the_configuration_arithmetic_at_every_step_shape():
+    """Every served tokens-per-request count (2 .. ``max_tokens_for``) of every requests count up to 32, then of the powers of two up
+    to the grid's limit, on the cc 10.0 readings at 148 SMs (the pick walks its three regimes by requests 4 there; past them the facts
+    move with ``requests`` only through the grid's y extent): the launch shape is the configuration arithmetic of the form ``cfg_for``
+    returns for the step shape, and the form is that config's fields (the geometry nested, ``NORM_FORM`` resolved) plus the requests,
+    the tokens per request and the norm epsilon -- the compile-key facts the config does not hold."""
+    k = entry.GdnVerifyFused("cpu", 1e-6)
+    k.sm_count = 148
+    fields, regimes = {}, set()
+    for requests in [*range(1, 33), *(2**p for p in range(6, 16)), entry.MAX_REQUESTS]:
+        top = k.max_tokens_for(requests)
+        regimes.add(top)
+        for tokens in range(kcfg.TOKENS_MIN, top + 1):
+            cfg = k.cfg_for(requests, tokens)
+            if cfg not in fields:
+                fields[cfg] = asdict(cfg)
+            assert k.launch_shape_for(requests, tokens) == _launch_arithmetic(cfg, requests, tokens), (requests, tokens)
+            assert k.form_for(requests, tokens) == {**fields[cfg], "REQUESTS": requests, "TOKENS": tokens, "EPS": 1e-6}, (requests, tokens)
+        assert k.launch_shape_for(requests) == k.launch_shape_for(requests, kcfg.TOKENS_MIN), "tokens None is the minimum, as in cfg_for"
+        assert k.form_for(requests)["TOKENS"] == kcfg.TOKENS_MIN
+        with pytest.raises(NotImplementedError, match=f"serves at most {top} on this part"):
+            k.launch_shape_for(requests, top + 1)
+    assert len(regimes) == 3 and {(c.TWO_CTAS_PER_HEAD, c.MIN_CTAS_PER_SM, c.NORM_FORM) for c in fields} >= {
+        (True, 1, "ctas2"),
+        (False, 1, "ctas1"),
+        (False, 2, "ctas1"),
+    }
+
+
+@pytest.mark.parametrize("pdl", (None, True))
+@pytest.mark.parametrize("g", [kcfg.DEFAULT_GEOMETRY] + RANK_GEOMETRIES, ids=_gid)
+@pytest.mark.parametrize("reading, sm_count", [(SM100_READING, 148), (SM100_READING, 152), (SM100_READING, 212), (SM120_READING, 170)])
+def test_launch_facts_follow_the_part_the_geometry_and_the_launch_knobs(monkeypatch, reading, sm_count, g, pdl):
+    """The same equality where the pick moves: per part reading and SM count (the device readers stubbed, as an entry on that part reads
+    them -- on a 99 KB opt-in the pick is token-aware), per geometry and with the PDL launch knob, at the requests counts around every
+    switch of the pick ladder and at the grid's limit, for the smallest, a middle and the largest served tokens count.  The shape is
+    asserted against the LIVE pick (``cfg_for``), never against a pick table: a retuned pick moves both sides."""
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: reading)
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: sm_count)
+    k = entry.GdnVerifyFused("cuda:0", 1e-6, geometry=g, pdl=pdl)
+    pair_requests, one_requests = sm_count // (2 * g.V_HEADS), sm_count // g.V_HEADS  # the last requests count of the pair / one-CTA grid
+    for requests in sorted({1, 2, 3, 4, 8, 16, max(pair_requests, 1), pair_requests + 1, max(one_requests, 1), one_requests + 1, entry.MAX_REQUESTS}):
+        top = k.max_tokens_for(requests)
+        for tokens in sorted({kcfg.TOKENS_MIN, min(6, top), min(9, top), top}):
+            cfg = k.cfg_for(requests, tokens)
+            shape = k.launch_shape_for(requests, tokens)
+            assert shape == _launch_arithmetic(cfg, requests, tokens) and _plain_ints(shape), (requests, tokens, shape)
+            assert shape.grid[0] * shape.grid[1] == requests * g.V_HEADS * cfg.CTAS_PER_HEAD and shape.shared_memory <= reading[1]
+            form = k.form_for(requests, tokens)
+            assert form == {**asdict(cfg), "REQUESTS": requests, "TOKENS": tokens, "EPS": 1e-6}, (requests, tokens)
+            assert form["GEOM"] == dict(K_HEADS=g.K_HEADS, V_HEADS=g.V_HEADS, HIDDEN=g.HIDDEN) and form["NORM_FORM"] in kcfg.NORM_FORMS
+            assert (form["PDL"], form["PDL_RELEASE"]) == (bool(pdl), bool(pdl)), "the launch knob is part of the form"
+            assert (form["SMEM_PER_SM_BYTES"], form["SMEM_OPTIN_BYTES"]) == reading, "the part's readings are part of the form"
+
+
+def test_launch_shape_of_the_module_forms_on_the_cc100_readings():
+    """The shapes of two module forms, each given as an explicit ``cfg`` on the cc 10.0 readings: the values a profiler recorded for
+    their launches on a cc 10.0 part (the pair at one request x 6 tokens, the one-CTA form at two requests x 2 tokens; the device cell
+    below repeats the comparison on whatever part runs it), and the shared memory growing with the tokens per request."""
+    pair = entry.GdnVerifyFused("cpu", 1e-6, cfg=kcfg.PAIR_CFG)
+    assert pair.launch_shape_for(1, 6) == ((96, 1, 1), (256, 1, 1), 126512)
+    one = entry.GdnVerifyFused("cpu", 1e-6, cfg=kcfg.CFG)
+    assert one.launch_shape_for(2, 2) == ((48, 2, 1), (256, 1, 1), 210528)
+    grown = [pair.launch_shape_for(1, t).shared_memory for t in range(kcfg.TOKENS_MIN, pair.max_tokens_for(1) + 1)]
+    assert grown == sorted(grown) and len(set(grown)) == len(grown), "every token adds its buffers to the pair's footprint"
+    assert (pair.form_for(1, 6)["NORM_FORM"], pair.form_for(2, 6)["NORM_FORM"]) == ("ctas2", "ctas1"), "the form states the resolved norm association"
+
+
+def test_launch_facts_are_plain_fresh_and_decline_an_unserved_step_shape():
+    """The facts are plain data (ints, a JSON-serialisable form), a fresh object per call (a caller's edit reaches nothing of the entry)
+    and the entry's typed declines for a step shape it does not serve: ``ValueError`` for a requests count below one or off the integers
+    and for a tokens count that is not an int, ``NotImplementedError`` past the grid's limit, below two tokens and past the form's bound."""
+    k = entry.GdnVerifyFused("cpu", 1e-6, pdl=True)
+    form = k.form_for(2, 4)
+    assert json.loads(json.dumps(form)) == form and type(form) is dict and type(form["GEOM"]) is dict
+    form["PDL"], form["GEOM"]["V_HEADS"] = "edited", 0
+    assert k.form_for(2, 4)["PDL"] is True and k.form_for(2, 4)["GEOM"]["V_HEADS"] == kcfg.V_HEADS and k.cfg_for(2, 4).GEOM.V_HEADS == kcfg.V_HEADS
+    assert _plain_ints(k.launch_shape_for(2, 4)) and all(type(k.form_for(2, 4)[name]) is int for name in ("REQUESTS", "TOKENS"))
+    for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
+        for requests in (0, -1, 1.0, "1", None, True):
+            with pytest.raises(ValueError, match="requests must be a positive int"):
+                fact(requests, 4)
+        for tokens in (4.0, "4"):
+            with pytest.raises(ValueError, match="tokens must be an int or None"):
+                fact(2, tokens)
+        with pytest.raises(NotImplementedError, match="at most 65535"):
+            fact(entry.MAX_REQUESTS + 1, 4)
+        with pytest.raises(NotImplementedError, match="serves at least 2 tokens per request"):
+            fact(2, 1)
+        with pytest.raises(NotImplementedError, match=f"serves at most {k.max_tokens_for(2)} on this part"):
+            fact(2, k.max_tokens_for(2) + 1)
+        fact(entry.MAX_REQUESTS, k.max_tokens_for(entry.MAX_REQUESTS))
+
+
+class _CompiledStandIn:
+    """What the entry keeps per compile key, as far as the launch facts read it: a compiled DSL host function carries ``kernel_info``,
+    keyed by the symbols of the kernels it launches."""
+
+    def __init__(self, *symbols):
+        self.kernel_info = {symbol: {} for symbol in symbols}
+
+
+def test_kernel_symbols_are_those_of_the_forms_compiled_for_the_step_shape():
+    """Host-only, with stand-ins in the entry's compile cache: nothing compiled -> an empty tuple; the symbols of every compiled form of
+    THAT step shape in THAT config, in compile order, without repeats (two parameter dtype sets of one step shape are two compiled
+    kernels); a compiled form of another tokens count, another requests count or another config is not named; a compiled object that
+    does not expose its kernels is the typed decline, never a guess."""
+    k = entry.GdnVerifyFused("cpu", 1e-6)
+    k.sm_count = 148
+    assert k.kernel_symbols_for(2, 4) == () and k.kernel_symbols_for(2) == ()
+    ops = make_operands(requests=2, tokens=4)
+    native, fp32 = _key(k, ops), _key(k, dict(ops, dt_bias=ops["dt_bias"].float()))  # another parameter dtype set: another compile key
+    assert native != fp32 and native[:3] == fp32[:3] == (2, 4, k.cfg_for(2, 4))
+    k.compiled[native] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_A_0")
+    assert k.kernel_symbols_for(2, 4) == ("cudnn_kernel_frost_gdn_verify_fused_A_0",)
+    assert k.kernel_symbols_for(2, 6) == () == k.kernel_symbols_for(4, 4) == k.kernel_symbols_for(2), "another step shape names nothing"
+    k.compiled[fp32] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_A_0")
+    assert k.kernel_symbols_for(2, 4) == ("cudnn_kernel_frost_gdn_verify_fused_A_0",), "two dtype sets behind one symbol: named once"
+    k.compiled[fp32] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_B_0")
+    assert k.kernel_symbols_for(2, 4) == ("cudnn_kernel_frost_gdn_verify_fused_A_0", "cudnn_kernel_frost_gdn_verify_fused_B_0")
+    other_cfg = (2, 4, replace(k.cfg_for(2, 4), PDL=True, PDL_RELEASE=True), *native[3:])
+    k.compiled[other_cfg] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_PDL_0")
+    assert "cudnn_kernel_frost_gdn_verify_fused_PDL_0" not in k.kernel_symbols_for(2, 4), "a form the step shape does not run is not named"
+    k.compiled[native] = object()
+    with pytest.raises(NotImplementedError, match="the fused GDN verify step: the installed CuTe DSL .* does not expose the kernel symbols"):
+        k.kernel_symbols_for(2, 4)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
 # device cells
 # ---------------------------------------------------------------------------------------------------------------------------
 def _device_or_skip():
@@ -1758,3 +1903,23 @@ def test_rank_geometry_requests_are_batch_invariant(g):
             if slot > 0:
                 assert torch.equal(snap1["ssm"][slot], snap4["ssm"][slot]), f"{_gid(g)} request {n}: state slot {slot}"
         assert torch.equal(snap1["conv"][int(idx[n, 0])], snap4["conv"][int(idx[n, 0])]), f"{_gid(g)} request {n}: the conv slot"
+
+
+@pytest.mark.parametrize("requests, tokens, pdl", [(1, 6, True), (2, 2, None)], ids=["req1-tok6-pdl", "req2-tok2"])
+def test_launch_facts_equal_the_profilers_record_of_a_launch(requests, tokens, pdl):
+    """On the device: one launch of the entry's pick for the step shape on THIS part (the PDL form at one request x 6 tokens, the plain
+    pick at two requests x 2 tokens) is ONE kernel whose profiler record -- name, grid, block, shared memory -- equals the entry's
+    launch facts; nothing is named before the first compile, and the form states the tokens per request and the launch knob the symbol
+    does not.  The helper synchronises between its warm launch and the recorded one, so the PDL form's predecessor has completed (the
+    config docstring's obligation)."""
+    dev = _device_or_skip()
+    k = entry.GdnVerifyFused(dev, 1e-6, pdl=pdl)
+    if tokens > k.max_tokens_for(requests):
+        pytest.skip(f"this part's shared memory holds at most {k.max_tokens_for(requests)} tokens per request at {requests} requests, not {tokens}")
+    ops = make_operands(requests=requests, tokens=tokens, device=dev, accepted="full")
+    assert k.kernel_symbols_for(requests, tokens) == (), "nothing is compiled yet"
+    record = assert_facts_equal_the_launch(k, lambda: _run(k, ops), requests, tokens, what=entry.NAME)
+    assert record.name.startswith("cudnn_kernel_frost_gdn_verify_fused_"), record.name
+    form = k.form_for(requests, tokens)
+    assert form == {**asdict(k.cfg_for(requests, tokens)), "REQUESTS": requests, "TOKENS": tokens, "EPS": 1e-6}
+    assert (form["PDL"], form["PDL_RELEASE"]) == (bool(pdl), bool(pdl))
