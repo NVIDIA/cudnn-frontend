@@ -63,10 +63,16 @@ launches per dtype, with zero differing output-storage bytes; the unsafe
 control fails 200/200 launches. This corrects the interpretation of the
 total launch grid in the earlier records without changing those measurements.
 
-The new FP8 stress and supplemental FP8 sanitizer executions are pending;
-they are not counted as passes above. An initial supplemental allocation
-exited during GPU inventory before testing. Its replacement preserves the
-one-GPU/architecture/idle checks and prints the failed precondition.
+The supplemental run passes all four half/FP8 warm cases with the same
+256 warm and 256 poisoned launches and the 200/200 unsafe control, plus the
+two FP8 small-page strict-golden cases under each sanitizer, with zero
+errors. Together the runs cover 80 distinct cases and five cases per
+sanitizer; the repeated half controls are not counted as new coverage.
+An initial supplemental allocation exited during GPU inventory before
+testing. The successful replacement preserves the one-GPU/architecture/idle
+checks. Generated PTX confirms that service warps 8 through 11 reach one
+common register-release instruction, with 128 full-barrier arrivals and
+384 participants in the tested M128 tile's K/V reuse barriers.
 
 Measured on RTX PRO 6000 Blackwell Server Edition, 188 SMs, Torch
 2.14.1+cu130, cuDNN 9.30.0.4, CuTe DSL 4.8.0 with actual CUDA 13.4 and
