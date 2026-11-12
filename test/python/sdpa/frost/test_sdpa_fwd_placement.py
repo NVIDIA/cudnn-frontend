@@ -1178,6 +1178,26 @@ def test_sm107_paged_gqa_prefill_leads_inside_its_box():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("cc, sms", [((10, 0), 148), ((10, 3), 160)], ids=["b200", "b300"])
+def test_sm100_paged_mixed_full_squares_lead(cc, sms):
+    """Study sm100_paged_full_prefill_20261112: mixed-length full prefills (Q = KV) lead for d128 GQA 4 / 8 to b 32, S 512-16384,
+    pages 16 / 64, and for d256 MHA to b 8; d128 MHA / group 2 and d64 keep the backend."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    base = dict(b=8, s_q=2048, s_kv=2048, bottom_right=False, max_total_seq_len_q=None, device_cc=cc, device_sm_count=sms)
+    place = lambda **over: placement.place(spec, _sm107_paged_facts(**{**base, **over}))
+    for h_q, h_kv, over in ((32, 8, {}), (64, 8, dict(b=32, s_q=512, s_kv=512, page_size=64)), (32, 8, dict(b=16, s_q=16384, s_kv=16384))):
+        assert place(h_q=h_q, h_kv=h_kv, **over) == placement.LEAD, (h_q, h_kv, over)
+    assert place(h_q=16, h_kv=16, d_qk=256, d_v=256) == placement.LEAD
+    assert place(h_q=16, h_kv=16, d_qk=256, d_v=256, b=9) == placement.TRAIL
+    assert place(h_q=32, h_kv=8, b=33) == placement.TRAIL
+    assert place(h_q=32, h_kv=8, page_size=32) == placement.TRAIL
+    for h_q, h_kv, d in ((40, 40, 128), (32, 16, 128), (32, 8, 64)):
+        assert not placement._sm100_paged_full_square(_sm107_paged_facts(**{**base, "h_q": h_q, "h_kv": h_kv, "d_qk": d, "d_v": d})), (h_q, h_kv, d)
+
+
+@pytest.mark.L0
 def test_sm100_paged_full_square_leads_inside_its_box():
     """cc 10.0 and cc 10.3 paged bf16 d128 full prefill squares lead for GQA 4/8/16, 1024 <= S <= 8192; MHA / group 2 keep the
     backend."""
@@ -1194,7 +1214,8 @@ def test_sm100_paged_full_square_leads_inside_its_box():
     # A square is placed as its bottom-right twin, so the packed full-prefill box (Q from 512, cc 10.0 / 10.3) leads it too.
     assert place(h_q=16, h_kv=4, s_q=512, s_kv=512) == placement.LEAD
     assert place(h_q=16, h_kv=4, device_cc=(10, 3), device_sm_count=160) == placement.LEAD
-    assert place(h_q=8, h_kv=1, b=1, s_q=16384, s_kv=16384) == placement.TRAIL
+    assert place(h_q=8, h_kv=1, b=1, s_q=16384, s_kv=16384) == placement.LEAD  # study sm100_paged_full_prefill_20261112
+    assert place(h_q=8, h_kv=1, b=1, s_q=16385, s_kv=16385) == placement.TRAIL
     assert place(h_q=16, h_kv=8, device_cc=(10, 3), device_sm_count=160) == placement.TRAIL  # group 2 on cc 10.3 too
 
 

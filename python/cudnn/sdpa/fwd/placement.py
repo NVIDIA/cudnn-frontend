@@ -393,6 +393,10 @@ cases through the inference harness's paged context phase, exact and undeclared 
 admitted, the default dispatch ran 0.47-0.60 of the backend's time on the 18 full squares, 0.60-0.95 on the 16 GQA16
 chunks and 0.79-0.95 on the 10 undeclared GQA 4 / 8 chunks. No case was slower than develop's default. The squares'
 margin is the backend's: its engine 10 is slow at lengths off the 128 tile, and four on-tile probe squares ran 0.86-0.92.
+Mixed-length full squares (study sm100_paged_full_prefill_20261112: FlashInfer's exact paged declaration, each request
+Q = KV under the declared S, 160 train cells on B200 at cuDNN 9.24 and 9.30): d128 GQA 4 / 8 lead to b 32, S 512-16384,
+pages 16 / 64 (FROST / backend 0.63-0.92 on 9.24, 0.71-0.995 on 9.30); d256 MHA leads to b 8 (0.46-0.75). D128 MHA / group 2
+and d64 stay near parity and keep the backend.
 :func:`place` reads a square causal mask as bottom-right (the same tiles), so
 GQA 4 / 8 squares also take the packed full-prefill lead (#1809) from S = 512 and on cc 10.3 / page 64: 80 top-left
 squares (S 512-8192, page 16 / 64, b 1 / 3, cuDNN 9.29.0.18) ran FROST at 0.45-0.98 of the backend on a B100 and
@@ -588,6 +592,11 @@ SM100_PAGED_D128_PREFIX_Q = (16, 2048)
 SM100_PAGED_D128_PREFIX_MAX_KV = 131072
 SM100_PAGED_D128_PREFIX_PAGES = (16, 64)
 SM100_PAGED_D128_PREFILL_CCS = ((10, 0), (10, 3))  # the paged bf16 d128 GQA prefill / full-square leads: measured on both parts
+# Paged full squares widened by study sm100_paged_full_prefill_20261112 (module docstring): d128 GQA 4 / 8 and d256 MHA.
+SM100_PAGED_FULL_SQUARE_S = (512, 16384)
+SM100_PAGED_FULL_SQUARE_PAGES = (16, 64)
+SM100_PAGED_FULL_SQUARE_GQA_MAX_B = 32
+SM100_PAGED_FULL_SQUARE_D256_MHA_MAX_B = 8
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
 SM107_PAGED_GQA_LONG_CHUNK_MAX_S_Q = 4096  # Rubin paged GQA long-prefix chunks: the measured query range ends here
 SM107_PAGED_GQA_LONG_CHUNK_MIN_KV = 6144  # ... and the cache range starts here (module docstring)
@@ -1084,24 +1093,27 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _sm100_paged_full_square(facts) -> bool:
-    """cc 10.0 / 10.3 paged bf16 d128 full prefill (Q = KV), page 16, head-major in-page K (module docstring)."""
+    """cc 10.0 / 10.3 paged bf16 full prefill (Q = KV), head-major in-page K (module docstring): d128 GQA16 (b <= 4, S 1024-8192,
+    page 16), d128 GQA 4 / 8 and d256 MHA (``SM100_PAGED_FULL_SQUARE_*``)."""
     group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
-    return (
+    if not (
         facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
         and facts.dtype == cudnn.data_type.BFLOAT16
-        and (facts.d_qk, facts.d_v) == (128, 128)
-        and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
         and facts.s_q == facts.s_kv
-        and group in (4, 8, 16)
-        and 1024 <= facts.s_q <= 8192
-        and facts.page_size == 16
         and facts.causal
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
-    )
+    ):
+        return False
+    wide = SM100_PAGED_FULL_SQUARE_S[0] <= facts.s_q <= SM100_PAGED_FULL_SQUARE_S[1] and facts.page_size in SM100_PAGED_FULL_SQUARE_PAGES and facts.b >= 1
+    if (facts.d_qk, facts.d_v) == (128, 128):
+        if group == 16:
+            return 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B and 1024 <= facts.s_q <= 8192 and facts.page_size == 16
+        return group in (4, 8) and wide and facts.b <= SM100_PAGED_FULL_SQUARE_GQA_MAX_B
+    return (facts.d_qk, facts.d_v) == (256, 256) and group == 1 and wide and facts.b <= SM100_PAGED_FULL_SQUARE_D256_MHA_MAX_B
 
 
 def _sm100_paged_gqa_prefill(facts) -> bool:
