@@ -906,15 +906,46 @@ def test_the_traced_pass_is_read_from_kernel_activity_records():
     assert "rate                  not printed for a reduced model" in reduced.text() and "bytes per step        reduced model: model 17.92 GB" in reduced.text()
 
 
-def test_a_session_traces_only_what_it_recorded_and_keeps_its_run():
+def test_a_session_traces_only_what_it_recorded_and_keeps_its_run(monkeypatch):
+    """The traced pass replays the recorded inputs from a zero state on a record of its own and puts the run's state and
+    record back, also when a step under the profiler raises.  A stand-in for the profiler runs the steps here, on the CPU."""
+    from model_samples import loop
+    from model_samples.timing import Trace
+
     session, text = _tiny_session(sequences=1)
     session.trace()
     assert session.report().trace is None and session.report().trace_missing == "needs a recorded step on a CUDA device", "nothing recorded, and no GPU here"
     assert "traced pass           not available: needs a recorded step on a CUDA device" in session.report().text()
     ids = session.prefill([text.encode("abc")])
-    state, record, position = session.state, session.record, session.state.position
+    state, record, position, calls = session.state, session.record, session.state.position, session._calls
     session.trace(2)
+    assert session.report().trace is None and session.report().trace_missing == "needs a recorded step on a CUDA device", "three steps recorded, no GPU"
     assert session.state is state and session.record is record and session.state.position == position == 3 and session.record.count == 3
+
+    seen = []
+
+    def profiled(step, count, device=None):
+        seen.append((session.state is state, session.record is record, session.state.position, session.record.count))
+        for i in range(count):
+            step(i)
+        seen.append((session.state.position, session.record.count, session.record.inputs.shape[0]))
+        return Trace(count, 1.0, 2.0, 3, 4, 5.0), ""
+
+    monkeypatch.setattr(loop, "trace_steps", profiled)
+    session.trace(2)
+    assert seen == [(False, False, 0, 0), (2, 2, 0)], "the traced steps start from a zero state at position 0, on a record that keeps nothing"
+    assert session.state is state and session.record is record and session.state.position == 3 and session.record.count == 3, "the run is put back"
+    assert session._calls == calls and session.report().trace.kernels == 3 and session.report().trace_missing == ""
+
+    def failing(step, count, device=None):
+        step(0)
+        raise RuntimeError("a step failed under the profiler")
+
+    monkeypatch.setattr(loop, "trace_steps", failing)
+    with pytest.raises(RuntimeError, match="a step failed under the profiler"):
+        session.trace(2)
+    assert session.state is state and session.record is record and session.state.position == 3 and session.record.count == 3, "also when a step raises"
+    assert session._calls == calls
     assert session.report().bytes == session.model.bytes_per_step(1, 3), "the report carries the bytes of a step at the position the run reached"
     session.new_report()
     assert session.report().trace_missing == "" and session.report().calls_per_step == 20 and not session.report().text_path, "a fresh report per prompt set"

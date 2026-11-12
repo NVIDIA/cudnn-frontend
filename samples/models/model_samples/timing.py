@@ -150,12 +150,16 @@ def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, flo
     return steps
 
 
-def trace_steps(step: Callable[[int], None], count: int) -> Tuple[Optional[Trace], str]:
+def trace_steps(step: Callable[[int], None], count: int, device=None) -> Tuple[Optional[Trace], str]:
     """Run ``step(i)`` for ``i`` in ``range(count)`` under the PyTorch profiler with kernel activity records only and return
-    ``(Trace, "")``, or ``(None, reason)`` where the records cannot be had.  ``step`` ends in the loop's one host read."""
+    ``(Trace, "")``, or ``(None, reason)`` where the records cannot be had.  ``step`` ends in the loop's one host read.
+    ``device`` is the device the steps run on, where the caller knows it: there are kernel activity records of a CUDA
+    device only, and no step is run for another."""
     import torch
     from torch.profiler import ProfilerActivity, profile
 
+    if device is not None and torch.device(device).type != "cuda":
+        return None, "needs a recorded step on a CUDA device"
     if ProfilerActivity.CUDA not in torch.profiler.supported_activities():
         return None, "this PyTorch build records no kernel activity"
 

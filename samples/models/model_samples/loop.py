@@ -235,14 +235,14 @@ class Session:
         profiler, each step ending in the host read of its ids, as in the loop.  The run's own state and record are put
         back afterwards.  Where kernel activity records cannot be had the report says why."""
         count = min(steps, self.record.count, self.record.inputs.shape[0])
-        if count < 1 or self.device.type != "cuda":
+        if count < 1:
             self._report.trace_missing = "needs a recorded step on a CUDA device"
             return
         inputs, kept, calls = self.record.inputs[:count], (self.state, self.record), self._calls
         self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
         self.record = Record(0, self.sequences, self.model.geometry.vocab, self.device)
-        try:
-            self._report.trace, self._report.trace_missing = trace_steps(lambda i: self._advance(inputs[i]).tolist(), count)
+        try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
+            self._report.trace, self._report.trace_missing = trace_steps(lambda i: self._advance(inputs[i]).tolist(), count, self.device)
         finally:
             (self.state, self.record), self._calls = kept, calls
 
