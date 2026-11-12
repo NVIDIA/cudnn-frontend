@@ -255,12 +255,17 @@ def _save_safetensors(path: Path, tensors: dict) -> None:
 
 
 def _write_checkpoint(directory: Path, tensors: dict, config: dict, shards: int = 2) -> Path:
+    """A checkpoint directory as a sharded checkpoint is published: numbered shards, the index file that maps every tensor to
+    its shard, ``config.json``."""
     directory.mkdir(parents=True, exist_ok=True)
     for old in directory.glob("*.safetensors"):
         old.unlink()
-    names = sorted(tensors)
+    names, where = sorted(tensors), {}
     for index in range(shards):
-        _save_safetensors(directory / f"model-{index + 1:05d}-of-{shards:05d}.safetensors", {name: tensors[name] for name in names[index::shards]})
+        shard = f"model-{index + 1:05d}-of-{shards:05d}.safetensors"
+        _save_safetensors(directory / shard, {name: tensors[name] for name in names[index::shards]})
+        where.update({name: shard for name in names[index::shards]})
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": where}))
     (directory / "config.json").write_text(json.dumps(config))
     return directory
 
@@ -295,8 +300,14 @@ def test_a_safetensors_header_is_read_without_its_tensors(tmp_path):
     raw = json.dumps(header).encode()
     path = tmp_path / "shard.safetensors"
     path.write_bytes(struct.pack("<Q", len(raw)) + raw)  # the header alone: the ten bytes of tensors are not there, and are not asked for
-    tensors, read = read_header(str(path))
+    tensors, read, data_bytes = read_header(str(path))
     assert tensors == {"w": ("F8_E4M3", (2, 3)), "s": ("F32", ())} and read == raw
+    assert data_bytes == 10, "where the last tensor ends: a whole file holds 8 + the header + this many bytes"
+
+    def entry(offsets):
+        body = json.dumps({"w": {"dtype": "F32", "shape": [1], **offsets}}).encode()
+        return struct.pack("<Q", len(body)) + body
+
     for name, content in (
         ("short.safetensors", b"abc"),
         ("text.safetensors", b"this is not a tensor file at all"),
@@ -304,6 +315,10 @@ def test_a_safetensors_header_is_read_without_its_tensors(tmp_path):
         ("list.safetensors", struct.pack("<Q", 6) + b"[1, 2]"),  # JSON, but not a header
         ("entry.safetensors", struct.pack("<Q", 24) + b'{"w": {"dtype": "F32"}} '),  # an entry without a shape
         ("number.safetensors", struct.pack("<Q", 8) + b'{"w": 3}'),
+        ("nowhere.safetensors", entry({})),  # an entry that does not say where its bytes are
+        ("backwards.safetensors", entry({"data_offsets": [4, 0]})),
+        ("fraction.safetensors", entry({"data_offsets": [0, 4.0]})),
+        ("cut.safetensors", (struct.pack("<Q", len(raw)) + raw)[:-9]),  # a file that ends inside its header
     ):
         (tmp_path / name).write_bytes(content)
         with pytest.raises(ValueError, match=f"{name} is not a safetensors file") as refusal:
@@ -522,9 +537,9 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
 
 
 def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_traceback(tmp_path, monkeypatch, capsys):
-    """A directory that is not one, a hub name, a file that is not what its name says, messages the template cannot render,
-    options that are not options, a tokenizer of another model and a place that cannot be written: each is one ``[00] ERROR``
-    line with exit code 1, before the plan, and none names a local path."""
+    """A directory that is not one, a hub name, a file that is not what its name says, a copy of a checkpoint that is not
+    whole, messages the template cannot render, options that are not options, a tokenizer of another model and a place that
+    cannot be written: each is one ``[00] ERROR`` line with exit code 1, before the plan, and none names a local path."""
     sample, directory = _sample_on_stated_facts(tmp_path, monkeypatch, [8 * 1024**3])
     import tokenizers
     from tokenizers import models
@@ -580,6 +595,32 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
     (directory / "a.safetensors").mkdir()  # a shard that cannot be opened: the system's error, with the file's own name
     assert last(model) == (1, "[00] ERROR a.safetensors: Is a directory")
     (directory / "a.safetensors").rmdir()
+    # a copy that is not whole -- a shard cut short, one that holds its header alone, one with bytes its header does not
+    # describe, one that is not there -- is an error that names the shard, before the plan: not a traceback in the load
+    header_alone = kept[: 8 + struct.unpack("<Q", kept[:8])[0]]
+    for content in (kept[:-3], header_alone, kept + b"\0"):
+        shard.write_bytes(content)
+        sizes = f"{shard.name} holds {len(content):,} bytes where its header describes {len(kept):,}: an incomplete or damaged copy"
+        assert last(model) == (1, f"[00] ERROR --model tiny-checkpoint: {sizes}")
+    shard.unlink()
+    gone = f"[00] ERROR --model tiny-checkpoint: {shard.name} is not there: an incomplete copy of the checkpoint"
+    assert last(model) == (1, gone), "the index file lists it, and the numbering of the shard that is there implies it"
+    index = directory / "model.safetensors.index.json"
+    listed = index.read_text()
+    index.unlink()
+    assert last(model) == (1, gone), "without the index file: the numbering alone"
+    other = sorted(directory.glob("*.safetensors"))[0]
+    other.rename(directory / "weights.safetensors")
+    index.write_text(json.dumps({"weight_map": {"a": "weights.safetensors", "b": shard.name, "c": "third.safetensors"}}))
+    two = f"[00] ERROR --model tiny-checkpoint: {shard.name} is not there (and 1 more): an incomplete copy of the checkpoint"
+    assert last(model) == (1, two), "shards without numbers: the index file alone"
+    for content, sentence in (("{not json", "is not a JSON file ("), (json.dumps({"weight_map": [1]}), "does not hold a weight map (")):
+        index.write_text(content)
+        code, line = last(model)
+        assert code == 1 and line.startswith(f"[00] ERROR --model tiny-checkpoint: model.safetensors.index.json {sentence}"), line
+    (directory / "weights.safetensors").rename(other)
+    index.write_text(listed)
+    shard.write_bytes(kept)
     words = tokenizers.Tokenizer(models.WordLevel({f"w{index}": index for index in range(300)}, unk_token="w0"))
     words.save(str(directory / "tokenizer.json"))
     mismatch = "the tokenizer has 300 ids, the model's embedding table 272 rows: not the tokenizer of this checkpoint"

@@ -22,8 +22,10 @@ make the midpoint choices of another quantiser.
 on neither the device nor the load order.
 
 ``Checkpoint.describe(directory)`` reads a checkpoint from local disk in two steps.  The description reads ``config.json``
-and the header of every ``*.safetensors`` shard -- names, dtypes, shapes -- and no tensor, so a sample can plan, state its
-memory need and decline before it reads a byte of weights.  A family then binds its tensor list to the description
+and the header of every ``*.safetensors`` shard -- names, dtypes, shapes, offsets -- and no tensor, so a sample can plan,
+state its memory need and decline before it reads a byte of weights.  It also checks that the copy is whole: every shard
+the index file lists (or the shards' numbering implies) is there, and every shard holds exactly the bytes its header
+describes; a cut download is an error here, not in the middle of a load.  A family then binds its tensor list to the description
 (``bind``), which checks every tensor's presence, storage format and shape; ``load`` reads one tensor through the
 ``safetensors`` library (no pickle, nothing executed), imported here and nowhere else.  The layout read is the one the
 quantised open-weight checkpoints of this family use:
@@ -41,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import struct
 import zlib
 from dataclasses import dataclass
@@ -261,8 +264,10 @@ REQUIREMENTS = "samples/models/requirements.txt"
 
 
 def read_header(path: str) -> tuple:
-    """The header of one safetensors file: ``(tensors, raw header bytes)`` with ``tensors`` name -> ``(dtype, shape)``.
-    The format is public: eight bytes of little-endian header length, then that many bytes of JSON; no tensor is read."""
+    """The header of one safetensors file: ``(tensors, raw header bytes, data bytes)`` with ``tensors`` name -> ``(dtype,
+    shape)`` and ``data bytes`` the end of the last tensor the header describes, counted from the end of the header.  The
+    format is public: eight bytes of little-endian header length, then that many bytes of JSON, then the tensors; a
+    complete file holds exactly ``8 + header length + data bytes`` bytes.  No tensor is read."""
     with open(path, "rb") as f:
         first = f.read(8)
         if len(first) != 8:
@@ -277,14 +282,46 @@ def read_header(path: str) -> tuple:
         raise ValueError(f"{os.path.basename(path)} is not a safetensors file ({error})") from error
     if not isinstance(header, dict):
         raise ValueError(f"{os.path.basename(path)} is not a safetensors file (its header is not a JSON object)")
-    tensors = {}
+    tensors, data_bytes = {}, 0
     for name, entry in header.items():
         if name == "__metadata__":
             continue
         if not isinstance(entry, dict) or not isinstance(entry.get("dtype"), str) or not isinstance(entry.get("shape"), list):
             raise ValueError(f"{os.path.basename(path)} is not a safetensors file (header entry {name!r} has no dtype and shape)")
+        offsets = entry.get("data_offsets")
+        if not isinstance(offsets, list) or len(offsets) != 2 or not all(type(o) is int for o in offsets) or not 0 <= offsets[0] <= offsets[1]:
+            raise ValueError(f"{os.path.basename(path)} is not a safetensors file (header entry {name!r} has no data offsets)")
         tensors[name] = (entry["dtype"], tuple(entry["shape"]))
-    return tensors, raw
+        data_bytes = max(data_bytes, offsets[1])
+    return tensors, raw, data_bytes
+
+
+#: the index file a sharded checkpoint carries beside its shards, and the way its shards are numbered
+INDEX_FILE = "model.safetensors.index.json"
+_NUMBERED_SHARD = re.compile(r"(.*)-(\d+)-of-(\d+)\.safetensors")
+
+
+def _missing_shards(directory: str, shards: Iterable[str]) -> list:
+    """The shards a checkpoint directory should hold and does not: those its index file lists, and the gaps in shards
+    numbered ``-00001-of-00003``.  A ``ValueError`` where the index file is not what its name says."""
+    present, wanted = set(shards), set()
+    index = os.path.join(directory, INDEX_FILE)
+    if os.path.isfile(index):
+        try:
+            with open(index, encoding="utf-8") as f:
+                listed = json.load(f)
+        except ValueError as error:
+            raise ValueError(f"{INDEX_FILE} is not a JSON file ({error})") from None
+        files = listed.get("weight_map") if isinstance(listed, dict) else None
+        if not isinstance(files, dict) or not all(isinstance(name, str) for name in files.values()):
+            raise ValueError(f"{INDEX_FILE} does not hold a weight map (tensor name -> shard file)")
+        wanted.update(files.values())
+    for name in present:
+        numbered = _NUMBERED_SHARD.fullmatch(name)
+        if numbered and 0 < int(numbered.group(3)) <= 10000:
+            stem, digits, of = numbered.groups()
+            wanted.update(f"{stem}-{number:0{len(digits)}d}-of-{of}.safetensors" for number in range(1, int(of) + 1))
+    return sorted(wanted - present)
 
 
 class Checkpoint:
@@ -309,8 +346,10 @@ class Checkpoint:
         """``config.json`` and the shard headers of a checkpoint directory on local disk; no tensor is read.
 
         Raises ``NotImplementedError`` (a SKIP that names the fix) when the ``safetensors`` package is missing, and
-        ``ValueError`` when the directory is not a checkpoint.  ``manifest_hash`` identifies the checkpoint's layout: a
-        SHA-256 over every shard's name, size and header bytes (tensor names, dtypes, shapes, offsets), not over its values."""
+        ``ValueError`` when the directory is not a checkpoint or not a whole one: a shard its index file lists (or its
+        numbering implies) is not there, or a shard does not hold the bytes its header describes.  ``manifest_hash``
+        identifies the checkpoint's layout: a SHA-256 over every shard's name, size and header bytes (tensor names, dtypes,
+        shapes, offsets), not over its values."""
         try:
             from safetensors import safe_open  # noqa: F401  the reader of ``_read``; imported here so that its absence declines before the plan
         except ImportError as error:
@@ -329,13 +368,22 @@ class Checkpoint:
         shards = sorted(name for name in os.listdir(directory) if name.endswith(".safetensors"))
         if not shards:
             raise ValueError(f"--model {shown}: no *.safetensors shard there")
+        try:
+            missing = _missing_shards(directory, shards)
+        except ValueError as error:
+            raise ValueError(f"--model {shown}: {error}") from None
+        if missing:
+            more = f" (and {len(missing) - 1} more)" if len(missing) > 1 else ""
+            raise ValueError(f"--model {shown}: {missing[0]} is not there{more}: an incomplete copy of the checkpoint")
         self = cls((), 0, "native", f"checkpoint {shown} (local)")
         self.synthetic_weights, self.config, self._directory = False, config, directory
         digest = hashlib.sha256()
         for shard in shards:
             path = os.path.join(directory, shard)
-            tensors, raw = read_header(path)
-            size = os.path.getsize(path)
+            tensors, raw, data_bytes = read_header(path)
+            size, described = os.path.getsize(path), 8 + len(raw) + data_bytes
+            if size != described:  # the reader asks for an exact cover: a cut download, or a copy that stopped early
+                raise ValueError(f"--model {shown}: {shard} holds {size:,} bytes where its header describes {described:,}: an incomplete or damaged copy")
             self.files[shard] = size
             digest.update(shard.encode() + b"\0" + str(size).encode() + b"\0" + raw)
             for name, (dtype, shape) in tensors.items():
