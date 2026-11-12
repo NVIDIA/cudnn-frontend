@@ -193,7 +193,7 @@ def _paged_pool(args, kv_lens, make):
     pages = (kv_lens + ps - 1) // ps
     total = int(pages.sum())
     perm = torch.randperm(total, generator=torch.Generator().manual_seed(1)).to(torch.int32)
-    table = torch.zeros(len(kv_lens), int(pages.max()), dtype=torch.int32)
+    table = torch.zeros(len(kv_lens), block_table_pages(args, kv_lens), dtype=torch.int32)
     start = 0
     for i, n in enumerate(pages.tolist()):
         table[i, :n] = perm[start : start + n]
@@ -206,6 +206,11 @@ def _paged_pool(args, kv_lens, make):
 def declared_max_kv(args, kv_lens):
     """The KV maximum a paged graph declares: the row's ``kv_len``, as FlashInfer's ``max_sequence_kv``, not the drawn lengths'."""
     return max(int(args.kv_len), int(kv_lens.max()))
+
+
+def block_table_pages(args, kv_lens):
+    """Pages per request in the direct graph's block table: cuDNN checks the table against the declared KV maximum."""
+    return -(-declared_max_kv(args, kv_lens) // args.page_size)
 
 
 def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
