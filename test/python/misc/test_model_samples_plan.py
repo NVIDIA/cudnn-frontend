@@ -148,20 +148,25 @@ def test_an_older_package_without_the_decode_step_is_a_skip_that_names_the_fix(m
 
 
 def test_memory_sentence_on_stated_device_facts():
+    from model_samples.blocks import DeviceFacts
     from model_samples.qwen_dense import QwenDense, configs
 
     model = QwenDense.reduced(2)
     need = model.memory_bytes(sequences=4, capacity=64)
     assert 3.5 * GIB < need < 4.5 * GIB, "1.70 GiB of bf16 copies, the state of 4 sequences and 2 GiB of working memory"
-    assert _plan().memory(need).startswith("this stack needs about 3.") and "80.0 GB are free" in _plan().memory(need)
+    assert _plan().memory(need).startswith("this stack needs about 3.") and "80.0 GiB are free" in _plan().memory(need)
     reserve = configs.FIRST_LAUNCH_RESERVE["cc12.x"]
     assert _plan(cc=(12, 0)).reserve_bytes() == reserve and _plan().reserve_bytes() == 0
     assert _plan(cc=(12, 0))["linear_attention.step"].first_launch() == {}, "nothing is launched by a plan: no measurement yet"
     assert _plan()["mlp.down"].first_launch() == {}, "a block that measures no launch reports none"
     small = _plan(cc=(12, 0))
     small.facts = _facts((12, 0), free=5 * GIB)
-    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 6\.\d GB on this GPU; 5.0 GB are free: free memory"):
+    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 6\.\d GiB on this GPU; 5.0 GiB are free: free memory"):
         small.memory(need)
+    small.facts = DeviceFacts((12, 0), "stated device", 170, 4 * GIB, 3 * GIB)  # a GPU that has less in total than the run needs
+    with pytest.raises(NotImplementedError, match=r"needs about 6\.\d GiB on this GPU; this GPU has 4.0 GiB in total: the run does not fit on it") as skip:
+        small.memory(need)
+    assert "free memory on this GPU" not in str(skip.value), "freeing memory cannot help there, and the sentence does not ask for it"
 
 
 def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
@@ -185,13 +190,13 @@ def test_every_count_of_a_run_is_planned_before_the_first_load(monkeypatch):
     assert later[0].plan is not None and later[0].plan.sequences == 4, "the later count is planned with the first one"
     need = model.memory_bytes(1, 58) + model.state_bytes(4, 58) + configs.FIRST_LAUNCH_RESERVE["cc12.x"]
     assert need < 7 * GIB, "the copies and the working memory are counted once for the run, the first launch once"
-    assert f"this stack needs about {need / GIB:.1f} GB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GB are free" in table
+    assert f"this stack needs about {need / GIB:.1f} GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in table
     assert "one count after the other" not in run(4)[1], "one count: the sentence of that count"
     with pytest.raises(NotImplementedError, match="serves rows 1-65,535; this run has 70000 sequences"):
         run(1, 70000)
     free[0] = 6 * GIB
     with pytest.raises(
-        NotImplementedError, match=r"needs about 6\.\d GB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GB are free: free memory"
+        NotImplementedError, match=r"needs about 6\.\d GiB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GiB are free: free memory"
     ):
         run(1, 4)
 
@@ -244,14 +249,16 @@ def test_the_sample_declines_before_its_first_load_and_checks_the_gpu_before_the
         code == 0 and out.splitlines()[-1] == "[00] SKIP cudnn.GdnDecodeFused serves rows 1-65,535; this run has 70000 sequences x 1 tokens per sequence"
     ), out
     code, out = _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=6 * GIB)
-    skip = "[00] SKIP stack fe-cublas needs about 6.7 GB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GB are free: free memory on this GPU"
+    skip = (
+        "[00] SKIP stack fe-cublas needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 6.0 GiB are free: free memory on this GPU"
+    )
     assert code == 0 and out.splitlines()[-1].startswith(skip), out
     code, out = _sample_main(monkeypatch, capsys, ["--provider", "mlp.down=nothing"])
     assert code == 1 and out.splitlines()[-1].startswith("[00] ERROR --provider mlp.down=nothing: not a declared row"), out
     with pytest.raises(AssertionError, match="reached a load"):
         _sample_main(monkeypatch, capsys, [], cc=(12, 0), free=8 * GIB)
     out = capsys.readouterr().out
-    assert "this stack needs about 6.7 GB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GB are free" in out
+    assert "this stack needs about 6.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 8.0 GiB are free" in out
     assert "[00] cuDNN Frontend 1.33.0 (editable checkout, source hash 0123456789ab; distribution 1.33.0)" in out and "SKIP" not in out
 
 
@@ -843,11 +850,14 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     text = model_samples.TextIO.synthetic(model.geometry.vocab)
     free = [31 * GIB]
     monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((12, 0), "stated device", 170, 0, free[0])))
-    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 55\.\d GB on this GPU; 31.0 GB are free: free memory on this GPU"):
+    with pytest.raises(NotImplementedError, match=r"stack fe-cublas needs about 55\.\d GiB on this GPU; 31.0 GiB are free: free memory on this GPU"):
         model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
+    card = blocks.plan(model.provider_table, model.regimes, blocks.DeviceFacts((12, 0), "stated device", 170, int(31.84 * GIB), 31 * GIB), 1, model=model)
+    with pytest.raises(NotImplementedError, match=r"needs about 55\.\d GiB on this GPU; this GPU has 31.8 GiB in total: the run does not fit on it"):
+        card.memory(need)  # the same card with its total stated: the sentence says that no freeing helps
     free[0] = 80 * GIB
     table = model_samples.Session(model, text, sequences=1, device="cuda:0", capacity=343).plan_table()
-    assert "this stack needs about 55." in table and "80.0 GB are free" in table and "add_norm_quantize        129" in table and "48 / 16" in table
+    assert "this stack needs about 55." in table and "80.0 GiB are free" in table and "add_norm_quantize        129" in table and "48 / 16" in table
 
 
 def test_the_checks_of_a_long_run_cover_its_first_steps_and_print_a_second_reference():

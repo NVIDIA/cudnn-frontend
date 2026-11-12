@@ -514,13 +514,15 @@ def test_the_sample_states_its_memory_need_for_a_checkpoint_before_it_reads_a_te
     out = capsys.readouterr().out
     assert code == 0 and str(tmp_path) not in out, out
     assert out.splitlines()[0].startswith("[00] qwen_dense decode | checkpoint tiny-checkpoint (local): 2 shards, ") and "manifest hash" in out
-    skip = "[00] SKIP stack fe-cublas needs about 2.0 GB on this GPU for 1 and 2 sequences, one count after the other; 1.0 GB are free: free memory on this GPU"
+    skip = (
+        "[00] SKIP stack fe-cublas needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other; 1.0 GiB are free: free memory on this GPU"
+    )
     assert out.splitlines()[-1].startswith(skip), out
     free[0] = 8 * 1024**3
     with pytest.raises(AssertionError, match="reached a load"):
         sample.main(arguments)
     out = capsys.readouterr().out
-    assert "this stack needs about 2.0 GB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GB are free" in out and "SKIP" not in out
+    assert "this stack needs about 2.0 GiB on this GPU for 1 and 2 sequences, one count after the other; 8.0 GiB are free" in out and "SKIP" not in out
     assert "stack fe-cublas, 1 sequence, cc 10.0" in out and "[00] tokenizer and chat template of checkpoint tiny-checkpoint" in out
     monkeypatch.setitem(sys.modules, "safetensors", None)  # as if the package were not installed
     code = sample.main(arguments)

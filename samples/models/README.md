@@ -104,18 +104,18 @@ no rate. None of it is a measurement of record: no clock is locked, and the stac
 | line | definition |
 |---|---|
 | header | the model (the reductions of the default run, or the checkpoint's directory name, shard count, size and manifest hash), the GPU, the sequence counts, the stack; the `cudnn` version, editable checkout or wheel, a source hash, the installed distribution; the reference's accumulation precision |
-| `served by` | per block: calls per step, provider, entry, the rows the entry serves, and whether the row has a published measurement or is a fallback; then the memory the run needs against what is free. Decided and printed before anything is loaded |
+| `served by` | per block: calls per step, provider, entry, the rows the entry serves, and whether the row has a published measurement or is a fallback; then the memory the run needs against what is free, in GiB (2^30 bytes). Decided and printed before anything is loaded |
 | `stage` | seconds of import, plan, read (or draw), merge, dequantise, compile and first launch of each compiled form, warm-up |
 | `text path` | render = chat messages to prompt text; tokenize = prompt text to ids, also per prompt token; ids to GPU = the copy of the prompt's ids to the device; text out = ids to text per produced token, inside the loop. With a checkpoint, the first call of the process and the same call repeated |
 | `first token` | the prefill route and its time. While the prompt goes through the decode step, one step per token, this is not a time to first token of record |
 | `steps` | period = from one step's first launch to the next step's, median and mean; in the step = from the first launch to the ids on the host; turnaround = from the ids on the host to the next launch (detokenise, stop check); block calls per step |
 | `traced pass` | the first 32 steps again, from a zero state, under the PyTorch profiler with kernel activity records only. GPU busy = the union of the intervals of the step's kernels and copies; idle inside the step = the step's span on the GPU less GPU busy; host-exposed = period - GPU busy; kernel launches and copies per step; the period under the profiler beside the untraced one. Where the records cannot be had the line says why |
 | `rate` | tokens produced / wall time of the decode loop, per sequence |
-| `bytes per step` | arithmetic on the model's tensor list: the bytes of the weights a step reads in their stored formats plus the state it reads and writes, against the same with the weights as this stack holds them |
+| `bytes per step` | arithmetic on the model's tensor list: the bytes of the weights a step reads in their stored formats plus the state it reads and writes, against the same with the weights as this stack holds them; in GB (10^9 bytes), as a checkpoint's size in the header |
 | `note` | what bounds a step of this stack |
 | `text out` | the text of sequence 0 and why it ended |
 | `checks` | replay, blocks, tokens, batch invariance (the family README has the bands); with a checkpoint, on the first 16 steps of every prompt, and the token line is `REPORTED`, not judged against a band |
-| `GPU memory`, `first launch` | PyTorch's peak, the growth on the device since the plan, and what the first launch of a compiled form took outside PyTorch's pool |
+| `GPU memory`, `first launch` | PyTorch's peak and the growth on the device since the plan, in GiB; what the first launch of a compiled form took outside PyTorch's pool, in MiB |
 
 ## What is verified where
 

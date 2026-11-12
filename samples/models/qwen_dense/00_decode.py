@@ -324,9 +324,10 @@ def main(argv=None) -> int:
     gib = 2.0**30
     grown = (facts.free_bytes - torch.cuda.mem_get_info(device)[0]) / gib
     print()
+    peak, reserved = torch.cuda.max_memory_allocated(device) / gib, torch.cuda.max_memory_reserved(device) / gib
     print(
-        f"{TAG} GPU memory: PyTorch peak {torch.cuda.max_memory_allocated(device) / gib:.2f} GB allocated, {torch.cuda.max_memory_reserved(device) / gib:.2f} GB reserved; "
-        f"in use on the device grew by {grown:.2f} GB since the plan (PyTorch's pool, CUDA libraries and kernel reservations of this process; other processes' changes included)"
+        f"{TAG} GPU memory: PyTorch peak {peak:.2f} GiB allocated, {reserved:.2f} GiB reserved; in use on the device grew by {grown:.2f} GiB "
+        "since the plan (PyTorch's pool, CUDA libraries and kernel reservations of this process; other processes' changes included)"
     )
     mib = 2.0**20
     allowance = getattr(model, "first_launch_reserve", {}).get(f"cc{facts.cc[0]}.x", 0)

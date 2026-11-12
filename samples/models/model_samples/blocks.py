@@ -202,16 +202,22 @@ class Plan(dict):
         return sum(block.reserve_bytes() for block in self.values())
 
     def memory(self, need_bytes: int, what: str = "") -> str:
-        """The memory sentence; ``what`` names what the need covers when that is more than this plan's run.  Raises
-        ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free."""
+        """The memory sentence, in GiB (2^30 bytes); ``what`` names what the need covers when that is more than this plan's
+        run.  Raises ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free, and says so when
+        the need exceeds what the GPU has in total: freeing memory cannot help there."""
         need = need_bytes + self.reserve_bytes()
-        free = self.facts.free_bytes
+        free, total = self.facts.free_bytes, self.facts.total_bytes
+        if total and need > total:
+            raise NotImplementedError(
+                f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; this GPU has {total / GIB:.1f} GiB in total: "
+                "the run does not fit on it (CUDA_VISIBLE_DEVICES selects another GPU)"
+            )
         if need > free:
             raise NotImplementedError(
-                f"stack {self.stack} needs about {need / GIB:.1f} GB on this GPU{what}; {free / GIB:.1f} GB are free: "
+                f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; {free / GIB:.1f} GiB are free: "
                 "free memory on this GPU, or select another one with CUDA_VISIBLE_DEVICES"
             )
-        return f"this stack needs about {need / GIB:.1f} GB on this GPU{what}; {free / GIB:.1f} GB are free"
+        return f"this stack needs about {need / GIB:.1f} GiB on this GPU{what}; {free / GIB:.1f} GiB are free"
 
 
 def parse_overrides(pairs: Sequence[str]) -> Dict[str, str]:

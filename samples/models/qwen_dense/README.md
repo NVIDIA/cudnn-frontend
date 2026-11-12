@@ -77,7 +77,7 @@ beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, th
 is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
 printed; reasoning the model writes before its answer is part of that text.
 
-Memory, in GiB (2^30 bytes; the memory lines of a run print these values with the label "GB"): the stack `fe-cublas`
+Memory, in GiB (2^30 bytes), as the memory lines of a run print it: the stack `fe-cublas`
 holds every weight as a bf16 copy, 50.1 GiB for this checkpoint, and its plan asks for about 52.4 GiB free with one
 sequence: the copies, the state and 2 GiB of working memory. For a checkpoint of this size that allowance is about 3 GiB
 short: on the run above PyTorch held 51.5 GiB at its peak, reserved 55.2 GiB from the device, and the device grew by
@@ -214,14 +214,14 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 A class the current checks have not run on is uncovered, not passing.
 
-Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GB at its peak and
-reserved 3.7 GB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GB free there. On compute capability 12.x
-it adds an allowance of 3 GiB and asks for about 6.7 GB: the first launch of the fused step reserves device memory outside
+Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
+reserved 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
+it adds an allowance of 3 GiB and asks for about 6.7 GiB: the first launch of the fused step reserves device memory outside
 PyTorch's pool on that class. The need is stated once, for every sequence count of the run, before anything is loaded: the
 copies, the working memory and the first launch are counted once, the state per count. The run measures that launch and
 prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
-6.9 GB of growth on the device over the whole run.
+6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
 Blackwell GPU: about 5 s to draw the weights, 1 to 2 s to compile the fused step per sequence count, the rest for the decode
 and its checks. These are orientation values of one run, not measurements of record.
