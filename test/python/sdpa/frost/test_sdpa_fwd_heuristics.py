@@ -2557,6 +2557,47 @@ def test_sm120_partial_pack_candidates_use_the_packed_subgroup(h_q):
         )
 
 
+@pytest.mark.L0
+def test_sm107_paged_d64_prefix_splits_on_the_rubin_budget(sm107_metadata_target):
+    """Study sm107_paged_d64_split_20261112: a Rubin paged bf16 D64 GQA prefix inside the measured bounds splits on the D128 Rubin
+    budget (packed, one CTA, N128 -- the native split #2502 admits) and leads; outside them it keeps the unsplit default."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    base = dict(
+        b=1,
+        h_q=64,
+        h_kv=8,
+        s_q=64,
+        s_kv=32768,
+        d_qk=64,
+        d_v=64,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (16 * 64 * 8, 16 * 64, 64, 1)),
+        max_total_seq_len_q=None,
+        device_cc=(10, 7),
+        device_sm_count=208,
+    )
+    f = _facts(**base)
+    splits, packed = paged_thd_split_choice(spec.capabilities, f)
+    assert splits > 1 and packed
+    first = _sm107_f16_plans(f)[0].knobs
+    assert (first.split_kv, first.pack_gqa, first.cga, first.tile_n) == (splits, True, 1, 128)
+    assert engines.mismatch(spec.capabilities, f, first) is None
+    assert placement.place(spec, f) == placement.LEAD
+    for over in (dict(h_q=40, h_kv=8), dict(b=17), dict(s_q=2048, s_kv=65536), dict(page_size=32), dict(has_sink=True), dict(window_left=127)):
+        assert paged_thd_split_choice(spec.capabilities, _facts(**dict(base, **over)))[0] == 1, over
+
+
 def _sm100_paged_prefix(d, h_q, h_kv, **over):
     """FlashInfer's exact paged prefill declaration on a 148-SM cc 10.0 part (head-major page pool, page 16)."""
     from types import SimpleNamespace
