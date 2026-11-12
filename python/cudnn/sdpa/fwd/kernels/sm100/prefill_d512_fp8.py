@@ -344,7 +344,7 @@ def _make_d512_sm100_bars(CFG, N_O_CHUNKS: int) -> Bars:
         mb_tma_o_full=MBarrier(_alloc(N_O_CHUNKS), stages=N_O_CHUNKS, init_count=COMPUTE_LANES, producer=Producer.THREAD),
         mb_tma_o_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=TWO_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
-        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.THREAD),
+        mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=2 * CFG.ONE_LANE, producer=Producer.THREAD),
     )
 
 
@@ -1594,12 +1594,18 @@ def _compute_warp_group(
                     bars.mb_stats_xfer_empty.wait(stats_xfer_empty_state.phase)
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
-        # The elected peer credit releases TMEM for all four compute warps.
+        # The elected credits release TMEM for all four local compute warps.
         # Join every reader after its final tcgen05.wait::ld; a faster lead
         # warp must not let the MMA pair deallocate a lagging warp's O tail.
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=32 * CFG.SOFTMAX_WG_WARPS)
+        # Each MMA warp waits for BOTH reader groups. A peer-only credit
+        # leaves its own CTA's readers unguarded when the other CTA finishes
+        # first; tcgen05.dealloc is not a reader join for the issuing CTA.
         peer_cta = cta_id_x ^ cutlass.Int32(1)
-        bars.mb_tmem_dealloc.arrive_on_peer(peer_cta, pred=is_lead_warp & nvvm.elect_sync())
+        if is_lead_warp:
+            if nvvm.elect_sync():
+                bars.mb_tmem_dealloc.arrive_on_peer(peer_cta)
+                bars.mb_tmem_dealloc.arrive()
 
 
 @cute.jit

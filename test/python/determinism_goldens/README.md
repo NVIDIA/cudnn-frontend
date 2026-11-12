@@ -3771,3 +3771,42 @@ cd test/python
 python -m pytest -q -m L0 \
   sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
 ```
+
+### D512 paired-CTA reader completion — 2026-11-12 follow-up
+
+The terminal four-warp join above still allowed an MMA warp to proceed
+before its own CTA's readers finished: its barrier counted only the peer
+CTA's completion. The role-split half/FP8 paths now send one elected local
+credit and one elected peer credit after each four-warp join. Each MMA warp
+waits for both reader groups. This retains the existing 2x2 path's
+local-plus-peer completion requirement and adds no mainloop synchronization.
+
+The lifetime regression now has nine cases: BF16/E4M3/E5M2 crossed with a
+delay in both output CTAs, only the even CTA, or only the odd CTA. It checks
+both CTAs' final TMEM loads against each deallocation. On unchanged
+`b70a558b4ea2`, the three symmetric cases pass but all six one-sided cases
+fail the event-order assertion (28.34s); output numerics still pass there.
+With the two-credit protocol, all nine pass (29.28s). A separate synthetic
+racecheck control removes only the local credit and its count from the
+candidate's temporary template: the even-CTA BF16 case fails the same
+ordering assertion, with zero reported hazards. That control is not a
+reproduction of the reviewer's numerical failure.
+
+The current-head reviewer still observed numerical/repeatability failures on
+`b70a558b4ea2` after the earlier join. Those results remain valid; this new
+local evidence does not by itself clear the reviewer's original setup.
+No seed, reference tolerance or golden is changed.
+
+The expanded full D512 class passes 54 cases, zero failures/skips, in 101.85s
+on the same SM100/148SM runtime, including all 12 unchanged committed
+goldens. All artifact caches remain disabled. Four changed SM103 variants
+(FP16/BF16 half and E4M3/E5M2 per-tensor FP8) compile offline with CUDA 13.4;
+SM103 execution remains unverified. The 2x2 and native binding sources are
+unchanged.
+
+CUDA 13.4 memcheck and synccheck each pass all nine lifetime variants with
+zero errors (34.04s and 30.95s). The separate racecheck runs pass the
+original four-case selection/order (182.94s) and an even-CTA BF16 lifetime
+case (56.87s), with zero hazards/errors/warnings. Kernel compilation remains
+CUDA 13.4 when using the available 13.2 racecheck tool. These local passes
+do not replace requalification in the original reviewer environment.

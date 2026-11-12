@@ -559,8 +559,9 @@ routes agree; origins and strides can change between invocations while
 logical lengths independently determine live work. Both half implementations
 also cover the already-admitted D384/V448 and D264/V504 head envelopes.
 
-The role-split half and FP8 kernels join all output-reader warps before
-releasing TMEM. A delayed-reader lifetime check complements numerical and
+The role-split half and FP8 kernels join all output-reader warps in both CTAs
+before either MMA warp releases TMEM. Symmetric and single-CTA delayed-reader
+lifetime checks complement numerical and
 byte comparisons: readable bytes after deallocation do not establish safe
 ownership. This check is measured on SM100 and does not extend the GPU
 qualification below.

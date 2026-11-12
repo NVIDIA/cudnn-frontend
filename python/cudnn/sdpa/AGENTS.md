@@ -692,15 +692,20 @@ A single elected release credit cannot stand in for multiple independent
 TMEM readers. Each reader must complete its `tcgen05.wait::ld`, and the
 release must join all readers before allowing the MMA pair to deallocate.
 The D512 role-split half and FP8 bodies use a non-aligned, 128-thread named
-barrier before their elected peer credit; the two-CTA deallocation then
-waits for both sides. Keep this terminal join outside the persistent loop.
+barrier before their elected local and peer credits. Each MMA warp's barrier
+counts both credits, so neither starts deallocation before both reader groups
+finish. A peer-only credit leaves the issuing CTA's readers unguarded. Keep
+this terminal join outside the persistent loop.
 
 Freed TMEM can retain readable bytes, so a numerical pass alone does not
 verify its lifetime. `TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers`
 delays one output warp and records final-load/deallocation event order in
 a temporary template, using synthetic inputs. Its old-kernel control fails
 for BF16, E4M3 and E5M2 even when output values remain correct. The test
-checks event order, not a hardware-dependent duration threshold.
+checks event order, not a hardware-dependent duration threshold. Delay only
+the even CTA and only the odd CTA as well as both: symmetric delays can hide
+a missing local completion credit. Check both CTAs' final loads against each
+deallocation; the 2x2 body's local-plus-peer protocol is the existing control.
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 

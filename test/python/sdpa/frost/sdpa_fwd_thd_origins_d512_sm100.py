@@ -149,7 +149,8 @@ def test_stats_slot_waits_for_all_warps(monkeypatch, tmp_path, dtype):
 
 
 @pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn", "float8_e5m2"])
-def test_tmem_release_waits_for_all_readers(monkeypatch, tmp_path, dtype):
+@pytest.mark.parametrize("delayed_cta", [None, 2, 3], ids=["both-ctas", "even-cta", "odd-cta"])
+def test_tmem_release_waits_for_all_readers(monkeypatch, tmp_path, dtype, delayed_cta):
     """A delayed output warp must finish its TMEM loads before deallocation.
 
     Freed TMEM can retain its bytes, so numerical replay alone misses this
@@ -187,9 +188,10 @@ def _test_tmem_event(slot):
         source = source.replace(anchor, helper + anchor)
         loop = "                for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):\n"
         assert source.count(loop) == 2
+        cta_guard = "" if delayed_cta is None else f" and (cute.arch.block_idx()[0] == cutlass.Int32({delayed_cta}))"
         delay = (
             "                    if cutlass.const_expr(b * O_EPI_BLOCK_SIZE == 384):\n"
-            "                        if wid_in_wg == cutlass.Int32(2):\n"
+            f"                        if (wid_in_wg == cutlass.Int32(2)){cta_guard}:\n"
             "                            tail_start = cute.arch.globaltimer()\n"
             "                            while cute.arch.globaltimer() - tail_start < cutlass.Int64(100_000):\n"
             "                                pass\n"
@@ -222,9 +224,10 @@ def _test_tmem_event(slot):
         records = trace.cpu().tolist()
         active = [row for row in records if any(row[:4])]
         assert len(active) == 2, records
+        last_reader = max(max(row[:4]) for row in active)
         for row in active:
             assert all(row[:5]), records
-            assert max(row[:4]) <= row[4], f"TMEM deallocated before all output readers finished: {records}"
+            assert last_reader <= row[4], f"TMEM deallocated before all output readers in both CTAs finished: {records}"
 
     monkeypatch.setattr(api_dsl, "load_template", traced)
     with process_watchdog(120.0, "D512 TMEM reader lifetime"):
