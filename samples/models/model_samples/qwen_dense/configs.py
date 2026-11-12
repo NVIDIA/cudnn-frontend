@@ -33,7 +33,7 @@ PROVIDERS = {
             "fe.gdn_decode_fused",
             "fe-cublas",
             serves="rows 1-65,535",
-            measured=("cc10.0: 1 row",),
+            measured=("cc 10.0, 1 row",),
             band="gdn_step",
             batch_invariant=("cc10.0", "cc10.3", "cc12.0"),
         ),

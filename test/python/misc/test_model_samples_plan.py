@@ -74,7 +74,7 @@ def test_plan_selects_the_first_matching_row_of_the_stack_and_prints_it():
     assert plan.rows["mlp.down"].key == "cublas.bf16_dequantized" and plan.rows["token_choice"].key == "torch.argmax"
     table = plan.table()
     assert "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2" in table
-    assert "cudnn.GdnDecodeFused" in table and "fallback: bf16 copy of 8-bit weights" in table and "regime: launch-bound" in table
+    assert "cudnn.GdnDecodeFused" in table and "fallback: bf16 copy of 8-bit weights" in table and "declared regime: launch-bound" in table
     reference = _plan(cc=(8, 0), stack="reference")
     assert {row.key.split(".")[0].split("+")[0] for row in reference.rows.values()} <= {"torch_ref", "torch"}
 
@@ -88,7 +88,8 @@ def test_a_row_no_test_runs_is_printed_as_unverified():
     model = QwenDense.reduced(2)
     table = dict(model.provider_table, token_choice=[replace(model.provider_table["token_choice"][0], ci=False)])
     text = plan(table, model.regimes, _facts(), 1, model=model).table()
-    assert "served, not measured here; unverified in CI" in text and text.count("unverified in CI") == 2 and "| unverified in CI: 1" in text
+    assert "  none; unverified in CI" in text and text.count("unverified in CI") == 2 and "| unverified in CI: 1" in text
+    assert "published record" in text.splitlines()[1] and "cc 10.0, 1 row" in text, "the last column is the entry's published record, not this run's"
     assert "unverified in CI" not in _plan().table()
 
 
@@ -701,9 +702,15 @@ def _sample_script(monkeypatch):
 
 
 def test_the_checks_of_a_run_hold_on_exact_stand_ins_and_fail_on_a_nan():
+    from model_samples import tie_out
+
     clean = _checked_run(2)
     assert clean.ok, clean.text()
     assert "6 of 6 provider blocks inside their bands" in clean.text() and "linear_attention.step equal (gated)" in clean.text()
+    assert _line(clean, "linear_attention.step").endswith("[band: gdn_step]  PASS") and _line(clean, "mlp.down").endswith("[band: bf16_rounding]  PASS")
+    bands = [line.strip() for line in clean.lines if line.strip().startswith("band ")]
+    assert bands == [f"band {name}: {tie_out.BANDS[name]}" for name in ("bf16_rounding", "gdn_step")], "each band's text once, on its own line"
+    assert max(len(line) for line in clean.lines) < 420, "no line of the checks carries a band's whole text beside its measurement"
     assert "largest logit distance 0 = 0.00 bf16 units" in _line(clean, "tokens") and _line(clean, "tokens").endswith("PASS")
 
     def nan_in_the_down_projection(product, weight):  # one element of one multiply, at every call
@@ -881,13 +888,19 @@ def test_the_traced_pass_is_read_from_kernel_activity_records():
     report.bytes = {"weights": 17_610_000_000, "copies": 51_250_000_000, "state": 310_000_000}
     text = report.text()
     assert "steps (4)            period 100.000 ms median / 100.000 mean | in the step 90.000 ms | turnaround 10.000 ms | 484 block calls per step" in text
-    traced = "traced pass (32)      GPU busy 40.000 ms | idle inside the step 55.000 ms | host-exposed 60.000 ms = period - GPU busy (60% of the period) | "
-    assert traced + "11750 kernel launches + 1016 copies per step | period under the profiler 125.000 ms (+25 %)" in text
+    traced = "traced pass (32)      period under the profiler 125.000 ms (+25 % against the untraced period) | GPU busy 40.000 ms | "
+    traced += "idle inside the traced step 55.000 ms | 11750 kernel launches + 1016 copies per step | "
+    assert traced + "host-exposed 60.000 ms = untraced period - GPU busy (60% of it)" in text, "busy + idle are parts of the traced period, which comes first"
+    launch_bound = "note                  host-exposed 60% of the period: the launch path from Python bounds this step, not the GPU; no floor and no"
+    assert launch_bound in text, "what bounds the step is said from the measured share"
+    report.trace = Trace(steps=32, busy=83.0, idle=5.0, kernels=599, copies=60, period=101.0)
+    assert "note                  GPU busy 83% of the period: the GPU work of this stack bounds this step, not the launch path; no floor" in report.text()
     assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in text
     assert "bytes per step        model 17.92 GB (weights 17.61 in their stored formats, state and cache 0.31); this stack moves 51.56 GB (2.88x)" in text
     assert "first token           prefill route: decode step, 58 tokens x one step; not a time to first token of record" in text
     report.trace, report.trace_missing = None, "the profiler recorded no kernel activity on this GPU"
     assert "traced pass           not available: the profiler recorded no kernel activity on this GPU" in report.text()
+    assert "note                  what bounds this step was not measured (no traced pass); no floor and no speed-of-light figure is printed" in report.text()
     reduced = Report("qwen_dense", reduced=True)
     reduced.bytes = report.bytes
     assert "rate                  not printed for a reduced model" in reduced.text() and "bytes per step        reduced model: model 17.92 GB" in reduced.text()

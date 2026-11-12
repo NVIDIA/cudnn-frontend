@@ -36,7 +36,7 @@ class ProviderRow:
     key: str  # "fe.gdn_decode_fused" | "cublas.bf16_dequantized" | ...: one of the closed list in providers.KEYS
     stack: Union[str, Tuple[str, ...]]  # "fe-cublas" | "native" | "reference" | "selectable" (only through --provider), or several
     serves: str  # what the entry admits, in rows
-    measured: Tuple[str, ...] = ()  # rows with a published record; elsewhere the table prints "served, not measured here"
+    measured: Tuple[str, ...] = ()  # where a published record of the entry exists (GPU class, rows); the table prints "none" otherwise
     fallback: str = ""  # non-empty for a reference chain or a dequantised copy: the reason printed in the table
     band: str = "same"  # the tie-out band against the reference block (tie_out.BANDS); never widened in place
     batch_invariant: Tuple[str, ...] = ()  # GPU classes on which "a sequence alone = the sequence in a batch" is a gate
@@ -177,25 +177,24 @@ class Plan(dict):
 
     def table(self) -> str:
         """The served-by table: decided before the load, printed before every run."""
-        head = ("block", "calls", "provider", "entry", "serves", "measured here")
+        head = ("block", "calls", "provider", "entry", "serves", "published record")  # of the entry: not a measurement of this run or GPU
         lines = [head]
         for name, block in self.items():
             row = self.rows[name]
             if row.fallback:
                 measured = f"fallback: {row.fallback}"
             else:
-                measured = "; ".join(row.measured) if row.measured else "served, not measured here"
+                measured = "; ".join(row.measured) if row.measured else "none"
             if not row.ci:
                 measured += "; unverified in CI"
             lines.append((name, self.calls.get(name, ""), block.provider, block.entry, row.serves, measured))
         widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
-        text = [
-            f"served by (decided before the load from {self.source}; stack {self.stack}, {self.sequences} sequence{'s' if self.sequences > 1 else ''}, {self.facts.class_text})"
-        ]
+        run = f"stack {self.stack}, {self.sequences} sequence{'s' if self.sequences > 1 else ''}, {self.facts.class_text}"
+        text = [f"served by (decided before the load from {self.source}; {run})"]
         text += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in lines]
         text.append("  " + self.by_provider())
         if self.regime is not None:
-            text.append(f"  regime: {self.regime.name} ({self.regime.note})")
+            text.append(f"  declared regime: {self.regime.name} ({self.regime.note})")
         return "\n".join(text)
 
     def reserve_bytes(self) -> int:

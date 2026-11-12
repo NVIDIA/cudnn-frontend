@@ -451,7 +451,9 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
     else:  # a line that compares nothing cannot fail: it is not printed as a pass
         lines.append("  blocks            no provider block to judge: every block of this run is the reference chain itself    REPORTED")
     for name, s in judged.items():
-        lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {BANDS[s.band]}]  {_verdict(s.ok)}")
+        lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {s.band}]  {_verdict(s.ok)}")
+    for band in dict.fromkeys(s.band for s in judged.values()):  # each band's text once, on a line of its own
+        lines.append(f"    band {band}: {BANDS[band]}")
     lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
     batch_ok = True
     if session.sequences > 1:
@@ -467,9 +469,8 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         gate_text = "; ".join(gated) if gated else f"no block is gated on {facts.class_text}"
         rest = f"{len(tap.stats) - len(differs)} of {len(tap.stats)} blocks equal" + (f"; differs: {', '.join(differs)}" if differs else "")
         verdict = _verdict(batch_ok) if gated else "REPORTED"
-        lines.append(
-            f"  batch invariance  one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences}): {gate_text}; {rest}    {verdict}"
-        )
+        rotation = f"one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences})"
+        lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
     session.reset(fresh=True)

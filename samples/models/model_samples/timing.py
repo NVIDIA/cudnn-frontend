@@ -29,8 +29,13 @@ step.  Per step:
 * **idle inside the step** = from the start of the step's first record to the end of its last, less GPU busy: time in
   which the GPU waited for the next launch;
 * **launches** = kernels of the step, and copies and memory sets beside them;
-* **host-exposed** = period - GPU busy: what the loop pays beyond the kernels' own time (the period is the untraced one;
-  the traced period is printed beside it).
+* **host-exposed** = period - GPU busy: what the loop pays beyond the kernels' own time.  The period is the untraced
+  one.  GPU busy and idle are parts of the traced step, which the profiler stretches, so the line prints the period
+  under the profiler first and host-exposed last, with what it is taken against.
+
+The **note** under the report says what bounds a step from that share: the launch path where host-exposed time is the
+larger part of the period, the GPU work of the stack where GPU busy is.  Without a traced pass it says that it was not
+measured.
 
 No pair of CUDA events is used for any of these: an event is stamped when the stream reaches it, so a pair spans every gap
 in which the GPU waited for the host.
@@ -240,15 +245,18 @@ class Report:
                 f"steps ({len(self.clock.launch)})            {prefix}period {s['period_median']:.3f} ms median / {s['period_mean']:.3f} mean | "
                 f"in the step {s['in_step_median']:.3f} ms | turnaround {s['turnaround_median']:.3f} ms | {self.calls_per_step} block calls per step"
             )
+        share = None  # host-exposed time as a share of the period, when a traced pass measured it
         if self.trace is not None:
             t = self.trace
             period = s["period_median"] if s is not None else t.period
             exposed = period - t.busy
-            stretch = f" ({(t.period / period - 1) * 100:+.0f} %)" if s is not None and period > 0 else ""
-            lines.append(
-                f"traced pass ({t.steps})      {prefix}GPU busy {t.busy:.3f} ms | idle inside the step {t.idle:.3f} ms | "
-                f"host-exposed {exposed:.3f} ms = period - GPU busy ({exposed / period:.0%} of the period) | "
-                f"{t.kernels} kernel launches + {t.copies} copies per step | period under the profiler {t.period:.3f} ms{stretch}"
+            share = exposed / period if period > 0 else None
+            stretch = f" ({(t.period / period - 1) * 100:+.0f} % against the untraced period)" if s is not None and period > 0 else ""
+            basis = "untraced period" if s is not None else "period under the profiler"
+            lines.append(  # the traced period first: GPU busy and idle are parts of the traced step, host-exposed is not
+                f"traced pass ({t.steps})      {prefix}period under the profiler {t.period:.3f} ms{stretch} | GPU busy {t.busy:.3f} ms | "
+                f"idle inside the traced step {t.idle:.3f} ms | {t.kernels} kernel launches + {t.copies} copies per step | "
+                f"host-exposed {exposed:.3f} ms = {basis} - GPU busy" + (f" ({share:.0%} of it)" if share is not None else "")
             )
         elif self.trace_missing:
             lines.append(f"traced pass           not available: {self.trace_missing}")
@@ -258,17 +266,25 @@ class Report:
             lines.append("rate                  not printed below three decode steps")
         else:
             wall = self.clock.ids[-1] - self.clock.launch[0]
-            lines.append(
-                f"rate                  {len(self.clock.ids) / wall:.1f} tokens per second per sequence = {len(self.clock.ids)} tokens / {wall:.3f} s of the decode loop"
-            )
+            produced = len(self.clock.ids)
+            lines.append(f"rate                  {produced / wall:.1f} tokens per second per sequence = {produced} tokens / {wall:.3f} s of the decode loop")
         if self.bytes:
             gb = 1e9
-            model = self.bytes["weights"] + self.bytes["state"]
-            moved = self.bytes["copies"] + self.bytes["state"]
+            weights, state = self.bytes["weights"], self.bytes["state"]
+            model, moved = weights + state, self.bytes["copies"] + state
+            stored = f"weights {weights / gb:.2f} in their stored formats, state and cache {state / gb:.2f}"
             lines.append(
-                f"bytes per step        {prefix}model {model / gb:.2f} GB (weights {self.bytes['weights'] / gb:.2f} in their stored formats, state and cache "
-                f"{self.bytes['state'] / gb:.2f}); this stack moves {moved / gb:.2f} GB ({moved / model:.2f}x): bf16 copies of the weights (arithmetic, not a measurement)"
+                f"bytes per step        {prefix}model {model / gb:.2f} GB ({stored}); "
+                f"this stack moves {moved / gb:.2f} GB ({moved / model:.2f}x): bf16 copies of the weights (arithmetic, not a measurement)"
             )
-        lines.append("note                  this stack's step is bound by the Python launch path: no floor and no speed-of-light figure is printed")
+        # what bounds a step is said from this run's traced pass, not as a constant: the same loop is bound by its launches
+        # on one stack and GPU and by its GPU work on another
+        if share is None:
+            bound = "what bounds this step was not measured (no traced pass)"
+        elif share >= 0.5:
+            bound = f"host-exposed {share:.0%} of the period: the launch path from Python bounds this step, not the GPU"
+        else:
+            bound = f"GPU busy {1 - share:.0%} of the period: the GPU work of this stack bounds this step, not the launch path"
+        lines.append(f"note                  {bound}; no floor and no speed-of-light figure is printed")
         lines.extend(self.notes)
         return "\n".join(lines)
