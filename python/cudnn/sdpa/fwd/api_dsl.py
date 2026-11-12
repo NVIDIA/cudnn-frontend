@@ -125,6 +125,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_nonpaged_d128_thd_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
+    TemplateParamsDecode as Sm100DecodeTemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
     SM100_NATIVE_D576_SHAPE,
     SM100_PAGED_FP8_THD_SHAPES,
@@ -827,6 +828,10 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_single_q"
+    elif flavor == (128, 128) and getattr(params, "decode_q_tile", 0):
+        # Native D128 geometry and live-column softmax in the swap-AB body.
+        filename = _SM100_DECODE_KERNEL_FILES[(256, 256)]
+        tag = f"sdpa_fwd_sm100_decode_{tag}"
     elif getattr(params, "decode_tile", False) or (flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and (not params.thd_varlen or params.split_kv > 1)):
         # D64's explicit decode tile and D128's one-CTA tile share this body.
         # D128 also owns admitted paged and nonpaged THD split members.
@@ -4217,6 +4222,30 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             two_by_two = two_by_two or self._mixed_fp8_kv or (self._rubin_native_d512_leg() and (self.paged or self.pack_gqa or self.split_kv > 1))
             if two_by_two:
                 params = replace(params, mma_2x2=True)
+        # A half-width softmax group can cover every declared query row of
+        # this paged D128 unit. The MMA keeps its minimum 16-column tile;
+        # unused P columns are initialized once by the swap-AB body. Keep the
+        # full Q/K sharing ratio here: a partial PackGQA subgroup is not an
+        # independently addressable KV head in that body.
+        decode_rows = self.s_q_max * (int(params.qh_per_kh) if self.pack_gqa else 1)
+        if (
+            self._device_cc in ((10, 0), (10, 3))
+            and self.flavor == (128, 128)
+            and params.cta_mma == 1
+            and self.paged
+            and not self.thd
+            and not self._fp8
+            and not self._mixed_fp8_kv
+            and 0 < decode_rows <= 8
+            and params.dtype_o in (-1, params.dtype_qkv)
+            and self.gate_desc is None
+            and self.bias_desc is None
+            and self.kv_mask_desc is None
+            and not self.softmax_scale_prefolded
+            and self.score_max_desc is None
+            and self.score_sum_exp_desc is None
+        ):
+            params = Sm100DecodeTemplateParams(**vars(replace(params, decode_q_tile=16)), decode_head_dim=128, decode_live_columns=8)
         return params
 
     def compile(self) -> None:

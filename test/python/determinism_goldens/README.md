@@ -34,6 +34,42 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### D128 paged live-column decode — qualification, 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py` covers FP16/BF16
+O and FP32 Stats for the eight-live-row swap-AB lowering, with fixed packing
+and split counts. Cases include Q1/G8, Q2/G4, split1/4 and D80/V120 inside
+the D128 envelope. Replay uses fresh buffers and concurrent work; batch
+changes include isolation, insertion, reordering, duplication and more than
+one device wave. Retained graphs change V, query/KV lengths and independent
+K/V page maps, then restore and compare bytes. Numerical checks use CPU FP64.
+The refill stress uses four blocks per SM, warm/poisoned runs and the unsafe
+ring control. Backward uses other kernels and is outside this suite.
+
+B200 native qualification (CUDA compiler/NVRTC13.4, CuTeDSL4.8,
+cuDNN9.30.0.4, Torch2.14.1+cu130): four replay/batch cases and two warm
+stress cases pass. Four new golden records were created after the numerical
+and replay checks, then all four pass in a separate strict process. Existing
+goldens are unchanged; the new records baseline the swap-AB reduction order.
+The stress uses592 blocks (4 per SM),256 warm and256 poisoned launches per
+dtype, with no mismatches; the unsafe control fails200/200. No skipped cases.
+
+Unfiltered Compute Sanitizer memcheck, synccheck and racecheck each pass the
+four golden cases. Memcheck/synccheck report0 errors; racecheck reports0
+hazards, errors or warnings. CUDA API error reporting is disabled. Under
+instrumentation FE reports cuDNN93000 and Torch92400; the explicit standalone
+FROST path executes no backend attention. SM103 is still unverified by this run.
+The separate public graph suite passes28 cases, including legacy D256
+wide-tile controls. The source/import and runtime library hashes are verified.
+
+Run from `test/python` with `CUDNN_DETERMINISM_RECORD` unset:
+
+```bash
+python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_determinism.py
+python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_sm100.py
+```
+
+
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
 Twenty-six SM100/SM107 forward templates now release the unchanged service

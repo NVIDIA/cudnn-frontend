@@ -980,6 +980,7 @@ def _paged_graph(
     table_batch_stride=None,
     require_prepared=False,
     sink=None,
+    expected_template="decode_d128_f16",
 ):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
@@ -1054,7 +1055,7 @@ def _paged_graph(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
 
         compiled = g._compiled_plans[g._plan_index]
-        assert compiled._compiled.kernel_template == "decode_d128_f16"
+        assert compiled._compiled.kernel_template == expected_template
         assert isinstance(compiled._prepared, PreparedDenseLaunch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
@@ -1094,7 +1095,7 @@ def _paged_graph(
 def test_graph_decode_prepared_keeps_int64_page_table_batch_stride():
     """A singleton table's unused batch stride must not narrow at the pointer ABI.
     B=1 keeps the valid allocation small while a stride over 2**31 catches int32 fakes."""
-    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True)
+    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True, expected_template="decode_d256_f16")
 
 
 @pytest.mark.L0
