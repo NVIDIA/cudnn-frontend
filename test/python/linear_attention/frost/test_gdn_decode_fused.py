@@ -16,9 +16,10 @@ per-rank geometries of the larger dense models (1 K head / 8 V heads / hidden 81
 and the BA partition's coverage of every hidden index -- and, on the device, the torch model and determinism per rows, every form family
 bitwise with the one-CTA form, and batch invariance at each of those geometries."""
 
+import json
 import math
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -28,6 +29,7 @@ cudnn = pytest.importorskip("cudnn")
 from cudnn.linear_attention.frost import gdn_decode_fused as entry  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_decode_fused_config as kcfg  # noqa: E402
 from cudnn.linear_attention.frost.kernel import gdn_geometry  # noqa: E402
+from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
@@ -840,6 +842,126 @@ def test_flat_view_covers_the_footprint_with_16_byte_alignment():
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
+# host-only: the launch facts (cudnn.frost.launch_facts) -- the symbols of the compiled forms, the form as plain data, the launch shape
+# ---------------------------------------------------------------------------------------------------------------------------
+def _launch_arithmetic(cfg, rows):
+    """The launch of ``kernel/gdn_decode_fused_f16.py`` restated from the config's FIELDS and its shared-memory ledger: one thread block
+    per (V head, request row), two per V head on the two-CTAs-per-head form; ``THREADS`` threads; the buffers plus the occupancy pad."""
+    return ((cfg.GEOM.V_HEADS * (2 if cfg.TWO_CTAS_PER_HEAD else 1), rows, 1), (cfg.THREADS, 1, 1), cfg.NATURAL_SMEM_BYTES + cfg.SMEM_PAD_BYTES)
+
+
+def _plain_ints(shape):
+    return all(type(v) is int for v in (*shape.grid, *shape.block, shape.shared_memory))
+
+
+def test_launch_facts_equal_the_configuration_arithmetic_at_every_rows_count():
+    """EVERY served rows count, 1 .. 65535, on the cc 10.0 readings at 148 SMs (the pick walks all three default forms there): the launch
+    shape is the configuration arithmetic of the form ``cfg_for`` returns, and the form is that config's fields (the geometry nested)
+    plus the rows count and the norm epsilon -- the two compile-key facts the config does not hold."""
+    k = entry.GdnDecodeFused("cpu", 1e-6)
+    k.sm_count = 148
+    fields = {}  # the config's fields per distinct form, by an independent route (dataclasses.asdict)
+    for rows in range(1, entry.MAX_ROWS + 1):
+        cfg = k.cfg_for(rows)
+        if cfg not in fields:
+            fields[cfg] = asdict(cfg)
+        shape = k.launch_shape_for(rows)
+        assert shape == _launch_arithmetic(cfg, rows), rows
+        assert k.form_for(rows) == {**fields[cfg], "ROWS": rows, "EPS": 1e-6}, rows
+    assert {(c.TWO_CTAS_PER_HEAD, c.MIN_CTAS_PER_SM) for c in fields} == {(True, 1), (False, 1), (False, 2)}, "the three default forms were walked"
+
+
+@pytest.mark.parametrize("pdl", (None, True))
+@pytest.mark.parametrize("g", [kcfg.DEFAULT_GEOMETRY] + RANK_GEOMETRIES, ids=_gid)
+@pytest.mark.parametrize("reading, sm_count", [(SM100_READING, 148), (SM100_READING, 152), (SM100_READING, 212), (SM120_READING, 170)])
+def test_launch_facts_follow_the_part_the_geometry_and_the_launch_knobs(monkeypatch, reading, sm_count, g, pdl):
+    """The same equality where the pick moves: per part reading and SM count (the device readers stubbed, as an entry on that part reads
+    them), per geometry and with the PDL launch knob, at the rows counts around every switch of the pick ladder and at the grid's limit.
+    The shape is asserted against the LIVE pick (``cfg_for``), never against a pick table: a retuned pick moves both sides."""
+    monkeypatch.setattr(entry, "device_shared_memory", lambda device: reading)
+    monkeypatch.setattr(entry, "device_multiprocessor_count", lambda device: sm_count)
+    k = entry.GdnDecodeFused("cuda:0", 1e-6, geometry=g, pdl=pdl)
+    pair_rows, one_rows = sm_count // (2 * g.V_HEADS), sm_count // g.V_HEADS  # the last rows count of the pair / of the one-CTA grid
+    for rows in sorted({1, 2, 3, 4, 8, 64, max(pair_rows, 1), pair_rows + 1, max(one_rows, 1), one_rows + 1, entry.MAX_ROWS}):
+        cfg = k.cfg_for(rows)
+        shape = k.launch_shape_for(rows)
+        assert shape == _launch_arithmetic(cfg, rows) and _plain_ints(shape), (rows, shape)
+        assert shape.grid[0] * shape.grid[1] == rows * g.V_HEADS * cfg.CTAS_PER_HEAD and shape.shared_memory <= reading[1], (rows, shape)
+        form = k.form_for(rows)
+        assert form == {**asdict(cfg), "ROWS": rows, "EPS": 1e-6}, rows
+        assert form["GEOM"] == dict(K_HEADS=g.K_HEADS, V_HEADS=g.V_HEADS, HIDDEN=g.HIDDEN)
+        assert (form["PDL"], form["PDL_RELEASE"]) == (bool(pdl), bool(pdl)), "the launch knob is part of the form"
+        assert (form["SMEM_PER_SM_BYTES"], form["SMEM_OPTIN_BYTES"]) == reading, "the part's readings are part of the form"
+
+
+def test_launch_shape_of_the_three_default_forms_on_the_cc100_readings():
+    """The shapes of the three module forms, each given as an explicit ``cfg`` on the cc 10.0 readings: the values a profiler recorded
+    for their launches on a cc 10.0 part (the device cell below repeats the comparison on whatever part runs it)."""
+    for form, rows, want in (
+        (kcfg.PAIR_CFG, 1, ((96, 1, 1), (256, 1, 1), 42112)),
+        (kcfg.CFG, 2, ((48, 2, 1), (256, 1, 1), 119808)),
+        (kcfg.CAPPED_CFG, 4, ((48, 4, 1), (256, 1, 1), 74848)),
+    ):
+        k = entry.GdnDecodeFused("cpu", 1e-6, cfg=form)
+        assert k.launch_shape_for(rows) == want, (form, rows)
+    threads128 = entry.GdnDecodeFused("cpu", 1e-6, cfg=kcfg.make_cfg(THREADS=128, WARPGROUP_SPLIT=False, TPR=2))
+    assert threads128.launch_shape_for(3).block == (128, 1, 1) and threads128.launch_shape_for(3).grid == (48, 3, 1), "the block follows THREADS"
+
+
+def test_launch_facts_are_plain_fresh_and_decline_an_unserved_rows_count():
+    """The facts are plain data (ints, a JSON-serialisable form), a fresh object per call (a caller's edit reaches nothing of the entry)
+    and the entry's typed declines for a rows count it does not serve: ``ValueError`` below one or off the integers,
+    ``NotImplementedError`` past the grid's limit."""
+    k = entry.GdnDecodeFused("cpu", 1e-6, pdl=True)
+    form = k.form_for(3)
+    assert json.loads(json.dumps(form)) == form and type(form) is dict and type(form["GEOM"]) is dict
+    form["PDL"], form["GEOM"]["V_HEADS"] = "edited", 0
+    assert k.form_for(3)["PDL"] is True and k.form_for(3)["GEOM"]["V_HEADS"] == kcfg.V_HEADS and k.cfg_for(3).GEOM.V_HEADS == kcfg.V_HEADS
+    assert _plain_ints(k.launch_shape_for(True)) and k.form_for(True)["ROWS"] == 1 and type(k.form_for(True)["ROWS"]) is int
+    for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
+        for rows in (0, -1, 1.0, "1", None):
+            with pytest.raises(ValueError, match="rows must be a positive int"):
+                fact(rows)
+        with pytest.raises(NotImplementedError, match="at most 65535"):
+            fact(entry.MAX_ROWS + 1)
+        fact(entry.MAX_ROWS)
+
+
+class _CompiledStandIn:
+    """What the entry keeps per compile key, as far as the launch facts read it: a compiled DSL host function carries ``kernel_info``,
+    keyed by the symbols of the kernels it launches."""
+
+    def __init__(self, *symbols):
+        self.kernel_info = {symbol: {} for symbol in symbols}
+
+
+def test_kernel_symbols_are_those_of_the_forms_compiled_for_the_rows_count():
+    """Host-only, with stand-ins in the entry's compile cache: nothing compiled -> an empty tuple; the symbols of every compiled form of
+    THAT rows count in THAT config, in compile order, without repeats (two operand layouts of one rows count are two compiled kernels);
+    a compiled form of another rows count or of another config is not named; a compiled object that does not expose its kernels is the
+    typed decline, never a guess."""
+    k = entry.GdnDecodeFused("cpu", 1e-6)
+    k.sm_count = 148
+    assert k.kernel_symbols_for(1) == () and k.kernel_symbols_for(4) == ()
+    ops = make_operands(rows=4)
+    serving = k.key(4, ops["x"], ops["cs"], ops["state"], ops["z"])
+    taps = k.key(4, ops["x"], ops["cs"].contiguous(), ops["state"], ops["z"])  # the tap-contiguous conv-state layout: another compile key
+    assert serving != taps and serving[:2] == taps[:2] == (4, k.cfg_for(4))
+    k.compiled[serving] = _CompiledStandIn("cudnn_kernel_frost_gdn_decode_fused_A_0")
+    assert k.kernel_symbols_for(4) == ("cudnn_kernel_frost_gdn_decode_fused_A_0",) and k.kernel_symbols_for(1) == () == k.kernel_symbols_for(8)
+    k.compiled[taps] = _CompiledStandIn("cudnn_kernel_frost_gdn_decode_fused_A_0")
+    assert k.kernel_symbols_for(4) == ("cudnn_kernel_frost_gdn_decode_fused_A_0",), "two layouts behind one symbol: named once"
+    k.compiled[taps] = _CompiledStandIn("cudnn_kernel_frost_gdn_decode_fused_B_0")
+    assert k.kernel_symbols_for(4) == ("cudnn_kernel_frost_gdn_decode_fused_A_0", "cudnn_kernel_frost_gdn_decode_fused_B_0")
+    other_cfg = (4, replace(k.cfg_for(4), PDL=True, PDL_RELEASE=True), *serving[2:])
+    k.compiled[other_cfg] = _CompiledStandIn("cudnn_kernel_frost_gdn_decode_fused_PDL_0")
+    assert "cudnn_kernel_frost_gdn_decode_fused_PDL_0" not in k.kernel_symbols_for(4), "a form the rows count does not run is not named"
+    k.compiled[serving] = object()
+    with pytest.raises(NotImplementedError, match="the fused GDN decode step: the installed CuTe DSL .* does not expose the kernel symbols"):
+        k.kernel_symbols_for(4)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
 # device cells
 # ---------------------------------------------------------------------------------------------------------------------------
 def _device_or_skip():
@@ -1319,3 +1441,19 @@ def test_rank_geometry_rows_are_batch_invariant(g):
         assert torch.equal(snap1["qout"][0], snap4["qout"][r]) and torch.equal(snap1["out"][0], snap4["out"][r]), f"{_gid(g)} row {r}: the outputs"
         assert torch.equal(snap1["state"][idx[r]], snap4["state"][idx[r]]), f"{_gid(g)} row {r}: the state slot"
         assert torch.equal(_bytes(snap1["cs"][idx[r]]), _bytes(snap4["cs"][idx[r]])), f"{_gid(g)} row {r}: the conv slot"
+
+
+@pytest.mark.parametrize("rows, pdl", [(1, None), (1, True), (2, None), (4, None)], ids=["rows1", "rows1-pdl", "rows2", "rows4"])
+def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, pdl):
+    """On the device: one launch of the entry's pick for ``rows`` on THIS part (the plain pick at three rows counts, and the PDL form at
+    rows 1) is ONE kernel whose profiler record -- name, grid, block, shared memory -- equals the entry's launch facts; nothing is named
+    before the first compile, and the form states the launch knob the symbol does not.  The helper synchronises between its warm launch
+    and the recorded one, so the PDL form's predecessor has completed (the config docstring's obligation)."""
+    dev = _device_or_skip()
+    k = entry.GdnDecodeFused(dev, 1e-6, pdl=pdl)
+    ops = make_operands(rows=rows, device=dev, slots=rows + 1)
+    assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
+    record = assert_facts_equal_the_launch(k, lambda: _run(k, ops), rows, what=entry.NAME)
+    assert record.name.startswith("cudnn_kernel_frost_gdn_decode_fused_"), record.name
+    form = k.form_for(rows)
+    assert form == {**asdict(k.cfg_for(rows)), "ROWS": rows, "EPS": 1e-6} and (form["PDL"], form["PDL_RELEASE"]) == (bool(pdl), bool(pdl))

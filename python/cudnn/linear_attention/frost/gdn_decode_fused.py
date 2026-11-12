@@ -43,6 +43,7 @@ from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
 from .kernel.gdn_decode_fused_config import (
     CFG,
@@ -178,6 +179,17 @@ def max_rows_for(x_stride: int, z_stride: int, geometry: Geometry) -> int:
     return min(MAX_ROWS, ROW_ADDRESS_LIMIT // widest)
 
 
+def check_rows(rows) -> int:
+    """``rows`` when it is a row count the kernel's grid serves: a positive ``int`` (``ValueError`` otherwise) of at most ``MAX_ROWS``
+    (``NotImplementedError``: one grid row per request).  The row-address bound of a row-strided operand (:func:`max_rows_for`) is a fact
+    of a call's operands and stays with :func:`check_binding`."""
+    if not isinstance(rows, int) or rows < 1:
+        raise ValueError(f"{NAME}: rows must be a positive int, got {rows!r}")
+    if rows > MAX_ROWS:
+        raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_ROWS} (CUDA's grid Y limit); got rows={rows}")
+    return rows
+
+
 def _check_device(tensors, device, anchor) -> None:
     """Every operand on ONE device: ``device`` (an entry's, resolved) when given, else the ``anchor`` operand's.  A ``torch.device``
     compares by type AND index, so a CPU tensor or one on another CUDA device is a ``ValueError`` naming the operand and both devices
@@ -201,10 +213,7 @@ def check_binding(rows, x, cs, cw, al, dt, state, idx, z, w, scale, hidden, baw,
     import torch
 
     g = resolve_geometry(geometry)
-    if not isinstance(rows, int) or rows < 1:
-        raise ValueError(f"{NAME}: rows must be a positive int, got {rows!r}")
-    if rows > MAX_ROWS:
-        raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_ROWS} (CUDA's grid Y limit); got rows={rows}")
+    check_rows(rows)
     tensors = dict(x=x, cs=cs, cw=cw, al=al, dt=dt, state=state, idx=idx, z=z, w=w, scale=scale, hidden=hidden, baw=baw)
     for name, t in tensors.items():
         if not isinstance(t, torch.Tensor):
@@ -307,7 +316,8 @@ class GdnDecodeFused:
     holding none is a typed ``NotImplementedError`` at construction).  An entry built for a non-CUDA device (host tests) has no SM count
     to pick by and keeps ``CFG`` on the cc 10.0 readings.  The device is resolved to a concrete CUDA ordinal at construction
     (:func:`resolve_device`), and every operand of every compile / launch must live on exactly it.  ``pdl`` / ``pdl_release`` (None = the
-    form's own fields) are the launch knobs on top of the form that serves."""
+    form's own fields) are the launch knobs on top of the form that serves.  What a rows count launches is readable without a launch:
+    :meth:`kernel_symbols_for`, :meth:`form_for` and :meth:`launch_shape_for` (the launch facts of :mod:`cudnn.frost.launch_facts`)."""
 
     def __init__(
         self,
@@ -377,6 +387,28 @@ class GdnDecodeFused:
         if form not in self.forms:
             self.forms[form] = self._on_this_part(form)
         return self.forms[form]
+
+    # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served rows count ----
+    def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
+        """The symbols of the kernels this entry has compiled for ``rows`` in the form :meth:`cfg_for` names: without repeats, in compile
+        order, empty until a form of that rows count is compiled.  One rows count compiles once per operand layout (the row strides are
+        compile-time constants), so several compiled kernels can stand behind it; they share one symbol wherever the layout sits behind
+        the symbol's cut.  The symbol carries the head of the config's text only: it never proves a form (:meth:`form_for` states it)."""
+        cfg = self.cfg_for(check_rows(rows))
+        return kernel_symbols((fn for key, fn in self.compiled.items() if key[0] == rows and key[1] == cfg), NAME)
+
+    def form_for(self, rows: int) -> Dict[str, Any]:
+        """The form of ``rows`` as plain data: every field of the config :meth:`cfg_for` returns (the pick or the caller's ``cfg``, with
+        this part's readings, the geometry as a nested ``dict`` and the launch knobs applied) plus ``ROWS`` and ``EPS``, the two facts of
+        the compile key the config does not hold.  The operand strides a compile is also keyed on belong to a call, not to a rows count."""
+        return plain_form(self.cfg_for(check_rows(rows)), ROWS=int(rows), EPS=self.eps)
+
+    def launch_shape_for(self, rows: int) -> LaunchShape:
+        """``(grid, block, shared memory)`` of the launch of ``rows``: one thread block per (V head, request row) -- two per V head on the
+        two-CTAs-per-head form -- so grid ``(V_HEADS x CTAS_PER_HEAD, rows, 1)``; ``THREADS`` threads; ``SMEM_BYTES`` of shared memory
+        per thread block (the kernel's buffers plus the occupancy pad of the form)."""
+        cfg = self.cfg_for(check_rows(rows))
+        return LaunchShape((cfg.GEOM.V_HEADS * cfg.CTAS_PER_HEAD, int(rows), 1), (cfg.THREADS, 1, 1), cfg.SMEM_BYTES)
 
     @property
     def debug(self) -> bool:
