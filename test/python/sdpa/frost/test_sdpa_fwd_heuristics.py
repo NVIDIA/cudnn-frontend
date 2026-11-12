@@ -2655,10 +2655,10 @@ def test_sm100_paged_d128_prefix_envelope_splits(over, cc):
         (64, 16, 32, 8, 32, 4095, 2),
         (256, 12, 64, 8, 128, 32768, 4),
         (64, 8, 64, 8, 128, 8192, 1),  # D64 at 128 rows over 64 KV tiles: no split
-        (64, 4, 32, 8, 256, 65536, 4),  # past the wave rule, the tail split (study sm100_paged_split_v2_20261112)
+        (64, 4, 32, 8, 256, 65536, 1),  # several Q tiles: the D64 tail split reverted (equal-length check)
         (256, 4, 16, 2, 256, 8192, 1),
     ],
-    ids=["d64_case102", "d64_q32", "d256_q128", "d64_q128_short_kv", "d64_q256_tail", "d256_q256"],
+    ids=["d64_case102", "d64_q32", "d256_q128", "d64_q128_short_kv", "d64_q256", "d256_q256"],
 )
 def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv, splits):
     """Study sm100_paged_packed_split_waves_20261112: with no first-wave room the packed split still leads short queries."""
@@ -2757,11 +2757,12 @@ def test_sm100_paged_packed_split_stays_inside_its_domain(over):
         (64, 32, 32, dict(b=8, s_q=32, s_kv=32768), (3, False)),
         (128, 64, 64, dict(b=8, s_q=64, s_kv=4095), (2, False)),
         (128, 32, 16, dict(b=16, s_q=64, s_kv=4095), (2, True)),
-        (256, 16, 16, dict(b=4, s_q=32, s_kv=16384), (3, False)),
-        (128, 64, 32, dict(b=2, s_q=256, s_kv=8191), (1, False)),  # four Q tiles over 64 KV tiles: unsplit
-        (64, 32, 4, dict(b=2, s_q=512, s_kv=16383), (1, False)),  # equal-length batches ran 1.30x slower split
+        (256, 16, 8, dict(b=4, s_q=256, s_kv=65536), (4, True)),  # D256, several Q tiles
+        (256, 16, 16, dict(b=4, s_q=32, s_kv=16384), (1, False)),  # D256 one Q tile: reverted (equal-length check)
+        (128, 64, 8, dict(b=4, s_q=128, s_kv=65536), (1, False)),  # D128 several Q tiles: reverted (ran 1.25-1.33x equal-length)
+        (64, 32, 4, dict(b=2, s_q=512, s_kv=16383), (1, False)),
     ],
-    ids=["mha_d64", "mha_d128", "g2_d128_b16", "mha_d256", "g2_d128_q256", "d64_q512"],
+    ids=["mha_d64", "mha_d128", "g2_d128_b16", "g2_d256_q256", "mha_d256_one_tile", "g8_d128_q128", "d64_q512"],
 )
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["b200", "b300"])
 def test_sm100_paged_tail_split(d, h_q, h_kv, over, choice, cc):

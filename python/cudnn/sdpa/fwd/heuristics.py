@@ -2908,18 +2908,17 @@ def _sm100_paged_packed_wave_split(caps: Capabilities, facts) -> int:
 
 
 # Past the choosers above (study sm100_paged_split_v2_20261112; B200 train / holdout, B300 transfer): an SM100/103 paged bf16
-# prefix they leave unsplit -- MHA, group 2, long queries, several waves of units -- still splits when its KV loop is long next to
-# the wave load. One Q tile per unit splits inside the first wave; otherwise the KV tiles must pass 2 x BREAK_EVEN x waves (one Q
-# tile at D <= 128, one at D256, more). Count = argmin PARTIAL_COST x waves x s + KV tiles / s (a partial's setup and combine vs
-# the loop's tail).
+# prefix they leave unsplit still splits when its KV loop is long next to the wave load. The equal-length check
+# (sm100_paged_tail_split_equal_check_20261112, B200 and B300) kept one Q tile per unit at D64 / D128 (always split) and more Q tiles
+# at D256 (KV tiles past 2 x BREAK_EVEN x waves); the other branches lost up to 1.33x on equal-length batches and revert.
+# Count = argmin PARTIAL_COST x waves x s + KV tiles / s (a partial's setup and combine vs the loop's tail).
 SM100_PAGED_TAIL_SPLIT_CGA = {(64, 64): 1, (128, 128): 1, (256, 256): 2}
 SM100_PAGED_TAIL_SPLIT_CCS = frozenset({(10, 0), (10, 3)})
-# B300 D128 more-than-one-Q-tile break-even (study sm103_paged_d128_tail_split_20261112; the B200 value failed the B300 transfer)
-SM103_PAGED_D128_TAIL_SPLIT_BREAK_EVEN_MULTI = 148
 SM100_PAGED_TAIL_SPLIT_MAX_B = 16
 SM100_PAGED_TAIL_SPLIT_Q = (16, 1024)  # declared S_q range measured
 SM100_PAGED_TAIL_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
-SM100_PAGED_TAIL_SPLIT_BREAK_EVEN = (0, 18, 74)
+SM100_PAGED_TAIL_SPLIT_ONE_TILE_DIMS = frozenset({64, 128})
+SM100_PAGED_TAIL_SPLIT_MULTI_TILE_BREAK_EVEN = {256: 74}
 SM100_PAGED_TAIL_SPLIT_PARTIAL_COST = 16
 SM100_PAGED_TAIL_SPLIT_COUNTS = (2, 3, 4, 6, 8, 12, 16)
 
@@ -2965,12 +2964,13 @@ def sm100_paged_tail_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]
     units = facts.b * (facts.h_kv if pack else facts.h_q) * q_tiles
     slots = facts.device_sm_count // cga
     kv_tiles = _ceil_div(facts.s_kv, 128)
-    one, one_d256, multi = SM100_PAGED_TAIL_SPLIT_BREAK_EVEN
-    if facts.device_cc == (10, 3) and d_shape == (128, 128):
-        multi = SM103_PAGED_D128_TAIL_SPLIT_BREAK_EVEN_MULTI
-    break_even = (one if facts.d_qk <= 128 else one_d256) if q_tiles == 1 else multi
-    if not (q_tiles == 1 and units <= slots) and kv_tiles * slots <= 2 * break_even * units:
-        return 1, False
+    if q_tiles == 1:
+        if facts.d_qk not in SM100_PAGED_TAIL_SPLIT_ONE_TILE_DIMS:
+            return 1, False
+    else:
+        break_even = SM100_PAGED_TAIL_SPLIT_MULTI_TILE_BREAK_EVEN.get(facts.d_qk)
+        if break_even is None or kv_tiles * slots <= 2 * break_even * units:
+            return 1, False
     counts = [s for s in SM100_PAGED_TAIL_SPLIT_COUNTS if kv_tiles // s >= 4]
     if not counts:
         return 1, False
