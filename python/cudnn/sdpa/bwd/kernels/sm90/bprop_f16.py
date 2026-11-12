@@ -656,4 +656,4 @@ def bprop_host(
         scale,
         q.element_type,
         causal,
-    ).launch(grid=(nk * k.shape[2], 1, q.shape[0]), block=(THREADS, 1, 1), stream=stream)
+    ).launch(grid=(nk * k.shape[2], 1, q.shape[0]), block=(THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)
