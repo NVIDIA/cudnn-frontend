@@ -344,7 +344,8 @@ def test_paged_two_kv_streams_match_the_reference(routed, name, b, s_q, page, ma
 @pytest.mark.parametrize(
     "b,h,kh,s_q,page,max_pages,lens,split,sched,packed,causal",
     [
-        (40, 64, 8, 1, 16, 72, [1152, 777, 0, 40] * 10, 4, 0, True, False),
+        # Sixteen live rows keep this on the two-stream producer; <=8 use native decode on SM100.
+        (40, 64, 8, 2, 16, 72, [1152, 777, 0, 40] * 10, 4, 0, True, False),
         (4, 64, 8, 4, 8, 33, [264, 129, 40, 0], 4, 1, True, True),
         (2, 8, 8, 64, 128, 9, [1152, 1000], 4, 2, False, False),
         (4, 64, 8, 4, 8, 33, [264, 129, 40, 0], 1, 0, True, True),

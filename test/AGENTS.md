@@ -548,6 +548,13 @@ Default-provider passes alone cannot qualify an advertised native path.
 
 ### CUDA Graph test lifetimes
 
+Apply `torch.cuda.set_sync_debug_mode("error")` around the execute body,
+inside an already entered CUDA Graph context. PyTorch capture setup itself can
+synchronize on newer versions; auditing `capture_begin()` can raise after
+capture starts and poison subsequent tests. Restore the prior mode before the
+context exits. Native FP8 decode graph tests cover eager and captured execution
+with this boundary.
+
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
 `finally` block or context manager. Python reference cycles can defer its CUDA
 executable destruction until GC runs inside a later test's capture, invalidating

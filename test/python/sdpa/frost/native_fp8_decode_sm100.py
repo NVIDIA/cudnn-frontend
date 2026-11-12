@@ -147,10 +147,15 @@ def test_native_fp8_decode_graph(in_key, out_dtype, sq, group, split, stats, hnd
             before = torch.cuda.memory_stats()["allocation.all.allocated"]
             execute()
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-            with torch.cuda.graph(capture):
-                execute()
         finally:
             torch.cuda.set_sync_debug_mode(mode)
+        # PyTorch capture setup may synchronize; audit the execute body itself.
+        with torch.cuda.graph(capture):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                execute()
+            finally:
+                torch.cuda.set_sync_debug_mode(mode)
 
         def poison():
             buf["o"].view(torch.uint8).fill_(127)

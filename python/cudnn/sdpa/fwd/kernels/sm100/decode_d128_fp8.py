@@ -23,7 +23,7 @@ THD, MXFP8, block-scaled O and other query widths retain their existing
 lowerings. This forward-only template adds no public API or knobs.
 """
 
-from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
+from cudnn.frost.compiled_cache import template_key as _template_key
 from typing import Callable, NamedTuple, Optional, Tuple
 
 from cutlass.experimental import primitives as nvvm
@@ -54,16 +54,11 @@ from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import MASK_CAUSAL, MASK_PADDED, MASK_SWA, compute_kv_loop_bounds
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16, fp32_to_fp8_pack
-from cudnn.sdpa.fwd.kernels._common_blackwell import row_max_for_exp2, sdpa_operand_tensors
+from cudnn.sdpa.fwd.kernels._common_blackwell import row_max_for_exp2
 from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax
 
-if FP8:
-    STORAGE_DTYPE = cutlass.Float8E4M3FN if CFG.DTYPE_QKV == 0 else cutlass.Float8E5M2
-elif CFG.DTYPE_QKV == 2:
-    STORAGE_DTYPE = cutlass.BFloat16
-else:
-    STORAGE_DTYPE = cutlass.Float16
-MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4 if FP8 else nvvm.Tcgen05MMAKind.F16
+STORAGE_DTYPE = cutlass.Float8E4M3FN if CFG.DTYPE_QKV == 0 else cutlass.Float8E5M2
+MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_1
 OUT_STORAGE_DTYPE = (cutlass.Float8E4M3FN, cutlass.Float8E5M2, cutlass.BFloat16, cutlass.Float16)[CFG.DTYPE_O]
 
@@ -74,7 +69,6 @@ TILE_O = CFG.TILE_O
 BPE = CFG.BPE
 STAGES = CFG.STAGES_KV
 SPLIT_KV = CFG.SPLIT_KV
-_FP32_PARTIALS = SPLIT_KV > 1
 
 # === PackGQA === row r of the Q tile is token r // G, head r % G (the prefill
 # tile's convention).  The Q TMA box covers Q_BOX_TOKENS tokens x G heads; a
