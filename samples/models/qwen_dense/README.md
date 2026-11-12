@@ -1,9 +1,11 @@
 # Dense Qwen 3.5-architecture model
 
 Samples for the dense model of the Qwen 3.5 architecture at its published 27B-class layer widths: hidden 5,120; 64 layers,
-three linear-attention (gated delta-rule) layers to one attention layer; linear attention with 16 key heads and 48 value heads
-of 128; attention with 24 query heads and 4 key/value heads of 256; MLP width 17,408; 8-bit projections, a 4-bit MLP and a
-4-bit output head. Area rules and the helper layer: [../README.md](../README.md).
+three linear-attention (gated delta-rule, GDN) layers to one attention layer; linear attention with 16 key heads and 48
+value heads of 128; attention with 24 query heads and 4 key/value heads of 256; MLP width 17,408; 8-bit projections, a
+4-bit MLP and a 4-bit output head. `nvidia/Qwen3.8-27B-NVFP4` is a checkpoint of this architecture, and the one this
+sample was last run with; the NVFP4 of its name is its 4-bit storage format (packed 4-bit codes with block scales and a
+global scale). Area rules, the helper layer and the words a run uses: [../README.md](../README.md).
 
 | script | what it runs | status |
 |---|---|---|
@@ -31,9 +33,9 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 | `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-new-tokens` |
 | `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt |
 | `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
-| `--stack fe-cublas\|reference` | `fe-cublas` | explicit, never chosen by what is installed |
-| `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed |
-| `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header |
+| `--stack fe-cublas\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
+| `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
+| `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header. `ieee-fp32` sets `torch.backends.cuda.matmul.fp32_precision` for the rest of the process, which ends with the run |
 | `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
 
 A `--messages` file (the `chat.json` of the last command above), here with a system turn and the reasoning switched off:
@@ -236,14 +238,15 @@ written from the format definitions.
 `cudnn.GdnDecodeFused` serves compute capability 10.x and 12.x and declines elsewhere; the sample then prints
 `[00] SKIP cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is <cc>` and exits 0. The entry is
 validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention/gdn_decode_flashinfer_backend.md`).
+`nvidia-smi --query-gpu=name,compute_cap --format=csv` prints the compute capability of a GPU.
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
-| 10.3 | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
-| 10.7 | runs (`[00] PASS`), unverified: batch invariance of the fused step is reported on this class, not gated |
-| 12.0 | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
-| any other | `[00] SKIP`, by design |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
+| 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
+| 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
+| 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
+| any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
 A class the current checks have not run on is uncovered, not passing.
 
@@ -256,5 +259,6 @@ prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
 6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
-Blackwell GPU: about 5 s to draw the weights, 1 to 2 s to compile the fused step per sequence count, the rest for the decode
-and its checks. These are orientation values of one run, not measurements of record.
+Blackwell GPU: about 5 s to draw the weights, about a second to compile the fused step for the first sequence count (0.5
+to 2.4 s in the runs so far) and 0.3 s for the next, the rest for the decode and its checks. These are orientation values
+of single runs, not measurements of record.

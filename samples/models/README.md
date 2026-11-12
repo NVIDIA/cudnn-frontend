@@ -12,8 +12,8 @@ experimental. Timings printed by a sample are for orientation only.
 first sample is the plain decode: by default on the reduced seeded model, self-checking; with `--model`, text in and text
 out on a checkpoint from local disk, with the checkpoint's own tokenizer and chat template. Both run on the stack
 `fe-cublas`, which is a reference path: it holds every quantised weight as a bf16 copy and issues every launch from Python.
-Kernels on the stored 8-bit and 4-bit formats, FlashInfer where it has the block, and a captured decode step follow as a
-second stack (`native`). The destination is a runnable performance reference. Until a sample reaches it, its README says
+Kernels on the stored 8-bit and 4-bit formats, FlashInfer where it has the block, and a captured decode step (a step
+recorded once and replayed without Python between its launches) follow as a second stack (`native`). The destination is a runnable performance reference. Until a sample reaches it, its README says
 what the sample measures and what it does not, and no README here carries a performance table: numbers are published
 through the formal mode of the `benchmark/` folder.
 
@@ -33,15 +33,16 @@ its time per token is longer and its time to first token is dominated by waiting
 
 ## Run
 
-Building cuDNN Frontend from this checkout needs a CUDA toolkit with its compiler, cuDNN 9 headers and libraries, CMake 3.26
-or newer and a C++17 compiler. Install PyTorch first so the build finds the cuDNN headers of its wheel, or set `CUDNN_PATH`.
-`pip install --group` reads the dependency groups of `pyproject.toml` and needs pip 25.1 or newer; the pip a new virtual
-environment starts with is often older, so upgrade it first.
+The decode entries are newer than the last released wheel, so install cuDNN Frontend from this checkout. Building it
+needs a CUDA toolkit with its compiler, cuDNN 9 headers and libraries, CMake 3.26 or newer and a C++17 compiler. Install
+PyTorch first so the build finds the cuDNN headers of its wheel, or set `CUDNN_PATH`; a CUDA toolkit outside its default
+location is named with `CUDAToolkit_ROOT`. `pip install --group` reads the dependency groups of `pyproject.toml` and needs
+pip 25.1 or newer; the pip a new virtual environment starts with is often older, so upgrade it first.
 
 ```bash
 python -m pip install --upgrade pip                # --group needs pip 25.1 or newer
 pip install --group torch
-pip install -e .                                   # the decode entries are newer than the last released wheel
+pip install -e .                                   # a minute or two; deprecation warnings of the build backend are expected
 python samples/models/qwen_dense/00_decode.py      # 2 layers, seeded weights, self-check: no checkpoint, no extra package
 
 # A checkpoint is your own download: the samples fetch nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
@@ -50,6 +51,8 @@ pip install -r samples/models/requirements.txt     # tokenizers, jinja2, safeten
 hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
 python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
 ```
+
+PyTorch warns once on stderr that NumPy is missing (`Failed to initialize NumPy`); the samples need none.
 
 `samples/models/requirements.txt` holds sample-only dependencies with lower bounds; none of them is a dependency of the
 `nvidia-cudnn-frontend` package, and the default run of every sample needs none of them. They are imported only inside the
@@ -87,7 +90,7 @@ and for a default run it imports nothing beyond cuDNN Frontend, PyTorch and the 
 | module | what it holds |
 |---|---|
 | `text_io.py` | text in, token ids; token ids, streamed text out: a synthetic byte-level tokenizer for the seeded run; a checkpoint's own tokenizer and chat template (messages, tool schemas, template options) from local disk |
-| `weights.py` | the three storage formats (bf16; 8-bit E4M3 with a scale; packed 4-bit with block scales and a global scale), the merge rule, dequantisation; seeded checkpoints built in memory; a checkpoint on local disk, described from its shard headers and read tensor by tensor without pickle |
+| `weights.py` | the three storage formats (bf16; 8-bit E4M3 with a scale; packed 4-bit with block scales and a global scale, the NVFP4 of a checkpoint's name), the merge rule, dequantisation; seeded checkpoints built in memory; a checkpoint on local disk, described from its shard headers and read tensor by tensor without pickle |
 | `state.py` | the key/value cache of the attention layers; the recurrent-state and conv-history pool of the linear-attention layers, by slot id |
 | `blocks.py` | provider rows as data, the plan for (GPU class, sequences, tokens per sequence, stack), the served-by table, the memory sentence, typed declines |
 | `providers/fe.py` | adapters to cuDNN Frontend entries |
@@ -101,8 +104,16 @@ and for a default run it imports nothing beyond cuDNN Frontend, PyTorch and the 
 
 ## What a run reports
 
-Every line below is printed by every run; a run on the reduced model prefixes its times with "reduced model" and prints
-no rate. None of it is a measurement of record: no clock is locked, and the stack is launched from Python.
+Every line below is printed by every run of the stack `fe-cublas`; `--stack reference` prints no `checks` and no
+`first launch` line. A run on the reduced model prefixes its times with "reduced model" and prints no rate. None of it is
+a measurement of record: no clock is locked, and the stack is launched from Python.
+
+Words a run and these pages use. *Sequence*: one text being generated. *Row*: one token position of a step; a plain decode
+has one row per sequence. *Step*: one pass of the model over all rows. *Period*: from the first launch of one step to the
+first launch of the next. *Captured*: recorded once and replayed without Python between the launches; these stacks are
+launched from Python instead, one launch after the other. *Clock not locked*: the GPU's clock frequency is left as it
+is, one reason no timing here is a measurement of record. *Teacher-forced*: a provider block and its reference block are
+run on the same operands and the same state, call by call, so that an error cannot accumulate from block to block.
 
 | line | definition |
 |---|---|
@@ -118,6 +129,7 @@ no rate. None of it is a measurement of record: no clock is locked, and the stac
 | `bytes per step` | arithmetic on the model's tensor list: the bytes of the weights a step reads in their stored formats plus the state it reads and writes, against the same with the weights as this stack holds them; in GB (10^9 bytes), as a checkpoint's size in the header |
 | `note` | what bounds a step of this run, from the traced pass: the launch path from Python where host-exposed time is the larger part of the period, the stack's GPU work where GPU busy is; "not measured" without a traced pass. No time per block and no limit (floor, speed-of-light figure) is printed by the stacks of this area so far |
 | `text out` | the text of sequence 0 and why it ended |
+| `ids hash` | in the last line before the verdict: a SHA-256 over the produced ids of every sequence of the run, its first 12 hex digits; equal between two runs that produced the same tokens. The other two hashes of a run are in its header: the manifest hash of a checkpoint (its layout, not its values) and the source hash of the package files the cuDNN Frontend provider runs |
 | `checks` | replay, blocks, tokens, batch invariance (the family README has the bands; a run prints each band's text once, under the block lines); with a checkpoint, on the first 16 steps of every prompt, and the token line is `REPORTED`, not judged against a band |
 | `GPU memory`, `first launch` | PyTorch's peak and the growth on the device since the plan, in GiB; what the first launch of a compiled form took outside PyTorch's pool, in MiB |
 
@@ -125,9 +137,9 @@ no rate. None of it is a measurement of record: no clock is locked, and the stac
 
 | what | by | where |
 |---|---|---|
-| the helper layer without a GPU: tables, plan, declines, memory sentence, environment check, token choice, stop rules, a decode of a tiny geometry on the CPU; the tie-out itself on stated tensors and through stand-in providers with deliberate defects (a NaN, one wrong value head, a row that reads its neighbour) | `test/python/misc/test_model_samples_plan.py` | any host, level L0 |
-| the weight formats: the bf16 copies both stacks read against a decode written from the format definitions, the quantisers, both merge rules, the reference multiply; a checkpoint directory generated in the test: described from its headers, bound through the family's name map, read back bit for bit, decoded on the CPU to the bytes the same tensors give from memory; the declines of a checkpoint the family does not read; the memory sentence of `--model` before a tensor is read | `test/python/misc/test_model_samples_weights.py` | any host, level L0; the checkpoint tests skip visibly without `safetensors` |
-| the text side: the synthetic tokenizer and its stream; chat requests from JSON files; a chat template with the constructs of a checkpoint's own (tool schemas, a reasoning block, tool calls and results, several turns, an option, a refusal) against stored strings; a tokenizer trained in the test, encoded, decoded and streamed; the requirement file | `test/python/misc/test_model_samples_text.py` | any host, level L0; the checkpoint tests skip visibly without `jinja2` or `tokenizers` |
+| the helper layer without a GPU: tables, plan, declines, memory sentence, environment check, token choice, stop rules, a decode of a tiny geometry on the CPU, also through the sample's own loop function; the sample's flags and its last line; the tie-out itself on stated tensors and through stand-in providers with deliberate defects (a NaN, one wrong value head, a row that reads its neighbour) | `test/python/misc/test_model_samples_plan.py` | any host, level L0 |
+| the weight formats: the bf16 copies both stacks read against a decode written from the format definitions, the quantisers, both merge rules, the reference multiply; a checkpoint directory generated in the test: described from its headers, bound through the family's name map, read back bit for bit, decoded on the CPU to the bytes the same tensors give from memory; the declines of a checkpoint the family does not read; the errors of a copy that is not whole and of what else a user can get wrong, each as the one line the sample prints; the memory sentence of `--model` before a tensor is read | `test/python/misc/test_model_samples_weights.py` | any host, level L0; the checkpoint tests skip visibly without `safetensors` |
+| the text side: the synthetic tokenizer and its stream; chat requests from JSON files; a chat template with the constructs of a checkpoint's own (tool schemas, a reasoning block, tool calls and results, several turns, an option, a refusal) against stored strings; a tokenizer trained in the test, encoded, decoded and streamed, also when it was saved with truncation and padding; the requirement file | `test/python/misc/test_model_samples_text.py` | any host, level L0; the checkpoint tests skip visibly without `jinja2` or `tokenizers` |
 | the default run of each sample: `[NN] PASS` with its own checks | `test/python/linear_attention/frost/test_model_sample_qwen_dense.py` | one GPU the family serves; L0 runs two layers, L1 four |
 | a real checkpoint: text out, and the sample's checks on the first 16 steps of every prompt | by hand, with a run record; the family README states the checkpoint, the versions and the GPU class of the last run | a GPU with room for the stack; never in CI |
 

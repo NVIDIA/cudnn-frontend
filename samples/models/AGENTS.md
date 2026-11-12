@@ -76,7 +76,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
     Only the profiler's own start and stop are reported as a missing trace; an error of a step under it propagates.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
-    file that is missing or is not what its name says, a request file that is not JSON, messages a template cannot render,
+    file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
+    that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
+    for, a request file that is not JSON, messages a template cannot render or renders to no token,
     an output file that cannot be written: each is raised as a `ValueError` whose text names the file by its own name, and
     the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
     untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
@@ -152,3 +154,24 @@ Each of these survived the first set of tests; the host tests now hold the defec
   pip of a new virtual environment has no `--group` option.
 - Both stacks of the tie-out read a checkpoint through the same loader, so `PASS` cannot see a wrong reading. Say what
   does verify it (the text, read by a person; a comparison of the dumped ids), and do not let the verdict line imply more.
+
+## What the second review of the checkpoint path taught
+
+Found by reading the run as somebody who had never seen it, and by feeding it what a download or a hand edit leaves
+behind; the host tests hold each.
+
+- A header that parses says nothing about the bytes behind it. A shard cut after its header passed the description, the
+  binding and the plan and failed in the load, without a file name. Compare every shard's size with what its header
+  describes, and the directory with what its index file lists, before the plan.
+- A check with nothing to judge cannot fail. "0 of 0 blocks inside their bands" is the reference compared with itself;
+  count what was judged, print the line as `REPORTED` and the run as `RAN` where the count is zero.
+- A sentence about what bounds a step, printed as a constant, will one day stand under a measurement that says the
+  opposite. Word it from the run's own figures.
+- One label for two units misleads on the line that decides whether a run starts: 52.4 GiB printed as "GB" is 56.3 GB.
+  Say GiB where the divisor is 2^30, and state an allowance that covers what a run was seen to take.
+- A run that prints nothing for a minute reads as a hang, and a budget cuts it. Say what comes next before a phase that
+  prints nothing, outside every timed interval, and flush the line.
+- A file a library saved carries the settings of the call before the save. A `tokenizer.json` with truncation or padding
+  switched on cuts or pads a prompt without a word; switch both off, and hold it with a tokenizer saved that way.
+- A command block is typed as it is written. A step that stands in a sentence elsewhere, such as fetching the checkpoint,
+  is a step the reader does not take: put it in the block, in order, with what it costs.

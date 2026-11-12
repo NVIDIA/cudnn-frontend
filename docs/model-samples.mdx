@@ -13,12 +13,13 @@ Model samples run one open-weight model family end to end in a single process: t
 
 ## Run
 
-The decode entries are newer than the last released wheel, so install cuDNN Frontend from the checkout. Building it needs a CUDA toolkit with its compiler, cuDNN 9 headers and libraries, CMake 3.26 or newer and a C++17 compiler. Install PyTorch first so the build finds the cuDNN headers of its wheel, or set `CUDNN_PATH`.
+The decode entries are newer than the last released wheel, so install cuDNN Frontend from the checkout. Building it needs a CUDA toolkit with its compiler, cuDNN 9 headers and libraries, CMake 3.26 or newer and a C++17 compiler. Install PyTorch first so the build finds the cuDNN headers of its wheel, or set `CUDNN_PATH`; a CUDA toolkit outside its default location is named with `CUDAToolkit_ROOT`.
 
 ```bash
+git clone https://github.com/NVIDIA/cudnn-frontend && cd cudnn-frontend
 python -m pip install --upgrade pip      # --group needs pip 25.1 or newer
 pip install --group torch
-pip install -e .
+pip install -e .                         # a minute or two; deprecation warnings of the build backend are expected
 python samples/models/qwen_dense/00_decode.py
 ```
 
