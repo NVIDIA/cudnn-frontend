@@ -734,6 +734,22 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "mtp", "dense", "window", True, "gqa", True): Entry("always", None, "sm107_dense_decode_20261031"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "q1", "dense", "none", False, "gqa", False): Entry("never", None, "sm107_dense_decode_20261031"),
     ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "q1", "dense", "none", False, "gqa", True): Entry("never", None, "sm107_dense_decode_20261031"),
+    # study sm107_d64_sink_prefill_20261112 (208-SM Rubin, cuDNN 9.30.0.4; benchmark/attention_inference's context graph: dense d64
+    # with a sink, bottom-right causal with and without a 128-key window, GQA 8, s_q 128-8192, S_kv 2k-131k on and off the tile,
+    # b 1 / 4; 264 train cells (measured default regret 1.52, up to 37.8x) + a 48-cell seeded holdout scored once: 0.61 geomean
+    # of the measured default per class, worst 1.08)
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "dense", "causal_br", True, "gqa", False): Entry(
+        "le", 8.5, "sm107_d64_sink_prefill_20261112", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "dense", "causal_br", True, "gqa", True): Entry(
+        "always", None, "sm107_d64_sink_prefill_20261112"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "dense", "window", True, "gqa", False): Entry(
+        "le", 8.5, "sm107_d64_sink_prefill_20261112", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm107", (10, 7), "bf16", (64, 64), "prefill", "dense", "window", True, "gqa", True): Entry(
+        "always", None, "sm107_d64_sink_prefill_20261112"
+    ),
     # study sm120_decode_20261112 (RTX PRO 6000 Server, cuDNN 9.30.0.4; benchmark/attention_inference's generation graph, s_q 1-4:
     # paged d128 / d256 GQA page 16, d512 / D576xV512 absorbed MLA dense and paged, d64 sink (and window 128) paged MTP; b 1-64, S_kv
     # 8k-131k on and off the tile; 333 train cells + a seeded holdout scored once per class: 0.34-0.67 geomean of the measured default,

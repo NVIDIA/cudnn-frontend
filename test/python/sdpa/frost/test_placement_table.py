@@ -357,6 +357,29 @@ def test_b300_d192_window_gqa_keeps_default_order(s_kv, monkeypatch):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("window_left", [None, 127], ids=["causal", "window"])
+def test_sm107_dense_d64_sink_prefill_follows_its_study(window_left):
+    """Study sm107_d64_sink_prefill_20261112 (Rubin): dense d64 prefill with a sink leads off the 128-key tile at any length and on the
+    tile up to 2^8.5 parallel tiles; without a sink, f16, or another part the hand rules keep deciding."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def f(**over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=128, s_kv=131072, d_qk=64, d_v=64, causal=True, bottom_right=True, has_sink=True, window_left=window_left)
+        base.update(has_paged_kv=False, padded=False, page_size=0, device_cc=(10, 7), device_sm_count=208)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (131072, 131071):
+        assert pt.lookup(row, f(s_kv=s_kv)) is True
+        assert pt.matched_entry(row, f(s_kv=s_kv)).study == "sm107_d64_sink_prefill_20261112"
+    assert pt.lookup(row, f(b=4, s_q=8192, s_kv=131072)) is False  # 4 x 8 x 64 tiles: past the on-tile threshold
+    assert pt.lookup(row, f(b=4, s_q=8192, s_kv=131071)) is True
+    assert getattr(pt.matched_entry(row, f(has_sink=False)), "study", None) != "sm107_d64_sink_prefill_20261112"
+    assert pt.lookup(row, f(dtype=cudnn.data_type.HALF)) is None
+    assert pt.lookup(row, f(device_cc=(10, 3))) is None
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("row, cc", [("sdpa_fwd_prefill_sm80", (8, 0)), ("sdpa_fwd_prefill_sm90", (9, 0))], ids=["a100", "h200"])
 def test_sm80_sm90_decode_shaped_gqa_follows_the_decode_studies(row, cc):
     """Studies sm80_decode_20261112 / sm90_decode_20261112: GQA decode-shaped rows -- s_q 2-4 (mtp) and 5-16 (verify, a row-local
