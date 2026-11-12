@@ -92,7 +92,7 @@ _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})
 _VERIFY_MAX_S_Q = 16  # placement.DECODE_SHAPED_MAX_S_Q: the spec-decode verify depth
 
 
-def class_key(row: str, facts) -> Optional[Tuple]:
+def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
     dtype = _dtype_name(facts.dtype)
     if dtype is None or _unmeasured(facts) or not facts.h_kv or facts.h_q % facts.h_kv:
         return None
@@ -106,7 +106,7 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         # No study has qualified this new class yet, so it falls back to the existing backend-first order.
         # This is row/part-local: GB10 and every other row keep their existing classification and studies.
         phase = "prefill_short_square"
-    elif row in _VERIFY_ROWS and facts.s_q <= _VERIFY_MAX_S_Q and facts.h_q != facts.h_kv:
+    elif verify and row in _VERIFY_ROWS and facts.s_q <= _VERIFY_MAX_S_Q and facts.h_q != facts.h_kv:
         # SM80 / SM90 GQA spec-decode verify rows run the packed split-KV decode tile, a different regime from the prefill bodies the
         # older prefill studies of these rows measured (sm80_dense_prefill_*: s_q 8-16 GQA there predates SM80 split-KV, #2399).
         phase = "verify"
@@ -220,8 +220,16 @@ def _answer(entry: Entry, facts) -> bool:
 
 
 def matched_entry(row: str, facts) -> Optional[Entry]:
-    """The entry :func:`lookup` answers from: the graph's own class, else a part transfer's borrowed class."""
+    """The entry :func:`lookup` answers from: the graph's own class, else a part transfer's borrowed class. A ``verify`` class
+    no study answers keeps the ``prefill`` class it had before that phase existed."""
     key = class_key(row, facts)
+    entry = _class_entry(key)
+    if entry is None and key is not None and key[4] == "verify":
+        entry = _class_entry(class_key(row, facts, verify=False))
+    return entry
+
+
+def _class_entry(key: Optional[Tuple]) -> Optional[Entry]:
     if key is None:
         return None
     entry = TABLE.get(key)

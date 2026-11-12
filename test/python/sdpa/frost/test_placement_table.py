@@ -381,6 +381,22 @@ def test_sm80_sm90_decode_shaped_gqa_follows_the_decode_studies(row, cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_q", [5, 8, 16])
+def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
+    """A verify class no study answers (here SM80 d64) keeps the prefill entry it had before the verify phase existed."""
+    row = "sdpa_fwd_prefill_sm80"
+    cases = [
+        dict(b=64, h_q=32, h_kv=4, s_kv=8193, causal=True, bottom_right=True),
+        dict(b=8, h_q=32, h_kv=4, s_kv=8192, causal=True, bottom_right=True, window_left=127, has_sink=True),
+    ]
+    for over in cases:
+        facts = _facts(s_q=s_q, d_qk=64, d_v=64, has_paged_kv=False, device_cc=(8, 0), **over)
+        assert pt.class_key(row, facts)[4] == "verify" and pt.class_key(row, facts) not in pt.TABLE
+        assert pt.matched_entry(row, facts) is pt.TABLE[pt.class_key(row, facts, verify=False)]
+        assert pt.lookup(row, facts) is True
+
+
+@pytest.mark.L0
 def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     """The A100 f16 dense prefill classes answer from their own study (sm80_f16_dense_prefill_20261106), not the bf16 one, and
     another Ampere part has no entry: the hand rules decide there."""
