@@ -124,9 +124,10 @@ conv state or slot indices. The default forms keep PDL off.
 
 ## Launch facts
 
-Both entries state what a step launches without launching it: three read-only answers per served row count, with the
-argument list of the entry's own `cfg_for` -- `(rows)` on `GdnDecodeFused`, `(requests, tokens)` on `GdnVerifyFused`
-(`tokens=None` is the minimum, 2).
+Both entries state what a step launches without launching it: three read-only answers per served row count -- `(rows)`
+on `GdnDecodeFused`, the step shape `(requests, tokens)` on `GdnVerifyFused`. Both verify arguments are required:
+`cfg_for` reads a missing `tokens` as the minimum (2) because one config can stand behind every tokens count, but the
+launch differs per tokens count (shared memory, compiled kernel), so a fact never answers for an assumed step.
 
 | fact | answer |
 |---|---|

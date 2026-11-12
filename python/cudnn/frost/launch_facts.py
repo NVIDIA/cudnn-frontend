@@ -7,7 +7,10 @@ what shape, without reading a config out of a kernel name.
 A CuTe DSL kernel symbol is the kernel's Python name followed by the text of its compile-time arguments, cut at a fixed length.  Two
 forms of one kernel can therefore share a symbol (the field that tells them apart sits behind the cut, or is not a kernel argument at
 all), and a symbol alone never proves a form.  So an entry states three read-only facts per served row count, under ONE naming on every
-entry -- ``<rows>`` below is the argument list of the entry's own ``cfg_for``:
+entry.  ``<rows>`` below is the row count as the entry's own ``cfg_for`` names it -- ``(rows)``, or the step shape ``(requests, tokens)``
+on an entry whose launch depends on both -- with EVERY argument required: where ``cfg_for`` lets an argument default (one config can
+stand behind every tokens count), the facts do not, because the launch differs.  A fact answers for the step it is given, never for an
+assumed one:
 
 * ``kernel_symbols_for(<rows>)`` -- the symbols of the kernels the entry has COMPILED for that row count: a tuple without repeats, in
   compile order; empty until a form of that row count is compiled; more than one element only when one row count was compiled for

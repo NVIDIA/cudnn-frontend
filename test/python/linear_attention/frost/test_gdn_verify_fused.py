@@ -1182,8 +1182,6 @@ def test_launch_facts_equal_the_configuration_arithmetic_at_every_step_shape():
                 fields[cfg] = asdict(cfg)
             assert k.launch_shape_for(requests, tokens) == _launch_arithmetic(cfg, requests, tokens), (requests, tokens)
             assert k.form_for(requests, tokens) == {**fields[cfg], "REQUESTS": requests, "TOKENS": tokens, "EPS": 1e-6}, (requests, tokens)
-        assert k.launch_shape_for(requests) == k.launch_shape_for(requests, kcfg.TOKENS_MIN), "tokens None is the minimum, as in cfg_for"
-        assert k.form_for(requests)["TOKENS"] == kcfg.TOKENS_MIN
         with pytest.raises(NotImplementedError, match=f"serves at most {top} on this part"):
             k.launch_shape_for(requests, top + 1)
     assert len(regimes) == 3 and {(c.TWO_CTAS_PER_HEAD, c.MIN_CTAS_PER_SM, c.NORM_FORM) for c in fields} >= {
@@ -1207,8 +1205,6 @@ def test_launch_facts_follow_the_part_the_geometry_and_the_launch_knobs(monkeypa
     pair_requests, one_requests = sm_count // (2 * g.V_HEADS), sm_count // g.V_HEADS  # the last requests count of the pair / one-CTA grid
     for requests in sorted({1, 2, 3, 4, 8, 16, max(pair_requests, 1), pair_requests + 1, max(one_requests, 1), one_requests + 1, entry.MAX_REQUESTS}):
         top = k.max_tokens_for(requests)
-        assert k.launch_shape_for(requests) == k.launch_shape_for(requests, kcfg.TOKENS_MIN), "tokens None is the minimum on every part"
-        assert k.form_for(requests) == k.form_for(requests, kcfg.TOKENS_MIN)
         for tokens in sorted({kcfg.TOKENS_MIN, min(6, top), min(9, top), top}):
             cfg = k.cfg_for(requests, tokens)
             shape = k.launch_shape_for(requests, tokens)
@@ -1234,6 +1230,26 @@ def test_launch_shape_of_the_module_forms_on_the_cc100_readings():
     assert (pair.form_for(1, 6)["NORM_FORM"], pair.form_for(2, 6)["NORM_FORM"]) == ("ctas2", "ctas1"), "the form states the resolved norm association"
 
 
+def test_launch_facts_take_the_tokens_per_request_and_never_assume_it():
+    """``cfg_for`` reads a missing ``tokens`` as the minimum, and on the cc 10.x readings it returns ONE config for every tokens count --
+    yet the launch differs per tokens count (the shared memory of a thread block, the compiled kernel).  So the three facts take the
+    step shape whole: a call without ``tokens`` is a ``TypeError`` (a missing argument), ``tokens=None`` a ``ValueError``, and a
+    compiled 6-token kernel is named by the 6-token step only.  A fact never answers for a step the caller did not name."""
+    k = entry.GdnVerifyFused("cpu", 1e-6, cfg=kcfg.PAIR_CFG)
+    assert k.cfg_for(1) == k.cfg_for(1, kcfg.TOKENS_MIN) == k.cfg_for(1, 6), "one config behind every tokens count on these readings"
+    assert (k.launch_shape_for(1, kcfg.TOKENS_MIN).shared_memory, k.launch_shape_for(1, 6).shared_memory) == (112368, 126512), "two launch shapes behind it"
+    assert (k.form_for(1, kcfg.TOKENS_MIN)["TOKENS"], k.form_for(1, 6)["TOKENS"]) == (kcfg.TOKENS_MIN, 6)
+    ops = make_operands(requests=1, tokens=6)
+    k.compiled[_key(k, ops)] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_T6_0")
+    assert k.kernel_symbols_for(1, 6) == ("cudnn_kernel_frost_gdn_verify_fused_T6_0",) and k.kernel_symbols_for(1, kcfg.TOKENS_MIN) == ()
+    for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
+        with pytest.raises(TypeError, match="missing 1 required positional argument: 'tokens'"):
+            fact(1)
+        for tokens in (None, True, 6.0, "6"):
+            with pytest.raises(ValueError, match="tokens must be an int"):
+                fact(1, tokens)
+
+
 def test_launch_facts_are_plain_fresh_and_decline_an_unserved_step_shape():
     """The facts are plain data (ints, a JSON-serialisable form), a fresh object per call (a caller's edit reaches nothing of the entry)
     and the entry's typed declines for a step shape it does not serve: ``ValueError`` for a requests count below one or off the integers
@@ -1248,8 +1264,8 @@ def test_launch_facts_are_plain_fresh_and_decline_an_unserved_step_shape():
         for requests in (0, -1, 1.0, "1", None, True):
             with pytest.raises(ValueError, match="requests must be a positive int"):
                 fact(requests, 4)
-        for tokens in (4.0, "4"):
-            with pytest.raises(ValueError, match="tokens must be an int or None"):
+        for tokens in (4.0, "4", None):
+            with pytest.raises(ValueError, match="tokens must be an int"):
                 fact(2, tokens)
         with pytest.raises(NotImplementedError, match="at most 65535"):
             fact(entry.MAX_REQUESTS + 1, 4)
@@ -1275,13 +1291,13 @@ def test_kernel_symbols_are_those_of_the_forms_compiled_for_the_step_shape():
     does not expose its kernels is the typed decline, never a guess."""
     k = entry.GdnVerifyFused("cpu", 1e-6)
     k.sm_count = 148
-    assert k.kernel_symbols_for(2, 4) == () and k.kernel_symbols_for(2) == ()
+    assert k.kernel_symbols_for(2, 4) == () and k.kernel_symbols_for(2, kcfg.TOKENS_MIN) == ()
     ops = make_operands(requests=2, tokens=4)
     native, fp32 = _key(k, ops), _key(k, dict(ops, dt_bias=ops["dt_bias"].float()))  # another parameter dtype set: another compile key
     assert native != fp32 and native[:3] == fp32[:3] == (2, 4, k.cfg_for(2, 4))
     k.compiled[native] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_A_0")
     assert k.kernel_symbols_for(2, 4) == ("cudnn_kernel_frost_gdn_verify_fused_A_0",)
-    assert k.kernel_symbols_for(2, 6) == () == k.kernel_symbols_for(4, 4) == k.kernel_symbols_for(2), "another step shape names nothing"
+    assert k.kernel_symbols_for(2, 6) == () == k.kernel_symbols_for(4, 4) == k.kernel_symbols_for(2, kcfg.TOKENS_MIN), "another step shape names nothing"
     k.compiled[fp32] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_A_0")
     assert k.kernel_symbols_for(2, 4) == ("cudnn_kernel_frost_gdn_verify_fused_A_0",), "two dtype sets behind one symbol: named once"
     k.compiled[fp32] = _CompiledStandIn("cudnn_kernel_frost_gdn_verify_fused_B_0")
