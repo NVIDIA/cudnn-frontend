@@ -3701,3 +3701,40 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   pytest -q -m L0 \
   sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
 ```
+
+### SM100 D256 paged THD packed split — 2026-11-11
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit` is collected
+by the existing SM100 CI entry, with all six cases marked L0. Four public graph
+cases cover FP16/BF16, CGA2, split2/3/5/9, unpacked and packed heads (including
+partial GQA6), HND/NHD/mixed page pools, page8/16/128/256, independent physical
+Q/O/Stats offsets and token/head Stats. They compare an independent CPU FP64
+reference, preserve poisoned gaps and inputs, rebind fresh storage, and replay
+changed data/offsets/tables/lengths through retained CUDA Graphs. Route assertions
+pin the D256 native body and native binder.
+
+The two standalone dtype cases hold split5 and packing fixed while comparing
+raw O/FP32 Stats bytes across fresh-buffer replay with concurrent work, sequence
+alone/batched/reordered/duplicated, changed-neighbor Q and129 requests. Lengths
+include zero and fully masked query rows. Independent references check both
+outputs and signed infinity sentinels before two small runtime-keyed goldens
+are recorded. These tests cover forward only; no backward capability is added.
+
+New measurement: six recording cases pass; the subsequent strict run passes all
+50 cases (six public/golden cases,36 native binding cases, eight existing
+paged controls), zero failures/skips. Both goldens match unchanged. The four
+public origin cases pass memcheck, racecheck and synccheck with zero sanitizer
+errors/hazards/warnings. Four SM103 half dtype/packing variants compile offline;
+this is not execution evidence. Runtime:
+SM100/148SM, driver595.71.05, cuDNN9.24.0.43, Torch2.14.1+cu130,
+CuTe DSL4.8.0 with actual compiler CUDA13.4, cuda-bindings13.4.4 and toolkit13.4.92.
+The Torch wheel's CUDA13.0 tag is separate from the asserted DSL compiler.
+The two JSON records were inspected after reference/replay passed. Strict
+comparison must leave `CUDNN_DETERMINISM_RECORD` unset. SM103 execution is
+unverified; this evidence does not establish cross-runtime bitwise stability.
+
+```bash
+cd test/python
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit
+```
