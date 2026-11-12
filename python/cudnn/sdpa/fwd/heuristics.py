@@ -2834,9 +2834,9 @@ SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
 SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
 SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
 SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
-# Past the first wave (study sm100_paged_packed_split_waves_20261112, B200): the parts timed, the declared S_q up to which the
+# Past the first wave (study sm100_paged_packed_split_waves_20261112; B200, B300 transfer): the parts timed, the declared S_q up to which the
 # packed split still leads, D64 also to 128 rows over at least this many KV tiles, and at most this many partitions.
-SM100_PAGED_PACKED_SPLIT_WAVE_CCS = frozenset({(10, 0)})
+SM100_PAGED_PACKED_SPLIT_WAVE_CCS = frozenset({(10, 0), (10, 3)})
 SM100_PAGED_PACKED_SPLIT_WAVE_Q = {(64, 64): 64, (256, 256): 128}
 SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES = 128
 SM100_PAGED_PACKED_SPLIT_WAVE_MAX = 4

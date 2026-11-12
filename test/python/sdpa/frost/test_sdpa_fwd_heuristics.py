@@ -2627,7 +2627,7 @@ def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv
     facts = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
     assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, facts) == splits
     b300 = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3))
-    assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, b300) == 1  # B300 not timed past the first wave
+    assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, b300) == splits  # the B300 transfer qualified the same rule
 
 
 @pytest.mark.L0
@@ -2637,13 +2637,14 @@ def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv
     ids=["b8_g8_kv32k", "b32_g8_kv2k", "b64_g8_kv8k", "q16", "q2048"],
 )
 def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
-    """Study sm100_paged_d128_prefill_20261112: on cc 10.0 FlashInfer's exact paged D128 GQA prefix (S_q < S_kv) leads."""
+    """Study sm100_paged_d128_prefill_20261112: on cc 10.0 / 10.3 FlashInfer's exact paged D128 GQA prefix (S_q < S_kv) leads."""
     from cudnn.sdpa.fwd import placement
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
     facts = _sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
     assert placement._sm100_paged_d128_prefix(facts)
     assert placement.place(spec, facts) == placement.LEAD
+    assert placement._sm100_paged_d128_prefix(_sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3)))
 
 
 @pytest.mark.L0
@@ -2652,13 +2653,13 @@ def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
     [
         dict(s_q=64, s_kv=64),  # a square: tiny squares trail 1.3-2.0x
         dict(max_total_seq_len_q=8 * 128),  # an exact total-Q declaration was not measured
-        dict(device_cc=(10, 3)),
+        dict(device_cc=(10, 7), device_sm_count=208),
         dict(b=65),
         dict(s_kv=131072),
         dict(page_size=32),
         dict(h_q=32, h_kv=32),
     ],
-    ids=["square", "total_q", "b300", "b65", "kv128k", "page32", "mha"],
+    ids=["square", "total_q", "rubin", "b65", "kv128k", "page32", "mha"],
 )
 def test_b200_paged_d128_prefix_rule_stays_inside_its_study(over):
     from cudnn.sdpa.fwd import placement

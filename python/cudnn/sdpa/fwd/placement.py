@@ -372,13 +372,14 @@ declaration and bounded MHA / group 2 showed no material gap and still trail. Fl
 ``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0, then
 transferred to cc 10.3 with the full squares below.
 
-SM100 paged bf16 d128 GQA prefixes (2026-11-12, ``_sm100_paged_d128_prefix``): on cc 10.0, FlashInfer's exact paged declaration
+SM100 paged bf16 d128 GQA prefixes (2026-11-12, ``_sm100_paged_d128_prefix``): on cc 10.0 / 10.3, FlashInfer's exact paged declaration
 (no total-Q capacity) with S_q < S_kv LEADs at b 1-64, 16 <= S_q <= 2048, S_kv to 65536, page 16 / 64, GQA 4 / 8 / 16, causal
 bottom-right, head-major in-page K. Study sm100_paged_d128_prefill_20261112 (B200 1000 W, FlashInfer's paged wrapper, recorded
 facts) timed 250 frozen cells at cuDNN 9.30.0.4 and 9.24.0.43: FROST's first plan (packed, unsplit cga2) ran 0.04-1.08 of the
 backend's first plan on prefixes, while tiny squares (Q = KV = 16-128) trail 1.3-2.0x and keep their rules. The 150 prefix
 cells whose default changes came to 0.62 (9.30) / 0.55 (9.24) of the measured default, worst 1.06; an 80-cell seeded holdout,
-scored once per version, came to 0.68 / 0.62 on its 39 changed cells, worst 1.04. cc 10.3 is not measured.
+scored once per version, came to 0.68 / 0.62 on its 39 changed cells, worst 1.04. A B300 transfer over all 330 frozen cells came to 0.53
+at both versions (223 changed cells, worst 1.09).
 
 SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
 b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
@@ -1125,10 +1126,10 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
 
 
 def _sm100_paged_d128_prefix(facts) -> bool:
-    """cc 10.0 paged bf16 d128 GQA prefix, S_q < S_kv, FlashInfer's exact declaration (module docstring)."""
+    """cc 10.0 / 10.3 paged bf16 d128 GQA prefix, S_q < S_kv, FlashInfer's exact declaration (module docstring)."""
     group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
     return (
-        facts.device_cc == (10, 0)
+        facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
         and not facts.shape_overrides
         and facts.max_total_seq_len_q is None
