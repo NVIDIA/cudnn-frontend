@@ -1330,7 +1330,7 @@ def _prefer_paged_d256_lpt(facts) -> bool:
         and facts.causal
         and facts.window_left is None
         and (facts.right_bound or 0) == 0
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.dtype == cudnn.data_type.BFLOAT16 or (facts.device_cc == (10, 0) and facts.dtype == cudnn.data_type.HALF))
         and (facts.d_qk, facts.d_v) == (256, 256)
         and facts.b == 1
         and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
@@ -2096,7 +2096,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         prefer = (
             pack_gqa is not False
             and _prefer_thd_pack_gqa(caps, facts)
-            and facts.dtype == cudnn.data_type.BFLOAT16
+            and (facts.dtype == cudnn.data_type.BFLOAT16 or (not rubin_paged and facts.has_paged_kv and facts.dtype == cudnn.data_type.HALF))
             and facts.bottom_right
             and facts.window_left is None
             and not facts.right_band_widening
@@ -2866,7 +2866,7 @@ def _sm100_paged_packed_wave_split(caps: Capabilities, facts) -> int:
         and caps.sm_lo == 100
         and facts.device_cc in ((10, 0), (10, 3))
         and paged_thd_split_domain(caps, facts)
-        and facts.dtype == cudnn.data_type.BFLOAT16  # the measured dtype, as the D128 split rule
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)  # the measured dtype, as the D128 split rule
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in SM100_PAGED_PACKED_SPLIT_GROUPS
@@ -2934,7 +2934,7 @@ def sm100_paged_tail_split_domain(caps: Capabilities, facts) -> bool:
         and paged_thd_split_domain(caps, facts)
         and not facts.shape_overrides
         and facts.max_total_seq_len_q is None
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and 1 <= facts.b <= SM100_PAGED_TAIL_SPLIT_MAX_B
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
@@ -3100,7 +3100,7 @@ def _measured_paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: b
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.dtype == cudnn.data_type.BFLOAT16 or (caps.sm_lo == 100 and facts.dtype == cudnn.data_type.HALF))
         and 1 <= facts.b <= (64 if caps.sm_lo == 107 else SM100_PAGED_D128_WIDE_MAX_B if wide else 4)
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0

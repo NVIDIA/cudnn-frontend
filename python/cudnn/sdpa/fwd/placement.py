@@ -1077,7 +1077,7 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
     """Bounded shard derived from measured workloads; inspect only graph declarations."""
     return (
         facts.device_cc == (10, 0)
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (256, 256)
         and facts.has_paged_kv
         and facts.thd
@@ -1099,7 +1099,7 @@ def _sm100_paged_full_square(facts) -> bool:
     if not (
         facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and facts.s_q == facts.s_kv
         and facts.causal
         and facts.window_left is None
@@ -1124,7 +1124,7 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
         facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
         and (group == 16 or (group in (4, 8) and (bool(facts.shape_overrides) or facts.max_total_seq_len_q is None)))
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
         and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) <= 4096
@@ -1147,7 +1147,7 @@ def _sm100_paged_d128_prefix(facts) -> bool:
         and facts.has_paged_kv
         and not facts.shape_overrides
         and facts.max_total_seq_len_q is None
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and group in (4, 8, 16)
         and 1 <= facts.b <= SM100_PAGED_D128_PREFIX_MAX_B
@@ -1213,7 +1213,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     if (
         512 <= facts.s_q <= 8192
         and facts.device_cc in PAGED_D128_FULL_PREFILL_CCS
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.thd
         and facts.has_paged_kv

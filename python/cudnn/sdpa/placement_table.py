@@ -229,7 +229,24 @@ def matched_entry(row: str, facts) -> Optional[Entry]:
     return entry
 
 
+DTYPE_TRANSFERS: Dict[Tuple[str, str], Tuple[str, FrozenSet[str]]] = {
+    # study sm100_paged_f16_transfer_20261112: FlashInfer's exact paged f16 prefill timed against these studies' bf16 verdicts.
+    ("sdpa_fwd_prefill_sm100", "f16"): ("bf16", frozenset({"sm100_paged_d64_d256_prefill_20261111", "sm100_d256_paged_context_20261030"})),
+}
+"""A dtype with no study of its own may borrow another dtype's entries on a row, study by study, once a transfer check timed
+those studies' classes in it."""
+
+
 def _class_entry(key: Optional[Tuple]) -> Optional[Entry]:
+    entry = _measured_entry(key)
+    if entry is None and key is not None and (key[0], key[2]) in DTYPE_TRANSFERS:
+        base, studies = DTYPE_TRANSFERS[(key[0], key[2])]
+        borrowed = _measured_entry(key[:2] + (base,) + key[3:])
+        entry = borrowed if borrowed is not None and borrowed.study in studies else None
+    return entry
+
+
+def _measured_entry(key: Optional[Tuple]) -> Optional[Entry]:
     if key is None:
         return None
     entry = TABLE.get(key)
