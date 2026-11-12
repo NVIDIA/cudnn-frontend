@@ -58,9 +58,18 @@ Unfiltered Compute Sanitizer memcheck, synccheck and racecheck each pass the
 four golden cases. Memcheck/synccheck report0 errors; racecheck reports0
 hazards, errors or warnings. CUDA API error reporting is disabled. Under
 instrumentation FE reports cuDNN93000 and Torch92400; the explicit standalone
-FROST path executes no backend attention. SM103 is still unverified by this run.
+FROST path executes no backend attention. No new SM103 sanitizer run is claimed.
 The separate public graph suite passes28 cases, including legacy D256
 wide-tile controls. The source/import and runtime library hashes are verified.
+
+Native B300 SXM6 AC (cc10.3,148SMs, same compiler/runtime versions) passes40
+checks through `TestDecodeLiveColumns` in the actual SM100/SM103 CI entry,
+including the older sink, routing, wide-tile and Int64 page-table-stride cases.
+Its four new golden records pass a separate strict process. Both dtype stress
+cases report0 mismatches in256 warm and256 poisoned launches at592 CTAs; the
+unsafe-ring control fails200/200. No skips. The B300 job's subsequent
+performance phase failed during FlashInfer import before any measurements;
+that harness failure does not change these completed qualification results.
 
 Run from `test/python` with `CUDNN_DETERMINISM_RECORD` unset:
 
