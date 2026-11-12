@@ -37,6 +37,11 @@ _SUPPORTED_FORWARD_INSTANCES = (
     (128, 512, 0),
     (128, 512, 512),
     (128, 512, 1024),
+    (128, 512, 2048),
+    (128, 576, 0),
+    (128, 576, 512),
+    (128, 576, 1024),
+    (128, 576, 2048),
 )
 
 
@@ -106,13 +111,15 @@ def test_DSA_sparse_attention_forward_rejects_invalid_public_contracts():
         DSA.SparseAttentionForward(q64, kv, torch.zeros((1, 256), dtype=torch.int32, device=device), indexer_topk=256).check_support()
     with pytest.raises(ValueError, match="must not exceed logical K"):
         DSA.SparseAttentionForward(q64, kv, topk64, indexer_topk=512).check_support()
-    with pytest.raises(ValueError, match="indexer_topk=2048 is unsupported"):
-        DSA.SparseAttentionForward(
-            q128,
-            kv,
-            torch.zeros((1, 2048), dtype=torch.int32, device=device),
-            indexer_topk=2048,
-        ).check_support()
+    # H128 D512 serves indexer_topk=2048 on two H64 head windows.
+    assert DSA.SparseAttentionForward(
+        q128,
+        kv,
+        torch.zeros((1, 2048), dtype=torch.int32, device=device),
+        indexer_topk=2048,
+    ).check_support()
+    with pytest.raises(ValueError, match="indexer_topk=256 is unsupported"):
+        DSA.SparseAttentionForward(q128, kv, torch.zeros((1, 256), dtype=torch.int32, device=device), indexer_topk=256).check_support()
 
 
 @pytest.mark.L0
@@ -223,7 +230,7 @@ def test_DSA_sparse_attention_forward_empty_wrapper_and_support_contract():
     with pytest.raises(ValueError, match="base pointer must be 16-byte aligned"):
         op.execute(q, kv, topk_idxs, out=misaligned_out)
 
-    bad_q = torch.empty((2, 128, 576), dtype=torch.bfloat16, device=device)
+    bad_q = torch.empty((2, 48, 576), dtype=torch.bfloat16, device=device)
     bad_kv = torch.empty((1, 576), dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError, match="supports only"):
         DSA.SparseAttentionForward(bad_q, bad_kv, topk_idxs).check_support()
@@ -509,8 +516,12 @@ def test_DSA_sparse_attention_forward_head128_softmax_exchange_scratch_reuse():
 
 
 @pytest.mark.L2
-@pytest.mark.parametrize("num_heads", [64, 96, 128])
-def test_DSA_sparse_attention_forward_threshold_rescale_is_warp_group_uniform(num_heads):
+@pytest.mark.parametrize(
+    "num_heads,head_dim",
+    [(64, 512), (96, 512), (128, 512), (128, 576)],
+    ids=["H64-D512", "H96-D512", "H128-D512", "H128-D576"],
+)
+def test_DSA_sparse_attention_forward_threshold_rescale_is_warp_group_uniform(num_heads, head_dim):
     """Lock down the threshold=6 vote-based rescale semantics."""
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
@@ -521,8 +532,8 @@ def test_DSA_sparse_attention_forward_threshold_rescale_is_warp_group_uniform(nu
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    q = torch.zeros((1, num_heads, 512), dtype=torch.bfloat16, device=device)
-    kv = torch.zeros((128, 512), dtype=torch.bfloat16, device=device)
+    q = torch.zeros((1, num_heads, head_dim), dtype=torch.bfloat16, device=device)
+    kv = torch.zeros((128, head_dim), dtype=torch.bfloat16, device=device)
     q[0, 0, 0] = 1  # Head 0 jumps by 7 log2 units and triggers group 0.
     q[0, 1, 1] = 1  # Head 1 has a sub-threshold jump in the same group.
     q[0, 33, 1] = 1  # Head 33 has the same jump in non-triggered group 1.
@@ -547,7 +558,7 @@ def test_DSA_sparse_attention_forward_threshold_rescale_is_warp_group_uniform(nu
 @pytest.mark.L1
 @pytest.mark.parametrize(
     "num_heads,head_dim",
-    [(64, 512), (64, 576), (96, 512), (96, 576), (128, 512)],
+    [(64, 512), (64, 576), (96, 512), (96, 576), (128, 512), (128, 576)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_DSA_sparse_attention_forward_matches_gather_reference(num_heads, head_dim, dtype):
@@ -601,11 +612,13 @@ def test_DSA_sparse_attention_forward_matches_gather_reference(num_heads, head_d
     assert torch.isposinf(result["lse"][2]).all()
     assert result["lse_indexer"] is None
 
-    if num_heads == 96:
-        # H96 runs the H64 kernel on heads [0, 64) and [32, 96); both launches
-        # must write the same bytes to the overlap, so each window equals an H64
-        # run on a contiguous copy of its heads.
-        for start in (0, 32):
+    window_starts = {(96, 512): (0, 32), (96, 576): (0, 32), (128, 576): (0, 64)}.get((num_heads, head_dim), ())
+    if window_starts:
+        # H96 runs the H64 kernel on heads [0, 64) and [32, 96), and H128 D576
+        # on [0, 64) and [64, 128). Both H96 launches must write the same bytes
+        # to the overlap, so each window equals an H64 run on a contiguous copy
+        # of its heads.
+        for start in window_starts:
             heads = slice(start, start + 64)
             window = DSA.sparse_attention_forward_wrapper(
                 q[:, heads].contiguous(),
@@ -645,8 +658,8 @@ def test_DSA_sparse_attention_forward_matches_gather_reference(num_heads, head_d
 @pytest.mark.L2
 @pytest.mark.parametrize(
     "num_heads,head_dim",
-    [(64, 512), (64, 576), (96, 576), (128, 512)],
-    ids=["H64-D512", "H64-D576", "H96-D576", "H128-D512"],
+    [(64, 512), (64, 576), (96, 576), (128, 512), (128, 576)],
+    ids=["H64-D512", "H64-D576", "H96-D576", "H128-D512", "H128-D576"],
 )
 def test_DSA_sparse_attention_forward_reuses_compilation_across_dynamic_extents(num_heads, head_dim, monkeypatch):
     """One specialization must handle simultaneous Q, KV, and padded-K growth."""
@@ -943,7 +956,7 @@ def test_DSA_sparse_attention_forward_graph_replay_uses_capture_stream():
 @pytest.mark.L1
 @pytest.mark.parametrize(
     "num_heads,indexer_topk,logical_topk",
-    [(64, 512, 576), (128, 1024, 1152)],
+    [(64, 512, 576), (128, 1024, 1152), (128, 2048, 2112)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 def test_DSA_sparse_attention_forward_indexer_lse(num_heads, indexer_topk, logical_topk, dtype):
@@ -972,3 +985,62 @@ def test_DSA_sparse_attention_forward_indexer_lse(num_heads, indexer_topk, logic
         return_full=True,
     )
     torch.testing.assert_close(result["lse_indexer"], ref_lse_indexer, atol=1e-6, rtol=2.01 / 65536)
+
+
+@pytest.mark.L0
+def test_DSA_sparse_attention_forward_head128_routing():
+    """H128 keeps its dedicated D512 kernel up to indexer_topk=1024; other H128 shapes run H64 windows."""
+    try:
+        from cudnn.deepseek_sparse_attention.sparse_attention_forward import _interface_sm100 as interface_sm100
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    for indexer_topk in (0, 512, 1024):
+        assert interface_sm100._kernel_variant(128, 512, indexer_topk) == "head128_small_topk_prefill"
+    assert interface_sm100._kernel_variant(128, 512, 2048) == "head64_regular"
+    for indexer_topk in (0, 512, 1024, 2048):
+        assert interface_sm100._kernel_variant(128, 576, indexer_topk) == "head64_regular"
+    assert interface_sm100._HEAD64_WINDOW_STARTS[128] == (0, 64)
+    with pytest.raises(ValueError, match="Unsupported SparseAttentionForward variant"):
+        interface_sm100._kernel_variant(48, 576)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("head_dim,indexer_topk", [(576, 0), (576, 2048), (512, 2048)], ids=["D576", "D576-indexer2048", "D512-indexer2048"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_DSA_sparse_attention_forward_head128_windows_match_head64(head_dim, indexer_topk, dtype):
+    """Windowed H128 writes, for each 64-head half, the bytes an H64 run on that half writes."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family GPU required")
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    total_s_q, logical_topk = 5, max(indexer_topk, 64) + 65
+    total_s_kv = logical_topk + 128
+    q = (torch.randn(total_s_q, 128, head_dim, device=device) / math.sqrt(head_dim)).to(dtype)
+    kv = (torch.randn(total_s_kv, head_dim, device=device) / math.sqrt(head_dim)).to(dtype)
+    topk_idxs = torch.stack([torch.randperm(total_s_kv, device=device)[:logical_topk] for _ in range(total_s_q)]).to(torch.int32)
+    topk_idxs[0, -2:] = -1
+    topk_length = torch.tensor([logical_topk, logical_topk - 1, logical_topk, max(indexer_topk, 1), 0], dtype=torch.int32, device=device)
+    attn_sink = torch.randn(128, dtype=torch.float32, device=device)
+    kwargs = dict(topk_length=topk_length, softmax_scale=1.0 / math.sqrt(head_dim), indexer_topk=indexer_topk)
+
+    result = DSA.sparse_attention_forward_wrapper(q, kv, topk_idxs, attn_sink=attn_sink, **kwargs)
+    names = ("out", "max_logits", "lse") + (("lse_indexer",) if indexer_topk else ())
+    for start in (0, 64):
+        heads = slice(start, start + 64)
+        window = DSA.sparse_attention_forward_wrapper(q[:, heads].contiguous(), kv, topk_idxs, attn_sink=attn_sink[heads].contiguous(), **kwargs)
+        for name in names:
+            assert torch.equal(result[name][:, heads], window[name]), f"{name}, heads [{start}, {start + 64})"
+    ref_out, ref_max, ref_lse, ref_lse_indexer = ref_sparse_attention_forward(
+        q, kv, attn_sink, topk_idxs, topk_length=topk_length, softmax_scale=kwargs["softmax_scale"], indexer_topk=indexer_topk, return_full=True
+    )
+    torch.testing.assert_close(result["out"].float(), ref_out.float(), atol=8e-4, rtol=3.01 / 128)
+    torch.testing.assert_close(result["lse"], ref_lse, atol=1e-6, rtol=2.01 / 65536)
+    if indexer_topk:
+        live = topk_length >= indexer_topk
+        torch.testing.assert_close(result["lse_indexer"][live], ref_lse_indexer[live], atol=1e-6, rtol=2.01 / 65536)
