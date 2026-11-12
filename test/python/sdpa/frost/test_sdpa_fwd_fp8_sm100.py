@@ -2671,6 +2671,7 @@ class TestD512PhysicalOrigins:
     test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
     test_half_head_envelope_origins = staticmethod(_origins.test_half_head_envelope_origins)
     test_stats_slot_waits_for_all_warps = staticmethod(_origins.test_stats_slot_waits_for_all_warps)
+    test_tmem_release_waits_for_all_readers = staticmethod(_origins.test_tmem_release_waits_for_all_readers)
     test_origin_golden = staticmethod(_origins.test_origin_golden)
 
 

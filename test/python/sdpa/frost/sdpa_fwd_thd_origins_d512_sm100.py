@@ -146,3 +146,87 @@ def test_stats_slot_waits_for_all_warps(monkeypatch, tmp_path, dtype):
     with process_watchdog(120.0, "D512 Stats slot reader join"):
         _check_case(monkeypatch, dtype, False, "token", total_hints=True)
     assert served, "the delayed role-split template did not serve the graph"
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn", "float8_e5m2"])
+def test_tmem_release_waits_for_all_readers(monkeypatch, tmp_path, dtype):
+    """A delayed output warp must finish its TMEM loads before deallocation.
+
+    Freed TMEM can retain its bytes, so numerical replay alone misses this
+    lifetime violation. Record device event order, with no duration threshold.
+    The test-only pointer is embedded in a unique temporary template; no
+    production signature or cache entry acquires a diagnostic argument.
+    """
+    from pathlib import Path
+
+    import torch
+
+    from cudnn.sdpa.fwd import api_dsl
+    from frost_test_utils import process_watchdog
+
+    monkeypatch.setenv("FROST_THD_CLUSTERS", "1")
+    trace = torch.zeros((4, 8), dtype=torch.int64, device="cuda")
+    original_load = api_dsl.load_template
+    served = []
+
+    def traced(path, params, tag="template", **kwargs):
+        source_path = Path(path)
+        if source_path.parent.name != "sm100" or source_path.name not in ("prefill_d512_f16.py", "prefill_d512_fp8.py"):
+            return original_load(path, params, tag, **kwargs)
+        source = source_path.read_text()
+        helper = f"""
+@cute.jit
+def _test_tmem_event(slot):
+    trace = cute.make_tensor(cute.make_ptr(cutlass.Int64, cutlass.Int64({trace.data_ptr()}), cute.AddressSpace.gmem, assumed_align=8), cute.make_layout(32))
+    if nvvm.elect_sync():
+        trace[cute.arch.block_idx()[0] * cutlass.Int32(8) + slot] = cute.arch.globaltimer()
+
+"""
+        anchor = "@cute.jit\ndef _compute_warp_group("
+        assert source.count(anchor) == 1
+        source = source.replace(anchor, helper + anchor)
+        loop = "                for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):\n"
+        assert source.count(loop) == 2
+        delay = (
+            "                    if cutlass.const_expr(b * O_EPI_BLOCK_SIZE == 384):\n"
+            "                        if wid_in_wg == cutlass.Int32(2):\n"
+            "                            tail_start = cute.arch.globaltimer()\n"
+            "                            while cute.arch.globaltimer() - tail_start < cutlass.Int64(100_000):\n"
+            "                                pass\n"
+        )
+        source = source.replace(loop, loop + delay)
+        lines = source.splitlines(keepends=True)
+        in_epilogue = False
+        recorded = 0
+        for i, line in enumerate(lines):
+            if line == loop:
+                in_epilogue = True
+            if in_epilogue and line.strip() == "nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)":
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] += indent + "if cutlass.const_expr(b == CFG.TILE_O // O_EPI_BLOCK_SIZE - 1):\n" + indent + "    _test_tmem_event(wid_in_wg)\n"
+                in_epilogue = False
+                recorded += 1
+        assert recorded == 2
+        source = "".join(lines)
+        dealloc = "    tmem_dealloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)\n"
+        assert source.count(dealloc) == 2
+        source = source.replace(dealloc, dealloc + "    _test_tmem_event(cutlass.Int32(4))\n")
+        target = tmp_path / source_path.name
+        target.write_text(source)
+        module = original_load(str(target), params, tag, **kwargs)
+        assert module.THD_PERSISTENT
+        served.append(source_path.name)
+        return module
+
+    def check_order(values, state, flat, stats_layout):
+        records = trace.cpu().tolist()
+        active = [row for row in records if any(row[:4])]
+        assert len(active) == 2, records
+        for row in active:
+            assert all(row[:5]), records
+            assert max(row[:4]) <= row[4], f"TMEM deallocated before all output readers finished: {records}"
+
+    monkeypatch.setattr(api_dsl, "load_template", traced)
+    with process_watchdog(120.0, "D512 TMEM reader lifetime"):
+        _check_case(monkeypatch, dtype, False, "token", total_hints=True, collect=check_order)
+    assert served, "the traced role-split template did not serve the graph"

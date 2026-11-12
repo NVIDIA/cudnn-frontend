@@ -686,6 +686,22 @@ It fails numerically with the old elected-only release and retains changed
 bindings, batch invariance and live/empty capture replay. Racecheck can report
 zero hazards while these numerical checks fail.
 
+**Rule S16 — TMEM deallocation joins every reader warp.**
+
+A single elected release credit cannot stand in for multiple independent
+TMEM readers. Each reader must complete its `tcgen05.wait::ld`, and the
+release must join all readers before allowing the MMA pair to deallocate.
+The D512 role-split half and FP8 bodies use a non-aligned, 128-thread named
+barrier before their elected peer credit; the two-CTA deallocation then
+waits for both sides. Keep this terminal join outside the persistent loop.
+
+Freed TMEM can retain readable bytes, so a numerical pass alone does not
+verify its lifetime. `TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers`
+delays one output warp and records final-load/deallocation event order in
+a temporary template, using synthetic inputs. Its old-kernel control fails
+for BF16, E4M3 and E5M2 even when output values remain correct. The test
+checks event order, not a hardware-dependent duration threshold.
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`

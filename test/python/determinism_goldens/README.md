@@ -3738,3 +3738,36 @@ cd test/python
 CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD256PackedSplit
 ```
+
+### SM100 D512 TMEM reader lifetime — 2026-11-12
+
+`TestD512PhysicalOrigins.test_tmem_release_waits_for_all_readers` adds three
+L0 cases (BF16, E4M3, E5M2). A temporary template delays one output warp and
+records completion of each warp's final TMEM load and the deallocation.
+It uses the existing synthetic physical-origin fixture, including reference,
+batch-invariance, changed-binding and retained live/empty graph checks. The
+assertion compares event order; it has no duration threshold. No production
+debug argument is added.
+
+Before the terminal reader join, all three cases fail the lifetime assertion
+in 10.96 seconds, although their numerical checks pass. With the join, the
+full D512 class passes all 48 cases in 94.30 seconds, with no failures/skips.
+This includes the twelve unchanged committed goldens and the existing Stats
+reader checks. Runtime: SM100/148SM, Torch 2.14.1+cu130, cuDNN 9.24.0.43,
+DSL 4.8.0 with actual compiler CUDA 13.4; all three artifact caches disabled.
+The same native extension is reused because no native source changed.
+
+The three new cases also pass Compute Sanitizer 13.4 memcheck and synccheck
+(12.46 and 12.29 seconds), with zero errors. The retained four-case selection
+passes racecheck 13.2 in 179.45 seconds, with zero hazards/errors/warnings;
+kernel compilation remains CUDA 13.4. These are local candidate results.
+
+This establishes and repairs a TMEM lifetime violation. It does not by itself
+attribute or clear the separately retained instrumented numerical failure.
+SM103 execution remains unverified; no golden or tolerance is changed.
+
+```bash
+cd test/python
+python -m pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestD512PhysicalOrigins
+```

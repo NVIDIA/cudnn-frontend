@@ -1594,6 +1594,10 @@ def _compute_warp_group(
                     bars.mb_stats_xfer_empty.wait(stats_xfer_empty_state.phase)
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
+        # The elected peer credit releases TMEM for all four compute warps.
+        # Join every reader after its final tcgen05.wait::ld; a faster lead
+        # warp must not let the MMA pair deallocate a lagging warp's O tail.
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=32 * CFG.SOFTMAX_WG_WARPS)
         peer_cta = cta_id_x ^ cutlass.Int32(1)
         bars.mb_tmem_dealloc.arrive_on_peer(peer_cta, pred=is_lead_warp & nvvm.elect_sync())
 
