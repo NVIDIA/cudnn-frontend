@@ -2126,8 +2126,6 @@ def _sm100_d128_spec() -> EngineSpec:
 
 def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
-    import re
-
     from .d128_contract import validate_dense_bounds
 
     if facts.thd or facts.padded:
@@ -2138,8 +2136,7 @@ def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
         return "the SM90 backward chain serves graphs without bias, sinks or dropout"
     if facts.h_kv <= 0 or facts.h_q % facts.h_kv:
         return "the SM90 backward chain requires an integral head ratio"
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version[1]) if version and version[0] == "nvidia-cutlass-dsl" else None
-    if match is None or tuple(map(int, match.groups())) < (4, 8, 0):
+    if version is None or cutedsl_too_old(version, floor=(4, 8, 0)):
         return f"the SM90 backward chain requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
     scale = facts.d_qk**-0.5 if facts.scale is None else facts.scale
     if not (scale > 0 and scale < float("inf")):

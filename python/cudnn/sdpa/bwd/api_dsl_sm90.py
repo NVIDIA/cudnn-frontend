@@ -11,6 +11,7 @@ from cudnn.sdpa.bwd.api_dsl import SdpaBwdDsl
 from .d128_contract import RELAY, relay_workspace_layout, validate_dense_bounds
 
 SM90_CC = (9, 0)
+SM90_DSL_FLOOR = (4, 8, 0)
 
 
 class SdpaBwdDslSm90(SdpaBwdDsl):
@@ -93,7 +94,7 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
 
     def check_support(self):
         from cudnn import _pybind_module
-        from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
         from cudnn.frost.device import compute_capability, resolve_device
         from .prepared import ROLES, _same_geometry
 
@@ -102,7 +103,10 @@ class SdpaBwdDslSm90(SdpaBwdDsl):
                 raise NotImplementedError(f"{self._NAME}: {reason}")
 
         installed, version = cutedsl_state()
-        require(installed and not cutedsl_too_old(version), f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, CUTEDSL_MIN_VERSION))}; found {version}")
+        require(
+            installed and not cutedsl_too_old(version, floor=SM90_DSL_FLOOR),
+            f"requires nvidia-cutlass-dsl >= {'.'.join(map(str, SM90_DSL_FLOOR))}; found {version}",
+        )
         require(self.q_desc.device.type == "cuda", "Q must reside on CUDA")
         cc = compute_capability(resolve_device(self.q_desc.device))
         require(tuple(cc) == SM90_CC, f"requires SM90 (cc 9.0); got {cc}")

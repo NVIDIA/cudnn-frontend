@@ -160,7 +160,16 @@ def test_both_requests_take_the_chain_bitwise(deterministic):
             case.graph.execute(case.pack, case.workspace)
         torch.cuda.synchronize()
         for name, expected in expected_bits.items():
-            assert torch.equal(case.tensors[name], expected), f"{name} changed across identical executions"
+            got = case.tensors[name].contiguous().view(torch.uint8)
+            assert torch.equal(got, expected.contiguous().view(torch.uint8)), f"{name} changed across identical executions"
+    # the captured graph reads its buffers, not values fixed at capture: a changed dO reproduces a fresh fp64 reference
+    torch.manual_seed(731)
+    case.tensors["do"].copy_((torch.randn(case.tensors["do"].shape, device="cuda") * 0.5).to(case.dt))
+    graph.replay()
+    torch.cuda.synchronize()
+    _, _, _, *fresh = _reference64(case.tensors["q"], case.tensors["k"], case.tensors["v"], case.tensors["do"], case.keep, group=2)
+    for name, ref in zip(("dq", "dk", "dv"), fresh):
+        _check(name, case.tensors[name], ref, case.dt)
 
 
 @requires_hopper
