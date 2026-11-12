@@ -14,7 +14,8 @@
 //   --compare-lib <other.so>: run the prefill cases through both libraries and require bit-identical outputs (the
 //             in-tree runtime shim vs the CuTeDSL runtime build: aot/attention/build.py --runtime cute-dsl)
 //
-// Exits 0 with "SKIPPED" when there is no compute capability 12.0 device or the library cannot be loaded.
+// On a compute capability 8.x device only the q8_0/q4_0 parts run (f16/bf16 plans must report ARCH_MISMATCH); on any
+// other device both kinds of plan must report ARCH_MISMATCH.
 
 #include "cudnn_frontend/experimental/aot_attention.h"
 
@@ -908,6 +909,16 @@ run_rejections() {
     a     = c.args;
     a.s_q = 0;
     EXPECT("s_q = 0", plan.execute(a, B.ws, B.ws_n, 0), CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT, plan);
+    // Past the TMA stride limit (2^40 bytes): the descriptor encode fails inside the generated wrapper, which must come
+    // back as a status, not abort the process. b = 1 keeps the stride unused if an encode ever accepts it.
+    a             = c.args;
+    a.k_stride[0] = int64_t(1) << 41;
+    EXPECT("K batch stride 2^41 bytes (TMA encode rejects)",
+           plan.execute(a, B.ws, B.ws_n, 0),
+           CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT,
+           plan);
+    EXPECT(
+        "valid call after a rejected encode", plan.execute(c.args, B.ws, B.ws_n, 0), CUDNN_FE_AOT_STATUS_SUCCESS, plan);
     {
         Problem pr;
         pr.build({128, 2, 4, 64, 1, 1, CUDNN_FE_AOT_DECODE_KV_Q8_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}, 7, false);
@@ -1009,15 +1020,14 @@ main(int argc, char** argv) {
         std::printf("SKIPPED: no CUDA device\n");
         return 0;
     }
+    int dev8 = -1;
     for (dev = 0; dev < n; ++dev) {
         cudaDeviceProp p;
         CK(cudaGetDeviceProperties(&p, dev));
-        if (p.major == 12 && p.minor == 0) break;
+        if (p.major == 12) break;
+        if (p.major == 8 && dev8 < 0) dev8 = dev;
     }
-    if (dev == n) {
-        std::printf("SKIPPED: no compute capability 12.0 device\n");
-        return 0;
-    }
+    if (dev == n) dev = dev8 >= 0 ? dev8 : 0;
     CK(cudaSetDevice(dev));
     aot::Library& lib = aot::Library::instance();
     if (lib.load(lib_path)) {
@@ -1027,8 +1037,11 @@ main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, dev));
     std::printf("device %d: %s (%d SMs); %s\n", dev, prop.name, prop.multiProcessorCount, lib.build_info());
-    CK(cudaFuncSetAttribute(reference_kernel<__half>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
-    CK(cudaFuncSetAttribute(reference_kernel<__nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+    if (prop.major == 12) {  // the f16/bf16 reference; this binary has no SASS for every device
+        CK(cudaFuncSetAttribute(reference_kernel<__half>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+        CK(cudaFuncSetAttribute(
+            reference_kernel<__nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+    }
     if (other) {
         aot::Library second;
         if (second.load(other)) {
@@ -1038,11 +1051,32 @@ main(int argc, char** argv) {
         std::printf("compare against %s\n", second.build_info());
         return run_compare(second);
     }
+    const bool frost = prop.major == 12, quantized = frost || prop.major == 8;
     auto want = [&](const char* part) { return !only || !std::strcmp(only, part); };
-    if (want("prefill")) run_prefill(quick);
+    if (!frost) {
+        std::printf(
+            "compute capability %d.%d: f16/bf16 parts (prefill, graph, reject) skipped\n", prop.major, prop.minor);
+        aot::SdpaPlan p;
+        EXPECT("f16 KV plan off 12.x",
+               p.build(desc_for(PrefillClass{128, CUDNN_FE_AOT_DTYPE_F16, 0, -1, 0}, 0)),
+               CUDNN_FE_AOT_STATUS_ARCH_MISMATCH,
+               p);
+    }
+    if (!quantized) {
+        std::printf("compute capability %d.%d: no kernel image; q8_0/q4_0 parts skipped\n", prop.major, prop.minor);
+        aot::SdpaPlan p;
+        EXPECT(
+            "q8_0 KV plan off 8.x / 12.x",
+            p.build(decode_desc({128, 2, 4, 64, 1, 1, CUDNN_FE_AOT_DECODE_KV_Q8_0, LAYOUT_GGML_TEST, MASK_KIND_NONE})),
+            CUDNN_FE_AOT_STATUS_ARCH_MISMATCH,
+            p);
+        std::printf("SUMMARY: %d passed, %d failed\n", g_pass, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (frost && want("prefill")) run_prefill(quick);
     if (want("decode")) run_decode(quick ? 4 : nrand, 1);
-    if (want("graph")) run_graph_and_streams();
-    if (want("reject")) run_rejections();
+    if (frost && want("graph")) run_graph_and_streams();
+    if (frost && want("reject")) run_rejections();
     if (want("contracts")) run_decode_contracts(lib_path);
     std::printf("SUMMARY: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

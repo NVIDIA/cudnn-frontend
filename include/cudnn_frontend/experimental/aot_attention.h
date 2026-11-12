@@ -4,7 +4,7 @@
  */
 
 /*
- * Header-only C++ API over libcudnn_frontend_aot_attention.so (ahead-of-time compiled sm_120a attention forward).
+ * Header-only C++ API over libcudnn_frontend_aot_attention.so (ahead-of-time compiled attention forward).
  * The library is dlopened; nothing here needs cuDNN, Python or a runtime compiler. See
  * docs/operations/attention/aot_attention.md.
  *

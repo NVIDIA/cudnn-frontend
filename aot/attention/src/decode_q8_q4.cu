@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Split-KV flash-decode over a q8_0 / q4_0 KV cache, SM120.
+// Split-KV flash-decode over a q8_0 / q4_0 KV cache (sm_80+: mma.sync, cp.async; PDL combine on sm_90+).
 // One CTA owns up to RT = 64 query rows (n_q * G) of one KV head, so each KV tile is read and dequantized once per CTA.
 // K(+mask) and V tiles stream through a CTA-wide cp.async ring as separate commit groups. QK^T uses a
 // (row block x KV column) warp map; P goes through smem as f16, and P.V uses a (D slice x all row blocks) warp map,
@@ -513,8 +513,10 @@ combine_body(const KParams& p) {
     __shared__ float redl[NSG], wmax[8];
     const int gr = blockIdx.x, c0 = blockIdx.y * CB, ns = p.nsplit, tid = threadIdx.x;
     // Launched with programmatic stream serialization: CTAs may start while the main kernel drains; wait for its
-    // writes here (a no-op for a plain launch).
+    // writes here (a no-op for a plain launch). Below sm_90 the combine is a plain launch.
+#if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;\n" ::: "memory");
+#endif
     const int sg = tid / NCOL, ct = tid % NCOL;
     const float* ml = p.ml_part + (size_t)gr * ns * 2;
     float M         = -INFINITY;
@@ -640,11 +642,13 @@ choose_config(int D, int kv_type, int R) {
 struct Plan {
     int cfg, R, nrg, nsplit, kv_mode;
     bool mask_direct;  // mask rows are 16 B aligned: the kernel stages them straight from the caller's tensor
+    bool pdl;          // programmatic dependent launch of the combine (sm_90+)
     size_t o_bytes, ml_bytes, mask_pitch, ws;
 };
 
 // Per-device facts cached per ordinal (write-once values; run() is on the per-token path).
 std::atomic<int> g_dev_sms[kMaxDev], g_dev_cc[kMaxDev];
+std::atomic<int> g_dev_image[kMaxDev];  // 1 + whether this library holds SASS for the device; 0 = not queried yet
 std::atomic<int> g_occ[kNumConfigs][3][kMaxDev];  // resident CTAs per SM + 1; 0 = not queried yet
 std::mutex g_attr_mu;
 
@@ -667,6 +671,21 @@ device_info(int* dev, int* sms, int* cc) {
         g_dev_sms[*dev].store(*sms, std::memory_order_relaxed);
     }
     return true;
+}
+
+// Whether the library carries SASS for the device (the build's -gencode list), probed through one kernel.
+bool
+has_image(int dev) {
+    if (dev < kMaxDev) {
+        const int v = g_dev_image[dev].load(std::memory_order_relaxed);
+        if (v) return v == 2;
+    }
+    cudaFuncAttributes attr{};
+    const cudaError_t e = cudaFuncGetAttributes(&attr, cudnn_fe_aot_decode_combine_f16_d128);
+    if (e != cudaSuccess) (void)cudaGetLastError();
+    const bool ok = e == cudaSuccess;
+    if (dev < kMaxDev) g_dev_image[dev].store(ok ? 2 : 1, std::memory_order_relaxed);
+    return ok;
 }
 
 // Sets the dynamic smem attribute (once per kernel and device); returns resident CTAs per SM, 0 on error.
@@ -722,7 +741,7 @@ make_plan(const cudnn_fe_aot_decode_params_t* p, Plan* out) {
     if (st != CUDNN_FE_AOT_DECODE_SUCCESS) return st;
     int dev = 0, sms = 0, cc = 0;
     if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
-    if (cc != 120) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH;
+    if (!has_image(dev)) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int G     = p->n_head / p->n_head_kv;
     const int R     = p->n_q * G;
     const int cfg   = choose_config(p->head_dim, p->kv_type, R);
@@ -762,6 +781,7 @@ make_plan(const cudnn_fe_aot_decode_params_t* p, Plan* out) {
     out->o_bytes        = ((size_t)nsplit * rows * p->head_dim * 2 + 255) / 256 * 256;
     out->ml_bytes       = ((size_t)nsplit * rows * 2 * 4 + 255) / 256 * 256;
     out->mask_pitch     = ((size_t)p->n_kv + 7) / 8 * 16;  // bytes per repacked mask row
+    out->pdl            = cc >= 90;
     out->mask_direct    = p->mask && aligned(p->mask, 16) && p->mask_nb[1] % 16 == 0 && p->mask_nb[3] % 16 == 0;
     out->ws             = out->o_bytes + out->ml_bytes + (p->mask ? (size_t)p->n_q * out->mask_pitch : 0);
     return CUDNN_FE_AOT_DECODE_SUCCESS;
@@ -775,7 +795,7 @@ cudnn_fe_aot_decode_status_t
 cudnn_fe_aot_decode_prewarm(int head_dim, int kv_type) {
     int dev = 0, sms = 0, cc = 0;
     if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
-    if (cc != 120) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH;
+    if (!has_image(dev)) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int first = choose_config(head_dim, kv_type, 1);
     cudaFuncAttributes attr{};
     for (int cfg = first; cfg < first + 3; ++cfg)
@@ -886,7 +906,7 @@ cudnn_fe_aot_decode_run(const cudnn_fe_aot_decode_params_t* p,
         at[0].id                                         = cudaLaunchAttributeProgrammaticStreamSerialization;
         at[0].val.programmaticStreamSerializationAllowed = 1;
         lc.attrs                                         = at;
-        lc.numAttrs                                      = 1;
+        lc.numAttrs                                      = pl.pdl ? 1 : 0;
         if (cudaLaunchKernelEx(&lc, comb, k) != cudaSuccess) {  // e.g. a driver without PDL: plain launch
             (void)cudaGetLastError();
             comb<<<dim3(rows, p->head_dim / 64), 256, 0, stream>>>(k);
@@ -917,7 +937,7 @@ cudnn_fe_aot_decode_status_string(cudnn_fe_aot_decode_status_t s) {
         case CUDNN_FE_AOT_DECODE_ERROR_WORKSPACE_TOO_SMALL:
             return "workspace too small";
         case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH:
-            return "unsupported device (need compute capability 12.0)";
+            return "unsupported device (the library has no kernel image for it)";
         case CUDNN_FE_AOT_DECODE_ERROR_CUDA:
             return "CUDA error";
     }

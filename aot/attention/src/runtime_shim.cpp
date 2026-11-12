@@ -8,6 +8,8 @@
 // aot/attention/build.py --runtime cute-dsl links the original instead; test_aot_attention --compare-lib checks both
 // agree.
 
+#include "assert_guard.h"
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -157,6 +159,10 @@ _cuTensorMapEncodeTiled(CUtensorMap* map,
 __attribute__((visibility("hidden"))) void
 cuda_dialect_assert_success(int err) {
     if (err == 0) return;
+    if (AotAssertGuard* g = g_aot_assert_guard) {
+        g->err = err;
+        std::longjmp(g->env, 1);
+    }
     const cudaError_t e = static_cast<cudaError_t>(err);
     std::fprintf(
         stderr, "CUDA Dialect Assertion failed on CUDA error: %s - %s\n", cudaGetErrorName(e), cudaGetErrorString(e));

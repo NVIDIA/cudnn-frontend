@@ -6,6 +6,7 @@
 // aot/attention/build.py into aot_registry.inc.
 
 #include "cudnn_frontend/experimental/aot_attention_abi.h"
+#include "assert_guard.h"
 #include "decode_q8_q4.h"
 
 #include <algorithm>
@@ -83,6 +84,8 @@ struct cudnn_fe_aot_sdpa_plan_s {
     int combine;                  // g_combine index: (dtype, sink)
 };
 
+thread_local AotAssertGuard* g_aot_assert_guard = nullptr;
+
 namespace {
 
 thread_local std::string g_last_error;
@@ -91,6 +94,33 @@ cudnn_fe_aot_status_t
 fail(cudnn_fe_aot_status_t s, std::string msg) {
     g_last_error = std::move(msg);
     return s;
+}
+
+// Runs one generated host wrapper; a descriptor encode it rejects returns here as *encode_err instead of aborting.
+template <class F>
+int32_t
+guarded_launch(F&& launch, int* encode_err) {
+    AotAssertGuard guard;
+    AotAssertGuard* const outer = g_aot_assert_guard;
+    g_aot_assert_guard          = &guard;
+    volatile int32_t r          = 0;
+    *encode_err                 = 0;
+    if (setjmp(guard.env) == 0)
+        r = launch();
+    else
+        *encode_err = guard.err;
+    g_aot_assert_guard = outer;
+    return r;
+}
+
+cudnn_fe_aot_status_t
+launch_status(const char* name, int32_t r, int encode_err) {
+    if (encode_err)
+        return fail(CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT,
+                    std::string(name) + ": the TMA descriptor encode rejected the operands (CUDA error " +
+                        std::to_string(encode_err) + ")");
+    if (r) return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR, std::string(name) + ": " + cudaGetErrorString(cudaError_t(r)));
+    return CUDNN_FE_AOT_STATUS_SUCCESS;
 }
 
 constexpr size_t kAlign = 256;
@@ -316,16 +346,10 @@ decode_status(cudnn_fe_aot_decode_status_t s) {
 }
 
 cudnn_fe_aot_status_t
-check_device(int device, int* sms) {
-    int major = 0, minor = 0;
-    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+query_device(int device, int* sms, int* major) {
+    if (cudaDeviceGetAttribute(major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
         cudaDeviceGetAttribute(sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
         return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR, "querying device " + std::to_string(device) + " failed");
-    if (major != 12 || minor != 0)
-        return fail(CUDNN_FE_AOT_STATUS_ARCH_MISMATCH,
-                    "the kernels are built for sm_120a; device " + std::to_string(device) + " is " +
-                        std::to_string(major) + "." + std::to_string(minor));
     return CUDNN_FE_AOT_STATUS_SUCCESS;
 }
 
@@ -358,8 +382,8 @@ cudnn_fe_aot_sdpa_plan_create(const cudnn_fe_aot_sdpa_desc_t* desc_in,
         return fail(CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT, "desc is null or desc.struct_size is too small");
     if (device < 0 && cudaGetDevice(&device) != cudaSuccess)
         return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR, "cudaGetDevice failed");
-    int sms = 0;
-    if (cudnn_fe_aot_status_t s = check_device(device, &sms)) return s;
+    int sms = 0, major = 0;
+    if (cudnn_fe_aot_status_t s = query_device(device, &sms, &major)) return s;
 
     struct DeviceGuard {
         int previous;
@@ -390,6 +414,11 @@ cudnn_fe_aot_sdpa_plan_create(const cudnn_fe_aot_sdpa_desc_t* desc_in,
         if (cudnn_fe_aot_status_t s = decode_status(cudnn_fe_aot_decode_prewarm(d.head_dim, kv_type))) return s;
     } else {
         if (cudnn_fe_aot_status_t s = resolve_frost(d, &p.dtype, &p.cls)) return s;
+        // sm_120f SASS: compute capability 12.x (120 and 121).
+        if (major != 12)
+            return fail(CUDNN_FE_AOT_STATUS_ARCH_MISMATCH,
+                        "f16/bf16 KV kernels are built for compute capability 12.x; device " + std::to_string(device) +
+                            " is " + std::to_string(major) + ".x");
         p.base      = kClassBase[p.dtype][p.cls];
         const int n = kClasses[p.cls].n_variants;
         int sm_i    = 0;
@@ -517,20 +546,19 @@ cudnn_fe_aot_sdpa_execute(const cudnn_fe_aot_sdpa_plan_t* p,
     L.q = const_cast<void*>(a.q), L.k = const_cast<void*>(a.k), L.v = const_cast<void*>(a.v);
     L.sinks = a.sinks, L.problem = problem, L.q_stride = qs, L.k_stride = ks, L.v_stride = vs;
     L.scale_log2 = scale * 1.4426950408889634f, L.stream = stream;
+    int encode_err = 0;
     if (v.knobs.split <= 1) {
         L.o = a.o, L.o_stride = os;
-        if (int32_t r = v.launch(L))
-            return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR,
-                        std::string(v.name) + ": " + cudaGetErrorString(cudaError_t(r)));
-        return CUDNN_FE_AOT_STATUS_SUCCESS;
+        const int32_t r = guarded_launch([&] { return v.launch(L); }, &encode_err);
+        return launch_status(v.name, r, encode_err);
     }
     // Split-major compact partials: O [split * b, s_q, h_q, d] in the I/O dtype, LSE [split * b, h_q, s_q] fp32.
     const int64_t hd      = int64_t(a.h_q) * d;
     const int64_t part[3] = {int64_t(a.s_q) * hd, hd, d};
     char* ws              = static_cast<char*>(workspace);
     L.o = ws, L.o_stride = part, L.lse = ws + o_bytes;
-    if (int32_t r = v.launch(L))
-        return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR, std::string(v.name) + ": " + cudaGetErrorString(cudaError_t(r)));
+    const int32_t r = guarded_launch([&] { return v.launch(L); }, &encode_err);
+    if (cudnn_fe_aot_status_t s = launch_status(v.name, r, encode_err)) return s;
     Variant& c                  = g_combine[p->combine];
     const int32_t cproblem[4]   = {a.b, a.h_q, a.s_q, d};
     const int64_t o_stride4[4]  = {os[0], os[1], os[2], 1};
@@ -538,9 +566,8 @@ cudnn_fe_aot_sdpa_execute(const cudnn_fe_aot_sdpa_plan_t* p,
     CombineLaunch C{};
     C.o_partial = ws, C.lse_partial = ws + o_bytes, C.o = a.o, C.sinks = a.sinks, C.problem = cproblem;
     C.n_splits = v.knobs.split, C.o_stride = o_stride4, C.lse_stride = lse_stride, C.stream = stream;
-    if (int32_t r = c.launch_combine(C))
-        return fail(CUDNN_FE_AOT_STATUS_CUDA_ERROR, std::string(c.name) + ": " + cudaGetErrorString(cudaError_t(r)));
-    return CUDNN_FE_AOT_STATUS_SUCCESS;
+    const int32_t rc = guarded_launch([&] { return c.launch_combine(C); }, &encode_err);
+    return launch_status(c.name, rc, encode_err);
 }
 
 AOT_API cudnn_fe_aot_status_t

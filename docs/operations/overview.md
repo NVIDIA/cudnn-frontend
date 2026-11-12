@@ -69,7 +69,7 @@ The experimental API catalog includes:
 - [DSv4.1 Vision RoPE Backward](/operations/RoPE/vision_rope_backward)
 - [Engram Saved-State Gate](/operations/Pointwise/engram_saved_gate)
 - [RMSNorm + RHT + Amax](/operations/Normalizations/rmsnorm_rht_amax)
-- [Ahead-of-time attention for SM120 (C/C++ API)](/operations/Attention/aot_attention)
+- [Ahead-of-time attention (C/C++ API)](/operations/Attention/aot_attention)
 - [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](/operations/Attention/sdpa_bwd_sm100_d128)
 - [SDPA Backward (SM120)](/operations/Attention/sdpa_bwd_sm120)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](/operations/Attention/sdpa_bwd_sm107)

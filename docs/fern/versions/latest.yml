@@ -27,7 +27,7 @@ navigation:
         path: ../../operations/Attention.md
         slug: operations/Attention
         contents:
-          - page: Ahead-of-time Attention (SM120 C/C++)
+          - page: Ahead-of-time Attention (C/C++)
             path: ../../operations/attention/aot_attention.md
             slug: aot_attention
           - page: Gated Attention Block (SM107)

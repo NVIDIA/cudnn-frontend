@@ -1,7 +1,7 @@
-# Ahead-of-time attention for SM120 (experimental)
+# Ahead-of-time attention (experimental)
 
-`libcudnn_frontend_aot_attention.so` serves attention forward on compute capability 12.0 GPUs (RTX 50xx, RTX PRO Blackwell) to
-C and C++ applications. It has no Python, cuDNN, NVRTC or runtime compiler. Every kernel is compiled ahead of time. A plan is
+`libcudnn_frontend_aot_attention.so` serves attention forward to C and C++ applications: f16/bf16 KV on compute capability
+12.x GPUs (RTX 50xx, RTX PRO Blackwell, DGX Spark), and q8_0/q4_0 KV also on 8.x GPUs (Ampere, Ada). It has no Python, cuDNN, NVRTC or runtime compiler. Every kernel is compiled ahead of time. A plan is
 built once per *shape class*, and `execute()` takes the run-time extents, strides and pointers and only launches. The
 motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 30 ms per new shape.
 
@@ -9,8 +9,9 @@ motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 3
 
 ## Contract
 
-- **Nothing compiles at run time.** The library holds SASS for `sm_120a` only (no PTX), so it loads on compute capability
-  12.0 and nowhere else. `ldd` lists libstdc++, libm, libgcc_s and libc; the CUDA runtime is linked statically and the CUDA
+- **Nothing compiles at run time.** The library holds SASS only (no PTX): `sm_120f` for the f16/bf16 kernels (the 12.x
+  family: 12.0 and 12.1), and `sm_80`, `sm_86`, `sm_89` and `sm_120f` for the q8_0/q4_0 kernels. On any other device
+  `plan_create` returns `CUDNN_FE_AOT_STATUS_ARCH_MISMATCH`. `ldd` lists libstdc++, libm, libgcc_s and libc; the CUDA runtime is linked statically and the CUDA
   driver is the only other run-time dependency.
 - **Plan build loads code; execute() launches.** `plan_create` loads every kernel module the plan can launch (a few ms for
   the first plan of a class in a process). `execute()` validates its arguments, looks up the kernel and launches it: no
@@ -20,15 +21,17 @@ motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 3
   `query()` on a quantized plan needs the actual pointer values to report its alignment-specific copy mode.
 - **C++ loader.** Link the opt-in `cudnn_frontend_aot_loader` CMake target, which supplies the platform loader library.
   Plans retain their loaded entry points and may outlive a caller-supplied `Library`; modules remain resident.
+- **No abort.** A TMA descriptor the driver refuses to encode (e.g. a stride of 2^40 bytes or more) fails `execute()` with
+  `CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT`; nothing is launched and the process continues.
 - **Streams and CUDA graphs.** A plan is immutable once built. One plan may be executed concurrently from several threads and
   streams, each call with its own workspace, and `execute()` can be captured in a CUDA graph.
 
 ## Two backends behind one API
 
-| KV dtype | kernels | Q / O | masks | head dim |
-|---|---|---|---|---|
-| f16, bf16 | FROST SM120 prefill templates (`python/cudnn/sdpa/fwd/kernels/sm120/`), exported ahead of time with run-time batch, sequence lengths, head counts and strides; decode-shaped calls run them split-KV and PackGQA | same dtype as KV | none, causal (bottom-right), causal + 128-token window with sinks | 64, 128, 256 |
-| q8_0, q4_0 (ggml blocks) | flash-decode over the quantized cache (`aot/attention/src/decode_q8_q4.cu`) | f32 | none or an additive f16 `[b, s_q, s_kv]` mask | 128, 256 |
+| KV dtype | kernels | GPUs | Q / O | masks | head dim |
+|---|---|---|---|---|---|
+| f16, bf16 | FROST SM120 templates (`python/cudnn/sdpa/fwd/kernels/sm120/`), exported ahead of time with run-time batch, sequence lengths, head counts and strides: the prefill templates, and the decode tile (`decode_f16.py`) for decode-shaped calls (S_q × G ≤ 32), split-KV and PackGQA | 12.x | same dtype as KV | none, causal (bottom-right), causal + 128-token window with sinks | 64, 128, 256 |
+| q8_0, q4_0 (ggml blocks) | flash-decode over the quantized cache (`aot/attention/src/decode_q8_q4.cu`) | 8.x, 12.x | f32 | none or an additive f16 `[b, s_q, s_kv]` mask | 128, 256 |
 
 The plan's `kv_dtype` picks the backend. A combination outside this table fails `plan_create` with
 `CUDNN_FE_AOT_STATUS_NOT_SUPPORTED` and a message naming what is missing. Run-time extents outside a backend's envelope fail
@@ -86,10 +89,10 @@ The selection is decided offline. `aot/attention/build.py` runs FROST's own SM12
 (`cudnn.sdpa.fwd.heuristics.recommend`, the one the Python engine uses) over a grid:
 - `b * h_kv` from 1 to 128, `s_q` from 1 to 16384 and `s_kv` from 1 to 131072, in power-of-two buckets;
 - G = h_q / h_kv from 1 to 8, plus one table for G > 8;
-- SM counts 170 (RTX 5090) and 188 (RTX PRO 6000).
+- SM counts 48 (RTX 5070, DGX Spark), 84 (RTX 5080), 170 (RTX 5090) and 188 (RTX PRO 6000).
 
 At each grid cell it keeps the first proposed knob set that is compiled; if none is, it snaps the first proposal into the
-compiled domain. On the default matrix, 73.2% of cells use the heuristic's first choice unchanged. The result is emitted as
+compiled domain. On the default matrix, 73.5% of cells use the heuristic's first choice unchanged. The result is emitted as
 `uint8` tables per (class, SM count, G) and compiled into the library.
 
 At run time, `execute()` buckets the extents by `ceil(log2(x))`, clamps past the last bucket, and reads the table. The plan
@@ -113,11 +116,13 @@ count and occupancy.
   sinks (gpt-oss).
 - **PackGQA ratios:** G = 2, 4, 6 and 8, and only G = 8 for the sink classes. G = 6 uses PackGQA with `tile_q % G != 0`.
 - **Splits:** 1, 2, 4, 8, 16 and 32. Splits combine with sinks: the combine folds each head's sink once.
-- **Tiles:** the class's KV tile (128, or 64 at d = 256).
-- **Extra knob sets:** unsplit sets at tile_m 64 and 128 for tuning.
+- **Tiles:** the prefill templates at tile_m 64 and 128 with the class's KV tile (128, or 64 at d = 256); the decode tile at
+  tile_m 16 and 32 with its stage width as the KV tile (32 at d = 64, 16 at d = 128 and 256), NATURAL scheduling, PackGQA
+  for the class's ratios up to tile_m.
+- **Extra knob sets:** unsplit sets at tile_m 16, 32, 64 and 128 for tuning.
 
-That is 444 prefill kernels and 4 combine kernels, 47.5 MiB in total. Compiling takes about 25 s and the heuristic pass about
-15 s on a 96-core build host; no GPU is needed.
+That is 1220 prefill/decode kernels and 4 combine kernels, 87.5 MiB in total. The heuristic pass takes about 40 s and the
+whole build about 2.5 min with 96 export jobs; no GPU is needed.
 
 To add a variant, edit `CLASSES`, `PACK_GQA`, `SPLITS`, `EXTRA_KNOBS` or `DTYPES` in `variants.py` and rebuild. The tables are
 regenerated from the heuristic, and `test_aot_attention` enumerates and runs every prebuilt knob set, so a new variant is tested
@@ -129,18 +134,19 @@ without editing the test.
 pip install -e .        # this checkout + the CuTeDSL wheel (nvidia-cutlass-dsl >= 4.8)
 cmake -B build -DCUDNN_FRONTEND_BUILD_AOT_ATTENTION=ON -DPython3_EXECUTABLE=$(which python) \
       -DCUDNN_FRONTEND_BUILD_SAMPLES=OFF -DCUDNN_FRONTEND_BUILD_TESTS=OFF
-cmake --build build -j  # -> build/aot/attention/lib/libcudnn_frontend_aot_attention.so, build/aot/{test,bench}_sdpa_sm120
+cmake --build build -j  # -> build/aot/attention/lib/libcudnn_frontend_aot_attention.so, build/aot/{test,bench}_aot_attention
 ```
 
-The option is OFF by default, and `include/` stays header-only. `python aot/attention/build.py --out <dir>` builds the library
+The option is OFF by default, and `include/` stays header-only. `export_to_c` emits host code for the build machine, so an
+aarch64 consumer (DGX Spark) needs a library built on aarch64. `python aot/attention/build.py --out <dir>` builds the library
 without CMake.
 
 The steps are:
 1. the heuristic pass;
-2. one `cute.compile(..., options="--gpu-arch sm_120a")` plus `export_to_c` per kernel, through
+2. one `cute.compile(..., options="--gpu-arch sm_120f")` plus `export_to_c` per kernel, through
    `python/cudnn/sdpa/fwd/kernels/sm120/aot_host.py`;
 3. the generated dispatch registry;
-4. nvcc for the decode kernels;
+4. nvcc for the quantized-KV kernels (`sm_80`, `sm_86`, `sm_89`, `sm_120f`; CUDA 12.9 or newer for the family target);
 5. one link.
 
 ### The CuTeDSL runtime is not linked
@@ -167,7 +173,8 @@ instead, and `test_aot_attention --compare-lib` checks that both libraries produ
   - two concurrent streams (bit-identical to single-stream runs);
   - rejection of unsupported classes and bad arguments.
 
-  It exits 0 with `SKIPPED` when there is no compute capability 12.0 device or no library.
+  On a compute capability 8.x device only the quantized-KV parts run, and f16/bf16 plans must report `ARCH_MISMATCH`; on
+  any other device both kinds of plan must report it.
 - `aot/attention/test/crosscheck_frost.py --lib <so>` runs the AOT library and the Python FROST engine with the same knob set on
   the same inputs and requires bit-identical outputs.
 - `bench_aot_attention [--lib <so>]` reports, per case:
@@ -178,7 +185,8 @@ instead, and `test_aot_attention --compare-lib` checks that both libraries produ
 
 ## Limits
 
-- **Architecture:** `sm_120a` only; sm_121 (DGX Spark) is not built.
+- **Architecture:** f16/bf16 KV needs 12.x; q8_0/q4_0 KV needs 8.x or 12.x. Hopper and datacenter Blackwell (9.x, 10.x)
+  are not built. The 12.1 path is exercised only by the CI `aot/attention:test:sm121` job.
 - **Masks:** the f16/bf16 kernels mask by index. There is no mask tensor, ALiBi or softcap, and a sliding window is built
   only with sinks at d = 64. A caller with a causal mask tensor (llama.cpp's `KQ_mask`) has to recognize it as causal.
 - **Outputs and sequences:** there is no LSE output. Batches are dense: every sequence has the same `s_q` and `s_kv`.

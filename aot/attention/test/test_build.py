@@ -54,10 +54,21 @@ class ExportCacheTests(unittest.TestCase):
 
 
 class VariantDomainTests(unittest.TestCase):
-    def test_small_query_tiles_use_a_prebuilt_template(self):
+    def test_query_tiles_map_to_a_prebuilt_template(self):
+        """16 / 32 name the decode tile (at its stage-width KV tile); any other proposal snaps to a prefill tile."""
         c = build.V.CLASSES[0]
-        with patch.object(build.V, "kv_tile", return_value=128):
-            for tile_m in (16, 32, 96, 256):
+        with patch.object(build.V, "kv_tile", return_value=128), patch.object(build.V, "decode_kv_tile", return_value=32):
+            for tile_m in (16, 32):
+                with self.subTest(tile_m=tile_m):
+                    self.assertTrue(build.V.in_domain(c, 1, build.V.Knobs(0, 0, 1, tile_m, 32)))
+                    self.assertTrue(build.V.in_domain(c, 8, build.V.Knobs(8, 0, 4, tile_m, 32)))
+                    self.assertFalse(build.V.in_domain(c, 1, build.V.Knobs(0, 2, 1, tile_m, 32)))
+                    candidate = build.V.Knobs(0, 0, 1, tile_m, 128)
+                    self.assertFalse(build.V.in_domain(c, 1, candidate))
+                    snapped = build.V.snap(c, 1, candidate)
+                    self.assertEqual((snapped.tile_m, snapped.tile_n), (tile_m, 32))
+                    self.assertTrue(build.V.in_domain(c, 1, snapped))
+            for tile_m in (96, 256):
                 with self.subTest(tile_m=tile_m):
                     candidate = build.V.Knobs(0, 0, 1, tile_m, 128)
                     self.assertFalse(build.V.in_domain(c, 1, candidate))

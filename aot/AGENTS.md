@@ -14,3 +14,8 @@ The optional AOT library exports kernels built from the current FE checkout. Kee
   queried capacity, and reject misaligned workspace before any launch (`test_aot_attention --only contracts`).
 - The optional `cudnn_frontend_aot_loader` target carries platform loader link requirements. Keep those off the
   original `cudnn_frontend` header-only target. A plan must survive the lifetime of a supplied `Library` wrapper.
+- Generated host wrappers call `cuda_dialect_assert_success` after a TMA descriptor encode. The runtime shim turns it into
+  a longjmp to `guarded_launch` (no abort), so only DSL-generated frames may sit between them. `--only reject` under
+  memcheck reports exactly one API error: the deliberate stride-2^40 encode failure.
+- `export_to_c` emits host code for the build machine: an aarch64 consumer (DGX Spark, sm_121) needs an aarch64 build.
+  Kernel images are gated per device (`ARCH_MISMATCH`), never by a hard-coded compute capability in the decode path.

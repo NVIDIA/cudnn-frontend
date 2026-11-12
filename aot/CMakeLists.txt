@@ -5,7 +5,7 @@
 #
 # libcudnn_frontend_aot_attention.so is produced by aot/attention/build.py, which needs a Python with this checkout importable
 # (e.g. `pip install -e .`, which brings the CuTeDSL wheel). Point CMake at it with -DPython3_EXECUTABLE=<python>.
-# No GPU is needed to build; the test and benchmark need an sm_120 GPU and skip without one.
+# No GPU is needed to build. The test needs a 12.x GPU (or 8.x for the quantized-KV part only); the benchmark a 12.x GPU.
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -41,7 +41,7 @@ add_compile_options(
 )
 
 add_executable(test_aot_attention attention/test/test_aot_attention.cu)
-set_target_properties(test_aot_attention PROPERTIES CUDA_ARCHITECTURES 120 CUDA_STANDARD 17)
+set_target_properties(test_aot_attention PROPERTIES CUDA_ARCHITECTURES "80;86;89;120" CUDA_STANDARD 17)
 target_include_directories(test_aot_attention PRIVATE ${PROJECT_SOURCE_DIR}/include attention/src attention/test)
 target_link_libraries(test_aot_attention PRIVATE CUDA::cudart cudnn_frontend_aot_loader)
 add_dependencies(test_aot_attention cudnn_frontend_aot_attention)

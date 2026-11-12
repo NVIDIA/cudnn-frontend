@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Build libcudnn_frontend_aot_attention.so: FROST SM120 prefill/combine kernels compiled ahead of time from the in-repo
-templates, the quantized-KV decode kernels, a CUDA runtime shim and the flat C ABI. No GPU is needed (sm_120a is
-cross-compiled); the build host needs the CuTeDSL wheel (nvidia-cutlass-dsl), a CUDA toolkit and a C++17 compiler.
+"""Build libcudnn_frontend_aot_attention.so: FROST SM120 prefill/decode/combine kernels compiled ahead of time from the
+in-repo templates (sm_120f: compute capability 12.x), the quantized-KV decode kernels (DECODE_GENCODE), a CUDA runtime
+shim and the flat C ABI. No GPU is needed (everything is cross-compiled); the build host needs the CuTeDSL wheel
+(nvidia-cutlass-dsl), a CUDA toolkit >= 12.9 (family targets) and a C++17 compiler.
 
     PYTHONPATH=<repo>/python python aot/attention/build.py --out <dir> [--jobs N] [--cuda /usr/local/cuda]
         [--classes d128] [--runtime shim|cute-dsl] [--reuse]
@@ -12,7 +13,7 @@ Steps (each writes under --out):
   1. selection  FROST's SM120 heuristic over variants.GRID -> per-class knob picks (selection.json)
   2. export     one object + header per (dtype, class, knob set) and per combine (obj/, include/)
   3. codegen    the dispatch registry and selection tables (gen/aot_registry.inc)
-  4. compile    decode .cu (nvcc, sm_120a), C ABI + runtime shim (C++), link lib/libcudnn_frontend_aot_attention.so
+  4. compile    decode .cu (nvcc, DECODE_GENCODE), C ABI + runtime shim (C++), link lib/libcudnn_frontend_aot_attention.so
   5. manifest   manifest.json: every variant, sizes, the FE commit, the CuTeDSL version
 
 ``--runtime cute-dsl`` links the CuTeDSL runtime (libcute_dsl_runtime.so) instead of the in-tree shim; it exists only to
@@ -41,8 +42,16 @@ sys.path.insert(0, str(HERE))
 import variants as V  # noqa: E402
 
 LIB_NAME = "libcudnn_frontend_aot_attention.so"
-# export_to_c without tvm-ffi and the --gpu-arch sm_120a cross-compile are verified on 4.8.0 (python/cudnn/AGENTS.md Rule 7).
+# export_to_c without tvm-ffi and the --gpu-arch sm_120f cross-compile are verified on 4.8.0 (python/cudnn/AGENTS.md Rule 7).
 AOT_CUTEDSL_MIN_VERSION = (4, 8)
+# SASS of the quantized-KV decode kernels: Ampere (sm_80 also serves 8.7), RTX 30xx, Ada, and the 12.x family.
+DECODE_GENCODE = ("arch=compute_80,code=sm_80", "arch=compute_86,code=sm_86", "arch=compute_89,code=sm_89", "arch=compute_120f,code=sm_120f")
+
+
+def aot_host_arch():
+    from cudnn.sdpa.fwd.kernels.sm120 import aot_host
+
+    return aot_host.EXPORT_OPTIONS.split()[-1]
 
 
 def check_checkout():
@@ -410,8 +419,7 @@ def compile_and_link(out: Path, objects, cuda: Path, cxx: str, runtime: str, dsl
             nvcc,
             "-O3",
             "-std=c++17",
-            "-gencode",
-            "arch=compute_120a,code=sm_120a",
+            *(f for g in DECODE_GENCODE for f in ("-gencode", g)),
             "-Xcompiler",
             "-fPIC,-fvisibility=hidden",
             *inc,
@@ -502,7 +510,7 @@ def main():
     git = lambda *a: subprocess.run(["git", "-C", str(REPO), *a], capture_output=True, text=True).stdout.strip()  # noqa: E731
     fe_commit = git("rev-parse", "--short=12", "HEAD") + ("-dirty" if git("status", "--porcelain", "--untracked-files=no") else "")
     n_pre = sum(1 for r in records if r["kind"] == "prefill")
-    build_info = f"cudnn-frontend {fe_commit} cutlass-dsl {getattr(cutlass, '__version__', '?')} sm_120a {n_pre} prefill + {len(records) - n_pre} combine kernels, runtime {args.runtime}"
+    build_info = f"cudnn-frontend {fe_commit} cutlass-dsl {getattr(cutlass, '__version__', '?')} {aot_host_arch()} {n_pre} prefill + {len(records) - n_pre} combine kernels, runtime {args.runtime}"
     (out / "gen" / "aot_registry.inc").write_text(gen_registry(class_ids, class_knobs, selection, build_info))
 
     dsl_libdir = Path(next(p for p in find_runtime_libraries(enable_tvm_ffi=False) if "cute_dsl_runtime" in p)).parent
@@ -513,7 +521,8 @@ def main():
         "fe_commit": git("rev-parse", "HEAD"),
         "fe_dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
         "cutlass_dsl": getattr(cutlass, "__version__", "?"),
-        "gpu_arch": "sm_120a",
+        "gpu_arch": aot_host_arch(),
+        "decode_gencode": list(DECODE_GENCODE),
         "runtime": args.runtime,
         "lib_bytes": lib.stat().st_size,
         "object_bytes": sum(r.get("obj_bytes", 0) for r in results.values()),

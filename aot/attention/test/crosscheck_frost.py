@@ -162,6 +162,12 @@ def main():
         (bf16, 2, 24, 4, 37, 1500, 256, True),
         (f16, 1, 32, 8, 1, 16384, 128, True),
         (f16, 4, 32, 8, 1, 4096, 128, False),
+        # decode-shaped (S_q x G <= 32): the decode tile (tile_m 16 / 32)
+        (bf16, 1, 8, 8, 1, 4096, 256, False),
+        (f16, 2, 32, 8, 4, 2048, 128, True),
+        (f16, 1, 16, 2, 2, 30000, 64, True),
+        (bf16, 3, 8, 1, 3, 777, 128, True),
+        (f16, 1, 12, 2, 5, 513, 256, True),
     ]
     results = [case(lib, *c) for c in cases]
     results.append(case(lib, f16, 1, 32, 8, 7, 3000, 128, True, layout="cache"))

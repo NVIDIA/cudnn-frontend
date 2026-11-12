@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Split-KV flash-decode over a quantized (q8_0 / q4_0) KV cache for SM120 (RTX 50xx).
+// Split-KV flash-decode over a quantized (q8_0 / q4_0) KV cache; SASS for sm_80, sm_86, sm_89 and sm_120f.
 // Semantics follow ggml GGML_OP_FLASH_ATTN_EXT for the decode regime (few query tokens, long KV):
 //   O[s][t][h][:] = softmax(scale * Q[s][h][t][:] . K[s][h/G][j][:] + mask[s][t][j]) @ V[s][h/G][j][:]
 // All strides are in BYTES and use ggml's tensor convention (nb[0] = element/block size, nb[1..3] = dims 1..3),
@@ -33,7 +33,7 @@ typedef enum {
                                                       // 4-byte
     CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_FEATURE,    // max_bias (ALiBi), logit_softcap, sinks
     CUDNN_FE_AOT_DECODE_ERROR_WORKSPACE_TOO_SMALL,
-    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH,  // device is not compute capability 12.0
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH,  // the library has no kernel image for the device
     CUDNN_FE_AOT_DECODE_ERROR_CUDA,              // a CUDA runtime call failed (see cudaGetLastError)
 } cudnn_fe_aot_decode_status_t;
 

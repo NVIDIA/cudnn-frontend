@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Ahead-of-time (AOT) export of the SM120 f16/bf16 prefill templates and the split combine.
+"""Ahead-of-time (AOT) export of the SM120 f16/bf16 prefill templates, the decode tile and the split combine.
 
 The prepared pointer host (``prepared_host.host``) binds batch, sequence lengths and strides at run time but keeps the head counts
 as plan constants. The AOT host below also takes ``h_q`` and ``h_kv`` at run time, so one exported object serves every head
@@ -22,9 +22,11 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda_driver
 
 from cudnn.frost.template_loader import load_template
+from cudnn.sdpa.fwd.config_sm120 import is_decode_tile
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd
 
-EXPORT_OPTIONS = "--gpu-arch sm_120a"
+# The 12.x family target: same SASS as sm_120a for these templates, and loadable on 12.1 (DGX Spark).
+EXPORT_OPTIONS = "--gpu-arch sm_120f"
 
 
 @cute.jit
@@ -83,15 +85,15 @@ def aot_prefill_host(
     )
 
 
-def _template_path(d: int) -> str:
-    name = "prefill_d256_f16.py" if d == 256 else "prefill_f16.py"
+def _template_path(d: int, q_tile: int) -> str:
+    name = "decode_f16.py" if is_decode_tile(q_tile) else "prefill_d256_f16.py" if d == 256 else "prefill_f16.py"
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 
 def build_prefill_kernel(params, d: int, gqa: int, tag: str):
     """The template's own kernel object for ``params`` (a config_sm120.TemplateParams), head dim ``d`` and PackGQA ratio ``gqa``
     (1 when ``params.pack_gqa`` is off), captured from the template's ``compile()`` instead of being re-constructed here."""
-    mod = load_template(_template_path(d), params, tag=tag)
+    mod = load_template(_template_path(d, params.q_tile), params, tag=tag)
     captured = {}
 
     def capture(kernel, *args, **kwargs):
