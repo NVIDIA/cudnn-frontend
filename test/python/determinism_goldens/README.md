@@ -1679,7 +1679,7 @@ Other GPU results are not inferred from this native SM107 qualification.
 
 ### Native SM107 half D64 dense/THD paging (2026-11-10)
 
-`test_sdpa_fwd_native_paged_sm107.py::TestNativeD64Paged` qualifies physical D64
+`test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged` qualifies physical D64
 operands/MMA/output on the native D128-family kernel file. Parent D64 dense
 paging selects the D128 envelope; parent THD D64 paging is declined. The new
 route supports matching FP16/BF16 Q/K/V/O, CGA1/2, packed/unpacked execution,
@@ -3971,3 +3971,76 @@ B1 fixture retained a packed-total hint above `B*S_q`, and the shape-override
 byte fixture omitted its required split packed-total bound. The corrected
 fixtures declare valid bounds; no numerical tolerance or byte assertion was
 relaxed. Those failures are retained separately from passing qualification.
+
+### Native SM107 D64 paged THD split forward — 2026-11-12
+
+`TestNativeD64Paged` in the CI-selected `test_sdpa_fwd_dsl_sm107.py` covers
+matching FP16/BF16 paged THD at CGA1/N128,
+with fixed split counts and packed or unpacked GQA. The shared physical-D64
+single-Q body is compiled for SM107 and writes FP32 partials; the final
+combine retains independent O/Stats origins. Mixed FP8 KV, split sinks and
+padded Stats retain their existing declines. No backward path is added.
+
+On SM107, cuDNN 9.30.0.2, CuTe DSL 4.8.0 compiled with CUDA 13.4 and
+Torch 2.14.0+cu130, 20 distinct focused cases pass: eight split origin/replay
+cases, eight existing unsplit controls, one admission case, one partial-GQA
+multi-wrap case and two replay/batch/golden cases. The two new goldens also
+pass strict comparison in a fresh process. No existing golden is replaced.
+
+The batch cases preserve fixed Q/K/V payloads across sequence insertion,
+reordering and duplication, including empty sequences, fresh output/workspace
+allocations and concurrent GPU work. Both O and Stats retain identical raw
+bytes under the same plan; independent FP64 checks remain separate. The graph
+cases check HND/NHD/mixed pools, physical origins and strides, changed-input
+capture replay and empty replay. The six-head sharing group exercises partial
+packing with more KV iterations than ring slots. The initial three-head-group
+fixture was correctly declined by the existing packing contract; the final
+case uses a supported group without widening that contract.
+
+```bash
+cd test/python
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_admission \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd_split_partial_pack \
+  sdpa/frost/test_sdpa_fwd_dsl_sm107.py::TestNativeD64Paged::test_thd_split_determinism
+```
+
+These new measurements qualify the SM107 extension only. Existing SM100/103
+paged-split support is unchanged and receives no new hardware coverage here.
+
+### SM107 D128 per-tensor FP8 single-CTA dense splits — 2026-11-12 (UTC)
+
+`test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split` exposes12 L0 cases
+through the selected Rubin CI entry: one graph-domain check, six functional
+rebind/capture cases, two replay/batch cases, two golden cases and one
+refilled-ring stress. E4M3/E5M2 input, BF16/FP16/E4M3/E5M2 output, packed
+and unpacked groups, splits2/3/9, dense/causal/bottom-right/SWA/sink,
+optional Stats and D112/V96 plus D80/V112 envelopes are exercised.
+Every functional check uses the shared FP64 FP8 probability-cast reference
+and checks Amax_O separately. Native template, single-CTA geometry,
+four-stage KV ring, K64 MMA and FP32 combine are asserted.
+
+On SM107216SMs, driver620.62, fullcuDNN9.30.0.4, CuTeDSL4.8.0 compiled
+with CUDA13.4 and Torch2.14.0+cu130, all12 cases passed in25.88s.
+The two new goldens also passed strict comparison in a fresh process
+(2 cases,3.21s). No previous golden was changed. The stress recorded zero
+wrong bytes in512 warm and512 poisoned launches; its unsafe control failed
+200/200 launches. The stress shape launches512 blocks and refills its ring
+four times per launch; numerical correctness is checked separately first.
+
+Fixed-payload batch checks compare the target alone, reordered, duplicated,
+with changed neighbors and among129 sequences. O/Stats are per-sequence;
+Amax_O is a whole-batch maximum, checked numerically after rebatching and
+bitwise during replay. New byte guarantees cover E4M3/BF16 packed split3
+and E5M2/FP16 unpacked split2. Other GPU lines are unmeasured by this suite;
+this change adds no backward or THD path.
+
+From `test/python`, with the correct checkout imported:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD128Fp8Cga1Split
+```

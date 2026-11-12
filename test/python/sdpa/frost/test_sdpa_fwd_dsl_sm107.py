@@ -8878,3 +8878,27 @@ class TestD512HalfPhysicalOrigins:
     test_origins_without_total_hints = staticmethod(_d512_origins.test_origins_without_total_hints)
     test_packed_origins_decline = staticmethod(_d512_origins.test_packed_origins_decline)
     test_half_head_envelope_declines = staticmethod(_d512_origins.test_half_head_envelope_declines)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD64Paged:
+    import native_d64_paged_sm107_checks as _checks
+
+    def test_admission(self):
+        self._checks.check_admission(_caps, _f16_facts)
+
+    test_boundaries = staticmethod(_checks.test_boundaries)
+    test_dense = staticmethod(_checks.test_dense)
+    test_thd = staticmethod(_checks.test_thd)
+    test_thd_split_partial_pack = staticmethod(_checks.test_thd_split_partial_pack)
+    test_dense_determinism = staticmethod(_checks.test_dense_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_batch_and_golden as _thd_determinism
+
+    test_thd_determinism = staticmethod(_thd_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_split_batch_and_golden as _thd_split_determinism
+
+    test_thd_split_determinism = staticmethod(_thd_split_determinism)
