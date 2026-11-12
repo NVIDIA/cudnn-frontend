@@ -14,12 +14,16 @@ comes before the first load or not at all.
 With ``--model DIR`` it runs a checkpoint from local disk (nothing is downloaded): the checkpoint's own tokenizer and chat
 template turn ``--prompt`` or ``--messages`` into token ids, the model decodes greedily to the end token or to
 ``--max-new-tokens``, the text is printed, and the same checks run on the first steps of every prompt.  That needs the
-packages of ``samples/models/requirements.txt`` and a GPU with room for a bf16 copy of every weight.
+packages of ``samples/models/requirements.txt``, the checkpoint on local disk (your own download) and a GPU with room for a
+bf16 copy of every weight: about 57 GiB free for the 27B checkpoint.
 
     python samples/models/qwen_dense/00_decode.py
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
     python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: reports RAN, never PASS
-    python samples/models/qwen_dense/00_decode.py --model /data/checkpoint --prompt "Why is the sky blue?" --max-new-tokens 256
+
+    pip install -r samples/models/requirements.txt                         # only for a checkpoint; brings the hf command
+    hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4   # your own step: the sample fetches nothing
+    python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?" --max-new-tokens 256
 
 The stack is explicit and never chosen by what is installed.  ``fe-cublas`` is a reference path, not a fast path: the
 linear-attention step runs on cuDNN Frontend's fused kernel, every multiply on cuBLAS over a bf16 copy of the quantised weights,
@@ -71,40 +75,90 @@ def _dump(path: str, stack: str, runs: list) -> str:
     return ""
 
 
+EPILOG = """\
+The default run needs no checkpoint and no extra package; it needs a GPU of compute capability 10.x or 12.x.
+With --model: pip install -r samples/models/requirements.txt first.  The checkpoint is your own download (nothing is
+fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas.
+The checkpoint, the memory, the checks and every flag: samples/models/qwen_dense/README.md
+"""
+
+
 def _arguments(argv):
     parser = argparse.ArgumentParser(
-        description="Plain decode of the dense Qwen model: the reduced seeded model (self-checking), or a checkpoint from local disk."
+        description="Plain decode of the dense Qwen model: the reduced seeded model (self-checking), or a checkpoint from local disk.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--model", metavar="DIR", help="a checkpoint directory on local disk; never a hub name, nothing is downloaded")
-    parser.add_argument("--prompt", action="append", default=[], metavar="TEXT", help="one user message; repeat for several prompts, run one after the other")
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help=f'with --model: one user message; repeat for several prompts, run one after the other (default "{DEFAULT_PROMPT}")',
+    )
     parser.add_argument(
         "--messages",
         action="append",
         default=[],
         metavar="FILE",
-        help="chat messages as JSON (a list, or an object with messages, tools, chat_template_kwargs)",
+        help="with --model: chat messages as JSON (a list, or an object with messages, tools, chat_template_kwargs); repeatable",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=256, metavar="N", help="stop after N new tokens unless the end token comes first (default 256)")
-    parser.add_argument("--force-tokens", type=int, default=None, metavar="N", help="decode exactly N tokens, ignoring the end token (the seeded run: 32)")
     parser.add_argument(
-        "--sequences", default=None, help="sequences per run, fixed before the first step; a list repeats the run per count (default 1,4; with --model 1)"
+        "--max-new-tokens", type=int, default=None, metavar="N", help="with --model: stop after N new tokens unless the end token comes first (default 256)"
     )
-    parser.add_argument("--layers", type=int, default=None, help="layers of the reduced model (default 2: one linear-attention + one attention layer)")
-    parser.add_argument("--stack", default="fe-cublas", choices=STACKS, help="explicit; never chosen by what is installed")
-    parser.add_argument("--provider", action="append", default=[], metavar="BLOCK=KEY", help="select one declared provider row of a block")
-    parser.add_argument("--reference-precision", default="fp64", choices=("fp64", "ieee-fp32"), help="accumulation of the reference blocks")
+    parser.add_argument(
+        "--force-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="decode exactly N tokens, ignoring the end token (default without --model: 32; with it: off)",
+    )
+    parser.add_argument(
+        "--sequences",
+        default=None,
+        metavar="N[,N...]",
+        help="sequences per run, fixed before the first step; a list repeats the run per count (default 1,4; with --model 1)",
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="layers of the reduced model (default 2: one linear-attention + one attention layer); not with --model",
+    )
+    parser.add_argument(
+        "--stack",
+        default="fe-cublas",
+        choices=STACKS,
+        help="fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch, checked against the reference; reference: every block in PyTorch, "
+        "on any CUDA GPU, nothing checked.  Explicit: never chosen by what is installed",
+    )
+    parser.add_argument(
+        "--provider",
+        action="append",
+        default=[],
+        metavar="BLOCK=KEY",
+        help="select one declared provider row of a block (an unknown block or key prints the declared ones)",
+    )
+    parser.add_argument("--reference-precision", default="fp64", choices=("fp64", "ieee-fp32"), help="accumulation of the reference blocks (default fp64)")
     parser.add_argument("--dump-tokens", metavar="FILE", help="write the prompt ids and the produced ids as JSON, for a comparison made elsewhere")
     args = parser.parse_args(argv)
     if args.model is None and (args.prompt or args.messages):
         parser.error("--prompt and --messages need --model: the seeded model has no language")
     if args.model is not None and args.layers is not None:
         parser.error("--layers is for the reduced model; a checkpoint has the depth it has")
+    if args.max_new_tokens is not None and args.model is None:  # the seeded run decodes a fixed count: the flag would be ignored
+        parser.error("--max-new-tokens is for --model; the seeded run decodes --force-tokens N (default 32)")
+    if args.max_new_tokens is not None and args.force_tokens is not None:
+        parser.error("--force-tokens N decodes exactly N tokens; --max-new-tokens does not apply beside it")
     try:
         args.sequences = [int(n) for n in str(args.sequences or ("1" if args.model else "1,4")).split(",")]
     except ValueError:
         parser.error("--sequences takes N or N,N,...")
     if args.force_tokens is None and args.model is None:
         args.force_tokens = 32
+    args.max_new_tokens = 256 if args.max_new_tokens is None else args.max_new_tokens
     if (
         min(args.sequences) < 1
         or args.max_new_tokens < 1
@@ -162,7 +216,7 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
     session.trace(TRACED_STEPS)  # the first steps again, under the profiler: GPU busy, idle, launches per step
     print(session.report().text())
     if getattr(text, "synthetic_text", True):
-        print(f"text out              sequence 0, {len(produced[0])} tokens: {pieces[0][:48]!r}")
+        print(f"text out              sequence 0, {len(produced[0])} tokens (seeded weights: not language): {pieces[0][:48]!r}")
     else:
         ended = "ended at the end token" if rule.ends(produced[0][-1]) else f"stopped after {len(produced[0])} tokens"
         print(f"text out              sequence 0, {len(produced[0])} tokens, {ended}:")
@@ -322,9 +376,8 @@ def main(argv=None) -> int:
                 print()
                 session.reset(fresh=True)
             if real:
-                print(
-                    f"prompt {index + 1} of {len(prompt_sets)}        {int(prompts[0].numel())} tokens, the same prompt for each of the {session.sequences} sequence(s)"
-                )
+                each = f"the same prompt for each of the {session.sequences} sequence(s)"
+                print(f"prompt {index + 1} of {len(prompt_sets)}        {int(prompts[0].numel())} tokens, {each}")
             session.new_report()
             session.report().text_path.update(seconds)
             ok, blocks_judged, produced = _decode(
@@ -333,7 +386,8 @@ def main(argv=None) -> int:
             passed, judged = passed and ok, judged + blocks_judged
             for ids in produced:
                 digest.update(b"".join(int(i).to_bytes(4, "little") for i in ids))
-            dumped.append({"sequences": session.sequences, "prompt": index, "prompt_ids": [int(i) for i in prompts[0]], "ids": produced})
+            # one prompt and one list of produced ids per sequence: in the seeded run every sequence has a prompt of its own
+            dumped.append({"sequences": session.sequences, "prompt": index, "prompt_ids": [[int(i) for i in p] for p in prompts], "ids": produced})
     if checkpoint is not None:
         checkpoint.close()
     gib = 2.0**30
@@ -351,9 +405,8 @@ def main(argv=None) -> int:
         if launches:
             forms = " | ".join(f"{rows} row{'s' if rows > 1 else ''} {taken / mib:,.0f} MiB" for rows, taken in launches.items())
             allowed = f"the plan allowed {allowance / mib:,.0f} MiB on this class" if allowance else "the plan allows none on this class"
-            print(
-                f"{TAG} first launch of {name}, device memory outside PyTorch's pool: {forms} (measured in this process, other processes' changes included; {allowed})"
-            )
+            measured = f"measured in this process, other processes' changes included; {allowed}"
+            print(f"{TAG} first launch of {name}, device memory outside PyTorch's pool: {forms} ({measured})")
     unwritten = _dump(args.dump_tokens, args.stack, dumped) if args.dump_tokens else ""
     if args.dump_tokens and not unwritten:
         print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")

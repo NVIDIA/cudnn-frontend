@@ -24,14 +24,14 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 | `--model DIR` | -- | a checkpoint directory on local disk; never a hub name; nothing is downloaded |
 | `--prompt TEXT` | `Why is the sky blue?` with `--model` | one user message, rendered by the checkpoint's chat template; repeat the flag for several prompts, run one after the other in one process |
 | `--messages FILE` | -- | chat messages as JSON: a list of messages, or an object with `messages` and optionally `tools` (JSON tool schemas) and `chat_template_kwargs` (options the checkpoint's template understands); repeatable |
-| `--max-new-tokens N` | `256` | stop after N new tokens unless an end token comes first |
-| `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token |
+| `--max-new-tokens N` | `256` | with `--model`: stop after N new tokens unless an end token comes first. Without `--model` the flag is an error: the seeded run decodes `--force-tokens` |
+| `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-new-tokens` |
 | `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt |
 | `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
 | `--stack fe-cublas\|reference` | `fe-cublas` | explicit, never chosen by what is installed |
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed |
 | `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header |
-| `--dump-tokens FILE` | -- | the prompt ids and the produced ids of every prompt as JSON, for a comparison made elsewhere |
+| `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
 
 ## What the default run is
 

@@ -796,6 +796,47 @@ def test_the_samples_loop_says_what_comes_next_before_the_phases_that_print_noth
     assert out.startswith("[00] decoding: 3 prompt tokens through the decode step, then up to 4 new tokens and a traced pass; ") and "[00] checks on" not in out
 
 
+def test_the_samples_flags_say_what_they_apply_to_and_none_is_ignored_in_silence(monkeypatch, capsys):
+    """The defaults of the two kinds of run, the flags that belong to one kind only, and the help text: it names the
+    requirement file, what a checkpoint run needs and where the rest is written."""
+    sample = _sample_script(monkeypatch)
+    seeded = sample._arguments([])
+    assert (seeded.model, seeded.sequences, seeded.layers, seeded.force_tokens, seeded.max_new_tokens, seeded.stack) == (None, [1, 4], 2, 32, 256, "fe-cublas")
+    real = sample._arguments(["--model", "some-directory"])
+    assert (real.sequences, real.force_tokens, real.max_new_tokens, real.reference_precision) == ([1], None, 256, "fp64")
+    assert sample._arguments(["--model", "d", "--max-new-tokens", "8"]).max_new_tokens == 8
+    assert sample._arguments(["--force-tokens", "8", "--sequences", "2,3"]).force_tokens == 8
+    for wrong, sentence in (
+        (["--max-new-tokens", "8"], "--max-new-tokens is for --model; the seeded run decodes --force-tokens N (default 32)"),
+        (["--model", "d", "--force-tokens", "4", "--max-new-tokens", "8"], "--force-tokens N decodes exactly N tokens; --max-new-tokens does not apply"),
+        (["--prompt", "hi"], "--prompt and --messages need --model"),
+        (["--model", "d", "--layers", "4"], "--layers is for the reduced model"),
+        (["--sequences", "0"], "take positive integers"),
+        (["--sequences", "two"], "--sequences takes N or N,N,..."),
+    ):
+        with pytest.raises(SystemExit) as stop:
+            sample._arguments(wrong)
+        assert stop.value.code == 2 and sentence in capsys.readouterr().err, wrong
+    with pytest.raises(SystemExit) as stop:
+        sample._arguments(["--help"])
+    shown = " ".join(capsys.readouterr().out.split())  # argparse wraps its lines by the terminal's width
+    assert stop.value.code == 0
+    for part in (
+        "pip install -r samples/models/requirements.txt",
+        "The checkpoint is your own download (nothing is fetched)",
+        "compute capability 10.x or 12.x",
+        "about 57 GiB of free GPU memory",
+        "samples/models/qwen_dense/README.md",
+        "--sequences N[,N...]",
+        "--layers N",
+        '(default "Why is the sky blue?")',
+        "fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch",
+        "not with --model",
+        "an unknown block or key prints the declared ones",
+    ):
+        assert part in shown, part
+
+
 def test_batch_invariance_covers_every_sequence_of_the_batch():
     """The sequence that runs alone rotates with the step, so a row other than the first that reads its neighbour is seen."""
 

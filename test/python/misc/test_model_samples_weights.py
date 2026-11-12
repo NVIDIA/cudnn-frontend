@@ -581,9 +581,10 @@ def test_what_a_user_can_get_wrong_ends_in_an_error_line_and_never_in_a_tracebac
             f"--dump-tokens {target.name}: No such file or directory",
             f"--dump-tokens {target.name}: Is a directory",
         )
-    assert sample._dump(str(tmp_path / "ids.json"), "fe-cublas", [{"sequences": 1, "prompt": 0, "prompt_ids": [1, 2], "ids": [[3]]}]) == ""
+    assert sample._dump(str(tmp_path / "ids.json"), "fe-cublas", [{"sequences": 1, "prompt": 0, "prompt_ids": [[1, 2]], "ids": [[3]]}]) == ""
     written = json.loads((tmp_path / "ids.json").read_text())
     assert written["stack"] == "fe-cublas" and written["greedy"] is True and written["runs"][0]["ids"] == [[3]]
+    assert written["runs"][0]["prompt_ids"] == [[1, 2]], "one prompt per sequence, as one list of produced ids per sequence"
 
     (directory / "generation_config.json").write_text("{not json")
     code, line = last(model)
