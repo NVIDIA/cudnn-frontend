@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Host and kernel time of libcudnn_frontend_aot_sm120.so through the public API.
+// Host and kernel time of libcudnn_frontend_aot_attention.so through the public API.
 //
-//   bench_sdpa_sm120 [--lib <path>] [--iters N]
+//   bench_aot_attention [--lib <path>] [--iters N]
 //
 // Per case: plan build (one time: loads every kernel module the plan can launch), the host time of the first execute()
 // after the build and the steady-state host time per execute() (batches of 100 calls, below the launch-queue depth, so
 // the CPU never waits on the GPU), and the kernel time per execute() (CUDA events around back-to-back calls).
 
-#include "cudnn_frontend/experimental/sm120_aot_attention.h"
+#include "cudnn_frontend/experimental/aot_attention.h"
 
 #include "decode_problem.h"
 
@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace aot = cudnn_frontend::experimental::sm120_aot;
+namespace aot = cudnn_frontend::experimental::aot;
 using Clock   = std::chrono::steady_clock;
 
 static double
@@ -84,7 +84,7 @@ time_plan(const aot::SdpaDesc& desc, const aot::SdpaArgs& a, int iters, std::str
 
 static void
 row(const char* what, const Timing& t, const std::string& kernel, aot::Status st) {
-    const std::string prefix = "cudnn_fe_aot_sm120_";
+    const std::string prefix = "cudnn_fe_aot_";
     std::string k            = kernel.compare(0, prefix.size(), prefix) == 0 ? kernel.substr(prefix.size()) : kernel;
     if (st)
         std::printf("%-46s status %d: %s\n", what, int(st), kernel.c_str());
@@ -191,7 +191,7 @@ main(int argc, char** argv) {
     }
 
     // q8_0 / q4_0 KV (decode kernels): the ggml test-backend-ops layout with a random f16 mask.
-    const int Q8 = CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, Q4 = CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0;
+    const int Q8 = CUDNN_FE_AOT_DECODE_KV_Q8_0, Q4 = CUDNN_FE_AOT_DECODE_KV_Q4_0;
     struct Dq {
         const char* name;
         Case c;
@@ -205,9 +205,9 @@ main(int argc, char** argv) {
     for (const Dq& dc : dcases) {
         Problem pr;
         pr.build(dc.c, 1, false);
-        const cudnn_fe_aot_sm120_decode_params_t& p = pr.p;
-        aot::SdpaDesc d                             = aot::make_desc();
-        d.head_dim                                  = dc.c.D;
+        const cudnn_fe_aot_decode_params_t& p = pr.p;
+        aot::SdpaDesc d                       = aot::make_desc();
+        d.head_dim                            = dc.c.D;
         d.q_dtype = d.o_dtype = CUDNN_FE_AOT_DTYPE_F32;
         d.kv_dtype            = dc.c.kv_type == Q8 ? CUDNN_FE_AOT_DTYPE_Q8_0 : CUDNN_FE_AOT_DTYPE_Q4_0;
         d.mask                = CUDNN_FE_AOT_MASK_ADDITIVE_F16;

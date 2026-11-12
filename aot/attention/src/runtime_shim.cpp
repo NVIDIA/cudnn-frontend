@@ -5,7 +5,8 @@
 // runtime (libcute_dsl_runtime.so). Each one reproduces the CuTeDSL 4.8 runtime's wrapper of the same name, read from
 // its disassembly (nvidia_cutlass_dsl/cu13/lib): the cuda* ones forward to cudart; the cu* ones resolve the driver
 // function through cudaGetDriverEntryPointByVersion and return CUDA_ERROR_UNKNOWN when it cannot be resolved.
-// aot/sm120/build.py --runtime cute-dsl links the original instead; test_sdpa_sm120 --compare-lib checks both agree.
+// aot/attention/build.py --runtime cute-dsl links the original instead; test_aot_attention --compare-lib checks both
+// agree.
 
 #include <cuda.h>
 #include <cuda_runtime.h>

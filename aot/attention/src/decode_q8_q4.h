@@ -18,24 +18,24 @@ extern "C" {
 
 // Values match enum ggml_type.
 typedef enum {
-    CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0 = 2,
-    CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0 = 8,
-} cudnn_fe_aot_sm120_decode_kv_type_t;
+    CUDNN_FE_AOT_DECODE_KV_Q4_0 = 2,
+    CUDNN_FE_AOT_DECODE_KV_Q8_0 = 8,
+} cudnn_fe_aot_decode_kv_type_t;
 
 typedef enum {
-    CUDNN_FE_AOT_SM120_DECODE_SUCCESS = 0,
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_NULL_POINTER,
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_HEAD_DIM,   // head_dim not in {128, 256}
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_KV_TYPE,    // K/V not q8_0/q4_0, or K type != V type
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_N_Q,        // n_q not in [1, 8]
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_BAD_SHAPE,              // n_kv < 1, n_head % n_head_kv != 0, n_seq < 1, ...
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT,  // K/V pointers or strides not 8-byte aligned, Q/O not
-                                                            // 4-byte
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_FEATURE,    // max_bias (ALiBi), logit_softcap, sinks
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_WORKSPACE_TOO_SMALL,
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH,  // device is not compute capability 12.0
-    CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA,              // a CUDA runtime call failed (see cudaGetLastError)
-} cudnn_fe_aot_sm120_decode_status_t;
+    CUDNN_FE_AOT_DECODE_SUCCESS = 0,
+    CUDNN_FE_AOT_DECODE_ERROR_NULL_POINTER,
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_HEAD_DIM,   // head_dim not in {128, 256}
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_KV_TYPE,    // K/V not q8_0/q4_0, or K type != V type
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_N_Q,        // n_q not in [1, 8]
+    CUDNN_FE_AOT_DECODE_ERROR_BAD_SHAPE,              // n_kv < 1, n_head % n_head_kv != 0, n_seq < 1, ...
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT,  // K/V pointers or strides not 8-byte aligned, Q/O not
+                                                      // 4-byte
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_FEATURE,    // max_bias (ALiBi), logit_softcap, sinks
+    CUDNN_FE_AOT_DECODE_ERROR_WORKSPACE_TOO_SMALL,
+    CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH,  // device is not compute capability 12.0
+    CUDNN_FE_AOT_DECODE_ERROR_CUDA,              // a CUDA runtime call failed (see cudaGetLastError)
+} cudnn_fe_aot_decode_status_t;
 
 typedef struct {
     int head_dim;   // D: 128 or 256 (K and V head size are equal)
@@ -51,7 +51,7 @@ typedef struct {
     // K, V: ggml block-quantized rows, ne = [D, n_kv, n_head_kv, n_seq]. nb[1] = KV-position stride,
     // nb[2] = KV-head stride. Head-major (nb[1] = row size) and llama.cpp KV-cache token-major
     // (nb[1] = n_head_kv * row size, nb[2] = row size) views are both supported.
-    int kv_type;  // cudnn_fe_aot_sm120_decode_kv_type_t, same for K and V
+    int kv_type;  // cudnn_fe_aot_decode_kv_type_t, same for K and V
     const void* k;
     int64_t k_nb[4];
     const void* v;
@@ -67,34 +67,34 @@ typedef struct {
     float scale;          // usually 1/sqrt(D)
     float max_bias;       // must be 0 (ALiBi unsupported)
     float logit_softcap;  // must be 0 (unsupported)
-} cudnn_fe_aot_sm120_decode_params_t;
+} cudnn_fe_aot_decode_params_t;
 
 // Load all configurations/copy modes and the combine kernel on the current device at plan creation.
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_prewarm(int head_dim, int kv_type);
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_prewarm(int head_dim, int kv_type);
 
 // Validates the inputs without launching anything.
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_check(const cudnn_fe_aot_sm120_decode_params_t* p);
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_check(const cudnn_fe_aot_decode_params_t* p);
 
 // Bytes of device workspace needed by run() on the current device (depends on the SM count). 0 on invalid input.
 size_t
-cudnn_fe_aot_sm120_decode_get_workspace_size(const cudnn_fe_aot_sm120_decode_params_t* p);
+cudnn_fe_aot_decode_get_workspace_size(const cudnn_fe_aot_decode_params_t* p);
 
 // Enqueues the attention on `stream` (main kernel + combine kernel per sequence). Asynchronous; no host sync,
 // no allocation. The tuned kernel configuration is chosen internally from (head_dim, kv_type, n_q * G, n_head_kv).
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_run(const cudnn_fe_aot_sm120_decode_params_t* p,
-                              void* workspace,
-                              size_t workspace_size,
-                              cudaStream_t stream);
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_run(const cudnn_fe_aot_decode_params_t* p,
+                        void* workspace,
+                        size_t workspace_size,
+                        cudaStream_t stream);
 
 // Writes a one-line description of the configuration run() would pick (kernel name, split count) into buf.
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_describe(const cudnn_fe_aot_sm120_decode_params_t* p, char* buf, size_t buf_size);
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_describe(const cudnn_fe_aot_decode_params_t* p, char* buf, size_t buf_size);
 
 const char*
-cudnn_fe_aot_sm120_decode_status_string(cudnn_fe_aot_sm120_decode_status_t s);
+cudnn_fe_aot_decode_status_string(cudnn_fe_aot_decode_status_t s);
 
 #ifdef __cplusplus
 }

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Bitwise cross-check of libcudnn_frontend_aot_sm120.so against the in-process Python FROST engine.
+"""Bitwise cross-check of libcudnn_frontend_aot_attention.so against the in-process Python FROST engine.
 
-For each case the AOT plan picks a knob set from its selection table (cudnn_fe_aot_sm120_sdpa_query); the Python
+For each case the AOT plan picks a knob set from its selection table (cudnn_fe_aot_sdpa_query); the Python
 engine (cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm120) is then built with exactly those knobs and both run the same inputs.
 The outputs must be identical bit for bit: the AOT kernels are the same templates, compiled ahead of time with dynamic
 extents and strides instead of per-plan in the process.
 
-    PYTHONPATH=<repo>/python python aot/sm120/test/crosscheck_frost.py --lib <dir>/lib/libcudnn_frontend_aot_sm120.so
+    PYTHONPATH=<repo>/python python aot/attention/test/crosscheck_frost.py --lib <dir>/lib/libcudnn_frontend_aot_attention.so
 
 Needs torch, the CuTeDSL wheel and an sm_120 GPU; the AOT library itself is driven through its C ABI (ctypes).
 """
@@ -58,19 +58,19 @@ class Args(ctypes.Structure):
 
 def load(path):
     lib = ctypes.CDLL(path)
-    lib.cudnn_fe_aot_sm120_sdpa_plan_create.argtypes = [ctypes.POINTER(Desc), ctypes.POINTER(Knobs), ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
-    lib.cudnn_fe_aot_sm120_sdpa_workspace_size.argtypes = [ctypes.c_void_p, ctypes.POINTER(Args), ctypes.POINTER(ctypes.c_size_t)]
-    lib.cudnn_fe_aot_sm120_sdpa_execute.argtypes = [ctypes.c_void_p, ctypes.POINTER(Args), ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
-    lib.cudnn_fe_aot_sm120_sdpa_query.argtypes = [ctypes.c_void_p, ctypes.POINTER(Args), ctypes.POINTER(Knobs), ctypes.POINTER(ctypes.c_char_p)]
-    lib.cudnn_fe_aot_sm120_sdpa_plan_destroy.argtypes = [ctypes.c_void_p]
-    lib.cudnn_fe_aot_sm120_last_error.restype = ctypes.c_char_p
-    lib.cudnn_fe_aot_sm120_build_info.restype = ctypes.c_char_p
+    lib.cudnn_fe_aot_sdpa_plan_create.argtypes = [ctypes.POINTER(Desc), ctypes.POINTER(Knobs), ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+    lib.cudnn_fe_aot_sdpa_workspace_size.argtypes = [ctypes.c_void_p, ctypes.POINTER(Args), ctypes.POINTER(ctypes.c_size_t)]
+    lib.cudnn_fe_aot_sdpa_execute.argtypes = [ctypes.c_void_p, ctypes.POINTER(Args), ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    lib.cudnn_fe_aot_sdpa_query.argtypes = [ctypes.c_void_p, ctypes.POINTER(Args), ctypes.POINTER(Knobs), ctypes.POINTER(ctypes.c_char_p)]
+    lib.cudnn_fe_aot_sdpa_plan_destroy.argtypes = [ctypes.c_void_p]
+    lib.cudnn_fe_aot_last_error.restype = ctypes.c_char_p
+    lib.cudnn_fe_aot_build_info.restype = ctypes.c_char_p
     return lib
 
 
 def check(lib, st, what):
     if st:
-        raise RuntimeError(f"{what}: status {st}: {lib.cudnn_fe_aot_sm120_last_error().decode()}")
+        raise RuntimeError(f"{what}: status {st}: {lib.cudnn_fe_aot_last_error().decode()}")
 
 
 def case(lib, dtype, b, hq, hkv, sq, skv, d, causal, sink=False, window_left=None, layout="bshd"):
@@ -90,7 +90,7 @@ def case(lib, dtype, b, hq, hkv, sq, skv, d, causal, sink=False, window_left=Non
     dt = 1 if dtype == torch.bfloat16 else 0
     desc = Desc(ctypes.sizeof(Desc), d, dt, dt, dt, int(causal), -1 if window_left is None else window_left, int(sink), hq // hkv)
     plan = ctypes.c_void_p()
-    check(lib, lib.cudnn_fe_aot_sm120_sdpa_plan_create(ctypes.byref(desc), None, -1, ctypes.byref(plan)), "plan_create")
+    check(lib, lib.cudnn_fe_aot_sdpa_plan_create(ctypes.byref(desc), None, -1, ctypes.byref(plan)), "plan_create")
     a = Args()
     a.struct_size = ctypes.sizeof(Args)
     a.b, a.h_q, a.h_kv, a.s_q, a.s_kv = b, hq, hkv, sq, skv
@@ -100,13 +100,13 @@ def case(lib, dtype, b, hq, hkv, sq, skv, d, causal, sink=False, window_left=Non
     a.scale = scale
     a.sinks = sinks.data_ptr() if sink else None
     kn, kname = Knobs(), ctypes.c_char_p()
-    check(lib, lib.cudnn_fe_aot_sm120_sdpa_query(plan, ctypes.byref(a), ctypes.byref(kn), ctypes.byref(kname)), "query")
+    check(lib, lib.cudnn_fe_aot_sdpa_query(plan, ctypes.byref(a), ctypes.byref(kn), ctypes.byref(kname)), "query")
     ws_n = ctypes.c_size_t()
-    check(lib, lib.cudnn_fe_aot_sm120_sdpa_workspace_size(plan, ctypes.byref(a), ctypes.byref(ws_n)), "workspace_size")
+    check(lib, lib.cudnn_fe_aot_sdpa_workspace_size(plan, ctypes.byref(a), ctypes.byref(ws_n)), "workspace_size")
     ws = torch.empty(max(ws_n.value, 256), dtype=torch.uint8, device="cuda")
     stream = torch.cuda.current_stream().cuda_stream
-    check(lib, lib.cudnn_fe_aot_sm120_sdpa_execute(plan, ctypes.byref(a), ws.data_ptr(), ws_n.value, stream), "execute")
-    lib.cudnn_fe_aot_sm120_sdpa_plan_destroy(plan)
+    check(lib, lib.cudnn_fe_aot_sdpa_execute(plan, ctypes.byref(a), ws.data_ptr(), ws_n.value, stream), "execute")
+    lib.cudnn_fe_aot_sdpa_plan_destroy(plan)
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
 
@@ -149,7 +149,7 @@ def main():
     ap.add_argument("--lib", required=True)
     args = ap.parse_args()
     lib = load(args.lib)
-    print(f"{torch.cuda.get_device_name()}; {lib.cudnn_fe_aot_sm120_build_info().decode()}", flush=True)
+    print(f"{torch.cuda.get_device_name()}; {lib.cudnn_fe_aot_build_info().decode()}", flush=True)
     f16, bf16 = torch.float16, torch.bfloat16
     cases = [
         (f16, 1, 16, 8, 1000, 1000, 256, True),

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Correctness test for libcudnn_frontend_aot_sm120.so through the public header-only API (dlopen).
+// Correctness test for libcudnn_frontend_aot_attention.so through the public header-only API (dlopen).
 //
-//   test_sdpa_sm120 [--lib <path>] [--filter <substr>] [--quick] [--decode-random N] [--compare-lib <path>]
+//   test_aot_attention [--lib <path>] [--filter <substr>] [--quick] [--decode-random N] [--compare-lib <path>]
 //
 //   prefill   f16/bf16 FROST kernels vs an fp32 reference: the selection table over shapes and GQA ratios (1..12,
 //             including tile_q % G != 0), and every prebuilt knob set pinned on two shapes each
@@ -12,11 +12,11 @@
 //   streams   two streams with their own workspaces, bit-identical to single-stream results
 //   reject    unsupported classes, bad arguments, small workspace
 //   --compare-lib <other.so>: run the prefill cases through both libraries and require bit-identical outputs (the
-//             in-tree runtime shim vs the CuTeDSL runtime build: aot/sm120/build.py --runtime cute-dsl)
+//             in-tree runtime shim vs the CuTeDSL runtime build: aot/attention/build.py --runtime cute-dsl)
 //
 // Exits 0 with "SKIPPED" when there is no compute capability 12.0 device or the library cannot be loaded.
 
-#include "cudnn_frontend/experimental/sm120_aot_attention.h"
+#include "cudnn_frontend/experimental/aot_attention.h"
 
 #include "decode_problem.h"
 
@@ -31,7 +31,7 @@
 #include <string>
 #include <vector>
 
-namespace aot = cudnn_frontend::experimental::sm120_aot;
+namespace aot = cudnn_frontend::experimental::aot;
 
 static int g_pass = 0, g_fail = 0;
 static const char* g_filter = nullptr;
@@ -523,8 +523,8 @@ run_prefill(bool quick) {
 
 static aot::SdpaArgs
 decode_args(const Problem& pr) {
-    const cudnn_fe_aot_sm120_decode_params_t& p = pr.p;
-    aot::SdpaArgs a                             = aot::make_args();
+    const cudnn_fe_aot_decode_params_t& p = pr.p;
+    aot::SdpaArgs a                       = aot::make_args();
     a.b = p.n_seq, a.h_q = p.n_head, a.h_kv = p.n_head_kv, a.s_q = p.n_q, a.s_kv = p.n_kv;
     a.q = p.q, a.k = p.k, a.v = p.v, a.o = p.o;
     a.q_stride[0] = p.q_nb[3], a.q_stride[1] = p.q_nb[1], a.q_stride[2] = p.q_nb[2];
@@ -542,7 +542,7 @@ decode_desc(const Case& c) {
     aot::SdpaDesc d = aot::make_desc();
     d.head_dim      = c.D;
     d.q_dtype = d.o_dtype = CUDNN_FE_AOT_DTYPE_F32;
-    d.kv_dtype = c.kv_type == CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0 ? CUDNN_FE_AOT_DTYPE_Q8_0 : CUDNN_FE_AOT_DTYPE_Q4_0;
+    d.kv_dtype = c.kv_type == CUDNN_FE_AOT_DECODE_KV_Q8_0 ? CUDNN_FE_AOT_DTYPE_Q8_0 : CUDNN_FE_AOT_DTYPE_Q4_0;
     d.mask     = c.mask ? CUDNN_FE_AOT_MASK_ADDITIVE_F16 : CUDNN_FE_AOT_MASK_NONE;
     return d;
 }
@@ -604,7 +604,7 @@ run_decode_case(const Case& c, uint32_t seed) {
 
 static void
 run_decode_contracts(const char* lib_path) {
-    for (int type : {CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0}) {
+    for (int type : {CUDNN_FE_AOT_DECODE_KV_Q8_0, CUDNN_FE_AOT_DECODE_KV_Q4_0}) {
         for (int d : {128, 256}) {
             Case c{d, 2, 4, 512, 2, 1, type, LAYOUT_GGML_TEST, MASK_KIND_PADDED};
             Problem pr;
@@ -674,7 +674,7 @@ run_decode_contracts(const char* lib_path) {
 
 static void
 run_decode(int nrand, uint32_t sd) {
-    const int Q8 = CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, Q4 = CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0;
+    const int Q8 = CUDNN_FE_AOT_DECODE_KV_Q8_0, Q4 = CUDNN_FE_AOT_DECODE_KV_Q4_0;
     std::vector<Case> cases;
     for (int t : {Q8, Q4})
         for (int D : {128, 256}) {
@@ -774,8 +774,8 @@ run_graph_and_streams() {
     }
     // Decode.
     for (const Case& gc :
-         {Case{256, 2, 8, 20000, 8, 2, CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, LAYOUT_KV_CACHE, MASK_KIND_RANDOM},
-          Case{128, 8, 4, 3001, 1, 1, CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}}) {
+         {Case{256, 2, 8, 20000, 8, 2, CUDNN_FE_AOT_DECODE_KV_Q8_0, LAYOUT_KV_CACHE, MASK_KIND_RANDOM},
+          Case{128, 8, 4, 3001, 1, 1, CUDNN_FE_AOT_DECODE_KV_Q4_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}}) {
         Problem pr;
         pr.build(gc, 99, false);
         aot::SdpaPlan dp;
@@ -910,10 +910,9 @@ run_rejections() {
     EXPECT("s_q = 0", plan.execute(a, B.ws, B.ws_n, 0), CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT, plan);
     {
         Problem pr;
-        pr.build({128, 2, 4, 64, 1, 1, CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}, 7, false);
+        pr.build({128, 2, 4, 64, 1, 1, CUDNN_FE_AOT_DECODE_KV_Q8_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}, 7, false);
         aot::SdpaPlan dp;
-        dp.build(
-            decode_desc({128, 2, 4, 64, 1, 1, CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}));
+        dp.build(decode_desc({128, 2, 4, 64, 1, 1, CUDNN_FE_AOT_DECODE_KV_Q8_0, LAYOUT_GGML_TEST, MASK_KIND_NONE}));
         aot::SdpaArgs da = decode_args(pr);
         da.s_q           = 9;
         size_t dws       = 0;

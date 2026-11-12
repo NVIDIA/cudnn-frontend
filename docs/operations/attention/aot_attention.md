@@ -1,6 +1,6 @@
 # Ahead-of-time attention for SM120 (experimental)
 
-`libcudnn_frontend_aot_sm120.so` serves attention forward on compute capability 12.0 GPUs (RTX 50xx, RTX PRO Blackwell) to
+`libcudnn_frontend_aot_attention.so` serves attention forward on compute capability 12.0 GPUs (RTX 50xx, RTX PRO Blackwell) to
 C and C++ applications. It has no Python, cuDNN, NVRTC or runtime compiler. Every kernel is compiled ahead of time. A plan is
 built once per *shape class*, and `execute()` takes the run-time extents, strides and pointers and only launches. The
 motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 30 ms per new shape.
@@ -28,7 +28,7 @@ motivating consumer is llama.cpp/ggml, where building a cuDNN graph cost about 3
 | KV dtype | kernels | Q / O | masks | head dim |
 |---|---|---|---|---|
 | f16, bf16 | FROST SM120 prefill templates (`python/cudnn/sdpa/fwd/kernels/sm120/`), exported ahead of time with run-time batch, sequence lengths, head counts and strides; decode-shaped calls run them split-KV and PackGQA | same dtype as KV | none, causal (bottom-right), causal + 128-token window with sinks | 64, 128, 256 |
-| q8_0, q4_0 (ggml blocks) | flash-decode over the quantized cache (`aot/sm120/src/decode_q8_q4.cu`) | f32 | none or an additive f16 `[b, s_q, s_kv]` mask | 128, 256 |
+| q8_0, q4_0 (ggml blocks) | flash-decode over the quantized cache (`aot/attention/src/decode_q8_q4.cu`) | f32 | none or an additive f16 `[b, s_q, s_kv]` mask | 128, 256 |
 
 The plan's `kv_dtype` picks the backend. A combination outside this table fails `plan_create` with
 `CUDNN_FE_AOT_STATUS_NOT_SUPPORTED` and a message naming what is missing. Run-time extents outside a backend's envelope fail
@@ -36,13 +36,13 @@ The plan's `kv_dtype` picks the backend. A combination outside this table fails 
 
 ## C++ API
 
-`include/cudnn_frontend/experimental/sm120_aot_attention.h` is header-only. It dlopens the library and needs only
+`include/cudnn_frontend/experimental/aot_attention.h` is header-only. It dlopens the library and needs only
 `cuda_runtime.h`. The library is found through a trusted explicit `Library::load(path)`, otherwise through
-`libcudnn_frontend_aot_sm120.so` on the loader path.
+`libcudnn_frontend_aot_attention.so` on the loader path.
 
 ```c++
-#include "cudnn_frontend/experimental/sm120_aot_attention.h"
-namespace aot = cudnn_frontend::experimental::sm120_aot;
+#include "cudnn_frontend/experimental/aot_attention.h"
+namespace aot = cudnn_frontend::experimental::aot;
 
 // Once per shape class (e.g. at model load).
 aot::SdpaDesc desc = aot::make_desc();
@@ -71,18 +71,18 @@ every KV head, and a K/V slice of a larger cache, both work.
 
 ## C ABI
 
-`include/cudnn_frontend/experimental/sm120_aot_attention_abi.h` declares the flat C ABI that the library exports (11
+`include/cudnn_frontend/experimental/aot_attention_abi.h` declares the flat C ABI that the library exports (11
 functions). Its rules:
 
 - **Growable structs.** Every struct starts with `struct_size`, and structs only grow at the end. The library reads only the
   fields the caller's `struct_size` covers and treats the rest as zero.
-- **ABI version.** `cudnn_fe_aot_sm120_abi_version()` lets a loader refuse an older library; the C++ header does this.
-- **Status codes.** Every call returns a `cudnn_fe_aot_status_t`, and `cudnn_fe_aot_sm120_last_error()` gives this thread's
+- **ABI version.** `cudnn_fe_aot_abi_version()` lets a loader refuse an older library; the C++ header does this.
+- **Status codes.** Every call returns a `cudnn_fe_aot_status_t`, and `cudnn_fe_aot_last_error()` gives this thread's
   reason for the last failure.
 
 ## How a kernel is selected
 
-The selection is decided offline. `aot/sm120/build.py` runs FROST's own SM120 heuristic
+The selection is decided offline. `aot/attention/build.py` runs FROST's own SM120 heuristic
 (`cudnn.sdpa.fwd.heuristics.recommend`, the one the Python engine uses) over a grid:
 - `b * h_kv` from 1 to 128, `s_q` from 1 to 16384 and `s_kv` from 1 to 131072, in power-of-two buckets;
 - G = h_q / h_kv from 1 to 8, plus one table for G > 8;
@@ -106,7 +106,7 @@ count and occupancy.
 
 ## The default matrix
 
-`aot/sm120/variants.py` is the only place the matrix is declared:
+`aot/attention/variants.py` is the only place the matrix is declared:
 
 - **Dtypes:** f16 and bf16.
 - **Classes:** d 64 / 128 / 256 × {no mask, causal}, plus d 64 causal with sinks and d 64 causal + 128-token window with
@@ -120,19 +120,19 @@ That is 444 prefill kernels and 4 combine kernels, 47.5 MiB in total. Compiling 
 15 s on a 96-core build host; no GPU is needed.
 
 To add a variant, edit `CLASSES`, `PACK_GQA`, `SPLITS`, `EXTRA_KNOBS` or `DTYPES` in `variants.py` and rebuild. The tables are
-regenerated from the heuristic, and `test_sdpa_sm120` enumerates and runs every prebuilt knob set, so a new variant is tested
+regenerated from the heuristic, and `test_aot_attention` enumerates and runs every prebuilt knob set, so a new variant is tested
 without editing the test.
 
 ## Build
 
 ```bash
 pip install -e .        # this checkout + the CuTeDSL wheel (nvidia-cutlass-dsl >= 4.8)
-cmake -B build -DCUDNN_FRONTEND_BUILD_AOT_SM120=ON -DPython3_EXECUTABLE=$(which python) \
+cmake -B build -DCUDNN_FRONTEND_BUILD_AOT_ATTENTION=ON -DPython3_EXECUTABLE=$(which python) \
       -DCUDNN_FRONTEND_BUILD_SAMPLES=OFF -DCUDNN_FRONTEND_BUILD_TESTS=OFF
-cmake --build build -j  # -> build/aot/sm120/lib/libcudnn_frontend_aot_sm120.so, build/aot/{test,bench}_sdpa_sm120
+cmake --build build -j  # -> build/aot/attention/lib/libcudnn_frontend_aot_attention.so, build/aot/{test,bench}_sdpa_sm120
 ```
 
-The option is OFF by default, and `include/` stays header-only. `python aot/sm120/build.py --out <dir>` builds the library
+The option is OFF by default, and `include/` stays header-only. `python aot/attention/build.py --out <dir>` builds the library
 without CMake.
 
 The steps are:
@@ -147,17 +147,17 @@ The steps are:
 
 An `export_to_c` object embeds its cubin and builds its TMA descriptors itself. Its only imports are ten thin wrappers
 (`_cudaLaunchKernelEx`, `_cudaLibraryLoadData`, `_cuTensorMapEncodeTiled`, ...) that `libcute_dsl_runtime.so` (42 MB)
-provides. `aot/sm120/src/runtime_shim.cpp` provides them instead:
+provides. `aot/attention/src/runtime_shim.cpp` provides them instead:
 - the `cuda*` ones forward to cudart;
 - the `cu*` ones resolve the driver function through `cudaGetDriverEntryPointByVersion`;
 - `_cuTensorMapEncodeTiled` applies the CuTeDSL runtime's post-encode fix for drivers up to CUDA 13.1.
 
 Each wrapper was read from the CuTeDSL 4.8.0 runtime's disassembly. `build.py --runtime cute-dsl` links the original runtime
-instead, and `test_sdpa_sm120 --compare-lib` checks that both libraries produce bit-identical outputs.
+instead, and `test_aot_attention --compare-lib` checks that both libraries produce bit-identical outputs.
 
 ## Tests and benchmark
 
-- `test_sdpa_sm120 [--lib <so>]` checks prefill (f16/bf16) against an fp32 reference, in two ways:
+- `test_aot_attention [--lib <so>]` checks prefill (f16/bf16) against an fp32 reference, in two ways:
   - through the selection table, over seven shapes and G in {1, 2, 3, 4, 6, 8, 12};
   - with every prebuilt knob set pinned.
 
@@ -168,9 +168,9 @@ instead, and `test_sdpa_sm120 --compare-lib` checks that both libraries produce 
   - rejection of unsupported classes and bad arguments.
 
   It exits 0 with `SKIPPED` when there is no compute capability 12.0 device or no library.
-- `aot/sm120/test/crosscheck_frost.py --lib <so>` runs the AOT library and the Python FROST engine with the same knob set on
+- `aot/attention/test/crosscheck_frost.py --lib <so>` runs the AOT library and the Python FROST engine with the same knob set on
   the same inputs and requires bit-identical outputs.
-- `bench_sdpa_sm120 [--lib <so>]` reports, per case:
+- `bench_aot_attention [--lib <so>]` reports, per case:
   - plan build time;
   - the host time of the first `execute()` after the build;
   - the steady-state host time per `execute()`;

@@ -18,7 +18,7 @@
 #include <cstdio>
 #include <mutex>
 
-namespace cudnn_fe_aot_sm120_decode_detail {
+namespace cudnn_fe_aot_decode_detail {
 
 constexpr int NQMAX = 8;  // mask staging holds NQMAX token rows per tile
 
@@ -40,9 +40,9 @@ struct KParams {
     float qscale;  // scale * log2(e), folded into Q
 };
 
-}  // namespace cudnn_fe_aot_sm120_decode_detail
+}  // namespace cudnn_fe_aot_decode_detail
 
-using namespace cudnn_fe_aot_sm120_decode_detail;
+using namespace cudnn_fe_aot_decode_detail;
 
 namespace {
 
@@ -576,25 +576,25 @@ combine_body(const KParams& p) {
     AOT_DECODE_KERNEL(base##_rows16, __VA_ARGS__, KV_ROWS16)   \
     AOT_DECODE_KERNEL(base##_rows8, __VA_ARGS__, KV_ROWS8)
 
-AOT_DECODE_KERNELS_D128(cudnn_fe_aot_sm120_decode_cta_q8_0_d128_rt16_t128_st2_nw8, 128, 34, 16, 128, 2, 8, 2)
-AOT_DECODE_KERNELS_D128(cudnn_fe_aot_sm120_decode_cta_q8_0_d128_rt32_t128_st2_nw8, 128, 34, 32, 128, 2, 8, 1)
-AOT_DECODE_KERNELS_D128(cudnn_fe_aot_sm120_decode_cta_q8_0_d128_rt64_t128_st2_nw8, 128, 34, 64, 128, 2, 8, 1)
-AOT_DECODE_KERNELS_D256(cudnn_fe_aot_sm120_decode_cta_q8_0_d256_rt16_t64_st2_nw8, 256, 34, 16, 64, 2, 8, 1)
-AOT_DECODE_KERNELS_D256(cudnn_fe_aot_sm120_decode_cta_q8_0_d256_rt32_t64_st2_nw8, 256, 34, 32, 64, 2, 8, 1)
-AOT_DECODE_KERNELS_D256(cudnn_fe_aot_sm120_decode_cta_q8_0_d256_rt64_t64_st2_nw8, 256, 34, 64, 64, 2, 8, 1)
-AOT_DECODE_KERNELS_D128(cudnn_fe_aot_sm120_decode_cta_q4_0_d128_rt16_t64_st2_nw8, 128, 18, 16, 64, 2, 8, 2)
-AOT_DECODE_KERNELS_D128(cudnn_fe_aot_sm120_decode_cta_q4_0_d128_rt32_t128_st2_nw8, 128, 18, 32, 128, 2, 8, 1)
-AOT_DECODE_KERNELS_D128(cudnn_fe_aot_sm120_decode_cta_q4_0_d128_rt64_t128_st2_nw8, 128, 18, 64, 128, 2, 8, 1)
-AOT_DECODE_KERNELS_D256(cudnn_fe_aot_sm120_decode_cta_q4_0_d256_rt16_t64_st2_nw8, 256, 18, 16, 64, 2, 8, 1)
-AOT_DECODE_KERNELS_D256(cudnn_fe_aot_sm120_decode_cta_q4_0_d256_rt32_t64_st2_nw8, 256, 18, 32, 64, 2, 8, 1)
-AOT_DECODE_KERNELS_D256(cudnn_fe_aot_sm120_decode_cta_q4_0_d256_rt64_t64_st2_nw8, 256, 18, 64, 64, 2, 8, 1)
+AOT_DECODE_KERNELS_D128(cudnn_fe_aot_decode_cta_q8_0_d128_rt16_t128_st2_nw8, 128, 34, 16, 128, 2, 8, 2)
+AOT_DECODE_KERNELS_D128(cudnn_fe_aot_decode_cta_q8_0_d128_rt32_t128_st2_nw8, 128, 34, 32, 128, 2, 8, 1)
+AOT_DECODE_KERNELS_D128(cudnn_fe_aot_decode_cta_q8_0_d128_rt64_t128_st2_nw8, 128, 34, 64, 128, 2, 8, 1)
+AOT_DECODE_KERNELS_D256(cudnn_fe_aot_decode_cta_q8_0_d256_rt16_t64_st2_nw8, 256, 34, 16, 64, 2, 8, 1)
+AOT_DECODE_KERNELS_D256(cudnn_fe_aot_decode_cta_q8_0_d256_rt32_t64_st2_nw8, 256, 34, 32, 64, 2, 8, 1)
+AOT_DECODE_KERNELS_D256(cudnn_fe_aot_decode_cta_q8_0_d256_rt64_t64_st2_nw8, 256, 34, 64, 64, 2, 8, 1)
+AOT_DECODE_KERNELS_D128(cudnn_fe_aot_decode_cta_q4_0_d128_rt16_t64_st2_nw8, 128, 18, 16, 64, 2, 8, 2)
+AOT_DECODE_KERNELS_D128(cudnn_fe_aot_decode_cta_q4_0_d128_rt32_t128_st2_nw8, 128, 18, 32, 128, 2, 8, 1)
+AOT_DECODE_KERNELS_D128(cudnn_fe_aot_decode_cta_q4_0_d128_rt64_t128_st2_nw8, 128, 18, 64, 128, 2, 8, 1)
+AOT_DECODE_KERNELS_D256(cudnn_fe_aot_decode_cta_q4_0_d256_rt16_t64_st2_nw8, 256, 18, 16, 64, 2, 8, 1)
+AOT_DECODE_KERNELS_D256(cudnn_fe_aot_decode_cta_q4_0_d256_rt32_t64_st2_nw8, 256, 18, 32, 64, 2, 8, 1)
+AOT_DECODE_KERNELS_D256(cudnn_fe_aot_decode_cta_q4_0_d256_rt64_t64_st2_nw8, 256, 18, 64, 64, 2, 8, 1)
 
 extern "C" __global__ void
-__launch_bounds__(256) cudnn_fe_aot_sm120_decode_combine_f16_d128(KParams p) {
+__launch_bounds__(256) cudnn_fe_aot_decode_combine_f16_d128(KParams p) {
     combine_body<128>(p);
 }
 extern "C" __global__ void
-__launch_bounds__(256) cudnn_fe_aot_sm120_decode_combine_f16_d256(KParams p) {
+__launch_bounds__(256) cudnn_fe_aot_decode_combine_f16_d256(KParams p) {
     combine_body<256>(p);
 }
 
@@ -613,18 +613,18 @@ struct Config {
 #define CFG256(name, D, QB, RT, T, ST, NW) CFG(name, D, QB, RT, T, ST, NW, name##_rows16)
 // Order: q8 d128 rt16/32/64, q8 d256 rt16/32/64, q4 d128 ..., q4 d256 ... (see choose_config)
 const Config kConfigs[] = {
-    CFG128(cudnn_fe_aot_sm120_decode_cta_q8_0_d128_rt16_t128_st2_nw8, 128, 34, 16, 128, 2, 8),
-    CFG128(cudnn_fe_aot_sm120_decode_cta_q8_0_d128_rt32_t128_st2_nw8, 128, 34, 32, 128, 2, 8),
-    CFG128(cudnn_fe_aot_sm120_decode_cta_q8_0_d128_rt64_t128_st2_nw8, 128, 34, 64, 128, 2, 8),
-    CFG256(cudnn_fe_aot_sm120_decode_cta_q8_0_d256_rt16_t64_st2_nw8, 256, 34, 16, 64, 2, 8),
-    CFG256(cudnn_fe_aot_sm120_decode_cta_q8_0_d256_rt32_t64_st2_nw8, 256, 34, 32, 64, 2, 8),
-    CFG256(cudnn_fe_aot_sm120_decode_cta_q8_0_d256_rt64_t64_st2_nw8, 256, 34, 64, 64, 2, 8),
-    CFG128(cudnn_fe_aot_sm120_decode_cta_q4_0_d128_rt16_t64_st2_nw8, 128, 18, 16, 64, 2, 8),
-    CFG128(cudnn_fe_aot_sm120_decode_cta_q4_0_d128_rt32_t128_st2_nw8, 128, 18, 32, 128, 2, 8),
-    CFG128(cudnn_fe_aot_sm120_decode_cta_q4_0_d128_rt64_t128_st2_nw8, 128, 18, 64, 128, 2, 8),
-    CFG256(cudnn_fe_aot_sm120_decode_cta_q4_0_d256_rt16_t64_st2_nw8, 256, 18, 16, 64, 2, 8),
-    CFG256(cudnn_fe_aot_sm120_decode_cta_q4_0_d256_rt32_t64_st2_nw8, 256, 18, 32, 64, 2, 8),
-    CFG256(cudnn_fe_aot_sm120_decode_cta_q4_0_d256_rt64_t64_st2_nw8, 256, 18, 64, 64, 2, 8),
+    CFG128(cudnn_fe_aot_decode_cta_q8_0_d128_rt16_t128_st2_nw8, 128, 34, 16, 128, 2, 8),
+    CFG128(cudnn_fe_aot_decode_cta_q8_0_d128_rt32_t128_st2_nw8, 128, 34, 32, 128, 2, 8),
+    CFG128(cudnn_fe_aot_decode_cta_q8_0_d128_rt64_t128_st2_nw8, 128, 34, 64, 128, 2, 8),
+    CFG256(cudnn_fe_aot_decode_cta_q8_0_d256_rt16_t64_st2_nw8, 256, 34, 16, 64, 2, 8),
+    CFG256(cudnn_fe_aot_decode_cta_q8_0_d256_rt32_t64_st2_nw8, 256, 34, 32, 64, 2, 8),
+    CFG256(cudnn_fe_aot_decode_cta_q8_0_d256_rt64_t64_st2_nw8, 256, 34, 64, 64, 2, 8),
+    CFG128(cudnn_fe_aot_decode_cta_q4_0_d128_rt16_t64_st2_nw8, 128, 18, 16, 64, 2, 8),
+    CFG128(cudnn_fe_aot_decode_cta_q4_0_d128_rt32_t128_st2_nw8, 128, 18, 32, 128, 2, 8),
+    CFG128(cudnn_fe_aot_decode_cta_q4_0_d128_rt64_t128_st2_nw8, 128, 18, 64, 128, 2, 8),
+    CFG256(cudnn_fe_aot_decode_cta_q4_0_d256_rt16_t64_st2_nw8, 256, 18, 16, 64, 2, 8),
+    CFG256(cudnn_fe_aot_decode_cta_q4_0_d256_rt32_t64_st2_nw8, 256, 18, 32, 64, 2, 8),
+    CFG256(cudnn_fe_aot_decode_cta_q4_0_d256_rt64_t64_st2_nw8, 256, 18, 64, 64, 2, 8),
 };
 const char* const kKvModeName[3] = {"contig", "rows16", "rows8"};
 constexpr int kNumConfigs        = sizeof(kConfigs) / sizeof(kConfigs[0]);
@@ -633,7 +633,7 @@ constexpr int kMaxDev            = 64;
 // R = n_q * G query rows per KV head; R > 64 runs ceil(R / 64) row-group CTAs per (KV head, split).
 int
 choose_config(int D, int kv_type, int R) {
-    const int base = (kv_type == CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0 ? 0 : 6) + (D == 128 ? 0 : 3);
+    const int base = (kv_type == CUDNN_FE_AOT_DECODE_KV_Q8_0 ? 0 : 6) + (D == 128 ? 0 : 3);
     return base + (R <= 16 ? 0 : R <= 32 ? 1 : 2);
 }
 
@@ -691,38 +691,38 @@ aligned(const void* p, int a) {
     return ((uintptr_t)p % a) == 0;
 }
 
-cudnn_fe_aot_sm120_decode_status_t
-validate(const cudnn_fe_aot_sm120_decode_params_t* p) {
-    if (!p || !p->q || !p->k || !p->v || !p->o) return CUDNN_FE_AOT_SM120_DECODE_ERROR_NULL_POINTER;
-    if (p->head_dim != 128 && p->head_dim != 256) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_HEAD_DIM;
-    if (p->kv_type != CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0 && p->kv_type != CUDNN_FE_AOT_SM120_DECODE_KV_Q4_0)
-        return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_KV_TYPE;
-    if (p->n_q < 1 || p->n_q > NQMAX) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_N_Q;
+cudnn_fe_aot_decode_status_t
+validate(const cudnn_fe_aot_decode_params_t* p) {
+    if (!p || !p->q || !p->k || !p->v || !p->o) return CUDNN_FE_AOT_DECODE_ERROR_NULL_POINTER;
+    if (p->head_dim != 128 && p->head_dim != 256) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_HEAD_DIM;
+    if (p->kv_type != CUDNN_FE_AOT_DECODE_KV_Q8_0 && p->kv_type != CUDNN_FE_AOT_DECODE_KV_Q4_0)
+        return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_KV_TYPE;
+    if (p->n_q < 1 || p->n_q > NQMAX) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_N_Q;
     if (p->n_kv < 1 || p->n_head < 1 || p->n_head_kv < 1 || p->n_seq < 1 || p->n_head % p->n_head_kv)
-        return CUDNN_FE_AOT_SM120_DECODE_ERROR_BAD_SHAPE;
-    if (p->max_bias != 0.f || p->logit_softcap != 0.f) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_FEATURE;
+        return CUDNN_FE_AOT_DECODE_ERROR_BAD_SHAPE;
+    if (p->max_bias != 0.f || p->logit_softcap != 0.f) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_FEATURE;
     const int64_t* nbs[] = {p->k_nb, p->v_nb};
     for (const int64_t* nb : nbs)
         for (int i = 1; i < 4; ++i)
-            if (nb[i] % 8) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
-    if (!aligned(p->k, 8) || !aligned(p->v, 8)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
+            if (nb[i] % 8) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
+    if (!aligned(p->k, 8) || !aligned(p->v, 8)) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
     for (int i = 1; i < 4; ++i)
-        if (p->q_nb[i] % 4 || p->o_nb[i] % 4) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
-    if (!aligned(p->q, 4) || !aligned(p->o, 4)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
+        if (p->q_nb[i] % 4 || p->o_nb[i] % 4) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
+    if (!aligned(p->q, 4) || !aligned(p->o, 4)) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
     if (p->mask) {
         if (!aligned(p->mask, 2) || p->mask_nb[1] % 2 || p->mask_nb[3] % 2)
-            return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
+            return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
     }
-    return CUDNN_FE_AOT_SM120_DECODE_SUCCESS;
+    return CUDNN_FE_AOT_DECODE_SUCCESS;
 }
 
-cudnn_fe_aot_sm120_decode_status_t
-make_plan(const cudnn_fe_aot_sm120_decode_params_t* p, Plan* out) {
-    const cudnn_fe_aot_sm120_decode_status_t st = validate(p);
-    if (st != CUDNN_FE_AOT_SM120_DECODE_SUCCESS) return st;
+cudnn_fe_aot_decode_status_t
+make_plan(const cudnn_fe_aot_decode_params_t* p, Plan* out) {
+    const cudnn_fe_aot_decode_status_t st = validate(p);
+    if (st != CUDNN_FE_AOT_DECODE_SUCCESS) return st;
     int dev = 0, sms = 0, cc = 0;
-    if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
-    if (cc != 120) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
+    if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
+    if (cc != 120) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int G     = p->n_head / p->n_head_kv;
     const int R     = p->n_q * G;
     const int cfg   = choose_config(p->head_dim, p->kv_type, R);
@@ -745,7 +745,7 @@ make_plan(const cudnn_fe_aot_sm120_decode_params_t* p, Plan* out) {
         occ = std::min(occ, kernel_occupancy(cfg, KV_CONTIG16, dev));
     else if (strides16 && RB % 16 == 0 && p->k_nb[1] % 16 == 0 && p->v_nb[1] % 16 == 0)
         occ = std::min(occ, kernel_occupancy(cfg, KV_ROWS16, dev));
-    if (!occ) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+    if (!occ) return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
     // At most one wave of CTAs (a partial second wave costs a whole CTA duration), split tile-balanced so any count
     // works; every split gets >= 1 tile.
     const int nrg       = (R + c.RT - 1) / c.RT;
@@ -764,65 +764,65 @@ make_plan(const cudnn_fe_aot_sm120_decode_params_t* p, Plan* out) {
     out->mask_pitch     = ((size_t)p->n_kv + 7) / 8 * 16;  // bytes per repacked mask row
     out->mask_direct    = p->mask && aligned(p->mask, 16) && p->mask_nb[1] % 16 == 0 && p->mask_nb[3] % 16 == 0;
     out->ws             = out->o_bytes + out->ml_bytes + (p->mask ? (size_t)p->n_q * out->mask_pitch : 0);
-    return CUDNN_FE_AOT_SM120_DECODE_SUCCESS;
+    return CUDNN_FE_AOT_DECODE_SUCCESS;
 }
 
 }  // namespace
 
 extern "C" {
 
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_prewarm(int head_dim, int kv_type) {
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_prewarm(int head_dim, int kv_type) {
     int dev = 0, sms = 0, cc = 0;
-    if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
-    if (cc != 120) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH;
+    if (!device_info(&dev, &sms, &cc)) return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
+    if (cc != 120) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH;
     const int first = choose_config(head_dim, kv_type, 1);
     cudaFuncAttributes attr{};
     for (int cfg = first; cfg < first + 3; ++cfg)
         for (int mode = 0; mode < 3; ++mode)
             if (kConfigs[cfg].kern[mode] && (cudaFuncGetAttributes(&attr, kConfigs[cfg].kern[mode]) != cudaSuccess ||
                                              !kernel_occupancy(cfg, mode, dev)))
-                return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+                return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
     void (*combine)(KParams) =
-        head_dim == 128 ? cudnn_fe_aot_sm120_decode_combine_f16_d128 : cudnn_fe_aot_sm120_decode_combine_f16_d256;
-    return cudaFuncGetAttributes(&attr, combine) == cudaSuccess ? CUDNN_FE_AOT_SM120_DECODE_SUCCESS
-                                                                : CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+        head_dim == 128 ? cudnn_fe_aot_decode_combine_f16_d128 : cudnn_fe_aot_decode_combine_f16_d256;
+    return cudaFuncGetAttributes(&attr, combine) == cudaSuccess ? CUDNN_FE_AOT_DECODE_SUCCESS
+                                                                : CUDNN_FE_AOT_DECODE_ERROR_CUDA;
 }
 
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_check(const cudnn_fe_aot_sm120_decode_params_t* p) {
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_check(const cudnn_fe_aot_decode_params_t* p) {
     Plan pl;
     return make_plan(p, &pl);
 }
 
 size_t
-cudnn_fe_aot_sm120_decode_get_workspace_size(const cudnn_fe_aot_sm120_decode_params_t* p) {
+cudnn_fe_aot_decode_get_workspace_size(const cudnn_fe_aot_decode_params_t* p) {
     Plan pl;
-    return make_plan(p, &pl) == CUDNN_FE_AOT_SM120_DECODE_SUCCESS ? pl.ws : 0;
+    return make_plan(p, &pl) == CUDNN_FE_AOT_DECODE_SUCCESS ? pl.ws : 0;
 }
 
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_describe(const cudnn_fe_aot_sm120_decode_params_t* p, char* buf, size_t buf_size) {
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_describe(const cudnn_fe_aot_decode_params_t* p, char* buf, size_t buf_size) {
     Plan pl;
-    const cudnn_fe_aot_sm120_decode_status_t st = make_plan(p, &pl);
-    if (st != CUDNN_FE_AOT_SM120_DECODE_SUCCESS) return st;
+    const cudnn_fe_aot_decode_status_t st = make_plan(p, &pl);
+    if (st != CUDNN_FE_AOT_DECODE_SUCCESS) return st;
     if (buf && buf_size)
         snprintf(
             buf, buf_size, "%s_%s nrg=%d nsplit=%d", kConfigs[pl.cfg].name, kKvModeName[pl.kv_mode], pl.nrg, pl.nsplit);
     return st;
 }
 
-cudnn_fe_aot_sm120_decode_status_t
-cudnn_fe_aot_sm120_decode_run(const cudnn_fe_aot_sm120_decode_params_t* p,
-                              void* workspace,
-                              size_t workspace_size,
-                              cudaStream_t stream) {
+cudnn_fe_aot_decode_status_t
+cudnn_fe_aot_decode_run(const cudnn_fe_aot_decode_params_t* p,
+                        void* workspace,
+                        size_t workspace_size,
+                        cudaStream_t stream) {
     Plan pl;
-    const cudnn_fe_aot_sm120_decode_status_t st = make_plan(p, &pl);
-    if (st != CUDNN_FE_AOT_SM120_DECODE_SUCCESS) return st;
-    if (!workspace) return CUDNN_FE_AOT_SM120_DECODE_ERROR_NULL_POINTER;
-    if (workspace_size < pl.ws) return CUDNN_FE_AOT_SM120_DECODE_ERROR_WORKSPACE_TOO_SMALL;
-    if (!aligned(workspace, 256)) return CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
+    const cudnn_fe_aot_decode_status_t st = make_plan(p, &pl);
+    if (st != CUDNN_FE_AOT_DECODE_SUCCESS) return st;
+    if (!workspace) return CUDNN_FE_AOT_DECODE_ERROR_NULL_POINTER;
+    if (workspace_size < pl.ws) return CUDNN_FE_AOT_DECODE_ERROR_WORKSPACE_TOO_SMALL;
+    if (!aligned(workspace, 256)) return CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT;
     const Config& c = kConfigs[pl.cfg];
 
     KParams k{};
@@ -868,15 +868,15 @@ cudnn_fe_aot_sm120_decode_run(const cudnn_fe_aot_sm120_decode_params_t* p,
                                   p->n_q,
                                   cudaMemcpyDeviceToDevice,
                                   stream) != cudaSuccess)
-                return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+                return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
             k.mask  = mask_ws;
             k.m_nb1 = (long long)pl.mask_pitch;
         }
         k.out = reinterpret_cast<unsigned char*>(p->o) + (size_t)s * p->o_nb[3];
         c.kern[pl.kv_mode]<<<grid, c.NW * 32, c.smem, stream>>>(k);
-        if (cudaPeekAtLastError() != cudaSuccess) return CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
-        void (*comb)(KParams) = p->head_dim == 128 ? cudnn_fe_aot_sm120_decode_combine_f16_d128
-                                                   : cudnn_fe_aot_sm120_decode_combine_f16_d256;
+        if (cudaPeekAtLastError() != cudaSuccess) return CUDNN_FE_AOT_DECODE_ERROR_CUDA;
+        void (*comb)(KParams) =
+            p->head_dim == 128 ? cudnn_fe_aot_decode_combine_f16_d128 : cudnn_fe_aot_decode_combine_f16_d256;
         // Programmatic dependent launch hides the combine's launch latency behind the main kernel's tail.
         cudaLaunchConfig_t lc = {};
         lc.gridDim            = dim3(rows, p->head_dim / 64);
@@ -892,33 +892,33 @@ cudnn_fe_aot_sm120_decode_run(const cudnn_fe_aot_sm120_decode_params_t* p,
             comb<<<dim3(rows, p->head_dim / 64), 256, 0, stream>>>(k);
         }
     }
-    return cudaGetLastError() == cudaSuccess ? CUDNN_FE_AOT_SM120_DECODE_SUCCESS : CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA;
+    return cudaGetLastError() == cudaSuccess ? CUDNN_FE_AOT_DECODE_SUCCESS : CUDNN_FE_AOT_DECODE_ERROR_CUDA;
 }
 
 const char*
-cudnn_fe_aot_sm120_decode_status_string(cudnn_fe_aot_sm120_decode_status_t s) {
+cudnn_fe_aot_decode_status_string(cudnn_fe_aot_decode_status_t s) {
     switch (s) {
-        case CUDNN_FE_AOT_SM120_DECODE_SUCCESS:
+        case CUDNN_FE_AOT_DECODE_SUCCESS:
             return "success";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_NULL_POINTER:
+        case CUDNN_FE_AOT_DECODE_ERROR_NULL_POINTER:
             return "null pointer";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_HEAD_DIM:
+        case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_HEAD_DIM:
             return "unsupported head_dim (need 128 or 256)";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_KV_TYPE:
+        case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_KV_TYPE:
             return "unsupported KV type (need q8_0 or q4_0)";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_N_Q:
+        case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_N_Q:
             return "unsupported n_q (need 1..8)";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_BAD_SHAPE:
+        case CUDNN_FE_AOT_DECODE_ERROR_BAD_SHAPE:
             return "bad shape";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ALIGNMENT:
+        case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ALIGNMENT:
             return "unsupported pointer/stride alignment";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_FEATURE:
+        case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_FEATURE:
             return "unsupported feature (ALiBi / softcap)";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_WORKSPACE_TOO_SMALL:
+        case CUDNN_FE_AOT_DECODE_ERROR_WORKSPACE_TOO_SMALL:
             return "workspace too small";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_UNSUPPORTED_ARCH:
+        case CUDNN_FE_AOT_DECODE_ERROR_UNSUPPORTED_ARCH:
             return "unsupported device (need compute capability 12.0)";
-        case CUDNN_FE_AOT_SM120_DECODE_ERROR_CUDA:
+        case CUDNN_FE_AOT_DECODE_ERROR_CUDA:
             return "CUDA error";
     }
     return "unknown";

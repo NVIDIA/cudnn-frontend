@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-only build-cache regression tests: python -m unittest discover -s aot/sm120/test."""
+"""Host-only build-cache regression tests: python -m unittest discover -s aot/attention/test."""
 
 import concurrent.futures
 import importlib.util
@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-SPEC = importlib.util.spec_from_file_location("sm120_aot_build", Path(__file__).resolve().parents[1] / "build.py")
+SPEC = importlib.util.spec_from_file_location("aot_attention_build", Path(__file__).resolve().parents[1] / "build.py")
 build = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(build)
 
