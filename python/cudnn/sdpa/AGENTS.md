@@ -640,6 +640,10 @@ role-local acquisitions, accounting separately for the correction group
 its paged specialization converged. D512 MXFP8 emits separate V-half entries.
 These compile checks do not establish native execution or performance on
 the target architecture; retain numerical, replay and sanitizer coverage.
+Instruction counts alone cannot establish participation. Trace the emitted
+release guard's operand back to `tid.x` and check every service lane; a
+single-warp guard leaves the release count unchanged. The SM100 D128 FP8
+compile test also rejects a private single-warp-guard control without launching it.
 
 
 **Rule S14 — Empty work must retain the buffer-acquisition acknowledgment.**
