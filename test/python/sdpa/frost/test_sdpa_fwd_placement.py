@@ -215,6 +215,23 @@ def test_sm120_d256_decode_of_a_group_the_tile_does_not_divide_trails(h_q, b):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("b, s_kv", [(1, 2048), (1, 131072), (12, 30000), (128, 131072)])
+def test_sm120_d512_decode_wide_group_leads_when_it_fills_the_tile(b, s_kv):
+    """SM120 d512 s_q == 1 over one KV head: a 128-wide group packs into one 128-row tile and leads at every batch and
+    KV length (0.16-0.70 of the backend, module docstring); 96 and 112 leave tile rows idle and keep the backend
+    (112/1 b96 ran 1.27-1.30x); 64 and below keep the one-KV-head rule (b1 at 2k KV trails)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    facts = dict(b=b, h_kv=1, s_q=1, s_kv=s_kv, d_qk=512, d_v=512, causal=False, bottom_right=False, device_cc=(12, 0), device_sm_count=188)
+    assert placement.place(spec, _facts(h_q=128, **facts)) == placement.LEAD
+    assert placement.place(spec, _facts(h_q=112, **facts)) == placement.TRAIL
+    assert placement.place(spec, _facts(h_q=96, **facts)) == placement.TRAIL
+    if (b, s_kv) == (1, 2048):
+        assert placement.place(spec, _facts(h_q=64, **facts)) == placement.TRAIL
+
+
+@pytest.mark.L0
 def test_paged_d512_decode_follows_the_generated_entry_and_trails_without_one():
     """Paged d512 at s_q == 1 on cc 10.0 follows the generated entry (study sm100_d512_paged_decode_b100_20261030): it
     leads past the cost threshold and trails tiny launches. Without an entry (an SM100-row part no study or transfer check covers) the hand rule's
