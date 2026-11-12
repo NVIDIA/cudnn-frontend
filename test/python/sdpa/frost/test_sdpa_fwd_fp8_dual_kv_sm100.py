@@ -339,8 +339,8 @@ _PHANTOM_BUDGET_S = 900.0  # one cold compile of the patched kernel (1-3 min) + 
 
 def test_phantom_step_cannot_lap_a_delayed_mma(tmp_path):
     """Stream 1's phantom step (odd KV tile count) publishes its P-ready credits only after its own
-    previous PV completed, so a delayed MMA cannot be lapped.  The MMA issues the next pair's BMM1 --
-    which releases the phantom -- before the previous pair's PVs, and ``mb_bmm2_ready`` chunk 1 counts
+    previous PV completed, so a delayed MMA cannot be lapped.  With P in SMEM, the MMA issues stream 1's
+    next BMM1 -- which releases the phantom -- before its previous PV, and ``mb_bmm2_ready`` chunk 1 counts
     softmax lanes only: a phantom that published at once completed a second phase of that barrier while
     the MMA's parity wait for the first was still pending, and the wait never saw a flip.  Child process
     under a wall budget (a regression is a budget miss, never a wedged suite): the kernel is run from a
