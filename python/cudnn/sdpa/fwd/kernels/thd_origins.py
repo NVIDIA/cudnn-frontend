@@ -74,6 +74,7 @@ def _build_one_batch_origins(
     clusters,
     paged: cutlass.Constexpr,
     splits: cutlass.Constexpr,
+    row_dims: cutlass.Constexpr,
 ):
     """One-sequence setup with no cross-warp metadata dependency.
 
@@ -114,7 +115,7 @@ def _build_one_batch_origins(
                         stride = cutlass.Int64(tensor.stride[1])
                         row_base = tensor.iterator.raw_ptr() + origin * stride
                         nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_ADDRESS, dptr, new_value=row_base.toint(cutlass.Int64))
-                        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=2)
+                        nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=row_dims[port])
                         set_tensor_map_bit21(dptr, cutlass.Int64(extent) * stride * cutlass.Int64(tensor.element_type.width // 8))
                         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     # The scheduler publisher is thread zero, not an implementation-defined
@@ -165,9 +166,12 @@ def build_thd_origins(
     splits: cutlass.Constexpr[int] = 1,
     single_maps: cutlass.Constexpr[bool] = False,
     single_batch_fast: cutlass.Constexpr[bool] = False,
+    row_dims: cutlass.Constexpr[tuple] = (2, 2, 2, 2),
 ):
     """Lengths control work and clipping; physical offsets control addresses.
 
+    ``row_dims`` names the token dimension in each Q/K/V/O tensor map;
+    input tensors retain their ordinary token stride even for rank-5 maps.
     A map per sequence also keeps interior KV padding (possibly NaN) outside
     every TMA load. Descriptor writers publish to the tensor-map proxy before
     the consuming launch acquires the maps. Compact prefixes remain unchanged.
@@ -197,6 +201,7 @@ def build_thd_origins(
             clusters,
             paged,
             splits,
+            row_dims,
         )
     else:
         tid = cutlass.Int32(cute.arch.thread_idx()[0])
@@ -269,7 +274,7 @@ def build_thd_origins(
                     tensors[3],
                     batch,
                     cutlass.Int64(tensors[3].stride[1]),
-                    2,
+                    row_dims[3],
                     slot_base=COMPACT_MAP_SEQUENCE,
                     first_batch=warp,
                     batch_step=cutlass.Int32(THD_SETUP_THREADS // 32),
@@ -281,12 +286,12 @@ def build_thd_origins(
                 total_q = cute.math.max(cutlass.Int32(meta[2 * batch]), cutlass.Int32(1))
                 total_kv = cute.math.max(cutlass.Int32(meta[3 * batch + 1]), cutlass.Int32(1))
                 if warp == 0:
-                    emit_clamped_desc(q_desc, maps, 1 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_q, 2)
+                    emit_clamped_desc(q_desc, maps, 1 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_q, row_dims[0])
                 if cutlass.const_expr(not paged):
                     if warp == 1:
-                        emit_clamped_desc(k_desc, maps, 2 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
+                        emit_clamped_desc(k_desc, maps, 2 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, row_dims[1])
                     if warp == 2:
-                        emit_clamped_desc(v_desc, maps, 3 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, 2)
+                        emit_clamped_desc(v_desc, maps, 3 * (batch + 1) + COMPACT_MAP_SEQUENCE, total_kv, row_dims[2])
             else:
                 # Stripe warps over ports as well as sequences. A short batch must
                 # not serialize all four maps on one elected writer. O/Q occupy the
@@ -305,7 +310,7 @@ def build_thd_origins(
                                 tensors[port],
                                 batch,
                                 cutlass.Int64(tensors[port].stride[1]),
-                                2,
+                                row_dims[port],
                                 slot_base=slot * (batch + 1),
                                 first_batch=warp // map_count,
                                 batch_step=cutlass.Int32(THD_SETUP_THREADS // 32 // map_count),

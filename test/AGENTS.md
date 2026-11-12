@@ -521,6 +521,20 @@ valid-memory control with and without that option before diagnosing a kernel
 error from the count alone. Use a known-bad memory/race canary to verify the
 detector, and retain a normal run of the real capture test without launch dumps.
 
+### Ragged physical-origin fixtures
+
+Token/head stride gaps do not vary sequence start addresses. Use
+`ExecConfig.ragged_origin_rows` for independent Q/K/V/O/Stats row starts,
+while sequence-length and cumulative-length tensors retain logical lengths.
+Packing, reference unpacking and output masks must all use the selected port's
+origins; masking everything after `sum(seq_lens)` drops valid gapped outputs.
+`test_mhas_v2.py::test_sdpa_physical_origins_L0` exercises the shared harness,
+and `frost/test_sdpa_physical_origins_shared.py` pins the native SM120 route so
+backend fallback cannot hide a missing kernel repair. The SM100 selected entry
+`test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
+FP8 D128 cases and checks both prepared and standalone graph execution.
+Default-provider passes alone cannot qualify an advertised native path.
+
 ### CUDA Graph test lifetimes
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
@@ -646,6 +660,11 @@ Dense V scale factors for D > 128 are plane-major; THD factors are packed
 per-sequence tiles per head. Reuse `_quantize_seq` when constructing THD test
 inputs; reshaping a dense buffer does not produce the THD contract. Rebind
 E8M0 exponent values as well as pointers and validate after graph replay.
+Both the shared graph harness and native fixtures use `pack_thd_columnwise_sf`
+to permute `[D-plane, H, tile, 512]` bytes into `[H, tile, D-plane * 512]`.
+`test_thd_columnwise_sf_matches_independent_atoms` compares that permutation
+with separately quantized per-head 128-token atoms. Keep D512 with multiple
+heads and token tiles: D128 alone cannot expose a misplaced D plane.
 The MXFP8 split combine has no per-tensor output scalar: specialize its
 scale pointer to None and remove Amax unscaling, rather than handing a NULL
 runtime address to the per-tensor unscale kernel. `test_prepared_mxfp8_capture_reads_current_scales`
@@ -1382,3 +1401,66 @@ matrix on a representative full-feature shape and retain separate native
 flavor rejection tests; do not widen eligibility to satisfy a stale fixture.
 The SM90 D64/D512 controls in `test_band_capabilities.py` and
 `test_sdpa_native_d64_sm90.py` exercise these distinct contracts.
+
+For packed THD split kernels, sequence-local Q maps and final O/Stats origins
+must stay separate from compact split scratch. Check partial head groups,
+independent Q/O/Stats gaps, changed-input graph replay and packed batches with
+empty/quiet sequences. `TestPagedD256PackedSplit` detects token-tile/head-index
+confusion; `test_native_d256_paged_split_frames` compares both binders and rejects
+partial buffers overlapping physical-origin metadata before launch.
+
+
+For quantized THD physical origins, cover every admitted cluster width and
+force a small persistent grid so a CTA switches sequences. SM100 D192 uses a rank-5
+K map but rank-4 Q/V/O maps; SM100 D256 MXFP8 uses rank-5 Q/K/V and rank-4 O.
+Native SM107 D192/D256/D512 per-tensor FP8 uses rank-4 for all four ports.
+Inspect the actual host descriptor geometry before reusing origin-axis indices.
+Their token axes differ. Move data origins independently while preserving the
+logical MXFP8 scale-tile order, including a reordered or duplicated sequence.
+On native SM107 MXFP8 D256, the data map index is the physical sequence;
+scale maps still use packed batch zero and logical SF tile prefixes.
+`TestD256Mxfp8PhysicalOrigins` detects accidentally applying the data batch
+coordinate to those scale descriptors.
+`TestMidwidthPhysicalOrigins` in both SM100 quantized architecture suites
+checks these cases, retained captures and concurrent-work byte equality.
+Run racecheck on a bottom-right tail as well: the V-scale sanitizer can access
+a peer's shared memory after that peer finishes its masked query rows.
+
+For the predecoded THD scheduler, an elected slot-credit arrival must follow
+all lanes' reads of every decoded field. Broadcast fields from lane zero
+before returning credit, or match per-lane arrivals with the initialization
+count. Check persistent CGA2 as well as CGA1: DSMEM publication does not
+protect later generic-proxy field reads. The D192 quantized origin tests
+force two clusters to exercise slot reuse; their compact-parent racecheck
+controls reproduce this failure without independent offsets.
+
+Host-frame fixtures that derive runtime arguments from a Python AST must retain
+unannotated arguments. Check `argument.annotation is None` before calling
+`ast.unparse`; only an explicit `Constexpr` annotation removes a runtime slot.
+The SM120 cases of `test_thd_fp8_actual_host_frames_and_current_pointers`
+exercise appended untyped origin arguments and compare native frames with
+the independent Python reference.
+
+When a THD fixture changes O's physical row stride, give O independent Int64
+element offsets and update them with the stride; retaining Q's compact offsets
+describes a different output location. Head-major Stats offsets advance by one
+element per token, while token-major Stats offsets advance by the head count.
+The FP8/MXFP8 prepared wide-stride tests and MXFP8 D256 Stats layout tests retain
+numerical and replay checks for these contracts.
+
+Paged tests with explicit Q lengths must also leave gaps between sequence
+origins. Uniform lengths hide a lowering that substitutes compact prefixes
+for the graph's Q/O/Stats offsets. `TestPagedD64PhysicalOrigins` covers both
+unsplit and packed/unpacked split plans, changed offsets and strides, poisoned
+padding, and retained capture; D128/D256 coverage cannot prove D64 forwarding.
+
+For D64, a CGA1 knob does not uniquely identify the body: short query envelopes
+select the decode tile, while larger THD queries select prefill. Physical-origin
+coverage must straddle that envelope boundary and assert the actual template.
+`TestPagedD64PhysicalOrigins` retains both bodies, changed bindings and empty replay.
+
+Host-ABI comparisons use the role-split baseline from the same architecture.
+An origin operand can land independently on SM100 and SM107; borrowing the
+other architecture's parameter list hides missing slots or rejects a valid
+new slot. `test_two_by_two_host_slots_match_role_split` pins each pair and
+checks the native SM107 origin operand explicitly.

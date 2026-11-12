@@ -2643,3 +2643,27 @@ class TestNativeFp8Strides:
     test_native_sf_alias_checks_original_operand = staticmethod(_native_fp8_checks.test_native_sf_alias_checks_original_operand)
     test_native_paged_qo_preserves_kv_pool_views = staticmethod(_native_fp8_checks.test_native_paged_qo_preserves_kv_pool_views)
     test_sm107_d256_strided_preserves_each_native_operand = staticmethod(_native_fp8_checks.test_sm107_d256_strided_preserves_each_native_operand)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD128Fp8PhysicalOrigins:
+    """Pin the repaired native route in the architecture-selected CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_thd_origins_fp8_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_half_origin_execution_routes = staticmethod(_origins.test_half_origin_execution_routes)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestMidwidthPhysicalOrigins:
+    """Exercise independent origins on the D192/V128 and D256 native bodies."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _checks("fp8")

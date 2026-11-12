@@ -975,8 +975,9 @@ def _place_sm120_fp8(facts) -> str:
 
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
-    # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else stays backend-first.
-    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):
+    # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else, paged KV included
+    # (unmeasured since the row admits it), stays backend-first.
+    if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):
         return TRAIL
     if facts.s_q == 1 and facts.b * facts.h_q < SM90_SQ1_MIN_Q_ROWS:
         return TRAIL
@@ -1067,8 +1068,8 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
-    # The prepared single-CTA split removes the underfilled paged D128
-    # launch. Placement and the concrete split share one bounded rule.
+    # The prepared single-CTA split removes the underfilled paged D128 launch, and the packed split the underfilled
+    # D64 / D256 one. Placement and the concrete split share one bounded rule.
     if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:

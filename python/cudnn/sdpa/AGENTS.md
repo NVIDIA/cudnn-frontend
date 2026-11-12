@@ -113,11 +113,37 @@ and layout, not just its paged path. Assert the prepared THD spec contains
 `origin_specs` when the graph declares offsets. The SM107 `TestMixedFp8Kv`
 THD cases cover mixed KV and uniform half, packed and unpacked, with poisoned
 gaps, independent port origins, rebinding, and changed-length replay.
-The SM120 half host must also retain each port's physical capacity: a
+The SM120 half, per-tensor FP8 and MXFP8 hosts must also retain each port's physical capacity: a
 `max_total_seq_len_*` hint bounds live work, not the address span of a gapped
 buffer. Exercise both prepared graph binding and the graph's standalone-adapter
 fallback; forwarding offsets only through the prepared route leaves the fallback
 without required operands. The SM120 origin and prepared-rebind suites detect both.
+The FP8 detector `test_sdpa_fwd_thd_origins_fp8_sm120.py` also changes device
+descale values during retained replay. Quantized origin operands follow the
+quantization-role tuple in the native binder frame; keep that order in the
+standalone adapter as well.
+
+MXFP8 origin operands follow the full quantization-role tuple, including
+Q/K/V scale buffers; using the shorter per-tensor FP8 role count binds scales
+as offsets. Data origins do not move the logically packed scale-tile prefixes.
+`test_sdpa_fwd_thd_origins_mxfp8_sm120.py` checks both facts with poisoned
+physical gaps, unchanged quantized payloads and repacked scale bytes across
+batch changes, then modifies scale exponents during retained replay.
+
+Tensor-map token dimensions need not match across ports or match the source
+tensor's axis number. SM100 D512 MXFP8 uses rank-5 Q/K/V maps with token
+dimension 1, while O retains dimension 2. Pass each map's token dimension to
+`build_thd_origins`; keep byte origins based on the source tensor's token
+stride. Data-map sequence selection must not change the logically packed SF
+batch/tile coordinates. `TestPhysicalOrigins` in
+`test_sdpa_fwd_mxfp8_sm100.py` pins D128 CGA2 and D512 CGA1, rebinds every
+port and checks changed-length and scale-only retained replay.
+
+MXFP8 V-scale tail sanitization in the leader MMA warp can access its peer's
+shared slab even when that peer has no live query rows. Keep the peer CTA
+alive until those cluster-memory accesses finish; role-local completion alone
+does not establish peer lifetime. The D128 CGA2 `TestPhysicalOrigins` replay
+cases in `test_sdpa_fwd_mxfp8_sm100.py` detect the unsafe exit with racecheck.
 
 A test that changes a port's token pitch must update that port's physical
 ragged offsets too. Bind offsets through the tensor's `ragged_offset` reference;
@@ -164,6 +190,12 @@ A graph-only test misses a direct-API operand silently dropped by that flag.
   default is `True`, which otherwise admits `S_q == 1` before the adapter
   rejects it. `test_sdpa_bwd_d192_sm107.py::test_decode_declines_before_lowering`
   checks real dense/THD graph declarations at that boundary.
+- When enabling partial PackGQA, test ordinary candidate generation as well
+  as explicit plans at groups `tile_q`, `tile_q + 2` and `2 * tile_q`.
+  `create_execution_plan` alone does not exercise `_pack_gqa_points`: its
+  packed token span must use the effective subgroup width. Dividing a tile
+  by the full sharing ratio can produce zero before any kernel launches.
+  Keep the full Q/K ratio separately for KV-head mapping and validation.
 
 **Rule S3 — When P is aliased into a score slot's TMEM tail, the warpgroup
 that stores into columns another warpgroup still has to read must be
@@ -573,6 +605,9 @@ production kernels gain no debug knob or timing-dependent assertion.
 
   Draw holdouts OFF the training lattice (odd head counts, batches, off-tile lengths), and add a key field only when it
   follows the kernel (`_unpacked_decode` reads the row's own pack decision).
+- A new FROST capability that changes a class's plan (e.g. the SM100 packed split) makes that class's entries stale where
+  the plan changed. Key the new regime from the row's own decision (`gqa_split`) and fit it; keep an older study's
+  entries for the unchanged regime instead of refitting it over a narrower grid than that study measured.
 
 
 **Rule S13 — Register redistribution must converge at warpgroup scope.**
@@ -1466,6 +1501,12 @@ Broadcast predecoded fields (Q tile, head, batch, bounds and split) as well as
 the original response before returning a slot credit. A vector response read
 alone leaves scalar field loads racing with the next local publication; the
 D256 multiwave racecheck catches the output-store warp reading a reused slot.
+The D256/D512 MXFP8 custom schedulers also publish single-CTA payloads
+locally. D256 uses the same field broadcasts with elected warp credits;
+D512 retains per-lane credits and the matching 32-times arrival count.
+Their compact THD multi-unit cases and
+`test_sdpa_fwd_mxfp8_sm100.py::TestPhysicalOrigins` cover both the existing
+compact contract and independent data origins under memcheck/racecheck.
 
 The D256 FP8 shared-alpha handoff uses per-lane release arrivals for both
 publication and reuse, with matching barrier counts. Keep elected warp

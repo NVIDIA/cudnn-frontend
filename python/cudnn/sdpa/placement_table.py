@@ -75,6 +75,19 @@ def _unpacked_decode(row: str, facts) -> bool:
     return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
 
 
+def _packed_split(row: str, facts) -> bool:
+    """A paged GQA prefix the SM100 row packs and splits (``heuristics.sm100_paged_packed_split_choice``): a different kernel
+    regime from the unsplit graphs beside it (B200 D64: 0.02-0.61 of the backend split, 0.24-1.08 unsplit), so it is a class
+    of its own, read from the row's own decision as ``_unpacked_decode`` is."""
+    if row != "sdpa_fwd_prefill_sm100" or not facts.has_paged_kv or facts.h_q == facts.h_kv:
+        return False
+    from cudnn.sdpa.fwd import heuristics
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next((s for s in ENGINE_SPECS if s.name == row), None)
+    return spec is not None and heuristics.sm100_paged_packed_split_choice(spec.capabilities, facts) > 1
+
+
 def class_key(row: str, facts) -> Optional[Tuple]:
     dtype = _dtype_name(facts.dtype)
     if dtype is None or _unmeasured(facts) or not facts.h_kv or facts.h_q % facts.h_kv:
@@ -92,9 +105,11 @@ def class_key(row: str, facts) -> Optional[Tuple]:
     else:
         phase = "prefill"
     bounded = bool(getattr(facts, "shape_overrides", False))
-    if bounded and phase == "prefill" and facts.s_q <= 128:
-        # One 128-row Q tile per request at most (FlashInfer's short-row declaration): the backend switches to its short-row
-        # engine and FROST runs one Q tile per head, a different regime from the long declaration.
+    sm100_paged_d64 = row == "sdpa_fwd_prefill_sm100" and facts.has_paged_kv and (facts.d_qk, facts.d_v) == (64, 64)
+    if phase == "prefill" and facts.s_q <= 128 and (bounded or sm100_paged_d64):
+        # One 128-row Q tile per request at most, where the backend switches to its short-row engine and FROST runs one Q tile
+        # per head: FlashInfer's short-row declaration, and SM100 paged D64 (FROST 0.24-0.46 of the backend past a 2k cache,
+        # 0.67-1.08 above one Q tile; study sm100_paged_d64_d256_prefill_20261111).
         phase = "prefill_short_q"
     if facts.has_paged_kv:
         layout = "paged"
@@ -112,7 +127,12 @@ def class_key(row: str, facts) -> Optional[Tuple]:
         mask = "causal_br" if bottom_right else "causal_tl"
     else:
         mask = "none"
-    group = "mha" if facts.h_q == facts.h_kv else ("gqa_unpacked" if _unpacked_decode(row, facts) else "gqa")
+    if facts.h_q == facts.h_kv:
+        group = "mha"
+    elif _unpacked_decode(row, facts):
+        group = "gqa_unpacked"
+    else:
+        group = "gqa_split" if _packed_split(row, facts) else "gqa"
     # Off the 128-key tile dense KV cannot split and paged KV measures differently near the boundary: its own class, which
     # an on-tile study never answers.
     kv_off_tile = facts.s_kv % 128 != 0
@@ -253,6 +273,40 @@ TABLE: Dict[Tuple, Entry] = {
     ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
         "ge", 28.999, "sm100_d256_paged_context_20261030"
+    ),
+    # study sm100_paged_d64_d256_prefill_20261111 (full-power B200, cuDNN 9.24.0.43; FlashInfer's paged cudnn path, recorded facts;
+    # bf16 HND page 16/64, GQA 2-16, causal: D64 / D256 b 1-16, Q 8-1024, KV 2k-64k on and off the 128-key tile, plus D64 short
+    # KV 128-1536, b 32-128 and Q 1024-8192; 752 train cells). ``gqa_split`` is the row's packed split (#2471); D256 unsplit
+    # keeps sm100_d256_paged_context_20261030's entries above.
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa_split", False): Entry(
+        "always", None, "sm100_paged_d64_d256_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "prefill", "paged", "causal_br", False, "gqa_split", True): Entry(
+        "always", None, "sm100_paged_d64_d256_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa", False): Entry(
+        "le", 11.5, "sm100_paged_d64_d256_prefill_20261111", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa", True): Entry(
+        "le", 12.026, "sm100_paged_d64_d256_prefill_20261111", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa_split", False): Entry(
+        "always", None, "sm100_paged_d64_d256_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill", "paged", "causal_br", False, "gqa_split", True): Entry(
+        "always", None, "sm100_paged_d64_d256_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa", False): Entry(
+        "ge", 7.5, "sm100_paged_d64_d256_prefill_20261111", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa", True): Entry(
+        "ge", 8.219, "sm100_paged_d64_d256_prefill_20261111", "kv"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa_split", False): Entry(
+        "always", None, "sm100_paged_d64_d256_prefill_20261111"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa_split", True): Entry(
+        "always", None, "sm100_paged_d64_d256_prefill_20261111"
     ),
     # study sm100_d576_dense_decode_20261030 (cuDNN 9.29.0.17; dense K/V, h_q 8-128, b 1-128, S_kv 4k-128k: on the tile on B200,
     # off it on B100 plus 18 cells at 384-768 query rows; off the tile KV cannot split, so the unsplit tile follows b * h_q)

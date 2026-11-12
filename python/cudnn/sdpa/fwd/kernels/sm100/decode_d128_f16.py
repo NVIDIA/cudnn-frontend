@@ -436,7 +436,8 @@ def _kernel(
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
 
-    if cutlass.const_expr(CFG.THD_VARLEN and SPLIT_KV > 1):
+    if cutlass.const_expr(CFG.THD_VARLEN and (SPLIT_KV > 1 or thd_origins is not None)):
+        # Physical maps have no initialized sentinel for dead initial units.
         # The split decoder folds its composite batch modulo n_batch. Reject
         # dead initial units before that fold could turn the sentinel into a
         # real sequence and an out-of-range partial split.
@@ -2810,6 +2811,7 @@ def _launch(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
+                paged=PAGED_KV,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(
@@ -3034,8 +3036,8 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
     )
     if not (CFG.THD_VARLEN and SPLIT_KV > 1 and supported_shape):
         raise ValueError("packed split requires D64, D128, or unpacked nonpaged D192 THD")
-    if thd_origin_specs is not None and not ((CFG.TILE_O == 128 or (CFG.TILE_O == 64 and not PAGED_KV)) and thd_origin_specs[0] is not None):
-        raise ValueError("physical split origins require D128 or nonpaged D64/D192 with Q offsets")
+    if thd_origin_specs is not None and not (CFG.TILE_O in (64, 128) and thd_origin_specs[0] is not None):
+        raise ValueError("physical split origins require D64/D128 or nonpaged D192 with Q offsets")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     if has_sink and not (CFG.TILE_K == CFG.TILE_O == 128 and PAGED_KV and not CFG.HAS_SINK):
         raise ValueError("packed split sinks require sink-free D128 paged partials")
@@ -3084,8 +3086,9 @@ def compile(  # noqa: A001
     if paged_hnd and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
     if thd_origin_specs is not None:
-        if not (CFG.THD_VARLEN and SPLIT_KV == 1 and not PAGED_KV and CFG.TILE_K == 192 and CFG.TILE_O == 128):
-            raise ValueError("unsplit physical origins require nonpaged D192 THD")
+        supported_origins = (PAGED_KV and CFG.TILE_K == CFG.TILE_O == 64) or (not PAGED_KV and CFG.TILE_K == 192 and CFG.TILE_O == 128)
+        if not (CFG.THD_VARLEN and SPLIT_KV == 1 and supported_origins):
+            raise ValueError("unsplit physical origins require paged D64 or nonpaged D192 THD")
         if len(thd_origin_specs) != 5:
             raise ValueError("physical origins require five Q/K/V/O/Stats specifications")
     gmem = cute.AddressSpace.gmem
