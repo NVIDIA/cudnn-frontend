@@ -2955,6 +2955,37 @@ SM100_PAGED_D128_WIDE_MAX_KV = 131072
 SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 GQA (group >= 4) split budget past one Q tile, in waves of SMs
 
 
+# Rubin paged bf16 D64 GQA prefixes split on the D128 Rubin budget (the native split is #2502's); study
+# sm107_paged_d64_split_20261112 measured these bounds.
+SM107_PAGED_D64_SPLIT_MAX_B = 16
+SM107_PAGED_D64_SPLIT_Q = (16, 1024)
+SM107_PAGED_D64_SPLIT_KV = (2048, 131072)
+SM107_PAGED_D64_SPLIT_PAGES = (16, 64)
+
+
+def _sm107_paged_d64_split_domain(caps: Capabilities, facts) -> bool:
+    return (
+        caps.sm_lo == 107
+        and paged_thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (64, 64)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 1 <= facts.b <= SM107_PAGED_D64_SPLIT_MAX_B
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (4, 8, 16)
+        and facts.page_size in SM107_PAGED_D64_SPLIT_PAGES
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and SM107_PAGED_D64_SPLIT_Q[0] <= facts.s_q <= SM107_PAGED_D64_SPLIT_Q[1]
+        and SM107_PAGED_D64_SPLIT_KV[0] <= facts.s_kv <= SM107_PAGED_D64_SPLIT_KV[1]
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
 def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = False) -> Tuple[int, bool]:
     """Measured bounded-graph (split count, packing); one keeps the existing plan.
 
@@ -2966,7 +2997,8 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
     listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
-    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed). On cc 10.3 the D128 envelope also
+    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed); Rubin D64 GQA prefixes take the Rubin
+    budget below inside ``SM107_PAGED_D64_SPLIT_*``. On cc 10.3 the D128 envelope also
     admits pages 32 / 64, s_q from 16, S_kv to 131072 and b to 16 (``SM100_PAGED_D128_WIDE_*``).
     """
     sm100_splits = sm100_paged_packed_split_choice(caps, facts)
@@ -2975,7 +3007,7 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
     wide = caps.sm_lo == 100 and facts.device_cc in SM100_PAGED_D128_WIDE_CCS
-    if not (
+    d128 = (
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
@@ -2993,7 +3025,8 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
         and 2048 <= facts.s_kv <= (SM100_PAGED_D128_WIDE_MAX_KV if wide else 32768)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
-    ):
+    )
+    if not (d128 or _sm107_paged_d64_split_domain(caps, facts)):
         return 1, False
     if caps.sm_lo == 100:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave
