@@ -453,9 +453,9 @@ def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch,
         assert placement.place(spec, _facts(**dict(values, causal=False, bottom_right=False, s_q=1))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, s_q=16, h_q=64, h_kv=4))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, dtype=cudnn.data_type.HALF))) == placement.LEAD
-        # The d64 envelope selects the row's native 64-wide prefill tile (a dense-only tile without a measured decode cell), not
-        # the shared decode tile: the row trails there.
-        assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.TRAIL
+        # The d64 envelope selects the row's native 64-wide prefill tile, not the shared decode tile; study
+        # sm107_d64_sink_prefill_20261112 measured it (verify rows 0.04-0.11 of the backend) and leads it.
+        assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, d_qk=96, d_v=96))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, b=8, s_kv=16384))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, b=8, h_q=16, h_kv=4, s_q=4))) == placement.LEAD

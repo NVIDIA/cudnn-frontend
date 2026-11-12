@@ -2648,6 +2648,70 @@ def test_sm100_paged_d128_prefix_envelope_splits(over, cc):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, b, h_q, h_kv, s_q, s_kv, splits",
+    [
+        (64, 3, 32, 8, 128, 32767, 3),  # FlashInfer case: unsplit PACK0 ran 2.4x the best packed split
+        (64, 16, 32, 8, 32, 4095, 2),
+        (256, 12, 64, 8, 128, 32768, 4),
+        (64, 8, 64, 8, 128, 8192, 1),  # D64 at 128 rows over 64 KV tiles: no split
+        (64, 4, 32, 8, 256, 65536, 1),  # long queries keep the unpacked default
+        (256, 4, 16, 2, 256, 8192, 1),
+    ],
+    ids=["d64_case102", "d64_q32", "d256_q128", "d64_q128_short_kv", "d64_q256", "d256_q256"],
+)
+def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv, splits):
+    """Study sm100_paged_packed_split_waves_20261112: with no first-wave room the packed split still leads short queries."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
+    assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, facts) == splits
+    b300 = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3))
+    assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, b300) == splits  # the B300 transfer qualified the same rule
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv",
+    [(8, 64, 8, 128, 32767), (32, 8, 1, 128, 2049), (64, 16, 2, 128, 8191), (1, 32, 8, 16, 512), (16, 32, 4, 2048, 4096)],
+    ids=["b8_g8_kv32k", "b32_g8_kv2k", "b64_g8_kv8k", "q16", "q2048"],
+)
+def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
+    """Study sm100_paged_d128_prefill_20261112: on cc 10.0 / 10.3 FlashInfer's exact paged D128 GQA prefix (S_q < S_kv) leads."""
+    from cudnn.sdpa.fwd import placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
+    assert placement._sm100_paged_d128_prefix(facts)
+    assert placement.place(spec, facts) == placement.LEAD
+    assert placement._sm100_paged_d128_prefix(_sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3)))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=64, s_kv=64),  # a square: tiny squares trail 1.3-2.0x
+        dict(max_total_seq_len_q=8 * 128),  # an exact total-Q declaration was not measured
+        dict(device_cc=(10, 7), device_sm_count=208),
+        dict(b=65),
+        dict(s_kv=131072),
+        dict(page_size=32),
+        dict(h_q=32, h_kv=32),
+    ],
+    ids=["square", "total_q", "rubin", "b65", "kv128k", "page32", "mha"],
+)
+def test_b200_paged_d128_prefix_rule_stays_inside_its_study(over):
+    from cudnn.sdpa.fwd import placement
+
+    values = dict(b=8, h_q=64, h_kv=8, s_q=128, s_kv=32767, max_total_seq_len_q=None)
+    values.update(over)
+    h_q, h_kv = values.pop("h_q"), values.pop("h_kv")
+    assert not placement._sm100_paged_d128_prefix(_sm100_paged_prefix(128, h_q, h_kv, **values))
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d, h_q, h_kv, s_q, cga", [(64, 32, 8, 64, 1), (256, 16, 8, 128, 2)], ids=["d64", "d256"])
 def test_sm100_paged_d64_d256_prefix_defaults_to_the_packed_split(d, h_q, h_kv, s_q, cga):
     """A one-request prefix over a 32k cache packs to 16 tiles (D64 decode tile) / 8 pairs (D256) on 148 SMs, so the default is
