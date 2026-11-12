@@ -2591,21 +2591,19 @@ def _sm100_paged_prefix(d, h_q, h_kv, **over):
     [dict(page_size=64), dict(page_size=32), dict(s_kv=131072), dict(s_q=16), dict(b=16, s_q=32)],
     ids=["page64", "page32", "kv128k", "q16", "b16"],
 )
-def test_b300_paged_d128_prefix_envelope_splits(over):
-    """cc 10.3 widens the paged D128 GQA split envelope (study sm103_paged_d128_envelope_20261112): pages 32 / 64, s_q from 16,
-    S_kv to 131072 and b to 16 split and lead; cc 10.0 keeps page 16 / 128, s_q >= 64, S_kv <= 32768 and b <= 4 until a B200
-    holdout qualifies the same bounds."""
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["b200", "b300"])
+def test_sm100_paged_d128_prefix_envelope_splits(over, cc):
+    """B200 and B300 widen the paged D128 GQA split envelope (study sm103_paged_d128_envelope_20261112): pages 32 / 64, s_q from
+    16, S_kv to 131072 and b to 16 split and lead."""
     from cudnn.sdpa.fwd import heuristics, placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
     values = dict(s_q=128, page_size=16)
     values.update(over)
-    b300 = _sm100_paged_prefix(128, 32, 8, device_cc=(10, 3), **values)
-    b200 = _sm100_paged_prefix(128, 32, 8, device_cc=(10, 0), **values)
-    assert heuristics.paged_thd_split_choice(spec.capabilities, b300)[0] > 1
-    assert placement.place(spec, b300) == placement.LEAD
-    assert heuristics.paged_thd_split_choice(spec.capabilities, b200)[0] == 1
+    facts = _sm100_paged_prefix(128, 32, 8, device_cc=cc, **values)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts)[0] > 1
+    assert placement.place(spec, facts) == placement.LEAD
 
 
 @pytest.mark.L0

@@ -2924,10 +2924,9 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1, prefer_pack: boo
     return 1, False
 
 
-# B300 (cc 10.3) paged D128 GQA prefix envelope, study sm103_paged_d128_envelope_20261112: pages 32 / 64, b <= 16, s_q 16-63 and
-# S_kv to 131072 split too (develop's split-free default ran 0.11-0.15 geomean slower there). cc 10.0 keeps the bounds below until
-# a B200 holdout qualifies them.
-SM100_PAGED_D128_WIDE_CCS = frozenset({(10, 3)})
+# Paged D128 GQA prefix envelope on the parts its study timed, sm103_paged_d128_envelope_20261112: pages 32 / 64, b <= 16, s_q 16-63
+# and S_kv to 131072 split too (holdout new / old 0.113 geomean on B300, 0.126 on B200).
+SM100_PAGED_D128_WIDE_CCS = frozenset({(10, 0), (10, 3)})
 SM100_PAGED_D128_WIDE_PAGES = (16, 32, 64, 128)
 SM100_PAGED_D128_WIDE_MAX_B = 16
 SM100_PAGED_D128_WIDE_MIN_Q = 16
