@@ -1216,6 +1216,9 @@ def _sm100_spec() -> EngineSpec:
             gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
             thd=True,
             thd_declared_totals=True,  # the blocked workspace is sized at build time
+            # Every port's bound ragged offsets become its own token origins (sequence-local maps in stage 2 and
+            # stage 3, origin-aware delta and GQA fold), so padded THD with gaps between sequences is served.
+            thd_ragged_offsets=True,
             # Independent native B/H/S nesting and aligned padding; no layout copies.
             declaration_check=_sm100_dense_layout_mismatch,
             layouts=frozenset({"bshd", "dense_flex"}),

@@ -1576,6 +1576,23 @@ non-BSHD-physical layout (the packed path has no staging copy), and a graph that
 does not declare **`max_total_seq_len_q`/`_kv`** — those are REQUIRED here,
 because `scratch_workspace_bytes()` is a build-time function and the blocked row
 count comes from the packed totals before any buffer exists.
+**Physical THD origins** (`thd_ragged_offsets`). Each bound Q/K/V/O/dO/Stats/dQ/dK/dV
+ragged-offset tensor is that port's own per-sequence token origin, so storage with gaps between
+sequences is read and written in place: nothing in a gap is read, and nothing in a gap is
+written. The setup launch materializes the origins as an Int64 `[9, B]` region of the workspace.
+Stage 2 (both bodies: the 4x1 role split and the 2x2 twin) acquires sequence-local Q/dO/K/V maps
+(`_seq_thd_input_descs_kernel`, slot `port * B + b`) and reads Stats at its own origin; the delta
+`dot(dO, O)` and the stage-3 GEMM output/operand maps are sequence-local too, and the GQA fold
+reads and writes dK/dV at their origins. A graph binds every THD port with ragged offsets, so
+every graph THD plan on this row takes this path, compact layouts included; the extra map setup
+costs about 1.3 % on a B300 at D512 BF16 (causal and unmasked). The stage-2 PTX of a plan
+without origins is unchanged (`_host` is a thin wrapper over `_host_chain`). The SM107 2x2 fork
+mirrors the stage-2 change line for line (its fork-diff list and its PTX without origins are
+unchanged); the SM107 rows still do not declare
+`thd_ragged_offsets` and are not validated on gapped layouts.
+Pins: `test_sdpa_bwd_thd_origins_sm100.py` (NaN-filled gaps, poisoned outputs, fp64 reference,
+both stage-2 bodies, MHA/GQA, unmasked/bottom-right/window) and the launch-chain census in
+`test_sdpa_bwd_thd_sm100.py` (`seq_thd_input_descs` once per chunk, no clamp launch).
 ʲ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
 attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and

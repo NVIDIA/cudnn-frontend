@@ -419,8 +419,8 @@ def test_fork_source_pins():
     assert sorted(inits) == sorted(
         ["ONE_LANE", "ONE_LANE", "CGA_M", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
     )
-    assert src.count("@cute.kernel") == 2 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
-    assert _code_only(src).count(".launch(") == 2, "plain launches (the THD clamp kernel + the main kernel); the DSL launcher sets the oversized-SMEM attribute"
+    assert src.count("@cute.kernel") == 3 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
+    assert _code_only(src).count(".launch(") == 3, "plain launches (the THD sequence-map or clamp kernel + the main kernel); the DSL launcher sets the oversized-SMEM attribute"
     for gone in ("is_exclusive", "tmem_load_max_reduction_tile", "ld.red", "cp_async_bulk_shared_cluster_shared_cta", "tcgen05_cp", "mma_ts("):
         assert gone not in _code_only(src), gone  # the prose names what is absent; the code must not
     assert "bars.mb_tmem_dealloc.arrive()" in src and "bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))" in src
