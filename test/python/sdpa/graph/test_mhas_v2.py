@@ -5411,7 +5411,9 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
     import re
     from cudnn.engines import manifest
     try:
-        from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
+        from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN
+
+        fixed_in = SQ1_MXFP8_PLANNING_CRASH_FIXED_IN.get((10, 7))
     except ImportError:  # no guard module in this tree: every known backend is treated as crashing
         fixed_in = None
 
@@ -5476,7 +5478,7 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
 # candidate, check_support and build_plans (nothing executes).  cuDNN 9.28.0 moved the crash from the first stage to the
 # last: its heuristics plan every contract, and building the backend's BHSD s_q == 1 plan killed an xdist worker on the cc
 # 10.7 CI lane -- a detector that stopped at planning called it clean.  One child interpreter walks the contracts in order
-# with the guard DISABLED inside it (the constant set to 0, so backend_guard() answers None), printing BEGIN / STAGE / RESULT
+# with every per-architecture bound set to 0 (the guard is disabled inside it, so backend_guard() answers None), printing BEGIN / STAGE / RESULT
 # lines; a crash is rc 139 / -11 of that child, never of the test runner, its stage is the last STAGE line the contract
 # printed, and the walk resumes in a fresh child right after the contract that took the previous one down -- one process
 # measures a clean backend, one process per crash a crashing one.  The sink contract is the control: every known backend
@@ -5511,7 +5513,7 @@ os.environ.pop("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", None)
 sys.path[:0] = {paths!r}
 import cudnn
 import cudnn.sdpa.fwd.backend_guard as guard_module
-guard_module.SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 0  # the guard disabled: the backend is consulted, its plan is built
+guard_module.SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = {cc: 0 for cc in guard_module.SQ1_MXFP8_PLANNING_CRASH_FIXED_IN}
 import test_mhas_v2 as harness
 def short(e):
     return (type(e).__name__ + ": " + str(e)[:160]).replace(chr(10), " ")
@@ -5603,7 +5605,7 @@ def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
     cc 10.7 only; kept in the FULL tier because it is the tripwire that retires the guard."""
     if not _device_is_cc107():
         pytest.skip("the backend planning crash is a cc 10.7 measurement")
-    _assert_sq1_mxfp8_crash_guard_is_current(request, _cc107_engine("mxfp8"), "cc 10.7")
+    _assert_sq1_mxfp8_crash_guard_is_current(request, _cc107_engine("mxfp8"), "cc 10.7", (10, 7))
 
 
 @pytest.mark.L0
@@ -5618,11 +5620,15 @@ def test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0(request):
         pytest.skip("the cc 10.0 / 10.3 single-query MXFP8 crash measurement")
     from cudnn.sdpa.fwd.engines import engine_name
 
-    _assert_sq1_mxfp8_crash_guard_is_current(request, engine_name(arch="sm100", mxfp8=True), f"cc {cc[0]}.{cc[1]}")
+    _assert_sq1_mxfp8_crash_guard_is_current(
+        request, engine_name(arch="sm100", mxfp8=True), f"cc {cc[0]}.{cc[1]}", cc
+    )
 
 
-def _assert_sq1_mxfp8_crash_guard_is_current(request, row, device_label):
-    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
+def _assert_sq1_mxfp8_crash_guard_is_current(request, row, device_label, device_cc):
+    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN
+
+    fixed_in = SQ1_MXFP8_PLANNING_CRASH_FIXED_IN.get(device_cc)
 
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
@@ -5644,11 +5650,11 @@ def _assert_sq1_mxfp8_crash_guard_is_current(request, row, device_label):
     if fixed_in is None or cudnn.backend_version() < fixed_in:
         assert crashed, (
             f"cuDNN {version} planned, supported and built every contract of the single-query MXFP8 trigger matrix cleanly: "
-            f"SQ1_MXFP8_PLANNING_CRASH_FIXED_IN={fixed_in} is stale -- re-measure the whole matrix per sdpa/fwd/backend_guard.py "
+            f"SQ1_MXFP8_PLANNING_CRASH_FIXED_IN[{device_cc}]={fixed_in} is stale -- re-measure the whole matrix per sdpa/fwd/backend_guard.py "
             f"and record {cudnn.backend_version()}; per contract: {summary}"
         )
     else:
-        assert not crashed, f"cuDNN {version} still crashes {crashed}: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN={fixed_in} names a build that is not clean; per contract: {summary}"
+        assert not crashed, f"cuDNN {version} still crashes {crashed}: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN[{device_cc}]={fixed_in} names a build that is not clean; per contract: {summary}"
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")

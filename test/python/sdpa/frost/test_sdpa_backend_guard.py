@@ -187,18 +187,21 @@ def test_no_facts_no_guard():
     assert backend_guard(None, None) is None
 
 
-def test_version_bound(monkeypatch):
-    """The recorded fix version is the exact boundary: armed one below it, lifted at it; while none is recorded no version
-    number lifts the guard (the installed library's own version decides for a real graph)."""
-    if SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is None:
-        # Every known build crashes: a future version number does not lift the guard until one is measured clean.
+@pytest.mark.parametrize(
+    ("device_cc", "fixed_in"),
+    [((10, 0), 93000), ((10, 3), None), ((10, 7), None)],
+)
+def test_version_bound(monkeypatch, device_cc, fixed_in):
+    """Each architecture's bound lifts only its own guard at the measured version."""
+    facts = _facts(device_cc=device_cc)
+    if fixed_in is None:
         monkeypatch.setattr(cudnn, "backend_version", lambda: 99999)
-        assert backend_guard(None, _facts()) is not None
+        assert backend_guard(None, facts) is not None
     else:
-        monkeypatch.setattr(cudnn, "backend_version", lambda: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN)
-        assert backend_guard(None, _facts()) is None
-        monkeypatch.setattr(cudnn, "backend_version", lambda: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN - 1)
-        assert backend_guard(None, _facts()) is not None
+        monkeypatch.setattr(cudnn, "backend_version", lambda: fixed_in)
+        assert backend_guard(None, facts) is None
+        monkeypatch.setattr(cudnn, "backend_version", lambda: fixed_in - 1)
+        assert backend_guard(None, facts) is not None
 
 
 def test_manifest_declares_the_guard_for_the_sdpa_forward_family():

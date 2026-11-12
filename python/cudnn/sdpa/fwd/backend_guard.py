@@ -30,39 +30,48 @@ for every SDPA-forward graph, twice.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
-# First backend version shown NOT to crash at any stage, or None while every known build crashes.  Measured:
-# 9.26.0.51 and 9.27.0.28 crash in the heuristics on 18 of the 21 contracts of the detector's trigger matrix (every
-# d128 contract; the three larger head dims are declined by the backend's engine-config step before the crash --
-# 216-SM cc 10.7 board, 2026-10-08).  cuDNN 9.28.0 is NOT clean either, only later: on the cc 10.7 CI lane its
-# heuristics planned all 21 contracts (a first detector revision that stopped at planning therefore reported
-# "record 92800"), and the same run lost its xdist worker to a process crash while check_support / build_plans ran the
-# backend's plan for the BHSD single-query graph (job 476641257, 2026-10-08).  (9.28.0.16 could not be loaded on the
-# measurement board itself: CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED at the first descriptor finalize.)  Set this only
-# from a measured run of the trigger matrix that is crash-free through planning AND building -- never a guessed
-# ceiling, which would re-arm the crash on the next build.
+# First backend version shown NOT to crash at any stage, measured per compute capability. Unmeasured architectures
+# remain guarded; one architecture's result must not lift the guard on another. Historically, 9.26.0.51 and 9.27.0.28
+# crash in the heuristics on 18 of the 21 contracts of the detector's trigger matrix (every d128 contract; the three
+# larger head dims are declined by the backend's engine-config step before the crash -- 216-SM cc 10.7 board,
+# 2026-10-08). cuDNN 9.28.0 is NOT clean either: on the cc 10.7 CI lane its heuristics planned all 21 contracts (a first
+# detector revision that stopped at planning therefore reported "record 92800"), and the same run lost its xdist worker
+# to a process crash while check_support / build_plans ran the backend's plan for the BHSD single-query graph (job
+# 476641257, 2026-10-08). 9.28.0.16 could not be loaded on the measurement board itself:
+# CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED at the first descriptor finalize.
+# cc 10.0: 9.30.0 (93000), measured on GB100 with cuDNN 9.30.0.4 (job 543389412, 2026-11-11). All 18 applicable
+# contracts built; the three larger-head contracts declined with no engine, and none crashed.
+# cc 10.3 and cc 10.7: no clean complete measurement yet. The cc 10.7 run on 9.30.0.4 timed out before the detector
+# completed (job 543389419, 2026-11-11).
+# Record a version only after the whole trigger matrix is clean on that architecture; never infer a bound from another
+# architecture or from planning alone, since the crash can happen during check_support or build_plans.
 #
-# Re-measure procedure (the constant is a measurement, so it is kept current by a detector rather than by memory):
-# test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0 walks, on a
-# cc 10.7 device, the 21-contract trigger matrix (_P1_CRASH_MATRIX: dense BSHD / BHSD and THD at s_q == 1, Stats on
+# Re-measure procedure (each per-CC bound is kept current by a detector rather than by memory):
+# test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0 walks, on a
+# cc 10.0 / 10.3 device, the 21-contract trigger matrix (_P1_CRASH_MATRIX: dense BSHD / BHSD and THD at s_q == 1, Stats on
 # and off, batch 1 / 2 / 4, KV 128 / 2048 / 4096, no mask / causal top-left / bottom-right, bf16 / f16 / E4M3 / E5M2 O,
 # E4M3 and E5M2 inputs, d128 / d192x128 / d256 / d512; plus the sink contract as the control the backend plans and
-# builds) in a child interpreter with this constant set to 0 inside it -- the guard disabled, the installed backend
+# builds) in a child interpreter with all bounds set to 0 inside it -- the guard disabled, the installed backend
 # asked through the ordinary [A, FALLBACK] walk, then, with the FROST row barred, its own plan taken through
 # check_support and build_plans (nothing executes) -- restarting the child after every crash so every contract reports
-# its stage (crash@plan / crash@support / crash@build, built, planned-but-declined, declined).  While this constant says
-# the installed backend crashes, at least one contract must take its child down; a backend that gets every contract
-# through planning and building cleanly FAILS the detector with the version to record here.  At or above a recorded
-# version no contract may crash, and the per-contract record is printed under "measured" in the run's terminal summary
-# (the CI job log).  Record a version only after the whole matrix is clean on it, and leave the graphs the row serves
-# on the row: this constant lifts the GUARD, not the placement verdict (``placement._place_sm107_mxfp8``).
-SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Optional[int] = None
+# its stage (crash@plan / crash@support / crash@build, built, planned-but-declined, declined). While a device's bound is
+# None, at least one contract must take its child down; a backend that gets every contract through planning and building
+# cleanly FAILS that device's detector with the version to record. At or above a recorded per-device version no contract
+# may crash, and the per-contract record is printed under "measured" in the run's terminal summary
+# (the CI job log). Record a version only after the whole matrix is clean on that device, and leave the graphs the row
+# serves on the row: these bounds lift the GUARD, not the placement verdict (``placement._place_sm107_mxfp8``).
+SQ1_MXFP8_PLANNING_CRASH_FIXED_IN: Dict[Tuple[int, int], Optional[int]] = {
+    (10, 0): 93000,
+    (10, 3): None,
+    (10, 7): None,
+}
 
 # The devices the crash is measured on.  cc 10.0 and 10.3 build the plan through the SM100 decode emitter and segfault in
 # it (emit_code_native_sdpa_decode_sm100, which has no MXFP8 scale-factor path) for a dense d128 graph on every build
 # tried: 9.23.1.3, 9.26.0.51, 9.27.0.42, 9.28.0.38 and the 9.30.0.2 nightly (148-SM cc 10.0, cc 10.3 B300, 2026-11-10).
-# The backend fix routes single-query MXFP8 graphs to the prefill kernel (in review), so one FIXED_IN covers all three.
+# Record and lift the guard independently for each architecture after its detector completes cleanly.
 SQ1_MXFP8_CRASH_DEVICES = frozenset({(10, 0), (10, 3), (10, 7)})
 
 
@@ -74,7 +83,8 @@ def backend_guard(graph, facts) -> Optional[str]:
         return None
     if facts.device_cc not in SQ1_MXFP8_CRASH_DEVICES or facts.s_q != 1 or facts.has_sink or facts.has_paged_kv:
         return None
-    if SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is not None and cudnn.backend_version() >= SQ1_MXFP8_PLANNING_CRASH_FIXED_IN:
+    fixed_in = SQ1_MXFP8_PLANNING_CRASH_FIXED_IN.get(facts.device_cc)
+    if fixed_in is not None and cudnn.backend_version() >= fixed_in:
         return None
     return (
         f"cuDNN {cudnn.backend_version_string()} backend crashes the process while planning or building single-query MXFP8 SDPA graphs "

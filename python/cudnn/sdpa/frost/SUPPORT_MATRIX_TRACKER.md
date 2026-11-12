@@ -1662,22 +1662,29 @@ Selection uses declared bounds for override graphs and never reads device
 lengths. The MXFP8 forward row is offered by default too (2026-10) and leads the
 backend on exact cc 10.7 for every graph it admits (`placement._place_sm107_mxfp8`),
 a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (the
-harness xfails them), their heuristics crash the process while planning any
+harness xfails them), and their heuristics crash the process while planning any
 single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
-9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
-planning there on every known build -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = None`: cuDNN 9.28.0's heuristics
-plan the 21-contract matrix but building the backend's BHSD single-query plan killed the test process on the cc
-10.7 CI lane (2026-10-08), and the detector re-measures the matrix through plan, check_support and build on
-every run of that lane; the same guard covers cc 10.0 / 10.3, where the SM100 decode emitter crashes the same 18 of
-the 21 contracts (in planning on cuDNN 9.27.0.42, in the plan build on 9.30.0.2;
-`test_mhas_v2.py::test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0`, 2026-11-10); an
-explicit backend pin, `create_execution_plan` with a backend engine id, on such a graph is
-a typed decline too; `test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0`
-walks the 21-contract trigger matrix -- plan, then the backend's own plan through check_support and
-build -- with the guard disabled in a child interpreter restarted after every crash (the per-contract, per-stage
-record is printed under `measured` in the run's summary) and fails when the installed backend gets every
-contract through cleanly -- the signal to re-measure and record the
-version), and their d256 / d512 MXFP8 plans fail to build (NVRTC
+9.26.0.51 and 9.27.0.28). The backend guard's fix version is recorded per
+compute capability in `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN`:
+cc 10.0 is measured clean at 93000 (cuDNN 9.30.0.4 on GB100, job 543389412,
+2026-11-11; 18 contracts built, three larger-head contracts declined with no
+engine, none crashed); cc 10.3 and cc 10.7 remain guarded until their own full
+matrix measurements complete. On cc 10.7, cuDNN 9.28.0's heuristics planned
+the 21-contract matrix but building the backend's BHSD single-query plan killed
+the test process (2026-10-08); the 9.30.0.4 SM107 test_mhas run timed out before
+its detector completed (job 543389419, 2026-11-11). The cc 10.0 / 10.3 detector
+previously observed the SM100 decode-emitter crash in 18 of 21 contracts (in
+planning on cuDNN 9.27.0.42 and during plan build on 9.30.0.2;
+`test_mhas_v2.py::test_sdpa_mxfp8_cc100_backend_planning_crash_guard_is_current_L0`,
+2026-11-10). An explicit backend pin, `create_execution_plan` with a backend
+engine id, on a guarded graph is a typed decline too.
+`test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0`
+walks the 21-contract trigger matrix -- plan, then the backend's own plan through
+check_support and build -- with the guard disabled in a child interpreter restarted
+after every crash (the per-contract, per-stage record is printed under `measured`
+in the run's summary) and fails when the installed backend gets every contract
+through cleanly -- the signal to re-measure and record that architecture's
+version. The cc 10.7 d256 / d512 MXFP8 plans also fail to build (NVRTC
 compilation failure on both engines, same two backends), so without this row those
 flavors have no provider on cc 10.7. THD/varlen is served at d256 only (#1488's
 `thd_d_shapes`); a THD MXFP8 request at another head dim declines with `THD (ragged) rides the
