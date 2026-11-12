@@ -1853,12 +1853,22 @@ def test_dsl_sm120_small_page_cache_determinism(dtype, kv_dtype):
 @pytest.mark.L0
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group("gpu_exclusive")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dsl_sm120_paged_vector_loop_warm(dtype):
+@pytest.mark.parametrize(
+    "dtype,kv_dtype",
+    [
+        pytest.param(torch.float16, None, id="fp16-half-kv"),
+        pytest.param(torch.bfloat16, None, id="bf16-half-kv"),
+        pytest.param(torch.float16, torch.float8_e4m3fn, id="fp16-e4m3-kv"),
+        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-e5m2-kv"),
+    ],
+)
+def test_dsl_sm120_paged_vector_loop_warm(dtype, kv_dtype):
     from test_sdpa_fwd_paged_sm120 import _case, _check
     from warm_stress import StressCase, assert_warm_stress
 
-    g, nodes, bufs, workspace, o_storage, stats_storage = _case(dtype, 2, 256, True, False, h=16, sq=4096, tile_m=128, tile_n=128, explicit_plan=True)
+    g, nodes, bufs, workspace, o_storage, stats_storage = _case(
+        dtype, 2, 256, True, False, h=16, sq=4096, tile_m=128, tile_n=128, explicit_plan=True, kv_dtype=kv_dtype
+    )
     pack = {nodes[name]: tensor for name, tensor in bufs.items()}
 
     def execute():
@@ -1869,7 +1879,7 @@ def test_dsl_sm120_paged_vector_loop_warm(dtype):
     # The live K length is 259: three K/V tiles, two refills in each CTA.
     assert_warm_stress(
         StressCase(
-            "SM120 paged D128 rolled copies",
+            "SM120 paged D128 cooperative half copies or FP8 widening",
             execute,
             {"o_storage": o_storage, "stats_storage": stats_storage},
             thread_blocks=2 * 16 * (4096 // 128),

@@ -34,6 +34,60 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM120 cooperative paged prefill — validation, 2026-11-12 (UTC)
+
+The paged half-MMA prefill loader partitions the same vector copies across
+all four existing service warps. Half K/V retains per-thread async-copy
+completion before publication; FP8 K/V retains ordinary release publication
+after widening stores. Full-barrier arrivals and named-barrier participation
+include all 128 producer threads. CTA size, register budgets, shared-memory
+layout and attention arithmetic are unchanged. Dense, decode and wide-head
+producer counts retain their existing values.
+
+The initial candidate on parent `b2c5270751eeab2213d85eb3103e0ef507937901`
+passed 78 existing cases with zero failures/skips, including eight unchanged
+strict parent O/Stats goldens, explicit-plan rebind/capture, reordered and
+duplicated batches, changed neighbors, width/mixed-KV controls and half refill
+stress. Racecheck, memcheck and synccheck each passed three selected cases
+with zero errors: one affected small-page half prefill case and two unchanged
+decode-ring controls. These runs used Compute Sanitizer 2026.4 (CUDA 13.5),
+with API error reporting disabled; the zero-error result applies to the
+selected memory/synchronization tools.
+
+`test_dsl_sm120_paged_vector_loop_warm` additionally covers FP16/E4M3 and
+BF16/E5M2 K/V, retaining both half cases. The M128/N128 shape has 512 live
+CTAs plus 512 empty-sequence controls, rather than 1,024 active CTAs. Each
+live CTA reads three KV tiles and refills twice. Independent numerical checks
+precede byte stress. The initial half checks pass 256 warm and 256 poisoned
+launches per dtype, with zero differing output-storage bytes; the unsafe
+control fails 200/200 launches. This corrects the interpretation of the
+total launch grid in the earlier records without changing those measurements.
+
+The supplemental run passes all four half/FP8 warm cases with the same
+256 warm and 256 poisoned launches and the 200/200 unsafe control, plus the
+two FP8 small-page strict-golden cases under each sanitizer, with zero
+errors. Together the runs cover 80 distinct cases and five cases per
+sanitizer; the repeated half controls are not counted as new coverage.
+An initial supplemental allocation exited during GPU inventory before
+testing. The successful replacement preserves the one-GPU/architecture/idle
+checks. Generated PTX confirms that service warps 8 through 11 reach one
+common register-release instruction, with 128 full-barrier arrivals and
+384 participants in the tested M128 tile's K/V reuse barriers.
+
+Measured on RTX PRO 6000 Blackwell Server Edition, 188 SMs, Torch
+2.14.1+cu130, cuDNN 9.30.0.4, CuTe DSL 4.8.0 with actual CUDA 13.4 and
+NVRTC 13.4. Source/import locations and runtime library hashes were checked.
+No golden, tolerance or skip changed. This is forward-only, fixed-runtime
+qualification; SM121 and cross-runtime identity remain unverified.
+
+From `test/python`, with recording disabled:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -n0 -m L0 sdpa/frost/test_sdpa_fwd_dsl_sm120.py \
+  -k 'small_page_cache_determinism or paged_vector_loop' -q -rs
+```
+
 ### SM120 warp-cached page tables — validation, 2026-11-12 (UTC)
 
 The common paged loader now loads a tile's live page IDs across a producer

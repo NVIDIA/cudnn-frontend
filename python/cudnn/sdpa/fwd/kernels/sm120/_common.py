@@ -117,8 +117,9 @@ def copy_paged_half_tile(
     kv_tile: cutlass.Constexpr[int],
     head_tile: cutlass.Constexpr[int],
     chunk_elems: cutlass.Constexpr[int],
+    producer_warps: cutlass.Constexpr[int] = 1,
 ) -> None:
-    """One producer warp fills a half MMA tile from half or FP8 page storage.
+    """Producer warps fill a half MMA tile from half or FP8 page storage.
 
     The caller owns publication: cp.async arrivals for half copies, ordinary
     release arrivals for the FP8 widening stores. Page lookups stay within
@@ -131,7 +132,10 @@ def copy_paged_half_tile(
     src = Pointer(cutlass.make_array_view(pool).data_ptr(), dtype=pool.element_type)
     lane = cute.arch.lane_idx()
     vectors_per_row = head_tile // 8
-    # One warp caches the tile's live page IDs before walking its vectors.
+    producer_threads = 32 * producer_warps
+    producer_lane = (cute.arch.warp_idx() % producer_warps) * 32 + lane
+    assert kv_tile * vectors_per_row % producer_threads == 0
+    # Each producer warp caches live page IDs before walking its vectors.
     # Include a possible unaligned first page; retain the scalar walk when
     # the largest possible span would exceed the warp's shuffle sources.
     cache_pages = (kv_tile + page_size - 2) // page_size + 1 <= 32
@@ -146,8 +150,8 @@ def copy_paged_half_tile(
     # Keep the generated loader bounded as the tile grows. Fully unrolling
     # dozens of vectors per lane duplicates the page-table/address machinery
     # and makes large paged prefill tiles much slower than the rolled walk.
-    for wave in cutlass.range(kv_tile * vectors_per_row // 32, unroll=1):
-        chunk = wave * 32 + lane
+    for wave in cutlass.range(kv_tile * vectors_per_row // producer_threads, unroll=1):
+        chunk = wave * producer_threads + producer_lane
         row = chunk // vectors_per_row
         col = (chunk % vectors_per_row) * 8
         logical_row = seq_coord + row
@@ -190,9 +194,12 @@ def load_paged_half_tile(
     kv_tile: cutlass.Constexpr[int],
     head_tile: cutlass.Constexpr[int],
     chunk_elems: cutlass.Constexpr[int],
+    producer_warps: cutlass.Constexpr[int] = 1,
 ) -> None:
-    """Fill one paged half tile, then publish all 32 producer arrivals."""
-    copy_paged_half_tile(s_dst.data_ptr(), pool, page_table, batch_idx, head_idx, seq_coord, seqlen_k, page_size, kv_tile, head_tile, chunk_elems)
+    """Fill one paged half tile, then publish every producer arrival."""
+    copy_paged_half_tile(
+        s_dst.data_ptr(), pool, page_table, batch_idx, head_idx, seq_coord, seqlen_k, page_size, kv_tile, head_tile, chunk_elems, producer_warps
+    )
     if cutlass.const_expr(pool.element_type in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
         # Ordinary release arrivals publish the generic widening stores.
         prims.mbarrier_arrive(mbar)
@@ -200,7 +207,7 @@ def load_paged_half_tile(
         prims.cp_async_commit_group()
         prims.cp_async_wait_group(0)
         # Async-tracked arrivals publish cp.async writes; .noinc accounts
-        # for the 32 lanes already counted by barrier initialization/rearm.
+        # for all producer lanes counted by barrier initialization/rearm.
         prims.cp_async_mbarrier_arrive(mbar, noinc=True)
 
 
