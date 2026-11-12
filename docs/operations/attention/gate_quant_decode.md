@@ -101,6 +101,19 @@ programmatic-stream-serialization attribute, and transitively its own dependents
 the attribute is unaffected. The release is verified standalone only: its bytes equal the default's with no dependent
 grid on the stream; a chain with a dependent launched under the attribute is not covered by this suite.
 
+## Launch facts
+
+The entry states what a row count launches without launching it: three read-only answers, with `cfg_for`'s argument.
+
+| fact | answer |
+| --- | --- |
+| `kernel_symbols_for(rows)` | the symbol of the kernel compiled for the config of `rows`, as a one-element tuple; empty until that config is compiled. One compiled kernel serves every row count of the config |
+| `form_for(rows)` | the form as plain data: `{"THREADS": ..., "PDL_RELEASE": ...}`, the fields of the config `cfg_for` returns with the launch knob applied. The compile key is the config alone, so nothing else is part of it. A fresh `dict` on every call |
+| `launch_shape_for(rows)` | `(grid, block, shared_memory)`: a flat grid of `ceil(rows x width / 8 / THREADS)` thread blocks, `THREADS` threads, no shared memory -- `((3, 1, 1), (256, 1, 1), 0)` for one row of width 6144. A profiler's kernel record of the launch reads the same three values |
+
+A row count outside 1 .. 160 is the entry's typed decline, and none of the three compiles, launches or touches device
+memory.
+
 ## Support matrix
 
 | question | answer |
@@ -114,7 +127,8 @@ grid on the stream; a chain with a dependent launched under the attribute is not
 | DSL | nvidia-cutlass-dsl >= 4.8.0. On cc 10.0 / 10.3 the CUDA 12.9 and CUDA 13.4 compiler flavours of 4.8.0 render the same PTX and are both served; on cc 10.7 the compiler must be CUDA 13.4 or later (the CUDA 12.9 flavour rejects the `sm_107a` target and is declined by name before JIT) |
 
 Tests: `test/python/attention_gate/frost/test_gate_quant_decode.py` (host declines, config and pick pins, the rendering
-pinned per target and tied to the entry's own launch arguments, the device cells against the fp64 reference, an entry
+pinned per target and tied to the entry's own launch arguments, the launch facts against the configuration arithmetic
+and against the profiler's record of a launch, the device cells against the fp64 reference, an entry
 on a device that is not the caller's current one), `test_gate_quant_decode_determinism.py` (replay, batch
 invariance, goldens) and `test_gate_quant_decode_census.py` (`pytest -m L2`: every bf16 pair). Source:
 `python/cudnn/attention_gate/frost/`.
