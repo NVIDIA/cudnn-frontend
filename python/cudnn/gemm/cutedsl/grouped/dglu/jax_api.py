@@ -151,8 +151,15 @@ def grouped_gemm_dglu_jax_sm100(
     (experts,). Offsets must be nondecreasing multiples of 256 within [0,m]; m
     is padded to 256. SF buffers contain packed E8M0 MMA-tiled bytes, at any
     dense rank (uint8 bit patterns also accepted). FP8 A/B and an e4m3
-    ``d_dtype`` are required. ``act_func`` is "dswiglu", "dgeglu", or MXFP8 "dsituglu" on SM100/SM103; the
-    activation scalars are compile-time constants of the traced call.
+    ``d_dtype`` are required.
+
+    ``act_func`` selects ``"dswiglu"``, ``"dgeglu"``, or ``"dsituglu"``.
+    For ``"dsituglu"``, this JAX entry supports MXFP8 inputs on SM100/SM103
+    only. ``situ_beta1`` sets the gate soft cap (default 4.0), and
+    ``situ_beta2`` sets the up-branch soft cap (default 25.0). Both must be
+    finite and positive. All activation parameters are static arguments of
+    the traced JAX call.
+
     ``discrete_col_sfd=True`` packs column scales by expert. Returns a
     TupleDict with the eager wrapper's keys: natural 2-D D_row/D_col, dprob
     (m,) and physical 6-D SF buffers. Only dprob is zero-initialized, for

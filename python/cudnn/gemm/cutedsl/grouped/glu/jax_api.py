@@ -132,9 +132,16 @@ def grouped_gemm_glu_jax_sm100(
     FP8 ``d_dtype`` and norm_const (1,) fp32, and return D, D_col and the
     physical 6-D SFD buffers; ``discrete_col_sfd=True`` packs column scales by
     expert. FP4 inputs take a BF16/FP16 ``d_dtype`` and return D and the
-    per-expert amax (experts,1). ``act_func`` is "swiglu", "geglu", or MXFP8 "situglu" on SM100/SM103; the
-    activation scalars are compile-time constants of the traced call. Returns
-    a TupleDict with the eager wrapper's keys (C None unless ``generate_c``).
+    per-expert amax ``(experts, 1)``.
+
+    ``act_func`` selects ``"swiglu"``, ``"geglu"``, or ``"situglu"``.
+    For ``"situglu"``, this JAX entry supports MXFP8 inputs on SM100/SM103
+    only. ``situ_beta1`` sets the gate soft cap (default 4.0), and
+    ``situ_beta2`` sets the up-branch soft cap (default 25.0). Both must be
+    finite and positive. All activation parameters are static arguments of
+    the traced JAX call.
+
+    Returns a TupleDict with the eager wrapper's keys (C None unless ``generate_c``).
     Rows at or past padded_offsets[-1] are unspecified. Runs the Rubin GLU
     kernel on SM107 and the SM100 kernel otherwise.
 
