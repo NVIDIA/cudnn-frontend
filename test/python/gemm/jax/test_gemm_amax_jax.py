@@ -251,12 +251,6 @@ def test_gemm_amax_jax_jit_sm100():
     skip_unless_sm100()
     from cudnn import gemm_amax_jax_sm100
 
-    # cudnn.jax is reachable from a bare `import cudnn` (lazy submodule export)
-    import cudnn
-
-    with pytest.warns(FutureWarning, match="cudnn.jax.TensorSpec is deprecated"):
-        assert cudnn.jax.TensorSpec is cutlass.jax.TensorSpec
-
     m, n, k = 512, 256, 256
     sf_vec_size = 32
     rng = np.random.default_rng(3)

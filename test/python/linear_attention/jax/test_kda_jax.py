@@ -389,22 +389,11 @@ def test_shape_inference():
 
 
 def test_explicit_entries_moved_to_cudnn_ops():
-    import cudnn.jax
     import cudnn.ops
 
     assert cudnn.ops.kimi_delta_attention_forward_jax is fwd
     assert cudnn.ops.kimi_delta_attention_backward_jax is bwd
-    for name in ("kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
-        assert name not in cudnn.jax.__all__
-        assert not hasattr(cudnn.jax, name)
-
-
-def test_helper_types_not_exported():
-    import cudnn.jax
-
-    for name in ("KdaResidual", "KdaGradients"):
-        assert name not in cudnn.jax.__all__
-        assert not hasattr(cudnn.jax, name)
+    assert not hasattr(cudnn, "jax")
 
 
 def test_arrays_on_another_gpu_run_there_and_split_arrays_are_rejected():

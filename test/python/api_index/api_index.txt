@@ -999,16 +999,6 @@ cudnn.hstu_attention_forward
 cudnn.hstu_lmsd_backward
 cudnn.hstu_lmsd_forward
 cudnn.is_frontend_knob_type
-cudnn.jax
-cudnn.jax.TensorSpec
-cudnn.jax.block_sparse_attention
-cudnn.jax.call
-cudnn.jax.gemm_operand_spec
-cudnn.jax.kimi_delta_attention
-cudnn.jax.neg_inf_init
-cudnn.jax.row_major_desc
-cudnn.jax.sf_atom_spec
-cudnn.jax.zeros_init
 cudnn.jit
 cudnn.knob
 cudnn.knob.max_value
