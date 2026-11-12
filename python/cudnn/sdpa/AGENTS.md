@@ -1607,9 +1607,17 @@ and synchronize all consuming warps before PV. The wide-head THD cases in
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
-qualified SM120 loader also retains producer-local commit/wait-group completion:
+qualified SM120 prefill loader also retains producer-local commit/wait-group completion:
 an async-arrival-only variant passed numerics but failed the same racecheck.
 Do not remove that drain without rerunning the native sanitizer/capture cases.
+Paged half decode has a separately qualified exception: `decode_f16.py` allocates
+its full completion barriers with `cute.arch.alloc_smem`, separately from the
+dynamic K/V ring. It retains commit and async-tracked arrivals while omitting
+the producer wait; consumer full waits and empty-barrier ring credits still
+order publication and reuse. `test_dsl_sm120_paged_decode_async_warm` covers
+FP16/BF16 warm and poisoned replay with repeated slot reuse; the native paged
+rebind and decode-ring tests cover sanitizer/capture behavior. Keep this
+exception confined to that allocation and protocol; prefill retains its drain.
 For a persistent CTA that reinitializes its K/V barriers between work units,
 keep the same producer arrival count at initial launch and every rearm. D512
 paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
