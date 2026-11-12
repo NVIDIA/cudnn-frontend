@@ -241,8 +241,6 @@ from cudnn.sdpa.fwd.kernels.thd_origins import (
     origin_tensors,
     origin_tma_slice,
     origin_map_ptr,
-    build_paged_split_q_maps,
-    build_split_load_maps,
     build_thd_origins,
 )
 from cudnn.sdpa.fwd.kernels._thd_split_host import host as _host_thd_split, compile_host as _compile_thd_split_host
@@ -2787,12 +2785,14 @@ def _launch(
     q_supers = (SQ * HEADS_PER_TILE + rows_per_cluster - 1) // rows_per_cluster
     # KV split rides the BATCH axis: z = batch + split*B (decoded as b % B, b // B).
     if cutlass.const_expr(CFG.THD_VARLEN):
-        # Setup launch (issue #552): builds the [kv | cu_q | cu_k] metadata
-        # buffer device-side from the caller's length tensors, then the
-        # per-batch O descriptors and the packed-total-clamped K/V descriptors
-        # (o_desc_words slots n_batch+1 / n_batch+2). One elected thread.
-        if cutlass.const_expr(thd_origin_ptrs is not None and SPLIT_KV == 1):
+        # One setup launch builds device-side lengths/scheduling and maps.
+        # With independent origins, input maps follow each caller's port;
+        # split output maps retain the compact partial layout.
+        if cutlass.const_expr(thd_origin_ptrs is not None):
             o_desc_words, origins, offsets = origin_tensors(o_desc_words.iterator, thd_origin_ptrs, cutlass.Int32(B))
+            # Split outputs are compact partials; the final combine alone
+            # applies the caller's independent O/Stats physical origins.
+            setup_specs = thd_origin_specs[:3] + (None, None) if cutlass.const_expr(SPLIT_KV > 1) else thd_origin_specs
             build_thd_origins(
                 (q_tensor, k_tensor, v_tensor, o_tensor),
                 tma_q_desc,
@@ -2802,7 +2802,7 @@ def _launch(
                 o_desc_words,
                 origins,
                 offsets,
-                thd_origin_specs,
+                setup_specs,
                 seq_kv_lens_tensor,
                 thd_q_lens_tensor,
                 thd_kv_lens_tensor,
@@ -2812,6 +2812,9 @@ def _launch(
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
                 paged=PAGED_KV,
+                rank_by_kv=SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+                splits=SPLIT_KV,
+                single_batch_fast=SPLIT_KV > 1,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(
@@ -2833,25 +2836,6 @@ def _launch(
                 SPLIT_KV,
                 SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
-            if cutlass.const_expr(thd_origin_ptrs is not None):
-                o_desc_words, origins, offsets = origin_tensors(o_desc_words.iterator, thd_origin_ptrs, cutlass.Int32(B))
-                if cutlass.const_expr(PAGED_KV):
-                    build_paged_split_q_maps(
-                        q_tensor, tma_q_desc, o_desc_words, origins, offsets[0], thd_origin_specs[0][1], seq_kv_lens_tensor, cutlass.Int32(B)
-                    ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
-                else:
-                    build_split_load_maps(
-                        (q_tensor, k_tensor, v_tensor),
-                        tma_q_desc,
-                        tma_k_desc,
-                        tma_v_desc,
-                        o_desc_words,
-                        origins,
-                        offsets,
-                        thd_origin_specs,
-                        seq_kv_lens_tensor,
-                        cutlass.Int32(B),
-                    ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (

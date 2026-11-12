@@ -3776,3 +3776,60 @@ CGA1 and unsplit packed D64 are outside these SM100 routes. The final suite
 uses supported dense D128 and paged D64/D128 routes; reference tolerances
 and byte assertions were not weakened. The earlier failed run is not counted
 as successful coverage.
+
+### SM100 unified D64/D128 split setup — 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestUnifiedSplitSetup` adds18 L0
+cases through the existing SM100/SM103 CI entry, with a helper that is not
+independently collected. Eight B1 paged-origin cases cover D64/D128,
+FP16/BF16, packed split5 and unpacked split3, HND/NHD pools and token/head
+Stats. Two nonpaged D128 split3 cases cover both half types. Two D128
+mixed-KV cases cover FP16/E4M3 paged and BF16/E5M2 nonpaged split3.
+They retain independent origins, changed storage/strides, numerical O/Stats
+checks and changed-input capture replay, including empty/keyless queries.
+
+Six split5 byte cases cover packed paged D64/D128 and unpacked nonpaged
+D128 for FP16/BF16. One declared-capacity256 plan alternates through runtime
+B1/B3/B5/B129 and back to B1, including reordered/duplicated sequences,
+changed neighbors, concurrent work, independent physical origins, poisoned
+workspace and CUDA Graph replay. Fixed CPU-generated payloads and CPU FP64
+references remain unchanged from the unsplit fixture. Split count and packing
+stay fixed; there is no assertion of cross-plan equality. The appended
+`splits=1` helper default preserves the existing unsplit tests and golden names.
+
+On local SM100 (148 SM), actual CUDA13.4 compiler, DSL4.8,
+Torch2.14.1+cu130 and cuDNN9.24.0.43, parent `21abdcc482a1` passed all18
+cases in50.89s and recorded six new goldens under `361d6da48de8fd55`.
+The candidate passed the same18 in50.09s, zero failures/skips, with recording
+unset and all six O/Stats hashes checked against the parent. No existing
+golden changed; the new input hashes also match the existing unsplit fixtures.
+All three compiled cache controls were disabled and source imports asserted.
+Earlier candidate qualification on local SM100 (68 SM), with the same compiler
+and library versions, passed13 existing physical-origin cases in35.75s and
+24 mixed-KV cases in70.21s, including unsplit and multisequence controls.
+
+CUDA13.4 memcheck and synccheck each passed three focused cases in12.43s
+and10.83s, with zero errors: packed B1 BF16 D64 paging, B1 FP16/E4M3 D128
+paging, and BF16 nonpaged D128 B1/B3/B5/B129 byte comparisons. Offline
+SM103 compilation passed ten split-host variants: both half types times
+paged D64, paged/nonpaged D128 and paged E4M3/nonpaged E5M2 KV.
+This is compilation evidence only; SM103 execution remains unverified.
+The change affects setup only and adds no backward qualification.
+Four existing unsplit controls also passed in13.60s, retaining their original
+goldens. CI-style collection with `-m L0 -k frost` finds all18 new cases.
+
+From `test/python`, after checking the actual imported checkout:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1 CUTE_DSL_NO_CACHE=1 CUTE_EXPERIMENTAL_DSL_NO_CACHE=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 -k frost \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestUnifiedSplitSetup
+```
+
+The first parent-only attempt failed15 cases before kernel launch: the paged
+B1 fixture retained a packed-total hint above `B*S_q`, and the shape-override
+byte fixture omitted its required split packed-total bound. The corrected
+fixtures declare valid bounds; no numerical tolerance or byte assertion was
+relaxed. Those failures are retained separately from passing qualification.

@@ -228,7 +228,7 @@ def test_paged_thd_origins_rebind_and_capture(
         paged_attention_k_table=nodes["kt"],
         paged_attention_v_table=nodes["vt"],
         paged_attention_max_seq_len_kv=kv_max,
-        max_total_seq_len_q=477,
+        max_total_seq_len_q=min(477, batch * maximum),
         stats_use_log2=stats_layout == "head",
     )
     nodes["o"].set_output(True).set_dim((batch, heads, maximum, d_v)).set_stride((maximum * heads * d_qk, d_qk, heads * d_qk, 1)).set_ragged_offset(

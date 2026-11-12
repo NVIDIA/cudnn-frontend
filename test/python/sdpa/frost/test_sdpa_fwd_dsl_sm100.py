@@ -3477,3 +3477,17 @@ class TestSingleSequenceSetup:
     test_physical_origins = staticmethod(_checks.test_single_sequence_physical_origins)
     test_batch_bytes = staticmethod(_checks.test_single_sequence_batch_bytes)
     test_paged_origins = staticmethod(_checks.test_single_sequence_paged_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64/D128 split setup on SM100/SM103")
+class TestUnifiedSplitSetup:
+    """Split partials and final physical origins survive runtime batch changes."""
+
+    import sdpa_split_setup_sm100 as _checks
+
+    test_paged_origins = staticmethod(_checks.test_single_sequence_paged_origins)
+    test_dense_origins = staticmethod(_checks.test_single_sequence_dense_origins)
+    test_mixed_origins = staticmethod(_checks.test_single_sequence_mixed_origins)
+    test_batch_bytes = staticmethod(_checks.test_runtime_batch_bytes)
