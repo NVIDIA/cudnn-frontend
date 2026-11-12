@@ -84,8 +84,18 @@ def _launch_context(device: torch.device, stream):
             yield stream, consumer
 
 
+# First head of each 64-head window the H64 kernel runs. H96 launches the H64
+# kernel twice, on heads [0, 64) and [32, 96), as views of the caller's
+# tensors: it does the work of 128 heads, and the second launch rewrites heads
+# [32, 64). The kernel takes its rescale decision per 32-head warp, so windows
+# that start at multiples of 32 give those heads the same group, and the
+# second launch writes the bytes the first one wrote.
+_HEAD64_WINDOW_STARTS = {64: (0,), 96: (0, 32)}
+_HEAD64_KERNEL_HEADS = 64
+
+
 def _kernel_variant(num_heads: int, head_dim: int) -> str:
-    if num_heads == 64 and head_dim in (512, 576):
+    if num_heads in _HEAD64_WINDOW_STARTS and head_dim in (512, 576):
         return "head64_regular"
     if num_heads == 128 and head_dim == 512:
         return "head128_small_topk_prefill"
@@ -166,6 +176,16 @@ def _check_output(
         raise ValueError(f"{name} base pointer must be 16-byte aligned, got 0x{tensor.data_ptr():x}")
 
 
+def _contiguous_strides(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Row-major strides of ``shape``, with singleton and empty extents counted as one."""
+    strides = []
+    running_stride = 1
+    for size in reversed(shape):
+        strides.append(running_stride)
+        running_stride *= max(int(size), 1)
+    return tuple(reversed(strides))
+
+
 def _contiguous_aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     """Materialize a contiguous, aligned tensor when either property is absent."""
     if not tensor.is_contiguous():
@@ -176,12 +196,7 @@ def _contiguous_aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         # has a different DLPack layout signature. Canonicalize only the
         # metadata (no copy) so structurally cached CuTe callables do not
         # depend on which singleton-stride representation compiled first.
-        expected_strides = []
-        running_stride = 1
-        for size in reversed(tensor.shape):
-            expected_strides.append(running_stride)
-            running_stride *= max(int(size), 1)
-        expected_strides = tuple(reversed(expected_strides))
+        expected_strides = _contiguous_strides(tensor.shape)
         if tensor.stride() != expected_strides:
             tensor = tensor.as_strided(tensor.shape, expected_strides)
     # ``contiguous()`` is a no-op for a contiguous storage-offset view.  Force
@@ -189,6 +204,37 @@ def _contiguous_aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     if tensor.data_ptr() % alignment:
         tensor = tensor.clone(memory_format=torch.contiguous_format)
     return tensor
+
+
+# Positions of the per-head operands in the kernels' tensor-argument order
+# (q, kv, indices, out, max_logits, lse, lse_indexer, attn_sink, topk_length).
+_PER_HEAD_ARGS = (0, 3, 4, 5, 6, 7)
+
+
+def _head_window_args(tensors: tuple, start: int, heads: int) -> tuple:
+    """Restrict the kernel tensor arguments to heads ``[start, start + heads)``.
+
+    Per-head operands become views along their head mode (mode 0 of the sink,
+    mode 1 otherwise); a window starting at a multiple of 32 heads keeps the
+    16-byte base alignment of every view. Other operands pass through, and a
+    window that covers every head returns the tensors themselves.
+    """
+    windowed = list(tensors)
+    for position in _PER_HEAD_ARGS:
+        tensor = tensors[position]
+        if tensor is not None:
+            head_mode = 0 if tensor.ndim == 1 else 1
+            if tensor.shape[head_mode] != heads:
+                windowed[position] = tensor.narrow(head_mode, start, heads)
+    return tuple(windowed)
+
+
+def _compact_alias(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Return a compact tensor of ``tensor``'s shape starting at its first element, to compile on only."""
+    if tensor is None:
+        return None
+    strides = _contiguous_strides(tuple(tensor.shape))
+    return tensor if tensor.stride() == strides else tensor.as_strided(tensor.shape, strides)
 
 
 def _record_stream(tensors, consumer: torch.cuda.Stream) -> None:
@@ -226,7 +272,7 @@ def _normalize_and_validate(
     if topk_idxs.shape[0] != total_s_q:
         raise ValueError(f"topk_idxs first dimension ({topk_idxs.shape[0]}) must match Q ({total_s_q})")
     variant = _kernel_variant(num_heads, head_dim)
-    valid_indexer = (0, 512, 1024, 2048) if num_heads == 64 else (0, 512, 1024)
+    valid_indexer = (0, 512, 1024, 2048) if variant == "head64_regular" else (0, 512, 1024)
     if indexer_topk not in valid_indexer:
         raise ValueError(f"indexer_topk={indexer_topk} is unsupported for H={num_heads}; expected one of {valid_indexer}")
     logical_topk = topk_idxs.shape[1]
@@ -343,11 +389,17 @@ def sparse_attention_forward_sm100(
         # ``to_cute_tensor`` makes the sequence/top-k extents and their
         # normalized layouts runtime-dynamic.  Cache only properties that
         # change the generated kernel or its optional-argument signature.
+        # H64 and H96 share one compiled H64 kernel; H96 launches it per window.
+        if variant == "head64_regular":
+            kernel_heads, window_starts = _HEAD64_KERNEL_HEADS, _HEAD64_WINDOW_STARTS[num_heads]
+        else:
+            kernel_heads, window_starts = num_heads, (0,)
+        tensors = (q, kv, topk_idxs, out, max_logits, lse, lse_indexer, attn_sink, topk_length)
         compile_key = (
             device,
             capability,
             variant,
-            int(num_heads),
+            int(kernel_heads),
             int(head_dim),
             q.dtype,
             kv.dtype,
@@ -359,38 +411,17 @@ def sparse_attention_forward_sm100(
         compiled = _compile_cache.get(compile_key)
         if compiled is None:
             kernel_obj = _make_kernel(variant, head_dim, int(indexer_topk))
+            # ``to_cute_tensor`` marks a compact shape, which a head window of
+            # a wider tensor is not. Shapes and strides stay runtime-dynamic,
+            # so the kernel compiled on compact aliases accepts the windows.
+            compile_args = tuple(_compact_alias(tensor) for tensor in _head_window_args(tensors, 0, kernel_heads))
             with torch.cuda.nvtx.range("dsa_sparse_attention_forward_compile"):
-                compiled = _compile_kernel(
-                    kernel_obj,
-                    q,
-                    kv,
-                    topk_idxs,
-                    out,
-                    max_logits,
-                    lse,
-                    lse_indexer,
-                    attn_sink,
-                    topk_length,
-                    scale,
-                    current_stream,
-                    device,
-                )
+                compiled = _compile_kernel(kernel_obj, *compile_args, scale, current_stream, device)
             _compile_cache[compile_key] = compiled
 
         with torch.cuda.nvtx.range("dsa_sparse_attention_forward_kernel"):
-            compiled(
-                q,
-                kv,
-                topk_idxs,
-                out,
-                max_logits,
-                lse,
-                lse_indexer,
-                attn_sink,
-                topk_length,
-                cutlass.Float32(scale),
-                current_stream,
-            )
+            for start in window_starts:
+                compiled(*_head_window_args(tensors, start, kernel_heads), cutlass.Float32(scale), current_stream)
         _record_stream(
             (q, kv, topk_idxs, out, max_logits, lse, lse_indexer, attn_sink, topk_length),
             consumer,
