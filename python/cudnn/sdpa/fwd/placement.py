@@ -115,6 +115,11 @@ runs 0.16-0.70 of the backend over b 1-128 and KV 2k-131k, and 0.16-0.37 on two 
 128-row tile holds with rows to spare stay TRAIL: 96/1 won the train lattice (0.26-0.78), but 112/1 at b 96 and KV 49k-100k
 ran 1.27-1.30x (split 4-8 there; split 1 at KV 20k ran 0.79).
 
+Paged K/V on the prefill body (no 16 / 32-row decode tile) TRAILs: on the RTX PRO 6000 (cuDNN 9.30.0.4, profiler kernel time)
+paged d128 runs 15-27x behind the backend at s_q 8-2048 (b1 q2048 kv2048 32/8: 2.92 ms vs 0.159 ms, against 0.133 ms on FROST's
+dense body), and a 72-cell seeded holdout's verify rows came out 0.04-0.09x of today's default with the backend. Paged
+decode-shaped graphs that fit the decode tile keep the rules below and study sm120_decode_20261112's entries.
+
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
 with ``b * h_q >= 512`` query rows in flight (0.25-0.95); 256 rows are parity (0.96-1.11) and fewer
@@ -1033,6 +1038,10 @@ def _place_sm90_f16(caps: Capabilities, facts) -> str:
 
 
 def _place_sm120_f16(caps: Capabilities, facts) -> str:
+    from .heuristics import _sm120_decode_tile_m
+
+    if facts.has_paged_kv and _sm120_decode_tile_m(caps, facts) == 0:
+        return TRAIL  # paged KV on the prefill body: 15-27x behind the backend at s_q 8-2048 (module docstring)
     if not facts.thd and facts.s_q == 1:
         units = facts.b * facts.h_kv
         if _selected_d_shape(caps, facts) == (512, 512):
