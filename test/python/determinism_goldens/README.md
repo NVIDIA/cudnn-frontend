@@ -34,22 +34,82 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
-### JAX linear attention — pending qualification, 2026-11-12 (UTC)
+### JAX linear attention — partial qualification, 2026-11-12 (UTC)
 
-`linear_attention/jax/test_linear_attention_jax_determinism.py` covers
-GDN, GDN2, GDP, and Mamba-2 forward and backward with `batch_invariant=True`.
-It checks FP16/BF16 results against the existing FP64 references, raw-byte
-replay with fresh inputs and concurrent GPU work, empty sequences, packed
-batch changes, and a scheduling-boundary workload. Comparisons include output,
-final state, and every returned input, initial-state, and optional-parameter
-gradient. Shared-parameter gradients use a fixed target sequence's loss when
-its batch changes.
+The numerical/API suite is
+[`linear_attention/jax/test_linear_attention_jax.py`](../linear_attention/jax/test_linear_attention_jax.py);
+[`test_linear_attention_jax_determinism.py`](../linear_attention/jax/test_linear_attention_jax_determinism.py)
+checks GDN, GDN2, GDP, and Mamba-2 forward/backward replay with fresh inputs,
+concurrent GPU work, empty sequences, and packed batch changes.
 
-GPU execution and golden recording are pending. No new golden results are
-claimed: SM100/103 determinism remains unverified, and these JAX APIs reject
-SM90 and SM107. The companion numerical/API suite is
-`linear_attention/jax/test_linear_attention_jax.py`; record goldens only after
-the reference and replay checks pass on the target GPU.
+| SM103 check | Collected-case result |
+| --- | --- |
+| Numerical/API, including long sequences and exact Mamba-2 Torch parity | 32 passed across split runs |
+| FP16/BF16 raw-byte replay and independent numerical references | 8 passed |
+| FP16/BF16 per-sequence batch invariance | 8 passed |
+| Scheduling-boundary replay | 4 passed |
+| Small BF16 golden recording | 4 passed |
+| Strict golden check without recording | 4 passed |
+
+Replay compares output, final state, and every input/state/parameter gradient
+as raw bytes. Batch invariance under `batch_invariant=True` applies to the
+sequence's output, recurrent state, and token/state gradients; those byte
+assertions remain strict. Shared GDN/GDP/GDN2 `a_log`/`dt_bias` and Mamba-2
+A/D/`dt_bias` gradients are whole-batch FP32 reductions. They are qualified
+for fixed-shape replay only; changed batch shapes/order use numerical checks
+with a fixed target loss.
+
+The first GDN batch test observed **1/8 bytes different in `d_a_log`** for a
+65-token sequence alone versus lengths `[65, 0, 17]`, with neighbor cotangents
+zero. This is a retained aggregate batch-invariance failure. Native scalar
+gate reduction changes from five 13-token stripes to six 14-token stripes;
+the same mathematical sum acquires a different FP32 association. The failure
+does not establish the outcome of comparisons after that first mismatch.
+
+The long fused BF16 Mamba-2 case (1,537 tokens, one head, BF16 state,
+checkpoint cadence 128, D/z and clamped dt) returned `d_dt_bias=0.03699809`
+versus FP64 `0.03411201`, an **8.46% relative scalar difference**. Exact-input
+JAX and native Torch FROST output, state, and every gradient matched bitwise.
+The long-case bias oracle follows the existing
+[`test_bwd_params`](../linear_attention/test_la.py#L972) contract:
+`d_dt_bias = sum_t ddt_t` at `1e-3`, while per-token `ddt` keeps its independent
+4% FP64 check and shorter-case FP64 bias checks remain. This qualifies the
+binding and reduction identity; it does not claim 4% FP64 accuracy for that
+cancellation-sensitive scalar.
+
+Measured runtime: NVIDIA B300 SXM6 AC, SM103, 148 SMs; JAX/JAXlib 0.9.1,
+CuTe DSL 4.8.1 cu13, Torch 2.12.1+cu130, frontend 1.33, cuDNN backend `92000`,
+TVM FFI 0.1.12, and driver API `13040` (driver `615.71.10` on the original
+node). The actual CUDA 13.4 compiler module is
+`/home/mgoldfarb/scratch/cudnn-jax-norm-deps/nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir/_mlir_libs/_cutlass_ir.cu13.cpython-312-x86_64-linux-gnu.so`.
+The binding revision is `d3478d01`, based on `fb53e410`; the eight replay and
+reference cases ran at `dbd28763` in job `5885948`. Native Torch parity job
+`5886058` passed one case in 50.65 s. Recording job `5886181` passed four BF16
+goldens plus the long Mamba-2 rerun in 109.89 s. The four reviewed JSON records
+use runtime key [`c14221f3a5e6ed0c`](c14221f3a5e6ed0c). Final qualification
+at `628f1754` in job `5886393` passed 16 cases without failures or skips in
+355.39 s: eight per-sequence batch cases, four scheduling-boundary cases,
+and four strict golden comparisons with recording disabled. Across focused
+runs, all 32 numerical/API and 24 determinism cases pass. Process shutdown
+still emits nanobind `WorkspaceCarve` leak diagnostics; those are not
+resolved by this binding change.
+
+Reproduce from `test/python` with recording unset; the completed results
+above come from focused split runs:
+
+```bash
+python -m pytest linear_attention/jax/test_linear_attention_jax.py --confcutdir=linear_attention/jax -q
+determinism_suite=linear_attention/jax/test_linear_attention_jax_determinism.py
+python -m pytest "${determinism_suite}::test_replay_and_reference" --confcutdir=linear_attention/jax -vv
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest "${determinism_suite}::test_batch_invariance" \
+    "${determinism_suite}::test_scheduling_boundary" "${determinism_suite}::test_golden" \
+    --confcutdir=linear_attention/jax -vv
+```
+
+SM100, the declared DSL 4.8.0 floor, CUDA 12, actual multiprocess JAX,
+mixed-architecture execution, and refilled-stage warm stress remain
+unqualified. These APIs reject SM90 and SM107.
 
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 

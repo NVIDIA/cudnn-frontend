@@ -44,10 +44,10 @@ arbitrary user callbacks.
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `cudnn.jax.gated_delta_net` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
-| `cudnn.jax.gated_delta_net_v2` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
-| `cudnn.jax.gated_delta_product` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
-| `cudnn.jax.mamba2` | fprop, bprop | FP16, BF16 | Unsupported | Unverified | Unsupported |
+| `cudnn.jax.gated_delta_net` | fprop, bprop | FP16, BF16 | Unsupported | SM103: Replay only; SM100: Unverified | Unsupported |
+| `cudnn.jax.gated_delta_net_v2` | fprop, bprop | FP16, BF16 | Unsupported | SM103: Replay only; SM100: Unverified | Unsupported |
+| `cudnn.jax.gated_delta_product` | fprop, bprop | FP16, BF16 | Unsupported | SM103: Replay only; SM100: Unverified | Unsupported |
+| `cudnn.jax.mamba2` | fprop, bprop | FP16, BF16 | Unsupported | SM103: Replay only; SM100: Unverified | Unsupported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
@@ -186,11 +186,20 @@ a row alone and inside a batch under the entry's own picks.
   other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
-- JAX GDN, GDN2, GDP, and Mamba-2: set `batch_invariant=True`; these APIs use
-  FROST directly. Repeatability and batch invariance remain unverified on
-  SM100/103 pending GPU measurements. See the
+- JAX GDN, GDN2, GDP, and Mamba-2 use FROST directly. Fixed-shape replay of
+  outputs and all input/state/parameter gradients is verified on SM103.
+  With `batch_invariant=True`, raw-byte batch invariance of per-sequence
+  outputs, states, and token/state gradients is verified in FP16 and BF16.
+  Shared GDN/GDP/GDN2 `a_log`/`dt_bias` gradients and Mamba-2 A/D/`dt_bias`
+  gradients are whole-batch FP32 reductions: replay is bitwise, but changing
+  batch shape or order can change their sum association and bytes, including
+  with a fixed target sequence's loss. Those aggregates are checked numerically
+  across batch layouts. Scheduling-boundary replay and strict golden checks
+  also pass; SM100 and other runtimes are unverified. See the
   [JAX linear-attention guide](/operations/LinearAttention/linear_attention_jax)
-  for supported shapes, state dtypes, and differentiation options.
+  for supported shapes, state dtypes, and differentiation options, and the
+  [measurement record on GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#jax-linear-attention--partial-qualification-2026-11-12-utc)
+  for numerical limitations and unmeasured configurations.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

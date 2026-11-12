@@ -163,11 +163,19 @@ visible. For traced calls, select the intended supported device with
 reads tuning properties from that device. Separate local calls do not require
 a single-process job. The initial public target set is SM100/SM103.
 
-`batch_invariant=True` requests the existing per-sequence scheduling mode.
-The JAX tests check raw-byte replay and sequence isolation, including all
-parameter and state gradients, separately from the FP64 numerical reference.
-GPU numerical, determinism, and heterogeneous-device qualification for these
-new bindings is pending; see the [determinism support page](/operations/determinism).
+`batch_invariant=True` requests the existing per-sequence scheduling mode for
+outputs, recurrent states, and token/state gradients. Shared parameter
+gradients are whole-batch reductions: GDN/GDP/GDN2 `a_log` and `dt_bias`, and
+Mamba-2 A, D, and `dt_bias`. Their fixed-shape replay is deterministic, but
+changing batch shape or order can change the association of FP32 sums and
+their result bytes, even when only one sequence has nonzero cotangents.
+
+SM103 FP16/BF16 numerical/API checks, raw-byte replay, and per-sequence batch
+checks have passed, along with scheduling-boundary replay and strict BF16
+golden comparisons. SM100 and other runtime configurations remain unqualified.
+See the [determinism support page](/operations/determinism) and the
+[measurement record on GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#jax-linear-attention--partial-qualification-2026-11-12-utc)
+for the measured scope, numerical limitations, and unmeasured configurations.
 
 These bindings cover the four recurrent forward/backward operations. Summary
 and context-parallel composition, paged/in-place state, and dedicated decode
