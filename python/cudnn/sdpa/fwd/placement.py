@@ -373,13 +373,15 @@ declaration and bounded MHA / group 2 showed no material gap and still trail. Fl
 transferred to cc 10.3 with the full squares below.
 
 SM100 paged bf16 d128 GQA prefixes (2026-11-12, ``_sm100_paged_d128_prefix``): on cc 10.0 / 10.3, FlashInfer's exact paged declaration
-(no total-Q capacity) with S_q < S_kv LEADs at b 1-64, 16 <= S_q <= 2048, S_kv to 65536, page 16 / 64, GQA 4 / 8 / 16, causal
+(no total-Q capacity) with S_q < S_kv LEADs at b 1-64, 16 <= S_q <= 2048, S_kv to 131072, page 16 / 64, GQA 4 / 8 / 16, causal
 bottom-right, head-major in-page K. Study sm100_paged_d128_prefill_20261112 (B200 1000 W, FlashInfer's paged wrapper, recorded
 facts) timed 250 frozen cells at cuDNN 9.30.0.4 and 9.24.0.43: FROST's first plan (packed, unsplit cga2) ran 0.04-1.08 of the
 backend's first plan on prefixes, while tiny squares (Q = KV = 16-128) trail 1.3-2.0x and keep their rules. The 150 prefix
 cells whose default changes came to 0.62 (9.30) / 0.55 (9.24) of the measured default, worst 1.06; an 80-cell seeded holdout,
 scored once per version, came to 0.68 / 0.62 on its 39 changed cells, worst 1.04. A B300 transfer over all 330 frozen cells came to 0.53
 at both versions (223 changed cells, worst 1.09).
+S_kv 65537-131072 (study sm100_paged_d128_prefix_kv131k_20261112, 120 train + 40 holdout cells on B200 and B300 at both
+versions): the changed cells came to 0.66-0.83 of the measured default, worst 1.03.
 
 SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
 b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
@@ -583,7 +585,7 @@ FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
 SM100_PAGED_D128_PREFIX_MAX_B = 64  # SM100 paged bf16 d128 GQA prefix lead: measured bounds (module docstring)
 SM100_PAGED_D128_PREFIX_Q = (16, 2048)
-SM100_PAGED_D128_PREFIX_MAX_KV = 65536
+SM100_PAGED_D128_PREFIX_MAX_KV = 131072
 SM100_PAGED_D128_PREFIX_PAGES = (16, 64)
 SM100_PAGED_D128_PREFILL_CCS = ((10, 0), (10, 3))  # the paged bf16 d128 GQA prefill / full-square leads: measured on both parts
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)

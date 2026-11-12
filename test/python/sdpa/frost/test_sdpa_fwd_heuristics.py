@@ -2674,8 +2674,8 @@ def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv
 @pytest.mark.L0
 @pytest.mark.parametrize(
     "b, h_q, h_kv, s_q, s_kv",
-    [(8, 64, 8, 128, 32767), (32, 8, 1, 128, 2049), (64, 16, 2, 128, 8191), (1, 32, 8, 16, 512), (16, 32, 4, 2048, 4096)],
-    ids=["b8_g8_kv32k", "b32_g8_kv2k", "b64_g8_kv8k", "q16", "q2048"],
+    [(8, 64, 8, 128, 32767), (32, 8, 1, 128, 2049), (64, 16, 2, 128, 8191), (1, 32, 8, 16, 512), (16, 32, 4, 2048, 4096), (4, 64, 8, 128, 131072)],
+    ids=["b8_g8_kv32k", "b32_g8_kv2k", "b64_g8_kv8k", "q16", "q2048", "b4_g8_kv128k"],
 )
 def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
     """Study sm100_paged_d128_prefill_20261112: on cc 10.0 / 10.3 FlashInfer's exact paged D128 GQA prefix (S_q < S_kv) leads."""
@@ -2696,11 +2696,11 @@ def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
         dict(max_total_seq_len_q=8 * 128),  # an exact total-Q declaration was not measured
         dict(device_cc=(10, 7), device_sm_count=208),
         dict(b=65),
-        dict(s_kv=131072),
+        dict(s_kv=131073),
         dict(page_size=32),
         dict(h_q=32, h_kv=32),
     ],
-    ids=["square", "total_q", "rubin", "b65", "kv128k", "page32", "mha"],
+    ids=["square", "total_q", "rubin", "b65", "kv_past_128k", "page32", "mha"],
 )
 def test_b200_paged_d128_prefix_rule_stays_inside_its_study(over):
     from cudnn.sdpa.fwd import placement
