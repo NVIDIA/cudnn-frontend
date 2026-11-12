@@ -397,6 +397,30 @@ def test_sm80_verify_class_without_an_entry_keeps_its_prefill_entry(s_q):
 
 
 @pytest.mark.L0
+def test_sm120_decode_entries_follow_their_study():
+    """Study sm120_decode_20261112 (RTX PRO 6000): paged d256 and D576 single-row decode keep the backend, dense D576 and long paged
+    d512 single-row decode lead; dense d512 s_q 1 has no entry (the hand rule decides, #2497); sink-only d64 MTP has no entry."""
+    row = "sdpa_fwd_prefill_sm120"
+
+    def f(**over):
+        base = dict(b=8, h_q=32, h_kv=2, s_q=1, s_kv=32768, d_qk=256, d_v=256, page_size=16, padded=True, device_cc=(12, 0), device_sm_count=188)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (32768, 32767):
+        assert pt.lookup(row, f(s_kv=s_kv)) is False
+        assert pt.matched_entry(row, f(s_kv=s_kv)).study == "sm120_decode_20261112"
+    assert pt.lookup(row, f(h_q=96, h_kv=1, d_qk=576, d_v=512, page_size=32)) is False
+    assert pt.lookup(row, f(h_q=96, h_kv=1, d_qk=576, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is True
+    assert pt.lookup(row, f(b=64, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is True  # 2^12 query rows past 2^11
+    assert pt.lookup(row, f(b=8, h_q=64, h_kv=1, d_qk=512, d_v=512, page_size=64, s_kv=131072)) is False
+    assert pt.lookup(row, f(h_q=128, h_kv=1, d_qk=512, d_v=512, has_paged_kv=False, padded=False, page_size=0)) is None
+    sink = dict(h_q=64, h_kv=8, d_qk=64, d_v=64, s_q=2, has_sink=True, causal=True, bottom_right=True)
+    assert pt.lookup(row, f(**sink)) is None
+    assert pt.matched_entry(row, f(window_left=127, **sink)).study == "sm120_decode_20261112"
+
+
+@pytest.mark.L0
 def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     """The A100 f16 dense prefill classes answer from their own study (sm80_f16_dense_prefill_20261106), not the bf16 one, and
     another Ampere part has no entry: the hand rules decide there."""
@@ -418,6 +442,27 @@ def test_sm80_f16_dense_prefill_entries_are_their_own_study():
     bf16 = prefill(1024, 1024, 64, dtype=cudnn.data_type.BFLOAT16)
     assert pt.TABLE[pt.class_key(row, bf16)].study.startswith("sm80_dense_prefill_")  # the bf16 study keeps its classes
     assert pt.lookup(row, prefill(1024, 1024, 64, device_cc=(8, 6))) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "mask_free"])
+@pytest.mark.parametrize("s_kv", [2048, 2049], ids=["on_tile", "off_tile"])
+def test_sm80_d192_gqa_prefill_leads_at_every_query_length(causal, s_kv):
+    """Study sm80_d192_gqa_r5_20261112 replaces the q >= 271 threshold of the D192/V128 GQA classes: with packed GQA and split-KV
+    FROST leads from 16 query tokens up (the old b1 64/8 q192 loss is gone). MHA and another Ampere part keep their own answers."""
+    row = "sdpa_fwd_prefill_sm80"
+
+    def prefill(s_q, **over):
+        base = dict(b=1, h_q=64, h_kv=8, s_q=s_q, s_kv=s_kv, d_qk=192, d_v=128, causal=causal, bottom_right=causal)
+        base.update(has_paged_kv=False, device_cc=(8, 0))
+        base.update(over)
+        return _facts(**base)
+
+    for s_q in (16, 192, 1024):
+        assert pt.lookup(row, prefill(s_q)) is True, s_q
+        assert pt.matched_entry(row, prefill(s_q)).study == "sm80_d192_gqa_r5_20261112"
+    assert getattr(pt.matched_entry(row, prefill(192, h_q=8)), "study", None) != "sm80_d192_gqa_r5_20261112"
+    assert pt.lookup(row, prefill(192, device_cc=(8, 6))) is None
 
 
 @pytest.mark.L0
@@ -530,13 +575,37 @@ def test_sm107_paged_mtp_entries_lead_their_classes(d, heads, mask, on_tile, off
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d", [(512, 512), (576, 512)], ids=["d512", "d576"])
-def test_sm107_paged_mla_single_row_decode_has_no_entry(d):
-    """Study sm107_paged_mtp_20261110 measured absorbed-MLA s_q == 1 but ships no entry for it: d512 lost 1.32x on the holdout at
-    h_kv 2, and D576 was not measured at h_kv > 1. The hand rules keep deciding these graphs."""
+@pytest.mark.parametrize("h_kv", [1, 2])
+def test_sm107_paged_mla_single_row_decode_follows_the_q1_study(d, h_kv):
+    """Study sm107_decode_q1_20261112 leads paged d512 / D576 s_q == 1 at every length on and off the tile, h_kv 1 and 2 (FROST
+    0.12-0.83 of the backend). f16 and another part keep the hand rules."""
     row = "sdpa_fwd_prefill_sm107"
     for s_kv in (131072, 131071, 1024, 1023):
-        facts = _facts(b=128, h_q=16, h_kv=1, s_q=1, s_kv=s_kv, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
-        assert pt.lookup(row, facts) is None
+        facts = _facts(b=128, h_q=16 * h_kv, h_kv=h_kv, s_q=1, s_kv=s_kv, d_qk=d[0], d_v=d[1], device_cc=(10, 7), page_size=64, padded=True)
+        assert pt.lookup(row, facts) is True
+        assert pt.matched_entry(row, facts).study == "sm107_decode_q1_20261112"
+    facts = dict(b=8, h_q=64, h_kv=1, s_q=1, s_kv=8192, d_qk=d[0], d_v=d[1], page_size=64, padded=True)
+    assert pt.lookup(row, _facts(device_cc=(10, 7), dtype=cudnn.data_type.HALF, **facts)) is None
+    assert pt.lookup(row, _facts(device_cc=(10, 3), **facts)) is None
+
+
+@pytest.mark.L0
+def test_sm107_dense_d256_single_row_decode_follows_the_q1_study():
+    """Study sm107_decode_q1_20261112: dense d256 s_q == 1 leads past a cost threshold on the KV tile and a tile-count threshold off
+    it; small launches keep the backend. d128 single-row decode has no entry (its holdout moved no cell)."""
+    row = "sdpa_fwd_prefill_sm107"
+
+    def q1(**over):
+        base = dict(b=32, h_q=32, h_kv=2, s_q=1, s_kv=131072, d_qk=256, d_v=256, device_cc=(10, 7), has_paged_kv=False, padded=False, page_size=0)
+        base.update(over)
+        return _facts(**base)
+
+    for s_kv in (131072, 131071):
+        assert pt.lookup(row, q1(s_kv=s_kv)) is True
+        assert pt.matched_entry(row, q1(s_kv=s_kv)).study == "sm107_decode_q1_20261112"
+    assert pt.lookup(row, q1(b=1, s_kv=2048)) is False
+    assert pt.lookup(row, q1(b=1, h_q=8, h_kv=1, s_kv=2049)) is False
+    assert getattr(pt.matched_entry(row, q1(d_qk=128, d_v=128, h_q=64, h_kv=8)), "study", None) != "sm107_decode_q1_20261112"
 
 
 def _fi_ragged(d, h_q, h_kv, b=4096, s_q=128, s_kv=65536, total=None, causal=True, **over):

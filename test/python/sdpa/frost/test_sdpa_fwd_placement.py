@@ -215,6 +215,38 @@ def test_sm120_d256_decode_of_a_group_the_tile_does_not_divide_trails(h_q, b):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("b, s_kv", [(1, 2048), (1, 131072), (12, 30000), (128, 131072)])
+def test_sm120_d512_decode_wide_group_leads_when_it_fills_the_tile(b, s_kv):
+    """SM120 d512 s_q == 1 over one KV head: a 128-wide group packs into one 128-row tile and leads at every batch and
+    KV length (0.16-0.70 of the backend, module docstring); 96 and 112 leave tile rows idle and keep the backend
+    (112/1 b96 ran 1.27-1.30x); 64 and below keep the one-KV-head rule (b1 at 2k KV trails)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    facts = dict(b=b, h_kv=1, s_q=1, s_kv=s_kv, d_qk=512, d_v=512, causal=False, bottom_right=False, device_cc=(12, 0), device_sm_count=188)
+    assert placement.place(spec, _facts(h_q=128, **facts)) == placement.LEAD
+    assert placement.place(spec, _facts(h_q=112, **facts)) == placement.TRAIL
+    assert placement.place(spec, _facts(h_q=96, **facts)) == placement.TRAIL
+    if (b, s_kv) == (1, 2048):
+        assert placement.place(spec, _facts(h_q=64, **facts)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [8, 16, 128, 2048])
+def test_sm120_paged_prefill_body_trails(s_q):
+    """SM120 paged K/V on the prefill body (no 16 / 32-row decode tile) keeps the backend first: it ran 15-27x behind on the RTX PRO
+    6000 (module docstring); the same graph on dense K/V still leads, and a paged graph that fits the decode tile keeps its rules."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    shape = dict(b=1, h_q=8, h_kv=1, s_q=s_q, s_kv=8192, d_qk=128, d_v=128, causal=True, bottom_right=True, device_cc=(12, 0), device_sm_count=188)
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == placement.TRAIL
+    assert placement.place(spec, _facts(**shape)) == placement.LEAD
+    decode_tile = dict(shape, h_q=32, h_kv=8, s_q=8)  # 8 x group 4 = 32 rows
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **decode_tile)) == placement.LEAD
+
+
+@pytest.mark.L0
 def test_paged_d512_decode_follows_the_generated_entry_and_trails_without_one():
     """Paged d512 at s_q == 1 on cc 10.0 follows the generated entry (study sm100_d512_paged_decode_b100_20261030): it
     leads past the cost threshold and trails tiny launches. Without an entry (an SM100-row part no study or transfer check covers) the hand rule's
@@ -544,6 +576,24 @@ def test_sm107_fp8_placement_trails_outside_the_measured_domain(over):
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
     values = {**_SM107_FP8_DENSE, **_SM107_FP8_QUANT, **over}
     assert placement.place(spec, _facts(device_cc=(10, 7), **values)) == placement.TRAIL
+
+
+@pytest.mark.L0
+def test_sm107_fp8_d64_sink_decode_placement_structure():
+    """cc 10.7 FP8 d64 decode with a sink: s_q 2-4 leads; s_q == 1 leads from the module's KV-unit floor; a window, paging, or
+    no sink keeps the backend. Bounds come from the module, so this pins the gate's structure, not a measured boundary."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107_fp8")
+    units = placement.SM107_FP8_D64_SINK_DECODE_MIN_UNITS
+    base = {**_SM107_FP8_QUANT, "d_qk": 64, "d_v": 64, "h_q": 64, "h_kv": 8, "s_kv": 131072, "has_sink": True, "device_cc": (10, 7)}
+    mtp = {**base, "b": 1, "s_q": 4, "causal": True, "bottom_right": True}
+    q1 = {**base, "s_q": 1, "causal": False, "bottom_right": False}
+    assert placement.place(spec, _facts(**mtp)) == placement.LEAD
+    assert placement.place(spec, _facts(**{**q1, "b": units // 8})) == placement.LEAD
+    assert placement.place(spec, _facts(**{**q1, "b": units // 8 - 1})) == placement.TRAIL
+    for over in (dict(window_left=127), dict(has_paged_kv=True), dict(has_sink=False), dict(device_cc=(10, 0))):
+        assert placement.place(spec, _facts(**{**mtp, **over})) == placement.TRAIL, over
 
 
 @pytest.mark.L0
@@ -941,7 +991,6 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     [
         None,
         dict(device_cc=(10, 0)),
-        dict(has_paged_kv=False, page_size=0, padded=False),  # a dense d256 cache at s_q == 1 was measured against the prefill body only
         dict(padded=False),  # a paged decode WITHOUT per-request KV lengths: every band cell carried the padding mask -> unmeasured
         dict(s_q=2),  # two query tokens WITHOUT the diagonal: not FlashInfer's MTP graph, unmeasured (the MTP band keys on the diagonal)
         dict(h_q=64, b=4, s_kv=8192),  # group 32 one step below its band (2**16 tokens in flight holds the parity cell)
@@ -965,7 +1014,6 @@ def test_sm107_paged_d256_past_the_mtp_rows_follows_the_generated_table(s_q, d):
     ids=[
         "inside",
         "sm100",
-        "dense",
         "unpadded",
         "q2_no_diagonal",
         "g32_below_band",
@@ -1002,6 +1050,8 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
     assert placement.place(spec, _sm107_paged_d256_decode_facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
     if outside is None:
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, s_q=2, causal=True, bottom_right=True)) == placement.LEAD  # the MTP rows (table)
+        # dense K/V leaves the shard: study sm107_decode_q1_20261112 (table) leads this cell
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, has_paged_kv=False, page_size=0, padded=False)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64)) == placement.LEAD  # group 32 inside its band (64 units x 8k)
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, h_q=64, dtype=cudnn.data_type.HALF)) == placement.LEAD  # its f16 twin
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, dtype=cudnn.data_type.HALF)) == placement.LEAD
