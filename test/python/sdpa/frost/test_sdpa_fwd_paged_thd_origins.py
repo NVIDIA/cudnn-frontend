@@ -62,6 +62,7 @@ def test_paged_thd_origins_rebind_and_capture(
     single_q=False,
     heads_override=None,
     q_bound=None,
+    batch_override=None,
 ):
     import cudnn
     import torch
@@ -89,6 +90,9 @@ def test_paged_thd_origins_rebind_and_capture(
         page_size,
         (1024 if d_qk == 576 else 8192),
     )
+    if batch_override is not None:
+        assert batch_override == 1
+        batch = 1
     if q_bound is not None:
         maximum = q_bound
     if kv_bound is not None:
@@ -143,10 +147,10 @@ def test_paged_thd_origins_rebind_and_capture(
 
     def fill(values, shift, replay=False, keyless=False, empty=False):
         ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
-        ql = [min(length, maximum) for length in ql]
-        kl = [kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max]
+        ql = [min(length, maximum) for length in ql[:batch]]
+        kl = ([kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max])[:batch]
         if keyless:
-            kl[1] = 0
+            kl[-1] = 0
         # shift=0 is the integration reproducer's shared [0,320,512] Q slots.
         # Subsequent bindings/replays also separate the three physical origins.
         starts = {
@@ -154,6 +158,7 @@ def test_paged_thd_origins_rebind_and_capture(
             "o": [shift + (16 if shift else 0), 320 + shift + (32 if shift else 0)],
             "stats": [shift + (32 if shift else 0), 320 + shift + (64 if shift else 0)],
         }
+        starts = {name: rows[:batch] for name, rows in starts.items()}
         for name, lengths in (("ql", ql), ("kl", kl)):
             values[name].copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32).view(batch, 1, 1, 1))
         for name in ("q", "o", "stats"):

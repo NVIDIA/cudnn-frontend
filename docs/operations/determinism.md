@@ -88,6 +88,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa` / standalone FROST D256 paged THD (CGA2, fixed PackGQA and split count, independent physical origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unsupported for this combined path |
+| `pygraph.sdpa`, FROST single-sequence THD setup (dense D128 or paged D64/D128, unsplit) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | See native single-sequence limits below |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
@@ -467,6 +468,14 @@ repacking follows changed lengths; this earlier qualification covered compact
 origins only. Independent physical gaps on SM120 are covered below; their
 execution on SM121 and other runtimes remains unverified.
 This qualification adds no backward support.
+
+SM100 half single-sequence THD setup retains O/Stats replay and batch
+invariance in the tested unsplit dense D128 and paged D64/D128 configurations.
+One capacity-4096 plan alternates between runtime B1 and multiple sequences;
+the fast setup applies only to runtime B1. Independent physical origins,
+changed bindings, empty/keyless replay and fixed-plan packing are covered.
+SM103 compiles but has no execution evidence from this change. The optimization
+adds no backward or cross-runtime byte guarantee.
 
 Native SM107 half D64/D128 single-sequence THD origin setup retains forward
 O/Stats byte and batch invariance on the qualified runtime. Independent

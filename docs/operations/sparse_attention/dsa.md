@@ -26,7 +26,7 @@ operations.
 **Scope:** this module ships CuTe-DSL kernels for sparse-attention forward and
 backward, indexer scores/top-K, sparse/dense score recompute, and sparse/dense
 indexer backward. On SM90, sparse forward covers H16/H32/H64/H96/H128 Prefill;
-on SM100 it covers regular H64 and small-top-k H128 Prefill. It does not
+on SM100 it covers regular H64/H96 and small-top-k H128 Prefill. It does not
 include a decode or split-KV forward mode.
 
 The module packages the following operations:
@@ -188,6 +188,9 @@ attention sink participates only in the output denominator, not in any stats.
   - SM90: `H in {16, 32, 64, 96, 128}`, `D_qk in {512, 576}`, and
     `indexer_topk in {0, 512, 1024, 2048}`
   - SM100 H64: `D_qk in {512, 576}`, `indexer_topk in {0, 512, 1024, 2048}`
+  - SM100 H96: as H64. It launches the H64 kernel twice, on heads `[0, 64)`
+    and `[32, 96)` of the same tensors, so it does the work of 128 heads;
+    both launches write identical bytes to heads `[32, 64)`.
   - SM100 H128 small-top-k Prefill: `D_qk=512`,
     `indexer_topk in {0, 512, 1024}`
 - **Indexer prefix constraint** — `indexer_topk <= K`. When `topk_length` is

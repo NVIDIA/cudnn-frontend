@@ -75,6 +75,7 @@ def _build_one_batch_origins(
     paged: cutlass.Constexpr,
     splits: cutlass.Constexpr,
     row_dims: cutlass.Constexpr,
+    single_maps: cutlass.Constexpr = False,
 ):
     """One-sequence setup with no cross-warp metadata dependency.
 
@@ -138,7 +139,10 @@ def _build_one_batch_origins(
         meta[5] = cutlass.Int32(0)
         meta[6] = ((q_len + tile_rows - 1) // tile_rows) * heads * cutlass.Int32(splits)
         meta[7] = clusters
-        origin_compact_word(origins, cutlass.Int32(1)).store(cutlass.Int64(0))
+        # One sequence has zero logical prefixes in every load port. Its
+        # rebased sequence-local map is also the sole load map, even when
+        # physical origins are nonzero; consumers can acquire it just once.
+        origin_compact_word(origins, cutlass.Int32(1)).store(cutlass.Int64(1 if single_maps else 0))
 
 
 @cute.kernel
@@ -184,7 +188,10 @@ def build_thd_origins(
     that choice for the consuming launch; a consumer that does not read it
     keeps sequence-local maps.
     """
-    if cutlass.const_expr(single_batch_fast and not single_maps and not release_dependents) and batch == 1:
+    # For one sequence, sequence-local and compact load maps have the same
+    # count and coordinates. The fast builder preserves single-map acquisition,
+    # including nonzero independent origins, without the compact-prefix vote.
+    if cutlass.const_expr(single_batch_fast and not release_dependents) and batch == 1:
         _build_one_batch_origins(
             tensors,
             (q_desc, k_desc, v_desc, o_desc),
@@ -202,6 +209,7 @@ def build_thd_origins(
             paged,
             splits,
             row_dims,
+            single_maps,
         )
     else:
         tid = cutlass.Int32(cute.arch.thread_idx()[0])

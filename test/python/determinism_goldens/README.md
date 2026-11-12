@@ -805,20 +805,22 @@ Head parameters have explicit IDs such as `q24-kv2`. A failure such as
 direction without a separate lookup table. A test stops at its first mismatch;
 later checks in that case are not claimed as passes.
 
-### DSA: 93 cases
+### DSA: 97 cases
 
 The suite lives in `deepseek_sparse_attention/cutedsl/test_DSA_determinism.py`:
-48 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
+52 `TestDSA` cases and 45 `TestDSADeterministicDKV` cases.
 Each `TestDSA` case checks all returned forward tensors. Backward uses deterministic
 execution and checks dQ, the shared K/V latent gradient dKV, and dSink.
 The three `(heads, QK dimension, Top-K)` layouts are `(64,512,64)`,
-`(64,576,64)`, and `(128,512,128)`. The 576-wide path uses all QK dimensions
+`(64,576,64)`, and `(128,512,128)`; `(96,576,64)` runs forward only. SM100
+H96 forward launches the H64 kernel on heads [0, 64) and [32, 96); H96
+backward is not in this suite. The 576-wide path uses all QK dimensions
 but only the first 512 KV dimensions for values.
 
 | Test method | Level | Parameters and purpose | Cases |
 | --- | --- | --- | ---: |
-| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts; eight executions, input mutation check, numerical reference | 12 |
-| `test_batch_invariance` | L0 | Same twelve combinations; each sequence alone, packed, reversed, and duplicated | 12 |
+| `test_replay` | L0 | fprop/bprop × FP16/BF16 × three layouts, and fprop × FP16/BF16 × H96; eight executions, input mutation check, numerical reference | 14 |
+| `test_batch_invariance` | L0 | Same fourteen combinations; each sequence alone, packed, reversed, and duplicated | 14 |
 | `test_selection` | L0 | fprop/bprop × ragged lengths, invalid indices, empty rows, Top-K 65 tail, indexer prefix 512; replay, reference, batch checks | 10 |
 | `test_query_boundary` | L0 | fprop/bprop × H64 with 128/129/257 queries and H128 with 74/75 queries; four replays then batch checks | 10 |
 | `test_neighbor_isolation` | L0 | fprop/bprop; change neighboring Q/KV values and Top-K selection while keeping the target fixed | 2 |
@@ -1084,6 +1086,31 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest QSA/cutedsl/test_qsa_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_determinism.py \
   deepseek_sparse_attention/cutedsl/test_DSA_indexer_determinism.py -m L0 -q -rs
+```
+
+## SM100 H96 sparse attention forward validation: 2026-11-11 (UTC)
+
+Change under test: `DSA.sparse_attention_forward_wrapper` accepts H96 with
+D512/D576 on SM100 by launching the H64 kernel on heads [0, 64) and [32, 96),
+and `TestDSA` adds the forward-only `h96-d576-k64` layout (four cases). Source:
+this change on `develop` `17e10b09e`. `cudnn` resolved to a package whose
+Python modules link to this checkout, with the installed pybind module. Only
+the DSA suite was rerun.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| B200, SM100, 148 SMs | Torch `2.14.0a0+b2c75dd062.nv26.09`, CUDA `13.4`, driver API `13040`, cuDNN `92600`, CuTe DSL `4.8.0` (CUDA 13.4 compiler), TVM FFI `0.1.14`; key `5c945a33b1699e7e` | **90 passed, 2 failed, 5 skipped** in 177 s: the four H96 cases passed; five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+| B300, SM103 (cc 10.3), 148 SMs | Same software runtime; key `b28819ca225d3a0b` | **90 passed, 2 failed, 5 skipped** in 289 s: the four H96 cases passed; five temporary skips; both goldens failed with `no golden` (no baseline for this runtime) |
+| SM107 (cc 10.7, `NVIDIA Graphics Device`), 208 SMs | Same software runtime; key `1c7a6611734bfd74` | **45 passed, 2 failed, 50 skipped** in 23 s: the four H96 cases passed; five temporary skips and 45 `TestDSADeterministicDKV` cases that run only on SM100/SM103; both goldens failed with `no golden` (no baseline for this runtime) |
+
+H96 backward is outside this change and is not in this suite.
+
+From `test/python`:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_determinism.py -m L0 -q -rs
 ```
 
 ## Deterministic dKV storage validation: 2026-11-06 (UTC)
@@ -3810,3 +3837,65 @@ original four-case selection/order (182.94s) and an even-CTA BF16 lifetime
 case (56.87s), with zero hazards/errors/warnings. Kernel compilation remains
 CUDA 13.4 when using the available 13.2 racecheck tool. These local passes
 do not replace requalification in the original reviewer environment.
+
+### SM100 single-sequence physical-origin setup — 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSingleSequenceSetup` collects
+18 new L0 cases through the existing CI entry. The helper is intentionally
+not named `test_*`, so a directory sweep does not collect a second copy.
+The four dense D128 physical-origin cases cover FP16/BF16, packed/unpacked
+CGA2, independent element offsets, changed addresses/strides, token/head
+Stats, retained capture and empty/keyless replay. Four paged B1 cases cover
+D64/D128, CGA1/CGA2, HND/NHD/mixed KV layouts and independent Q/O/Stats
+origins. Ten FP16/BF16 byte cases cover dense D128 packed/unpacked, paged
+D64 CGA1/CGA2 and paged packed D128 CGA2, all with split count one.
+
+Each byte case uses fixed CPU-generated sequence payloads and independent
+CPU FP64 O/Stats references. It compares B1 with reordered, duplicated and
+changed-neighbor B3/B5/B129 bindings through one capacity-4096 plan, then
+returns to B1. Fresh buffers, concurrent GPU work, poisoned workspace,
+empty/keyless sequences and retained CUDA Graph replay remain checked.
+Paged payloads are copied once into finite-poisoned pools; unused page tails
+cannot change the reference. Input bytes, O bytes and FP32 Stats bytes are
+checked separately. Negative-infinity Stats is accepted only at keyless rows.
+There is no backward setup change or new backward qualification.
+
+On local SM100 (148 SM), actual CUDA 13.4 compiler/sanitizer, DSL4.8,
+Torch2.14.1+cu130, cuDNN9.24.0.43, driver API13020 and TVM FFI0.1.14.post1,
+the unchanged kernel parent `cb4c4e759873` passed all25 selected L0 cases
+(18 new, six existing D64 paged-origin controls, one compact B4 control),
+with one L1 case deselected, in68.41s. Ten new runtime goldens were recorded
+under `361d6da48de8fd55`; no existing golden was changed. The final candidate
+passed the same25 cases, zero failures/skips and one deselection, in70.12s
+with recording unset and every new golden checked against that baseline.
+Actual imports and native compatibility were asserted; all three compiled
+cache controls were disabled. The generic multi-sequence setup body and
+existing native source are unchanged.
+
+CUDA13.4 memcheck and synccheck each passed the packed BF16 dense-origin
+case and D64 CGA1 paged-origin case, with zero errors (10.93s and8.38s).
+Offline compilation passed six SM103 half variants (FP16/BF16 times paged
+D64 CGA1, dense D128 CGA2 and packed paged D128 CGA2), plus two SM107 dense
+D128 CGA2 controls of the shared helper's unchanged default. GPU execution
+on SM103 and new SM107 execution remain unverified; compilation is not a
+runtime pass. This setup-only optimization changes neither the attention
+arithmetic nor eligibility/ranking, and does not promise cross-plan bytes.
+
+From `test/python`, after checking that `cudnn` imports this checkout:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1 CUTE_DSL_NO_CACHE=1 CUTE_EXPERIMENTAL_DSL_NO_CACHE=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSingleSequenceSetup \
+  sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestPagedD64PhysicalOrigins \
+  sdpa/frost/test_sdpa_fwd_thd_origins.py::test_compact_thd_origins_use_single_load_maps
+```
+
+The first baseline attempt copied unsupported SM107 configurations and
+failed10 cases before candidate testing: dense D64 origins, dense D128 GQA
+CGA1 and unsplit packed D64 are outside these SM100 routes. The final suite
+uses supported dense D128 and paged D64/D128 routes; reference tolerances
+and byte assertions were not weakened. The earlier failed run is not counted
+as successful coverage.

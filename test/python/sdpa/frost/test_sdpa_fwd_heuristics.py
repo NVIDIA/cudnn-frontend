@@ -2555,3 +2555,70 @@ def test_sm120_partial_pack_candidates_use_the_packed_subgroup(h_q):
         assert _pack_gqa_points(caps, SdpaGraphFacts(h_q=2 * g, **shape), 64, 1, 1) == _pack_gqa_points(
             spec.capabilities, SdpaGraphFacts(h_q=2 * g, **shape), 64, 1, 1
         )
+
+
+def _sm100_paged_prefix(d, h_q, h_kv, **over):
+    """FlashInfer's exact paged prefill declaration on a 148-SM cc 10.0 part (head-major page pool, page 16)."""
+    from types import SimpleNamespace
+
+    base = dict(
+        b=1,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=64,
+        s_kv=32768,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (16 * d * h_kv, 16 * d, d, 1)),
+        device_cc=(10, 0),
+        device_sm_count=148,
+    )
+    base.update(over)
+    base.setdefault("max_total_seq_len_q", base["b"] * base["s_q"])
+    return _facts(**base)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, h_q, h_kv, s_q, cga", [(64, 32, 8, 64, 1), (256, 16, 8, 128, 2)], ids=["d64", "d256"])
+def test_sm100_paged_d64_d256_prefix_defaults_to_the_packed_split(d, h_q, h_kv, s_q, cga):
+    """A one-request prefix over a 32k cache packs to 16 tiles (D64 decode tile) / 8 pairs (D256) on 148 SMs, so the default is
+    FROST's packed split over 9 partitions (B200: 941 -> 41 us D64, 371 -> 78 us D256 vs the previous default)."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    facts = _sm100_paged_prefix(d, h_q, h_kv, s_q=s_q)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id == _OFFERED[_F16])
+    assert first.knobs == SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=9)
+    assert engines.mismatch(spec.capabilities, facts, first.knobs) is None
+    assert placement.place(spec, facts) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(b=16, s_q=1024, s_kv=4096),  # the packed launch fills the part: no split
+        dict(h_q=32, h_kv=32),  # MHA: nothing to pack
+        dict(causal=False, bottom_right=False),
+        dict(device_cc=(10, 7), device_sm_count=208),
+        dict(s_kv=512),
+        dict(dtype=cudnn.data_type.HALF),
+    ],
+    ids=["full-grid", "mha", "mask-free", "rubin", "short-kv", "f16"],
+)
+def test_sm100_paged_packed_split_stays_inside_its_domain(over):
+    from cudnn.sdpa.fwd.heuristics import sm100_paged_packed_split_choice
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    heads = dict(h_q=32, h_kv=8)
+    heads.update({k: over.pop(k) for k in ("h_q", "h_kv") if k in over})
+    for d in (64, 256):
+        assert sm100_paged_packed_split_choice(spec.capabilities, _sm100_paged_prefix(d, heads["h_q"], heads["h_kv"], **over)) == 1, (d, over)
