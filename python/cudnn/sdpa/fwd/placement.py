@@ -366,6 +366,14 @@ declaration and bounded MHA / group 2 showed no material gap and still trail. Fl
 ``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0, then
 transferred to cc 10.3 with the full squares below.
 
+SM100 paged bf16 d128 GQA prefixes (2026-11-12, ``_sm100_paged_d128_prefix``): on cc 10.0, FlashInfer's exact paged declaration
+(no total-Q capacity) with S_q < S_kv LEADs at b 1-64, 16 <= S_q <= 2048, S_kv to 65536, page 16 / 64, GQA 4 / 8 / 16, causal
+bottom-right, head-major in-page K. Study sm100_paged_d128_prefill_20261112 (B200 1000 W, FlashInfer's paged wrapper, recorded
+facts) timed 250 frozen cells at cuDNN 9.30.0.4 and 9.24.0.43: FROST's first plan (packed, unsplit cga2) ran 0.04-1.08 of the
+backend's first plan on prefixes, while tiny squares (Q = KV = 16-128) trail 1.3-2.0x and keep their rules. The 150 prefix
+cells whose default changes came to 0.62 (9.30) / 0.55 (9.24) of the measured default, worst 1.06; an 80-cell seeded holdout,
+scored once per version, came to 0.68 / 0.62 on its 39 changed cells, worst 1.04. cc 10.3 is not measured.
+
 SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
 b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
 legal-pool sweep over mixed-length full prefills found FROST's first plan ahead of engine 10 on these shapes, and a
@@ -566,6 +574,10 @@ SM100_FP8_D512_MTP_FLOOR_KV = 1448
 SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
+SM100_PAGED_D128_PREFIX_MAX_B = 64  # SM100 paged bf16 d128 GQA prefix lead: measured bounds (module docstring)
+SM100_PAGED_D128_PREFIX_Q = (16, 2048)
+SM100_PAGED_D128_PREFIX_MAX_KV = 65536
+SM100_PAGED_D128_PREFIX_PAGES = (16, 64)
 SM100_PAGED_D128_PREFILL_CCS = ((10, 0), (10, 3))  # the paged bf16 d128 GQA prefill / full-square leads: measured on both parts
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
 SM107_PAGED_GQA_LONG_CHUNK_MAX_S_Q = 4096  # Rubin paged GQA long-prefix chunks: the measured query range ends here
@@ -1102,6 +1114,30 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
     )
 
 
+def _sm100_paged_d128_prefix(facts) -> bool:
+    """cc 10.0 paged bf16 d128 GQA prefix, S_q < S_kv, FlashInfer's exact declaration (module docstring)."""
+    group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
+    return (
+        facts.device_cc == (10, 0)
+        and facts.has_paged_kv
+        and not facts.shape_overrides
+        and facts.max_total_seq_len_q is None
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and group in (4, 8, 16)
+        and 1 <= facts.b <= SM100_PAGED_D128_PREFIX_MAX_B
+        and SM100_PAGED_D128_PREFIX_Q[0] <= facts.s_q <= SM100_PAGED_D128_PREFIX_Q[1]
+        and facts.s_q < facts.s_kv <= SM100_PAGED_D128_PREFIX_MAX_KV
+        and facts.page_size in SM100_PAGED_D128_PREFIX_PAGES
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
@@ -1111,7 +1147,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
-    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts):
+    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts) or _sm100_paged_d128_prefix(facts):
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
