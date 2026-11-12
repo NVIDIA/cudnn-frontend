@@ -375,7 +375,10 @@ def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh,
 
 
 _PHANTOM_CHILD = textwrap.dedent(r"""
-    import os, sys
+    import faulthandler, os, sys
+    faulthandler.dump_traceback_later(870, exit=True)
+    # pytest adds test/python for shared helpers; a fresh child in tmp_path does not.
+    sys.path.insert(0, os.path.dirname(os.path.dirname("__TEST_DIR__")))
     sys.path.insert(0, "__TEST_DIR__")
     import torch
     import test_sdpa_fwd_fp8_dual_kv_sm100 as t
@@ -406,6 +409,7 @@ _PHANTOM_CHILD = textwrap.dedent(r"""
     print("max_rel_err", err, flush=True)
     assert err < 0.04, err
     print("OK", flush=True)
+    faulthandler.cancel_dump_traceback_later()
     """)
 
 _PHANTOM_BUDGET_S = 900.0  # one cold compile of the patched kernel (1-3 min) + one launch; a lap parks the child in its synchronize for ever
@@ -425,6 +429,7 @@ def test_phantom_step_cannot_lap_a_delayed_mma(tmp_path):
         proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=_PHANTOM_BUDGET_S, cwd=str(tmp_path))
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        pytest.fail(f"HANG: the delayed-MMA two-stream child did not finish within {_PHANTOM_BUDGET_S:.0f} s (the phantom lapped its consumer).\n{out[-3000:]}")
+        err = (e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        pytest.fail(f"the delayed-MMA two-stream child did not finish within {_PHANTOM_BUDGET_S:.0f} s.\n{out[-3000:]}\n{err[-3000:]}")
     assert proc.returncode == 0, f"child failed rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     assert "OK" in proc.stdout, proc.stdout[-2000:]

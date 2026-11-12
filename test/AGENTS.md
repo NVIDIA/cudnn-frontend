@@ -182,6 +182,11 @@ Validate with a deliberately blocked child that emits both streams; retain the
 original deadline and do not classify a compilation stall as a GPU hang without
 child-stage evidence.
 
+A subprocess importing a test module must also add that module's shared-helper
+root (`test/python`); pytest's own `sys.path` changes are not inherited. Check
+the child from a temporary working directory without that root on `PYTHONPATH`.
+The delayed-MMA FP8 dual-KV probe needs both this root and `sdpa/frost`.
+
 
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its

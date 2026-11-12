@@ -707,15 +707,12 @@ def _kernel(
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
 
-    # Device-scale fold: every thread loads the four 1-element fp32 scales
-    # (same addresses -> L2 broadcast, negligible) and folds them into the
-    # softmax scale and the output scale.
+    # Fold the Q/K descales into the softmax scale. The output scale is
+    # folded in the correction role below so it does not live across the
+    # common service-register release.
     _dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-    _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
-    _scl_o = _scale_or_one(scale_o_t)
     scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
-    o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     # Service roles form one warpgroup and must release at one common
     # instruction before branching into MMA, load, store and scheduler.
@@ -776,6 +773,10 @@ def _kernel(
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
         nvvm.setmaxregister(CFG.CORRECTION_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+        # Only the correction role uses this scale; retain the original multiply order.
+        _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
+        _scl_o = _scale_or_one(scale_o_t)
+        correction_scale = o_scale_fused * _dsc_v * _scl_o
         _correction_warp_group(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
@@ -794,7 +795,7 @@ def _kernel(
             leader_cta_id=leader_cta_id,
             cta_in_pair=cta_in_pair,
             cta_id_x=cta_id_x,
-            o_scale_fused=o_scale_fused,
+            o_scale_fused=correction_scale,
             amax_o_tensor=amax_o_tensor,
             qh_per_kh=qh_per_kh,
             o_partial_f32=o_partial_f32,
