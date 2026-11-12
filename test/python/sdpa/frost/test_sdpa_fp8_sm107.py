@@ -2054,6 +2054,25 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
 
 
 @requires_rubin
+class TestNativeD128Fp8Cga1Split:
+    """Single-CTA dense split coverage through the selected Rubin CI entry."""
+
+    from native_fp8_cga1_split_sm107_checks import (
+        test_dense_split_domain as _domain,
+        test_rebind_and_capture as _capture,
+        test_replay_and_batch_invariance as _bytes,
+        test_golden as _golden,
+        test_warm_refilled_ring as _warm,
+    )
+
+    test_rebind_and_capture = staticmethod(_capture)
+    test_dense_split_domain = staticmethod(_domain)
+    test_replay_and_batch_invariance = staticmethod(_bytes)
+    test_golden = staticmethod(_golden)
+    test_warm_refilled_ring = staticmethod(_warm)
+
+
+@requires_rubin
 class TestNativeFp8SinkSplit:
     """Keep the native regressions in the explicitly selected SM107 CI entry."""
 
