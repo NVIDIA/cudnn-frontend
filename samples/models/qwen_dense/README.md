@@ -206,7 +206,7 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell) | not run with the checks as they are now; `[00] PASS` with the first version of the checks (before the bands were held per value head, asked for finite values and the logits band was declared) |
+| 10.0 (data-center Blackwell) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
 | 10.3 | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
 | 10.7 | runs (`[00] PASS`), unverified: batch invariance of the fused step is reported on this class, not gated |
 | 12.0 | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The traced pass of the report and the checkpoint path came later and have not run on this class |
