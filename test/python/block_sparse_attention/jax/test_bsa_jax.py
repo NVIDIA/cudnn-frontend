@@ -18,7 +18,7 @@ if requirement_error:
 jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 
-from cudnn.jax import block_sparse_attention as attention
+from cudnn.block_sparse_attention.jax_api import block_sparse_attention as attention
 from cudnn.ops import block_sparse_attention_forward_jax as forward
 from cudnn.ops import block_sparse_attention_backward_jax as backward
 
@@ -332,7 +332,7 @@ class NoTorch:
 sys.meta_path.insert(0, NoTorch())
 import jax
 import jax.numpy as jnp
-from cudnn.jax import block_sparse_attention as attention
+from cudnn.block_sparse_attention.jax_api import block_sparse_attention as attention
 from cudnn.tensor_adapter import get_compute_capability
 assert get_compute_capability() in ((10, 0), (10, 3))
 assert get_compute_capability(0) == get_compute_capability()

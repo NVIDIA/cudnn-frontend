@@ -243,7 +243,7 @@ def test_gemm_amax_jax_wrapper_errors():
 
 @pytest.mark.L0
 def test_gemm_amax_jax_jit_sm100():
-    """XLA custom-call entry point (cudnn.jax.call): eager, jitted, cached, and composed."""
+    """XLA custom-call entry point (cudnn._jax.call): eager, jitted, cached, and composed."""
     import cutlass.jax
 
     if not cutlass.jax.is_available():
@@ -254,7 +254,8 @@ def test_gemm_amax_jax_jit_sm100():
     # cudnn.jax is reachable from a bare `import cudnn` (lazy submodule export)
     import cudnn
 
-    assert cudnn.jax.TensorSpec is cutlass.jax.TensorSpec
+    with pytest.warns(FutureWarning, match="cudnn.jax.TensorSpec is deprecated"):
+        assert cudnn.jax.TensorSpec is cutlass.jax.TensorSpec
 
     m, n, k = 512, 256, 256
     sf_vec_size = 32

@@ -99,7 +99,7 @@ def test_gemm_proj_rope_mxfp8_mxfp8in_jax_matches_torch():
 @pytest.mark.L0
 @pytest.mark.parametrize("input_path", ["bf16in", "mxfp8in"])
 def test_gemm_proj_rope_mxfp8_jax_jit_matches_eager(input_path):
-    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper."""
+    """XLA custom-call entry point (cudnn._jax.call): bit-identical to the eager JAX wrapper."""
     import cutlass.jax
 
     if not cutlass.jax.is_available():

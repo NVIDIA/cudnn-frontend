@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""cudnn.jax.call: cutlass.jax.cutlass_call with cuDNN conveniences."""
+"""cudnn._jax.call: cutlass.jax.cutlass_call with cuDNN conveniences."""
 
 from functools import lru_cache, partial
 

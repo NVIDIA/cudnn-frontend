@@ -687,6 +687,7 @@ toward Speed of Light.
 `cudnn.ops.block_sparse_attention_forward_jax` and
 `cudnn.ops.block_sparse_attention_backward_jax` provide explicit forward/backward;
 `cudnn.jax.block_sparse_attention` adds first-order reverse-mode differentiation.
+The `cudnn.jax` namespace is deprecated and emits a `FutureWarning`; use the `cudnn.ops` names.
 All three accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch.
 `cudnn.jax.block_sparse_attention_forward` and `cudnn.jax.block_sparse_attention_backward`
 have been removed; use the `cudnn.ops` names.

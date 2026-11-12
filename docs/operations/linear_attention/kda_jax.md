@@ -1,5 +1,8 @@
 # Kimi Delta Attention in JAX
 
+The `cudnn.jax` namespace is deprecated and emits a `FutureWarning`; use
+`cudnn.ops.kimi_delta_attention_forward_jax` and `cudnn.ops.kimi_delta_attention_backward_jax`.
+
 `cudnn.jax.kimi_delta_attention` returns `(output, final_state_or_None)` and
 supports `jax.jit` and first-order reverse-mode differentiation. It uses the
 existing Frost KDA kernels, including their backward, checkpoint recompute,

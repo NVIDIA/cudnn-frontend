@@ -3,7 +3,7 @@
 
 """JAX-native (XLA custom call) entry point for the blockscaled GEMM + amax kernel.
 
-Built on :func:`cudnn.jax.call` (CuTeDSL's native JAX bridge): the kernel runs on
+Built on :func:`cudnn._jax.call` (CuTeDSL's native JAX bridge): the kernel runs on
 XLA's compute stream, outputs are XLA-managed, and the call composes with ``jax.jit``
 and CUDA graph capture. No manual synchronization is needed.
 """
@@ -19,7 +19,7 @@ import cutlass.utils
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec, zeros_init
+from cudnn._jax import call, gemm_operand_spec, row_major_desc as _make_desc, sf_atom_spec, zeros_init
 from .api import GemmAmaxSm100
 
 # config_key -> (kernel instance, max_active_clusters). The instance does not vary

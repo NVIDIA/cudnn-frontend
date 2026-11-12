@@ -15,7 +15,7 @@ import jax.numpy as jnp
 
 import cutlass.cute as cute
 from cutlass.jax import TensorSpec
-from cudnn.jax import call, zeros_init
+from cudnn._jax import call, zeros_init
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 

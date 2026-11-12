@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry points for grouped GEMM dGLU, built on
-:func:`cudnn.jax.call`.
+:func:`cudnn._jax.call`.
 
 ``grouped_gemm_dglu_jax_sm100`` serves two modes. With ``b_tensor`` it is the
 canonical MXFP8 backward: dense A ``(m, k)``, B ``(experts, n, k)``, saved C
@@ -32,7 +32,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cudnn.api_base import TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype, get_compute_capability
-from cudnn.jax import call, gemm_operand_spec, neg_inf_init, zeros_init
+from cudnn._jax import call, gemm_operand_spec, neg_inf_init, zeros_init
 from ..canonical import kernel_facing_fp4
 from ..canonical_jax import (
     check_bf16_dense_inputs,

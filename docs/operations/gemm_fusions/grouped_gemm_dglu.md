@@ -10,7 +10,7 @@
 
 **BF16 backend:** supports **JAX arrays** in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense BF16 `b_tensor` and discrete block-scaled weights are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
 
-For jitted BF16 JAX programs use the same entry point `grouped_gemm_dglu_jax_sm100` with `b_ptrs` and `n` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+For jitted BF16 JAX programs use the same entry point `grouped_gemm_dglu_jax_sm100` with `b_ptrs` and `n` (built on `cutlass.jax.cutlass_call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 

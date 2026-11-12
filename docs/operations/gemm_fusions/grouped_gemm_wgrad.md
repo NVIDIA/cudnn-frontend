@@ -21,7 +21,7 @@ pip install nvidia-cudnn-frontend
 
 **BF16 backend:** supports **JAX arrays**: A k-major and B n-major C-contiguous arrays, dense `(experts, m, n)` C-contiguous output or discrete output pointers (packed uint8 / int64 with jax x64 mode). The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs.
 
-For jitted BF16 JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cudnn.jax.call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). Under tracing the per-group offsets *values* cannot be host-validated; the external buffers must stay alive and unmoved across every execution of the traced computation.
+For jitted BF16 JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_wgrad_jax_sm100` (built on `cutlass.jax.cutlass_call`; BF16, discrete output pointers): the per-expert weight-gradient buffers behind `wgrad_ptrs` are caller-owned external memory the kernel writes through, so the entry returns a completion **token** — `jax.block_until_ready(token)` before reading them (and zero them yourself between runs unless accumulating). Under tracing the per-group offsets *values* cannot be host-validated; the external buffers must stay alive and unmoved across every execution of the traced computation.
 
 ## Operation
 

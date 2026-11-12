@@ -20,7 +20,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32
 
-from cudnn.jax import TensorSpec, call
+from cudnn._jax import TensorSpec, call
 from .compression import fmha_helpers
 from .compression.fmha import BlackwellFusedMultiHeadAttentionForward
 from .selection.NSA_select_attn_fwd_hmma import HopperSelectAttentionFwd

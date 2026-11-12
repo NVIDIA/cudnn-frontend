@@ -18,7 +18,7 @@ jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 import numpy as np
 
-from cudnn.jax import kimi_delta_attention as kda
+from cudnn.linear_attention.jax_api import kimi_delta_attention as kda
 from cudnn.ops import kimi_delta_attention_forward_jax as fwd, kimi_delta_attention_backward_jax as bwd
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
@@ -254,7 +254,7 @@ class RejectTorch:
 sys.meta_path.insert(0, RejectTorch())
 import jax
 import jax.numpy as jnp
-from cudnn.jax import kimi_delta_attention as kda
+from cudnn.linear_attention.jax_api import kimi_delta_attention as kda
 jax.config.update("jax_enable_x64", True)
 q = jnp.ones((80, 1, 64), jnp.bfloat16) * 0.05
 b = jnp.ones((80, 1), jnp.float32) * 0.5
