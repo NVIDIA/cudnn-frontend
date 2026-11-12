@@ -376,7 +376,7 @@ def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh,
 
 _PHANTOM_CHILD = textwrap.dedent(r"""
     import faulthandler, os, sys
-    faulthandler.dump_traceback_later(870, exit=True)
+    faulthandler.dump_traceback_later(870, exit=False)
     # pytest adds test/python for shared helpers; a fresh child in tmp_path does not.
     sys.path.insert(0, os.path.dirname(os.path.dirname("__TEST_DIR__")))
     sys.path.insert(0, "__TEST_DIR__")
