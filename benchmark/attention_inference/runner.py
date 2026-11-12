@@ -42,8 +42,11 @@ FI_PINNED_LEGS = ("flashinfer_fa2", "flashinfer_cudnn")
 def kv_layouts_for(config, backend, phase, model=None) -> List[str]:
     """The cudnn legs sweep ``config.kv_layouts``; every other backend runs its native layout once (the paged-KV backends
     page their generation cache, except b12x's dense sliding-window GQA fallback; their prefill reads contiguous K/V)."""
-    if backend in CUDNN_LEGS or backend in FI_PINNED_LEGS:
+    if backend in CUDNN_LEGS:
         return list(config.kv_layouts)
+    if backend in FI_PINNED_LEGS:
+        # Context sweeps FlashInfer's ragged and paged prefill; its generation always reads a paged cache.
+        return list(config.kv_layouts) if phase == "context" else ["paged"]
     if backend == "b12x" and model is not None and model.kind == "gqa" and model.sliding_window_size:
         return ["dense"]
     return ["paged" if backend in PAGED_BACKENDS and phase == "generation" else "dense"]

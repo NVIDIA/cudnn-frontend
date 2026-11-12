@@ -107,6 +107,13 @@ class PageSizeTest(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertEqual((cmd[cmd.index("--kv_layout") + 1], cmd[cmd.index("--kv_min_fill") + 1]), ("paged", "0.25"))
         self.assertEqual((result.kv_layout, result.kv_min_fill), ("paged", 0.25))
+        from benchmark.attention_inference.runner import kv_layouts_for
+
+        both = SimpleNamespace(kv_layouts=["dense", "paged"])
+        for leg in ("flashinfer_fa2", "flashinfer_cudnn"):
+            # pinned FlashInfer generation always reads a paged cache; only its prefill has a ragged (dense) form
+            self.assertEqual(kv_layouts_for(both, leg, "generation"), ["paged"])
+            self.assertEqual(kv_layouts_for(both, leg, "context"), ["dense", "paged"])
 
     def test_serving_prefill_cases(self):
         """context_cases expand per layout with their fills and pages; the cudnn paged prefill legs record the total-Q
@@ -160,6 +167,15 @@ class RequestLensTest(unittest.TestCase):
         self.assertGreater(len(set(q_p.tolist())), 1)
         q_eq, kv_eq = request_lens(SimpleNamespace(batch_size=2, q_tokens=4096, kv_len=4096, phase="context", kv_min_fill=1.0))
         self.assertTrue(bool((q_eq == 4096).all()) and bool((kv_eq == 4096).all()))
+
+    def test_mixed_lengths_declare_the_row_maximum(self):
+        """The direct cuDNN graph declares the row's KV maximum, as FlashInfer's cudnn path does, not the drawn lengths' maximum."""
+        from benchmark.attention_inference.benchmark_single_attention import declared_max_kv, request_lens
+
+        args = SimpleNamespace(batch_size=4, q_tokens=2048, kv_len=2048, phase="context", kv_min_fill=0.25)
+        _, kv = request_lens(args)
+        self.assertLess(int(kv.max()), 2048)
+        self.assertEqual(declared_max_kv(args, kv), 2048)
 
 
 if __name__ == "__main__":

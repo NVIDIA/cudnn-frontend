@@ -203,6 +203,11 @@ def _paged_pool(args, kv_lens, make):
     return k_pool, v_pool, table.view(len(kv_lens), 1, -1, 1).cuda()
 
 
+def declared_max_kv(args, kv_lens):
+    """The KV maximum a paged graph declares: the row's ``kv_len``, as FlashInfer's ``max_sequence_kv``, not the drawn lengths'."""
+    return max(int(args.kv_len), int(kv_lens.max()))
+
+
 def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
     """The serving form of the cuDNN call (FlashInfer's cudnn backend): paged K/V with per-request lengths and a padding
     mask; a prefill's Q/O are THD (ragged offsets, sequences packed back to back), a decode's Q stays dense. Returns
@@ -222,7 +227,7 @@ def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
         seq_len_kv=t["seq_kv"],
         paged_attention_k_table=t["k_table"],
         paged_attention_v_table=t["v_table"],
-        paged_attention_max_seq_len_kv=int(kv_lens.max()),
+        paged_attention_max_seq_len_kv=declared_max_kv(args, kv_lens),
     )
     if thd and args.cudnn_total_q == "exact":
         kwargs["max_total_seq_len_q"] = int(q_lens.sum())
@@ -656,6 +661,8 @@ def _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace):
     its cudnn / auto backends, the lengths and block table that wrapper's cuDNN path declares (FlashInfer's own graph)."""
     if args.has_sink or args.kind != "gqa":
         raise NotImplementedError("the paged prefill leg covers GQA without sinks")
+    if args.head_dim_vo != args.head_dim_qk:
+        raise NotImplementedError("the paged prefill leg runs V / O at the Q / K width")
     hq, hkv, dqk = args.num_q_heads, args.num_kv_heads, args.head_dim_qk
     q_lens, kv_lens = request_lens(args)
     _, kv_indptr, kv_indices, last_page_len, block_tables = _paged_kv_layout(kv_lens, args.page_size)
