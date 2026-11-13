@@ -41,10 +41,11 @@ def _assert_decode(mod):
 
 
 @pytest.mark.parametrize(
-    "in_key,out_dtype,sq,group,split,stats,hnd",
+    "in_key,out_dtype,sq,group,split,stats,hnd,d",
     [
-        (key, dt, sq, group, split, stats, hnd)
+        (key, dt, sq, group, split, stats, hnd, d)
         for key, fp8 in [("e4m3", torch.float8_e4m3fn), ("e5m2", torch.float8_e5m2)]
+        for d in (64, 128)
         for dt, sq, group, split, stats, hnd in [
             (fp8, 1, 8, 1, True, True),
             (fp8, 1, 8, 4, True, True),
@@ -52,11 +53,16 @@ def _assert_decode(mod):
             (torch.bfloat16, 2, 4, 4, True, False),
             (torch.float16, 2, 4, 4, False, False),
         ]
+    ]
+    + [
+        ("e4m3", torch.float8_e4m3fn, 3, 8, 1, True, True, 64),
+        ("e5m2", torch.bfloat16, 4, 8, 4, True, False, 64),
+        ("e4m3", torch.float16, 9, 2, 1, False, True, 64),
     ],
 )
-def test_native_fp8_decode_graph(in_key, out_dtype, sq, group, split, stats, hnd, monkeypatch):
+def test_native_fp8_decode_graph(in_key, out_dtype, sq, group, split, stats, hnd, d, monkeypatch):
     loaded = _observe_loader(monkeypatch)
-    b, kh, d, page, pages = 3, 2, 128, 16, 33
+    b, kh, page, pages = 3, 2, 16, 33
     lens = [513, 77, 0]
     torch.manual_seed(918)
     row = dict(input=in_key, output=str(out_dtype), sq=sq, gqa=group, split=split, stats=stats, hnd=hnd, checks=[])
@@ -76,6 +82,7 @@ def test_native_fp8_decode_graph(in_key, out_dtype, sq, group, split, stats, hnd
         explicit_split=split,
         explicit_pack=True,
         explicit_cga=1,
+        explicit_swap_ab=1 if d <= 64 else None,
         v_table_layout="strided",
         q_lens=[sq, max(0, sq - 1), sq],
         return_case=True,
@@ -196,18 +203,25 @@ def test_native_fp8_decode_graph(in_key, out_dtype, sq, group, split, stats, hnd
         capture.reset()
 
 
-@pytest.mark.parametrize("feature", ["g3_unpacked", "mha", "q8_mha", "page8", "page256", "head_padding", "d80v112", "causal_window", "sink"])
+@pytest.mark.parametrize(
+    "feature",
+    ["g3_unpacked", "mha", "q8_mha", "page8", "page256", "head_padding", "d80v112", "causal_window", "sink", "d32v48", "d64_mtp_window", "d64_mtp_sink"],
+)
 def test_native_fp8_decode_features(feature, monkeypatch):
     loaded = _observe_loader(monkeypatch)
     group = 3 if feature == "g3_unpacked" else (1 if feature in ("mha", "q8_mha") else 4)
     page = 8 if feature == "page8" else (256 if feature == "page256" else 16)
     kwargs = {"head_padding": True} if feature == "head_padding" else {}
-    if feature == "causal_window":
+    if feature in ("causal_window", "d64_mtp_window"):
         kwargs.update(causal="bottom_right", window_left=73)
-    if feature == "sink":
+    if feature in ("sink", "d64_mtp_sink"):
         kwargs.update(sinks=torch.linspace(-120, 120, 2 * group, device="cuda").view(1, -1, 1, 1))
     sq = 8 if feature == "q8_mha" else 2
     d, dv = (80, 112) if feature == "d80v112" else (128, 128)
+    if feature == "d32v48":
+        d, dv = 32, 48
+    if feature.startswith("d64_mtp"):
+        d, dv, sq = 64, 64, 4
     paged._run_graph_fp8(
         3,
         2 * group,
@@ -225,16 +239,67 @@ def test_native_fp8_decode_features(feature, monkeypatch):
         explicit_pack=feature != "g3_unpacked",
         explicit_split=1,
         explicit_cga=1,
+        explicit_swap_ab=1 if d <= 64 else None,
         **kwargs,
     )
     _assert_decode(loaded[-1])
 
 
-@pytest.mark.parametrize("sq,group,cga", [(1, 16, 1), (9, 1, 1), (1, 8, 2)])
-def test_native_fp8_decode_route_boundaries(sq, group, cga, monkeypatch):
+@pytest.mark.parametrize("sq,group,cga,d", [(1, 16, 1, 128), (9, 1, 1, 128), (1, 8, 2, 128), (5, 8, 1, 64), (33, 1, 1, 64), (1, 16, 1, 64)])
+def test_native_fp8_decode_route_boundaries(sq, group, cga, d, monkeypatch):
     loaded = _observe_loader(monkeypatch)
-    paged._run_graph_fp8(2, 2 * group, 2, 128, 16, 9, [129, 77], True, s_q=sq, explicit_pack=True, explicit_split=1, explicit_cga=cga)
+    paged._run_graph_fp8(2, 2 * group, 2, d, 16, 9, [129, 77], True, s_q=sq, explicit_pack=True, explicit_split=1, explicit_cga=cga)
     assert loaded[-1].__file__.endswith("sm100/prefill_d128_fp8.py")
+
+
+@pytest.mark.parametrize("swap_ab", [None, 0, 1])
+def test_d64_swap_ab_public_choice(swap_ab, monkeypatch):
+    import cudnn
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    loaded = _observe_loader(monkeypatch)
+    graph, _, _, _, _ = paged._run_graph_fp8(
+        2,
+        16,
+        2,
+        64,
+        16,
+        9,
+        [129, 77],
+        True,
+        s_q=4,
+        explicit_pack=True,
+        explicit_split=4,
+        explicit_cga=1,
+        explicit_swap_ab=swap_ab,
+        return_case=True,
+        override=True,
+    )
+    expected = "decode_d128_fp8.py" if swap_ab == 1 else "prefill_d128_fp8.py"
+    assert loaded[-1].__file__.endswith("sm100/" + expected)
+    _, public = graph.get_engine_and_knobs_at_index(graph._plan_index)
+    assert public.get(cudnn.knob_type.SWAP_AB) == swap_ab
+    assert SdpaFwdKnobs.from_public(public).to_public() == public
+
+
+@pytest.mark.parametrize("sq,group,d", [(5, 8, 64), (33, 1, 64), (1, 16, 64), (1, 8, 128)])
+def test_d64_swap_ab_declines_unsupported(sq, group, d):
+    with pytest.raises(NotImplementedError, match="swap_ab"):
+        paged._run_graph_fp8(
+            2,
+            2 * group,
+            2,
+            d,
+            16,
+            9,
+            [129, 77],
+            True,
+            s_q=sq,
+            explicit_pack=True,
+            explicit_split=1,
+            explicit_cga=1,
+            explicit_swap_ab=1,
+        )
 
 
 def test_native_fp8_decode_config():

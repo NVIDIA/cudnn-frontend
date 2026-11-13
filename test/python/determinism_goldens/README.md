@@ -34,7 +34,49 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
-### SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
+### SM100 D64 FP8 swap-AB decode — 2026-11-13
+
+The existing `TestNativeFp8Decode` and `TestNativeFp8DecodeDeterminism` entries
+now cover explicit `SWAP_AB=1` D64 decode, in addition to D128's existing
+lowering. `SWAP_AB=0` and an unset knob preserve D64 prefill. The public knob
+record round-trips through integer keys; unsupported geometries decline.
+No existing engine eligibility or heuristic ranking changes.
+
+Qualification on a local SM100 development GPU (NVML name `NVIDIA Graphics
+Device`,148SM), cuDNN9.30.0.4, CuTeDSL4.8/compiler13.4, loaded NVRTC13.4,
+Torch2.14.1+cu130: **77 cases passed** in one invocation, including six strict
+goldens, both FP8 input types, half/FP8 output, independent strided K/V page
+tables, partial/empty sequences, unequal logical widths, window/sink, and
+changed-input retained replay. This is not qualification on a named B200/GB200
+product or SM103. The two existing warnings concern xdist marker availability
+and PyTorch's synchronization-debug feature.
+
+Four existing strict records are compared against the unchanged parent in the
+same runtime and retain their bytes. Only two new D64 records are committed;
+no existing record or tolerance is changed. Each D64 warm-refill case uses
+1776CTAs/148SM, five stage refills,256 warm+256 poisoned launches, with zero
+mismatches. The unsafe-ring negative control fails200/200. D128 controls pass
+unchanged. Fixed-plan O/Stats batch invariance covers insertion, reordering,
+duplication and B513; whole-batch Amax is checked separately.
+
+Before adding explicit knob plumbing, four D64 MTP/window/sink cases each
+passed CUDA13.5.25 memcheck, synccheck and racecheck with zero reported errors.
+The routed kernel bytes are unchanged by that plumbing. Racecheck filters
+`kns=cudnn_kernel_`; CUDAAPI error reporting is disabled. These are not
+unfiltered CUDAAPI or SM103 sanitizer results.
+
+Run the existing CI entries from `test/python`, with recording unset:
+
+```bash
+pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py \
+  -k 'TestNativeFp8Decode or test_native_fp8_decode_architecture_route' -m L0 -q
+```
+
+For a runtime without an existing golden environment, use the standard
+parent-record/strict-compare protocol. Never record the old paths from the
+candidate merely to remove a missing-golden failure.
+
+## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
 
 Review follow-up on `6536a9d4226ced931c8c41886e72c6c2ac9cd5cc`, B200 with

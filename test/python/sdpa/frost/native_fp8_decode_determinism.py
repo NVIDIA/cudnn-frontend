@@ -17,8 +17,17 @@ CASES = [
     (torch.float8_e5m2, torch.bfloat16, 2, 4, 128, 128, 4, True, True, True),
     (torch.float8_e4m3fn, torch.float16, 1, 8, 80, 112, 4, False, False, False),
     (torch.float8_e5m2, torch.float8_e4m3fn, 2, 4, 128, 128, 1, False, True, True),
+    (torch.float8_e4m3fn, torch.float8_e4m3fn, 3, 8, 64, 64, 1, True, True, False),
+    (torch.float8_e5m2, torch.bfloat16, 4, 4, 64, 64, 4, True, True, True),
 ]
-IDS = ["e4-e4-q1-g8-split1", "e5-bf16-q2-g4-split4-log2", "e4-f16-d80-v112-split4-no-amax-stats", "e5-e4-q2-g4-no-amax-log2"]
+IDS = [
+    "e4-e4-q1-g8-split1",
+    "e5-bf16-q2-g4-split4-log2",
+    "e4-f16-d80-v112-split4-no-amax-stats",
+    "e5-e4-q2-g4-no-amax-log2",
+    "e4-e4-d64-q3-g8",
+    "e5-bf16-d64-q4-g4-split4",
+]
 
 
 def _runner(dtype, out_dtype, sq, h, d, dv, split, amax, stats, log2):
@@ -122,6 +131,7 @@ def _runner(dtype, out_dtype, sq, h, d, dv, split, amax, stats, log2):
                 cga=1,
                 split_kv=split,
                 pack_gqa=True,
+                swap_ab=1 if max(d, dv) <= 64 else None,
             )
             api.check_support()
             api.compile()
@@ -210,17 +220,18 @@ def test_golden(dtype, out_dtype, sq, h, d, dv, split, amax, stats, log2):
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group("gpu_exclusive")
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"])
-def test_warm_refill(dtype):
+@pytest.mark.parametrize("d,sq", [(128, 1), (64, 3)], ids=["d128-q1", "d64-q3"])
+def test_warm_refill(dtype, d, sq):
     from warm_stress import StressCase, assert_warm_stress
 
-    run, _, buffers, prepare, outputs = _runner(dtype, torch.bfloat16, 1, 8, 128, 128, 1, True, True, False)
+    run, _, buffers, prepare, outputs = _runner(dtype, torch.bfloat16, sq, 8, d, d, 1, True, True, False)
     reference = snapshot(run([0]))
     b = 4 * torch.cuda.get_device_properties(0).multi_processor_count
     t = buffers([0] * b)
     # The stress checker poisons every output byte and requires actual,
     # contiguous kernel storage. Strided outputs/canaries are checked above.
-    t["o"] = torch.empty((b, 8, 1, 128), device="cuda", dtype=torch.bfloat16)
-    t["lse"] = torch.empty((b, 8, 1), device="cuda")
+    t["o"] = torch.empty((b, 8, sq, d), device="cuda", dtype=torch.bfloat16)
+    t["lse"] = torch.empty((b, 8, sq), device="cuda")
     launch, _ = prepare(t)
     launch()
     expected = {name: value if name == "amax" else value.expand((b,) + value.shape[1:]).contiguous() for name, value in reference.items()}
@@ -228,5 +239,7 @@ def test_warm_refill(dtype):
     # Five visited KV tiles issue five K loads and five V loads, refilling the
     # five-slot ring within one CTA. Four CTA waves exercise the reuse order.
     assert_warm_stress(
-        StressCase("FP8 D128 five-slot decode", launch, outputs(t), thread_blocks=b, refills_per_launch=5, reference=expected), warm=256, poisoned=256
+        StressCase(f"FP8 D{d} Q{sq} five-slot decode", launch, outputs(t), thread_blocks=b * sq, refills_per_launch=5, reference=expected),
+        warm=256,
+        poisoned=256,
     )

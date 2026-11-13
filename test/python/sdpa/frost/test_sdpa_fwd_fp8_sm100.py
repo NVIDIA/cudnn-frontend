@@ -2688,7 +2688,7 @@ class TestMidwidthPhysicalOrigins:
 @pytest.mark.L0
 @pytest.mark.skipif(_SM != 100, reason="native FP8 decode lowering is selected on SM100")
 class TestNativeFp8Decode:
-    """Paged D128 swap-AB through the architecture-selected CI entry."""
+    """Paged D64/D128 swap-AB through the architecture-selected CI entry."""
 
     from sdpa.frost import native_fp8_decode_sm100 as _decode
 
@@ -2696,6 +2696,8 @@ class TestNativeFp8Decode:
     test_features = staticmethod(_decode.test_native_fp8_decode_features)
     test_route_boundaries = staticmethod(_decode.test_native_fp8_decode_route_boundaries)
     test_config = staticmethod(_decode.test_native_fp8_decode_config)
+    test_d64_public_choice = staticmethod(_decode.test_d64_swap_ab_public_choice)
+    test_d64_knob_declines = staticmethod(_decode.test_d64_swap_ab_declines_unsupported)
 
     test_packed_g3_decline = staticmethod(_decode.test_native_fp8_decode_keeps_packed_g3_decline)
     test_optional_outputs = staticmethod(_decode.test_native_fp8_decode_optional_outputs)

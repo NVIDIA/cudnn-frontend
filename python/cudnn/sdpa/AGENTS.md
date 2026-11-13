@@ -13,6 +13,12 @@ of the generic scheduler. The SM100 FP8 D128 decode body puts batch in
 for batch sizes at most 65535. Its architecture-route test checks both sides
 of that boundary without allocating a huge batch.
 
+In swap-AB decode, count token units using live softmax columns, independently
+of the padded MMA width. SM100 FP8 uses sixteen physical columns but only
+eight live columns; counting the padding as tokens skips MTP rows at G8.
+The D64 cases in `TestNativeFp8Decode` check Q3/G8 and Q4/G8 with explicit
+`SWAP_AB=1`, plus unset/zero knob controls retaining the prefill body.
+
 Paged live-page counts are scalar integer arithmetic. Preserve the existing
 `(length + page_size - 1) // page_size` expression in persistent loaders:
 CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations

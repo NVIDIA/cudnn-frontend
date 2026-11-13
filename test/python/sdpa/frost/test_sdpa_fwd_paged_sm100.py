@@ -1534,6 +1534,7 @@ def _run_graph_fp8(
     softmax_precision=None,
     amax=True,
     stats_log2=False,
+    explicit_swap_ab=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1638,7 +1639,7 @@ def _run_graph_fp8(
         )
         assert idx is not None, f"no {target_engine} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None:
+    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None or explicit_swap_ab is not None:
         from dataclasses import replace
 
         selected = g.plans[g._plan_index]
@@ -1649,7 +1650,9 @@ def _run_graph_fp8(
             knobs = replace(knobs, pack_gqa=explicit_pack)
         if explicit_cga is not None:
             knobs = replace(knobs, cga=explicit_cga)
-        g.create_execution_plan(selected.engine_id, knobs)
+        if explicit_swap_ab is not None:
+            knobs = replace(knobs, swap_ab=explicit_swap_ab)
+        g.create_execution_plan(selected.engine_id, knobs.to_public() if explicit_swap_ab is not None else knobs)
         g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
