@@ -92,7 +92,9 @@ BARRIER TABLE (``S`` operand stages = 5 / 4 / 4 / 3 at token tiles 8 / 16 / 32 /
   named 1               128       the four epilogue warps: after a sub-tile's staging stores, after its quantise, before the dealloc
   init                            warp 0, one elected lane, every stage of the four rings; a fence and an all-thread sync follow
 
-Named barriers 1 and 2 are reached from warp-role branches by a subset of the CTA.
+Named barriers 1 and 2 are reached from warp-role branches by a subset of the CTA, so they are the UNALIGNED form
+(``tile_dsl.barrier.named_barrier_sync_unaligned``: ``barrier.sync id, n``); the aligned ``bar.sync`` promises that every thread of
+the CTA executes the same barrier and is used for named barrier 0 only.
 
 SMEM BUFFER TABLE (allocation order; totals 231,424 / 231,424 / 231,424 / 230,400 B = what the launch reserves):
 
@@ -132,7 +134,8 @@ and barrier names; the cuDNN symbol prefix with the form at the head of the symb
 stored; (6) every operand extent is a run-time value, so one compiled form serves every row count its token tile holds, launched on
 an explicit stream; (7) the base class's launch and copy-partition helpers are methods of this class; (8) the stage rule's capacity
 is a constant checked against the DSL, and the traced layout is checked against the config's mirror; (9) DSL names that moved
-between releases are bound through ``cudnn._cutlass_compat``.
+between releases are bound through ``cudnn._cutlass_compat``; (10) the five named barriers of the warp-role branches are the
+unaligned form (the source: the aligned one).
 """
 
 from typing import Optional, Tuple, Type, Union
@@ -153,11 +156,12 @@ from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, get_smem_capacity_in_bytes
 from cudnn.frost.buffers import cutedsl_state
-from cudnn.frost.tile_dsl import pointwise, sf_layout, tma
+from cudnn.frost.tile_dsl import barrier, pointwise, sf_layout, tma
 
 from .swiglu_fp4_decode_config import (
     CTA_SYNC_BARRIER,
     EPILOG_SYNC_BARRIER,
+    EPILOGUE_THREADS,
     EPILOGUE_WARPS,
     FLAT_ALIGN_BYTES,
     K_TILES,
@@ -171,6 +175,7 @@ from .swiglu_fp4_decode_config import (
     TMA_WARP,
     TMEM_ALLOC_COLS,
     TMEM_PTR_SYNC_BARRIER,
+    TMEM_PTR_SYNC_THREADS,
     WEIGHT_TILE_ROWS,
     Cfg,
     epilogue_tile,
@@ -1608,11 +1613,8 @@ class SwigluFp4DecodeKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
-            cute.arch.barrier(
-                barrier_id=self.tmem_ptr_sync_bar_id,
-                number_of_threads=tmem_ptr_read_threads,
-            )
+            # A subset of the CTA reaches this barrier from a warp-role branch: the unaligned form (module docstring).
+            barrier.named_barrier_sync_unaligned(self.tmem_ptr_sync_bar_id, TMEM_PTR_SYNC_THREADS)
 
             #
             # Retrieving tensor memory ptr and make accumulator/SFA/SFB tensor
@@ -1849,11 +1851,8 @@ class SwigluFp4DecodeKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
-            cute.arch.barrier(
-                barrier_id=self.tmem_ptr_sync_bar_id,
-                number_of_threads=tmem_ptr_read_threads,
-            )
+            # A subset of the CTA reaches this barrier from a warp-role branch: the unaligned form (module docstring).
+            barrier.named_barrier_sync_unaligned(self.tmem_ptr_sync_bar_id, TMEM_PTR_SYNC_THREADS)
 
             #
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -2046,11 +2045,7 @@ class SwigluFp4DecodeKernel:
                         "async.shared",
                         space="cta",
                     )
-                    epilog_threads = 32 * len(self.epilog_warp_id)
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=epilog_threads,
-                    )
+                    barrier.named_barrier_sync_unaligned(self.epilog_sync_bar_id, EPILOGUE_THREADS)
 
                     #
                     # TMA store C to global memory
@@ -2081,10 +2076,7 @@ class SwigluFp4DecodeKernel:
                             mC_mnl.shape[0] // 2,
                             self.epi_tile_n,
                         )
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=epilog_threads,
-                    )
+                    barrier.named_barrier_sync_unaligned(self.epilog_sync_bar_id, EPILOGUE_THREADS)
 
                 #
                 # Async arrive accumulator buffer empty
@@ -2105,8 +2097,7 @@ class SwigluFp4DecodeKernel:
             #
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
-            epilog_threads = 32 * len(self.epilog_warp_id)
-            cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads)
+            barrier.named_barrier_sync_unaligned(self.epilog_sync_bar_id, EPILOGUE_THREADS)
             if warp_idx == self.epilog_warp_id[0]:
                 if use_2cta_instrs:
                     cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
