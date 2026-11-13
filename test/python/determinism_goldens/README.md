@@ -1595,9 +1595,10 @@ set is owed with a stated reason when the sum tree, the rounding chain or the sc
 GPU coverage: cc 10.0 (replay, batch invariance and goldens).  cc 10.3 and cc 10.7 have not been run on a device: the entry admits
 compute capability 10.x and the status page reads "SM103: Unverified" and, for SM107, "Unverified"; a run there skips the six golden
 cases (no set for its runtime) -- a coverage gap, not a pass.  cc 9.0 and cc 12.x are declined by type.  Every run below is one
-in-process pytest run per command (`CUDNN_TEST_NO_ISOLATION=1`), one visible device, from `test/python`; `<suite>` =
-`norm/frost/test_add_norm_quant_decode_determinism.py`, `<module>` = `norm/frost/test_add_norm_quant_decode.py`.  The device is a shared
-development part: these are correctness runs, and no timing was taken.
+pytest run per command on one visible device, from `test/python`; `<suite>` = `norm/frost/test_add_norm_quant_decode_determinism.py`,
+`<module>` = `norm/frost/test_add_norm_quant_decode.py`.  A command on `<suite>` alone is an in-process run
+(`CUDNN_TEST_NO_ISOLATION=1`); a command that names `<module>` runs under the suite's default per-test isolation.  The device is a
+shared development part: these are correctness runs, and no timing was taken.
 
 cc 10.0 record (2026-11-13 UTC): a cc 10.0 part with 148 SMs (the device reports the name `NVIDIA Graphics Device`; x86 host, Python
 3.10) with torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi
@@ -1611,20 +1612,27 @@ residual's hash equals that of the host's `bf16(x + residual)` in the four add c
 cases share their operands and their updated residual; the store and no-residual cases share `x` and differ in their codes (scales 0.02
 and 1.0).
 
-Strict check and the functional module, from a clean tree one commit behind the branch's last commit that changes a test (that one
-commit changes documentation text only; 2026-11-13 UTC, the runtime above; the six golden files are unchanged since they were recorded).
+Strict check and the functional module, from a clean tree with the package, test and golden files of the branch's last commit that
+changes any of them (2026-11-13 UTC, the runtime above; the six golden files are unchanged since they were recorded).
 `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 61 passed, 0 skipped: `test_replay` 24,
 `test_replay_on_a_fresh_entry_and_fresh_operands` 6, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 6,
 `test_insertion_removal_and_reordering` 6, `test_duplicated_row_and_neighbour_isolation` 6, `test_inputs_are_unmodified` 1,
 `test_crosses_a_scheduling_wave` 2, `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 6.  `pytest <module>
-core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` (under the suite's default per-test isolation) -> 178 passed, 1 skipped: the
-module 174 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 179 passed, 1 skipped: the
+module 175 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
 are required" -- one device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the
 symbol-prefix test 4 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 12 of
 12 cells (one kernel per call; grid `(rows, 1, 1)`, block `(640, 1, 1)`, 80 B of shared memory).  The module's case behind a
 predecessor that released early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 16 of 16 launches of the
 step equal to the plain step, behind its positive control: a dependent without a wait read other bytes than the written ones in 4 of 4
 eager launches and 4 of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.
+The module's overflow case (`test_rows_whose_sum_of_squares_overflows_normalize_to_zeros`: a finite row whose sum of squares exceeds
+the largest fp32 value writes signed zeros, the signed zero's codes and zero block scales, and its neighbours keep their bytes) is one
+of the 175.
+
+The records of the next three paragraphs (the CUDA 12.9 flavour, CuTe DSL 4.8.1, the cold compile) are from an earlier tree: the
+functional module had one case fewer there (the overflow case did not exist), it did not reset its captured CUDA graphs, and the
+package differed from this tree's in docstrings and in the text of two decline messages only.
 
 CUDA 12.9 compiler flavour on the same part and runtime (2026-11-13 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
 libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL
@@ -1634,7 +1642,7 @@ for those cases; the functional command -> 177 passed, 2 skipped (`test_renderin
 rejects the target, and the case skips with the entry's own decline; the two-device case).
 
 CuTe DSL 4.8.1 on the same part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime; the same tree as the
-4.8.0 rows above).  Compiling with CUDA 13.4: the functional command -> 178
+CUDA 12.9 runs above).  Compiling with CUDA 13.4: the functional command -> 178
 passed, 1 skipped (the two-device case); the determinism command WITHOUT the goldens variable -> 55 passed, 6 skipped (the six
 `test_golden` cases: the DSL version is part of the runtime key and no set is committed for that key, so the golden comparison is a
 coverage gap there, not a pass).  With only the CUDA 12 toolchain libraries of 4.8.1 (`CUDA_VERSION` 12.9): 177 passed, 2 skipped (the
