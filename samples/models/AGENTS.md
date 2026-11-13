@@ -116,8 +116,8 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     Frontend entries with byte-equal results, declared stand-ins -- never as one. A section is `claimed` only on a
     `recorded` basis and only when no row selected on it is a fallback; until then a run prints `NOT CLAIMED` with every
     reason that applies, and a section of one GPU class, SM count or row count is never used for another. A pull request
-    that changes a form the kernel census names updates the census in the same commit. Public text of this area says
-    "the target kernel set"; it names no serving engine's integration.
+    that changes a form the kernel census names updates the census in the same commit. Public text of this area calls
+    it "the target kernel set" and names no product, repository or person for it.
 
 ## What the first GPU run of this area taught
 

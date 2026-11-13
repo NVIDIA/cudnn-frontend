@@ -546,7 +546,7 @@ BASES = ("recorded", "planned")
 #: the parts of a step in a census section besides its layers: before them, after them, after the step
 PARTS = ("prologue", "epilogue", "after_step")
 #: the packages the providers of this area import, as a run names them: of the versions a census records, these are
-#: compared with what is installed.  A slice that brings a provider of another package adds the package here
+#: compared with what is installed.  A change that brings a provider of another package adds the package here
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
 
 

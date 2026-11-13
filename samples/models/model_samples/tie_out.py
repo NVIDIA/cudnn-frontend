@@ -302,6 +302,10 @@ class BlockTap:
         ``ref_state`` what each left in the state the call updates, ``twin`` the block ``ref`` came from (a band reads from
         it what it needs beyond the outputs).  The band of the row decides per output."""
         if stats.band == "gate_fp8":  # output 0: the 8-bit codes, against the twin's bracket of the gated value
+            if getattr(twin, "bracket", None) is None:  # a table that names this band for a block whose twin is another chain
+                raise ValueError(
+                    "the band gate_fp8 is judged against the gate at the kernel's rounding points: the block's twin keeps no bracket of the gated value"
+                )
             codes, nearest = out[0], ref[0]
             other, margin = twin.bracket
             same = codes == nearest

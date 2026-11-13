@@ -62,7 +62,7 @@ FE_ENTRIES = "by provider: cuDNN FE 2 | fallbacks 7 (cuBLAS over copies 4, PyTor
 def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
     """Run the sample's ``main()`` and hold its output.  ``unobserved`` accepts, beside ``[00] PASS``, the verdict of a run
     whose kernel check could not look (``RAN <stack> stack (kernels not observed: ...)``, exit code 0): the line is recorded
-    as it is, so a lane without the profiler's records shows as such in the job log."""
+    as it is, so a CI job without the profiler's records shows as such in its log."""
     start = time.perf_counter()
     code = sample.main(arguments)
     seconds = time.perf_counter() - start

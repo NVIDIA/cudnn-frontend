@@ -2068,6 +2068,9 @@ def test_the_gates_twin_and_its_band_on_stated_tensors():
     with pytest.raises(ValueError, match="the gate's twin quantises to static 8-bit codes"):
         torch_ref.GateQuantizeQuotient(row, model, DeviceFacts((0, 0), "cpu"), {})(attn, gate, Quant("nvfp4", 1.0))
     assert "gate_fp8" in tie_out.BANDS and "2.5 fp32 units" in tie_out.BANDS["gate_fp8"]
+    chain = torch_ref.GateQuantize(row, model, DeviceFacts((0, 0), "cpu"), {})  # the reference chain: it rounds elsewhere and keeps no bracket
+    with pytest.raises(ValueError, match="the band gate_fp8 is judged against the gate at the kernel's rounding points"):
+        tie_out.BlockTap._judge(tie_out.BlockStats("gate_fp8"), (codes,), tie_out._tensors(chain(attn, gate, quant)), [], [], 0, chain)
 
 
 def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tmp_path):
