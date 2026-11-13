@@ -982,6 +982,69 @@ def test_caller_buffers_past_the_call_stay_untouched(geometry, rows):
             assert torch.equal(poisoned[name], v), f"the input {name} was modified"
 
 
+@pytest.mark.parametrize("rows", (3, 40))
+@pytest.mark.parametrize("geometry", GEOMETRIES, ids=gid)
+def test_accepted_operand_forms_write_the_same_bytes(geometry, rows):
+    """Every operand form the entry documents as served writes the bytes of the plain form (``uint8`` scale buffers of exactly one
+    band, ``[1]`` scalars, whole tensors): the three scale operands as ``torch.float8_e4m3fn`` tensors of another shape; 0-d
+    scalars; scale storage longer than one band (the bytes behind the first band are neither read nor written); and operands that
+    are aligned views INTO larger storage -- the activation and the outputs starting at a non-zero offset of their buffers, whose
+    bytes in front of and behind the view keep their sentinel."""
+    dev = U.device_or_skip()
+    k = _entry(dev, geometry)
+    ops, _ = _ops(dev, geometry, rows, "random", seed=17)
+    want_out, want_scale = U.run(k, ops)
+    h, i = geometry.HIDDEN, geometry.INTERMEDIATE
+    band_in, band_out = 128 * h // 16, 128 * i // 16
+    E4M3 = torch.float8_e4m3fn
+
+    def call(o, out, out_scale):
+        k(o["weight"], o["weight_scale"], o["activation"], o["activation_scale"], o["alpha"], o["out_global_scale"], out, out_scale)
+        torch.cuda.synchronize()
+
+    # (1) E4M3-typed scale tensors of another shape, 0-d scalars
+    typed = dict(
+        ops,
+        weight_scale=ops["weight_scale"].view(E4M3).reshape(2 * i, h // 16),
+        activation_scale=ops["activation_scale"].view(E4M3).reshape(128, h // 16),
+        alpha=ops["alpha"].reshape(()),
+        out_global_scale=ops["out_global_scale"].reshape(()),
+    )
+    out, out_scale = U.new_outputs(geometry, rows, dev)
+    call(typed, out, out_scale.view(E4M3).reshape(-1, i // 16))
+    U.assert_same_bytes(out, want_out, "E4M3-typed scales and 0-d scalars: codes")
+    U.assert_same_bytes(out_scale, want_scale, "E4M3-typed scales and 0-d scalars: the scale band")
+
+    # (2) scale storage longer than one band: three bands in, two bands out
+    gen = torch.Generator(device="cpu").manual_seed(23)
+    long_in = torch.randint(0, 256, (3 * band_in,), dtype=torch.uint8, generator=gen).to(dev)
+    long_in[:band_in] = ops["activation_scale"]
+    long_out = torch.full((2 * band_out,), 0xA5, dtype=torch.uint8, device=dev)
+    out = torch.full_like(want_out, 0xA5)
+    call(dict(ops, activation_scale=long_in), out, long_out)
+    U.assert_same_bytes(out, want_out, "longer scale storage: codes")
+    U.assert_same_bytes(long_out[:band_out], want_scale, "longer scale storage: the first band")
+    assert int((long_out[band_out:] != 0xA5).sum()) == 0, "a scale byte behind the first band was written"
+
+    # (3) aligned views into larger storage, at a non-zero offset
+    act_store = torch.randint(0, 256, (rows + 4, h // 2), dtype=torch.uint8, generator=gen).to(dev)
+    act_store[2 : 2 + rows] = ops["activation"]
+    out_store = torch.full((rows + 2, i // 2), 0x3C, dtype=torch.uint8, device=dev)
+    scale_store = torch.full((3 * band_out,), 0x3C, dtype=torch.uint8, device=dev)
+    out_view, scale_view = out_store[1 : 1 + rows], scale_store[band_out : 2 * band_out]
+    assert out_view.data_ptr() != out_store.data_ptr() and scale_view.data_ptr() != scale_store.data_ptr()
+    call(dict(ops, activation=act_store[2 : 2 + rows]), out_view, scale_view)
+    U.assert_same_bytes(out_view, want_out, "views into larger storage: codes")
+    live = U.live_mask(rows, geometry, dev)
+    U.assert_same_bytes(scale_view[live], want_scale[live], "views into larger storage: live scale bytes")
+    assert (
+        int((scale_view[~live] != 0x3C).sum()) == 0
+        and int((scale_store[:band_out] != 0x3C).sum()) == 0
+        and int((scale_store[2 * band_out :] != 0x3C).sum()) == 0
+    )
+    assert int((out_store[0] != 0x3C).sum()) == 0 and int((out_store[rows + 1] != 0x3C).sum()) == 0, "a byte around the output view was written"
+
+
 ARMS = [
     dict(cfg=Cfg(TOKEN_TILE=16)),
     dict(cfg=Cfg(TOKEN_TILE=32)),
