@@ -1802,10 +1802,10 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
     bare = [record._replace(grid=None, block=None, shared_memory=None) for record in _step()]
     unseen = census.Traced.of([replace(site, facts=None) if site.facts else site for site in sites], [], bare, 1, "", rows=1, claim=claim)
     assert unseen.judge() == (census.NOT_OBSERVED, []) and unseen.details()[-1].endswith("; the launch shapes of its target launches were not observed")
-    # a call that is not the target's (another form, a fallback row) is held to no recorded shape
-    claim.identities[2] = Identity(
-        census.OTHER, "gdn_decode_fused", "code", "the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True]"
-    )
+    # a call that is not the target's (another form, a fallback row) is held to no recorded shape -- whatever its identity carries
+    reason = "the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True]"
+    claim.identities[2] = Identity(census.OTHER, "gdn_decode_fused", "code", reason, SHAPE)
+    assert claim.recorded == {0: GATHER_SHAPE}, "only a call whose identity is target (or stand-in) is held to the census"
     assert census.Traced.of(moved, [], _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge() == (census.PASS, [])
 
 
@@ -2064,6 +2064,24 @@ def test_the_gates_twin_and_its_band_on_stated_tensors():
     wrong[0, 0] = 0x7F
     stats, _ = judged(wrong)
     assert not stats.ok and not stats.finite and "NON-FINITE VALUES" in stats.line()
+    # ... and a NaN operand, which the kernel and the twin both turn into the NaN byte: equal bytes, and not a pass
+    nan_attn = attn.clone()
+    nan_attn[1, 5] = float("nan")
+    twin = torch_ref.GateQuantizeQuotient(row, model, DeviceFacts((0, 0), "cpu"), {})
+    stats = tie_out.BlockStats("gate_fp8")
+    tie_out.BlockTap._judge(stats, (kernel_chain(nan_attn, gate),), tie_out._tensors(twin(nan_attn, gate, quant)), [], [], 0, twin)
+    assert not stats.ok and not stats.finite and stats.outside == 0 and stats.off_nearest == 0, "only the finite rule sees it"
+    # the nearest bf16 value is decided against the midpoint, never by a cast that rounds twice: over two million seeded pairs
+    # a few quotients round to the midpoint itself in fp32, where nearest-even then picks the farther of the two values
+    many = torch.Generator().manual_seed(11)
+    a = torch.randn((1 << 21,), generator=many).to(torch.bfloat16)
+    g = (3 * torch.randn((1 << 21,), generator=many)).to(torch.bfloat16)
+    nearest, other, margin = torch_ref.gate_quotient_bracket(a, g, torch.float64)
+    quotient = a.double() / (1.0 + torch.exp(-g.double()))
+    twice = quotient.float().to(torch.bfloat16)
+    assert int((nearest != twice).sum()) > 0, "the pairs hold a quotient whose two-step rounding leaves the nearest bf16 value"
+    assert bool(((quotient - nearest.double()).abs() <= (quotient - other.double()).abs()).all()), "the nearest value is never the farther one"
+    assert float(margin[nearest != twice].max()) < tie_out.GATE_MARGIN_ULP32, "and such a quotient sits inside the band's margin"
     # (4) state a call updates is compared byte for byte by a band that has no rule for it
     stats = tie_out.BlockStats("bf16_rounding")
     out = torch.ones((1, 8), dtype=torch.bfloat16)
