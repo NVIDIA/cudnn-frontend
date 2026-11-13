@@ -15,7 +15,11 @@ from cudnn.gemm.frost.projection_decode.kernel import fp8_projection_decode_conf
 
 G_IN = kcfg.Geometry(4608, 8192)
 G_OUT = kcfg.Geometry(8192, 2048)
-CLASSES = list(kcfg.SERVED_CLASSES)  # (G_IN, 4), (G_IN, 2), (G_OUT, 2)
+G_5K = kcfg.Geometry(5120, 6144)
+G_16K = kcfg.Geometry(16384, 5120)
+G_14K = kcfg.Geometry(14336, 5120)
+# in served order: (G_IN, 4), (G_IN, 2), (G_OUT, 2) -- the one-wave classes -- then (G_5K, 4), (G_5K, 2), (G_16K, 1), (G_14K, 1), run as written
+CLASSES = list(kcfg.SERVED_CLASSES)
 SM100_READING = dict(sm_count=kcfg.SM100_SM_COUNT, smem_per_sm=kcfg.SM100_SMEM_PER_SM_BYTES, smem_optin=kcfg.SM100_SMEM_OPTIN_BYTES)  # 152 / 233,472 / 232,448
 E4M3 = torch.float8_e4m3fn
 NAN_CODE = 0x7F  # the positive E4M3 NaN; 0xFF is the negative one

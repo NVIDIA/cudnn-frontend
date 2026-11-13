@@ -3,12 +3,16 @@
 
 """The FP8 split-K projection for decode rows (``cudnn.Fp8ProjectionDecode``).  Host: the config's ledgers and derived constants (the
 shared-memory mirror, the barrier counts, the tensor-memory ledger), the measured pick and its structural separation from the numerics,
-the typed declines of the host entry (CPU tensors), the DSL gate, the plan-time compile key and the lazy exports.  On a cc 10.x device:
+the pick of the classes run as written (their table rows on every part, the late tensor-memory release, the wave counts as numbers),
+the splits each geometry is served at, the text a rendering carries in its kernel symbol, the typed declines of the host entry (CPU
+tensors), the DSL gate, the plan-time compile key and the lazy exports.  On a cc 10.x device:
 the entry against an fp64 reference of the E4M3 operands under a per-element bound, exact-integer cells byte for byte against the host,
 the edge rows (zeros, NaN, overflow), the output rows it must not touch, every performance arm bitwise with the default, a row alone
 against the same row in a batch, CUDA-graph replay, the warm call (a cache hit that reads nothing to the host and allocates nothing),
-the launch matrix in a child process with a stage-aware deadline, and a warm stress with byte references.  A child interpreter runs the
-source overlay of this process and reports the files it loaded; the parent compares them with its own.
+the launch matrix in child processes with a stage-aware deadline (one per group of classes; both tensor-memory release orders of the
+classes run as written), a warm stress with byte references, and the warm stress behind this GPU's positive control for the classes
+run as written.  A child interpreter runs the source overlay of this process and reports the files it loaded; the parent compares
+them with its own.
 The operand builders, the reference and the device gate live in ``fp8_projection_decode_utils.py`` beside this module; replay, batch
 invariance per row count, the pick's byte neutrality and the goldens live in ``test_fp8_projection_decode_determinism.py``."""
 
@@ -32,6 +36,9 @@ cudnn = pytest.importorskip("cudnn")
 from fp8_projection_decode_utils import (  # noqa: E402  (the operand builders, the reference and the device gate)
     CLASSES,
     E4M3,
+    G_5K,
+    G_14K,
+    G_16K,
     G_IN,
     G_OUT,
     MAX_CODE,
@@ -57,7 +64,9 @@ from launch_records import assert_facts_equal_the_launch  # noqa: E402
 pytestmark = [pytest.mark.L0, pytest.mark.no_workspace_shim]
 
 Form, Numerics, Geometry = kcfg.Form, kcfg.Numerics, kcfg.Geometry
-C_IN4, C_IN2, C_OUT2 = CLASSES
+C_IN4, C_IN2, C_OUT2 = CLASSES[:3]  # the one-wave classes (a measured pick each)
+C_5K4, C_5K2, C_16K1, C_14K1 = CLASSES[3:]  # the classes run as written
+AS_WRITTEN = CLASSES[3:]
 REPO = Path(__file__).resolve().parents[5]  # <repo>/test/python/gemm/frost/projection_decode/<this file>
 
 
@@ -77,6 +86,8 @@ def test_split_k_for_is_a_function_of_the_geometry_alone():
     assert kcfg.split_k_for(G_IN) == 4 and kcfg.split_k_for(G_OUT) == 2
     assert list(inspect.signature(kcfg.split_k_for).parameters) == ["geometry"], "the default split may read nothing but the geometry"
     assert kcfg.split_k_for(Geometry(64, 128)) == 1  # one K tile: no slice of eight
+    # the default follows the K tiles alone, so it is not a served class at every geometry: an explicit split_k builds those entries
+    assert [kcfg.split_k_for(g) for g in (G_5K, G_16K, G_14K)] == [4, 4, 4]
 
 
 # (class, first row, last row) -> (MMA_M, STAGES, token tile, TMEM_COLS, footprint B, CTAs, CTAs per SM); measured on compute capability 10.3
@@ -115,11 +126,77 @@ def test_pick_is_the_measured_table_at_one_wave():
 def test_pick_model_keeps_one_wave_on_other_sm_counts(sm_count):
     """The co-residency MODEL (slots = SMs x CTAs per SM) on the other SM100-class SM counts: the same forms, still one wave.  A slot count,
     not a placement: where a cluster of slices may sit on a part is not modelled here."""
-    for numerics in CLASSES:
+    for numerics in (c for c in CLASSES if c in kcfg.ONE_WAVE_CLASSES):
         for rows in range(1, 33):
             form = kcfg.pick(numerics, rows, sm_count, SM100_READING["smem_per_sm"], SM100_READING["smem_optin"])
             cfg = kcfg.resolve_form(numerics, rows, form, kcfg.part_readings(SM100_READING["smem_per_sm"], SM100_READING["smem_optin"], sm_count))
             assert cfg.WAVES == 1 and form == kcfg.pick(numerics, rows, **SM100_READING), (cid(numerics), rows)
+
+
+# (class, first row, last row) -> (MMA_M, STAGES, token tile, TMEM_COLS, footprint B, CTAs, CTAs per SM, waves on 148 / 152 / 212 SMs).
+# The rows of the classes run as written: not measured with this entry; the wave counts are the slot-count model of the config.
+AS_WRITTEN_TABLE = {
+    (C_5K4, 1, 8): (64, 7, 8, 32, 71040, 320, 3, (1, 1, 1)),
+    (C_5K4, 9, 16): (64, 7, 16, 32, 84352, 320, 2, (2, 2, 1)),
+    (C_5K4, 17, 32): (64, 7, 32, 32, 110976, 320, 2, (2, 2, 1)),
+    (C_5K2, 1, 8): (64, 11, 8, 32, 103808, 160, 2, (1, 1, 1)),
+    (C_5K2, 9, 16): (64, 11, 16, 32, 117120, 160, 1, (2, 2, 1)),
+    (C_5K2, 17, 32): (64, 11, 32, 32, 143744, 160, 1, (2, 2, 1)),
+    (C_16K1, 1, 8): (128, 8, 8, 32, 139520, 128, 1, (1, 1, 1)),
+    (C_16K1, 9, 16): (128, 8, 16, 32, 147712, 128, 1, (1, 1, 1)),
+    (C_16K1, 17, 32): (128, 8, 32, 32, 164096, 128, 1, (1, 1, 1)),
+    (C_14K1, 1, 8): (128, 8, 8, 32, 139520, 112, 1, (1, 1, 1)),
+    (C_14K1, 9, 16): (128, 8, 16, 32, 147712, 112, 1, (1, 1, 1)),
+    (C_14K1, 17, 32): (128, 8, 32, 32, 164096, 112, 1, (1, 1, 1)),
+}
+
+
+def test_pick_of_the_classes_run_as_written_is_the_table_row_on_every_part():
+    """Every class outside ``ONE_WAVE_CLASSES`` x rows 1 .. 32: the pick is the table row on 64, 148, 152 and 212 SMs alike (the form
+    does not follow the SM count), with 32 tensor-memory columns and the late tensor-memory release; its footprint, grid, co-residency
+    and the number of waves the slot-count model gives on three SM counts are pinned as numbers -- two waves where the model says two."""
+    assert kcfg.ONE_WAVE_CLASSES == {C_IN4, C_IN2, C_OUT2} and kcfg.HOLD_TMEM_CLASSES == set(AS_WRITTEN)
+    assert kcfg.ONE_WAVE_CLASSES | kcfg.HOLD_TMEM_CLASSES == set(kcfg.SERVED_CLASSES) and set(kcfg.PICKS) == set(kcfg.SERVED_CLASSES)
+    per_sm, optin = SM100_READING["smem_per_sm"], SM100_READING["smem_optin"]
+    seen = 0
+    for (numerics, lo, hi), want in AS_WRITTEN_TABLE.items():
+        for rows in range(lo, hi + 1):
+            forms = {sm_count: kcfg.pick(numerics, rows, sm_count, per_sm, optin) for sm_count in (64, 148, 152, 212)}
+            assert len(set(forms.values())) == 1, (cid(numerics), rows, forms)
+            form = forms[152]
+            assert form == Form(MMA_M=want[0], STAGES=want[1], TMEM_COLS=want[3], HOLD_TMEM=True), (cid(numerics), rows, form)
+            waves = []
+            for sm_count in (148, 152, 212):
+                cfg = kcfg.resolve_form(numerics, rows, form, kcfg.part_readings(per_sm, optin, sm_count))
+                kcfg.validate_cfg(cfg)
+                waves.append(cfg.WAVES)
+            got = (cfg.MMA_M, cfg.STAGES, cfg.TOKEN_TILE, cfg.TMEM_COLS, cfg.SMEM_BYTES, cfg.CTAS, cfg.SMEM_RESIDENT, tuple(waves))
+            assert got == want, (cid(numerics), rows, got)
+            assert cfg.RUNNING == cfg.SMEM_RESIDENT and cfg.SMEM_RESIDENT * cfg.TMEM_COLS <= 512 and cfg.STAGES < cfg.K_TILES_PER_SLICE
+            seen += 1
+    assert seen == len(AS_WRITTEN) * 32
+    # the one-wave classes keep the early release in their pick: the same Form as before the other classes were served
+    assert all(not kcfg.pick(numerics, rows, **SM100_READING).HOLD_TMEM for numerics in kcfg.ONE_WAVE_CLASSES for rows in range(1, 33))
+
+
+def test_pick_of_a_class_run_as_written_is_lowered_only_to_fit_the_part():
+    """A modelled part with 100 KB per SM and a 99 KB per-CTA opt-in: a row that fits is returned as written although its grid takes
+    more than one wave; a row that does not fit is lowered until the footprint fits, never further; a part whose opt-in cannot hold
+    one stage is the typed decline of a part."""
+    small = dict(sm_count=152, smem_per_sm=100 * 1024, smem_optin=99 * 1024)
+    part = kcfg.part_readings(small["smem_per_sm"], small["smem_optin"], small["sm_count"])
+    form = kcfg.pick(C_5K4, 1, **small)  # 71,040 B fits: seven stages, one CTA per SM here, three waves
+    cfg = kcfg.resolve_form(C_5K4, 1, form, part)
+    assert (form.STAGES, cfg.SMEM_RESIDENT, cfg.WAVES) == (7, 1, 3) and form.HOLD_TMEM
+    for numerics, rows in ((C_5K4, 32), (C_5K2, 1), (C_16K1, 1), (C_14K1, 32)):
+        form = kcfg.pick(numerics, rows, **small)
+        cfg = kcfg.resolve_form(numerics, rows, form, part)
+        deeper = kcfg.resolve_form(numerics, rows, replace(form, STAGES=form.STAGES + 1), part)
+        assert form.STAGES < kcfg.pick(numerics, rows, **SM100_READING).STAGES and form.HOLD_TMEM, (cid(numerics), rows)
+        assert cfg.SMEM_BYTES <= small["smem_optin"] < deeper.SMEM_BYTES, (cid(numerics), rows, cfg.SMEM_BYTES, deeper.SMEM_BYTES)
+        kcfg.validate_cfg(cfg)
+    with pytest.raises(NotImplementedError, match="opt-in"):
+        kcfg.pick(C_16K1, 1, sm_count=152, smem_per_sm=16 * 1024, smem_optin=15 * 1024)
 
 
 def test_pick_lowers_the_stages_on_a_part_that_cannot_hold_them():
@@ -235,6 +312,48 @@ def test_tensor_memory_ledger_declines_a_parked_form_by_name():
     kcfg.validate_cfg(kcfg.resolve_form(C_OUT2, 1, Form(MMA_M=64, STAGES=2), part))
 
 
+def test_given_forms_of_the_classes_run_as_written_meet_their_bounds_by_name():
+    """The bounds a given ``form`` meets at the four classes run as written, on the reference readings.  The ring holds at most the K
+    tiles of ONE slice -- 12 at ``(5120, 6144)`` split 4, 24 at split 2, 40 at the two split-1 classes -- and one stage more is a
+    ``ValueError`` naming both counts.  The tensor-memory ledger at split 1, where no reduction mailbox pads a small CTA: a one-stage
+    ring of the 64-row weight tile would sit 22 to an SM and is declined, the same ring of the 128-row tile (12 to an SM) and two
+    stages are served.  256 tensor-memory columns fit where the table row places at most two CTAs on an SM (the split-1 classes and
+    ``(5120, 6144)`` split 2) and are declined where it places three (``(5120, 6144)`` split 4 up to 8 rows).  And a given form is
+    taken as given: it releases the tensor memory early unless it says ``HOLD_TMEM``, with which it is the pick's own rendering."""
+    part = kcfg.part_readings(SM100_READING["smem_per_sm"], SM100_READING["smem_optin"], SM100_READING["sm_count"])
+    for numerics, slice_tiles in zip(AS_WRITTEN, (12, 24, 40, 40)):
+        assert numerics.GEOM.K_TILES // numerics.SPLIT_K == slice_tiles
+        geometry, split = numerics.GEOM, numerics.SPLIT_K
+        with pytest.raises(
+            ValueError, match=rf"{slice_tiles + 1} stages exceed the {slice_tiles} K tiles of one slice of K {geometry.IN_FEATURES} at split_k {split}"
+        ):
+            entry.Fp8ProjectionDecode("cpu", geometry, split_k=split, form=Form(STAGES=slice_tiles + 1))
+        mma_m, stages = kcfg.PICKS[numerics][0][2:]
+        pick = entry.Fp8ProjectionDecode("cpu", geometry, split_k=split)
+        given = entry.Fp8ProjectionDecode("cpu", geometry, split_k=split, form=Form(MMA_M=mma_m, STAGES=stages))
+        held = entry.Fp8ProjectionDecode("cpu", geometry, split_k=split, form=Form(MMA_M=mma_m, STAGES=stages, HOLD_TMEM=True))
+        for rows in range(1, kcfg.MAX_ROWS + 1):
+            assert pick.cfg_for(rows).HOLD_TMEM and not given.cfg_for(rows).HOLD_TMEM, (cid(numerics), rows)
+            assert held.key(rows) == pick.key(rows) != given.key(rows), (cid(numerics), rows)
+    for numerics in (C_16K1, C_14K1):
+        tiny = kcfg.resolve_form(numerics, 1, Form(MMA_M=64, STAGES=1), part)
+        assert (tiny.SMEM_BYTES, tiny.SMEM_RESIDENT, tiny.MAILBOX_ELEMENTS) == (9344, 22, 0)
+        with pytest.raises(ValueError, match=r"22 CTAs of 9344 B .*704 > 512"):
+            kcfg.validate_cfg(tiny)
+        with pytest.raises(ValueError, match="the form cannot be served at 1 rows"):
+            entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=1, form=Form(MMA_M=64, STAGES=1))
+        for form, resident in ((Form(MMA_M=128, STAGES=1), 12), (Form(MMA_M=64, STAGES=2), 11), (Form(MMA_M=128, STAGES=2), 6)):
+            cfg = kcfg.resolve_form(numerics, 1, form, part)
+            kcfg.validate_cfg(cfg)
+            assert cfg.SMEM_RESIDENT == resident, (cid(numerics), form)
+    for numerics, resident in ((C_5K2, (2, 1, 1)), (C_16K1, (1, 1, 1)), (C_14K1, (1, 1, 1))):
+        mma_m, stages = kcfg.PICKS[numerics][0][2:]
+        wide = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, form=Form(MMA_M=mma_m, STAGES=stages, TMEM_COLS=256))
+        assert tuple(wide.cfg_for(rows).SMEM_RESIDENT for rows in (1, 9, 17)) == resident and {c.TMEM_COLS for c in wide.cfgs.values()} == {256}
+    with pytest.raises(ValueError, match=r"cannot be served at 1 rows .*3 CTAs of 71040 B .*768 > 512"):
+        entry.Fp8ProjectionDecode("cpu", G_5K, form=Form(MMA_M=64, STAGES=7, TMEM_COLS=256))
+
+
 def _cfg(**kw):
     base = kcfg.Cfg(GEOM=G_IN, SPLIT_K=4, ROWS=1)
     return replace(base, **kw)
@@ -286,10 +405,41 @@ def test_served_classes_decline_every_other_pair_by_name():
             kcfg.check_numerics(geometry, split)
     with pytest.raises(ValueError, match="split_k must be one of"):
         kcfg.check_numerics(G_IN, 3)
-    with pytest.raises(NotImplementedError, match="out features 5120, in features 6144"):
-        kcfg.check_numerics(Geometry(5120, 6144))
+    with pytest.raises(NotImplementedError, match="out features 5120, in features 4096"):
+        kcfg.check_numerics(Geometry(5120, 4096))
     with pytest.raises(TypeError, match="Geometry"):
         kcfg.check_numerics((4608, 8192))
+
+
+def test_classes_run_as_written_are_served_at_their_splits_and_declined_at_every_other():
+    """``(5120, 6144)`` at split 4 (the geometry's default) and at split 2; ``(16384, 5120)`` and ``(14336, 5120)`` at split 1 only,
+    which is NOT their default: such an entry is built with an explicit ``split_k``, and the decline of the default says so.  Every
+    decline of a served geometry names the splits that geometry is served at."""
+    assert kcfg.check_numerics(G_5K) == C_5K4 and kcfg.check_numerics(G_5K, 2) == C_5K2
+    assert kcfg.check_numerics(G_16K, 1) == C_16K1 and kcfg.check_numerics(G_14K, 1) == C_14K1
+    assert [c.SPLIT_K for c in AS_WRITTEN] == [4, 2, 1, 1] and len(set(kcfg.SERVED_CLASSES)) == len(kcfg.SERVED_CLASSES) == 7
+    for geometry in (G_16K, G_14K):
+        with pytest.raises(
+            NotImplementedError, match=rf"serves split_k 1 at {geometry.describe()} \(validated\); got split_k 4 -- the default of the geometry; pass split_k"
+        ):
+            kcfg.check_numerics(geometry)
+        with pytest.raises(NotImplementedError, match=r"got split_k 4 -- the default of the geometry; pass split_k"):
+            entry.Fp8ProjectionDecode("cpu", geometry)
+        for split in (2, 4):
+            with pytest.raises(NotImplementedError, match=rf"serves split_k 1 at {geometry.describe()} \(validated\); got split_k {split}$"):
+                kcfg.check_numerics(geometry, split)
+    with pytest.raises(NotImplementedError, match=r"serves split_k 4 or 2 at out features 5120, in features 6144 \(validated\); got split_k 1$"):
+        kcfg.check_numerics(G_5K, 1)
+    with pytest.raises(NotImplementedError, match=r"serves split_k 4 or 2 at out features 4608, in features 8192 \(validated\); got split_k 1$"):
+        kcfg.check_numerics(G_IN, 1)
+    with pytest.raises(NotImplementedError, match=r"serves split_k 2 at out features 8192, in features 2048 \(validated\); got split_k 4$"):
+        entry.Fp8ProjectionDecode("cpu", G_OUT, split_k=4)
+    # an explicit split 1: one K slice per weight tile -- no reduction mailbox, a cluster of one, one row of thread blocks
+    k = entry.Fp8ProjectionDecode("cpu", G_16K, split_k=1)
+    cfg = k.cfg_for(6)
+    assert (k.split_k, cfg.MAILBOX_ELEMENTS, cfg.REDUCE_TX_BYTES, cfg.K_TILES_PER_SLICE, cfg.CTAS) == (1, 0, 0, 40, 128)
+    assert k.launch_shape_for(6) == ((128, 1, 1), (256, 1, 1), 139520)
+    assert cfg.SMEM_BYTES == kcfg._align_up(128 * 128 * 8 + 8 * 128 * 8 + 2 * 8 * 8 + 2 * 8 + 4, 128)  # the rings, the barriers, the base pointer
 
 
 def test_a_split_that_does_not_cut_the_k_tiles_evenly_is_declined_by_value(monkeypatch):
@@ -334,6 +484,15 @@ def test_served_operands_pass_the_host_checks_at_both_geometries():
     zero_dim = _host_ops()
     zero_dim["scale"] = zero_dim["scale"].reshape(())
     assert call_check(zero_dim) == 3
+    wide = dict(
+        weight=from_codes(torch.zeros(14336, 5120, dtype=torch.uint8)),
+        activation=from_codes(torch.zeros(6, 5120, dtype=torch.uint8)),
+        scale=torch.ones(1),
+        out=torch.zeros(6, 14336, dtype=torch.bfloat16),
+    )
+    assert call_check(wide) == 6 and call_check(wide, geometry=G_14K) == 6
+    with pytest.raises(ValueError, match=r"weight must be \[16384, 5120\]"):
+        call_check(wide, geometry=G_16K)
 
 
 @pytest.mark.parametrize(
@@ -629,6 +788,61 @@ def test_launch_shape_of_the_served_classes_at_the_recorded_forms():
         assert k.launch_shape_for(rows) == want, (numerics, form, rows)
 
 
+def test_launch_shape_and_form_of_the_classes_run_as_written():
+    """The pick of the four classes run as written on the reference readings: the grid is one row of thread blocks per K slice, the
+    shared memory is the table row's footprint at the row count's token tile, and the form states the late tensor-memory release."""
+    for numerics, rows, want in (
+        (C_5K4, 6, ((80, 4, 1), (256, 1, 1), 71040)),
+        (C_5K4, 9, ((80, 4, 1), (256, 1, 1), 84352)),
+        (C_5K2, 6, ((80, 2, 1), (256, 1, 1), 103808)),
+        (C_16K1, 1, ((128, 1, 1), (256, 1, 1), 139520)),
+        (C_16K1, 32, ((128, 1, 1), (256, 1, 1), 164096)),
+        (C_14K1, 6, ((112, 1, 1), (256, 1, 1), 139520)),
+    ):
+        k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K)
+        assert k.launch_shape_for(rows) == want, (cid(numerics), rows)
+        form = k.form_for(rows)
+        assert form["HOLD_TMEM"] is True and form["TMEM_COLS"] == 32 and form["SPLIT_K"] == numerics.SPLIT_K
+        early = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, form=Form(MMA_M=form["MMA_M"], STAGES=form["STAGES"]))
+        assert early.launch_shape_for(rows) == want and early.form_for(rows)["HOLD_TMEM"] is False, "a given form is taken as given"
+
+
+def test_symbol_text_names_the_rendering_of_a_class_run_as_written():
+    """``Cfg.SYMBOL_TEXT``: empty for the classes whose symbol names the weight's shape only; for every other class a text of at most 41
+    characters of ``[a-z0-9_]`` (the DSL drops other characters from a symbol) that differs whenever a field the kernel depends on
+    differs -- across the classes, the 32 row counts, the dependent-launch knobs and the form arms -- and does not move with the
+    part's readings.  The kernel's name is 41 characters, so the text ends inside the first 100 characters of the symbol."""
+    assert kcfg.SHAPE_SYMBOL_CLASSES == {C_IN4, C_IN2, C_OUT2}
+    for numerics in (C_IN4, C_IN2, C_OUT2):
+        for arm in (dict(), dict(pdl=True), dict(form=Form(MMA_M=128, STAGES=4))):
+            k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+            assert {k.cfg_for(rows).SYMBOL_TEXT for rows in range(1, 33)} == {""}
+    kernel_name = "cudnn_kernel_frost_fp8_projection_decode_"
+    arms = [dict(), dict(pdl=True), dict(pdl=True, pdl_release=False), dict(pdl_release=True)]
+    arms += [dict(form=Form(MMA_M=m, STAGES=g)) for m, g in ((64, 7), (64, 8), (128, 4))]
+    arms += [
+        dict(form=Form(MMA_M=64, STAGES=7, HOLD_TMEM=True)),
+        dict(form=Form(MMA_M=64, STAGES=7, TMEM_COLS=64)),
+        dict(form=Form(MMA_M=64, STAGES=7, TOKEN_TILE=16)),
+    ]
+    arms += [dict(form=Form(MMA_M=64, STAGES=7, PREWAIT_WEIGHTS=False), pdl=True)]
+    texts = {}
+    for numerics in AS_WRITTEN:
+        for arm in arms:
+            k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+            for rows in range(1, 33):
+                cfg = k.cfg_for(rows)
+                text = cfg.SYMBOL_TEXT
+                assert text and len(text) <= 41 and len(kernel_name) + len(text) <= 100 and set(text) <= set("abcdefghijklmnopqrstuvwxyz0123456789_"), text
+                rendering = replace(cfg, SMEM_PER_SM_BYTES=0, SMEM_OPTIN_BYTES=0, SM_COUNT=0)  # everything of the compile key but the part
+                assert texts.setdefault(text, rendering) == rendering, f"two renderings share the text {text}"
+                assert replace(cfg, SM_COUNT=64, SMEM_PER_SM_BYTES=1 << 20).SYMBOL_TEXT == text
+    assert len(texts) == len({r for r in texts.values()}) > 4 * 32 * 6
+    cfg = entry.Fp8ProjectionDecode("cpu", G_16K, split_k=1, pdl=True).cfg_for(6)
+    assert cfg.SYMBOL_TEXT == "n16384k5120s1r6_m128g8t8c32_w1h1p1q1"
+    assert entry.Fp8ProjectionDecode("cpu", G_5K, split_k=2, form=Form(MMA_M=64, STAGES=11)).cfg_for(8).SYMBOL_TEXT == "n5120k6144s2r8_m64g11t8c32_w1h0p0q0"
+
+
 def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
     """The facts are plain data, a fresh object per call (a caller's edit reaches nothing of the entry) and the entry's typed declines
     for a row count outside 1 .. 32."""
@@ -757,17 +971,26 @@ def test_cudnn_level_export_resolves_to_the_entry():
 
 
 def test_docs_rows_exist_for_the_api():
-    """The determinism status page carries the API's row -- SM90 unsupported (declined by type); SM100/103 verified on cc 10.3 only, so
-    the cell names the cc 10.0 gap inside the shared column; SM107 supported (verified on cc 10.7) -- and its required-settings bullet;
-    the goldens README carries the suite's row and section; the operation page, its navigation entry, the overview line and the
-    ``llms.txt`` line exist; and the page's byte-class table names exactly the classes the entry serves."""
+    """The determinism status page carries the API's row -- one row for the one scale form (a single fp32 scale); SM90 unsupported
+    (declined by type); the evidence differs by class, so each GPU cell states its limit inside the existing column: cc 10.0 ran every
+    served class, cc 10.3 and cc 10.7 the classes of ``(4608, 8192)`` and ``(8192, 2048)`` only, and every class a part did not run
+    reads Unverified there -- and its required-settings bullet, which names every served geometry; the goldens README carries the
+    suite's row and section; the operation page, its navigation entry, the overview line and the ``llms.txt`` line exist; and the
+    page's byte-class table names exactly the classes the entry serves."""
     det = (REPO / "docs" / "operations" / "determinism.md").read_text()
     row = [line for line in det.splitlines() if line.startswith("| `Fp8ProjectionDecode`")]
     assert len(row) == 1, "one Fp8ProjectionDecode row on the status page"
     cells = [c.strip() for c in row[0].strip("|").split("|")]
     assert cells[1] == "fprop (inference step)" and cells[3] == "Unsupported", cells
-    assert cells[4] == "SM100: Unverified; SM103: Supported" and cells[5] == "Supported", cells
+    assert cells[2] == "FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate", cells
+    verified_everywhere = "`ProjectionGeometry(4608, 8192)` and `(8192, 2048)`"
+    assert cells[4] == f"SM100: Supported; SM103: Supported at {verified_everywhere}, Unverified at the other served geometries", cells
+    assert cells[5] == f"Supported at {verified_everywhere}; Unverified at the other served geometries", cells
     assert "FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism" in det
+    bullet = " ".join(det[det.index("FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism") :].split("\n- ")[0].split())
+    for geometry in kcfg.SERVED_GEOMETRIES:
+        assert f"`ProjectionGeometry({geometry.OUT_FEATURES}, {geometry.IN_FEATURES})`" in bullet, geometry
+    assert "verified on cc 10.0 only" in bullet and "not been run" in bullet
     readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
     assert "`Fp8ProjectionDecode`" in readme and "test_fp8_projection_decode_determinism.py" in readme
     assert "### FP8 projection for decode rows" in readme
@@ -1090,25 +1313,27 @@ def test_a_row_alone_writes_the_bytes_it_writes_in_a_batch(numerics):
     assert_same_bytes(_run(k, reversed_ops, 32), alone[perm], f"{cid(numerics)}: the reversed batch")
 
 
-def test_split_is_a_byte_class_and_each_class_replays():
+@pytest.mark.parametrize("pair", ((C_IN4, C_IN2), (C_5K4, C_5K2)), ids=lambda pair: cid(pair[0])[:-2])
+def test_split_is_a_byte_class_and_each_class_replays(pair):
     """Another split is another fp32 association: both splits of one geometry stay inside the reference bound and each replays bitwise;
     the number of elements on which they differ is printed, never asserted."""
     dev = device_or_skip()
-    ops = _ops(dev, G_IN, "wide")
+    ops = _ops(dev, pair[0].GEOM, "wide")
     outs = {}
-    for numerics in (C_IN4, C_IN2):
+    for numerics in pair:
         k = _entry(dev, numerics)
         outs[numerics] = _run(k, ops, 24)
         assert_same_bytes(_run(k, ops, 24), outs[numerics], f"{cid(numerics)} replay")
         ratio, bad = error_over_bound(outs[numerics], dict(ops, activation=ops["activation"][:24]), numerics.SPLIT_K)
         assert ratio <= 1.0 and bad == 0
-    differing = int((raw(outs[C_IN4]) != raw(outs[C_IN2])).sum())
-    print(f"split 4 against split 2 at 24 rows: {differing} of {outs[C_IN4].numel()} elements differ")
+    differing = int((raw(outs[pair[0]]) != raw(outs[pair[1]])).sum())
+    print(f"{pair[0].GEOM.describe()}: split 4 against split 2 at 24 rows: {differing} of {outs[pair[0]].numel()} elements differ")
 
 
 def test_graph_capture_replays_bitwise_with_eager():
     dev = device_or_skip()
-    layers = [(_entry(dev, numerics), _ops(dev, numerics.GEOM, "random", seed=7), rows) for numerics, rows in ((C_IN4, 6), (C_OUT2, 6), (C_IN2, 24))]
+    cells = ((C_IN4, 6), (C_OUT2, 6), (C_IN2, 24), (C_16K1, 6), (C_5K2, 6), (C_5K4, 12))  # split 4, 2 and 1; one wave and two
+    layers = [(_entry(dev, numerics), _ops(dev, numerics.GEOM, "random", seed=7), rows) for numerics, rows in cells]
     eager = [_run(k, ops, rows).clone() for k, ops, rows in layers]  # compile + warm
     outs = [new_out(k.geometry, rows, dev, fill=0.0) for k, _, rows in layers]
     g = torch.cuda.CUDAGraph()
@@ -1256,8 +1481,12 @@ def test_reservation_covers_the_kernel_allocation(capfd):
 # The launch matrix in a child interpreter.  The child prints a stage line before every phase and arms its own traceback dump ahead of the
 # parent's deadline; the parent reads the LAST stage line to tell a compile stall (a setup budget) from a dispatched kernel that did not
 # return (a hang: audit the barrier table of the kernel module -- the limit below is never raised).
-CHILD_COMPILE_BUDGET_S = 420  # a cold DSL import plus 54 trace-compiles
-CHILD_DISPATCH_LIMIT_S = 60  # 54 forms x 16 warm launches each take milliseconds
+CHILD_COMPILE_BUDGET_S = 420  # a cold DSL import plus the child's trace-compiles (54 or 144)
+CHILD_DISPATCH_LIMIT_S = 60  # the child's forms x 16 warm launches each take milliseconds
+# One child per group of classes: the one-wave classes at their pick; the classes run as written at their pick AND in the given form
+# of the same weight tile and ring depth, which releases the tensor memory early -- so both release orders of every class that can
+# take more than one wave, and of the split-1 classes, first run where a kernel that does not return is attributed to its stage.
+CHILD_GROUPS = {"one-wave": (0, 3, False), "as-written": (3, 7, True)}
 _CHILD = """
 import faulthandler, sys, time
 faulthandler.dump_traceback_later({dump_s}, exit=False)
@@ -1271,16 +1500,20 @@ print("LOADED config", kcfg.__file__, flush=True)
 dev = torch.device("cuda", torch.cuda.current_device())
 print("STAGE compile", flush=True)
 cells = []
-for numerics in kcfg.SERVED_CLASSES:
+for numerics in kcfg.SERVED_CLASSES[{first}:{last}]:
     g = numerics.GEOM
     w = torch.zeros(g.OUT_FEATURES, g.IN_FEATURES, dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
     x = torch.zeros(32, g.IN_FEATURES, dtype=torch.uint8, device=dev).view(torch.float8_e4m3fn)
     s = torch.ones(1, dtype=torch.float32, device=dev)
     for pdl in (False, True):
-        k = entry.Fp8ProjectionDecode(dev, g, split_k=numerics.SPLIT_K, pdl=pdl)
-        for rows in (1, 2, 4, 5, 8, 9, 16, 17, 32):
-            k.compile(rows)
-            cells.append((k, w, x[:rows], s, torch.empty(rows, g.OUT_FEATURES, dtype=torch.bfloat16, device=dev)))
+        entries = [entry.Fp8ProjectionDecode(dev, g, split_k=numerics.SPLIT_K, pdl=pdl)]
+        if {given_form}:
+            pick = entries[0].cfg_for(1)
+            entries.append(entry.Fp8ProjectionDecode(dev, g, split_k=numerics.SPLIT_K, pdl=pdl, form=kcfg.Form(MMA_M=pick.MMA_M, STAGES=pick.STAGES)))
+        for k in entries:
+            for rows in (1, 2, 4, 5, 8, 9, 16, 17, 32):
+                k.compile(rows)
+                cells.append((k, w, x[:rows], s, torch.empty(rows, g.OUT_FEATURES, dtype=torch.bfloat16, device=dev)))
 torch.cuda.synchronize()
 print("STAGE dispatch", len(cells), "forms", flush=True)
 t0 = time.monotonic()
@@ -1293,10 +1526,12 @@ print("STAGE done", round(time.monotonic() - t0, 3), "s", flush=True)
 """
 
 
-def test_launch_matrix_completes_in_a_child_process():
+@pytest.mark.parametrize("group", CHILD_GROUPS)
+def test_launch_matrix_completes_in_a_child_process(group):
     device_or_skip()
     limit = CHILD_COMPILE_BUDGET_S + CHILD_DISPATCH_LIMIT_S
-    code = _CHILD.format(dump_s=limit - 15, tree=CHILD_TREE)
+    first, last, given_form = CHILD_GROUPS[group]
+    code = _CHILD.format(dump_s=limit - 15, tree=CHILD_TREE, first=first, last=last, given_form=given_form)
     try:
         proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=limit)
     except subprocess.TimeoutExpired as e:
@@ -1347,9 +1582,14 @@ def test_warm_launches_keep_writing_the_cold_bytes(numerics, rows):
 
 
 LAUNCH_RECORD_CELLS = [(C_IN4, 1, dict()), (C_IN4, 6, dict(pdl=True)), (C_IN2, 9, dict()), (C_OUT2, 1, dict())]
+LAUNCH_RECORD_IDS = ["in-split4-rows1", "in-split4-rows6-pdl", "in-split2-rows9", "out-split2-rows1"]
+LAUNCH_RECORD_CELLS += [(C_5K4, 9, dict()), (C_5K2, 6, dict(pdl=True)), (C_16K1, 6, dict(pdl=True)), (C_14K1, 1, dict())]
+LAUNCH_RECORD_CELLS += [(C_16K1, 6, dict(pdl=True, form=Form(MMA_M=128, STAGES=8)))]
+LAUNCH_RECORD_IDS += ["n5120k6144-split4-rows9", "n5120k6144-split2-rows6-pdl", "n16384k5120-split1-rows6-pdl", "n14336k5120-split1-rows1"]
+LAUNCH_RECORD_IDS += ["n16384k5120-split1-rows6-pdl-given-form"]
 
 
-@pytest.mark.parametrize("numerics, rows, arm", LAUNCH_RECORD_CELLS, ids=["in-split4-rows1", "in-split4-rows6-pdl", "in-split2-rows9", "out-split2-rows1"])
+@pytest.mark.parametrize("numerics, rows, arm", LAUNCH_RECORD_CELLS, ids=LAUNCH_RECORD_IDS)
 def test_launch_facts_equal_the_profilers_record_of_a_launch(numerics, rows, arm):
     """On the device: one launch of the entry's pick for ``rows`` on THIS part (each served class; one under dependent launch) is ONE
     kernel whose profiler record -- name, grid, block, shared memory -- equals the entry's launch facts; nothing is named before the
@@ -1363,6 +1603,86 @@ def test_launch_facts_equal_the_profilers_record_of_a_launch(numerics, rows, arm
     assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
     record = assert_facts_equal_the_launch(k, lambda: k(ops["weight"], ops["activation"][:rows], ops["scale"], out), rows, what=entry.NAME)
     assert record.name.startswith("cudnn_kernel_frost_fp8_projection_decode_"), record.name
+    text = k.cfg_for(rows).SYMBOL_TEXT
+    if numerics in kcfg.SHAPE_SYMBOL_CLASSES:
+        assert text == "" and "Fp8ProjectionDecodeKernel" in record.name, record.name
+    else:  # the launched kernel's name carries the rendering's text inside its first 100 characters
+        assert text and record.name[:100].startswith(f"cudnn_kernel_frost_fp8_projection_decode_{text}_"), (record.name, text)
     other = 32 if rows != 32 else 1
     assert k.kernel_symbols_for(other) == (), "a row count that was not compiled names nothing"
     assert k.form_for(rows) == asdict(k.cfg_for(rows)) and (k.form_for(rows)["PDL"], k.form_for(rows)["ROWS"]) == (bool(arm.get("pdl")), rows)
+
+
+def test_renderings_of_a_class_run_as_written_have_a_symbol_each():
+    """Compiled, not launched: at one class and row count the pick, the pick under dependent launch, the pick without the release and
+    the given form of the pick's tile and depth (the early tensor-memory release) are four renderings with four symbols, each
+    carrying its ``SYMBOL_TEXT``; two row counts of one entry differ too.  At a one-wave class the same four share one symbol."""
+    dev = device_or_skip()
+
+    def symbols(numerics, rows):
+        pick = entry.Fp8ProjectionDecode(dev, numerics.GEOM, split_k=numerics.SPLIT_K).cfg_for(rows)
+        arms = (dict(), dict(pdl=True), dict(pdl=True, pdl_release=False), dict(form=Form(MMA_M=pick.MMA_M, STAGES=pick.STAGES)))
+        found = []
+        for arm in arms:
+            k = entry.Fp8ProjectionDecode(dev, numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+            k.compile(rows)
+            (symbol,) = k.kernel_symbols_for(rows)
+            found.append((symbol, k.cfg_for(rows).SYMBOL_TEXT))
+        return found
+
+    for numerics in (C_5K4, C_14K1):
+        found = symbols(numerics, 6) + symbols(numerics, 7)[:1]
+        assert len({symbol for symbol, _ in found}) == len(found) == 5, found
+        assert all(text and symbol[:100].startswith(f"cudnn_kernel_frost_fp8_projection_decode_{text}_") for symbol, text in found), found
+    shared = symbols(C_OUT2, 6)
+    assert len({symbol for symbol, _ in shared}) == 1 and {text for _, text in shared} == {""}, shared
+
+
+# (class, rows, arm).  The classes run as written, at their pick: the 8- and the 32-row token tile, and nine rows where the grid first
+# takes two waves.  Then the cases a pick does not reach: the given form that releases the tensor memory EARLY where the grid takes
+# more than one wave (a CTA of the second wave can be given columns a CTA of the first deallocated), and a form of the split-1 classes
+# small enough for several thread blocks per SM (their picks sit one per SM, below the geometry the stress's control is run in).
+STRESS_CELLS = [(numerics, rows, dict()) for numerics in AS_WRITTEN for rows in (1, 32)] + [(C_5K4, 9, dict()), (C_5K2, 9, dict())]
+STRESS_CELLS += [(C_5K4, rows, dict(form=Form(MMA_M=64, STAGES=7))) for rows in (9, 32)]
+STRESS_CELLS += [(numerics, 1, dict(form=Form(MMA_M=64, STAGES=4, HOLD_TMEM=hold))) for numerics in (C_16K1, C_14K1) for hold in (True, False)]
+
+
+def _stress_id(cell):
+    numerics, rows, arm = cell
+    form = arm.get("form")
+    tail = "" if form is None else f"-m{form.MMA_M}g{form.STAGES}-{'late' if form.HOLD_TMEM else 'early'}"
+    return f"{cid(numerics)}-rows{rows}{tail}"
+
+
+@pytest.mark.parametrize("cell", STRESS_CELLS, ids=_stress_id)
+def test_warm_stress_of_the_classes_run_as_written(cell):
+    """The warm stress with byte references (``warm_stress.py``): a cold reference behind a cache flush that equals the host's bytes
+    (exact-integer operands), then warm launches back to back and launches each behind a kernel that overwrites every SM's shared
+    memory, every output byte compared after every launch -- behind the positive control of this GPU; where the control does not
+    reproduce, the cell is skipped as not validated.  The stage counted as refilled is the operand ring (a K slice is longer than the
+    ring at every one of these forms)."""
+    from warm_stress import StressCase, assert_warm_stress
+
+    dev = device_or_skip()
+    numerics, rows, arm = cell
+    k = _entry(dev, numerics, **arm)
+    cfg = k.cfg_for(rows)
+    ops = _ops(dev, numerics.GEOM, integer=True)
+    act = ops["activation"][:rows].contiguous()
+    exact = act.float().double() @ ops["weight"].float().double().t()
+    want = (exact * ops["scale"].double().reshape(())).float().to(torch.bfloat16).contiguous()
+    out = new_out(numerics.GEOM, rows, dev)
+    k.compile(rows)
+    report = assert_warm_stress(
+        StressCase(
+            f"{entry.NAME}: {cfg.describe()}, tensor memory released {'late' if cfg.HOLD_TMEM else 'early'}",
+            lambda: k(ops["weight"], act, ops["scale"], out),
+            {"out": out},
+            thread_blocks=cfg.CTAS,
+            refills_per_launch=cfg.K_TILES_PER_SLICE - cfg.STAGES,
+            reference={"out": want},
+        ),
+        warm=1024,
+        poisoned=1024,
+    )
+    print(report.text())
