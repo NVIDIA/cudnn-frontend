@@ -135,6 +135,7 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
         "bias_max_form",
         "softmax_wgs",
         "swap_ab",
+        "causal_exclude_own_block",
     ], params[j + 2 :]
 
 

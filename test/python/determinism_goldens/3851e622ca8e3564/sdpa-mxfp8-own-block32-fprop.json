@@ -1,0 +1,100 @@
+{
+  "inputs": {
+    "dk": {
+      "dtype": "torch.uint8",
+      "sha256": "2c1027e1094157bb3394d309723a570c411278fa7584ce9b0826b13649c15957",
+      "shape": [
+        2,
+        2,
+        256,
+        4
+      ]
+    },
+    "dq": {
+      "dtype": "torch.uint8",
+      "sha256": "10356717d48a7a7760d6971ec625b4c86f332d535c3511f82f7933f49c524ada",
+      "shape": [
+        2,
+        4,
+        256,
+        4
+      ]
+    },
+    "dv": {
+      "dtype": "torch.uint8",
+      "sha256": "2b6bfd74415e0299228aa1365afdf2d1ba4e518b5cf15b537e53dd53acb4be28",
+      "shape": [
+        2,
+        2,
+        8,
+        128
+      ]
+    },
+    "k": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "c5caafa861d83b83003875c2eda22fad440119fc06e15075361a4c49494a4f10",
+      "shape": [
+        2,
+        2,
+        256,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "64dbf1cd850e336a3593e62d4fe52d754280deec7333531dc1e7a7d5dfc02613",
+      "shape": [
+        2,
+        4,
+        256,
+        128
+      ]
+    },
+    "v": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "b974aeaa6dc1a7181b935096d6bcb66edcb8622e0efab848ed55224bdcd8341a",
+      "shape": [
+        2,
+        2,
+        256,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "bb2b25a3281f6c384e78ae534ed63f2fc83874df69806ad311adb86d298718cb",
+      "shape": [
+        2,
+        4,
+        256
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "6b78adc5459108d3f66b54a6c15979ef14e155fa1e55163c1a1d3bd593063be1",
+      "shape": [
+        2,
+        4,
+        256,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13040,
+    "cudnn": 92500,
+    "cutlass": "4.8.1",
+    "gpu": "NVIDIA B200",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.14.0a0+4fdf77b940.nv26.08",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}
