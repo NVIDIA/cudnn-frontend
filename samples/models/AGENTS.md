@@ -74,7 +74,8 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
-    Only the profiler's own start and stop are reported as a missing trace; an error of a step under it propagates.
+    Only the profiler's own start and stop -- and, where launch records are asked for, the export and the read of its
+    trace -- are reported as a missing trace, in a sentence that names no path; an error of a step under it propagates.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
