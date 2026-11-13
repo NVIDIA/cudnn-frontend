@@ -1183,10 +1183,16 @@ def assert_situ_math_reference(arrays, result, backward, situ_betas):
         act_func=act_func,
         **caps,
     )
-    if backward:
-        reference = run_discrete_dswiglu_ref(**ref_options, c_ref=tensors["c_tensor"][:rows].float().unsqueeze(-1), beta_tensor=tensors["beta_tensor"])
-    else:
-        reference = run_discrete_grouped_gemm_ref(**ref_options)
+    precision = torch.get_float32_matmul_precision()
+    try:
+        # Reference GEMMs must not inherit TF32 from the test image.
+        torch.set_float32_matmul_precision("highest")
+        if backward:
+            reference = run_discrete_dswiglu_ref(**ref_options, c_ref=tensors["c_tensor"][:rows].float().unsqueeze(-1), beta_tensor=tensors["beta_tensor"])
+        else:
+            reference = run_discrete_grouped_gemm_ref(**ref_options)
+    finally:
+        torch.set_float32_matmul_precision(precision)
     _, quantized = compute_reference_row_quant(reference["d_ref"], torch.float8_e4m3fn, torch.float8_e8m0fnu, 32, float(arrays["norm_const_tensor"][0]))
     name = "d_row_tensor" if backward else "d_tensor"
     actual = torch.from_numpy(np.asarray(result[name])[:rows].astype(np.float32))

@@ -20,6 +20,16 @@ from gemm.jax.test_grouped_gemm_canonical_jax import assert_situ_math_reference,
 pytestmark = pytest.mark.L0
 
 
+@pytest.fixture
+def matmul_precision(request):
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(request.param or previous)
+    try:
+        yield torch.get_float32_matmul_precision()
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
 def active_outputs(result, rows, start=0):
     outputs = {}
     for name, value in result.items():
@@ -42,8 +52,13 @@ def active_outputs(result, rows, start=0):
 
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
-@pytest.mark.parametrize("rows", [256, 1024, 32768])
-def test_situ_jax_replay_and_capacity_isolation(backward, rows):
+@pytest.mark.parametrize(
+    "rows,matmul_precision",
+    [(256, "high"), (256, "highest"), (1024, None), (32768, None)],
+    ids=["256-tf32", "256-ieee", "1024", "32768"],
+    indirect=["matmul_precision"],
+)
+def test_situ_jax_replay_and_capacity_isolation(backward, rows, matmul_precision):
     skip_unless_situ_supported()
     import cudnn
 
@@ -89,6 +104,7 @@ def test_situ_jax_replay_and_capacity_isolation(backward, rows):
     assert_bitwise(baseline, run(), "unused capacity and empty expert")
     if rows == 256:
         assert_bitwise(baseline, run(check_reference=True), "independently checked golden outputs")
+        assert torch.get_float32_matmul_precision() == matmul_precision
         fixed_inputs = {name: torch.from_numpy(np.array(array, copy=True).view(np.uint8)) for name, array in arrays.items()}
         assert_golden(
             "jax_grouped_dsitu_mxfp8" if backward else "jax_grouped_situ_mxfp8",
