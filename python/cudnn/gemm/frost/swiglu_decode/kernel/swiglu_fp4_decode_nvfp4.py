@@ -114,10 +114,10 @@ TENSOR MEMORY: one allocation of 512 columns by warp 0 below the wait, released 
 arrives; what was read from it is cast and stored to the staging ring in front of them.
 
 DEPENDENT LAUNCH.  Both ``griddepcontrol`` instructions are always emitted; ``Cfg.PDL`` is the launch attribute.  AS A DEPENDENT:
-warps 0-4 wait right behind the all-thread sync, the loader after its pre-wait stages.  Read above a wait: ``alpha`` (every thread,
-prologue) and the pre-staged weight and weight-scale tiles -- so no launch that can still be running when this kernel starts may write
-``weight``, ``weight_scale`` or ``alpha``.  The activation, its scales and the output's global scale are read below the reading
-role's wait, and both global stores are below the epilogue's.  The tensor-memory allocation is below the wait: a waiting CTA holds
+warps 0-4 wait right behind the all-thread sync, the loader after its pre-wait stages.  Read above a wait: the pre-staged weight and
+weight-scale tiles only -- so no launch that can still be running when this kernel starts may write ``weight`` or ``weight_scale``.
+The activation, its scales, ``alpha`` and the output's global scale are read below the reading role's wait, and both global stores
+are below the epilogue's.  The tensor-memory allocation is below the wait: a waiting CTA holds
 shared memory and no tensor memory.  AS A PREDECESSOR: ONE ``launch_dependents`` statement stands behind the three role branches, so a
 CTA signals when its FIRST role finishes -- the loader warp, once the MMA warp has consumed the CTA's last operand stage and BEFORE
 the CTA's last tile is written.  A dependent launched with the attribute must issue its own wait before it reads ``out`` or
@@ -136,7 +136,8 @@ an explicit stream; (7) the base class's launch and copy-partition helpers are m
 is a constant checked against the DSL, and the traced layout is checked against the config's mirror; (9) DSL names that moved
 between releases are bound through ``cudnn._cutlass_compat``; (10) the five named barriers of the warp-role branches are the
 unaligned form (the source: the aligned one); (11) the tensor map of C, its prefetch, its store pipeline and the store itself are
-gone: the null-pointer C tensor carries the shape and the staging dtype only.
+gone: the null-pointer C tensor carries the shape and the staging dtype only; (12) ``alpha`` is read in the epilogue role below its
+wait (the source: by every thread above every wait).
 """
 
 from typing import Optional, Tuple, Type, Union
@@ -1098,16 +1099,6 @@ class SwigluFp4DecodeKernel:
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
-        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
-        # before multiplication could cause overflow when acc values are large.
-        # In per-token mode the epilogue folds the scale into the accumulators
-        # once the output coordinate is known, so this stays neutral.
-        if cutlass.const_expr(self.per_token_alpha is not None):
-            alpha_value = cutlass.Float32(1.0)
-        else:
-            alpha_value = alpha[0].to(cutlass.Float32)
-
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -1783,6 +1774,18 @@ class SwigluFp4DecodeKernel:
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
+            # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
+            # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
+            # before multiplication could cause overflow when acc values are large.
+            # In per-token mode the epilogue folds the scale into the accumulators
+            # once the output coordinate is known, so this stays neutral.
+            # Read HERE, in the only role that uses it and below that role's
+            # dependent-launch wait: a predecessor may write alpha.
+            if cutlass.const_expr(self.per_token_alpha is not None):
+                alpha_value = cutlass.Float32(1.0)
+            else:
+                alpha_value = alpha[0].to(cutlass.Float32)
+
             #
             # Alloc tensor memory buffer
             #

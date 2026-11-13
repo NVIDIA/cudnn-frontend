@@ -30,13 +30,13 @@ device, a compute capability 10.x part, a CuTe DSL >= 4.8.0 compiling with CUDA 
 names the kernel is written on.  ``out`` / ``out_scale`` overlapping an input is undefined (not checked).
 
 Launch knob: ``pdl`` (default off) puts the programmatic-stream-serialization attribute on every launch.  AS A DEPENDENT the kernel
-then waits for its predecessor before it reads ``activation``, ``activation_scale`` and ``out_global_scale``; ``alpha`` and (with the
-config's two pre-wait stages) the first weight tiles are read ahead of that wait.  CALLER OBLIGATION: no kernel that can still be
+then waits for its predecessor before it reads ``activation``, ``activation_scale``, ``alpha`` and ``out_global_scale``; with the
+config's two pre-wait stages the first weight tiles are read ahead of that wait.  CALLER OBLIGATION: no kernel that can still be
 running when the launch starts -- the immediate stream predecessor and every earlier launch of an unbroken chain of early releases --
-writes ``weight``, ``weight_scale`` or ``alpha``.  AS A PREDECESSOR a thread block signals its dependents when its loader warp has
-finished, BEFORE the block's last output tile is written: a kernel launched behind this entry with the attribute may start while
-``out`` and ``out_scale`` are still being written and must issue its own wait before it reads them; a kernel launched without the
-attribute starts after this one has completed.  There is no release knob: the release point is the kernel's own.
+writes ``weight`` or ``weight_scale``.  AS A PREDECESSOR a thread block signals its dependents when its loader warp has finished,
+BEFORE the block's last output tile is written: a kernel launched behind this entry with the attribute may start while ``out`` and
+``out_scale`` are still being written and must issue its own wait before it reads them; a kernel launched without the attribute
+starts after this one has completed.  There is no release knob: the release point is the kernel's own.
 
 Rules 1-5 on the execute path: views only (``view(torch.uint8)``, ``reshape(-1)`` of a contiguous tensor), no conversion, no copy, no
 device allocation, no device read; the launch goes onto torch's current stream of the entry's device.  The entry owns no device memory.
