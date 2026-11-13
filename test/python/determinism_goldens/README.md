@@ -447,10 +447,14 @@ compute-sanitizer racecheck on `_case(torch.bfloat16, 64, True, 1, 3, 1, 65, 257
 and `_case(torch.float16, 128, True, 1, 3, 1, 65, 257)` reported zero hazards;
 every shared-memory writer and every ring reader arrives its mbarrier directly,
 where the earlier elected-lane publication reported 20 hazard sites per case.
-The command, run from `test/python/sdpa/frost`:
+The commands, run from `test/python/sdpa/frost`:
 
 ```bash
 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 pytest -q -rA test_sdpa_bwd_sm90.py
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 compute-sanitizer --tool racecheck --kernel-name kns=bprop_sm90 \
+  python -c "import torch; from test_sdpa_bwd_sm90 import _case; _case(torch.bfloat16, 64, True, 1, 3, 1, 65, 257)"
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 compute-sanitizer --tool racecheck --kernel-name kns=bprop_sm90 \
+  python -c "import torch; from test_sdpa_bwd_sm90 import _case; _case(torch.float16, 128, True, 1, 3, 1, 65, 257)"
 ```
 
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
