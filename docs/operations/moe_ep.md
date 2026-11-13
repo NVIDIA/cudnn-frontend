@@ -570,6 +570,11 @@ hold unspecified data and scale values. Consumers must use both metadata
 tensors: `expert_offsets` locates each physical segment and
 `valid_route_counts` limits the rows read from it.
 
+The saved `fc1_preact` uses the same receiver-domain pool and valid-row
+intervals. Its padded rows are also unspecified: forward may store a complete
+TMA tile, and backward masks invalid rows before its reductions. Retain the
+whole saved tensor for backward, but inspect or compare only valid rows.
+
 The existing grouped WGrad API derives its GEMM K extent from adjacent
 `expert_offsets` and therefore reads complete padded segments. Under this
 validity contract MoeEP operands are **not** guaranteed to be directly
@@ -668,6 +673,17 @@ configured capacity.
 
 Private instance resources cannot grow during replay. Capacity changes require a
 new operator preparation; caller-address changes require recapture.
+
+## JAX API
+
+`cudnn.moe_ep.prepare_moe_ep_jax` is temporarily unavailable and raises
+`NotImplementedError` before importing a kernel backend or initializing GPU
+resources. Expert-parallel JAX inference and training will be enabled when
+its NVSHMEM launch path can use the standard CuTe DSL JAX bridge.
+
+The public function, prepared-plan interface and JAX weight/result types
+remain importable to preserve their names. The PyTorch `MoeEp` API remains
+available under the support conditions below.
 
 ## Execution support
 

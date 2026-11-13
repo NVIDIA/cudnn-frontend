@@ -65,6 +65,29 @@ start while launch 2 runs and must issue its own `griddepcontrol.wait` before it
 without the attribute (the stock add) is unaffected. Measured on a GB300 (cc 10.3), the early release is a loss in every
 form and stays off.
 
+## JAX
+
+```python
+import jax
+from cudnn.ops import shared_expert_decode_forward_jax
+
+with jax.default_device(device):
+    (y,) = jax.jit(shared_expert_decode_forward_jax)(x, w_gate_up, w_down, w_gate)
+```
+
+The JAX entry accepts BF16 arrays with the same supported geometry and token
+counts. `w_gate` may be `[H]` or `[1,H]`. It returns a fresh `[T,H]` BF16
+array; XLA owns both the output and inter-launch scratch. The original inputs
+reach the native kernel without a framework conversion or input reshape.
+Both launches run on XLA's CUDA stream, with dependent launch disabled.
+
+Eager calls select the operands' GPU. During tracing, select an appropriate
+`jax.default_device`; compilation targets that GPU's architecture. Unrelated
+visible GPUs and JAX process count do not restrict local calls. The entry is
+inference-only: automatic differentiation and `vmap` are unsupported.
+
+JAX coverage: `test/python/moe/jax/test_shared_expert_decode_jax.py`.
+
 ## Support matrix
 
 | question | answer |

@@ -61,6 +61,40 @@ def test_importing_cudnn_pulls_no_framework():
     _assert_absent(_imported_by("import cudnn"), "import cudnn")
 
 
+@pytest.mark.parametrize("with_jax", [False, True])
+def test_moe_ep_config_and_jax_imports_do_not_require_torch(with_jax):
+    if with_jax and importlib.util.find_spec("jax") is None:
+        pytest.skip("JAX is not installed")
+    code = """
+import importlib.abc
+import sys
+
+class BlockTorch(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ImportError("blocked torch for import-boundary test")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+from cudnn.moe_ep import MoeEpConfig, MoeEpModelConfig, MoeEpParallelConfig, MoeFormat
+
+config = MoeEpConfig(
+    model=MoeEpModelConfig(num_experts=4, hidden_size=128, intermediate_size=256, top_k=2),
+    parallel=MoeEpParallelConfig(max_tokens_per_rank=128),
+)
+assert config.data_path.output_format is MoeFormat.BF16
+"""
+    if with_jax:
+        code += """
+from cudnn.moe_ep import MoeEpJaxForwardWeights, MoeEpJaxBackwardWeights, prepare_moe_ep_jax
+assert callable(prepare_moe_ep_jax)
+assert len(MoeEpJaxForwardWeights._fields) == len(MoeEpJaxBackwardWeights._fields) == 4
+"""
+    imported = _imported_by(code)
+    _assert_absent(imported, "MoeEP public configuration/JAX imports")
+    assert "nvshmem.core" not in imported
+
+
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="the gated attention block requires torch")
 def test_gated_block_declaration_and_execute_preflight_do_not_import_cache_kernel():
     """Exercise the public constructor in a fresh process, including on the real DSL floor -- the write-through declared

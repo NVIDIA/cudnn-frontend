@@ -23,6 +23,10 @@ unverified status does not imply an unavailable API.
 
 ## API support by GPU
 
+JAX expert-parallel MoE is temporarily unavailable pending integration with
+CuTeDSL's JAX bridge. FP8 projection decode requires CuTeDSL 4.9.0 and remains
+unverified through that bridge; earlier measurements used a removed FFI path.
+
 The four linear-attention APIs are in `cudnn.linear_attention.ops`; bprop uses
 PyTorch autograd through the same API. The two fused GDN step entries
 (`GdnDecodeFused`, `GdnVerifyFused`) are imported from `cudnn` (lazily; also
@@ -51,6 +55,10 @@ arbitrary user callbacks.
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in; BF16 out; FP32 accumulate | Unsupported | SM100: Unverified; SM103: Supported | Supported |
+| `shared_expert_decode_forward_jax` | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | SM100: Unverified; SM103: Supported | Unverified |
+| `fp8_projection_decode_forward_jax` | fprop (inference step) | FP8 E4M3 in; BF16 out; FP32 accumulate | Unsupported | Unverified | Unverified |
+| `MoeEpJax.inference`, `MoeEpJax.training_forward` | fprop | BF16/FP32 activation; native MXFP8 weights; BF16 out | Unsupported | Unsupported | Unsupported |
+| `MoeEpJax.training_backward` | explicit bprop | BF16/FP32 upstream; BF16 dactivation; FP32 routing gradient; MXFP8 WGrad operands | Unsupported | Unsupported | Unsupported |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |

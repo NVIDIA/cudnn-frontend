@@ -456,6 +456,9 @@ DSL satisfies your kernel.**
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
   `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
   the JAX dependency group and runtime guard enforce this higher floor.
+  JAX calls to `@cute.experimental.jit` launchers → 4.9.0; earlier JAX bridges
+  wrap them in regular `@cute.jit`, mixing compiler contexts. Gate execution,
+  keeping the public symbol importable for API inspection on older versions.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
   `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode

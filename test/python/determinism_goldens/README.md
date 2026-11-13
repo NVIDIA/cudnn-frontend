@@ -420,6 +420,76 @@ python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_sm100.py
 ```
 
 
+### JAX MoE and decode bindings — 2026-11-12 (UTC)
+
+The FP8 projection and expert-parallel MoE measurements below describe the
+removed custom FFI prototype at `3c10e577`. FP8 projection now uses CuTeDSL's JAX bridge
+with a 4.9.0 runtime floor and has not been requalified. Expert-parallel MoE
+JAX preparation is temporarily disabled pending native bridge integration.
+The unchanged shared-expert decode measurements still apply.
+
+Candidate branch `mgoldfarb/jax-moe-decode` is based on
+`fb53e410233d27f4ce4f3a650b519bbd0edddbcb`. Imports resolved to its uploaded
+source throughout. B300/SM103, JAX 0.9.1, CuTe DSL 4.8.1 with its CUDA 13.4
+compiler, Torch 2.12.1+cu130 and cuDNN 9.20: **11 shared-expert and 22 FP8
+projection JAX tests pass**, without skips. These cover numerical references,
+eager/JIT equality, changed operands without retracing, full input/output
+immutability, fresh-buffer replay under concurrent work and row insertion,
+removal, duplication and reordering across dispatch boundaries. Shared-expert
+coverage uses H8192/I128 and I256 at T1/17/24. Projection covers all three
+documented geometry/split classes at T1/9/17/32, including exact integer
+outputs and scalar alpha. SM100 and SM107 decode, the CuTe DSL 4.8.0 floor
+and the CUDA 12 compiler flavor are unmeasured for these bindings.
+
+From `test/python`:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 python -m pytest moe/jax/test_shared_expert_decode_jax.py -m L0 -x -q -rs
+CUDNN_TEST_NO_ISOLATION=1 python -m pytest gemm/jax/test_fp8_projection_decode_jax.py -m L0 -x -q -rs
+```
+
+Two SM107 GPUs, driver 620.43, CuTe DSL 4.8.1/CUDA 13.4, Torch
+2.14.0a0+b2c75dd062.nvinternal.main and cuDNN 9.26: the EP2 numerical case
+passes separately with JAX **0.9.1 and 0.10.2**. It covers H128/I256/top-k2,
+uneven local T2/T3, BF16 activations, FP32 upstream and BF16 combine;
+inference, explicit forward/backward, all represented dense weight gradients,
+counts/offsets, changed routing/upstream, retained state and input immutability.
+The minimum-version run also closes the plan while the other GPU is current
+and verifies restoration. Every process sees both GPUs. NVSHMEM is 3.7.2
+with nvshmem4py-cu13 0.3.1. Other EP sizes/precisions/tuning and multi-node
+execution are unmeasured.
+
+An initial full-capacity replay check failed at saved preactivation row130:
+1024/262144 bytes differed, counts were `[3,2]`, and offsets `[128,256]`.
+No defined row differed: row130 follows the second expert's valid rows128–129.
+Native TMA stores full subtiles and backward masks these padding rows; the
+buffer contract leaves them unspecified. Replay checks therefore compare all
+defined payload and used scale bytes; retained-allocation immutability still
+compares the entire physical storage. No tolerance or numerical kernel changed.
+
+The final defined-byte replay case passes with JAX **0.9.1**, without skips:
+three fresh executions under concurrent GPU work compare every primary result,
+valid preactivation/payload row, used unswizzled scale byte and metadata field.
+Together with the numerical case this is **two passing EP2 cases**. Batch
+invariance was unmeasured, so the prototype's combined repeatability/batch-invariance
+contract was Unverified. To reproduce these historical results, check out
+`3c10e577` and run from `test/python`:
+
+```bash
+PYTHONNOUSERSITE=1 JAX_PLATFORMS=cuda PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  CUDNN_TEST_NO_ISOLATION=1 python -m pytest moe_ep/jax/test_jax_moe_ep.py -m 'L0 or L1' -x -q -rs
+```
+
+Earlier setup/debugging failures are not qualification: missing runtime
+libraries caused skips; `no_tracing` on an effectful Python JIT wrapper
+rejected cached slow dispatch; selected-device cleanup then exposed a real
+teardown-context defect, now fixed. A memcheck attempt stalled in distributed
+bootstrap and was terminated after its watchdog: no sanitizer qualification.
+The native FFI lifecycle/bounds suite passes four cases on each of SM103 and
+SM107, and the two Torch-free EP import checks and two existing configuration
+regressions pass. The initial FP8 regular/experimental compiler nesting error
+and TVM wrapper-handle error were fixed before its 22-case passing run.
+
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
 Twenty-six SM100/SM107 forward templates now release the unchanged service

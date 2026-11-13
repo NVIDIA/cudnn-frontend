@@ -131,6 +131,10 @@ def shared_memory_per_block_optin(device: int) -> int:
     return device_info(device).shared_memory_per_block_optin
 
 
+def shared_memory_per_multiprocessor(device: int) -> int:
+    return device_info(device).shared_memory_per_multiprocessor
+
+
 def oversized_shared_memory_per_block(device: int) -> int:
     return device_info(device).oversized_shared_memory_per_block
 
