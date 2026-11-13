@@ -18,6 +18,12 @@ TWO KINDS OF KNOBS, kept in two types so that one can never reach the other:
 
 ``Cfg`` is one compiled rendering: a ``Numerics``, a ``Form`` resolved for one row count, the launch knobs and the part's readings.
 
+TWO KINDS OF SERVED CLASSES, by how their pick was obtained.  The classes of ``ONE_WAVE_CLASSES`` have a measured table and the rule
+that goes with it: the ring is lowered until the grid fits one wave on the part.  Every other served class runs its table row AS WRITTEN
+-- the row was not measured with this entry, the ring is lowered only until a CTA fits the part's per-CTA shared memory, and the grid may
+take more than one wave -- and its pick releases the tensor memory late (``HOLD_TMEM_CLASSES``), so that a CTA's accumulator registers
+are consumed before another CTA of the same launch can be given its columns.
+
 LEDGERS.  Shared memory: :func:`smem_bytes` mirrors the kernel's allocation order (the buffer table of the kernel module) and is what the
 launch reserves; ``Cfg.SMEM_RESIDENT`` = how many CTAs of that footprint shared memory lets the launcher place on one SM (an upper
 bound of what a part places).  Tensor memory: an SM has 512 columns and a CTA of this kernel holds ``TMEM_COLS`` of them from its first
@@ -100,7 +106,7 @@ class Geometry:
 
 
 #: the geometries the kernel was validated on; the host entry declines any other by name (the structural validator admits more, unmeasured)
-SERVED_GEOMETRIES = (Geometry(4608, 8192), Geometry(8192, 2048))
+SERVED_GEOMETRIES = (Geometry(4608, 8192), Geometry(8192, 2048), Geometry(5120, 6144), Geometry(16384, 5120), Geometry(14336, 5120))
 
 
 @dataclass(frozen=True)
@@ -114,12 +120,26 @@ class Numerics:
         return f"{self.GEOM.describe()}, split_k {self.SPLIT_K}"
 
 
-#: the validated byte classes (a reference check and a measured pick each); every other ``(geometry, split_k)`` is declined by name
+#: the validated byte classes (a reference check each; a measured pick at the first three, a table row run as written at the others);
+#: every other ``(geometry, split_k)`` is declined by name
 SERVED_CLASSES = (
     Numerics(Geometry(4608, 8192), 4),
     Numerics(Geometry(4608, 8192), 2),
     Numerics(Geometry(8192, 2048), 2),
+    Numerics(Geometry(5120, 6144), 4),
+    Numerics(Geometry(5120, 6144), 2),
+    Numerics(Geometry(16384, 5120), 1),
+    Numerics(Geometry(14336, 5120), 1),
 )
+
+#: the classes whose pick is lowered to ONE wave (rule 3 of :func:`pick`): the classes that rule was measured on.  Every other served
+#: class runs its ``PICKS`` row as written.
+ONE_WAVE_CLASSES = frozenset(SERVED_CLASSES[:3])
+#: the classes whose pick releases the tensor memory late (``Form.HOLD_TMEM``): every class that runs its row as written.  Their grids
+#: can take more than one wave, so columns a CTA deallocates can be given to another CTA of the same launch; with the late release the
+#: registers read from those columns are consumed (the remote stores, the output store) before the release.  A performance pick like
+#: any other: no byte depends on it.
+HOLD_TMEM_CLASSES = frozenset(SERVED_CLASSES[3:])
 
 
 @dataclass(frozen=True)
@@ -284,14 +304,17 @@ def check_geometry(geometry) -> Geometry:
     if not isinstance(geometry, Geometry):
         raise TypeError(f"{NAME}: geometry must be a fp8_projection_decode_config.Geometry, got {type(geometry).__name__}")
     if geometry not in SERVED_GEOMETRIES:
-        raise NotImplementedError(f"{NAME} serves {' or '.join(g.describe() for g in SERVED_GEOMETRIES)} (validated); got {geometry.describe()}")
+        raise NotImplementedError(f"{NAME} serves {'; '.join(g.describe() for g in SERVED_GEOMETRIES)} (validated); got {geometry.describe()}")
     return geometry
 
 
 def check_numerics(geometry, split_k: Optional[int] = None) -> Numerics:
     """The byte class of ``(geometry, split_k)`` (``split_k`` None = :func:`split_k_for`): ``ValueError`` for a split that is not 1 / 2 / 4
-    or does not cut the geometry's K tiles evenly, ``NotImplementedError`` (by name) for a legal pair that was not validated."""
+    or does not cut the geometry's K tiles evenly, ``NotImplementedError`` (by name) for a legal pair that was not validated -- the
+    message names the splits the geometry IS served at, and says so when the declined split is the geometry's default (the default
+    is a function of the geometry alone and is not a served class at every geometry: such an entry is built with an explicit split)."""
     geometry = check_geometry(geometry)
+    defaulted = split_k is None
     if split_k is None:
         split_k = split_k_for(geometry)
     if not _is_int(split_k) or split_k not in SPLITS:
@@ -300,7 +323,11 @@ def check_numerics(geometry, split_k: Optional[int] = None) -> Numerics:
         raise ValueError(f"{NAME}: split_k {split_k} does not cut the {geometry.K_TILES} K tiles of {geometry.describe()} into equal slices")
     numerics = Numerics(geometry, split_k)
     if numerics not in SERVED_CLASSES:
-        raise NotImplementedError(f"{NAME} serves {'; '.join(c.describe() for c in SERVED_CLASSES)} (validated); got {numerics.describe()}")
+        splits = [str(c.SPLIT_K) for c in SERVED_CLASSES if c.GEOM == geometry]
+        if not splits:
+            raise NotImplementedError(f"{NAME} serves {'; '.join(c.describe() for c in SERVED_CLASSES)} (validated); got {numerics.describe()}")
+        how = " -- the default of the geometry; pass split_k" if defaulted else ""
+        raise NotImplementedError(f"{NAME} serves split_k {' or '.join(splits)} at {geometry.describe()} (validated); got split_k {split_k}{how}")
     return numerics
 
 
@@ -356,13 +383,20 @@ def validate_cfg(cfg: Cfg) -> None:
         )
 
 
-# (first row, last row, MMA_M, STAGES) per served class; measured on compute capability 10.3 (152 SMs) with 32 tensor-memory columns.
+# (first row, last row, MMA_M, STAGES) per served class.  The first three: measured on compute capability 10.3 (152 SMs) with 32
+# tensor-memory columns.
 # A deeper ring pays while the grid still fits one wave AND the kernel starts ahead of its predecessor; from five rows the 7-stage form
 # is level or ahead at (4608, 8192), and past the 8-row token tile an 11-stage CTA no longer shares an SM.
 PICKS: Dict[Numerics, Tuple[Tuple[int, int, int, int], ...]] = {
     Numerics(Geometry(4608, 8192), 4): ((1, 4, 64, 11), (5, 32, 64, 7)),
     Numerics(Geometry(4608, 8192), 2): ((1, 32, 64, 8),),
     Numerics(Geometry(8192, 2048), 2): ((1, 32, 64, 8),),
+    # The rows below are forms of the classes run AS WRITTEN: not measured with this entry; the ring depth is lowered only to fit a
+    # part's per-CTA shared-memory limit, and these classes release the tensor memory late (``HOLD_TMEM_CLASSES``).
+    Numerics(Geometry(5120, 6144), 4): ((1, 32, 64, 7),),
+    Numerics(Geometry(5120, 6144), 2): ((1, 32, 64, 11),),
+    Numerics(Geometry(16384, 5120), 1): ((1, 32, 128, 8),),
+    Numerics(Geometry(14336, 5120), 1): ((1, 32, 128, 8),),
 }
 
 
@@ -386,22 +420,26 @@ def resolve_form(numerics: Numerics, rows: int, form: Form, readings: Dict[str, 
 
 
 def pick(numerics: Numerics, rows: int, sm_count: int, smem_per_sm: int, smem_optin: int) -> Form:
-    """The measured performance form of ``rows`` for a served class on a part's readings -- a ``Form``, so it cannot name a split.
+    """The performance form of ``rows`` for a served class on a part's readings -- a ``Form``, so it cannot name a split: the measured
+    performance form for a class of ``ONE_WAVE_CLASSES``, the table row as written for every other class.
 
     1. the token tile is the smallest of 8 / 16 / 32 holding ``rows`` and the tensor-memory columns are what that tile needs;
     2. ``(MMA_M, STAGES)`` is the row of ``PICKS`` whose band holds ``rows``;
-    3. the stages are lowered until the grid fits ONE wave on this part (``CTAS <= SM count x RUNNING``) -- a deeper ring never pays for a
-       second wave; a part whose opt-in cannot hold a one-stage CTA is a ``NotImplementedError`` (a part fact), and a grid that fits one
-       wave at no depth keeps one stage."""
+    3. a class of ``ONE_WAVE_CLASSES``: the stages are lowered until the grid fits ONE wave on this part (``CTAS <= SM count x
+       RUNNING``) -- a deeper ring never pays for a second wave -- and a grid that fits one wave at no depth keeps one stage.  Every
+       other class: the stages are lowered only until a CTA fits the part's per-CTA shared memory; the grid may take more than one
+       wave.  Either way a part whose opt-in cannot hold a one-stage CTA is a ``NotImplementedError`` (a part fact);
+    4. a class of ``HOLD_TMEM_CLASSES`` releases the tensor memory late."""
     token_tile_for(rows)
     readings = part_readings(smem_per_sm, smem_optin, sm_count)
     if numerics not in PICKS:
         raise NotImplementedError(f"{NAME} has no measured form for {numerics.describe()}")
     mma_m, stages = next((m, s) for lo, hi, m, s in PICKS[numerics] if lo <= rows <= hi)
     stages = min(stages, numerics.GEOM.K_TILES // numerics.SPLIT_K)
+    one_wave = numerics in ONE_WAVE_CLASSES
     while True:
         cfg = resolve_form(numerics, rows, Form(MMA_M=mma_m, STAGES=stages), readings)
-        if cfg.SMEM_BYTES <= smem_optin and cfg.WAVES == 1:
+        if cfg.SMEM_BYTES <= smem_optin and (cfg.WAVES == 1 or not one_wave):
             break
         if stages == 1:
             if cfg.SMEM_BYTES > smem_optin:
@@ -411,4 +449,4 @@ def pick(numerics: Numerics, rows: int, sm_count: int, smem_per_sm: int, smem_op
                 )
             break
         stages -= 1
-    return Form(MMA_M=cfg.MMA_M, STAGES=cfg.STAGES, TMEM_COLS=cfg.TMEM_COLS)
+    return Form(MMA_M=cfg.MMA_M, STAGES=cfg.STAGES, TMEM_COLS=cfg.TMEM_COLS, HOLD_TMEM=numerics in HOLD_TMEM_CLASSES)

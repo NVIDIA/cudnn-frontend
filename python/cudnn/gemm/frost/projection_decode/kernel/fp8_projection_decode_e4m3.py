@@ -101,10 +101,11 @@ SMEM BUFFER TABLE (allocation order = ``smem_bytes`` of the config, which the la
 
 TENSOR MEMORY.  Warp 2 allocates ``TMEM_COLS`` columns at entry (the accumulator is one column per token row; 32 is the allocation
 granule and the default at every token tile) and deallocates the same constant after the rendezvous.  An SM has 512 columns; the config
-declines a form whose shared-memory co-residency times ``TMEM_COLS`` exceeds them.  By default the epilogue releases the columns right
-after ``tcgen05.ld`` + ``tcgen05.wait``, so the deallocation overlaps rank 0's wait for its peers while the loaded registers are
-still unread; ``HOLD_TMEM`` releases them only after the last use of those registers, at the price of a deallocation that starts
-after the output store.
+declines a form whose shared-memory co-residency times ``TMEM_COLS`` exceeds them.  With ``HOLD_TMEM`` off (a form's default and the
+pick of the one-wave classes) the epilogue releases the columns right after ``tcgen05.ld`` + ``tcgen05.wait``, so the deallocation
+overlaps rank 0's wait for its peers while the loaded registers are still unread; ``HOLD_TMEM`` (the pick of every other class, whose
+grids can take more than one wave, so that the freed columns can go to another CTA of the same launch) releases them only after the
+last use of those registers, at the price of a deallocation that starts after the output store.
 
 PDL SITES.  ``PDL``: the launch carries the programmatic-stream-serialization attribute; warp 1 issues ``griddepcontrol.wait`` as its
 first instruction, i.e. BEFORE every read of ``activation``.  Above that wait run the barrier inits, the cluster sync, warp 2's

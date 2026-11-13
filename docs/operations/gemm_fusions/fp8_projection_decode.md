@@ -75,6 +75,10 @@ Served byte classes -- every other pair is declined by name:
 | `ProjectionGeometry(4608, 8192)` | 4 | the default of the geometry |
 | `ProjectionGeometry(4608, 8192)` | 2 | explicit `split_k=2`; another byte class than split 4 |
 | `ProjectionGeometry(8192, 2048)` | 2 | the default of the geometry |
+| `ProjectionGeometry(5120, 6144)` | 4 | the default of the geometry |
+| `ProjectionGeometry(5120, 6144)` | 2 | explicit `split_k=2`; another byte class than split 4 |
+| `ProjectionGeometry(16384, 5120)` | 1 | explicit `split_k=1` (one K slice per weight tile, no cluster reduction); the geometry's default split, 4, is not served |
+| `ProjectionGeometry(14336, 5120)` | 1 | explicit `split_k=1`; the geometry's default split, 4, is not served |
 
 On the validated cc 10.3 part, split 2 measured faster than split 4 at 17 .. 32 rows of
 `ProjectionGeometry(4608, 8192)`. The entry still never changes the split with the row count: a caller that wants
@@ -147,7 +151,7 @@ device memory.
 | question | answer |
 | --- | --- |
 | device | compute capability 10.x (validated on cc 10.3 and cc 10.7; cc 10.0 is admitted and unverified); every other capability is declined by name |
-| geometry and split | the three byte classes above; any other geometry or split is declined by name |
+| geometry and split | the seven byte classes above; any other geometry or split is declined by name, and the decline of a served geometry names the splits it is served at |
 | rows | 1 .. 32 per call (a compile key; `compile()` covers all 32); 33 and up declined by name, never served by another kernel |
 | dtypes | FP8 E4M3 weight and activation; one fp32 scale (per tensor); bf16 out; fp32 accumulation |
 | layouts | contiguous operands, 32-byte aligned storage (4-byte for `scale`), every operand on the entry's device; `out` exactly `[rows, OUT_FEATURES]` |

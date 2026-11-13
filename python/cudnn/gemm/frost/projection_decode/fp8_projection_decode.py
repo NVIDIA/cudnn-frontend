@@ -16,10 +16,14 @@ slice is one tensor-core chain in ascending K, the slice sums are added in slice
 
 NUMERICS AND PICKS.  The output bytes are a function of ``(geometry, split_k)`` on one runtime.  ``split_k`` is therefore fixed at
 construction -- given, or :func:`split_k_for` of the geometry alone -- and never depends on the row count: a caller that wants another
-split builds another entry and owns the statement that the two are different byte classes.  Everything else is a performance ``Form``
-(weight tile, ring stages, tensor-memory columns, token tile, the weight stream ahead of the dependent-launch wait): the measured
-:func:`pick` per row count on THIS part's readings, or the caller's ``form`` as a whole; no form changes a byte, and a row's bytes are
-the same alone and among up to 32 rows.
+split builds another entry and owns the statement that the two are different byte classes.  The default split is not a served class
+at every geometry: where it is not, the entry is built with an explicit ``split_k`` (``split_k=1`` = one K slice per weight tile, no
+cluster reduction) and the decline names the splits the geometry is served at.  Everything else is a performance ``Form``
+(weight tile, ring stages, tensor-memory columns, token tile, the weight stream ahead of the dependent-launch wait, the release of the
+tensor memory): :func:`pick` per row count on THIS part's readings -- a measured form at the classes of ``ONE_WAVE_CLASSES``, the table
+row as written (not measured with this entry; its grid may take more than one wave) with the late tensor-memory release at every
+other class -- or the caller's ``form`` as a whole; no form changes a byte, and a row's bytes are the same alone and among up to 32
+rows.
 
 Served (declined otherwise, by name): the validated geometries and splits (``SERVED_CLASSES``), rows 1 .. 32, contiguous operands with
 32-byte aligned storage, every operand on the entry's device, a compute capability 10.x part, a CuTe DSL >= 4.8.0 that provides the
