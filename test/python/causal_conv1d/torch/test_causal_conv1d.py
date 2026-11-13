@@ -207,7 +207,14 @@ def test_causal_conv1d_nwh_autograd(dtype, kernel_size, activation):
     x = x_data.detach().requires_grad_(True)
     weight = weight_data.detach().requires_grad_(True)
     bias = bias_data.detach().requires_grad_(True)
-    actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    try:
+        actual = cudnn.ops.causal_conv1d_nwh(x, weight, bias, activation=activation)
+    except RuntimeError as error:
+        # CUDNN_STATUS_NOT_SUPPORTED_SHARED_MEMORY_INSUFFICIENT: the FP64 NWH kernel needs more shared memory per block than
+        # a ~99 KB device (SM86 / SM89 / SM120) offers; the backend declines it there.
+        if "status 3010" in str(error):
+            pytest.skip(f"cuDNN reports insufficient shared memory for this NWH case on this device: {error}")
+        raise
     actual.backward(grad_out)
 
     x_ref = x_data.double().detach().requires_grad_(True)
@@ -285,7 +292,7 @@ def test_causal_conv1d_runs_on_a_thread_with_no_cuda_context(variant):
     with status 5000 (CUDA_ERROR_INVALID_CONTEXT). Each primitive binds the work's context first: a fresh thread making
     no CUDA call of its own reproduces the main thread's forward and backward bitwise."""
     import importlib
-    import threading
+    from concurrent.futures import ThreadPoolExecutor
 
     # cudnn.ops exports are lazy: register the primitives here so the test also runs on its own (-k), not only after
     # earlier tests in the file called the public wrappers.
@@ -326,20 +333,16 @@ def test_causal_conv1d_runs_on_a_thread_with_no_cuda_context(variant):
 
     expected = run()
     torch.cuda.synchronize()
-    result, errors = [], []
 
     def on_fresh_thread():
-        try:
-            result.extend(run())
-            torch.cuda.synchronize()
-        except BaseException as error:  # surfaced on the main thread below
-            errors.append(error)
+        result = run()
+        torch.cuda.synchronize()
+        return result
 
-    worker = threading.Thread(target=on_fresh_thread)
-    worker.start()
-    worker.join()
-    if errors:
-        raise errors[0]
+    # A new executor gives this call a fresh thread. result() propagates worker
+    # exceptions to pytest instead of relying on a shared error list.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(on_fresh_thread).result()
     for got, want in zip(result, expected, strict=True):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
 

@@ -15,7 +15,7 @@ import pytest
 import cudnn
 from cudnn._pygraph import cudnn_graph_not_supported, pygraph
 from cudnn.engines import manifest
-from cudnn.engines.engine_ids import is_python_engine
+from cudnn.engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID, is_python_engine
 from cudnn.sdpa import graph_analyzer
 from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN, backend_guard
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
@@ -24,7 +24,7 @@ from frost_test_utils import requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107_mxfp8"
-_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.7"
+_GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.0 / 10.3 / 10.7"
 _TAIL = "the backend is not consulted for this graph"
 _FAMILY = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
 
@@ -145,11 +145,14 @@ def test_guard_names_the_backend_and_the_reason_on_the_measured_domain(crashing_
         dict(b=1, h_q=1, h_kv=1, s_kv=128),
         dict(d_qk=256, d_v=256),
         dict(d_qk=192, d_v=128),
+        dict(device_cc=(10, 0), device_sm_count=148),
+        dict(device_cc=(10, 3), device_sm_count=148),
     ],
     ids=lambda over: ",".join(f"{k}={v}" for k, v in over.items()) or "base",
 )
 def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(crashing_backend, over):
-    """The measured crash domain: dense and THD, Stats on or off, every O dtype, both inputs, every head dim alike."""
+    """The measured crash domain: dense and THD, Stats on or off, every O dtype, both inputs, every head dim alike, on cc 10.7
+    and on cc 10.0 / 10.3 (the SM100 decode emitter)."""
     assert backend_guard(None, _facts(**over)) is not None
 
 
@@ -161,9 +164,9 @@ def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(crashing_backe
         dict(s_q=4096),
         dict(has_sink=True),
         dict(has_paged_kv=True, page_size=128, padded=True),
-        dict(device_cc=(10, 0)),
-        dict(device_cc=(10, 3)),
+        dict(device_cc=(9, 0)),
         dict(device_cc=(10, 8)),
+        dict(device_cc=(12, 0)),
         dict(device_cc=None),
         dict(is_mxfp8=False, is_fp8=True),
         dict(is_mxfp8=False, dtype=cudnn.data_type.BFLOAT16, dtype_o=None),
@@ -324,3 +327,153 @@ def test_a_guarded_graph_whose_row_fails_to_build_names_the_guard_in_the_exhaust
         g.build_plans()
     msg = str(exc.value)
     assert "no plan in the list could be built" in msg and "stub build decline" in msg and _GUARD in msg, msg
+
+
+# ---------------------------------------------------------------------------------------------- backend engine guard
+# The native SM100 / SM107 forward engines (10, 18) build O from the K buffer when d_qk <= 128 < d_v
+# (NVIDIA/cudnn-frontend#2401). sdpa/fwd/backend_guard.py::backend_engine_guard keeps those two engines off such graphs
+# on every backend from 9.23.1 until a recorded fix; the backend's SM80 engine (8) serves them.
+
+from cudnn.sdpa.fwd import backend_guard as _bg  # noqa: E402
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("dims", [(128, 256), (64, 256), (128, 192)])
+def test_wide_v_engine_guard_arms_on_blackwell_from_9_23_1(monkeypatch, cc, dims):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92301)
+    monkeypatch.setattr(cudnn, "backend_version_string", lambda: "9.23.1")
+    facts = _facts(d_qk=dims[0], d_v=dims[1], dtype=cudnn.data_type.BFLOAT16, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=False, device_cc=cc, s_q=512)
+    excluded = _bg.backend_engine_guard(None, facts)
+    assert sorted(excluded) == [10, 18]
+    assert all("#2401" in reason for reason in excluded.values())
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(d_qk=128, d_v=128),  # d_v within the K buffer's width
+        dict(d_qk=192, d_v=256),  # d_qk past 128: the chunk loop stages V in smem_K, which the descriptor names
+        dict(d_qk=256, d_v=128),
+        dict(device_cc=(9, 0)),
+        dict(device_cc=(12, 0)),
+        dict(is_backward=True),
+    ],
+)
+def test_wide_v_engine_guard_leaves_other_graphs_alone(monkeypatch, over):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 93000)
+    base = dict(d_qk=128, d_v=256, dtype=cudnn.data_type.BFLOAT16, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=False, device_cc=(10, 0), s_q=512)
+    assert _bg.backend_engine_guard(None, _facts(**{**base, **over})) == {}
+
+
+def test_wide_v_engine_guard_version_bounds(monkeypatch):
+    facts = _facts(d_qk=128, d_v=256, dtype=cudnn.data_type.BFLOAT16, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=False, device_cc=(10, 0), s_q=512)
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92300)  # 9.23.0.39 measured correct
+    assert _bg.backend_engine_guard(None, facts) == {}
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 93100)
+    monkeypatch.setattr(_bg, "WIDE_V_WRONG_O_FIXED_IN", 93100)
+    assert _bg.backend_engine_guard(None, facts) == {}
+    monkeypatch.setattr(_bg, "WIDE_V_WRONG_O_FIXED_IN", 93101)
+    assert sorted(_bg.backend_engine_guard(None, facts)) == [10, 18]
+
+
+def test_wide_v_engine_guard_is_declared_by_the_forward_family():
+    assert manifest.resolve_backend_engine_guard(_FAMILY) is _bg.backend_engine_guard
+
+
+def _wide_v_graph():
+    import torch
+
+    b, hq, hkv, s, dqk, dv = 2, 16, 4, 1024, 128, 256
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(b, hq, s, dqk, device="cuda", generator=gen).to(torch.bfloat16)
+    k = torch.randn(b, hkv, s, dqk, device="cuda", generator=gen).to(torch.bfloat16)
+    v = torch.randn(b, hkv, s, dv, device="cuda", generator=gen).to(torch.bfloat16)
+    o = torch.empty(b, hq, s, dv, device="cuda", dtype=torch.bfloat16)
+    g = pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    Q, K, V = g.tensor_like(q), g.tensor_like(k), g.tensor_like(v)
+    O, _ = g.sdpa(q=Q, k=K, v=V, attn_scale=1 / math.sqrt(dqk), use_causal_mask=True, generate_stats=False)
+    O.set_output(True).set_dim(o.size()).set_stride(o.stride())
+    g.validate()
+    g.build_operation_graph()
+    r = hq // hkv
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float().repeat_interleave(r, 1), v.float().repeat_interleave(r, 1), is_causal=True, scale=1 / math.sqrt(dqk)
+    )
+    return g, {Q: q, K: k, V: v, O: o}, o, ref
+
+
+def _run_plan(g, pack, index):
+    import torch
+
+    g.select_plan(index)
+    g.check_support()
+    g.build_plans()
+    g.execute(pack, torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8))
+    torch.cuda.synchronize()
+
+
+def _requires_wide_v_device():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the wide-V engine guard covers cc 10.x devices")
+    if cudnn.backend_version() < _bg.WIDE_V_WRONG_O_SINCE:
+        pytest.skip(f"cuDNN {cudnn.backend_version()} predates the defect (9.23.1)")
+
+
+def test_wide_v_graph_never_offers_the_wrong_engines_and_its_default_is_right(monkeypatch):
+    _requires_wide_v_device()
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, pack, o, ref = _wide_v_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    armed = bool(_bg.backend_engine_guard(g, g._facts_for(graph_analyzer.analyze)))
+    offered = [int(p.engine_id) for p in g.plans if not is_python_engine(p.engine_id)]
+    if armed:
+        assert not set(offered) & set(_bg.WIDE_V_WRONG_O_ENGINES), offered
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="#2401"):
+            g.create_execution_plan(10, {})
+    _run_plan(g, pack, 0)
+    assert (o.float() - ref).abs().max().item() < 0.05
+
+
+def test_wide_v_guard_withholds_the_opensource_delegate(monkeypatch):
+    """OPENSOURCE in the heuristics adds a delegating entry that lets C++ pick from its own list, engines 10 / 18
+    included. An armed guard withholds it, and every backend plan offered returns the right O."""
+    _requires_wide_v_device()
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    g, pack, o, ref = _wide_v_graph()
+    g.create_execution_plans([cudnn.heur_mode.OPENSOURCE, cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    if not _bg.backend_engine_guard(g, g._facts_for(graph_analyzer.analyze)):
+        pytest.skip(f"the wide-V guard is not armed on cuDNN {cudnn.backend_version()}")
+    backend = [i for i, p in enumerate(g.plans) if not is_python_engine(p.engine_id)]
+    assert backend and all(int(g.plans[i].engine_id) != BACKEND_HEURISTIC_ENGINE_ID for i in backend)
+    for index in backend:
+        _run_plan(g, pack, index)
+        assert (o.float() - ref).abs().max().item() < 0.05, g.get_plan_name_at_index(index)
+
+
+def test_wide_v_engine_guard_is_current(monkeypatch):
+    """Detector for WIDE_V_WRONG_O_FIXED_IN: with the guard lifted, the installed backend's engine 10 / 18 plans for the
+    dense causal 128/256 graph run against torch's fp32 SDPA. While no fix version is recorded they must still be wrong (a
+    right O fails with the version to record); at or above a recorded version they must be right."""
+    _requires_wide_v_device()
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    recorded = _bg.WIDE_V_WRONG_O_FIXED_IN
+    monkeypatch.setattr(_bg, "WIDE_V_WRONG_O_FIXED_IN", 0)  # lift the guard
+    g, pack, o, ref = _wide_v_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    native = [i for i, p in enumerate(g.plans) if int(p.engine_id) in _bg.WIDE_V_WRONG_O_ENGINES]
+    if not native:
+        pytest.skip(f"cuDNN {cudnn.backend_version()} offers neither engine 10 nor 18 for this graph")
+    errors = []
+    for index in native:
+        _run_plan(g, pack, index)
+        errors.append((int(g.plans[index].engine_id), (o.float() - ref).abs().max().item()))
+    wrong = any(err > 0.05 for _, err in errors)
+    if recorded is None:
+        assert wrong, (
+            f"cuDNN {cudnn.backend_version()} engines {errors} return the right O: record WIDE_V_WRONG_O_FIXED_IN = "
+            f"{cudnn.backend_version()} in sdpa/fwd/backend_guard.py"
+        )
+    elif cudnn.backend_version() >= recorded:
+        assert not wrong, f"cuDNN {cudnn.backend_version()} engines {errors} at or above the recorded fix {recorded}"

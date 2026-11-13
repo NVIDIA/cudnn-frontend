@@ -47,7 +47,7 @@ pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutl
                               # ".[cutedsl]" still resolves -- it now holds only cuda-python, which the DSL pulls in anyway
 pip install -e ".[cutile]"    # + the cuTile linear-attention engines (cuda-tile; needs a system tileiras)
 pip install --group torch      # + torch for the CuTeDSL APIs (torch, torch-c-dlpack-ext)
-pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.5; XLA entry points via cutlass.jax)
+pip install --group jax        # + jax for the CuTeDSL APIs (jax >= 0.9.1; XLA entry points via cutlass.jax)
 ```
 
 `setup.py` honors env vars: `CUDNN_PATH`, `CUDA_PATH` / `CUDAToolkit_ROOT`, `DEBUG=1` (debug build), `CMAKE_BUILD_PARALLEL_LEVEL`, `CMAKE_GENERATOR`.
@@ -101,7 +101,7 @@ First invocation builds the hook environments and can take >5 minutes; later run
 
 ## Agent skills
 
-Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
+Reusable task recipes live in `skills/` (auto-discovered by Claude Code via `.claude/skills` and by Codex via `.agents/skills`; other agents: read the relevant `skills/<name>/SKILL.md` before starting a matching task):
 
 - `skills/cutedsl-kernel-integration/` — integrating a CuTeDSL kernel as a frontend-only Python API end to end (API class, wrapper, exports, docs, tests).
 - [skills/determinism_tests/](skills/determinism_tests/SKILL.md) — required for new numerical APIs and changes to kernels, datatypes, or GPU targets: add and run L0 determinism tests, then update the API support page.

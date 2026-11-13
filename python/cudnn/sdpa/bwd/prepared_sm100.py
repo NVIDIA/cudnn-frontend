@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.frost.tile_dsl.thd import THD_BWD_META_WORDS
-from .prepared import BwdLaunchSpec, Operand, ROLES
+from .prepared import ATTRIBUTES, BwdLaunchSpec, Operand, ROLES
 
 
 def native_io_strides(desc):
@@ -43,6 +43,12 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     tq = api._t_q_cap if api.thd else api.s_q_max
     tk = api._t_kv_cap if api.thd else api.s_k_max
     actual_batch = 1 if api.thd else b
+    # Independent physical origins (THD): a port bound with ragged offsets is viewed at its DECLARED capacity -- its
+    # sequences sit anywhere inside it -- while the workspace stays sized from the packed totals.
+    origins = bool(api.thd and api._thd_ro_spec)
+    ro_ports = api._thd_ro_spec if origins else {}
+    phys_q = int(api.max_total_seq_len_q) if origins else tq
+    phys_k = int(api.max_total_seq_len_kv) if origins else tk
     geometry = []
     operands = []
     for role in ROLES[:9]:
@@ -50,13 +56,17 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
         shape, strides = tuple(desc.shape), tuple(desc.stride)
         if role == "stats":
             if api.thd:
-                geom = compact((tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or tq))
+                stats_tq = phys_q if "stats" in ro_ports else tq
+                geom = compact((stats_tq, h)) if api._thd_lse_token_major else compact((1, h, api._thd_lse_head_stride or stats_tq))
             else:
                 geom = (shape[:3], strides[:3])
             alignment = 4
         else:
             if api.thd:
-                tokens = tk if role in ("k", "v", "dk", "dv") else tq
+                if role in ro_ports:
+                    tokens = phys_k if role in ("k", "v", "dk", "dv") else phys_q
+                else:
+                    tokens = tk if role in ("k", "v", "dk", "dv") else tq
                 shape = (1, shape[1], tokens, shape[3])
                 strides = (max(tokens, 1) * strides[2], *strides[1:])
             else:
@@ -70,6 +80,10 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
         span = 0 if not math.prod(shape) else 1 + sum((n - 1) * st for n, st in zip(shape, strides))
         operands.append(Operand(str(desc.dtype).split(".")[-1], shape, strides, span, alignment, desc.dtype.itemsize))
     operands.extend([Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) if api.thd else None for _ in range(2)])
+    if origins:
+        for name in api._thd_origin_dtypes:
+            width = 8 if name == "int64" else 4
+            operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
     offset = 0
 
     def region(shape, itemsize):
@@ -84,10 +98,11 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     scores = region((actual_batch, api._qh_chunk, rows, api._skv_pad), 2)
     dscores = region((actual_batch, api._qh_chunk, rows, api._skv_pad), 2)
     meta = region((THD_BWD_META_WORDS(b) if api.thd else b,), 4)
-    desc2 = region((4 * 16 if api.thd else 1,), 8)
-    desc3 = region(((b + 1) * 16,), 8) if api.thd else None
+    desc2 = region(((4 * b if origins else 4) * 16 if api.thd else 1,), 8)
+    desc3 = region(((2 * b if origins else b + 1) * 16,), 8) if api.thd else None
     dkw = region((actual_batch, tk, h, d), 2) if hk != h else None
     dvw = region((actual_batch, tk, h, d), 2) if hk != h else None
+    org = region((9, b), 8) if origins else None
     if offset != api.scratch_workspace_bytes():
         raise RuntimeError("SM100 backward prepared workspace differs from its advertised requirement")
     # Stage 2's q span per cluster: CLUSTER_Q_ROWS on the 2x2 twin, TILE_M * CTA_MMA on the role split (both 256).
@@ -100,17 +115,52 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     device_index = resolve_device(api.q_desc.device)
     major, minor = compute_capability(device_index)
     sm = major * 10 + minor
-    regions = delta, scores, dscores, meta, desc2, desc3, dkw, dvw
+    # The origins region is appended only on an origins plan, so the compact artifact's key and carve are unchanged.
+    regions = (delta, scores, dscores, meta, desc2, desc3, dkw, dvw) + ((org,) if origins else ())
     geometry = tuple(geometry)
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (stage2, mm_lo, mm_hi)), params, geometry, regions, sm))
+    if origins:
+        key = repr((key, "thd-origins", api._thd_origins, api._thd_origin_dtypes))
     # The row's name is the spec's, the artifact symbol's (``frost_sdpa_bwd_sm100_prepared`` on the SM100 row, the cc 10.7 d512
     # row's own on ``sdpa_bwd_sm107_d512``) and the launch spec's; the chain is the same for both.
     name = api._NAME
-    entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key, symbol=f"frost_{name}_prepared")
+    if origins:
+        entry = compile_host(
+            stage2._host_chain,
+            mm_lo._host_chain,
+            mm_hi._host_chain,
+            params,
+            geometry,
+            regions,
+            dtype,
+            sm,
+            key,
+            symbol=f"frost_{name}_prepared",
+            origin_specs=api._thd_origins,
+            origin_dtypes=api._thd_origin_dtypes,
+        )
+    else:
+        entry = compile_host(stage2._host, mm_lo._host, mm_hi._host, params, geometry, regions, dtype, sm, key, symbol=f"frost_{name}_prepared")
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
         raise NotImplementedError("SM100 backward requires a positional tvm-ffi entry")
+    if origins:
+        from .d128_thd_contract import RAGGED_ROLES
+
+        return BwdLaunchSpec(
+            owner,
+            fn,
+            tuple(operands),
+            offset,
+            device_index,
+            api.scale_softmax,
+            name,
+            True,
+            roles=ROLES[:11] + RAGGED_ROLES,
+            attributes=ATTRIBUTES[:11] + RAGGED_ROLES,
+            native_binding=True,
+        )
     return BwdLaunchSpec(owner, fn, tuple(operands), offset, device_index, api.scale_softmax, name, True, native_binding=True)
 
 
@@ -126,7 +176,7 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
         raise ValueError(f"{spec.name} requires {spec.workspace_bytes} bytes of contiguous uint8 workspace on CUDA device {spec.device_index}")
     if current_stream is None:
         current_stream = torch.cuda.current_stream(api.q_desc.device).cuda_stream
-    facts = dict(zip(ROLES, map(facts_of_tensor, tensors)))
+    facts = dict(zip(spec.roles, map(facts_of_tensor, tensors)))
     geometry = []
     for i, op in enumerate(spec.operands):
         geom = None

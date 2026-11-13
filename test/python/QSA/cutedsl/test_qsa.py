@@ -31,7 +31,7 @@ def supported_gpu():
 
 def skip_without_cuda13_for_12q1kv(hkv):
     # the 12Q/1KV backward declines the CUDA 12 build of the DSL compiler, which its key-major kernel crashes
-    from cudnn.QSA.kernels.bprop_sm100 import dsl_cuda_major
+    from cudnn.QSA._backward import dsl_cuda_major
 
     if hkv == 1 and dsl_cuda_major() < 13:
         pytest.skip("12Q/1KV QSA backward requires the CUDA 13 build of CuTe DSL")
@@ -126,7 +126,7 @@ def test_signature():
     tail = ["sel_blocks", "lo", "hi", "blk_base", "tok_base", "block_first", "block_last", "scale", "block_size"]
     for function, prefix, options in (
         (qsa_forward, ["q", "k", "v"], []),
-        (qsa_backward, ["grad_out", "q", "k", "v", "out_fp32", "lse"], ["ds_precision"]),
+        (qsa_backward, ["grad_out", "q", "k", "v", "out_fp32", "lse"], ["ds_precision", "deterministic"]),
     ):
         signature = inspect.signature(function)
         assert list(signature.parameters) == prefix + tail + options
@@ -134,6 +134,7 @@ def test_signature():
         assert signature.parameters["block_size"].default == 4
         assert all(p.default is inspect.Parameter.empty for name, p in signature.parameters.items() if name not in ("block_size", *options))
     assert inspect.signature(qsa_backward).parameters["ds_precision"].default == "fp32"
+    assert inspect.signature(qsa_backward).parameters["deterministic"].default is False
 
 
 @pytest.mark.L0

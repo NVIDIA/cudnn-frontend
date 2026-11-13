@@ -56,8 +56,8 @@ from .kernel.shared_expert_decode_config import (
     validate_one_wave,
 )
 
-#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts only (validated on cc 10.3; cc 10.0 / 10.7
-#: unverified).  cc 12.x (99 KB per-CTA opt-in) holds no launch-1 form and stays declined until one is measured.
+#: the served compute capabilities as closed ranges of ``10 * major + minor``: SM100-class parts only (validated on cc 10.0, cc 10.3
+#: and cc 10.7).  cc 12.x (99 KB per-CTA opt-in) holds no launch-1 form and stays declined until one is measured.
 SUPPORTED_CC_RANGES = ((100, 109),)
 SUPPORTED_CC_TEXT = "10.x (SM100-class)"
 DSL_FLOOR = (4, 8, 0)

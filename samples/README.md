@@ -78,10 +78,22 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
 * [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul. Needs a data-center Blackwell-family GPU (`100 <= SM < 120`); on other parts the scripts print `[NN] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)` and exit 0.
 * [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2, GDP and Mamba-2 prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
+  [26_gdn_decode_fused.py](frost/linear_attention/26_gdn_decode_fused.py) drives the fused GDN decode step (`cudnn.GdnDecodeFused`) from a slot pool for 32 steps at 1 and 4 rows, checked against an fp64-accumulated PyTorch step; the entry serves compute capability 10.x and 12.x GPUs, and elsewhere the script prints `[26] SKIP` with the requirement and exits 0.
 * [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
 
 ```
 python samples/frost/linear_attention/01_gdn_prefill.py
+```
+
+## Model Samples
+End-to-end samples of open-weight model families in [samples/models](models/): one process, a printed table of which provider serves every block of the model, and a self-check against a plain-PyTorch reference. They are not a serving engine and carry no performance table; see [models/README.md](models/README.md).
+* [models/qwen_dense](models/qwen_dense/): the dense Qwen 3.5-architecture model. `00_decode.py` runs a plain greedy decode on the reduced seeded model (2 layers at the published widths, no checkpoint, no extra package), token ids in and token ids out, with the linear-attention step on `cudnn.GdnDecodeFused`. Needs a GPU of compute capability 10.x or 12.x; elsewhere it prints `[00] SKIP <requirement>` and exits 0. With `--model DIR` it runs a checkpoint from local disk, text in and text out, with the checkpoint's own tokenizer and chat template; that needs the packages of `samples/models/requirements.txt`, the checkpoint on local disk (your own download: the sample fetches nothing) and a GPU with room for a bf16 copy of every weight, about 57 GiB free for the 27B checkpoint.
+
+```
+python samples/models/qwen_dense/00_decode.py
+pip install -r samples/models/requirements.txt
+hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4
+python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --prompt "Why is the sky blue?"
 ```
 
 ## C++ Interface Samples

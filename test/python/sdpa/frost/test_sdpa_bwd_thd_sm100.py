@@ -928,9 +928,10 @@ def _cuda_kernel_names(fn):
 @pytest.mark.parametrize("h, hkv, chunk, kw", _CHUNK_CELLS)
 def test_graph_thd_launch_count_is_the_promised_chain(h, hkv, chunk, kw, stage2_datapath):
     """Launches per execute, from a CUPTI trace, == exactly the chain the host promises (Rules 1-2: no hidden launches):
-    ``setup + dot [+ zero-fill] + chunks * (clamp + stage 2 + (2 + group) * (patch + GEMM)) [+ dkv_reduce]`` -- for a dense-mask
+    ``setup + dot [+ zero-fill] + chunks * (maps + stage 2 + (2 + group) * (patch + GEMM)) [+ dkv_reduce]`` -- for a dense-mask
     MHA plan ``2 + 8 * chunks``.  The per-chunk THD helpers are counted by name too, so a chunk that silently skipped (or
-    doubled) a launch is attributed."""
+    doubled) a launch is attributed.  A graph binds every THD port with ragged offsets, so stage 2's input maps are the
+    sequence-local ones (``seq_thd_input_descs``), never the packed-total clamp."""
     guard, _ = _force_thd_head_chunk(chunk)
     with guard:
         case, *_ = _run_graph(_CHUNK_LENS, _CHUNK_LENS, h=h, hkv=hkv, check=False, **kw)
@@ -940,7 +941,8 @@ def test_graph_thd_launch_count_is_the_promised_chain(h, hkv, chunk, kw, stage2_
     want = 2 + int(causal) + chunks * 2 + 2 * gemms + int(group > 1)
     count = lambda sub: sum(sub in n for n in names)  # noqa: E731
     assert len(names) == want, f"{len(names)} launches != {want} (chunks {chunks}, group {group}, causal {causal}); trace:\n" + "\n".join(names)
-    assert count("thd_bwd_setup") == 1 and count("clamp_thd_input_descs") == chunks and count("thd_patch_descs") == gemms, names
+    assert count("thd_bwd_setup") == 1 and count("seq_thd_input_descs") == chunks and count("clamp_thd_input_descs") == 0, names
+    assert count("thd_patch_descs") == gemms, names
     assert count("bprop_matmul") == gemms and count("dot_do_o") == 1 and count("zero_workspace") == int(causal) and count("dkv_reduce") == int(group > 1), names
 
 

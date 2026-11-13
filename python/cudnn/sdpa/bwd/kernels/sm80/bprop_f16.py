@@ -109,7 +109,7 @@ from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor, swizzle_xor_128b  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA, compute_q_loop_bounds, q_tile_kv_hi  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
@@ -254,7 +254,8 @@ def _bprop_kernel(
     attn_scale: cutlass.Float32,  # linear scale (for dS)
     right_bound: cutlass.Int32,  # causal right-band widening (k <= q+rb)
     bias_bstride: cutlass.Int64,  # bias batch stride (0 = broadcast over B)
-    sem_q_stride: cutlass.Int32,  # DQ_SEM per-(seq,head) stride = ceil(max_SQ/tile_q) (deterministic only)
+    sem_q_stride: cutlass.Int32,  # DQ_SEM per-(seq,head,partition) stride
+    grad_dim_splits: cutlass.Constexpr[int] = 1,
 ):
     # ---- compile-time derived counts --------------------------------------
     """SM80 SDPA backward main kernel: one CTA per (kv-tile, head, batch|sequence) owns dK/dV
@@ -264,7 +265,9 @@ def _bprop_kernel(
     DV_CHUNKS = d_v // 16  # BMM1' K-reduce over d (dP = V·dOᵀ)
     Q_CHUNKS = tile_q // 16  # BMM2 K-reduce over q (dV/dK)
     KV_CHUNKS = tile_kv // 16  # dQ K-reduce over kv
-    DQ_N = d_qk // 2  # dQ N per sub-group
+    GRAD_DQK = d_qk // grad_dim_splits
+    GRAD_DV = d_v // grad_dim_splits
+    DQ_N = GRAD_DQK // 2  # dQ N per sub-group and column partition
     KV_PER_WARP = tile_kv // warps_per_sg  # rows of S/dP a warp owns (== 16)
     Q_PER_WARP = tile_q // warps_per_sg  # rows of dQ a warp owns (16 or 32)
     # dQ M-blocks per warp.  dQ is [tile_q, d_qk]; warps_per_sg warps each own
@@ -278,6 +281,8 @@ def _bprop_kernel(
     M_STRIDE = warps_per_sg * 16  # q-row stride between dQ m-blocks
 
     bx, by, bz = cute.arch.block_idx()
+    grad_col_idx = bx % grad_dim_splits
+    bx = bx // grad_dim_splits
     B = Q.shape[0]
     SQ = Q.shape[1]
     H = Q.shape[2]  # query heads (grid head dim; Q/dO/dQ/dK_ws/dV_ws)
@@ -334,7 +339,7 @@ def _bprop_kernel(
             # The deterministic relay hands each dQ slot from the highest visiting
             # kv-tile down, so a kv-tile waits on HIGHER ones: schedule those first
             # (lower blockIdx) to keep every awaited predecessor resident.
-            kv_tile = cutlass.Int32(cute.arch.grid_dim()[0]) - cutlass.Int32(1) - bx
+            kv_tile = cutlass.Int32(cute.arch.grid_dim()[0]) // grad_dim_splits - cutlass.Int32(1) - bx
         head = by
         batch = bz
     # GQA: CTA processes ONE query head `head`; its KV head = head // (H//Hkv).
@@ -492,7 +497,7 @@ def _bprop_kernel(
         if cutlass.const_expr(THD_VARLEN):
             relay_kv_last = (s_kv_b + cutlass.Int32(tile_kv - 1)) // cutlass.Int32(tile_kv) - cutlass.Int32(1)
         else:
-            relay_kv_last = cutlass.Int32(cute.arch.grid_dim()[0]) - cutlass.Int32(1)
+            relay_kv_last = cutlass.Int32(cute.arch.grid_dim()[0]) // grad_dim_splits - cutlass.Int32(1)
 
     # K/V tile (row 0) GMEM element pointers — at the KV head (GQA-mapped).
     # kv_row_origin = batch*SKV (dense) or cu_k[b] (THD packed).
@@ -572,6 +577,13 @@ def _bprop_kernel(
     # valid dQ).  Under THD row_base is the packed in-sequence row (kv_base).
     kv_valid = kv_bound if cutlass.const_expr(GATE_KV) else None
     kv_rbase = kv_base if cutlass.const_expr(GATE_KV) else None
+    if cutlass.const_expr(has_seq_kv_lens and not THD_VARLEN):
+        # Dense PADDED: rows in [eff_skv, SKV) are runtime padding inside the
+        # declared S_kv, unread data like the forward's (#2135). P is already 0
+        # there, but dP = dO.V^T and dQ's dS^T.K would carry a NaN pad row into
+        # valid dQ, so the loads zero-fill them too.
+        kv_valid = cute.math.max(cutlass.Int32(0), cute.math.min(eff_skv, cutlass.Int32(SKV)))
+        kv_rbase = kv_base
     load_tile_2d(
         sK,
         k_tile_gmem,
@@ -649,7 +661,7 @@ def _bprop_kernel(
     # acc_grad: sg0 → dV[kv, d_v]; sg1 → dK[kv, d_qk].  Sized for the larger
     # of the two N (d_qk != d_v on dsv3 → size to max; equal on llama/qwen).
     # One m-block, N//8 n_frags.
-    GRAD_N = d_qk if cutlass.const_expr(d_qk >= d_v) else d_v
+    GRAD_N = GRAD_DQK if cutlass.const_expr(d_qk >= d_v) else GRAD_DV
     GRAD_NFRAGS = GRAD_N // 8
     acc_grad = cutlass.Array(cutlass.Float32, GRAD_NFRAGS * 4, alignment=16, space=cutlass.AddressSpace.rmem)
     for i in cutlass.range(GRAD_NFRAGS * 4, unroll_full=True):
@@ -669,7 +681,7 @@ def _bprop_kernel(
 
     a_list = [a_persist[i] for i in range(A_CHUNKS * 4)]
 
-    sg_d_base = sg_id * cutlass.Int32(DQ_N)  # dQ d-col base for this sub-group
+    sg_d_base = grad_col_idx * cutlass.Int32(GRAD_DQK) + sg_id * cutlass.Int32(DQ_N)  # dQ d-col base for this sub-group
     # Q/dO row-gate bound (per-seq under THD) + packed seq origin for the GMEM
     # base (q_row_origin = batch*SQ dense / cu_q[b] THD).
     SQ_rt = q_bound
@@ -914,8 +926,8 @@ def _bprop_kernel(
                 # sP write (fp32 P; sg1 forms dS from it).  col is even, so the
                 # pair stays inside one 16 B swizzle chunk.
                 col = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
-                i_top = kv_row_g * cutlass.Int32(tile_q) + swizzle_xor_128b(kv_row_g, col, elem_bytes=4)
-                i_bot = kv_row_g8 * cutlass.Int32(tile_q) + swizzle_xor_128b(kv_row_g8, col, elem_bytes=4)
+                i_top = kv_row_g * cutlass.Int32(tile_q) + swizzle_xor(kv_row_g, col, tile_q, 4)
+                i_bot = kv_row_g8 * cutlass.Int32(tile_q) + swizzle_xor(kv_row_g8, col, tile_q, 4)
                 Pointer(sP.subview(i_top).data_ptr(), dtype=cutlass.Float32).store(p0)
                 Pointer(sP.subview(i_top + cutlass.Int32(1)).data_ptr(), dtype=cutlass.Float32).store(p1)
                 Pointer(sP.subview(i_bot).data_ptr(), dtype=cutlass.Float32).store(p2)
@@ -941,8 +953,8 @@ def _bprop_kernel(
                 dd0 = Pointer(DOT_view.data_ptr() + dot_head_base + qr0, dtype=cutlass.Float32).load()
                 dd1 = Pointer(DOT_view.data_ptr() + dot_head_base + qr1, dtype=cutlass.Float32).load()
                 col = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
-                swz_top = swizzle_xor_128b(kv_row_g, col, elem_bytes=4)
-                swz_bot = swizzle_xor_128b(kv_row_g8, col, elem_bytes=4)
+                swz_top = swizzle_xor(kv_row_g, col, tile_q, 4)
+                swz_bot = swizzle_xor(kv_row_g8, col, tile_q, 4)
                 a_top = sP.subview(kv_row_g * cutlass.Int32(tile_q) + swz_top)
                 a_bot = sP.subview(kv_row_g8 * cutlass.Int32(tile_q) + swz_bot)
                 ptop = Pointer(a_top.data_ptr(), dtype=cutlass.Float32).load(count=2)
@@ -959,28 +971,37 @@ def _bprop_kernel(
                 db1 = (acc1[off + 1] - dd1) * p1
                 db2 = (acc1[off + 2] - dd0) * p2
                 db3 = (acc1[off + 3] - dd1) * p3
+                if cutlass.const_expr(has_seq_len_q):
+                    # An empty dense member has no live delta row to clamp to.
+                    # Its physical O/dO/Stats may be NaN; masked P=0 must still
+                    # produce dS=0 instead of evaluating NaN * 0.
+                    db0 = cutlass.Float32(arith.select((p0 == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), db0.ir_value()))
+                    db1 = cutlass.Float32(arith.select((p1 == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), db1.ir_value()))
+                    db2 = cutlass.Float32(arith.select((p2 == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), db2.ir_value()))
+                    db3 = cutlass.Float32(arith.select((p3 == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), db3.ir_value()))
                 if cutlass.const_expr(has_bias):
-                    if cutlass.const_expr(PARTIAL_Q or PARTIAL_KV):
-                        # Padded cells have db == 0 (P masked) but their dBias
-                        # GMEM slot is OOB ([.,H,SQ,SKV]) → row/col-gate the
-                        # atomicAdd so no out-of-bounds write lands.
-                        _q0 = qc0 < cutlass.Int32(SQ)
-                        _q1 = qc1 < cutlass.Int32(SQ)
-                        _k0 = kv_a < cutlass.Int32(SKV)
-                        _k8 = kv_a8 < cutlass.Int32(SKV)
-                        if _q0 & _k0:
+                    if grad_col_idx == 0:
+                        if cutlass.const_expr(PARTIAL_Q or PARTIAL_KV):
+                            # Padded cells have db == 0 (P masked) but their dBias
+                            # GMEM slot is OOB ([.,H,SQ,SKV]) → row/col-gate the
+                            # atomicAdd so no out-of-bounds write lands.
+                            _q0 = qc0 < cutlass.Int32(SQ)
+                            _q1 = qc1 < cutlass.Int32(SQ)
+                            _k0 = kv_a < cutlass.Int32(SKV)
+                            _k8 = kv_a8 < cutlass.Int32(SKV)
+                            if _q0 & _k0:
+                                _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a, db0)
+                            if _q1 & _k0:
+                                _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a, db1)
+                            if _q0 & _k8:
+                                _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a8, db2)
+                            if _q1 & _k8:
+                                _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a8, db3)
+                        else:
                             _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a, db0)
-                        if _q1 & _k0:
                             _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a, db1)
-                        if _q0 & _k8:
                             _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a8, db2)
-                        if _q1 & _k8:
                             _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a8, db3)
-                    else:
-                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a, db0)
-                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a, db1)
-                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc0) * cutlass.Int64(SKV) + kv_a8, db2)
-                        _atomic_add_f32(_dbias_ptr + bias_base + cutlass.Int64(qc1) * cutlass.Int64(SKV) + kv_a8, db3)
                 ds0 = attn_scale * db0
                 ds1 = attn_scale * db1
                 ds2 = attn_scale * db2
@@ -992,16 +1013,16 @@ def _bprop_kernel(
                 # transpose); swizzled per (q, kv) so the dQ ldmatrix is conflict-free.
                 q0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
                 q1 = q0 + cutlass.Int32(1)
-                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q0, kv_row_g, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor(q0, kv_row_g, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds0.to(io_dtype)
                 )
-                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q1, kv_row_g, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor(q1, kv_row_g, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds1.to(io_dtype)
                 )
-                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q0, kv_row_g8, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q0 * cutlass.Int32(tile_kv) + swizzle_xor(q0, kv_row_g8, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds2.to(io_dtype)
                 )
-                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor_128b(q1, kv_row_g8, elem_bytes=_ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
+                Pointer(sdST.subview(q1 * cutlass.Int32(tile_kv) + swizzle_xor(q1, kv_row_g8, tile_kv, _ELEM_BYTES)).data_ptr(), dtype=io_dtype).store(
                     ds3.to(io_dtype)
                 )
 
@@ -1012,12 +1033,16 @@ def _bprop_kernel(
         a_bmm2 = [bmm2_a[i] for i in range(S_NFRAGS * 2)]
         if is_sg0:
             for kc in cutlass.range_constexpr(Q_CHUNKS):
-                b = load_b_smem_x4(o_cur, k_step=kc, N=d_v, sB_elems_per_row=cutlass.Int32(d_v), b_trans=True, lane=lane, swizzle=True)
-                mma_step(acc_grad, a_bmm2, b, k_step=kc, M=16, N=d_v, ab_dtype=io_dtype)
+                b = load_b_smem_x4(
+                    o_cur, k_step=kc, N=GRAD_DV, sB_elems_per_row=cutlass.Int32(d_v), b_trans=True, lane=lane, swizzle=True, col_base=grad_col_idx * GRAD_DV
+                )
+                mma_step(acc_grad, a_bmm2, b, k_step=kc, M=16, N=GRAD_DV, ab_dtype=io_dtype)
         else:
             for kc in cutlass.range_constexpr(Q_CHUNKS):
-                b = load_b_smem_x4(q_cur, k_step=kc, N=d_qk, sB_elems_per_row=cutlass.Int32(d_qk), b_trans=True, lane=lane, swizzle=True)
-                mma_step(acc_grad, a_bmm2, b, k_step=kc, M=16, N=d_qk, ab_dtype=io_dtype)
+                b = load_b_smem_x4(
+                    q_cur, k_step=kc, N=GRAD_DQK, sB_elems_per_row=cutlass.Int32(d_qk), b_trans=True, lane=lane, swizzle=True, col_base=grad_col_idx * GRAD_DQK
+                )
+                mma_step(acc_grad, a_bmm2, b, k_step=kc, M=16, N=GRAD_DQK, ab_dtype=io_dtype)
 
         # ---- B2: sdS / sdSᵀ ready -------------------------------------------
         nvvm.barrier_cta_sync()
@@ -1034,9 +1059,7 @@ def _bprop_kernel(
             col = kc * 16 + a_col * 8
             for mb in cutlass.range_constexpr(DQ_M_BLOCKS):
                 row = cutlass.Int32(mb * M_STRIDE) + warp_local * 16 + a_row
-                vv = nvvm.ldmatrix(
-                    sdST.subview(row * cutlass.Int32(tile_kv) + swizzle_xor_128b(row, col, elem_bytes=_ELEM_BYTES)).data_ptr(), 4, nvvm.MMALayout.ROW
-                )
+                vv = nvvm.ldmatrix(sdST.subview(row * cutlass.Int32(tile_kv) + swizzle_xor(row, col, tile_kv, _ELEM_BYTES)).data_ptr(), 4, nvvm.MMALayout.ROW)
                 adst[mb * 4 + 0] = vv[0]
                 adst[mb * 4 + 1] = vv[1]
                 adst[mb * 4 + 2] = vv[2]
@@ -1066,7 +1089,7 @@ def _bprop_kernel(
         # Every visitor computes the same kv_hi, so acquire (== turn) and release
         # (turn + 1) agree.  Folds out when deterministic=False.
         if cutlass.const_expr(deterministic):
-            sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
+            sem_idx = ((batch * cutlass.Int32(H) + head) * grad_dim_splits + grad_col_idx) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
             relay_kv_hi = q_tile_kv_hi(
                 q_iter,
@@ -1257,8 +1280,8 @@ def _bprop_kernel(
         kv_top_ok = (kv_base + kv_row_g) < kv_bound
         kv_bot_ok = (kv_base + kv_row_g8) < kv_bound
     if is_sg0:
-        for nf in cutlass.range_constexpr(d_v // 8):
-            d0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
+        for nf in cutlass.range_constexpr(GRAD_DV // 8):
+            d0 = grad_col_idx * GRAD_DV + cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
             off = nf * 4
             base_top = DV_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g)) * DV_RS + cutlass.Int64(head) * cutlass.Int64(dV.stride[2]) + d0
             base_bot = DV_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g8)) * DV_RS + cutlass.Int64(head) * cutlass.Int64(dV.stride[2]) + d0
@@ -1304,8 +1327,8 @@ def _bprop_kernel(
                     acc_grad[off_hi + ridx] = hi0 * c0 - lo0 * s0
                     acc_grad[off + ridx + 1] = lo1 * c1 + hi1 * s1
                     acc_grad[off_hi + ridx + 1] = hi1 * c1 - lo1 * s1
-        for nf in cutlass.range_constexpr(d_qk // 8):
-            d0 = cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
+        for nf in cutlass.range_constexpr(GRAD_DQK // 8):
+            d0 = grad_col_idx * GRAD_DQK + cutlass.Int32(nf * 8) + cutlass.Int32(2) * p_lane
             off = nf * 4
             base_top = DK_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g)) * DK_RS + cutlass.Int64(head) * cutlass.Int64(dK.stride[2]) + d0
             base_bot = DK_BATCH + (cutlass.Int64(kv_base) + cutlass.Int64(kv_row_g8)) * DK_RS + cutlass.Int64(head) * cutlass.Int64(dK.stride[2]) + d0
@@ -1869,6 +1892,7 @@ def _bprop_host(
     grid_kv_tiles: cutlass.Int32,
     grid_batch: cutlass.Int32,
     stream: cuda.CUstream,
+    grad_dim_splits: cutlass.Constexpr[int] = 1,
 ):
     SKV = K.shape[1]
     H = Q.shape[2]
@@ -1878,13 +1902,13 @@ def _bprop_host(
     # H, n_seq) from host-computed runtime counts (packed B == 1).  THD uses the
     # 3-D grid only (SCHED_DEFAULT); LPT+THD is a future scheduler tweak.
     if cutlass.const_expr(thd_varlen):
-        grid = (grid_kv_tiles, H, grid_batch)
+        grid = (grid_kv_tiles * grad_dim_splits, H, grid_batch)
     elif cutlass.const_expr(sched_policy == SCHED_LPT or sched_policy == SCHED_LPT_L2):
         n_kv_tiles = (SKV + tile_kv - 1) // tile_kv
-        grid = (n_kv_tiles * H * B, 1, 1)
+        grid = (n_kv_tiles * H * B * grad_dim_splits, 1, 1)
     else:
         n_kv_tiles = (SKV + tile_kv - 1) // tile_kv
-        grid = (n_kv_tiles, H, B)
+        grid = (n_kv_tiles * grad_dim_splits, H, B)
     _bprop_kernel(
         Q,
         K,
@@ -1932,6 +1956,7 @@ def _bprop_host(
         right_bound,
         bias_bstride,
         sem_q_stride,
+        grad_dim_splits,
     ).launch(grid=grid, block=(threads, 1, 1), stream=stream)
 
 

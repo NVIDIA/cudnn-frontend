@@ -367,6 +367,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
             tmem_holding_buf: Int32
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.MemRange[cutlass.Int32, 4]
+            claim_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]  # after clc_response: it is read as one 16-byte word
             sPerHead: cute.struct.Align[cute.struct.MemRange[Float32, sPerHead_size], 128]
             sRed: cute.struct.Align[cute.struct.MemRange[Float32, 8 * self.num_math_wg], 128]
             sQ: cute.struct.Align[cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes]
@@ -378,6 +379,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
         tmem_holding_buf = storage.tmem_holding_buf.ptr
         clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
+        claim_mbar_ptr = storage.claim_mbar_ptr.data_ptr()
         clc_response_ptr = storage.clc_response.data_ptr()
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -410,11 +412,14 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
             defer_sync=True,
         )
         if warp_idx == 1:
-            cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, self.num_math_wg)
         if warp_idx == 0:
-            for _w in cutlass.range_constexpr(NUM_ACC):
-                cute.arch.mbarrier_init(T_mbar_ptr + _w, 1)  # full: MMA commit
-                cute.arch.mbarrier_init(T_mbar_ptr + NUM_ACC + _w, self.WARPGROUP_SIZE * self.num_math_wg)  # empty: every math thread
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(claim_mbar_ptr, 1)  # load warp -> CLC warp: the tile's loads are issued
+                for _w in cutlass.range_constexpr(NUM_ACC):
+                    cute.arch.mbarrier_init(T_mbar_ptr + _w, 1)  # full: MMA commit
+                    cute.arch.mbarrier_init(T_mbar_ptr + NUM_ACC + _w, self.WARPGROUP_SIZE * self.num_math_wg)  # empty: every math thread
         num_clc_consumer_threads = self.WARP_SIZE * (3 + 4 * self.num_math_wg)
         clc_pipeline = PipelineClcFetchAsync.create(
             barrier_storage=clc_mbar_ptr,
@@ -516,6 +521,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
                                 if const_expr(_kc % G == G - 1):
                                     KV_producer_state.advance()
                             nb = nb + 1
+                    self._release_claim(claim_mbar_ptr)
                     clc_pipeline.consumer_wait(clc_consumer_state)
                     work_tile = tile_sched.get_current_work()
                     clc_pipeline.consumer_release(clc_consumer_state)
@@ -577,7 +583,7 @@ class IndexerScoreUnifiedSm100(IndexerScoreSm100Base):
 
             # ---------------- CLC scheduler warp ----------------
             if warp_idx == self.sched_warp_id:
-                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state)
+                self._sched_warp(work_tile, tile_sched, clc_pipeline, clc_consumer_state, claim_mbar_ptr, clc_response_ptr)
 
         # ---------------- math warpgroups ----------------
         if warp_group_idx > 0:

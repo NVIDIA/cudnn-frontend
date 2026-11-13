@@ -75,6 +75,7 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
 )
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    thd_row_origin,
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
     nvvm_threadquad_reduction_max,
@@ -460,6 +461,11 @@ class SM120FusedMultiHeadAttentionForward:
                 prims.cp_async_shared_global(dst + lane * 8, src, 8, "ca")
                 if cutlass.const_expr(self._qk_plane_present(half, 1)):
                     prims.cp_async_shared_global(dst + self.k_sf_stage_hi_off + lane * 4, src + SF_ATOM_BYTES, 4, "ca")
+            # Complete the producer's copy group before publishing its arrival,
+            # as in the native SM120 paged loader. The async-tracked arrival
+            # still publishes these writes to the other compute warps.
+            prims.cp_async_commit_group()
+            prims.cp_async_wait_group(0)
             prims.cp_async_mbarrier_arrive(mbar, noinc=True)
         if prims.elect_sync():
             if cutlass.const_expr(envelope):
@@ -1191,10 +1197,9 @@ class SM120FusedMultiHeadAttentionForward:
         Each warp publishes its partial scores in its own ``sX`` slots
         (``[warp][k_frag][lane][4]``, one 16-byte store per fragment), meets its
         partner on the slab's named barrier, and adds the partner's slots in
-        place. The buffer is single-buffered: the caller runs this after the V
-        tile's mbarrier wait, and the next V tile is issued only after every
-        warp has consumed the current one, so the partner has finished reading
-        this tile's partials before anyone writes the next tile's.
+        place. A second pair barrier completes both partners' reads before
+        either warp reuses the single buffer. The K/V asynchronous-copy
+        handoff does not release generic reads of these score slots.
 
         :param basic_params: Lane mapping, warp-pair indices, and ``sX``.
         :param s_regs: This warp's partial QK scores; the full scores on return.
@@ -1217,6 +1222,8 @@ class SM120FusedMultiHeadAttentionForward:
             partner = (partner_base + k_frag * 32 * 4).load(count=4, alignment=16).bitcast(cutlass.Float32)
             for i in cutlass.range_constexpr(4):
                 s_regs[s_off + i] = s_regs[s_off + i] + partner[i]
+        # Keep score ownership separate from the K/V copy completion protocol.
+        prims.barrier_cta_sync(self.bar_pair_base + basic_params.slab, thread_count=self.HEAD_SPLIT * cute.arch.WARP_SIZE)
 
     @cute.jit
     def compute_one_kv_tile(
@@ -1295,8 +1302,8 @@ class SM120FusedMultiHeadAttentionForward:
         while not prims.mbarrier_try_wait_parity(basic_params.v_tma_mbar, tma_phase):
             pass
 
-        # Full scores = this warp's head-dim half + the partner's. After the V
-        # wait on purpose: see exchange_partial_s for why that keeps sX race-free.
+        # Full scores combine both head-dim halves. The pair barriers own
+        # the shared score slots independently of the V-copy wait above.
         self.exchange_partial_s(basic_params, s_regs)
 
         p_regs = self.online_softmax(
@@ -1310,16 +1317,20 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+            # Shared V-tail zero stores have one owner and complete before
+            # any compute warp starts its PV ldmatrix reads.
+            if basic_params.compute_warp_idx == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs, kv_sf_row0, v_sf_valid_blocks)
         if basic_params.compute_warp_idx == 0:
             prims.barrier_cta_sync(self.bar_v_consumed, thread_count=self.threads_kv_pipeline)
@@ -1330,7 +1341,7 @@ class SM120FusedMultiHeadAttentionForward:
                     basic_params.v_tma_mbar,
                     basic_params.tma_batch_idx,
                     basic_params.kv_head_idx,
-                    basic_params.kv_row_base + (kv_tile_idx - 1) * self.kv_tile,
+                    basic_params.v_row_base + (kv_tile_idx - 1) * self.kv_tile,
                     is_v=True,
                     envelope=basic_params.v_envelope,
                     **self._v_sf_load(basic_params.sf_coords, mma_params.sVSF, (kv_tile_idx - 1) * self.kv_tile),
@@ -1456,6 +1467,8 @@ class SM120FusedMultiHeadAttentionForward:
         head_idx,
         unit_idx,
         n_q_tiles,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> cutlass.Int32:
         """Compute one (Q tile, sequence, head) unit, optionally within a KV split.
 
@@ -1498,6 +1511,18 @@ class SM120FusedMultiHeadAttentionForward:
 
         num_heads_q = q.shape[2]
         num_heads_kv = k.shape[2]
+        o_row_base = q_row_base
+        stats_row_base = q_row_base
+        v_row_base = kv_row_base
+        if cutlass.const_expr(thd_origin_specs is not None):
+            # Length prefixes locate logical work and scale tiles; data ports own their physical origins.
+            q_row_base = thd_row_origin(thd_origins, thd_origin_specs, 0, batch_idx, q.stride[1], q_row_base)
+            kv_row_base = cutlass.Int32(thd_row_origin(thd_origins, thd_origin_specs, 1, batch_idx, k.stride[1], kv_row_base))
+            v_row_base = cutlass.Int32(thd_row_origin(thd_origins, thd_origin_specs, 2, batch_idx, v.stride[1], v_row_base))
+            o_row_base = thd_row_origin(thd_origins, thd_origin_specs, 3, batch_idx, o.stride[1], o_row_base)
+            if cutlass.const_expr(lse is not None and not self.thd_lse_padded):
+                stats_stride = lse.stride[1] if cutlass.const_expr(self.thd_lse_head_major) else lse.stride[0]
+                stats_row_base = thd_row_origin(thd_origins, thd_origin_specs, 4, batch_idx, stats_stride, stats_row_base)
         head_dim_qk = q.shape[3]
         head_dim_v = v.shape[3]
         # ENVELOPE flags (static shapes): actual dim < compile-time tile means
@@ -1515,7 +1540,7 @@ class SM120FusedMultiHeadAttentionForward:
             # batch stride term, and every Q/O row index below stays
             # sequence-local.
             q_head_off = q_row_base * q_seq_stride + q_head_base * q_head_stride
-            o_head_off = q_row_base * o_seq_stride + q_head_base * o_head_stride
+            o_head_off = o_row_base * o_seq_stride + q_head_base * o_head_stride
         else:
             q_head_off = batch_idx * q_batch_stride + q_head_base * q_head_stride
             o_head_off = o_batch_idx * o_batch_stride + q_head_base * o_head_stride
@@ -1678,6 +1703,7 @@ class SM120FusedMultiHeadAttentionForward:
             tma_batch_idx=tma_batch_idx,
             kv_head_idx=kv_head_idx,
             kv_row_base=kv_row_base,
+            v_row_base=v_row_base,
             min_kv_tile=min_kv_tile,
             k_envelope=k_envelope,
             v_envelope=v_envelope,
@@ -1742,7 +1768,7 @@ class SM120FusedMultiHeadAttentionForward:
                 v_tma_mbar,
                 tma_batch_idx,
                 kv_head_idx,
-                kv_row_base + kv_seq_idx,
+                v_row_base + kv_seq_idx,
                 is_v=True,
                 envelope=v_envelope,
                 **self._v_sf_load(sf_coords, sVSF, kv_seq_idx),
@@ -1904,9 +1930,9 @@ class SM120FusedMultiHeadAttentionForward:
                                 # per-batch padded Stats (B, H, s_max), no ragged offsets
                                 lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
                             elif cutlass.const_expr(self.thd_lse_head_major):
-                                lse_arr[_lse_head, q_row_base + lse_q_idx] = lse_out
+                                lse_arr[_lse_head, stats_row_base + lse_q_idx] = lse_out
                             else:
-                                lse_arr[q_row_base + lse_q_idx, _lse_head] = lse_out
+                                lse_arr[stats_row_base + lse_q_idx, _lse_head] = lse_out
                     else:
                         # Rows at/past this batch's Q length trim to -inf.
                         if lse_q_idx >= seqlen_q:
@@ -2072,6 +2098,8 @@ class SM120FusedMultiHeadAttentionForward:
         sf_q: cute.Tensor,
         sf_k: cute.Tensor,
         sf_v: cute.Tensor,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> None:
         """SM120 block-scaled MXFP8 d512 FMHA prefill kernel.
 
@@ -2223,6 +2251,8 @@ class SM120FusedMultiHeadAttentionForward:
                     _h,
                     cutlass.Int32(0),
                     n_q_tiles,
+                    thd_origins=thd_origins,
+                    thd_origin_specs=thd_origin_specs,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -2283,6 +2313,8 @@ class SM120FusedMultiHeadAttentionForward:
                     head_idx,
                     _uid,
                     n_q_tiles,
+                    thd_origins=thd_origins,
+                    thd_origin_specs=thd_origin_specs,
                 )
                 _uid = self._next_dense_unit(_uid)
 
@@ -2311,6 +2343,8 @@ class SM120FusedMultiHeadAttentionForward:
         thd_n_ctas: cutlass.Int32,
         stream: cuda_driver.CUstream,
         prepared: cutlass.Constexpr[bool] = False,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> None:
         """Launch the SM120 block-scaled MXFP8 d512 FMHA kernel.
 
@@ -2498,6 +2532,8 @@ class SM120FusedMultiHeadAttentionForward:
             sf_q,
             sf_k,
             sf_v,
+            thd_origins=thd_origins,
+            thd_origin_specs=thd_origin_specs,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -2531,6 +2567,7 @@ def compile(  # noqa: A001
     scale_o_in_combine: bool = False,
     sfo_geometry: Optional[tuple[int, int, int, int]] = None,
     has_scale_o: bool = False,
+    thd_origin_specs=None,
 ) -> Callable:
     """Compile the dense/packed pointer host; geometry binds at execution.
 
@@ -2585,6 +2622,7 @@ def compile(  # noqa: A001
         persistent_ctas,
         _cache_key,
         thd_max_sq=sq if PARAMS.thd_varlen else 0,
+        thd_origin_specs=thd_origin_specs,
         output_dtype=OUT_DTYPE,
         has_amax=has_amax,
     )

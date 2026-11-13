@@ -102,7 +102,7 @@ def test_fft_causal_conv1d_runs_on_a_thread_with_no_cuda_context(path):
     CUDA_ERROR_INVALID_CONTEXT) even with the kernels already built on the main thread. Each primitive binds the
     work's context first; a fresh thread making no CUDA call of its own reproduces the main thread's results."""
     _require_fft_causal_conv1d()
-    import threading
+    from concurrent.futures import ThreadPoolExecutor
 
     if path == "medium":
         x, weight = _make_inputs(1, 2, 256, 128, torch.float32)
@@ -122,20 +122,16 @@ def test_fft_causal_conv1d_runs_on_a_thread_with_no_cuda_context(path):
 
     expected = run()
     torch.cuda.synchronize()
-    result, errors = [], []
 
     def on_fresh_thread():
-        try:
-            result.extend(run())
-            torch.cuda.synchronize()
-        except BaseException as error:  # surfaced on the main thread below
-            errors.append(error)
+        result = run()
+        torch.cuda.synchronize()
+        return result
 
-    worker = threading.Thread(target=on_fresh_thread)
-    worker.start()
-    worker.join()
-    if errors:
-        raise errors[0]
+    # A new executor gives this call a fresh thread. result() propagates worker
+    # exceptions to pytest instead of relying on a shared error list.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(on_fresh_thread).result()
     for got, want in zip(result, expected, strict=True):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
 

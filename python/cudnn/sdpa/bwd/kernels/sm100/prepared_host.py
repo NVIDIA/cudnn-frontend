@@ -11,7 +11,8 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.tile_dsl.tma import st_global_v4
-from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host, dot_do_o_kernel
+from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host
 from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
 from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
 
@@ -77,13 +78,30 @@ def _permuted(tensor: cute.Tensor, order: cutlass.Constexpr):
 
 
 @cute.jit
-def _matmul(entry: cutlass.Constexpr, a, b, output, heads: cutlass.Constexpr, batches: cutlass.Constexpr, grid_m: cutlass.Constexpr, meta, desc, stream):
+def _matmul(
+    entry: cutlass.Constexpr,
+    a,
+    b,
+    output,
+    heads: cutlass.Constexpr,
+    batches: cutlass.Constexpr,
+    grid_m: cutlass.Constexpr,
+    meta,
+    desc,
+    stream,
+    origins=None,
+    origin_rows: cutlass.Constexpr = (-1, -1),
+):
     # Widen dimensions and strides before the stage-3 descriptor's byte products.
     problem = tuple(
         cutlass.Int64(x)
         for x in (grid_m, b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
     )
-    entry(problem, a, b, output, meta, desc, stream)
+    if cutlass.const_expr(origins is not None):
+        # `entry` is the GEMM's `_host_chain`: B (the token operand) and the output take their ports' own origins.
+        entry(problem, a, b, output, meta, desc, stream, thd_origins=origins, thd_origin_rows=origin_rows)
+    else:
+        entry(problem, a, b, output, meta, desc, stream)
 
 
 @cute.jit
@@ -112,7 +130,97 @@ def host(
     dtype: cutlass.Constexpr,
     stream: driver.CUstream,
 ):
+    """The compact exported frame (dense, and THD on packed prefixes)."""
+    _chain(
+        q_ptr, k_ptr, v_ptr, o_ptr, do_ptr, stats_ptr, dq_ptr, dk_ptr, dv_ptr, q_lens_ptr, kv_lens_ptr, workspace, scale_log2, scale, lens_form,
+        stage2, mm_lo, mm_hi, config, geometry, regions, dtype, stream, None, None,
+    )  # fmt: skip
+
+
+@cute.jit
+def host_origins(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    stats_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    q_lens_ptr: cute.Pointer,
+    kv_lens_ptr: cute.Pointer,
+    ro_q: Optional[cute.Pointer],
+    ro_k: Optional[cute.Pointer],
+    ro_v: Optional[cute.Pointer],
+    ro_o: Optional[cute.Pointer],
+    ro_do: Optional[cute.Pointer],
+    ro_dq: Optional[cute.Pointer],
+    ro_dk: Optional[cute.Pointer],
+    ro_dv: Optional[cute.Pointer],
+    ro_stats: Optional[cute.Pointer],
+    workspace: cute.Pointer,
+    scale_log2: cutlass.Float32,
+    scale: cutlass.Float32,
+    lens_form: cutlass.Int32,
+    stage2: cutlass.Constexpr,
+    mm_lo: cutlass.Constexpr,
+    mm_hi: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    origin_specs: cutlass.Constexpr,
+    stream: driver.CUstream,
+):
+    """THD with independent physical origins: a SIBLING frame (the nine ragged-offset operands after the lengths) with its
+    own symbol and cache key, so the compact artifact and its ABI are untouched.  ``origin_specs`` is one ``(row, multiplier,
+    token stride)`` or ``None`` per port in the shared order (q, k, v, o, do, dq, dk, dv, stats)."""
+    _chain(
+        q_ptr, k_ptr, v_ptr, o_ptr, do_ptr, stats_ptr, dq_ptr, dk_ptr, dv_ptr, q_lens_ptr, kv_lens_ptr, workspace, scale_log2, scale, lens_form,
+        stage2, mm_lo, mm_hi, config, geometry, regions, dtype, stream, (ro_q, ro_k, ro_v, ro_o, ro_do, ro_dq, ro_dk, ro_dv, ro_stats), origin_specs,
+    )  # fmt: skip
+
+
+@cute.jit
+def _chain(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    o_ptr,
+    do_ptr,
+    stats_ptr,
+    dq_ptr,
+    dk_ptr,
+    dv_ptr,
+    q_lens_ptr,
+    kv_lens_ptr,
+    workspace,
+    scale_log2,
+    scale,
+    lens_form,
+    stage2: cutlass.Constexpr,
+    mm_lo: cutlass.Constexpr,
+    mm_hi: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    stream,
+    origin_ptrs,
+    origin_specs: cutlass.Constexpr,
+):
     batch, heads, kv_heads, dim, q_max, kv_max, q_rows, kv_rows, chunk, thd, zero_workspace, units, granularity, dq_b_head_group = config
+    # Independent physical origins (THD only): the Int64 [9, B] token origins the setup launch materializes from the bound
+    # offsets, and each port's row in them (-1 = the port keeps its compact prefix).
+    physical = cutlass.const_expr(origin_specs is not None)
+    origins = _scratch(workspace, regions[8], cutlass.Int64) if cutlass.const_expr(physical) else None
+    offsets = (
+        tuple(_view(ptr, ((batch + 1,), (1,))) if cutlass.const_expr(ptr is not None) else None for ptr in origin_ptrs)
+        if cutlass.const_expr(physical)
+        else None
+    )
+    rows = tuple(spec[0] if spec is not None else -1 for spec in origin_specs) if cutlass.const_expr(physical) else (-1,) * 9
     q = _view(q_ptr, geometry[0])
     k = _view(k_ptr, geometry[1])
     v = _view(v_ptr, geometry[2])
@@ -141,7 +249,24 @@ def host(
         # persistent scheduler hand out `(heads - chunk) * q_units` dead units
         # per launch.  The claim counter the same call seeds serves only the
         # FIRST launch; stage 2's clamp kernel re-seeds it before each launch.
-        thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream)
+        if cutlass.const_expr(physical):
+            thd_bwd_setup_host(
+                meta,
+                q_lens,
+                kv_lens,
+                lens_form,
+                chunk,
+                batch,
+                128,
+                granularity,
+                units,
+                stream,
+                org_t=origins,
+                origin_offsets=offsets,
+                origin_specs=origin_specs,
+            )
+        else:
+            thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream)
     # Zero once outside the head-chunk loop: stage 2 leaves mask-skipped tiles
     # unwritten, and stage 3 can consume a wider tile. The skipped set is the
     # same for every chunk, including THD (its per-sequence K-trim, THD_STAGE3_TRIM, still consumes a 512-row M tile
@@ -149,7 +274,13 @@ def host(
     if cutlass.const_expr(zero_workspace):
         _zero_workspace(s_full, ds_full).launch(grid=(min((cute.size(s_full) // 8 + 255) // 256, 4096), 1, 1), block=(256, 1, 1), stream=stream)
     padded_dim = (dim + 63) // 64 * 64
-    dot_do_o_host(o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, stream)
+    if cutlass.const_expr(physical):
+        # O / dO at their own origins into the compact packed delta; one block column per sequence, clipped to its length.
+        dot_do_o_kernel(
+            o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, None, None, meta, origins, (rows[3], rows[4]), cutlass.Int32(batch)
+        ).launch(grid=((q_max + 127) // 128, o.shape[2], batch), block=(256, 1, 1), stream=stream)
+    else:
+        dot_do_o_host(o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, stream)
     group = heads // kv_heads
     dk_target, dv_target = dk, dv
     if cutlass.const_expr(group > 1):
@@ -163,7 +294,10 @@ def host(
     for chunk_id in range(heads // chunk):
         head_base = chunk_id * chunk
         problem = (batch, heads, q_rows, kv_rows, chunk, kv_heads, q_max, kv_max, units)
-        stage2(q, k, v, do, s_full, ds_full, stats, delta, meta, desc2, problem, scale, scale_log2, scale, head_base, 0, stream)
+        if cutlass.const_expr(physical):
+            stage2(q, k, v, do, s_full, ds_full, stats, delta, meta, desc2, problem, scale, scale_log2, scale, head_base, 0, stream, origins, rows)
+        else:
+            stage2(q, k, v, do, s_full, ds_full, stats, delta, meta, desc2, problem, scale, scale_log2, scale, head_base, 0, stream)
         do_heads = _heads(do, head_base, chunk)
         q_heads = _heads(q, head_base, chunk)
         dv_heads = _heads(dv_target, head_base, chunk)
@@ -179,6 +313,8 @@ def host(
             meta,
             desc3,
             stream,
+            origins,
+            (rows[4], -1 if group > 1 else rows[7]),
         )
         _matmul(
             mm_lo,
@@ -191,6 +327,8 @@ def host(
             meta,
             desc3,
             stream,
+            origins,
+            (rows[0], -1 if group > 1 else rows[6]),
         )
         if cutlass.const_expr(chunk % group != 0):
             # A budget-limited chunk splits or crosses a GQA group: map each Q
@@ -207,6 +345,8 @@ def host(
                     meta,
                     desc3,
                     stream,
+                    origins,
+                    (rows[1], rows[5]),
                 )
         else:
             kv_count = chunk // group
@@ -234,9 +374,15 @@ def host(
                     meta,
                     desc3,
                     stream,
+                    origins,
+                    (rows[1], rows[5]),
                 )
     if cutlass.const_expr(group > 1):
-        dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
+        if cutlass.const_expr(physical):
+            # Compact per-Q-head partials -> the caller's dK / dV at their own origins, live rows only.
+            dkv_reduce_thd_origins_host(dk_target, dv_target, dk, dv, meta, origins, batch, kv_max, rows[6], rows[7], dim, group, dtype, stream)
+        else:
+            dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
 
 
 def _dq_launches(group: int, dq_b_head_group: int) -> int:
@@ -253,7 +399,9 @@ def _dq_launches(group: int, dq_b_head_group: int) -> int:
     return group // dq_b_head_group
 
 
-def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key, symbol="frost_sdpa_bwd_sm100_prepared"):
+def compile_host(
+    stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key, symbol="frost_sdpa_bwd_sm100_prepared", origin_specs=None, origin_dtypes=None
+):
     # Source codegen domain: the SM100 line proper (SM100 / SM103, where the ``sdpa_bwd_sm100`` row is qualified) and the
     # Rubin line as a RANGE (cc 10.7 up to the SM100 line's end, the ``sdpa_bwd_sm107_d512`` row's ``_RUBIN`` span -- the
     # part that ships next is not declined by a list).  Other targets are used for isolated lowering checks only.
@@ -266,10 +414,14 @@ def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cac
 
     args = [ptr(dtype) for _ in range(5)] + [ptr(cutlass.Float32, 4)] + [ptr(dtype) for _ in range(3)]
     args += [ptr(cutlass.Int32, 4) if params.thd else None for _ in range(2)]
+    physical = origin_specs is not None
+    if physical:
+        # The nine ragged-offset operands, in the shared port order; a port bound without offsets is None-specialized.
+        args += [None if name is None else ptr(cutlass.Int64 if name == "int64" else cutlass.Int32, 8 if name == "int64" else 4) for name in origin_dtypes]
     # The persistent artifact wrapper accepts primitive constexpr tuples; a
     # dataclass argument prevents export even when it is compile-time-only.
     return compile_cached(
-        host,
+        host_origins if physical else host,
         *args,
         ptr(cutlass.Uint8),
         cutlass.Float32(1),
@@ -297,6 +449,7 @@ def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cac
         geometry,
         regions,
         dtype,
+        *((origin_specs,) if physical else ()),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=cache_key,

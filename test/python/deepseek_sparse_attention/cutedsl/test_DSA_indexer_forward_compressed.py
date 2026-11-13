@@ -933,7 +933,10 @@ def test_DSA_compressed_stage2_deterministic_thd_ties(monkeypatch):
     assert len(compress_top_k_sm100._compile_cache) == cache_size
     torch.cuda.synchronize()
 
-    matching_cache_keys = [key for key in compress_top_k_sm100._compile_cache if key[:-1] == ("varlen", top_k, 1, 512, True, False)]
+    capability = torch.cuda.get_device_capability(device)
+    matching_cache_keys = [
+        key for key in compress_top_k_sm100._compile_cache if key[:-1] == (candidates.device.index, capability, "varlen", top_k, 1, 512, True, False)
+    ]
     assert {key[-1] for key in matching_cache_keys} == {False, True}
 
     expected = torch.arange(top_k, dtype=torch.int32, device=device).expand(2, -1)

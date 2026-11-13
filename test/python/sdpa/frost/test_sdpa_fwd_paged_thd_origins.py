@@ -60,6 +60,9 @@ def test_paged_thd_origins_rebind_and_capture(
     key_growth=1.0,
     independent_table_strides=False,
     single_q=False,
+    heads_override=None,
+    q_bound=None,
+    batch_override=None,
 ):
     import cudnn
     import torch
@@ -72,10 +75,11 @@ def test_paged_thd_origins_rebind_and_capture(
     if rubin and (reason := cutedsl_arch_requirement_error((10, 7))) is not None:
         pytest.skip(reason)
     native_rubin_shape = (dim in (64, 128) and cga in (1, 2)) or (dim == (192, 128) and cga == 2)
-    if rubin and (not native_rubin_shape or splits != 1):
-        pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2, unsplit")
+    native_rubin_split = dim == 64 and cga == 1 and splits > 1
+    if rubin and not ((native_rubin_shape and splits == 1) or native_rubin_split):
+        pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2 unsplit, or D64 CGA1 split")
     engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
-    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+    if dim != 64 and cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
@@ -87,8 +91,15 @@ def test_paged_thd_origins_rebind_and_capture(
         page_size,
         (1024 if d_qk == 576 else 8192),
     )
+    if batch_override is not None:
+        assert batch_override == 1
+        batch = 1
+    if q_bound is not None:
+        maximum = q_bound
     if kv_bound is not None:
         kv_max = kv_bound
+    if heads_override is not None:
+        heads = heads_override
     scale = d_qk**-0.5 if attention_scale is None else attention_scale
     pages_per_sequence, page_count = kv_max // page, batch * kv_max // page
     dtype = getattr(torch, dtype_name)
@@ -137,9 +148,10 @@ def test_paged_thd_origins_rebind_and_capture(
 
     def fill(values, shift, replay=False, keyless=False, empty=False):
         ql = ([257, 49] if replay else [300, 177]) if not empty else [0, 0]
-        kl = [kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max]
+        ql = [min(length, maximum) for length in ql[:batch]]
+        kl = ([kv_max - 31, kv_max // 2 + 7] if replay else [kv_max, kv_max])[:batch]
         if keyless:
-            kl[1] = 0
+            kl[-1] = 0
         # shift=0 is the integration reproducer's shared [0,320,512] Q slots.
         # Subsequent bindings/replays also separate the three physical origins.
         starts = {
@@ -147,6 +159,7 @@ def test_paged_thd_origins_rebind_and_capture(
             "o": [shift + (16 if shift else 0), 320 + shift + (32 if shift else 0)],
             "stats": [shift + (32 if shift else 0), 320 + shift + (64 if shift else 0)],
         }
+        starts = {name: rows[:batch] for name, rows in starts.items()}
         for name, lengths in (("ql", ql), ("kl", kl)):
             values[name].copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32).view(batch, 1, 1, 1))
         for name in ("q", "o", "stats"):
@@ -216,7 +229,7 @@ def test_paged_thd_origins_rebind_and_capture(
         paged_attention_k_table=nodes["kt"],
         paged_attention_v_table=nodes["vt"],
         paged_attention_max_seq_len_kv=kv_max,
-        max_total_seq_len_q=477,
+        max_total_seq_len_q=min(477, batch * maximum),
         stats_use_log2=stats_layout == "head",
     )
     nodes["o"].set_output(True).set_dim((batch, heads, maximum, d_v)).set_stride((maximum * heads * d_qk, d_qk, heads * d_qk, 1)).set_ragged_offset(
@@ -242,16 +255,27 @@ def test_paged_thd_origins_rebind_and_capture(
     graph.check_support()
     graph.build_plans()
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
+    if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
+        plan = graph._compiled_plans[graph._plan_index]
+        decode_tile = splits > 1 or (cga != 2 and not pack_gqa and maximum <= 128)
+        expected_template = ("decode_d128_f16" if decode_tile else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
+        assert plan._compiled.kernel_template == expected_template
+        assert plan._prepared.spec.native is not None
+        assert plan._prepared.spec.origin_specs is not None
     if rubin:
         import inspect
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
-        assert api._k_mod.__file__.endswith("sm107/prefill_d256_f16.py" if single_q else "sm107/prefill_d128_f16.py")
-        assert api._k_mod.CFG.STAGES_KV == (4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
+        expected_template = "sm100/decode_d128_f16.py" if native_rubin_split else "sm107/prefill_d256_f16.py" if single_q else "sm107/prefill_d128_f16.py"
+        assert api._k_mod.__file__.endswith(expected_template)
+        assert api._k_mod.CFG.STAGES_KV == (3 if native_rubin_split else 4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
         if tile_n is not None:
             assert api._k_mod.CFG.TILE_N == tile_n
-            if single_q:
+            if native_rubin_split:
+                assert api._k_mod.CFG.S_SLOTS == 1 and api._k_mod.CFG.TILES_Q == 1
+                assert api._k_mod._FP32_PARTIALS and api._k_mod.SPLIT_KV == splits
+            elif single_q:
                 assert api._k_mod.PARAMS.s_slots == 2 and api._k_mod.CFG.TILES_Q == 1
             else:
                 assert api._k_mod.CFG.S_SLOTS == (2 if tile_n == 64 else 1)

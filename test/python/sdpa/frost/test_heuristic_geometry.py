@@ -599,9 +599,11 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
     for packing in (False, True):
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
     assert effective_cgas(spec.capabilities, replace(facts, has_paged_kv=False, page_size=0), 1) == frozenset({1, 2})
-    for other in (replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
+    for other in (replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
-    # dense d128: cga1 is the shared decode tile (issue #1472); dense PAGED queries above stay on cga2 (not wired on cc 10.7)
+    # dense PAGED d128 queries admit native cga1 and cga2 since #2375
+    assert effective_cgas(spec.capabilities, replace(facts, thd=False), 1) == frozenset({1, 2})
+    # dense d128: cga1 is the shared decode tile (issue #1472)
     assert 1 in effective_cgas(spec.capabilities, replace(facts, thd=False, has_paged_kv=False, page_size=0), 1)
 
 
@@ -620,8 +622,13 @@ def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, p
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert mismatch(spec.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
-    for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
-        assert mismatch(spec.capabilities, facts, invalid) is not None
+    assert mismatch(spec.capabilities, facts, replace(knobs, cga=1)) is not None
+    packed = replace(knobs, pack_gqa=True)
+    if paged and device_cc in ((10, 0), (10, 3)):
+        assert mismatch(spec.capabilities, facts, packed) is None
+        assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in packed.to_public().items()}) == packed
+    else:
+        assert mismatch(spec.capabilities, facts, packed) is not None
     for invalid in (
         replace(facts, has_sink=True),
         replace(facts, has_epilogue_gate=True),
@@ -646,8 +653,13 @@ def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packe
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
-    for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
-        assert mismatch(SPEC.capabilities, facts, invalid) is not None
+    assert mismatch(SPEC.capabilities, facts, replace(knobs, cga=2)) is not None
+    # Unsplit D64 PackGQA uses the shared final-output prefill body. Its
+    # N128 path is independent of the single-CTA split geometry above.
+    unsplit = replace(knobs, split_kv=1, pack_gqa=True, tile_n=128)
+    assert mismatch(SPEC.capabilities, facts, unsplit) is None
+    assert mismatch(SPEC.capabilities, facts, replace(unsplit, cga=2)) is None
+    assert mismatch(SPEC.capabilities, facts, replace(unsplit, tile_n=64)) is not None
     assert mismatch(SPEC.capabilities, replace(facts, has_paged_kv=False), knobs) is None
     for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
         assert mismatch(SPEC.capabilities, invalid, knobs) is not None

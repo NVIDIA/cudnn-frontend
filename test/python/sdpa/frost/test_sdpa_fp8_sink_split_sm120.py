@@ -223,3 +223,16 @@ def test_sm120_fp8_sink_split_standalone(output):
     from test_sdpa_prepared_fp8_split import test_prepared_fp8_split_standalone_default_scales
 
     test_prepared_fp8_split_standalone_default_scales("sm120", 128, 128, output, sink=True)
+
+
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_sm120_fp8_sink_at_decode(d, dv, output, dtype):
+    """Dense per-tensor FP8 with an attention sink at S_q == 1, unsplit, on the SM120 FP8 templates
+    (d <= 256 and the d512 flavor): O, Stats and Amax_O match the reference, sink mass included."""
+    sink = torch.linspace(-12, 12, 4, device="cuda").view(1, 4, 1, 1)
+    g, vp, ws, bufs, _ = shared._case(arch="sm120", d=d, dv=dv, sq=1, skv=512, split_kv=1, output_dtype=output, sink=sink, dtype=dtype)
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    shared._check(bufs, thd=False, sq=1, skv=512)
