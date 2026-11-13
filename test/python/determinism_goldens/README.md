@@ -1610,6 +1610,32 @@ residual's hash equals that of the host's `bf16(x + residual)` in the four add c
 cases share their operands and their updated residual; the store and no-residual cases share `x` and differ in their codes (scales 0.02
 and 1.0).
 
+Strict check and the functional module, from a clean tree at the commit that carries the goldens (2026-11-13 UTC, the runtime above).
+`CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 61 passed, 0 skipped: `test_replay` 24,
+`test_replay_on_a_fresh_entry_and_fresh_operands` 6, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 6,
+`test_insertion_removal_and_reordering` 6, `test_duplicated_row_and_neighbour_isolation` 6, `test_inputs_are_unmodified` 1,
+`test_crosses_a_scheduling_wave` 2, `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 6.  `pytest <module>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` (under the suite's default per-test isolation) -> 171 passed, 1 skipped: the
+module 167 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
+are required" -- one device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the
+symbol-prefix test 4 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 12 of
+12 cells (one kernel per call; grid `(rows, 1, 1)`, block `(640, 1, 1)`, 80 B of shared memory).
+
+CUDA 12.9 compiler flavour on the same part and runtime (2026-11-13 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
+libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL
+compatibility and is not a deployment that uses CUDA 12 throughout): the strict determinism command -> 61 passed, 0 skipped -- the six
+golden cases pass against the SAME set, whose runtime key does not name the compiler flavour, so the two flavours write the same bytes
+for those cases; the functional command -> 170 passed, 2 skipped (`test_rendering_pins_the_convention` for `sm_107a`: that compiler
+rejects the target, and the case skips with the entry's own decline; the two-device case).
+
+CuTe DSL 4.8.1 (2026-11-13 UTC): cold compile only, on an x86 host (a cc 8.0 device: every device case skips; fake tensors, the 4.8.1
+wheels put first on the path of the same environment).  The kernel's 45 renderings per target (fifteen forms x three launch arms) are
+byte-identical cubins to 4.8.0's for `sm_100a`, `sm_103a` and `sm_107a` with the CUDA 13.4 compiler (135 of 135) and for `sm_100a` /
+`sm_103a` with the CUDA 12.9 compiler (90 of 90); `sm_107a` does not compile under CUDA 12.9 in either version (the entry's typed
+decline).  `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` on that host: 101 passed, 132 skipped
+under 4.8.0 and under 4.8.1 with CUDA 13.4; 100 passed, 133 skipped under 4.8.1 with CUDA 12.9 (the `sm_107a` rendering case skips).
+Not run on a device: 4.8.1.
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
