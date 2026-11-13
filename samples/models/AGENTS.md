@@ -83,6 +83,18 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
     untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
 
+15. **A kernel is declared, then observed; a name proves no form.** Every adapter declares its census entries (`kernels`,
+    `model_samples/census.py`): the kernels one call launches, as `exact` (judged one by one: name, order, count, and the
+    launch shape where the entry states one), or as the families of a `fallback` row or of the `host` path. A provider row
+    names the form its entry is called in (`form`: fields of the entry's own form), the adapter passes exactly those, and
+    the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. It then holds the
+    profiler's record of every launch of the traced steps against the plan. Where those records cannot be had the run
+    ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check stays `FAIL`. A new
+    adapter comes with its census entries, and a chain that gains an operator whose kernel no pattern of
+    `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name. The host
+    tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there must fail
+    with its own sentence.
+
 ## What the first GPU run of this area taught
 
 - A chain of 8-bit and 4-bit quantisers is not a continuous function. Two correct stacks whose multiplies differ by one bf16
@@ -175,3 +187,23 @@ behind; the host tests hold each.
   switched on cuts or pads a prompt without a word; switch both off, and hold it with a tokenizer saved that way.
 - A command block is typed as it is written. A step that stands in a sentence elsewhere, such as fetching the checkpoint,
   is a step the reader does not take: put it in the block, in order, with what it costs.
+
+## What building the kernel check taught
+
+- A generated kernel symbol is the kernel's name and the text of its compile-time arguments, cut at a fixed length. Two
+  forms of one kernel can share a symbol, and a launch shape too: the grid, the block and the shared memory of a launch
+  do not say whether the kernel waits for its predecessor. Compare the form on the objects (the row's fields against the
+  entry's own form), and use the name and the launch shape for what they do show: whose kernel it is, and in which shape.
+- In a stack with reference chains the kernel names of a step are not the same in every step, although their number is:
+  the softmax kernel of the reference attention is instantiated by the length of the cache, and its fp64 multiplies
+  over a cache of one position are served by other kernels than over a longer one. So only the kernels of an entry are
+  judged one by one; a chain is attributed by family, and no test may assume one name sequence per step for a plan that
+  has chains.
+- The profiler's `events()` carry names and times; the grid, the block and the shared memory of a launch are in its
+  exported trace. That trace grows with the launches of a step (32 steps of the two-layer model: about 30 MB), so it
+  is read event by event and never held as a whole.
+- A copy inside a launch graph that was captured before the process's first profiler pass was seen to be replayed as a
+  kernel record, not as a copy record (PyTorch 2.14). Count a copy by either spelling, or a captured step has one more
+  kernel than the same step launched from Python.
+- A check that could not look must not read as one that looked and found nothing: a run without the profiler's records
+  is `RAN`, and the reason is in its last line.
