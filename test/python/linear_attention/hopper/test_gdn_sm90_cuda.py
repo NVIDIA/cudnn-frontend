@@ -35,8 +35,8 @@ import cudnn  # noqa: F401 -- import-order requirement, see test/python/conftest
 from cudnn.linear_attention import gated_delta_net, kimi_delta_attention
 from linear_attention.reference_gdn import gdn_reference, rms_ratio
 
+# Levels are set per test: the full gate x shape sweep against the fp64 recurrence runs at L1, a subset of it at L0.
 pytestmark = [
-    pytest.mark.L0,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
 ]
 
@@ -173,9 +173,19 @@ SHAPES = [
 ]
 
 
+def _sweep():
+    """Every gate on the first shape and every shape on the ``init`` gate at L0; the rest of the matrix at L1."""
+    cells = []
+    for gate in GATES:
+        for index, shape in enumerate(SHAPES):
+            lengths, heads = shape.values
+            level = pytest.mark.L0 if gate == "init" or index == 0 else pytest.mark.L1
+            cells.append(pytest.param(gate, lengths, heads, id=f"{shape.id}-{gate}", marks=level))
+    return cells
+
+
 @requires_hopper
-@pytest.mark.parametrize("gate", GATES)
-@pytest.mark.parametrize("lengths, heads", SHAPES)
+@pytest.mark.parametrize("gate, lengths, heads", _sweep())
 def test_matches_the_fp64_recurrence(gate, lengths, heads):
     """Output and all five gradients against the token-by-token fp64 recurrence."""
     tensors, cu, d_out = make_case(lengths, heads, gate)
@@ -186,6 +196,7 @@ def test_matches_the_fp64_recurrence(gate, lengths, heads):
 
 @requires_hopper
 @pytest.mark.parametrize("gate", ["init", "slow"])
+@pytest.mark.L0
 def test_split_forward_with_wide_scan_matches_the_fp64_recurrence(gate):
     """Four sequences of sixteen chunks at 32 (sequence, head) pairs: eight forward pieces each, and scan<64>.
 
@@ -200,6 +211,7 @@ def test_split_forward_with_wide_scan_matches_the_fp64_recurrence(gate):
 
 @requires_hopper
 @pytest.mark.parametrize("lengths, heads", [([257], 2), ([130, 1, 63, 64, 65], 3), ([64] * 40, 8)], ids=["one_seq", "ragged", "many_seq"])
+@pytest.mark.L0
 def test_agrees_with_the_per_channel_kernels_on_a_bounded_gate(lengths, heads):
     """Where the per-channel kernels are valid, the scalar build is the same function.
 
@@ -217,6 +229,7 @@ def test_agrees_with_the_per_channel_kernels_on_a_bounded_gate(lengths, heads):
 
 
 @requires_hopper
+@pytest.mark.L0
 def test_a_slow_gate_walks_back_to_the_start():
     """Pieces that cannot truncate their history must replay it, not drop it.
 
@@ -240,6 +253,7 @@ def test_a_slow_gate_walks_back_to_the_start():
     [([100, 164], 3), ([70, 64, 130, 56], 8), ([320], 8), ([300], 8), ([320], 32), ([300], 32)],
     ids=["scan32", "scan64", "scan16_single", "scan16_single_tail", "scan64_single", "scan64_single_tail"],
 )
+@pytest.mark.L0
 def test_carried_state_and_its_gradients_match_the_fp64_recurrence(lengths, heads):
     """A non-zero initial_state in, final_state out, and gradients through both.
 
@@ -273,6 +287,7 @@ def test_carried_state_and_its_gradients_match_the_fp64_recurrence(lengths, head
 @requires_hopper
 @pytest.mark.parametrize("scale", [0.5, 1.0])
 @pytest.mark.parametrize("lengths, heads", [([130, 1, 63, 64, 65], 3), ([64] * 8, 8)], ids=["ragged", "wide_scan"])
+@pytest.mark.L0
 def test_query_scale_matches_the_fp64_recurrence(scale, lengths, heads):
     """A non-default query scale reaches both directions: the backward takes it as an argument."""
     tensors, cu, d_out = make_case(lengths, heads, "init")
@@ -281,6 +296,7 @@ def test_query_scale_matches_the_fp64_recurrence(scale, lengths, heads):
 
 @requires_hopper
 @pytest.mark.parametrize("lengths, heads", [([1000, 37, 515], 4), ([64] * 8, 8)], ids=["ragged", "wide_scan"])
+@pytest.mark.L0
 def test_floored_runs_then_mild_gates_match_the_fp64_recurrence(lengths, heads):
     """The in-chunk decays are differences of fp32 prefix sums behind a -128 floor.
 
@@ -293,6 +309,7 @@ def test_floored_runs_then_mild_gates_match_the_fp64_recurrence(lengths, heads):
 
 
 @requires_hopper
+@pytest.mark.L0
 def test_carried_state_composes():
     """Running a sequence in two calls through final_state / initial_state equals one call."""
     tensors, cu, _ = make_case([384], 4, "slow", seed=5)
@@ -307,6 +324,7 @@ def test_carried_state_composes():
 
 
 @requires_hopper
+@pytest.mark.L0
 def test_strided_inputs_are_not_misread():
     """A padded q slice must not change the answer (the kernels never see a stride).
 
@@ -335,6 +353,7 @@ def test_strided_inputs_are_not_misread():
 
 @requires_hopper
 @pytest.mark.parametrize("heads", [8, 16], ids=["scan32", "scan64_aliased_workspace"])
+@pytest.mark.L0
 def test_run_to_run_bitwise(heads):
     """Same inputs, same launch geometry: identical bytes, forward and backward.
 
@@ -360,6 +379,7 @@ def test_run_to_run_bitwise(heads):
 
 # ----------------------------------------------------------------------------- routing
 @requires_hopper
+@pytest.mark.L0
 def test_is_the_default_on_hopper(launches):
     """An unpinned call picks this engine, not slot-1 cuTile, in both directions."""
     tensors, cu, d_out = make_case([512, 512], 4)
@@ -368,6 +388,7 @@ def test_is_the_default_on_hopper(launches):
     assert launches == [("fwd", True), ("bwd", True)], f"expected the scalar-gate sm90 kernels, got {launches}"
 
 
+@pytest.mark.L0
 def test_the_hook_reorders_only_on_hopper(monkeypatch):
     """The ranking itself, independent of which engines this machine can offer.
 
@@ -396,6 +417,7 @@ def test_the_hook_reorders_only_on_hopper(monkeypatch):
 
 @requires_hopper
 @pytest.mark.skipif(not _has_cutile(), reason="pins gdn_cutile, which needs the optional cuda.tile runtime ([cutile] extra)")
+@pytest.mark.L0
 def test_plan_name_still_overrides(launches):
     """Ranking is a default, not a lock: naming another engine still runs it."""
     tensors, cu, d_out = make_case([512], 4, "bounded")
@@ -406,6 +428,7 @@ def test_plan_name_still_overrides(launches):
 
 
 @requires_hopper
+@pytest.mark.L0
 def test_declined_graph_falls_through(launches):
     """A head dim the sm90 kernels do not serve must not reach them.
 
@@ -426,6 +449,7 @@ def test_declined_graph_falls_through(launches):
 
 @requires_hopper
 @pytest.mark.parametrize("kwargs", [{"use_qk_l2norm_in_kernel": True}, {"batch_invariant": True}], ids=["l2norm", "batch_invariant"])
+@pytest.mark.L0
 def test_out_of_scope_graphs_are_declined(kwargs):
     """Pinning the engine on a graph outside its scope raises instead of mis-serving it."""
     tensors, cu, _ = make_case([256], 4, "bounded")
@@ -436,14 +460,15 @@ def test_out_of_scope_graphs_are_declined(kwargs):
 # ----------------------------------------------------------------------------- CUDA graphs
 @requires_hopper
 @pytest.mark.parametrize("lengths, heads", [([2048], 12), ([1024] * 4, 32)], ids=["2048x12", "4x1024x32"])
+@pytest.mark.L0
 def test_cuda_graph_capture_replays(lengths, heads):
     """The forward captures, and a replay recomputes from the inputs as they are at replay time.
 
-    Capture only works while steady state allocates and synchronises nothing,
-    so this fails the moment a per-call allocation creeps back onto the path.
-    The inputs are changed in place between capture and replay: a kernel that
-    ran eagerly during capture instead of being recorded would leave the
-    captured output holding the old answer.
+    Capture fails on a host synchronisation; it does not catch allocations
+    (``test_warm_execute_allocates_nothing_and_never_synchronizes`` does). The
+    inputs are changed in place between capture and replay: a kernel that ran
+    eagerly during capture instead of being recorded would leave the captured
+    output holding the old answer.
     """
     tensors, cu, _ = make_case(lengths, heads, "init")
     call = lambda: gated_delta_net(*tensors, cu, plan_name=ENGINE)[0]  # noqa: E731
@@ -470,7 +495,377 @@ def test_cuda_graph_capture_replays(lengths, heads):
         torch.cuda.synchronize()
         after = call()
         torch.cuda.synchronize()
-        assert torch.equal(captured, after), "the replay did not reproduce an eager call on the same inputs"
+        assert torch.isfinite(captured.float()).all(), "the replay produced a non-finite output"
+        assert torch.equal(captured.view(torch.uint8), after.view(torch.uint8)), "the replay did not reproduce an eager call on the same inputs"
         assert not torch.equal(captured, before), "the replay did not recompute from the changed inputs"
     finally:
         graph.reset()
+
+
+# ----------------------------------------------------------------------------- graph API: R9, capture, workspace
+def _raw(t):
+    return t.detach().contiguous().view(torch.uint8)
+
+
+def _graph(backward, total, n, heads, with_state):
+    """One single-node graph from the op's own builder, pinned to this engine and built."""
+    from cudnn.linear_attention.ops import common
+    from cudnn.linear_attention.ops import gdn as gdn_ops
+
+    bf16, f32, i32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT, cudnn.data_type.INT32
+    state = f32 if with_state else None
+    if backward:
+        graph, ports = gdn_ops.build_bprop_graph(total, n, heads, heads, heads, DIM, DIM, bf16, f32, f32, state, state, i32, None, DIM**-0.5, False, False)
+    else:
+        graph, ports = gdn_ops.build_fprop_graph(total, n, heads, heads, heads, DIM, DIM, bf16, f32, f32, state, i32, DIM**-0.5, True, False, False, 0, None)
+    common.select_plan(graph, ENGINE)
+    return graph, ports
+
+
+def _pack(ports, tensors, cu, d_out, state=None, d_final=None):
+    """The variant pack and the output buffers it binds, the way the op binds them."""
+    q, k, v, g, beta = tensors
+    pack = {ports["q"]: q, ports["k"]: k, ports["v"]: v, ports["g"]: g, ports["beta"]: beta, ports["cu"]: cu}
+    if ports.get("dO") is not None:
+        pack[ports["dO"]] = d_out
+        outs = {"dQ": torch.empty_like(q), "dK": torch.empty_like(k), "dV": torch.empty_like(v), "dG": torch.empty_like(g), "dBeta": torch.empty_like(beta)}
+        if state is not None:
+            pack[ports["state0"]] = state
+            pack[ports["dfs"]] = d_final
+            outs["dstate0"] = torch.empty_like(state)
+    else:
+        outs = {"O": torch.empty_like(v), "fs": torch.empty(cu.numel() - 1, q.shape[1], DIM, DIM, device="cuda")}
+        if state is not None:
+            pack[ports["state0"]] = state
+    for name, buf in outs.items():
+        pack[ports[name]] = buf
+    return pack, outs
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
+def test_warm_execute_allocates_nothing_and_never_synchronizes(backward):
+    """Recipe R9 on the zero-copy path (packed bf16 q/k/v, fp32 gate, beta and state, int32 cu_seqlens).
+
+    The shape splits the forward and runs the 64-column backward scan. Strided inputs, int64
+    cu_seqlens and bf16 state go through hopper/marshal.py, which allocates and copies; they are
+    a declared exception and not covered here.
+    """
+    from cudnn.linear_attention.ops import common
+
+    lengths, heads = [1000, 37, 515], 16
+    tensors, cu, d_out = make_case(lengths, heads, "init")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    state = torch.randn(len(lengths), heads, DIM, DIM, generator=gen, device="cuda") * 0.05
+    d_final = torch.randn(len(lengths), heads, DIM, DIM, generator=gen, device="cuda")
+    graph, ports = _graph(backward, sum(lengths), len(lengths), heads, with_state=True)
+    pack, _ = _pack(ports, tensors, cu, d_out, state, d_final)
+    device = torch.device("cuda")
+    workspace = common.graph_workspace(graph, device)
+    handle = common.get_handle(device)
+    common.execute_graph(graph, pack, workspace, handle)  # warm: first-call initialisation
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            common.execute_graph(graph, pack, workspace, handle)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated, "a warm execute allocated"
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
+def test_absent_state_ports_ignore_what_the_workspace_held(backward):
+    """With no initial_state (and, backward, no d_final_state) the engine carves zeroed stand-ins from the caller's
+    workspace. Running on a side stream with the workspace poisoned to 0x00 and then 0xFF must give the same bytes."""
+    from cudnn.linear_attention.ops import common
+
+    lengths, heads = [300, 65], 4
+    tensors, cu, d_out = make_case(lengths, heads, "init")
+    graph, ports = _graph(backward, sum(lengths), len(lengths), heads, with_state=False)
+    device = torch.device("cuda")
+    common.graph_workspace(graph, device)  # builds the plan
+    size = max(graph.get_workspace_size(), 1)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    results = []
+    with torch.cuda.stream(side):
+        for fill in (0x00, 0xFF):
+            workspace = torch.full((size,), fill, dtype=torch.uint8, device=device)
+            pack, outs = _pack(ports, tensors, cu, d_out)
+            common.execute_graph(graph, pack, workspace, common.get_handle(device, side))
+            results.append({name: buf.clone() for name, buf in outs.items()})
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    for name in results[0]:
+        assert torch.isfinite(results[0][name].float()).all(), f"{name} is not finite"
+        assert torch.equal(_raw(results[0][name]), _raw(results[1][name])), f"{name} depends on what the workspace held"
+
+
+@pytest.mark.L0
+@requires_hopper
+def test_the_first_call_of_a_shape_can_be_captured():
+    """Rule 8's detector: the first execute of a shape, forward and backward, happens inside torch.cuda.graph.
+
+    The kernel modules are loaded once per process, by a different shape first; what runs under
+    capture is this shape's graph build, plan build and workspace. A replay must give the bytes of
+    an eager call.
+    """
+    warm, warm_cu, warm_d = make_case([256], 4, "init")
+    run_engine(warm, warm_cu, warm_d)
+    torch.cuda.synchronize()
+
+    tensors, cu, d_out = make_case([700, 300], 6, "init", seed=11)
+    leaves = [t.clone().requires_grad_(True) for t in tensors]
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            out = gated_delta_net(*leaves, cu, plan_name=ENGINE)[0]
+            grads = torch.autograd.grad(out, leaves, grad_outputs=d_out)
+        graph.replay()
+        torch.cuda.synchronize()
+        eager = run_engine(tensors, cu, d_out)
+        torch.cuda.synchronize()
+        assert torch.equal(_raw(out), _raw(eager[0])), "o: the replay differs from an eager call"
+        for name, mine, theirs in zip(GRAD_NAMES, grads, eager[1]):
+            assert torch.equal(_raw(mine), _raw(theirs)), f"{name}: the replay differs from an eager call"
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@requires_hopper
+def test_one_captured_graph_replays_through_mild_steep_and_mild_gates():
+    """The decay section's replay test: one captured forward + backward and one workspace, replayed while the gate goes
+    slow, steep, hard resets and slow again. The forward's walk-back loop branches on the gate values on the device.
+    Every replay must be finite first, then equal an eager call on the same inputs byte for byte."""
+    lengths, heads = [1000, 37, 515], 4
+    tensors, cu, d_out = make_case(lengths, heads, "slow")
+    leaves = [t.clone().requires_grad_(True) for t in tensors]
+
+    def step():
+        out = gated_delta_net(*leaves, cu, plan_name=ENGINE)[0]
+        return out, torch.autograd.grad(out, leaves, grad_outputs=d_out)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            out, grads = step()
+        gen = torch.Generator(device="cuda").manual_seed(29)
+        for kind in ("slow", "steep", "reset", "slow"):
+            with torch.no_grad():
+                leaves[3].copy_(make_gate(kind, sum(lengths), heads, gen))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.isfinite(out.float()).all(), f"{kind}: non-finite o"
+            for name, value in zip(GRAD_NAMES, grads):
+                assert torch.isfinite(value.float()).all(), f"{kind}: non-finite {name}"
+            eager = run_engine([t.detach() for t in leaves], cu, d_out)
+            torch.cuda.synchronize()
+            assert torch.equal(_raw(out), _raw(eager[0])), f"{kind}: o differs from an eager call"
+            for name, mine, theirs in zip(GRAD_NAMES, grads, eager[1]):
+                assert torch.equal(_raw(mine), _raw(theirs)), f"{kind}: {name} differs from an eager call"
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize("gate", ["none", "steep8", "steep"])
+@pytest.mark.parametrize("zero_inputs", [False, True], ids=["random_inputs", "zero_qkv_and_state"])
+def test_a_large_state_gradient_stays_finite_and_accurate(gate, zero_inputs):
+    """The decay section's range test: the state-gradient magnitude varies independently of the gate.
+
+    d_final_state is about 7e4 (the backward keeps its state gradient in bf16 between kernels). With
+    zero q, k, v and state every gradient but d_initial_state is exactly zero.
+
+    At a constant -20 per token with a non-zero d_final_state, dG on the last tokens of a sequence is a
+    difference of terms some 1e8 times larger than the result, and no fp32 implementation resolves it:
+    on H100 the rms ratio against the fp64 recurrence was 1.1 here, 13-57 for FLA and 33-155 for
+    gdn_cutile. That cell checks finiteness and every other gradient; -8 per token (still steep, and
+    well conditioned) checks dG too.
+    """
+    lengths, heads = [130, 65], 4
+    tensors, cu, d_out = make_case(lengths, heads, "steep" if gate == "steep8" else gate, seed=31)
+    if gate == "steep8":
+        tensors[3].fill_(-8.0)
+    gen = torch.Generator(device="cuda").manual_seed(37)
+    shape = (len(lengths), heads, DIM, DIM)
+    state = torch.randn(shape, generator=gen, device="cuda") * 0.05
+    d_final = torch.randn(shape, generator=gen, device="cuda") * 7e4
+    if zero_inputs:
+        for t in (tensors[0], tensors[1], tensors[2], state):
+            t.zero_()
+
+    leaves = [t.clone().requires_grad_(True) for t in (*tensors, state)]
+    out, final = gated_delta_net(*leaves[:5], cu, initial_state=leaves[5], output_final_state=True, plan_name=ENGINE)
+    grads = torch.autograd.grad([out, final], leaves, grad_outputs=[d_out, d_final])
+    ref_leaves = [t.clone().double().requires_grad_(True) for t in (*tensors, state)]
+    ref_out, ref_final = gdn_reference(*(t.unsqueeze(0) for t in ref_leaves[:5]), initial_state=ref_leaves[5], cu_seqlens=cu)
+    ref_grads = torch.autograd.grad([ref_out, ref_final], ref_leaves, grad_outputs=[d_out.double().unsqueeze(0), d_final.double()])
+
+    checks = [("o", out, ref_out.squeeze(0), FWD_TOL), ("final_state", final, ref_final, STATE_TOL)]
+    checks += [(name, mine, theirs, BWD_TOL) for name, mine, theirs in zip(GRAD_NAMES, grads, ref_grads)]
+    checks += [("d_initial_state", grads[5], ref_grads[5], STATE_GRAD_TOL)]
+    for name, mine, theirs, tol in checks:
+        assert torch.isfinite(mine.float()).all(), f"{name}: non-finite"
+        if name == "dg" and gate == "steep" and not zero_inputs:
+            continue  # ill-conditioned for any fp32 implementation; see the docstring
+        if not theirs.any():
+            assert not mine.any(), f"{name}: the reference is exactly zero and this is not"
+            continue
+        err = rms_ratio(mine, theirs)
+        assert err <= tol, f"{name} rms_ratio {err:.3e} > {tol}"
+
+
+@pytest.mark.L0
+@requires_hopper
+def test_a_failed_kernel_build_declines(monkeypatch):
+    """build_plan compiles and loads the kernels. If that fails (no NVRTC, an unwritable cubin cache) the build declines:
+    a pinned call raises the engine's reason, and an unpinned one moves on to the next engine."""
+    from cudnn.linear_attention.hopper import cuda_bwd_host, cuda_host, gdn_cuda_engine
+    from linear_attention.test_la import clear_caches
+
+    def broken(*args, **kwargs):
+        raise OSError("read-only cubin cache")
+
+    monkeypatch.setattr(gdn_cuda_engine, "_LOAD_FAILURES", {})
+    monkeypatch.setattr(cuda_host, "_library", broken)
+    monkeypatch.setattr(cuda_bwd_host, "library", broken)
+    clear_caches()
+    try:
+        tensors, cu, d_out = make_case([256], 4, "init", seed=23)
+        with pytest.raises(Exception, match="could not be compiled or loaded"):
+            run_engine(tensors, cu, d_out)
+        if _has_cutile():
+            out, grads = run_engine(tensors, cu, d_out, plan=None)
+            torch.cuda.synchronize()
+            assert torch.isfinite(out.float()).all() and all(torch.isfinite(x.float()).all() for x in grads)
+    finally:
+        clear_caches()
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
+def test_a_buffer_of_another_shape_raises_before_launch(backward, launches):
+    """Rule 1: the launches take T, N and H from the graph, so a smaller buffer, or an execute-time override that
+    changes a shape, must raise before any kernel runs. An override that keeps the declared shape is fine."""
+    from cudnn.linear_attention.ops import common
+
+    lengths, heads = [200, 56], 4
+    total = sum(lengths)
+    tensors, cu, d_out = make_case(lengths, heads, "init")
+    graph, ports = _graph(backward, total, len(lengths), heads, with_state=False)
+    device = torch.device("cuda")
+    workspace = common.graph_workspace(graph, device)
+    handle = common.get_handle(device)
+
+    short = [t[: total - 8].contiguous() if i < 3 else t for i, t in enumerate(tensors)]
+    pack, _ = _pack(ports, short, cu, d_out[: total - 8].contiguous())
+    with pytest.raises(ValueError, match="the plan was built for"):
+        common.execute_graph(graph, pack, workspace, handle)
+
+    pack, _ = _pack(ports, tensors, cu, d_out)
+    q = ports["q"]
+    with pytest.raises(ValueError, match="the plan was built for"):
+        graph.execute(
+            pack, workspace, handle=handle, override_uids=[q.get_uid()], override_shapes=[[total - 8, heads, DIM]], override_strides=[[heads * DIM, DIM, 1]]
+        )
+    torch.cuda.synchronize()
+    assert launches == [], f"a kernel ran before the shape check: {launches}"
+
+    graph.execute(pack, workspace, handle=handle, override_uids=[q.get_uid()], override_shapes=[[total, heads, DIM]], override_strides=[[heads * DIM, DIM, 1]])
+    torch.cuda.synchronize()
+    assert launches == [("bwd" if backward else "fwd", True)]
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
+def test_a_stream_zero_handle_launches_on_stream_zero(backward, monkeypatch):
+    """Rule 5 / R1: a handle on the legacy default stream launches there, even inside a torch side-stream context,
+    the same stream the backend plans and gdn_cutile use for that handle."""
+    from cudnn.linear_attention.hopper import cuda_bwd_host, cuda_host
+    from cudnn.linear_attention.ops import common
+
+    seen = []
+    for module in (cuda_host, cuda_bwd_host):
+        real = module.launch
+
+        def spy(*args, _real=real, **kwargs):
+            seen.append(kwargs["stream"])
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(module, "launch", spy)
+
+    lengths, heads = [200, 56], 4
+    tensors, cu, d_out = make_case(lengths, heads, "init")
+    graph, ports = _graph(backward, sum(lengths), len(lengths), heads, with_state=False)
+    device = torch.device("cuda")
+    workspace = common.graph_workspace(graph, device)
+    pack, _ = _pack(ports, tensors, cu, d_out)
+    torch.cuda.synchronize()
+    handle = cudnn.create_handle()
+    try:
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            graph.execute(pack, workspace, handle=handle)
+        torch.cuda.synchronize()
+    finally:
+        cudnn.destroy_handle(handle)
+    assert seen == [0], f"launched on {seen}, expected the handle's stream 0"
+
+
+@pytest.mark.L0
+@requires_hopper
+def test_new_shapes_after_warm_up_never_compile(monkeypatch):
+    """Rule 4: the compile key holds no runtime extent. Once both modules are loaded, new token counts, sequence
+    counts and head counts (new graphs, new build_plan calls) must not reach NVRTC."""
+    from cudnn.linear_attention.cake import compiler
+    from cudnn.linear_attention.hopper import cuda_bwd_host
+
+    warm, warm_cu, warm_d = make_case([256], 4, "init")
+    run_engine(warm, warm_cu, warm_d)
+    torch.cuda.synchronize()
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a kernel was compiled after warm-up")
+
+    monkeypatch.setattr(compiler, "compile_cubin", refuse)
+    monkeypatch.setattr(cuda_bwd_host, "_compile", refuse)
+    for lengths, heads in (([300, 17], 4), ([64] * 40, 8), ([1000, 37, 515], 16), ([4096], 2)):
+        tensors, cu, d_out = make_case(lengths, heads, "init")
+        out, grads = run_engine(tensors, cu, d_out)
+        torch.cuda.synchronize()
+        assert torch.isfinite(out.float()).all() and all(torch.isfinite(x.float()).all() for x in grads)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2 or not _hopper(), reason="needs two Hopper GPUs")
+def test_a_plan_built_for_one_device_refuses_another():
+    """Rule 4: the plan's kernels were loaded for the device build_plan saw; operands on another device raise."""
+    from cudnn.linear_attention.ops import common
+
+    lengths, heads = [200, 56], 4
+    with torch.cuda.device(0):
+        graph, ports = _graph(False, sum(lengths), len(lengths), heads, with_state=False)
+        workspace = common.graph_workspace(graph, torch.device("cuda:0"))
+    with torch.cuda.device(1):
+        tensors, cu, d_out = make_case(lengths, heads, "init")
+        pack, _ = _pack(ports, tensors, cu, d_out)
+        with pytest.raises(ValueError, match="the plan was built for cuda:0"):
+            graph.execute(pack, workspace.to("cuda:1"), handle=common.get_handle(torch.device("cuda:1")))

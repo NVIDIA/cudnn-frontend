@@ -59,6 +59,7 @@ serves it.
 from typing import TYPE_CHECKING
 
 from cudnn import behavior_note
+from cudnn._torch_stream import launch_stream
 from cudnn.engines.base import BaseEngine, CompiledPlan, bind_ports
 from cudnn.frost import buffers
 from cudnn.frost.workspace import Workspace
@@ -87,13 +88,15 @@ class _GdnHopperCudaPlanBase(CompiledPlan):
     takes_variant_pack = True
     plan_name = ENGINE
 
-    def __init__(self, graph):
+    def __init__(self, graph, device=None):
         (node,) = graph.nodes
         q, cu = (node.inputs[p] for p in ("q", "cu_seqlens"))
         self.total, self.h, self.k = (int(d) for d in q.dim)
         self.n_seqs = int(cu.dim[0]) - 1
         self.state_bytes = self.n_seqs * self.h * STATE_ITEM
         self.ports = None
+        # The kernels were compiled and loaded for this device in build_plan.
+        self._build_device = device
         self._device = None
 
     def _bind(self, graph, variant_pack):
@@ -102,11 +105,24 @@ class _GdnHopperCudaPlanBase(CompiledPlan):
         if self.ports is None:
             self.ports = bind_ports(graph, variant_pack)
             (slots,) = self.ports.values()
+            (node,) = graph.nodes
             self.names = list(slots.inputs) + list(slots.outputs)
             self.indices = list(slots.inputs.values()) + list(slots.outputs.values())
+            declared = {**node.inputs, **node.outputs}
+            self.dims = [tuple(int(d) for d in declared[name].dim) for name in self.names]
         views = variant_pack.operands(self.indices)
+        # The launches take every extent from the graph (T, N and H are kernel arguments), so a buffer
+        # of another shape -- an execute-time override that changes it, or a buffer smaller than its
+        # declaration -- would be read or written past what it holds. Raise before anything launches.
+        for name, view, want in zip(self.names, views, self.dims):
+            if tuple(view.shape) != want:
+                raise ValueError(
+                    f"{ENGINE}: {name} has shape {tuple(view.shape)}, but the plan was built for {want}; execute-time shape changes are not supported"
+                )
         if self._device is None:
             self._device = torch.from_dlpack(views[0]).device
+        if self._build_device is not None and self._device.index != self._build_device:
+            raise ValueError(f"{ENGINE}: the operands are on cuda:{self._device.index}, but the plan was built for cuda:{self._build_device}")
         return views
 
     def _slab(self, cursor, stream, zero):
@@ -143,8 +159,8 @@ class GdnHopperCudaPlan(_GdnHopperCudaPlanBase):
 
     _WANT = {"cu_seqlens": "int32", "g": "float32", "beta": "float32", "initial_state": "float32"}
 
-    def __init__(self, graph):
-        super().__init__(graph)
+    def __init__(self, graph, device=None):
+        super().__init__(graph, device)
         from . import cuda_host
 
         (node,) = graph.nodes
@@ -166,7 +182,8 @@ class GdnHopperCudaPlan(_GdnHopperCudaPlanBase):
             raise ValueError(f"{ENGINE}: this plan has no context (get_context_size() is 0)")
         views = self._bind(graph, variant_pack)
         # Resolved first: every copy and fill below is issued on it.
-        stream = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+        # A handle's stream 0 is the legacy default stream, never "torch's current stream" (Rule 5, R1).
+        stream = launch_stream(ctx.stream, self._device).cuda_stream
         addr, _keepalive = marshal.resolve_inputs(self.names, views, ENGINE, stream, self._WANT)
 
         # The kernel always reads a seed and always writes a final state.
@@ -209,8 +226,8 @@ class GdnHopperCudaBwdPlan(_GdnHopperCudaPlanBase):
 
     _WANT = {"cu_seqlens": "int32", "g": "float32", "beta": "float32", "initial_state": "float32", "d_final_state": "float32"}
 
-    def __init__(self, graph):
-        super().__init__(graph)
+    def __init__(self, graph, device=None):
+        super().__init__(graph, device)
         from . import cuda_bwd_host, cuda_host
 
         (node,) = graph.nodes
@@ -234,7 +251,8 @@ class GdnHopperCudaBwdPlan(_GdnHopperCudaPlanBase):
         if ctx.context is not None:
             raise ValueError(f"{ENGINE}: this plan has no context (get_context_size() is 0)")
         views = self._bind(graph, variant_pack)
-        stream = ctx.stream if ctx.stream else torch.cuda.current_stream().cuda_stream
+        # A handle's stream 0 is the legacy default stream, never "torch's current stream" (Rule 5, R1).
+        stream = launch_stream(ctx.stream, self._device).cuda_stream
         addr, _keepalive = marshal.resolve_inputs(self.names, views, ENGINE, stream, self._WANT)
 
         # initial_state and d_final_state are optional, absent meaning zero; the
@@ -426,4 +444,4 @@ class GdnHopperCudaEngine(BaseEngine):
                 raise
         except Exception as exc:  # noqa: BLE001 -- whatever stops the kernels loading, the engine cannot serve
             raise NotImplementedError(f"{ENGINE}: the sm90 kernels could not be compiled or loaded: {exc}") from exc
-        return GdnHopperCudaBwdPlan(graph) if is_bwd else GdnHopperCudaPlan(graph)
+        return GdnHopperCudaBwdPlan(graph, int(device)) if is_bwd else GdnHopperCudaPlan(graph, int(device))

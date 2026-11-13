@@ -373,6 +373,18 @@ are close.
   `"linear"`) selects whether `g` is `ln(alpha)` or `alpha` itself; the
   FROST GDN / KDA / GDP / GDN-2 engines serve `"linear"` (forward and
   backward, `dG` with respect to `alpha`); the cuTile engines are log-only.
+- `GdnHopperCudaEngine` (`gdn_hopper_cuda`,
+  `cudnn.linear_attention.hopper.gdn_cuda_engine`) is the SM90 default for
+  `gdn` and `gdn_bwd`: `linear_attention/gdn_heuristics.py` ranks it ahead of
+  the cuTile engine on Hopper only. It runs the SM90 KDA CUDA kernels
+  (`hopper/cuda_kernels/`, compiled with NVRTC) in their scalar-gate build
+  (`-DKDA_FUSED_SCALAR_GATE`, `-DKDA_BWD_SCALAR_GATE`), which reads `g` and
+  writes `dG` at `[total_T, HV]`. It serves packed THD bf16 q/k/v with equal
+  head counts and K = V = 128, a log-space fp32 gate, a post-sigmoid fp32
+  `beta`, caller-normalized q/k and an optional fp32 or bf16 state; it
+  declines `use_qk_l2norm`, `safe_gate`, `use_beta_sigmoid`, `"linear"`,
+  `batch_invariant`, checkpoints, `state_indices` and the context-parallel
+  ports, which then fall through to the cuTile engine.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
   `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
   per-key-channel decay: its `g` is the log-space vector gate
