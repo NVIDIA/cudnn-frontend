@@ -220,6 +220,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_hopper": EngineSlot(4),
             "kda_hopper_cuda": EngineSlot(5),
             "kda_cake_det": EngineSlot(6, opt_in=True),
+            "kda_summary_hopper_cuda": EngineSlot(7),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
         # Ordering only, and only on Hopper: slot order is identity, not
