@@ -60,6 +60,28 @@ The support matrix is based on cuDNN backend version 9.18.1. Later sections note
 | Blackwell (Consumer) <br /> (Bprop)   |  fp16, bf16 | BHSD, BSHD, Interleaved, <br /> Padded, Ragged | NA | Yes | Yes | d &lt;= 128 |
 
 
+### FROST support matrix (python engines, FP16 / BF16)
+
+FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_*`, `sdpa_bwd_*`) that the frontend ranks beside the cuDNN backend plans; a graph every FROST row declines runs on the backend. The table covers the FP16 / BF16 rows for dense, padded (dense inputs with `use_padding_mask`) and ragged (THD) graphs; the FP8 / MXFP8 rows are documented with their kernels under `docs/operations/attention/`. Head dims are the native tiles; smaller multiples of 8 ride the next envelope.
+
+| Arch | Fprop | Bprop | Deterministic bprop⁶ | Padded | Ragged (THD) | Head dim |
+|-----------|-------------|-------------|-------------|-------------|-------------|------|
+| Ampere A100 (cc 8.0) | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 256 (d_qk = 192, d_vo = 128) |
+| Ampere / Ada GA10x, AD10x (cc 8.6, 8.9)⁷ | Yes | d &lt;= 128 | d &lt;= 128 | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop d &lt;= 128 |
+| Hopper (cc 9.0) | Yes | No | No | Fprop (d &gt; 64) | Fprop (d &gt; 64) | d &lt;= 512 |
+| Blackwell B200 / B300 (cc 10.0, 10.3)⁸ | Yes | Yes | Yes | Fprop | Fprop; bprop d &gt;= 128 (deterministic: d_qk &gt;= 192) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
+| Thor (SM110, cc 11.0)⁹ | Yes | Yes | Yes | Fprop | As cc 10.0 / 10.3 | As cc 10.0 / 10.3 |
+| SM107 (cc 10.7)⁸ | Yes | Yes | d &lt;= 128 (d_qk = 192, d_vo = 128) | Fprop | Fprop; bprop d &lt;= 256 (deterministic: d_qk = 192, d_vo = 128) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
+| Blackwell consumer (cc 12.0) | Yes | Yes | Yes (THD: d = 512) | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 |
+
+⁶ `use_deterministic_algorithm=True`: the rows listed produce bitwise identical gradients across runs. FROST fprop plans are bitwise repeatable; FROST bprop plans without the flag are not (atomic dQ accumulation).
+
+⁷ cc 8.6 / 8.9 run the SM80 kernels under their smaller per-CTA shared-memory budget: the d = 256 prefill runs its 32-key tile, the d = 128 backward runs single-buffered Q / dO without the dQ staging tile, and the (192, 128) and 256 backward envelopes decline. The rows rank after the backend plans.
+
+⁸ The cc 10.x FROST bprop rows take BSHD-physical Q / K / V / O / dO / dQ / dK / dV (BHSD-physical only through the d = 512 row) and do not serve `use_padding_mask` with dense inputs. The ragged (192, 128) rows (`sdpa_bwd_sm100_d192`, `sdpa_bwd_sm107_d192`) are opt-in (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`).
+
+⁹ Thor is served by the SM100-line rows (the kernels compile for `sm_110a`); they rank after the backend plans.
+
 ### Glossary
 ¹ Interleaved q,k,v tensors. Generally they have layouts as BS3HD, B3SHD.
 
@@ -1529,6 +1551,8 @@ Always deterministic on all architectures
 SM100 - Deterministic requires cuDNN backend version 9.19.0 or later.
 SM80 and SM120 do not support deterministic algorithm with ragged input tensor.
 SM90 - Determinism is supported.
+
+FROST plans: fprop is bitwise repeatable on every architecture; `use_deterministic_algorithm=True` selects the FROST bprop rows of the FROST support matrix above.
 
 
 

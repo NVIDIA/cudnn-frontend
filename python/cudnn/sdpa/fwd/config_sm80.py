@@ -77,6 +77,14 @@ def graph_tile_domains(d_qk: int, d_v: int) -> tuple[frozenset[int], frozenset[i
     return frozenset({16, 32, 64, 128}), frozenset({16, 32, 64} if cfg == QWEN_CFG else {16, 32, 64, 128})
 
 
+def prefill_smem_bytes(d_qk: int, d_v: int, tile_m: int, tile_n: int, io_bytes: int = 2) -> int:
+    """Shared memory of one prefill CTA at the flavor envelope ``(d_qk, d_v)``: the kernels' sQ / sK (/ sV) buffers."""
+    elems_q, kv_k, kv_v = tile_m * d_qk, tile_n * d_qk, tile_n * d_v
+    if d_qk > 256 or d_v > 256:
+        return (max(elems_q, tile_m * d_v) + kv_k + kv_v) * io_bytes
+    return (max(elems_q, 2 * kv_v, tile_m * d_v) + 2 * kv_k) * io_bytes
+
+
 # ---------------------------------------------------------------------------
 # TemplateParams — the compile-time identity of one SM80 kernel specialization.
 #

@@ -32,7 +32,7 @@ def test_implementation_selection_is_plan_time():
     assert select_implementation(**(args | {"cc": (10, 7)})) == ACCUMULATION  # Rubin: admitted by name, the same bodies compiled for sm_107a
     for changed in (
         {"cc": (10, 1)},
-        {"cc": (11, 0)},
+        {"cc": (11, 5)},
         {"dsl_version": ("nvidia-cutlass-dsl", "4.7.1")},
         {"dsl_version": ("nvidia-cutlass-dsl-internal", "0.3.0")},
         {"dsl_version": None},

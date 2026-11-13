@@ -59,7 +59,7 @@ _SLOT = 8  # engines/manifest.py: EngineSlot(8, opt_in=True) -> FROST_SDPA_BWD_I
 _ENGINE_ID = 20_608
 _D = 512
 _RUBIN_CC = (10, 7)
-_SM_RANGE = (107, 119)  # the row mirrors the other Rubin rows (engines._RUBIN)
+_SM_RANGE = (107, 109)  # the row mirrors the other Rubin rows (engines._RUBIN); Thor (sm110) is the SM100 d512 row's
 _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
 _FORK_FILE = "sm107/d512_f16_2x2/kernel.py"
@@ -128,7 +128,7 @@ def test_engine_is_registered_and_offered_by_default():
 def test_capabilities_match_what_is_implemented():
     """The row claims exactly what the accept tests run; every deferral is pinned False with its reject test."""
     c = _spec().capabilities
-    assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "the Rubin-line (107 <= SM <= 119), like the d256 rows; the SM100 d512 row stops at 103"
+    assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "the Rubin-line (107 <= SM <= 109), like the d256 rows; the SM100 d512 row stops at 103 and names Thor"
     assert c.d == frozenset({_D}) and c.d_envelope and c.d_pad_multiple == 8 and c.d_envelope_floor == 256 and not c.dqk_ge_dv
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
@@ -253,7 +253,7 @@ def test_served_graph_passes_the_row_probe(monkeypatch, kw):
     assert _decline_reason(monkeypatch, **kw) is None
 
 
-@pytest.mark.parametrize("cc", [(10, 7), (10, 8), (11, 0), (11, 9)], ids=["sm107", "sm108", "sm110", "sm119"])
+@pytest.mark.parametrize("cc", [(10, 7), (10, 8)], ids=["sm107", "sm108"])
 def test_d512_half_graph_is_served_by_exactly_this_row_on_the_rubin_line(monkeypatch, cc):
     """No other python row serves the half d512 backward on the Rubin line (the SM100 d512 row stops at 103, the d256 rows are
     exact-256): the plan list offers this row alone (and no backend plan exists for it on cc 10.7)."""
@@ -318,10 +318,16 @@ def test_deterministic_follows_the_claim(monkeypatch):
     assert (_decline_reason(monkeypatch, use_deterministic_algorithm=True) is None) == claimed
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (12, 0), (8, 0), (9, 0)], ids=["sm100", "sm103", "sm106", "sm120", "sm80", "sm90"])
+def test_d512_half_graph_on_thor_is_the_sm100_row(monkeypatch):
+    """Thor (cc 11.0) is an SM100-class part: the SM100 d512 rows serve it exactly as on cc 10.0 and this row declines it."""
+    thor = _eligible(monkeypatch, cc=(11, 0))
+    assert thor == _eligible(monkeypatch, cc=(10, 0)) and thor and _ENGINE not in thor, thor
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (11, 0), (12, 0), (8, 0), (9, 0)], ids=["sm100", "sm103", "sm106", "sm110", "sm120", "sm80", "sm90"])
 def test_reject_other_arch_lines(monkeypatch, cc):
     reason = _decline_reason(monkeypatch, cc=cc)
-    assert reason is not None and "SM107-119" in reason, reason
+    assert reason is not None and "SM107-109" in reason, reason
 
 
 def test_reject_quantized_graphs(monkeypatch):

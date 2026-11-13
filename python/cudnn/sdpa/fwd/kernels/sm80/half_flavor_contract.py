@@ -17,7 +17,8 @@ from .f16_k_prefetch import contract as k_prefetch
 from .wide_cooperative import contract as wide_cooperative
 
 LEGACY_ROW = k_prefetch.LEGACY_ROW
-DEVICE_CCS = ((8, 0),)
+from cudnn.sdpa.native_sm80 import SM80_ROW_PARTS as DEVICE_CCS  # noqa: E402
+
 # config_sm80.FLAVOR_CFGS (D_QK, D_V) in pick order; a test pins the equality.
 FLAVOR_DIMS = (("gptoss", (64, 64)), ("llama", (128, 128)), ("dsv3", (192, 128)), ("qwen", (256, 256)), ("wide512", (512, 512)), ("mla576", (576, 512)))
 _CONTRACTS = {c.NAME: c for c in (k_prefetch, d256_kv_prefetch, wide_cooperative)}
@@ -104,7 +105,7 @@ def select_geometry(facts, knobs):
 
 def mismatch(implementation, facts, knobs):
     if facts.device_cc not in DEVICE_CCS:
-        return f"requires SM80 (A100); current device is {facts.device_cc}"
+        return f"requires SM80, SM86 or SM89; current device is {facts.device_cc}"
     if owner(facts) != implementation:
         flavors = ", ".join(_CONTRACTS[implementation].FLAVORS)
         return f"{implementation} serves eight-aligned FP16/BF16 head dims in the {flavors} flavor envelopes"

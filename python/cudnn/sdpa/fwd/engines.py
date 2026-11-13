@@ -231,11 +231,15 @@ _LOG = logging.getLogger(__name__)
 # Arch ranges the spec rows below serve, inclusive, encoded major*10 + minor as
 # in engines/manifest.py. RANGES, not the exact device families that exist
 # today: an sm100 kernel runs on the whole sm100 line, so enumerating members
-# silently declines the parts that ship later -- Rubin (sm107) and Thor (sm110)
-# are meant to reuse these kernels and an exact {(10,0), (10,3)} excluded both.
+# silently declines the parts that ship later. The SM100-line rows stop at 106
+# and name Thor (sm110: an SM100-class part, the same 227 KiB SMEM carveout) in
+# ``Capabilities.sm_extra``; the Rubin rows own 107-109 (Thor cannot run the
+# Rubin kernels, which assume Rubin's 327 KiB carveout).
 # Within the range, cc10.3+ additionally enables the fused LDTM.STAT row-max for
 # MXFP8 — handled in the lowering, from the device capability.
 _BLACKWELL = (100, 119)
+_RUBIN = (107, 109)
+_THOR = 110
 _BLACKWELL_GEFORCE = (120, 129)
 
 
@@ -747,6 +751,8 @@ class Capabilities:
 
     # Delegate by the native shape a padded graph selects, so an owner also serves the row's envelope onto its tile.
     delegated_envelope: bool = False
+    # cc codes outside [sm_lo, sm_hi] the row also serves (Thor on the SM100-line rows, cc 8.6 / 8.9 on the SM80 rows).
+    sm_extra: frozenset[int] = frozenset()
 
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V
@@ -2556,8 +2562,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store"
     cc = facts.device_cc
     sm = None if cc is None else cc[0] * 10 + cc[1]
-    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
-        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi or sm in capabilities.sm_extra):
+        extra = "".join(f" or SM{code}" for code in sorted(capabilities.sm_extra))
+        return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}{extra}; current device is {cc}"
     for owner in (_sm90_d64_owner, _sm90_three_wg_owner, _sm90_d128_owner):
         if capabilities.implementation == owner.NAME:
             reason = owner.mismatch(facts, knobs)
@@ -3097,13 +3104,15 @@ def _sm100_spec() -> EngineSpec:
     is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
     tile (128 rows per CTA, sm100/d128_f16_single_q/kernel.py) -- the "decode vs prefill
     by S_q" kernel choice EngineSpec.lower anticipates, driven by the
-    heuristics' cga rule. The separate SM107 row owns Rubin lowering."""
+    heuristics' cga rule. The separate SM107 row owns Rubin lowering. Thor (cc 11.0) is an SM100-class part and rides this
+    row (``sm_extra``)."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100",
         capabilities=Capabilities(
             mixed_fp8_kv_d_shapes=frozenset({(128, 128)}),
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
+            sm_extra=frozenset({_THOR}),
             phase="prefill",
             delegated_exact=frozenset(
                 (cc, shape)
@@ -3507,8 +3516,8 @@ def _sm107_spec() -> EngineSpec:
         name="sdpa_fwd_prefill_sm107",
         capabilities=Capabilities(
             layouts=frozenset({"bshd", "dense_flex"}),
-            sm_lo=107,
-            sm_hi=_BLACKWELL[1],
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
             delegated_exact=frozenset(((10, 7), shape) for shape in _sm107_shared_half.SHAPES | {(512, 512), (576, 512)}),
             delegated_envelope=True,
             phase="prefill",
@@ -3921,8 +3930,8 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
             # 107-119 the SM107 sibling.
-            sm_lo=107 if rubin_row else _BLACKWELL[0],
-            sm_hi=_BLACKWELL[1] if rubin_row else 106,
+            sm_lo=_RUBIN[0] if rubin_row else _BLACKWELL[0],
+            sm_hi=_RUBIN[1] if rubin_row else 106,
             phase="prefill",
             # Both architectures carry native D64 through their d128 FP8 body.
             # The record selects 64-wide K/O geometry, including packed/split plans.
@@ -4552,8 +4561,8 @@ def _sm107_mxfp8_spec() -> EngineSpec:
         capabilities=Capabilities(
             delegated_exact=frozenset((cc, shape) for cc in _sm107_mxfp8.DEVICE_CCS for shape in _sm107_mxfp8.SHAPES),
             layouts=frozenset({"bshd", "dense_flex"}),
-            sm_lo=107,
-            sm_hi=_BLACKWELL[1],
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
             phase="prefill",
             # Exact native shapes only -- the SF tensors are not zero-padded.
             # (192, 128) deliberately takes NO cgas_by_d_shape entry below, so it
@@ -4719,7 +4728,8 @@ def _sm80_spec() -> EngineSpec:
         capabilities=Capabilities(
             zero_scale=True,  # score_sign specialization (#1435)
             sm_lo=80,
-            sm_hi=80,  # A100 exactly: the kernels assume its 164 KiB opt-in SMEM
+            sm_hi=80,
+            sm_extra=frozenset({86, 89}),  # the same sm_80 kernels; api_dsl fits the tiles into the 99 KiB per-CTA budget
             phase="prefill",
             d_shapes=frozenset({(256, 256), (512, 512), (576, 512)}),  # masked native loads
             d_pad_multiple=8,

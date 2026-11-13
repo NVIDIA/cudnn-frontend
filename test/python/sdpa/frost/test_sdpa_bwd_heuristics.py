@@ -119,7 +119,7 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20632]), ((11, 0), [20632]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20618])],
+    [((10, 7), [20632]), ((11, 0), [20607]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20618])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
@@ -171,7 +171,7 @@ def test_sm100_d256_row_lists_ahead_of_the_d192_half_row_on_dense_graphs(monkeyp
         assert [p.engine_id for p in recommend("A", _facts(**base, causal=causal, **thd), offered)] == [20612, 20607], causal
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7"])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7), (11, 0)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7", "cc11.0"])
 def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
     """Dense MHA offers recompute explicitly; grouped and THD retain the accumulation row."""
     from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
@@ -183,7 +183,8 @@ def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
         expected.append((20629, None))
     assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == expected
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20630, None), (20631, None)] if cc in ACCUMULATION_CCS else [])
+    two_cta = [(20631, None)] if cc != (11, 0) else []  # the two-CTA accumulation row keeps its named parts (no Thor)
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20630, None)] + two_cta if cc in ACCUMULATION_CCS else [])
     assert ((10, 7) in ACCUMULATION_CCS) and ((10, 6) not in ACCUMULATION_CCS)  # the admitted parts are named, the envelope's hypothetical ccs are not
     assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
@@ -192,14 +193,14 @@ def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
     "cc, d, want",
     [
         ((10, 7), 512, [20608]),
-        ((11, 0), 512, [20608]),
+        ((11, 0), 512, [20626, 20627]),  # Thor: the SM100 d512 explicit rows (sm_extra)
         ((10, 7), 264, [20608]),
         ((10, 7), 504, [20608]),
         ((10, 0), 512, [20626, 20627]),
         ((10, 3), 512, [20626, 20627]),
         ((10, 7), 256, [20632]),
         ((10, 7), 128, [20630, 20628]),  # accumulation default, followed by explicit recompute; never the d512 row
-        ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
+        ((11, 0), 128, [20630, 20628]),  # Thor: the SM100 d128 rows (sm_extra), the cc 10.7 order
         ((12, 0), 512, [20621]),  # SM120's two-subgroup body
     ],
     ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
@@ -232,7 +233,7 @@ def test_sm107_fp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20625]), ((10, 3), [20625]), ((12, 0), [])],
+    [((10, 7), [20606]), ((11, 0), []), ((10, 0), [20625]), ((10, 3), [20625]), ((12, 0), [])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_mxfp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
