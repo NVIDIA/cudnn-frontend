@@ -140,6 +140,10 @@ gone: the null-pointer C tensor carries the shape and the staging dtype only; (1
 wait (the source: by every thread above every wait); (13) the arms this step never selects are removed -- a per-row alpha, the
 192-token scale path, the two-CTA MMA, cluster multicast, the overlapped accumulator, descriptor prefetch, the other L2 policies,
 the plain and no-op epilogues and the source's own configuration validators (the host entry's typed declines replace them).
+
+The work tiles are dealt by the DSL's own static persistent tile scheduler (``cutlass.utils``), as in the source: with it the
+rendered kernel is the source's up to the changes above.  The DSL has announced that this copy leaves its wheel; a DSL without it is
+declined by name by the host entry's probe (``DSL_NAMES``), never an error from inside the trace.
 """
 
 from typing import Tuple, Type, Union

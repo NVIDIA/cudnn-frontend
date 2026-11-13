@@ -374,19 +374,19 @@ def test_compile_declines_by_name_before_the_kernel_module_is_imported(monkeypat
     monkeypatch.setattr(entry, "DSL_NAMES", (("os", ("path", "no_such_name_in_this_module")),))
     with pytest.raises(NotImplementedError, match=r"written on os; .*9\.9\.9.* does not export no_such_name_in_this_module"):
         k.compile(1)
-    rubin = _modelled_cuda_entry(monkeypatch, readings=(233472, 232448, 212), cc=(10, 7))
+    part107 = _modelled_cuda_entry(monkeypatch, readings=(233472, 232448, 212), cc=(10, 7))
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     with pytest.raises(NotImplementedError, match="sm_107a"):
-        rubin.compile(1)
+        part107.compile(1)
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(entry, "dsl_compiler_version", lambda: (12, 9))
-    for e in (k, rubin):  # the compiler floor is the kernel's (its bytes), not a part's: it declines on every class
+    for e in (k, part107):  # the compiler floor is the kernel's (its bytes), not a part's: it declines on every class
         with pytest.raises(
             NotImplementedError, match=r"is qualified with the CuTe DSL compiling with CUDA 13\.4 or later; the DSL in this process compiles with CUDA 12\.9"
         ):
             e.compile(1)
-    assert not k.compiled and not rubin.compiled and k._kernel_module is None and rubin._kernel_module is None
+    assert not k.compiled and not part107.compiled and k._kernel_module is None and part107._kernel_module is None
 
 
 def test_compiler_gate_never_declines_on_a_value_it_cannot_read(monkeypatch):
