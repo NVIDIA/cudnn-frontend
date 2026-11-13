@@ -30,7 +30,6 @@ cudnn = pytest.importorskip("cudnn")
 
 from add_norm_quant_utils import (  # noqa: E402  (the form tables, the operand builders, the references and the device gate)
     BF16,
-    DETERMINISM_FORMS,
     E2M1_MIDPOINTS,
     E4M3,
     E4M3_SCALES,
@@ -43,20 +42,22 @@ from add_norm_quant_utils import (  # noqa: E402  (the form tables, the operand 
     U8,
     _device_or_skip,
     assert_nvfp4_codes,
+    assert_reference,
     assert_y,
     e2m1_codes,
     e4m3_codes,
     edge_operands,
     exact_operands,
+    exact_signs,
+    exact_targets,
     form_kwargs,
     make_entry,
     make_operands,
     nvfp4_scale_bytes,
-    pack_e2m1,
-    residual_reference,
     scale_bytes_layout_mask,
     scale_bytes_of_rows,
     scale_tensor,
+    twin_form,
     unpack_e2m1,
 )
 
@@ -690,6 +691,23 @@ def test_import_cudnn_does_not_import_the_kernel_or_torch():
     assert fresh(code) == "[]"
 
 
+def test_kernel_takes_its_quantization_helpers_from_the_tile_library():
+    """One definition per helper: the kernel module imports the static E4M3 store, the correctly rounded reciprocal and the NVFP4
+    block-scale chain from ``cudnn.frost.tile_dsl.pointwise`` (their own cells are in
+    ``sdpa/frost/test_tile_dsl_quant_helpers.py``) and carries no inline PTX of its own.  Read from the source: no DSL import."""
+    import ast
+
+    tree = ast.parse((REPO / "python" / "cudnn" / "norm" / "frost" / "kernel" / "add_norm_quant_decode_f16.py").read_text())
+    imported = {
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module == "cudnn.frost.tile_dsl.pointwise" for alias in node.names
+    }
+    assert {"fp32_times_inv_to_e4m3", "rcp_div_rn", "nvfp4_block_scale_global", "fp32_to_e2m1x2"} <= imported, imported
+    defined = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert defined == {"_bf16_words", "frost_add_rms_norm_quant", "launch"}, defined
+    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert "inline_ptx" not in names, "the kernel spells an instruction inline instead of through the tile library"
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # host-only: the rendering (the instructions that define the sum tree and the rounding chain), per claimed target
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -964,45 +982,6 @@ def _assert_same(got, want, label, names=None):
         assert _same(got[name], want[name]), f"{label}: {name} differs in {int((_bits(got[name]) != _bits(want[name])).sum())} of {got[name].numel()} elements"
 
 
-def _assert_reference(form, got, x, res0, weight, scale, y=None, share_bound=False, label="", bracket=None):
-    """The references of ``add_norm_quant_utils`` on one launch's bytes: the residual, the normalized value (where the form writes it;
-    otherwise ``y`` is the bf16 twin form's output, already checked), the E4M3 codes, the NVFP4 block scales and the code bracket.
-    ``bracket`` is the precomputed fp64 bracket of the same operands."""
-    add, store, bf16, quant = FORMS[form]
-    rows = x.shape[0]
-    if add or store:
-        assert torch.equal(_bits(got["residual"].cpu()), _bits(residual_reference(x, res0, add))), f"{label}: the residual"
-    else:
-        assert "residual" not in got
-    if bf16:
-        assert_y(got["out"], x, res0, weight, add, share_bound=share_bound, label=label, bracket=bracket)
-        y = got["out"]
-    else:
-        assert "out" not in got and y is not None
-    if quant == "e4m3_static":
-        assert got["codes"].dtype == E4M3 and tuple(got["codes"].shape) == (rows, HIDDEN)
-        want = e4m3_codes(y, scale)
-        n = int((got["codes"].view(U8).cpu() != want).sum())
-        assert n == 0, f"{label}: {n} E4M3 codes differ from the static quantization of the kernel's own bf16 value"
-    if quant == "nvfp4":
-        assert got["codes"].dtype == U8 and tuple(got["codes"].shape) == (rows, HIDDEN // 2)
-        assert got["scales"].dtype == E4M3 and tuple(got["scales"].shape) == (kcfg.scale_rows(rows), HIDDEN // 16)
-        stored = scale_bytes_of_rows(got["scales"], rows)
-        n = int((stored != nvfp4_scale_bytes(y, scale)).sum())
-        assert n == 0, f"{label}: {n} NVFP4 block scales differ from e4m3(gs x (amax x fp32(1/6))) of the kernel's own bf16 value"
-        assert_nvfp4_codes(got["codes"], y, stored, scale, label)
-        pad = ~scale_bytes_layout_mask(kcfg.scale_rows(rows), rows)
-        assert bool((got["scales"].view(U8).cpu().reshape(-1)[pad] == 0).all()), f"{label}: the entry-owned scale buffer's pad rows are zero"
-    if quant is None:
-        assert "codes" not in got and "scales" not in got
-
-
-def _twin(form):
-    """The form with the same residual mode and quant that also writes the bf16 value."""
-    mode, _, rest = form.partition("-")
-    return form if rest.startswith("bf16") else f"{mode}-bf16-{rest}"
-
-
 _OPERANDS, _BRACKETS = {}, {}
 
 
@@ -1038,7 +1017,7 @@ def test_matches_the_reference(form, kind):
     dev = _device_or_skip()
     add, store, bf16, quant = FORMS[form]
     k = _entry(dev, form)
-    twin = None if bf16 else _entry(dev, _twin(form))
+    twin = None if bf16 else _entry(dev, twin_form(form))
     xs, rs, w = _reference_operands(dev, kind)
     scales = (None,) if quant is None else (E4M3_SCALES if quant == "e4m3_static" else NVFP4_SCALES)
     for rows in ROWS:
@@ -1057,38 +1036,14 @@ def test_matches_the_reference(form, kind):
                 _assert_same(got, ref, label + ": against the form that also writes bf16", names=list(got))
                 y = ref["out"]
             if first is None:
-                _assert_reference(form, got, x, res0, w, scale, y=y, share_bound=kind == "random", label=label, bracket=bracket)
+                assert_reference(form, got, x, res0, w, scale, y=y, share_bound=kind == "random", label=label, bracket=bracket)
                 first = dict(got, y=y)
             else:
                 _assert_same(got, first, label + ": the scale moves codes only", names=[n for n in ("out", "residual") if n in got])
                 if twin is not None:
                     assert _same(y, first["y"]), label + ": the twin's bf16 value does not depend on the scale"
-                _assert_reference(form, dict(got, **({"out": first["out"]} if bf16 else {})), x, res0, w, scale, y=y, label=label, bracket=bracket)
+                assert_reference(form, dict(got, **({"out": first["out"]} if bf16 else {})), x, res0, w, scale, y=y, label=label, bracket=bracket)
     assert len(k.compiled) == 1, "one compiled kernel served every row count"
-
-
-def _exact_targets():
-    """``[hidden]`` targets of the exact cells, per 16-element block: blocks 0-3 a block maximum of ``6 x 2^m`` with the seven E2M1
-    midpoints times ``2^m`` twice and a zero (power-of-two block scales: exact codes); blocks 8-9 a maximum of 9.0 and 10.5 with the
-    midpoints times 1.5 and 1.75 (block scales 1.5 and 1.75 at global scale 1: every midpoint element is an EXACT tie decided by the
-    approximate reciprocal); block 20 all zero; block 21 all at the maximum; the rest 1.0."""
-    mids = torch.tensor(E2M1_MIDPOINTS)
-    t = torch.ones(HIDDEN)
-    for i, (peak, unit) in enumerate(((6.0, 1.0), (12.0, 2.0), (0.75, 0.125), (96.0, 16.0))):
-        t[16 * i : 16 * i + 16] = torch.cat([torch.tensor([peak]), mids * unit, mids * unit, torch.tensor([0.0])])
-    for i, (peak, unit) in ((8, (9.0, 1.5)), (9, (10.5, 1.75))):
-        t[16 * i : 16 * i + 16] = torch.cat([torch.tensor([peak]), mids * unit, mids * unit, torch.tensor([0.0])])
-    t[320:336] = 0.0
-    t[336:352] = 6.0
-    return t
-
-
-def _exact_signs(rows):
-    gen = torch.Generator(device="cpu").manual_seed(9)
-    signs = torch.where(torch.rand(rows, HIDDEN, generator=gen) < 0.5, -1.0, 1.0)
-    signs[0] = 1.0
-    signs[1] = -1.0
-    return signs
 
 
 def _assert_exact_nvfp4_codes(codes, y, block_scale, gs, rows):
@@ -1123,7 +1078,7 @@ def test_exact_cells_nvfp4(form):
     dev = _device_or_skip()
     add, store, bf16, quant = FORMS[form]
     rows = 4
-    x, res0, w, y = exact_operands(_exact_targets(), _exact_signs(rows), dev)
+    x, res0, w, y = exact_operands(exact_targets(), exact_signs(rows), dev)
     k = _entry(dev, form)
     for gs in (1.0, 0.25):
         scale = scale_tensor(gs, dev)
@@ -1151,7 +1106,7 @@ def test_exact_cells_e4m3():
     ``0x80``)."""
     dev = _device_or_skip()
     rows = 4
-    x, res0, w, y = exact_operands(_exact_targets(), _exact_signs(rows), dev)
+    x, res0, w, y = exact_operands(exact_targets(), exact_signs(rows), dev)
     for form in ("store-bf16-e4m3", "none-e4m3"):
         k = _entry(dev, form)
         for value in (1.0, 2.0**-7, 0.25):
@@ -1181,7 +1136,7 @@ def test_edge_rows():
         k = _entry(dev, form)
         scale = None if quant is None else scale_tensor(0.02 if quant == "e4m3_static" else 37.0, dev)
         got = _snap(k, x, res0, w, scale)
-        _assert_reference(form, got, x, res0, w, scale, label=f"{form} edge rows")
+        assert_reference(form, got, x, res0, w, scale, label=f"{form} edge rows")
         out = got["out"].float().cpu()
         assert bool((out[0] == 0).all()) and torch.equal(
             torch.signbit(out[0]), torch.signbit(1.0 + w.float().cpu())
@@ -1406,7 +1361,7 @@ def test_one_compile_serves_every_row_count(monkeypatch):
     for rows in ROWS:
         x, res0 = xs[:rows], rs[:rows]
         got = _snap(k, x, res0, w, scale)
-        _assert_reference(form, got, x, res0, w, scale, label=f"rows {rows} after one compile")
+        assert_reference(form, got, x, res0, w, scale, label=f"rows {rows} after one compile")
         _assert_same(_snap(k, x, res0, w.reshape(1, HIDDEN), scale_tensor(37.0, dev, zero_d=True)), got, f"rows {rows}: a 0-d scale and a [1, hidden] weight")
         mine = {name: t for name, t in _outs(k.cfg, rows, dev, extra=0).items()}
         mine["scales"].view(U8).zero_()
@@ -1558,7 +1513,7 @@ def test_entry_on_another_device_launches_there_and_keeps_the_callers_device_cur
     torch.cuda.synchronize(other)
     assert torch.cuda.current_device() == current and out.device == other and codes.device == other
     with torch.cuda.device(other):  # the references are plain torch math: run them with the operands' device current
-        _assert_reference(form, dict(residual=residual, out=out, codes=codes), x, res0, w, scale, label="an entry on a non-current device")
+        assert_reference(form, dict(residual=residual, out=out, codes=codes), x, res0, w, scale, label="an entry on a non-current device")
 
 
 @pytest.mark.parametrize("arm, arm_id", list(zip(LAUNCH_ARMS, LAUNCH_ARM_IDS)), ids=LAUNCH_ARM_IDS)

@@ -157,6 +157,31 @@ def exact_operands(targets, signs, device="cpu", hidden=HIDDEN):
     return x.to(device), residual.to(device), weight.to(device), y.to(device)
 
 
+def exact_targets(hidden=HIDDEN):
+    """``[hidden]`` targets of the exact cells, per 16-element block: blocks 0-3 a block maximum of ``6 x 2^m`` with the seven E2M1
+    midpoints times ``2^m`` twice and a zero (power-of-two block scales: exact codes); blocks 8-9 a maximum of 9.0 and 10.5 with the
+    midpoints times 1.5 and 1.75 (block scales 1.5 and 1.75 at global scale 1: every midpoint element is an EXACT tie decided by the
+    approximate reciprocal); block 20 all zero; block 21 all at the maximum; the rest 1.0."""
+    mids = torch.tensor(E2M1_MIDPOINTS)
+    t = torch.ones(hidden)
+    for i, (peak, unit) in enumerate(((6.0, 1.0), (12.0, 2.0), (0.75, 0.125), (96.0, 16.0))):
+        t[16 * i : 16 * i + 16] = torch.cat([torch.tensor([peak]), mids * unit, mids * unit, torch.tensor([0.0])])
+    for i, (peak, unit) in ((8, (9.0, 1.5)), (9, (10.5, 1.75))):
+        t[16 * i : 16 * i + 16] = torch.cat([torch.tensor([peak]), mids * unit, mids * unit, torch.tensor([0.0])])
+    t[320:336] = 0.0
+    t[336:352] = 6.0
+    return t
+
+
+def exact_signs(rows, hidden=HIDDEN):
+    """``[rows, hidden]`` signs of +-1 for the exact cells from a CPU generator: row 0 all positive, row 1 all negative."""
+    gen = torch.Generator(device="cpu").manual_seed(9)
+    signs = torch.where(torch.rand(rows, hidden, generator=gen) < 0.5, -1.0, 1.0)
+    signs[0] = 1.0
+    signs[1] = -1.0
+    return signs
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # the references (host torch math on copies; every function returns host tensors)
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -309,6 +334,47 @@ def assert_nvfp4_codes(codes, y, scale_bytes, global_scale, label=""):
         n_out == 0
     ), f"{label}: {n_out} of {got.numel()} NVFP4 codes outside the bracket of the approximate reciprocals (first at flat index {int(outside.reshape(-1).nonzero()[0])})"
     return int((lo != hi).sum())
+
+
+def twin_form(form):
+    """The form with the same residual mode and quant that also writes the bf16 value."""
+    mode, _, rest = form.partition("-")
+    return form if rest.startswith("bf16") else f"{mode}-bf16-{rest}"
+
+
+def assert_reference(form, got, x, res0, weight, scale, y=None, share_bound=False, label="", bracket=None):
+    """The references of this module on ONE launch's bytes (``got``: the residual after the call and every output the form
+    produces, by name; ``res0`` the residual before it): the residual, the normalized value (where the form writes it; otherwise ``y``
+    is the output of :func:`twin_form`'s entry on the same operands, already checked), the E4M3 codes, the NVFP4 block scales and the
+    code bracket, and the zero pad rows of a scale buffer of exactly the call's tiles.  ``bracket`` is the precomputed fp64 bracket
+    of the same operands."""
+    add, store, bf16, quant = FORMS[form]
+    rows = x.shape[0]
+    if add or store:
+        assert torch.equal(_bits(got["residual"].detach().cpu()), _bits(residual_reference(x, res0, add))), f"{label}: the residual"
+    else:
+        assert "residual" not in got
+    if bf16:
+        assert_y(got["out"], x, res0, weight, add, share_bound=share_bound, label=label, bracket=bracket)
+        y = got["out"]
+    else:
+        assert "out" not in got and y is not None
+    if quant == "e4m3_static":
+        assert got["codes"].dtype == E4M3 and tuple(got["codes"].shape) == (rows, HIDDEN)
+        want = e4m3_codes(y, scale)
+        n = int((got["codes"].view(U8).cpu() != want).sum())
+        assert n == 0, f"{label}: {n} E4M3 codes differ from the static quantization of the kernel's own bf16 value"
+    if quant == "nvfp4":
+        assert got["codes"].dtype == U8 and tuple(got["codes"].shape) == (rows, HIDDEN // 2)
+        assert got["scales"].dtype == E4M3 and tuple(got["scales"].shape) == (kcfg.scale_rows(rows), HIDDEN // 16)
+        stored = scale_bytes_of_rows(got["scales"], rows)
+        n = int((stored != nvfp4_scale_bytes(y, scale)).sum())
+        assert n == 0, f"{label}: {n} NVFP4 block scales differ from e4m3(gs x (amax x fp32(1/6))) of the kernel's own bf16 value"
+        assert_nvfp4_codes(got["codes"], y, stored, scale, label)
+        pad = ~scale_bytes_layout_mask(kcfg.scale_rows(rows), rows)
+        assert bool((got["scales"].view(U8).cpu().reshape(-1)[pad] == 0).all()), f"{label}: the scale buffer's pad rows are zero"
+    if quant is None:
+        assert "codes" not in got and "scales" not in got
 
 
 def _device_or_skip():
