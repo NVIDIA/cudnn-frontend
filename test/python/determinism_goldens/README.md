@@ -1611,30 +1611,33 @@ residual's hash equals that of the host's `bf16(x + residual)` in the four add c
 cases share their operands and their updated residual; the store and no-residual cases share `x` and differ in their codes (scales 0.02
 and 1.0).
 
-Strict check and the functional module, from a clean tree at the branch's last commit that changes a test (2026-11-13 UTC, the runtime
-above; the six golden files are unchanged since they were recorded).
+Strict check and the functional module, from a clean tree one commit behind the branch's last commit that changes a test (that one
+commit changes documentation text only; 2026-11-13 UTC, the runtime above; the six golden files are unchanged since they were recorded).
 `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 61 passed, 0 skipped: `test_replay` 24,
 `test_replay_on_a_fresh_entry_and_fresh_operands` 6, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 6,
 `test_insertion_removal_and_reordering` 6, `test_duplicated_row_and_neighbour_isolation` 6, `test_inputs_are_unmodified` 1,
 `test_crosses_a_scheduling_wave` 2, `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 6.  `pytest <module>
-core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` (under the suite's default per-test isolation) -> 175 passed, 1 skipped: the
-module 171 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` (under the suite's default per-test isolation) -> 178 passed, 1 skipped: the
+module 174 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
 are required" -- one device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the
 symbol-prefix test 4 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 12 of
-12 cells (one kernel per call; grid `(rows, 1, 1)`, block `(640, 1, 1)`, 80 B of shared memory).
+12 cells (one kernel per call; grid `(rows, 1, 1)`, block `(640, 1, 1)`, 80 B of shared memory).  The module's case behind a
+predecessor that released early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 16 of 16 launches of the
+step equal to the plain step, behind its positive control: a dependent without a wait read other bytes than the written ones in 4 of 4
+eager launches and 4 of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.
 
 CUDA 12.9 compiler flavour on the same part and runtime (2026-11-13 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
 libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL
 compatibility and is not a deployment that uses CUDA 12 throughout): the strict determinism command -> 61 passed, 0 skipped -- the six
 golden cases pass against the SAME set, whose runtime key does not name the compiler flavour, so the two flavours write the same bytes
-for those cases; the functional command -> 174 passed, 2 skipped (`test_rendering_pins_the_convention` for `sm_107a`: that compiler
+for those cases; the functional command -> 177 passed, 2 skipped (`test_rendering_pins_the_convention` for `sm_107a`: that compiler
 rejects the target, and the case skips with the entry's own decline; the two-device case).
 
-CuTe DSL 4.8.1 on the same part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime; these runs are one commit
-later than the 4.8.0 rows above, which changes this report's text only).  Compiling with CUDA 13.4: the functional command -> 175
+CuTe DSL 4.8.1 on the same part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime; the same tree as the
+4.8.0 rows above).  Compiling with CUDA 13.4: the functional command -> 178
 passed, 1 skipped (the two-device case); the determinism command WITHOUT the goldens variable -> 55 passed, 6 skipped (the six
 `test_golden` cases: the DSL version is part of the runtime key and no set is committed for that key, so the golden comparison is a
-coverage gap there, not a pass).  With only the CUDA 12 toolchain libraries of 4.8.1 (`CUDA_VERSION` 12.9): 174 passed, 2 skipped (the
+coverage gap there, not a pass).  With only the CUDA 12 toolchain libraries of 4.8.1 (`CUDA_VERSION` 12.9): 177 passed, 2 skipped (the
 `sm_107a` rendering case and the two-device case); 55 passed, 6 skipped (the golden cases, same reason).  A record into a new directory
 under each flavour (`-k golden`: 6 passed, 55 deselected) holds the input and output hashes of the committed 4.8.0 set in 6 of 6 files;
 it is not committed.
@@ -1643,7 +1646,7 @@ Cold compile on an x86 host (2026-11-13 UTC; a cc 8.0 device: every device case 
 target (fifteen forms x three launch arms) under 4.8.1 are byte-identical cubins to 4.8.0's for `sm_100a`, `sm_103a` and `sm_107a` with
 the CUDA 13.4 compiler (135 of 135) and for `sm_100a` / `sm_103a` with the CUDA 12.9 compiler (90 of 90); `sm_107a` does not compile
 under CUDA 12.9 in either version (the entry's typed decline).  `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m
-L0 -q -ra` on that host: 101 passed, 136 skipped under 4.8.0 and under 4.8.1 with CUDA 13.4; 100 passed, 137 skipped under either
+L0 -q -ra` on that host: 102 passed, 138 skipped under 4.8.0 and under 4.8.1 with CUDA 13.4; 101 passed, 139 skipped under either
 version with CUDA 12.9 (the `sm_107a` rendering case skips with the entry's decline).
 
 ### QSA: 42 cases
