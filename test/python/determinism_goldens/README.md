@@ -4598,7 +4598,8 @@ GQA2/4/8/16, pages8/16/64/256, short-query routing, window/sink/Stats handling,
 fresh strides, changed device lengths/tables, empty replay and tail canaries.
 The graph batch tests hold sequence payloads fixed across reorder, duplication,
 changed neighbors and B1/B3/B5/B129 under one capacity4096 plan. The refill
-checks compare O/Stats with CPU FP64 before stressing the four-stage KV ring.
+checks validate both cold O/Stats baselines with CPU FP64 before stressing
+the four-stage KV ring with exact byte comparisons.
 No backward kernel is changed or qualified by these tests.
 
 ```bash
@@ -4621,12 +4622,38 @@ the control's three-CTA geometry, so the rate bound is specific to that grid.
 Forty-two existing host config/capability regressions and eight new contract
 checks also pass locally. Changed-file pre-commit and fern check pass.
 
-Run the functional phase with `-k 'not batch_and_golden and not warm_refill'`,
-the golden phase with `-k batch_and_golden`, and stress with `-k warm_refill`.
-Record into a fresh `CUDNN_DETERMINISM_RECORD` directory only after references
-and byte comparisons pass; the strict phase uses `CUDNN_DETERMINISM_GOLDENS`
-and disables recording. Sanitizer selection is
-`-k 'test_paged_origins and (g2 or g4)'` on the same L0 entrypoint.
+The original qualification snapshot's production and test bytes match
+`e4e1e46c53567673b1c728e388e890f6f0e04083`, based on
+`fed09b0fa691273435e993676f4bfb28c28a0461`. The review follow-up adds the FP64
+checks to the two actual cold launches; it changes no production code or
+golden bytes. Its two updated stress cases pass on each B200 and B300, with
+no skips, using the same runtime and unchanged 256 warm/256 poisoned counts.
+The qualified helper SHA256 is `ceef49f454fc3ff386680d00eb728b78a862e7b3b0320ab149c688ea9713847f`.
+The phase commands are below (from `test/python`, using the runtime above). The recording test writes only after its numerical and
+bytewise batch checks pass. Strict rechecks always disable recording.
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CUDNN_TEST_NO_ISOLATION=1
+entry=sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestD64ThdPackedUnsplit
+golden_dir=$(mktemp -d)
+env -u CUDNN_DETERMINISM_RECORD -u CUDNN_DETERMINISM_GOLDENS \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short \
+  -k 'not batch_and_golden and not warm_refill'
+env -u CUDNN_DETERMINISM_GOLDENS CUDNN_DETERMINISM_RECORD="$golden_dir" \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short -k batch_and_golden
+env -u CUDNN_DETERMINISM_RECORD CUDNN_DETERMINISM_GOLDENS="$golden_dir" \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short -k batch_and_golden
+env -u CUDNN_DETERMINISM_RECORD -u CUDNN_DETERMINISM_GOLDENS \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short -k warm_refill
+for sanitizer in memcheck synccheck racecheck; do
+  env -u CUDNN_DETERMINISM_RECORD -u CUDNN_DETERMINISM_GOLDENS \
+    compute-sanitizer --tool "$sanitizer" --error-exitcode 91 --report-api-errors no \
+    python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short \
+    -k 'test_paged_origins and (g2 or g4)'
+done
+```
+
 The retained development smoke passed two N128 paged origin/replay cases;
 it also exposed the existing N64 dense-only factory boundary, which is now
 rejected by capability and standalone checks before compilation. An earlier

@@ -158,6 +158,7 @@ def test_warm_refill(dtype, monkeypatch):
         _execute_compact_thd(api, values, workspace)
 
     launch()
+    references = {"o": [], "lse": []}
     for batch in range(b):
         q = values["q"][batch * sq : (batch + 1) * sq].cpu().double().transpose(0, 1)
         k = values["k"][batch * sk : (batch + 1) * sk].cpu().double().repeat_interleave(h // hk, 1).transpose(0, 1)
@@ -166,12 +167,30 @@ def test_warm_refill(dtype, monkeypatch):
         scores.masked_fill_(torch.arange(sk)[None, :] > torch.arange(sq)[:, None], -torch.inf)
         reference = (scores.softmax(-1) @ v).transpose(0, 1)
         stats = scores.logsumexp(-1).T
-        torch.testing.assert_close(values["o"][batch * sq : (batch + 1) * sq].cpu().double(), reference, atol=0.004, rtol=0.02)
-        torch.testing.assert_close(values["lse"][batch * sq : (batch + 1) * sq].cpu().double(), stats, atol=0.0006, rtol=0)
+        references["o"].append(reference)
+        references["lse"].append(stats)
+    references = {name: torch.cat(parts) for name, parts in references.items()}
+
+    # FP64 is a numerical oracle, not the native reduction's exact output
+    # bytes. Check BOTH cold launches that the helper uses as its byte
+    # baseline; an unrelated preceding launch cannot validate that baseline.
+    cold_checked = 0
+
+    def checked_launch():
+        nonlocal cold_checked
+        launch()
+        if cold_checked < 2:
+            torch.testing.assert_close(values["o"].cpu().double(), references["o"], atol=0.004, rtol=0.02)
+            torch.testing.assert_close(values["lse"].cpu().double(), references["lse"], atol=0.0006, rtol=0)
+            cold_checked += 1
+
     assert seen
     # Late query tiles traverse nine KV tiles through a four-stage ring.
     assert_warm_stress(
-        StressCase("D64 packed THD prefill", launch, {name: values[name] for name in ("o", "lse")}, thread_blocks=api._thd_plan().units, refills_per_launch=5),
+        StressCase(
+            "D64 packed THD prefill", checked_launch, {name: values[name] for name in ("o", "lse")}, thread_blocks=api._thd_plan().units, refills_per_launch=5
+        ),
         warm=256,
         poisoned=256,
     )
+    assert cold_checked == 2
