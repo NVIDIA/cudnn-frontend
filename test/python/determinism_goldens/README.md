@@ -4597,12 +4597,9 @@ and changed neighbors. Active data and scale outputs use raw-byte comparisons.
 Atomic dprob is excluded from bitwise claims; canonical parity checks it
 against the Torch result numerically. General dprob determinism is not claimed.
 
-New GB200 SM100 measurements: native cuDNN/TE builds and imports passed;
+New GB200 SM100 measurements: native cuDNN builds and imports passed;
 73 canonical parity/validation cases passed, two new golden recordings passed,
 and all eight strict replay/invariance/golden cases passed (zero skips).
-The companion TE integration passed 93 API/fallback tests and 12 complete
-MoE forward/backward configurations on four GB200s against an independent JAX
-reference, with unchanged tolerances. This is not full Kimi-K3 model validation.
 
 Runtime: JAX 0.12.0.dev20261014, Torch 2.16.0.dev20261030+cu130, CUDA toolkit
 13.5, CuTeDSL 4.8.0/compiler CUDA13.4; cuDNN backend 9.26 (Torch reports 9.27).

@@ -4,17 +4,13 @@
 
 ## JAX support
 
-**Canonical MXFP8 (block-scaled, dense weights):** the `jax.jit`-compatible entry point `grouped_gemm_dglu_jax_sm100` takes the canonical operands as keywords. They are `b_tensor` `(experts, n, k)`, already MMA-packed E8M0 `sfa_tensor`/`sfb_tensor` bytes (physical or flat), and an explicit `norm_const_tensor`, along with A `(m, k)`, saved C `(m, 2n)` BF16/FP16, prob `(m,)` fp32/bf16, alpha and beta `(experts,)` fp32, and `d_dtype` e4m3.
+**Canonical MXFP8 (block-scaled, dense weights):** the `jax.jit`-compatible entry point `grouped_gemm_dglu_jax_sm100` takes the canonical operands as keywords. They are `b_tensor` `(experts, n, k)`, already MMA-packed E8M0 `sfa_tensor`/`sfb_tensor` bytes (physical or flat), and an explicit `norm_const_tensor`, along with A `(m, k)`, saved C `(m, 2n)` BF16/FP16, prob `(m,)` fp32/bf16, alpha and beta `(experts,)` fp32, `d_dtype` e4m3, and `act_func` `"dswiglu"`, `"dgeglu"`, or `"dsituglu"`. It returns a `TupleDict` with the eager wrapper's keys (`dbias_tensor` and `amax_tensor` are None). It runs the Rubin dGLU kernel on SM107 and the SM100 kernel otherwise. The activation scalars are compile-time constants of the traced call, and `discrete_col_sfd=True` packs column scales by expert. Only `dprob` is zero-initialized, because the kernel accumulates into it; other outputs are not initialized, so rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path. `grouped_gemm_dglu_wrapper_sm100` dispatches JAX inputs with dense `b_tensor` and `sfa_tensor` to it; set `sf_vec_size=32`, an e4m3 `d_dtype`, and `dprob_tensor=None`. dbias, discrete weights, deterministic reduction, dynamic scheduling, and `round_dgrad_to_input_dtype` raise `ValueError`.
 
-`act_func` selects `"dswiglu"`, `"dgeglu"`, or `"dsituglu"`. For `"dsituglu"`, this JAX entry supports MXFP8 inputs on SM100/SM103 only. `situ_beta1` sets the gate soft cap (default `4.0`), and `situ_beta2` sets the up-branch soft cap (default `25.0`). Both must be finite and positive. All activation parameters are static arguments of the traced JAX call.
-
-It returns a `TupleDict` with the eager wrapper's keys (`dbias_tensor` and `amax_tensor` are None). It runs the Rubin dGLU kernel on SM107 and the SM100 kernel otherwise. `discrete_col_sfd=True` packs column scales by expert. Only `dprob` is zero-initialized, because the kernel accumulates into it; other outputs are not initialized, so rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path.
-
-`grouped_gemm_dglu_wrapper_sm100` dispatches JAX inputs with dense `b_tensor` and `sfa_tensor` to it; set `sf_vec_size=32`, an e4m3 `d_dtype`, and `dprob_tensor=None`. dbias, discrete weights, deterministic reduction, dynamic scheduling, and `round_dgrad_to_input_dtype` raise `ValueError`.
+For `act_func="dsituglu"`, the JAX entry supports MXFP8 inputs on SM100/SM103 only. `situ_beta1` sets the gate soft cap (default `4.0`), and `situ_beta2` sets the up-branch soft cap (default `25.0`). Both must be finite and positive and are static arguments of the traced JAX call.
 
 **Canonical FP4 and BF16 (dense weights):** the same entry also takes packed FP4 A/B with `sf_vec_size` (keyword). Packed FP4 operands travel as `uint8` with two values per byte (JAX has no packed FP4 dtype), so K is twice the array extent; their scale buffers are E4M3 with `sf_vec_size=16` for NVFP4, or E8M0. FP4 inputs take a BF16/FP16 `d_dtype` and no `norm_const_tensor`, and return D_row, dprob and the per-expert amax `(experts, 2, 1)`; D_col is not produced. With a BF16 `b_tensor` and no scale tensors it runs the BF16 kernel on canonical A `(m, k)`, C `(m, 2n)` and fp32 prob `(m,)`, returning D_row and dprob. `grouped_gemm_dglu_wrapper_sm100` dispatches JAX inputs with any dense `b_tensor` to the entry.
 
-**Legacy eager BF16 (discrete weights):** supports **JAX arrays** (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense BF16 weights use the canonical entry above. Discrete block-scaled weights remain unsupported for JAX. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+**BF16 backend:** supports **JAX arrays** in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense BF16 `b_tensor` and discrete block-scaled weights are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
 
 For jitted BF16 JAX programs use the same entry point `grouped_gemm_dglu_jax_sm100` with `b_ptrs` and `n` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
@@ -30,7 +26,7 @@ This is a **unified API** that supports both weight layout modes:
 - **Dense mode**: All expert weights packed into a single contiguous `(N, K, L)` tensor
 - **Discrete mode**: Per-expert weight pointers (no weight stacking required)
 
-Supported backward activation functions:
+And both backward activation functions:
 - **dSwiGLU**: `act_func="dswiglu"` (default)
 - **dGeGLU**: `act_func="dgeglu"`
 - **dSiTU-GLU**: `act_func="dsituglu"` (block-scaled SM100/SM103 only)
