@@ -53,7 +53,6 @@ def _ref(
     return_stats=False,
 ):
     """sdpa.fp8_ref.compute_ref on this file's bhsd fp8 tensors (fp32 O, natural-log LSE [b, h, s])."""
-    import cudnn
     from sdpa.fp8_ref import compute_ref
 
     b, h_q, s_q, d_qk = q8.shape
@@ -105,8 +104,6 @@ def _ref_kwargs(sdpa_kwargs):
         out["right_bound"] = right_bound
     diagonal_alignment = sdpa_kwargs.get("diagonal_alignment")
     if diagonal_alignment is not None:
-        import cudnn
-
         out["bottom_right"] = diagonal_alignment == cudnn.diagonal_alignment.BOTTOM_RIGHT
     lb = sdpa_kwargs.get("left_bound")
     if lb is not None:

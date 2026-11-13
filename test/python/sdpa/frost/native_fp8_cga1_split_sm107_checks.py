@@ -10,7 +10,7 @@ import torch
 import cudnn
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 import test_sdpa_prepared_fp8 as shared
-from fp8_test_reference import _bound_handle, _check, _execute, _ref, _ref_kwargs
+from fp8_test_reference import _bound_handle, _check, _ref, _ref_kwargs
 
 
 @pytest.mark.L0

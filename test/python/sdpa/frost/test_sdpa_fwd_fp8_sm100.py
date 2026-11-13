@@ -25,7 +25,6 @@ import pytest
 import torch
 
 import fp8_test_reference as fp8_reference
-from fp8_test_reference import _FP8, _E5M2_EDGE_MAX, _check, _half_atol, _ref, _ref_kwargs
 
 from test_utils import torch_fork_set_rng
 
@@ -43,6 +42,14 @@ from frost_test_utils import (
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
+
+# Preserve the shared reference names used by this suite and its consumers.
+_FP8 = fp8_reference._FP8
+_E5M2_EDGE_MAX = fp8_reference._E5M2_EDGE_MAX
+_check = fp8_reference._check
+_half_atol = fp8_reference._half_atol
+_ref = fp8_reference._ref
+_ref_kwargs = fp8_reference._ref_kwargs
 
 pytestmark = [requires_blackwell, requires_dsl]
 
