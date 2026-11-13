@@ -128,19 +128,22 @@ def test_zero_weight_replay_and_batch_invariance(form, dtype, splits):
     _invoke(fn, op, lp, out)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        _invoke(fn, op, lp, out)
-    changed = saved["op"].clone()
-    changed[ignored:].add_(0.25)
-    for current in (changed, saved["op"]):
-        op.copy_(current)
-        for value in out.values():
-            value.fill_(float("nan"))
-        graph.replay()
-        _reference(op, lp, out)
-        snapshot(out)
-    assert_bitwise({"op": op, "lp": lp}, saved, "inputs restored and unmodified")
-    assert_bitwise({name: value[1:2] for name, value in out.items()}, expected, "restored capture")
-    assert_bitwise({"op": target_op, "lp": target_lp}, {"op": saved["op"][:, 1:2], "lp": saved["lp"][:, 1:2]}, "target inputs unmodified")
-    if splits == 129:
-        assert_golden(f"sdpa-combine-zero-weight-{form}-{tag}", {"op": target_op, "lp": target_lp}, expected)
+    try:
+        with torch.cuda.graph(graph):
+            _invoke(fn, op, lp, out)
+        changed = saved["op"].clone()
+        changed[ignored:].add_(0.25)
+        for current in (changed, saved["op"]):
+            op.copy_(current)
+            for value in out.values():
+                value.fill_(float("nan"))
+            graph.replay()
+            _reference(op, lp, out)
+            snapshot(out)
+        assert_bitwise({"op": op, "lp": lp}, saved, "inputs restored and unmodified")
+        assert_bitwise({name: value[1:2] for name, value in out.items()}, expected, "restored capture")
+        assert_bitwise({"op": target_op, "lp": target_lp}, {"op": saved["op"][:, 1:2], "lp": saved["lp"][:, 1:2]}, "target inputs unmodified")
+        if splits == 129:
+            assert_golden(f"sdpa-combine-zero-weight-{form}-{tag}", {"op": target_op, "lp": target_lp}, expected)
+    finally:
+        graph.reset()
