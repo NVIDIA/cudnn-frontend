@@ -193,6 +193,7 @@ __all__ = [
     "SMEM_USABLE_BYTES",
     "SM107_FP8_THD_SHAPES",
     "SM107_FP8_SPLIT_SHAPES",
+    "SM107_MXFP8_SPLIT_SHAPES",
     "SM107_FP8_PACK_GQA_SHAPES",
     "SM107_F16_THD_SHAPES",
     "SM107_EPILOGUE_GATE_SHAPES",
@@ -298,6 +299,7 @@ _O_BLOCK_SCALE_BY_DTYPE = {_DTYPE_O_NVFP4: 16, _DTYPE_O_MXFP8: 32}
 SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 # Bodies with FP32 partial stores: shared by factory, admission and prepared workspace.
 SM107_FP8_SPLIT_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+SM107_MXFP8_SPLIT_SHAPES = frozenset({(128, 128)})
 # Packing and splitting are separate domains; both graph and adapter read this one.
 SM107_FP8_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
 
@@ -405,15 +407,8 @@ def supports_native_d192_paged(d_shape, *, device_cc, fp8, paged, cga=None, spli
 
 
 def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None, thd=False):
-    """Native half D64 packing; paged THD is unsplit, nonpaged THD splits use one CTA."""
-    return (
-        device_cc == (10, 7)
-        and d_shape == (64, 64)
-        and not fp8
-        and (not (paged and thd) or split_kv == 1)
-        and (not thd or split_kv == 1 or cga in (None, 1))
-        and cga in (None, 1, 2)
-    )
+    """Native half D64 packing; THD splits use one CTA with either KV layout."""
+    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and (not thd or split_kv == 1 or cga in (None, 1)) and cga in (None, 1, 2)
 
 
 def supports_native_d128_single_q(
@@ -2229,10 +2224,12 @@ def _validate_q_in_tmem(cfg, flavor: str) -> None:
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
-    # Per-tensor FP8 and half D64/D128/D192 share FP32 split partials.
-    # MXFP8 has no split loop yet.
-    split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(64, 64), (128, 128), (192, 128)}
-    split_wired = not mxfp8 and (tile_k, tile_o) in split_shapes
+    # Per-tensor FP8 D64/D128/D192, half D64/D128/D192 and MXFP8 D128 share FP32 split partials.
+    if mxfp8:
+        split_shapes = SM107_MXFP8_SPLIT_SHAPES
+    else:
+        split_shapes = SM107_FP8_SPLIT_SHAPES if params.dtype_qkv <= _DTYPE_E5M2 else {(64, 64), (128, 128), (192, 128)}
+    split_wired = (tile_k, tile_o) in split_shapes
     # The block-scaled O epilogue lives in the two d128 kernels (per-tensor fp8 and
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128
@@ -2322,6 +2319,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"its 128-register softmax holds one 64-column chunk and the one-batch-entry paths hand-unroll two sub-tiles"
             )
     softmax_regs, correction_regs = _D128_REG_SPLIT[2 if softmax_wgs == 2 else (softmax_wgs, tile_k)]
+    if mxfp8:
+        softmax_regs, correction_regs = 184, 104
     total_warps = _d128_total_warps(softmax_wgs)
     corr_warp_base = softmax_wgs * _D128_SOFTMAX_WG_WARPS
     mma_warp_id = corr_warp_base + _D128_CORRECTION_WARPS

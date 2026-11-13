@@ -26,12 +26,57 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestServiceRegisterRelease:
+    from service_register_release_checks import test_sm107_service_register_release as _release
+
+    test_service_register_release = staticmethod(_release)
+
+
 class TestNativeHalfRegisterRelease:
     """Cross-compile the half kernel through the selected SM107 CI entry."""
 
     from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
 
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
+@requires_rubin
+class TestD128Fp8PhysicalOrigins:
+    """Exercise native data maps and independent Stats through the CI entry."""
+
+    from sdpa.frost import native_fp8_origins_sm107_checks as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@requires_rubin
+class TestD192Fp8PhysicalOrigins:
+    """Native rank-4 maps keep physical offsets separate from logical lengths."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [((192, 128), 2)])
+
+
+@requires_rubin
+class TestWideFp8PhysicalOrigins:
+    """D256 and role-split D512 use independent sequence-local rank-4 maps."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
+
+
+@requires_rubin
+class TestD256Mxfp8PhysicalOrigins:
+    """Physical data maps retain the original logical scale-tile coordinates."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("mxfp8", "sm107", [(256, 1)])
 
 
 @pytest.fixture(autouse=True)
@@ -838,12 +883,13 @@ def test_sm107_split_is_wired_only_for_supported_flavors():
     cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
     cfg.make_cfg_d256(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d128_mxfp8(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
     cfg.make_cfg_d512(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
 
     # Block-scaled Rubin cells still refuse split.
     unwired = [
-        ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
+        ("d192 mxfp8", cfg.make_cfg_d192_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d256 mxfp8", cfg.make_cfg_d256_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
     for name, make, params in unwired:
@@ -1928,6 +1974,12 @@ def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=False) == (1,)
+    # the per-tensor d192x128 kernel lists the single CTA on the 107 line with an fp8 O only
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True, fp8_o=True) == (1, 2)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (2,)
+    assert supported_cgas_for((192, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=True) == (1, 2)
+    assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
     # the row domain, narrowed per graph
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert dict(caps.cgas_by_d_shape)[(256, 256)] == frozenset({1, 2})
@@ -2005,6 +2057,25 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
         assert err <= 0.1 * scale, f"cga {cga}: max err {err} vs fp32 reference (scale {scale})"
     assert torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1]), "O / LSE must be bit-identical across the CTA widths"
     assert torch.equal(outs[None][0], outs[2][0]) and torch.equal(outs[None][1], outs[2][1]), "the unset knob must be the pair"
+
+
+@requires_rubin
+class TestNativeD128Fp8Cga1Split:
+    """Single-CTA dense split coverage through the selected Rubin CI entry."""
+
+    from native_fp8_cga1_split_sm107_checks import (
+        test_dense_split_domain as _domain,
+        test_rebind_and_capture as _capture,
+        test_replay_and_batch_invariance as _bytes,
+        test_golden as _golden,
+        test_warm_refilled_ring as _warm,
+    )
+
+    test_rebind_and_capture = staticmethod(_capture)
+    test_dense_split_domain = staticmethod(_domain)
+    test_replay_and_batch_invariance = staticmethod(_bytes)
+    test_golden = staticmethod(_golden)
+    test_warm_refilled_ring = staticmethod(_warm)
 
 
 @requires_rubin
@@ -2476,3 +2547,61 @@ class TestMixedFp8Kv:
     test_compact_split = staticmethod(compact_split)
     test_dense_paged_native = staticmethod(dense_paged_native)
     test_uniform_control = staticmethod(uniform_control)
+
+
+@requires_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("group", [32, 64])
+def test_coalesced_split_replay_batch_golden(dtype_name, group):
+    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+    from native_d128_dense_paged_determinism import _runner
+
+    run, inputs = _runner(dtype_name, dtype_name, 2, 4, 128, head_dim=512, num_q_heads=2 * group)
+    target = assert_replays(lambda: run([0]), repeats=4)
+    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 16 + [0] + [2] * 16):
+        actual = snapshot(run(order))
+        for row, sequence in enumerate(order):
+            if sequence == 0:
+                assert_bitwise({name: actual[name][row : row + 1] for name in target}, target, f"batch row {row}")
+    run([0, 1, 2, 3, 4], capture=True)
+    actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
+    assert_golden(f"sdpa-half-d512-paged-coalesced-{dtype_name}-g{group}-split4", inputs, actual)
+
+
+import sdpa_bwd_fp8_d192_sm107 as _d192_bwd_checks
+
+ds_knob = _d192_bwd_checks.ds_knob
+test_stage3_tile_rule_fp8_d192 = _d192_bwd_checks.test_stage3_tile_rule_fp8_d192
+
+
+@requires_rubin
+class TestNativeFp8D192Bwd:
+    """Run the D192/V128 per-tensor fp8 backward pair checks in the native CI entry."""
+
+    test_native_stage3 = staticmethod(_d192_bwd_checks.test_d192_native_stage3_matches_the_oracle_and_the_d256_row)
+
+
+import d192_fp8_pair_checks as _d192_pair_checks
+
+
+@requires_rubin
+class TestNativeFp8D192Pair:
+    """Run the ``sdpa_bwd_sm100_d192_fp8`` kernel pair checks in the native CI entry."""
+
+    @pytest.fixture
+    def sm100_row(self, monkeypatch):
+        import test_sdpa_bwd_fp8_sm107 as fp8
+
+        monkeypatch.setattr(fp8, "_ENGINE", "sdpa_bwd_sm100_d192_fp8")
+        monkeypatch.setattr(fp8, "_D", 192)
+        return fp8
+
+    test_dense = staticmethod(_d192_pair_checks.test_dense)
+    test_causal = staticmethod(_d192_pair_checks.test_causal)
+    test_non_tile_multiple_seqlens = staticmethod(_d192_pair_checks.test_non_tile_multiple_seqlens)
+    test_amax_subsets = staticmethod(_d192_pair_checks.test_amax_subsets)
+    test_repeated_launches_are_bitwise = staticmethod(_d192_pair_checks.test_repeated_launches_are_bitwise)
+    test_causal_empty_kv_tiles = staticmethod(_d192_pair_checks.test_causal_empty_kv_tiles)
+    test_negative_scale_declined_at_check = staticmethod(_d192_pair_checks.test_negative_scale_declined_at_check)
+    test_explicit_attn_scale = staticmethod(_d192_pair_checks.test_explicit_attn_scale)

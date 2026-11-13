@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: MIT
 
 """
-A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D=512 heads on NVIDIA
+A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D128/D256/D512 on NVIDIA
 Hopper SM90 (sm_90a), on WGMMA tensor cores.
 
-The CTA tile is (64, 64) over the (512, 512) head tile, which fixes both GEMM shapes. QK
-is m64n64k512, one commit group of 32 k16 instructions. PV is m64n256k64 per compute
-warpgroup, one group of 4. A 64-row FP32 O accumulator over 512 columns costs 256
-registers per thread, and a WGMMA N is at most 256. Two compute warpgroups therefore
-split the head dim, each owning one 256-column V/O half.
+The CTA tile is (64, 64). QK contracts the specialized 128/256/512-column
+head tile in one group of k16 instructions. Two compute warpgroups split
+V/O into 64/128/256-column halves, each using four k16 PV instructions.
+The D512 specialization retains its original arithmetic and geometry.
 
 The kernel implements:
 - Three warpgroups per CTA. WG0 issues the TMA loads. WG1 runs QK (SS), the online
@@ -25,7 +24,7 @@ The kernel implements:
   lengths, THD (ragged / packed) batches, PackGQA, per-Q-head sinks, and per-row LSE
   (Stats) in natural log or, under ``stats_log2``, base 2.
 
-Storage: Q, K and V/O are single-stage 64 x 512 regions of eight SW128 slabs, V and O
+Storage: Q, K and V/O are single-stage regions of two/four/eight SW128 slabs, V and O
 aliasing one of them. Single-stage K and V mean the producer cannot run a KV tile ahead:
 the next K lands only after QK releases the current one. P is the one multi-stage
 region, crossing WG1 to WG2 through a three-stage ring; the alpha and inverse row
@@ -38,7 +37,7 @@ Constraints:
 - Q/K/V/O keep their declared strides: D contiguous, the rest 16-byte multiples.
 - ``SdpaFwdDslSm90.check_support`` owns the served set.
 
-WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the D512 tile
+WGMMA instructions and descriptors live in FROST ``tile_dsl/wgmma.py``, the tile
 operations and softmax arithmetic in ``sm90/_common_hopper.py``.
 """
 
@@ -64,7 +63,6 @@ from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, THD_MAPS_OFF, thd_port_o
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 from cudnn.sdpa.fwd.config_sm100 import pack_gqa_group_size
 from cudnn.sdpa.fwd.config_sm90 import (
-    D_TILE,
     SCALE_POSITIVE,
     SCALE_ZERO,
     TILE_M,
@@ -149,7 +147,7 @@ class Bars(NamedTuple):
 
 
 class SM90FusedMultiHeadAttentionForward:
-    """Configure and launch the SM90 FP16/BF16 D512 FMHA prefill kernel.
+    """Configure and launch the native-width SM90 FP16/BF16 FMHA prefill kernel.
 
     Each CTA runs one query tile and its assigned KV interval through three
     warpgroups. Dense splits write normalized half O and natural-log FP32 Stats
@@ -160,7 +158,7 @@ class SM90FusedMultiHeadAttentionForward:
     # The CTA tile: Q_TILE rows by KV_TILE keys over the HEAD_TILE-column D envelope.
     Q_TILE = TILE_M
     KV_TILE = TILE_N
-    HEAD_TILE = D_TILE
+    HEAD_TILE = PARAMS.head_tile
     PV_HALF = HEAD_TILE // 2
     P_STAGES = 3  # Slots of the WG1-to-WG2 P ring.
     # setmaxnreg budgets per warpgroup: 128 * (24 + 240 + 240) fits the SM's 65,536.
@@ -186,9 +184,13 @@ class SM90FusedMultiHeadAttentionForward:
         stats_log2: bool = False,
         thd_origins: tuple | None = None,
         split_kv: int = 1,
+        page_size: int = 0,
     ):
         """Initialize the SM90 D512 FMHA prefill kernel configuration.
 
+        :param page_size: Dense-Q paged KV specialization; zero means ordinary
+            dense or THD KV. Page sizes divide 64 or are multiples of 64, with
+            an eight-row minimum for complete SW128 atoms.
         :param shape: The declared problem ``(b, h_q, h_kv, s_q, s_kv)``, fixed at plan
             time. ``b``, ``h_q`` and ``s_q`` size the grid, and ``s_q``/``s_kv`` are the
             dense lengths that clamp device lengths. Under THD, ``b`` is the sequence
@@ -265,6 +267,8 @@ class SM90FusedMultiHeadAttentionForward:
         self.fold_sink = has_sink and split_kv == 1
         self.split_kv = split_kv
         self.thd_varlen = thd_varlen
+        self.page_size = page_size
+        self.kv_tma_rows = min(page_size, self.KV_TILE) if page_size else self.KV_TILE
         self.thd_origins = thd_origins if thd_varlen else None
         # Dense graphs clamp per-sequence device lengths to the declared envelope; THD
         # reads its lengths from the setup launch's metadata instead.
@@ -414,12 +418,32 @@ class SM90FusedMultiHeadAttentionForward:
         """
         # is_v picks the port at trace time, so no branch is staged. This construction
         # carries no arithmetic, so it has no ordering constraint against the arrive.
-        desc_ptr = work.v_desc_ptr if is_v else work.k_desc_ptr
-        kv_coord = kv_seq_idx + work.kv_offset if cutlass.const_expr(self.thd_varlen) else kv_seq_idx
-        source = self.tma_slice(tma_desc, desc_ptr, work.kv_head, kv_coord, work.batch, self.tma_orders[2 if is_v else 1])
-        mbar.arrive(n_bytes=tma_desc.global_tx_bytes() * s_dst.tma_loads_per_tile, pred=prims.elect_sync())
-        # Caller-origin maps were acquired once at the top of tmaldg_warp_group.
-        tma_load_tile(s_dst, source, mbar.smem_ptr, acquire=self.thd_origins is None)
+        if cutlass.const_expr(self.page_size > 0):
+            table = work.block_table_v if is_v else work.block_table
+            parts = self.KV_TILE // self.kv_tma_rows
+            mbar.arrive(n_bytes=tma_desc.global_tx_bytes() * s_dst.tma_loads_per_tile * parts, pred=prims.elect_sync())
+            for part in cutlass.range_constexpr(parts):
+                token = kv_seq_idx + part * self.kv_tma_rows
+                # Dead subpages still issue zero-filling TMA boxes, preserving the
+                # barrier byte count without reading unused page-table entries.
+                page = cutlass.Int32(-1)
+                if token < work.kv_len:
+                    page = table[work.batch, token // self.page_size]
+                source = self.tma_slice(tma_desc, None, work.kv_head, token % self.page_size, page, self.tma_orders[2 if is_v else 1])
+                chunk = SimpleNamespace(
+                    base=s_dst.base.subview(part * self.kv_tma_rows * self.swizzle_chunk_elems),
+                    tma_loads_per_tile=s_dst.tma_loads_per_tile,
+                    tma_granu_elems=s_dst.tma_granu_elems,
+                    tma_subtile_stride_elems=s_dst.tma_subtile_stride_elems,
+                )
+                tma_load_tile(chunk, source, mbar.smem_ptr)
+        else:
+            desc_ptr = work.v_desc_ptr if is_v else work.k_desc_ptr
+            kv_coord = kv_seq_idx + work.kv_offset if cutlass.const_expr(self.thd_varlen) else kv_seq_idx
+            source = self.tma_slice(tma_desc, desc_ptr, work.kv_head, kv_coord, work.batch, self.tma_orders[2 if is_v else 1])
+            mbar.arrive(n_bytes=tma_desc.global_tx_bytes() * s_dst.tma_loads_per_tile, pred=prims.elect_sync())
+            # Caller-origin maps were acquired once at the top of tmaldg_warp_group.
+            tma_load_tile(s_dst, source, mbar.smem_ptr, acquire=self.thd_origins is None)
 
     @cute.jit
     def tmaldg_warp_group(self, sQ, sK, sV, bars, tma_q_desc, tma_k_desc, tma_v_desc, work):
@@ -640,7 +664,7 @@ class SM90FusedMultiHeadAttentionForward:
         SM80 (#2135) and SM120 bodies.
         """
         row_lo = work.kv_len - (work.kv_right - 1) * self.KV_TILE
-        zero_v_tail_rows(sV_raw.subview(half * self.vo_half_elements), row_lo, local_tid, self.storage_dtype)
+        zero_v_tail_rows(sV_raw.subview(half * self.vo_half_elements), row_lo, local_tid, self.storage_dtype, self.PV_HALF)
         prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
         prims.barrier_cta_sync(self.bar_v_tail_base + half, thread_count=cute.arch.THREADS_PER_WARPGROUP)
 
@@ -673,7 +697,7 @@ class SM90FusedMultiHeadAttentionForward:
         sP_xfer_raw, sAlpha_xfer_raw = basic_params.sP_xfer_raw, basic_params.sAlpha_xfer_raw
         kv_seq_idx = (work.kv_right - 1 - kv_step) * self.KV_TILE
         bars.mb_tma_k_full.wait(kv_full_state.phase)
-        mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype)
+        mma_qk(mma_params, s_regs, ab_dtype=self.storage_dtype, head_tile=self.HEAD_TILE)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_k_empty.arrive()
@@ -841,6 +865,8 @@ class SM90FusedMultiHeadAttentionForward:
         tile,
         head,
         batch,
+        block_table=None,
+        block_table_v=None,
     ):
         """Resolve one (Q tile, head, batch) work tile and run this thread's role on it.
 
@@ -959,6 +985,8 @@ class SM90FusedMultiHeadAttentionForward:
             v_desc_ptr=v_desc_ptr,
             o_desc_ptr=o_desc_ptr,
             kv_right=kv_right,
+            block_table=block_table,
+            block_table_v=block_table_v,
         )
         if wg == 0:
             prims.setmaxregister(self.REG_BUDGETS[0], prims.SetMaxRegisterAction.DECREASE)
@@ -1238,6 +1266,8 @@ class SM90FusedMultiHeadAttentionForward:
         seq_q_lens,
         seq_kv_lens,
         scale: cutlass.Float32,
+        block_table=None,
+        block_table_v=None,
     ):
         """Run one work tile per CTA: allocate, decode, then run the three roles.
 
@@ -1438,6 +1468,8 @@ class SM90FusedMultiHeadAttentionForward:
             tile,
             head,
             batch,
+            block_table,
+            block_table_v,
         )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1464,6 +1496,8 @@ class SM90FusedMultiHeadAttentionForward:
         thd_ro_o: Optional[cute.Tensor],
         thd_ro_lse: Optional[cute.Tensor],
         stream: cuda_driver.CUstream,
+        block_table: Optional[cute.Tensor] = None,
+        block_table_v: Optional[cute.Tensor] = None,
     ) -> None:
         """Build the port maps, run the THD setup when packed, and launch the kernel.
 
@@ -1514,8 +1548,8 @@ class SM90FusedMultiHeadAttentionForward:
 
         tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc = (
             port_tma_desc(q, self.heads_per_tile, self.Q_TILE, self.tma_orders[0]),
-            port_tma_desc(k, 1, self.KV_TILE, self.tma_orders[1]),
-            port_tma_desc(v, 1, self.KV_TILE, self.tma_orders[2]),
+            port_tma_desc(k, 1, self.kv_tma_rows, self.tma_orders[1]),
+            port_tma_desc(v, 1, self.kv_tma_rows, self.tma_orders[2]),
             port_tma_desc(o, self.heads_per_tile, self.Q_TILE, self.tma_orders[3]),
         )
         # The LPT policies launch the same tiles on one axis, which kernel unflattens.
@@ -1611,14 +1645,21 @@ class SM90FusedMultiHeadAttentionForward:
             ports = (*ports, ("LSE", lse, self.h_q, self.s_q))
         for name, tensor, heads, tokens in ports:
             declared = (batch * (self.split_kv if name in ("O", "LSE") else 1), heads, tokens)
+            if cutlass.const_expr(self.page_size > 0 and name in ("K", "V")):
+                declared = (tensor.shape[0], heads, self.page_size)
             if cutlass.const_expr(any(isinstance(extent, int) and extent != size for extent, size in zip(tensor.shape, declared))):
                 raise ValueError(f"prefill_d512_f16_sm90: {name} shape {tuple(tensor.shape)} disagrees with the declared (B, H, S) = {declared}")
         # Only a length tensor some role reads reaches the kernel; THD's is the metadata.
         read_q_lens = seq_q_lens if cutlass.const_expr(self.dense_q_lengths) else None
         read_kv_lens = seq_kv_lens if cutlass.const_expr(self.thd_varlen or self.dense_kv_lengths) else None
-        self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, sinks, read_q_lens, read_kv_lens, scale).launch(
-            grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream
-        )
+        if cutlass.const_expr(self.page_size > 0):
+            self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, sinks, read_q_lens, read_kv_lens, scale, block_table, block_table_v).launch(
+                grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream
+            )
+        else:
+            self.kernel(tma_q_desc, tma_k_desc, tma_v_desc, tma_o_desc, lse, sinks, read_q_lens, read_kv_lens, scale).launch(
+                grid=grid, block=(self.threads_per_cta, 1, 1), stream=stream
+            )
 
 
 def compile(  # noqa: A001
@@ -1646,15 +1687,17 @@ def compile(  # noqa: A001
     ``(B, H, S, D)`` mode order, with a zero batch stride under THD, and ``lse_stride``
     the ``(B, H_q, S_q)`` Stats strides of a ``has_lse`` template. The result exposes the positional pointer ABI in ``prepared_host.host``.
 
-    ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). They size only the
-    GMEM descriptors: the compute tile stays 512 wide, so a smaller D still pays the
-    D512 tile cost. This front coerces them to plain ints: ``template_key`` refuses a
+    ``d_qk``/``d_v`` are the graph's actual head dims (Q/K and V/O). The adapter
+    selects their covering native head tile in ``PARAMS``; these dimensions
+    also bound the GMEM maps. This front coerces them to plain ints: ``template_key`` refuses a
     non-plain argument, which would drop the persisted cache entry.
     """
     reason = head_dims_mismatch(d_qk, d_v)
     if reason is not None:
         raise ValueError(f"prefill_d512_f16_sm90: {reason}")
     d_qk, d_v = int(d_qk), int(d_v)
+    if max(d_qk, d_v) > PARAMS.head_tile:
+        raise ValueError("SM90 declared dimensions exceed the specialized head tile")
     if PARAMS.thd_varlen:
         s_q = s_kv = 0
     return _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, lse_stride, target=target, d_qk=d_qk, d_v=d_v)
@@ -1690,6 +1733,7 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         stats_log2=PARAMS.stats_log2,
         thd_origins=PARAMS.thd_origins,
         split_kv=PARAMS.split_kv,
+        page_size=PARAMS.page_size,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel

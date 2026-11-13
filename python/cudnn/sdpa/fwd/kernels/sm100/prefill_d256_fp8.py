@@ -159,7 +159,7 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 HEADS_PER_TILE = CFG.QH_PER_KH if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 
-from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from cudnn.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_map_ptr, origin_tensors, origin_tma_slice
 from cudnn.frost.tile_dsl.thd import thd_port_origin, exit_if_dead_thd_cluster
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel
 from cudnn.sdpa.fwd.kernels.thd_helpers import (
@@ -749,6 +749,11 @@ def _kernel(
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
 
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
@@ -842,7 +847,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -892,7 +896,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -926,7 +929,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -944,7 +946,6 @@ def _kernel(
         )
 
     else:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
         _scheduler_warp_loop_predecode(
             sched,
@@ -1052,7 +1053,10 @@ def _tmaldg_warp_group(
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)  # noqa: E731
     else:
         tma_q = GmemTileTma(tma_q_desc)
-    if cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
+    if cutlass.const_expr(thd_origins is not None and not PAGED_KV):
+        tma_k = lambda d, r, c, h, b: tma_slice_runtime_desc(origin_map_ptr(o_desc_words, 2, n_batch, b), d, r, c, h, cutlass.Int32(0))  # noqa: E731
+        tma_v = lambda d, r, c, h, b: tma_slice_runtime_desc(origin_map_ptr(o_desc_words, 3, n_batch, b), d, r, c, h, cutlass.Int32(0))  # noqa: E731
+    elif cutlass.const_expr(CFG.THD_VARLEN and not PAGED_KV):
         k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         tma_tensormap_acquire(k_rt_ptr)
@@ -1115,6 +1119,9 @@ def _tmaldg_warp_group(
             # A persistent unit can switch batches; acquire its current Q map.
             q_map = o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1) + batch_idx) * cutlass.Int32(_TENSOR_MAP_QWORDS)
             tma_tensormap_acquire(q_map.tospace(cutlass.AddressSpace.generic))
+            if cutlass.const_expr(not PAGED_KV):
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, batch_idx))
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, batch_idx))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         if cutlass.const_expr(MAY_BE_EMPTY) and (kv_right <= kv_left):
@@ -3117,7 +3124,8 @@ def _host(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(rows_per_cluster // HEADS_PER_TILE),
                 n_thd_units,
-                paged=True,
+                paged=PAGED_KV,
+                row_dims=(2, 1, 1, 2),
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         elif cutlass.const_expr(PAGED_KV):
             # Compact standalone THD keeps page-pool maps intact as well.
@@ -3233,8 +3241,8 @@ def compile_prepared(
         raise ValueError("lse_kind 'dense' is the dense form; 'token' / 'head' / 'padded' are the THD forms")
     if paged_hnd and not PARAMS.paged_kv:
         raise ValueError("paged_hnd requires a paged-KV specialization")
-    if thd_origin_specs is not None and (not CFG.THD_VARLEN or not PAGED_KV or CFG.SPLIT_KV != 1 or len(thd_origin_specs) != 5):
-        raise ValueError("physical origins require unsplit paged THD and five port specifications")
+    if thd_origin_specs is not None and (not CFG.THD_VARLEN or CFG.SPLIT_KV != 1 or len(thd_origin_specs) != 5):
+        raise ValueError("physical origins require unsplit THD and five port specifications")
     return compile_host(
         _host,
         CFG,

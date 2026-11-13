@@ -143,7 +143,7 @@ def test_adapter_kwarg_is_appended_and_declines_typed():
     from cudnn.sdpa.fwd import api_dsl
 
     sig = inspect.signature(api_dsl.SdpaFwdDslSm100.__init__)
-    assert list(sig.parameters)[-2:] == ["bias_max_form", "softmax_wgs"] and sig.parameters["bias_max_form"].default is None
+    assert list(sig.parameters)[-3:] == ["bias_max_form", "softmax_wgs", "swap_ab"] and sig.parameters["bias_max_form"].default is None
     assert "bias_max_form=self._resident_arm_bias_max_form()" in Path(api_dsl.__file__).read_text()
 
 

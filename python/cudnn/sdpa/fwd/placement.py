@@ -90,8 +90,8 @@ regression; the rules above answer the rest there, f16 included.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
-d512 row with a 128-wide GQA group (DeepSeek-V4 "pro", 128 query heads over one KV head) loses
-5-10x at every batch; sliding-window dense squares (gpt_oss 2k x 2k, 8k x 8k) are 1.28-1.48 -> TRAIL
+d512 row with a 128-wide GQA group (DeepSeek-V4 "pro", 128 query heads over one KV head) lost
+5-10x at every batch before #2456 (re-measured below); sliding-window dense squares (gpt_oss 2k x 2k, 8k x 8k) are 1.28-1.48 -> TRAIL
 on those three, LEAD everywhere else.
 Re-measured 2026-10-08 against public cuDNN 9.27.0.42 (same part, CUDA-graph replay, 399 cases incl. a
 random hold-out): prefill and ``2 <= s_q <= 16`` still lead (prefill median 0.42, decode-shaped
@@ -109,6 +109,17 @@ The 16- / 32-row decode tile leaves ``s_q == 1`` backend-first: FROST/backend 0.
 locked at 2100 / 12481 MHz, cuDNN 9.27.0.42, profiler kernel time, median of three alternating pairs, CV <=
 1.2%): 1.11-1.24 at b = 1 on a 4k cache, within 4% from a 64k cache, and the d256 leads at 12+ KV units
 run 1.00-1.05 -> the rule above stands.
+d512 ``s_q == 1`` over one KV head with a group wider than 64, re-measured 2026-11-12 after SM120 partial PackGQA
+(#2456, #2486) on the RTX PRO 6000 Server Edition (cuDNN 9.27.0.42, CUDA-graph replay): the 128-wide group now packs and
+runs 0.16-0.70 of the backend over b 1-128 and KV 2k-131k, and 0.16-0.37 on two off-lattice holdouts -> LEAD. Groups the
+128-row tile holds with rows to spare stay TRAIL: 96/1 won the train lattice (0.26-0.78), but 112/1 at b 96 and KV 49k-100k
+ran 1.27-1.30x (split 4-8 there; split 1 at KV 20k ran 0.79).
+
+The SM120 hand rule TRAILs paged K/V on the prefill body (no 16 / 32-row decode tile); generated table entries still answer
+first for the classes they measured. On the RTX PRO 6000 (cuDNN 9.30.0.4, profiler kernel time)
+paged d128 runs 15-27x behind the backend at s_q 8-2048 (b1 q2048 kv2048 32/8: 2.92 ms vs 0.159 ms, against 0.133 ms on FROST's
+dense body), and a 72-cell seeded holdout's verify rows came out 0.04-0.09x of today's default with the backend. Paged
+decode-shaped graphs that fit the decode tile keep the rules below and study sm120_decode_20261112's entries.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -207,8 +218,8 @@ Rubin row has its own arm ("SM107 per-tensor FP8 row" below).
   4k, 4 x 8k, 1 x 32k) the cells are MIXED, 0.78-1.79, and 12 of them are launch-bound and unverifiable, so the band starts
   at 2**16 (replay alone also led at 16 x 2k, 0.82-0.85 with three geometries unverifiable, and at 8 x 4k, 0.89-0.95: not admitted);
   fewer than 4 units lose up to 1.79x below the 128k endpoint, where 1-2 units led 0.75-0.83 in one column (not admitted); above 512
-  units and past 128k declared KV: unmeasured. Two further bands of the SAME measurement (2026-10-13, the same board, method and
-  arms) LEAD by default too, each where the tile is strictly faster than the backend's default plan with margin in BOTH regimes;
+  units and past 128k declared KV: unmeasured. A further band of the SAME measurement (2026-10-13, the same board, method and
+  arms) LEADs by default too, where the tile is strictly faster than the backend's default plan with margin in BOTH regimes;
   FE's placement is a verdict against the backend's plan, and what the consumer's other kernels do is the consumer's routing:
   -- group 32 on its measured geometry 64/2 (the 32-column tile in ONE unit, ``s_q == 1``; a 32/1 graph is the same group but was
   not measured and trails): the tile 0.27-0.79 of the backend on every quotable cell with
@@ -217,15 +228,10 @@ Rubin row has its own arm ("SM107 per-tensor FP8 row" below).
   starts at 2**17 (the 2**15 / 2**16 cells that led -- 32 x 1k 0.64 / 0.58, 16 x 2k 0.68 / 0.68, 64 x 1k 0.54 / 0.79 -- are not
   admitted; 2 units led only at the 128k endpoint, 0.67, not admitted); the f16 twin (32 x 8k, 0.38 both regimes) measured inside the
   band; page 16 only -- page 32 / 64 were measured on 24/2, not on 64/2. The tile trails FlashInfer's fa2 kernel on part of this band (7-9 % at the medians),
-  which does not change the verdict against the backend;
-  -- the MTP rows (``2 <= s_q <= 4`` on the measured geometries 24/2 and 32/2 -- 12/1 and 16/1 share the groups but were not measured
-  at ``s_q > 1`` and trail -- = the 32-column tile in up to two token units; FlashInfer's decode graph at
-  ``q_len_per_req`` 2-4 declares the BOTTOM-RIGHT CAUSAL diagonal with the padding mask): the tile 0.01-0.31 of the backend's default
-  plan (which costs 6.8-142 ms per launch at KV 128k) on ALL 576 (cell, regime) pairs -- b 1-128 x declared KV 1k-128k, i.e.
-  ``2 <= units <= 256`` and the whole KV band, every cell quotable -- so the band carries no tokens-in-flight floor
-  (``SM107_PAGED_D256_MTP_*``); measured at page 16 in bf16 only, so page 32 / 64 and the f16 twin keep the backend first until
-  measured. The tile trails fa2 by 6 % (q = 2) and 21-22 % (q = 3 / 4) at the medians -- the kernel gap in SUPPORT_MATRIX_TRACKER.md's
-  gaps table, the consumer's routing question, not FE's verdict against the backend.
+  which does not change the verdict against the backend.
+  The MTP rows (``2 <= s_q <= 4`` under the bottom-right diagonal FlashInfer's decode graph declares) are the generated table's,
+  d64-d576 (study ``sm107_paged_mtp_20261110`` in ``placement_table``). On 24/2 and 32/2 the tile trails fa2 by 6 % (q = 2) and
+  21-22 % (q = 3 / 4) at the medians -- the kernel gap in SUPPORT_MATRIX_TRACKER.md's gaps table, the consumer's routing question.
   Stats, a sink, a causal mask or window at ``s_q == 1`` (the diagonal is the MTP rows' shape, not the single-token one), page 128, a
   dense (unpaged) d256 cache (measured against the prefill body only, above), THD queries, the fused gate and a paged decode WITHOUT
   per-request KV lengths (no padding mask: every band cell carried one) were not measured -> TRAIL.
@@ -277,7 +283,8 @@ arch range) TRAIL until measured.
 SM107 per-tensor FP8 row (``sdpa_fwd_prefill_sm107_fp8``, offered by default since 2026-10-16): LEAD on exact
 cc 10.7 at exact d256 / d512, dense, E4M3, causal (top-left or bottom-right) or mask-free, Stats on or off; TRAIL
 for one KV tile with at most 8 Q tiles, for d192, for d128 outside the chunk arm below, and for every feature the A/B did not cover (THD, paged
-KV, padding mask, window, right band, sink, block-scaled O, fused gate, E5M2), except paged D512 decode below. Measured 2026-10-16 on a 216-SM
+KV, padding mask, window, right band, sink, block-scaled O, fused gate, E5M2), except paged D512 decode and dense d64
+sink decode below. Measured 2026-10-16 on a 216-SM
 cc 10.7 board, cuDNN 9.27.0.42 GA, ab.py (same graph, Amax_S virtual), CUDA-graph replay, two rounds with the
 arm order swapped, warm and cold L2; FROST time over backend time on the led graphs:
   d256: 0.24-0.96 (75 cases), hold-out 0.16-0.84 (12); eager, S_kv < 1024: 0.45-0.96 (35)
@@ -293,6 +300,12 @@ Paged D512 decode / MTP (dense Q over E4M3 page pools with per-request lengths, 
 one mask-free row or s_q 2-16 under the bottom-right diagonal; 2026-11-10, 208-SM, cuDNN 9.30.0.2, 264 cases b 1-128,
 KV 1k-64k, page 16 / 64, plus a 48-cell hold-out with uneven lengths): FROST 0.001-0.89 of the backend at s_q 2-16,
 and the backend has no plan for one row -> LEAD; the hold-out never fell behind the default.
+
+Dense d64 decode / MTP with a sink and no window (gpt-oss): s_q 2-4 LEAD; s_q == 1 LEAD from 32 KV units (b * h_kv). 2026-11-12,
+208-SM, cuDNN 9.30.0.4, the attention_inference generation graph, back-to-back GPU time; 180 train cells (b 1-128, 64/8, 32/4,
+8/1, KV 4k-128k) and a 36-cell seeded holdout scored once: s_q 2-4 0.11-1.03 (holdout 0.55 geomean, worst 0.88); s_q == 1 at
+<= 16 units 1.03-1.18, from 32 units 0.13-0.65 (holdout worst 1.03). A window of 128 keys won the on-tile train lattice
+(0.10-1.00) but lost 1.10-1.34x on off-tile holdout KV at b 2-24, so windowed graphs keep the backend.
 
 d128 chunks (2026-10-22, same board and harness): LEAD when the GQA group is a power of two (the Q tile packs it) and
 either bottom-right causal with s_q <= 512 and S_kv >= 8192, or S_kv >= 4096 and S_kv >= 64 s_q; or mask-free with
@@ -328,6 +341,10 @@ window 128 / 512 / 4096; bottom-right chunks q128 / q2048 over a 32k cache at wi
   Rubin (216 SMs; the SM107 half and per-tensor FP8 rows) bf16 0.33-0.97, FP8 0.40-0.73
 FP8 agrees with the backend within rel-RMS 0.04 (E4M3 O), bf16 within 0.003.
 
+Rubin bf16 THD prefill through FlashInfer's paths (page 16 / 64 and ragged, d64-d256) is placed by the generated table
+(study ``sm107_thd_prefill_20261111``), which answers before the hand rules below; they still decide f16, bounded paged
+declarations, sinks and the classes that study left without an entry.
+
 Rubin paged bf16 d128 GQA prefill chunks (2026-10-24, ``_sm107_paged_gqa_prefill``): LEAD for GQA 4 / 8 at b 1-4,
 128 < s_q <= 1024, S_kv 2k-32k, bottom-right causal, page 16, head-major in-page K. MHA and group 2 retain the
 backend-first order. Long-prefix chunks (2026-10-27): GQA 4 / 8 / 16 also lead at 1024 < s_q <= 4096 with
@@ -355,6 +372,17 @@ declaration and bounded MHA / group 2 showed no material gap and still trail. Fl
 ``max_total_seq_len_q`` unset (capacity b * max_q), so GQA 4 / 8 lead there too. Measured on cc 10.0, then
 transferred to cc 10.3 with the full squares below.
 
+SM100 paged bf16 d128 GQA prefixes (2026-11-12, ``_sm100_paged_d128_prefix``): on cc 10.0 / 10.3, FlashInfer's exact paged declaration
+(no total-Q capacity) with S_q < S_kv LEADs at b 1-64, 16 <= S_q <= 2048, S_kv to 131072, page 16 / 64, GQA 4 / 8 / 16, causal
+bottom-right, head-major in-page K. Study sm100_paged_d128_prefill_20261112 (B200 1000 W, FlashInfer's paged wrapper, recorded
+facts) timed 250 frozen cells at cuDNN 9.30.0.4 and 9.24.0.43: FROST's first plan (packed, unsplit cga2) ran 0.04-1.08 of the
+backend's first plan on prefixes, while tiny squares (Q = KV = 16-128) trail 1.3-2.0x and keep their rules. The 150 prefix
+cells whose default changes came to 0.62 (9.30) / 0.55 (9.24) of the measured default, worst 1.06; an 80-cell seeded holdout,
+scored once per version, came to 0.68 / 0.62 on its 39 changed cells, worst 1.04. A B300 transfer over all 330 frozen cells came to 0.53
+at both versions (223 changed cells, worst 1.09).
+S_kv 65537-131072 (study sm100_paged_d128_prefix_kv131k_20261112, 120 train + 40 holdout cells on B200 and B300 at both
+versions): the changed cells came to 0.66-0.83 of the measured default, worst 1.03.
+
 SM100 paged bf16 d128 full squares (2026-10-25, ``_sm100_paged_full_square``): Q = KV per graph (full paged prefill),
 b 1-4, page 16, head-major in-page K, causal, no window / sink: GQA 4 / 8 / 16 lead for 1024 <= S <= 8192. A
 legal-pool sweep over mixed-length full prefills found FROST's first plan ahead of engine 10 on these shapes, and a
@@ -365,6 +393,10 @@ cases through the inference harness's paged context phase, exact and undeclared 
 admitted, the default dispatch ran 0.47-0.60 of the backend's time on the 18 full squares, 0.60-0.95 on the 16 GQA16
 chunks and 0.79-0.95 on the 10 undeclared GQA 4 / 8 chunks. No case was slower than develop's default. The squares'
 margin is the backend's: its engine 10 is slow at lengths off the 128 tile, and four on-tile probe squares ran 0.86-0.92.
+Mixed-length full squares (study sm100_paged_full_prefill_20261112: FlashInfer's exact paged declaration, each request
+Q = KV under the declared S, 160 train cells on B200 at cuDNN 9.24 and 9.30): d128 GQA 4 / 8 lead to b 32, S 512-16384,
+pages 16 / 64 (FROST / backend 0.63-0.92 on 9.24, 0.71-0.995 on 9.30); d256 MHA leads to b 8 (0.46-0.75). D128 MHA / group 2
+and d64 stay near parity and keep the backend.
 :func:`place` reads a square causal mask as bottom-right (the same tiles), so
 GQA 4 / 8 squares also take the packed full-prefill lead (#1809) from S = 512 and on cc 10.3 / page 64: 80 top-left
 squares (S 512-8192, page 16 / 64, b 1 / 3, cuDNN 9.29.0.18) ran FROST at 0.45-0.98 of the backend on a B100 and
@@ -504,7 +536,7 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
 SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
-SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
+SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a wider group leads when it is a power of two (fills the packed tile), else trails
 
 # SM90 f16/bf16 thresholds.
 SM90_SQ1_MIN_Q_ROWS = 512  # s_q == 1 (no split-KV on SM90): b * h_q >= 512 wins 0.25-0.95; 256 is parity, below loses up to 33x
@@ -531,22 +563,14 @@ SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT = (
 )  # units * declared KV: every cell at or above it leads in both regimes (0.43-0.90); the 2**15 cells are mixed (0.78-1.79)
 SM107_PAGED_D256_DECODE_KV_TOKENS = (1024, 131072)  # the declared-KV band measured
 SM107_PAGED_D256_DECODE_PAGE_SIZES = (16, 32, 64)  # 16 on every geometry, 32 / 64 at 24/2 (0.43-0.85: the page size moved nothing); 128 unmeasured
-# The same measurement's two further bands (module docstring, "Two further bands"), each the tile strictly faster than the backend with
-# margin in both regimes.  Group 32 (64/2: the 32-column tile in one unit) at s_q == 1: units and the declared KV as above, the floor one
+# The same measurement's further band (module docstring, "A further band"): the tile strictly faster than the backend with margin in
+# both regimes.  Group 32 (64/2: the 32-column tile in one unit) at s_q == 1: units and the declared KV as above, the floor one
 # step higher (the 2**16 step holds the 8 x 8k eager parity cell).
 SM107_PAGED_D256_G32_GEOMETRIES = ((64, 2),)  # the (h_q, h_kv) pair measured for group 32; a 32/1 graph is the same group but unmeasured -> TRAIL
 SM107_PAGED_D256_G32_PAGE_SIZES = (16,)  # the page the 64/2 band and its f16 twin ran at; page 32 / 64 were measured on 24/2 only, not here
 SM107_PAGED_D256_G32_MIN_UNITS = 4  # 2 units led only at the 128k endpoint (0.67): one column, not admitted
 SM107_PAGED_D256_G32_MAX_UNITS = 256  # b 128 x 2 KV heads, the largest column measured at 64/2 (0.36-0.48 there)
 SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT = 2**17  # every quotable cell at or above it leads in both regimes, 0.27-0.79; 2**16 holds a parity cell (1.00)
-# The MTP rows: 2 <= s_q <= 4 on the groups measured (24/2, 32/2), FlashInfer's decode graph with the bottom-right causal diagonal; the tile
-# 0.01-0.31 of the backend on every one of the 576 (cell, regime) pairs over b 1-128 x KV 1k-128k, so no tokens-in-flight floor; page 16 bf16
-# is what was measured (page 32 / 64 and the f16 twin keep the backend first until measured).
-SM107_PAGED_D256_MTP_GEOMETRIES = ((24, 2), (32, 2))  # the (h_q, h_kv) pairs measured; 12/1 and 16/1 share the groups but were not measured at s_q > 1 -> TRAIL
-SM107_PAGED_D256_MTP_S_Q = (2, 4)  # q_len_per_req 2, 3, 4 (inclusive band)
-SM107_PAGED_D256_MTP_UNITS = (2, 256)  # b 1-128 x 2 KV heads
-SM107_PAGED_D256_MTP_KV_TOKENS = (1024, 131072)
-SM107_PAGED_D256_MTP_PAGE_SIZES = (16,)
 
 # SM100 per-tensor FP8 thresholds (prefill, s_q > 16).
 FP8_D512_WIDE_Q_HEADS = 32  # d512 with >= 32 query heads wins at every measured cache (0.20-0.73 GPU, 0.20-0.91 eager)
@@ -563,7 +587,16 @@ SM100_FP8_D512_MTP_FLOOR_KV = 1448
 SM100_FP8_SINK_DECODE_MIN_KV_UNITS = 32  # d64 sink below 32 KV units: full-cache s_q == 1 loses 1.20-1.23, paged SWA s_q >= 2 1.09-1.49
 FP8_SYNTH_KV_MIN_TILE_KV = 2**21  # S_kv off the KV tile, mask-free: Q tiles * s_kv from which FROST wins (0.41-0.89)
 SM100_PAGED_GQA16_MAX_B = 4  # SM100 paged bf16 GQA prefill: measured batch range (module docstring)
+SM100_PAGED_D128_PREFIX_MAX_B = 64  # SM100 paged bf16 d128 GQA prefix lead: measured bounds (module docstring)
+SM100_PAGED_D128_PREFIX_Q = (16, 2048)
+SM100_PAGED_D128_PREFIX_MAX_KV = 131072
+SM100_PAGED_D128_PREFIX_PAGES = (16, 64)
 SM100_PAGED_D128_PREFILL_CCS = ((10, 0), (10, 3))  # the paged bf16 d128 GQA prefill / full-square leads: measured on both parts
+# Paged full squares widened by study sm100_paged_full_prefill_20261112 (module docstring): d128 GQA 4 / 8 and d256 MHA.
+SM100_PAGED_FULL_SQUARE_S = (512, 16384)
+SM100_PAGED_FULL_SQUARE_PAGES = (16, 64)
+SM100_PAGED_FULL_SQUARE_GQA_MAX_B = 32
+SM100_PAGED_FULL_SQUARE_D256_MHA_MAX_B = 8
 SM107_PAGED_GQA_MAX_B = 4  # Rubin paged bf16 GQA prefill chunks: measured batch range (module docstring)
 SM107_PAGED_GQA_LONG_CHUNK_MAX_S_Q = 4096  # Rubin paged GQA long-prefix chunks: the measured query range ends here
 SM107_PAGED_GQA_LONG_CHUNK_MIN_KV = 6144  # ... and the cache range starts here (module docstring)
@@ -574,6 +607,7 @@ SM107_FP8_D128_MHA_MAX_S_Q = 512  # MHA cannot pack: past one 512-row Q tile it 
 SM107_FP8_D128_LONG_KV = 8192  # bottom-right causal chunk from this cache length: 0.04-0.97
 SM107_FP8_D128_MIN_KV = 4096  # ... or from this length when the cache is at least
 SM107_FP8_D128_KV_PER_Q = 64  # ... this many times the query length
+SM107_FP8_D64_SINK_DECODE_MIN_UNITS = 32  # cc 10.7 FP8 d64 + sink, s_q == 1, no window: 16 KV units lose 1.03-1.18, 32+ win
 SM107_FP8_D128_MASKFREE_MAX_S_Q = 128  # mask-free chunk on the KV tile: 0.28-0.96
 SM120_FP8_SHORT_KV = 512  # cc 12.x per-tensor FP8 d128 prefill at or below this cache: 0.81-1.19 on 13-60 us launches
 SM120_FP8_MASKFREE_SHORT_KV = 1024  # ... mask-free at or below this cache: 0.93-1.16
@@ -663,25 +697,20 @@ def _d128_one_decode_tile_wave(caps: Capabilities, facts) -> bool:
 
 
 def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
-    """Paged dense-Q d256 decode on the Rubin d256 decode tile inside its measured bands (module docstring, "PAGED dense-Q d256 half
-    decode" and "Two further bands"): a measured GQA group packed whole onto the tile (``engines.d256_decode_tile_selected`` -- half
-    inputs, dense queries, the (256, 256) flavor, no pre-folded scale; the 32-column tile in token units on the MTP rows), a page pool
-    of a measured page size in either in-page layout (both measured on the s_q == 1 band: the token-major band and the head-major 24/2
-    chunk; the group-32 and MTP cells ran on the token-major pool), per-request KV lengths (the padding mask every band cell carried),
-    no window / sink / Stats / gate, and one of the three
-    bands -- all three the frontier CUDA-graph replay and eager share:
+    """Paged dense-Q d256 single-row decode on the Rubin d256 decode tile inside its measured bands (module docstring, "PAGED dense-Q
+    d256 half decode" and "A further band"): a measured GQA group packed whole onto the tile (``engines.d256_decode_tile_selected`` --
+    half inputs, dense queries, the (256, 256) flavor, no pre-folded scale), a page pool of a measured page size in either in-page
+    layout (both measured: the token-major band and the head-major 24/2 chunk; the group-32 cells ran on the token-major pool),
+    per-request KV lengths (the padding mask every band cell carried), no window / sink / Stats / gate, and one of the two bands --
+    both the frontier CUDA-graph replay and eager share (the MTP rows are the generated table's, study sm107_paged_mtp_20261110):
 
     * ``s_q == 1``, no mask, groups ``SM107_PAGED_D256_DECODE_GROUPS``: ``SM107_PAGED_D256_DECODE_MIN_UNITS <= b * h_kv <=
       SM107_PAGED_D256_DECODE_MAX_UNITS``, the declared KV inside ``SM107_PAGED_D256_DECODE_KV_TOKENS`` and ``units * KV >=
       SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT`` tokens in flight;
     * ``s_q == 1``, no mask, the measured group-32 geometry ``SM107_PAGED_D256_G32_GEOMETRIES`` (64/2 -- a 32/1 graph is the same
       group but unmeasured) at ``SM107_PAGED_D256_G32_PAGE_SIZES`` (16): ``SM107_PAGED_D256_G32_MIN_UNITS <= units <=
-      SM107_PAGED_D256_G32_MAX_UNITS``, the same declared-KV band, ``units * KV >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT``;
-    * the MTP rows: ``SM107_PAGED_D256_MTP_S_Q`` (2 <= s_q <= 4) with the bottom-right causal diagonal FlashInfer's decode graph
-      declares there, the measured geometries ``SM107_PAGED_D256_MTP_GEOMETRIES`` (24/2, 32/2 -- 12/1 and 16/1 share the groups but
-      were not measured there), ``SM107_PAGED_D256_MTP_UNITS``, ``SM107_PAGED_D256_MTP_KV_TOKENS``, bf16 at
-      ``SM107_PAGED_D256_MTP_PAGE_SIZES`` (what was measured), no tokens-in-flight floor (every cell led)."""
-    if not (facts.has_paged_kv and facts.padded and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0):
+      SM107_PAGED_D256_G32_MAX_UNITS``, the same declared-KV band, ``units * KV >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT``."""
+    if facts.s_q != 1 or not (facts.has_paged_kv and facts.padded and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0):
         return False
     group = facts.h_q // facts.h_kv
     if facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
@@ -689,38 +718,19 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     if facts.window_left is not None or facts.right_band_widening or facts.has_sink or facts.wants_stats or facts.has_epilogue_gate:
         return False
     units = facts.b * facts.h_kv
-    if facts.s_q == 1:
-        if facts.causal or facts.page_size not in SM107_PAGED_D256_DECODE_PAGE_SIZES or not d256_decode_tile_selected(caps, facts, group):
-            return False
-        kv_lo, kv_hi = SM107_PAGED_D256_DECODE_KV_TOKENS
-        if not kv_lo <= facts.s_kv <= kv_hi:
-            return False
-        if group in SM107_PAGED_D256_DECODE_GROUPS:
-            return (
-                SM107_PAGED_D256_DECODE_MIN_UNITS <= units <= SM107_PAGED_D256_DECODE_MAX_UNITS
-                and units * facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT
-            )
-        if (facts.h_q, facts.h_kv) in SM107_PAGED_D256_G32_GEOMETRIES and facts.page_size in SM107_PAGED_D256_G32_PAGE_SIZES:
-            return (
-                SM107_PAGED_D256_G32_MIN_UNITS <= units <= SM107_PAGED_D256_G32_MAX_UNITS and units * facts.s_kv >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT
-            )
+    if facts.causal or facts.page_size not in SM107_PAGED_D256_DECODE_PAGE_SIZES or not d256_decode_tile_selected(caps, facts, group):
         return False
-    # The MTP rows: FlashInfer's decode graph at q_len_per_req 2-4 carries the bottom-right causal diagonal (a sliding window would too,
-    # but it was not measured and is refused above).
-    s_lo, s_hi = SM107_PAGED_D256_MTP_S_Q
-    if not (s_lo <= facts.s_q <= s_hi and facts.causal and facts.bottom_right):
+    kv_lo, kv_hi = SM107_PAGED_D256_DECODE_KV_TOKENS
+    if not kv_lo <= facts.s_kv <= kv_hi:
         return False
-    if (
-        (facts.h_q, facts.h_kv) not in SM107_PAGED_D256_MTP_GEOMETRIES
-        or facts.dtype != cudnn.data_type.BFLOAT16
-        or facts.page_size not in SM107_PAGED_D256_MTP_PAGE_SIZES
-    ):
-        return False
-    if not d256_decode_tile_selected(caps, facts, group):
-        return False
-    u_lo, u_hi = SM107_PAGED_D256_MTP_UNITS
-    kv_lo, kv_hi = SM107_PAGED_D256_MTP_KV_TOKENS
-    return u_lo <= units <= u_hi and kv_lo <= facts.s_kv <= kv_hi
+    if group in SM107_PAGED_D256_DECODE_GROUPS:
+        return (
+            SM107_PAGED_D256_DECODE_MIN_UNITS <= units <= SM107_PAGED_D256_DECODE_MAX_UNITS
+            and units * facts.s_kv >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT
+        )
+    if (facts.h_q, facts.h_kv) in SM107_PAGED_D256_G32_GEOMETRIES and facts.page_size in SM107_PAGED_D256_G32_PAGE_SIZES:
+        return SM107_PAGED_D256_G32_MIN_UNITS <= units <= SM107_PAGED_D256_G32_MAX_UNITS and units * facts.s_kv >= SM107_PAGED_D256_G32_MIN_KV_TOKENS_IN_FLIGHT
+    return False
 
 
 def _sm107_paged_gqa_prefill(facts) -> bool:
@@ -779,8 +789,8 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         return LEAD
     # Paged dense-Q d256 decode on the Rubin decode tile -- FlashInfer's cuDNN decode graph shape -- LEADs inside its measured bands
     # (module docstring, "PAGED dense-Q d256 half decode": the tile 0.43-0.90 of the backend's default plan on every cell with >= 4
-    # units and >= 2**16 KV tokens in flight, both regimes; "Two further bands": group 32 from 2**17 tokens in flight, the MTP rows
-    # 2 <= s_q <= 4 on 24/2 and 32/2 at 0.01-0.31 of the backend everywhere); everything unmeasured trails.
+    # units and >= 2**16 KV tokens in flight, both regimes; "A further band": group 32 from 2**17 tokens in flight); everything
+    # unmeasured trails.
     if _sm107_paged_d256_decode_tile_leads(caps, facts):
         return LEAD
     if _prefer_paged_d256_lpt(facts):
@@ -936,6 +946,8 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
     # Measured: exact cc 10.7, dense per-tensor E4M3, causal (TL / BR) or mask-free, Stats on or off; and paged D512 decode.
     if _sm107_fp8_paged_d512_decode(facts):
         return LEAD
+    if _sm107_fp8_d64_sink_decode_leads(facts):
+        return LEAD
     if (
         facts.device_cc != (10, 7)
         or facts.thd
@@ -956,6 +968,27 @@ def _place_sm107_fp8(caps: Capabilities, facts) -> str:
     if facts.s_kv <= SM107_FP8_TINY_MAX_KV and _q_tiles(facts) <= SM107_FP8_TINY_MAX_Q_TILES:
         return TRAIL  # one KV tile, <= 8 Q tiles: both ~7 us; d512 b1 8/1 q32 kv128 loses 1.07-1.12 (graph and eager)
     return LEAD  # d256 0.16-0.96, d512 0.13-0.81 (module docstring); the backend does not build s_q == 1 here (NVRTC)
+
+
+def _sm107_fp8_d64_sink_decode_leads(facts) -> bool:
+    """cc 10.7 per-tensor FP8 dense d64 decode / MTP with a sink and no window (module docstring, "SM107 per-tensor FP8 row")."""
+    if (
+        facts.device_cc != (10, 7)
+        or facts.dtype != cudnn.data_type.FP8_E4M3
+        or (facts.d_qk, facts.d_v) != (64, 64)
+        or not facts.has_sink
+        or facts.window_left is not None
+        or facts.thd
+        or facts.has_paged_kv
+        or facts.padded
+        or facts.right_band_widening
+        or facts.o_block_scale
+        or facts.has_epilogue_gate
+        or not 1 <= facts.s_q <= 4
+        or (facts.s_q > 1 and not (facts.causal and facts.bottom_right))
+    ):
+        return False
+    return facts.s_q > 1 or facts.b * facts.h_kv >= SM107_FP8_D64_SINK_DECODE_MIN_UNITS
 
 
 def _sm107_fp8_d128_chunk_leads(caps: Capabilities, facts) -> bool:
@@ -1008,8 +1041,9 @@ def _place_sm120_fp8(facts) -> str:
 
 
 def _place_sm90_f16(caps: Capabilities, facts) -> str:
-    # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else stays backend-first.
-    if facts.thd or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):
+    # Measured only dense, exact d512 without a sink (a window only inside _d512_swa); everything else, paged KV included
+    # (unmeasured since the row admits it), stays backend-first.
+    if facts.thd or facts.has_paged_kv or (facts.window_left is not None and not _d512_swa(facts)) or facts.has_sink or (facts.d_qk, facts.d_v) != (512, 512):
         return TRAIL
     if facts.s_q == 1 and facts.b * facts.h_q < SM90_SQ1_MIN_Q_ROWS:
         return TRAIL
@@ -1017,11 +1051,16 @@ def _place_sm90_f16(caps: Capabilities, facts) -> str:
 
 
 def _place_sm120_f16(caps: Capabilities, facts) -> str:
+    from .heuristics import _sm120_decode_tile_m
+
+    if facts.has_paged_kv and _sm120_decode_tile_m(caps, facts) == 0:
+        return TRAIL  # paged KV on the prefill body: 15-27x behind the backend at s_q 8-2048 (module docstring)
     if not facts.thd and facts.s_q == 1:
         units = facts.b * facts.h_kv
         if _selected_d_shape(caps, facts) == (512, 512):
-            if facts.h_q // max(facts.h_kv, 1) > SM120_SQ1_MAX_GQA_GROUP:
-                return TRAIL
+            group = facts.h_q // max(facts.h_kv, 1)
+            if group > SM120_SQ1_MAX_GQA_GROUP:
+                return TRAIL if group & (group - 1) else LEAD
             # one KV head: the b = 1, >=32-query-head win (0.44-0.85) was measured at 128k KV only.
             return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
         group = facts.h_q // max(facts.h_kv, 1)
@@ -1038,7 +1077,7 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
     """Bounded shard derived from measured workloads; inspect only graph declarations."""
     return (
         facts.device_cc == (10, 0)
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (256, 256)
         and facts.has_paged_kv
         and facts.thd
@@ -1054,24 +1093,27 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _sm100_paged_full_square(facts) -> bool:
-    """cc 10.0 / 10.3 paged bf16 d128 full prefill (Q = KV), page 16, head-major in-page K (module docstring)."""
+    """cc 10.0 / 10.3 paged bf16 full prefill (Q = KV), head-major in-page K (module docstring): d128 GQA16 (b <= 4, S 1024-8192,
+    page 16), d128 GQA 4 / 8 and d256 MHA (``SM100_PAGED_FULL_SQUARE_*``)."""
     group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
-    return (
+    if not (
         facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
-        and facts.dtype == cudnn.data_type.BFLOAT16
-        and (facts.d_qk, facts.d_v) == (128, 128)
-        and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and facts.s_q == facts.s_kv
-        and group in (4, 8, 16)
-        and 1024 <= facts.s_q <= 8192
-        and facts.page_size == 16
         and facts.causal
         and facts.window_left is None
         and not (facts.has_sink or facts.right_band_widening)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
-    )
+    ):
+        return False
+    wide = SM100_PAGED_FULL_SQUARE_S[0] <= facts.s_q <= SM100_PAGED_FULL_SQUARE_S[1] and facts.page_size in SM100_PAGED_FULL_SQUARE_PAGES and facts.b >= 1
+    if (facts.d_qk, facts.d_v) == (128, 128):
+        if group == 16:
+            return 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B and 1024 <= facts.s_q <= 8192 and facts.page_size == 16
+        return group in (4, 8) and wide and facts.b <= SM100_PAGED_FULL_SQUARE_GQA_MAX_B
+    return (facts.d_qk, facts.d_v) == (256, 256) and group == 1 and wide and facts.b <= SM100_PAGED_FULL_SQUARE_D256_MHA_MAX_B
 
 
 def _sm100_paged_gqa_prefill(facts) -> bool:
@@ -1082,7 +1124,7 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
         facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
         and facts.has_paged_kv
         and (group == 16 or (group in (4, 8) and (bool(facts.shape_overrides) or facts.max_total_seq_len_q is None)))
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and 1 <= facts.b <= SM100_PAGED_GQA16_MAX_B
         and 128 < min(facts.s_q, facts.max_total_seq_len_q or facts.s_q) <= 4096
@@ -1097,16 +1139,43 @@ def _sm100_paged_gqa_prefill(facts) -> bool:
     )
 
 
-def _place_sm100_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
+def _sm100_paged_d128_prefix(facts) -> bool:
+    """cc 10.0 / 10.3 paged bf16 d128 GQA prefix, S_q < S_kv, FlashInfer's exact declaration (module docstring)."""
+    group = facts.h_q // facts.h_kv if facts.h_kv and facts.h_q % facts.h_kv == 0 else 0
+    return (
+        facts.device_cc in SM100_PAGED_D128_PREFILL_CCS
+        and facts.has_paged_kv
+        and not facts.shape_overrides
+        and facts.max_total_seq_len_q is None
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and group in (4, 8, 16)
+        and 1 <= facts.b <= SM100_PAGED_D128_PREFIX_MAX_B
+        and SM100_PAGED_D128_PREFIX_Q[0] <= facts.s_q <= SM100_PAGED_D128_PREFIX_Q[1]
+        and facts.s_q < facts.s_kv <= SM100_PAGED_D128_PREFIX_MAX_KV
+        and facts.page_size in SM100_PAGED_D128_PREFIX_PAGES
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
 
-    # The prepared single-CTA split removes the underfilled paged D128
-    # launch. Placement and the concrete split share one bounded rule.
+
+def _place_sm100_f16(caps: Capabilities, facts) -> str:
+    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice, sm100_paged_tail_split_domain
+
+    # The prepared single-CTA split removes the underfilled paged D128 launch, and the packed split the underfilled
+    # D64 / D256 one. Placement and the concrete split share one bounded rule.
     if paged_thd_split_choice(caps, facts)[0] > 1:
+        return LEAD
+    if facts.d_qk == 256 and facts.h_q == facts.h_kv and sm100_paged_tail_split_domain(caps, facts):
+        # Unsplit too: FROST's D256 pair tile ran 0.45-0.51 of the backend on every MHA prefix of study sm100_paged_split_v2_20261112.
         return LEAD
     if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
-    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts):
+    if _sm100_paged_gqa_prefill(facts) or _sm100_paged_full_square(facts) or _sm100_paged_d128_prefix(facts):
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
@@ -1144,7 +1213,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     if (
         512 <= facts.s_q <= 8192
         and facts.device_cc in PAGED_D128_FULL_PREFILL_CCS
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and facts.thd
         and facts.has_paged_kv

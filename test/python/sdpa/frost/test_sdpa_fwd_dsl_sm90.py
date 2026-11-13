@@ -3,7 +3,7 @@
 
 """End-to-end tests for the FROST SM90 DSL SDPA-forward engine against a torch reference.
 
-SM90 serves one flavor -- (512, 512) f16/bf16 prefill -- so this file is the arch line's whole
+SM90 serves native D64/D128/D256/D512 f16/bf16 prefill; this file retains the D512
 forward suite. The end-to-end half runs through test_sdpa_fwd_dsl_sm100.py: its runners, fp32
 references and tolerances are arch-neutral apart from a module-level ``_ARCH`` fed to
 ``engine_name(arch=...)``, so the ``sm100`` fixture repins that one string and SM90 runs the same
@@ -433,15 +433,11 @@ def test_dsl_sm90_wrapper_matches_the_reference(sm100):
 
 @pytest.mark.parametrize(
     ("d_qk", "d_v", "served"),
-    [(512, 512, True), (264, 504, True), (512, 264, True), (256, 512, False), (192, 128, False), (8, 8, False)],
-    ids=["native", "both-inside", "v-inside", "at-floor", "d192x128", "tiny"],
+    [(512, 512, True), (264, 504, True), (512, 264, True), (256, 512, False), (192, 128, True), (128, 128, True), (256, 256, True), (8, 8, False)],
+    ids=["native", "both-inside", "v-inside", "at-floor", "d192x128", "d128", "d256", "tiny"],
 )
-def test_sm90_row_floors_the_d_envelope_at_256(d_qk, d_v, served):
-    """Two levels, deliberately different reach. The ROW serves (256, 512] on both dims
-    (``d_envelope_floors``), so a small graph is declined rather than run at up to 64x
-    zero-padding; the TEMPLATE still serves every multiple of 8 in (0, 512], so a direct
-    adapter caller keeps the full envelope. The declines are the floor's ONLY detector:
-    without them, reverting ``d_envelope_floors`` to () is silent."""
+def test_sm90_row_bounds_native_head_envelopes(d_qk, d_v, served):
+    """Graph admission bounds padding separately for each native width."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.config_sm90 import head_dims_mismatch
 
@@ -552,7 +548,7 @@ def test_sm90_declines_pv_bf16():
 @pytest.mark.parametrize(
     ("declared", "why"),
     [
-        pytest.param(dict(paged_page_size=128, paged_max_seq_len_kv=256), "does not support paged KV", id="paged"),
+        pytest.param(dict(paged_page_size=128, paged_max_seq_len_kv=256), "paged KV requires device KV lengths", id="paged-without-kv-lengths"),
         pytest.param(dict(pertensor_fp8=True), "does not support FP8 or PV BF16 inputs", id="fp8"),
         pytest.param(dict(dtype=torch.float32), "Q/K/V/O other than FP16/BF16", id="qkv-dtype"),
         pytest.param(dict(dtype_o=torch.bfloat16), "an output dtype different from Q", id="o-dtype"),

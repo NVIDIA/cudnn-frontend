@@ -241,8 +241,6 @@ from cudnn.sdpa.fwd.kernels.thd_origins import (
     origin_tensors,
     origin_tma_slice,
     origin_map_ptr,
-    build_paged_split_q_maps,
-    build_split_load_maps,
     build_thd_origins,
 )
 from cudnn.sdpa.fwd.kernels._thd_split_host import host as _host_thd_split, compile_host as _compile_thd_split_host
@@ -436,7 +434,8 @@ def _kernel(
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
 
-    if cutlass.const_expr(CFG.THD_VARLEN and SPLIT_KV > 1):
+    if cutlass.const_expr(CFG.THD_VARLEN and (SPLIT_KV > 1 or thd_origins is not None)):
+        # Physical maps have no initialized sentinel for dead initial units.
         # The split decoder folds its composite batch modulo n_batch. Reject
         # dead initial units before that fold could turn the sentinel into a
         # real sequence and an out-of-range partial split.
@@ -581,6 +580,11 @@ def _kernel(
     tma_mcast_mask = cutlass.Int16(0)
 
     # === Per-warp role dispatch ===
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
@@ -628,7 +632,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _mma_warp_group(
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
@@ -649,7 +652,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -685,7 +687,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -702,7 +703,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # cga1: this CTA is always the cluster's first CTA.
         is_cga_first_cta = cutlass.Int32(1) == cutlass.Int32(1)
         if cutlass.const_expr(CFG.THD_VARLEN):
@@ -2786,12 +2786,14 @@ def _launch(
     q_supers = (SQ * HEADS_PER_TILE + rows_per_cluster - 1) // rows_per_cluster
     # KV split rides the BATCH axis: z = batch + split*B (decoded as b % B, b // B).
     if cutlass.const_expr(CFG.THD_VARLEN):
-        # Setup launch (issue #552): builds the [kv | cu_q | cu_k] metadata
-        # buffer device-side from the caller's length tensors, then the
-        # per-batch O descriptors and the packed-total-clamped K/V descriptors
-        # (o_desc_words slots n_batch+1 / n_batch+2). One elected thread.
-        if cutlass.const_expr(thd_origin_ptrs is not None and SPLIT_KV == 1):
+        # One setup launch builds device-side lengths/scheduling and maps.
+        # With independent origins, input maps follow each caller's port;
+        # split output maps retain the compact partial layout.
+        if cutlass.const_expr(thd_origin_ptrs is not None):
             o_desc_words, origins, offsets = origin_tensors(o_desc_words.iterator, thd_origin_ptrs, cutlass.Int32(B))
+            # Split outputs are compact partials; the final combine alone
+            # applies the caller's independent O/Stats physical origins.
+            setup_specs = thd_origin_specs[:3] + (None, None) if cutlass.const_expr(SPLIT_KV > 1) else thd_origin_specs
             build_thd_origins(
                 (q_tensor, k_tensor, v_tensor, o_tensor),
                 tma_q_desc,
@@ -2801,7 +2803,7 @@ def _launch(
                 o_desc_words,
                 origins,
                 offsets,
-                thd_origin_specs,
+                setup_specs,
                 seq_kv_lens_tensor,
                 thd_q_lens_tensor,
                 thd_kv_lens_tensor,
@@ -2810,6 +2812,10 @@ def _launch(
                 cutlass.Int32(QH // HEADS_PER_TILE),
                 cutlass.Int32(CGA_TILE_M // HEADS_PER_TILE),
                 n_thd_units,
+                paged=PAGED_KV,
+                rank_by_kv=SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+                splits=SPLIT_KV,
+                single_batch_fast=SPLIT_KV > 1,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(
@@ -2831,25 +2837,6 @@ def _launch(
                 SPLIT_KV,
                 SPLIT_KV > 1 and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
-            if cutlass.const_expr(thd_origin_ptrs is not None):
-                o_desc_words, origins, offsets = origin_tensors(o_desc_words.iterator, thd_origin_ptrs, cutlass.Int32(B))
-                if cutlass.const_expr(PAGED_KV):
-                    build_paged_split_q_maps(
-                        q_tensor, tma_q_desc, o_desc_words, origins, offsets[0], thd_origin_specs[0][1], seq_kv_lens_tensor, cutlass.Int32(B)
-                    ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
-                else:
-                    build_split_load_maps(
-                        (q_tensor, k_tensor, v_tensor),
-                        tma_q_desc,
-                        tma_k_desc,
-                        tma_v_desc,
-                        o_desc_words,
-                        origins,
-                        offsets,
-                        thd_origin_specs,
-                        seq_kv_lens_tensor,
-                        cutlass.Int32(B),
-                    ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         grid_shape = (
@@ -3034,8 +3021,8 @@ def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd
     )
     if not (CFG.THD_VARLEN and SPLIT_KV > 1 and supported_shape):
         raise ValueError("packed split requires D64, D128, or unpacked nonpaged D192 THD")
-    if thd_origin_specs is not None and not ((CFG.TILE_O == 128 or (CFG.TILE_O == 64 and not PAGED_KV)) and thd_origin_specs[0] is not None):
-        raise ValueError("physical split origins require D128 or nonpaged D64/D192 with Q offsets")
+    if thd_origin_specs is not None and not (CFG.TILE_O in (64, 128) and thd_origin_specs[0] is not None):
+        raise ValueError("physical split origins require D64/D128 or nonpaged D192 with Q offsets")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     if has_sink and not (CFG.TILE_K == CFG.TILE_O == 128 and PAGED_KV and not CFG.HAS_SINK):
         raise ValueError("packed split sinks require sink-free D128 paged partials")
@@ -3084,8 +3071,9 @@ def compile(  # noqa: A001
     if paged_hnd and not PAGED_KV:
         raise ValueError("paged_hnd is a paged-KV specialization")
     if thd_origin_specs is not None:
-        if not (CFG.THD_VARLEN and SPLIT_KV == 1 and not PAGED_KV and CFG.TILE_K == 192 and CFG.TILE_O == 128):
-            raise ValueError("unsplit physical origins require nonpaged D192 THD")
+        supported_origins = (PAGED_KV and CFG.TILE_K == CFG.TILE_O == 64) or (not PAGED_KV and CFG.TILE_K == 192 and CFG.TILE_O == 128)
+        if not (CFG.THD_VARLEN and SPLIT_KV == 1 and supported_origins):
+            raise ValueError("unsplit physical origins require paged D64 or nonpaged D192 THD")
         if len(thd_origin_specs) != 5:
             raise ValueError("physical origins require five Q/K/V/O/Stats specifications")
     gmem = cute.AddressSpace.gmem

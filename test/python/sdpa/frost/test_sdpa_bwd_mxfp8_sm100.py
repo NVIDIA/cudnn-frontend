@@ -174,9 +174,9 @@ def _build_graph(
         out.set_output(True).set_data_type(grad_half).set_dim(list(sh)).set_stride(stride_fn(sh))
     # The op returns the amax ports unconditionally and validate() wants their
     # dims; they stay virtual (not requested) unless declare_amax.
-    for a in (amax_dq, amax_dk, amax_dv):
+    for name, a in zip(("amax_dQ", "amax_dK", "amax_dV"), (amax_dq, amax_dk, amax_dv)):
         a.set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-        if declare_amax:
+        if declare_amax is True or (declare_amax and name in declare_amax):
             a.set_output(True)
     if with_sink:
         t["dsink"].set_output(True)

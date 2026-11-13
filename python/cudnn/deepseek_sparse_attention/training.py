@@ -33,8 +33,8 @@ def _validate_contract(q, kv, indices, attn_sink, topk_length, softmax_scale):
     sq, heads, dim = q.shape
     if sq <= 0 or kv.shape[0] <= 0 or indices.shape[1] <= 0:
         raise ValueError("sequence extents and physical Top-K must be positive")
-    if heads not in (16, 32, 64, 128) or dim not in (512, 576) or (heads, dim) == (128, 576):
-        raise NotImplementedError("native training supports H16/H32/H64 D512/D576 and H128 D512")
+    if heads not in (16, 32, 64, 96, 128) or dim not in (512, 576):
+        raise NotImplementedError("native training supports H16/H32/H64/H96/H128 with D512/D576")
     if kv.shape[1] != dim or indices.shape[0] != sq:
         raise ValueError("KV dimension and index row count must match Q")
     if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16 or indices.dtype != torch.int32:

@@ -295,6 +295,54 @@ def test_sm90_blk64_partial_kv_blocks(with_block_sizes, kv_splits):
 
 
 @pytest.mark.L1
+@pytest.mark.parametrize("size_range", ((1, 64), (1, 15)), ids=("rows_1_64", "rows_1_15"))
+@torch_fork_set_rng(seed=41)
+def test_sm90_blk64_row_aware_boxes_match_full_boxes(monkeypatch, size_range):
+    """The row-count-aware K/V TMA boxes load 16 * ceil(rows / 16) rows of a partial KV block and leave the rest of the
+    K tile and V slot to what an earlier full load of the same CTA put there (the prologue's K[0]/V[0] and step 1's
+    V[1] always load all 64 rows); the masked columns then make O and LSE bitwise equal to the full-box kernel. Random
+    block sizes, lists whose first block is partial and lists of 0..4 blocks (N = 1 has no steady state, N = 2 fills
+    V slot 1 in step 1, N >= 3 prefetches two steps ahead) keep that invariant under test."""
+    ops = import_bsa(families=(9,), reason="the blk64 forward kernel under test is specific to SM90")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    fwd = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90")
+    heads, q_blocks, kv_blocks, width = 2, 16, 16, 4
+    seqlen = kv_blocks * 64
+    q, k, v = [torch.randn((1, heads, seqlen, 128), device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    counts = torch.randint(0, width + 1, (1, heads, q_blocks), device="cuda", dtype=torch.int32)
+    # Distinct block ids per row (the prefix of a random permutation); the slots past the count hold a poison index.
+    indices = torch.argsort(torch.rand((1, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    indices.masked_fill_(torch.arange(width, device="cuda") >= counts[..., None], 2147483647)
+    sizes = torch.randint(size_range[0], size_range[1] + 1, (kv_blocks,), device="cuda", dtype=torch.int32)
+    assert (sizes[indices[..., 0][counts > 0]] < 64).any(), "some list must start with a partial block"
+
+    def forward(**flags):
+        builds = []
+
+        class Kernel(fwd.BlockSparseAttnForwardSm90Blk64):
+            def __init__(self, *args, **kwargs):
+                builds.append(flags)
+                super().__init__(*args, **kwargs, **flags)
+
+        monkeypatch.setattr(interface, "BlockSparseAttnForwardSm90Blk64", Kernel)
+        monkeypatch.setattr(interface.bsa_attn_fwd, "compile_cache", {})
+        result = ops.block_sparse_attention_forward(
+            q, k, v, indices, width, sizes, q2k_block_nums=counts, sparse_block_size=64, kv_splits=1, allow_empty_block_nums=True
+        )
+        assert builds, "the forward did not build the SM90 blk64 kernel"
+        return result["o_tensor"].clone(), result["lse_tensor"].clone()
+
+    o_full, lse_full = forward(row_aware_boxes=False, window_prefetch=False)
+    o_boxes, lse_boxes = forward()
+    assert torch.isfinite(o_boxes).all()
+    assert torch.equal(o_boxes, o_full) and torch.equal(lse_boxes, lse_full)
+    mask = block_sparse_mask(indices, width, sizes, seqlen, seqlen, 64, counts)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(o_boxes.float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(lse_boxes, lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("head_dim", (64, 96, 128))
 @pytest.mark.parametrize("value_dim", (96, 128))
