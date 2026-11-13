@@ -1696,7 +1696,13 @@ Cold compile on an x86 host (a cc 8.0 device: every device case skips; fake tens
 core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs`: 87 passed, 296 skipped under CuTe DSL 4.8.0 and under 4.8.1 (the 4.8.1
 wheels put first on the path), both compiling with CUDA 13.4 -- the three rendering cases (`sm_100a`, `sm_103a`, `sm_107a`) among the
 passes; 84 passed, 299 skipped under 4.8.0 with CUDA 12.9 (the rendering cases skip with the entry's decline).  The four token-tile
-forms render byte-identical cubins under 4.8.1 and under 4.8.0 for the three targets (12 of 12).  Not run on a device: 4.8.1.
+forms render byte-identical cubins under 4.8.1 and under 4.8.0 for the three targets (12 of 12).
+
+CuTe DSL 4.8.1 on the cc 10.0 part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime, compiling with CUDA
+13.4): `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 201 passed, 0 skipped.
+`CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -x -q -ra` -> 182 passed; its 5 records hold the input and output
+hashes of the committed 4.8.0 set and are not committed.  The DSL version is part of the runtime key, so against the committed
+directory the 5 golden cases skip under 4.8.1 -- a coverage gap there, not a pass.
 
 ### QSA: 42 cases
 
