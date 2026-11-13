@@ -21,6 +21,7 @@ bf16 copy of every weight: about 57 GiB free for the 27B checkpoint.
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
     python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: reports RAN, never PASS
     python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
+    python samples/models/qwen_dense/00_decode.py --stack native           # the target kernel set, as far as it is served here
 
     pip install -r samples/models/requirements.txt                         # only for a checkpoint; brings the hf command
     hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4   # your own step: the sample fetches nothing
@@ -29,6 +30,14 @@ bf16 copy of every weight: about 57 GiB free for the 27B checkpoint.
 The stack is explicit and never chosen by what is installed.  ``fe-cublas`` is a reference path, not a fast path: the
 linear-attention step runs on cuDNN Frontend's fused kernel, every multiply on cuBLAS over a bf16 copy of the quantised weights,
 the rest in PyTorch, and every launch is issued from Python.  Timings printed here are for orientation only.
+
+``--stack native`` is the target kernel set of this model's decode step: per block the kernel a recorded census of that set
+names (``model_samples/qwen_dense/kernel_census.json``), in the form the target calls it in.  A block whose kernel is not
+served here yet stays on its fallback row and is printed as ``not yet``; the run says how many launches of a step are target
+kernels, always as three numbers, and why its GPU class is ``NOT CLAIMED``.  It always checks its kernels, and it holds the
+launch shape of every target launch against the census.  ``--stack fe-entries`` is every cuDNN Frontend row of ``native`` with
+the rest on fallback rows: no package beyond cuDNN Frontend and PyTorch.  Until ``native`` has a row a library serves, the two
+are the same rows.
 
 ``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
 launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's
@@ -59,7 +68,7 @@ if _HELPERS not in sys.path:
     sys.path.insert(0, _HELPERS)
 
 TAG = "[00]"
-STACKS = ("fe-cublas", "reference")
+STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 DEFAULT_PROMPT = "Why is the sky blue?"
 CHECKED_STEPS = 16  # with a checkpoint the checks cover the first steps of every prompt
 TRACED_STEPS = 32
@@ -96,7 +105,8 @@ def _writable(flag: str, path: str) -> None:
 EPILOG = """\
 The default run needs no checkpoint and no extra package; it needs a GPU of compute capability 10.x or 12.x.
 With --model: pip install -r samples/models/requirements.txt first.  The checkpoint is your own download (nothing is
-fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stack fe-cublas.
+fetched); the 27B checkpoint needs 22 GB of disk and about 57 GiB of free GPU memory on the stacks fe-cublas, native and
+fe-entries, each of which holds a bf16 copy of every weight.
 The checkpoint, the memory, the checks and every flag: samples/models/qwen_dense/README.md
 """
 
@@ -149,8 +159,10 @@ def _arguments(argv):
         "--stack",
         default="fe-cublas",
         choices=STACKS,
-        help="fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch, checked against the reference; reference: every block in PyTorch, "
-        "on any CUDA GPU, nothing checked.  Explicit: never chosen by what is installed",
+        help="fe-cublas (default): cuDNN Frontend + cuBLAS + PyTorch, checked against the reference; native: the target kernel set of the "
+        "decode step, per block the kernel a recorded census names, with the blocks not served yet on fallback rows (printed as not yet) "
+        "and the kernel check always on; fe-entries: the cuDNN Frontend rows of native, everything else on fallback rows; reference: "
+        "every block in PyTorch, on any CUDA GPU, nothing checked.  Explicit: never chosen by what is installed",
     )
     parser.add_argument(
         "--provider",
@@ -166,7 +178,8 @@ def _arguments(argv):
         action="store_true",
         help="also check the kernels: print the kernel table, keep the profiler's record of every launch of the traced steps and hold "
         "them against the plan (every launch attributed to a block; an entry's kernel by name, order, count and launch shape). "
-        "Where the profiler cannot run the run reports RAN (kernels not observed), never PASS; not with --stack reference",
+        "Where the profiler cannot run the run reports RAN (kernels not observed), never PASS; not with --stack reference; always on "
+        "in the stacks native and fe-entries",
     )
     parser.add_argument(
         "--dump-census",
@@ -291,6 +304,8 @@ def main(argv=None) -> int:
     if not torch.cuda.is_available():
         print(f"{TAG} SKIP needs a CUDA GPU")
         return 0
+    # a stack that declares a target kernel set makes a statement about its kernels: it always checks them
+    args.check_kernels = args.check_kernels or args.stack in QwenDense.target_stacks
     device = torch.device("cuda", torch.cuda.current_device())
     real = args.model is not None
     checkpoint, requests, described = None, [], 0.0
@@ -391,6 +406,7 @@ def main(argv=None) -> int:
     planning = time.perf_counter()
     try:
         tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
+        claims = [session.claim() for session, _ in runs]  # of a stack that declares a target: how each run stands to it
     except NotImplementedError as error:
         print(f"{TAG} SKIP {error}")
         return 0
@@ -411,11 +427,11 @@ def main(argv=None) -> int:
 
     passed, judged, digest, dumped = True, 0, hashlib.sha256(), []
     unobserved, censuses = "", []  # of the kernel check: why the kernels were not observed; the launch records per prompt set
-    for (session, prompt_sets), table in zip(runs, tables):
+    for (session, prompt_sets), table, claim in zip(runs, tables, claims):
         print()
         print(table)
         if args.check_kernels:  # the kernel table, first part: from the plan alone, before the load
-            print(census.table(session.plan))
+            print(census.table(session.plan, claim))
         session.load()
         print(f"{TAG} {session.stages.line()}")
         if args.check_kernels:  # second part: what the entries, now built, state about their launches

@@ -12,7 +12,8 @@ chosen ids stay on the GPU, and the one host read of a step is the caller's (``r
 no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
 lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
 what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
-traced steps and the profiler's record of every launch.
+traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
+say about that set (``claim``).
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -30,7 +31,7 @@ from .sampling import GREEDY
 from .state import DecodeState
 from .timing import Report, Stages, now, trace_steps
 
-STACKS = ("fe-cublas", "reference")
+STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 PREFILL_ROUTES = ("decode-step",)
 
 
@@ -93,7 +94,8 @@ class Session:
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
         ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step).
         ``check_kernels`` says that the run will check its kernels: what that needs of a provider is then part of the plan
-        (a decline is a SKIP before the load), and the traced pass keeps its launch records."""
+        (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack that declares a target
+        kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if prefill not in PREFILL_ROUTES:
@@ -105,7 +107,7 @@ class Session:
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
-        self.check_kernels = bool(check_kernels)
+        self.check_kernels = bool(check_kernels) or stack in getattr(model, "target_stacks", ())
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
         self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
@@ -136,6 +138,15 @@ class Session:
                 source=self.model.table_source,
             )
         return self.plan
+
+    def claim(self) -> Optional[census.Claim]:
+        """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the
+        three numbers, the reasons its GPU class is not claimed (``census.Claim``) -- or ``None`` for a stack that declares no
+        target.  Decided from the plan and the family's census file: before anything is loaded.  ``ValueError`` when that
+        file is not a census of this model."""
+        if self.stack not in getattr(self.model, "target_stacks", ()):
+            return None
+        return self.model.target().claim(self.resolve(), self.model)
 
     def plan_table(self, later: Sequence["Session"] = ()) -> str:
         """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
@@ -251,11 +262,12 @@ class Session:
         none."""
         records = self.check_kernels if records is None else bool(records)
         sites = census.expected(self.plan, self.model) if records else []
+        claim = self.claim() if records else None
         count = min(steps, self.record.count, self.record.inputs.shape[0])
         if count < 1:
             self._report.trace_missing = "needs a recorded step on a CUDA device"
             if records:
-                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences)
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences, claim=claim)
             return
         inputs, kept, calls = self.record.inputs[:count], (self.state, self.record), self._calls
         self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
@@ -277,7 +289,7 @@ class Session:
         finally:
             (self.state, self.record), self._calls, self._call_log = kept, calls, None
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences)
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences, claim)
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
