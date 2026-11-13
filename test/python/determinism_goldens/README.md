@@ -74,6 +74,17 @@ production files remain byte-identical to the three GPU qualifications.
 The final SM100 run passed all 30 dense cases with strict goldens plus the
 existing known-E5M2-edge scope regression (31 passed, no failures or skips).
 
+Review follow-up on the same B300 runtime passed all 30 cases with recording
+unset and the four existing goldens unchanged. Graph cases now poison outputs
+and initialize workspace to both zero and `0xff` for eager execution and
+changed/restored-input replay. Every declared Amax is also checked with
+`sdpa.fp8.assert_amax_o` against the unscaled reference and stored output in
+pre-scale units; the existing output check is retained. The 26 CPU-tensor
+Amax checker regressions also pass. A 12-cell host precision-domain check
+reproduced six incorrect HALF/BFLOAT16 admissions before the fix and passes
+after aligning the public SWAP_AB domain with the lowering's None/FLOAT limit.
+This changes no kernel arithmetic or default selection.
+
 Record new goldens in a fresh directory only after numerical and replay checks
 pass, then compare them in a separate process with `CUDNN_DETERMINISM_GOLDENS`.
 
