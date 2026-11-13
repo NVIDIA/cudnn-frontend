@@ -246,7 +246,7 @@ a row alone and inside a batch under the entry's own picks.
   fixed packed layout: every FP32 accumulation adds in an order the layout
   fixes. The bytes change with the packed layout (key tiles, query groups,
   query ranges and KV passes are positions in the packed buffer), with
-  `max_seq_len`, with the GPU's SM count and with `ds_precision`. Every
+  `max_seq_len` and with the GPU's SM count. Every
   document must use one four-token block grid, and a row must not repeat a
   block.
 - Dense indexer backward exposes no determinism switch.

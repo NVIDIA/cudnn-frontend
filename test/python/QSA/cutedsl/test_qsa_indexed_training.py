@@ -234,7 +234,7 @@ def test_indexed_execute_on_a_sparse_plan_uses_only_caller_storage(canonical_inp
 
     inputs = canonical_inputs(28000, 83, h_kv=1, width=2052, saved_output_dtype=torch.float32)
     q, k, v, indices = (inputs[name] for name in ("q", "k", "v", "topk_idxs"))
-    plan = _plan(q.shape[0], indices.shape[1], q.device, "bprop", 0, 12, 3)
+    plan = _plan(q.shape[0], indices.shape[1], q.device, "bprop", 0, 12)
     assert plan.engine_plan.has_sparse
     outputs = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
     workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
@@ -266,7 +266,6 @@ def test_causal_topk_options_are_explicit_and_append_only(supported_gpu):
         ({"selection_mode": None}, "selection_mode"),
         ({"cu_seqlens": torch.tensor([0, 5], device="cuda", dtype=torch.int32)}, "require selection_mode"),
         ({"max_seq_len": 5}, "require selection_mode"),
-        ({"ds_precision": "fp16"}, "ds_precision"),
         ({"deterministic": 1}, "deterministic"),
     ]:
         with pytest.raises(ValueError, match=message):

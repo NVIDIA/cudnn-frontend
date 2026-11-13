@@ -186,16 +186,16 @@ class TestQSA:
 ENGINE_REPLAYS = [
     # dense kernel: several key tiles (a dQ row takes one add per tile), several bands per tile (as do its dK / dV
     # rows per band), a key tile shared by two sequences
-    pytest.param("bitmap", (300, 700, 129), 24, 2, "fp32", id="dense-tiles-q24-kv2"),
-    pytest.param("bitmap", (2057, 3), 12, 1, "bf16", id="dense-tiles-q12-kv1-bf16"),
-    pytest.param("bitmap", (1024,), 6, 1, "fp32", id="dense-tiles-q6-kv1"),
+    pytest.param("bitmap", (300, 700, 129), 24, 2, id="dense-tiles-q24-kv2"),
+    pytest.param("bitmap", (2057, 3), 12, 1, id="dense-tiles-q12-kv1"),
+    pytest.param("bitmap", (1024,), 6, 1, id="dense-tiles-q6-kv1"),
     # 6152 sparse queries fill a record window and a second one with two query ranges, the first size at which the order
     # of a key's adds shows. A token count that is a multiple of 8 leaves the key-major item list no spare key to pad with.
-    pytest.param("bitmap", (26632,), 24, 2, "fp32", id="sparse-windows-q24-kv2"),
-    pytest.param("bitmap", (26632,), 6, 1, "bf16", id="sparse-windows-q6-kv1-bf16"),
-    pytest.param("indexed", (26632,), 12, 1, "fp32", id="sparse-windows-indexed-q12-kv1"),
+    pytest.param("bitmap", (26632,), 24, 2, id="sparse-windows-q24-kv2"),
+    pytest.param("bitmap", (26632,), 6, 1, id="sparse-windows-q6-kv1"),
+    pytest.param("indexed", (26632,), 12, 1, id="sparse-windows-indexed-q12-kv1"),
     # a sparse sequence packed between dense ones, origins off the 4-token grid
-    pytest.param("indexed", (3, 26633, 2051), 12, 1, "fp32", id="sparse-packed-indexed-q12-kv1"),
+    pytest.param("indexed", (3, 26633, 2051), 12, 1, id="sparse-packed-indexed-q12-kv1"),
 ]
 
 
@@ -204,10 +204,10 @@ class TestQSABackwardEngine:
     """Backward replay on the engine paths the packed cases above do not reach."""
 
     @pytest.mark.L0
-    @pytest.mark.parametrize("entry, lengths, h_q, h_kv, ds_precision", ENGINE_REPLAYS)
-    def test_replay(self, entry, lengths, h_q, h_kv, ds_precision):
+    @pytest.mark.parametrize("entry, lengths, h_q, h_kv", ENGINE_REPLAYS)
+    def test_replay(self, entry, lengths, h_q, h_kv):
         _skip_cu12(h_kv)
         inputs = _inputs(lengths, h_kv, seed=sum(lengths), h_q=h_q)
-        run_entry = lambda: _entry_backward(entry, inputs, lengths, ds_precision=ds_precision, deterministic=True)
+        run_entry = lambda: _entry_backward(entry, inputs, lengths, deterministic=True)
         grads = assert_replays(lambda: dict(zip(("dq", "dk", "dv"), run_entry())), repeats=4)
         _check(inputs, tuple(grads[name] for name in ("dq", "dk", "dv")))
