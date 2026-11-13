@@ -5257,41 +5257,24 @@ CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
 
 ### 2026-11-13 follow-up
 
-The dedicated JAX SiTU suite includes two GB200 golden records.
-Golden JSON bytes are unchanged from
+Tested source revision: `f9619cedc5d8631654ee789d01d1eb8e1fdd04cb`.
+All 85 selected canonical cases and eight strict replay/invariance/golden
+cases passed, with zero failures or skips. The canonical total includes four
+independent Torch-reference cases and eight changed-data/routing cases.
+Both small golden cases also check their actual inputs and outputs against
+the shared numerical reference before checking or recording hashes.
+
+Runtime: GB200 SM100 (152 SMs), driver CUDA API 13050,
+JAX 0.12.0.dev20261014, Torch 2.16.0.dev20261030+cu130 (CUDA 13.0),
+cuDNN 9.26, CuTeDSL 4.8.0/compiler CUDA 13.4 and apache-tvm-ffi 0.1.15.post2.
+Use the commands above with `CUBLAS_WORKSPACE_CONFIG=:4096:8` and
+`CUDNN_DETERMINISM_RECORD` unset. Both golden JSONs are byte-identical to
 `5593a9f3816b918896f5ba526c0097ccdffa7f75`; no baseline was regenerated.
-The four SiTU implementation files are unchanged by this test-only follow-up.
 
-The canonical suite adds four independent numerical-reference cases using
-existing Torch SiTU and dSiTU reference helpers and the reference quantizer,
-plus eight changed-data/routing cases after JIT compilation. The latter cover
-direct/shared entries and global/expert-packed column scales. The small
-forward/backward golden cases now check their actual inputs and outputs
-against the shared numerical reference before checking or recording hashes.
-Numerical tolerances match the existing Torch checks; bytewise replay checks
-remain exact and continue to exclude atomic dprob.
+Two earlier reference-harness failures involved dprob singleton dimensions
+and inputs beyond the active row range. These were fixed without changing
+numerical tolerances or golden bytes; the complete suites then passed.
 
-New GB200 SM100 execution passed all 85 selected canonical cases and all
-eight strict replay/invariance/golden cases, with zero failures or skips.
-The latter ran with recording disabled and an explicit golden directory;
-both historical records matched without any hash update. The 12 new
-canonical reference/routing cases are included in the 85 passed cases.
-Both suites ran as separate steps in one persistent allocation. All six
-implementation/test source hashes matched the laptop checkout, and the
-imported cudnn package path pointed to that synchronized checkout.
-Runtime matches the historical record above: 152-SM GB200, driver CUDA API
-13050, Torch 2.16.0.dev20261030+cu130, JAX 0.12.0.dev20261014, cuDNN 9.26,
-CuTeDSL 4.8.0 and apache-tvm-ffi 0.1.15.post2. No native kernel code changed;
-the existing native frontend extension was reused.
-
-Two development runs found test-reference shape assumptions: dprob's
-singleton dimensions and probability rows beyond the active capacity.
-The shared reference now normalizes dprob shape and slices active inputs.
-The complete suites then passed with unchanged numerical tolerances and
-unchanged golden bytes. Fern check passed with zero errors; authenticated
-redirect checking was unavailable. Changed-file pre-commit passed.
-
-SM103, E5M2 and other runtime combinations remain unverified. No shared-memory
-kernel body is changed; dedicated warm-stress qualification of the underlying
-GEMM kernel is not claimed by this bridge follow-up. Atomic dprob remains
-outside the bytewise and golden guarantees.
+Atomic dprob remains outside bytewise/golden guarantees. SM103, E5M2 and other
+runtime combinations remain unverified. No shared-memory kernel body changed;
+dedicated warm-stress qualification of the underlying GEMM is not claimed.
