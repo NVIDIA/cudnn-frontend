@@ -548,7 +548,7 @@ def test_sm90_declines_pv_bf16():
 @pytest.mark.parametrize(
     ("declared", "why"),
     [
-        pytest.param(dict(paged_page_size=128, paged_max_seq_len_kv=256), "does not support paged KV", id="paged"),
+        pytest.param(dict(paged_page_size=128, paged_max_seq_len_kv=256), "paged KV requires device KV lengths", id="paged-without-kv-lengths"),
         pytest.param(dict(pertensor_fp8=True), "does not support FP8 or PV BF16 inputs", id="fp8"),
         pytest.param(dict(dtype=torch.float32), "Q/K/V/O other than FP16/BF16", id="qkv-dtype"),
         pytest.param(dict(dtype_o=torch.bfloat16), "an output dtype different from Q", id="o-dtype"),

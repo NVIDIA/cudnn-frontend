@@ -15,12 +15,13 @@ invariance per row count, the pick's byte neutrality and the goldens live in ``t
 import ast
 import importlib
 import inspect
+import json
 import subprocess
 import sys
 import textwrap
 import types
 import warnings
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,7 @@ from fp8_projection_decode_utils import (  # noqa: E402  (the operand builders, 
 
 from cudnn.gemm.frost.projection_decode import fp8_projection_decode as entry  # noqa: E402
 from cudnn.gemm.frost.projection_decode.kernel import fp8_projection_decode_config as kcfg  # noqa: E402
+from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 # ``no_workspace_shim``: this directory's conftest wraps the GEMM engine's MoE plans for every test unless a test opts out, which would
 # import the engine's compilers (and the DSL) into tests of an entry that never touches the engine.
@@ -559,6 +561,113 @@ def test_compile_key_is_plan_time_only():
     other = entry.Fp8ProjectionDecode("cpu", G_IN, split_k=2)
     assert other.key(3) != k.key(3) and entry.Fp8ProjectionDecode("cpu", G_IN, pdl=True).key(3) != k.key(3)
     hash(k.key(3))
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# host-only: the launch facts (cudnn.frost.launch_facts) -- the symbol of the compiled rendering, the form as plain data, the launch shape
+# ---------------------------------------------------------------------------------------------------------------------------
+def _launch_arithmetic(cfg):
+    """The launch of ``kernel/fp8_projection_decode_e4m3.py`` restated from the rendering's FIELDS and the shared-memory ledger: one
+    thread block per weight tile along x, one per K slice along y for the one token tile that holds the rows; 256 threads; the
+    reservation ``smem_bytes`` mirrors."""
+    grid = (-(-cfg.GEOM.OUT_FEATURES // cfg.MMA_M), -(-cfg.ROWS // cfg.TOKEN_TILE) * cfg.SPLIT_K, 1)
+    return (grid, (256, 1, 1), kcfg.smem_bytes(cfg.MMA_M, cfg.TOKEN_TILE, cfg.SPLIT_K, cfg.STAGES))
+
+
+LAUNCH_FACT_ARMS = [
+    dict(),
+    dict(pdl=True),
+    dict(form=Form(MMA_M=128, STAGES=4)),
+    dict(form=Form(MMA_M=64, STAGES=2, TOKEN_TILE=16), pdl=True, pdl_release=False),
+]
+
+
+@pytest.mark.parametrize("arm", LAUNCH_FACT_ARMS, ids=["pick", "pick-pdl", "form-m128-s4", "form-m64-s2-tile16-pdl"])
+@pytest.mark.parametrize("numerics", CLASSES, ids=cid)
+def test_launch_facts_equal_the_configuration_arithmetic_at_every_row_count(numerics, arm):
+    """EVERY served row count, 1 .. 32, per served class and form arm (the pick, the pick under dependent launch, two given forms): the
+    launch shape is the configuration arithmetic of the rendering ``cfg_for`` returns -- its thread blocks are the rendering's ``CTAS``
+    -- and the form is that rendering's fields, the geometry nested: the rendering is the whole compile key, so nothing is added."""
+    k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+    for rows in range(1, kcfg.MAX_ROWS + 1):
+        cfg = k.cfg_for(rows)
+        shape = k.launch_shape_for(rows)
+        assert shape == _launch_arithmetic(cfg), (rows, shape)
+        assert all(type(v) is int for v in (*shape.grid, *shape.block, shape.shared_memory)), shape
+        assert shape.grid[0] * shape.grid[1] == cfg.CTAS and shape.grid[1] == numerics.SPLIT_K and shape.shared_memory <= cfg.SMEM_OPTIN_BYTES
+        form = k.form_for(rows)
+        assert form == asdict(cfg) and form["ROWS"] == rows and form["SPLIT_K"] == numerics.SPLIT_K, rows
+        assert form["GEOM"] == dict(OUT_FEATURES=numerics.GEOM.OUT_FEATURES, IN_FEATURES=numerics.GEOM.IN_FEATURES)
+        assert (form["PDL"], form["PDL_RELEASE"]) == (
+            bool(arm.get("pdl")),
+            bool(arm.get("pdl_release", arm.get("pdl"))),
+        ), "the launch knobs are part of the form"
+        assert {name: form[name] for name in ("MMA_M", "STAGES", "TOKEN_TILE", "TMEM_COLS", "PREWAIT_WEIGHTS", "HOLD_TMEM")} == asdict(cfg.FORM)
+
+
+def test_launch_facts_follow_the_part(monkeypatch):
+    """The same equality on modelled part facts: a part with 100 KB per SM lowers the ring depth of the pick, and the launch shape and
+    the form follow the rendering the entry resolved for THAT part (its readings are fields of the form)."""
+    k = _modelled_cuda_entry(monkeypatch, (100 * 1024, 99 * 1024, 152), geometry=G_IN)
+    reference = entry.Fp8ProjectionDecode("cpu", G_IN)
+    for rows in range(1, kcfg.MAX_ROWS + 1):
+        assert k.launch_shape_for(rows) == _launch_arithmetic(k.cfg_for(rows)) and k.form_for(rows) == asdict(k.cfg_for(rows))
+        assert k.launch_shape_for(rows).shared_memory < reference.launch_shape_for(rows).shared_memory, "a shallower ring on the smaller part"
+    assert (k.form_for(1)["SMEM_PER_SM_BYTES"], k.form_for(1)["SMEM_OPTIN_BYTES"], k.form_for(1)["SM_COUNT"]) == (100 * 1024, 99 * 1024, 152)
+
+
+def test_launch_shape_of_the_served_classes_at_the_recorded_forms():
+    """The shapes a profiler recorded for launches on a cc 10.0 part, each form given explicitly on the reference readings: the three
+    served classes at their stage counts (the device cell below repeats the comparison on whatever part runs it)."""
+    for numerics, form, rows, want in (
+        (C_IN4, Form(MMA_M=64, STAGES=11), 1, ((72, 4, 1), (256, 1, 1), 107904)),
+        (C_IN4, Form(MMA_M=64, STAGES=7), 6, ((72, 4, 1), (256, 1, 1), 71040)),
+        (C_IN2, Form(MMA_M=64, STAGES=8), 9, ((72, 2, 1), (256, 1, 1), 86400)),
+        (C_OUT2, Form(MMA_M=64, STAGES=8), 1, ((128, 2, 1), (256, 1, 1), 76160)),
+    ):
+        k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, form=form)
+        assert k.launch_shape_for(rows) == want, (numerics, form, rows)
+
+
+def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
+    """The facts are plain data, a fresh object per call (a caller's edit reaches nothing of the entry) and the entry's typed declines
+    for a row count outside 1 .. 32."""
+    k = entry.Fp8ProjectionDecode("cpu", G_IN, pdl=True)
+    form = k.form_for(9)
+    assert json.loads(json.dumps(form)) == form and type(form) is dict and type(form["GEOM"]) is dict
+    form["PDL"], form["GEOM"]["OUT_FEATURES"] = "edited", 0
+    assert k.form_for(9)["PDL"] is True and k.form_for(9)["GEOM"]["OUT_FEATURES"] == 4608 and k.cfg_for(9).GEOM.OUT_FEATURES == 4608
+    for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
+        for rows in (0, -1, 1.0, "1", None, True):
+            with pytest.raises(ValueError, match="rows must be a positive int"):
+                fact(rows)
+        with pytest.raises(NotImplementedError, match="at most 32 rows"):
+            fact(33)
+        fact(32)
+
+
+class _CompiledStandIn:
+    """What the entry keeps per compile key, as far as the launch facts read it: a compiled DSL host function carries ``kernel_info``,
+    keyed by the symbols of the kernels it launches."""
+
+    def __init__(self, *symbols):
+        self.kernel_info = {symbol: {} for symbol in symbols}
+
+
+def test_kernel_symbol_is_that_of_the_rendering_compiled_for_the_row_count():
+    """Host-only, with stand-ins in the entry's compile cache: nothing compiled -> an empty tuple; a row count names the symbol of ITS
+    compiled rendering only (one rendering per row count; two renderings of one geometry share a symbol in practice, which is why the
+    form, not the symbol, tells them apart); a compiled object that does not expose its kernels is the typed decline, never a guess."""
+    k = entry.Fp8ProjectionDecode("cpu", G_IN)
+    assert all(k.kernel_symbols_for(rows) == () for rows in range(1, kcfg.MAX_ROWS + 1))
+    shared = "cudnn_kernel_frost_fp8_projection_decode_o460881921819210_0"
+    k.compiled[k.cfg_for(3)] = _CompiledStandIn(shared)
+    assert k.kernel_symbols_for(3) == (shared,) and k.kernel_symbols_for(4) == () and k.kernel_symbols_for(1) == ()
+    k.compiled[k.cfg_for(9)] = _CompiledStandIn(shared)
+    assert k.kernel_symbols_for(9) == k.kernel_symbols_for(3) == (shared,) and k.form_for(9) != k.form_for(3), "one symbol, two forms"
+    k.compiled[k.cfg_for(3)] = object()
+    with pytest.raises(NotImplementedError, match="the FP8 projection decode kernel: the installed CuTe DSL .* does not expose the kernel symbols"):
+        k.kernel_symbols_for(3)
 
 
 def test_dsl_gate_names_the_version_and_the_missing_layer(monkeypatch):
@@ -1235,3 +1344,25 @@ def test_warm_launches_keep_writing_the_cold_bytes(numerics, rows):
             launches += len(ring)
     assert launches >= 2000
     assert wrong == 0, f"{wrong} of {launches} warm launches wrote other bytes than the cold launch"
+
+
+LAUNCH_RECORD_CELLS = [(C_IN4, 1, dict()), (C_IN4, 6, dict(pdl=True)), (C_IN2, 9, dict()), (C_OUT2, 1, dict())]
+
+
+@pytest.mark.parametrize("numerics, rows, arm", LAUNCH_RECORD_CELLS, ids=["in-split4-rows1", "in-split4-rows6-pdl", "in-split2-rows9", "out-split2-rows1"])
+def test_launch_facts_equal_the_profilers_record_of_a_launch(numerics, rows, arm):
+    """On the device: one launch of the entry's pick for ``rows`` on THIS part (each served class; one under dependent launch) is ONE
+    kernel whose profiler record -- name, grid, block, shared memory -- equals the entry's launch facts; nothing is named before the
+    first compile, and another row count of the entry is named only once it is compiled.  A fresh entry per cell (not the module's
+    shared ones): the cell reads the compile cache.  The helper synchronises between its warm launch and the recorded one, so the
+    dependent-launch form finds no kernel in flight."""
+    dev = device_or_skip()
+    k = entry.Fp8ProjectionDecode(dev, numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+    ops = _ops(dev, numerics.GEOM, "random")
+    out = new_out(numerics.GEOM, rows, dev)
+    assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
+    record = assert_facts_equal_the_launch(k, lambda: k(ops["weight"], ops["activation"][:rows], ops["scale"], out), rows, what=entry.NAME)
+    assert record.name.startswith("cudnn_kernel_frost_fp8_projection_decode_"), record.name
+    other = 32 if rows != 32 else 1
+    assert k.kernel_symbols_for(other) == (), "a row count that was not compiled names nothing"
+    assert k.form_for(rows) == asdict(k.cfg_for(rows)) and (k.form_for(rows)["PDL"], k.form_for(rows)["ROWS"]) == (bool(arm.get("pdl")), rows)

@@ -38,7 +38,17 @@ from mxfp8_test_reference import _cdiv, _quantize, _quantize_seq, _ref
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import (
+    _SM,
+    assert_no_new_spills,
+    make_dense_stats,
+    requires_blackwell,
+    requires_dsl,
+    requires_pre_rubin_blackwell,
+    requires_rubin,
+    run_sass_probe,
+    sass_probe_source,
+)
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -1793,8 +1803,8 @@ def _run_thd(
         else:
             if stats_layout == "head":
                 # Ragged Stats, packed HEAD-major: [h, head_stride] storage, the head stride a token capacity that
-                # covers the packed total (rounded up to 64 like the backward suite declares it); the kernel adds
-                # cu_q[b] itself, the ragged offsets keep the declaration a packed one (SDPA Rule S1).
+                # covers the packed total (rounded up to 64 like the backward suite declares it).
+                # Each sequence's physical element origin advances by one per token in this layout.
                 head_stride = max(64, _cdiv(T_q, 64) * 64)
                 stats_stor = torch.zeros(H_q * head_stride, dtype=torch.float32, device=dev)
                 stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((H_q * head_stride, head_stride, 1, 1))
@@ -1803,7 +1813,8 @@ def _run_thd(
                 # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
                 stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
                 stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-            stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
+            stats_token_stride = 1 if stats_layout == "head" else H_q
+            stats_ro_t = (torch.tensor(cu_q, dtype=torch.int64, device=dev) * stats_token_stride).view(B + 1, 1, 1, 1)
             stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
             stats_t.set_ragged_offset(stats_ro)
             vp[stats_ro] = stats_ro_t
@@ -3043,3 +3054,26 @@ def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
     assert not o_neg.isnan().any()
     assert torch.equal(o_neg, o_pos)
     assert torch.equal(a_neg, a_pos)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestPhysicalOrigins:
+    """Collect native D128/D512 origin contracts in the architecture CI entry."""
+
+    from sdpa.frost import sdpa_fwd_thd_origins_mxfp8_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestMidwidthPhysicalOrigins:
+    """Exercise independent origins on the D192/V128 and D256 native bodies."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _checks("mxfp8")

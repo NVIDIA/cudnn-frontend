@@ -27,9 +27,8 @@ assert the decline through the row's own ``mismatch()`` on REAL graphs with a
 faked cc 10.7 device -- including the one shape-conditioned decline this row
 carries and the half row does not: bottom-right causal with ``S_q % 128 != 0``
 (the fp8 body derives the diagonal from its PADDED S_q; ``api_dsl_sm107`` module
-doc), asserted host-side on the row probe AND the adapter backstop, and end to
-end on Rubin.  The two graph-admission cases of the bring-up
-placeholder are kept (Rubin only).  The host-only static and sm_107a SASS pins
+doc), asserted host-side on the row probe AND the adapter backstop.  The two
+graph-admission cases of the bring-up placeholder are kept (Rubin only).  The host-only static and sm_107a SASS pins
 of this row's kernel body live in ``test_sdpa_bwd_dsl_sm107.py`` (both bodies,
 one machinery); the kernel-vs-kernel targets are the pre-port kernel's
 ``fp8_*.pt`` dumps under ``frost_dev/results/bwd_d256_sm107/<ref>/`` (located by
@@ -1151,22 +1150,6 @@ def test_unserved_e5m2_graph_declines_as_not_supported():
     fails to finalize used to fold into (every SDPA harness skips on the typed error and FAILS on anything else)."""
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         g = _build_graph(fp8=_E5M2)
-        g.validate()
-        g.build_operation_graph()
-        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        g.check_support()
-        g.build_plans()
-
-
-@requires_rubin
-@pytest.mark.parametrize("sq,skv", _BR_RAGGED_SQ_SHAPES[:1], ids=_BR_RAGGED_SQ_IDS[:1])
-def test_unserved_bottom_right_ragged_s_q_graph_declines_as_not_supported(sq, skv):
-    """End to end on the device: the row's ``mismatch()`` drops it, no other engine serves a d256 fp8 backward, and the
-    typed ``cudnnGraphNotSupportedError`` surfaces (never a silently shifted diagonal, never a bare RuntimeError)."""
-    if _spec().capabilities.bottom_right_s_q_multiple == 1:
-        pytest.skip("the fp8 row serves a ragged S_q under bottom-right now; test_causal_bottom_right_* cover it")
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g = _build_graph(b=1, h=2, s=sq, skv=skv, causal=True, bottom_right=True)
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])

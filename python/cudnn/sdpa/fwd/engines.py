@@ -39,6 +39,7 @@ from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains as _sm80_graph_tile_domains
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
+    supports_d64_fp8_swap_ab,
     SM100_SCORE_STATS_SHAPES,
     SM100_THD_PACK_GQA_SHAPES,
     SM100_PAGED_FP8_THD_SHAPES,
@@ -181,6 +182,8 @@ class SdpaFwdKnobs:
     split_kv: Optional[int] = None
     # Warp-specialization topology: 0 = existing topology, 1 = one full Q tile.
     warp_spec_cfg: Optional[int] = None
+    # Explicit MMA operand orientation; unset preserves the existing lowering.
+    swap_ab: Optional[int] = None
 
     # field name -> cudnn.knob_type member name (resolved lazily: the compiled
     # module is not importable at class-definition time in every build).
@@ -192,6 +195,7 @@ class SdpaFwdKnobs:
         ("pack_gqa", "PACK_GQA"),
         ("split_kv", "SPLIT_KV"),
         ("warp_spec_cfg", "WARP_SPEC_CFG"),
+        ("swap_ab", "SWAP_AB"),
     )
 
     def to_public(self) -> dict:
@@ -621,6 +625,7 @@ class Capabilities:
 
     # Append-only public warp-topology knob domain.
     warp_spec_cfgs: frozenset[int] = frozenset({0})
+    swap_abs: frozenset[int] = frozenset()
 
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
@@ -1147,6 +1152,28 @@ def _sm80_explicit_tile_domains(capabilities: Capabilities, facts: "ga.SdpaGraph
     return None
 
 
+def effective_swap_abs(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: SdpaFwdKnobs) -> frozenset[int]:
+    """The existing prefill and swap-AB decode bodies on the same legal graph."""
+    if not capabilities.swap_abs or not facts.is_fp8 or facts.o_block_scale:
+        return frozenset()
+    if facts.has_bias or facts.has_kv_mask or facts.has_epilogue_gate or facts.has_score_max or facts.has_score_sum_exp or facts.attn_scale_prefolded:
+        return frozenset()
+    if not supports_d64_fp8_swap_ab(
+        _selected_d_shape(capabilities, facts, knobs),
+        device_cc=facts.device_cc,
+        paged=facts.has_paged_kv,
+        thd=facts.thd,
+        batch_size=facts.b,
+        s_q=facts.s_q,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        pack_gqa=knobs.pack_gqa,
+        cga=knobs.cga,
+    ):
+        return frozenset()
+    return capabilities.swap_abs
+
+
 def effective_tile_ms(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
     """Explicit native query tiles; keep the default proposal domain unchanged."""
     sm80_domains = _sm80_explicit_tile_domains(capabilities, facts, knobs)
@@ -1161,8 +1188,15 @@ def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     if sm80_domains is not None:
         return sm80_domains[1]
     selected = _selected_d_shape(capabilities, facts, knobs)
-    if selected == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1 and not (facts.is_fp8 or facts.is_mxfp8):
-        return frozenset({128})  # the packed split host selects the single-Q body
+    if (
+        selected == (64, 64)
+        and facts.thd
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and (capabilities.sm_lo == 100 or (knobs is not None and (knobs.split_kv or 1) > 1))
+    ):
+        # Native SM100 D64 THD and the shared split body use N128. The N64
+        # small-tile factory serves dense, unpacked inputs on SM100 only.
+        return frozenset({128})
     if capabilities.sm_lo == 107 and facts.is_fp8 and not facts.is_mxfp8:
         # Explicit per-tensor widths do not inherit the half-precision resident-arm
         # default picker. Keep the row's default128 while admitting the D64 option.
@@ -1322,6 +1356,11 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and facts.has_paged_kv and selected == (192, 128):
         return frozenset({2})
     if sm100_nonpaged_d128_thd_single_cta_leg(capabilities, facts, cga=cga, split_kv=split_kv):
+        return frozenset({1, 2})
+    if capabilities.sm_lo == 107 and capabilities.is_fp8 and selected == (128, 128) and not facts.thd and not facts.has_paged_kv and (split_kv or 1) > 1:
+        # Native per-tensor D128 has single-CTA FP32 partial stores as well
+        # as the collective path. The split domain is independent of the
+        # unsplit small-working-set policy below; ranking chooses between them.
         return frozenset({1, 2})
     if (
         capabilities.sm_lo == 107
@@ -1672,7 +1711,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return facts.invalid
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
-    if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64):
+    if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
         why = native_d64_mismatch(
@@ -1690,6 +1729,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         )
         if why is not None:
             return why
+    if capabilities.sm_lo == 90 and facts.has_paged_kv:
+        if facts.thd:
+            return "SM90 paged KV currently requires dense Q"
     if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
@@ -1718,6 +1760,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv, knobs.cga), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
             (knobs.warp_spec_cfg, capabilities.warp_spec_cfgs, "warp_spec_cfg"),
+            (knobs.swap_ab, effective_swap_abs(capabilities, facts, knobs), "swap_ab"),
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
@@ -2236,7 +2279,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             cga=knobs.cga if knobs is not None else None,
             thd=facts.thd,
         ):
-            return "native D64 THD requires half inputs; paged plans are unsplit and nonpaged splits require one CTA"
+            return "native D64 THD requires half inputs; split plans require one CTA"
     if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
         from cudnn.sdpa.native_sm80 import forward_thd_layout_mismatch
 
@@ -2548,8 +2591,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(capabilities.paged_d_shapes))
                 return f"paged KV is wired on the {wired} kernel flavors only; head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
         p = facts.page_size
-        if p % 8 != 0 or (p < 128 and 128 % p != 0) or (p > 128 and p % 128 != 0):
-            return f"page_size {p} must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it"
+        page_tile = 64 if capabilities.sm_lo == 90 else 128
+        if p % 8 != 0 or (p < page_tile and page_tile % p != 0) or (p > page_tile and p % page_tile != 0):
+            return f"page_size {p} must be a multiple of 8 that divides the {page_tile}-row KV tile or is a multiple of it"
 
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
@@ -2907,7 +2951,7 @@ def _sm107_spec() -> EngineSpec:
             # SM107_F16_THD_SHAPES is the single definition, shared with the
             # standalone adapter's gate so the two cannot drift (rule 8b').  It
             # covers the native D64 and larger f16 flavors. D32 remains dense;
-            # D64 THD additionally requires nonpaged, unsplit plans.
+            # D64 THD splits require the single-CTA N128 body.
             thd=True,
             thd_padded_stats=True,
             padded_stats=True,
@@ -3336,6 +3380,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
             split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((192, 128), frozenset({2})))),
+            swap_abs=frozenset() if rubin_row else frozenset({0, 1}),
             # f16x2-softmax arm: only the cc 10.7 sibling kernels carry the
             # path, in every per-tensor FP8 flavor (MUFU EX2.F16x2 exists below
             # cc10.7 but no other file wires it). FLOAT is the f32 pipeline
@@ -3717,6 +3762,7 @@ def _sm120_spec() -> EngineSpec:
             tile_ns=frozenset({16, 32, 48, 64, 128}),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
+            pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
@@ -3908,6 +3954,7 @@ def lower_dsl_prefill(
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         **({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {}),
+        **({"swap_ab": knobs.swap_ab} if knobs is not None and knobs.swap_ab is not None else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
         # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
@@ -3991,7 +4038,14 @@ def lower_dsl_prefill(
                 (
                     not (facts.is_fp8 or facts.is_mxfp8)
                     and (
-                        ((api.split_kv == 1 or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE) and api.cga in (None, 2))
+                        (
+                            (
+                                api.split_kv == 1
+                                or (facts.d_qk, facts.d_v) == SM100_NATIVE_D576_SHAPE
+                                or ((facts.d_qk, facts.d_v) == (256, 256) and facts.has_paged_kv and api.packed_thd_split)
+                            )
+                            and api.cga in (None, 2)
+                        )
                         or (
                             facts.d_qk == 128
                             and api.cga == 1
@@ -4004,8 +4058,21 @@ def lower_dsl_prefill(
                         )
                     )
                 )
-                or (facts.is_fp8 and facts.has_paged_kv and api.split_kv == 1)
+                or (facts.is_fp8 and (facts.has_paged_kv or (facts.d_qk, facts.d_v) in ((128, 128), (256, 256))) and api.split_kv == 1)
             )
+        )
+        or (
+            # D64 paging and packed prefill share D128's origin-aware body.
+            # Explicit live lengths must not replace the graph's Q/O/Stats
+            # addresses, including when the split scratch is compact.
+            facts.thd
+            and not getattr(api, "thd_decode_leg", False)
+            and facts.epilogue_gate_t is None
+            and spec.name == "sdpa_fwd_prefill_sm100"
+            and facts.device_cc in ((10, 0), (10, 3))
+            and (facts.d_qk, facts.d_v) == (64, 64)
+            and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+            and (facts.has_paged_kv or api.pack_gqa)
         )
         or (
             # Native D64 and paged D192 use the same per-port origins as native D128.
@@ -4037,7 +4104,56 @@ def lower_dsl_prefill(
             and api.split_kv == 1
             and api.cga in (None, 2)
         )
+        or (
+            facts.thd
+            and spec.name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm100_fp8")
+            and api.flavor == (512, 512)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm107"
+            and api.flavor == (512, 512)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm107_fp8"
+            and api.flavor in ((128, 128), (192, 128), (256, 256), (512, 512))
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm107_mxfp8"
+            and api.flavor == (256, 256)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name in ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_prefill_sm100_mxfp8")
+            and api.flavor == (192, 128)
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
+        or (
+            facts.thd
+            and spec.name == "sdpa_fwd_prefill_sm100_mxfp8"
+            and api.flavor in ((128, 128), (256, 256), (512, 512))
+            and not facts.has_paged_kv
+            and facts.epilogue_gate_t is None
+            and api.split_kv == 1
+        )
         or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
+        or (facts.thd and spec.name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
@@ -4272,7 +4388,7 @@ def lower_dsl_prefill(
                 block_table=_table_view(bt_k, binding.paged_k_table, facts.b),
                 block_table_v=_table_view(bt_v, binding.paged_v_table, facts.b),
             )
-        if facts.thd and ("sample_ragged_q" in _ctor_params or (spec.name == "sdpa_fwd_prefill_sm120" and getattr(api, "_thd_origin_specs", None) is not None)):
+        if facts.thd and ("sample_ragged_q" in _ctor_params or getattr(api, "_thd_origin_specs", None) is not None):
             for name in ("q", "k", "v", "o", "stats"):
                 offsets = getattr(binding, "ragged_" + name)
                 execute_kwargs["ragged_" + ("lse" if name == "stats" else name)] = (
@@ -4529,6 +4645,7 @@ def _sm90_spec() -> EngineSpec:
             right_band_widening=True,
             swa=True,
             padded=True,
+            paged_kv=True,
             padded_stats=True,
             sink=True,
             stats=True,

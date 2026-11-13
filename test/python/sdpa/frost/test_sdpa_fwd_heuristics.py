@@ -404,8 +404,11 @@ def test_sm120_d512_sliding_window_packs_gqa():
     for d_qk, d_v in ((264, 512), (512, 264), (320, 384)):
         packed = primary(window_left=128, d_qk=d_qk, d_v=d_v)
         assert (packed.pack_gqa, packed.tile_m, packed.tile_n, packed.sched_policy) == (True, 64, 32, SCHED_LPT)
-    pro = primary(window_left=128, h_q=128, h_kv=1)  # G=128 does not divide the 64-row tile; windowed units still walk LPT
-    assert (pro.pack_gqa, pro.sched_policy) == (False, SCHED_LPT)
+    # G=128 does not fit the 64-row tile: a partial-PackGQA flavor packs a 64-head subgroup, the full contract stays unpacked;
+    # windowed units walk LPT either way.
+    pro = primary(window_left=128, h_q=128, h_kv=1)
+    partial = (512, 512) in (spec.capabilities.pack_gqa_partial_d_shapes or ())
+    assert (pro.pack_gqa, pro.sched_policy) == (partial, SCHED_LPT)
     assert primary(window_left=128, h_q=64, h_kv=64).pack_gqa is False  # MHA
     full_causal = primary()  # full causal prefill: decode rule only, L2 rule for the scheduler
     assert (full_causal.pack_gqa, full_causal.sched_policy) == (False, SCHED_LPT_L2)
@@ -451,14 +454,20 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
             assert reason(tile, d_qk=d, d_v=d) is None, (d, tile)
             assert reason(tile, d_qk=d, d_v=d, h_q=20) is None, (d, tile)  # G = 5
             refused = reason(tile, d_qk=d, d_v=d, h_q=2 * tile[0], h_kv=1)
-            assert refused is not None and f"does not pack at tile_m={tile[0]}" in refused, (d, tile, refused)
+            if (d, d) in (caps.pack_gqa_partial_d_shapes or ()):
+                assert refused is None, (d, tile, refused)  # partial PackGQA packs a tile-sized subgroup
+            else:
+                assert refused is not None and f"does not pack at tile_m={tile[0]}" in refused, (d, tile, refused)
 
     def unset(h_q, d):
         facts = _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=h_q, h_kv=1, d_qk=d, d_v=d)})
         return engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
 
     refused = unset(96, 512)
-    assert refused is not None and "does not pack at tile_m=64" in refused, refused
+    if engines.pack_gqa_partial(caps, _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=96, h_kv=1, d_qk=512, d_v=512)})):
+        assert refused is None, refused  # partial PackGQA packs a 32-head subgroup of the 96
+    else:
+        assert refused is not None and "does not pack at tile_m=64" in refused, refused
     assert unset(64, 512) is None
     assert unset(96, 256) is None  # 128 rows below D=512
     assert pack_gqa_supported(24, 4, 64, requires_divisible=False) and pack_gqa_supported(64, 1, 64, requires_divisible=False)
@@ -2522,3 +2531,284 @@ def test_sm107_pt_fp8_d128_dense_legs_take_the_single_cta(sm107_metadata_target)
     mx = _facts(**{**base, "is_fp8": False, "is_mxfp8": True, "dtype_o": cudnn.data_type.BFLOAT16})
     assert effective_cgas(mx_spec.capabilities, mx) == frozenset({1, 2})
     assert _auto_sched_cga(mx_spec, mx, split_kv=1, sched_policy=SCHED_LPT) == (SCHED_LPT, 1)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q", [2 * 66, 2 * 96, 2 * 128])
+def test_sm120_partial_pack_candidates_use_the_packed_subgroup(h_q):
+    """A partial-PackGQA SM120 half flavor packs a subgroup of a ratio larger than its 64-row tile (G 66 -> 2, 96 -> 32,
+    128 -> 64): candidate generation scores the subgroup the kernel packs, so G 66 / 96 / 128 list admissible sets instead
+    of dividing the tile by G (zero rows per head). Groups that fit the tile keep their full-ratio score."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.config_sm120 import WIDE_F16_FLAVORS
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_group, _pack_gqa_points
+
+    spec = _sm120_spec("sdpa_fwd_prefill_sm120")
+    caps = dataclasses.replace(spec.capabilities, pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS)
+    shape = dict(b=2, h_kv=2, s_q=3, s_kv=65, d_qk=512, d_v=512, dtype=cudnn.data_type.HALF, causal=True, device_cc=(12, 0), device_sm_count=188)
+    facts = SdpaGraphFacts(h_q=h_q, **shape)
+    p = _pack_gqa_group(caps, facts, 64, True)
+    assert 1 < p < h_q // 2 and (h_q // 2) % p == 0 and 64 % p == 0, p
+    assert True in _pack_gqa_points(caps, facts, 64, 1, 1)
+    for g in (6, 64):
+        assert _pack_gqa_points(caps, SdpaGraphFacts(h_q=2 * g, **shape), 64, 1, 1) == _pack_gqa_points(
+            spec.capabilities, SdpaGraphFacts(h_q=2 * g, **shape), 64, 1, 1
+        )
+
+
+@pytest.mark.L0
+def test_sm107_paged_d64_prefix_splits_on_the_rubin_budget(sm107_metadata_target):
+    """Study sm107_paged_d64_split_20261112: a Rubin paged bf16 D64 GQA prefix inside the measured bounds splits on the D128 Rubin
+    budget (packed, one CTA, N128 -- the native split #2502 admits) and leads; outside them it keeps the unsplit default."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    base = dict(
+        b=1,
+        h_q=64,
+        h_kv=8,
+        s_q=64,
+        s_kv=32768,
+        d_qk=64,
+        d_v=64,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (16 * 64 * 8, 16 * 64, 64, 1)),
+        max_total_seq_len_q=None,
+        device_cc=(10, 7),
+        device_sm_count=208,
+    )
+    f = _facts(**base)
+    splits, packed = paged_thd_split_choice(spec.capabilities, f)
+    assert splits > 1 and packed
+    first = _sm107_f16_plans(f)[0].knobs
+    assert (first.split_kv, first.pack_gqa, first.cga, first.tile_n) == (splits, True, 1, 128)
+    assert engines.mismatch(spec.capabilities, f, first) is None
+    assert placement.place(spec, f) == placement.LEAD
+    for over in (dict(h_q=40, h_kv=8), dict(b=17), dict(s_q=2048, s_kv=65536), dict(page_size=32), dict(has_sink=True), dict(window_left=127)):
+        assert paged_thd_split_choice(spec.capabilities, _facts(**dict(base, **over)))[0] == 1, over
+
+
+def _sm100_paged_prefix(d, h_q, h_kv, **over):
+    """FlashInfer's exact paged prefill declaration on a 148-SM cc 10.0 part (head-major page pool, page 16)."""
+    from types import SimpleNamespace
+
+    base = dict(
+        b=1,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=64,
+        s_kv=32768,
+        d_qk=d,
+        d_v=d,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        k_t=SimpleNamespace(get_stride=lambda: (16 * d * h_kv, 16 * d, d, 1)),
+        device_cc=(10, 0),
+        device_sm_count=148,
+    )
+    base.update(over)
+    base.setdefault("max_total_seq_len_q", base["b"] * base["s_q"])
+    return _facts(**base)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [dict(page_size=64), dict(page_size=32), dict(s_kv=131072), dict(s_q=16), dict(b=16, s_q=32)],
+    ids=["page64", "page32", "kv128k", "q16", "b16"],
+)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["b200", "b300"])
+def test_sm100_paged_d128_prefix_envelope_splits(over, cc):
+    """B200 and B300 widen the paged D128 GQA split envelope (study sm103_paged_d128_envelope_20261112): pages 32 / 64, s_q from
+    16, S_kv to 131072 and b to 16 split and lead."""
+    from cudnn.sdpa.fwd import heuristics, placement
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    values = dict(s_q=128, page_size=16)
+    values.update(over)
+    facts = _sm100_paged_prefix(128, 32, 8, device_cc=cc, **values)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts)[0] > 1
+    assert placement.place(spec, facts) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, b, h_q, h_kv, s_q, s_kv, splits",
+    [
+        (64, 3, 32, 8, 128, 32767, 3),  # FlashInfer case: unsplit PACK0 ran 2.4x the best packed split
+        (64, 16, 32, 8, 32, 4095, 2),
+        (256, 12, 64, 8, 128, 32768, 4),
+        (64, 8, 64, 8, 128, 8192, 1),  # D64 at 128 rows over 64 KV tiles: no split
+        (64, 4, 32, 8, 256, 65536, 1),  # several Q tiles: the D64 tail split reverted (equal-length check)
+        (256, 4, 16, 2, 256, 8192, 1),
+    ],
+    ids=["d64_case102", "d64_q32", "d256_q128", "d64_q128_short_kv", "d64_q256", "d256_q256"],
+)
+def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv, splits):
+    """Study sm100_paged_packed_split_waves_20261112: with no first-wave room the packed split still leads short queries."""
+    from cudnn.sdpa.fwd import heuristics
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
+    assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, facts) == splits
+    b300 = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3))
+    assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, b300) == splits  # the B300 transfer qualified the same rule
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "b, h_q, h_kv, s_q, s_kv",
+    [(8, 64, 8, 128, 32767), (32, 8, 1, 128, 2049), (64, 16, 2, 128, 8191), (1, 32, 8, 16, 512), (16, 32, 4, 2048, 4096), (4, 64, 8, 128, 131072)],
+    ids=["b8_g8_kv32k", "b32_g8_kv2k", "b64_g8_kv8k", "q16", "q2048", "b4_g8_kv128k"],
+)
+def test_b200_paged_d128_prefix_leads(b, h_q, h_kv, s_q, s_kv):
+    """Study sm100_paged_d128_prefill_20261112: on cc 10.0 / 10.3 FlashInfer's exact paged D128 GQA prefix (S_q < S_kv) leads."""
+    from cudnn.sdpa.fwd import placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
+    assert placement._sm100_paged_d128_prefix(facts)
+    assert placement.place(spec, facts) == placement.LEAD
+    assert placement._sm100_paged_d128_prefix(_sm100_paged_prefix(128, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3)))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=64, s_kv=64),  # a square: tiny squares trail 1.3-2.0x
+        dict(max_total_seq_len_q=8 * 128),  # an exact total-Q declaration was not measured
+        dict(device_cc=(10, 7), device_sm_count=208),
+        dict(b=65),
+        dict(s_kv=131073),
+        dict(page_size=32),
+        dict(h_q=32, h_kv=32),
+    ],
+    ids=["square", "total_q", "rubin", "b65", "kv_past_128k", "page32", "mha"],
+)
+def test_b200_paged_d128_prefix_rule_stays_inside_its_study(over):
+    from cudnn.sdpa.fwd import placement
+
+    values = dict(b=8, h_q=64, h_kv=8, s_q=128, s_kv=32767, max_total_seq_len_q=None)
+    values.update(over)
+    h_q, h_kv = values.pop("h_q"), values.pop("h_kv")
+    assert not placement._sm100_paged_d128_prefix(_sm100_paged_prefix(128, h_q, h_kv, **values))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d, h_q, h_kv, s_q, cga", [(64, 32, 8, 64, 1), (256, 16, 8, 128, 2)], ids=["d64", "d256"])
+def test_sm100_paged_d64_d256_prefix_defaults_to_the_packed_split(d, h_q, h_kv, s_q, cga):
+    """A one-request prefix over a 32k cache packs to 16 tiles (D64 decode tile) / 8 pairs (D256) on 148 SMs, so the default is
+    FROST's packed split over 9 partitions (B200: 941 -> 41 us D64, 371 -> 78 us D256 vs the previous default)."""
+    from cudnn.sdpa.fwd import placement
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    facts = _sm100_paged_prefix(d, h_q, h_kv, s_q=s_q)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id == _OFFERED[_F16])
+    assert first.knobs == SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=9)
+    assert engines.mismatch(spec.capabilities, facts, first.knobs) is None
+    assert placement.place(spec, facts) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(b=16, s_q=1024, s_kv=4096),  # the packed launch fills the part: no split
+        dict(h_q=32, h_kv=32),  # MHA: nothing to pack
+        dict(causal=False, bottom_right=False),
+        dict(device_cc=(10, 7), device_sm_count=208),
+        dict(s_kv=512),
+        dict(dtype=cudnn.data_type.FP8_E4M3),
+    ],
+    ids=["full-grid", "mha", "mask-free", "rubin", "short-kv", "fp8"],
+)
+def test_sm100_paged_packed_split_stays_inside_its_domain(over):
+    from cudnn.sdpa.fwd.heuristics import sm100_paged_packed_split_choice
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    heads = dict(h_q=32, h_kv=8)
+    heads.update({k: over.pop(k) for k in ("h_q", "h_kv") if k in over})
+    for d in (64, 256):
+        assert sm100_paged_packed_split_choice(spec.capabilities, _sm100_paged_prefix(d, heads["h_q"], heads["h_kv"], **over)) == 1, (d, over)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d, h_q, h_kv, over, choice",
+    [
+        (64, 32, 32, dict(b=8, s_q=32, s_kv=32768), (3, False)),
+        (128, 64, 64, dict(b=8, s_q=64, s_kv=4095), (2, False)),
+        (128, 32, 16, dict(b=16, s_q=64, s_kv=4095), (2, True)),
+        (256, 16, 8, dict(b=4, s_q=256, s_kv=65536), (4, True)),  # D256, several Q tiles
+        (256, 16, 16, dict(b=4, s_q=32, s_kv=16384), (1, False)),  # D256 one Q tile: reverted (equal-length check)
+        (128, 64, 8, dict(b=4, s_q=128, s_kv=65536), (1, False)),  # D128 several Q tiles: reverted (ran 1.25-1.33x equal-length)
+        (64, 32, 4, dict(b=2, s_q=512, s_kv=16383), (1, False)),
+    ],
+    ids=["mha_d64", "mha_d128", "g2_d128_b16", "g2_d256_q256", "mha_d256_one_tile", "g8_d128_q128", "d64_q512"],
+)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)], ids=["b200", "b300"])
+def test_sm100_paged_tail_split(d, h_q, h_kv, over, choice, cc):
+    """Study sm100_paged_split_v2_20261112: a prefix the measured choosers leave unsplit still splits when its KV loop is long
+    next to the wave load (MHA, group 2, several waves of units); the split leads and is the first FROST plan."""
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(d, h_q, h_kv, max_total_seq_len_q=None, device_cc=cc, **over)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == choice
+    if choice[0] > 1:
+        assert placement.place(spec, facts) == placement.LEAD
+        first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id == _OFFERED[_F16])
+        assert (first.knobs.split_kv, bool(first.knobs.pack_gqa)) == choice
+
+
+@pytest.mark.L0
+def test_sm100_paged_d256_mha_prefix_leads_unsplit():
+    """Study sm100_paged_split_v2_20261112: the D256 pair tile ran 0.45-0.51 of the backend on every MHA prefix, split or not."""
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    facts = _sm100_paged_prefix(256, 16, 16, b=2, s_q=1024, s_kv=4096, max_total_seq_len_q=None)
+    assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == (1, False)
+    assert placement.place(spec, facts) == placement.LEAD
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(device_cc=(10, 7), device_sm_count=208),
+        dict(max_total_seq_len_q=8 * 64),  # a total-Q declaration was not measured
+        dict(b=17),
+        dict(s_kv=65537),
+        dict(s_q=8),
+        dict(dtype=cudnn.data_type.FP8_E4M3),
+        dict(window_left=128),
+    ],
+    ids=["rubin", "total_q", "b17", "kv_past_64k", "q8", "fp8", "window"],
+)
+def test_sm100_paged_tail_split_stays_inside_its_study(over):
+    from cudnn.sdpa.fwd import heuristics, placement
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    values = dict(b=8, s_q=64, s_kv=4095, max_total_seq_len_q=None)
+    values.update(over)
+    assert heuristics.sm100_paged_tail_split_choice(spec.capabilities, _sm100_paged_prefix(128, 64, 64, **values)) == (1, False), over
+    assert not heuristics.sm100_paged_tail_split_domain(spec.capabilities, _sm100_paged_prefix(256, 16, 16, **values)), over

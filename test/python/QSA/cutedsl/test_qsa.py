@@ -126,14 +126,13 @@ def test_signature():
     tail = ["sel_blocks", "lo", "hi", "blk_base", "tok_base", "block_first", "block_last", "scale", "block_size"]
     for function, prefix, options in (
         (qsa_forward, ["q", "k", "v"], []),
-        (qsa_backward, ["grad_out", "q", "k", "v", "out_fp32", "lse"], ["ds_precision", "deterministic"]),
+        (qsa_backward, ["grad_out", "q", "k", "v", "out_fp32", "lse"], ["deterministic"]),
     ):
         signature = inspect.signature(function)
         assert list(signature.parameters) == prefix + tail + options
         assert all(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in signature.parameters.values())
         assert signature.parameters["block_size"].default == 4
         assert all(p.default is inspect.Parameter.empty for name, p in signature.parameters.items() if name not in ("block_size", *options))
-    assert inspect.signature(qsa_backward).parameters["ds_precision"].default == "fp32"
     assert inspect.signature(qsa_backward).parameters["deterministic"].default is False
 
 
@@ -266,32 +265,6 @@ def test_forward_large_values(supported_gpu, heads, score, magnitude):
     for actual, ref in zip(qsa_forward(**inputs), expected):
         assert actual.isfinite().all()
         assert_close(actual, ref)
-
-
-@pytest.mark.L0
-@pytest.mark.parametrize("heads", [(12, 1), (24, 2), (6, 1)])
-@pytest.mark.parametrize("keys", ["constant-key", "large-logits", "near-equal-keys"])
-def test_backward_cancellation(supported_gpu, heads, keys):
-    skip_without_cuda13_for_12q1kv(heads[1])
-    inputs = make_inputs((257,), *heads, all_selected=True)
-    inputs["k"].fill_(1)
-    if keys == "large-logits":
-        inputs["q"].fill_(8)
-        inputs["k"].fill_(-8)
-        inputs["k"][1::2] = 8
-    elif keys == "near-equal-keys":
-        # P differs per key, so rounding P (not only dS) would leave its error in the small dQ
-        inputs["k"][1::2] = 1 + 2**-7
-    # Independent saved state isolates backward precision from forward rounding.
-    _, out, lse = reference(inputs)
-    out, lse = out.float(), lse.float()
-    grad_out = inputs["q"] * 0.125
-    expected = reference(inputs, grad_out, out, lse)
-    # The default feeds the dQ MMAs three bf16 parts of dS, which keeps the analytically zero dQ of this construction
-    # within the absolute floor (a single rounding, ds_precision="bf16", does not).
-    actual = qsa_backward(grad_out, **inputs, out_fp32=out, lse=lse)
-    for grad, ref in zip(actual, expected):
-        assert_close(grad, ref)
 
 
 @pytest.mark.L0
@@ -500,8 +473,8 @@ def test_reject_before_launch(supported_gpu, monkeypatch):
         qsa_forward(**inputs, block_size=8)
     with pytest.raises(ValueError, match="lse"):
         qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((17, 12), device="cuda"))
-    with pytest.raises(ValueError, match="ds_precision"):
-        qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((12, 17), device="cuda"), ds_precision="fp16")
+    with pytest.raises(ValueError, match="deterministic"):
+        qsa_backward(inputs["q"], **inputs, out_fp32=inputs["q"].float(), lse=torch.empty((12, 17), device="cuda"), deterministic=1)
     for heads in ((3, 1), (24, 1), (6, 2), (12, 2)):
         with pytest.raises(NotImplementedError, match="6/1, 12/1 or 24/2"):
             qsa_forward(**make_inputs((17,), *heads))

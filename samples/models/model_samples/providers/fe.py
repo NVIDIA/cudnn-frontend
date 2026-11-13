@@ -17,6 +17,8 @@ allocator (``first_launch``), which the plan's memory sentence allows for per cl
 
 from __future__ import annotations
 
+import re
+
 from ..state import RecurrentSlots
 from ..weights import ScaledTensor
 from . import BlockBase, GdnParams, split_qkvz
@@ -32,6 +34,17 @@ SOURCE_FILES = (
 #: the first cuDNN Frontend version that carries the fused decode step, and the CuTe DSL floor its page states
 FIRST_VERSION = "1.33.0"
 DSL_FLOOR = (4, 8, 0)
+
+
+def serves_floor(installed: str, floor: tuple) -> bool:
+    """Whether a version string is at or above ``floor`` (three numbers).  The first three fields are read by their leading
+    digits, so "4.8.1rc1" is 4.8.1 and serves a floor of 4.8.0; a pre-release or development build of the floor itself
+    ("4.8.0rc1", "4.8.0.dev3") is below it."""
+    public = installed.split("+")[0]
+    numbers = [int(digits.group()) if (digits := re.match(r"\d+", field)) else 0 for field in public.split(".")[:3]]
+    release = tuple(numbers + [0] * (3 - len(numbers)))
+    before = re.match(r"\.?(a|b|rc|dev)", re.sub(r"^\d+(\.\d+)*", "", public), re.IGNORECASE)
+    return release > tuple(floor) or (release == tuple(floor) and not before)
 
 
 #: one entry per (device, geometry, epsilon) of the process: the entry compiles once per rows count, and every session shares it
@@ -82,7 +95,7 @@ class GdnDecodeFusedBlock(BlockBase):
         except metadata.PackageNotFoundError:
             installed = None
         floor = ".".join(str(n) for n in DSL_FLOOR)
-        if installed is None or tuple(int(n) for n in installed.split(".")[:3] if n.isdigit()) < DSL_FLOOR:
+        if installed is None or not serves_floor(installed, DSL_FLOOR):
             raise NotImplementedError(f"cudnn.GdnDecodeFused needs nvidia-cutlass-dsl >= {floor}; this is {installed or 'not installed'}")
         if self.facts.total_bytes and "device" in self.options:
             self._build(self.options["device"])  # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP
