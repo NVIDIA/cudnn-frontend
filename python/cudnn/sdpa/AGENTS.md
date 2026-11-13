@@ -1596,6 +1596,14 @@ weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contaminat
 specializations with FP64, including sink-dominated rows and changed-total replay.
 `test_quantized_sink_combine_excludes_zero_weight_payload` covers the dense
 quantized small/serial reductions with NaN and both infinite payloads.
+The grid reducer must also discard zero-weight chain accumulators and old
+round accumulators when their rescaling factor underflows. The architecture
+entries' `TestSplitCombineZeroWeight` covers local, inter-chain and next-round
+underflow (16/32/129 splits), plus unchanged goldens and changed-input replay.
+After changing a weight predicate, inspect generated load placement and run
+finite-input A/B/A: testing the selected weight directly can delay the grid's
+prefetched partial-O reads. Retaining the original live predicate and testing
+the unselected exponential preserves the same mask without that dependency.
 
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by

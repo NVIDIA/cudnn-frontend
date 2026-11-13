@@ -36,6 +36,48 @@ pytest core/test_determinism_utils.py
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 | `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
 
+### Grid/walk split-combine zero weights — 2026-11-13
+
+`TestSplitCombineZeroWeight` is registered in both `test_sdpa_fwd_dsl_sm100.py`
+and `test_sdpa_fwd_dsl_sm107.py`. The helper module has no independent test
+collection. The suite covers FP32 partial O/LSE and FP16/BF16 O in both
+grid and lean-walk forms: finite-LSE underflow with NaN, positive infinity
+and negative infinity payloads at 16, 32 and 129 splits. It also checks empty
+rows, repeated launches, reordered/duplicated/removed sequences, changed
+neighbors, multiple CTA waves and changed/restored inputs under CUDA Graph
+replay. Numerical references and exact O/LSE byte comparisons are separate.
+No backward or attention-producer qualification is implied.
+
+The final numerical bodies pass all 44 cases on SM100, SM103 and SM107 with
+CuTeDSL 4.8.0, compiler/NVRTC 13.4 and cuDNN backend 9.30.0. Each GPU has four
+new runtime-specific golden records; existing records are unchanged. The
+final predicate change was checked against these already-recorded outputs
+with recording disabled. SM103 and SM107 additionally pass 182 existing
+finite-input grid/walk regressions, including dtype/Stats, strided stores and
+the gated grid entry. Finite-input component A/B/A checks retain exact O/LSE
+bytes; they are not a serving-performance or default-selection claim.
+
+SM100 racecheck and synccheck each pass ten BF16 underflow/replay cases with
+zero reported hazards/errors. Memcheck executes the same ten passing cases
+and reports no device-memory fault, but exits 99 with 40 retained host API
+version-probe diagnostics from `cuGetProcAddress_v2` (requested 13030/13041,
+driver 13020). This is not an all-clean CUDA API run. Native SM103/SM107
+sanitizer execution is not claimed.
+
+```bash
+cd test/python
+env -u CUDNN_DETERMINISM_RECORD CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestSplitCombineZeroWeight \
+  -o addopts= -m L0 -q -rs --tb=short
+# Use test_sdpa_fwd_dsl_sm107.py on SM107.
+```
+
+The regression control predating the fix fails all 18 original BF16
+underflow cells numerically. The initial fix corrected those cases but
+delayed grid partial-O loads; retaining the original live-split predicate
+alongside the exponential-zero check restored their early issue. The
+reduction order, launch selection, workspace and pointer ABI are unchanged.
+
 ### SM100 D64 FP8 swap-AB decode — 2026-11-13
 
 The existing `TestNativeFp8Decode` and `TestNativeFp8DecodeDeterminism` entries
