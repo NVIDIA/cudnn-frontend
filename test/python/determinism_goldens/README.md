@@ -111,6 +111,17 @@ SM100, the declared DSL 4.8.0 floor, CUDA 12, actual multiprocess JAX,
 mixed-architecture execution, and refilled-stage warm stress remain
 unqualified. These APIs reject SM90 and SM107.
 
+On 2026-11-13, revision `ce9c4f84` restored the Mamba-2 launcher's `@cute.jit`
+with an explicit `config: cutlass.Constexpr[dict]` parameter and
+`cutlass.const_expr` guards on plan-dependent branches. The constexpr-dictionary
+annotation alone reproduced the `NumericMeta` missing-`self` error at a plain
+`if is_bwd` in control job `5912692`. With the static guards, job `5912819`
+passed six existing Mamba-2 numerical/API cases in 92.95 s on B300 using the
+same JAX 0.9.1 / CuTe DSL 4.8.1 cu13 environment. They cover BF16, fused FP16,
+long-sequence dispatch, optional state, state-only gradients, and exact native
+Torch output/gradient parity. The 56-case record above describes the initial
+qualification; this follow-up reran those six Mamba-2 cases.
+
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
 Twenty-six SM100/SM107 forward templates now release the unchanged service
