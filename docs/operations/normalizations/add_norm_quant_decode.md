@@ -170,9 +170,12 @@ Both knobs default to off and neither changes a byte (the suite compares their b
   of this call. Whether the release helps depends on the row count (a released consumer occupies SMs); a caller that
   wants it for some row counts only builds two entries.
 
-`pdl=True` alone is wait + release; `pdl=True, pdl_release=False` is wait only. The suite runs the wait behind a
-predecessor on the same stream that rewrites `x` and `residual`, and the release with a dependent launch on the stream
-that waits and copies the outputs, eager and captured.
+`pdl=True` alone is wait + release; `pdl=True, pdl_release=False` is wait only. The suite pins the wait's position in
+the kernel's text for every form and target: the loads of `weight` and `scale` are the only global accesses in front
+of it, the loads of `x` and `residual` and every store follow it, and the release is the next instruction. On a
+device it runs the step behind a predecessor that releases its dependents before it writes `x` and `residual`, the
+release with a dependent launch on the stream that waits and copies the outputs, and two steps chained through one
+buffer; each eager and captured.
 
 ## Launch facts
 
@@ -203,6 +206,7 @@ A row count outside 1 .. 1024 is a typed decline (`ValueError` for one that is n
 Tests: `test/python/norm/frost/test_add_norm_quant_decode.py` (host declines, the config's limits and tables, the
 rendering pinned per target and tied to the entry's own launch arguments, the launch facts against the configuration
 arithmetic and against the profiler's record of a launch, the device cells against the references above, exact and
-edge rows, output ownership, the bit-neutral arms, the release beside a dependent launch, CUDA-graph replay, an entry
-on a device that is not the caller's current one) and `test_add_norm_quant_decode_determinism.py` (replay, batch
+edge rows, output ownership, the bit-neutral arms, the wait behind a predecessor that released early, the release
+beside a dependent launch, a chain of two steps, CUDA-graph replay, an entry on a device that is not the caller's
+current one) and `test_add_norm_quant_decode_determinism.py` (replay, batch
 invariance, goldens). Source: `python/cudnn/norm/frost/`.

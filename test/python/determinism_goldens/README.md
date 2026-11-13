@@ -1586,8 +1586,9 @@ Golden sets: `add-norm-quant-decode-h5120-<case>`, six files in `c84dd9abaee769b
 `store-e4m3-rows3` and `none-e4m3-rows3` (the three residual modes with static E4M3 codes), `add-nvfp4-rows3` and `add-nvfp4-rows130`
 (NVFP4 codes in one and in two scale tiles) and `add-bf16-nvfp4-ties-rows2` (rows of `x = +-1` whose weight places the normalized value
 on chosen bf16 values: two blocks get the block scales 1.5 and 1.75 and fourteen elements each on an exact E2M1 rounding tie).  The
-launch arms write the default's bytes inside `test_golden` and, on more shapes and behind a predecessor that writes the operands, in
-`test_add_norm_quant_decode.py` (`test_bit_neutral_arms_write_the_default_bytes`), so the one set holds for every arm.  The tie case's
+launch arms write the default's bytes inside `test_golden` and, on more shapes, in `test_add_norm_quant_decode.py`
+(`test_bit_neutral_arms_write_the_default_bytes`; behind a predecessor that released its dependents before it wrote the operands,
+`test_wait_holds_every_read_behind_a_predecessor_that_released_early`), so the one set holds for every arm.  The tie case's
 codes follow the part's approximate reciprocal: its hashes are a record of this runtime, not a claim across GPU architectures.  A new
 set is owed with a stated reason when the sum tree, the rounding chain or the scale layout changes.
 
