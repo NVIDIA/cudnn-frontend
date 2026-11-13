@@ -93,6 +93,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa` / standalone FROST D256 paged THD (CGA2, fixed PackGQA and split count, independent physical origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unsupported for this combined path |
 | `pygraph.sdpa`, FROST single-sequence THD setup (dense D128 or paged D64/D128, unsplit) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | See native single-sequence limits below |
 | `pygraph.sdpa`, FROST D64/D128 split THD setup (CGA1, fixed packing and split count) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | Unverified by this suite |
+| `pygraph.sdpa` / standalone FROST D64 packed THD prefill (CGA1/2, N128, unsplit, independent origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (tested configurations) | Unverified by this suite |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 
@@ -714,3 +715,15 @@ E4M3/E5M2, E8M0-scale and BF16-output cases. Independent data origins do
 not move the logical scale-tile prefixes. The CUDA13.4 qualification also
 covers fresh strides and retained live/empty captures. Other native MXFP8
 THD widths and backward are not qualified by this suite.
+
+## SM100/SM103 D64 packed THD prefill
+
+The direct-output D64 route supports whole-group PackGQA with dense or paged
+K/V, N128 and fixed CGA1/2. Its O and FP32 Stats are final outputs; it uses
+neither split partials nor a combine launch. The L0 suite exercises independent
+origins, current strides, retained captures, changed lengths and tables, fixed
+sequence payloads across batch changes, and a KV-ring refill workload. B200 and
+B300 preserve O/Stats bytes for the tested configurations under CUDA13.4.
+The refill checks cover the native one-CTA-per-SM persistent grid; their
+stress bound is limited to that geometry.
+Backward uses separate kernels and is outside this forward-path change.

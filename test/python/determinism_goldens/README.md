@@ -4587,3 +4587,48 @@ common-release fix and are refreshed; the three SM107 score-off records stay
 byte-identical. PTX and SASS are retained for attribution, and the existing
 spill and score-store detectors remain active. CUDA 13.5 disassembles the
 SM107 cubins. Native SM103 execution is unverified by this follow-up.
+
+## SM100/SM103 D64 packed THD prefill (2026-11-13)
+
+The new L0 `TestD64ThdPackedUnsplit` entry checks exact D64 with whole-group
+PackGQA, N128, CGA1/2 and SPLIT_KV=1. Both graph and standalone calls assert
+the direct native prefill body, native binding, independent origin metadata
+and absent split workspace. Coverage includes FP16/BF16, HND/NHD/mixed pools,
+GQA2/4/8/16, pages8/16/64/256, short-query routing, window/sink/Stats handling,
+fresh strides, changed device lengths/tables, empty replay and tail canaries.
+The graph batch tests hold sequence payloads fixed across reorder, duplication,
+changed neighbors and B1/B3/B5/B129 under one capacity4096 plan. The refill
+checks compare O/Stats with CPU FP64 before stressing the four-stage KV ring.
+No backward kernel is changed or qualified by these tests.
+
+```bash
+cd test/python
+python -m pytest sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestD64ThdPackedUnsplit \
+  -o addopts= -m L0 -q -rs
+```
+
+B200 (148 SMs) and B300 (148 SMs), with CuTeDSL4.8.0, compiler/NVRTC13.4,
+FE backend9.30.0 and Torch2.14.1+cu130, each pass all **22 unique cases**:
+16 contract/functional cases, four bytewise batch/golden cases and two warm
+refill cases. Each run additionally passes four strict golden rechecks and
+two cases under each of memcheck, synccheck and racecheck: **32 successful
+test executions per GPU**, no failures or skips. Sanitizers report zero
+errors/hazards. Complete allocations took 2m52s and 2m53s respectively.
+Four new golden records per GPU are committed; existing records are unchanged.
+Both precisions pass256 warm and256 poisoned launches; the unsafe ring
+control fails200/200. The actual persistent grid has one CTA per SM, below
+the control's three-CTA geometry, so the rate bound is specific to that grid.
+Forty-two existing host config/capability regressions and eight new contract
+checks also pass locally. Changed-file pre-commit and fern check pass.
+
+Run the functional phase with `-k 'not batch_and_golden and not warm_refill'`,
+the golden phase with `-k batch_and_golden`, and stress with `-k warm_refill`.
+Record into a fresh `CUDNN_DETERMINISM_RECORD` directory only after references
+and byte comparisons pass; the strict phase uses `CUDNN_DETERMINISM_GOLDENS`
+and disables recording. Sanitizer selection is
+`-k 'test_paged_origins and (g2 or g4)'` on the same L0 entrypoint.
+The retained development smoke passed two N128 paged origin/replay cases;
+it also exposed the existing N64 dense-only factory boundary, which is now
+rejected by capability and standalone checks before compilation. An earlier
+config admission failure and a synthetic fixture missing its padding flag
+are retained as development failures; neither is a successful GPU test.

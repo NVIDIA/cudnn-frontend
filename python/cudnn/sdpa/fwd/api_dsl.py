@@ -2771,6 +2771,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Even compact standalone THD uses sequence-local maps. Graph lowering
             # replaces these absent offsets with the caller's per-port declarations.
             self._thd_origin_specs = (None,) * 5
+        if self.thd and self.flavor == (64, 64) and self.pack_gqa and self.split_kv == 1 and self._device_cc in ((10, 0), (10, 3)):
+            # The packed prefill body writes final O/Stats directly. Compact
+            # standalone calls and graph offsets share its sequence-local maps.
+            self._thd_origin_specs = (None,) * 5
         if self.packed_thd_split and self.paged and self.flavor == (256, 256) and self._device_cc in ((10, 0), (10, 3)):
             # The split body reads physical Q origins; only the final combine
             # addresses caller O/Stats. Standalone THD supplies compact prefixes.
@@ -2818,10 +2822,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     (self._device_cc != (10, 7) or self.paged or self._rubin_shared_thd_pack_leg())
                     and not self._fp8
                     and (int(d_qk), int(d_v)) in SM100_THD_PACK_GQA_SHAPES
-                    and (self.cga in (None, 2) or paged_prefill_cga1 or self._rubin_native_thd_prefill_leg())
+                    and (
+                        self.cga in (None, 2)
+                        or (self._device_cc in ((10, 0), (10, 3)) and self.flavor == (64, 64))
+                        or paged_prefill_cga1
+                        or self._rubin_native_thd_prefill_leg()
+                    )
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
+                "THD PackGQA requires half D64 cga1/2 unsplit or cga1 split, half D128 cga2 unsplit/cga1 split, native Rubin nonpaged D128 cga1/2 unsplit, "
                 "Rubin paged D128 cga1 unsplit, SM100/103 paged D256 cga2, or SM107 paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
@@ -2925,7 +2934,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _tile_ns = dict(_SM107_FP8_TILE_NS_BY_D_SHAPE).get(self.flavor, frozenset({128}))
         if self._native_d128_narrow_tile():
             _tile_ns = frozenset({64, 128})
-        if self.packed_thd_split and self.flavor == (64, 64):
+        if self.flavor == (64, 64) and self.thd and not self._fp8 and (self._device_cc in ((10, 0), (10, 3)) or self.packed_thd_split):
             _tile_ns = frozenset({128})
         self._value_error_if(
             self.tile_n is not None and self.tile_n not in _tile_ns,
