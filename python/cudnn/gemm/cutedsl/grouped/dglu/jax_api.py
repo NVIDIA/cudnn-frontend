@@ -449,7 +449,7 @@ def grouped_dglu_adapter(
 def dglu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, act_func, sf_vec_size, situ_beta1=4.0, situ_beta2=25.0):
     ab_dtype, sf_dtype, k = check_grouped_shapes(inputs, outputs, backward=True, sf_vec_size=sf_vec_size)
     if act_func not in ("dswiglu", "dgeglu", "dsituglu"):
-        raise ValueError(f"act_func must be 'dswiglu' or 'dgeglu' or 'dsituglu' for the JAX block-scaled path, got {act_func!r}")
+        raise ValueError(f"act_func must be 'dswiglu', 'dgeglu', or 'dsituglu' for the JAX block-scaled path, got {act_func!r}")
     if act_func == "dsituglu":
         if get_compute_capability() not in ((10, 0), (10, 3)):
             raise ValueError("SiTU-GLU is supported only on SM100/SM103")
@@ -472,18 +472,7 @@ def dglu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd,
     use_2cta = mma_tiler_mn[0] == 256
     cluster = tuple(cluster_shape_mn or ((2, 1) if use_2cta else (1, 1)))
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    key = (
-        get_device_type(),
-        experts,
-        tuple(mma_tiler_mn),
-        cluster,
-        margin,
-        discrete_col_sfd,
-        act_func,
-        sf_vec_size,
-        float(situ_beta1) if act_func == "dsituglu" else None,
-        float(situ_beta2) if act_func == "dsituglu" else None,
-    )
+    key = (get_device_type(), experts, tuple(mma_tiler_mn), cluster, margin, discrete_col_sfd, act_func, sf_vec_size)
     signature = (key, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items())))
     if signature not in validated_configs:
         check_packed_sf_size(inputs, (("sfa", m, 1), ("sfb", n, experts)), ceil_div(ceil_div(k, sf_vec_size), 4))
@@ -527,7 +516,6 @@ def dglu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd,
             expert_cnt=experts,
             weight_mode=MoEWeightMode.DENSE,
             act_func=act_func,
-            **({"situ_beta1": float(situ_beta1)} if act_func == "dsituglu" else {}),
         )
         kernel_cache[key] = (kernel, mac)
     return kernel_cache[key]

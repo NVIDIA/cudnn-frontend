@@ -6,11 +6,7 @@
 
 **Canonical MXFP8 (block-scaled, dense weights):** the `jax.jit`-compatible entry point `grouped_gemm_dglu_jax_sm100` takes the canonical operands as keywords. They are `b_tensor` `(experts, n, k)`, already MMA-packed E8M0 `sfa_tensor`/`sfb_tensor` bytes (physical or flat), and an explicit `norm_const_tensor`, along with A `(m, k)`, saved C `(m, 2n)` BF16/FP16, prob `(m,)` fp32/bf16, alpha and beta `(experts,)` fp32, and `d_dtype` e4m3.
 
-`act_func` selects `"dswiglu"`, `"dgeglu"`, or `"dsituglu"`.
-For `"dsituglu"`, this JAX entry supports MXFP8 inputs on SM100/SM103 only.
-`situ_beta1` sets the gate soft cap (default `4.0`), and `situ_beta2` sets the
-up-branch soft cap (default `25.0`). Both must be finite and positive.
-All activation parameters are static arguments of the traced JAX call.
+`act_func` selects `"dswiglu"`, `"dgeglu"`, or `"dsituglu"`. For `"dsituglu"`, this JAX entry supports MXFP8 inputs on SM100/SM103 only. `situ_beta1` sets the gate soft cap (default `4.0`), and `situ_beta2` sets the up-branch soft cap (default `25.0`). Both must be finite and positive. All activation parameters are static arguments of the traced JAX call.
 
 It returns a `TupleDict` with the eager wrapper's keys (`dbias_tensor` and `amax_tensor` are None). It runs the Rubin dGLU kernel on SM107 and the SM100 kernel otherwise. `discrete_col_sfd=True` packs column scales by expert. Only `dprob` is zero-initialized, because the kernel accumulates into it; other outputs are not initialized, so rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path.
 

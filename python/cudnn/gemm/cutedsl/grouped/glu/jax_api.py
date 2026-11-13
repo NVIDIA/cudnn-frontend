@@ -411,7 +411,7 @@ def glu_kernel_type():
 def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, act_func, sf_vec_size, situ_beta1=4.0, situ_beta2=25.0):
     ab_dtype, sf_dtype, k = check_grouped_shapes(inputs, outputs, backward=False, sf_vec_size=sf_vec_size)
     if act_func not in ("swiglu", "geglu", "situglu"):
-        raise ValueError(f"act_func must be 'swiglu' or 'geglu' or 'situglu' for the JAX block-scaled path, got {act_func!r}")
+        raise ValueError(f"act_func must be 'swiglu', 'geglu', or 'situglu' for the JAX block-scaled path, got {act_func!r}")
     if act_func == "situglu":
         if get_compute_capability() not in ((10, 0), (10, 3)):
             raise ValueError("SiTU-GLU is supported only on SM100/SM103")
@@ -438,7 +438,6 @@ def glu_plan(inputs, outputs, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd, 
         sf_vec_size,
         low_precision,
         float(situ_beta1) if act_func == "situglu" else None,
-        float(situ_beta2) if act_func == "situglu" else None,
     )
     validation_key = (config, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items())))
     if validation_key not in validated_configs:
