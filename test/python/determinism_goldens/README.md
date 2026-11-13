@@ -5224,33 +5224,3 @@ it also exposed the existing N64 dense-only factory boundary, which is now
 rejected by capability and standalone checks before compilation. An earlier
 config admission failure and a synthetic fixture missing its padding flag
 are retained as development failures; neither is a successful GPU test.
-
-## 2026-11-10 — JAX grouped SiTU integration
-
-Added `gemm/jax/test_grouped_gemm_situ_determinism.py`: eight L0 cases covering
-forward/backward, 256/1024/32768 active rows, fresh buffers, concurrent work,
-empty experts, poisoned capacity tails, expert packing/reordering/duplication
-and changed neighbors. Active data and scale outputs use raw-byte comparisons.
-Atomic dprob is excluded from bitwise claims; canonical parity checks it
-against the Torch result numerically. General dprob determinism is not claimed.
-
-New GB200 SM100 measurements: native cuDNN builds and imports passed;
-73 canonical parity/validation cases passed, two new golden recordings passed,
-and all eight strict replay/invariance/golden cases passed (zero skips).
-
-Runtime: JAX 0.12.0.dev20261014, Torch 2.16.0.dev20261030+cu130, CUDA toolkit
-13.5, CuTeDSL 4.8.0/compiler CUDA13.4; cuDNN backend 9.26 (Torch reports 9.27).
-New goldens are under runtime key `ec5f7cd6b51a0ce3`; no existing golden changed.
-They were recorded into a new candidate directory after numerical parity,
-then checked in a separate run with recording disabled. FP8 E5M2, SM103,
-cu12 and other runtime combinations remain unverified.
-
-Commands (from `test/python`, with `CUDA_VISIBLE_DEVICES=0` and
-`XLA_PYTHON_CLIENT_PREALLOCATE=false`):
-
-```bash
-python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -m L0 -q -x \
-  -k 'canonical_jax_glu_parity or canonical_jax_dglu_parity or situ or jax_glu_rejects_unsupported_options or jax_dglu_rejects_unsupported_options'
-CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
-  python -m pytest gemm/jax/test_grouped_gemm_situ_determinism.py -m L0 -q -x
-```
