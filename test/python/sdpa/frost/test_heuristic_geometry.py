@@ -653,8 +653,13 @@ def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packe
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed)
     assert mismatch(SPEC.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
-    for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
-        assert mismatch(SPEC.capabilities, facts, invalid) is not None
+    assert mismatch(SPEC.capabilities, facts, replace(knobs, cga=2)) is not None
+    # Unsplit D64 PackGQA uses the shared final-output prefill body. Its
+    # N128 path is independent of the single-CTA split geometry above.
+    unsplit = replace(knobs, split_kv=1, pack_gqa=True, tile_n=128)
+    assert mismatch(SPEC.capabilities, facts, unsplit) is None
+    assert mismatch(SPEC.capabilities, facts, replace(unsplit, cga=2)) is None
+    assert mismatch(SPEC.capabilities, facts, replace(unsplit, tile_n=64)) is not None
     assert mismatch(SPEC.capabilities, replace(facts, has_paged_kv=False), knobs) is None
     for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
         assert mismatch(SPEC.capabilities, invalid, knobs) is not None
