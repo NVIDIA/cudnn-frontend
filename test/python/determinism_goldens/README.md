@@ -1629,14 +1629,21 @@ golden cases pass against the SAME set, whose runtime key does not name the comp
 for those cases; the functional command -> 174 passed, 2 skipped (`test_rendering_pins_the_convention` for `sm_107a`: that compiler
 rejects the target, and the case skips with the entry's own decline; the two-device case).
 
-CuTe DSL 4.8.1 (2026-11-13 UTC): cold compile only, on an x86 host (a cc 8.0 device: every device case skips; fake tensors, the 4.8.1
-wheels put first on the path of the same environment).  The kernel's 45 renderings per target (fifteen forms x three launch arms) are
-byte-identical cubins to 4.8.0's for `sm_100a`, `sm_103a` and `sm_107a` with the CUDA 13.4 compiler (135 of 135) and for `sm_100a` /
-`sm_103a` with the CUDA 12.9 compiler (90 of 90); `sm_107a` does not compile under CUDA 12.9 in either version (the entry's typed
-decline).  `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` on that host: 101 passed, 136 skipped
-under 4.8.0 and under 4.8.1 with CUDA 13.4; 100 passed, 137 skipped under either version with CUDA 12.9 (the `sm_107a` rendering case
-skips with the entry's decline).
-Not run on a device: 4.8.1.
+CuTe DSL 4.8.1 on the same part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime; these runs are one commit
+later than the 4.8.0 rows above, which changes this report's text only).  Compiling with CUDA 13.4: the functional command -> 175
+passed, 1 skipped (the two-device case); the determinism command WITHOUT the goldens variable -> 55 passed, 6 skipped (the six
+`test_golden` cases: the DSL version is part of the runtime key and no set is committed for that key, so the golden comparison is a
+coverage gap there, not a pass).  With only the CUDA 12 toolchain libraries of 4.8.1 (`CUDA_VERSION` 12.9): 174 passed, 2 skipped (the
+`sm_107a` rendering case and the two-device case); 55 passed, 6 skipped (the golden cases, same reason).  A record into a new directory
+under each flavour (`-k golden`: 6 passed, 55 deselected) holds the input and output hashes of the committed 4.8.0 set in 6 of 6 files;
+it is not committed.
+
+Cold compile on an x86 host (2026-11-13 UTC; a cc 8.0 device: every device case skips; fake tensors).  The kernel's 45 renderings per
+target (fifteen forms x three launch arms) under 4.8.1 are byte-identical cubins to 4.8.0's for `sm_100a`, `sm_103a` and `sm_107a` with
+the CUDA 13.4 compiler (135 of 135) and for `sm_100a` / `sm_103a` with the CUDA 12.9 compiler (90 of 90); `sm_107a` does not compile
+under CUDA 12.9 in either version (the entry's typed decline).  `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m
+L0 -q -ra` on that host: 101 passed, 136 skipped under 4.8.0 and under 4.8.1 with CUDA 13.4; 100 passed, 137 skipped under either
+version with CUDA 12.9 (the `sm_107a` rendering case skips with the entry's decline).
 
 ### QSA: 42 cases
 
