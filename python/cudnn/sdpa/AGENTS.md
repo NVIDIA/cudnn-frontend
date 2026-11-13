@@ -1638,9 +1638,16 @@ and synchronize all consuming warps before PV. The wide-head THD cases in
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
-qualified SM120 prefill loader also retains producer-local commit/wait-group completion:
-an async-arrival-only variant passed numerics but failed the same racecheck.
-Do not remove that drain without rerunning the native sanitizer/capture cases.
+qualified SM120 prefill loader retains producer-local commit/wait-group completion
+by default: removing both K and V drains passed numerics but failed racecheck.
+Paged half prefill has a K-only exception in `prefill_f16.py`: separate,
+16-byte-aligned static completion barriers retain commit and tracked arrivals,
+while the V producer drain retires both copy groups. Each compute lane stores
+a value dependent on every QK/PV result fragment before its named K/V reuse
+arrival; inspect the compiled load-use/store/release ordering (package Rule 11).
+The native paged rebind, vector-loop warm/determinism and D512 control cases
+cover this protocol. Removing the V drain still fails native racecheck even
+with ordered consumer releases; keep it unless a new protocol is qualified.
 Paged half decode has a separately qualified exception: `decode_f16.py` allocates
 its full completion barriers with `cute.arch.alloc_smem`, separately from the
 dynamic K/V ring. It retains commit and async-tracked arrivals while omitting
@@ -1648,7 +1655,8 @@ the producer wait; consumer full waits and empty-barrier ring credits still
 order publication and reuse. `test_dsl_sm120_paged_decode_async_warm` covers
 FP16/BF16 warm and poisoned replay with repeated slot reuse; the native paged
 rebind and decode-ring tests cover sanitizer/capture behavior. Keep this
-exception confined to that allocation and protocol; prefill retains its drain.
+exception confined to that allocation and protocol; prefill's exception remains
+K-only, with the V drain and result-dependent release stores described above.
 For a persistent CTA that reinitializes its K/V barriers between work units,
 keep the same producer arrival count at initial launch and every rearm. D512
 paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own
