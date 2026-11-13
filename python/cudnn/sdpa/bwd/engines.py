@@ -43,6 +43,7 @@ _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
 _SM100_D128 = "SdpaBwdDslSm100D128"
+_SM90 = "SdpaBwdDslSm90"
 _SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
 _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
@@ -57,6 +58,10 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
         return SdpaBwdDslSm100D128
+    if name == _SM90:
+        from cudnn.sdpa.bwd.api_dsl_sm90 import SdpaBwdDslSm90
+
+        return SdpaBwdDslSm90
     if name == _SM100_D128_FP8:
         from cudnn.sdpa.bwd.api_dsl_sm100_d128_fp8 import SdpaBwdDslSm100D128Fp8
 
@@ -2119,6 +2124,53 @@ def _sm100_d128_spec() -> EngineSpec:
     )
 
 
+def _sm90_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """The Hopper chain serves dense compact-BSHD half-precision graphs: unmasked or top-left causal, MHA or an integral head ratio."""
+    from .d128_contract import validate_dense_bounds, validate_relay_launch
+
+    if facts.thd or facts.padded:
+        return "the SM90 backward chain serves dense graphs without padding masks"
+    if facts.bottom_right or facts.window_left is not None:
+        return "the SM90 backward chain serves unmasked or top-left causal attention"
+    if facts.has_bias or facts.has_sink or facts.has_dropout:
+        return "the SM90 backward chain serves graphs without bias, sinks or dropout"
+    if facts.h_kv <= 0 or facts.h_q % facts.h_kv:
+        return "the SM90 backward chain requires an integral head ratio"
+    if version is None or cutedsl_too_old(version, floor=(4, 8, 0)):
+        return f"the SM90 backward chain requires nvidia-cutlass-dsl >= 4.8.0; found {version}"
+    scale = facts.d_qk**-0.5 if facts.scale is None else facts.scale
+    if not (scale > 0 and scale < float("inf")):
+        return "the SM90 backward chain requires a positive finite attn_scale"
+    try:
+        validate_dense_bounds(facts.b, facts.h_q, facts.s_q, facts.s_kv, None)
+        validate_relay_launch(facts.b, facts.h_q)
+    except ValueError as error:
+        return "the SM90 backward chain: " + str(error)
+    return None
+
+
+def _sm90_spec() -> EngineSpec:
+    """Hopper dense d64 / d128 backward: the key-owner kernel with the ordered dQ relay (cc 9.0 only).
+
+    Every request runs the same ordered chain, so the row claims ``deterministic`` for free; the row is opt-in
+    (``EngineSlot.opt_in``).
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm90",
+        capabilities=Capabilities(
+            sm_lo=90,
+            sm_hi=90,
+            d=frozenset({64, 128}),
+            causal=True,
+            deterministic=True,
+            compact_bshd=True,
+            gqa=True,
+            declaration_check=_sm90_declaration_mismatch,
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM90),
+    )
+
+
 def _sm100_d128_fp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     if facts.window_left is not None and facts.d_qk != 64:
         return "the fp8 d128 row serves a sliding window at d64 only"
@@ -2378,6 +2430,7 @@ ENGINE_SPECS = (
     _sm100_d256_spec(),
     _sm107_d512_spec(),
     _sm100_d128_spec(),
+    _sm90_spec(),
     _sm107_d192_spec(),
     _sm100_d128_fp8_spec(),
     _d512_fp8_spec(),
