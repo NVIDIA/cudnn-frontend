@@ -1582,7 +1582,7 @@ orders at every row count of these four.  `pytest <module> -m L0 -q -rs -n 0 -k 
 (the case that needs two CUDA devices), 105 deselected, and `pytest <module> -m L0 -q -rs -n 0 -k performance_arms` -> 105 passed,
 418 deselected: the module 522 passed, 1 skipped; nine launch-fact cells compared equal with the profiler's record of a launch, and
 the warm stress of the four classes that run their table row as written read 0 wrong launches in 16 of 16 cases behind a control that
-reproduced in 200 of 200 launches (12 of the 16 shapes run fewer than two thread blocks per SM, where a zero bounds little).  The nine
+reproduced in 200 of 200 launches (11 of the 16 shapes run fewer than two thread blocks per SM, where a zero bounds little).  The nine
 cc 10.0 result hashes of the first three classes equal those of the cc 10.3 set -- an observation on these two runtimes, not a
 contract across architectures.
 
