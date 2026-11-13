@@ -17,6 +17,7 @@ module; replay, batch invariance per row count and the goldens live in the deter
 Marked ``no_workspace_shim``: the engine suite's autouse fixture would otherwise import torch and both architecture compilers for
 every test of this direct-call entry."""
 
+import ast
 import contextlib
 import importlib
 import os
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import textwrap
 import types
+import warnings
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -438,6 +440,67 @@ def test_installed_dsl_provides_the_names_or_declines_by_name():
     assert len(names) == len(set(names)) and ("cudnn._cutlass_compat", "SmemAllocator") in names and ("cutlass.pipeline", "PipelineTmaUmma") in names
 
 
+SCHEDULER_MODULE = "cudnn._cutlass_helpers.static_persistent_tile_scheduler"
+
+
+def test_name_probe_covers_the_vendored_tile_scheduler(monkeypatch):
+    """The kernel deals its work tiles with the tree's vendored static persistent tile scheduler and reads no scheduler name off
+    ``cutlass.utils`` (the DSL has announced that its wheel's copy leaves, and that copy warns at every trace).  The probe imports
+    the vendored module, so a DSL on which it does not import is a decline by name before the kernel module is imported, never an
+    ``ImportError`` out of ``compile``."""
+    from cudnn.frost import buffers
+
+    rows = [row for row in entry.DSL_NAMES if row[0] == SCHEDULER_MODULE]
+    assert rows == [(SCHEDULER_MODULE, ("PersistentTileSchedulerParams", "StaticPersistentTileScheduler"))]
+    assert not [module for module, _ in entry.DSL_NAMES if module == "cutlass.utils"], "no name is bound off cutlass.utils itself"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "9.9.9")))
+    monkeypatch.setattr(entry, "dsl_compiler_version", lambda: (13, 4))
+    monkeypatch.setattr(entry, "DSL_NAMES", tuple(rows))
+    monkeypatch.setitem(sys.modules, SCHEDULER_MODULE, None)  # the import system raises for a None entry
+    k = _modelled_cuda_entry(monkeypatch)
+    with pytest.raises(NotImplementedError, match=r"cudnn\._cutlass_helpers\.static_persistent_tile_scheduler, which does not import .*9\.9\.9"):
+        k.compile(1)
+    assert not k.compiled and k._kernel_module is None
+
+
+def test_kernel_module_reads_no_deprecated_name_off_a_dsl_module():
+    """Every name the kernel module -- and the vendored tile scheduler it deals its work tiles with -- imports from a DSL module or
+    reads off one resolves on the installed DSL without a ``DeprecationWarning``.  The DSL keeps a moved name as a warning alias for
+    some releases and then drops it; a kernel that still reads the alias raises from inside the trace on that release, at every row
+    count, where the entry promises a decline by name.  (A deprecated DSL object that warns only when it is USED shows in the trace:
+    ``test_rendering_pins_the_convention`` on a host, ``test_trace_raises_no_deprecation_warning_from_the_kernel_package`` on a
+    device.)"""
+    msg = entry.dsl_error()
+    if msg is not None:
+        pytest.skip(msg)
+    kernel = importlib.import_module("cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_nvfp4")
+    scheduler = importlib.import_module(SCHEDULER_MODULE)
+    assert kernel.StaticPersistentTileScheduler is scheduler.StaticPersistentTileScheduler, "the kernel deals its tiles with the vendored scheduler"
+    assert kernel.PersistentTileSchedulerParams is scheduler.PersistentTileSchedulerParams
+    flagged, total = [], 0
+    for mod in (kernel, scheduler):
+        reads = set()
+        for node in ast.walk(ast.parse(Path(mod.__file__).read_text())):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module.startswith("cutlass"):
+                reads |= {(node.module, alias.name, node.lineno) for alias in node.names}
+            elif isinstance(node, ast.Import):
+                assert not [alias.name for alias in node.names if alias.name == "cutlass.utils"], f"{mod.__name__} binds cutlass.utils itself"
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                owner = vars(mod).get(node.value.id)
+                if isinstance(owner, types.ModuleType) and owner.__name__.startswith("cutlass"):
+                    reads.add((owner.__name__, node.attr, node.lineno))
+        total += len(reads)
+        for module, name, line in sorted(reads):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                try:
+                    getattr(importlib.import_module(module), name)
+                except (DeprecationWarning, AttributeError) as e:
+                    flagged.append(f"{Path(mod.__file__).name} line {line}: {module}.{name}: {type(e).__name__}: {e}")
+    assert total > 100, "the scan found the DSL reads of both modules"
+    assert not flagged, flagged
+
+
 _ENGINE_SKIP = re.compile(
     r"runs only on \d+ <= SM < \d+.* but the active GPU is sm_\d+" r"|is served by the sm\d+ arch tree, but this process runs the sm\d+ tree"
 )
@@ -695,7 +758,7 @@ def test_host_entry_and_decline_do_not_import_cutlass():
 # host: the rendering pin (a trace-compile per claimed target; no device)
 # ---------------------------------------------------------------------------------------------------------------------------
 _RENDER_PROBE = textwrap.dedent("""
-    import json, os, sys
+    import json, os, sys, warnings
     dump, arch, source = sys.argv[1], sys.argv[2], sys.argv[3]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
     os.environ["CUTE_DSL_KEEP"] = "ptx,cubin"
@@ -715,8 +778,13 @@ _RENDER_PROBE = textwrap.dedent("""
         tile, prewait = (int(x) for x in spec.split(":"))
         before = set(os.listdir(dump))
         cfg = kcfg.Cfg(TOKEN_TILE=tile, PREWAIT_STAGES=prewait)
-        compiled = kernel.compile_kernel(cfg)        # refuses a trace whose layout differs from the config's mirror
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            compiled = kernel.compile_kernel(cfg)    # refuses a trace whose layout differs from the config's mirror
         print("SYMBOLS", spec, json.dumps(list(compiled.kernel_info)))
+        for w in seen:
+            if issubclass(w.category, DeprecationWarning):
+                print("DEPRECATED", spec, json.dumps(f"{w.filename}:{w.lineno}: {w.message}"))
         for name in sorted(set(os.listdir(dump)) - before):
             print("KEPT", spec, name)
     print("COMPILED", arch)
@@ -725,7 +793,8 @@ _RENDER_PROBE = textwrap.dedent("""
 
 def _render(tmp_path, arch, specs):
     """Run the probe for ``arch`` in a fresh process (the DSL reads its dump settings once, at the first import); returns the
-    compiler's CUDA version, ``{spec: [kept file paths]}`` and ``{spec: [kernel symbols]}``.  A compile failure FAILS."""
+    compiler's CUDA version, ``{spec: [kept file paths]}``, ``{spec: [kernel symbols]}`` and the ``DeprecationWarning`` texts of the
+    traces (``<file>:<line>: <message>``).  A compile failure FAILS."""
     probe = tmp_path / "render_probe.py"  # a FILE, not ``python -c``: the DSL preprocessor re-reads a kernel's source through inspect
     probe.write_text(_RENDER_PROBE)
     dump = tmp_path / "dump"
@@ -736,7 +805,7 @@ def _render(tmp_path, arch, specs):
     assert f"COMPILED {arch}" in lines, proc.stdout[-2000:]
     assert loaded_files(proc.stdout) == {"kernel": KERNEL_FILE}, f"the child did not render the kernel of the tree under test:\n{proc.stdout[-2000:]}"
     compiler = tuple(int(x) for x in next(ln for ln in lines if ln.startswith("COMPILER")).split()[1:])
-    kept, symbols = {}, {}
+    kept, symbols, deprecated = {}, {}, []
     for ln in lines:
         if ln.startswith("KEPT "):
             _, spec, name = ln.split(" ", 2)
@@ -744,7 +813,10 @@ def _render(tmp_path, arch, specs):
         elif ln.startswith("SYMBOLS "):
             _, spec, text = ln.split(" ", 2)
             symbols[spec] = __import__("json").loads(text)
-    return compiler, kept, symbols
+        elif ln.startswith("DEPRECATED "):
+            _, spec, text = ln.split(" ", 2)
+            deprecated.append(__import__("json").loads(text))
+    return compiler, kept, symbols, deprecated
 
 
 def _sass(cubin):
@@ -778,13 +850,17 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     ``griddepcontrol.wait`` (one without pre-wait stages: every warp waits at the same statement) and one ``launch_dependents``, nine tensor loads (six without the pre-wait block's three) behind four tensor-map
     prefetches, ``.reqntid 192``, and a symbol that starts with the cuDNN prefix and carries the form's text in its first 100
     characters.  The traced layout equals the config's mirror (``compile_kernel`` refuses otherwise).  With an nvdisasm that decodes
-    the cubin: no ``FFMA``, the two reciprocals of each pass predicated (the zero rule is a branch, not a select).  A compile
-    failure FAILS; a DSL that does not serve the target SKIPS with the gate's text."""
+    the cubin: no ``FFMA``, the two reciprocals of each pass predicated (the zero rule is a branch, not a select).  No trace raises
+    a ``DeprecationWarning`` that is attributed to a file of the cudnn package (the kernel module, the tile library, the vendored
+    tile scheduler): a deprecated DSL object in the kernel body shows here on the releases that warn, ahead of the one that drops
+    it.  A compile failure FAILS; a DSL that does not serve the target SKIPS with the gate's text."""
     msg = entry.dsl_error(cc)
     if msg is not None:
         pytest.skip(msg)
     specs = ["8:2", "16:2", "32:2", "64:2", "8:0"]
-    compiler, kept, symbols = _render(tmp_path, arch, specs)
+    compiler, kept, symbols, deprecated = _render(tmp_path, arch, specs)
+    own = sorted({text for text in deprecated if text.startswith(SOURCE_CUDNN)})
+    assert not own, f"{arch}: a trace raised a DeprecationWarning from the cudnn package: {own}"
     seen = set()
     for spec in specs:
         tile, prewait = (int(x) for x in spec.split(":"))
@@ -1354,6 +1430,20 @@ def test_launch_facts_equal_the_profilers_record_of_a_launch(geometry, rows, arm
     other = 64 if kcfg.token_tile_for(rows) != 64 else 1
     assert k.kernel_symbols_for(other) == (), "a form that was not compiled names nothing"
     assert k.form_for(rows)["PDL"] is bool(arm.get("pdl")) and k.form_for(rows)["TOKEN_TILE"] == kcfg.token_tile_for(rows)
+
+
+def test_trace_raises_no_deprecation_warning_from_the_kernel_package():
+    """A fresh entry's ``compile()`` -- a real trace of the four forms on this device's DSL -- attributes no ``DeprecationWarning`` to
+    a file of the cudnn package: a deprecated DSL object in the kernel body shows here on the releases that warn, ahead of the one
+    that drops it."""
+    dev = U.device_or_skip()
+    k = entry.SwigluFp4Decode(dev, G_SMALL)  # not one of this module's shared entries: nothing is compiled yet, so compile traces
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        k.compile()
+    assert len(k.compiled) == 4
+    own = [f"{w.filename}:{w.lineno}: {w.message}" for w in seen if issubclass(w.category, DeprecationWarning) and str(w.filename).startswith(SOURCE_CUDNN)]
+    assert not own, own
 
 
 # The launch matrix in a child interpreter.  The child prints a stage line before every phase and arms its own traceback dump ahead of

@@ -487,7 +487,17 @@ DSL satisfies your kernel.**
   the entry's probe names it) and
   `test_trace_raises_no_deprecation_warning_from_the_kernel_package` (device: a real trace) in
   `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py`; the pytest warnings
-  summary of a kernel suite shows the same reads by file and line.
+  summary of a kernel suite shows the same reads by file and line. The first detector sees a
+  name that warns when it is READ. An object the DSL deprecates in place warns only when it is
+  USED: on 4.8.0 `cutlass.utils.StaticPersistentTileScheduler` and
+  `PersistentTileSchedulerParams` resolve silently, and a trace that deals its tiles with them
+  raises 63 `DeprecationWarning`s per compiled form (one attributed to the kernel's line, the
+  rest inside the wheel) -- an exception from inside the trace under
+  `-W error::DeprecationWarning`. Only a trace shows it: take the tree's vendored copy
+  (`cudnn._cutlass_helpers.static_persistent_tile_scheduler`) and pin the trace on a host as
+  well as on a device (`test_rendering_pins_the_convention` and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` in
+  `test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py`).
 - **A kernel on the `cutlass.cute.experimental` layer reads TWO environment namespaces.** The
   target check of `cutlass.utils.blackwell_helpers` reads `CUTE_DSL_ARCH`; the layer's own
   lowering, dump and cache settings read `CUTE_EXPERIMENTAL_DSL_*`. A cross-target render

@@ -141,9 +141,9 @@ wait (the source: by every thread above every wait); (13) the arms this step nev
 192-token scale path, the two-CTA MMA, cluster multicast, the overlapped accumulator, descriptor prefetch, the other L2 policies,
 the plain and no-op epilogues and the source's own configuration validators (the host entry's typed declines replace them).
 
-The work tiles are dealt by the DSL's own static persistent tile scheduler (``cutlass.utils``), as in the source: with it the
-rendered kernel is the source's up to the changes above.  The DSL has announced that this copy leaves its wheel; a DSL without it is
-declined by name by the host entry's probe (``DSL_NAMES``), never an error from inside the trace.
+The work tiles are dealt by the repository's vendored static persistent tile scheduler (``cudnn._cutlass_helpers``), as in the
+tree's other persistent GEMM kernels.  The source takes the copy in the DSL's wheel, which the DSL has announced for removal and
+which warns at every trace: the schedule is the same static one, and the rendering differs from the source's in parameter loads.
 """
 
 from typing import Tuple, Type, Union
@@ -152,7 +152,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import llvm
@@ -163,6 +162,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, get_smem_capacity_in_bytes
+from cudnn._cutlass_helpers.static_persistent_tile_scheduler import PersistentTileSchedulerParams, StaticPersistentTileScheduler
 from cudnn.frost.buffers import cutedsl_state
 from cudnn.frost.tile_dsl import barrier, pointwise, sf_layout, tma
 
@@ -997,7 +997,7 @@ class SwigluFp4DecodeKernel:
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
         out: cute.Tensor,
@@ -1216,7 +1216,7 @@ class SwigluFp4DecodeKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
             ab_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
@@ -1413,7 +1413,7 @@ class SwigluFp4DecodeKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
             ab_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
@@ -1624,7 +1624,7 @@ class SwigluFp4DecodeKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            tile_sched = StaticPersistentTileScheduler.create(tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
 
             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
@@ -1747,7 +1747,7 @@ class SwigluFp4DecodeKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+    ) -> Tuple[PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Computes the grid size for the kernel launch.
 
         This method uses a persistent tile scheduler to determine the grid
@@ -1770,8 +1770,8 @@ class SwigluFp4DecodeKernel:
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
+        tile_sched_params = PersistentTileSchedulerParams(num_ctas_mnl, cluster_shape_mnl)
+        grid = StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
 

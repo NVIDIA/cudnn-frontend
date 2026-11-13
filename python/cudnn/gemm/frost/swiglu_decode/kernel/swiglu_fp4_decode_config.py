@@ -74,7 +74,6 @@ SM100_SMEM_OPTIN_BYTES, SM100_SMEM_PER_SM_BYTES, SM100_SM_COUNT = 227 * 1024, 22
 #: that clears the version floor but moved one of them declines by name instead of raising from inside the DSL
 DSL_NAMES = (
     ("cutlass.pipeline", ("PipelineTmaUmma", "PipelineUmmaAsync", "CooperativeGroup", "Agent", "make_pipeline_state", "PipelineUserType")),
-    ("cutlass.utils", ("StaticPersistentTileScheduler", "PersistentTileSchedulerParams")),
     (
         "cutlass.utils.blackwell_helpers",
         ("make_blockscaled_trivial_tiled_mma", "compute_epilogue_tile_shape", "make_smem_layout_a", "make_smem_layout_b", "make_smem_layout_epi")
@@ -95,6 +94,9 @@ DSL_NAMES = (
     ("cutlass.cutlass_dsl", ("dsl_user_op",)),
     # the tree's shim over the DSL names that moved between releases; a DSL on which the shim itself does not import declines by name
     ("cudnn._cutlass_compat", ("LayoutEnum", "SmemAllocator", "get_smem_capacity_in_bytes")),
+    # the tree's vendored static persistent tile scheduler (not the copy in the DSL's wheel, which the DSL has announced for removal):
+    # it is written on DSL names of its own, so a DSL on which it does not import declines by name as well
+    ("cudnn._cutlass_helpers.static_persistent_tile_scheduler", ("PersistentTileSchedulerParams", "StaticPersistentTileScheduler")),
 )
 
 
