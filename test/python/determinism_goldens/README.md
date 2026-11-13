@@ -1673,8 +1673,10 @@ every result) and copied.  `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens p
 `test_launch_on_a_side_stream_writes_the_same_bytes` 2, `test_batch_invariance` 126,
 `test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` 8, `test_duplicated_row_and_neighbour_isolation` 2,
 `test_token_tile_pick_is_byte_neutral` 2, `test_inputs_are_unmodified` 2, `test_sixty_four_to_sixty_five_rows_is_the_typed_decline` 1,
-`test_golden` 5.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 201 passed, 0 skipped: the module 197,
-the symbol-prefix test 4.
+`test_golden` 5.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 206 passed, 0 skipped: the module 202,
+the symbol-prefix test 4.  After the record the kernel's work tiles went from the tile scheduler in the DSL's wheel to the repository's
+vendored one (the same static order; the rendering differs in parameter loads).  The set was NOT recorded again: the strict run and the
+module run above are from the tree with the vendored scheduler, so the committed hashes are that kernel's bytes too.
 
 Negative control (same part, same day): the suite run once with ONE launch per case given a changed operand, patched in memory -- the
 second launch of a case receives a copy of the activation whose first row has the sign of every code flipped -> 179 of the 182 cases
@@ -1684,22 +1686,24 @@ The other compiler flavor of the DSL is a DECLINE, not a lane.  The entry's byte
 approximate instructions and were qualified with the DSL compiling with CUDA 13.4; an older compiler is declined by name before any
 compile.  With nvidia-cutlass-dsl 4.8.0 bound to its CUDA 12.9 flavor on the same part and runtime
 (`cutlass.base_dsl.version_info.CUDA_VERSION` = 12.9; torch and the driver stay CUDA 13 -- a statement about the DSL's compiler
-flavor, not about a CUDA 12 deployment): `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs` -> 84
-passed, 299 skipped.  Every case that needs a compiled kernel (296) skips with the entry's message ("... is qualified with the CuTe
-DSL compiling with CUDA 13.4 or later; the DSL in this process compiles with CUDA 12.9 ..."), the three rendering cases skip with the
-same message, nothing is traced; the host-only cases and the symbol-prefix test pass.  Replay and batch invariance are therefore
-evidence for the CUDA 13.4 flavor only.  A probe, not a claim: with that gate lifted in the test process alone, the CUDA 12.9 flavor
+flavor, not about a CUDA 12 deployment): `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs` -> 86
+passed, 302 skipped.  Every case that needs a compiled kernel (298) skips with the entry's message ("... is qualified with the CuTe
+DSL compiling with CUDA 13.4 or later; the DSL in this process compiles with CUDA 12.9 ..."), the three rendering cases and the scan
+of the kernel module's DSL names skip with the same message, nothing is traced; the other host-only cases and the symbol-prefix test
+pass.  Replay and batch invariance are therefore evidence for the CUDA 13.4 flavor only.  A probe, not a claim: with that gate lifted in the test process alone, the CUDA 12.9 flavor
 passes `<suite>` strictly against the committed set on this part (182 passed, 0 skipped); the decline stays until that flavor is
 qualified in full.
 
 Cold compile on an x86 host (a cc 8.0 device: every device case skips; fake tensors, no launch), `pytest <module> <suite>
-core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs`: 87 passed, 296 skipped under CuTe DSL 4.8.0 and under 4.8.1 (the 4.8.1
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs`: 90 passed, 298 skipped under CuTe DSL 4.8.0 and under 4.8.1 (the 4.8.1
 wheels put first on the path), both compiling with CUDA 13.4 -- the three rendering cases (`sm_100a`, `sm_103a`, `sm_107a`) among the
-passes; 84 passed, 299 skipped under 4.8.0 with CUDA 12.9 (the rendering cases skip with the entry's decline).  The four token-tile
-forms render byte-identical cubins under 4.8.1 and under 4.8.0 for the three targets (12 of 12).
+passes, each of which also fails on a `DeprecationWarning` that a trace attributes to a file of the cudnn package (none is raised);
+86 passed, 302 skipped under 4.8.0 and under 4.8.1 with CUDA 12.9 (the rendering cases and the scan of the kernel module's DSL names
+skip with the entry's decline).  The four token-tile forms, without and with the launch attribute, render byte-identical cubins under
+4.8.1 and under 4.8.0 for the three targets (24 of 24).
 
 CuTe DSL 4.8.1 on the cc 10.0 part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime, compiling with CUDA
-13.4): `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 201 passed, 0 skipped.
+13.4): `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 206 passed, 0 skipped.
 `CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -x -q -ra` -> 182 passed; its 5 records hold the input and output
 hashes of the committed 4.8.0 set and are not committed.  The DSL version is part of the runtime key, so against the committed
 directory the 5 golden cases skip under 4.8.1 -- a coverage gap there, not a pass.
