@@ -7,6 +7,12 @@ never renumber.
 
 ## Hard rules
 
+When selecting a specialized launch body, check its grid bounds independently
+of the generic scheduler. The SM100 FP8 D128 decode body puts batch in
+`gridDim.y` for every scheduler policy, so it only replaces the existing body
+for batch sizes at most 65535. Its architecture-route test checks both sides
+of that boundary without allocating a huge batch.
+
 Paged live-page counts are scalar integer arithmetic. Preserve the existing
 `(length + page_size - 1) // page_size` expression in persistent loaders:
 CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations

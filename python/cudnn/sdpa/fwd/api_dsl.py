@@ -4246,6 +4246,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     # SM103's existing producer schedule is faster on the
                     # measured FP8 decode cells; keep its current lowering.
                     and self._device_cc == (10, 0)
+                    # This decode body always puts batch in gridDim.y.
+                    and self.batch_size <= 65535
                     and self._pertensor
                     and not params.pv_bf16
                     and not params.softmax_f16

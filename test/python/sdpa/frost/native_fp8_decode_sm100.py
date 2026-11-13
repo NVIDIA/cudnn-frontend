@@ -360,13 +360,20 @@ def check_architecture_route(monkeypatch):
 
     def inspect(api):
         actual = api._device_cc
+        actual_batch = api.batch_size
         try:
             api._device_cc = (10, 0)
             sm100 = original(api)
+            api.batch_size = 65535
+            assert original(api).decode_live_columns == 8
+            api.batch_size = 65536
+            assert original(api).decode_q_tile == 0
+            api.batch_size = actual_batch
             api._device_cc = (10, 3)
             sm103 = original(api)
         finally:
             api._device_cc = actual
+            api.batch_size = actual_batch
         assert sm100.decode_q_tile == 16 and sm100.decode_live_columns == 8
         assert sm103.decode_q_tile == 0
         checked.append(True)
