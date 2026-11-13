@@ -135,7 +135,8 @@ stored; (6) every operand extent is a run-time value, so one compiled form serve
 an explicit stream; (7) the base class's launch and copy-partition helpers are methods of this class; (8) the stage rule's capacity
 is a constant checked against the DSL, and the traced layout is checked against the config's mirror; (9) DSL names that moved
 between releases are bound through ``cudnn._cutlass_compat``; (10) the five named barriers of the warp-role branches are the
-unaligned form (the source: the aligned one).
+unaligned form (the source: the aligned one); (11) the tensor map of C, its prefetch, its store pipeline and the store itself are
+gone: the null-pointer C tensor carries the shape and the staging dtype only.
 """
 
 from typing import Optional, Tuple, Type, Union
@@ -671,14 +672,7 @@ class SwigluFp4DecodeKernel:
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
 
-        # Setup TMA store for C
-        epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(),
-            c_tensor,
-            epi_smem_layout,
-            self.epi_tile,
-        )
+        # The product is never stored: no tensor map is built for C.
 
         return (
             tiled_mma,
@@ -691,8 +685,6 @@ class SwigluFp4DecodeKernel:
             tma_tensor_sfa,
             tma_atom_sfb,
             tma_tensor_sfb,
-            tma_atom_c,
-            tma_tensor_c,
         )
 
     @staticmethod
@@ -927,48 +919,6 @@ class SwigluFp4DecodeKernel:
         tRS_rC = tiled_copy_r2s.retile(tTR_rC)
         return tiled_copy_r2s, tRS_rC, tRS_sC
 
-    def epilog_gmem_copy_and_partition(
-        self,
-        tidx: cutlass.Int32,
-        atom: Union[cute.CopyAtom, cute.TiledCopy],
-        gC_mnl: cute.Tensor,
-        epi_tile: cute.Tile,
-        sC: cute.Tensor,
-    ) -> Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
-        """
-        Make tiledCopy for global memory store, then use it to:
-        partition shared memory (source) and global memory (destination) for TMA store version.
-
-        Args:
-            tidx (cutlass.Int32): The thread index in epilogue warp groups
-            atom (Union[cute.CopyAtom, cute.TiledCopy]): The copy_atom_c to be used for TMA store version, or tiled_copy_t2r for none TMA store version
-            gC_mnl (cute.Tensor): The global tensor C
-            epi_tile (cute.Tile): The epilogue tiler
-            sC (cute.Tensor): The shared memory tensor to be copied and partitioned
-
-        Returns:
-            A tuple containing (tma_atom_c, bSG_sC, bSG_gC) where:
-                - tma_atom_c: The TMA copy atom
-                - bSG_sC: The partitioned shared memory tensor C
-                - bSG_gC: The partitioned global tensor C
-        """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
-        gC_epi = cute.flat_divide(gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile)
-
-        tma_atom_c = atom
-        sC_for_tma_partition = cute.group_modes(sC, 0, 2)
-        gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
-        bSG_sC, bSG_gC = cpasync.tma_partition(
-            tma_atom_c,
-            0,
-            cute.make_layout(1),
-            sC_for_tma_partition,
-            gC_for_tma_partition,
-        )
-        return tma_atom_c, bSG_sC, bSG_gC
-
     @cute.jit
     def __call__(
         self,
@@ -1016,8 +966,6 @@ class SwigluFp4DecodeKernel:
             tma_tensor_sfa,
             tma_atom_sfb,
             tma_tensor_sfb,
-            tma_atom_c,
-            tma_tensor_c,
         ) = self._prepare_tma(
             a_tensor,
             b_tensor,
@@ -1091,8 +1039,7 @@ class SwigluFp4DecodeKernel:
             tma_tensor_sfa,
             tma_atom_sfb,
             tma_tensor_sfb,
-            tma_atom_c,
-            tma_tensor_c,
+            c_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1132,7 +1079,6 @@ class SwigluFp4DecodeKernel:
         mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
-        tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -1173,7 +1119,6 @@ class SwigluFp4DecodeKernel:
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
-            cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
 
@@ -1889,7 +1834,6 @@ class SwigluFp4DecodeKernel:
 
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(tiled_copy_t2r, tTR_rC, epi_tidx, sC)
-            tma_atom_c, bSG_sC, bSG_gC_partitioned = self.epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, epi_tile, sC)
 
             #
             # Persistent tile scheduling loop
@@ -1899,16 +1843,6 @@ class SwigluFp4DecodeKernel:
 
             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
 
-            # Threads/warps participating in tma store pipeline
-            c_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                32 * len(self.epilog_warp_id),
-            )
-            c_pipeline = pipeline.PipelineTmaStore.create(
-                num_stages=self.num_c_stage,
-                producer_group=c_producer_group,
-            )
-
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -1917,19 +1851,6 @@ class SwigluFp4DecodeKernel:
                     cur_tile_coord[1],
                     cur_tile_coord[2],
                 )
-
-                #
-                # Slice to per mma tile index
-                #
-                # ((ATOM_V, REST_V), EPI_M, EPI_N)
-                bSG_gC = bSG_gC_partitioned[
-                    (
-                        None,
-                        None,
-                        None,
-                        *mma_tile_coord_mnl,
-                    )
-                ]
 
                 if cutlass.const_expr(self.per_token_alpha is not None):
                     # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
@@ -1968,7 +1889,6 @@ class SwigluFp4DecodeKernel:
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
                 #
                 # Store accumulator to global memory in sub-tiles
@@ -2048,18 +1968,9 @@ class SwigluFp4DecodeKernel:
                     barrier.named_barrier_sync_unaligned(self.epilog_sync_bar_id, EPILOGUE_THREADS)
 
                     #
-                    # TMA store C to global memory
+                    # SwiGLU + block quantisation of the staged tile, stored to global memory
                     #
-                    if cutlass.const_expr(self.epilogue_mode == "plain"):
-                        if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, real_subtile_idx)],
-                            )
-                            c_pipeline.producer_commit()
-                            c_pipeline.producer_acquire()
-                    elif cutlass.const_expr(self.epilogue_mode == "quant"):
+                    if cutlass.const_expr(self.epilogue_mode == "quant"):
                         # One CTA contains [gate64, up64]. The first BF16
                         # rounding was performed by the ordinary GEMM epilogue.
                         # Quantization preserves the second BF16 rounding after SiLU.
@@ -2103,12 +2014,6 @@ class SwigluFp4DecodeKernel:
                     cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
                     cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
                 cute.arch.dealloc_tmem(acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs)
-            #
-            # Wait for C store complete
-            #
-            if cutlass.const_expr(self.epilogue_mode == "plain"):
-                c_pipeline.producer_tail()
-
         griddepcontrol_launch_dependents()
 
     frost_swiglu_fp4_decode.set_name_prefix("cudnn", remove_cutlass_symbol=True)
