@@ -1760,6 +1760,10 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
     assert claim.recorded == {0: GATHER_SHAPE, 2: SHAPE}
     clean = census.Traced.of(sites, [], _step(), 1, "", rows=1, claim=claim)
     assert clean.judge() == (census.PASS, [])
+    assert clean.details()[0] == (
+        "embedding: torch.index_select, 1 launch per step (1 call x 1 per call); embedding_gather by name, and in the launch shape the census records: "
+        "grid (40, 1, 1), block (128, 1, 1), shared memory 0 B"
+    )
     assert clean.details()[-3:] == [
         "the target kernel set of a step of this model, when a stack reproduces all of it: 4 launches per step = 3 the target's own compiled kernels "
         "+ 1 cuDNN Frontend entry with byte-equal results + 0 declared stand-ins",

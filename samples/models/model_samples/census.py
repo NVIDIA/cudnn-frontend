@@ -927,6 +927,7 @@ class Traced:
         """Per exact row what a step launched, and the kernels a library chose inside the fallback rows (printed, not gated)."""
         lines = []
         calls = Counter(site.block for site in self.sites)
+        recorded = {} if self.claim is None else {self.sites[index].block: shape for index, shape in self.claim.recorded.items()}
         for site in {site.block: site for site in self.sites}.values():
             for kernel in site.kernels:
                 if kernel.relation != "exact":
@@ -940,6 +941,10 @@ class Traced:
                     )
                 elif kernel.shape == "entry":
                     lines.append(f"{site.block}: {site.entry}{form_text(site.form)}, {count}; the entry states no launch for this run")
+                elif site.block in recorded:  # no entry states its shape; the census of the target records one
+                    lines.append(
+                        f"{site.block}: {site.entry}, {count}; {kernel.id} by name, and in the launch shape the census records: {shape_text(recorded[site.block])}"
+                    )
                 else:
                     lines.append(f"{site.block}: {site.entry}, {count}; {kernel.id} by name (no launch shape is declared for it)")
         if self.result is not None:

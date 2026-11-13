@@ -136,6 +136,20 @@ serves, the two stacks are the same rows.
 On compute capability 12.x the gate entry does not serve; the block then stays on its reference chain (`not yet (reference
 chain)`) in both stacks, and the census has no section for that class.
 
+The stack was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
+line of every run names the PyTorch version as other than the recorded 2.14.0):
+
+| run | result |
+|---|---|
+| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 460 kernel launches and 37 copies; 3 are judged one by one. At 1 sequence the gather, the fused step and the gate have the recorded launch shapes; at 4 no identity is stated. The gate entry was inside its band with every byte the code of the nearest bf16 value (350,208 bytes at 1 sequence, 1,400,832 at 4), and equal alone and among 4 |
+| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 65 launches of every one of the 32 traced steps on target kernels, in the wiring order (the gather, then three fused steps and one gate, 16 times), each in the recorded launch shape; 11,574 kernel launches and 968 copies per traced step in all. Replay held; 7 of 7 provider blocks inside their bands; the gate entry over 256 calls with all of its 1,572,864 bytes the code of the nearest bf16 value; the token line reported |
+| the default run, `--stack fe-entries` | `[00] PASS`, the same lines; also as the L0 cell of the area's GPU test |
+| `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 2 remaining target launches in the recorded shape |
+
+The fused step has the same launch shape in both of its forms, grid (96, 1, 1), block (256, 1, 1), 42,112 B at 1 row:
+that it waits and releases shows in its symbol and in its form, not in a launch record. The stack has not run on
+another GPU class.
+
 ## A checkpoint from local disk
 
 `--model DIR` runs a checkpoint of this architecture in the build with 8-bit projections and a 4-bit MLP and output head.
@@ -388,13 +402,15 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on. The stacks `native` and `fe-entries`: `[00] PASS` at 1 and 4 sequences and with the checkpoint, batch invariance of the fused step and of the gate entry gated and equal; the only class these stacks have run on |
 | 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
 | 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
 | 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |
 | any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
-A class the current checks have not run on is uncovered, not passing.
+A class the current checks have not run on is uncovered, not passing. That holds for the stacks `native` and
+`fe-entries` on every class but 10.0: the gate entry inside this sample, the fused step in its wait + release form, and
+the kernel patterns of the check have run on 10.0 only.
 
 Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
 reserved 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
