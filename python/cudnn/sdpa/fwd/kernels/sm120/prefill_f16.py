@@ -401,6 +401,8 @@ class SM120FusedMultiHeadAttentionForward:
                 self.head_tile_v if is_v else self.head_tile_qk,
                 self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
                 producer_warps=self.num_load_warps,
+                # K copies can overlap the V issue; the V drain still retires both.
+                async_publication=not is_v,
             )
         else:
             chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
@@ -1466,9 +1468,14 @@ class SM120FusedMultiHeadAttentionForward:
         )
         sK = sKV
         sV = sKV.subview(self.k_tile_elems)
-        tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
-        k_tma_mbar = tma_mbar
-        v_tma_mbar = tma_mbar.subview(1)
+        if cutlass.const_expr(self.page_size > 0 and k.dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+            # Keep asynchronous copy completion barriers separate from the dynamic payload.
+            full_ptr = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)
+        else:
+            tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            full_ptr = tma_mbar.data_ptr()
+        k_tma_mbar = full_ptr
+        v_tma_mbar = full_ptr + 1
 
         # Initialize the TMA completion barriers before any load or compute warp
         # can touch the K/V pipeline.
