@@ -40,6 +40,10 @@ measured.
 No pair of CUDA events is used for any of these: an event is stamped when the stream reaches it, so a pair spans every gap
 in which the GPU waited for the host.
 
+The same pass can hand over its **launch records** (``trace_steps(..., records=[...])``): the profiler's trace is then exported
+and read record by record (``census.read_trace``), every kernel and copy with its name, grid, block and shared memory, and the
+step facts above are taken from those same records.  The kernel check of a sample reads them (``model_samples.census``).
+
 **Bytes per step** is arithmetic on the model's tensor list, not a measurement: the bytes of the weights a step reads in
 their stored formats plus the state it reads and writes ("model"), against the same with the weights as the running stack
 holds them ("this stack moves").
@@ -55,6 +59,8 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
+
+from .census import copy_name, read_trace
 
 
 def now() -> float:
@@ -132,7 +138,8 @@ class Trace:
 def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, float, int, int]]:
     """Per step ``(GPU busy, idle inside the step, kernels, copies)`` from kernel activity records ``(name, start, end)`` on
     one clock.  A step ends with its host read: the record of a device-to-host copy closes it.  Records after the last
-    such copy belong to no step."""
+    such copy belong to no step.  A copy is counted as one in either spelling the profiler has for it
+    (``census.copy_name``: the copy node of a replayed launch graph can come as a kernel record)."""
     steps, current = [], []
     for name, start, end in sorted(records, key=lambda r: r[1]):
         current.append((name, start, end))
@@ -144,17 +151,33 @@ def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, flo
                 elif b > reach:
                     busy, reach = busy + (b - reach), b
             span = max(b for _, _, b in current) - current[0][1]
-            copies = sum(n.startswith(("Memcpy", "Memset")) for n, _, _ in current)
+            copies = sum(copy_name(n) for n, _, _ in current)
             steps.append((busy, span - busy, len(current) - copies, copies))
             current = []
     return steps
 
 
-def trace_steps(step: Callable[[int], None], count: int, device=None) -> Tuple[Optional[Trace], str]:
+def _exported(profiler) -> list:
+    """The launch records of a stopped profiler pass: its trace exported to a file of this process's temporary folder and
+    read record by record."""
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "trace.json")
+        profiler.export_chrome_trace(path)
+        return read_trace(path)
+
+
+def trace_steps(step: Callable[[int], None], count: int, device=None, records: Optional[list] = None) -> Tuple[Optional[Trace], str]:
     """Run ``step(i)`` for ``i`` in ``range(count)`` under the PyTorch profiler with kernel activity records only and return
     ``(Trace, "")``, or ``(None, reason)`` where the records cannot be had.  ``step`` ends in the loop's one host read.
     ``device`` is the device the steps run on, where the caller knows it: there are kernel activity records of a CUDA
-    device only, and no step is run for another."""
+    device only, and no step is run for another.
+
+    ``records``, a list, asks for the launch records of the pass: the profiler's trace is exported and every kernel and copy
+    record of it (``census.Launch``: name, grid, block, shared memory) is appended in start order -- also where the step facts
+    cannot be formed from them, so that the caller can say why.  The step facts then come from these records."""
     import torch
     from torch.profiler import ProfilerActivity, profile
 
@@ -185,12 +208,16 @@ def trace_steps(step: Callable[[int], None], count: int, device=None) -> Tuple[O
         raise
     try:
         profiler.__exit__(None, None, None)
-        device_type = torch.autograd.DeviceType.CUDA
-        records = [(e.name, e.time_range.start / 1e3, e.time_range.end / 1e3) for e in profiler.events() if e.device_type == device_type]
-    except RuntimeError as error:  # the profiler could not stop, or has no records to hand over
+        if records is None:
+            device_type = torch.autograd.DeviceType.CUDA
+            activity = [(e.name, e.time_range.start / 1e3, e.time_range.end / 1e3) for e in profiler.events() if e.device_type == device_type]
+        else:
+            records.extend(_exported(profiler))
+            activity = [(launch.name, launch.start, launch.end) for launch in records]
+    except (RuntimeError, OSError, ValueError) as error:  # the profiler could not stop, has no records to hand over, or no readable trace
         return failed(error)
-    facts = step_facts(records)
-    if not records:
+    facts = step_facts(activity)
+    if not activity:
         return None, "the profiler recorded no kernel activity on this GPU"
     if len(facts) != count:
         return None, f"the records show {len(facts)} host reads for {count} steps"

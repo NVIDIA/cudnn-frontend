@@ -10,7 +10,9 @@ merges and dequantises the weights, compiles what a provider compiles (a compile
 warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
 chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
 no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
-lines (``timing``); it leaves the run's state and record as they were.
+lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
+what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
+traced steps and the profiler's record of every launch.
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -23,7 +25,7 @@ from typing import List, Optional, Sequence
 
 import torch
 
-from . import blocks
+from . import blocks, census
 from .sampling import GREEDY
 from .state import DecodeState
 from .timing import Report, Stages, now, trace_steps
@@ -85,10 +87,13 @@ class Session:
         merge_rule: str = "largest_scale",
         share: Optional["Session"] = None,
         record_steps: Optional[int] = None,
+        check_kernels: bool = False,
     ):
         """``capacity`` is the number of positions (prompt + new tokens) a sequence may reach.  ``checkpoint`` defaults to the
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
-        ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step)."""
+        ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step).
+        ``check_kernels`` says that the run will check its kernels: what that needs of a provider is then part of the plan
+        (a decline is a SKIP before the load), and the traced pass keeps its launch records."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if prefill not in PREFILL_ROUTES:
@@ -100,6 +105,9 @@ class Session:
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
+        self.check_kernels = bool(check_kernels)
+        self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
+        self._call_log: Optional[list] = None  # the block calls of the traced step that is running
         self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
         self.plan: Optional[blocks.Plan] = None
         self.weights = None
@@ -113,7 +121,7 @@ class Session:
     # ------------------------------------------------------------------ plan
     def resolve(self) -> blocks.Plan:
         if self.plan is None:
-            options = {"reference_precision": self.reference_precision, "device": str(self.device)}
+            options = {"reference_precision": self.reference_precision, "device": str(self.device), "check_kernels": self.check_kernels}
             facts = self.device if self.device.type == "cuda" else blocks.DeviceFacts((0, 0), "cpu")
             self.plan = blocks.plan(
                 self.model.provider_table,
@@ -187,6 +195,8 @@ class Session:
     # ------------------------------------------------------------------ run
     def _call(self, name: str, layer: int, *operands):
         self._calls += 1
+        if self._call_log is not None:  # a traced step: the call site, and what the adapter says serves it
+            self._call_log.append(census.Call(name, layer, self.sequences, *self.plan[name].serving()))
         if self.tap is not None:
             return self.tap(name, layer, self.plan[name], operands)
         return self.plan[name](*operands)
@@ -230,21 +240,44 @@ class Session:
             self._report.clock.mark_ids()
         return tokens
 
-    def trace(self, steps: int = 32) -> None:
+    def trace(self, steps: int = 32, records: Optional[bool] = None) -> None:
         """The traced pass of the report: replay the first ``steps`` recorded inputs of this run from a zero state under the
         profiler, each step ending in the host read of its ids, as in the loop.  The run's own state and record are put
-        back afterwards.  Where kernel activity records cannot be had the report says why."""
+        back afterwards.  Where kernel activity records cannot be had the report says why.
+
+        With ``records`` (default: the session's ``check_kernels``) the pass also keeps ``self.traced`` for the kernel check:
+        the sites of a step with what the entries state about their launches, read before the first traced step; the log
+        of every block call of every traced step; and the launch records of the pass, cut into steps -- or why there are
+        none."""
+        records = self.check_kernels if records is None else bool(records)
+        sites = census.expected(self.plan, self.model) if records else []
         count = min(steps, self.record.count, self.record.inputs.shape[0])
         if count < 1:
             self._report.trace_missing = "needs a recorded step on a CUDA device"
+            if records:
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences)
             return
         inputs, kept, calls = self.record.inputs[:count], (self.state, self.record), self._calls
         self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
         self.record = Record(0, self.sequences, self.model.geometry.vocab, self.device)
+        call_log: List[list] = []
+        launches: list = []
+
+        def step(i: int) -> None:
+            if records:
+                self._call_log = []
+                call_log.append(self._call_log)
+            self._advance(inputs[i]).tolist()
+
         try:  # the device is trace_steps' to decline: what is swapped here is put back whatever it does
-            self._report.trace, self._report.trace_missing = trace_steps(lambda i: self._advance(inputs[i]).tolist(), count, self.device)
+            if records:
+                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device, records=launches)
+            else:
+                self._report.trace, self._report.trace_missing = trace_steps(step, count, self.device)
         finally:
-            (self.state, self.record), self._calls = kept, calls
+            (self.state, self.record), self._calls, self._call_log = kept, calls, None
+        if records:
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences)
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
