@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Packed linear-attention scans with explicit backward and first-order JAX AD."""
+"""Public JAX APIs for packed linear-attention scans and their gradients."""
 
-from ._jax_scan import _DeltaConfig, _MambaConfig, _Operation, _backward, _differentiable, _forward
+from ._jax_execution import _DeltaConfig, _MambaConfig, _Operation, _backward, _differentiable, _forward
 
 
 def gated_delta_net_fwd(

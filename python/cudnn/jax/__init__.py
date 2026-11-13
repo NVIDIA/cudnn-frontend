@@ -64,7 +64,7 @@ __all__ = [
 
 def __getattr__(name):
     if name in _LINEAR_ATTENTION_EXPORTS:
-        value = getattr(import_module("cudnn.linear_attention.scan_jax"), name)
+        value = getattr(import_module("cudnn.linear_attention.jax_scan_api"), name)
         globals()[name] = value
         return value
     if name in _BSA_EXPORTS:

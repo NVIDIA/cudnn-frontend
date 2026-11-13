@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared JAX execution and differentiation for native FROST scans."""
+"""Shared JAX validation, execution, and differentiation for FROST scans."""
 
 from dataclasses import asdict, dataclass
 from enum import Enum
