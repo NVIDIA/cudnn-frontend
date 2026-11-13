@@ -1150,6 +1150,47 @@ def test_exact_cells_e4m3():
             assert bool((codes[0, 320:336] == 0x00).all()) and bool((codes[1, 320:336] == 0x80).all()), "the zero's code carries the sign"
 
 
+@pytest.mark.parametrize(
+    "form, value",
+    [pytest.param(form, 2.0**exponent, id=f"{form}-pow{exponent}") for form in ("add-bf16-e4m3", "add-bf16-nvfp4") for exponent in (-100, 100)],
+)
+def test_scale_contract_ends(form, value):
+    """Both ends of the documented scale range (``2**-100 .. 2**100``) against the references.  Static E4M3: a scale of 2^-100
+    saturates every non-zero element (``0x7E`` / ``0xFE``), a scale of 2^100 rounds every element to a signed zero.  NVFP4: a global
+    scale of 2^100 saturates the block scales (``0x7E``) and the codes of the non-zero elements, a global scale of 2^-100 rounds
+    every block scale to zero, and a zero block scale writes the codes of the signed zero.  The bf16 output and the residual do not
+    depend on the scale."""
+    dev = _device_or_skip()
+    rows = 8
+    x, res0, w = make_operands(rows, HIDDEN, dev, seed=37, kind="structured")
+    k = _entry(dev, form)
+    scale = scale_tensor(value, dev)
+    got = _snap(k, x, res0, w, scale)
+    assert_reference(form, got, x, res0, w, scale, label=f"{form} scale {value}")
+    other = _snap(k, x, res0, w, scale_tensor(1.0, dev))
+    _assert_same(got, other, f"{form}: the scale moves codes only", names=["out", "residual"])
+    y = got["out"].float().cpu()
+    nonzero = y != 0
+    if form.endswith("e4m3"):
+        codes = got["codes"].view(U8).cpu()
+        if value < 1:
+            assert bool(((codes & 0x7F) == 0x7E)[nonzero].all()), "a scale of 2^-100: every non-zero element saturates"
+        else:
+            assert bool(((codes & 0x7F) == 0)[nonzero].all()), "a scale of 2^100: every element rounds to a signed zero"
+        assert torch.equal(codes >> 7, torch.signbit(y).to(U8)), "the code carries the sign of the bf16 value"
+    else:
+        stored = scale_bytes_of_rows(got["scales"], rows)
+        codes = unpack_e2m1(got["codes"].cpu())
+        live = (y.abs().reshape(rows, -1, 16).amax(dim=2) != 0).repeat_interleave(16, dim=1)
+        if value < 1:
+            assert bool((stored == 0).all()), "a global scale of 2^-100: every block scale rounds to zero"
+            assert bool(((codes & 7) == 0).all()), "a zero block scale: the codes of the signed zero"
+        else:
+            assert bool((stored[live[:, ::16]] == 0x7E).all()), "a global scale of 2^100: the block scale of a non-zero block saturates"
+            assert bool(((codes & 7) == 7)[nonzero].all()), "a global scale of 2^100: every non-zero element saturates"
+        assert torch.equal((codes >> 3)[live], torch.signbit(y).to(U8)[live]), "the code carries the sign of the bf16 value"
+
+
 def test_edge_rows():
     """Edge rows beside a plain one: an all-zero row (``y`` a signed zero whose sign is ``1 + w``'s, zero block scales), negative zeros,
     one dominant element, values whose squares underflow, a large in-domain row, a residual that cancels ``x`` -- each inside the same
@@ -1293,7 +1334,8 @@ def test_bit_neutral_arms_write_the_default_bytes(quant, rows):
     """What never changes a byte: the launch arms (wait; wait + release) against the plain launch; writing the bf16 value or not;
     storing ``x`` to the residual or not.  The launch arms run BEHIND a real predecessor on the same stream -- a torch copy that
     rewrites ``x`` and the residual right before the launch -- so the wait has something to wait for: a kernel that read ``x`` before
-    its wait would see the previous values.  The release has no dependent in this cell (inert here; the cell below gives it one)."""
+    its wait would see the previous values.  The release has no dependent in this cell (inert here; the cell below gives it one).
+    Over the three quant parameters the cell launches every one of the fifteen forms under every one of the three launch arms."""
     dev = _device_or_skip()
     tail = {None: "", "e4m3_static": "-e4m3", "nvfp4": "-nvfp4"}[quant]
     scale = None if quant is None else scale_tensor(0.02 if quant == "e4m3_static" else 37.0, dev)
@@ -1314,9 +1356,10 @@ def test_bit_neutral_arms_write_the_default_bytes(quant, rows):
             if mode != "none":
                 got["residual"] = residual
             _assert_same(got, base, f"{base_form} {arm_id} rows {rows}")
-        if quant is not None:  # the form without the bf16 value writes the same residual, codes and scales
-            lean = _snap(_entry(dev, f"{mode}{tail}"), xs, rs, w, scale)
-            _assert_same(lean, base, f"{mode}{tail} against {base_form} rows {rows}", names=list(lean))
+        if quant is not None:  # the form without the bf16 value writes the same residual, codes and scales, under every launch arm
+            for arm, arm_id in zip(LAUNCH_ARMS, LAUNCH_ARM_IDS):
+                lean = _snap(_entry(dev, f"{mode}{tail}", arm), xs, rs, w, scale)
+                _assert_same(lean, base, f"{mode}{tail} {arm_id} against {base_form} rows {rows}", names=list(lean))
     stored = _snap(_entry(dev, f"store-bf16{tail}"), xs, rs, w, scale)
     plain = _snap(_entry(dev, f"none-bf16{tail}"), xs, rs, w, scale)
     _assert_same(stored, plain, f"store against none rows {rows}", names=list(plain))
