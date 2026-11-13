@@ -3119,6 +3119,7 @@ class Picking:
                 continue
             self.forced.setdefault(name, set()).add(i)
             return SimpleNamespace(best=SimpleNamespace(config=cfg))
+        raise AssertionError(f"{name}: no candidate ran")  # unreachable: the default candidate asserts above
 
 
 class Failing:
@@ -3217,6 +3218,9 @@ def test_determinism_cutile_autotune_host_hooks(backend, variant, tune_cache):
 
     with waive_unsupported(backend, variant):
         run(Picking(0), record_hint=record)
+        # the host's own errors reach the caller instead of being taken for a tuning failure
+        with pytest.raises(RuntimeError, match="the host could not record"):
+            run(Picking(0), record_hint=Mock(side_effect=RuntimeError("the host could not record")))
     assert recorded, f"{variant}: no timed winner was recorded"
     assert all(config == vars(common.launch_hint_configs((1,), (common.DEFAULT_NWW,))[0]) for config in recorded.values()), recorded
 
