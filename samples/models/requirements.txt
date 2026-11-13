@@ -1,0 +1,9 @@
+# Sample-only dependencies; not part of cudnn-frontend's runtime package.
+# Needed only to run a model sample on a checkpoint from local disk (--model): the checkpoint's tokenizer, its chat
+# template and its weight shards. The default run of every sample needs none of them.
+# Lower bounds, no pins: PyTorch itself requires jinja2. A checkpoint's chat template is untrusted input and runs in
+# jinja2's sandbox: the bound for jinja2 is the release with the latest sandbox fixes known when this file was written.
+# Validated with: tokenizers 0.23.3, jinja2 3.1.6, safetensors 0.8.0
+tokenizers>=0.21.1
+jinja2>=3.1.6
+safetensors>=0.4.3

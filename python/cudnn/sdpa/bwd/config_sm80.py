@@ -116,6 +116,8 @@ class TemplateParams:
     # Zero/None retain the established per-head-dimension SM80 choices.
     qo_stages: int = 0
     dq_smem_coalesce: bool | None = None
+    # Independent CTAs own disjoint gradient columns; score reductions stay full.
+    grad_dim_splits: int = 1
 
 
 def validate_bwd_params(p: TemplateParams) -> None:
@@ -133,6 +135,10 @@ def validate_bwd_params(p: TemplateParams) -> None:
         raise ValueError(f"sm80 bwd: d_qk//2 ({p.d_qk // 2}) must be a multiple of 16 (ldmatrix.x4 N//8 even)")
     if p.d_v % 32 != 0:
         raise ValueError(f"sm80 bwd: d_v ({p.d_v}) must be a multiple of 32 (do_dot warp reduce)")
+    if p.grad_dim_splits not in (1, 2) or p.d_qk % (32 * p.grad_dim_splits) or p.d_v % (16 * p.grad_dim_splits):
+        raise ValueError("native mma.sync bwd: invalid gradient column partition")
+    if p.grad_dim_splits > 1 and (p.has_rope or p.dq_smem_coalesce is not False):
+        raise ValueError("native mma.sync bwd: partitioned gradients require direct dQ stores and no RoPE")
     if p.has_rope and p.d_qk > 128:
         raise ValueError("sm80 bwd: RoPE requires d_qk <= 128 (the sDQ SMEM staging exceeds the A100 budget beyond that)")
     if p.sched_policy not in (_SCHED_NATURAL, _SCHED_LPT, _SCHED_LPT_L2):

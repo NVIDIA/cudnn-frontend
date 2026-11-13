@@ -893,7 +893,7 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
     # The pools' strides in the kernel's [num_pages, page_size, H_kv, d] order carry the layout (HND vs NHD).
     fn = mod.compile(d_qk=d, d_v=d_v, has_lse=True, lse_kind="dense", paged_hnd=k_view.stride(1) < k_view.stride(2))
     # Split partials are fp32 on SM100 (#891); the combine must be compiled for that width.
-    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+    from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     o_p = torch.zeros(splits * B, 1, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, 1, device=dev, dtype=torch.float32)
@@ -1532,6 +1532,9 @@ def _run_graph_fp8(
     d_v=None,
     head_padding=False,
     softmax_precision=None,
+    amax=True,
+    stats_log2=False,
+    explicit_swap_ab=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1606,6 +1609,7 @@ def _run_graph_fp8(
         scale_o=son,
         attn_scale=scale,
         generate_stats=stats,
+        stats_use_log2=stats_log2,
         use_padding_mask=True,
         seq_len_q=sq_t,
         seq_len_kv=sk_t,
@@ -1620,7 +1624,8 @@ def _run_graph_fp8(
         lse = torch.empty(B, H, s_q, 1, device=dev, dtype=torch.float32)
         st.set_output(True).set_dim([B, H, s_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amax_o = torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32)
-    amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if amax:
+        amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -1634,7 +1639,7 @@ def _run_graph_fp8(
         )
         assert idx is not None, f"no {target_engine} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None:
+    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None or explicit_swap_ab is not None:
         from dataclasses import replace
 
         selected = g.plans[g._plan_index]
@@ -1645,7 +1650,9 @@ def _run_graph_fp8(
             knobs = replace(knobs, pack_gqa=explicit_pack)
         if explicit_cga is not None:
             knobs = replace(knobs, cga=explicit_cga)
-        g.create_execution_plan(selected.engine_id, knobs)
+        if explicit_swap_ab is not None:
+            knobs = replace(knobs, swap_ab=explicit_swap_ab)
+        g.create_execution_plan(selected.engine_id, knobs.to_public() if explicit_swap_ab is not None else knobs)
         g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -1668,6 +1675,8 @@ def _run_graph_fp8(
         ssn: _sc(1.0),
         son: _sc(1.0),
     }
+    if not amax:
+        vp.pop(amx_o)
     if sink_t is not None:
         vp[sink_t] = sinks
     if stats:
@@ -1724,9 +1733,12 @@ def _run_graph_fp8(
         assert torch.count_nonzero(out[dead]).item() == 0, "trimmed and sink-only rows must write exact zero O"
     # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32 values; the
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
-    assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
+    if amax:
+        assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
     if stats:
         got_lse = lse.view(B, H, s_q)
+        if stats_log2:
+            ref_lse = ref_lse * math.log2(math.e)
         lse_atol = _fp8_lse_atol(256 if max(d, d_v) > 128 else d)
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=lse_atol, rtol=0)
         if (~live).any():
@@ -1739,14 +1751,16 @@ def _run_graph_fp8(
             tensors["sinks"] = sink_t
         if stats:
             tensors["lse"] = st
-        return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
+        buffers = {name: vp[tensor] for name, tensor in tensors.items() if tensor in vp}
+        buffers["amax_o"] = amax_o
+        return g, vp, ws, buffers, tensors
     return (plan, g) if return_graph else plan
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 128])
+@pytest.mark.parametrize("page_size", [8, 16, 128])
 def test_paged_graph_fp8_matches_reference(in_key, hnd, page_size):
     """FP8 twin of test_paged_graph_matches_reference: mixed lengths incl. 0 and 1
     (partial last pages, dead pages NaN-filled), GQA 8:2 (PackGQA), a tile-unaligned
@@ -2843,7 +2857,7 @@ def test_paged_mxfp8_adapter_sm107_device_contract(monkeypatch, dims):
             assert "Rubin paged KV" not in str(e), e
             raise
     else:
-        with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
+        with pytest.raises(NotImplementedError, match=r"Rubin paged KV.*MXFP8 D128/D256"):
             _api().check_support()
 
 

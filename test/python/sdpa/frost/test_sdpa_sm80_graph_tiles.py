@@ -65,7 +65,20 @@ def _facts(d=192, dv=128, mode="dense", causal=False):
     )
 
 
-@pytest.mark.parametrize("d,dv,m,n", _POINTS + [(48, 32, 64, 128), (96, 80, 64, 64), (136, 112, 64, 128), (248, 200, 64, 32)])
+@pytest.mark.parametrize(
+    "d,dv,m,n",
+    _POINTS
+    + [
+        (48, 32, 16, 16),
+        (128, 128, 16, 32),
+        (192, 128, 32, 32),
+        (256, 256, 16, 16),
+        (48, 32, 64, 128),
+        (96, 80, 64, 64),
+        (136, 112, 64, 128),
+        (248, 200, 64, 32),
+    ],
+)
 @pytest.mark.parametrize("mode", ["dense", "thd", "paged"])
 def test_explicit_graph_geometry(d, dv, m, n, mode):
     facts = _facts(d, dv, mode)
@@ -77,20 +90,47 @@ def test_explicit_graph_geometry(d, dv, m, n, mode):
 @pytest.mark.parametrize(
     "d,dv,kw,label",
     [
-        (192, 128, {"tile_m": 32}, "tile_m"),
-        (192, 128, {"tile_n": 32}, "tile_n"),
+        (192, 128, {"tile_m": 8}, "tile_m"),
+        (192, 128, {"tile_n": 8}, "tile_n"),
         (256, 256, {"tile_n": 128}, "tile_n"),
         (248, 200, {"tile_n": 128}, "tile_n"),
         (512, 512, {"tile_m": 64}, "tile_m"),
         (576, 512, {"tile_n": 64}, "tile_n"),
         (192, 128, {"cga": 2}, "cga"),
-        (192, 128, {"split_kv": 2}, "split"),
-        (192, 128, {"pack_gqa": True}, "pack_gqa"),
     ],
 )
 def test_unsupported_geometry_declines(d, dv, kw, label):
     reason = engines.mismatch(_CAPS, _facts(d, dv), engines.SdpaFwdKnobs(**kw))
     assert reason is not None and label in reason
+
+
+@pytest.mark.parametrize("mode", ["dense", "paged", "thd"])
+def test_split_geometry_requires_dense_queries(mode):
+    knobs = engines.SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1, sched_policy=0, split_kv=2)
+    reason = engines.mismatch(_CAPS, _facts(mode=mode), knobs)
+    if mode == "thd":
+        assert reason is not None and "split" in reason
+    else:
+        assert reason is None
+
+
+@pytest.mark.parametrize("group", [1, 3, 12, 128])
+@pytest.mark.parametrize("mode", ["dense", "paged", "thd"])
+def test_pack_geometry_crosses_tile_boundaries(group, mode):
+    knobs = engines.SdpaFwdKnobs(tile_m=16, tile_n=32, cga=1, sched_policy=0, pack_gqa=True)
+    facts = replace(_facts(mode=mode), h_q=group * 8)
+    reason = engines.mismatch(_CAPS, facts, knobs)
+    if mode == "thd":
+        assert reason is not None and "PackGQA" in reason
+    else:
+        assert reason is None
+        # Unspecified tile geometry must not read max() of an empty domain.
+        assert engines.mismatch(_CAPS, facts, replace(knobs, tile_m=None, tile_n=None)) is None
+
+
+def test_pack_geometry_keeps_unsupported_widths_a_decline():
+    reason = engines.mismatch(_CAPS, _facts(584, 512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert reason is not None and "envelope" in reason
 
 
 @pytest.mark.parametrize("mode", ["dense", "thd", "paged"])
@@ -147,7 +187,7 @@ def test_public_graph_geometry_rebind_replay(d, dv, m, n, cudnn_handle, monkeypa
     case = _case(d, dv, sq=192, layout="gapped", stats=m != 128, causal=scheduler == 2, graph_knobs=public)
     g = case.graph
     assert g.get_engine_and_knobs_at_index(g._plan_index)[1] == public
-    warps = 4 if m == 64 or d == 64 or d > 256 else 8
+    warps = m // 16 if m in (16, 32) and d <= 256 else 4 if m == 64 or d == 64 or d > 256 else 8
     assert observed and observed[-1] == (m, n, warps)
     execution_stream = torch.cuda.ExternalStream(cudnn.get_stream(cudnn_handle))
     for binding in range(2):

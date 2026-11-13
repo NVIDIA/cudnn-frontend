@@ -31,6 +31,7 @@ class LaunchSpec:
     operands: tuple
     device_index: int
     scale: float
+    workspace_bytes: int = 0
     native: object = field(init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self):
@@ -88,16 +89,24 @@ def build_spec(api):
         for shape, strides in api._sm80_paged_table_geometry:
             add(shape, strides, "int32", 4)
     geometry = tuple(geometry)
+    from cudnn.sdpa.fwd.kernels.sm100.split_combine import FROST_SOURCE_DIGEST as combine_digest
+
     key = template_key(
         vars(api._k_mod),
-        dict(geometry=geometry, swa_window=api.swa_window_runtime, right_bound=api.right_bound_runtime, max_skv=api.s_k_max if api.paged else None),
+        dict(
+            geometry=geometry,
+            swa_window=api.swa_window_runtime,
+            right_bound=api.right_bound_runtime,
+            max_skv=api.s_k_max if api.paged else None,
+            combine_digest=combine_digest if api.split_kv > 1 else None,
+        ),
         "prepared_dense",
     )
     artifact = compile_host(api._k_mod, api._params, geometry, api.swa_window_runtime, api.right_bound_runtime, key, api.s_k_max if api.paged else None)
     fn = positional_entry(artifact)
     if fn is None:
         raise NotImplementedError("SM80 prepared forward requires a positional tvm-ffi entry")
-    return LaunchSpec(artifact, fn, tuple(operands), int(api.q_desc.device.index or 0), api.scale_softmax)
+    return LaunchSpec(artifact, fn, tuple(operands), int(api.q_desc.device.index or 0), api.scale_softmax, api.scratch_workspace_bytes())
 
 
 def bind(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False):
@@ -110,8 +119,15 @@ def bind(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=Fa
     return list(spec.native.bind(pack, tuple(range(len(roles))), stream_int, scale, overridden_indices, raw_storage))
 
 
-def execute(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False):
-    spec.fn(*bind(spec, facts, stream_int, scale=scale, overridden=overridden, raw_storage=raw_storage))
+def execute(spec, facts, stream_int, *, scale=None, overridden=None, raw_storage=False, workspace_ptr=0):
+    _check_workspace_pointer(spec, workspace_ptr)
+    frame = bind(spec, facts, stream_int, scale=scale, overridden=overridden, raw_storage=raw_storage)
+    spec.fn(*frame, *((workspace_ptr,) if spec.workspace_bytes else ()))
+
+
+def _check_workspace_pointer(spec, workspace_ptr):
+    if spec.workspace_bytes and (not workspace_ptr or workspace_ptr % 16):
+        raise ValueError("SM80 split-KV workspace must be non-null and 16-byte aligned")
 
 
 class PreparedSm80Launch:
@@ -130,15 +146,31 @@ class PreparedSm80Launch:
         if self._native_indices is None:
             roles = dict(zip(self._roles, self._indices))
             self._native_indices = tuple(roles.get(role, -1) for role in PAGED_ROLES[: len(self.spec.operands)])
-        self.spec.native.execute(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
+        if self.spec.workspace_bytes:
+            _check_workspace_pointer(self.spec, workspace_ptr)
+            frame = self.spec.native.bind(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
+            self.spec.fn(*frame, workspace_ptr)
+        else:
+            self.spec.native.execute(pack.native, self._native_indices, stream_int, None, tuple(pack.overridden), True)
 
 
-def execute_tensors(spec, buffers, stream_int, *, scale=None):
+def execute_tensors(spec, buffers, stream_int, *, scale=None, workspace=None):
     """Observe current standalone carriers once; keep their stricter contract."""
     from cudnn import _pybind_module
     from cudnn.sdpa.fwd.prepared import _set_native_fact, facts_of_tensor
 
+    workspace_ptr = 0
+    if spec.workspace_bytes:
+        ws = facts_of_tensor(workspace) if workspace is not None else None
+        if ws is None or ws.device != (2, spec.device_index) or not ws.contiguous or ws.numel * workspace.element_size() < spec.workspace_bytes:
+            raise ValueError(f"SM80 split-KV requires a contiguous {spec.workspace_bytes}-byte workspace on the plan device")
+        workspace_ptr = ws.ptr
+        _check_workspace_pointer(spec, workspace_ptr)
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))
-    spec.native.execute(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)
+    if spec.workspace_bytes:
+        frame = spec.native.bind(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)
+        spec.fn(*frame, workspace_ptr)
+    else:
+        spec.native.execute(pack, tuple(range(len(spec.operands))), stream_int, scale, (), False)

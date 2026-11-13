@@ -5693,6 +5693,9 @@ def _host(
                 paged=PAGED_KV,
                 rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
                 release_dependents=THD_SETUP_PDL,
+                # Runtime B selects the fast branch, including plans whose declared
+                # capacity is larger than the current invocation.
+                single_batch_fast=not PAGED_KV and PARAMS.dtype_kv < 0 and CFG.SPLIT_KV == 1,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_o_descs_kernel(
@@ -5805,8 +5808,8 @@ def compile(  # noqa: A001
         if len(thd_origin_specs) != 5:
             raise ValueError("physical THD origins require five port declarations")
     _cache_key = _template_key(globals(), locals(), "compile")
-    if MIXED_FP8_KV and (d_qk, d_v) != (128, 128):
-        raise ValueError("independent FP8 KV storage requires exact D128 head dimensions")
+    if MIXED_FP8_KV and (d_qk, d_v) not in ((64, 64), (128, 128)):
+        raise ValueError("independent FP8 KV storage requires exact D64 or D128 head dimensions")
     if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O):
         raise ValueError(f"d{CFG.TILE_K} envelope: need 0 < d_qk <= {CFG.TILE_K} and 0 < d_v <= {CFG.TILE_O}; got ({d_qk}, {d_v})")
     if (d_qk * CFG.BPE) % 16 != 0 or (d_v * CFG.BPE_O) % 16 != 0:

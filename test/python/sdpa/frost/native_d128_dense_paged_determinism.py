@@ -18,12 +18,12 @@ _CASES = [
 ]
 
 
-def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None):
+def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None, pack=True, num_q_heads=8):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     _rubin_only()
     dtype, kv_dtype = getattr(torch, dtype_name), getattr(torch, kv_name)
-    h, kh, sq, d, page, blocks = 8, 2, 17, head_dim, 16, 17
+    h, kh, sq, d, page, blocks = num_q_heads, 2, 17, head_dim, 16, 17
     dv = d if value_dim is None else value_dim
     rng = torch.Generator().manual_seed(73461)
     q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
@@ -103,12 +103,12 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=Non
                 paged_table_v_stride=t["vt"].stride(),
                 cga=cga,
                 split_kv=split,
-                pack_gqa=True,
+                pack_gqa=pack,
                 tile_n=tile_n,
             )
             api.check_support()
             api.compile()
-            kernel = "prefill_d512_f16_2x2.py" if head_dim >= 512 else "prefill_d128_f16.py"
+            kernel = "prefill_d512_f16_2x2.py" if head_dim >= 512 else "prefill_d256_f16.py" if head_dim == 256 else "prefill_d128_f16.py"
             assert api._k_mod.__file__.endswith(f"sm107/{kernel}")
             assert api.flavor == (head_dim, dv)
             assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
@@ -167,8 +167,8 @@ def _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=Non
 
 
 @pytest.mark.parametrize("dtype_name,kv_name,cga,split,tile_n", _CASES)
-def test_replay_batch_and_golden(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None):
-    run, inputs = _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=head_dim, value_dim=value_dim)
+def test_replay_batch_and_golden(dtype_name, kv_name, cga, split, tile_n, head_dim=128, value_dim=None, pack=True):
+    run, inputs = _runner(dtype_name, kv_name, cga, split, tile_n, head_dim=head_dim, value_dim=value_dim, pack=pack)
     target = assert_replays(lambda: run([0]), repeats=4)
     for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 64 + [0] + [2] * 64):
         actual = snapshot(run(order))
@@ -177,4 +177,5 @@ def test_replay_batch_and_golden(dtype_name, kv_name, cga, split, tile_n, head_d
                 assert_bitwise({n: actual[n][row : row + 1] for n in target}, target, f"batch row {row}")
     run([0, 1, 2, 3, 4], capture=True)
     actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
-    assert_golden(f"sdpa-half-d{head_dim}-dense-paged-{dtype_name}-{kv_name}-cga{cga}-split{split}-n{tile_n}", inputs, actual)
+    suffix = "" if pack else "-unpacked"
+    assert_golden(f"sdpa-half-d{head_dim}-dense-paged-{dtype_name}-{kv_name}-cga{cga}-split{split}-n{tile_n}{suffix}", inputs, actual)

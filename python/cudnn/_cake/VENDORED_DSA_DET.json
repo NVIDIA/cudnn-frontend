@@ -1,0 +1,245 @@
+{
+  "source_repository": "https://github.com/radixark/miles-ext-kernels",
+  "source_commit": "f55fb99674be5edb0e1f6a0e4d6a911335da86ce",
+  "packages": {
+    "cake_dsa_sparse_det": {
+      "build": {
+        "arch_from": {
+          "sm_107a": "sm_103a"
+        },
+        "link_flags": [
+          "-shared",
+          "-lcudart",
+          "-lcuda"
+        ],
+        "nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--compiler-options=-fPIC",
+          "--expt-relaxed-constexpr"
+        ],
+        "registry": "registry.json"
+      },
+      "cake_revision": null,
+      "files": {
+        "csrc/cake_dsa_train_034619277b2a7cad3fb1_binding.cu": "2b156b796545af1302450831649dc82d59c12a33",
+        "csrc/cake_dsa_train_034619277b2a7cad3fb1_kernel.cu": "0a33e6b284feed789ff93908d681844efa70677d",
+        "csrc/cake_dsa_train_06715348ab7d777400f6_binding.cu": "91fc6aa5c13b953c87c17b3625a73241d25531ab",
+        "csrc/cake_dsa_train_06715348ab7d777400f6_kernel.cu": "4b04d83f46966deb99da0bd90bd0c2d451567710",
+        "csrc/cake_dsa_train_0a7a02609d5f6606e334_binding.cu": "d14b56c15cb994f72233013d8ef3d414962b738a",
+        "csrc/cake_dsa_train_0a7a02609d5f6606e334_kernel.cu": "63b9eb0e75364bf444d5348a93a532032d6017df",
+        "csrc/cake_dsa_train_0b27153f9e8d04ecfc0e_binding.cu": "23987c4aa7df0650e3dabe628f35d1726614e24a",
+        "csrc/cake_dsa_train_0b27153f9e8d04ecfc0e_kernel.cu": "6d1617d044aaac116c2dc4c3d6d1f33e11714c2f",
+        "csrc/cake_dsa_train_0ce1e9067590768ebdd8_binding.cu": "c6860b7b7ce41bff45ca15c3dee35827b8db182d",
+        "csrc/cake_dsa_train_0ce1e9067590768ebdd8_kernel.cu": "2f2b9c686e9b46196943448b558699d2673a1930",
+        "csrc/cake_dsa_train_0eb4ed1c080107e23f57_binding.cu": "f8cb9d794c8d722420fcadb6b4072c81dd64834e",
+        "csrc/cake_dsa_train_0eb4ed1c080107e23f57_kernel.cu": "58be054a2913ac406146d17c5f0dd97b2ef26a47",
+        "csrc/cake_dsa_train_14e92451a856d3999844_binding.cu": "2465647cb5f88b3a5a69d14161599e8710f6045b",
+        "csrc/cake_dsa_train_14e92451a856d3999844_kernel.cu": "60bc9efdf655ecf7840debb011fa331a7632bf8b",
+        "csrc/cake_dsa_train_1654b25c2b5cb8c61a2b_binding.cu": "7c2aea245b006ae20e98ec6870f90491bdacba59",
+        "csrc/cake_dsa_train_1654b25c2b5cb8c61a2b_kernel.cu": "aed1b8365cbbdb5095b766d60c28f1fe6faacf87",
+        "csrc/cake_dsa_train_231514c37b7a88bdee84_binding.cu": "11b5b75d20c5afd8b141b3965b59007944b70af0",
+        "csrc/cake_dsa_train_231514c37b7a88bdee84_kernel.cu": "4d9657d6d9a9c3fbc794e98c2489459cba4cc4de",
+        "csrc/cake_dsa_train_3512b831f4234be3805a_binding.cu": "501f503a3c6d47215cd5f55ba5be20272f59aa06",
+        "csrc/cake_dsa_train_3512b831f4234be3805a_kernel.cu": "f3a3370db508c61f55a66db7a9623b11e63856b2",
+        "csrc/cake_dsa_train_3980765703ea26ab79c5_binding.cu": "daf18db5ea33701e9848e0fd0ebe7c62e04d3e2b",
+        "csrc/cake_dsa_train_3980765703ea26ab79c5_kernel.cu": "d43dcdbe2f81557d4d928516c84467ae070c8af2",
+        "csrc/cake_dsa_train_3c35d9ed3f99fd6126c1_binding.cu": "76f0c87366cbcf20cc769815a67b69ca31a17f63",
+        "csrc/cake_dsa_train_3c35d9ed3f99fd6126c1_kernel.cu": "2619b8bed3f4408212f4698400472df0daf32829",
+        "csrc/cake_dsa_train_442304493c2e4a426948_binding.cu": "3215bdac201f3aa1a28b704e14986d5cfce5015e",
+        "csrc/cake_dsa_train_442304493c2e4a426948_kernel.cu": "7b873742119ad072ce3d04e27fc29036f8ce6f97",
+        "csrc/cake_dsa_train_4615ad9861a213d4a0ef_binding.cu": "d72267b5f434b69af6d8ccc3cc3f93819386b892",
+        "csrc/cake_dsa_train_4615ad9861a213d4a0ef_kernel.cu": "931f28788e7e90517faf62bbe35da2c39a4cc56c",
+        "csrc/cake_dsa_train_475f8e2e5941e4fc1ce2_binding.cu": "f3fa900dc212ff6f1361768b52d09645b5bcd20f",
+        "csrc/cake_dsa_train_475f8e2e5941e4fc1ce2_kernel.cu": "546eb6b3413c77589797b91747d313b8f2987878",
+        "csrc/cake_dsa_train_5a4bb39a9926cac540dc_binding.cu": "88e0b1d703e9859f81c246979a0c771a18b821e6",
+        "csrc/cake_dsa_train_5a4bb39a9926cac540dc_kernel.cu": "2c667207d2be17f2f21fa049cff654e75ea4fd0f",
+        "csrc/cake_dsa_train_653d700abc84b87466dc_binding.cu": "0d22a2b4594cbc559544b0bbfff86e126d86299f",
+        "csrc/cake_dsa_train_653d700abc84b87466dc_kernel.cu": "9a98b3b3281bf2c801d78cae9fc883a3e29d908f",
+        "csrc/cake_dsa_train_670475469542d8141df4_binding.cu": "399c17852ff8f7ad82dcbeed8a41fcc47005b675",
+        "csrc/cake_dsa_train_670475469542d8141df4_kernel.cu": "559c1e5e219d6d1818bc5daa617c209a84e3b7f1",
+        "csrc/cake_dsa_train_69f4526804efd8bff32d_binding.cu": "558636e8d890029554977e78cdd5503800561f4b",
+        "csrc/cake_dsa_train_69f4526804efd8bff32d_kernel.cu": "ef695a78a08bfe9d41d41d623c97fd93c46c54cf",
+        "csrc/cake_dsa_train_6e606ba42629487ad039_binding.cu": "f2abb28887d2b6a3188166b5ad1f351913613c52",
+        "csrc/cake_dsa_train_6e606ba42629487ad039_kernel.cu": "098b1ed394989e11ab11a0423b32777be371b823",
+        "csrc/cake_dsa_train_7e9a7e6ce3b91357cd13_binding.cu": "a0ae1648ebfa6b1c5cdbd3e3709f3f2ac22b041d",
+        "csrc/cake_dsa_train_7e9a7e6ce3b91357cd13_kernel.cu": "501f086a33f1b3e93c0ea0a23238e317333d58b9",
+        "csrc/cake_dsa_train_891901a9531dd15abae2_binding.cu": "3b19fb07cf85e4c632b90e162de393c0bae614c7",
+        "csrc/cake_dsa_train_891901a9531dd15abae2_kernel.cu": "522dc591eee387389aee277878890182460722ab",
+        "csrc/cake_dsa_train_8b9da8b0a1ede8fb7d21_binding.cu": "101fe4a49e4861049011c6c724456652fc56aafc",
+        "csrc/cake_dsa_train_8b9da8b0a1ede8fb7d21_kernel.cu": "ce6f47129b763821872f2a262d83a3ffcb1e1996",
+        "csrc/cake_dsa_train_92d8a30cab6750cca896_binding.cu": "4f4d46f643cbb7056406249a965a7240f49eff69",
+        "csrc/cake_dsa_train_92d8a30cab6750cca896_kernel.cu": "b659400583a02ded054938858d72614269cefd03",
+        "csrc/cake_dsa_train_96e895319af439cd8a81_binding.cu": "db75231ed56a3d17b66dd1c7a189642063b0dea7",
+        "csrc/cake_dsa_train_96e895319af439cd8a81_kernel.cu": "a3f4a8e844fbc935475cfab2bfb63507f7f23077",
+        "csrc/cake_dsa_train_9959b25a12a1350f6418_binding.cu": "f4c60840cf9e04a732758a6d1b5a0dabe3e68b5d",
+        "csrc/cake_dsa_train_9959b25a12a1350f6418_kernel.cu": "b7d532329abea6cf7e61854a61ca4410335e7c4a",
+        "csrc/cake_dsa_train_9fd0d765700968122201_binding.cu": "986d624c9dcf4f2299855fc1a1fcd2368d4e9baf",
+        "csrc/cake_dsa_train_9fd0d765700968122201_kernel.cu": "7ebf86d8d080b944421d97efba528a47c30551e2",
+        "csrc/cake_dsa_train_a03ec4bc5be256e3b310_binding.cu": "856998fd081bcdd75c0179d65cbab5bcf9699b0d",
+        "csrc/cake_dsa_train_a03ec4bc5be256e3b310_kernel.cu": "d1893d9677b40a6805de0a7d649a00282ad8b505",
+        "csrc/cake_dsa_train_b081261da31439655152_binding.cu": "c8951e90717b4654b5980bae75343ed2cf459862",
+        "csrc/cake_dsa_train_b081261da31439655152_kernel.cu": "bd75882eb623d6972698605eecd9672ce46d4e82",
+        "csrc/cake_dsa_train_b2919c4310c5c7049a83_binding.cu": "c409d810bcf9b30d711a27a281892f89ac610755",
+        "csrc/cake_dsa_train_b2919c4310c5c7049a83_kernel.cu": "ed6e081e2b6228520f6b370716d09ff88051691d",
+        "csrc/cake_dsa_train_cc76e868a5ea3276d768_binding.cu": "24ae5b8d3b7a5cd94e9e533a448a788cfb50e453",
+        "csrc/cake_dsa_train_cc76e868a5ea3276d768_kernel.cu": "b38580a0732f107b811965f75c53120a082eb7f4",
+        "csrc/cake_dsa_train_d1104bd6373a6115f000_binding.cu": "a4a9f6018221b5c3355f85e311ba659f509e8fd7",
+        "csrc/cake_dsa_train_d1104bd6373a6115f000_kernel.cu": "351982abcaaeb9c7b00399fa9434f45846827424",
+        "csrc/cake_dsa_train_d1b4849be87537357817_binding.cu": "998457b6e50d8f9a9afa8a2fd550d1a513f57384",
+        "csrc/cake_dsa_train_d1b4849be87537357817_kernel.cu": "a77815bc15a6168648d834f74152cadcdfc6deb4",
+        "csrc/cake_dsa_train_e0b86c71f7e42ccd7cc7_binding.cu": "816591444eab8fa80a7cda56d727bdee6a517f6d",
+        "csrc/cake_dsa_train_e0b86c71f7e42ccd7cc7_kernel.cu": "1f3d3ac710f18d2e63ca46ca073ca716f03416f7",
+        "csrc/cake_dsa_train_e12772a5f085d7195076_binding.cu": "4f559b87deba7e077b67f32b1cd10cdd4a0ce875",
+        "csrc/cake_dsa_train_e12772a5f085d7195076_kernel.cu": "bcf196296bdc588930b52d16e9db72a3ebe4e2ec",
+        "csrc/cake_dsa_train_e55b4b44b1fe9a685974_binding.cu": "e7c7c447374c4df9dee9c8f90eed57b05c2e26f2",
+        "csrc/cake_dsa_train_e55b4b44b1fe9a685974_kernel.cu": "7d362fb958161af83e67373c8017d7d67a39b186",
+        "csrc/cake_dsa_train_ec4987f0492b1c232a5d_binding.cu": "6d7968f7097714c6a2c7fd297ad963dc125db299",
+        "csrc/cake_dsa_train_ec4987f0492b1c232a5d_kernel.cu": "5306dc414dd8446f4fc27f11cca96391b1469933",
+        "csrc/cake_dsa_train_ef0fc9d37fc4567e95a6_binding.cu": "cdc49e9ddc55ce1d957e6bab62d6b2104e8ec9cd",
+        "csrc/cake_dsa_train_ef0fc9d37fc4567e95a6_kernel.cu": "1c5f2a54ae3677f4fd1cac5c7cfce6659a824f62",
+        "csrc/cake_dsa_train_ef91e1448bf412905893_binding.cu": "b99262ef5d0c181d9d160d406e6eeb637c4a4719",
+        "csrc/cake_dsa_train_ef91e1448bf412905893_kernel.cu": "80d031933619b16bad1b7b1161c4c379ae8c61aa",
+        "csrc/cake_dsa_train_f2c52a8dc5a125ae7df5_binding.cu": "817369df030482af4bc09b7ca0bd41df6156a33f",
+        "csrc/cake_dsa_train_f2c52a8dc5a125ae7df5_kernel.cu": "a20c604748f51823811e3f0c0260edaef9d31472",
+        "csrc/cake_dsa_train_f91a3ad6150c22e98b9e_binding.cu": "95ace002143484ab821136952bdf185287488569",
+        "csrc/cake_dsa_train_f91a3ad6150c22e98b9e_kernel.cu": "5741a05fb2456b449fcda77a38cbd263e2374634",
+        "csrc/cake_dsa_train_fa77197aabbb9302c31c_binding.cu": "926902b023b05f9d6c426508542e2d06757bd715",
+        "csrc/cake_dsa_train_fa77197aabbb9302c31c_kernel.cu": "c269092fc8728bdb3d67d908c0c6543db69f7ee7",
+        "csrc/cake_dsa_train_ffb24e5f04b41781bf62_binding.cu": "4ca2ea12a081ea842aa8e15e47b5860c19735c52",
+        "csrc/cake_dsa_train_ffb24e5f04b41781bf62_kernel.cu": "ed4d12eef30d288e7379f582b513816d7437de34",
+        "registry.json": "37f00b42d09c9327cfc58f5ac3d91230b221558b"
+      },
+      "local": {
+        "__init__.py": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "build.json": "6fa0ca464299313a5b7eb6bc66dcebae02c2d8bc",
+        "cake_build.py": "00756137eb159e30a77907eda84fd245123d87ea",
+        "csrc/cake_host_shim.h": "c1c8014348020224a4753a421d2e26da72824089"
+      },
+      "source": {
+        "commit": "a1b763c82360afeb00c551aeb7ea93b30870e5bf",
+        "exclude": {
+          "csrc/cake_host_shim.h": "fdc706d6720ced076315d4a11701f03798c96186"
+        },
+        "include": [
+          "csrc",
+          "registry.json"
+        ],
+        "kind": "miles-pr",
+        "path": "miles/kernels/attention/dsa/cake",
+        "pr": 3599,
+        "repo": "https://github.com/radixark/miles"
+      },
+      "local_modifications": {
+        "csrc/cake_dsa_train_442304493c2e4a426948_kernel.cu": {
+          "blob": "68f92927d00e575a9961bf0a75ad1a6baf7bef18",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_442304493c2e4a426948_binding.cu": {
+          "blob": "078268b7b7ba66fd48e4f61527abd5679b5e424f",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_0eb4ed1c080107e23f57_kernel.cu": {
+          "blob": "149d75e2c609876810919fb9b7126d86c5891328",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_0eb4ed1c080107e23f57_binding.cu": {
+          "blob": "437f38a9e05d3ff23c19622a5c58fde5d92c8297",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_b2919c4310c5c7049a83_kernel.cu": {
+          "blob": "ffcd47138159ce7bfc8b1c77f0793a5aae238835",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_b2919c4310c5c7049a83_binding.cu": {
+          "blob": "98703c3694b575b49519a7f3f832789c9f22202f",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_9fd0d765700968122201_kernel.cu": {
+          "blob": "4b4b4621888e9f1d9bf7a04a490c8c67932e71e8",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_9fd0d765700968122201_binding.cu": {
+          "blob": "732d27d0b96481fdb7ec4f36d46335a5a74ecdba",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_3980765703ea26ab79c5_kernel.cu": {
+          "blob": "78a3ab93fea566fd995245d1b3586771e00686f4",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_3980765703ea26ab79c5_binding.cu": {
+          "blob": "b1104c6a87943cb5fc7555957d572802aeb61e80",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_7e9a7e6ce3b91357cd13_kernel.cu": {
+          "blob": "439d4eb8027b3545b7a066a9b5e7fd577e23d73a",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_7e9a7e6ce3b91357cd13_binding.cu": {
+          "blob": "8e45650441b54326f562cd6415a0beff94a23d4f",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_06715348ab7d777400f6_kernel.cu": {
+          "blob": "3a50fec4cbbbca0d863532c318b3ef4c4ef24de0",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_06715348ab7d777400f6_binding.cu": {
+          "blob": "fd1589faa006262bde4fe62efd1300a33f01a054",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_3512b831f4234be3805a_kernel.cu": {
+          "blob": "9edfbe353558881f2380dab2b6d1b351941c5aab",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_3512b831f4234be3805a_binding.cu": {
+          "blob": "3c86a5ec1b89f6105837a045fc1713fa1ef6bbba",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_ec4987f0492b1c232a5d_kernel.cu": {
+          "blob": "3b9261e917d6f15662bb561c4a7b4e55ae829b99",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_ec4987f0492b1c232a5d_binding.cu": {
+          "blob": "ad05b52fc24212be7bf265b9995054a9aa3980ca",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_f2c52a8dc5a125ae7df5_kernel.cu": {
+          "blob": "c6e70bbdb5b63a8ce6b1f4ec94aaf407fab5d9f5",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_f2c52a8dc5a125ae7df5_binding.cu": {
+          "blob": "3a46ae23a9b9e2805b649e83dba95dafcbb80fbb",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_a03ec4bc5be256e3b310_kernel.cu": {
+          "blob": "34079044c2773ed8a983db5f03af6b5d4cc7c49c",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_a03ec4bc5be256e3b310_binding.cu": {
+          "blob": "9b9cdd78f102eee50ab260691d87b358b1b62129",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_8b9da8b0a1ede8fb7d21_kernel.cu": {
+          "blob": "14f4f5fa0b7c7749f8e304628e381f028dd8ff75",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_8b9da8b0a1ede8fb7d21_binding.cu": {
+          "blob": "828c4289c1d88867ba1e86f6d1ad5ee37bb67747",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_14e92451a856d3999844_kernel.cu": {
+          "blob": "95935a8439db37be82e06087c2d23251813e5f32",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "csrc/cake_dsa_train_14e92451a856d3999844_binding.cu": {
+          "blob": "afb6588247dcd5ad935d887f47b9fb97d8b8e5cf",
+          "reason": "Bound shared sparse indices by the logical key count before native loads."
+        },
+        "build.json": {
+          "blob": "ceb727e32b1783f6bd61e4a8e6797e505344fd9e",
+          "reason": "Update build digests for the local native key-bound patches."
+        }
+      }
+    }
+  }
+}
