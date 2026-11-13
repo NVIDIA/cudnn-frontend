@@ -1713,7 +1713,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "dead_subtile_quiet",
         "bias_max_form",
         "softmax_wgs",
+        "swap_ab",
     ], params[extension_start:]
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["swap_ab"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["decode_q_tile_max"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["use_pdl"].default is False

@@ -43,6 +43,10 @@ pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
 Use the normal test environment: some analyzer cases also validate the C++
 graph and require a CUDA device and backend handle.
+When appending an SDPA adapter constructor argument, update every signature-tail
+pin, including the API-contract, score-stats, SM107 and bias-max suites. Search
+for the previous trailing parameter in `test/python/sdpa/frost`; a new feature's
+GPU tests do not exercise all of these host-only append-order assertions.
 When a CUDA-graph check can select a backend plan, supply an explicit cuDNN handle and bind it to the same
 capture stream used by Torch. A Python-engine path may follow Torch's current stream while a backend handle
 stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
