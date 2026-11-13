@@ -1,0 +1,47 @@
+{
+  "source_repository": "https://github.com/radixark/miles-ext-kernels",
+  "source_commit": "f55fb99674be5edb0e1f6a0e4d6a911335da86ce",
+  "packages": {
+    "cake_dsa_sparse_attention_nondet_train": {
+      "cake_revision": "22d54f0ecbc34edab4611fec87dbe3028825ae0d",
+      "files": {
+        ".gitignore": "e5fd70b13ee2e116ccd3094d1035544ee7f627ed",
+        "README.md": "c4bf62cb9b858a058bac7026195f88ebe4ee5b70",
+        "__init__.py": "7710e549980b96a20d6d640c41925d147a4a5864",
+        "build.json": "57191491914f8147badcb673e6a765d63fdef777",
+        "cake_backend.py": "468ee1e107c0d1325527a046694f999f0532b2ae",
+        "cake_build.py": "00756137eb159e30a77907eda84fd245123d87ea",
+        "cake_jit.py": "c2cf77de4d359d67a1750043e0ee840e051fd07d",
+        "cake_launch.py": "21c4219c5a752917fc7899f19f1eb49ba2392524",
+        "csrc/cake_dsa_h64_train/.clang-format": "47a38a93f2dbdd6d944f9dddc3465e3fb65aec29",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_46cdc056c891876ed545_binding.cu": "103d6794787b5a2cef668e5953d29f6010ad7b24",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_46cdc056c891876ed545_kernel.cu": "5f613fa90320b59cfbcca51afbfd122f6972992e",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_90ab03044736858291f5_binding.cu": "2b65fb92dc9ad67f6ff3a5c7bc9765ecad4ab081",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_90ab03044736858291f5_kernel.cu": "80ab5e589e1d4c33238a0880c40aaa8ad1aca654",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_ae9db52dff326ae8409b_binding.cu": "4ddcdba79e4d99bcdffb792fcc8a3250549ef1e8",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_ae9db52dff326ae8409b_kernel.cu": "f462b6c10060fcb62305eed7873ee032b79ad192",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_d7b52eccaf718555e88f_binding.cu": "1104dcdb463987bfaea0ead3711aa67917d96b8c",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_d7b52eccaf718555e88f_kernel.cu": "a9f8efa72d1dee98872b4278c59704feb17f0b3b",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_db791110b21a91be1388_binding.cu": "cfdc8de11cebee91212d8aa27c61e002ef1b1247",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_nope_train_db791110b21a91be1388_kernel.cu": "12cc7fc4c66807be8c52a81d3a5c4a330a6223de",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_19c560118a407f5473fe_binding.cu": "7e4c16223b906a3214391a4de4ce610cd3a3f0a0",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_19c560118a407f5473fe_kernel.cu": "183ac644a070da93ad3fc8f9506b80e35e2a26cf",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_c949a885132a772bdb53_binding.cu": "60a6f0baf7949d552913317c7e9f946726a7f0c2",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_c949a885132a772bdb53_kernel.cu": "ee06b91b94447431b7e1b9a19fed02313cac9b31",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_c96be96662a6d97e0b53_binding.cu": "356348f470bbde32c5091cb1ebf73d085c838f17",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_c96be96662a6d97e0b53_kernel.cu": "793d9825ba5bac16d33a792cef7a04e9b1739d42",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_binding.cu": "ac487f8ce232f730cd764e9bb0b9338b3a362b8d",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_d6a7bc0b3aa5b7084667_kernel.cu": "dfe6d5374768582fc4541e5955ae0df045eb2dbb",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_binding.cu": "6e8297b9c6b169e2bcaa9a7e5718cb6515ee3b0f",
+        "csrc/cake_dsa_h64_train/cake_dsa_h64_train_e29d165e3abca62c430b_kernel.cu": "cea65883169dca80aaa6062922a7994b1ad4ce95",
+        "csrc/cake_ffi_checks.h": "129288f9432e054dc51b77d93194fb0f2ec20d9c"
+      },
+      "source": {
+        "commit": "f5ab85cc77edbd0257b0145eefe0113074dc6ee2",
+        "kind": "flashinfer",
+        "path": "flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train",
+        "repo": "https://github.com/flashinfer-ai/flashinfer"
+      }
+    }
+  }
+}

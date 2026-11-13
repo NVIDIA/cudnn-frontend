@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native D128 FP8 single-CTA dense splits, exposed by the SM107 CI entry."""
 
-from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -11,7 +10,7 @@ import torch
 import cudnn
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 import test_sdpa_prepared_fp8 as shared
-from test_sdpa_fwd_fp8_sm100 import _check, _ref, _ref_kwargs
+from fp8_test_reference import _bound_handle, _check, _ref, _ref_kwargs
 
 
 @pytest.mark.L0
@@ -28,20 +27,6 @@ def test_dense_split_domain():
     assert 1 not in engines.effective_cgas(caps, _quant_facts(thd=True), split_kv=2)
     mx = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert 1 not in engines.effective_cgas(mx, _quant_facts(is_mx=True), split_kv=2)
-
-
-@contextmanager
-def _bound_handle(handle):
-    previous = cudnn.get_stream(handle)
-    try:
-        yield lambda g, vp, ws: _execute(g, vp, ws, handle)
-    finally:
-        cudnn.set_stream(handle, previous)
-
-
-def _execute(g, vp, ws, handle):
-    cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
-    g.execute(vp, ws, handle=handle)
 
 
 def _case(*, split=3, pack=True, dtype=torch.float8_e4m3fn, output=torch.bfloat16, b=2, sq=17, skv=1024, d=128, dv=128, mask=None, stats=True, sink=False):

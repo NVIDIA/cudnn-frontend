@@ -38,6 +38,7 @@ def _case(
     gate=None,
     padded_stats=False,
     independent_o_offsets=False,
+    sink=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -100,6 +101,10 @@ def _case(
             kwargs[("seq_len_" if arch == "sm120" else "cu_seq_len_") + name] = lens
         kwargs["use_padding_mask"] = True
     kwargs.update(sf_args)
+    if sink is not None:
+        sink_t = g.tensor_like(sink)
+        buffers["sinks"], tensors["sinks"], vp[sink_t] = sink, sink_t, sink
+        kwargs["sink_token"] = sink_t
     o, lse, am = g.sdpa_mxfp8(q=tensors["q"], k=tensors["k"], v=tensors["v"], attn_scale=1 / math.sqrt(d), generate_stats=stats, **kwargs)
     out_type = {
         torch.bfloat16: cudnn.data_type.BFLOAT16,
@@ -201,6 +206,9 @@ def _check(bufs, *, thd, b=2, sq=128, skv=128):
     )
     scores = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
     ref, stats = scores.softmax(-1) @ v, scores.logsumexp(-1)
+    if "sinks" in bufs:
+        stats = torch.logaddexp(stats, bufs["sinks"].double().reshape(1, q.shape[1], 1))
+        ref = (scores - stats.unsqueeze(-1)).exp() @ v
     am = ref.abs().amax()
     if "gate" in bufs:
         ref *= torch.sigmoid(bufs["gate"].float())

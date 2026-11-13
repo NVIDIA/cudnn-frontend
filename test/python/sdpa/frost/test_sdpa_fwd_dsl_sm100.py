@@ -3518,3 +3518,31 @@ class TestDecodeLiveColumns:
     test_replay_batch = staticmethod(_determinism.test_live_columns_replay_batch)
     test_golden = staticmethod(_determinism.test_live_columns_golden)
     test_warm_refill = staticmethod(_determinism.test_live_columns_warm_refill)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="SM100/SM103 native D64 packed THD prefill")
+class TestD64ThdPackedUnsplit:
+    """Direct final stores, independent origins and retained batch/replay bytes."""
+
+    import sdpa_d64_thd_packed_unsplit as _checks
+
+    test_contract = staticmethod(_checks.test_contract)
+    test_paged_origins = staticmethod(_checks.test_paged_origins)
+    test_nonpaged_origins = staticmethod(_checks.test_nonpaged_origins)
+    test_standalone = staticmethod(_checks.test_standalone)
+    test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)
+    test_warm_refill = staticmethod(_checks.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(not 100 <= _SM <= 106, reason="SM100-family entry; native SM107 entry owns Rubin")
+class TestSplitCombineZeroWeight:
+    """The fixed-order combine excludes zero-weight payloads before multiplication."""
+
+    import split_combine_zero_weight_checks as _checks
+
+    test_partial_and_chain = staticmethod(_checks.test_zero_weight_partial_and_chain_are_excluded)
+    test_replay_and_batch_invariance = staticmethod(_checks.test_zero_weight_replay_and_batch_invariance)

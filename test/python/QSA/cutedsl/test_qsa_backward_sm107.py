@@ -21,10 +21,9 @@ def rubin():
         pytest.skip("the SM107 backward kernels need SM107 and the oversized shared memory carveout of a CUDA 13.4 driver")
 
 
-@pytest.mark.parametrize("ds_precision", ["fp32", "bf16"])
 @pytest.mark.parametrize("h_kv, group", [(2, 12), (1, 12), (1, 6)])
 @pytest.mark.parametrize("lengths", [(4099,), (3, 2051, 22529)])
-def test_sm107_kernels_match_the_sm100_kernels(rubin, monkeypatch, lengths, h_kv, group, ds_precision):
+def test_sm107_kernels_match_the_sm100_kernels(rubin, monkeypatch, lengths, h_kv, group):
     # the dense pair kernel alone, then all three kernels with packed documents off the 4-token grid
     from cudnn.QSA import _backward as engine
     from cudnn.QSA.kernels import bprop_sm100, bprop_sm107
@@ -44,14 +43,14 @@ def test_sm107_kernels_match_the_sm100_kernels(rubin, monkeypatch, lengths, h_kv
 
     monkeypatch.setattr(engine, "compile_cached", recording_compile)
     monkeypatch.setattr(engine, "_PLANS", {})
-    sm107 = _bitmap_backward(inputs, meta, ds_precision=ds_precision)
+    sm107 = _bitmap_backward(inputs, meta)
     assert engine._PLANS and all(plan.rubin for plan in engine._PLANS.values())
     assert (rubin_hosts if sum(lengths) > 22527 else {bprop_sm107._dpair_host}) <= set(hosts)
     assert {bprop_sm100._sparse_query_host, bprop_sm100._sparse_key_host, bprop_sm100._dpair_host}.isdisjoint(hosts)
     hosts.clear()
     monkeypatch.setattr(engine, "_PLANS", {})
     monkeypatch.setattr(bprop_sm107, "supported", lambda device_index: False)
-    sm100 = _bitmap_backward(inputs, meta, ds_precision=ds_precision)
+    sm100 = _bitmap_backward(inputs, meta)
     assert engine._PLANS and not any(plan.rubin for plan in engine._PLANS.values())
     assert bprop_sm100._dpair_host in hosts and rubin_hosts.isdisjoint(hosts)
     _check(inputs, sm107)

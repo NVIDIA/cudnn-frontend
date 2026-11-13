@@ -7,6 +7,18 @@ never renumber.
 
 ## Hard rules
 
+When selecting a specialized launch body, check its grid bounds independently
+of the generic scheduler. The SM100 FP8 D128 decode body puts batch in
+`gridDim.y` for every scheduler policy, so it only replaces the existing body
+for batch sizes at most 65535. Its architecture-route test checks both sides
+of that boundary without allocating a huge batch.
+
+In swap-AB decode, count token units using live softmax columns, independently
+of the padded MMA width. SM100 FP8 uses sixteen physical columns but only
+eight live columns; counting the padding as tokens skips MTP rows at G8.
+The D64 cases in `TestNativeFp8Decode` check Q3/G8 and Q4/G8 with explicit
+`SWAP_AB=1`, plus unset/zero knob controls retaining the prefill body.
+
 Paged live-page counts are scalar integer arithmetic. Preserve the existing
 `(length + page_size - 1) // page_size` expression in persistent loaders:
 CuTe DSL 4.8 can lower `cute.ceil_div(Int32, Int32)` through tile operations
@@ -576,6 +588,14 @@ production kernels gain no debug knob or timing-dependent assertion.
 - Exercise overlaunch without total-length hints and replay after changing
   all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
   live-row numerical comparisons do not cover the dead-unit path.
+
+- Physical-origin Stats and other raw per-row scalar loads need their own live-unit
+  guard if dead units remain in the barrier protocol. Clamping to the last batch
+  is not sufficient: its final sequence can be empty with its origin at capacity.
+  A zero numerical contribution does not make an out-of-range read safe.
+  Run `test_empty_final_origin_stats_guard` under initcheck with a retained,
+  uninitialized backing guard; initialized-guard and interior-origin controls
+  distinguish this read from unrelated uninitialized accesses.
 
 **Rule S12 — Placement grows by measured table entries, not by new hand-written boxes.**
 
@@ -1576,6 +1596,14 @@ weight before arithmetic; testing only `LSE == -inf` misses `0 * NaN` contaminat
 specializations with FP64, including sink-dominated rows and changed-total replay.
 `test_quantized_sink_combine_excludes_zero_weight_payload` covers the dense
 quantized small/serial reductions with NaN and both infinite payloads.
+The grid reducer must also discard zero-weight chain accumulators and old
+round accumulators when their rescaling factor underflows. The architecture
+entries' `TestSplitCombineZeroWeight` covers local, inter-chain and next-round
+underflow (16/32/129 splits), plus unchanged goldens and changed-input replay.
+After changing a weight predicate, inspect generated load placement and run
+finite-input A/B/A: testing the selected weight directly can delay the grid's
+prefetched partial-O reads. Retaining the original live predicate and testing
+the unselected exponential preserves the same mask without that dependency.
 
 Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
 Without an explicit packed-total hint, the split workspace is still bounded by
@@ -1624,9 +1652,16 @@ and synchronize all consuming warps before PV. The wide-head THD cases in
 For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 (`cp_async_mbarrier_arrive(noinc=True)` with all lane arrivals counted at init),
 rather than publishing those copies with an ordinary mbarrier arrival. The
-qualified SM120 prefill loader also retains producer-local commit/wait-group completion:
-an async-arrival-only variant passed numerics but failed the same racecheck.
-Do not remove that drain without rerunning the native sanitizer/capture cases.
+qualified SM120 prefill loader retains producer-local commit/wait-group completion
+by default: removing both K and V drains passed numerics but failed racecheck.
+Paged half prefill has a K-only exception in `prefill_f16.py`: separate,
+16-byte-aligned static completion barriers retain commit and tracked arrivals,
+while the V producer drain retires both copy groups. Each compute lane stores
+a value dependent on every QK/PV result fragment before its named K/V reuse
+arrival; inspect the compiled load-use/store/release ordering (package Rule 11).
+The native paged rebind, vector-loop warm/determinism and D512 control cases
+cover this protocol. Removing the V drain still fails native racecheck even
+with ordered consumer releases; keep it unless a new protocol is qualified.
 Paged half decode has a separately qualified exception: `decode_f16.py` allocates
 its full completion barriers with `cute.arch.alloc_smem`, separately from the
 dynamic K/V ring. It retains commit and async-tracked arrivals while omitting
@@ -1634,7 +1669,8 @@ the producer wait; consumer full waits and empty-barrier ring credits still
 order publication and reuse. `test_dsl_sm120_paged_decode_async_warm` covers
 FP16/BF16 warm and poisoned replay with repeated slot reuse; the native paged
 rebind and decode-ring tests cover sanitizer/capture behavior. Keep this
-exception confined to that allocation and protocol; prefill retains its drain.
+exception confined to that allocation and protocol; prefill's exception remains
+K-only, with the V drain and result-dependent release stores described above.
 For a persistent CTA that reinitializes its K/V barriers between work units,
 keep the same producer arrival count at initial launch and every rearm. D512
 paged uses 32 lane arrivals while dense TMA uses one; Q TMA keeps its own

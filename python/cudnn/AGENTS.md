@@ -239,6 +239,12 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Cache-key decorators preserve `None`.** `template_key()` returns `None`
+  when a specialization cannot be identified safely. Appending a suffix must
+  leave it uncacheable; formatting it as a string lets unrelated kernels share
+  the first compiled object even with the disk cache disabled. Detector:
+  `test_uncacheable_fp8_hosts_do_not_reuse_another_kernel` in the SDPA API
+  contract suite runs through the real in-process memo with compilation mocked.
 - **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
   when compiling storage-free declarations; compile and execute under that device,
   and reject differently placed bindings before lowering pointers. An outer
@@ -352,6 +358,13 @@ the kernel that reads it).
   wrapper. Detector:
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
+
+- **Restore caller device state after native context binding, including errors.**
+  Scope `ensure_current_context` and the native call with the shared
+  `device_context(x.device)`, and select `current_stream(x.device)` explicitly.
+  A two-GPU regression test should put operands on one GPU and make the other
+  current, check the binding stream before launch, and verify device/stream
+  restoration after both successful calls and injected native exceptions.
 
 SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
