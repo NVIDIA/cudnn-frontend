@@ -60,6 +60,9 @@ def host(
     d_v: cutlass.Constexpr[int],
     persistent_ctas: cutlass.Constexpr[int],
     thd_max_sq: cutlass.Constexpr[int],
+    thd_origin_ptrs,
+    thd_origin_caps,
+    thd_origin_specs: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     """Bind the pointers into tensors and launch the MXFP8 kernel.
@@ -98,6 +101,7 @@ def host(
         d_v,
         persistent_ctas,
         thd_max_sq,
+        thd_origin_caps,
     )
     b = problem_size[0]
 
@@ -122,6 +126,9 @@ def host(
         return cute.make_tensor(ptr, cute.make_layout((1,), stride=(1,)))
 
     kwargs = dict(prepared=True)
+    if cutlass.const_expr(thd_origin_specs is not None):
+        origins = tuple(None if ptr is None else cute.make_tensor(ptr, cute.make_layout((problem_size[0] + 1,), stride=(1,))) for ptr in thd_origin_ptrs)
+        kwargs.update(thd_origins=origins, thd_origin_specs=thd_origin_specs)
     if cutlass.const_expr(sfo_geometry is not None):
         kwargs.update(
             scale_o_t=None if cutlass.const_expr(scale_o_ptr is None) else scalar(scale_o_ptr),
@@ -173,6 +180,7 @@ def compile_host(
     has_amax=False,
     sfo_geometry=None,
     has_scale_o=False,
+    thd_origin_specs=None,
 ):
     """Compile one pointer entry with Int64 stride leaves and a fixed head geometry."""
     if kernel.thd_varlen and kernel.split_kv != 1:
@@ -224,6 +232,13 @@ def compile_host(
         d_v,
         persistent_ctas,
         thd_max_sq,
+        (
+            tuple(None if spec is None else ptr(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, spec[3] // 8) for spec in thd_origin_specs)
+            if thd_origin_specs is not None
+            else None
+        ),
+        (cutlass.Int64(0),) * 5 if thd_origin_specs is not None else None,
+        thd_origin_specs,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

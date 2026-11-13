@@ -188,15 +188,13 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     exec_params = list(inspect.signature(api_cls.execute).parameters)
     tail = exec_params[exec_params.index("sf_o") :]
     if api_cls is SdpaFwdDslSm120:
-        assert tail == ["sf_o", "block_table", "block_table_v"], tail
-        assert params["block_table"].default is None
-        assert params["block_table_v"].default is None
+        # Physical origins follow the existing sf_o / paged-table prefix.
+        assert tail[:8] == ["sf_o", "block_table", "block_table_v", "ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_lse"], tail
+        for name in tail[1:8]:
+            assert params[name].default is None
     else:
         # SM100 appends ragged-Q offsets, score side outputs and resident-block operands.
-        assert tail in (
-            ["sf_o"],
-            ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"],
-        ), tail
+        assert tail[:8] == ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"], tail
 
 
 @pytest.mark.L0
@@ -230,3 +228,68 @@ def test_ordinary_paths_do_not_need_the_packed_fp4_dtype(monkeypatch, api_cls, d
         return  # an arch-specific decline of this shape on this box is fine; only the eager lookup is not
     if api_cls is SdpaFwdDslSm100:
         assert supported
+
+
+@pytest.fixture
+def fp8_host_compiler(monkeypatch):
+    import cutlass.cute as cute
+    from cudnn.frost import compiled_cache
+
+    calls = []
+    monkeypatch.setattr(cute, "compile", lambda fn, *args, **kwargs: calls.append((fn, args, kwargs)) or object())
+    monkeypatch.setattr(compiled_cache, "_memo_device", lambda: (0, 0))
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "1")
+    compiled_cache.clear_memo()
+    compiled_cache.reset_stats()
+    yield calls, compiled_cache
+    compiled_cache.clear_memo()
+    compiled_cache.reset_stats()
+
+
+def _compile_fp8_host(kernel, cache_key, amax_prescaled):
+    import cutlass
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd.kernels._fp8_host import compile_host
+
+    return compile_host(
+        kernel,
+        SimpleNamespace(SPLIT_KV=1, THD_VARLEN=False),
+        cutlass.Float8E4M3FN,
+        cutlass.BFloat16,
+        False,
+        cache_key,
+        128,
+        128,
+        True,
+        "dense",
+        True,
+        amax_prescaled=amax_prescaled,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("amax_prescaled", [False, True])
+def test_uncacheable_fp8_hosts_do_not_reuse_another_kernel(fp8_host_compiler, amax_prescaled):
+    calls, cache = fp8_host_compiler
+    first_kernel, second_kernel = object(), object()
+    first = _compile_fp8_host(first_kernel, None, amax_prescaled)
+    second = _compile_fp8_host(second_kernel, None, amax_prescaled)
+    repeated = _compile_fp8_host(first_kernel, None, amax_prescaled)
+    assert len(calls) == 3
+    assert len({id(first), id(second), id(repeated)}) == 3
+    assert cache.stats()["bypassed"] == 3 and cache.stats()["memo_hits"] == 0
+    assert not cache._MEMO
+
+
+@pytest.mark.L0
+def test_identified_fp8_hosts_reuse_only_their_amax_variant(fp8_host_compiler):
+    calls, cache = fp8_host_compiler
+    kernel = object()
+    ordinary = _compile_fp8_host(kernel, "fp8-test-digest", False)
+    prescaled = _compile_fp8_host(kernel, "fp8-test-digest", True)
+    assert ordinary is not prescaled
+    assert _compile_fp8_host(kernel, "fp8-test-digest", False) is ordinary
+    assert _compile_fp8_host(kernel, "fp8-test-digest", True) is prescaled
+    assert len(calls) == 2 and cache.stats()["memo_hits"] == 2
+    assert {key[2] for key in cache._MEMO} == {"fp8-test-digest", "fp8-test-digest:amax_prescaled"}

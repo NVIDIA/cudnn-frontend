@@ -479,6 +479,11 @@ def _kernel(
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
 
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
@@ -533,7 +538,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -577,7 +581,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -613,7 +616,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -630,7 +632,6 @@ def _kernel(
         )
 
     else:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
         if cutlass.const_expr(CFG.THD_VARLEN):
             # THD: persistent grid + device-bounded claim counter, so no unit
@@ -2513,6 +2514,9 @@ def _host(
         # bases must step in real rows or every batch >= 1 lands OOB.
         if cutlass.const_expr(thd_origin_ptrs is not None):
             o_desc_words, origins, offsets = origin_tensors(o_desc_ptr, thd_origin_ptrs, cutlass.Int32(B))
+            # Split attention writes compact partials. Physical O/Stats offsets
+            # are consumed exclusively by the final packed combine.
+            setup_specs = thd_origin_specs[:3] + (None, None) if cutlass.const_expr(SPLIT_KV > 1) else thd_origin_specs
             build_thd_origins(
                 (q_tensor, k_tensor, v_tensor, o_tensor),
                 tma_q_desc,
@@ -2522,7 +2526,7 @@ def _host(
                 o_desc_words,
                 origins,
                 offsets,
-                thd_origin_specs,
+                setup_specs,
                 seq_kv_lens_tensor,
                 thd_q_lens_tensor,
                 thd_kv_lens_tensor,
@@ -2533,7 +2537,8 @@ def _host(
                 n_thd_units,
                 paged=PAGED_KV,
                 rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
-                single_maps=True,
+                splits=SPLIT_KV,
+                single_maps=SPLIT_KV == 1,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(
@@ -2602,14 +2607,25 @@ LSE_KINDS = ("dense", "token", "head", "padded")
 
 
 @lru_cache(maxsize=None)
-def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
+def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False, thd_origin_specs=None) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
-    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and not CFG.PACK_GQA):
-        raise ValueError("packed D256 split requires THD without PackGQA")
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256):
+        raise ValueError("packed D256 split requires THD and split_kv > 1")
+    if thd_origin_specs is not None and len(thd_origin_specs) != 5:
+        raise ValueError("physical THD origins require five port declarations")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     # gate_slots: this body's host ends in the two required epilogue-gate slots; the split wrapper passes the no-gate pair.
     return _compile_thd_split_host(
-        _host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False, gate_slots=True
+        _host,
+        CFG,
+        STORAGE_DTYPE,
+        cache_key,
+        has_lse=has_lse,
+        lse_kind=lse_kind,
+        paged_hnd=paged_hnd,
+        ragged_q_slots=False,
+        gate_slots=True,
+        thd_origin_specs=thd_origin_specs,
     )
 
 

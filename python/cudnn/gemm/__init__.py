@@ -8,6 +8,7 @@ Layout::
     cudnn.gemm.cutedsl.dense.<fusion>            dense GEMM + fused epilogue
     cudnn.gemm.cutedsl.grouped.<fusion>          MoE grouped GEMM + fused epilogue
     cudnn.gemm.cutedsl.discrete_grouped.<fusion> discrete-weight grouped GEMM
+    cudnn.gemm.frost.projection_decode           FP8 split-K projection for decode rows (direct-call entry)
     cudnn.gemm.ops                               backend-independent op contracts
     cudnn.gemm.reference                         pure-PyTorch correctness engine
 
@@ -18,7 +19,10 @@ which is the supported entry point for users.
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "Fp8ProjectionDecode": ("cudnn.gemm.frost.projection_decode.fp8_projection_decode", "Fp8ProjectionDecode"),
     "MhcProjectionBackward": ("cudnn.gemm.mhc_projection_bwd", "MhcProjectionBackward"),
+    "ProjectionForm": ("cudnn.gemm.frost.projection_decode.kernel.fp8_projection_decode_config", "Form"),
+    "ProjectionGeometry": ("cudnn.gemm.frost.projection_decode.kernel.fp8_projection_decode_config", "Geometry"),
     "mhc_projection_backward": ("cudnn.gemm.mhc_projection_bwd", "mhc_projection_backward"),
     "moe_grouped_matmul": ("cudnn.gemm.ops", "moe_grouped_matmul"),
     "situ_mlp": ("cudnn.gemm.ops", "situ_mlp"),

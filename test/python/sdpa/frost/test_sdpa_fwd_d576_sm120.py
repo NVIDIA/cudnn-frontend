@@ -124,13 +124,14 @@ def test_d576_admission():
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("thd,splits", [(False, 1), (False, 3), (True, 1)], ids=["dense", "dense_split", "thd"])
-def test_d576_dense_thd_determinism(dtype, thd, splits):
+def test_d576_dense_thd_determinism(dtype, thd, splits, *, dims=(576, 512), num_q_heads=6, num_kv_heads=1, neighbor_repeats=64):
     import cudnn
     from cudnn.engines.manifest import engines_for
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, engine_name
     from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 
-    h, hk, sq, sk, dq, dv = 6, 1, 17, 67, 576, 512
+    h, hk, sq, sk = num_q_heads, num_kv_heads, 17, 67
+    dq, dv = dims
     rng = torch.Generator().manual_seed(576512)
     records = [tuple((torch.randn(shape, generator=rng) * 0.25).to(dtype) for shape in ((h, sq, dq), (hk, sk, dq), (hk, sk, dv))) for _ in range(3)]
     sink_cpu = torch.linspace(-1, 1, h)
@@ -223,7 +224,7 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
     ref_o = (scores - ref_lse[..., None]).exp() @ vv.double().repeat_interleave(h // hk, 0)
     torch.testing.assert_close(expected["o"][0].cpu().double(), ref_o, atol=0.003, rtol=0.02)
     torch.testing.assert_close(expected["lse"][0].cpu().double(), ref_lse, atol=0.0006, rtol=0)
-    for order in ([1, 0, 0, 2], [1, 2] * 64 + [0]):
+    for order in ([1, 0, 0, 2], [1, 2] * neighbor_repeats + [0]):
         buffers, launch = prepare(order)
         replay_inputs = {name: buffers[name].clone() for name in ("q", "k", "v")} if thd else None
         launch()
@@ -264,4 +265,13 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
         finally:
             torch.cuda.synchronize()
             captured.reset()
-    assert_golden(f"sdpa-sm120-d576v512-{'thd' if thd else 'dense'}-split{splits}-{dtype}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+    suffix = f"-h{h}kv{hk}" if (h, hk) != (6, 1) else ""
+    assert_golden(f"sdpa-sm120-d{dq}v{dv}-{'thd' if thd else 'dense'}-split{splits}-{dtype}{suffix}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+@pytest.mark.parametrize("group", [96, 128])
+@pytest.mark.parametrize("splits", [1, 3])
+def test_sm120_wide_subgroup_dense_determinism(dtype, dims, group, splits):
+    test_d576_dense_thd_determinism(dtype, False, splits, dims=dims, num_q_heads=2 * group, num_kv_heads=2, neighbor_repeats=16)

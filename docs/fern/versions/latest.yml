@@ -9,6 +9,9 @@ navigation:
   - page: Samples
     path: ../../samples.mdx
     slug: samples
+  - page: Model Samples
+    path: ../../model-samples.mdx
+    slug: model-samples
   - link: Release Notes
     href: https://github.com/NVIDIA/cudnn-frontend/releases
   - section: API Reference
@@ -27,9 +30,15 @@ navigation:
         path: ../../operations/Attention.md
         slug: operations/Attention
         contents:
+          - page: Ahead-of-time Attention (SM120 C/C++)
+            path: ../../operations/attention/aot_sm120_attention.md
+            slug: aot_sm120_attention
           - page: Gated Attention Block (SM107)
             path: ../../operations/attention/gated_attention_block.md
             slug: gated_attention_block
+          - page: Attention Gate + Quantize Decode Step (SM100-class)
+            path: ../../operations/attention/gate_quant_decode.md
+            slug: gate_quant_decode
           - page: Compact GQA backward (SM107)
             path: ../../operations/attention/compact_gqa_backward.md
             slug: compact_gqa_backward
@@ -151,6 +160,9 @@ navigation:
               - page: Discrete Grouped GEMM + SwiGLU (SM100)
                 path: ../../operations/gemm_fusions/discrete_grouped_gemm_swiglu.md
                 slug: discrete_grouped_gemm_swiglu
+              - page: FP8 Projection for Decode Rows (SM100-class)
+                path: ../../operations/gemm_fusions/fp8_projection_decode.md
+                slug: fp8_projection_decode
               - page: GEMM + Amax (SM100)
                 path: ../../operations/gemm_fusions/gemm_amax.md
                 slug: gemm_amax
@@ -216,6 +228,9 @@ navigation:
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
         contents:
+          - page: LayerNorm and RMSNorm in JAX
+            path: ../../operations/normalizations/norm_jax.md
+            slug: norm_jax
           - page: RMSNorm + RHT + Amax (SM100)
             path: ../../operations/normalizations/rmsnorm_rht_amax.md
             slug: rmsnorm_rht_amax

@@ -64,6 +64,8 @@ def _launch(
     has_amax: cutlass.Constexpr[bool],
     optional_amax: cutlass.Constexpr[bool],
     sfo_geometry: cutlass.Constexpr,
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     thd, split_kv, o_block_scale, epilogue_gate, pv_bf16, paged, page_size = config
@@ -126,6 +128,8 @@ def _launch(
     if cutlass.const_expr(split_kv == 1 and (has_amax or not optional_amax)):
         _reset_amax_kernel(amax_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     kwargs = dict()
+    if cutlass.const_expr(thd_origin_ptrs is not None):
+        kwargs.update(thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs)
     if cutlass.const_expr(epilogue_gate):
         _, _, _, sq, _, _ = problem_size
         kwargs.update(gate_tensor=cute.make_tensor(gate_ptr, cute.make_layout((b, sq, qh, d_v), stride=(*gate_strides, 1))))
@@ -222,6 +226,8 @@ def host(
     optional_amax: cutlass.Constexpr[bool],
     sfo_geometry: cutlass.Constexpr,
     static_lse_strides: cutlass.Constexpr,
+    thd_origin_ptrs=None,
+    thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     leading = (
@@ -275,14 +281,14 @@ def host(
         sfo_geometry,
     )
     if cutlass.const_expr(static_lse_strides is None):
-        _launch(*leading, lse_strides, *trailing, stream=stream)
+        _launch(*leading, lse_strides, *trailing, thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs, stream=stream)
     else:
         # Preserve generic runtime layouts while specializing the declared
         # dense Stats layout. Both arms launch the same logical operation.
         if (lse_strides[0] == static_lse_strides[0]) & (lse_strides[1] == static_lse_strides[1]) & (lse_strides[2] == static_lse_strides[2]):
-            _launch(*leading, static_lse_strides, *trailing, stream=stream)
+            _launch(*leading, static_lse_strides, *trailing, thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs, stream=stream)
         else:
-            _launch(*leading, lse_strides, *trailing, stream=stream)
+            _launch(*leading, lse_strides, *trailing, thd_origin_ptrs=thd_origin_ptrs, thd_origin_specs=thd_origin_specs, stream=stream)
 
 
 def compile_host(
@@ -304,6 +310,7 @@ def compile_host(
     static_lse_strides=None,
     sfo_geometry=None,
     has_scale_o=False,
+    thd_origin_specs=None,
 ):
     if static_lse_strides is not None:
         if not has_lse or cfg.THD_VARLEN or cfg.SPLIT_KV != 1:
@@ -380,6 +387,14 @@ def compile_host(
         optional_amax,
         sfo_geometry,
         static_lse_strides,
+        thd_origin_ptrs=(
+            tuple(
+                pointer(cutlass.Int64 if spec[3] == 64 else cutlass.Int32, 8 if spec[3] == 64 else 4) if spec is not None else None for spec in thd_origin_specs
+            )
+            if thd_origin_specs is not None
+            else None
+        ),
+        thd_origin_specs=thd_origin_specs,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=cache_key,

@@ -2060,6 +2060,7 @@ else:
                 or item.key.startswith("kernel_cutlass")
                 or "pytorch_flash::" in item.key
                 or "flash::" in item.key
+                or "flashinfer::" in item.key
                 or "at::native::" in item.key
                 or "cutlass3x" in item.key
                 or "(anonymous namespace)::" in item.key
@@ -2136,6 +2137,7 @@ else:
                 or item.key.startswith("kernel_cutlass")
                 or "pytorch_flash::" in item.key
                 or "flash::" in item.key
+                or "flashinfer::" in item.key
                 or "at::native::" in item.key
                 or "cutlass3x" in item.key
                 or "(anonymous namespace)::" in item.key

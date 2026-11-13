@@ -26,12 +26,57 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestServiceRegisterRelease:
+    from service_register_release_checks import test_sm107_service_register_release as _release
+
+    test_service_register_release = staticmethod(_release)
+
+
 class TestNativeHalfRegisterRelease:
     """Cross-compile the half kernel through the selected SM107 CI entry."""
 
     from sm107_register_release_checks import test_service_warpgroup_has_one_register_release as _release
 
     test_service_warpgroup_has_one_register_release = staticmethod(_release)
+
+
+@requires_rubin
+class TestD128Fp8PhysicalOrigins:
+    """Exercise native data maps and independent Stats through the CI entry."""
+
+    from sdpa.frost import native_fp8_origins_sm107_checks as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@requires_rubin
+class TestD192Fp8PhysicalOrigins:
+    """Native rank-4 maps keep physical offsets separate from logical lengths."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [((192, 128), 2)])
+
+
+@requires_rubin
+class TestWideFp8PhysicalOrigins:
+    """D256 and role-split D512 use independent sequence-local rank-4 maps."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
+
+
+@requires_rubin
+class TestD256Mxfp8PhysicalOrigins:
+    """Physical data maps retain the original logical scale-tile coordinates."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("mxfp8", "sm107", [(256, 1)])
 
 
 @pytest.fixture(autouse=True)
@@ -2015,6 +2060,25 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
 
 
 @requires_rubin
+class TestNativeD128Fp8Cga1Split:
+    """Single-CTA dense split coverage through the selected Rubin CI entry."""
+
+    from native_fp8_cga1_split_sm107_checks import (
+        test_dense_split_domain as _domain,
+        test_rebind_and_capture as _capture,
+        test_replay_and_batch_invariance as _bytes,
+        test_golden as _golden,
+        test_warm_refilled_ring as _warm,
+    )
+
+    test_rebind_and_capture = staticmethod(_capture)
+    test_dense_split_domain = staticmethod(_domain)
+    test_replay_and_batch_invariance = staticmethod(_bytes)
+    test_golden = staticmethod(_golden)
+    test_warm_refilled_ring = staticmethod(_warm)
+
+
+@requires_rubin
 class TestNativeFp8SinkSplit:
     """Keep the native regressions in the explicitly selected SM107 CI entry."""
 
@@ -2483,6 +2547,26 @@ class TestMixedFp8Kv:
     test_compact_split = staticmethod(compact_split)
     test_dense_paged_native = staticmethod(dense_paged_native)
     test_uniform_control = staticmethod(uniform_control)
+
+
+@requires_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("group", [32, 64])
+def test_coalesced_split_replay_batch_golden(dtype_name, group):
+    from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
+    from native_d128_dense_paged_determinism import _runner
+
+    run, inputs = _runner(dtype_name, dtype_name, 2, 4, 128, head_dim=512, num_q_heads=2 * group)
+    target = assert_replays(lambda: run([0]), repeats=4)
+    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 16 + [0] + [2] * 16):
+        actual = snapshot(run(order))
+        for row, sequence in enumerate(order):
+            if sequence == 0:
+                assert_bitwise({name: actual[name][row : row + 1] for name in target}, target, f"batch row {row}")
+    run([0, 1, 2, 3, 4], capture=True)
+    actual = assert_replays(lambda: run([0, 1, 2]), repeats=3)
+    assert_golden(f"sdpa-half-d512-paged-coalesced-{dtype_name}-g{group}-split4", inputs, actual)
 
 
 import sdpa_bwd_fp8_d192_sm107 as _d192_bwd_checks
