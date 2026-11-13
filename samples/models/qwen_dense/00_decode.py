@@ -20,6 +20,7 @@ bf16 copy of every weight: about 57 GiB free for the 27B checkpoint.
     python samples/models/qwen_dense/00_decode.py
     python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
     python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: reports RAN, never PASS
+    python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
 
     pip install -r samples/models/requirements.txt                         # only for a checkpoint; brings the hf command
     hf download nvidia/Qwen3.8-27B-NVFP4 --local-dir /data/Qwen3.8-27B-NVFP4   # your own step: the sample fetches nothing
@@ -28,6 +29,13 @@ bf16 copy of every weight: about 57 GiB free for the 27B checkpoint.
 The stack is explicit and never chosen by what is installed.  ``fe-cublas`` is a reference path, not a fast path: the
 linear-attention step runs on cuDNN Frontend's fused kernel, every multiply on cuBLAS over a bf16 copy of the quantised weights,
 the rest in PyTorch, and every launch is issued from Python.  Timings printed here are for orientation only.
+
+``--check-kernels`` adds a fifth check, against the plan instead of the reference: the run prints which kernels every block
+launches (the kernel table, before the load) and what the entries state about their launches (after it), keeps the profiler's
+record of every launch of the traced steps, and holds them against each other -- every launch attributed to a block, the
+kernels of an entry by name, order, count, grid, block and shared memory.  Where the profiler cannot run the run ends in
+``[00] RAN <stack> stack (kernels not observed: <reason>)``, never in ``PASS``.  ``--dump-census FILE`` writes those launch
+records as JSON.
 """
 
 from __future__ import annotations
@@ -64,15 +72,25 @@ def _reason(error) -> str:
     return str(error)
 
 
-def _dump(path: str, stack: str, runs: list) -> str:
-    """Write the prompt ids and the produced ids of a run as JSON.  Returns "" or, where the file cannot be written after
-    all (the check before the run passed: a full disk, a folder that went away), the reason with the file's own name."""
+def _dump(path: str, stack: str, runs: list, flag: str = "--dump-tokens", **facts) -> str:
+    """Write the prompt ids and the produced ids of a run as JSON -- or, for ``--dump-census``, the launch records of its
+    traced steps.  Returns "" or, where the file cannot be written after all (the check before the run passed: a full disk,
+    a folder that went away), the reason with the file's own name."""
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"sample": "qwen_dense/00_decode", "stack": stack, "greedy": True, "runs": runs}, f)
+            json.dump({"sample": "qwen_dense/00_decode", "stack": stack, "greedy": True, **facts, "runs": runs}, f)
     except OSError as error:
-        return f"--dump-tokens {os.path.basename(os.path.normpath(path))}: {error.strerror or type(error).__name__}"
+        return f"{flag} {os.path.basename(os.path.normpath(path))}: {error.strerror or type(error).__name__}"
     return ""
+
+
+def _writable(flag: str, path: str) -> None:
+    """A file a flag asks for that cannot be written is an error before the run, not after it: a ``ValueError`` that names the
+    file by its own name."""
+    target = os.path.abspath(path)
+    there = os.path.exists(target)
+    if os.path.isdir(target) or not os.access(target if there else os.path.dirname(target), os.W_OK):
+        raise ValueError(f"{flag} {os.path.basename(os.path.normpath(path))}: cannot be written there")
 
 
 EPILOG = """\
@@ -143,7 +161,23 @@ def _arguments(argv):
     )
     parser.add_argument("--reference-precision", default="fp64", choices=("fp64", "ieee-fp32"), help="accumulation of the reference blocks (default fp64)")
     parser.add_argument("--dump-tokens", metavar="FILE", help="write the prompt ids and the produced ids as JSON, for a comparison made elsewhere")
+    parser.add_argument(
+        "--check-kernels",
+        action="store_true",
+        help="also check the kernels: print the kernel table, keep the profiler's record of every launch of the traced steps and hold "
+        "them against the plan (every launch attributed to a block; an entry's kernel by name, order, count and launch shape). "
+        "Where the profiler cannot run the run reports RAN (kernels not observed), never PASS; not with --stack reference",
+    )
+    parser.add_argument(
+        "--dump-census",
+        metavar="FILE",
+        help="write the launch records of the traced steps as JSON (kernel, grid, block, shared memory per launch), for a comparison "
+        "made elsewhere; implies --check-kernels",
+    )
     args = parser.parse_args(argv)
+    args.check_kernels = args.check_kernels or args.dump_census is not None
+    if args.check_kernels and args.stack == "reference":
+        parser.error("--check-kernels and --dump-census are for a provider stack; --stack reference checks nothing")
     if args.model is None and (args.prompt or args.messages):
         parser.error("--prompt and --messages need --model: the seeded model has no language")
     if args.model is not None and args.layers is not None:
@@ -170,20 +204,25 @@ def _arguments(argv):
     return args
 
 
-def _verdict(stack: str, passed: bool, judged: int) -> str:
+def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str:
     """The last line of a run.  ``PASS`` says that provider blocks were judged against the reference and held.  A run on the
     reference stack, or one whose ``--provider`` flags put every judged block on its reference row, compared the reference
-    with itself: it reports ``RAN``."""
+    with itself: it reports ``RAN``.  So does a run that was asked to check its kernels and could not observe them
+    (``unobserved``: why): its other checks held, the one it was asked for did not run.  A failed check is ``FAIL`` whatever
+    else is true."""
     if stack == "reference":
         return "RAN reference stack (no provider checked)"
     if not passed:
         return "FAIL"
+    if unobserved:
+        return f"RAN {stack} stack (kernels not observed: {unobserved})"
     return "PASS" if judged else "RAN (no provider block was judged)"
 
 
-def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
+def _decode(session, text, rule, prompts, tie_out, check, checked_steps, kernels=False):
     """One prompt set: prefill, the decode loop (the one host read of a step is here), the traced pass, the report and the
-    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.
+    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.  With ``kernels`` the traced pass keeps its
+    launch records and the checks include the kernel check; its outcome stays on the session (``session.traced``).
 
     Two lines say what comes next before the phases that print nothing for a while (the prompt and the decode loop; the
     checks).  They are printed outside every timed interval, and flushed, so a run through a pipe shows them too."""
@@ -213,7 +252,7 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
         next_ids = session.step(next_ids)  # embedding, the layers, the output head, token choice: ids stay on the GPU
         tokens = session.read(next_ids)  # the one host read of a step: 4 bytes per sequence
     session.report().text_path["text_out"] = text_seconds / max(sum(len(ids) for ids in produced), 1)
-    session.trace(TRACED_STEPS)  # the first steps again, under the profiler: GPU busy, idle, launches per step
+    session.trace(TRACED_STEPS, records=kernels)  # the first steps again, under the profiler: GPU busy, idle, launches per step
     print(session.report().text())
     if getattr(text, "synthetic_text", True):
         print(f"text out              sequence 0, {len(produced[0])} tokens (seeded weights: not language): {pieces[0][:48]!r}")
@@ -224,8 +263,14 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
     if not check:
         return True, 0, produced
     steps = "every step" if checked_steps is None else f"the first {checked_steps} steps"
-    print(f"{TAG} checks on {steps} against the {session.reference_precision}-accumulated reference (replay, every provider block, the tokens)", flush=True)
-    checks = tie_out.run_checks(session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None)
+    also = "; the kernels of the traced steps against the plan" if kernels else ""
+    print(
+        f"{TAG} checks on {steps} against the {session.reference_precision}-accumulated reference (replay, every provider block, the tokens){also}",
+        flush=True,
+    )
+    checks = tie_out.run_checks(
+        session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None, kernels=kernels
+    )
     print(checks.text())
     return checks.ok, checks.judged, produced
 
@@ -239,7 +284,7 @@ def main(argv=None) -> int:
         print(f"{TAG} SKIP needs nvidia-cudnn-frontend and PyTorch ({error}): see samples/models/README.md")
         return 0
     import model_samples
-    from model_samples import text_io, tie_out
+    from model_samples import census, text_io, tie_out
     from model_samples.blocks import DeviceFacts, parse_overrides
     from model_samples.qwen_dense import QwenDense
 
@@ -251,11 +296,9 @@ def main(argv=None) -> int:
     checkpoint, requests, described = None, [], 0.0
     try:
         overrides = parse_overrides(args.provider)
-        if args.dump_tokens:  # a file that cannot be written is an error before the run, not after it
-            target = os.path.abspath(args.dump_tokens)
-            there = os.path.exists(target)
-            if os.path.isdir(target) or not os.access(target if there else os.path.dirname(target), os.W_OK):
-                raise ValueError(f"--dump-tokens {os.path.basename(os.path.normpath(args.dump_tokens))}: cannot be written there")
+        for flag, path in (("--dump-tokens", args.dump_tokens), ("--dump-census", args.dump_census)):
+            if path:  # a file that cannot be written is an error before the run, not after it
+                _writable(flag, path)
         if real:  # the text side and the description of the checkpoint: config and shard headers, no weights
             describing = time.perf_counter()
             text = model_samples.TextIO.from_checkpoint(args.model)
@@ -339,6 +382,7 @@ def main(argv=None) -> int:
             checkpoint=checkpoint,
             share=runs[0][0] if runs else None,
             record_steps=max(CHECKED_STEPS, TRACED_STEPS) if real else None,
+            check_kernels=args.check_kernels,
         )
         runs.append((session, prompt_sets))
     # Every sequence count is planned before the first load, and the memory sentence covers the whole run: a GPU class, a
@@ -366,11 +410,16 @@ def main(argv=None) -> int:
     print(f"{TAG} clock not locked: timings are for orientation only | reference precision {args.reference_precision}")
 
     passed, judged, digest, dumped = True, 0, hashlib.sha256(), []
+    unobserved, censuses = "", []  # of the kernel check: why the kernels were not observed; the launch records per prompt set
     for (session, prompt_sets), table in zip(runs, tables):
         print()
         print(table)
+        if args.check_kernels:  # the kernel table, first part: from the plan alone, before the load
+            print(census.table(session.plan))
         session.load()
         print(f"{TAG} {session.stages.line()}")
+        if args.check_kernels:  # second part: what the entries, now built, state about their launches
+            print(census.stated(session.plan))
         for index, (prompts, seconds) in enumerate(prompt_sets):
             if index:  # a session keeps nothing between two prompt sets
                 print()
@@ -381,9 +430,19 @@ def main(argv=None) -> int:
             session.new_report()
             session.report().text_path.update(seconds)
             ok, blocks_judged, produced = _decode(
-                session, text, rule, prompts, tie_out, check=args.stack != "reference", checked_steps=CHECKED_STEPS if real else None
+                session,
+                text,
+                rule,
+                prompts,
+                tie_out,
+                check=args.stack != "reference",
+                checked_steps=CHECKED_STEPS if real else None,
+                kernels=args.check_kernels,
             )
             passed, judged = passed and ok, judged + blocks_judged
+            if args.check_kernels:
+                unobserved = unobserved or session.traced.unobserved
+                censuses.append({"sequences": session.sequences, "prompt": index, **session.traced.dump()})
             for ids in produced:
                 digest.update(b"".join(int(i).to_bytes(4, "little") for i in ids))
             # one prompt and one list of produced ids per sequence: in the seeded run every sequence has a prompt of its own
@@ -407,16 +466,31 @@ def main(argv=None) -> int:
             allowed = f"the plan allowed {allowance / mib:,.0f} MiB on this class" if allowance else "the plan allows none on this class"
             measured = f"measured in this process, other processes' changes included; {allowed}"
             print(f"{TAG} first launch of {name}, device memory outside PyTorch's pool: {forms} ({measured})")
-    unwritten = _dump(args.dump_tokens, args.stack, dumped) if args.dump_tokens else ""
-    if args.dump_tokens and not unwritten:
-        print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
+    unwritten = []  # what a flag asked for and is not there
+    if args.dump_tokens:
+        error = _dump(args.dump_tokens, args.stack, dumped)
+        if error:
+            unwritten.append(error)
+        else:
+            print(f"{TAG} token ids of {len(dumped)} prompt set(s) written to {os.path.basename(args.dump_tokens)}")
+    if args.dump_census:
+        if not any(run["steps"] for run in censuses):  # no launch record was kept: there is nothing to write
+            why = f"kernels not observed: {unobserved}" if unobserved else "the kernels line of the checks says why"
+            error = f"--dump-census {os.path.basename(os.path.normpath(args.dump_census))}: no launch records to write ({why})"
+        else:
+            gpu = {"name": facts.name, "compute_capability": list(facts.cc), "sm_count": facts.sm_count}
+            error = _dump(args.dump_census, args.stack, censuses, "--dump-census", schema=1, gpu=gpu, traced_steps=TRACED_STEPS)
+        if error:
+            unwritten.append(error)
+        else:
+            print(f"{TAG} launch records of {len(censuses)} traced pass(es) written to {os.path.basename(args.dump_census)}")
     if real:
         print(f"{TAG} checkpoint weights, greedy decoding; ids hash {digest.hexdigest()[:12]}")
     else:
         print(f"{TAG} seeded weights: the output is not language; ids hash {digest.hexdigest()[:12]}")
-    verdict = _verdict(args.stack, passed, judged)
+    verdict = _verdict(args.stack, passed, judged, unobserved)
     if unwritten:  # the run is done and its verdict stands, but what was asked for is not there
-        print(f"{TAG} ERROR {unwritten} (the run itself: {verdict})")
+        print(f"{TAG} ERROR {'; '.join(unwritten)} (the run itself: {verdict})")
         return 1
     print(f"{TAG} {verdict}")
     return 0 if passed else 1
