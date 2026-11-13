@@ -4,6 +4,8 @@
 
 Component boundaries use ``TensorWithContract`` to keep per-thread RMEM layout
 semantics explicit across transpose, activation, quantization, and store stages.
+
+The B-reuse tile uses ``GluMxfp8BreuseEpilogue`` (glu_mxfp8_fc12_epilogue_breuse.py).
 """
 
 from typing import Optional, Tuple, Type, Union, Any
@@ -26,6 +28,7 @@ from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64
 from cutlass.cute.typing import Float32
 
 from ......helpers.iket_compat import iket
+from ......helpers.tmem_transpose import _TmemTranspose16x32Core
 from ......helpers.flag_batch import GpuReleaseFlagBatchTracker
 from ......helpers.ptx_helpers import (
     cp_async_bulk_s2g,
@@ -36,11 +39,8 @@ from ......helpers.ptx_helpers import (
 from ..helpers.utils import quant_sfd_row, swiglu_act
 from ......quant_def import CombineFormat
 from ......communication.token_protocol import TokenSrcMetadata
+from .....function_mapping import CoordinateSpace, FunctionMapping
 from .....schedulers.fc12_mapping import BlockPhase
-
-# The 16x32 TMEM transpose core is architecture-neutral; reuse the local
-# materialized source copy to keep the shared transpose implementation single-sourced.
-from ..tmem_transpose import _TmemTranspose16x32Core
 
 Fc1GateUpInterleave = 32
 EpilogueTileN = 32
@@ -52,8 +52,112 @@ Fc1CTMAStages = 1
 
 
 # =============================================================================
-# Fc2OutputDest  (MegaMoE fc2 STG destination resolver, non-swap MXFP8 path)
+# FC2 output routing and training-specific store mappings
 # =============================================================================
+
+
+def make_fc2_stg_store_out_mapping(
+    wire_width: int,
+    cta_token_tile_size: int,
+    cta_hidden_tile_size: int,
+) -> FunctionMapping:
+    """Per-vector-STG destination mapping for training's token-major FC2 tile."""
+    elems_per_stg = min(256 // wire_width, EpilogueTileN)
+    copy_iters = cta_hidden_tile_size // elems_per_stg
+    return FunctionMapping(
+        domain=CoordinateSpace(
+            ("epi_tid", "iter_idx"), (cta_token_tile_size, copy_iters)
+        ),
+        codomain=CoordinateSpace(
+            ("token_in_cta_tile", "hidden_in_cta_tile"),
+            (cta_token_tile_size, cta_hidden_tile_size),
+        ),
+        function=lambda epi_tid, iter_idx: {
+            "token_in_cta_tile": epi_tid,
+            "hidden_in_cta_tile": iter_idx * elems_per_stg,
+        },
+    )
+
+
+def make_fc2_ublk_store_out_mapping(
+    wire_width: int,
+    cta_token_tile_size: int,
+    cta_hidden_tile_size: int,
+) -> FunctionMapping:
+    """Per-128B UBLK destination mapping.
+
+    MXFP8 combines four 32-hidden accumulator subtiles per issue; BF16 combines
+    two.  In both cases one epilogue thread owns one token and every issue stays
+    within that token's contiguous hidden row.
+    """
+    elems_per_ublk = 128 * 8 // wire_width
+    copy_iters = cta_hidden_tile_size // elems_per_ublk
+    return FunctionMapping(
+        domain=CoordinateSpace(
+            ("epi_tid", "iter_idx"), (cta_token_tile_size, copy_iters)
+        ),
+        codomain=CoordinateSpace(
+            ("token_in_cta_tile", "hidden_in_cta_tile"),
+            (cta_token_tile_size, cta_hidden_tile_size),
+        ),
+        function=lambda epi_tid, iter_idx: {
+            "token_in_cta_tile": epi_tid,
+            "hidden_in_cta_tile": iter_idx * elems_per_ublk,
+        },
+    )
+
+
+def make_fc2_redg_store_out_mapping(
+    cta_token_tile_size: int,
+    cta_hidden_tile_size: int,
+) -> FunctionMapping:
+    """Per-red.v2 destination mapping for training's coalesced BF16 REDG."""
+    tokens_per_pass = 16
+    hidden_per_issue = 4
+    passes_per_subtile = cta_token_tile_size // tokens_per_pass
+    subtile_count = cta_hidden_tile_size // EpilogueTileN
+    return FunctionMapping(
+        domain=CoordinateSpace(
+            ("epi_tid", "iter_idx"),
+            (cta_token_tile_size, subtile_count * passes_per_subtile),
+        ),
+        codomain=CoordinateSpace(
+            ("token_in_cta_tile", "hidden_in_cta_tile"),
+            (cta_token_tile_size, cta_hidden_tile_size),
+        ),
+        function=lambda epi_tid, iter_idx: {
+            "token_in_cta_tile": (
+                (iter_idx % passes_per_subtile) * tokens_per_pass
+                + epi_tid // (EpilogueTileN // hidden_per_issue)
+            ),
+            "hidden_in_cta_tile": (
+                (iter_idx // passes_per_subtile) * EpilogueTileN
+                + (epi_tid % (EpilogueTileN // hidden_per_issue))
+                * hidden_per_issue
+            ),
+        },
+    )
+
+
+def make_fc2_sf_store_out_mapping(
+    cta_token_tile_size: int,
+    cta_hidden_tile_size: int,
+) -> FunctionMapping:
+    """Per-E8M0-block local destination mapping."""
+    block_count = cta_hidden_tile_size // EpilogueTileN
+    return FunctionMapping(
+        domain=CoordinateSpace(
+            ("epi_tid", "iter_idx"), (cta_token_tile_size, block_count)
+        ),
+        codomain=CoordinateSpace(
+            ("token_in_cta_tile", "hidden_block_in_cta_tile"),
+            (cta_token_tile_size, block_count),
+        ),
+        function=lambda epi_tid, iter_idx: {
+            "token_in_cta_tile": epi_tid,
+            "hidden_block_in_cta_tile": iter_idx,
+        },
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,9 +202,226 @@ class Fc2OutputDest:
         local_row = cute.slice_(self.tensor, (Int64(src_token), src_topk, None))
         # next's SymmetricBufferDevice exposes ``map_pointer``
         peer_iter = self.peer_rank_ptr_mapper.map_pointer(
-            local_row.iterator, src_rank,
+            local_row.iterator, src_rank, byte_alignment=32,
         )
         return cute.make_tensor(peer_iter, local_row.layout)
+
+
+@dataclasses.dataclass(frozen=True)
+class Fc2OutputRouter:
+    """Unified training FC2 data/SF destination router.
+
+    Direct STG/UBLK stores prefetch one invariant token row.  REDG distributes
+    one prefetched row to each lane and shuffles row bases within 8-lane groups.
+    """
+
+    output_mapping: FunctionMapping
+    pool_token_base: cutlass.Int32
+    hidden_base_this_cta_tile: cutlass.Int32
+    valid_tokens_this_cta_tile: cutlass.Int32
+    valid_hidden: cutlass.Int32
+    epi_tid: cutlass.Int32
+    wire_bytes: int
+    output: Any = None
+    metadata: Any = None
+    peer_rank_ptr_mapper: Any = None
+    local_data_base_addr: Any = None
+    local_data_token_base: Any = None
+    local_data_row_stride: Any = None
+    reduce_topk_in_kernel: bool = False
+    prefetch_data_row: bool = True
+    sf_mapping: Any = None
+    sf_base_addr: Any = None
+    sf_token_base: Any = None
+    sf_row_stride: Any = None
+    sf_hidden_block_base: Any = None
+    sf_bytes: int = 1
+    row_base: Any = None
+    row_valid: Any = None
+
+    def __post_init__(self) -> None:
+        peer = self.metadata is not None
+        local = self.local_data_base_addr is not None
+        if peer == local:
+            raise ValueError(
+                "Fc2OutputRouter requires exactly one peer or local data destination."
+            )
+        if peer != (self.peer_rank_ptr_mapper is not None):
+            raise ValueError(
+                "Fc2OutputRouter requires peer_rank_ptr_mapper iff metadata is set."
+            )
+        if self.reduce_topk_in_kernel and not peer:
+            raise ValueError("FC2 REDG routing requires a peer destination.")
+        sf_fields = (
+            self.sf_mapping,
+            self.sf_base_addr,
+            self.sf_token_base,
+            self.sf_row_stride,
+            self.sf_hidden_block_base,
+        )
+        if any(value is None for value in sf_fields) != all(
+            value is None for value in sf_fields
+        ):
+            raise ValueError(
+                "Fc2OutputRouter SF mapping, base, token base, row stride, "
+                "and hidden-block base must be provided together."
+            )
+
+    @cute.jit
+    def prefetch(self) -> "Fc2OutputRouter":
+        """Resolve one invariant DATA row before the store loop."""
+        if cutlass.const_expr(self.reduce_topk_in_kernel):
+            redg_lanes_per_token: cutlass.Constexpr[int] = (
+                EpilogueTileN // 4
+            )
+            prefetch_iter = self.epi_tid % cutlass.Int32(
+                redg_lanes_per_token
+            )
+            coord = self.output_mapping.evaluate(
+                epi_tid=self.epi_tid, iter_idx=prefetch_iter
+            )
+        else:
+            if cutlass.const_expr(not self.prefetch_data_row):
+                return self
+            coord = self.output_mapping.evaluate(
+                epi_tid=self.epi_tid, iter_idx=cutlass.Int32(0)
+            )
+
+        token_in_tile = cutlass.Int32(coord["token_in_cta_tile"])
+        row_base = Int64(0)
+        row_valid = cutlass.Int32(0)
+        token_valid = token_in_tile < self.valid_tokens_this_cta_tile
+        if cutlass.const_expr(self.reduce_topk_in_kernel):
+            prefetch_valid = token_valid
+        else:
+            prefetch_valid = (
+                token_valid
+                and self.hidden_base_this_cta_tile < self.valid_hidden
+            )
+        if prefetch_valid:
+            if cutlass.const_expr(self.metadata is None):
+                local_token = self.local_data_token_base + token_in_tile
+                row_base = (
+                    self.local_data_base_addr
+                    + Int64(local_token)
+                    * Int64(self.local_data_row_stride)
+                    * Int64(self.wire_bytes)
+                )
+            else:
+                output_dest = Fc2OutputDest(
+                    tensor=self.output,
+                    metadata=self.metadata,
+                    peer_rank_ptr_mapper=self.peer_rank_ptr_mapper,
+                    reduce_topk_in_kernel=self.reduce_topk_in_kernel,
+                )
+                row_base = output_dest.resolve_token_row(
+                    self.pool_token_base + token_in_tile
+                ).iterator.toint()
+            row_valid = cutlass.Int32(1)
+        return dataclasses.replace(
+            self, row_base=row_base, row_valid=row_valid
+        )
+
+    @cute.jit
+    def get_data_addr_from_coord(self, token_in_tile, hidden_in_tile):
+        """Return one DATA address from an already evaluated store coordinate."""
+        hidden = self.hidden_base_this_cta_tile + hidden_in_tile
+        addr = Int64(0)
+        pred = cutlass.Int32(0)
+        if (
+            token_in_tile < self.valid_tokens_this_cta_tile
+            and hidden < self.valid_hidden
+        ):
+            pred = cutlass.Int32(1)
+            if cutlass.const_expr(self.prefetch_data_row):
+                addr = self.row_base + Int64(hidden) * Int64(self.wire_bytes)
+                pred = self.row_valid
+            elif cutlass.const_expr(self.metadata is None):
+                local_token = self.local_data_token_base + token_in_tile
+                addr = (
+                    self.local_data_base_addr
+                    + Int64(local_token)
+                    * Int64(self.local_data_row_stride)
+                    * Int64(self.wire_bytes)
+                    + Int64(hidden) * Int64(self.wire_bytes)
+                )
+            else:
+                output_dest = Fc2OutputDest(
+                    tensor=self.output,
+                    metadata=self.metadata,
+                    peer_rank_ptr_mapper=self.peer_rank_ptr_mapper,
+                    reduce_topk_in_kernel=self.reduce_topk_in_kernel,
+                )
+                addr = output_dest.resolve_token_row(
+                    self.pool_token_base + token_in_tile
+                ).iterator.toint() + Int64(hidden) * Int64(self.wire_bytes)
+        return addr, pred
+
+    @cute.jit
+    def get_data_addr(self, iter_idx):
+        """Return the mapped byte address and validity predicate for one issue."""
+        coord = self.output_mapping.evaluate(
+            epi_tid=self.epi_tid, iter_idx=iter_idx
+        )
+        return self.get_data_addr_from_coord(
+            cutlass.Int32(coord["token_in_cta_tile"]),
+            cutlass.Int32(coord["hidden_in_cta_tile"]),
+        )
+
+    @cute.jit
+    def get_sf_addr(self, iter_idx):
+        """Return the local E8M0 destination for one mapped scale block."""
+        coord = self.sf_mapping.evaluate(
+            epi_tid=self.epi_tid, iter_idx=iter_idx
+        )
+        token_in_tile = cutlass.Int32(coord["token_in_cta_tile"])
+        hidden_block_in_tile = cutlass.Int32(
+            coord["hidden_block_in_cta_tile"]
+        )
+        hidden_block = self.sf_hidden_block_base + hidden_block_in_tile
+        addr = Int64(0)
+        pred = cutlass.Int32(0)
+        if (
+            token_in_tile < self.valid_tokens_this_cta_tile
+            and hidden_block * cutlass.Int32(EpilogueTileN) < self.valid_hidden
+        ):
+            pred = cutlass.Int32(1)
+            sf_token = self.sf_token_base + token_in_tile
+            addr = (
+                self.sf_base_addr
+                + Int64(sf_token) * Int64(self.sf_row_stride)
+                * Int64(self.sf_bytes)
+                + Int64(hidden_block) * Int64(self.sf_bytes)
+            )
+        return addr, pred
+
+
+@dataclasses.dataclass(frozen=True)
+class Fc2TmaTileRouter:
+    """Own tile-level addressing for the rank-local FC2 TMA destination."""
+
+    output: cute.Tensor
+    pool_token_base: cutlass.Int32
+    hidden_base_this_cta_tile: cutlass.Int32
+    valid_tokens_this_cta_tile: cutlass.Int32
+    cta_token_tile_size: int
+
+    @cute.jit
+    def get_data_tile(self, subtile_idx):
+        tiled_output = cute.flat_divide(
+            self.output, (self.cta_token_tile_size, EpilogueTileN)
+        )
+        token_tile_idx = self.pool_token_base // cutlass.Int32(
+            self.cta_token_tile_size
+        )
+        hidden_tile_idx = (
+            self.hidden_base_this_cta_tile
+            + subtile_idx * cutlass.Int32(EpilogueTileN)
+        ) // cutlass.Int32(EpilogueTileN)
+        return (
+            tiled_output[None, None, token_tile_idx, hidden_tile_idx],
+            self.valid_tokens_this_cta_tile > 0,
+        )
 
 
 # =============================================================================
@@ -108,10 +429,25 @@ class Fc2OutputDest:
 # =============================================================================
 
 class GluMxfp8Epilogue:
+    """Epilogue of the fused FC1 (+ SwiGLU + MXFP8 quant) / FC2 kernel: 4 warps, one
+    128-row task tile per work tile. Tile variants override the ``_get_task_tile``,
+    ``_run_fc1_subtiles`` and ``_run_fc2_task_tile`` hooks instead of branching here.
+    """
 
     _SubtileBarIdBase = 4
     # Named barrier for cross-warp sync during raw-C TMA stores.
     _CStoreBarId = 10
+
+    def _validate_tile_shape(self) -> None:
+        assert self._cta_tile_m == self._epi_tile_m, (
+            f"{type(self).__name__} needs a per-CTA tile M of "
+            f"{self._epi_tile_m}, got {self._cta_tile_m}"
+        )
+        if len(self._epilogue_warp_ids) != EpiWarpCount:
+            raise ValueError(
+                f"epilogue requires {EpiWarpCount} warps, "
+                f"got {len(self._epilogue_warp_ids)}."
+            )
 
     def __init__(
         self,
@@ -139,7 +475,10 @@ class GluMxfp8Epilogue:
         act_func: str = "swiglu",
         fc2_use_bulk: bool = False,
         fc2_tma_stages: Optional[int] = None,
+        one_task_per_cta: bool = False,
+        fc1_done_slot_m: Optional[int] = None,
     ) -> None:
+        """``one_task_per_cta``: one work tile per CTA, so a single accumulator stage suffices."""
         self._act_func = act_func
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout
@@ -152,7 +491,20 @@ class GluMxfp8Epilogue:
         self._use_2cta_instrs = use_2cta_instrs
 
         self._atom_thr_size = 2 if use_2cta_instrs else 1
+        self._cluster_m = cluster_shape_mn[0]
+        # CTA tiles folded into one fc1_done slot; the kernel owns the choice (MMA band on the
+        # standalone path, cluster token tile under MegaMoE) and both sides must agree.
+        self._fc1_done_slot_m = (
+            self._atom_thr_size if fc1_done_slot_m is None else fc1_done_slot_m
+        )
+        if self._cluster_m % self._fc1_done_slot_m != 0:
+            raise ValueError(
+                f"fc1_done_slot_m ({self._fc1_done_slot_m}) must divide "
+                f"cluster_m ({self._cluster_m})."
+            )
         self._cta_tile_m = mma_tiler_mnk[0] // self._atom_thr_size
+        self._epi_tile_m = EpiWarpCount * WarpThreadCount
+        self._validate_tile_shape()
         self._cta_tile_n = mma_tiler_mnk[1]
         self._mma_tiler_k = mma_tiler_mnk[2]
         self._cta_tile_n_sfb = ((mma_tiler_mnk[1] + 127) // 128) * 128
@@ -165,11 +517,11 @@ class GluMxfp8Epilogue:
         else:
             self._fc2_stg_needs_predicate: bool = True
 
-        # TMA tile is (EpilogueTileN tokens, Fc1EpilogueOutputTileN intermediates)
-        self._epi_tile = (EpilogueTileN, Fc1EpilogueOutputTileN)
+        # SwiGLU folds the accumulator's N columns (gate and up) into N // 2 outputs.
+        self._epi_tile = (EpilogueTileN, self._cta_tile_n // 2)
         self._subtile_cnt = self._cta_tile_n // 2 // EpilogueTileN
 
-        self._num_acc_stage = 2
+        self._num_acc_stage = 1 if one_task_per_cta else 2
         self._num_acc_pipeline_stages = self._num_acc_stage
 
         k = self._mma_tiler_k
@@ -190,15 +542,21 @@ class GluMxfp8Epilogue:
             combine_format = CombineFormat.parse("bf16")
         self._combine_format = combine_format
         self._combine_mxfp8 = combine_format.is_quantized
+        if self._combine_mxfp8 and (
+            combine_format.act_dtype is not cutlass.Float8E4M3FN
+            or combine_format.scale_dtype is not cutlass.Float8E8M0FNU
+            or combine_format.scale_block != EpilogueTileN
+        ):
+            raise NotImplementedError(
+                "The training GLU epilogue supports only 32e4m3xe8m0 for a quantized combine."
+            )
+        self._hidden_fc2 = static_expert_shape[2] if static_expert_shape is not None else 0
         # sf_block_pad for fc2 MXFP8 combine
         if self._combine_mxfp8 and static_expert_shape is not None:
-            _hidden_fc2 = static_expert_shape[2]
-            _sf_blocks_fc2 = _hidden_fc2 // EpilogueTileN
+            _sf_blocks_fc2 = self._hidden_fc2 // EpilogueTileN
             self._fc2_sf_block_pad = ((_sf_blocks_fc2 + 15) // 16) * 16
-            self._hidden_fc2 = _hidden_fc2
         else:
             self._fc2_sf_block_pad = 0
-            self._hidden_fc2 = 0
         # batching stg.64 SF
         self._fc2_sf_batch8 = (
             self._combine_mxfp8
@@ -206,7 +564,7 @@ class GluMxfp8Epilogue:
             and (self._hidden_fc2 % self._cta_tile_n == 0)
             and (self._cta_tile_n // EpilogueTileN == 8)
         )
-        self._epi_tile_c = (self._cta_tile_m, 2 * Fc1GateUpInterleave)
+        self._epi_tile_c = (self._epi_tile_m, 2 * Fc1GateUpInterleave)
         self._epi_fc1_batch = max(1, epi_flag_batch[0])
         self._epi_fc2_batch = max(1, epi_flag_batch[1])
 
@@ -214,43 +572,147 @@ class GluMxfp8Epilogue:
             cutlass.Float32(glu_clamp) if glu_clamp is not None else None
         )
 
-        self._fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
-        self._fc2_use_tma = (
-            bool(fc2_use_bulk) and token_back_by_dispatch and self._combine_mxfp8
+        # When FC1 and FC2 work tiles are separated by a bulk-group drain and a
+        # 128-thread rendezvous, so their scratch can share one physical slab.
+        d_staged_layout = self.staged_smem_layout(self._subtile_cnt)
+        self._fc1_d_scratch_bytes = (
+            0
+            if self._use_stg_fc1
+            else int(cute.size_in_bytes(self.fc1_output_dtype, d_staged_layout))
         )
-        _ublk_hidden_ok = (
-            self._combine_mxfp8
-            and static_expert_shape is not None
+        self._fc1_c_scratch_offset = (
+            (self._fc1_d_scratch_bytes + 127) // 128
+        ) * 128
+        self._fc1_c_scratch_bytes = (
+            int(
+                cute.size_in_bytes(
+                    self._c_dtype,
+                    self.staged_c_smem_layout(Fc1CTMAStages),
+                )
+            )
+            if self._generate_c
+            else 0
+        )
+        self._fc1_scratch_bytes = (
+            self._fc1_c_scratch_offset + self._fc1_c_scratch_bytes
+            if self._generate_c
+            else self._fc1_d_scratch_bytes
+        )
+
+        self._fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
+        bulk_hidden_doable = (
+            static_expert_shape is not None
             and self._hidden_fc2 % self._cta_tile_n == 0
         )
+        if fc2_use_bulk and static_expert_shape is not None and not bulk_hidden_doable:
+            raise ValueError(
+                "FC2 bulk store requires hidden to be divisible by the FC2 CTA tile N."
+            )
+        self._fc2_use_tma = (
+            bool(fc2_use_bulk)
+            and token_back_by_dispatch
+            and not self._fc2_in_kernel_topk_reduce
+            and bulk_hidden_doable
+        )
         self._fc2_use_ublk = (
-            bool(fc2_use_bulk) and (not token_back_by_dispatch) and _ublk_hidden_ok
+            bool(fc2_use_bulk)
+            and not token_back_by_dispatch
+            and not self._fc2_in_kernel_topk_reduce
+            and bulk_hidden_doable
         )
         self._fc2_needs_staging = self._fc2_use_tma or self._fc2_use_ublk
-        if fc2_tma_stages is not None and not 1 <= fc2_tma_stages <= self._fc2_subtile_cnt:
-            raise ValueError(
-                f"fc2_tma_stages must be in [1, {self._fc2_subtile_cnt}], got {fc2_tma_stages}."
-            )
-        if self._fc2_needs_staging:
-            self._fc2_tma_stages = (
-                fc2_tma_stages if fc2_tma_stages is not None else min(2, self._fc2_subtile_cnt)
-            )
-        else:
-            self._fc2_tma_stages = 0
+        # Phases that commit bulk (TMA / cp.async.bulk) stores and need the drain in run().
+        self._fc1_bulk_store = (not self._use_stg_fc1) or self._generate_c
+        self._fc2_bulk_store = self._fc2_needs_staging
         self._fc2_wire_dtype = (
             self._combine_format.act_dtype if self._combine_mxfp8 else cutlass.BFloat16
         )
-        self._fc2_tma_stage_bytes = (
-            self._cta_tile_m * EpilogueTileN * self._fc2_wire_dtype.width // 8
+        self._fc2_wire_bytes = self._fc2_wire_dtype.width // 8
+        self._fc2_ublk_bytes = 128
+        self._fc2_ublk_elems = self._fc2_ublk_bytes // self._fc2_wire_bytes
+        self._fc2_ublk_subtiles = self._fc2_ublk_elems // EpilogueTileN
+        self._fc2_ublk_issue_count = (
+            self._fc2_subtile_cnt // self._fc2_ublk_subtiles
         )
+        self._fc2_staging_hidden = (
+            self._fc2_ublk_elems if self._fc2_use_ublk else EpilogueTileN
+        )
+        max_store_stages = (
+            self._fc2_ublk_issue_count
+            if self._fc2_use_ublk
+            else self._fc2_subtile_cnt
+        )
+        if fc2_tma_stages is not None and not 1 <= fc2_tma_stages <= max_store_stages:
+            raise ValueError(
+                f"fc2_tma_stages must be in [1, {max_store_stages}], got {fc2_tma_stages}."
+            )
+        single_stage_bytes = (
+            self._epi_tile_m
+            * self._fc2_staging_hidden
+            * self._fc2_wire_dtype.width
+            // 8
+        )
+        if not self._fc2_needs_staging:
+            self._fc2_tma_stages = 0
+        elif fc2_tma_stages is not None:
+            self._fc2_tma_stages = fc2_tma_stages
+        elif self._fc2_use_ublk:
+            # The 128B peer path measured best at one stage.
+            self._fc2_tma_stages = 1
+        else:
+            # TMA-only auto sizing: consume the FC1 scratch lifetime that is free
+            # during FC2, while preserving at least the old two-stage BF16 baseline.
+            bf16_baseline_bytes = (
+                min(2, max_store_stages)
+                * self._epi_tile_m
+                * EpilogueTileN
+                * cutlass.BFloat16.width
+                // 8
+            )
+            available_staging_bytes = max(
+                self._fc1_scratch_bytes, bf16_baseline_bytes
+            )
+            auto_stage_cap = min(4, max_store_stages)
+            self._fc2_tma_stages = max(
+                1,
+                min(
+                    auto_stage_cap,
+                    available_staging_bytes // single_stage_bytes,
+                ),
+            )
+        self._fc2_store_out_mapping = (
+            make_fc2_ublk_store_out_mapping(
+                self._fc2_wire_dtype.width, self._epi_tile_m, self._cta_tile_n
+            )
+            if self._fc2_use_ublk
+            else make_fc2_stg_store_out_mapping(
+                self._fc2_wire_dtype.width, self._epi_tile_m, self._cta_tile_n
+            )
+        )
+        self._fc2_redg_store_out_mapping = make_fc2_redg_store_out_mapping(
+            self._epi_tile_m, self._cta_tile_n
+        )
+        self._fc2_sf_store_out_mapping = make_fc2_sf_store_out_mapping(
+            self._epi_tile_m, self._cta_tile_n
+        )
+        self._fc2_tma_stage_bytes = single_stage_bytes
         self._fc2_tma_staging_bytes = self._fc2_tma_stages * self._fc2_tma_stage_bytes
 
         self._fc2_reduce_coalesce = bool(self._fc2_in_kernel_topk_reduce)
+
         # bf16 staging tile: (cta_tile_m tokens x EpilogueTileN hidden), 2 B/elem.
         self._fc2_reduce_staging_bytes = (
-            self._cta_tile_m * EpilogueTileN * cutlass.BFloat16.width // 8
+            self._epi_tile_m * EpilogueTileN * cutlass.BFloat16.width // 8
             if self._fc2_reduce_coalesce
             else 0
+        )
+        self._fc2_scratch_bytes = max(
+            self._fc2_tma_staging_bytes,
+            self._fc2_reduce_staging_bytes,
+        )
+        self._scratch_bytes = max(
+            self._fc1_scratch_bytes,
+            self._fc2_scratch_bytes,
         )
 
     # -- Codegen-time queries  --
@@ -353,21 +815,34 @@ class GluMxfp8Epilogue:
         return self._fc2_tma_staging_bytes
 
     @property
+    def fc1_c_scratch_offset(self) -> int:
+        return self._fc1_c_scratch_offset
+
+    @property
+    def scratch_bytes(self) -> int:
+        """Physical bytes for the FC1/FC2 lifetime-overlaid scratch slab."""
+        return self._scratch_bytes
+
+    @property
     def fc2_tma_tile(self) -> Tuple[int, int]:
-        """TMA store tile: (cta_tile_m=128 tokens, EpilogueTileN=32 hidden)."""
-        return (self._cta_tile_m, EpilogueTileN)
+        """TMA store tile: (epi_tile_m=128 tokens, EpilogueTileN=32 hidden)."""
+        return (self._epi_tile_m, EpilogueTileN)
 
     def fc2_tma_staged_smem_layout(self, n_stages: int):
-        """Row-major (128 tokens, 32 hidden, n_stages) staging tile for the FC2
-        bulk store.  No swizzle: each thread owns one token row and writes its 32
-        contiguous wire-dtype elements as a single 256-bit STS, and a 32-byte
-        innermost box is a valid (unswizzled) TMA tile.  ``select(mode=[0,1])``
-        yields the single-stage tile used to build the TMA atom."""
-        cta_tile_m = self._cta_tile_m
-        stage_stride = cta_tile_m * EpilogueTileN
+        """Token-major FC2 staging.
+
+        Dispatch TMA retains a 128x32 tile.  Peer UBLK expands each token row
+        to exactly 128 bytes: 128 MXFP8 or 64 BF16 elements.
+        """
+        epi_tile_m = self._epi_tile_m
+        stage_stride = epi_tile_m * self._fc2_staging_hidden
         layout = cute.make_layout(
-            (cta_tile_m, EpilogueTileN, n_stages),
-            stride=(EpilogueTileN, 1, stage_stride if n_stages > 1 else 0),
+            (epi_tile_m, self._fc2_staging_hidden, n_stages),
+            stride=(
+                self._fc2_staging_hidden,
+                1,
+                stage_stride if n_stages > 1 else 0,
+            ),
         )
         return layout
 
@@ -389,7 +864,7 @@ class GluMxfp8Epilogue:
         Each epi thread writes its token's contiguous hidden row (64 B STS); the
         coalesced-issue re-partition reads 4-elem chunks hidden-major."""
         return cute.make_layout(
-            (self._cta_tile_m, EpilogueTileN), stride=(EpilogueTileN, 1)
+            (self._epi_tile_m, EpilogueTileN), stride=(EpilogueTileN, 1)
         )
 
     @staticmethod
@@ -476,13 +951,12 @@ class GluMxfp8Epilogue:
         # Fence + barrier: ensure all warps have written before TMA issue.
         cute.arch.fence_proxy("async.shared", space="cta")
         c_store_bar = pipeline.NamedBarrier(
-            barrier_id=self._CStoreBarId,
+            barrier_id=self._c_store_bar_id(work_tile_info),
             num_threads=EpiWarpCount * WarpThreadCount,
         )
         c_store_bar.arrive_and_wait()
 
-        # Warp 0 issues TMA S2G, commits, then pre-acquires the next stage so
-        # smem is guaranteed free before the next call's R2S writes.
+        # Warp 0 issues TMA S2G, then the one-stage pipeline overlaps the store.
         if warp_idx == 0:
             if work_tile_info.valid_tokens_in_cta_tile > cutlass.Int32(0):
                 g_c_2d = cute.slice_(gmem_c_subtile_view, (None, None, 0))
@@ -493,6 +967,14 @@ class GluMxfp8Epilogue:
                 )
                 cute.copy(tma_atom_c, bSG_sC, bSG_gC)
             c_pipeline.producer_commit()
+
+    def _c_store_bar_id(self, work_tile_info):
+        """Named-barrier ID for one raw-C producer group.
+
+        The base epilogue has one four-warp producer group. Tile variants with
+        multiple independent producer groups override this hook.
+        """
+        return cutlass.Int32(self._CStoreBarId)
 
     def _subtile_local_tmem_tensor_pair(
         self,
@@ -562,6 +1044,8 @@ class GluMxfp8Epilogue:
         tma_atom_c: cute.CopyAtom,
         gmem_c: cute.Tensor,
         c_pipeline,
+        acc_wait: bool = True,
+        acc_release: bool = True,
     ) -> None:
         """MXFP8 fc1 task-tile: TmemTranspose16x32 TMEM loading + cross-warp E8M0 exchange."""
         real_fc1_output, _    = sched_ext.get_gmem_tensor("d",    gmem_fc1_output,    work_tile_info)
@@ -579,8 +1063,12 @@ class GluMxfp8Epilogue:
         if cutlass.const_expr(self._generate_c):
             real_c, _ = sched_ext.get_gmem_tensor("c", gmem_c, work_tile_info)
             c_n_base = work_tile_info.tile_n_idx * cutlass.Int32(self._subtile_cnt)
+        else:
+            real_c = None
+            c_n_base = None
 
-        acc_pipeline.consumer_wait(acc_consumer_state)
+        if cutlass.const_expr(acc_wait):
+            acc_pipeline.consumer_wait(acc_consumer_state)
         if warp_idx == 0:
             iket.range_push("fc1_epi_tile")
 
@@ -602,53 +1090,46 @@ class GluMxfp8Epilogue:
             self.fc1_output_dtype,
             num_bits_per_copy=128,
         )
-        tRS_sC = None
 
-        for i in cutlass.range(0, subtile_cnt, 1, unroll=1):
-            subtile_idx = cutlass.Int32(i)
+        # Keyword bundles shared by every subtile call; ``lean_c_args`` are the raw-C placeholders.
+        subtile_args = dict(
+            real_fc1_output=real_fc1_output,
+            real_fc1_output_sf=real_fc1_output_sf,
+            real_topk_scores=real_topk_scores,
+            work_tile_info=work_tile_info,
+            smem_fc1_output_buffer=smem_fc1_output_buffer,
+            tma_atom_fc1_output=tma_atom_fc1_output,
+            r2s_copy_atom=r2s_copy_atom,
+            warp_idx=warp_idx,
+            tidx=tidx,
+            alpha=alpha,
+            norm_const=norm_const,
+            rmem_sf=rmem_sf,
+            c_pipeline=c_pipeline,
+        )
+        lean_c_args = dict(
+            smem_c_buffer=smem_fc1_output_buffer,
+            tma_atom_c=tma_atom_fc1_output,
+            gmem_c_subtile_view=real_fc1_output,
+            c_buffer_idx=cutlass.Int32(0),
+        )
 
-            if cutlass.const_expr(self._generate_c):
-                c_buffer_idx = cutlass.Int32(i % Fc1CTMAStages)
-                g_c_subtile = cute.local_tile(
-                    real_c,
-                    (self._cta_tile_m, 2 * Fc1GateUpInterleave, 1),
-                    (work_tile_info.tile_m_idx, c_n_base + subtile_idx, cutlass.Int32(0)),
-                )
-                smem_c_buf_arg = smem_c_buffer
-                tma_atom_c_arg = tma_atom_c
-                gmem_c_subtile_arg = g_c_subtile
-            else:
-                c_buffer_idx = cutlass.Int32(0)
-                smem_c_buf_arg = smem_fc1_output_buffer
-                tma_atom_c_arg = tma_atom_fc1_output
-                gmem_c_subtile_arg = real_fc1_output
-
-            self._run_fc1_subtile(
-                subtile_idx=subtile_idx,
-                tmem_gate_tensor=tmem_gate,
-                tmem_up_tensor=tmem_up,
-                real_fc1_output=real_fc1_output,
-                real_fc1_output_sf=real_fc1_output_sf,
-                real_topk_scores=real_topk_scores,
-                work_tile_info=work_tile_info,
-                smem_fc1_output_buffer=smem_fc1_output_buffer,
-                tma_atom_fc1_output=tma_atom_fc1_output,
-                r2s_copy_atom=r2s_copy_atom,
-                warp_idx=warp_idx,
-                tidx=tidx,
-                alpha=alpha,
-                norm_const=norm_const,
-                rmem_sf=rmem_sf,
-                smem_c_buffer=smem_c_buf_arg,
-                tma_atom_c=tma_atom_c_arg,
-                gmem_c_subtile_view=gmem_c_subtile_arg,
-                c_buffer_idx=c_buffer_idx,
-                c_pipeline=c_pipeline,
-            )
-
-            tmem_gate, tmem_up = self._subtile_forward_tmem_tensor(tmem_gate, tmem_up, tmem_forward_cols)
-
-        self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
+        self._run_fc1_subtiles(
+            tmem_gate=tmem_gate,
+            tmem_up=tmem_up,
+            tmem_forward_cols=tmem_forward_cols,
+            subtile_cnt=subtile_cnt,
+            subtile_args=subtile_args,
+            lean_c_args=lean_c_args,
+            real_c=real_c,
+            c_n_base=c_n_base,
+            smem_c_buffer=smem_c_buffer,
+            tma_atom_c=tma_atom_c,
+            work_tile_info=work_tile_info,
+            acc_pipeline=acc_pipeline,
+            acc_consumer_state=acc_consumer_state,
+            acc_release=acc_release,
+        )
 
         if cutlass.const_expr(self.fc1_output_dtype.width == 8):
             self._stg_sf_fc1(rmem_sf, real_fc1_output_sf, work_tile_info, tidx)
@@ -656,12 +1137,12 @@ class GluMxfp8Epilogue:
         # TMA store: 4 stores (one per warp group) after all subtiles
         if cutlass.const_expr(not self._use_stg_fc1):
             base_token_tile = (
-                work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m // EpilogueTileN)
+                work_tile_info.tile_m_idx * cutlass.Int32(self._epi_tile_m // EpilogueTileN)
             )
             for idx in cutlass.range_constexpr(EpiWarpCount):
                 g_fc1_output_warp_view = cute.local_tile(
                     real_fc1_output,
-                    (EpilogueTileN, Fc1EpilogueOutputTileN, 1),
+                    (EpilogueTileN, self._epi_tile[1], 1),
                     (base_token_tile + idx, work_tile_info.tile_n_idx, 0),
                 )
                 GluMxfp8Epilogue.tma_store_fc1_output(
@@ -674,6 +1155,58 @@ class GluMxfp8Epilogue:
             iket.range_pop()
 
     @cute.jit
+    def _run_fc1_subtiles(
+        self,
+        tmem_gate,
+        tmem_up,
+        tmem_forward_cols,
+        subtile_cnt,
+        subtile_args,
+        lean_c_args,
+        real_c,
+        c_n_base,
+        smem_c_buffer,
+        tma_atom_c,
+        work_tile_info,
+        acc_pipeline,
+        acc_consumer_state,
+        acc_release: bool,
+    ) -> None:
+        """fc1 subtile schedule up to and including the accumulator release (here: all in order).
+
+        Overrides must not wait on the accumulator, must release it exactly once after their
+        last TMEM read, and must have issued every subtile's stores and filled ``rmem_sf``."""
+        for i in cutlass.range(0, subtile_cnt, 1, unroll=1):
+            subtile_idx = cutlass.Int32(i)
+
+            if cutlass.const_expr(self._generate_c):
+                g_c_subtile = cute.local_tile(
+                    real_c,
+                    (self._epi_tile_m, 2 * Fc1GateUpInterleave, 1),
+                    (work_tile_info.tile_m_idx, c_n_base + subtile_idx, cutlass.Int32(0)),
+                )
+                c_args = dict(
+                    smem_c_buffer=smem_c_buffer,
+                    tma_atom_c=tma_atom_c,
+                    gmem_c_subtile_view=g_c_subtile,
+                    c_buffer_idx=cutlass.Int32(i % Fc1CTMAStages),
+                )
+            else:
+                c_args = lean_c_args
+
+            self._run_fc1_subtile(
+                subtile_idx=subtile_idx,
+                tmem_gate_tensor=tmem_gate,
+                tmem_up_tensor=tmem_up,
+                **subtile_args,
+                **c_args,
+            )
+
+            tmem_gate, tmem_up = self._subtile_forward_tmem_tensor(tmem_gate, tmem_up, tmem_forward_cols)
+
+        self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, acc_release)
+
+    @cute.jit
     def _swiglu_act(
         self,
         t_swiglu: cute.Tensor,
@@ -683,6 +1216,23 @@ class GluMxfp8Epilogue:
     ) -> None:
         """SwiGLU hook consumed by ``_run_fc1_subtile`` """
         swiglu_act(t_swiglu, t_up, t_gate, prob)
+
+    @cute.jit
+    def _fc1_subtile_load(
+        self,
+        tmem_gate_tensor: cute.Tensor,
+        tmem_up_tensor: cute.Tensor,
+    ) -> (cute.Tensor, cute.Tensor):
+        """LDTM one fc1 subtile's gate and up columns into f32 registers."""
+        r_layout = cute.make_layout((((Fc1GateUpInterleave,), 1),), stride=(((1,), 0),))
+        r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
+        r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
+        atom_t2r = cute.make_copy_atom(
+            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), self.acc_dtype,
+        )
+        cute.copy(atom_t2r, tmem_gate_tensor, r_gate)
+        cute.copy(atom_t2r, tmem_up_tensor, r_up)
+        return r_gate, r_up
 
     @cute.jit
     def _run_fc1_subtile(
@@ -708,19 +1258,64 @@ class GluMxfp8Epilogue:
         c_buffer_idx,
         c_pipeline,
     ) -> None:
-        """MXFP8 fc1 subtile: GLU + E8M0 SF + fp8 R2S."""
+        """MXFP8 fc1 subtile: LDTM gate/up, then GLU + E8M0 SF + fp8 store."""
+        r_gate, r_up = self._fc1_subtile_load(tmem_gate_tensor, tmem_up_tensor)
+
+        self._fc1_subtile_compute_store(
+            subtile_idx=subtile_idx,
+            r_gate=r_gate,
+            r_up=r_up,
+            real_fc1_output=real_fc1_output,
+            real_fc1_output_sf=real_fc1_output_sf,
+            real_topk_scores=real_topk_scores,
+            work_tile_info=work_tile_info,
+            smem_fc1_output_buffer=smem_fc1_output_buffer,
+            tma_atom_fc1_output=tma_atom_fc1_output,
+            r2s_copy_atom=r2s_copy_atom,
+            warp_idx=warp_idx,
+            tidx=tidx,
+            alpha=alpha,
+            norm_const=norm_const,
+            rmem_sf=rmem_sf,
+            smem_c_buffer=smem_c_buffer,
+            tma_atom_c=tma_atom_c,
+            gmem_c_subtile_view=gmem_c_subtile_view,
+            c_buffer_idx=c_buffer_idx,
+            c_pipeline=c_pipeline,
+        )
+
+    @cute.jit
+    def _fc1_subtile_compute_store(
+        self,
+        subtile_idx,
+        r_gate: cute.Tensor,
+        r_up: cute.Tensor,
+        real_fc1_output: cute.Tensor,
+        real_fc1_output_sf: cute.Tensor,
+        real_topk_scores: cute.Tensor,
+        work_tile_info,
+        smem_fc1_output_buffer: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        r2s_copy_atom: cute.CopyAtom,
+        warp_idx: int,
+        tidx,
+        alpha,
+        norm_const,
+        rmem_sf: cute.Tensor,
+        smem_c_buffer: cute.Tensor,
+        tma_atom_c: cute.CopyAtom,
+        gmem_c_subtile_view: cute.Tensor,
+        c_buffer_idx,
+        c_pipeline,
+    ) -> None:
+        """fc1 subtile from registers: (raw-C store) + GLU + E8M0 SF + fp8 store.
+
+        Split from ``_run_fc1_subtile`` so the deferred-subtile path can run
+        it after the accumulator release on gate/up held in registers."""
         if warp_idx == 0:
             iket.range_push("fc1_epilogue_subtile")
 
         r_layout = cute.make_layout((((Fc1GateUpInterleave,), 1),), stride=(((1,), 0),))
-        r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-        r_up = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-
-        atom_t2r = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), self.acc_dtype,
-        )
-        cute.copy(atom_t2r, tmem_gate_tensor, r_gate)
-        cute.copy(atom_t2r, tmem_up_tensor, r_up)
 
         # ── generate_c: store raw gate+up to GMEM C tensor via SMEM staging ──
         if cutlass.const_expr(self._generate_c):
@@ -747,7 +1342,7 @@ class GluMxfp8Epilogue:
         if cutlass.const_expr(self._apply_topk_in_fc1):
             thread_in_warp = tidx % cutlass.Int32(WarpThreadCount)
             token_in_tile = (
-                work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
+                work_tile_info.tile_m_idx * cutlass.Int32(self._epi_tile_m)
                 + cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
             )
             topk = Float32(real_topk_scores[token_in_tile])
@@ -779,7 +1374,7 @@ class GluMxfp8Epilogue:
             token_in_tile = cutlass.Int32(warp_idx * EpilogueTileN) + thread_in_warp
             if token_in_tile < work_tile_info.valid_tokens_in_cta_tile:
                 abs_token = (
-                    work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
+                    work_tile_info.tile_m_idx * cutlass.Int32(self._epi_tile_m)
                     + cutlass.Int32(warp_idx * EpilogueTileN) + thread_in_warp
                 )
                 # absolute column start (element index in the intermediate axis)
@@ -816,7 +1411,7 @@ class GluMxfp8Epilogue:
             if warp_idx == 0:
                 c_pipeline.producer_acquire()
             c_store_bar = pipeline.NamedBarrier(
-                barrier_id=self._CStoreBarId,
+                barrier_id=self._c_store_bar_id(work_tile_info),
                 num_threads=EpiWarpCount * WarpThreadCount,
             )
             c_store_bar.arrive_and_wait()
@@ -870,6 +1465,69 @@ class GluMxfp8Epilogue:
             acc_pipeline.consumer_release(acc_consumer_state)
 
     @cute.jit
+    def _fc2_subtile_cols(self, work_tile_info, subtile_idx):
+        """(hidden_group, hidden_col_start) of one fc2 subtile of the current task tile."""
+        fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
+        hidden_group = (
+            work_tile_info.tile_n_idx * cutlass.Int32(fc2_subtile_cnt) + subtile_idx
+        )
+        hidden_col_start = (
+            work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
+            + subtile_idx * cutlass.Int32(EpilogueTileN)
+        )
+        return hidden_group, hidden_col_start
+
+    @cute.jit
+    def _fc2_subtile_load(self, tmem_subtile_tensor: cute.Tensor) -> cute.Tensor:
+        """LDTM one fc2 subtile (EpilogueTileN f32 per thread) into registers."""
+        r_acc_layout = cute.make_layout((((EpilogueTileN,), 1),), stride=(((1,), 0),))
+        atom_t2r = cute.make_copy_atom(
+            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), self.acc_dtype,
+        )
+        r_acc = cute.make_rmem_tensor(r_acc_layout.shape, self.acc_dtype)
+        cute.copy(atom_t2r, tmem_subtile_tensor, r_acc)
+        return r_acc
+
+    @cute.jit
+    def _fc2_lean_mxfp8_store(
+        self,
+        r_fp8: cute.Tensor,
+        real_fc2_output: cute.Tensor,
+        work_tile_info,
+        hidden_group,
+        token_row_in_cta,
+    ) -> None:
+        """Lean path: STG.256 of one thread's EpilogueTileN fp8 fc2 elements; the caller predicates."""
+        fp8_dtype = self._combine_format.act_dtype
+        g_fc2_output_tile = cute.local_tile(
+            real_fc2_output,
+            (self._epi_tile_m, EpilogueTileN, 1),
+            (work_tile_info.tile_m_idx, hidden_group, 0),
+        )
+        g_fc2_slice = cute.slice_(g_fc2_output_tile, (None, None, 0))
+        g_thread_row = cute.local_tile(
+            g_fc2_slice, (1, EpilogueTileN), (token_row_in_cta, 0),
+        )
+        g_flat = cute.coalesce(g_thread_row)
+        aligned_iter = cute.make_ptr(
+            fp8_dtype,
+            g_flat.iterator.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=32,
+        )
+        stg_fp8_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), fp8_dtype,
+            num_bits_per_copy=256,
+        )
+        r_fp8_flat = cute.make_tensor(
+            r_fp8.iterator, cute.make_layout(EpilogueTileN)
+        )
+        cute.copy(
+            stg_fp8_atom, r_fp8_flat,
+            cute.make_tensor(aligned_iter, cute.make_layout(EpilogueTileN)),
+        )
+
+    @cute.jit
     def _run_fc2_subtile(
         self,
         subtile_idx,
@@ -880,30 +1538,23 @@ class GluMxfp8Epilogue:
         warp_idx: int,
         tidx,
         token_comm_args=None,
+        fc2_output_router=None,
         rmem_sf_fc2=None,
         smem_fc2_tma_buffer=None,
         tma_atom_fc2_output=None,
-        gmem_fc2_tma_output=None,
+        fc2_tma_tile_router=None,
         smem_fc2_reduce_buffer=None,
     ) -> None:
         """fc2 subtile: LDTM + encode + STG."""
         if warp_idx == 0:
             iket.range_push("fc2_epi_subtile")
 
-        fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
-        hidden_group = (
-            work_tile_info.tile_n_idx * cutlass.Int32(fc2_subtile_cnt) + subtile_idx
-        )
         hidden_col_start = (
             work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
             + subtile_idx * cutlass.Int32(EpilogueTileN)
         )
         r_acc_layout = cute.make_layout((((EpilogueTileN,), 1),), stride=(((1,), 0),))
-        atom_t2r = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), self.acc_dtype,
-        )
-        r_acc = cute.make_rmem_tensor(r_acc_layout.shape, self.acc_dtype)
-        cute.copy(atom_t2r, tmem_subtile_tensor, r_acc)
+        r_acc = self._fc2_subtile_load(tmem_subtile_tensor)
 
         thread_in_warp = tidx % WarpThreadCount
         token_row_in_cta = cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
@@ -924,59 +1575,78 @@ class GluMxfp8Epilogue:
                     r_acc, r_fp8, 1.0, EpilogueTileN,
                     cutlass.Float8E8M0FNU, fp8_dtype,
                 )
-                pool_token_global = (
-                    work_tile_info.cumulative_data_physical_row
-                    + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
-                    + token_row_in_cta
-                )
-                metadata_u32 = cute.recast_tensor(
-                    token_comm_args.token_src_metadata, cutlass.Uint32,
-                )
-                fc2_output_dest = Fc2OutputDest(
-                    tensor=token_comm_args.combine_output,
-                    metadata=metadata_u32,
-                    peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-                )
-                dest_row = fc2_output_dest.resolve_token_row(pool_token_global)
                 r_fp8_flat = cute.make_tensor(
                     r_fp8.iterator, cute.make_layout(EpilogueTileN)
                 )
-                dest_fp8_ptr = cute.make_ptr(
-                    fp8_dtype,
-                    dest_row.iterator.toint() + Int64(hidden_col_start),
-                    cute.AddressSpace.gmem,
-                    assumed_align=32,
-                )
-                if cutlass.const_expr(self._fc2_use_ublk):
-                    # UBLK: stage this token's 32 fp8 elems into SMEM
-                    stage_idx = subtile_idx % cutlass.Int32(self._fc2_tma_stages)
+                if cutlass.const_expr(
+                    self._fc2_use_ublk and token_comm_args is not None
+                ):
+                    # Four 32-hidden MXFP8 subtiles form one contiguous 128B
+                    # peer UBLK for this token.
+                    subtile_in_ublk = subtile_idx % cutlass.Int32(
+                        self._fc2_ublk_subtiles
+                    )
+                    ublk_iter_idx = subtile_idx // cutlass.Int32(
+                        self._fc2_ublk_subtiles
+                    )
+                    stage_idx = ublk_iter_idx % cutlass.Int32(
+                        self._fc2_tma_stages
+                    )
                     smem_row = cute.slice_(
                         smem_fc2_tma_buffer, (token_row_in_cta, None, stage_idx)
+                    )
+                    smem_chunk = cute.local_tile(
+                        smem_row,
+                        (EpilogueTileN,),
+                        (subtile_in_ublk,),
                     )
                     sts_fp8_atom = cute.make_copy_atom(
                         cute.nvgpu.CopyUniversalOp(), fp8_dtype, num_bits_per_copy=256,
                     )
-                    cute.copy(sts_fp8_atom, r_fp8_flat, smem_row)
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    cp_async_bulk_s2g(
-                        dest_fp8_ptr,
-                        smem_row.iterator,
-                        cutlass.Int32(EpilogueTileN * fp8_dtype.width // 8),
-                    )
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(
-                        self._fc2_tma_stages - 1, read=True
-                    )
+                    cute.copy(sts_fp8_atom, r_fp8_flat, smem_chunk)
+                    if subtile_in_ublk == self._fc2_ublk_subtiles - 1:
+                        dest_addr, dest_valid = fc2_output_router.get_data_addr(
+                            ublk_iter_idx
+                        )
+                        if dest_valid != 0:
+                            dest_fp8_ptr = cute.make_ptr(
+                                fp8_dtype,
+                                dest_addr,
+                                cute.AddressSpace.gmem,
+                                assumed_align=32,
+                            )
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cp_async_bulk_s2g(
+                                dest_fp8_ptr,
+                                smem_row.iterator,
+                                cutlass.Int32(self._fc2_ublk_bytes),
+                            )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(
+                                self._fc2_tma_stages - 1, read=True
+                            )
                 else:
                     # STG 32 fp8 elements = 256 bits in one shot.
+                    dest_addr, dest_valid = fc2_output_router.get_data_addr(
+                        subtile_idx
+                    )
                     stg_fp8_atom = cute.make_copy_atom(
                         cute.nvgpu.CopyUniversalOp(), fp8_dtype,
                         num_bits_per_copy=256,
                     )
-                    cute.copy(
-                        stg_fp8_atom, r_fp8_flat,
-                        cute.make_tensor(dest_fp8_ptr, cute.make_layout(EpilogueTileN)),
-                    )
+                    if dest_valid != 0:
+                        dest_fp8_ptr = cute.make_ptr(
+                            fp8_dtype,
+                            dest_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=32,
+                        )
+                        cute.copy(
+                            stg_fp8_atom, r_fp8_flat,
+                            cute.make_tensor(
+                                dest_fp8_ptr, cute.make_layout(EpilogueTileN)
+                            ),
+                        )
                 # Buffer the E8M0 scale; the whole task tile's 8 scales are
                 # flushed together by _stg_sf_fc2 (single stg.64 when aligned).
                 self._write_sf_fc2_buffer(rmem_sf_fc2, subtile_idx, qpvscale)
@@ -986,11 +1656,6 @@ class GluMxfp8Epilogue:
                 # MegaMoE token-back-by-dispatch + quantized combine:
                 # Epilogue writes fp8 data to local pool; dispatch warps push
                 # both data (fc2_output_workspace) and SF (fc2_output_sf) to peers.
-                pool_token_global = (
-                    work_tile_info.cumulative_data_physical_row
-                    + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
-                    + token_row_in_cta
-                )
                 fp8_dtype = self._combine_format.act_dtype
                 r_fp8 = cute.make_rmem_tensor(r_acc_layout.shape, fp8_dtype)
                 qpvscale = quant_sfd_row(
@@ -1008,26 +1673,28 @@ class GluMxfp8Epilogue:
                     )
                     cute.copy(sts_fp8_atom, r_fp8_flat, smem_row)
                 else:
-                    # Write 32 fp8 elements to local fc2_output_workspace pool.
-                    fp8_byte_addr = (
-                        token_comm_args.fc2_output_workspace.iterator.toint()
-                        + Int64(pool_token_global) * Int64(self._hidden_fc2)
-                        + Int64(hidden_col_start)
+                    # Local token-back pool STG uses affine Router addressing.
+                    dest_addr, dest_valid = fc2_output_router.get_data_addr(
+                        subtile_idx
                     )
                     stg_fp8_atom = cute.make_copy_atom(
                         cute.nvgpu.CopyUniversalOp(), fp8_dtype,
                         num_bits_per_copy=256,
                     )
-                    aligned_fp8_iter = cute.make_ptr(
-                        fp8_dtype,
-                        fp8_byte_addr,
-                        cute.AddressSpace.gmem,
-                        assumed_align=32,
-                    )
-                    cute.copy(
-                        stg_fp8_atom, r_fp8_flat,
-                        cute.make_tensor(aligned_fp8_iter, cute.make_layout(EpilogueTileN)),
-                    )
+                    if dest_valid != 0:
+                        aligned_fp8_iter = cute.make_ptr(
+                            fp8_dtype,
+                            dest_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=32,
+                        )
+                        cute.copy(
+                            stg_fp8_atom, r_fp8_flat,
+                            cute.make_tensor(
+                                aligned_fp8_iter,
+                                cute.make_layout(EpilogueTileN),
+                            ),
+                        )
                 # Buffer the E8M0 scale; flushed together by _stg_sf_fc2 after
                 # the subtile loop (single stg.64 when hidden-aligned).
                 self._write_sf_fc2_buffer(rmem_sf_fc2, subtile_idx, qpvscale)
@@ -1041,22 +1708,6 @@ class GluMxfp8Epilogue:
                     r_acc, r_fp8, 1.0, EpilogueTileN,
                     cutlass.Float8E8M0FNU, fp8_dtype,
                 )
-                g_fc2_output_tile = cute.local_tile(
-                    real_fc2_output,
-                    (self._cta_tile_m, EpilogueTileN, 1),
-                    (work_tile_info.tile_m_idx, hidden_group, 0),
-                )
-                g_fc2_slice = cute.slice_(g_fc2_output_tile, (None, None, 0))
-                g_thread_row = cute.local_tile(
-                    g_fc2_slice, (1, EpilogueTileN), (token_row_in_cta, 0),
-                )
-                g_flat = cute.coalesce(g_thread_row)
-                aligned_iter = cute.make_ptr(
-                    fp8_dtype,
-                    g_flat.iterator.toint(),
-                    cute.AddressSpace.gmem,
-                    assumed_align=32,
-                )
                 stg_fp8_atom = cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(), fp8_dtype,
                     num_bits_per_copy=256,
@@ -1064,93 +1715,134 @@ class GluMxfp8Epilogue:
                 r_fp8_flat = cute.make_tensor(
                     r_fp8.iterator, cute.make_layout(EpilogueTileN)
                 )
-                cute.copy(
-                    stg_fp8_atom, r_fp8_flat,
-                    cute.make_tensor(aligned_iter, cute.make_layout(EpilogueTileN)),
+                dest_addr, dest_valid = fc2_output_router.get_data_addr(
+                    subtile_idx
                 )
+                if dest_valid != 0:
+                    aligned_iter = cute.make_ptr(
+                        fp8_dtype,
+                        dest_addr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=32,
+                    )
+                    cute.copy(
+                        stg_fp8_atom, r_fp8_flat,
+                        cute.make_tensor(
+                            aligned_iter, cute.make_layout(EpilogueTileN)
+                        ),
+                    )
                 # Buffer the E8M0 scale; flushed together by _stg_sf_fc2 after
                 # the subtile loop (single stg.64 when hidden-aligned).
                 self._write_sf_fc2_buffer(rmem_sf_fc2, subtile_idx, qpvscale)
             else:
-                # BF16 path (default): fp32->bf16, two 256-bit STGs.
+                # BF16 path: either stage a 128x32 tile for TMA/UBLK or use
+                # the original pair of 256-bit vector stores.
                 r_bf16 = cute.make_rmem_tensor(r_acc_layout.shape, cutlass.BFloat16)
                 r_bf16.store(r_acc.load().to(cutlass.BFloat16))
-                stg_atom = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256,
+                r_bf16_flat = cute.make_tensor(
+                    r_bf16.iterator, cute.make_layout(EpilogueTileN)
                 )
                 if cutlass.const_expr(self._fc2_reduce_coalesce):
                     # In-kernel reduce: stage the full bf16 token row token-major into
                     # SMEM (row start is 64 B aligned).
                     cute.autovec_copy(
-                        cute.make_tensor(r_bf16.iterator, cute.make_layout(EpilogueTileN)),
+                        r_bf16_flat,
                         cute.slice_(smem_fc2_reduce_buffer, (token_row_in_cta, None)),
                     )
                 if cutlass.const_expr(
-                    token_comm_args is not None and not self._token_back_by_dispatch
+                    self._fc2_use_ublk and token_comm_args is not None
                 ):
-                    metadata_u32 = cute.recast_tensor(
-                        token_comm_args.token_src_metadata, cutlass.Uint32,
+                    # Two 32-hidden BF16 subtiles form one contiguous 128B peer UBLK for this token.
+                    subtile_in_ublk = subtile_idx % cutlass.Int32(
+                        self._fc2_ublk_subtiles
                     )
-                    fc2_output_dest = Fc2OutputDest(
-                        tensor=token_comm_args.combine_output,
-                        metadata=metadata_u32,
-                        peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-                        reduce_topk_in_kernel=self._fc2_in_kernel_topk_reduce,
+                    ublk_iter_idx = subtile_idx // cutlass.Int32(
+                        self._fc2_ublk_subtiles
                     )
-                    pool_token_global = (
-                        work_tile_info.cumulative_data_physical_row
-                        + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
-                        + token_row_in_cta
+                    stage_idx = ublk_iter_idx % cutlass.Int32(
+                        self._fc2_tma_stages
                     )
-                    dest_row = fc2_output_dest.resolve_token_row(pool_token_global)
-                for stg_half in cutlass.range_constexpr(EpilogueTileN // 16):
-                    reg_view = cute.make_tensor(
-                        r_bf16.iterator + stg_half * 16,
-                        cute.make_layout(16),
+                    smem_row = cute.slice_(
+                        smem_fc2_tma_buffer, (token_row_in_cta, None, stage_idx)
                     )
-                    if cutlass.const_expr(
-                        token_comm_args is not None and not self._token_back_by_dispatch
-                    ):
-                        hidden_off = hidden_col_start + cutlass.Int32(stg_half * 16)
-                        dest_ptr = cute.make_ptr(
-                            cutlass.BFloat16,
-                            dest_row.iterator.toint() + hidden_off * cutlass.Int64(2),
-                            cute.AddressSpace.gmem,
-                            assumed_align=32,
+                    smem_chunk = cute.local_tile(
+                        smem_row,
+                        (EpilogueTileN,),
+                        (subtile_in_ublk,),
+                    )
+                    cute.autovec_copy(r_bf16_flat, smem_chunk)
+                    if subtile_in_ublk == self._fc2_ublk_subtiles - 1:
+                        dest_addr, dest_valid = fc2_output_router.get_data_addr(
+                            ublk_iter_idx
                         )
-                        # Reduce path staged to SMEM above; only the non-reduce Form-A
-                        # combine does the direct peer STG here.
-                        if cutlass.const_expr(not self._fc2_reduce_coalesce):
-                            cute.copy(
-                                stg_atom, reg_view,
-                                cute.make_tensor(dest_ptr, cute.make_layout(16)),
+                        if dest_valid != 0:
+                            dest_ptr = cute.make_ptr(
+                                cutlass.BFloat16,
+                                dest_addr,
+                                cute.AddressSpace.gmem,
+                                assumed_align=32,
                             )
-                    else:
-                        g_fc2_output_tile = cute.local_tile(
-                            real_fc2_output,
-                            (self._cta_tile_m, EpilogueTileN, 1),
-                            (work_tile_info.tile_m_idx, hidden_group, 0),
-                        )
-                        g_fc2_slice = cute.slice_(g_fc2_output_tile, (None, None, 0))
-                        g_thread_row = cute.local_tile(
-                            g_fc2_slice, (1, 16), (token_row_in_cta, stg_half),
-                        )
-                        g_flat = cute.coalesce(g_thread_row)
-                        aligned_iter = cute.make_ptr(
-                            cutlass.BFloat16,
-                            g_flat.iterator.toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=32,
-                        )
-                        cute.copy(stg_atom, reg_view, cute.make_tensor(aligned_iter, g_flat.layout))
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cp_async_bulk_s2g(
+                                dest_ptr,
+                                smem_row.iterator,
+                                cutlass.Int32(self._fc2_ublk_bytes),
+                            )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(
+                                self._fc2_tma_stages - 1, read=True
+                            )
+                elif cutlass.const_expr(self._fc2_use_tma):
+                    # Dispatch token-back path: TMA stores this staged tile to
+                    # the rank-local FC2 pool after all 128 rows rendezvous.
+                    stage_idx = subtile_idx % cutlass.Int32(self._fc2_tma_stages)
+                    smem_row = cute.slice_(
+                        smem_fc2_tma_buffer, (token_row_in_cta, None, stage_idx)
+                    )
+                    cute.autovec_copy(r_bf16_flat, smem_row)
+                else:
+                    stg_atom = cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(),
+                        cutlass.BFloat16,
+                        num_bits_per_copy=256,
+                    )
+                    if cutlass.const_expr(not self._fc2_reduce_coalesce):
+                        for stg_half in cutlass.range_constexpr(
+                            EpilogueTileN // 16
+                        ):
+                            reg_view = cute.make_tensor(
+                                r_bf16.iterator + stg_half * 16,
+                                cute.make_layout(16),
+                            )
+                            stg_iter_idx = (
+                                subtile_idx
+                                * cutlass.Int32(EpilogueTileN // 16)
+                                + cutlass.Int32(stg_half)
+                            )
+                            dest_addr, dest_valid = (
+                                fc2_output_router.get_data_addr(stg_iter_idx)
+                            )
+                            if dest_valid != 0:
+                                dest_ptr = cute.make_ptr(
+                                    cutlass.BFloat16,
+                                    dest_addr,
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=32,
+                                )
+                                cute.copy(
+                                    stg_atom,
+                                    reg_view,
+                                    cute.make_tensor(
+                                        dest_ptr, cute.make_layout(16)
+                                    ),
+                                )
 
         if cutlass.const_expr(self._fc2_use_tma):
             self._issue_fc2_tma_store(
                 subtile_idx=subtile_idx,
                 smem_fc2_tma_buffer=smem_fc2_tma_buffer,
                 tma_atom_fc2_output=tma_atom_fc2_output,
-                gmem_fc2_tma_output=gmem_fc2_tma_output,
-                work_tile_info=work_tile_info,
+                fc2_tma_tile_router=fc2_tma_tile_router,
                 warp_idx=warp_idx,
             )
 
@@ -1160,11 +1852,9 @@ class GluMxfp8Epilogue:
             self._issue_fc2_reduce_coalesced(
                 subtile_idx=subtile_idx,
                 smem_fc2_reduce_buffer=smem_fc2_reduce_buffer,
-                token_comm_args=token_comm_args,
-                work_tile_info=work_tile_info,
-                valid_hidden=valid_hidden,
                 warp_idx=warp_idx,
                 tidx=tidx,
+                fc2_output_router=fc2_output_router,
             )
 
         if warp_idx == 0:
@@ -1177,27 +1867,15 @@ class GluMxfp8Epilogue:
         subtile_idx,
         smem_fc2_tma_buffer: cute.Tensor,
         tma_atom_fc2_output: cute.CopyAtom,
-        gmem_fc2_tma_output: cute.Tensor,
-        work_tile_info,
+        fc2_tma_tile_router: Fc2TmaTileRouter,
         warp_idx: int,
     ) -> None:
         """Issue the FC2 bulk-tensor store for one subtile's staged SMEM tile."""
         stage_idx = subtile_idx % cutlass.Int32(self._fc2_tma_stages)
         smem_stage = cute.slice_(smem_fc2_tma_buffer, (None, None, stage_idx))
-        token_base = (
-            work_tile_info.cumulative_data_physical_row
-            + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
+        gmem_subtile, tile_valid = fc2_tma_tile_router.get_data_tile(
+            subtile_idx
         )
-        hidden_col = (
-            work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
-            + subtile_idx * cutlass.Int32(EpilogueTileN)
-        )
-        token_tile_idx = token_base // cutlass.Int32(self._cta_tile_m)
-        hidden_tile_idx = hidden_col // cutlass.Int32(EpilogueTileN)
-        tiled_output = cute.flat_divide(
-            gmem_fc2_tma_output, (self._cta_tile_m, EpilogueTileN)
-        )
-        gmem_subtile = tiled_output[None, None, token_tile_idx, hidden_tile_idx]
         bSG_s, bSG_g = cpasync.tma_partition(
             tma_atom_fc2_output,
             0,
@@ -1212,9 +1890,12 @@ class GluMxfp8Epilogue:
         )
         bar.arrive_and_wait()
         if warp_idx == 0:
-            cute.copy(tma_atom_fc2_output, bSG_s, bSG_g)
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(self._fc2_tma_stages - 1, read=True)
+            if tile_valid:
+                cute.copy(tma_atom_fc2_output, bSG_s, bSG_g)
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(
+                    self._fc2_tma_stages - 1, read=True
+                )
         bar.arrive_and_wait()
 
     @cute.jit
@@ -1222,18 +1903,16 @@ class GluMxfp8Epilogue:
         self,
         subtile_idx,
         smem_fc2_reduce_buffer: cute.Tensor,
-        token_comm_args,
-        work_tile_info,
-        valid_hidden,
         warp_idx: int,
         tidx,
+        fc2_output_router: Fc2OutputRouter,
     ) -> None:
         """Coalesced peer red.add of one subtile's staged reduce tile."""
         redg_width: cutlass.Constexpr[int] = 4  # bf16 per red.v2.bf16x2
         lanes_per_token: cutlass.Constexpr[int] = EpilogueTileN // redg_width  # 8
         tokens_per_warp: cutlass.Constexpr[int] = WarpThreadCount // lanes_per_token  # 4
         tokens_per_pass: cutlass.Constexpr[int] = tokens_per_warp * EpiWarpCount  # 16
-        passes: cutlass.Constexpr[int] = self._cta_tile_m // tokens_per_pass  # 8
+        passes: cutlass.Constexpr[int] = self._epi_tile_m // tokens_per_pass  # 8
 
         # Rendezvous: make every thread's staged SMEM row visible before the reads.
         bar = pipeline.NamedBarrier(
@@ -1243,34 +1922,70 @@ class GluMxfp8Epilogue:
         bar.arrive_and_wait()
 
         thread_in_warp = tidx % WarpThreadCount
-        token_in_warp = thread_in_warp // cutlass.Int32(lanes_per_token)  # 0..tokens_per_warp-1
         chunk = thread_in_warp % cutlass.Int32(lanes_per_token)           # 0..lanes_per_token-1
-        hidden_off = (
-            work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
-            + subtile_idx * cutlass.Int32(EpilogueTileN)
+        epi_tid = (
+            cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
+        )
+        token_group = epi_tid // cutlass.Int32(lanes_per_token)  # 0..15
+        group_first_lane = thread_in_warp - chunk
+        hidden_in_tile = (
+            subtile_idx * cutlass.Int32(EpilogueTileN)
             + chunk * cutlass.Int32(redg_width)
         )
-        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
-        metadata_u32 = cute.recast_tensor(token_comm_args.token_src_metadata, cutlass.Uint32)
-        fc2_output_dest = Fc2OutputDest(
-            tensor=token_comm_args.combine_output,
-            metadata=metadata_u32,
-            peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-            reduce_topk_in_kernel=True,
+        hidden = fc2_output_router.hidden_base_this_cta_tile + hidden_in_tile
+        hidden_valid = cutlass.Int32(0)
+        if hidden < fc2_output_router.valid_hidden:
+            hidden_valid = cutlass.Int32(1)
+
+        # Every lane prefetched one distinct token row for its 8-lane group.
+        # Broadcast the selected pass's 64-bit row base as two i32 values.
+        prefetched_row = Int64(fc2_output_router.row_base)
+        prefetched_row_lo = cutlass.Int32(
+            prefetched_row & Int64(0xFFFFFFFF)
         )
+        prefetched_row_hi = cutlass.Int32(
+            (prefetched_row >> Int64(32)) & Int64(0xFFFFFFFF)
+        )
+        prefetched_valid = cutlass.Int32(fc2_output_router.row_valid)
+
         for p in cutlass.range_constexpr(passes):
             token_in_cta = (
-                cutlass.Int32(p * tokens_per_pass)
-                + cutlass.Int32(warp_idx) * cutlass.Int32(tokens_per_warp)
-                + token_in_warp
+                cutlass.Int32(p * tokens_per_pass) + token_group
             )
-            if token_in_cta < valid_tokens and hidden_off < valid_hidden:
-                pool_token_global = (
-                    work_tile_info.cumulative_data_physical_row
-                    + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
-                    + token_in_cta
+            source_lane = group_first_lane + cutlass.Int32(p)
+            row_lo = cutlass.Int32(
+                cute.arch.shuffle_sync(
+                    prefetched_row_lo,
+                    source_lane,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=31,
                 )
-                dest_row = fc2_output_dest.resolve_token_row(pool_token_global)
+            )
+            row_hi = cutlass.Int32(
+                cute.arch.shuffle_sync(
+                    prefetched_row_hi,
+                    source_lane,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=31,
+                )
+            )
+            dest_valid = cutlass.Int32(
+                cute.arch.shuffle_sync(
+                    prefetched_valid,
+                    source_lane,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=31,
+                )
+            ) & hidden_valid
+            if dest_valid != 0:
+                dest_row = (
+                    ((Int64(row_hi) & Int64(0xFFFFFFFF)) << Int64(32))
+                    | (Int64(row_lo) & Int64(0xFFFFFFFF))
+                )
+                dest_addr = (
+                    dest_row
+                    + Int64(hidden) * Int64(fc2_output_router.wire_bytes)
+                )
                 # LDS this lane's 4 staged bf16 (contiguous hidden chunk).
                 smem_chunk_ptr = cute.slice_(
                     smem_fc2_reduce_buffer, (token_in_cta, None)
@@ -1282,7 +1997,7 @@ class GluMxfp8Epilogue:
                 r4_u32 = cute.recast_tensor(r4, cutlass.Uint32)  # 2 u32 = 4 bf16
                 dest_ptr = cute.make_ptr(
                     cutlass.BFloat16,
-                    dest_row.iterator.toint() + Int64(hidden_off) * Int64(2),
+                    dest_addr,
                     cute.AddressSpace.gmem,
                     assumed_align=8,
                 )
@@ -1301,34 +2016,79 @@ class GluMxfp8Epilogue:
                 rmem_sf_fc2[j] = qpvscale
 
     @cute.jit
+    def _stg_sf_row_group(
+        self,
+        real_sf: cute.Tensor,
+        token_idx,
+        sf_col,
+        rmem_src_iter,
+        count: int,
+        assumed_align: int,
+    ) -> None:
+        """Convert ``count`` scales to ``sf_dtype`` and store them contiguously at (token_idx, sf_col)."""
+        sf_base = cute.local_tile(
+            real_sf, (1, 1, 1), (token_idx, sf_col, cutlass.Int32(0))
+        )
+        sf_ptr = cute.make_ptr(
+            self.sf_dtype,
+            sf_base.iterator.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=assumed_align,
+        )
+        r_src = cute.make_tensor(rmem_src_iter, cute.make_layout(count))
+        r_sf = cute.make_rmem_tensor(cute.make_layout(count).shape, self.sf_dtype)
+        r_sf.store(r_src.load().to(self.sf_dtype))
+        cute.autovec_copy(r_sf, cute.make_tensor(sf_ptr, cute.make_layout(count)))
+
+    @cute.jit
+    def _stg_sf_fc2_blocked(
+        self,
+        rmem_sf_fc2: cute.Tensor,
+        real_fc2_output_sf: cute.Tensor,
+        work_tile_info,
+        tidx,
+    ) -> None:
+        """Store one task tile's fc2 E8M0 scales into the blocked SF plane, one token row per thread."""
+        token_idx = (
+            work_tile_info.cumulative_sf_physical_row
+            + work_tile_info.tile_m_idx * cutlass.Int32(self._epi_tile_m)
+            + tidx
+        )
+        if tidx < work_tile_info.valid_tokens_in_cta_tile:
+            if cutlass.const_expr(self._cta_tile_n < 4 * self._sf_vec_size):
+                self._stg_sf_row_group(
+                    real_fc2_output_sf,
+                    token_idx,
+                    work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n),
+                    rmem_sf_fc2.iterator,
+                    count=self._cta_tile_n // self._sf_vec_size,
+                    assumed_align=2,
+                )
+            for g in cutlass.range_constexpr(
+                self._cta_tile_n // (4 * self._sf_vec_size)
+            ):
+                self._stg_sf_row_group(
+                    real_fc2_output_sf,
+                    token_idx,
+                    work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
+                    + cutlass.Int32(g * 4 * self._sf_vec_size),
+                    rmem_sf_fc2.iterator + 4 * g,
+                    count=4,
+                    assumed_align=4,
+                )
+
+    @cute.jit
     def _stg_sf_fc2(
         self,
         rmem_sf_fc2: cute.Tensor,
-        sf_base_addr,
-        sf_row_stride,
-        work_tile_info,
-        valid_hidden,
-        warp_idx: int,
-        tidx,
+        fc2_output_router: Fc2OutputRouter,
     ) -> None:
         """Flush a task tile's fc2 E8M0 scales to the local ``fc2_output_sf``."""
         fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN
-        thread_in_warp = tidx % WarpThreadCount
-        token_row_in_cta = cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
-        if token_row_in_cta < work_tile_info.valid_tokens_in_cta_tile:
-            pool_token_global = (
-                work_tile_info.cumulative_data_physical_row
-                + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
-                + token_row_in_cta
-            )
-            hidden_group_base = (
-                work_tile_info.tile_n_idx * cutlass.Int32(fc2_subtile_cnt)
-            )
-            sf_byte_addr = (
-                sf_base_addr
-                + Int64(pool_token_global) * Int64(sf_row_stride)
-                + Int64(hidden_group_base)
-            )
+        sf_byte_addr, sf_valid = fc2_output_router.get_sf_addr(
+            cutlass.Int32(0)
+        )
+        if sf_valid != 0:
             if cutlass.const_expr(self._fc2_sf_batch8):
                 stg_e8m0x8_from_f32(
                     sf_byte_addr,
@@ -1337,12 +2097,182 @@ class GluMxfp8Epilogue:
                 )
             else:
                 for j in cutlass.range_constexpr(fc2_subtile_cnt):
+                    hidden_block = (
+                        fc2_output_router.sf_hidden_block_base
+                        + cutlass.Int32(j)
+                    )
+                    if (
+                        hidden_block * cutlass.Int32(EpilogueTileN)
+                        < fc2_output_router.valid_hidden
+                    ):
+                        stg_e8m0_from_f32(
+                            sf_byte_addr
+                            + Int64(j) * Int64(fc2_output_router.sf_bytes),
+                            rmem_sf_fc2[j],
+                        )
+
+    @cute.jit
+    def _stg_sf_fc2_flat(
+        self,
+        rmem_sf_fc2: cute.Tensor,
+        real_fc2_output_sf: cute.Tensor,
+        work_tile_info,
+        valid_hidden,
+        warp_idx: int,
+        tidx,
+    ) -> None:
+        """Flush FC2 scales through the legacy flat-SF address path.
+
+        Tile variants that do not construct an FC2 data router, such as the
+        drain-first B-reuse epilogue, use this fallback.
+        """
+        fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN
+        thread_in_warp = tidx % WarpThreadCount
+        token_row_in_cta = (
+            cutlass.Int32(warp_idx * WarpThreadCount) + thread_in_warp
+        )
+        if token_row_in_cta < work_tile_info.valid_tokens_in_cta_tile:
+            pool_token_global = (
+                work_tile_info.cumulative_data_physical_row
+                + work_tile_info.tile_m_idx * cutlass.Int32(self._epi_tile_m)
+                + token_row_in_cta
+            )
+            hidden_group_base = (
+                work_tile_info.tile_n_idx * cutlass.Int32(fc2_subtile_cnt)
+            )
+            sf_byte_addr = (
+                real_fc2_output_sf.iterator.toint()
+                + Int64(pool_token_global)
+                * Int64(real_fc2_output_sf.stride[0])
+                + Int64(hidden_group_base)
+            )
+            if cutlass.const_expr(self._fc2_sf_batch8):
+                stg_e8m0x8_from_f32(
+                    sf_byte_addr,
+                    rmem_sf_fc2[0],
+                    rmem_sf_fc2[1],
+                    rmem_sf_fc2[2],
+                    rmem_sf_fc2[3],
+                    rmem_sf_fc2[4],
+                    rmem_sf_fc2[5],
+                    rmem_sf_fc2[6],
+                    rmem_sf_fc2[7],
+                )
+            else:
+                for j in cutlass.range_constexpr(fc2_subtile_cnt):
                     block_hidden_start = (
-                        work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
+                        work_tile_info.tile_n_idx
+                        * cutlass.Int32(self._cta_tile_n)
                         + cutlass.Int32(j * EpilogueTileN)
                     )
                     if block_hidden_start < valid_hidden:
-                        stg_e8m0_from_f32(sf_byte_addr + Int64(j), rmem_sf_fc2[j])
+                        stg_e8m0_from_f32(
+                            sf_byte_addr + Int64(j), rmem_sf_fc2[j]
+                        )
+
+    @cute.jit
+    def _make_fc2_output_router(
+        self,
+        *,
+        work_tile_info,
+        real_fc2_output: cute.Tensor,
+        valid_hidden,
+        warp_idx: int,
+        tidx,
+        token_comm_args=None,
+        gmem_fc2_output_sf=None,
+    ) -> Fc2OutputRouter:
+        """Build one data/SF router for this FC2 task tile and epilogue thread."""
+        epi_tid = cutlass.Int32(
+            cutlass.Int32(warp_idx * WarpThreadCount)
+            + tidx % WarpThreadCount
+        )
+        hidden_tile_start = (
+            work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
+        )
+        local_token_base = (
+            work_tile_info.tile_m_idx * cutlass.Int32(self._epi_tile_m)
+        )
+        pool_token_base = (
+            work_tile_info.cumulative_data_physical_row + local_token_base
+        )
+
+        output = None
+        metadata = None
+        peer_rank_ptr_mapper = None
+        local_data_base_addr = real_fc2_output.iterator.toint()
+        local_data_row_stride = real_fc2_output.stride[0]
+        if cutlass.const_expr(token_comm_args is not None):
+            if cutlass.const_expr(
+                not self._token_back_by_dispatch
+            ):
+                output = token_comm_args.combine_output
+                metadata = cute.recast_tensor(
+                    token_comm_args.token_src_metadata, cutlass.Uint32,
+                )
+                peer_rank_ptr_mapper = token_comm_args.peer_rank_ptr_mapper
+                local_data_base_addr = None
+                local_data_row_stride = None
+
+        sf_base_addr = None
+        sf_token_base = None
+        sf_row_stride = None
+        if cutlass.const_expr(self._combine_mxfp8):
+            if cutlass.const_expr(token_comm_args is not None):
+                if cutlass.const_expr(token_comm_args.fc2_output_sf is None):
+                    raise ValueError(
+                        "MXFP8 token communication requires fc2_output_sf."
+                    )
+                sf_base_addr = token_comm_args.fc2_output_sf.iterator.toint()
+                sf_token_base = pool_token_base
+                sf_row_stride = self._fc2_sf_block_pad
+            else:
+                if cutlass.const_expr(gmem_fc2_output_sf is None):
+                    raise ValueError("MXFP8 FC2 output requires an SF tensor.")
+                sf_base_addr = gmem_fc2_output_sf.iterator.toint()
+                sf_token_base = pool_token_base
+                sf_row_stride = gmem_fc2_output_sf.stride[0]
+
+        output_mapping = (
+            self._fc2_redg_store_out_mapping
+            if self._fc2_reduce_coalesce
+            else self._fc2_store_out_mapping
+        )
+        return Fc2OutputRouter(
+            output_mapping=output_mapping,
+            pool_token_base=pool_token_base,
+            hidden_base_this_cta_tile=hidden_tile_start,
+            valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,
+            valid_hidden=valid_hidden,
+            epi_tid=epi_tid,
+            wire_bytes=self._fc2_wire_bytes,
+            output=output,
+            metadata=metadata,
+            peer_rank_ptr_mapper=peer_rank_ptr_mapper,
+            local_data_base_addr=local_data_base_addr,
+            local_data_token_base=local_token_base,
+            local_data_row_stride=local_data_row_stride,
+            reduce_topk_in_kernel=self._fc2_reduce_coalesce,
+            prefetch_data_row=(
+                not self._fc2_reduce_coalesce and not self._fc2_use_tma
+            ),
+            sf_mapping=(
+                self._fc2_sf_store_out_mapping
+                if self._combine_mxfp8
+                else None
+            ),
+            sf_base_addr=sf_base_addr,
+            sf_token_base=sf_token_base,
+            sf_row_stride=sf_row_stride,
+            sf_hidden_block_base=(
+                (
+                    work_tile_info.tile_n_idx
+                    * cutlass.Int32(self._cta_tile_n // EpilogueTileN)
+                )
+                if self._combine_mxfp8
+                else None
+            ),
+        ).prefetch()
 
     @cute.jit
     def _run_fc2_task_tile(
@@ -1358,18 +2288,55 @@ class GluMxfp8Epilogue:
         tidx,
         token_comm_args=None,
         gmem_fc2_output_sf=None,
+        gmem_fc2_output_sf_blocked=None,
         smem_fc2_tma_buffer=None,
         tma_atom_fc2_output=None,
         gmem_fc2_tma_output=None,
         smem_fc2_reduce_buffer=None,
+        acc_wait: bool = True,
+        acc_release: bool = True,
     ) -> None:
-        """FC2 (Linear2) task-tile body using two-stage TMEM accumulation."""
-        real_fc2_output, _ = sched_ext.get_gmem_tensor(
-            "d", gmem_fc2_output, work_tile_info,
+        """fc2 task-tile body for one 128-row tile (here: LDTM + quantize + store per subtile).
+
+        Overrides must open with ``_begin_fc2_task_tile``, release the accumulator exactly once
+        after the last TMEM read, and close with ``_finish_fc2_task_tile``."""
+        real_fc2_output = self._begin_fc2_task_tile(
+            work_tile_info=work_tile_info,
+            acc_pipeline=acc_pipeline,
+            acc_consumer_state=acc_consumer_state,
+            sched_ext=sched_ext,
+            gmem_fc2_output=gmem_fc2_output,
+            warp_idx=warp_idx,
+            acc_wait=acc_wait,
         )
-        acc_pipeline.consumer_wait(acc_consumer_state)
-        if warp_idx == 0:
-            iket.range_push("fc2_epi_tile")
+
+        fc2_output_router = self._make_fc2_output_router(
+            work_tile_info=work_tile_info,
+            real_fc2_output=real_fc2_output,
+            valid_hidden=valid_hidden,
+            warp_idx=warp_idx,
+            tidx=tidx,
+            token_comm_args=token_comm_args,
+            gmem_fc2_output_sf=gmem_fc2_output_sf,
+        )
+        fc2_tma_tile_router = None
+        if cutlass.const_expr(self._fc2_use_tma):
+            fc2_tma_tile_router = Fc2TmaTileRouter(
+                output=gmem_fc2_tma_output,
+                pool_token_base=(
+                    work_tile_info.cumulative_data_physical_row
+                    + work_tile_info.tile_m_idx
+                    * cutlass.Int32(self._epi_tile_m)
+                ),
+                hidden_base_this_cta_tile=(
+                    work_tile_info.tile_n_idx
+                    * cutlass.Int32(self._cta_tile_n)
+                ),
+                valid_tokens_this_cta_tile=(
+                    work_tile_info.valid_tokens_in_cta_tile
+                ),
+                cta_token_tile_size=self._epi_tile_m,
+            )
 
         fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
 
@@ -1401,44 +2368,100 @@ class GluMxfp8Epilogue:
                 warp_idx=warp_idx,
                 tidx=tidx,
                 token_comm_args=token_comm_args,
+                fc2_output_router=fc2_output_router,
                 rmem_sf_fc2=rmem_sf_fc2,
                 smem_fc2_tma_buffer=smem_fc2_tma_buffer,
                 tma_atom_fc2_output=tma_atom_fc2_output,
-                gmem_fc2_tma_output=gmem_fc2_tma_output,
+                fc2_tma_tile_router=fc2_tma_tile_router,
                 smem_fc2_reduce_buffer=smem_fc2_reduce_buffer,
             )
 
             tmem_t = self._advance_fc2_tmem_tensor(tmem_t, tmem_forward_cols)
 
-        self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
+        self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, acc_release)
 
+        self._finish_fc2_task_tile(
+            rmem_sf_fc2=rmem_sf_fc2,
+            work_tile_info=work_tile_info,
+            valid_hidden=valid_hidden,
+            warp_idx=warp_idx,
+            tidx=tidx,
+            token_comm_args=token_comm_args,
+            fc2_output_router=fc2_output_router,
+            gmem_fc2_output_sf=gmem_fc2_output_sf,
+            gmem_fc2_output_sf_blocked=gmem_fc2_output_sf_blocked,
+        )
+
+    @cute.jit
+    def _begin_fc2_task_tile(
+        self,
+        work_tile_info,
+        acc_pipeline,
+        acc_consumer_state,
+        sched_ext,
+        gmem_fc2_output: cute.Tensor,
+        warp_idx: int,
+        acc_wait: bool,
+    ) -> cute.Tensor:
+        """Open one fc2 task tile: resolve the output tile, wait on the accumulator, push profiling."""
+        real_fc2_output, _ = sched_ext.get_gmem_tensor(
+            "d", gmem_fc2_output, work_tile_info,
+        )
+        if cutlass.const_expr(acc_wait):
+            acc_pipeline.consumer_wait(acc_consumer_state)
+        if warp_idx == 0:
+            iket.range_push("fc2_epi_tile")
+        return real_fc2_output
+
+    @cute.jit
+    def _finish_fc2_task_tile(
+        self,
+        rmem_sf_fc2,
+        work_tile_info,
+        valid_hidden,
+        warp_idx: int,
+        tidx,
+        token_comm_args=None,
+        fc2_output_router=None,
+        gmem_fc2_output_sf=None,
+        gmem_fc2_output_sf_blocked=None,
+    ) -> None:
+        """Close one fc2 task tile: flush the buffered E8M0 scales and pop the profiling range."""
         # Flush the buffered E8M0 scales
         if cutlass.const_expr(self._combine_mxfp8 and token_comm_args is not None):
             self._stg_sf_fc2(
                 rmem_sf_fc2=rmem_sf_fc2,
-                sf_base_addr=token_comm_args.fc2_output_sf.iterator.toint(),
-                sf_row_stride=Int64(self._fc2_sf_block_pad),
+                fc2_output_router=fc2_output_router,
+            )
+        elif cutlass.const_expr(
+            self._combine_mxfp8 and gmem_fc2_output_sf_blocked is not None
+        ):
+            self._stg_sf_fc2_blocked(
+                rmem_sf_fc2=rmem_sf_fc2,
+                real_fc2_output_sf=gmem_fc2_output_sf_blocked,
                 work_tile_info=work_tile_info,
-                valid_hidden=valid_hidden,
-                warp_idx=warp_idx,
                 tidx=tidx,
             )
         elif cutlass.const_expr(
             self._combine_mxfp8 and gmem_fc2_output_sf is not None
         ):
-            self._stg_sf_fc2(
-                rmem_sf_fc2=rmem_sf_fc2,
-                sf_base_addr=gmem_fc2_output_sf.iterator.toint(),
-                sf_row_stride=Int64(gmem_fc2_output_sf.stride[0]),
-                work_tile_info=work_tile_info,
-                valid_hidden=valid_hidden,
-                warp_idx=warp_idx,
-                tidx=tidx,
-            )
+            if cutlass.const_expr(fc2_output_router is not None):
+                self._stg_sf_fc2(
+                    rmem_sf_fc2=rmem_sf_fc2,
+                    fc2_output_router=fc2_output_router,
+                )
+            else:
+                self._stg_sf_fc2_flat(
+                    rmem_sf_fc2=rmem_sf_fc2,
+                    real_fc2_output_sf=gmem_fc2_output_sf,
+                    work_tile_info=work_tile_info,
+                    valid_hidden=valid_hidden,
+                    warp_idx=warp_idx,
+                    tidx=tidx,
+                )
 
         if warp_idx == 0:
             iket.range_pop()
-
 
     @cute.jit
     def _stg_sf_fc1(
@@ -1449,30 +2472,47 @@ class GluMxfp8Epilogue:
         tidx,
     ) -> None:
         """Compute gmem SF tile coords and store fc1 scale factors to gmem."""
-        bx, _, _ = cute.arch.block_idx()
         sf_idx = work_tile_info.tile_n_idx
         token_idx = (
-            work_tile_info.tile_m_idx * self._cta_tile_m
+            work_tile_info.tile_m_idx * self._epi_tile_m
             + tidx
         )
         if tidx < work_tile_info.valid_tokens_in_cta_tile:
-            sf_base = cute.local_tile(
+            # Store exactly subtile_cnt scales; a fixed 4-byte store would clobber the neighbor N-tile.
+            self._stg_sf_row_group(
                 real_fc1_output_sf,
-                (1, 1, 1),
-                (token_idx, sf_idx * cutlass.Int32(Fc1EpilogueOutputTileN), cutlass.Int32(0)),
+                token_idx,
+                sf_idx * cutlass.Int32(self._cta_tile_n // 2),
+                rmem_sf_f32.iterator,
+                count=self._subtile_cnt,
+                assumed_align=(
+                    4 if self._subtile_cnt % 4 == 0
+                    else (2 if self._subtile_cnt % 2 == 0 else 1)
+                ),
             )
-            sf_ptr = cute.make_ptr(
-                self.sf_dtype,
-                sf_base.iterator.toint(),
-                cute.AddressSpace.gmem,
-                assumed_align=4,
-            )
-            gmem_sf_f8 = cute.make_tensor(sf_ptr, cute.make_layout(4))
-            sf_layout = cute.make_layout(4)
-            r_sf_f8 = cute.make_rmem_tensor(sf_layout.shape, self.sf_dtype)
-            r_sf_f8.store(rmem_sf_f32.load().to(self.sf_dtype))
-            cute.autovec_copy(r_sf_f8, gmem_sf_f8)
 
+    @staticmethod
+    @cute.jit
+    def _drain_bulk_stores() -> None:
+        """Commit and wait for all in-flight bulk stores, then make them GPU-visible."""
+        cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0)
+        cute.arch.fence_proxy("async")
+        cute.arch.fence_acq_rel_gpu()
+
+    def _get_task_tile(self, work_tile_info, tmem_acc_tensor, acc_stage_index, warp_idx, tidx):
+        """Entries ``run()`` consumes for one work tile (here: one, the whole 128-row tile).
+
+        Overrides return ``(tile_info, tmem_acc_stage_tensor, warp_idx, tidx, acc_wait,
+        acc_release)`` entries that wait on and release the accumulator stage exactly once."""
+        return [(
+            work_tile_info,
+            tmem_acc_tensor[(None, None, None, acc_stage_index)],
+            warp_idx,
+            tidx,
+            True,
+            True,
+        )]
 
     @cute.jit
     def run(
@@ -1494,6 +2534,7 @@ class GluMxfp8Epilogue:
         norm_const=None,
         token_comm_args=None,
         gmem_fc2_output_sf: Optional[cute.Tensor] = None,
+        gmem_fc2_output_sf_blocked: Optional[cute.Tensor] = None,
         smem_c_buffer: cute.Tensor = None,
         tma_atom_c: cute.CopyAtom = None,
         gmem_c: cute.Tensor = None,
@@ -1531,7 +2572,6 @@ class GluMxfp8Epilogue:
 
         valid_hidden = cutlass.Int32(gmem_fc2_output.shape[1])
 
-        bidx, bidy, bidz = cute.arch.block_idx()
         work_tile_info = sched_consumer.consume_work()
 
         flag_tracker = GpuReleaseFlagBatchTracker(
@@ -1543,75 +2583,100 @@ class GluMxfp8Epilogue:
 
         while work_tile_info.is_valid_tile:
             acc_stage_index = acc_consumer_state.index
-            tmem_acc_stage_tesnor = tmem_acc_tensor[(None, None, None, acc_stage_index)]
 
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
-                if cutlass.const_expr(self._generate_c):
-                    _smem_c_buf = smem_c_buffer
-                    _tma_atom_c  = tma_atom_c
-                    _gmem_c      = gmem_c
-                else:
-                    _smem_c_buf = smem_fc1_output_buffer
-                    _tma_atom_c  = tma_atom_fc1_output
-                    _gmem_c      = gmem_fc1_output
-                self._run_fc1_task_tile(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_stage_tesnor,
-                    acc_pipeline=acc_pipeline,
-                    acc_consumer_state=acc_consumer_state,
-                    smem_fc1_output_buffer=smem_fc1_output_buffer,
-                    tma_atom_fc1_output=tma_atom_fc1_output,
-                    sched_ext=sched_ext,
-                    gmem_fc1_output=gmem_fc1_output,
-                    gmem_fc1_output_sf=gmem_fc1_output_sf,
-                    gmem_topk_scores=gmem_topk_scores,
-                    warp_idx=warp_idx,
-                    tidx=tidx,
-                    alpha=alpha,
-                    norm_const=norm_const,
-                    smem_c_buffer=_smem_c_buf,
-                    tma_atom_c=_tma_atom_c,
-                    gmem_c=_gmem_c,
-                    c_pipeline=_c_pipeline,
-                )
-            else:
-                self._run_fc2_task_tile(
-                    work_tile_info=work_tile_info,
-                    tmem_acc_tensor=tmem_acc_stage_tesnor,
+            # ``_get_task_tile`` decides how the tile is consumed; the real tile feeds the fc1_done slot.
+            for (
+                half_tile_info,
+                tmem_acc_stage_tensor,
+                warpgroup_warp_idx,
+                warpgroup_tidx,
+                _acc_wait,
+                _acc_release,
+            ) in self._get_task_tile(
+                work_tile_info, tmem_acc_tensor, acc_stage_index, warp_idx, tidx
+            ):
+                # fc2 keyword bundle, built outside the dynamic phase branch.
+                _fc2_kwargs = dict(
+                    work_tile_info=half_tile_info,
+                    tmem_acc_tensor=tmem_acc_stage_tensor,
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
                     sched_ext=sched_ext,
                     gmem_fc2_output=gmem_fc2_output,
                     valid_hidden=valid_hidden,
-                    warp_idx=warp_idx,
-                    tidx=tidx,
-                    token_comm_args=token_comm_args,
+                    warp_idx=warpgroup_warp_idx,
+                    tidx=warpgroup_tidx,
                     gmem_fc2_output_sf=gmem_fc2_output_sf,
-                    smem_fc2_tma_buffer=smem_fc2_tma_buffer,
-                    tma_atom_fc2_output=tma_atom_fc2_output,
-                    gmem_fc2_tma_output=gmem_fc2_tma_output,
-                    smem_fc2_reduce_buffer=smem_fc2_reduce_buffer,
+                    gmem_fc2_output_sf_blocked=gmem_fc2_output_sf_blocked,
+                    acc_wait=_acc_wait,
+                    acc_release=_acc_release,
                 )
+                if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                    if cutlass.const_expr(self._generate_c):
+                        _smem_c_buf = smem_c_buffer
+                        _tma_atom_c  = tma_atom_c
+                        _gmem_c      = gmem_c
+                    else:
+                        _smem_c_buf = smem_fc1_output_buffer
+                        _tma_atom_c  = tma_atom_fc1_output
+                        _gmem_c      = gmem_fc1_output
+                    self._run_fc1_task_tile(
+                        work_tile_info=half_tile_info,
+                        tmem_acc_tensor=tmem_acc_stage_tensor,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        gmem_fc1_output_sf=gmem_fc1_output_sf,
+                        gmem_topk_scores=gmem_topk_scores,
+                        warp_idx=warpgroup_warp_idx,
+                        tidx=warpgroup_tidx,
+                        alpha=alpha,
+                        norm_const=norm_const,
+                        smem_c_buffer=_smem_c_buf,
+                        tma_atom_c=_tma_atom_c,
+                        gmem_c=_gmem_c,
+                        c_pipeline=_c_pipeline,
+                        acc_wait=_acc_wait,
+                        acc_release=_acc_release,
+                    )
+                else:
+                    self._run_fc2_task_tile(
+                        token_comm_args=token_comm_args,
+                        smem_fc2_tma_buffer=smem_fc2_tma_buffer,
+                        tma_atom_fc2_output=tma_atom_fc2_output,
+                        gmem_fc2_tma_output=gmem_fc2_tma_output,
+                        smem_fc2_reduce_buffer=smem_fc2_reduce_buffer,
+                        **_fc2_kwargs,
+                    )
 
             acc_consumer_state.advance()
 
             cur_was_linear1 = work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+            # The cumulative count is in cluster-tile units, so scale it by slots per cluster
+            # tile. The kernel's fc2 consumer computes the same slot.
             cur_fc1_counter_slot = (
                 work_tile_info.cumulative_token_block_count
-                + work_tile_info.tile_m_idx // cutlass.Int32(self._atom_thr_size)
+                * cutlass.Int32(self._cluster_m // self._fc1_done_slot_m)
+                + work_tile_info.tile_m_idx // cutlass.Int32(self._fc1_done_slot_m)
             )
             cur_fc2_expert_idx = work_tile_info.expert_idx
 
             work_tile_info = sched_consumer.consume_work()
 
-            # Drain in-flight bulk stores before publishing the done counter.
-            if cur_was_linear1 or cutlass.const_expr(
-                self._fc2_use_tma or self._fc2_use_ublk
+            # Drain only the phases that issued asynchronous bulk stores.
+            if cutlass.const_expr(
+                self._fc1_bulk_store and self._fc2_bulk_store
             ):
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0)
-                cute.arch.fence_proxy("async")
-                cute.arch.fence_acq_rel_gpu()
+                GluMxfp8Epilogue._drain_bulk_stores()
+            elif cutlass.const_expr(self._fc1_bulk_store):
+                if cur_was_linear1:
+                    GluMxfp8Epilogue._drain_bulk_stores()
+            elif cutlass.const_expr(self._fc2_bulk_store):
+                if not cur_was_linear1:
+                    GluMxfp8Epilogue._drain_bulk_stores()
 
             task_tile_boundary_bar.arrive_and_wait()
 

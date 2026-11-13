@@ -32,6 +32,8 @@ under `cudnn.moe.frost`), `AttentionGateQuantDecode` (the attention gate +
 quantize decode step, also under `cudnn.attention_gate.frost`) and
 `Fp8ProjectionDecode` (the FP8 projection for decode rows, also under
 `cudnn.gemm`) are the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+`MoeEp` (expert-parallel MoE, `cudnn.MoeEp`) has an inference entry (`__call__`)
+and stateless training entries (`training_forward`, `training_backward`).
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
@@ -45,6 +47,9 @@ arbitrary user callbacks.
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
+| `MoeEp.__call__` (expert-parallel MoE inference) | fprop | MXFP8 activation and weights; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_forward` | fprop | MXFP8 compute; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_backward` | bprop | MXFP8 compute; FP32 dprob | Unsupported | Unsupported | Unverified |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in; BF16 out; FP32 accumulate | Unsupported | SM100: Unverified; SM103: Supported | Supported |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -217,6 +222,16 @@ a row alone and inside a batch under the entry's own picks.
   belong to one cc 10.3 runtime and one cc 10.7 runtime: on cc 10.0 the
   status rests on the replay and batch-invariance cells, and the golden
   comparison is not covered there. SM90 and SM120 are declined by type.
+- Expert-parallel MoE (`MoeEp`): no deterministic mode and no determinism
+  suite yet, so SM107 is unverified; SM90, SM100/103 and SM120 are declined by
+  the capability check. Known order-dependent reductions:
+  `reduce_topk_in_kernel=True` adds the top-k expert outputs with BF16
+  bulk-reduce stores, and training backward adds per-tile dprob partials with
+  FP32 atomics. Training forward and backward route tokens in a fixed
+  sequence; inference token communication does not. The functionality tests
+  check that the forward tuning fields write the default tuning's output bytes
+  when `reduce_topk_in_kernel=False`, and that repeated calls do not
+  accumulate. Neither check qualifies replay or batch invariance.
 - Attention gate + quantize decode step (`AttentionGateQuantDecode`): no
   determinism switch and no numerics knob. The kernel has no reduction, so a
   row's bytes are a function of its own operand values and of the scale: a

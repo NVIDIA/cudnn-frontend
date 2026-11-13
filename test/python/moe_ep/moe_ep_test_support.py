@@ -38,6 +38,7 @@ __all__ = [
     "_forward_config",
     "_moe_ep_config",
     "_grad_output",
+    "_join_spawned_with_deadline",
     "_make_forward_case",
     "_naive_reference",
     "_output_as_float",
@@ -48,6 +49,7 @@ __all__ = [
     "_replay_cuda_graph",
     "_require_distributed_sm107",
     "_run_grouped_wgrad_kernel",
+    "_run_isolated",
     "_sm107_device",
     "_stress_backend_reuse",
     "_training_abi_prepared",
@@ -119,16 +121,16 @@ def make_distributed_forward_inputs(
     rank: int,
     world_size: int,
     device: torch.device,
+    hidden: int = 128,
 ):
     """Build rank-local inputs with one local and one remote route per token."""
 
     generator = torch.Generator(device=device).manual_seed(20260811 + rank)
     # Vary local shapes without exceeding the distributed tests'
     # max_tokens_per_rank=8 contract at EP sizes above seven.
-    local_experts, tokens, hidden, intermediate = (
+    local_experts, tokens, intermediate = (
         2,
         rank % 7 + 2,
-        128,
         256,
     )
     activation = quantize_mxfp8(
@@ -210,6 +212,22 @@ def _training_graph_pattern(
             physical_recv_pool_size=128,
             combine_format="bf16",
         )
+    if name == "smoke_h256":
+        # The smallest workload FC2 bulk store accepts (hidden_size % 256 == 0),
+        # valid at any EP size: rank r routes each token to ranks r .. r+top_k-1.
+        top_k = min(8, 2 * world_size)
+        max_tokens_per_rank = 128
+        return _TrainingGraphPattern(
+            name=name,
+            num_experts=2 * world_size,
+            hidden_size=256,
+            intermediate_size=256,
+            top_k=top_k,
+            max_tokens_per_rank=max_tokens_per_rank,
+            # Room for every route on one rank plus per-expert padding: never overflows.
+            physical_recv_pool_size=world_size * max_tokens_per_rank * top_k + 2 * 128,
+            combine_format="bf16",
+        )
     if name == "ds3_ep4_pattern":
         if world_size != 4:
             raise ValueError("ds3_ep4_pattern training graph pattern requires world_size=4, " f"got {world_size}")
@@ -223,7 +241,7 @@ def _training_graph_pattern(
             physical_recv_pool_size=131968,
             combine_format="mxfp8",
         )
-    raise ValueError("training graph pattern must be 'smoke' or 'ds3_ep4_pattern', " f"got {name!r}")
+    raise ValueError("training graph pattern must be 'smoke', 'smoke_h256' or 'ds3_ep4_pattern', " f"got {name!r}")
 
 
 def _constant_mxfp8(
@@ -906,6 +924,44 @@ def _replay_cuda_graph(
             _assert_matches_reference(graph_output, alternate_expected)
         else:
             _assert_matches_reference(graph_output, expected)
+
+
+def _terminate_processes(processes) -> None:
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=30)
+
+
+def _run_isolated(target, args=(), *, timeout_seconds: float = 300, what: str) -> None:
+    """Run ``target(*args)`` in a spawned process; a hang fails instead of blocking pytest."""
+
+    import torch.multiprocessing as mp
+
+    process = mp.get_context("spawn").Process(target=target, args=args)
+    process.start()
+    process.join(timeout=timeout_seconds)
+    if process.is_alive():
+        _terminate_processes((process,))
+        pytest.fail(f"{what} did not finish within {timeout_seconds} s")
+    assert process.exitcode == 0, f"{what} failed with exit code {process.exitcode}"
+
+
+def _join_spawned_with_deadline(process_context, *, timeout_seconds: float = 300, what: str) -> None:
+    """Join an ``mp.spawn(join=False)`` context; a hung rank fails instead of blocking pytest."""
+
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process_context.join(timeout=min(1.0, max(0.0, deadline - time.monotonic()))):
+            return
+    _terminate_processes(process_context.processes)
+    pytest.fail(f"{what} did not finish within {timeout_seconds} s")
 
 
 # Backward

@@ -21,7 +21,6 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.nvgpu.tcgen05 import CollectorOp
 
-from ..tmem_transpose import _TmemTranspose16x32Core
 from .dglu_mxfp8_fc12_epilogue import DgluMxfp8Epilogue
 from .....schedulers.fc12_mapping import BlockPhase
 from .....schedulers.base import WorkIdAcquisitionMode
@@ -31,6 +30,7 @@ from ..fwd_glu.glu_mxfp8_fc12_extension import WeightStorageMode, raw_discrete_w
 from ......api import KernelClass, StaticOrRuntimeIntegerType
 from ..helpers.constants import SupportedMmaTileM, SupportedMmaTileN
 from ......helpers.iket_compat import iket
+from ......helpers.tmem_transpose import _TmemTranspose16x32Core
 from ......helpers.dsl_helpers import spin_wait
 from ......helpers.ptx_helpers import nanosleep
 from ......quant_def import CombineFormat, QuantKind
@@ -456,7 +456,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         if n not in SupportedMmaTileN:
             raise ValueError(
                 f"mma_tiler N ({n}) must be one of {SupportedMmaTileN} in fused fc12 "
-                f"(N=64 SFB special case is dropped; swap-AB sched handles short-N "
+                f"(N=64 SFB hack is dropped; swap-AB sched handles short-N "
                 f"via subtile early-exit)."
             )
 
@@ -902,7 +902,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
     # =========================================================================
     # Token-comm hook surface (MegaMoE-only; lean base = no-op stubs)
     #
-    # Mirrors the hook interface in ``moe_mxfp8_glu.kernel_mxfp8_glu_fc12``
+    # Mirrors the hook interface in the sibling forward GLU fc12 kernel
     # so that ``Sm107MegaMoEMxfp8DgluKernel`` can override exactly the same
     # methods.  The mega wrapper places dispatch in a contiguous block beginning
     # at warp 8 and relocates ``c_load_warp_id`` above the transfer block; the

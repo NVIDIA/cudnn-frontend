@@ -69,6 +69,7 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
             fc2_ready_is_mask=self.fc2_ready_is_mask,
             weight_storage_mode=self.weight_storage_mode,
             weight_descriptor_workspace=weight_descriptor_workspace,
+            is_mixed_cga=self.is_mixed_cga,
             expert_token_sizes=expert_token_sizes,
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
@@ -183,6 +184,7 @@ class DgluMxFp8Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
         elif cutlass.const_expr(tensor_name == "sfcol_output"):
             return (self._aux_sf_tensor(gmem_tensor_in_moe_view, work_tile_info, shape[0]), None)
 
+        is_mix_cga = False # No mix cga support on dglu yet.
         return GluMxFp8Fc12SchedExtension.get_gmem_tensor(
-            self, tensor_name, gmem_tensor_in_moe_view, work_tile_info
+            self, tensor_name, gmem_tensor_in_moe_view, work_tile_info, is_mix_cga
         )

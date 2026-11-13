@@ -1,12 +1,12 @@
 """Minimal inline-PTX primitives required by the greenfield NVFP4 kernels."""
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm, vector
-from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Float32, Int16, Int32, Int64, T, dsl_user_op
 
 
 TmaCacheHintEvictFirst = 0x12F0000000000000
@@ -51,6 +51,67 @@ def exit(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] =
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def tanh_approx_f32(value, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Float32:
+    """``tanh.approx.f32``: one MUFU.TANH."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def sigmoid_pair_ex2_rcp(pair):
+    """``sigmoid(x) = rcp(1 + exp2(-x * log2e))`` on one f32x2 pair: one ``ex2.approx`` and one ``rcp.approx``
+    (MUFU.EX2 + MUFU.RCP) per element, the epilogue's default sigmoid. The tester's hardware-matched SiTU reference
+    calls this; the epilogue spells out the same packed sequence."""
+    neg_log2e = Float32(-1.4426950408889634)
+    one = Float32(1.0)
+    neg = cute.arch.mul_packed_f32x2(pair, (neg_log2e, neg_log2e))
+    e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
+    d = cute.arch.add_packed_f32x2(e, (one, one))
+    return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+
+def sigmoid_pair_tanh_approx(pair):
+    """``sigmoid(x) = 0.5 * tanh(0.5 * x) + 0.5`` on one f32x2 pair: one ``tanh.approx.f32`` (MUFU.TANH) per element
+    instead of the MUFU.EX2 + MUFU.RCP of ``sigmoid_pair_ex2_rcp``. The ``use_tanh_sigmoid`` problem field selects it
+    for the SwiGLU and SiTU cores; the Rubin epilogue and the tester's hardware-matched references both call this, so
+    they run the same instruction sequence."""
+    half = (Float32(0.5), Float32(0.5))
+    scaled = cute.arch.mul_packed_f32x2(pair, half)
+    return cute.arch.fma_packed_f32x2((tanh_approx_f32(scaled[0]), tanh_approx_f32(scaled[1])), half, half)
+
+
+def situ_pair_tanh_approx(gate_pair, up_pair, beta: float, linear_beta: float, sigmoid_gate):
+    """Kimi K3 SiTU on one f32x2 pair, its two tanh on ``tanh.approx.f32`` (one MUFU.TANH each):
+
+        beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta),
+
+    where ``sigmoid_gate`` is sigmoid of the raw gate pair (not the soft-capped one), from
+    ``sigmoid_pair_ex2_rcp`` or, with ``use_tanh_sigmoid``, ``sigmoid_pair_tanh_approx``. The betas fold at trace
+    time into the input scales and one output factor. The Rubin epilogue and the tester's hardware-matched reference
+    both call this, so they run the same instruction sequence.
+    """
+    def scaled_tanh(pair, scale):
+        scaled = cute.arch.mul_packed_f32x2(pair, (Float32(scale), Float32(scale)))
+        return (tanh_approx_f32(scaled[0]), tanh_approx_f32(scaled[1]))
+
+    tanh_gate = scaled_tanh(gate_pair, 1.0 / beta)
+    tanh_up = scaled_tanh(up_pair, 1.0 / linear_beta)
+    beta_product = Float32(beta * linear_beta)
+    soft_up = cute.arch.mul_packed_f32x2(tanh_up, (beta_product, beta_product))
+    return cute.arch.mul_packed_f32x2(cute.arch.mul_packed_f32x2(tanh_gate, sigmoid_gate), soft_up)
 
 
 @dsl_user_op
@@ -323,6 +384,37 @@ def lds128_v4_b32(smem_pointer, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ldg_v4_b32(address: Int64, *, loc=None, ip=None):
+    """One 16-byte global load (``ld.global.v4.b32``); the four words are returned as ``Int32``."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [address.ir_value()],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def stg_v4_b32(address: Int64, word0: Int32, word1: Int32, word2: Int32, word3: Int32, *, loc=None, ip=None) -> None:
+    """One 16-byte global store (``st.global.v4.b32``) of four ``Int32`` words."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), word0.ir_value(), word1.ir_value(), word2.ir_value(), word3.ir_value()],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def stg_f32(address: Int64, value: Float32, predicate: Optional[Int32] = None, *, loc=None, ip=None) -> None:
     if predicate is None:
         llvm.inline_asm(
@@ -493,6 +585,64 @@ def red_add_relaxed_sys_v2_bf16x2(
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def f32x2_pack(lo, hi, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int64:
+    """Pack two f32 into one b64 f32x2 operand (low word ``lo``, high word ``hi``)."""
+    packed = llvm.inline_asm(
+        T.i64(),
+        [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+        "mov.b64 $0, {$1, $2};",
+        "=l,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(packed)
+
+
+@dsl_user_op
+def fma_rn_f32x2_bf16x2(
+    word, scale2, acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Int64:
+    """``acc2 + word * scale2`` on a packed bf16x2 / f32x2 pair (``fma.rn.f32x2.bf16x2.f32x2.f32x2``, one rounding
+    per lane; scale 1.0 gives an exact ``acc + bf16``)."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [
+            Int32(word).ir_value(loc=loc, ip=ip),
+            Int64(scale2).ir_value(loc=loc, ip=ip),
+            Int64(acc2).ir_value(loc=loc, ip=ip),
+        ],
+        "fma.rn.f32x2.bf16x2.f32x2.f32x2 $0, $1, $2, $3;",
+        "=l,r,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def cvt_rn_bf16x2_f32x2(acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int32:
+    """Round a packed f32x2 (low word -> low bf16 half) to one bf16x2 word with RN rounding (one F2FP)."""
+    packed = llvm.inline_asm(
+        T.i32(),
+        [Int64(acc2).ir_value(loc=loc, ip=ip)],
+        "{\n  .reg .f32 lo, hi;\n  mov.b64 {lo, hi}, $1;\n  cvt.rn.bf16x2.f32 $0, hi, lo;\n}",
+        "=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed)
 
 
 @cute.jit
@@ -740,6 +890,7 @@ __all__ = [
     "cvt_f32x4_to_f8x4_scaled4_pack_i32",
     "cvt_f32x4_to_f8x4_scaled_pack_i32",
     "exit",
+    "ldg_v4_b32",
     "lds128_v4_b32",
     "mbarrier_arrive_expect_tx_on_peer",
     "movmatrix_b16",
@@ -758,5 +909,10 @@ __all__ = [
     "stg_e8m0_from_f32",
     "stg_e8m0x8_from_f32",
     "stg_f32",
+    "stg_v4_b32",
     "tma_load_1d",
+    "fence_acq_rel_gpu",
+    "f32x2_pack",
+    "fma_rn_f32x2_bf16x2",
+    "cvt_rn_bf16x2_f32x2",
 ]
