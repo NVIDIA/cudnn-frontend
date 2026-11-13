@@ -378,6 +378,17 @@ text of its compile-time arguments, cut at a fixed length, so two forms can shar
 why the form is compared on the objects and the name only against the entry's own symbol. Registers per thread are
 recorded in `--dump-census` and compared with nothing. Nothing here is a timing.
 
+The names themselves come from the profiler, and the profiler names a kernel wrongly in one situation: after a kernel
+module was unloaded in the same process, a kernel loaded where the unloaded one had been can be recorded under the
+unloaded kernel's name. Two raw CUDA kernels loaded, launched and unloaded in turn were recorded under each other's name
+on about every second launch, while each wrote its own output; with every module kept loaded, never (PyTorch 2.13.0,
+CUDA 13.0, a compute capability 8.0 GPU; the fused step in its two forms showed it on compute capability 10.0). The
+kernel that runs is the right one; the name of its record is not. A run of this sample unloads nothing: its entries live
+until the process ends, so its names are right. A longer process that builds and frees entries before it runs the check
+-- a test session that runs two stacks one after the other -- can fail the check by name alone. It errs to that side
+only: the expected symbols are read from the entry object that was called, so a stale name cannot make another kernel
+pass. The area's GPU test runs the `fe-entries` sample in a fresh interpreter for this reason.
+
 Where the profiler's launch records cannot be had (no profiler library in the environment, another profiler attached, a
 trace that cannot be exported or read, records without launch arguments), the line reads `NOT OBSERVED` with the reason
 and the run ends in `[00] RAN fe-cublas stack (kernels not observed: <reason>)` with exit code 0: its other checks

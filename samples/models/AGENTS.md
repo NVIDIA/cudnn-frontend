@@ -266,4 +266,12 @@ Each of these passed every test of the first version; the host tests now hold th
   that sat in the environment and that no provider of the stack had loaded.
 - A new row of an existing provider key changes what `--provider BLOCK=KEY` selects when it is placed first: the first
   declared row of that key that serves the run wins. Put it below the row an existing command selects.
+- The profiler's name of a kernel is right only in a process that has unloaded no kernel module. The GPU test of the
+  second stack failed its kernel check one run in three, by the name of the fused step alone: the test session had run
+  the default stack first and dropped its entries, and the new form's kernel was recorded under the old form's symbol.
+  Two raw CUDA kernels, loaded and unloaded in turn, showed the same on about every second launch, each writing its own
+  output; nothing of it where every module stayed loaded. So the kernel that runs is right and its recorded name is not.
+  A sample process never unloads an entry; a test that checks kernels runs the sample in a fresh interpreter. When a
+  kernel check fails by one name only, and the name is another form of the same entry, look for an unload before the
+  run before looking for a wrong launch -- and then look for the wrong launch.
 
