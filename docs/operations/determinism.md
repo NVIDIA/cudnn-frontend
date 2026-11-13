@@ -806,3 +806,22 @@ B300 preserve O/Stats bytes for the tested configurations under CUDA13.4.
 The refill checks cover the native one-CTA-per-SM persistent grid; their
 stress bound is limited to that geometry.
 Backward uses separate kernels and is outside this forward-path change.
+
+## Unified FP32 SDPA forward
+
+This qualification uses `pygraph.sdpa` with explicit `UNIFIED`, backend engine
+21 and a direct-output plan on a cuDNN 9.30+ runtime that enables FP32 support.
+AUTO continues to choose the composite implementation for FP32. The statuses
+below apply to the tested noncausal GQA configurations, including sequence
+tails, independent QK/V widths, optional FP16/BF16/FP32 additive bias, FP32 O
+and saved LSE. FP32 backward is unsupported by this unified path.
+
+| API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) | SM120 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `pygraph.sdpa` (UNIFIED, engine 21) | fprop | FP32 Q/K/V/O and LSE | Unverified | Unverified | Unverified | Supported (tested configurations) |
+
+The scope includes Q15/16/17 and Q257, K31/32/33 and K129, grouped heads,
+QK/V widths 16/32, 32/16, 56/80, and 128/96, and fully masked bias rows with O=0 and
+LSE=-inf. Causal FP32, widths above 128 and split reduction are outside this
+path. See the [measured coverage report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md)
+for the precise test matrix and software environment.

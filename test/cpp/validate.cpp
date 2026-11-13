@@ -327,6 +327,59 @@ TEST_CASE("SDPA block-mask backend support boundary", "[graph][sdpa][validate]")
     }
 }
 
+TEST_CASE("SDPA FP32 unified support boundary", "[graph][sdpa][validate]") {
+    namespace fe       = cudnn_frontend;
+    using Impl         = fe::AttentionImplementation_t;
+    using Attr         = fe::graph::SDPA_attributes;
+    auto const version = fe::detail::get_backend_version();
+    if (std::min(version, fe::detail::get_compiled_version()) < 91301) {
+        SKIP("Unified SDPA descriptors require cuDNN 9.13.1+ headers and library");
+    }
+
+    // This checks descriptor admission and AUTO routing, not engine availability.
+    for (int const sm : {80, 90, 100, 120}) {
+        for (auto const dtype : {fe::DataType_t::HALF, fe::DataType_t::BFLOAT16, fe::DataType_t::FLOAT}) {
+            for (auto const impl : {Impl::AUTO, Impl::UNIFIED, Impl::COMPOSITE}) {
+                for (bool const inferred : {false, true}) {
+                    CAPTURE(version, sm, dtype, impl, inferred);
+                    fe::detail::Context context;
+                    context.set_sm_version(sm).set_io_data_type(dtype).set_intermediate_data_type(
+                        fe::DataType_t::FLOAT);
+                    auto tensor = [&]() {
+                        return std::make_shared<fe::graph::Tensor_attributes>(
+                            fe::graph::Tensor_attributes()
+                                .set_data_type(inferred ? fe::DataType_t::NOT_SET : dtype)
+                                .set_dim({1, 2, 32, 64})
+                                .set_stride({4096, 2048, 64, 1}));
+                    };
+                    Attr attrs;
+                    attrs.set_implementation(impl).set_generate_stats(false)._set_mma_core_mode(fe::DataType_t::HALF);
+                    attrs.inputs[Attr::input_names::Q]   = tensor();
+                    attrs.inputs[Attr::input_names::K]   = tensor();
+                    attrs.inputs[Attr::input_names::V]   = tensor();
+                    attrs.outputs[Attr::output_names::O] = tensor();
+                    if (impl == Impl::AUTO) {
+                        attrs._auto_select_implementation(context);
+                        auto const expected = dtype == fe::DataType_t::FLOAT ? Impl::COMPOSITE : Impl::UNIFIED;
+                        REQUIRE(nlohmann::json(attrs).at("implementation").get<Impl>() == expected);
+                    }
+                    // Real graph validation resolves defaults before the final surface check.
+                    for (auto& port : attrs.inputs) port.second->set_data_type(dtype);
+                    attrs.outputs.at(Attr::output_names::O)->set_data_type(dtype);
+                    auto status = attrs.validate_sdpa_support_surface(context, 32, false, false);
+                    INFO(status.get_message());
+                    if (dtype == fe::DataType_t::FLOAT && impl == Impl::UNIFIED && version < 93000) {
+                        REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+                        REQUIRE(status.get_message().find("cuDNN 9.30.0+") != std::string::npos);
+                    } else {
+                        REQUIRE(status.is_good());
+                    }
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("Rmsnorm forward without scale", "[graph][rmsnorm][validate]") {
     namespace fe = cudnn_frontend;
 

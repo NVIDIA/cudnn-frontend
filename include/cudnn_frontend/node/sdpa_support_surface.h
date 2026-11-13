@@ -543,12 +543,15 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 error_code_t::GRAPH_NOT_SUPPORTED,
                 "Unified SDPA node doesn't support dynamic shape. Use override shape instead.");
 
+            // FP32 uses the existing descriptors, so only the runtime version
+            // needs a new gate. Mixed FP32/low-precision I/O remains unsupported.
+            bool const fp32_io = io_dtypes_within({DataType_t::FLOAT}) && detail::get_backend_version() >= 93000;
             RETURN_CUDNN_FRONTEND_ERROR_IF(
-                !io_dtypes_within({DataType_t::HALF, DataType_t::BFLOAT16, DataType_t::FP8_E4M3, DataType_t::FP8_E5M2}),
+                !fp32_io && !io_dtypes_within(
+                                {DataType_t::HALF, DataType_t::BFLOAT16, DataType_t::FP8_E4M3, DataType_t::FP8_E5M2}),
                 error_code_t::GRAPH_NOT_SUPPORTED,
-                "Unified SDPA node supports only FP16/BF16/FP8 Q/K/V/O I/O; the requested I/O data "
-                "type is not supported by the unified implementation. (FP32 I/O is available via the "
-                "composite implementation, e.g. AttentionImplementation_t::AUTO.)");
+                "Unified SDPA node supports only FP16/BF16/FP8 Q/K/V/O I/O, or all-FP32 I/O with cuDNN 9.30.0+. "
+                "FP32 remains available via the composite implementation on older versions.");
 
             // TODO: Provide smarter error messages that provide the required cuDNN version for each input.
             std::unordered_set<SDPA_attributes::input_names> allowed_input_names{

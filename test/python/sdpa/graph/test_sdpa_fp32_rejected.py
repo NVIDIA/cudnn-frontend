@@ -3,16 +3,11 @@
 
 """Regression test for https://github.com/NVIDIA/cudnn-frontend/issues/424.
 
-The unified SDPA node has no FP32 I/O kernel: ``mma_core_mode`` is auto-set to
-HALF in ``Graph::sdpa()`` regardless of the I/O dtype, so an FP32 graph would
-previously build and then dispatch a half-precision kernel onto 4-byte data,
-reading/writing shared memory out of bounds (a CUDA invalid memory reference).
-
-``verify_sdpa_support_surface_for_implementation`` now checks each Q/K/V/O I/O
-dtype against an allowlist on both paths: the unified path allows FP16/BF16/FP8,
-the composite path additionally allows FP32; neither allows FP64 or anything
-else. Unsupported dtypes fail cleanly at build time with GRAPH_NOT_SUPPORTED.
-Under AUTO, FP32 is routed to the composite implementation.
+Older unified engines interpreted FP32 I/O as half precision, causing invalid
+memory accesses. All-FP32 unified descriptors are admitted from cuDNN 9.30;
+mixed FP32/low-precision I/O and FP64 remain rejected. AUTO retains composite
+FP32 routing across architectures and shapes. Actual engine support is checked
+separately from frontend descriptor admission.
 """
 
 import cudnn
@@ -89,7 +84,7 @@ def _build_sdpa(implementation, base_dtype=torch.float16, *, overrides=None):
 def test_unified_rejects_unsupported_io_dtype(port, bad_dtype):
     """Each Q/K/V/O port is checked independently on the unified path: an
     unsupported dtype on any single port (the rest FP16) is rejected by the
-    unified support surface. Covers FP32 (issue #424) and FP64. The ``match``
+    unified support surface. Covers mixed FP32 (issue #424) and FP64. The ``match``
     asserts the rejection comes from our dtype check, not an incidental one."""
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Unified SDPA node"):
         _build_sdpa(
