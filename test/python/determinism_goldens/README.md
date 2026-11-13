@@ -599,6 +599,7 @@ pytest core/test_determinism_utils.py
 | `sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` | the SM90 D128 template (`SdpaFwdDslSm90`, the 128 x 128 tile pinned) | O, Stats | none (forward-only template; no backward) |
 | `sdpa/frost/test_sdpa_fwd_sm90_owned_determinism.py` | fixed SM90 dedicated D128 and three-WG D512 bodies, FP16/BF16 | O, Stats; claim counter in stress | none (forward-only qualification) |
 | `sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` | `pygraph.sdpa_mxfp8(causal_exclude_own_block=32)` (SM100/SM103 MXFP8 D128 FROST kernel) | BF16 O, FP32 Stats | — (the option is forward-only) |
+| `sdpa/frost/test_sdpa_bwd_sm90.py` | `pygraph.sdpa_backward` through the opt-in `sdpa_bwd_sm90` row (the Hopper dense D64 / D128 key-owner chain with the ordered dQ relay) | — (backward-only engine row) | dQ, dK, dV |
 
 ### SM90 D128 template forward (issue #378): validation, 2026-11-13 (UTC)
 
@@ -646,6 +647,7 @@ checked strictly against this branch: 127 passed, 0 failed, bytes identical.
 Forward only: the template has no backward. THD, paged KV, split-KV, PackGQA,
 sinks, windows, per-batch lengths and `s_q == 1` are declined by the template and
 not covered here.
+
 
 ### Grid/walk split-combine zero weights — 2026-11-13
 
@@ -1796,6 +1798,37 @@ python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_determini
 python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_sm100.py
 ```
 
+### SM90 dense D64 / D128 backward chain — validation, 2026-11-12 (UTC)
+
+`sdpa/frost/test_sdpa_bwd_sm90.py` covers the opt-in `sdpa_bwd_sm90` row
+(`pygraph.sdpa_backward`; dense compact-BSHD BF16 / FP16 at D64 and D128;
+MHA, GQA and MQA; unmasked or top-left causal). The FP64 reference gate runs
+eleven shape cells per dtype, including tail lengths and a one-query graph.
+Repeatability: repeated executions with a poisoned workspace are compared as
+bytes on two multi-wave grids (256 and 144 CTAs, beyond one wave of the 132
+SMs), and CUDA Graph replays with a poisoned workspace and a changed dO are
+compared as bytes for causal GQA at D128 under both the deterministic and the
+default request. Batch invariance: reordered, duplicated and uniform batches,
+and the sequence declared alone through a one-batch graph, are compared as
+bytes for causal GQA at D128 and unmasked MHA at D64. Adjacent cases pin the
+three launches without allocation or synchronization, the declines by name
+and the batch / query-head grid limits. No runtime golden is recorded: the
+FP64 reference is the numerical arm and the byte comparisons are the
+repeatability and batch-invariance arms. SM100/103 and SM107 are outside this
+row's range.
+
+Measured on an SM90 validation host (cc 9.0, 132 SMs) with Torch 2.12.1+cu130,
+CUDA 13.0 and `nvidia-cutlass-dsl` 4.8.0a0: the file passed 41 collected cases
+with no skips in 34 s from a cold compiled-plan cache. compute-sanitizer
+racecheck on `_case(torch.bfloat16, 64, True, 1, 3, 1, 65, 257)` and
+`_case(torch.float16, 128, True, 1, 3, 1, 65, 257)` reported zero hazards once
+every shared-memory writer and every ring reader arrives its mbarrier directly;
+the earlier elected-lane publication reported 20 hazard sites per case. The
+command, run from `test/python/sdpa/frost`:
+
+```bash
+CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 pytest -q -rA test_sdpa_bwd_sm90.py
+```
 
 ### Native SDPA service register release — validation, 2026-11-12 (UTC)
 
