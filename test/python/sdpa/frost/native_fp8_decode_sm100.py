@@ -389,13 +389,17 @@ def test_native_fp8_decode_score_release(tmp_path, dtype_qkv, dtype_o, split):
     import sys
     import textwrap
 
+    import cudnn
     import warm_stress
 
     source = textwrap.dedent("""
         import faulthandler, sys
+        from pathlib import Path
         faulthandler.dump_traceback_later(150, exit=True)
         sys.meta_path[:] = [f for f in sys.meta_path if "editable" not in str(f).lower()]
         sys.path[:0] = sys.argv[1:3]
+        import cudnn
+        assert Path(cudnn.__file__).resolve().parent.parent == Path(sys.argv[1]).resolve()
         from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
         from cudnn.sdpa.fwd.config_sm100 import TemplateParamsDecode
         params = TemplateParamsDecode(
@@ -408,7 +412,9 @@ def test_native_fp8_decode_score_release(tmp_path, dtype_qkv, dtype_o, split):
         mod.compile_prepared()
     """)
     test_root = Path(__file__).resolve().parents[2]
-    source_root = test_root.parents[1] / "python"
+    # CI imports an installed wheel; its source checkout has no native module.
+    # Compile the same package the parent loaded, including editable worktrees.
+    source_root = Path(cudnn.__file__).resolve().parent.parent
     env = dict(
         os.environ,
         CUTE_DSL_DUMP_DIR=str(tmp_path),
