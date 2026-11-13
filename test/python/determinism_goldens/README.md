@@ -439,14 +439,15 @@ FP64 reference is the numerical arm and the byte comparisons are the
 repeatability and batch-invariance arms. SM100/103 and SM107 are outside this
 row's range.
 
-Measured on an SM90 validation host (cc 9.0, 132 SMs) with Torch 2.12.1+cu130,
-CUDA 13.0 and `nvidia-cutlass-dsl` 4.8.0a0: the file passed 41 collected cases
-with no skips in 34 s from a cold compiled-plan cache. compute-sanitizer
-racecheck on `_case(torch.bfloat16, 64, True, 1, 3, 1, 65, 257)` and
-`_case(torch.float16, 128, True, 1, 3, 1, 65, 257)` reported zero hazards once
-every shared-memory writer and every ring reader arrives its mbarrier directly;
-the earlier elected-lane publication reported 20 hazard sites per case. The
-command, run from `test/python/sdpa/frost`:
+Measured at source revision a78f6ce4 on an SM90 validation host (cc 9.0,
+132 SMs) with Torch 2.12.1+cu130, CUDA 13.0 and `nvidia-cutlass-dsl` 4.8.0a0:
+the file passed 41 collected cases with no skips in 34.3 s from a cold
+compiled-plan cache (30 compiled entries). At the same revision,
+compute-sanitizer racecheck on `_case(torch.bfloat16, 64, True, 1, 3, 1, 65, 257)`
+and `_case(torch.float16, 128, True, 1, 3, 1, 65, 257)` reported zero hazards;
+every shared-memory writer and every ring reader arrives its mbarrier directly,
+where the earlier elected-lane publication reported 20 hazard sites per case.
+The command, run from `test/python/sdpa/frost`:
 
 ```bash
 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 pytest -q -rA test_sdpa_bwd_sm90.py
