@@ -428,9 +428,10 @@ MHA, GQA and MQA; unmasked or top-left causal). The FP64 reference gate runs
 eleven shape cells per dtype, including tail lengths and a one-query graph.
 Repeatability: repeated executions with a poisoned workspace are compared as
 bytes on two multi-wave grids (256 and 144 CTAs, beyond one wave of the 132
-SMs), and CUDA Graph replays with a poisoned workspace and a changed dO are
+SMs), and identical-input CUDA Graph replays with a poisoned workspace are
 compared as bytes for causal GQA at D128 under both the deterministic and the
-default request. Batch invariance: reordered, duplicated and uniform batches,
+default request; a replay with a changed dO is then checked against a fresh
+FP64 reference. Batch invariance: reordered, duplicated and uniform batches,
 and the sequence declared alone through a one-batch graph, are compared as
 bytes for causal GQA at D128 and unmasked MHA at D64. Adjacent cases pin the
 three launches without allocation or synchronization, the declines by name
