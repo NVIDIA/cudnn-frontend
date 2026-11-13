@@ -5757,3 +5757,23 @@ python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -m L0 -q -x -k situ
 
 This corrects the test reference; it does not establish broader kernel
 coverage. SM103, E5M2 and atomic dprob determinism remain unverified.
+
+## Linear attention cuTile validation: 2026-11-11 (UTC)
+
+One GB300 (cc 10.3, 152 SMs), CUDA 13.4 driver 13040, torch 2.14.0a0 (nv26.09), nvidia-cutlass-dsl 4.8.0, cudnn-frontend
+source checkout of PR #1735 rebased on develop. From `test/python`:
+
+```bash
+python -m pytest linear_attention/test_la.py -k "autotune or determinism" -rA
+```
+
+**49 passed, 84 skipped, 0 failed**: `test_determinism_fwd` / `_bwd` / `_multi_tile_fwd` / `_multi_tile_bwd` and
+`test_determinism_bwd_all_grads` on FROST (all five variants) and cuTile (GDN, KDA);
+`test_determinism_cutile_autotune_configs`, which forces every autotune candidate of GDN and KDA in turn and asserts
+that each one, and the tuning-failure fallback, replays its own bytes; and `test_determinism_cutile_autotune_host_hooks`,
+which records the timed winners through `record_hint` and then pins every launch through `select_hints`, asserting that
+the timed search never runs and the bytes are the chosen candidate's. The candidates do not all agree with each other
+(forcing each on GB300: occupancy never moved a bit; `num_worker_warps=8` moved the bits of the kkt solve, dqkwg and
+prepare_wy_repr_bwd kernels), which is why a host pins the pick instead of relying on the timing.
+`test_multi_graph_stress` is not selected by this command. The `hopper` / `hopper_cuda` rows and cuTile's
+gdn2 / gdp / mamba2 rows are waived (no plan on this GPU) and count among the skips.

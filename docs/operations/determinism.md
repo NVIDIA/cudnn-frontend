@@ -240,6 +240,19 @@ a row alone and inside a batch under the entry's own picks.
   for BF16/FP16, including changed-length CUDA Graph replay. This additional
   workspace regression has not been rerun on SM100 or SM107; their earlier
   determinism coverage remains recorded in the test report.
+- Linear attention cuTile engine (GDN, KDA): the launch autotune times
+  occupancy and worker-warp candidates, and the worker-warp count changes the
+  cross-warp summation trees of the kernels that reduce with `ct.sum`, so two
+  processes that time their own candidates can write different bytes. Every
+  candidate replays its own bytes, and a run whose tuning fails or times out
+  launches the first candidate's hints rather than the unhinted kernel. A host
+  that needs the same bytes on every rank and in every run pins the pick
+  through the hooks in `cutile/kernels/common.py`: `record_hint` is told each
+  timed winner, `select_hints` returns the candidate to run and skips the
+  timing (Megatron-LM's `megatron.core.tuning` records a table and pins from
+  it). The cuTile engine is not on this page's table: per-candidate replay and
+  the hooks are verified on cc 10.3 by `test_la.py`'s determinism tests, batch
+  invariance is not claimed.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
