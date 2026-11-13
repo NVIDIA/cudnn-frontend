@@ -120,6 +120,47 @@ def gate_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
     return quantize((o.float() * torch.sigmoid(gate.float()).to(BF16).float()).to(BF16), quant)
 
 
+#: the largest fp32 value: an fp32 exponential beyond it is +inf, and the value it divides is then +-0
+FP32_MAX = 3.4028234663852886e38
+
+
+def _bf16_bits(v: torch.Tensor) -> torch.Tensor:
+    return v.view(torch.int16).to(torch.int32) & 0xFFFF
+
+
+def _bf16_from_bits(bits: torch.Tensor) -> torch.Tensor:
+    return bits.to(torch.int16).view(BF16)
+
+
+def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
+    """The gated attention output formed as the QUOTIENT ``o / (1 + exp(-gate))``, accumulated in ``acc`` on the bf16 operands,
+    with its bf16 bracket: ``(nearest, other, margin)``.  ``nearest`` is the round-to-nearest-even bf16 of the quotient,
+    decided by comparing the quotient with the midpoint of the two bf16 values around it (never by a cast that rounds
+    twice); ``other`` is the bf16 value on the other side of the quotient (``nearest`` itself where the quotient is a bf16
+    value); ``margin`` is the distance of the quotient from the midpoint of the two, in fp32 units of the quotient (+inf
+    where it is a bf16 value).  A kernel that forms the same quotient in fp32 rounds to ``nearest`` wherever the margin
+    exceeds its own fp32 error, and to one of the two everywhere."""
+    exponential = torch.exp(-gate.to(acc))
+    exponential = torch.where(exponential > FP32_MAX, torch.full_like(exponential, float("inf")), exponential)
+    t = o.to(acc) / (1.0 + exponential)
+    v = t.float().to(BF16)  # one end of the bracket (both roundings are monotone); which end is decided below, in ``acc``
+    bits = _bf16_bits(v)
+    sign, magnitude = bits & 0x8000, bits & 0x7FFF
+    away = _bf16_from_bits(sign | (magnitude + 1).clamp(max=0x7F80))
+    toward = _bf16_from_bits(sign | (magnitude - 1).clamp(min=0))
+    va = v.to(acc)
+    other = torch.where(t.abs() > va.abs(), away, torch.where(t.abs() < va.abs(), toward, v))
+    oa = other.to(acc)
+    exact = t == va
+    to_v, to_other = (t - va).abs(), (t - oa).abs()
+    tie = (to_v == to_other) & ~exact  # the quotient on the midpoint at the resolution of ``acc``: nearest-even decides
+    nearest = torch.where(exact | (to_v < to_other) | (tie & ((bits & 1) == 0)), v, other)
+    exponent = torch.frexp(t.abs()).exponent.clamp(min=-125)
+    unit = torch.pow(torch.tensor(2.0, dtype=acc, device=t.device), (exponent - 24).to(acc))  # one fp32 unit of the quotient
+    margin = torch.where(exact, torch.full_like(t, float("inf")), (t - (va + oa) * 0.5).abs() / unit)
+    return nearest, other, margin
+
+
 def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> ScaledTensor:
     """One decode step of a gated delta-rule linear-attention layer, for ``rows`` sequences whose slots are ``slot_ids``:
     the beta / alpha projection of the normed hidden state, the causal conv over the slot's history with SiLU, the scaled query
@@ -232,6 +273,26 @@ class GateQuantize(_Reference):
 
     def __call__(self, o, gate, quant):
         return gate_quantize(o, gate, quant)
+
+
+class GateQuantizeQuotient(_Reference):
+    """The gate + quantise at the rounding points of a kernel that forms the gated value as a quotient
+    (``cudnn.AttentionGateQuantDecode``): ``code = e4m3(bf16(o / (1 + exp(-gate))) * (1 / scale))``, the quotient accumulated
+    in ``acc`` and rounded ONCE to bf16.  The reference chain (``gate_quantize``) rounds the sigmoid to bf16 first and then
+    the product: another function, one code apart on rare elements.  This block is the twin of that entry's adapter, not a
+    row of any table; ``bracket`` keeps, of the last call, the codes of the other bf16 value around each quotient and the
+    quotient's distance from the midpoint, which the band of the entry is judged with (``tie_out``: ``gate_fp8``)."""
+
+    entry = "torch_ref.gate_quantize at the kernel's rounding points"
+    per_row = (0, 1)
+    bracket = None
+
+    def __call__(self, o, gate, quant):
+        if quant is None or quant.fmt != "fp8":
+            raise ValueError("the gate's twin quantises to static 8-bit codes")
+        nearest, other, margin = gate_quotient_bracket(o, gate, self.acc)
+        self.bracket = (quantize_fp8(other, quant.scale).codes, margin)
+        return quantize_fp8(nearest, quant.scale)
 
 
 class GdnDecodeStep(_Reference):

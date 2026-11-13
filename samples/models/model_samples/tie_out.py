@@ -37,7 +37,21 @@ says ``NOT OBSERVED`` with the reason, ``Checks.unobserved`` carries it, and a s
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``same`` = the provider is the reference chain, nothing to compare.
+``gate_fp8`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
+
+**What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
+other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
+kernel's rounding points, and is compared with that.  The reference is matched to the kernel's documented arithmetic; a
+band is never widened to cover a chain that rounds elsewhere.  **A band is judged per output**: it names the outputs it
+applies to and what it needs of the twin; an output it does not name is compared by its dtype (bf16: within one bf16
+unit; anything else: bytes), and state a call updates is compared byte for byte unless the band has a rule for it.
+
+``gate_fp8``, the band of the attention gate + quantise entry, is that entry's documented numerics contract, not a share.
+Its kernel forms the gated value as the quotient ``attn / (1 + exp(-gate))`` in fp32, rounds it once to bf16 and once to an
+8-bit code.  The twin forms the same quotient in the reference's accumulation precision and keeps the two bf16 values
+around it.  The band: every byte is the code of one of those two bf16 values, and the code of the nearest one wherever the
+quotient is more than 2.5 fp32 units from their midpoint; every value finite.  Inside that margin the fp32 quotient may
+fall on the other side of the midpoint, which is the kernel's own arithmetic; the line prints how many bytes did.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -85,6 +99,10 @@ GDN_STATE_BAND = 1e-4
 GDN_STATE_SHARE = 0.999
 GDN_CELL_STATE = 0.999
 GDN_STATE_CAP = 2.0**-6
+#: the gate entry's contract: beyond this many fp32 units from the midpoint of the two bf16 values around the gated value, the
+#: byte is the code of the nearest one (``docs/operations/attention/gate_quant_decode.md``: measured over every operand
+#: pair at five scales, doubled).  Not a tolerance of this sample: it moves only with that page
+GATE_MARGIN_ULP32 = 2.5
 BANDS = {
     "same": "the provider is the reference chain",
     "bitwise": "byte-identical",
@@ -94,6 +112,11 @@ BANDS = {
         f"8-bit bytes: more than {GDN_EQUAL_BYTES:.1%} equal over the run and more than {GDN_CELL_BYTES:.0%} in every cell (layer, sequence, value head); "
         f"state: more than {GDN_STATE_SHARE:.1%} within {GDN_STATE_BAND:g} over the run and more than {GDN_CELL_STATE:.1%} in every cell, "
         "all of it finite and within two bf16 units; conv history equal; null slot untouched"
+    ),
+    "gate_fp8": (
+        "8-bit bytes against the gate at the kernel's rounding points: every byte the code of one of the two bf16 values around the gated value "
+        f"attn / (1 + exp(-gate)), and the code of the nearest one wherever that value is more than {GATE_MARGIN_ULP32:g} fp32 units from their midpoint; "
+        "every value finite"
     ),
 }
 
@@ -174,6 +197,9 @@ class BlockStats:
     within_cap: bool = True
     conv_equal: bool = True
     null_equal: bool = True
+    state_equal: bool = True  # of a band without a rule for state: what the call updated, byte for byte
+    outside: int = 0  # gate_fp8: bytes that are the code of neither bf16 value around the gated value
+    off_nearest: int = 0  # gate_fp8: bytes off the nearest value's code although the gated value is beyond the margin
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -196,8 +222,16 @@ class BlockStats:
                 f"rms ratio {self.state_rms:.1e} at the worst call (printed, not gated); conv history {'equal' if self.conv_equal else 'DIFFERS'}; "
                 f"null slot {'untouched' if self.null_equal else 'WRITTEN'}{loud}"
             )
+        if self.band == "gate_fp8":
+            other = self.total_bytes - self.equal_bytes - self.outside
+            return (
+                f"{self.equal_bytes / max(self.total_bytes, 1):.4%} of 8-bit bytes are the code of the nearest bf16 value; {other:,} of {self.total_bytes:,} "
+                f"the code of the other one around the gated value, {self.off_nearest:,} of them more than {GATE_MARGIN_ULP32:g} fp32 units from the "
+                f"midpoint; {self.outside:,} the code of neither{loud}"
+            )
         share = self.off_by_one / max(self.elements, 1)
-        return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{loud}"
+        state = "" if self.state_equal else "; STATE DIFFERS"
+        return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{state}{loud}"
 
 
 def _smallest(counts: torch.Tensor, total: int, layer: int) -> Tuple[float, str]:
@@ -232,7 +266,7 @@ class BlockTap:
                 t.copy_(c)
 
     def __call__(self, name, layer, block, operands):
-        row, ref = self.plan.rows[name], self.reference[name]
+        row, ref = self.plan.rows[name], block.twin(self.reference[name])  # the reference block, or the block's own twin
         independent = type(ref) is not type(block)
         alone = self.plan.sequences > 1
         if not independent and not alone:
@@ -247,7 +281,7 @@ class BlockTap:
         if independent:
             self._load(holders, before)
             ref_out = ref(*operands)
-            self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer)
+            self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer, ref)
         if alone:
             s = self.step % self.plan.sequences
             self._load(holders, before)
@@ -263,7 +297,22 @@ class BlockTap:
         return out
 
     @staticmethod
-    def _judge(stats: BlockStats, out, ref, state, ref_state, layer: int = 0) -> None:
+    def _judge(stats: BlockStats, out, ref, state, ref_state, layer: int = 0, twin=None) -> None:
+        """One call of a provider block against its twin: ``out`` / ``ref`` are the compared outputs of the two, ``state`` /
+        ``ref_state`` what each left in the state the call updates, ``twin`` the block ``ref`` came from (a band reads from
+        it what it needs beyond the outputs).  The band of the row decides per output."""
+        if stats.band == "gate_fp8":  # output 0: the 8-bit codes, against the twin's bracket of the gated value
+            codes, nearest = out[0], ref[0]
+            other, margin = twin.bracket
+            same = codes == nearest
+            stats.equal_bytes += int(same.sum())
+            stats.total_bytes += codes.numel()
+            stats.outside += int((~same & (codes != other)).sum())
+            stats.off_nearest += int((~same & (margin > GATE_MARGIN_ULP32)).sum())
+            stats.finite = stats.finite and bool(((codes & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
+            stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.state_equal
+            return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
             (recurrent, conv), (ref_recurrent, ref_conv) = state[0], ref_state[0]
@@ -320,7 +369,8 @@ class BlockTap:
             stats.off_by_one += int((units >= 0.5).sum())
             stats.worst_units = _largest(stats.worst_units, float(units.amax()))
             stats.ok = stats.ok and bool((units <= 1.0).all())  # element by element: False for a NaN
-        stats.ok = stats.ok and stats.finite
+        stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # no rule of this band for state: byte for byte
+        stats.ok = stats.ok and stats.finite and stats.state_equal
 
 
 def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:

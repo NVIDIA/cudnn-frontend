@@ -14,11 +14,20 @@ The entry compiles once per (rows, operand strides) per process; ``compile`` bui
 kernel compiled and launched.  That first launch is measured: on some GPU classes it reserves device memory outside PyTorch's
 allocator (``first_launch``), which the plan's memory sentence allows for per class before anything is loaded.
 
-The provider row says in which form the entry is called (``row.form``: fields of the entry's own form, under the entry's names).
-The adapter passes exactly those to the entry (``FORM_ARGUMENTS``) and nothing else that fixes the kernel, so the row is the
-whole statement; ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it
-compiled, its form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / ``launch_shape_for``).  ``serving``
-says what served the last call: the entry instance ``__call__`` launched and the row's fields as that instance states them.
+``fe.attention_gate_quant_decode`` calls ``cudnn.AttentionGateQuantDecode``, the output gate of an attention layer fused with
+the static 8-bit quantisation of the out-projection's input (``docs/operations/attention/gate_quant_decode.md``): one launch
+per attention layer and step.  One compiled kernel serves every row count and layer.  The adapter hands the entry an output
+buffer of its own per call: the entry's own buffer is one for every row count and is overwritten by its next call.  Its
+kernel rounds the gated value at other points than the reference chain does, so the adapter names the reference block it is
+compared with (``twin``): the gate written at the kernel's rounding points.
+
+A provider row says in which form its entry is called (``row.form``: fields of the entry's own form, under the entry's names).
+An adapter passes exactly those to the entry and nothing else that fixes the kernel, so the row is the whole statement;
+``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it compiled, its
+form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / ``launch_shape_for``).  ``serving`` says what
+served the last call: the entry instance ``__call__`` launched and the row's fields as that instance states them.  On a real
+device an adapter asks its entry, while the run is planned, for the launch of the run's row count: an entry that declines what its row claims is a
+``ValueError`` -- the provider table is wrong, which a sample reports as an ``ERROR``, never as a ``SKIP``.
 """
 
 from __future__ import annotations
@@ -38,12 +47,18 @@ SOURCE_FILES = (
     "linear_attention/frost/kernel/gdn_decode_fused_f16.py",
     "linear_attention/frost/kernel/gdn_geometry.py",
     "frost/launch_facts.py",
+    "attention_gate/frost/gate_quant_decode.py",
+    "attention_gate/frost/kernel/gate_quant_decode_config.py",
+    "attention_gate/frost/kernel/gate_quant_decode_f16.py",
 )
 #: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
 FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+#: the fields of the form of ``cudnn.AttentionGateQuantDecode`` a provider row may name: ``THREADS`` goes into the entry's
+#: config (``cfg=Cfg(THREADS=...)``), ``PDL_RELEASE`` is its launch knob ``pdl_release=``
+GATE_FORM_FIELDS = ("THREADS", "PDL_RELEASE")
 #: the entry's three launch facts: what the kernel check reads
 LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
-#: the first cuDNN Frontend version that carries the fused decode step, and the CuTe DSL floor its page states
+#: the first cuDNN Frontend version that carries the fused decode step and the gate entry, and the CuTe DSL floor their pages state
 FIRST_VERSION = "1.33.0"
 DSL_FLOOR = (4, 8, 0)
 
@@ -59,7 +74,7 @@ def serves_floor(installed: str, floor: tuple) -> bool:
     return release > tuple(floor) or (release == tuple(floor) and not before)
 
 
-#: one entry per (device, geometry, epsilon, form) of the process: the entry compiles once per rows count, and every session shares it
+#: the entries of the process, one per (entry, device, geometry, form): an entry compiles once per form, and every session shares it
 _ENTRIES: dict = {}
 #: rows -> device bytes the first launch of that form took outside PyTorch's allocator in this process, as measured
 _FIRST_LAUNCH: dict = {}
@@ -77,12 +92,15 @@ def _outside_pool(device, launch) -> int:
     return (free - torch.cuda.mem_get_info(device)[0]) - (torch.cuda.memory_reserved(device) - pool)
 
 
-class GdnDecodeFusedBlock(BlockBase):
+class EntryBlock(BlockBase):
+    """An adapter to a cuDNN Frontend entry that states its launch: what such adapters share.  A subclass names the entry
+    (``name``), builds it from the row's form (``_build``) and notes in ``__call__`` the entry object it launched and the
+    row count (``_served``); the call log and the kernel check read the rest from here."""
+
     provider = "cuDNN FE"
-    kernels = (Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per layer and step
-    per_row = (0, 1, 2, 3)
-    state_args = (5,)
     compiles = True
+    name = ""  # the entry, as ``cudnn`` exports it
+    what = ""  # what the entry is, for the sentence of an older package
     _served = None  # (entry instance, rows) of the last call
     _answer = None  # (entry instance, rows, what ``serving`` says of them): asked of an instance once, not once per call
 
@@ -90,6 +108,82 @@ class GdnDecodeFusedBlock(BlockBase):
         import cudnn  # before torch in a sample's own imports; here torch is already loaded by the sample
 
         return cudnn
+
+    def _build(self, device):
+        raise NotImplementedError
+
+    def _check_package(self) -> None:
+        """The declines of the installed packages, each a ``NotImplementedError`` (a SKIP) that names the fix: a cuDNN
+        Frontend without the entry, one whose entry states no launch facts where the run checks its kernels, a CuTe DSL
+        below the entry's floor."""
+        cudnn = self._cudnn()
+        entry = getattr(cudnn, self.name, None)
+        if entry is None:
+            raise NotImplementedError(
+                f"needs nvidia-cudnn-frontend with {self.what} (>= {FIRST_VERSION}); this is {cudnn.__version__}: install from the checkout (see README)"
+            )
+        if self.options.get("check_kernels") and not all(hasattr(entry, fact) for fact in LAUNCH_FACTS):
+            raise NotImplementedError(
+                f"the kernel check needs the launch facts of {self.entry} ({', '.join(LAUNCH_FACTS)}); this nvidia-cudnn-frontend "
+                f"{cudnn.__version__} has none: install from the checkout (see README), or run without --check-kernels"
+            )
+        import importlib.metadata as metadata
+
+        try:
+            installed = metadata.version("nvidia-cutlass-dsl")
+        except metadata.PackageNotFoundError:
+            installed = None
+        floor = ".".join(str(n) for n in DSL_FLOOR)
+        if installed is None or not serves_floor(installed, DSL_FLOOR):
+            raise NotImplementedError(f"{self.entry} needs nvidia-cutlass-dsl >= {floor}; this is {installed or 'not installed'}")
+
+    def _check_claim(self, entry, rows: int) -> None:
+        """On a real device: the row claims this run, so the entry must state a launch for its row count.  One that declines
+        is a wrong table -- a ``ValueError``, which a sample reports as an ``ERROR`` and never as a ``SKIP``."""
+        if not hasattr(entry, "launch_shape_for"):
+            return
+        try:
+            entry.launch_shape_for(rows)
+        except (ValueError, NotImplementedError) as error:
+            cc = self.facts.cc
+            raise ValueError(
+                f"the provider table is wrong: the row of {self.row.key} claims this run ({rows} row{'s' if rows != 1 else ''} on compute "
+                f"capability {cc[0]}.{cc[1]}), and {self.entry} declines it: {error}"
+            ) from None
+
+    def serving(self):
+        """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
+        its kind in this process: one per device, geometry and form) and the fields of the row's form as THAT instance states
+        them for the call's row count (its ``form_for``).  Read from the object that was called, never from the row: an entry
+        built without the row's knobs, or a call served from another instance, shows here.  Before the first call nothing
+        has served and nothing was passed."""
+        if self._served is None:
+            return self.entry, ()
+        entry, rows = self._served
+        if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
+            place = next((n for n, built in enumerate((e for e in _ENTRIES.values() if type(e) is type(entry)), 1) if built is entry), 0)
+            try:
+                stated = entry.form_for(rows)
+            except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
+                stated = {}
+            form = tuple((name, stated[name]) for name, _ in self.row.form if name in stated)
+            self._answer = (entry, rows, (f"{self.entry} #{place}" if place else self.entry, form))
+        return self._answer[2]
+
+    def launch_facts(self, rows: int) -> Facts:
+        """The entry's own answers for ``rows``: the symbols of the kernels it has compiled for that row count, its form as plain
+        data and its launch shape.  The entry's typed declines pass through: a row that claims a row count the entry does not
+        serve is a wrong table."""
+        entry = self._build(self.options.get("device", "cuda"))
+        return Facts(tuple(entry.kernel_symbols_for(rows)), entry.form_for(rows), tuple(entry.launch_shape_for(rows)))
+
+
+class GdnDecodeFusedBlock(EntryBlock):
+    name = "GdnDecodeFused"
+    what = "the fused linear-attention decode step"
+    kernels = (Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per layer and step
+    per_row = (0, 1, 2, 3)
+    state_args = (5,)
 
     def _arguments(self) -> dict:
         """The constructor arguments the row's form stands for.  A field this adapter cannot pass is a wrong table."""
@@ -101,33 +195,14 @@ class GdnDecodeFusedBlock(BlockBase):
         return {FORM_ARGUMENTS[name]: value for name, value in self.row.form}
 
     def check_support(self, sequences: int, tokens: int) -> None:
-        cudnn = self._cudnn()
-        try:
-            cudnn.GdnDecodeFused
-        except AttributeError:
-            raise NotImplementedError(
-                f"needs nvidia-cudnn-frontend with the fused linear-attention decode step (>= {FIRST_VERSION}); this is {cudnn.__version__}: "
-                "install from the checkout (see README)"
-            ) from None
+        self._check_package()
         self._arguments()
-        if self.options.get("check_kernels") and not all(hasattr(cudnn.GdnDecodeFused, fact) for fact in LAUNCH_FACTS):
-            raise NotImplementedError(
-                f"the kernel check needs the launch facts of cudnn.GdnDecodeFused ({', '.join(LAUNCH_FACTS)}); this nvidia-cudnn-frontend "
-                f"{cudnn.__version__} has none: install from the checkout (see README), or run without --check-kernels"
-            )
         if tokens != 1:
             raise NotImplementedError(f"cudnn.GdnDecodeFused is the one-token decode step; this run has {tokens} tokens per sequence")
-        import importlib.metadata as metadata
-
-        try:
-            installed = metadata.version("nvidia-cutlass-dsl")
-        except metadata.PackageNotFoundError:
-            installed = None
-        floor = ".".join(str(n) for n in DSL_FLOOR)
-        if installed is None or not serves_floor(installed, DSL_FLOOR):
-            raise NotImplementedError(f"cudnn.GdnDecodeFused needs nvidia-cutlass-dsl >= {floor}; this is {installed or 'not installed'}")
         if self.facts.total_bytes and "device" in self.options:
-            self._build(self.options["device"])  # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP
+            # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP; once it is built, a row
+            # count it does not serve is a wrong table
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)
 
     def reserve_bytes(self) -> int:
         """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
@@ -153,32 +228,6 @@ class GdnDecodeFusedBlock(BlockBase):
             geometry = GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden)
             _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
         return _ENTRIES[key]
-
-    def serving(self):
-        """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
-        this process: one per device, geometry, epsilon and form) and the fields of the row's form as THAT instance states them
-        for the call's row count (its ``form_for``).  Read from the object that was called, never from the row: an entry
-        built without the row's knobs, or a call served from another instance, shows here.  Before the first call nothing
-        has served and nothing was passed."""
-        if self._served is None:
-            return self.entry, ()
-        entry, rows = self._served
-        if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
-            place = next((n for n, built in enumerate(_ENTRIES.values(), 1) if built is entry), 0)
-            try:
-                stated = entry.form_for(rows)
-            except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
-                stated = {}
-            form = tuple((name, stated[name]) for name, _ in self.row.form if name in stated)
-            self._answer = (entry, rows, (f"{self.entry} #{place}" if place else self.entry, form))
-        return self._answer[2]
-
-    def launch_facts(self, rows: int) -> Facts:
-        """The entry's own answers for ``rows``: the symbols of the kernels it has compiled for that row count, its form as plain
-        data and its launch shape.  The entry's typed declines pass through: a row that claims a row count the entry does not
-        serve is a wrong table."""
-        entry = self._build(self.options.get("device", "cuda"))
-        return Facts(tuple(entry.kernel_symbols_for(rows)), entry.form_for(rows), tuple(entry.launch_shape_for(rows)))
 
     def compile(self, sequences: int, tokens: int) -> None:
         import torch
@@ -227,3 +276,102 @@ class GdnDecodeFusedBlock(BlockBase):
         except NotImplementedError as error:
             raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands of this step: {error}") from error
         return ScaledTensor(qout.view(torch.uint8).view(x.shape[0], -1), params.out_scale_value)
+
+
+class AttentionGateQuantDecodeBlock(EntryBlock):
+    """``cudnn.AttentionGateQuantDecode``: ``code = e4m3(bf16(attn / (1 + exp(-gate))) * (1 / scale))`` per element of the
+    attention output, one launch per attention layer and step."""
+
+    name = "AttentionGateQuantDecode"
+    what = "the attention gate + quantise decode step"
+    kernels = (Kernel("gate_quant", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per attention layer and step
+    per_row = (0, 1)
+    _twin = None
+    _scales = None  # scale value -> the one-element fp32 tensor the kernel reads: built once per value, never inside a later step
+
+    def _width(self) -> int:
+        g = self.model.geometry
+        return g.attn_heads * g.attn_head_dim
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass is a wrong table."""
+        unknown = [name for name, _ in self.row.form if name not in GATE_FORM_FIELDS]
+        if unknown:
+            raise ValueError(
+                f"provider row {self.row.key}: its form names {', '.join(unknown)}; this adapter passes {', '.join(GATE_FORM_FIELDS)} "
+                "to cudnn.AttentionGateQuantDecode"
+            )
+        form, arguments = dict(self.row.form), {}
+        if "THREADS" in form:
+            from cudnn.attention_gate.frost import Cfg
+
+            arguments["cfg"] = Cfg(THREADS=form["THREADS"])
+        if "PDL_RELEASE" in form:
+            arguments["pdl_release"] = form["PDL_RELEASE"]
+        return arguments
+
+    def check_support(self, sequences: int, tokens: int) -> None:
+        self._check_package()
+        self._arguments()
+        if self.facts.total_bytes and "device" in self.options:
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)
+
+    def _build(self, device):
+        import torch
+
+        device = torch.device(device)
+        key = ("attention_gate_quant_decode", str(device), self._width(), tuple(self.row.form))
+        if key not in _ENTRIES:
+            try:
+                _ENTRIES[key] = self._cudnn().AttentionGateQuantDecode(device, self._width(), **self._arguments())
+            except NotImplementedError as error:  # the entry declines the width the family's table hands it
+                raise ValueError(f"the provider table is wrong: {self.entry} declines the geometry of the row of {self.row.key}: {error}") from None
+        return _ENTRIES[key]
+
+    def _scale(self, value: float, device):
+        import torch
+
+        if self._scales is None:
+            self._scales = {}
+        key = (float(value), str(device))
+        if key not in self._scales:
+            self._scales[key] = torch.tensor([float(value)], dtype=torch.float32, device=device)
+        return self._scales[key]
+
+    def twin(self, reference):
+        """The reference block this adapter is compared with: the gate at the kernel's rounding points (the gated value as a
+        quotient, rounded once to bf16), not the reference chain's product of a rounded sigmoid."""
+        from . import torch_ref
+
+        if self._twin is None:
+            self._twin = torch_ref.GateQuantizeQuotient(reference.row, self.model, self.facts, self.options)
+        return self._twin
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device = torch.device(self.options.get("device", "cuda"))
+        rows, width = sequences * tokens, self._width()
+        entry = self._build(device)
+        attn = torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
+        out = torch.empty((rows, width), dtype=torch.float8_e4m3fn, device=device)
+        operands = (attn, torch.zeros_like(attn), self._scale(1.0, device), out)
+        try:
+            entry.compile(*operands)
+            entry(*operands)  # the first launch of the compiled kernel, before the first step
+        except NotImplementedError as error:  # the plan found the part and the versions served: what is left is this adapter's own layout
+            raise RuntimeError(f"cudnn.AttentionGateQuantDecode declined the operands this adapter built: {error}") from error
+
+    def __call__(self, o, gate, quant):
+        import torch
+
+        if quant.fmt != "fp8":
+            raise ValueError(f"cudnn.AttentionGateQuantDecode writes static 8-bit codes; this block is asked for {quant.fmt!r}")
+        entry, rows = self._build(o.device), int(o.shape[0])
+        self._served = (entry, rows)  # what the call log of a traced step reads back (``serving``)
+        out = torch.empty((rows, o.shape[1]), dtype=torch.float8_e4m3fn, device=o.device)  # this call's own: never the entry's one buffer
+        try:
+            entry(o, gate, self._scale(quant.scale, o.device), out)
+        except NotImplementedError as error:
+            raise RuntimeError(f"cudnn.AttentionGateQuantDecode declined the operands of this step: {error}") from error
+        return ScaledTensor(out.view(torch.uint8), float(quant.scale))
