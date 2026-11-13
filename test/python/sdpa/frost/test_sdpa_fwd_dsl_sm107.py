@@ -1040,8 +1040,10 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(blackwell_caps, blackwell, knobs) is None
         for changed in (dict(has_paged_kv=False), dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3)):
             assert engines.mismatch(blackwell_caps, dataclasses.replace(blackwell, **changed), knobs) is not None, (cc, changed)
-        for changed in (dict(cga=1), dict(split_kv=2)):
-            assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, **changed)) is not None, (cc, changed)
+        # SM100/103 also support the packed THD split path; the native SM107
+        # row above still declines it. Neither row admits CGA1 for this D256 plan.
+        assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, split_kv=2)) is None
+        assert engines.mismatch(blackwell_caps, blackwell, dataclasses.replace(knobs, cga=1)) is not None
 
 
 @pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
@@ -1711,7 +1713,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "dead_subtile_quiet",
         "bias_max_form",
         "softmax_wgs",
+        "swap_ab",
     ], params[extension_start:]
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["swap_ab"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["decode_q_tile_max"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["use_pdl"].default is False
@@ -2548,8 +2552,15 @@ def test_sm107_gate_kernel_signatures_are_append_only():
         stream_slot = host.index("stream")
         assert host[stream_slot : stream_slot + 2] == ["stream", "gate_tensor"], (mod.__name__, host[stream_slot:])
         tail = ["prepared", "o_partial_f32"] if mod is fp8 else ["prepared"]
-        assert host[stream_slot + 2 :] == tail, (mod.__name__, host[stream_slot:])
-        assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
+        tail_end = stream_slot + 2 + len(tail)
+        assert host[stream_slot + 2 : tail_end] == tail, (mod.__name__, host[stream_slot:])
+        # Appending defaulted origin operands preserves existing callers. Keep
+        # the old order pinned, and reject any newly required argument.
+        params = inspect.signature(mod._host).parameters
+        for name in host[tail_end:]:
+            assert params[name].default is not inspect.Parameter.empty, (mod.__name__, name)
+            assert params[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        assert params["gate_tensor"].default is None
     assert inspect.signature(fp8._host).parameters["o_partial_f32"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
@@ -3102,12 +3113,14 @@ def test_sm107_gate_lpt_is_bitwise_natural():
 # Re-recorded under nvidia-cutlass-dsl 4.8.0 after #1547 (the dense CLC path reads the tile id through one scheduler publisher,
 # `read_tile_id_arrive_on_leader`, under `not CFG.THD_VARLEN`): the dense gated arm moved with that body change; both THD arms
 # re-rendered byte-identical to their records, as the `THD_VARLEN` guard predicts.
+# Re-recorded after #2527: the service warps now converge at one register release.
+# Same-toolchain parent renders reproduce all three prior records; all three bodies change.
 _THD_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "dense_gated_bf16_lse": "fde505d05124f3978d1f106b7b47891b",
-    "thd_ungated_bf16_head": "0ef74afd0cc3bf72ed771a4ae7af936c",  # re-recorded: THD unit decode through the work prefix
+    "dense_gated_bf16_lse": "a1793a682026b79c9b009bccc38a4bfe",
+    "thd_ungated_bf16_head": "1051866fef374ab0d09e1cf1f6659b13",  # re-recorded: THD unit decode through the work prefix
     # the THD-gated rendering itself (the packed gate map): recorded WITH the descriptor, so the next change to it is seen
-    "thd_gated_bf16_head": "f90bfeac779eb29ca384ea3dfe817e4e",  # re-recorded with the ungated twin (same decode change)
+    "thd_gated_bf16_head": "c7aa88d4d04ef90f4dcac786e8209393",  # re-recorded with the ungated twin (same decode change)
 }
 _THD_GATE_CUBIN_RENDERINGS = {
     # (TemplateParams fields the adapter derives on cc 10.7 for the bf16 causal cga2 d256 plan, compile kwargs)
@@ -3532,18 +3545,20 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
 # probe does not select the separate native SM107 dense body.
 # Re-recorded after #2064: fused dense P1 register math overlaps the previous PV. Both dense cubins change;
 # the eight THD / paged / gated renderings remain byte-identical.
+# Re-recorded after #2527: one common service-warpgroup register release replaces
+# four role-local releases. All ten old records reproduce on the parent with DSL 4.8.0 / CUDA 13.4.
 _PAGED_GATE_CUBIN_RECORD = {
     "nvidia-cutlass-dsl": "4.8.0",
-    "sm_100a_dense": "89b5cba5c546804bc16ca9934226111c",
-    "sm_100a_thd": "d10d4f3814461e315a33778705e1920c",
-    "sm_100a_paged_thd": "066bb542a059b0c1c1083f85f60fddcb",
-    "sm_100a_paged_thd_pack": "a812d2551488e2b3b19177b470003278",
-    "sm_107a_dense": "48b8f362d864ec60c670ef51ba88f588",
-    "sm_107a_thd": "38403df53e25b064f21b0e0eb3471af3",
-    "sm_107a_paged_thd": "3c106cb810219e1d3f1eab0433049b80",
-    "sm_107a_paged_thd_pack": "cb43d702cddfa33ef699cfbe22441edb",
-    "sm_107a_gated_paged_thd": "d62622a3ced6820bc54c34296c933e37",
-    "sm_107a_gated_paged_thd_pack": "76d2d9014cc9be46a002141c6ce59a4d",
+    "sm_100a_dense": "af6dae54a94b94a1d880dbff0e8e46a0",
+    "sm_100a_thd": "82638fa370bd24241dc0b03cbe365a92",
+    "sm_100a_paged_thd": "e819cb77bd06ccff1988e76ad0df7d78",
+    "sm_100a_paged_thd_pack": "4d6c1c236b0f6dda01c79d41b91596ff",
+    "sm_107a_dense": "a6e4bd715d87b2df34ac02e571228961",
+    "sm_107a_thd": "0dc6aa6da3a9da3af7d8668a7e26349f",
+    "sm_107a_paged_thd": "df6c5e7013b4be3a9c56e72047dcf4bf",
+    "sm_107a_paged_thd_pack": "5a57e4691a552098bb66248f3dd4f9e4",
+    "sm_107a_gated_paged_thd": "ce088438638826674c6339211dd1837f",
+    "sm_107a_gated_paged_thd_pack": "6064db80300d651676ae3dd3fb35bd5a",
 }
 _PAGED_GATE_BASE = dict(dtype_qkv=2, dtype_o=2, window_right=0, qh_per_kh=4, cta_mma=2)
 _PAGED_GATE_PAGED = dict(_PAGED_GATE_BASE, bottom_right=True, thd_varlen=True, seq_kv_lens_present=True, paged_kv=True, page_size=16)
@@ -8864,3 +8879,41 @@ class TestD192LptContract:
 
     test_work_order = staticmethod(_checks.test_thd_work_order)
     test_admission = staticmethod(_checks.test_native_admission)
+
+
+# The SM107 CI lane selects this file explicitly; helpers are not separately collected.
+from frost_test_utils import requires_rubin
+from sdpa.frost import sdpa_fwd_thd_origins_d512_sm107 as _d512_origins
+
+
+@requires_rubin
+class TestD512HalfPhysicalOrigins:
+    test_shared_physical_origins = staticmethod(_d512_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_d512_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_d512_origins.test_origins_without_total_hints)
+    test_packed_origins_decline = staticmethod(_d512_origins.test_packed_origins_decline)
+    test_half_head_envelope_declines = staticmethod(_d512_origins.test_half_head_envelope_declines)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestNativeD64Paged:
+    import native_d64_paged_sm107_checks as _checks
+
+    def test_admission(self):
+        self._checks.check_admission(_caps, _f16_facts)
+
+    test_boundaries = staticmethod(_checks.test_boundaries)
+    test_dense = staticmethod(_checks.test_dense)
+    test_thd = staticmethod(_checks.test_thd)
+    test_thd_split_partial_pack = staticmethod(_checks.test_thd_split_partial_pack)
+    test_dense_determinism = staticmethod(_checks.test_dense_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_batch_and_golden as _thd_determinism
+
+    test_thd_determinism = staticmethod(_thd_determinism)
+
+    from native_d64_paged_thd_determinism import test_thd_split_batch_and_golden as _thd_split_determinism
+
+    test_thd_split_determinism = staticmethod(_thd_split_determinism)

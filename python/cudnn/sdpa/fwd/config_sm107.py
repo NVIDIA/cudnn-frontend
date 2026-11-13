@@ -407,15 +407,8 @@ def supports_native_d192_paged(d_shape, *, device_cc, fp8, paged, cga=None, spli
 
 
 def supports_native_d64_pack(d_shape, *, device_cc, fp8, paged, split_kv=1, cga=None, thd=False):
-    """Native half D64 packing; paged THD is unsplit, nonpaged THD splits use one CTA."""
-    return (
-        device_cc == (10, 7)
-        and d_shape == (64, 64)
-        and not fp8
-        and (not (paged and thd) or split_kv == 1)
-        and (not thd or split_kv == 1 or cga in (None, 1))
-        and cga in (None, 1, 2)
-    )
+    """Native half D64 packing; THD splits use one CTA with either KV layout."""
+    return device_cc == (10, 7) and d_shape == (64, 64) and not fp8 and (not thd or split_kv == 1 or cga in (None, 1)) and cga in (None, 1, 2)
 
 
 def supports_native_d128_single_q(

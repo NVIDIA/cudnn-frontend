@@ -2657,3 +2657,67 @@ class TestD128Fp8PhysicalOrigins:
     test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
     test_half_origin_execution_routes = staticmethod(_origins.test_half_origin_execution_routes)
     test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestD512PhysicalOrigins:
+    """Exercise both half datapaths and FP8 through the selected CI entry."""
+
+    from sdpa.frost import sdpa_fwd_thd_origins_d512_sm100 as _origins
+
+    test_shared_physical_origins = staticmethod(_origins.test_shared_physical_origins)
+    test_independent_origins_rebind_replay = staticmethod(_origins.test_independent_origins_rebind_replay)
+    test_origins_without_total_hints = staticmethod(_origins.test_origins_without_total_hints)
+    test_half_head_envelope_origins = staticmethod(_origins.test_half_head_envelope_origins)
+    test_stats_slot_waits_for_all_warps = staticmethod(_origins.test_stats_slot_waits_for_all_warps)
+    test_tmem_release_waits_for_all_readers = staticmethod(_origins.test_tmem_release_waits_for_all_readers)
+    test_origin_golden = staticmethod(_origins.test_origin_golden)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+class TestMidwidthPhysicalOrigins:
+    """Exercise independent origins on the D192/V128 and D256 native bodies."""
+
+    from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _checks
+
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _checks("fp8")
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 100, reason="native FP8 decode lowering is selected on SM100")
+class TestNativeFp8Decode:
+    """Paged D64/D128 swap-AB through the architecture-selected CI entry."""
+
+    from sdpa.frost import native_fp8_decode_sm100 as _decode
+
+    test_graph = staticmethod(_decode.test_native_fp8_decode_graph)
+    test_features = staticmethod(_decode.test_native_fp8_decode_features)
+    test_route_boundaries = staticmethod(_decode.test_native_fp8_decode_route_boundaries)
+    test_config = staticmethod(_decode.test_native_fp8_decode_config)
+    test_d64_public_choice = staticmethod(_decode.test_d64_swap_ab_public_choice)
+    test_d64_knob_declines = staticmethod(_decode.test_d64_swap_ab_declines_unsupported)
+
+    test_packed_g3_decline = staticmethod(_decode.test_native_fp8_decode_keeps_packed_g3_decline)
+    test_optional_outputs = staticmethod(_decode.test_native_fp8_decode_optional_outputs)
+    test_direct_partial_log_base = staticmethod(_decode.test_native_fp8_decode_direct_partial_log_base)
+    test_score_release = staticmethod(_decode.test_native_fp8_decode_score_release)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM != 100, reason="native FP8 decode lowering is selected on SM100")
+class TestNativeFp8DecodeDeterminism:
+    from sdpa.frost import native_fp8_decode_determinism as _decode
+
+    test_replay_batch = staticmethod(_decode.test_replay_batch)
+    test_golden = staticmethod(_decode.test_golden)
+    test_warm_refill = staticmethod(_decode.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
+def test_native_fp8_decode_architecture_route(monkeypatch):
+    from sdpa.frost.native_fp8_decode_sm100 import check_architecture_route
+
+    check_architecture_route(monkeypatch)

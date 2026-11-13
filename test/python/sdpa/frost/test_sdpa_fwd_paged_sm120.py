@@ -455,12 +455,28 @@ def test_sm120_frost_paged_widths(dtype, dims, mode, monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dims", [(64, 64), (120, 88)])
 @pytest.mark.parametrize("packed", [False, True])
-def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, tile_n=64, split_kv=1, kv_dtype=None, api_type=None, arch="sm120"):
+def test_sm120_frost_paged_width_determinism(
+    dtype,
+    dims,
+    packed,
+    *,
+    tile_m=64,
+    tile_n=64,
+    split_kv=1,
+    kv_dtype=None,
+    api_type=None,
+    arch="sm120",
+    num_q_heads=4,
+    neighbor_repeats=64,
+    page=16,
+    blocks=5,
+    kv_lengths=None,
+):
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
     from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 
     d, dv = dims
-    h, kh, sq, page, blocks = 4, 2, 17, 16, 5
+    h, kh, sq = num_q_heads, 2, 17
     rng = torch.Generator().manual_seed(13631)
     q = (torch.randn(5, h, sq, d, generator=rng) * 0.3).to(dtype).cuda()
     k = (torch.randn(37, kh, page, d, generator=rng) * 0.3).to(dtype).cuda()
@@ -470,7 +486,7 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
     kt = torch.stack([torch.randperm(37, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
     vt = torch.stack([torch.randperm(37, generator=rng)[:blocks] for _ in range(5)]).int().cuda()
     ql = torch.tensor([17, 1, 0, 9, 16], device="cuda", dtype=torch.int32)
-    kl = torch.tensor([67, 33, 0, 49, 1], device="cuda", dtype=torch.int32)
+    kl = torch.tensor([67, 33, 0, 49, 1] if kv_lengths is None else kv_lengths, device="cuda", dtype=torch.int32)
     sinks = torch.linspace(-0.5, 0.5, h).cuda()
     source = dict(q=q, k=k, v=v, kt=kt, vt=vt, ql=ql, kl=kl, sinks=sinks)
     before = {n: t.clone() for n, t in source.items()}
@@ -595,7 +611,7 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
         return result
 
     target = assert_replays(lambda: run([0]), repeats=4)
-    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * 64 + [0] + [2] * 64):
+    for order in ([1, 0, 2], [2, 1, 0], [0, 1, 0, 2, 3], [4, 0, 3], [1] * neighbor_repeats + [0] + [2] * neighbor_repeats):
         actual = snapshot(run(order))
         for row, sequence in enumerate(order):
             if sequence == 0:
@@ -605,6 +621,10 @@ def test_sm120_frost_paged_width_determinism(dtype, dims, packed, *, tile_m=64, 
     suffix = f"-decode{tile_m}-split{split_kv}" if tile_m in (16, 32) else (f"-d512-split{split_kv}" if min(dims) > 256 else "")
     if kv_dtype is not None:
         suffix += f"-kv{kv_dtype}"
+    if num_q_heads != 4:
+        suffix += f"-h{num_q_heads}"
+    if page != 16 or blocks != 5:
+        suffix += f"-page{page}-blocks{blocks}"
     assert_golden(f"sdpa-{arch}-paged-d{d}v{dv}-{dtype}-pack{int(packed)}{suffix}", before, actual)
 
 
@@ -969,3 +989,19 @@ def test_sm120_mixed_paged_conversion_all_encodings(qdtype, kvdtype):
     torch.testing.assert_close(out, ref, atol=0, rtol=0, equal_nan=True)
     finite = ref.isfinite()
     assert_bitwise({"finite": out[finite]}, {"finite": ref[finite]}, "all finite FP8 encodings and signed zeros")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+@pytest.mark.parametrize("group", [96, 128])
+@pytest.mark.parametrize("splits", [1, 3])
+def test_sm120_wide_subgroup_paged_determinism(dtype, dims, group, splits):
+    test_sm120_frost_paged_width_determinism(dtype, dims, True, tile_m=64, tile_n=32, split_kv=splits, num_q_heads=2 * group, neighbor_repeats=16)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+@pytest.mark.parametrize("group", [96, 128])
+def test_sm120_wide_subgroup_mixed_paged_determinism(dtype, kv_dtype, dims, group):
+    test_sm120_frost_paged_width_determinism(dtype, dims, True, tile_m=64, tile_n=32, split_kv=3, kv_dtype=kv_dtype, num_q_heads=2 * group, neighbor_repeats=16)

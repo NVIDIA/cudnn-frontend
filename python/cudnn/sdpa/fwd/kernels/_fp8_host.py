@@ -204,7 +204,8 @@ def compile_host(
     amax_prescaled=False,
     thd_origin_specs=None,
 ):
-    if amax_prescaled:
+    # None means this specialization cannot be identified for reuse.
+    if cache_key is not None and amax_prescaled:
         cache_key = f"{cache_key}:amax_prescaled"
     if cfg.SPLIT_KV > 1 and not has_lse:
         raise ValueError("prepared FP8 split-KV requires partial LSE")

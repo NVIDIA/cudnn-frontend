@@ -42,15 +42,11 @@ def qsa_backward(
     block_last: Tensor,
     scale: float,
     block_size: int = 4,
-    ds_precision: str = "fp32",
     deterministic: bool = False,
 ) -> TupleDict:
     ...  # dq, dk, dv
 ```
 
-`ds_precision` selects how dS reaches the dQ MMAs. `"fp32"` feeds three bf16
-parts of its fp32 value, which keeps a dQ whose terms nearly cancel accurate.
-`"bf16"` rounds dS to bf16 (on the dense prefix, P as well) at a lower cost.
 `deterministic=True` returns the same gradient bytes on every run with the
 same inputs and packed layout, at a lower speed.
 
@@ -179,8 +175,8 @@ low bits between runs. The dense prefix of each sequence
 runs on a key-tile kernel whose two CTAs share a key tile and accumulate dK / dV
 on chip; the remaining queries write bf16 P / dS records that a key-major pass
 sums per block, so no per-pair floating-point atomics are issued. dS reaches
-the dQ MMAs as three bf16 parts of its fp32 value. With `ds_precision="bf16"`
-dS is rounded to bf16, and on the dense prefix P is as well. A nonfinite
+the dQ MMAs rounded to BF16. The dense prefix forms it from a P that one CTA
+sends the other in BF16, the remaining queries from an FP32 P. A nonfinite
 K / V value of a masked token adds exact zeros. One of a selected token poisons
 the queries that select it and that block's dK / dV, nothing else. A nonfinite
 Q or dO value is not contained: it can also reach the dQ of neighboring sparse
@@ -223,9 +219,9 @@ With `deterministic=True` the backward returns the same `dq`, `dk` and `dv`
 bytes on every run with the same inputs and packed layout: the FP32
 accumulators of the dense prefix add in an order the layout fixes, which the
 other accumulators do in both modes while no two blocks share a token. The
-bytes follow that layout, the GPU's SM count and `ds_precision`
+bytes follow that layout and the GPU's SM count
 ([docs](/operations/determinism), [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/determinism.md)).
-The ordered adds make the dense prefix slower, most with `ds_precision="bf16"`,
+The ordered adds make the dense prefix slower,
 and a plan without a sparse path carries two more FP32 dK / dV accumulators.
 
 ## Support and execution
@@ -254,9 +250,8 @@ where those pay off. A driver without the oversized carveout (older than CUDA
 Calls allocate outputs and scratch on the input device and enqueue work on its
 current PyTorch CUDA stream. The backward compiles different kernels below and
 above the 22528-token dense crossover, from 196608 tokens on, and for each
-`ds_precision` and `deterministic` value. Before CUDA graph capture, warm up
-with the head geometry, token counts, `ds_precision` and `deterministic` the
-capture will use.
+`deterministic` value. Before CUDA graph capture, warm up with the head
+geometry, token counts and `deterministic` the capture will use.
 Compiled kernels reuse symbolic token and block extents; metadata is
 rebuilt from the current bitmap on each call. Forward scratch includes an int32
 `[T, NB]` compact-index buffer and int32 `[T]` counts. Backward compacts the

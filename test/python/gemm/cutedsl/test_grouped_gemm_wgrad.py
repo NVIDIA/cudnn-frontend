@@ -790,10 +790,14 @@ def _make_wgrad_wrapper_cache_inputs(group_k_list, sf_vec_size=16):
     }
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("output_mode", ["dense", "discrete"])
 def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, output_mode):
     from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
+    # The wrapper memo is consulted before the backend cache, so a prior test's
+    # entry could bypass compile(); give this test an empty one.
+    monkeypatch.setattr(grouped_gemm_wgrad_api, "_wgrad_wrapper_memo", {})
     grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
     compile_count = {"value": 0}

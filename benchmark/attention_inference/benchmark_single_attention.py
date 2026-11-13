@@ -104,10 +104,11 @@ def attention_bytes(batch, q_tokens, kv_len, num_q_heads, num_kv_heads, d_qk, d_
 # its numbers silently non-comparable with the other's. Grow BOTH together.
 def _is_attention_kernel(key: str) -> bool:
     return (
-        key.startswith("cudnn")
+        "cudnn" in key
         or key.startswith("kernel_cutlass")
         or "pytorch_flash::" in key
         or "flash::" in key
+        or "flashinfer::" in key
         or "at::native::" in key
         or "cutlass3x" in key
         or "(anonymous namespace)::" in key
@@ -166,16 +167,23 @@ def time_fn(fn, num_warmup, num_iters) -> float:
 
 
 def request_lens(args):
-    """Per-request (q, kv) lengths as int64 CPU tensors. Equal lengths by default; with ``--kv_min_fill F < 1`` a generation
-    batch draws each KV length (seeded) from [max(q, F * kv_len), kv_len], as a serving batch's caches differ."""
+    """Per-request (q, kv) lengths as int64 CPU tensors. Equal lengths by default; with ``--kv_min_fill F < 1`` a batch draws
+    each KV length (seeded) from [F * kv_len, kv_len] (generation: at least q), as a serving batch's caches differ; a prefill
+    with ``--q_min_fill G < 1`` draws each chunk from [G * q_tokens, q_tokens]. q_tokens / kv_len stay the declared maxima."""
     b, sq, skv = args.batch_size, args.q_tokens, args.kv_len
-    if args.kv_min_fill < 1.0 and args.phase == "generation":
-        lo = max(sq, math.ceil(args.kv_min_fill * skv))
+    context = args.phase == "context"
+    if args.kv_min_fill < 1.0:
+        lo = max(1 if context else sq, math.ceil(args.kv_min_fill * skv))
         kv = torch.randint(lo, skv + 1, (b,), generator=torch.Generator().manual_seed(0))
     else:
         kv = torch.full((b,), skv, dtype=torch.int64)
-    q = kv.clone() if (args.phase == "context" and sq == skv) else torch.full((b,), sq, dtype=torch.int64)
-    return q, kv
+    if context and sq == skv:
+        return kv.clone(), kv
+    q = torch.full((b,), sq, dtype=torch.int64)
+    if context and getattr(args, "q_min_fill", 1.0) < 1.0:
+        q = torch.randint(max(1, math.ceil(args.q_min_fill * sq)), sq + 1, (b,), generator=torch.Generator().manual_seed(2))
+    # a prefill chunk never outruns its own cache
+    return q, (torch.maximum(kv, q) if context else kv)
 
 
 def _paged_pool(args, kv_lens, make):
@@ -185,7 +193,7 @@ def _paged_pool(args, kv_lens, make):
     pages = (kv_lens + ps - 1) // ps
     total = int(pages.sum())
     perm = torch.randperm(total, generator=torch.Generator().manual_seed(1)).to(torch.int32)
-    table = torch.zeros(len(kv_lens), int(pages.max()), dtype=torch.int32)
+    table = torch.zeros(len(kv_lens), block_table_pages(args, kv_lens), dtype=torch.int32)
     start = 0
     for i, n in enumerate(pages.tolist()):
         table[i, :n] = perm[start : start + n]
@@ -193,6 +201,16 @@ def _paged_pool(args, kv_lens, make):
     k_pool = make((total, args.num_kv_heads, ps, args.head_dim_qk))
     v_pool = k_pool[..., : args.head_dim_vo] if args.kind == "mla_absorbed" else make((total, args.num_kv_heads, ps, args.head_dim_vo))
     return k_pool, v_pool, table.view(len(kv_lens), 1, -1, 1).cuda()
+
+
+def declared_max_kv(args, kv_lens):
+    """The KV maximum a paged graph declares: the row's ``kv_len``, as FlashInfer's ``max_sequence_kv``, not the drawn lengths'."""
+    return max(int(args.kv_len), int(kv_lens.max()))
+
+
+def block_table_pages(args, kv_lens):
+    """Pages per request in the direct graph's block table: cuDNN checks the table against the declared KV maximum."""
+    return -(-declared_max_kv(args, kv_lens) // args.page_size)
 
 
 def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
@@ -214,9 +232,9 @@ def _cudnn_paged_inputs(graph, args, q_lens, kv_lens, k_pool, v_pool, table):
         seq_len_kv=t["seq_kv"],
         paged_attention_k_table=t["k_table"],
         paged_attention_v_table=t["v_table"],
-        paged_attention_max_seq_len_kv=int(kv_lens.max()),
+        paged_attention_max_seq_len_kv=declared_max_kv(args, kv_lens),
     )
-    if thd:
+    if thd and args.cudnn_total_q == "exact":
         kwargs["max_total_seq_len_q"] = int(q_lens.sum())
 
     def bind_o(o):
@@ -489,23 +507,26 @@ def _paged_kv_layout(kv_lens, page_size, device="cuda"):
     return total, indptr, indices, last_page_len, table.to(device)
 
 
-def setup_flashinfer(args, dtype):
+def setup_flashinfer(args, dtype, fi_backend=None):
     import flashinfer
 
     b, hq, hkv = args.batch_size, args.num_q_heads, args.num_kv_heads
     dqk, dvo = args.head_dim_qk, args.head_dim_vo
     sq, skv = args.q_tokens, args.kv_len
-    fi_backend = os.environ.get("FLASHINFER_BENCH_BACKEND", "auto")
+    fi_backend = fi_backend or os.environ.get("FLASHINFER_BENCH_BACKEND", "auto")
     # Large batch x long-KV split-KV plans need a big float workspace.
     workspace = torch.empty(1024 * 1024 * 1024, device="cuda", dtype=torch.uint8)
 
+    if args.phase == "context" and args.kv_layout == "paged":
+        return _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace)
     if args.phase == "context":
-        # Ragged (contiguous) batch prefill.
-        q_gpu = torch.randn(b * sq, hq, dqk, device="cuda", dtype=dtype) * 0.1
-        k_gpu = torch.randn(b * skv, hkv, dqk, device="cuda", dtype=dtype) * 0.1
-        v_gpu = torch.randn(b * skv, hkv, dvo, device="cuda", dtype=dtype) * 0.1
-        qo_indptr = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * sq
-        kv_indptr = torch.arange(0, b + 1, device="cuda", dtype=torch.int32) * skv
+        # Ragged (contiguous) batch prefill, per-request lengths.
+        q_lens, kv_lens = request_lens(args)
+        q_gpu = torch.randn(int(q_lens.sum()), hq, dqk, device="cuda", dtype=dtype) * 0.1
+        k_gpu = torch.randn(int(kv_lens.sum()), hkv, dqk, device="cuda", dtype=dtype) * 0.1
+        v_gpu = torch.randn(int(kv_lens.sum()), hkv, dvo, device="cuda", dtype=dtype) * 0.1
+        cum = lambda t: torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(t, 0)]).to(device="cuda", dtype=torch.int32)
+        qo_indptr, kv_indptr = cum(q_lens), cum(kv_lens)
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD", backend=fi_backend)
         wrapper.plan(
             qo_indptr,
@@ -636,6 +657,39 @@ def setup_flashinfer(args, dtype):
 
     def fn():
         wrapper.run(q_gpu, kv_cache)
+
+    return fn, f"flashinfer prefill-paged backend={getattr(wrapper, '_backend', fi_backend)}"
+
+
+def _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace):
+    """A serving prefill through FlashInfer's paged wrapper: HND pages, per-request lengths under the declared maxima, and, for
+    its cudnn / auto backends, the lengths and block table that wrapper's cuDNN path declares (FlashInfer's own graph)."""
+    if args.has_sink or args.kind != "gqa":
+        raise NotImplementedError("the paged prefill leg covers GQA without sinks")
+    if args.head_dim_vo != args.head_dim_qk:
+        raise NotImplementedError("the paged prefill leg runs V / O at the Q / K width")
+    hq, hkv, dqk = args.num_q_heads, args.num_kv_heads, args.head_dim_qk
+    q_lens, kv_lens = request_lens(args)
+    _, kv_indptr, kv_indices, last_page_len, block_tables = _paged_kv_layout(kv_lens, args.page_size)
+    total = int(kv_indptr[-1])
+    kv_cache = torch.randn(total, 2, hkv, args.page_size, dqk, device="cuda", dtype=dtype) * 0.1
+    q_gpu = torch.randn(int(q_lens.sum()), hq, dqk, device="cuda", dtype=dtype) * 0.1
+    qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(q_lens, 0)]).to(torch.int32)
+    kw = dict(
+        causal=args.causal,
+        window_left=args.sliding_window_size if args.sliding_window_size else -1,
+        sm_scale=args.sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    if fi_backend in ("cudnn", "auto"):
+        kw.update(seq_lens=kv_lens.to(torch.int32), block_tables=block_tables, max_token_per_sequence=args.q_tokens, max_sequence_kv=args.kv_len)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "HND", backend=fi_backend)
+    wrapper.plan(qo_indptr, kv_indptr.cpu(), kv_indices, last_page_len.cpu(), hq, hkv, dqk, args.page_size, **kw)
+    out = torch.empty_like(q_gpu)
+
+    def fn():
+        wrapper.run(q_gpu, (kv_cache[:, 0], kv_cache[:, 1]), out=out)
 
     return fn, f"flashinfer prefill-paged backend={getattr(wrapper, '_backend', fi_backend)}"
 
@@ -882,6 +936,10 @@ SETUPS = {
     "cudnn_oss": setup_cudnn_oss,
     "cudnn_auto": setup_cudnn_auto,
     "flashinfer": setup_flashinfer,
+    # FlashInfer with its attention backend pinned (the FLASHINFER_BENCH_BACKEND default otherwise): the reference a serving
+    # stack compares cuDNN against, and cuDNN through FlashInfer's own graph declaration.
+    "flashinfer_fa2": lambda args, dtype: setup_flashinfer(args, dtype, "fa2"),
+    "flashinfer_cudnn": lambda args, dtype: setup_flashinfer(args, dtype, "cudnn"),
     "b12x": setup_b12x,
     "flash_mla": setup_flash_mla,
     "flash_attention_4": setup_flash_attention_4,
@@ -924,17 +982,34 @@ def main():
         help="generation: each request's KV length is drawn (seeded) from [F * kv_len, kv_len]; 1.0 = equal lengths. "
         "Served by the paged cudnn legs and flashinfer",
     )
+    p.add_argument(
+        "--q_min_fill",
+        type=float,
+        default=1.0,
+        help="context: each request's Q length is drawn (seeded) from [F * q_tokens, q_tokens]; 1.0 = equal lengths",
+    )
+    p.add_argument(
+        "--cudnn_total_q",
+        choices=["exact", "none"],
+        default="exact",
+        help="cudnn paged prefill: declare the batch's total query tokens (exact), or leave it undeclared as FlashInfer does",
+    )
     args = p.parse_args()
     if not 0.0 < args.kv_min_fill <= 1.0:
         p.error("--kv_min_fill must be in (0, 1]")
+    if not 0.0 < args.q_min_fill <= 1.0:
+        p.error("--q_min_fill must be in (0, 1]")
 
     if args.sm_scale is None:
         args.sm_scale = 1.0 / math.sqrt(args.head_dim_qk)
     dtype = torch.bfloat16 if args.data_type == "bfloat16" else torch.float16
 
     cudnn_leg = args.backend in ("cudnn", "cudnn_oss", "cudnn_auto")
-    if args.kv_min_fill < 1.0 and not ((cudnn_leg and args.kv_layout == "paged") or args.backend == "flashinfer"):
-        raise NotImplementedError("per-request KV lengths are wired for the paged cudnn legs and flashinfer only")
+    fi_leg = args.backend.startswith("flashinfer")
+    if min(args.kv_min_fill, args.q_min_fill) < 1.0 and not ((cudnn_leg and args.kv_layout == "paged") or fi_leg):
+        raise NotImplementedError("per-request lengths are wired for the paged cudnn legs and flashinfer only")
+    if args.q_min_fill < 1.0 and args.phase != "context":
+        raise NotImplementedError("--q_min_fill applies to the context phase")
     fn, detail = SETUPS[args.backend](args, dtype)
     ms = time_fn(fn, args.num_warmup_iterations, args.num_iterations)
 

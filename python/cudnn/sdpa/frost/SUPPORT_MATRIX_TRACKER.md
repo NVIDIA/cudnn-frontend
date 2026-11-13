@@ -1,5 +1,13 @@
 # FROST SDPA — support matrix
 
+**SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
+retain full groups that fit the 64-row tile, including nondividing groups.
+Larger groups use their greatest common divisor with 64 as a subgroup width;
+a width of one is declined. Native Q/O/Stats indexing follows the subgroup,
+while K/V addressing and runtime validation retain the full GQA ratio.
+Existing dense/paged, split, mask and sink eligibility remains in force;
+THD packing and quantized-query partial packing remain unsupported.
+
 **SM80 half PackGQA:** dense queries may pack heads sharing a KV head into
 native MMA rows, including groups that cross tile boundaries. Dense/paged KV,
 split-KV, masks, sinks, bias and independent Q/O/Stats strides use the existing
@@ -27,7 +35,11 @@ heads selecting D512 retain the envelope. THD paging remains declined.
 64-wide Q/K/V/MMA/output specialization of `sm107/prefill_d128_f16.py`.
 FP16/BF16 matching Q/K/V/O, independent table contents, HND/NHD pool layouts,
 page8-1024, masks/windows/sinks, CGA1/2, N64/N128 and partial PackGQA compose.
-Dense plans support split-KV; paged THD remains unsplit. Smaller aligned dense
+Dense plans support split-KV. Exact-D64 paged THD also supports explicit
+CGA1/N128 splits, with or without PackGQA, using the shared physical-64
+single-Q body compiled for SM107. Those partials are FP32 with compact
+workspace; the final combine preserves independent O/Stats origins. Split
+THD sinks and padded Stats retain their existing declines. Smaller aligned dense
 heads use the D64 envelope; THD retains its exact-width rule. Exact D64 also supports E4M3/E5M2 K/V with half Q/O: converted loads use the
 native physical-64 prefill body, including CGA1 dense splits. Unsplit THD
 retains independent origins and packed Stats; mixed D64 THD splits decline
@@ -99,6 +111,26 @@ body and D256 its native body. Other quantization families, Rubin FP8 pools,
 block-scaled O, and THD split/PackGQA remain governed by their existing gates.
 `test_sdpa_fwd_paged_thd_fp8.py` covers independent origins, pool layouts,
 rebinding, retained capture, changed scales/tables/lengths and empty work.
+
+SM100/SM103 exact half D64 THD supports **unsplit whole-group PackGQA**
+at CGA1/2 and N128 with dense or paged K/V. The shared physical-width64
+prefill body writes final O/Stats directly, without partial buffers or combine.
+Standalone compact prefixes and graph physical Q/K/V/O/Stats offsets share
+sequence-local maps; paging keeps independent K/V tables and pool strides.
+The N64 small-tile factory remains dense-only on this architecture, so both
+capability and standalone checks decline N64 for D64 THD before compilation.
+`TestD64ThdPackedUnsplit` covers direct stores, origins, replay, batch changes,
+FP16/BF16 and refill stress. Existing split and proper-divisor domains remain.
+
+SM100/SM103 half D256 paged THD also supports **combined PackGQA and split-KV**
+at CGA2, including partial head groups. The setup retains physical Q origins,
+while partial O/Stats use compact FP32 scratch and the final combine applies
+independent caller O/Stats origins. HND/NHD K/V pools and independent page
+tables retain their existing contract. Standalone compact THD uses the same
+sequence-local maps. This does not widen SM107 or quantized packing admission,
+and candidate generation/ranking remain separate from native capability.
+`TestPagedD256PackedSplit` covers FP16/BF16 origins, capture replay, batch
+invariance and page tails; native frame tests check workspace separation.
 
 Prepared scalar-output MXFP8 dense plans can specialize their declared Stats strides
 at compilation and retain a generic compiled host branch for other valid runtime
@@ -974,7 +1006,7 @@ never name two kernels. `SdpaFwdDslSm100._d64_decode_tile` sets it, mirroring
 `_decode_q_tile` for the d256 tile, and only with the cga knob unset or 1: the
 tile is cga1-only (`make_cfg_d64_decode`), so an explicit `cga=2` selects the
 prefill pipeline instead. Explicit paged THD FP16/BF16 split plans also use
-this native D64 tile on SM100/SM103, with cga1, with or without packed GQA. The shared
+this native D64 tile on SM100/SM103/SM107, with cga1, with or without packed GQA. The shared
 packed partial/combine host supports packed token/head-major Stats; padded
 Stats, sinks and other architectures retain their prior admission. Default
 selection is unchanged.
@@ -1626,6 +1658,23 @@ non-BSHD-physical layout (the packed path has no staging copy), and a graph that
 does not declare **`max_total_seq_len_q`/`_kv`** — those are REQUIRED here,
 because `scratch_workspace_bytes()` is a build-time function and the blocked row
 count comes from the packed totals before any buffer exists.
+**Physical THD origins** (`thd_ragged_offsets`). Each bound Q/K/V/O/dO/Stats/dQ/dK/dV
+ragged-offset tensor is that port's own per-sequence token origin, so storage with gaps between
+sequences is read and written in place: nothing in a gap is read, and nothing in a gap is
+written. The setup launch materializes the origins as an Int64 `[9, B]` region of the workspace.
+Stage 2 (both bodies: the 4x1 role split and the 2x2 twin) acquires sequence-local Q/dO/K/V maps
+(`_seq_thd_input_descs_kernel`, slot `port * B + b`) and reads Stats at its own origin; the delta
+`dot(dO, O)` and the stage-3 GEMM output/operand maps are sequence-local too, and the GQA fold
+reads and writes dK/dV at their origins. A graph binds every THD port with ragged offsets, so
+every graph THD plan on this row takes this path, compact layouts included; the extra map setup
+costs about 1.3 % on a B300 at D512 BF16 (causal and unmasked). The stage-2 PTX of a plan
+without origins is unchanged (`_host` is a thin wrapper over `_host_chain`). The SM107 2x2 fork
+mirrors the stage-2 change line for line (its fork-diff list and its PTX without origins are
+unchanged); the SM107 rows still do not declare
+`thd_ragged_offsets` and are not validated on gapped layouts.
+Pins: `test_sdpa_bwd_thd_origins_sm100.py` (NaN-filled gaps, poisoned outputs, fp64 reference,
+both stage-2 bodies, MHA/GQA, unmasked/bottom-right/window) and the launch-chain census in
+`test_sdpa_bwd_thd_sm100.py` (`seq_thd_input_descs` once per chunk, no clamp launch).
 ʲ Not a gap in this engine: `cu_seq_len_q/kv` is a **forward-only** graph
 attribute. `SDPA_backward_attributes` has no such input port and
 `pygraph.sdpa_backward()` no such keyword, so no backward row can claim it and
@@ -1676,7 +1725,7 @@ a qualification verdict: the backend's cc 10.7 MXFP8 engines mis-report Amax_O (
 harness xfails them), their heuristics crash the process while planning any
 single-query MXFP8 graph without a sink (dense and THD, Stats on or off; cuDNN
 9.26.0.51 and 9.27.0.28; `sdpa/fwd/backend_guard.py` keeps the backend out of
-planning there on every known build -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = None`: cuDNN 9.28.0's heuristics
+planning there below cuDNN 9.30.0 -- `SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 93000`, the 9.30.0.5 nightly measured clean on cc 10.0 / 10.3 / 10.7, 2026-11-12: cuDNN 9.28.0's heuristics
 plan the 21-contract matrix but building the backend's BHSD single-query plan killed the test process on the cc
 10.7 CI lane (2026-10-08), and the detector re-measures the matrix through plan, check_support and build on
 every run of that lane; the same guard covers cc 10.0 / 10.3, where the SM100 decode emitter crashes the same 18 of
@@ -4804,8 +4853,8 @@ and TILE_N 64 or 128. Attention sinks are excluded from the partials and
 folded exactly once by the shared combine; final Stats can use natural or
 base-2 logarithms. Graph and standalone APIs use the same feature domain.
 Existing mask, scalar-tail and per-request padding restrictions still apply.
-Native D64 THD remains nonpaged; explicit split plans use the single-CTA
-N128 body described below. Paged plans retain their existing flavor selection. Automatic split/packing policy is a separate workstream.
+Native D64 THD supports dense or paged KV; explicit split plans use the single-CTA
+N128 body described below. Automatic split/packing policy is a separate workstream.
 
 The physical D64 dense split uses the shared single-Q half body at CGA1/N128,
 compiled for SM107, and native SM107 prefill at CGA2 or N64. Both store FP32
@@ -4999,3 +5048,60 @@ THD, padding, bottom-right, sinks and bias remain declined. GB10 SM121 passes
 and eleven cases per memory/race/synchronization sanitizer. Host admission
 passes 44 MXFP8 checks; SM100/SM120 D128 and D512 compile offline. SM120
 hardware and performance remain unmeasured; candidate placement is unchanged.
+
+
+### SM100/SM103 D192/D256 quantized THD physical addressing
+
+Existing unsplit nonpaged D192/V128 and D256 per-tensor FP8/MXFP8 plans
+forward independent Q/K/V/O/Stats offsets into sequence-local tensor maps.
+D192 uses token dimension1 in its rank-5 K map and dimension2 in Q/V/O;
+D256 per-tensor FP8 uses dimension1 for K/V, while MXFP8 uses it for Q/K/V.
+O remains rank4. Logical length prefixes and packed MXFP8 scale-tile bases
+remain independent of physical data gaps. No eligibility row or knob domain
+changes. `TestMidwidthPhysicalOrigins` in both architecture suites covers
+both admitted D192 cluster widths and D256 CGA1, numerical references,
+changed bindings, capture, concurrent work and batch byte invariance.
+
+### Native SM107 D128 per-tensor FP8 THD physical addressing
+
+The existing unsplit, unpacked D128 FP8 THD route forwards independent
+Q/K/V/O/Stats origins through the common prepared binder. Its existing setup
+launch builds sequence-local maps that clip each live K/V segment; persistent
+loaders acquire the current sequence's maps. Logical lengths and physical
+addresses remain distinct. Eligibility rows and knob domains are unchanged.
+`TestD128Fp8PhysicalOrigins` in `test_sdpa_fp8_sm107.py` pins the native CGA2
+body and covers both FP8 encodings, BF16 O, token/head Stats, changed bindings,
+retained replay and batch invariance. Native SM107 passes all12 strict cases
+with four new byte goldens under CUDA 13.4. Directed memory, race and
+synchronization checks each pass four cases. Ten origin/dense variants also
+compile offline. Other native quantized widths are not qualified by this suite.
+
+### Native SM107 wider per-tensor FP8 THD physical addressing
+
+The existing unsplit, unpacked D192/V128, D256 and D512 FP8 THD routes now
+forward independent Q/K/V/O/Stats origins through their native prepared
+hosts. All four data descriptors are rank-4 on these SM107 bodies, including
+D192 K; the SM100 D192 rank-5 K geometry must not be transferred here.
+The existing setup launch writes sequence-local maps and logical prefixes;
+persistent loaders acquire the current sequence maps, and Stats keeps its
+own origin. Dead initial clusters exit before touching uninitialized maps.
+The public eligibility rows and knob domains are unchanged; split, packed
+and paged paths retain their existing contracts. The native architecture
+entry exposes30 reference/replay/batch/golden cases, all passing on native
+SM107 under CUDA13.4, alongside22 existing compact neighbors and12 golden
+files. Each of memcheck/racecheck/synccheck passes12 directed cases; all30
+offline variants compile. This is not a default placement or performance claim.
+
+### Native SM107 D256 MXFP8 THD physical addressing
+
+The existing native D256 MXFP8 THD route now binds independent Q/K/V/O/Stats
+origins through its prepared host. Q/K/V use sequence-local data maps, while
+Q/K/V scale descriptors keep the packed batch and logical scale-tile prefixes.
+The existing setup launch builds rank-4 data maps and logical metadata; dead
+initial clusters exit before acquiring uninitialized maps. Eligibility rows,
+other MXFP8 widths, packing/splitting and paging are unchanged.
+`TestD256Mxfp8PhysicalOrigins` in the SM107 CI entry passes10 strict
+reference/replay/batch/golden cases under CUDA13.4, with four new goldens.
+All ten origin/dense variants compile;24 compact prepared neighbors pass
+on both parent and candidate. Memcheck4/racecheck4/synccheck4 are clean.
+This is not a default-placement or performance claim.

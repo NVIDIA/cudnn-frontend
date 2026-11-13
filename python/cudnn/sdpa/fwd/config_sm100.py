@@ -91,7 +91,7 @@ from cudnn.sdpa.fwd.config_d128_family import (
 )
 
 # Native half THD flavors whose worklist and Stats stores use packed heads.
-SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128), (576, 512)})
+SM100_THD_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (576, 512)})
 
 # Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
 SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
@@ -475,6 +475,31 @@ class TemplateParams:
     dtype_kv: int = -1
 
 
+def supports_d64_fp8_swap_ab(shape, *, device_cc, paged, thd, batch_size, s_q, h_q, h_kv, pack_gqa, cga):
+    """Legal eight-live-column D64 decode geometry, independent of ranking."""
+    group = h_q // h_kv if pack_gqa and h_kv else 1
+    return (
+        device_cc == (10, 0)
+        and shape == (64, 64)
+        and paged
+        and not thd
+        and 0 < batch_size <= 65535
+        and cga in (None, 1)
+        and h_kv > 0
+        and h_q % h_kv == 0
+        and 0 < group <= 8
+        and 0 < s_q <= 4 * (8 // group)
+    )
+
+
+@dataclass(frozen=True)
+class TemplateParamsDecode(TemplateParams):
+    """Extra geometry for the new swap-AB route, without changing legacy records' cache keys."""
+
+    decode_head_dim: int = 128
+    decode_live_columns: int = 0
+
+
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
 # other flavor must reject it rather than silently reading K/V as dense.
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
@@ -513,7 +538,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
         and thd
         and not padded_stats
         and (
-            (d_shape == (64, 64) and max_q > 0 and (not paged or device_cc in ((10, 0), (10, 3))))
+            (d_shape == (64, 64) and max_q > 0)
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (d_shape == (256, 256) and max_q > 0)
@@ -561,7 +586,15 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """The shared D256 packed-head path serves paged half THD on SM100/103/107."""
-    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+    return (
+        device_cc in ((10, 0), (10, 3), (10, 7))
+        and d_shape == (256, 256)
+        and not fp8
+        and thd
+        and paged
+        and cga in (None, 2)
+        and (split_kv == 1 or (device_cc in ((10, 0), (10, 3)) and split_kv > 1))
+    )
 
 
 def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
@@ -700,7 +733,7 @@ def _validate_params(
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
             (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and not fp8)
-            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
+            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and (not k.pack_gqa or k.paged_kv))
             or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2 and not fp8)
             or (
                 flavor == "d128"
@@ -724,7 +757,7 @@ def _validate_params(
         if k.thd_varlen and not (
             not fp8
             and (
-                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.split_kv > 1)
+                (flavor == "d64" and ((not k.decode_tile and k.cta_mma in (1, 2) and k.split_kv == 1) or (k.decode_tile and k.cta_mma == 1 and k.split_kv > 1)))
                 or (
                     flavor == "d128"
                     and (
@@ -732,13 +765,13 @@ def _validate_params(
                         or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
                     )
                 )
-                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2)
                 or (flavor == "d512" and k.d_flavor == 576 and k.cta_mma == 2)
             )
         ):
             raise ValueError(
-                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, "
-                "paged half d256 cga2 unsplit, or native half d576 cga2"
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1/2 unsplit or cga1 split, "
+                "paged half d256 cga2, or native half d576 cga2"
             )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
@@ -1726,7 +1759,12 @@ def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D25
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     b = bpe(params.dtype_qkv)
     softmax_warps = 4 * (int(params.decode_q_tile) // 16)
+    decode_head_dim = getattr(params, "decode_head_dim", 256)
+    if decode_head_dim not in (128, 256):
+        raise ValueError("swap-AB decode: head-dimension envelope must be 128 or 256")
     cfg = CfgD256Decode(
+        TILE_K=decode_head_dim,
+        TILE_O=decode_head_dim,
         N_Q=int(params.decode_q_tile),
         SOFTMAX_WARPS=softmax_warps,
         MMA_WARP_ID=softmax_warps,
@@ -1753,6 +1791,63 @@ def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D25
         PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d256_decode(cfg, q_tiles)
+    return cfg, _tma_iters(cfg)
+
+
+@dataclass(frozen=True)
+class CfgD128Fp8Decode(CfgD256Decode):
+    """The D128 FP8 swap-AB geometry; shares role and mask fields with half decode."""
+
+    TILE_K: int = 128
+    TILE_O: int = 128
+    DTYPE_QKV: int = DTYPE_E4M3
+    DTYPE_O: int = DTYPE_E4M3
+    BPE: int = 1
+    BPE_O: int = 1
+    TILE_K_HW: int = 32
+    STAGES_KV: int = 5
+    THD_VARLEN: int = 0
+
+
+def make_cfg_d128_fp8_decode(params: TemplateParamsDecode) -> Tuple[CfgD128Fp8Decode, TmaIters]:
+    """Native per-tensor FP8 paged decode, retaining common graph-semantic checks."""
+    # decode_q_tile selects this body instead of the prefill body. Validate
+    # the remaining public semantics with the common D128 predicates.
+    _validate_params("d128", replace(params, decode_q_tile=0))
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    checks = (
+        (params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2), "FP8 inputs required"),
+        (dtype_o in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16), "FP8 or half output required"),
+        (params.cta_mma == 1 and params.paged_kv, "one CTA and paged KV required"),
+        (not params.thd_varlen and not params.ragged_q, "THD queries use the prefill tile"),
+        (not params.pv_bf16 and not params.softmax_f16, "FP8 P and FP32 softmax required"),
+        (not params.dual_kv_stream, "dual_kv_stream selects the prefill pipeline"),
+        (params.decode_q_tile == 16, "a 16-column MMA tile is required"),
+        (getattr(params, "decode_head_dim", 0) == 128, "a physical D128 envelope is required"),
+        (getattr(params, "decode_live_columns", 0) == 8, "eight live softmax columns are required"),
+        (not params.pack_gqa or params.qh_per_kh <= 8, "the full packed head group must fit eight columns"),
+    )
+    for ok, message in checks:
+        if not ok:
+            raise ValueError(f"d128 FP8 decode: {message}")
+    cfg = CfgD128Fp8Decode(
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE_O=bpe(dtype_o),
+        MASK_FLAGS=_mask_flags_from(params),
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
+        HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        SPLIT_KV=int(params.split_kv),
+        PACK_GQA=int(params.pack_gqa),
+        QH_PER_KH=int(params.qh_per_kh),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
+    )
     return cfg, _tma_iters(cfg)
 
 

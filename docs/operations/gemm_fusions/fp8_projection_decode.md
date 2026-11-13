@@ -127,6 +127,21 @@ this one runs, must issue its own wait before it reads `out`, and -- if it alloc
 must fit beside this kernel's columns (at most 96 per SM at the default forms). A consumer launched without the
 attribute is unaffected.
 
+## Launch facts
+
+The entry states what a row count launches without launching it: three read-only answers, with `cfg_for`'s argument.
+
+| fact | answer |
+| --- | --- |
+| `kernel_symbols_for(rows)` | the symbol of the kernel compiled for `rows`, as a one-element tuple; empty until that row count is compiled |
+| `form_for(rows)` | the form as plain data: every field of the rendering `cfg_for` returns under its own name -- `GEOM` (a nested `dict`), `SPLIT_K`, `ROWS`, the resolved performance form (`MMA_M`, `STAGES`, `TOKEN_TILE`, `TMEM_COLS`, `PREWAIT_WEIGHTS`, `HOLD_TMEM`), the launch knobs `PDL` / `PDL_RELEASE` and the part's readings. A fresh `dict` on every call |
+| `launch_shape_for(rows)` | `(grid, block, shared_memory)`: grid `(OUT_FEATURES / MMA_M, split_k, 1)`, block `(256, 1, 1)` and the shared memory the launch reserves per thread block (the "shared memory per CTA" column of the pick table above) -- `((72, 4, 1), (256, 1, 1), 107904)` for one row of `ProjectionGeometry(4608, 8192)` at split 4 under the pick above. A profiler's kernel record of the launch reads the same three values |
+
+The symbol names the weight's shape and nothing of the split, the form or the row count: every rendering of one
+geometry shares it. Compare the form, not the name. A row count outside 1 .. 32 is a typed decline (`ValueError` for
+one that is not a positive `int`, `NotImplementedError` past 32), and none of the three compiles, launches or touches
+device memory.
+
 ## Support matrix
 
 | question | answer |
@@ -148,5 +163,6 @@ The kernel is derived from FlashInfer's cluster split-K dense GEMM (Apache-2.0);
 `THIRD_PARTY_LICENSES.txt` carry the notice and the list of changes.
 
 Tests: `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py` (host declines, config and pick pins,
-the device cells) and `test_fp8_projection_decode_determinism.py` (replay, batch invariance, the pick's byte neutrality,
-goldens). Source: `python/cudnn/gemm/frost/projection_decode/`.
+the launch facts against the configuration arithmetic and against the profiler's record of a launch, the device cells)
+and `test_fp8_projection_decode_determinism.py` (replay, batch invariance, the pick's byte neutrality, goldens).
+Source: `python/cudnn/gemm/frost/projection_decode/`.
