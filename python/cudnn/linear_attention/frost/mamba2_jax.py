@@ -5,8 +5,10 @@
 
 import inspect
 import math
+from functools import partial
 
 import cutlass as ct
+import cutlass.cute as cute
 
 from .common import gate_bwd, head_reduce, split_k
 from .kda_jax import contiguous_view, workspace_views
@@ -144,7 +146,8 @@ def make_launcher(plan, names):
     scalar_types = {name: p.annotation for name, p in parameters.items() if p.annotation in (ct.Int32, ct.Float32)}
     regions = plan.workspace_regions
 
-    def launch(stream, *buffers):
+    @cute.jit
+    def launch(stream, *buffers, config: ct.Constexpr[dict]):
         ports = dict(zip(names, buffers[:-1]))
         w = workspace_views(buffers[-1], regions)
         q, k, v, g, a, cu = (ports[name] for name in ("q", "k", "v", "g", "a", "cu_seqlens"))
@@ -166,9 +169,9 @@ def make_launcher(plan, names):
             dcomposed=None,
             stream=stream,
         )
-        if is_bwd:
+        if ct.const_expr(is_bwd):
             do = ports["dO"]
-            if has_z:
+            if ct.const_expr(has_z):
                 num_vectors = total * (dv // (16 // (io_dtype.width // 8)))
                 n_blocks = max(1, min(-(-num_vectors // gate_bwd.MAMBA2_ZGATE_THREADS), max(1, 4096 // ho)))
                 gate_bwd.mamba2_zgate_bwd_launch(
@@ -199,7 +202,7 @@ def make_launcher(plan, names):
                 seed_indices=ports.get("state_indices"),
                 final_indices=ports.get("state_indices"),
             )
-        if chain:
+        if ct.const_expr(chain):
             args.update(
                 cu_pieces=w["cu_pieces"],
                 main_rows=w["main_rows"],
@@ -213,7 +216,7 @@ def make_launcher(plan, names):
                 transition=w["transition"],
                 seed=state0,
             )
-            if is_bwd:
+            if ct.const_expr(is_bwd):
                 args.update(
                     scheduler_summary_fwd=w["scheduler_summary_fwd"],
                     scheduler_summary_bwd=w["scheduler_summary_bwd"],
@@ -252,7 +255,7 @@ def make_launcher(plan, names):
                 transition=None,
                 workspace=w["tensormaps"],
             )
-            if regenerate:
+            if ct.const_expr(regenerate):
                 args.update(
                     scheduler_recompute=w["scheduler_recompute"],
                     scheduler_bprop=w["scheduler_bwd"],
@@ -264,9 +267,9 @@ def make_launcher(plan, names):
         for name, scalar_type in scalar_types.items():
             args[name] = scalar_type(args[name])
         host(**{name: args[name] for name in parameters})
-        if is_bwd:
+        if ct.const_expr(is_bwd):
             for src, dst, heads in ((dq, ports["dQ"], hq), (dkey, ports["dK"], hk)):
-                if heads != ho:
+                if ct.const_expr(heads != ho):
                     words = total * heads * (dk // 2)
                     head_reduce.launch(
                         src,
@@ -282,7 +285,7 @@ def make_launcher(plan, names):
                         stream,
                     )
             skip_part = w.get("skip_bwd_part")
-            if skip_part is not None:
+            if ct.const_expr(skip_part is not None):
                 skip_part = contiguous_view(skip_part.iterator, (math.prod(skip_part.shape),))
             gate_bwd.mamba2_gate_bwd_launch(
                 w["dot_q"],
@@ -309,4 +312,4 @@ def make_launcher(plan, names):
                 stream,
             )
 
-    return launch
+    return partial(launch, config=config)

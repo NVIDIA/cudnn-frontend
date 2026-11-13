@@ -1223,9 +1223,10 @@ reject without changing the selected reduction mode.
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/operations/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
-Keep dictionary/plan orchestration passed to `cudnn.jax.call` in ordinary Python;
-the bridge supplies the outer `@cute.jit`, while native hosts remain JIT-decorated.
-An extra decorator can lower static branches and flatten DSL dtype classes (`NumericMeta.__extract_mlir_values__` missing `self`).
+In `@cute.jit` JAX launchers, annotate static configuration arguments with
+`cutlass.Constexpr` and guard plan-dependent branches with `cutlass.const_expr`.
+Copying that configuration into a dictionary of tensor arguments does not make
+the new dictionary constexpr; its metadata must not cross a runtime branch.
 Detector: Mamba2 cases in `test/python/linear_attention/jax/test_linear_attention_jax.py::test_forward_and_jitted_gradients`.
 
 JAX tracers do not reveal eventual buffer placement. A default device can supply
