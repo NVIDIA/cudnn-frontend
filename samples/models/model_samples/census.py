@@ -12,14 +12,17 @@ launches.  Three things meet here:
   launches are attributed by family, their number is not a fact of the row) or ``host`` (the sample's own host path, listed
   and not compared);
 * **what the adapters wrote down** -- the call log (:class:`Call`): for every block call of a traced step the call site, the entry
-  instance that served it and the form the adapter passed;
+  instance that served it and the fields of the row's form as THAT instance states them, read from the object that was
+  called after the call (``Block.serving``), never copied from the row;
 * **what the profiler recorded** -- one :class:`Launch` per kernel and per copy of the traced steps, read from the profiler's
   exported trace (:func:`read_trace`): the name, the grid, the block, the shared memory of a thread block.
 
 The kernel check (:func:`check_forms`, :func:`compare`; a sample runs it with ``--check-kernels``):
 
 0. **Form, on the objects.**  Every field a provider row names in its ``form`` equals the entry's own form for the run's row
-   count, and every logged call carries the row's form.  This is the only place a form is shown: see below.
+   count, and every logged call was served by an entry instance that states those same values.  A row of an entry that states
+   its launch names at least one field: with none the entry would be called on its own pick, and nothing would be compared.
+   This is the only place a form is shown: see below.
 1. Every launch of a traced step is attributed.  The exact kernels must be there in the wiring order; a launch between two of
    them must belong to a family that a fallback or host row between them declares.  An unattributed kernel fails the run and is
    named.
@@ -98,13 +101,14 @@ class Launch(NamedTuple):
 
 
 class Call(NamedTuple):
-    """One line of the call log: the block call ``(block, layer)`` at ``rows`` rows was served by ``instance`` with ``form``."""
+    """One line of the call log: the block call ``(block, layer)`` at ``rows`` rows was served by ``instance``, which states
+    ``form`` for the fields the provider row names."""
 
     block: str
     layer: int
     rows: int
     instance: str  # the entry instance, as the adapter names it; "" for a block without one
-    form: tuple
+    form: tuple  # (field, value) pairs as the serving instance states them; () where nothing was passed
 
 
 class Facts(NamedTuple):
@@ -303,13 +307,16 @@ def _short(name: str, width: int = 96) -> str:
 
 
 def check_forms(sites: Sequence[Site], call_log: Sequence[Sequence[Call]] = ()) -> List[str]:
-    """Item 0, on the objects: for every block whose entry states its launch, each field the provider row names equals the
-    entry's own form; and every logged call of a block carries its row's form.  Returns the sentences of what does not
+    """Item 0, on the objects: for every block whose entry states its launch, the provider row names a form and each field
+    it names equals the entry's own form; and every logged call of a block was served by an entry instance that states the
+    row's form (``Call.form``: what the adapter read from the object it called).  Returns the sentences of what does not
     hold."""
     failures = []
     for site in {site.block: site for site in sites}.values():
         if site.wrong:
             failures.append(f"{site.block}: {site.entry} states no launch for this run ({site.wrong}): the provider table is wrong")
+        if not site.form and any(kernel.shape == "entry" for kernel in site.kernels):
+            failures.append(f"{site.block}: the row names no form; {site.entry} would be called on its own pick")
         if site.facts is None:
             continue
         for name, value in site.form:
@@ -318,7 +325,7 @@ def check_forms(sites: Sequence[Site], call_log: Sequence[Sequence[Call]] = ()) 
             elif site.facts.form[name] != value:
                 failures.append(f"{site.block}: the row's form says {name} {value!r}, {site.entry} states {name} {site.facts.form[name]!r} for this run")
     by_site = {(site.block, site.layer): site for site in sites}
-    served = {}  # (block, the form the adapter passed) -> the first call site: one sentence per kind of difference
+    served = {}  # (block, the form the serving instance states) -> the first call site: one sentence per kind of difference
     for calls in call_log:
         for call in calls:
             site = by_site.get((call.block, call.layer))
@@ -582,15 +589,17 @@ class Traced:
         return lines
 
     def dump(self) -> dict:
-        """The census of this pass as plain data: the sites of a step, the call log's entry instances and the launch records of
-        every traced step, names stored once."""
+        """The census of this pass as plain data: the sites of a step -- each with the row's form (``form``) and, from the call
+        log, the entry instance that served it and the form that instance states (``instance``, ``served``) -- and the launch
+        records of every traced step, names stored once."""
         names: Dict[str, int] = {}
         steps = []
         for step in self.steps or []:
             steps.append(
                 [[names.setdefault(r.name, len(names)), canonical(r), r.kind, r.grid, r.block, r.shared_memory, r.registers, *r.graph, r.bytes] for r in step]
             )
-        instances = {(call.block, call.layer): call.instance for calls in self.call_log for call in calls}
+        logged = {(call.block, call.layer): call for calls in self.call_log for call in calls}
+        unlogged = Call("", -1, self.rows, "", ())  # of a pass that made no traced step
         return {
             "rows": self.rows,
             "check": self.status,
@@ -600,8 +609,9 @@ class Traced:
                     "block": site.block,
                     "layer": site.layer,
                     "entry": site.entry,
-                    "instance": instances.get((site.block, site.layer), ""),
+                    "instance": logged.get((site.block, site.layer), unlogged).instance,
                     "form": {name: value for name, value in site.form},
+                    "served": {name: value for name, value in logged.get((site.block, site.layer), unlogged).form},
                     "kernels": [{"id": k.id, "origin": k.origin, "relation": k.relation, "launches": k.launches, "shape": k.shape} for k in site.kernels],
                     "stated": (
                         None

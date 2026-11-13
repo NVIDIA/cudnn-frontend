@@ -157,16 +157,30 @@ def step_facts(records: List[Tuple[str, float, float]]) -> List[Tuple[float, flo
     return steps
 
 
-def _exported(profiler) -> list:
-    """The launch records of a stopped profiler pass: its trace exported to a file of this process's temporary folder and
-    read record by record."""
+def _exported(profiler) -> Tuple[list, str]:
+    """``(launch records, "")`` of a stopped profiler pass -- its trace exported to a file of this process's temporary folder
+    and read record by record -- or ``([], reason)`` where that trace cannot be exported or read.  The file is this
+    function's own and is gone when it returns, so the reason says what failed and never where: the system's words for an
+    error of the file system (the text of an ``OSError`` carries the file's path), any other error's first line without the
+    folder.  No output of a sample names a local path."""
     import os
     import tempfile
 
-    with tempfile.TemporaryDirectory() as folder:
-        path = os.path.join(folder, "trace.json")
-        profiler.export_chrome_trace(path)
-        return read_trace(path)
+    folder, what = "", "exported"
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "trace.json")
+            profiler.export_chrome_trace(path)
+            if not os.path.exists(path):  # the exporter logs what it cannot write and raises nothing
+                return [], "the profiler exported no trace"
+            what = "read"
+            return read_trace(path), ""
+    except OSError as error:  # no temporary folder, no room in it, a file that went away
+        why = os.strerror(error.errno) if error.errno else type(error).__name__
+    except (RuntimeError, ValueError) as error:  # the exporter's refusal; a file that is no trace or ends inside its events
+        why = (str(error).splitlines() or [type(error).__name__])[0]
+        why = (why.replace(folder + os.sep, "") if folder else why)[:120]
+    return [], f"the profiler's trace could not be {what} ({why})"
 
 
 def trace_steps(step: Callable[[int], None], count: int, device=None, records: Optional[list] = None) -> Tuple[Optional[Trace], str]:
@@ -211,11 +225,14 @@ def trace_steps(step: Callable[[int], None], count: int, device=None, records: O
         if records is None:
             device_type = torch.autograd.DeviceType.CUDA
             activity = [(e.name, e.time_range.start / 1e3, e.time_range.end / 1e3) for e in profiler.events() if e.device_type == device_type]
-        else:
-            records.extend(_exported(profiler))
-            activity = [(launch.name, launch.start, launch.end) for launch in records]
-    except (RuntimeError, OSError, ValueError) as error:  # the profiler could not stop, has no records to hand over, or no readable trace
+    except RuntimeError as error:  # the profiler could not stop, or has no records to hand over
         return failed(error)
+    if records is not None:  # the profiler stopped: a trace that cannot be exported or read is said as that, not as its failure
+        exported, reason = _exported(profiler)
+        if reason:
+            return None, reason
+        records.extend(exported)
+        activity = [(launch.name, launch.start, launch.end) for launch in records]
     facts = step_facts(activity)
     if not activity:
         return None, "the profiler recorded no kernel activity on this GPU"

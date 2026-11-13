@@ -9,8 +9,9 @@ containers below are what the blocks of a family pass to each other.  Nothing he
 cuDNN Frontend until :func:`factories` is called.
 
 Every adapter declares its census entries (``kernels``, :class:`model_samples.census.Kernel`): the kernels one call launches.
-An adapter to an entry that states its launch also answers ``launch_facts(rows)`` and names the entry instance that serves a call
-(``serving()``), which a traced step writes into its call log.
+An adapter to an entry that states its launch also answers ``launch_facts(rows)`` and says what served its last call
+(``serving()``: the entry instance, and the fields of the row's form as that instance states them), which a traced step writes
+into its call log.
 """
 
 from __future__ import annotations
@@ -124,9 +125,10 @@ class BlockBase:
         return out
 
     def serving(self) -> Tuple[str, tuple]:
-        """``(entry instance, form)`` of what serves a call of this block, for the call log of a traced step: no entry
-        instance, and the row's form."""
-        return "", tuple(self.row.form)
+        """``(entry instance, form)`` of what served the last call of this block, for the call log of a traced step.  This
+        block has no entry: no instance, and nothing was passed.  (So a row that names a form for it fails the kernel
+        check: nothing carries that form.)  An adapter to an entry answers from the object it called."""
+        return "", ()
 
     def launch_facts(self, rows: int):
         """What the block's entry states about its launch at ``rows``; ``None``: this block has no entry that states one."""

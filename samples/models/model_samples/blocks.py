@@ -121,7 +121,9 @@ class Block(Protocol):
         """What the first launch of each compiled form took, measured at load."""
 
     def serving(self) -> Tuple[str, tuple]:
-        """``(entry instance, form)`` of the entry that serves a call: the line of a traced step's call log."""
+        """``(entry instance, form)`` of what served the block's last call: the line a traced step writes into its call log
+        after the call.  The form is read from the object that was called -- the fields of the row's form as that entry
+        instance states them -- and never copied from the row; a block without an entry has no instance and passed nothing."""
 
     def launch_facts(self, rows: int):
         """What the block's entry states about its launch at ``rows`` (``census.Facts``: the symbols of its compiled kernels, its

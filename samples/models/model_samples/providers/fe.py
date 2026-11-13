@@ -17,7 +17,8 @@ allocator (``first_launch``), which the plan's memory sentence allows for per cl
 The provider row says in which form the entry is called (``row.form``: fields of the entry's own form, under the entry's names).
 The adapter passes exactly those to the entry (``FORM_ARGUMENTS``) and nothing else that fixes the kernel, so the row is the
 whole statement; ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it
-compiled, its form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / ``launch_shape_for``).
+compiled, its form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / ``launch_shape_for``).  ``serving``
+says what served the last call: the entry instance ``__call__`` launched and the row's fields as that instance states them.
 """
 
 from __future__ import annotations
@@ -82,6 +83,8 @@ class GdnDecodeFusedBlock(BlockBase):
     per_row = (0, 1, 2, 3)
     state_args = (5,)
     compiles = True
+    _served = None  # (entry instance, rows) of the last call
+    _answer = None  # (entry instance, rows, what ``serving`` says of them): asked of an instance once, not once per call
 
     def _cudnn(self):
         import cudnn  # before torch in a sample's own imports; here torch is already loaded by the sample
@@ -149,13 +152,26 @@ class GdnDecodeFusedBlock(BlockBase):
 
             geometry = GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden)
             _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
-        self._instance = list(_ENTRIES).index(key) + 1
         return _ENTRIES[key]
 
     def serving(self):
-        """The entry instance of this adapter (one per device, geometry, epsilon and form of the process) and the row's form."""
-        instance = getattr(self, "_instance", None)
-        return (f"{self.entry} #{instance}" if instance else self.entry), tuple(self.row.form)
+        """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
+        this process: one per device, geometry, epsilon and form) and the fields of the row's form as THAT instance states them
+        for the call's row count (its ``form_for``).  Read from the object that was called, never from the row: an entry
+        built without the row's knobs, or a call served from another instance, shows here.  Before the first call nothing
+        has served and nothing was passed."""
+        if self._served is None:
+            return self.entry, ()
+        entry, rows = self._served
+        if self._answer is None or self._answer[0] is not entry or self._answer[1] != rows:
+            place = next((n for n, built in enumerate(_ENTRIES.values(), 1) if built is entry), 0)
+            try:
+                stated = entry.form_for(rows)
+            except (ValueError, NotImplementedError):  # no form stated for rows it has just served: the log shows none
+                stated = {}
+            form = tuple((name, stated[name]) for name, _ in self.row.form if name in stated)
+            self._answer = (entry, rows, (f"{self.entry} #{place}" if place else self.entry, form))
+        return self._answer[2]
 
     def launch_facts(self, rows: int) -> Facts:
         """The entry's own answers for ``rows``: the symbols of the kernels it has compiled for that row count, its form as plain
@@ -204,8 +220,10 @@ class GdnDecodeFusedBlock(BlockBase):
     def __call__(self, x, z, hidden, slot_ids, params, slots):
         import torch
 
+        entry = self._build(x.device)
+        self._served = (entry, int(x.shape[0]))  # what the call log of a traced step reads back (``serving``)
         try:
-            qout = self._build(x.device)(*self._operands(x, z, hidden, slot_ids, params, slots))
+            qout = entry(*self._operands(x, z, hidden, slot_ids, params, slots))
         except NotImplementedError as error:
             raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands of this step: {error}") from error
         return ScaledTensor(qout.view(torch.uint8).view(x.shape[0], -1), params.out_scale_value)

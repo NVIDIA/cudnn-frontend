@@ -195,11 +195,11 @@ class Session:
     # ------------------------------------------------------------------ run
     def _call(self, name: str, layer: int, *operands):
         self._calls += 1
-        if self._call_log is not None:  # a traced step: the call site, and what the adapter says serves it
-            self._call_log.append(census.Call(name, layer, self.sequences, *self.plan[name].serving()))
-        if self.tap is not None:
-            return self.tap(name, layer, self.plan[name], operands)
-        return self.plan[name](*operands)
+        block = self.plan[name]
+        out = self.tap(name, layer, block, operands) if self.tap is not None else block(*operands)
+        if self._call_log is not None:  # a traced step: the call site, and what the adapter says served the call it has just made
+            self._call_log.append(census.Call(name, layer, self.sequences, *block.serving()))
+        return out
 
     def _advance(self, ids: torch.Tensor) -> torch.Tensor:
         if self.state.position >= self.capacity:

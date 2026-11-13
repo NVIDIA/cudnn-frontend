@@ -9,7 +9,8 @@ missing one, a swapped pair, a kernel of a fallback family where none is declare
 another block or another shared memory, another symbol, a kernel nobody declares, an undeclared copy).  Then the same check
 through a real ``Session`` on the CPU and the sample's own checks, with stand-in providers whose launches a stand-in profiler
 records: the clean stand-ins pass, and an adapter that DECLARES one kernel and launches another fails.  With the profiler out,
-the run is ``RAN ... (kernels not observed: <reason>)`` and never ``PASS``.  No GPU, no weights, no profiler."""
+the run is ``RAN ... (kernels not observed: <reason>)`` and never ``PASS``: held on the last line of the sample's own
+``main()``, run to its end on the CPU.  No GPU, no weights, no profiler."""
 
 import json
 import subprocess
@@ -245,7 +246,24 @@ def test_the_wiring_order_of_a_decode_step():
     session._advance(torch.zeros(2, dtype=torch.int32))
     call_log, session._call_log = session._call_log, None
     assert [(call.block, call.layer) for call in call_log] == list(session.model.wiring()), "what a step calls is the wiring"
-    assert {call.rows for call in call_log} == {2} and {call.instance for call in call_log} == {""}, "reference blocks have no entry instance"
+    assert {call.rows for call in call_log} == {2} and {(call.instance, call.form) for call in call_log} == {("", ())}, "no entry instance, nothing passed"
+
+    class Late:  # a block that knows what served a call only once the call was made
+        said = "before the call"
+
+        def __call__(self, operand):
+            self.said = f"after the call on {operand}"
+            return operand
+
+        def serving(self):
+            return self.said, ()
+
+    from model_samples.census import Call
+
+    session.plan["late"], session._call_log = Late(), []
+    result = session._call("late", -1, 7)
+    assert result == 7 and session._call_log == [Call("late", -1, 2, "after the call on 7", ())], "the line is written after the call"
+    session._call_log = None
 
 
 def test_a_clean_step_passes_and_says_what_it_attributed():
@@ -368,11 +386,17 @@ def test_a_second_host_read_and_a_call_log_that_is_not_the_wiring_fail():
     assert census.compare([step], sites, call_log).sentences() == [
         "step 0: the step made 4 block calls, the wiring has 5; call 2 is linear_attention.step (layer 0), the wiring has add_norm_quantize (layer 0) there"
     ]
+    short = [[Call(site.block, site.layer, 1, "", site.form) for site in sites[:-1]]]  # every call of the wiring but its last
+    assert census.compare([step], sites, short).sentences() == [
+        "step 0: the step made 4 block calls, the wiring has 5; call 5 is nothing, the wiring has token_choice there"
+    ]
 
 
 def test_the_form_is_checked_on_the_objects():
-    """Item 0: every field a row names equals the entry's own form, and every logged call carries the row's form.  A launch
-    record cannot show either; a row whose entry declines to state its launch is a wrong table."""
+    """Item 0: every field a row names equals the entry's own form, and every logged call was served by an entry instance that
+    states the row's form.  A launch record cannot show either; a row whose entry declines to state its launch is a wrong
+    table, and so is a row that names no form for an entry that states its launch: nothing would be compared, and the entry
+    would be called on its own pick."""
     from dataclasses import replace
 
     from model_samples import census
@@ -388,11 +412,25 @@ def test_the_form_is_checked_on_the_objects():
     declined = replace(step, facts=None, wrong="cudnn.GdnDecodeFused serves at most 65535 rows; got rows=70000")
     wrong = "linear_attention.step: cudnn.GdnDecodeFused states no launch for this run (cudnn.GdnDecodeFused serves at most 65535 rows; got rows=70000): "
     assert census.check_forms([declined]) == [wrong + "the provider table is wrong"]
-    call_log = [[Call("linear_attention.step", 0, 1, "cudnn.GdnDecodeFused #2", (("PDL", True), ("PDL_RELEASE", True)))]]
-    assert census.check_forms(sites, call_log) == [
+    # a call that another entry instance served: the instance states another form than the row, in every step alike -> one sentence
+    other_instance = Call("linear_attention.step", 0, 1, "cudnn.GdnDecodeFused #2", (("PDL", True), ("PDL_RELEASE", True)))
+    assert census.check_forms(sites, [[other_instance], [other_instance]]) == [
         "linear_attention.step (layer 0): the adapter served the call with the form [PDL True, PDL_RELEASE True] (cudnn.GdnDecodeFused #2); "
         "the row says [PDL False, PDL_RELEASE False]"
     ]
+    # ... and a call that nothing with a form served (an adapter that passes nothing), under a row that names one
+    assert census.check_forms(sites, [[Call("linear_attention.step", 0, 1, "", ())]]) == [
+        "linear_attention.step (layer 0): the adapter served the call with the form [] (no entry instance); the row says [PDL False, PDL_RELEASE False]"
+    ]
+    assert census.check_forms(sites, [[Call(site.block, site.layer, 1, "", site.form) for site in sites]]) == [], "the control: every call as its row says"
+    # a row that names no form for an entry that states its launch: every field would compare equal, because there is none
+    bare = replace(step, form=(), facts=Facts((SYMBOL,), {"PDL": True, "PDL_RELEASE": True}, SHAPE))
+    no_form = "linear_attention.step: the row names no form; cudnn.GdnDecodeFused would be called on its own pick"
+    assert census.check_forms([bare]) == [no_form]
+    assert census.check_forms([replace(bare, facts=None, wrong="declined")])[1:] == [no_form], "said also where the entry stated nothing"
+    assert census.check_forms([replace(sites[0], form=())]) == [], "a kernel known by its name alone has no entry to pick anything"
+    status, lines = census.Traced.of([sites[0], sites[1], bare, *sites[3:]], [], _step(), 1, "", rows=1).judge()
+    assert status == census.FAIL and lines == [f"form: {no_form}"], "it fails a pass whose launch records are clean"
     # a form that does not hold fails a pass whose launch records are clean, and one that observed nothing
     for records, missing in ((_step(), ""), ([], "the profiler failed (no tracing library)")):
         status, lines = census.Traced.of([sites[0], sites[1], other, *sites[3:]], [], records, 1, missing, rows=1).judge()
@@ -442,12 +480,57 @@ def test_provider_rows_state_a_form_and_a_rows_range():
     assert step.form == (("PDL", False), ("PDL_RELEASE", False)), "the fe-cublas row says what the entry does when nothing is passed"
 
 
-def _plan(sequences=1, layers=2, **kwargs):
+def _plan(sequences=1, layers=2, table=None, **kwargs):
     from model_samples.blocks import DeviceFacts, plan
     from model_samples.qwen_dense import QwenDense
 
     model = QwenDense.reduced(layers)
-    return plan(model.provider_table, model.regimes, DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB), sequences, model=model, **kwargs), model
+    facts = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    return plan(table or model.provider_table, model.regimes, facts, sequences, model=model, **kwargs), model
+
+
+def test_every_row_of_an_entry_that_states_its_launch_names_a_form():
+    """The family's provider table: a row whose adapter declares a kernel that is judged against the entry's own launch facts
+    names at least one field of the entry's form.  With none the adapter passes nothing, the entry is called on its own pick
+    and the form check has nothing to compare -- so the check fails such a row, through the real adapter and entry."""
+    from dataclasses import replace
+
+    from model_samples import census
+    from model_samples.providers import factories
+    from model_samples.qwen_dense import QwenDense, configs
+
+    build = factories()
+    stated = [(block, row) for block, rows in configs.PROVIDERS.items() for row in rows if any(kernel.shape == "entry" for kernel in build[row.key].kernels)]
+    assert ("linear_attention.step", "fe.gdn_decode_fused") in [(block, row.key) for block, row in stated], "the table has such rows"
+    for block, row in stated:
+        assert row.form, f"{block}: the row of {row.key} names no form: its entry would be called on its own pick"
+    rows = QwenDense.reduced(2).provider_table["linear_attention.step"]
+    table = dict(QwenDense.reduced(2).provider_table)
+    table["linear_attention.step"] = [replace(rows[0], form=()), *rows[1:]]
+    plan, model = _plan(table=table, options={"device": "cpu"})  # a host entry, built without any knob: its own pick
+    sites = census.expected(plan, model)
+    assert sites[3].form == () and sites[3].facts is not None and "cudnn.GdnDecodeFused: grid (" in census.stated(plan)
+    assert census.check_forms(sites) == ["linear_attention.step: the row names no form; cudnn.GdnDecodeFused would be called on its own pick"]
+
+
+def test_an_entry_that_states_no_launch_for_the_run_is_a_wrong_table(monkeypatch):
+    """A block declares a kernel that is judged against its entry's launch facts, and the adapter has none for the run -- it
+    answers nothing, or the entry declines the row count the row claims: the site carries the reason and the check fails."""
+    from model_samples import census
+    from model_samples.providers import fe
+
+    plan, model = _plan(options={"device": "cpu"})
+    wrong = "linear_attention.step: cudnn.GdnDecodeFused states no launch for this run ({}): the provider table is wrong"
+    monkeypatch.setattr(fe.GdnDecodeFusedBlock, "launch_facts", lambda self, rows: None)
+    sites = census.expected(plan, model)
+    assert sites[3].facts is None and census.check_forms(sites) == [wrong.format("the adapter states no launch facts")]
+
+    def declines(self, rows):
+        raise NotImplementedError(f"cudnn.GdnDecodeFused serves at most 8 rows; got rows={rows}")
+
+    monkeypatch.setattr(fe.GdnDecodeFusedBlock, "launch_facts", declines)
+    assert census.check_forms(census.expected(plan, model, rows=9)) == [wrong.format("cudnn.GdnDecodeFused serves at most 8 rows; got rows=9")]
+    assert "cudnn.GdnDecodeFused: states no launch for this run (cudnn.GdnDecodeFused serves at most 8 rows; got rows=9)" in census.stated(plan, rows=9)
 
 
 def test_the_kernel_table_of_the_default_plan():
@@ -502,21 +585,29 @@ def test_a_row_whose_form_the_adapter_cannot_pass_is_a_wrong_table():
 
 def test_the_adapter_builds_its_entry_from_the_rows_form_and_states_the_entrys_facts(monkeypatch):
     """The cuDNN Frontend adapter over a stand-in entry: the row's form reaches the constructor as the entry's own arguments,
-    one entry instance per form, and ``launch_facts`` hands over the entry's three answers unchanged."""
+    one entry instance per form, and ``launch_facts`` hands over the entry's three answers unchanged.  ``serving`` is an
+    observation: after a call it names the instance that was called and the row's fields as THAT instance states them, so
+    an entry built without the row's knobs and a call served from another instance both show in the call log."""
     from dataclasses import replace
+    from types import SimpleNamespace
 
     import cudnn
 
+    from model_samples import census
     from model_samples.blocks import DeviceFacts
-    from model_samples.providers import fe
+    from model_samples.providers import fe, torch_ref
     from model_samples.qwen_dense import QwenDense, configs
 
     built = []
 
     class Entry:
         def __init__(self, device, eps, geometry=None, **knobs):
-            self.knobs = knobs
+            self.knobs, self.calls = knobs, []
             built.append(self)
+
+        def __call__(self, rows, *operands):
+            self.calls.append(rows)
+            return torch.zeros((rows, 4), dtype=torch.uint8)
 
         def kernel_symbols_for(self, rows):
             return (SYMBOL,) if rows == 1 else ()
@@ -535,18 +626,69 @@ def test_the_adapter_builds_its_entry_from_the_rows_form_and_states_the_entrys_f
     row = configs.PROVIDERS["linear_attention.step"][0]
     facts = DeviceFacts((10, 0), "stated device", 148, 0, 0)
     options = {"device": "cpu", "check_kernels": True}
+
+    def call(block, rows):  # one call of the adapter on operands of ``rows`` rows; the stand-in entry reads none of them
+        weights = SimpleNamespace(conv_weight=None, a_log=None, dt_bias=None, norm_weight=None, out_scale=None, ba_weight=None, out_scale_value=1.0)
+        return block(torch.zeros((rows, 4)), None, None, None, weights, SimpleNamespace(conv=None, state=None))
+
     plain = fe.GdnDecodeFusedBlock(row, model, facts, options)
     plain.check_support(1, 1)
-    assert plain.serving() == ("cudnn.GdnDecodeFused", (("PDL", False), ("PDL_RELEASE", False))), "before the entry is built it has no instance"
+    assert plain.serving() == ("cudnn.GdnDecodeFused", ()), "before a call nothing has served and nothing was passed"
     stated = plain.launch_facts(1)
-    assert built[0].knobs == {"pdl": False, "pdl_release": False} and plain.serving()[0] == "cudnn.GdnDecodeFused #1"
+    assert built[0].knobs == {"pdl": False, "pdl_release": False} and plain.serving() == ("cudnn.GdnDecodeFused", ()), "stating the facts is not a call"
     assert stated == ((SYMBOL,), {"PDL": False, "PDL_RELEASE": False, "ROWS": 1}, ((96, 1, 1), (256, 1, 1), 42112))
     with pytest.raises(NotImplementedError, match="this stand-in serves 8 rows"):
         plain.launch_facts(9)
+    call(plain, 1)
+    assert built[0].calls == [1] and plain.serving() == ("cudnn.GdnDecodeFused #1", (("PDL", False), ("PDL_RELEASE", False)))
     waiting = fe.GdnDecodeFusedBlock(replace(row, form=(("PDL", True),)), model, facts, options)
-    assert waiting.launch_facts(4).form["PDL"] is True and built[1].knobs == {"pdl": True} and waiting.serving()[0] == "cudnn.GdnDecodeFused #2"
+    assert waiting.launch_facts(4).form["PDL"] is True and built[1].knobs == {"pdl": True} and waiting.serving() == ("cudnn.GdnDecodeFused", ())
+    call(waiting, 4)
+    assert built[1].calls == [4] and waiting.serving() == ("cudnn.GdnDecodeFused #2", (("PDL", True),)), "the fields the row names, as the instance states them"
     assert fe.GdnDecodeFusedBlock(row, model, facts, options).launch_facts(1) == stated and len(built) == 2, "one entry per form, shared by every block"
     assert "frost/launch_facts.py" in fe.SOURCE_FILES, "the source hash of a run covers the module the facts come from"
+    chain = torch_ref.GdnDecodeStep(replace(row, key="torch_ref.gdn_decode_step"), model, facts, options)
+    assert chain.serving() == ("", ()) and chain.launch_facts(1) is None, "a block without an entry passes nothing, whatever form its row names"
+
+    # The call log is an observation of the object that was called, not a copy of the row.  (1) A call served from ANOTHER
+    # instance than the one whose facts the check read -- an adapter that owns several: the row's fields equal the facts of
+    # the right instance, so the first half of item 0 holds and only the call log shows it.
+    site = census.Site("linear_attention.step", 0, plain.kernels, plain.entry, tuple(row.form), stated)
+    assert census.check_forms([site], [[census.Call("linear_attention.step", 0, 1, *plain.serving())]]) == []
+    with monkeypatch.context() as patch:
+        patch.setattr(plain, "_build", lambda device: built[1])
+        call(plain, 1)
+    assert built[1].calls == [4, 1] and plain.serving() == ("cudnn.GdnDecodeFused #2", (("PDL", True), ("PDL_RELEASE", False)))
+    assert census.check_forms([site], [[census.Call("linear_attention.step", 0, 1, *plain.serving())]]) == [
+        "linear_attention.step (layer 0): the adapter served the call with the form [PDL True, PDL_RELEASE False] (cudnn.GdnDecodeFused #2); "
+        "the row says [PDL False, PDL_RELEASE False]"
+    ]
+    # (2) A row that says PDL True over an adapter that passes nothing: the entry is built on its own pick, and the log says so.
+    with monkeypatch.context() as patch:
+        patch.setattr(fe, "_ENTRIES", {})
+        patch.setattr(fe.GdnDecodeFusedBlock, "_arguments", lambda self: {})
+        silent = fe.GdnDecodeFusedBlock(replace(row, form=(("PDL", True), ("PDL_RELEASE", True))), model, facts, options)
+        call(silent, 2)
+        assert built[2].knobs == {} and silent.serving() == ("cudnn.GdnDecodeFused #1", (("PDL", False), ("PDL_RELEASE", False)))
+    # (3) An instance that states no form for the rows it has just served shows none: never the row's.
+
+    def no_form(self, rows):
+        raise NotImplementedError(f"no form at rows={rows}")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Entry, "form_for", no_form)
+        mute = fe.GdnDecodeFusedBlock(row, model, facts, options)
+        call(mute, 1)
+        assert built[0].calls == [1, 1] and mute.serving() == ("cudnn.GdnDecodeFused #1", ())
+    # the answer is asked of an instance once per row count, not once per call of a traced step
+    asked = []
+    with monkeypatch.context() as patch:
+        patch.setattr(Entry, "form_for", lambda self, rows: asked.append(rows) or {"PDL": False, "PDL_RELEASE": False})
+        again = fe.GdnDecodeFusedBlock(row, model, facts, options)
+        for rows in (1, 1, 1, 2, 2):
+            call(again, rows)
+            assert again.serving() == ("cudnn.GdnDecodeFused #1", (("PDL", False), ("PDL_RELEASE", False)))
+    assert asked == [1, 2]
 
     class Older:  # an installed package whose entry states no launch facts
         pass
@@ -588,20 +730,22 @@ def _tiny_session(sequences, stack="reference"):
     return session, text
 
 
-def _recorded_run(monkeypatch, step_launches=None, declares=None, profiler="records", sequences=2):
-    """A decode of the tiny geometry on the CPU through the ``fe-cublas`` rows, with a device that exists only as a log: every
-    provider is a stand-in that runs the reference's arithmetic and writes the launches a real provider of its row would make
-    into the log; a stand-in profiler hands the log over as the launch records of the traced pass.
+def _stand_ins(monkeypatch, step_launches=None, declares=None, profiler="records", serves=None):
+    """The provider factories of a device that exists only as a log: every provider of the ``fe-cublas`` rows is a stand-in that
+    runs the reference's arithmetic and writes the launches a real provider of its row would make into the log; a stand-in
+    profiler (it replaces ``loop.trace_steps``) hands the log over as the launch records of a traced pass.
 
     ``step_launches`` replaces what the stand-in of the fused step launches (default: the entry's own symbol in the shape the
-    entry states); ``declares`` replaces the census entries it declares.  ``profiler``: ``"records"``, or the reason it cannot
-    run.  Returns ``(session, text, prompts)`` with the run recorded and the traced pass not yet made."""
-    from model_samples import Session, TextIO, blocks, loop
+    entry states); ``declares`` replaces the census entries it declares; ``serves`` what it says served a call (default: its
+    one entry instance, which states the form of the row).  ``profiler``: ``"records"``, or the reason it cannot run -- or a
+    list of these, one per traced pass, the last one for every further pass."""
+    from model_samples import loop
     from model_samples.census import Facts, Kernel, Launch
     from model_samples.providers import factories, torch_ref
     from model_samples.timing import Trace
 
     log = []
+    passes = [profiler] if isinstance(profiler, str) else list(profiler)
 
     def launch(name, shape=((1, 1, 1), (128, 1, 1), 0), kind="kernel"):
         at = float(len(log))
@@ -623,8 +767,8 @@ def _recorded_run(monkeypatch, step_launches=None, declares=None, profiler="reco
         def launch_facts(self, rows):
             return Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, ((96, rows, 1), (256, 1, 1), 42112))
 
-        def serving(self):
-            return "cudnn.GdnDecodeFused #1", tuple(self.row.form)
+        def serving(self):  # what the stand-in's own entry instance states, whatever the row says
+            return serves or ("cudnn.GdnDecodeFused #1", (("PDL", False), ("PDL_RELEASE", False)))
 
         def __call__(self, x, z, hidden, slot_ids, params, slots):
             for name, shape in step_launches or [(SYMBOL, ((96, x.shape[0], 1), (256, 1, 1), 42112))]:
@@ -648,8 +792,9 @@ def _recorded_run(monkeypatch, step_launches=None, declares=None, profiler="reco
             stand_in.kernels, stand_in.provider = real.kernels, real.provider
 
     def profiled(step, count, device=None, records=None):
-        if profiler != "records":
-            return None, profiler
+        outcome = passes.pop(0) if len(passes) > 1 else passes[0]
+        if outcome != "records":
+            return None, outcome
         del log[:]
         for i in range(count):
             step(i)
@@ -659,12 +804,22 @@ def _recorded_run(monkeypatch, step_launches=None, declares=None, profiler="reco
         return Trace(count, 1.0, 2.0, 3, 4, 5.0), ""
 
     monkeypatch.setattr(loop, "trace_steps", profiled)
+    return dict(factories(), **stand_ins)
+
+
+def _recorded_run(monkeypatch, sequences=2, **stand_in):
+    """A decode of the tiny geometry on the CPU through the ``fe-cublas`` rows, on the stand-in providers and the stand-in
+    profiler of :func:`_stand_ins` (``stand_in``: its options).  Returns ``(session, text, prompts)`` with the run recorded
+    and the traced pass not yet made."""
+    from model_samples import Session, TextIO, blocks
+
+    build = _stand_ins(monkeypatch, **stand_in)
     model = _tiny_model()
     text = TextIO.synthetic(model.geometry.vocab)
     session = Session(model, text, sequences=sequences, stack="fe-cublas", device="cpu", capacity=16, check_kernels=True)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
     options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True}
-    session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=dict(factories(), **stand_ins))
+    session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, model=model, options=options, factories=build)
     session.load()
     prompts = [text.encode("ab" + str(s)) for s in range(sequences)]
     ids = session.prefill(prompts)
@@ -705,6 +860,7 @@ def test_the_kernel_check_of_a_run_holds_on_clean_stand_ins(monkeypatch):
     assert dumped["names"][fused[0]] == SYMBOL and fused[2:6] == ["kernel", (96, 2, 1), (256, 1, 1), 42112]
     site = dumped["sites"][3]
     assert site["block"] == "linear_attention.step" and site["instance"] == "cudnn.GdnDecodeFused #1" and site["form"] == {"PDL": False, "PDL_RELEASE": False}
+    assert site["served"] == {"PDL": False, "PDL_RELEASE": False} and dumped["sites"][0]["served"] == {}, "from the call log: what the instance states"
     assert site["stated"] == {"symbols": [SYMBOL], "launch": [[96, 2, 1], [256, 1, 1], 42112]} and site["kernels"][0]["relation"] == "exact"
     session = _recorded_run(monkeypatch)[0]
     session.trace(4, records=False)
@@ -749,6 +905,26 @@ def test_an_adapter_that_declares_one_kernel_and_launches_another_fails(monkeypa
         f"kernels: step 0 (and 3 more of the 4 traced steps): launched {SYMBOL[:93] + '...'!r} after embedding: the kernel gdn_decode_fused, "
         "which no block of the plan declares"
     ], hidden
+
+
+def test_a_call_served_by_another_entry_instance_fails_the_run(monkeypatch):
+    """The call log through a real session.  The stand-in of the fused step launches the kernel its entry names, in the shape
+    its entry states -- the launch records are clean -- but says that another entry instance served its calls, one that
+    states another form than the row.  Only the call log shows it; the other four checks hold."""
+    from model_samples import census, tie_out
+
+    session = _recorded_run(monkeypatch, serves=("cudnn.GdnDecodeFused #2", (("PDL", True), ("PDL_RELEASE", True))))[0]
+    session.trace(4)
+    assert session.traced.call_log[0][3] == census.Call("linear_attention.step", 0, 2, "cudnn.GdnDecodeFused #2", (("PDL", True), ("PDL_RELEASE", True)))
+    checks = tie_out.run_checks(session, prompt_tokens=3, kernels=True)
+    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
+    assert [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")] == [
+        "kernels: form: linear_attention.step (layer 0): the adapter served the call with the form [PDL True, PDL_RELEASE True] "
+        "(cudnn.GdnDecodeFused #2); the row says [PDL False, PDL_RELEASE False]"
+    ], checks.text()
+    for other in ("replay", "blocks", "tokens", "batch invariance"):
+        assert _line(checks, other).endswith("PASS"), checks.text()
+    assert session.traced.dump()["sites"][3]["served"] == {"PDL": True, "PDL_RELEASE": True}
 
 
 def _sample_script(monkeypatch):
@@ -802,8 +978,12 @@ def test_without_a_profiler_the_run_is_reported_and_never_a_pass(monkeypatch, ca
 
 def test_the_traced_pass_hands_over_its_launch_records(monkeypatch, tmp_path):
     """``trace_steps`` with a list: the profiler's trace is exported and its kernel and copy records are appended, the step
-    facts come from them; the records are handed over also where they cannot be cut into the steps that ran; a trace that
-    cannot be exported is the profiler's failure, not the run's."""
+    facts come from them; the records are handed over also where they cannot be cut into the steps that ran.  A trace that
+    cannot be exported or read is a reason, not an error of the run -- and the reason says what failed, never where: the
+    file is a temporary one, and no output of a sample names a local path."""
+    import errno
+    import os
+
     import torch.profiler
 
     from model_samples import timing
@@ -831,6 +1011,15 @@ def test_the_traced_pass_hands_over_its_launch_records(monkeypatch, tmp_path):
             return False
 
         def export_chrome_trace(self, path):
+            Profile.path = path
+            if self.fail == "no room":
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), path)
+            if self.fail == "names the file":
+                raise RuntimeError(f"cannot save the trace to {path}\nsecond line")
+            if self.fail == "cut short":
+                return Path(path).write_text(_trace_text(events(self.steps))[:900])
+            if self.fail == "writes nothing":
+                return None  # an exporter that logs what it cannot write and raises nothing
             if self.fail:
                 raise RuntimeError(self.fail)
             Path(path).write_text(_trace_text(events(self.steps)))
@@ -847,9 +1036,19 @@ def test_the_traced_pass_hands_over_its_launch_records(monkeypatch, tmp_path):
     Profile.steps = 3
     records = []
     assert timing.trace_steps(ran.append, 2, records=records) == (None, "the records show 3 host reads for 2 steps") and len(records) == 9
-    Profile.fail = "the trace could not be saved"
-    records = []
-    assert timing.trace_steps(ran.append, 2, records=records) == (None, "the profiler failed (the trace could not be saved)") and records == []
+    for fail, reason in (
+        ("the trace could not be saved", "the profiler's trace could not be exported (the trace could not be saved)"),
+        ("no room", "the profiler's trace could not be exported (No space left on device)"),
+        ("names the file", "the profiler's trace could not be exported (cannot save the trace to trace.json)"),
+        ("writes nothing", "the profiler exported no trace"),
+        ("cut short", "the profiler's trace could not be read (the exported trace ends inside its traceEvents array)"),
+    ):
+        Profile.fail, records = fail, []
+        outcome = timing.trace_steps(ran.append, 2, records=records)
+        assert outcome == (None, reason) and records == [], fail
+        folder = os.path.dirname(Profile.path)
+        assert os.path.isabs(Profile.path) and not os.path.exists(folder), "the trace was a file of a temporary folder, which is gone"
+        assert os.sep not in reason and os.path.basename(folder) not in reason, "the reason names no path"
 
 
 def test_the_samples_flags_for_the_kernel_check(monkeypatch, capsys):
@@ -927,6 +1126,111 @@ def test_the_kernel_table_is_printed_before_the_load_and_a_decline_is_a_skip(mon
     skip = "[00] SKIP the kernel check needs the launch facts of cudnn.GdnDecodeFused (kernel_symbols_for, form_for, launch_shape_for); "
     skip += "this nvidia-cudnn-frontend "
     assert code == 0 and out.splitlines()[-1].startswith(skip) and out.splitlines()[-1].endswith("or run without --check-kernels"), out
+
+
+def _sample_run(monkeypatch, capsys, arguments, **stand_in):
+    """``main()`` of the sample script to its LAST line, on the CPU: stated device facts (compute capability 10.0), the tiny
+    geometry, and the stand-in providers and stand-in profiler of :func:`_stand_ins` (``stand_in``: its options).  Returns
+    ``(exit code, the lines the run printed)``."""
+    import importlib.util
+
+    from model_samples import blocks
+    from model_samples.qwen_dense import QwenDense
+
+    model_samples = importlib.import_module("model_samples")  # the package as an object: its names are patched below
+    build = _stand_ins(monkeypatch, **stand_in)
+    stated = blocks.DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    real_session = model_samples.Session
+
+    def session(model, text, **options):  # the sample's session on the CPU, planned on the stated facts and the stand-ins
+        made = real_session(model, text, **dict(options, device="cpu"))
+        plan_options = {"reference_precision": made.reference_precision, "device": "cpu", "check_kernels": made.check_kernels}
+        table, regimes = model.provider_table, model.regimes
+        made.plan = blocks.plan(table, regimes, stated, made.sequences, 1, made.stack, made.overrides, model=model, options=plan_options, factories=build)
+        return made
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (80 * GIB, 180 * GIB))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: stated))
+    monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
+    monkeypatch.setattr(model_samples, "Session", session)
+    monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=None: _tiny_model()))
+    paths = list(sys.path)
+    spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_census_run", MODELS / "qwen_dense" / "00_decode.py")
+    module = importlib.util.module_from_spec(spec)
+    capsys.readouterr()
+    try:
+        spec.loader.exec_module(module)
+        code = module.main(["--force-tokens", "4", *arguments])
+    finally:
+        sys.path[:] = paths
+    return code, capsys.readouterr().out.splitlines()
+
+
+def _kernel_lines(lines):
+    return [line.strip() for line in lines if line.startswith("  kernels  ")]
+
+
+def test_the_last_line_of_a_run_that_checks_its_kernels(monkeypatch, capsys, tmp_path):
+    """The sample's ``main()`` with ``--check-kernels``, run to its last line.  Stand-in launch records that hold: ``[00] PASS``.
+    A stand-in that launches another shape than its entry states: ``[00] FAIL``, exit code 1.  The profiler out: the kernels
+    line reads ``NOT OBSERVED`` and the last line is ``[00] RAN fe-cublas stack (kernels not observed: <reason>)`` with exit
+    code 0 -- never ``PASS``, also where only ONE of the run's sequence counts could not be observed."""
+    code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "2"])
+    assert code == 0 and lines[-1] == "[00] PASS", lines[-3:]
+    (line,) = _kernel_lines(lines)
+    assert line.endswith("    PASS") and "2 on exact rows, in the wiring order" in line, line
+    assert any(line.startswith("kernels, planned (decided before the load") for line in lines) and "[00] seeded weights" in lines[-2]
+
+    code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "2"], step_launches=[(SYMBOL, ((96, 2, 1), (256, 1, 1), 74848))])
+    assert code == 1 and lines[-1] == "[00] FAIL", lines[-3:]
+    assert _kernel_lines(lines)[0].endswith("; 1 kind of difference between the launches and the plan    FAIL")
+
+    reason = "the profiler failed (no tracing library)"
+    code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "2"], profiler=reason)
+    assert code == 0 and lines[-1] == f"[00] RAN fe-cublas stack (kernels not observed: {reason})", lines[-3:]
+    assert _kernel_lines(lines) == [f"kernels           not observed: {reason}    NOT OBSERVED"] and "[00] PASS" not in lines
+    others = [line for line in lines if line.startswith(("  replay  ", "  blocks  ", "  tokens  ", "  batch invariance  "))]
+    assert len(others) == 4 and all(line.endswith("PASS") for line in others), "the other four checks held"
+
+    # two sequence counts, the profiler out for the first one only: one pass that was not observed is a run that was not
+    code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "1,2"], profiler=[reason, "records"])
+    first, second = _kernel_lines(lines)
+    assert first.endswith("    NOT OBSERVED") and second.endswith("    PASS"), (first, second)
+    assert code == 0 and lines[-1] == f"[00] RAN fe-cublas stack (kernels not observed: {reason})", lines[-3:]
+
+    # without the flag the same run is a PASS and prints no kernel line: the profiler's records are not asked for
+    code, lines = _sample_run(monkeypatch, capsys, ["--sequences", "2"], profiler=reason)
+    assert code == 0 and lines[-1] == "[00] PASS" and _kernel_lines(lines) == [] and not any(line.startswith("kernels, planned") for line in lines)
+
+
+def test_the_census_file_of_a_run(monkeypatch, capsys, tmp_path):
+    """``--dump-census FILE`` through ``main()``: the launch records of the traced pass are written and the run says so by
+    the file's own name; with nothing observed there is nothing to write, which is an ``ERROR`` that names the file and
+    states the run's own verdict -- never an empty file under a ``RAN`` line."""
+    target = tmp_path / "census.json"
+    code, lines = _sample_run(monkeypatch, capsys, ["--dump-census", str(target), "--sequences", "2"])
+    assert code == 0 and lines[-1] == "[00] PASS" and "[00] launch records of 1 traced pass(es) written to census.json" in lines, lines[-4:]
+    written = json.loads(target.read_text())
+    assert (written["sample"], written["stack"], written["schema"], written["traced_steps"]) == ("qwen_dense/00_decode", "fe-cublas", 1, 32)
+    assert written["gpu"] == {"name": "stated device", "compute_capability": [10, 0], "sm_count": 148} and str(tmp_path) not in target.read_text()
+    (run,) = written["runs"]
+    assert (run["sequences"], run["prompt"], run["rows"], run["check"], run["not_observed"]) == (2, 0, 2, "PASS", "")
+    assert _kernel_lines(lines)[0].startswith(f"kernels           {len(run['steps'])} traced steps: "), "every traced step of the kernels line is in the file"
+    assert all(run["names"][step[-1][0]] == HOST_READ for step in run["steps"]) and len(run["steps"]) > 4, "each ends with its host read"
+    step = run["sites"][3]
+    assert step["instance"] == "cudnn.GdnDecodeFused #1" and step["form"] == step["served"] == {"PDL": False, "PDL_RELEASE": False}
+    target.unlink()
+    reason = "the profiler failed (no tracing library)"
+    code, lines = _sample_run(monkeypatch, capsys, ["--dump-census", str(target), "--sequences", "2"], profiler=reason)
+    ran = f"RAN fe-cublas stack (kernels not observed: {reason})"
+    assert (
+        code == 1 and lines[-1] == f"[00] ERROR --dump-census census.json: no launch records to write (kernels not observed: {reason}) (the run itself: {ran})"
+    )
+    assert not target.exists(), "nothing was observed: no file"
 
 
 def test_a_dry_plan_with_its_kernel_table_imports_nothing_new():
