@@ -821,6 +821,9 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # the role-split and the 2x2 specializations coexist in one process (the decode_q_tile precedent).
         filename = _SM100_D512_2X2_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_2x2"
+    elif fp8 and pertensor and flavor == (128, 128) and getattr(params, "decode_q_tile", 0):
+        filename = "sm100/decode_d128_fp8.py"
+        tag = f"sdpa_fwd_sm100_fp8_decode_{tag}"
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
@@ -4234,10 +4237,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and params.cta_mma == 1
             and self.paged
             and not self.thd
-            and not self._fp8
             and not self._mixed_fp8_kv
             and 0 < decode_rows <= 8
-            and params.dtype_o in (-1, params.dtype_qkv)
+            and (
+                (not self._fp8 and params.dtype_o in (-1, params.dtype_qkv))
+                or (
+                    self._fp8
+                    # SM103's existing producer schedule is faster on the
+                    # measured FP8 decode cells; keep its current lowering.
+                    and self._device_cc == (10, 0)
+                    # This decode body always puts batch in gridDim.y.
+                    and self.batch_size <= 65535
+                    and self._pertensor
+                    and not params.pv_bf16
+                    and not params.softmax_f16
+                    and not params.ragged_q
+                    and params.dtype_o in (-1, 0, 1, 2, 3)
+                )
+            )
             and self.gate_desc is None
             and self.bias_desc is None
             and self.kv_mask_desc is None
@@ -4245,7 +4262,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.score_max_desc is None
             and self.score_sum_exp_desc is None
         ):
-            params = Sm100DecodeTemplateParams(**vars(replace(params, decode_q_tile=16)), decode_head_dim=128, decode_live_columns=8)
+            params = Sm100DecodeTemplateParams(**vars(replace(params, decode_q_tile=16, dual_kv_stream=False)), decode_head_dim=128, decode_live_columns=8)
         return params
 
     def compile(self) -> None:

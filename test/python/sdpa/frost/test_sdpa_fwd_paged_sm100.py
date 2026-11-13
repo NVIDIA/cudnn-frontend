@@ -1532,6 +1532,8 @@ def _run_graph_fp8(
     d_v=None,
     head_padding=False,
     softmax_precision=None,
+    amax=True,
+    stats_log2=False,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1606,6 +1608,7 @@ def _run_graph_fp8(
         scale_o=son,
         attn_scale=scale,
         generate_stats=stats,
+        stats_use_log2=stats_log2,
         use_padding_mask=True,
         seq_len_q=sq_t,
         seq_len_kv=sk_t,
@@ -1620,7 +1623,8 @@ def _run_graph_fp8(
         lse = torch.empty(B, H, s_q, 1, device=dev, dtype=torch.float32)
         st.set_output(True).set_dim([B, H, s_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amax_o = torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32)
-    amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if amax:
+        amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -1668,6 +1672,8 @@ def _run_graph_fp8(
         ssn: _sc(1.0),
         son: _sc(1.0),
     }
+    if not amax:
+        vp.pop(amx_o)
     if sink_t is not None:
         vp[sink_t] = sinks
     if stats:
@@ -1724,9 +1730,12 @@ def _run_graph_fp8(
         assert torch.count_nonzero(out[dead]).item() == 0, "trimmed and sink-only rows must write exact zero O"
     # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32 values; the
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
-    assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
+    if amax:
+        assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
     if stats:
         got_lse = lse.view(B, H, s_q)
+        if stats_log2:
+            ref_lse = ref_lse * math.log2(math.e)
         lse_atol = _fp8_lse_atol(256 if max(d, d_v) > 128 else d)
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=lse_atol, rtol=0)
         if (~live).any():
@@ -1739,7 +1748,9 @@ def _run_graph_fp8(
             tensors["sinks"] = sink_t
         if stats:
             tensors["lse"] = st
-        return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
+        buffers = {name: vp[tensor] for name, tensor in tensors.items() if tensor in vp}
+        buffers["amax_o"] = amax_o
+        return g, vp, ws, buffers, tensors
     return (plan, g) if return_graph else plan
 
 

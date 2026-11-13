@@ -187,6 +187,12 @@ root (`test/python`); pytest's own `sys.path` changes are not inherited. Check
 the child from a temporary working directory without that root on `PYTHONPATH`.
 The delayed-MMA FP8 dual-KV probe needs both this root and `sdpa/frost`.
 
+Compiler subprocesses must import the same `cudnn` package as their parent.
+Derive its package root from `cudnn.__file__`, then check the child import path.
+CI may run source tests against an installed wheel while the source checkout
+contains no native extension; prepending `<checkout>/python` then fails before
+compilation. The native FP8 decode score-release probe exercises this contract.
+
 
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its
@@ -547,6 +553,13 @@ FP8 D128 cases and checks both prepared and standalone graph execution.
 Default-provider passes alone cannot qualify an advertised native path.
 
 ### CUDA Graph test lifetimes
+
+Apply `torch.cuda.set_sync_debug_mode("error")` around the execute body,
+inside an already entered CUDA Graph context. PyTorch capture setup itself can
+synchronize on newer versions; auditing `capture_begin()` can raise after
+capture starts and poison subsequent tests. Restore the prior mode before the
+context exits. Native FP8 decode graph tests cover eager and captured execution
+with this boundary.
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
 `finally` block or context manager. Python reference cycles can defer its CUDA
