@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Per-tensor FP8 paged decode with swap-AB MMA and a D128 physical tile.
+"""Per-tensor FP8 dense or paged decode with swap-AB MMA and a D128 physical tile.
 
 The D64 flavor uses TMA zero fill for the physical tile's extra columns;
 output stores retain the runtime logical widths. Short MTP queries span

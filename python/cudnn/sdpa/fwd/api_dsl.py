@@ -112,6 +112,7 @@ from cudnn.sdpa.fwd.config_sm100 import SM100_DENSE_ONLY_D_SHAPES as _SM100_DENS
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     supports_d64_fp8_swap_ab,
+    supports_dense_fp8_swap_ab,
     FP8_DUAL_KV_STREAM_MAX_ROWS,
     fp8_dual_kv_stream_routed,
     supports_thd_split,
@@ -793,6 +794,10 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # version-0 descriptor window) -- the dense twin of the single-CTA THD leg above (issue #1472).  THD_VARLEN at cga1
         # is the two-slab paged prefill (above) or the single-Q split (above); never this body.
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
+    if rubin and fp8 and pertensor and flavor == (128, 128) and getattr(params, "decode_q_tile", 0):
+        # This shared body has a dense TMA loader and fits the version-0 SMEM
+        # descriptor window. Compile it for the actual Rubin target.
+        return _load_kernel_template("sm100/decode_d128_fp8.py", params, f"sdpa_fwd_sm107_fp8_decode_{tag}")
     if rubin:
         # Tag spelling is load-bearing: it keys the template-module cache, and
         # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
@@ -962,9 +967,10 @@ class SdpaFwdDsl(APIBase):
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
-        ``swap_ab`` (APPENDED): explicit SM100 D64 per-tensor FP8 paged
-        implementation, 0 = existing prefill, 1 = swap-AB decode with eight
-        live query columns per token unit. None preserves the existing
+        ``swap_ab`` (APPENDED): explicit per-tensor FP8 implementation for
+        SM100 D64 paged or SM100/SM103/SM107 D128 dense decode. 0 = existing
+        prefill, 1 = swap-AB decode with eight live query columns per token
+        unit. Dense D128 requires CGA1 and one unit. None preserves the existing
         selection. Unsupported requests fail at support checking; the graph
         exposes this performance choice as the existing SWAP_AB knob.
 
@@ -1227,7 +1233,7 @@ class SdpaFwdDsl(APIBase):
         if swap_ab is not None and (type(swap_ab) is not int or swap_ab not in (0, 1)):
             raise ValueError("swap_ab must be None, 0 or 1")
         if swap_ab is not None and not isinstance(self, SdpaFwdDslSm100):
-            raise NotImplementedError("SWAP_AB is supported only by the SM100 D64 per-tensor FP8 paged lowering")
+            raise NotImplementedError("SWAP_AB is supported only by the SM100-family per-tensor FP8 lowering")
         self.swap_ab = swap_ab
         # Unlike scheduler/CGA defaults, standalone split_kv=None means unsplit;
         # graph heuristics pass an explicit split count when splitting wins.
@@ -3767,17 +3773,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         if self.swap_ab is not None:
             self._not_implemented_error_if(
-                not self._d64_fp8_swap_ab_leg(),
-                "SWAP_AB requires SM100 D64 per-tensor FP8, dense Q/paged KV, CGA1, at most four eight-column token units, without extra epilogues",
+                not self._fp8_swap_ab_leg(),
+                "SWAP_AB requires per-tensor FP8 SM100 D64 paged or SM100/SM103/SM107 D128 dense decode, CGA1 and supported query geometry, without extra epilogues",
             )
         self._check_native_dense_layouts()
         self._is_supported = True
         self._logger.debug("check_support completed successfully")
         return True
 
-    def _d64_fp8_swap_ab_leg(self) -> bool:
+    def _fp8_swap_ab_leg(self) -> bool:
         from cudnn import data_type
 
+        geometry = dict(
+            device_cc=self._device_cc,
+            paged=self.paged,
+            thd=self.thd,
+            batch_size=self.batch_size,
+            s_q=self.s_q_max,
+            h_q=self.h_q,
+            h_kv=self.h_kv,
+            pack_gqa=self.pack_gqa,
+            cga=self.cga,
+        )
         return (
             self._fp8
             and self._pertensor
@@ -3792,18 +3809,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and not self.softmax_scale_prefolded
             and self.score_max_desc is None
             and self.score_sum_exp_desc is None
-            and supports_d64_fp8_swap_ab(
-                self.flavor,
-                device_cc=self._device_cc,
-                paged=self.paged,
-                thd=self.thd,
-                batch_size=self.batch_size,
-                s_q=self.s_q_max,
-                h_q=self.h_q,
-                h_kv=self.h_kv,
-                pack_gqa=self.pack_gqa,
-                cga=self.cga,
-            )
+            and (supports_d64_fp8_swap_ab(self.flavor, **geometry) or supports_dense_fp8_swap_ab(self.flavor, **geometry, tile_n=self.tile_n))
         )
 
     def _decode_q_tile_for(self, s_q: int, h_q: int, h_kv: int, b: Optional[int] = None, s_kv: Optional[int] = None) -> int:
@@ -4294,8 +4300,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # the extra columns, with no staging copy. Up to four eight-column
         # token units cover short MTP queries without running both 128-row
         # prefill sub-tiles. D128 keeps its existing one-unit envelope.
-        fp8_d64_decode = self.swap_ab == 1 and self._d64_fp8_swap_ab_leg()
-        if (
+        explicit_fp8_decode = self.swap_ab == 1 and self._fp8_swap_ab_leg()
+        fp8_d64_decode = explicit_fp8_decode and self.flavor == (64, 64)
+        if explicit_fp8_decode and not self.paged:
+            params = Sm100DecodeTemplateParams(**vars(replace(params, decode_q_tile=16, dual_kv_stream=False)), decode_head_dim=128, decode_live_columns=8)
+        elif (
             self._device_cc in ((10, 0), (10, 3))
             and (self.flavor == (128, 128) or fp8_d64_decode)
             and params.cta_mma == 1
