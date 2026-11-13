@@ -1,0 +1,88 @@
+{
+  "inputs": {
+    "activation": {
+      "dtype": "torch.uint8",
+      "sha256": "11f0b0a517bc437f29bdd9a88228c74206658887cf921e18d5635bb16d47bef0",
+      "shape": [
+        40,
+        2560
+      ]
+    },
+    "activation_scale": {
+      "dtype": "torch.uint8",
+      "sha256": "4c787d21a4cec4ef7f12b068c9dc5f3b6e374d2841fc69d7fa97cc563a336086",
+      "shape": [
+        40960
+      ]
+    },
+    "alpha": {
+      "dtype": "torch.float32",
+      "sha256": "a50c4fe393bde2a458935daf4e5413dc0efab26d466fa63ef8fb2457423c3b42",
+      "shape": [
+        1
+      ]
+    },
+    "out_global_scale": {
+      "dtype": "torch.float32",
+      "sha256": "ea2845900b5856c9bf354b1aa9761b5aa6888e5ed61738fe9579ca42bc0f6054",
+      "shape": [
+        1
+      ]
+    },
+    "weight": {
+      "dtype": "torch.uint8",
+      "sha256": "ee5b6e6841866252732d0b4779e022258fefb0fe528f41e965fa07ebe290ff35",
+      "shape": [
+        34816,
+        2560
+      ]
+    },
+    "weight_scale": {
+      "dtype": "torch.uint8",
+      "sha256": "e8b13eb7b1651bcb85dc8e53f4b66509f90b1b928731ca839898e94ae234b7c1",
+      "shape": [
+        11141120
+      ]
+    }
+  },
+  "outputs": {
+    "out": {
+      "dtype": "torch.uint8",
+      "sha256": "585075909be0e2e6311cd5112a6cf9e074bfe238d4e10c26b3ebdec89254b855",
+      "shape": [
+        40,
+        8704
+      ]
+    },
+    "scale": {
+      "dtype": "torch.uint8",
+      "sha256": "10b06fa8709e1d8c97647580f558b8e6383e6d1a33e7eac3341e105429a3b4ee",
+      "shape": [
+        40,
+        1088
+      ]
+    },
+    "scale_band": {
+      "dtype": "torch.uint8",
+      "sha256": "3a0cdd02d3edf9616a565d903a18f034eec2ae72ab52540970b2a55e4fe2c628",
+      "shape": [
+        139264
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13010,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.13.0+cu130",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}
