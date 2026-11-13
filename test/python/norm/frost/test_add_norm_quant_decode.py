@@ -708,6 +708,33 @@ def test_kernel_takes_its_quantization_helpers_from_the_tile_library():
     assert "inline_ptx" not in names, "the kernel spells an instruction inline instead of through the tile library"
 
 
+GOLDEN_CASES = ("add-bf16-e4m3-rows3", "store-e4m3-rows3", "none-e4m3-rows3", "add-nvfp4-rows3", "add-nvfp4-rows130", "add-bf16-nvfp4-ties-rows2")
+
+
+def test_docs_rows_exist_for_the_api():
+    """The determinism status page carries the API's ONE row -- SM90 unsupported (declined by type); SM100/103 split by the evidence
+    (replay and batch invariance verified on cc 10.0, cc 10.3 not run); SM107 unverified (admitted, not run) -- and its bullet under
+    the required settings; the goldens README its suite row and section; the operation page, its navigation entry and the overview
+    and llms.txt links exist; and the six golden cases are committed for at least one runtime."""
+    det = (REPO / "docs" / "operations" / "determinism.md").read_text()
+    row = [ln for ln in det.splitlines() if ln.startswith("| `AddNormQuantDecode`")]
+    assert len(row) == 1, "one AddNormQuantDecode row on the status page"
+    cells = [c.strip() for c in row[0].strip("|").split("|")]
+    assert cells[1] == "fprop (inference step)" and cells[2] == "BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate", cells
+    assert cells[3] == "Unsupported" and cells[4] == "SM100: Supported; SM103: Unverified" and cells[5] == "Unverified", cells
+    assert "- Add + RMSNorm + quantize decode step (`AddNormQuantDecode`):" in det
+    readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
+    assert "AddNormQuantDecode" in readme and "norm/frost/test_add_norm_quant_decode_determinism.py" in readme
+    assert "### Add + RMSNorm + quantize decode step:" in readme
+    page = REPO / "docs" / "operations" / "normalizations" / "add_norm_quant_decode.md"
+    assert page.exists() and "cudnn.AddNormQuantDecode" in page.read_text()
+    assert "../../operations/normalizations/add_norm_quant_decode.md" in (REPO / "docs" / "fern" / "versions" / "latest.yml").read_text()
+    assert "/operations/Normalizations/add_norm_quant_decode" in (REPO / "docs" / "operations" / "overview.md").read_text()
+    assert "docs/operations/normalizations/add_norm_quant_decode.md" in (REPO / "llms.txt").read_text()
+    goldens = {p.name for p in (REPO / "test" / "python" / "determinism_goldens").glob("*/add-norm-quant-decode-*.json")}
+    assert goldens == {f"add-norm-quant-decode-h{HIDDEN}-{case}.json" for case in GOLDEN_CASES}, goldens
+
+
 # ---------------------------------------------------------------------------------------------------------------------------
 # host-only: the rendering (the instructions that define the sum tree and the rounding chain), per claimed target
 # ---------------------------------------------------------------------------------------------------------------------------
