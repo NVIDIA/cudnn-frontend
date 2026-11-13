@@ -475,6 +475,23 @@ class TemplateParams:
     dtype_kv: int = -1
 
 
+def supports_d64_fp8_swap_ab(shape, *, device_cc, paged, thd, batch_size, s_q, h_q, h_kv, pack_gqa, cga):
+    """Legal eight-live-column D64 decode geometry, independent of ranking."""
+    group = h_q // h_kv if pack_gqa and h_kv else 1
+    return (
+        device_cc == (10, 0)
+        and shape == (64, 64)
+        and paged
+        and not thd
+        and 0 < batch_size <= 65535
+        and cga in (None, 1)
+        and h_kv > 0
+        and h_q % h_kv == 0
+        and 0 < group <= 8
+        and 0 < s_q <= 4 * (8 // group)
+    )
+
+
 @dataclass(frozen=True)
 class TemplateParamsDecode(TemplateParams):
     """Extra geometry for the new swap-AB route, without changing legacy records' cache keys."""

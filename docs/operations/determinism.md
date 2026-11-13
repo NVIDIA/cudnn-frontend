@@ -123,6 +123,18 @@ and FP8 probability conversion relative to the older implementation, so it does
 not preserve that implementation's output bytes. SM103 retains its existing
 FP8 lowering. No backward entry point is added.
 
+SM100 D64 per-tensor FP8 paging also offers an explicit `SWAP_AB=1`
+implementation. Each token unit computes eight packed query columns using a
+D128 physical tile with TMA zero fill; up to four units serve a short query.
+`SWAP_AB=0` and an unset knob retain the existing D64 prefill implementation.
+The new implementation has the same fixed-plan replay and O/Stats batch
+invariance contract, including E4M3/E5M2 inputs, mixed logical QK/V widths
+inside the D64 envelope, split KV and retained capture. Amax remains a
+whole-batch reduction. Equality is not promised between the two implementations.
+The knob's candidate selection belongs to the graph heuristics; these results
+qualify the implementation on a local SM100 development GPU, not a new default
+ranking or an SM103 path.
+
 The native D128 paging row fixes the CTA width, tile width and split count per
 plan. Its standalone suite checks O/Stats bytes across repeated launches,
 reordered/duplicated batches and fresh buffers, including mixed FP8 KV storage.

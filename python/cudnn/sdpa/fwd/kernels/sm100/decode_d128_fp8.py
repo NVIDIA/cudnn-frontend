@@ -1,7 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""SM100/SM103 per-tensor FP8 D128 paged decode with swap-AB MMA.
+"""Per-tensor FP8 paged decode with swap-AB MMA and a D128 physical tile.
+
+The D64 flavor uses TMA zero fill for the physical tile's extra columns;
+output stores retain the runtime logical widths. Short MTP queries span
+token units sized by the live softmax columns, not padded MMA columns.
 
 Keys occupy the 128-lane MMA M axis; at most eight live packed query rows
 occupy a 16-column N tile. Four softmax warps process only the live half.
@@ -72,13 +76,16 @@ SPLIT_KV = CFG.SPLIT_KV
 
 # === PackGQA === row r of the Q tile is token r // G, head r % G (the prefill
 # tile's convention).  The Q TMA box covers Q_BOX_TOKENS tokens x G heads; a
-# group that does not divide N_Q leaves N_Q - Q_BOX_ROWS tail rows, zero-filled
+# group that does not divide the live softmax width leaves tail rows, zero-filled
 # once at kernel start (their S^T / O^T columns are computed and never stored).
 HEADS_PER_TILE = CFG.QH_PER_KH if CFG.PACK_GQA else 1
-Q_BOX_TOKENS = N_Q // HEADS_PER_TILE
+LIVE_Q_COLUMNS = getattr(PARAMS, "decode_live_columns", 0) or N_Q
+# The sixteen-column MMA has only eight computed softmax columns. Counting
+# its padded columns as tokens would skip every second token unit under G8.
+Q_BOX_TOKENS = LIVE_Q_COLUMNS // HEADS_PER_TILE
 Q_BOX_ROWS = Q_BOX_TOKENS * HEADS_PER_TILE
 if Q_BOX_TOKENS < 1:
-    raise ValueError(f"decode_d128_fp8: the packed head group ({HEADS_PER_TILE}) does not fit the {N_Q}-row Q tile")
+    raise ValueError(f"decode_d128_fp8: the packed head group ({HEADS_PER_TILE}) does not fit the {LIVE_Q_COLUMNS} live Q columns")
 # === Token units === a unit covers Q_BOX_TOKENS consecutive Q tokens of its head group; a graph with more tokens
 # than one Q box holds is cut into ceil(S_q / Q_BOX_TOKENS) TOKEN UNITS per (head group, batch, split), each a CTA
 # that streams the unit's KV range once (MTP: S_q = 4 at 24/2 = two units of two tokens on the 32-column tile).  The
