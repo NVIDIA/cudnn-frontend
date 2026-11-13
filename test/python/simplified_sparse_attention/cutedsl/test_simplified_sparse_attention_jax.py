@@ -23,21 +23,44 @@ def test_public_jax_export():
     assert package_export is simplified_sparse_attention_jax
 
 
+class _TorchDLPack:
+    def __init__(self, tensor):
+        self.tensor = tensor
+
+    def __dlpack_device__(self):
+        return self.tensor.__dlpack_device__()
+
+    def __dlpack__(self, **kwargs):
+        # JAX can change the current device before requesting the capsule.
+        with torch.cuda.device(self.tensor.device):
+            return self.tensor.__dlpack__(**kwargs)
+
+
 def jax_inputs(inputs):
     tensors, metadata, upstream = inputs
+    caller = torch.cuda.current_device()
 
     def convert(t):
-        with torch.cuda.device(t.device):
-            return jax.dlpack.from_dlpack(t)
+        return jax.dlpack.from_dlpack(_TorchDLPack(t))
 
-    values = tuple(convert(t) for t in tensors)
-    bounds = tuple(convert(t) for t in (metadata.key_starts, metadata.key_ends, metadata.query_valid, metadata.loss_denominator))
-    return values, bounds, convert(upstream)
+    try:
+        values = tuple(convert(t) for t in tensors)
+        bounds = tuple(convert(t) for t in (metadata.key_starts, metadata.key_ends, metadata.query_valid, metadata.loss_denominator))
+        return values, bounds, convert(upstream)
+    finally:
+        torch.cuda.set_device(caller)
 
 
 def torch_outputs(result, device):
-    with torch.cuda.device(device):
-        return tuple(torch.from_dlpack(x) for x in result)
+    caller = torch.cuda.current_device()
+    try:
+        outputs = []
+        for x in result:
+            torch.cuda.set_device(device)
+            outputs.append(torch.from_dlpack(x))
+        return tuple(outputs)
+    finally:
+        torch.cuda.set_device(caller)
 
 
 @lru_cache(maxsize=None)
@@ -59,9 +82,13 @@ def runner(topk=512, coefficient=0.1, triangular=False, backward=True):
 
 
 def execute(inputs, topk=512, coefficient=0.1, triangular=False, backward=True):
-    tensors, metadata, upstream = jax_inputs(inputs)
-    result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
-    return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
+    caller = torch.cuda.current_device()
+    try:
+        tensors, metadata, upstream = jax_inputs(inputs)
+        result = jax.block_until_ready(runner(topk, coefficient, triangular, backward)(*tensors, *metadata, upstream))
+        return dict(zip(("output", "indexer_loss", "dq", "dk", "dv", "dq_idx", "dk_idx"), torch_outputs(result, inputs[0][0].device)))
+    finally:
+        torch.cuda.set_device(caller)
 
 
 @pytest.mark.parametrize("heads", [16, 32, 96], ids=lambda n: f"bf16-h{n}")
@@ -154,35 +181,81 @@ def test_dense_workspace_index_limit():
         jax.eval_shape(lambda *x: simplified_sparse_attention_jax(*x, triangular_scores=True), *inputs)
 
 
-def test_dlpack_device_context(monkeypatch):
-    from contextlib import contextmanager
-
+@pytest.mark.parametrize("fail", [False, True])
+def test_dlpack_device_context(monkeypatch, fail):
     inputs = pack([sample(3)])
-    active = []
+    current = [7]
     seen = []
 
-    @contextmanager
-    def device_guard(device):
-        active.append(device)
-        try:
-            yield
-        finally:
-            active.pop()
+    def set_device(device):
+        current[0] = torch.device(device).index if isinstance(device, torch.device) else device
 
-    def convert(t):
-        assert active == [t.device], "DLPack conversion lacks its tensor device context"
+    def exchange(device):
+        previous = current[0]
+        set_device(device)
+        return previous
+
+    def export(t, **kwargs):
+        assert current[0] == t.device.index
         seen.append(t)
+        if fail:
+            raise BufferError("export failed")
         return t
 
-    monkeypatch.setattr(torch.cuda, "device", device_guard)
+    def convert(value):
+        # Model JAX stream setup changing the current CUDA device.
+        current[0] = 3
+        return value.__dlpack__()
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+    monkeypatch.setattr(torch.cuda, "_exchange_device", exchange)
+    monkeypatch.setattr(torch.cuda, "_maybe_exchange_device", exchange)
+    monkeypatch.setattr(torch.Tensor, "__dlpack__", export)
     monkeypatch.setattr(jax.dlpack, "from_dlpack", convert)
-    monkeypatch.setattr(torch, "from_dlpack", convert)
-    values, bounds, upstream = jax_inputs(inputs)
-    assert len(seen) == 10
-    assert not active
-    torch_outputs((*values, *bounds, upstream), inputs[0][0].device)
-    assert len(seen) == 20
-    assert not active
+    if fail:
+        with pytest.raises(BufferError, match="export failed"):
+            jax_inputs(inputs)
+    else:
+        values, bounds, upstream = jax_inputs(inputs)
+        assert len(seen) == 10
+        assert current[0] == 7
+
+        def reverse(t):
+            assert current[0] == inputs[0][0].device.index
+            current[0] = 3
+            return t
+
+        monkeypatch.setattr(torch, "from_dlpack", reverse)
+        torch_outputs((*values, *bounds, upstream), inputs[0][0].device)
+    assert current[0] == 7
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_execute_restores_device(monkeypatch, fail):
+    import sys
+
+    module = sys.modules[__name__]
+    inputs = pack([sample(3)])
+    current = [7]
+
+    def invoke(*args):
+        current[0] = 3
+        if fail:
+            raise RuntimeError("execution failed")
+        return ()
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: current.__setitem__(0, device))
+    monkeypatch.setattr(module, "jax_inputs", lambda inputs: ((), (), None))
+    monkeypatch.setattr(module, "runner", lambda *args: invoke)
+    monkeypatch.setattr(module, "torch_outputs", lambda *args: ())
+    if fail:
+        with pytest.raises(RuntimeError, match="execution failed"):
+            execute(inputs)
+    else:
+        assert execute(inputs) == {}
+    assert current[0] == 7
 
 
 def test_dlpack_with_another_gpu_current():

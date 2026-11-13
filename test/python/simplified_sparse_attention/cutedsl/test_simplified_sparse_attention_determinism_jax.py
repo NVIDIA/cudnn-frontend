@@ -52,7 +52,11 @@ def test_batch_invariance(backward, heads, topk):
         inputs[2][stop:] = 0
         actual = checked_run(inputs, backward, topk)
         actual = {name: x if x.ndim == 0 else x[offset:stop] for name, x in actual.items()}
-        check_bytes(lambda: assert_bitwise(actual, alone, f"packed slot {slot}"), backward, packed_loss=(heads, topk) in ((32, 1024), (96, 2048)))
+        check_bytes(
+            lambda: assert_bitwise(actual, alone, f"packed slot {slot}"),
+            backward,
+            packed_loss=(heads, topk) in ((32, 1024), (96, 2048)) or (heads, topk, backward) == (16, 512, False),
+        )
 
 
 @pytest.mark.parametrize("backward", [False, True], ids=["bf16-fprop", "bf16-bprop"])

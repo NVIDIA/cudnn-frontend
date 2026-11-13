@@ -5224,3 +5224,44 @@ it also exposed the existing N64 dense-only factory boundary, which is now
 rejected by capability and standalone checks before compilation. An earlier
 config admission failure and a synthetic fixture missing its padding flag
 are retained as development failures; neither is a successful GPU test.
+
+
+### SSA CI job 547907137 device transfer fix (2026-11-13)
+
+The SM100 job reported six JAX device-context failures and three one-byte
+scalar-loss failures. JAX can change the current CUDA device during stream
+setup, after the old outer Torch device guard has entered. The transfer helper
+now selects the tensor device inside its DLPack export and restores the caller
+explicitly after conversion and JIT execution, including on failure.
+
+Validation used this checkout through `PYTHONPATH`, SM100, Torch 2.13.0+cu130,
+JAX 0.11.0, and CuTe DSL 4.8.0 (CUDA 13.4 compiler):
+
+- `pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py -q`:
+  **24 passed, 1 skipped**, 147.24 s. The real two-GPU case skipped on this
+  single-GPU host. This run preceded the final whole-execution restore guard.
+- `pytest simplified_sparse_attention/cutedsl/test_simplified_sparse_attention_jax.py -k 'device_context or restores_device' -q`:
+  **4 passed, 23 deselected**, 2.87 s, after that guard was added.
+- Disabling the export guard with a temporary pytest plugin produced
+  **2 failed, 23 deselected**, 3.01 s; both failures detected device 3 where
+  tensor device 0 was required.
+- The two reported Phase 1 loss cases passed locally: **2 passed**, 5.86 s.
+  The reported JAX H16 packed-loss case also passed: **1 passed**, 34.78 s.
+  These passes do not establish determinism. The fused Phase 1 kernel uses
+  FP32 atomic loss accumulation; the Torch path changes reduction grouping
+  with packed shapes.
+
+The approved CI loss exceptions apply only on SM100:
+
+- Phase 1 H96 split forward CuTe replay: `replay <n> loss: 1/4 bytes differ`.
+- Phase 1 H16 tiny forward Torch packing: `packed slot 0 loss: 1/4 bytes differ`.
+- JAX H16/top-k512 forward packing: `packed slot 1 indexer_loss: 1/4 bytes differ`.
+
+Reference checks still run before byte comparisons. Other cases, architectures,
+tensors, byte counts and numerical errors remain strict. Remove these exceptions
+when their reductions are deterministic. Exception-scope tests plus the two
+Phase 1 CI cases reported **14 passed, 31 deselected** in 7.48 s. The scope tests
+reject other architectures, cases, tensors, byte counts and numerical errors.
+The final JAX H16 packed-loss rerun reported **1 passed** in 33.95 s.
+The CI environment uses Torch 2.15.0a0 and multiple GPUs; that configuration
+remains unverified.
