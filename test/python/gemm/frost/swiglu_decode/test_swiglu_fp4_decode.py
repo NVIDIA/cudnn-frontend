@@ -17,6 +17,7 @@ module; replay, batch invariance per row count and the goldens live in the deter
 Marked ``no_workspace_shim``: the engine suite's autouse fixture would otherwise import torch and both architecture compilers for
 every test of this direct-call entry."""
 
+import contextlib
 import importlib
 import os
 import re
@@ -24,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import types
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -387,6 +389,34 @@ def test_compile_declines_by_name_before_the_kernel_module_is_imported(monkeypat
         ):
             e.compile(1)
     assert not k.compiled and not part107.compiled and k._kernel_module is None and part107._kernel_module is None
+
+
+def test_a_form_that_fails_to_compile_leaves_the_earlier_forms_bound_to_the_kernel_module(monkeypatch):
+    """``compile()`` of every form on a CUDA entry whose SECOND form raises: the first form stays in the compile cache, and the
+    kernel module the launch path reads its operand views from is bound with it -- a caller that catches the error and serves the
+    rows of the compiled form launches, it does not find a half-built entry.  A stub stands for the kernel module, so nothing is
+    traced and no device is touched; the device cell ``test_a_failed_form_leaves_the_compiled_forms_launchable`` launches."""
+    k = _modelled_cuda_entry(monkeypatch)
+    name = "cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_nvfp4"
+    stub, seen = types.ModuleType(name), []
+
+    def compile_kernel(cfg):
+        seen.append(cfg)
+        if len(seen) == 2:
+            raise RuntimeError("the second form does not compile")
+        return object()
+
+    stub.compile_kernel = compile_kernel
+    monkeypatch.setattr(entry, "dsl_error", lambda device_cc=None: None)
+    monkeypatch.setitem(sys.modules, name, stub)
+    monkeypatch.setattr(importlib.import_module("cudnn.gemm.frost.swiglu_decode.kernel"), "swiglu_fp4_decode_nvfp4", stub, raising=False)
+    monkeypatch.setattr(torch.cuda, "device", contextlib.nullcontext)
+    with pytest.raises(RuntimeError, match="the second form does not compile"):
+        k.compile()
+    assert seen == [k.forms[8], k.forms[16]] and list(k.compiled) == [k.forms[8]], "the first form is compiled, the second raised, the rest were not tried"
+    assert k._kernel_module is stub, "a compiled form without the kernel module: its launch would fail on the execute path"
+    k.compile()  # a later call compiles what is missing, the failed form included
+    assert seen[2:] == [k.forms[16], k.forms[32], k.forms[64]] and list(k.compiled) == list(k.forms.values())
 
 
 def test_compiler_gate_never_declines_on_a_value_it_cannot_read(monkeypatch):
@@ -1110,6 +1140,43 @@ def test_plan_time_compile_covers_every_served_row_count(monkeypatch):
     torch.cuda.synchronize()
     symbols = {k.kernel_symbols_for(rows) for rows in (1, 9, 17, 33)}
     assert len(symbols) == 4 and all(len(s) == 1 and s[0].startswith("cudnn_kernel_frost_swiglu_fp4_decode_h5120_i128_t") for s in symbols)
+
+
+def test_a_failed_form_leaves_the_compiled_forms_launchable(monkeypatch):
+    """On the device: ``compile()`` of a fresh entry compiles the 8-token form, then the 16-token form's trace raises.  A caller
+    that catches the error can serve rows 1 .. 8: the launch finds the form compiled and writes the default entry's bytes.  Once
+    the trace works again, ``compile()`` builds the three missing forms and a row count of the failed form launches."""
+    dev = U.device_or_skip()
+    kernel = importlib.import_module("cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_nvfp4")  # behind the gate of device_or_skip
+    real, seen = kernel.compile_kernel, []
+
+    def second_form_raises(cfg):
+        seen.append(cfg.TOKEN_TILE)
+        if len(seen) == 2:
+            raise RuntimeError("the second form does not compile")
+        return real(cfg)
+
+    k = entry.SwigluFp4Decode(dev, G_SMALL)
+    with monkeypatch.context() as patched:
+        patched.setattr(kernel, "compile_kernel", second_form_raises)
+        with pytest.raises(RuntimeError, match="the second form does not compile"):
+            k.compile()
+        assert seen == [8, 16] and [form.TOKEN_TILE for form in k.compiled] == [8]
+        ops, _ = _ops(dev, G_SMALL, 5)
+        want = U.run(_entry(dev, G_SMALL), ops)
+        got = U.run(k, ops)  # compiles nothing: the 8-token form is in the cache
+        torch.cuda.synchronize()
+        assert seen == [8, 16], "a launch of the compiled form reached the compiler"
+        U.assert_same_bytes(got[0], want[0], "the form compiled before the failure: codes")
+        U.assert_same_bytes(got[1], want[1], "the form compiled before the failure: the scale band")
+    k.compile()
+    assert len(k.compiled) == 4
+    ops, _ = _ops(dev, G_SMALL, 12)
+    want = U.run(_entry(dev, G_SMALL), ops)
+    got = U.run(k, ops)
+    torch.cuda.synchronize()
+    U.assert_same_bytes(got[0], want[0], "the form that failed first, compiled by the later call: codes")
+    U.assert_same_bytes(got[1], want[1], "the form that failed first, compiled by the later call: the scale band")
 
 
 def test_graph_capture_replays_bitwise_with_eager():

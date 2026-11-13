@@ -425,7 +425,8 @@ class SwigluFp4Decode:
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan-time compile: the form of one row count, or EVERY form of the entry when ``rows`` is None (so that no launch of a
         served row count compiles on the execute path).  Typed declines first (the row count, the device, the compute capability),
-        then the DSL gate, then one trace-compile per form that is not compiled yet, under the entry's device.  Needs no operand."""
+        then the DSL gate, then one trace-compile per form that is not compiled yet, under the entry's device.  Needs no operand.
+        A form whose compile raises leaves the forms compiled before it launchable: a later call compiles the missing form again."""
         forms = list(self.forms.values()) if rows is None else [self.cfg_for(rows)]
         if self.device.type != "cuda":
             raise NotImplementedError(f"{NAME} serves CUDA devices only; this entry was built for {self.device}")
@@ -438,11 +439,12 @@ class SwigluFp4Decode:
             raise NotImplementedError(msg)
         from .kernel import swiglu_fp4_decode_nvfp4 as mod
 
+        # Bound in front of the loop: the launch path reads the module for every form in ``compiled``, also when a later form raised.
+        self._kernel_module = mod
         with torch.cuda.device(self.device):
             for form in forms:
                 if form not in self.compiled:
                     self.compiled[form] = mod.compile_kernel(form)
-        self._kernel_module = mod
 
     def __call__(self, weight, weight_scale, activation, activation_scale, alpha, out_global_scale, out, out_scale):
         """Launch on torch's current stream of the entry's device; returns ``(out, out_scale)`` (the caller's tensors: every byte of
