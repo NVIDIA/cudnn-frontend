@@ -94,6 +94,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D64/D128 paged KV with dense Q (fixed CTA width, packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or matching FP8 O | Unsupported | Supported (tested configurations) | Unverified by this suite |
 | `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D128 dense single-CTA splits (fixed split count and packing) | fprop | E4M3 to BF16; E5M2 to FP16; FP32 tensor scales | Unsupported | Unverified by this suite | Supported (tested configurations) |
+| `pygraph.sdpa_fp8`, FROST D128 dense `SWAP_AB=1` (at most eight live query rows per packed unit; fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | Unverified | Unverified |
 | `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D192/V128 and D256 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
@@ -128,6 +129,18 @@ Stats always use natural logarithms. This lowering changes the reduction order
 and FP8 probability conversion relative to the older implementation, so it does
 not preserve that implementation's output bytes. SM103 retains its existing
 FP8 lowering. No backward entry point is added.
+
+Dense D128 FP8 graphs can explicitly select the eight-live-row body with
+`SWAP_AB=1` on SM100, SM103 and SM107. The CI-selected
+`TestDenseFp8SwapAB` checks preserve quantized input payloads and per-tensor
+scales under reordering, duplication and changed neighboring sequences.
+O and Stats are compared across batches; whole-batch Amax is compared across
+replays and checked numerically after rebatching. The existing D128 admission
+rules still apply, including the decline for padded dense splits. Unsplit
+checks cover empty actual Q/KV lengths; split partial Stats use natural logs
+regardless of the final Stats base. `SWAP_AB=0` and an unset knob keep the
+prefill body, whose output bytes need not equal this body's. This is forward
+only and adds no backward implementation.
 
 SM100 D64 per-tensor FP8 paging also offers an explicit `SWAP_AB=1`
 implementation. Each token unit computes eight packed query columns using a

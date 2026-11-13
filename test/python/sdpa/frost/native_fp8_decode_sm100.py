@@ -311,11 +311,13 @@ def test_native_fp8_decode_config():
     cfg, tma = make_cfg_d128_fp8_decode(params)
     assert (cfg.BPE, cfg.BPE_O, cfg.TILE_K_HW, cfg.STAGES_KV, cfg.THD_VARLEN) == (1, 2, 32, 5, 0)
     assert tma.QK_GRANU_ELEMS == tma.VO_GRANU_ELEMS == 128
+    dense, dense_tma = make_cfg_d128_fp8_decode(replace(params, paged_kv=False, page_size=0))
+    assert (dense.BPE, dense.BPE_O, dense.TILE_K_HW, dense.STAGES_KV, dense.THD_VARLEN) == (1, 2, 32, 5, 0)
+    assert dense_tma.QK_GRANU_ELEMS == dense_tma.VO_GRANU_ELEMS == 128
     for change in [
         dict(dtype_qkv=3),
         dict(dtype_o=5),
         dict(cta_mma=2),
-        dict(paged_kv=False, page_size=0),
         dict(thd_varlen=True),
         dict(pv_bf16=True),
         dict(softmax_f16=True),

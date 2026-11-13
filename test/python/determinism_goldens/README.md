@@ -4,6 +4,34 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Dense D128 FP8 swap-AB qualification (2026-11-13)
+
+`sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`
+in the existing SM100/SM103 and SM107 FP8 CI entry files. It pins the public
+`SWAP_AB=1` plan, the actual shared decode module, and the five-stage,
+eight-live-column geometry. Forward only; no backward path is added.
+Packing and split count are fixed during byte comparisons. Fixed CPU-quantized
+E4M3/E5M2 payloads feed FP8 and half outputs, with O/Stats batch invariance,
+whole-batch Amax replay, fresh bindings, scheduling pressure, duplicated and
+changed neighbors, independent numerical references and per-path goldens.
+The functional matrix covers masks, sink, unequal logical head widths,
+row gaps, optional Stats/Amax, empty actual lengths and current-scale capture.
+D128 padded dense splits keep their existing typed decline; unsplit padding
+and unpadded split execution are qualified separately. Warm stress includes
+multiple ring refills and the shared unsafe-ring control.
+
+Qualification is in progress. SM100, SM103 and SM107 determinism claims remain
+unverified until the corresponding results below are recorded. Run from
+`test/python` with the correct imported checkout and CUDA 13.4 or 13.5:
+
+```bash
+pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestDenseFp8SwapAB -m L0 -q -rs
+pytest sdpa/frost/test_sdpa_fp8_sm107.py::TestDenseFp8SwapAB -m L0 -q -rs
+```
+
+Record new goldens in a fresh directory only after numerical and replay checks
+pass, then compare them in a separate process with `CUDNN_DETERMINISM_GOLDENS`.
+
 These suites check six attention families and the DSA indexer APIs. Run from `test/python`:
 
 ```bash

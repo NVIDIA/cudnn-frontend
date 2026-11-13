@@ -2717,6 +2717,21 @@ class TestNativeFp8DecodeDeterminism:
 
 @pytest.mark.L0
 @requires_pre_rubin_blackwell
+class TestDenseFp8SwapAB:
+    from sdpa.frost import native_fp8_dense_swap_ab as _dense
+
+    test_rebind_capture = staticmethod(_dense.test_rebind_capture)
+    test_public_choice = staticmethod(_dense.test_public_choice)
+    test_standalone_current_lengths_and_logbase = staticmethod(_dense.test_standalone_current_lengths_and_logbase)
+    test_domain = staticmethod(_dense.test_domain)
+    test_invalid_plan_then_recovery = staticmethod(_dense.test_invalid_plan_then_recovery)
+    test_replay_batch = staticmethod(_dense.test_replay_batch)
+    test_golden = staticmethod(_dense.test_golden)
+    test_warm_refill = staticmethod(_dense.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_pre_rubin_blackwell
 def test_native_fp8_decode_architecture_route(monkeypatch):
     from sdpa.frost.native_fp8_decode_sm100 import check_architecture_route
 
