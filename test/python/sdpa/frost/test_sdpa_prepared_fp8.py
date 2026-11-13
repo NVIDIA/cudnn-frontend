@@ -45,10 +45,14 @@ def _case(
     arch="sm100",
     split_kv=1,
     gate=None,
+    sink=None,
+    sdpa_kwargs=None,
+    heads=(4, 2),
+    seq_lens=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
-    hq, hk = 4, 2
+    hq, hk = heads
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.FP8_E4M3,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -63,7 +67,7 @@ def _case(
         strides = [seq * h * dim, dim, h * dim, 1] if thd else list(buf.stride())
         t = g.tensor(dim=[b, h, seq, dim], stride=strides, data_type=input_type, name=name)
         buffers[name], tensors[name], vp[t] = buf, t, buf
-    kwargs = {}
+    kwargs = dict(sdpa_kwargs or {})
     if thd:
         for name, seq, h in (("q", sq, hq), ("kv", skv, hk)):
             cu = torch.arange(b + 1, device="cuda", dtype=torch.int32) * seq
@@ -79,11 +83,22 @@ def _case(
                 tensors["off_v"], vp[off_v] = off_v, cu * hk * dv
             kwargs[("seq_len_" if arch == "sm120" else "cu_seq_len_") + name] = lens
         kwargs["use_padding_mask"] = True
+    if seq_lens is not None:
+        assert not thd
+        for name, values in zip(("seq_q", "seq_kv"), seq_lens):
+            value = torch.tensor(values, device="cuda", dtype=torch.int32).view(b, 1, 1, 1)
+            tensor = g.tensor_like(value)
+            buffers[name], tensors[name], vp[tensor] = value, tensor, value
+        kwargs.update(use_padding_mask=True, seq_len_q=tensors["seq_q"], seq_len_kv=tensors["seq_kv"])
     for name, val in (("descale_q", 0.8), ("descale_k", 0.9), ("descale_v", 0.7), ("descale_s", 1.0), ("scale_s", 1.0), ("scale_o", 1.3)):
         t = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT, name=name)
         buf = torch.full((1,), val, device="cuda", dtype=torch.float32)
         buffers[name], tensors[name], vp[t] = buf, t, buf
         kwargs[name] = t
+    if sink is not None:
+        t = g.tensor_like(sink)
+        buffers["sinks"], tensors["sinks"], vp[t] = sink, t, sink
+        kwargs["sink_token"] = t
     o, lse, _, am = g.sdpa_fp8(q=tensors["q"], k=tensors["k"], v=tensors["v"], attn_scale=1 / math.sqrt(d), generate_stats=stats, **kwargs)
     out_type = {
         torch.bfloat16: cudnn.data_type.BFLOAT16,
@@ -170,8 +185,13 @@ def _reference(bufs, *, thd, b=2, sq=128, skv=128):
     k = dense(bufs["k"], 2, skv).repeat_interleave(2, 1) * bufs["descale_k"]
     v = dense(bufs["v"], 2, skv).repeat_interleave(2, 1) * bufs["descale_v"]
     scores = q @ k.transpose(-1, -2) / math.sqrt(bufs["q"].shape[-1])
-    out = scores.softmax(-1) @ v
-    lse = scores.logsumexp(-1)
+    if "sinks" in bufs:
+        scores_with_sink = torch.cat((scores, bufs["sinks"].view(1, 4, 1, 1).expand(b, 4, sq, 1)), dim=-1)
+        out = scores_with_sink.softmax(-1)[..., :-1] @ v
+        lse = scores_with_sink.logsumexp(-1)
+    else:
+        out = scores.softmax(-1) @ v
+        lse = scores.logsumexp(-1)
     am = out.abs().amax()
     out *= bufs["scale_o"]
     if "gate" in bufs:
@@ -494,27 +514,30 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
 
 @pytest.mark.parametrize("output_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("padding", [8, 16])
-def test_fp8_output_pitch_preserves_prepared_and_conversion_routes(output_dtype, padding, monkeypatch):
-    """One-byte O needs 16-element TMA alignment; other pitches retain conversion."""
+def test_fp8_output_pitch_requires_native_byte_alignment(output_dtype, padding, monkeypatch):
+    """One-byte O needs 16-element TMA alignment; unsupported pitches decline."""
+    if padding == 8:
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="o: native dense forward.*16-byte outer-stride alignment"):
+            _case(output_dtype=output_dtype, output_padding=padding)
+        return
     g, vp, ws, bufs, _ = _case(output_dtype=output_dtype, output_padding=padding)
     plan = g._compiled_plans[g._plan_index]
-    assert (plan._prepared is not None) == (padding == 16)
+    assert plan._prepared is not None
     prepared_calls = []
-    if padding == 16:
-        execute = plan._prepared.execute
+    execute = plan._prepared.execute
 
-        def record(*args, **kwargs):
-            prepared_calls.append(True)
-            return execute(*args, **kwargs)
+    def record(*args, **kwargs):
+        prepared_calls.append(True)
+        return execute(*args, **kwargs)
 
-        monkeypatch.setattr(plan._prepared, "execute", record)
+    monkeypatch.setattr(plan._prepared, "execute", record)
     g.execute(vp, ws)
-    assert len(prepared_calls) == (1 if padding == 16 else 0)
+    assert len(prepared_calls) == 1
     _check(bufs, thd=False)
     with _cuda_graph() as captured:
         with torch.cuda.graph(captured):
             g.execute(vp, ws)
-        assert len(prepared_calls) == (2 if padding == 16 else 0)
+        assert len(prepared_calls) == 2
         bufs["descale_v"].mul_(0.5)
         bufs["o"].fill_(float("nan"))
         captured.replay()

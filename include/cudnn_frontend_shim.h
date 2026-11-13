@@ -10,15 +10,80 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <type_traits>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #ifdef _WIN32
+#include <cuda_runtime_api.h>
+#if CUDART_VERSION < 13000 || CUDART_VERSION >= 14000
+#error "cuDNN Frontend dynamic loading on Windows requires CUDA 13 headers and a CUDA 13 runtime"
+#endif
 #define NOMINMAX
 #include <windows.h>
-#define dlerror() static_cast<UINT_PTR>(GetLastError())
-#define dlopen(x, y) LoadLibrary(x)
-#define dlsym(x, y) GetProcAddress(x, y)
+#include <memory>
+#include <string>
+
+namespace cudnn_frontend::detail {
+inline const char *
+windows_dlerror() {
+    const auto code = GetLastError();
+    SetLastError(ERROR_SUCCESS);
+    if (code == ERROR_SUCCESS) {
+        return nullptr;
+    }
+    static thread_local std::string message;
+    message = "Windows error " + std::to_string(code);
+    return message.c_str();
+}
+
+inline HMODULE
+windows_dlopen(const char *name) {
+    // DEFAULT_DIRS includes directories registered by Python's
+    // os.add_dll_directory(). The legacy search is retained as a fallback for
+    // callers that supply their CUDA installation through PATH.
+    DWORD flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    std::string full_path;
+    const char *library = name;
+    if (std::string(name).find_first_of("\\/:") != std::string::npos) {
+        const DWORD size = GetFullPathNameA(name, 0, nullptr, nullptr);
+        if (size) {
+            full_path.resize(size);
+            const DWORD written = GetFullPathNameA(name, size, full_path.data(), nullptr);
+            if (written && written < size) {
+                full_path.resize(written);
+                library = full_path.c_str();
+                flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
+            }
+        }
+    }
+    auto handle = LoadLibraryExA(library, nullptr, flags);
+    if (!handle) {
+        const auto error = GetLastError();
+        handle           = LoadLibraryA(name);
+        if (!handle) {
+            SetLastError(error);
+        }
+    }
+    if (handle) {
+        SetLastError(ERROR_SUCCESS);
+    }
+    return handle;
+}
+
+inline FARPROC
+windows_dlsym(HMODULE handle, const char *name) {
+    auto symbol = GetProcAddress(handle, name);
+    if (symbol) {
+        SetLastError(ERROR_SUCCESS);
+    }
+    return symbol;
+}
+}  // namespace cudnn_frontend::detail
+
+#define dlerror() cudnn_frontend::detail::windows_dlerror()
+#define dlopen(x, y) cudnn_frontend::detail::windows_dlopen(x)
+#define dlsym(x, y) cudnn_frontend::detail::windows_dlsym(x, y)
 #define dlclose(x) FreeLibrary(x)
 #else
 #include <dlfcn.h>
@@ -102,6 +167,32 @@ load_cuda_so() {
     return handle;
 }
 
+#ifdef _WIN32
+inline HMODULE
+validate_cuda13_runtime(HMODULE handle, const char *library) {
+    // Own the reference before diagnostics can allocate or throw.
+    std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)> owner(handle, &FreeLibrary);
+    // CUDA 13 graph wrappers use CUDA 13 signatures. Symbol names alone do not
+    // distinguish those signatures from the incompatible CUDA 12 entry points.
+    dlerror();
+    auto symbol       = dlsym(handle, "cudaRuntimeGetVersion");
+    const char *error = reinterpret_cast<const char *>(dlerror());
+    if (!symbol || error) {
+        const std::string message = "Cannot validate CUDA 13 runtime " + std::string(library) + ": " +
+                                    std::string(error ? error : "cudaRuntimeGetVersion unavailable");
+        throw std::runtime_error(message);
+    }
+    int version = 0;
+    auto status = reinterpret_cast<decltype(&cudaRuntimeGetVersion)>(symbol)(&version);
+    if (status != cudaSuccess || version / 1000 != 13) {
+        throw std::runtime_error("CUDA 13 runtime required; " + std::string(library) + " reported version " +
+                                 std::to_string(version) + " (cudaRuntimeGetVersion status " +
+                                 std::to_string(static_cast<int>(status)) + ")");
+    }
+    return owner.release();
+}
+#endif
+
 inline HMODULE
 load_cudart_so() {
     // Clear any existing error
@@ -113,7 +204,7 @@ load_cudart_so() {
     // search path. In such cases the automatic detection below warns about the ambiguity
     // (see below) and falls back to the first match. Setting CUDNN_FRONTEND_CUDART_LIB_NAME
     // to the desired library name (or path), e.g. "libcudart.so.13", bypasses the detection
-    // and loads exactly that library.
+    // and loads exactly that library. On Windows, overrides must also report CUDA 13.
     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
     if (user_lib) {
         if (user_lib[0] != '\0') {
@@ -123,23 +214,28 @@ load_cudart_so() {
                     "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
                     std::string(user_lib) + "): " + last_dl_error());
             }
+#ifdef _WIN32
+            return validate_cuda13_runtime(handle, user_lib);
+#else
             return handle;
+#endif
         }
     }
 
-    // List of potential libcudart libraries (Adding major version to support python package)
 #ifdef _WIN32
-    // Only the runtime matching the compiled CUDA major is ABI-compatible with the versioned
-    // entry points below (e.g. cudaStreamGetCaptureInfo), so there is no cross-major fallback.
-#if CUDART_VERSION >= 13000
-    constexpr const char *libs[] = {"cudart64_13.dll"};
+    // Windows dynamic loading currently supports CUDA 13 only.
+    constexpr const char *library = "cudart64_13.dll";
+    HMODULE handle                = dlopen(library, RTLD_NOW);
+    const char *error             = reinterpret_cast<const char *>(dlerror());
+    if (!handle || error) {
+        throw std::runtime_error("CUDA 13 runtime unavailable: unable to load " + std::string(library) + ": " +
+                                 std::string(error ? error : "Unknown error"));
+    }
+    return validate_cuda13_runtime(handle, library);
 #else
-    constexpr const char *libs[] = {"cudart64_12.dll"};
-#endif
-#else
+    // List of potential libcudart libraries (Adding major version to support python package)
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
-#endif
-    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
+    constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;
     int loaded_index   = -1;
@@ -176,6 +272,7 @@ load_cudart_so() {
     }
 
     return lib_handle;
+#endif
 }
 
 inline void *
@@ -255,6 +352,46 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
 #define NV_FE_CALL_TO_CU(function_name, cuda_symbol, ...) return cuda_symbol(__VA_ARGS__);
 
 #endif
+
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+// Version of the libcudart that was loaded, which can be a different major than CUDART_VERSION
+// (e.g. a CUDA 13 wheel next to a CUDA 12 torch). Entry points whose ABI changed between majors
+// dispatch on it (#1563).
+inline int
+loaded_cudart_version() {
+    static int const version = [] {
+        using Fn  = cudaError_t (*)(int *);
+        int value = 0;
+        if (reinterpret_cast<Fn>(get_cuda_symbol(CudaLibrary::CUDART, "cudaRuntimeGetVersion"))(&value) !=
+            cudaSuccess) {
+            value = 0;
+        }
+        return value;
+    }();
+    return version;
+}
+#endif
+
+inline cudaError_t
+cuda_runtime_get_version(int *version) {
+    NV_FE_CALL_TO_CUDA(cuda_runtime_get_version, cudaRuntimeGetVersion, version);
+}
+
+// Version of the CUDA runtime this process actually loaded, as major * 1000 +
+// minor * 10 (12.8 -> 12080, 13.2 -> 13020).  cudaRuntimeGetVersion has one ABI
+// on every CUDA 12 and 13 runtime, so it can be resolved before the version is
+// known, and the answer cannot change within a process.
+inline int
+get_cuda_runtime_version() {
+    static int const version = []() {
+        int value = 0;
+        if (cuda_runtime_get_version(&value) != cudaSuccess) {
+            return 0;
+        }
+        return value;
+    }();
+    return version;
+}
 
 inline cudaError_t
 cuda_graph_create(cudaGraph_t *pGraph, unsigned int flags) {
@@ -336,12 +473,34 @@ cuda_graph_node_get_dependent_nodes_v2(cudaGraphNode_t node,
                                        cudaGraphNode_t *pDependentNodes,
                                        cudaGraphEdgeData *edgeData,
                                        size_t *pNumDependentNodes) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // A build against the CUDA 13 headers can be running on a CUDA 12 runtime,
+    // which the loader prefers when both are present.  The edge-data form is the
+    // BASE symbol only from CUDA 13 on: on CUDA 12 the base symbol still takes
+    // three parameters and the edge-data form is the _v2 one, so resolving by
+    // name alone would pass edgeData where the count is expected.
+    if (get_cuda_runtime_version() >= 13000) {
+        NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
+                           cudaGraphNodeGetDependentNodes,
+                           node,
+                           pDependentNodes,
+                           edgeData,
+                           pNumDependentNodes);
+    }
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
+                       cudaGraphNodeGetDependentNodes_v2,
+                       node,
+                       pDependentNodes,
+                       edgeData,
+                       pNumDependentNodes);
+#else
     NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependent_nodes_v2,
                        cudaGraphNodeGetDependentNodes,
                        node,
                        pDependentNodes,
                        edgeData,
                        pNumDependentNodes);
+#endif
 }
 #endif
 
@@ -350,13 +509,82 @@ inline cudaError_t
 cuda_graph_node_get_dependent_nodes(cudaGraphNode_t node,
                                     cudaGraphNode_t *pDependentNodes,
                                     size_t *pNumDependentNodes) {
-#if (CUDART_VERSION >= 13000)
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // CUDA 13 added an edge-data parameter to the unversioned symbol.
+    void *fptr = get_cuda_symbol(CudaLibrary::CUDART, "cudaGraphNodeGetDependentNodes");
+    if (loaded_cudart_version() >= 13000) {
+        using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, void *, size_t *);
+        return reinterpret_cast<Fn>(fptr)(node, pDependentNodes, /*edgeData=*/nullptr, pNumDependentNodes);
+    }
+    using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, size_t *);
+    return reinterpret_cast<Fn>(fptr)(node, pDependentNodes, pNumDependentNodes);
+#elif (CUDART_VERSION >= 13000)
     // The 3-parameter version of cudaGraphNodeGetDependentNodes was removed in CUDA 13.0,
     // so call the other shim.
     return cuda_graph_node_get_dependent_nodes_v2(node, pDependentNodes, /*edgeData=*/nullptr, pNumDependentNodes);
 #else
     NV_FE_CALL_TO_CUDA(
         cuda_graph_node_get_dependent_nodes, cudaGraphNodeGetDependentNodes, node, pDependentNodes, pNumDependentNodes);
+#endif
+}
+
+// 4-parameter shim for cudaGraphNodeGetDependencies.
+// Same story as the DependentNodes shim above: the edge-data form exists from
+// CUDA 12.3, and the 3-parameter form is gone in CUDA 13.0.
+#if (CUDART_VERSION >= 13000)
+inline cudaError_t
+cuda_graph_node_get_dependencies_v2(cudaGraphNode_t node,
+                                    cudaGraphNode_t *pDependencies,
+                                    cudaGraphEdgeData *edgeData,
+                                    size_t *pNumDependencies) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // Same dispatch as the DependentNodes shim above: the base symbol carries the
+    // edge-data form only from CUDA 13 on, the _v2 symbol carries it on CUDA 12.
+    if (get_cuda_runtime_version() >= 13000) {
+        NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
+                           cudaGraphNodeGetDependencies,
+                           node,
+                           pDependencies,
+                           edgeData,
+                           pNumDependencies);
+    }
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
+                       cudaGraphNodeGetDependencies_v2,
+                       node,
+                       pDependencies,
+                       edgeData,
+                       pNumDependencies);
+#else
+    NV_FE_CALL_TO_CUDA(cuda_graph_node_get_dependencies_v2,
+                       cudaGraphNodeGetDependencies,
+                       node,
+                       pDependencies,
+                       edgeData,
+                       pNumDependencies);
+#endif
+}
+#endif
+
+// 3-parameter shim for cudaGraphNodeGetDependencies.
+inline cudaError_t
+cuda_graph_node_get_dependencies(cudaGraphNode_t node, cudaGraphNode_t *pDependencies, size_t *pNumDependencies) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // CUDA 13 added an edge-data parameter to the unversioned symbol. Dispatch on the loaded runtime, not on
+    // CUDART_VERSION of the headers this file was compiled with.
+    void *fptr = get_cuda_symbol(CudaLibrary::CUDART, "cudaGraphNodeGetDependencies");
+    if (loaded_cudart_version() >= 13000) {
+        using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, void *, size_t *);
+        return reinterpret_cast<Fn>(fptr)(node, pDependencies, /*edgeData=*/nullptr, pNumDependencies);
+    }
+    using Fn = cudaError_t (*)(cudaGraphNode_t, cudaGraphNode_t *, size_t *);
+    return reinterpret_cast<Fn>(fptr)(node, pDependencies, pNumDependencies);
+#elif (CUDART_VERSION >= 13000)
+    // The 3-parameter version of cudaGraphNodeGetDependencies was removed in CUDA 13.0,
+    // so call the other shim.
+    return cuda_graph_node_get_dependencies_v2(node, pDependencies, /*edgeData=*/nullptr, pNumDependencies);
+#else
+    NV_FE_CALL_TO_CUDA(
+        cuda_graph_node_get_dependencies, cudaGraphNodeGetDependencies, node, pDependencies, pNumDependencies);
 #endif
 }
 
@@ -439,7 +667,29 @@ cuda_stream_get_capture_info_v2(cudaStream_t stream,
 // Reports the capture status of `stream` and, when it is capturing, the graph it records into.
 inline cudaError_t
 cuda_stream_get_capture_info(cudaStream_t stream, cudaStreamCaptureStatus *capture_status, cudaGraph_t *graph) {
-#if (CUDART_VERSION >= 13000)
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    // Pick the prototype of the loaded runtime; on CUDA 12 the unversioned symbol is the legacy
+    // 3-parameter one that never reports the graph.
+    if (loaded_cudart_version() >= 13000) {
+        using Fn = cudaError_t (*)(cudaStream_t,
+                                   cudaStreamCaptureStatus *,
+                                   unsigned long long *,
+                                   cudaGraph_t *,
+                                   const cudaGraphNode_t **,
+                                   const void **,
+                                   size_t *);
+        return reinterpret_cast<Fn>(get_cuda_symbol(CudaLibrary::CUDART, "cudaStreamGetCaptureInfo"))(
+            stream, capture_status, nullptr, graph, nullptr, nullptr, nullptr);
+    }
+    using Fn = cudaError_t (*)(cudaStream_t,
+                               cudaStreamCaptureStatus *,
+                               unsigned long long *,
+                               cudaGraph_t *,
+                               const cudaGraphNode_t **,
+                               size_t *);
+    return reinterpret_cast<Fn>(get_cuda_symbol(CudaLibrary::CUDART, "cudaStreamGetCaptureInfo_v2"))(
+        stream, capture_status, nullptr, graph, nullptr, nullptr);
+#elif (CUDART_VERSION >= 13000)
     return cuda_stream_get_capture_info_v3(stream, capture_status, nullptr, graph, nullptr, nullptr, nullptr);
 #else
     return cuda_stream_get_capture_info_v2(stream, capture_status, nullptr, graph, nullptr, nullptr);
@@ -525,9 +775,22 @@ cuda_mem_set_async(void *devPtr, int value, size_t count, cudaStream_t stream) {
     NV_FE_CALL_TO_CUDA(cuda_mem_set_async, cudaMemsetAsync, devPtr, value, count, stream);
 }
 
+// The cudaDeviceProp layout differs between CUDA majors, so with dynamic loading it is only valid when
+// the loaded runtime matches CUDART_VERSION; prefer cuda_device_get_attribute() (#1563).
 inline cudaError_t
 cuda_get_device_properties(cudaDeviceProp *prop, int device) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING && CUDART_VERSION >= 12000 && CUDART_VERSION < 13000
+    // CUDA 12 headers map cudaGetDeviceProperties to the _v2 symbol; the unversioned one fills the CUDA 11 layout.
+    if (loaded_cudart_version() < 13000) {
+        NV_FE_CALL_TO_CUDA(cuda_get_device_properties, cudaGetDeviceProperties_v2, prop, device);
+    }
+#endif
     NV_FE_CALL_TO_CUDA(cuda_get_device_properties, cudaGetDeviceProperties, prop, device);
+}
+
+inline cudaError_t
+cuda_device_get_attribute(int *value, cudaDeviceAttr attr, int device) {
+    NV_FE_CALL_TO_CUDA(cuda_device_get_attribute, cudaDeviceGetAttribute, value, attr, device);
 }
 
 inline cudaError_t
@@ -710,6 +973,10 @@ destroy_handle(cudnnHandle_t handle) {
 }
 
 #if CUDNN_VERSION >= 92200
+// Defined below. Built against cuDNN >= 9.22 but running on an older backend, the symbols below do not exist.
+inline size_t
+get_backend_version(void);
+
 inline cudnnStatus_t
 causal_conv1d_forward(cudaStream_t stream,
                       const void *x,
@@ -722,6 +989,9 @@ causal_conv1d_forward(cudaStream_t stream,
                       int kernel_size,
                       cudnnDataType_t data_type,
                       cudnnCausalConv1dActivation_t activation) {
+    if (get_backend_version() < 92200) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
     NV_FE_CALL_TO_BACKEND(causal_conv1d_forward,
                           cudnnCausalConv1dForward,
                           stream,
@@ -753,6 +1023,9 @@ causal_conv1d_backward(cudaStream_t stream,
                        cudnnDataType_t data_type,
                        cudnnDataType_t dw_data_type,
                        cudnnCausalConv1dActivation_t activation) {
+    if (get_backend_version() < 92200) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
     NV_FE_CALL_TO_BACKEND(causal_conv1d_backward,
                           cudnnCausalConv1dBackward,
                           stream,
@@ -2001,6 +2274,44 @@ set_attribute(cudnnBackendDescriptor_t descriptor,
                           attributeType,
                           elementCount,
                           arrayOfElements);
+}
+
+template <typename SetAttribute>
+inline cudnnStatus_t
+set_shared_memory_limit_if_supported(cudnnBackendDescriptor_t descriptor,
+                                     cudnnBackendAttributeName_t attribute_name,
+                                     int64_t requested_limit,
+                                     size_t backend_version,
+                                     SetAttribute &&set_attribute_fn) {
+    // A backend value of zero means no limit was specified. Leave non-positive
+    // frontend limits to the existing engine-config filter so its semantics do not change.
+    if (requested_limit <= 0 || backend_version < 92800) {
+        return CUDNN_STATUS_SUCCESS;
+    }
+
+    auto const backend_limit =
+        static_cast<int32_t>(std::min<int64_t>(requested_limit, std::numeric_limits<int32_t>::max()));
+    return set_attribute_fn(descriptor, attribute_name, CUDNN_TYPE_INT32, 1, &backend_limit);
+}
+
+inline cudnnStatus_t
+set_shared_memory_limit_if_supported(cudnnBackendDescriptor_t descriptor,
+                                     cudnnBackendAttributeName_t attribute_name,
+                                     int64_t requested_limit) {
+    if (requested_limit <= 0) {
+        return CUDNN_STATUS_SUCCESS;
+    }
+
+    return set_shared_memory_limit_if_supported(
+        descriptor,
+        attribute_name,
+        requested_limit,
+        get_backend_version(),
+        [](cudnnBackendDescriptor_t desc,
+           cudnnBackendAttributeName_t attr,
+           cudnnBackendAttributeType_t type,
+           int64_t count,
+           void const *value) { return set_attribute(desc, attr, type, count, value); });
 }
 
 inline cudnnStatus_t

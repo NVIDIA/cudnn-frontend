@@ -24,6 +24,7 @@ os.environ.setdefault("NVTE_FRAMEWORK", "pytorch")
 
 import faulthandler
 import gc
+import importlib.util
 import re
 import socket
 import subprocess
@@ -361,6 +362,20 @@ def _apply_tier_markers(config, items):
             item.add_marker(pytest.mark.nightly_only)
 
 
+# =================== JAX absent =====================
+# JAX is optional (pyproject's ``jax`` group). Without it, the test directory
+# gemm/jax -- which has no __init__.py -- imports as a namespace package named
+# ``jax`` as soon as pytest's prepend import mode puts test/python/gemm on
+# sys.path, which it does for gemm/test_*.py. pytest.importorskip("jax") then
+# passes and each gemm/jax module dies at ``import jax.numpy``: a collection
+# error per module, which interrupts the whole session. Record the absence
+# before any test path is added, so every importorskip("jax") skips and the
+# gate below sees no JAX.
+_jax_spec = importlib.util.find_spec("jax")
+if _jax_spec is None or _jax_spec.origin is None:  # not installed, or only a namespace directory
+    sys.modules["jax"] = None
+
+
 # =================== JAX/XLA target gate =====================
 # XLA cannot compile for every GPU these tests run on, and when it cannot it
 # does not raise -- it prints
@@ -469,10 +484,15 @@ def _under_xdist():
 
 
 def _torch_empty_cache():
-    # No-op unless torch (and thus its caching allocator) is loaded.
     torch = sys.modules.get("torch")
-    if torch is not None:
-        torch.cuda.empty_cache()
+    if torch is None or not torch.cuda.is_initialized():
+        return
+    # Expandable-segment cleanup can synchronize stream 0 on the wrong device.
+    # Finish each populated device before empty_cache() unmaps its memory.
+    for device in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(device):
+            torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
 
 
 def _wait_for_free_gpu_memory(context):
@@ -585,6 +605,16 @@ def pytest_configure(config):
         print(f"PyTorch Path: {torch.__file__}")
         print(f"PyTorch CUDA Version: {torch.version.cuda}")
         print(f"PyTorch cuDNN Version: {torch.backends.cudnn.version()}")
+    try:
+        # The CuTe DSL wheel and the CUDA toolchain it bound (its cu12 / cu13 flavour, picked by the driver): the compiler floors of the
+        # OSS kernels (python/cudnn/AGENTS.md Rule 7) read THIS, never torch.version.cuda, so a lane's log names the compiler it ran.
+        import cutlass as _cutlass
+        from cutlass.base_dsl.version_info import CUDA_VERSION as _dsl_cuda
+    except Exception as e:  # noqa: BLE001 -- no DSL, or an unusable one: the OSS tests decline or skip for themselves
+        print(f"CuTe DSL: not available ({type(e).__name__}: {str(e)[:160]})")
+    else:
+        print(f"CuTe DSL Version: {_cutlass.__version__} (compiles with CUDA {_dsl_cuda.major}.{_dsl_cuda.minor})")
+        print(f"CuTe DSL Path: {_cutlass.__file__}")
 
 # fmt: off
 def pytest_addoption(parser):

@@ -10,6 +10,7 @@ import torch
 
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+from cudnn.frost.device import PORTABLE_ELEMENTWISE_CCS
 
 _INPUTS = ("grad_q", "grad_k", "grad_v", "cosine", "sine")
 
@@ -86,8 +87,8 @@ class VisionRoPEBackward(APIBase):
         if not self._initial_alignment:
             raise ValueError("all input addresses must be 16-byte aligned")
         self._capability = torch.cuda.get_device_capability(self._device)
-        if self._capability != (10, 0):
-            raise NotImplementedError("FROST vision RoPE backward currently supports SM100")
+        if self._capability not in PORTABLE_ELEMENTWISE_CCS:
+            raise NotImplementedError(f"FROST vision RoPE backward supports cc {PORTABLE_ELEMENTWISE_CCS}; got {self._capability}")
         self._is_supported = True
         return True
 

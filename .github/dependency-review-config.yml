@@ -1,0 +1,13 @@
+fail-on-severity: moderate
+warn-only: false
+
+comment-summary-in-pr: never
+
+allow-licenses:
+  - Apache-2.0
+  - BSD-2-Clause
+  - BSD-3-Clause
+  - ISC
+  - MIT
+  - Python-2.0
+  - Unicode-DFS-2016

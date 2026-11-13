@@ -312,13 +312,29 @@ def test_override_beyond_the_declared_extent_is_rejected():
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="non-causal override off the tile grid is silently wrong (measured: s=96 max|dO| 8.1e-01, "
-    "s=160 4.9e-01) while the same shape declared outright is correct",
+    reason="non-causal s_kv override off the plan's KV tile attends the tile's padding rows, silently wrong "
+    "(measured with s_q == s_kv: s=96 max|dO| 8.1e-01, s=160 4.9e-01) while the same shape declared outright is correct (#1567)",
 )
 def test_non_causal_override_off_the_tile_grid_is_served():
+    # s_q stays on the grid so only the KV override can fail this case.
     case = OverrideCase()
-    got = case.execute(96, 96)
-    case.assert_served(96, 96, got=got)
+    got = case.execute(64, 96)
+    case.assert_served(64, 96, got=got)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="override_strides are accepted but not used: the kernel reads and writes with the declared BHSD strides, "
+    "so BSHD buffers at the declared shape are silently wrong (measured max|dO| 8.1e-01) (#1570)",
+)
+def test_override_strides_for_another_layout_are_honored():
+    case = OverrideCase()
+    q, k, v = (torch.randn(B, S_MAX, H, D, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3) for _ in range(3))
+    o = torch.full((B, S_MAX, H, D), float("nan"), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    bufs = (q, k, v, o, case.bufs[4])
+    got = case.execute(S_MAX, S_MAX, bufs=bufs)
+    case.assert_served(S_MAX, S_MAX, got=got, bufs=bufs)
 
 
 def test_override_triple_must_name_the_same_tensors():

@@ -58,6 +58,9 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d192(PARAMS)
+# Test-only schedule skew; no plan/runtime API sets this, so ordinary builds
+# compile the delay out. Detector: test_fp8_d192_final_p1_reuse_under_mma_skew.
+_DEBUG_MMA_P1_DELAY_US = int(globals().get("FROST_D192_FP8_DEBUG_MMA_P1_DELAY_US", 0))
 if PARAMS.paged_kv:
     # config_sm100._PAGED_KV_FLAVORS names "d192" for the f16/bf16 kernel; this file has no PAGED_KV specialization.
     raise ValueError(
@@ -173,14 +176,14 @@ def _max_abs_reduction(vec):
 def _exp2_chunk0_mask_aware(vec, apply_mask):
     """Evaluate softmax chunk 0 with the precision required by each static path.
 
-    E5M2 mask-boundary tiles use native EXP2 because degree-2 emulation can
-    exceed the output tolerance there. The repeated unmasked path retains its
-    tuned emulation mix, while the E4M3 instruction mix remains unchanged.
+    Mask-boundary tiles use native EXP2: emulation can move a probability
+    across an FP8 midpoint, which is amplified when a row has few valid keys.
+    The repeated unmasked path retains its tuned emulation mix.
     With the split off (_E2E_ENABLED, cc != 10.0) every element takes native EXP2.
     """
     values = []
     for i in range(0, int(vec.shape[0]), 2):
-        if not _E2E_ENABLED or (CFG.DTYPE_QKV == 1 and apply_mask):
+        if not _E2E_ENABLED or apply_mask:
             x = cute.math.exp2(vec[i], fastmath=True)
             y = cute.math.exp2(vec[i + 1], fastmath=True)
         elif CFG.DTYPE_QKV == 1 and i < 32:
@@ -721,6 +724,7 @@ def _kernel(
     amax_o_tensor: cute.Tensor,
     seq_q_lens_addr: cutlass.Int64 = 0,
     o_partial_f32: Optional[cute.Tensor] = None,
+    qk_padded: cutlass.Constexpr[bool] = False,
 ) -> None:
 
     if cutlass.const_expr(CFG.SPLIT_KV > 1):
@@ -763,7 +767,7 @@ def _kernel(
         leading_byte_offset=LEADING_BYTE_OFFSET_QK,
         stride_byte_offset=STRIDE_BYTE_OFFSET_QK,
         layout=SMEM_LAYOUT_QKO,
-        tma_loads_per_tile=1,
+        tma_loads_per_tile=TMA_QK_ITERS if qk_padded else 1,
         tma_granu_elems=TMA_QK_GRANU_ELEMS,
         tma_subtile_stride_elems=(CFG.TILE_N // CFG.CTA_MMA) * TMA_QK_GRANU_ELEMS,
     )
@@ -985,6 +989,7 @@ def _kernel(
             tmem_ptr_i32=tmem_ptr_i32,
             tidx=tidx,
             bars=bars,
+            score_bars=score_bars,
             sched=sched,
             lse_tensor=lse_tensor,
             sinks_tensor=sinks_tensor,
@@ -1077,6 +1082,7 @@ def _kernel(
             is_leader=is_leader,
             cta_in_pair=cta_in_pair,
             tma_mcast_mask=tma_mcast_mask,
+            qk_padded=qk_padded,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -1141,6 +1147,7 @@ def _tmaldg_warp_group(
     is_leader,
     cta_in_pair,
     tma_mcast_mask,
+    qk_padded: cutlass.Constexpr[bool],
 ):
     """Unified TMA-LDG warp — cga1/cga2 × MASK_NONE/PADDED/CAUSAL/SWA.
 
@@ -1236,11 +1243,11 @@ def _tmaldg_warp_group(
                 # is byte-identical for dense but reads the wrong packed location
                 # for THD batch>=1 (see the f16 kernel's prologue K-load fix).
                 tma_k(
-                    cutlass.Int32(0),
-                    kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off,
-                    cutlass.Int32(0),
-                    kv_head_idx,
-                    tma_batch,
+                    *(
+                        (cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch)
+                        if cutlass.const_expr(qk_padded)
+                        else (cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch)
+                    )
                 ),
                 bars.mb_k_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
@@ -1290,11 +1297,11 @@ def _tmaldg_warp_group(
                 tma_load_tile(
                     sK[kv_state.idx],
                     tma_k(
-                        cutlass.Int32(0),
-                        kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off,
-                        cutlass.Int32(0),
-                        kv_head_idx,
-                        tma_batch,
+                        *(
+                            (cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch)
+                            if cutlass.const_expr(qk_padded)
+                            else (cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch)
+                        )
                     ),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
@@ -1722,6 +1729,9 @@ def _mma_warp_group(
                 bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
+                if cutlass.const_expr(_DEBUG_MMA_P1_DELAY_US > 0):
+                    for _us in cutlass.range(_DEBUG_MMA_P1_DELAY_US, unroll=1):
+                        nvvm.inline_ptx("nanosleep.u32 1000;", read_only_args=[])
                 _wait_mbarrier(bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0], bmm2_ready_phase)
                 desc_V = sV[old_state.idx].desc()
                 accum_b2 = is_not_first_bmm2
@@ -2363,8 +2373,9 @@ def _softmax_warp_group(
                 state,
             )
 
-        if sub_tile_id == 0:
-            # No S0[last+1] exists; release P1[last] with one synthetic event.
+        if sub_tile_id == 0 and bounds.right <= bounds.left + cutlass.Int32(1):
+            # No prior P1 exists for an empty/single-KV tile. Multi-KV tiles
+            # release the final P1 slot from correction after prior PV drains.
             score_bars.mb_s_consumed[0].arrive()
 
         # End-of-kv: publish (total_max, total_sum_final) — corr does LSE.
@@ -2410,6 +2421,7 @@ def _correction_warp_group(
     tmem_ptr_i32,
     tidx,
     bars,
+    score_bars,
     sched,
     lse_tensor: Optional[cute.Tensor],
     sinks_tensor: cute.Tensor,
@@ -2494,6 +2506,13 @@ def _correction_warp_group(
                 bars.mb_stat_empty[qs].arrive()
 
                 _wait_mbarrier(bars.mb_bmm2_done[qs], bmm2_done_phase)
+
+                if cutlass.const_expr(qs == 1):
+                    if kv_loop == bounds.right - cutlass.Int32(1):
+                        # Final S0 lookahead is synthetic: unlike a real S0
+                        # completion it does not order the previous P1 read.
+                        # Both correction and softmax have 128 lanes/CTA.
+                        score_bars.mb_s_consumed[0].arrive()
 
                 # Split O_CHUNK=16 into 2× O_HALF=8 LDTM/STTM issued back-to-back —
                 # distinct scoreboard slots overlap second LDTM with first's wait.
@@ -2876,25 +2895,33 @@ def _host(
         if cutlass.const_expr(q_tensor.shape[2] != k_tensor.shape[2] * CFG.QH_PER_KH):
             raise ValueError(f"CFG.QH_PER_KH ({CFG.QH_PER_KH}) does not match tensor head extents H_q={q_tensor.shape[2]}, H_kv={k_tensor.shape[2]}")
     qk_box_q = (1, CFG.TILE_M // HEADS_PER_TILE, HEADS_PER_TILE, TMA_QK_GRANU_ELEMS)
-    # Expose D192 as three contiguous chunks so one rank-5 K TMA covers a tile.
-    k_rank5_layout = cute.make_layout(
-        (
-            k_tensor.shape[0],
-            k_tensor.shape[2],
-            TMA_QK_ITERS,
-            k_tensor.shape[1],
-            TMA_QK_GRANU_ELEMS,
-        ),
-        stride=(
-            k_tensor.stride[0],
-            k_tensor.stride[2],
-            TMA_QK_GRANU_ELEMS,
-            k_tensor.stride[1],
-            1,
-        ),
-    )
-    k_rank5_tensor = cute.make_tensor(k_tensor.iterator, k_rank5_layout)
-    qk_box_k = (1, 1, TMA_QK_ITERS, CFG.TILE_N // CFG.CTA_MMA, TMA_QK_GRANU_ELEMS)
+    # The rank-5 chunk view loses the logical head bound. Keep it for exact
+    # D192, but let rank-4 TMA zero-fill a partial final chunk when Q/K is padded.
+    qk_padded = k_tensor.shape[3] != CFG.TILE_K
+    if cutlass.const_expr(qk_padded):
+        k_tma_tensor = k_tensor
+        qk_box_k = (1, CFG.TILE_N // CFG.CTA_MMA, 1, TMA_QK_GRANU_ELEMS)
+        k_stride_order = (3, 2, 1, 0)
+    else:
+        k_rank5_layout = cute.make_layout(
+            (
+                k_tensor.shape[0],
+                k_tensor.shape[2],
+                TMA_QK_ITERS,
+                k_tensor.shape[1],
+                TMA_QK_GRANU_ELEMS,
+            ),
+            stride=(
+                k_tensor.stride[0],
+                k_tensor.stride[2],
+                TMA_QK_GRANU_ELEMS,
+                k_tensor.stride[1],
+                1,
+            ),
+        )
+        k_tma_tensor = cute.make_tensor(k_tensor.iterator, k_rank5_layout)
+        qk_box_k = (1, 1, TMA_QK_ITERS, CFG.TILE_N // CFG.CTA_MMA, TMA_QK_GRANU_ELEMS)
+        k_stride_order = (4, 3, 2, 1, 0)
     vo_box_v = (1, CFG.TILE_N, 1, TMA_VO_GRANU_ELEMS)
     vo_box_o = (1, CFG.TILE_M // HEADS_PER_TILE, HEADS_PER_TILE, _O_GRANU_ELEMS)
     stride_order = (3, 2, 1, 0)
@@ -2910,9 +2937,9 @@ def _host(
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
     tma_k_desc = tmap.create_tensor_map_tiled_from_view(
-        k_rank5_tensor,
+        k_tma_tensor,
         box_dims=qk_box_k,
-        stride_order=(4, 3, 2, 1, 0),
+        stride_order=k_stride_order,
         swizzle=_tma_swz(CFG.K_SWZ_BYTES),
         l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
     )
@@ -2998,6 +3025,7 @@ def _host(
         amax_o_tensor,
         seq_q_lens_addr,
         o_partial_f32,
+        qk_padded=qk_padded,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -3026,8 +3054,10 @@ def compile_prepared(
 
     if PARAMS.paged_kv or getattr(CFG, "O_BLOCK_SCALE", 0):
         raise NotImplementedError("prepared FP8 serves non-paged scalar-scaled outputs")
-    if (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
-        raise NotImplementedError("prepared FP8 requires the native head dimensions")
+    if not (0 < d_qk <= CFG.TILE_K and 0 < d_v <= CFG.TILE_O and d_qk % 16 == 0 and d_v % 16 == 0):
+        raise NotImplementedError("prepared FP8 requires 16-aligned heads within the D192x128 tile")
+    if CFG.THD_VARLEN and (d_qk, d_v) != (CFG.TILE_K, CFG.TILE_O):
+        raise NotImplementedError("prepared THD FP8 requires the native head dimensions")
     if lse_kind not in LSE_KINDS:
         raise ValueError(f"lse_kind must be one of {LSE_KINDS}; got {lse_kind!r}")
     if has_lse and (lse_kind == "dense") == bool(CFG.THD_VARLEN):

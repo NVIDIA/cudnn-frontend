@@ -87,6 +87,20 @@ def _cc():
 requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
 
 
+def _quant_part_row_first():
+    """Whether the BLOCK's part row speaks before any stage on this host: since the cc 10.0 admission of the dense bf16 / f16 forms
+    (2026-10-29) ``check_support`` on a served part other than Rubin declines ``quant`` by name ahead of every stage (the lift named),
+    so the stage-level texts these rows pin are read from the stage itself there.  Read the way the block reads its device (the
+    module's own device read), not torch's capability, so a simulated reading agrees with the block."""
+    from cudnn.gated_attention_block import api as _api
+
+    cc = _api._device_cc_of(torch.device("cuda")) if torch.cuda.is_available() else None
+    return cc is not None and cc != _SM107 and _api._dense_part_decline(cc) is None
+
+
+_QUANT_PART_ROW = r"quant=MxQuantSpec on cc \d+\.\d+: the FP8 / MXFP8 pipelines bind the Rubin"
+
+
 def _mxfp8_fork_missing():
     """The reason the fully fused MXFP8 block declines on this checkout, or None once S6 has landed."""
     from cudnn.gated_attention_block.api import _FusedQkvProjection
@@ -502,8 +516,15 @@ def test_mxfp8_fused_declines_typed_when_the_fork_twin_is_missing(monkeypatch, w
     blk = _decl_block(**_FUSED)
     reason = _mxfp8_fork_missing()
     assert reason is not None
+    raiser = blk.check_support
+    if _quant_part_row_first():
+        # a served part other than Rubin: the block's quant part row precedes every stage; the fork's own check_support still says
+        # what is missing (its twin check precedes its cc gate)
+        with pytest.raises(NotImplementedError, match=_QUANT_PART_ROW):
+            blk.check_support()
+        raiser = blk._proj.check_support
     with pytest.raises(NotImplementedError, match="fork twin") as ei:
-        blk.check_support()
+        raiser()
     msg = str(ei.value)
     assert reason in msg
     assert ("run_fused_proj_gemm_mxfp8" in msg) if what == "runner" else ("proj_gemm_norm_rope_mxfp8" in msg)
@@ -535,7 +556,9 @@ def test_mxfp8_gated_sdpa_declines_typed_without_the_adapters_sample_gate(monkey
     # the UNGATED MXFP8 stage does not consult the gate hook at all
     st_plain = _Sdpa(g, batch=1, seq_len=256, dtype=E4M3, device=torch.device("cuda"), want_lse=False, mxfp8=True)
     if _cc() != _SM107:
-        with pytest.raises(NotImplementedError, match="SM107"):
+        # off Rubin: the dense part statement (an unserved part: "... SM107 ...") or, on a served part other than Rubin, the quantized
+        # stage's own gate ("binds the Rubin (cc 10.7) d256 MXFP8 row only") -- both typed, before the adapter
+        with pytest.raises(NotImplementedError, match=r"SM107|binds the Rubin \(cc 10\.7\) d256 MXFP8 row only"):
             st_plain.check_support()
 
 
@@ -676,15 +699,16 @@ def test_mxfp8_ragged_padded_entries_match_the_oracle():
 
 
 @requires_rubin
-def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_cga1():
+def test_mxfp8_block_second_execute_agrees_bitwise_and_runs_natural_pair():
     """Same plan, fresh output + workspace, bit-identical (no per-execute compile / allocation; a cold-cache race
-    probe); the compiled record is the MXFP8 row's NATURAL policy at cta_mma 1 (the adapter's quantized d256 rule),
+    probe); the compiled record is the MXFP8 row's NATURAL policy at cta_mma 2 (a dense, unsplit d256 MXFP8 leg runs the
+    2-CTA pair on cc 10.7, config_sm100.d256_mxfp8_pair_leg, #1608),
     the block-scale kernel (pertensor False), amax folded out."""
     from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
 
     out, _, blk, mx, _ = _run_mx_block(_GEOM, batch=1, seq_len=512)
     tp = blk._sdpa._impl.template_params()
-    assert tp.sched_policy == SCHED_NATURAL and tp.cta_mma == 1 and tp.epilogue_gate is False
+    assert tp.sched_policy == SCHED_NATURAL and tp.cta_mma == 2 and tp.epilogue_gate is False
     assert blk._sdpa._impl._pertensor is False and blk._sdpa._impl.has_amax_o is False
     # The compiled record folded the amax OUT (kernel carries `has_amax`, caller asked for none): the adapter then
     # binds None in the amax slot and issues NO per-execute `amax_o.zero_()` memset -- the CUPTI-free half of the
@@ -764,8 +788,14 @@ def test_mxfp8_fused_declines_ragged_s_at_b_gt_1():
     hsf = torch.zeros(sf_blob_bytes(2000, geom.d_model), dtype=torch.uint8, device="cuda")
     wsf = torch.zeros(sf_blob_bytes(geom.n_qkvg, geom.d_model), dtype=torch.uint8, device="cuda")
     b = GatedAttentionBlockFwd(*args, geom, quant=_SPEC, sample_h_sf=hsf, sample_w_qkvg_sf=wsf, **_FUSED)
+    raiser = b.check_support
+    if _quant_part_row_first():
+        # a served part other than Rubin: the block's quant part row speaks first; the fork's geometry rule is the fork's own word
+        with pytest.raises(NotImplementedError, match=_QUANT_PART_ROW):
+            b.check_support()
+        raiser = b._proj.check_support
     with pytest.raises(NotImplementedError, match="S % 128 == 0 when B > 1"):
-        b.check_support()
+        raiser()
 
 
 @requires_rubin

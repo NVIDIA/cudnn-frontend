@@ -64,6 +64,33 @@ Where:
 
 See the [NHW forward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/60_causal_conv1d_forward.ipynb) and [NHW backward notebook](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/61_causal_conv1d_backward.ipynb) for PyTorch references and numerical comparisons.
 
+### `cudnn.ops.fft_causal_conv1d`
+
+Computes the same depthwise causal 1-D convolution with FFT kernels, matching cuhyena's `fft_causal_conv1d(x, weight)` wrapper:
+
+```python
+import cudnn
+
+y = cudnn.ops.fft_causal_conv1d(x, weight)
+```
+
+**Minimum cuDNN version:** 9.26.0, with Frontend bindings built against cuDNN 9.26.0 or newer. With an older backend, or bindings that lack the FFT entry points, the call raises `RuntimeError` before it executes.
+
+**Args:**
+- `x` (torch.Tensor): Input tensor of shape $(B, D, L)$. Must be on CUDA.
+- `weight` (torch.Tensor): Filter tensor of shape $(D, K)$. Same dtype as `x`.
+
+**Returns:**
+- `y` (torch.Tensor): Output of shape $(B, D, L)$, same dtype as `x`.
+
+The wrapper has no fused bias or activation, and supports `torch.autograd`.
+
+**Filter orientation differs from `cudnn.ops.causal_conv1d`.** `causal_conv1d` follows the Dao-AILab cross-correlation convention used by its Triton kernel, while `fft_causal_conv1d` follows cuhyena's convolution convention, which applies the time-reversed filter:
+
+$$\text{fft\_causal\_conv1d}(x, w) = \text{causal\_conv1d}(x, w.\text{flip}(-1))$$
+
+(fp32 agrees to 6e-7). The two entry points are therefore not drop-in interchangeable on the same weights.
+
 ### `cudnn.ops.causal_conv1d_nwh`
 
 Runs the same depthwise causal convolution with NWH tensor layout. NWH stores the channel dimension last, so input and output use $(B, L, D)$ while the filter uses $(K, D)$. The operation is equivalent to:

@@ -27,3 +27,4 @@ Samples need a GPU + cuDNN backend at runtime; individual cases `SKIP()` on unsu
 - Follow the existing pattern: build graph → `validate()` → `build_operation_graph()` → plans → `check_support()` (skip gracefully if unsupported) → execute → verify.
 - Python notebooks are formatted by `black-jupyter` (`pre-commit run`); keep the numbered-prefix naming so the tutorial order stays obvious.
 - A new public feature should come with a sample here and a doc page under `docs/`.
+- Version-gated Python samples must check both the headers used to compile the module and the loaded cuDNN library. A newer runtime cannot enable code compiled out by older headers. Exercise old-header/new-runtime, new-header/old-runtime, and supported controls; notebook 71 checks this before any cuDNN graph cell.

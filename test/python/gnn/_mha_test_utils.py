@@ -15,6 +15,8 @@ def _require_gnn_mha(variant: str) -> None:
     minimum_version = 92900 if variant == "simple" else 92800
     if cudnn.backend_version() < minimum_version:
         pytest.skip(f"GNN MHA {variant} requires cuDNN {minimum_version // 10000}.{(minimum_version // 100) % 100}.0 or newer")
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("GNN MHA operators require SM 8.0 or newer")
 
 
 def _tolerances(dtype: torch.dtype) -> tuple[float, float]:

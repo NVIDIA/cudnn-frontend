@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM80 packed/staged forward pointer binding, replay and artifact reuse."""
+"""SM80 packed/native forward pointer binding, replay and artifact reuse."""
 
 import itertools
 import math
@@ -208,36 +208,31 @@ def test_thd_wrapper_physical_stride_and_product(role, product, d, dv):
 @pytest.mark.L0
 @pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeypatch):
+def test_dense_native_replay_or_rope_decline(d, dv, rope, dtype, monkeypatch):
     from cudnn.sdpa.fwd import api_dsl, sdpa_fwd_wrapper_sm80
 
     q, k, v = (t.transpose(1, 2) for t in _inputs(d, dv, dtype, capq=128, capkv=256))
     freqs = torch.arange(256, device="cuda", dtype=torch.float32)[:, None] * torch.linspace(0.001, 0.01, d // 2, device="cuda")[None, :] if rope else None
-    calls = []
-    from cudnn.sdpa.fwd import prepared_staged_sm80
+    if rope:
+        with pytest.raises(NotImplementedError, match="RoPE"):
+            sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, rope_freqs=freqs)
+        return
+    from cudnn.sdpa.fwd import prepared_sm80
 
-    module, entry = prepared_staged_sm80, "execute" if rope else "_copy"
-    original = getattr(module, entry)
+    native_calls = []
+    native_execute = prepared_sm80.execute_tensors
 
-    def staged_call(*args, **kwargs):
-        calls.append(True)
-        return original(*args, **kwargs)
+    def native_call(*args, **kwargs):
+        native_calls.append(True)
+        return native_execute(*args, **kwargs)
 
-    monkeypatch.setattr(module, entry, staged_call)
+    monkeypatch.setattr(prepared_sm80, "execute_tensors", native_call)
 
     def run():
         return sdpa_fwd_wrapper_sm80(q, k, v, is_causal=True, rope_freqs=freqs)
 
     def check(out):
         qr, kr = q.double(), k.double()
-        if rope:
-
-            def rotate(t):
-                angles = freqs[: t.shape[2]].double()[None, None]
-                a, b = t.chunk(2, -1)
-                return torch.cat((a * angles.cos() - b * angles.sin(), b * angles.cos() + a * angles.sin()), -1).to(dtype).double()
-
-            qr, kr = rotate(qr), rotate(kr)
         logits = qr @ kr.repeat_interleave(2, 1).transpose(-1, -2) / math.sqrt(d)
         logits.masked_fill_(torch.arange(256, device="cuda")[None, :] > torch.arange(128, device="cuda")[:, None], -torch.inf)
         stats = logits.logsumexp(-1)
@@ -246,11 +241,11 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
         torch.testing.assert_close(out["lse_tensor"].double(), stats, rtol=0.002, atol=0.002)
 
     check(run())
-    assert calls, "the dense off-flavor/RoPE case must exercise the staged entry"
+    assert native_calls, "aligned padded widths must use the native entry without copies"
     import cutlass.cute.runtime as runtime
 
     def forbid_dlpack(*args, **kwargs):
-        pytest.fail("SM80 staged launch rebuilt DLPack operands")
+        pytest.fail("SM80 native launch rebuilt DLPack operands")
 
     monkeypatch.setattr(runtime, "from_dlpack", forbid_dlpack)
     check(run())
@@ -259,8 +254,6 @@ def test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, dtype, monkeyp
         with torch.cuda.graph(graph):
             captured = run()
         q.mul_(0.8)
-        if freqs is not None:
-            freqs.add_(0.1)
         for value in captured.values():
             value.fill_(float("nan"))
         graph.replay()
@@ -323,9 +316,9 @@ def test_thd_nonpositive_and_large_scale(d, dv, scale, features):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("d,dv", [(96, 96), (192, 96)])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_dense_staged_artifact_reload_in_new_process(d, dv, rope, dtype, tmp_path):
+def test_dense_native_artifact_reload_in_new_process(d, dv, dtype, tmp_path):
     import json
     import os
     from pathlib import Path
@@ -341,27 +334,26 @@ import torch, pytest, cudnn
 import cutlass.cute as cute
 from cudnn.frost import compiled_cache
 from cudnn.sdpa.fwd.kernels.sm80 import prepared_host
-tests, package, d, dv, rope, dtype, reload = sys.argv[1:]
+tests, package, d, dv, dtype, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 assert torch.cuda.get_device_capability() == (8, 0)
 sys.path.insert(0, tests)
-from test_sdpa_sm80_thd_forward_prepared import test_dense_staged_pointer_launch_and_rope_replay
-from cudnn.sdpa.fwd import prepared_staged_sm80
-module, entry = prepared_staged_sm80, "compile_plan"
+from test_sdpa_sm80_thd_forward_prepared import test_dense_native_replay_or_rope_decline
+from cudnn.sdpa.fwd import prepared_sm80
+module, entry = prepared_sm80, "build_spec"
 original = getattr(module, entry)
 artifacts = []
-def record(*args):
-    result = original(*args)
-    artifacts.append(result.core.artifact)
-    artifacts.extend(c[0] for c in result.copies if c is not None)
+def record(*args, **kwargs):
+    result = original(*args, **kwargs)
+    artifacts.append(result.artifact)
     return result
 with pytest.MonkeyPatch.context() as patch:
     patch.setattr(module, entry, record)
     if reload == "1":
         def forbidden(*args, **kwargs):
-            raise AssertionError("staged forward invoked JIT in the second process")
+            raise AssertionError("native forward invoked JIT in the second process")
         patch.setattr(cute, "compile", forbidden)
-    test_dense_staged_pointer_launch_and_rope_replay(int(d), int(dv), rope == "1", getattr(torch, dtype), patch)
+    test_dense_native_replay_or_rope_decline(int(d), int(dv), False, getattr(torch, dtype), patch)
 assert artifacts
 if reload == "1":
     assert all(hasattr(a, "_compiled_cache_raw") for a in artifacts)
@@ -372,7 +364,7 @@ print(json.dumps(compiled_cache.stats()))
     results = []
     for reload in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(d), str(dv), str(int(rope)), dtype, str(reload)],
+            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, str(d), str(dv), dtype, str(reload)],
             env=env,
             capture_output=True,
             text=True,
@@ -386,19 +378,13 @@ print(json.dumps(compiled_cache.stats()))
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d,dv,rope", [(96, 96, False), (192, 96, False), (128, 128, True), (256, 256, True)])
+@pytest.mark.parametrize("d,dv", [(96, 96), (192, 96)])
 @pytest.mark.parametrize("cache_mode", ["disabled", "unknown_manifest"])
-def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode, tmp_path, monkeypatch):
+def test_dense_native_process_reuse_without_persistence(d, dv, cache_mode, tmp_path, monkeypatch):
     import cutlass.cute as cute
     from cudnn.frost import compiled_cache
     from cudnn.sdpa.fwd.api_dsl import _sm80_wrapper_cache
 
-    from cudnn.sdpa.fwd.prepared_staged_sm80 import _compile_core
-    from cudnn.sdpa.fwd.kernels.sm80.staged_copy import compile_gather
-    from cudnn.sdpa.fwd.kernels.staged_copy import compile_copy
-
-    for cached in (_compile_core, compile_gather, compile_copy):
-        cached.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
     if cache_mode == "disabled":
         monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
@@ -408,8 +394,8 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
         _sm80_wrapper_cache.clear()
         with pytest.MonkeyPatch.context() as patch:
             if reload:
-                patch.setattr(cute, "compile", lambda *a, **k: pytest.fail("staged forward lost process-local artifact reuse"))
-            test_dense_staged_pointer_launch_and_rope_replay(d, dv, rope, torch.float16, patch)
+                patch.setattr(cute, "compile", lambda *a, **k: pytest.fail("native forward lost process-local artifact reuse"))
+            test_dense_native_replay_or_rope_decline(d, dv, False, torch.float16, patch)
 
 
 @pytest.mark.L0
@@ -419,8 +405,9 @@ def test_dense_staged_process_reuse_without_persistence(d, dv, rope, cache_mode,
     + [(role, invalid) for role in ("lse", "sinks", "seq_q_lens", "seq_kv_lens", "bias_tensor") for invalid in ("dtype", "device")]
     + [("bias_tensor", "empty_batch")],
 )
-def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, monkeypatch):
-    from cudnn.sdpa.fwd import api_dsl, prepared_staged_sm80
+def test_dense_native_rejects_invalid_operands_before_launch(role, invalid, monkeypatch):
+    from cudnn.sdpa.fwd import api_dsl
+    from dataclasses import replace
 
     q = torch.empty((2, 17, 4, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
     kv = torch.empty((2, 33, 2, 96), device="cuda", dtype=torch.float16).transpose(1, 2)
@@ -442,7 +429,7 @@ def test_dense_staged_rejects_invalid_operands_before_staging(role, invalid, mon
     api.check_support()
     api.compile()
     workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
-    monkeypatch.setattr(prepared_staged_sm80, "_copy", lambda *a, **k: pytest.fail("invalid operand reached workspace staging"))
+    monkeypatch.setattr(api, "_sm80_spec", replace(api._sm80_spec, fn=lambda *a, **k: pytest.fail("invalid operand reached native launch")))
     tensor = values[role]
     if invalid == "shape":
         values[role] = tensor[:, :, :-1]

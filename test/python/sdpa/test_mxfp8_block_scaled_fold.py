@@ -6,9 +6,9 @@ plain MXFP8 forward.
 
 The ``sf_o`` output has no backend lowering, so a draw the harness admits and the
 FROST MXFP8 engine then declines FAILS the test (not a skip). The predicate must
-therefore mirror the engine rows exactly -- including their ARCH RANGE: the SM120
-CI lane (cc 12.0, so ``major >= 10``) failed every admitted draw on #1180 because
-no SM120 MXFP8 engine exists. Pure python; runs on every lane."""
+therefore mirror the engine rows exactly -- including their ARCH RANGE and their
+block-size domain: the SM120 MXFP8 row serves the 32-element (MXFP8) O only. Pure
+python; runs on every lane."""
 
 import cudnn
 import pytest
@@ -45,9 +45,16 @@ def test_admitted_on_the_sm100_line(sm):
     assert _draw(16, sm=sm) == 16
 
 
-@pytest.mark.parametrize("sm", [80, 90, 120, 121])
+@pytest.mark.parametrize("sm", [120, 121])
+def test_sm120_admits_the_mxfp8_output_only(sm):
+    """The SM120 MXFP8 row serves the E4M3 + UE8M0/32 O; an NVFP4 draw folds to a plain forward."""
+    assert _draw(32, sm=sm) == 32
+    assert _draw(16, sm=sm) == 0
+
+
+@pytest.mark.parametrize("sm", [80, 90])
 def test_folds_off_the_mxfp8_engine_rows(sm):
-    """SM120 has no MXFP8 kernel; Hopper and Ampere have no FROST MXFP8 row at all."""
+    """Hopper and Ampere have no FROST MXFP8 row at all."""
     assert _draw(32, sm=sm) == 0
     assert _draw(16, sm=sm) == 0
 
@@ -81,17 +88,34 @@ def test_fp4_needs_the_packed_dtype():
 
 
 def test_default_engines_enabled_follows_the_manifest(monkeypatch):
-    """The default admission follows the manifest, not the raw flag: the cc 10.7 row is a default candidate (offered
-    with the flag deleted), the SM100 row still answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES.  The sm_107a DSL target
-    is modelled as present (test/AGENTS.md: SM107 metadata tests run on every lane; the public 4.7.0 wheel lacks it)."""
+    """The default admission follows the manifest, not the raw flag: the cc 10.7 and SM120 rows are default candidates
+    (offered with the flag deleted), the SM100 row still answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES.  A CuTe DSL at
+    the FROST floor and the sm_107a target are modelled as present (test/AGENTS.md: SM107 metadata tests run on every
+    lane; the public 4.7.0 wheel lacks the target)."""
     from cudnn.frost import buffers
 
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.7.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     assert _draw(32, sm=107, engines_enabled=None) == 32
+    assert _draw(32, sm=120, engines_enabled=None) == 32
+    assert _draw(32, sm=121, engines_enabled=None) == 32
     assert _draw(32, sm=100, engines_enabled=None) == 0
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert _draw(32, sm=100, engines_enabled=None) == 32
+
+
+@pytest.mark.parametrize("state", [(False, None), (True, ("nvidia-cutlass-dsl", "4.6.2"))], ids=["absent", "below_floor"])
+def test_default_admission_needs_a_usable_dsl(monkeypatch, state):
+    """Rule 7: every FROST MXFP8 row declines without a CuTe DSL at the FROST floor, so the mirror folds the draw there
+    on every arch -- an admitted draw the row declines would fail the test."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: state)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    for sm in (100, 107, 120):
+        assert _draw(32, sm=sm, engines_enabled=None) == 0, sm
 
 
 def test_cc107_default_admission_needs_the_sm_107a_dsl_target(monkeypatch):

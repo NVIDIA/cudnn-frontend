@@ -83,9 +83,17 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 from cutlass.cute.runtime import from_dlpack
 
-from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
+from ..common.thd import (
+    emit_checkpoint_seq_descs,
+    emit_family_descs,
+    emit_seq_descs,
+    emit_tile_seq_descs,
+    expanded_view,
+    tma_load_family,
+    TENSOR_MAP_QWORDS,
+)
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
-from ..common.host import get_dtype
+from ..common.host import get_dtype, family_slots
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -93,7 +101,6 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
-    launch_dependent_grids,
     wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
@@ -835,10 +842,12 @@ def tmaldg_warp(
     bars,
     q_ratio,
     k_ratio,
+    arr_words,
 ):
-    """TMA-LDG warp role (warp 13): every Q/K/dO TMA load and the chunk-factor tile TMA loads; a dO stage is recycled
-    after both its readers (the dU intra GEMM and CG0) release it."""
+    """TMA-LDG warp role (warp 13): every Q/K/dO TMA load (K through its (token, slot, head, dim) descriptor family) and
+    the chunk-factor tile TMA loads; a dO stage is recycled after both its readers (the dU intra GEMM and CG0) release it."""
     nvvm.setmaxregister(cfg.num_regs_other, nvvm.SetMaxRegisterAction.DECREASE)
+    acquired_batch = cutlass.Int32(-1)
 
     q_index = PipelineState.start(phase=1)
     k_index = PipelineState.start(phase=1)
@@ -908,15 +917,17 @@ def tmaldg_warp(
         head_k = head_idx // k_ratio
         slot = batch_idx * desc_qwords
         desc_q_slot = (desc_q_base + slot).tospace(cutlass.AddressSpace.generic)
-        desc_k_slot = (desc_k_base + slot).tospace(cutlass.AddressSpace.generic)
+        desc_k_family = desc_k_base + slot
         desc_do_slot = (desc_do_base + slot).tospace(cutlass.AddressSpace.generic)
-        if elect_one:
-            tma_tensormap_acquire(desc_q_slot)
-            tma_tensormap_acquire(desc_k_slot)
-            tma_tensormap_acquire(desc_do_slot)
         desc_tinv_slot = (desc_tinv_base + slot).tospace(cutlass.AddressSpace.generic)
-        if elect_one:
-            tma_tensormap_acquire(desc_tinv_slot)
+        if batch_idx != acquired_batch:
+            acquired_batch = batch_idx
+            if elect_one:
+                tma_tensormap_acquire(desc_q_slot)
+                for s in cutlass.range_constexpr(1 if cfg.b_t % cfg.k_slots == 0 else cfg.k_slots + 1):
+                    tma_tensormap_acquire((desc_k_family + s * arr_words).tospace(cutlass.AddressSpace.generic))
+                tma_tensormap_acquire(desc_do_slot)
+                tma_tensormap_acquire(desc_tinv_slot)
 
         if cutlass.const_expr(cfg.expand_num > 1):
             sub = (compute_end - 1) % cutlass.Int32(cfg.expand_num)
@@ -936,8 +947,7 @@ def tmaldg_warp(
             k_index = advance(k_index, cfg.smem_k_stages)
             if elect_one:
                 bars.mb_k_ready[k_idx].arrive(n_bytes=cfg.tma_k_bytes)
-            k_slice = tma_slice_runtime_desc(desc_k_slot, cutlass.Int32(0), head_k, tok_coord)
-            tma_load_tile(sK_tma[k_idx], k_slice, bars.mb_k_ready[k_idx].smem_ptr, acquire=False)
+            tma_load_family(sK_tma[k_idx], desc_k_family, arr_words, head_k, chunk_idx, bars.mb_k_ready[k_idx].smem_ptr, cutlass.Int32(0), cfg.b_t, cfg.k_slots)
 
             # ---- Q load: the block's 64 compact tokens -------------------------------
             if block_head:
@@ -986,8 +996,6 @@ def tmaldg_warp(
     for _ in range(cfg.smem_t_inv_stages):
         bars.mb_t_inv_done[tinv_index.idx].wait(tinv_index.phase)
         tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1380,8 +1388,10 @@ def compute2_warp_group(
     bidx,
     num_ctas,
     mWorkItems,
+    cu_seqlens,
     mDstate0_out,
     mDstate_in,
+    mDcomposed,
     tidx,
     tmem_base_slot,
     sCumprod,
@@ -1435,10 +1445,15 @@ def compute2_warp_group(
             gate_index = advance(gate_index, cfg.smem_gate_stages)
             if cutlass.const_expr(cfg.use_dstate_in):
                 cumprod_top = sCumprod[sCumprod.shape[0] - 1, 0, gate_idx]
-                gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                if cutlass.const_expr(cfg.dstate_table):
+                    gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                    dstate_src = (gDstate_in.iterator + gDstate_in.layout((dstate_gmem_row, 0))).raw_ptr()
+                    seed_vw = cutlass.const_expr(16 // (mDstate_in.element_type.width // 8))
+                if cutlass.const_expr(cfg.has_composed_dstate):
+                    is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                    gDcomposed = mDcomposed[None, None, head_idx, cutlass.Int32(0)]
+                    composed_src = (gDcomposed.iterator + gDcomposed.layout((dstate_gmem_row, 0))).raw_ptr()
                 seed_from_dstate_in = compute_end == batch_num_chunks
-                dstate_src = (gDstate_in.iterator + gDstate_in.layout((dstate_gmem_row, 0))).raw_ptr()
-                seed_vw = cutlass.const_expr(16 // (mDstate_in.element_type.width // 8))
                 dstate_input_idx = dstate_input_index.idx
                 bars.mb_dstate_input_done[dstate_input_idx].wait(dstate_input_index.phase)
                 dstate_input_index = advance(dstate_input_index, cfg.tmem_dstate_input_stages)
@@ -1447,10 +1462,16 @@ def compute2_warp_group(
                     for t in cutlass.range_constexpr(16):
                         seed_block[t] = cutlass.Float32(0.0)
                     if seed_from_dstate_in:
-                        for g in cutlass.range_constexpr(16 // seed_vw):
-                            seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
-                            for t in cutlass.range_constexpr(seed_vw):
-                                seed_block[g * seed_vw + t] = seed_chunk[t].to(cutlass.Float32)
+                        if cutlass.const_expr(cfg.dstate_table):
+                            for g in cutlass.range_constexpr(16 // seed_vw):
+                                seed_chunk = (dstate_src + i * 16 + g * seed_vw).load(count=seed_vw, alignment=16)
+                                for t in cutlass.range_constexpr(seed_vw):
+                                    seed_block[g * seed_vw + t] = seed_chunk[t].to(cutlass.Float32)
+                        if cutlass.const_expr(cfg.has_composed_dstate):
+                            for g in cutlass.range_constexpr(4):
+                                composed_chunk = (composed_src + i * 16 + g * 4).load(count=4, alignment=16)
+                                for t in cutlass.range_constexpr(4):
+                                    seed_block[g * 4 + t] = composed_chunk[t] if is_boundary else seed_block[g * 4 + t]
                     seed_pack = cutlass.Array(cutlass.Int32, 8, alignment=16)
                     for pc in cutlass.range_constexpr(8):
                         seed_pack[pc] = fp32_to_fp16(seed_block[2 * pc], seed_block[2 * pc + 1], dtype=cfg.io_dtype)
@@ -1535,11 +1556,22 @@ def compute2_warp_group(
             if write_passthrough:
                 gDstate0 = mDstate0_out[None, None, head_idx, batch_idx]
                 if cutlass.const_expr(cfg.use_dstate_in):
-                    gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                    if cutlass.const_expr(cfg.dstate_table):
+                        gDstate_in = mDstate_in[None, None, head_idx, batch_idx]
+                    if cutlass.const_expr(cfg.has_composed_dstate):
+                        is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
+                        gDcomposed = mDcomposed[None, None, head_idx, cutlass.Int32(0)]
                     for i in cutlass.range_constexpr(num_ldtms):
                         for kk in cutlass.range_constexpr(32):
                             if dstate_row_valid:
-                                gDstate0[dstate_gmem_row, i * ldtm_width + kk] = gDstate_in[dstate_gmem_row, i * ldtm_width + kk]
+                                if cutlass.const_expr(cfg.dstate_table):
+                                    seed_val = gDstate_in[dstate_gmem_row, i * ldtm_width + kk]
+                                else:
+                                    seed_val = cutlass.Float32(0.0).to(mDstate0_out.element_type)
+                                if cutlass.const_expr(cfg.has_composed_dstate):
+                                    composed_val = gDcomposed[dstate_gmem_row, i * ldtm_width + kk].to(mDstate0_out.element_type)
+                                    seed_val = composed_val if is_boundary else seed_val.to(mDstate0_out.element_type)
+                                gDstate0[dstate_gmem_row, i * ldtm_width + kk] = seed_val
                 else:
                     for i in cutlass.range_constexpr(num_ldtms):
                         for kk in cutlass.range_constexpr(32):
@@ -1572,15 +1604,17 @@ def build_descs_body(
     b_t: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     q_step: cutlass.Constexpr[int] = 1,
+    k_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp), after the prologue's order pass.
     q and dO address the compact
     token timeline (``expand_num`` scales k alone); ``q_step`` > 1 reads the phase rows of an expanded q buffer."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
+    family_arrays = 1 if b_t % expand_num == 0 else expand_num + 1
     sub0 = cute.make_tensor(desc_workspace.iterator, cute.make_layout((arr_words,), stride=(1,)))
-    sub1 = cute.make_tensor(desc_workspace.iterator + arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub2 = cute.make_tensor(desc_workspace.iterator + 2 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
-    sub3 = cute.make_tensor(desc_workspace.iterator + 3 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
+    sub1 = cute.make_tensor(desc_workspace.iterator + arr_words, cute.make_layout((family_arrays * arr_words,), stride=(1,)))
+    sub2 = cute.make_tensor(desc_workspace.iterator + (1 + family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
+    sub3 = cute.make_tensor(desc_workspace.iterator + (2 + family_arrays) * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
         if cutlass.const_expr(q_step > 1):
@@ -1593,7 +1627,7 @@ def build_descs_body(
             emit_seq_descs(base_q, sub0, cu_seqlens, q, n_batch, 2, 1, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        emit_seq_descs(base_k, sub1, cu_seqlens, k, n_batch, 2, expand_num, lanes=32)
+        emit_family_descs(base_k, sub1, cu_seqlens, k, n_batch, b_t, k_slots, expand_num, lanes=32)
         if cutlass.const_expr(tinv is not None):
             emit_tile_seq_descs(base_tinv, sub3, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
@@ -1624,13 +1658,13 @@ def frost_gdn_bprop_summary_prologue(
     mWorkItems: cute.Tensor,
     mScheduler: Optional[cute.Tensor],
     n_batch: cutlass.Int32,
+    k_slots: cutlass.Constexpr[int] = 1,
 ) -> None:
     """Two-CTA prologue: under ``run_order`` (this kernel is the first work-item-table consumer) block 0 LPT-orders the
     table and zeroes both consumers' scheduler rings (:func:`order_body`); block 1 builds the per-batch TMA-descriptor
     arrays (:func:`build_descs_body`)."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -1661,21 +1695,7 @@ def frost_gdn_bprop_summary_prologue(
             )
     else:
         build_descs_body(
-            widx,
-            base_q,
-            base_k,
-            base_do,
-            base_tinv,
-            desc_workspace,
-            cu_seqlens,
-            q,
-            k,
-            do_,
-            tinv,
-            n_batch,
-            b_t,
-            expand_num,
-            q_step,
+            widx, base_q, base_k, base_do, base_tinv, desc_workspace, cu_seqlens, q, k, do_, tinv, n_batch, b_t, expand_num, q_step, k_slots=k_slots
         )
 
 
@@ -1698,11 +1718,13 @@ def prologue(
     tinv: Optional[cute.Tensor],
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
+    k_slots: cutlass.Constexpr[int] = 1,
 ):
     """One-launch prologue: LPT-order the work items (``run_order``, when this kernel is the backward pair's first table
     consumer) and build the per-(b,h) TMA-descriptor arrays (Q, K, dO) into ``tensormap_workspace``."""
+    k = expanded_view(k, k_slots, expand_num)
     h_q = q.shape[1]
-    h_k = k.shape[1]
+    h_k = k.shape[2]
     h_v = do_.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = h_q if h_q >= h_v else h_v
@@ -1712,7 +1734,6 @@ def prologue(
     bt = b_t
 
     q_row_stride, q_head_stride = q.stride[0], q.stride[1]
-    k_row_stride, k_head_stride = k.stride[0], k.stride[1]
 
     d_k = q.shape[2]
     if cutlass.const_expr(q_step > 1):
@@ -1722,12 +1743,20 @@ def prologue(
         )
     else:
         q_headed = cute.make_tensor(q.iterator, cute.make_layout((q.shape[0], h_q, d_k), stride=(q_row_stride, q_head_stride, 1)))
-    k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], h_k, d_k), stride=(k_row_stride, k_head_stride, 1)))
 
     do_headed = cute.make_tensor(do_.iterator, cute.make_layout((d_v, heads_out, do_.shape[0]), stride=(1, do_.stride[1], do_.stride[0])))
     swizzle_128b = tma.TensorMapSwizzle.s128b
     base_desc_q = tma.create_tensor_map_tiled_from_view(q_headed, box_dims=(bt, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
-    base_desc_k = tma.create_tensor_map_tiled_from_view(k_headed, box_dims=(bt, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
+    if cutlass.const_expr(k_slots == 1):
+        k_rows = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0], k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[2], 1)))
+        base_desc_k = tma.create_tensor_map_tiled_from_view(k_rows, box_dims=(b_t, 1, box_elems), stride_order=(2, 1, 0), swizzle=swizzle_128b)
+    else:
+        k_headed = cute.make_tensor(
+            k.iterator, cute.make_layout((k.shape[0], k_slots, k.shape[2], k.shape[3]), stride=(k.stride[0], k.stride[1], k.stride[2], 1))
+        )
+        base_desc_k = tma.create_tensor_map_tiled_from_view(
+            k_headed, box_dims=(b_t // k_slots, k_slots, 1, box_elems), stride_order=(3, 2, 1, 0), swizzle=swizzle_128b
+        )
     base_desc_do = tma.create_tensor_map_tiled_from_view(do_headed, box_dims=(box_elems, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
 
     base_desc_tinv = base_desc_k
@@ -1758,6 +1787,7 @@ def prologue(
         work_items,
         scheduler_all,
         cutlass.Int32(batch_size),
+        k_slots,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -1773,6 +1803,7 @@ def host(
     cu_seqlens: cute.Tensor,
     dstate0: cute.Tensor,
     dstate_in: Optional[cute.Tensor],
+    dcomposed: Optional[cute.Tensor],
     tinv: cute.Tensor,
     work_items: Optional[cute.Tensor],
     work_count: Optional[cute.Tensor],
@@ -1783,8 +1814,9 @@ def host(
 ):
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = cutlass.Int32(gate.shape[1])
+    k = expanded_view(k, cfg.k_slots, cfg.expand_num)
     q_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(q.shape[1]))
-    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[1]))
+    k_ratio = cute.FastDivmodDivisorV2(heads_out // cutlass.Int32(k.shape[2]))
 
     # ---- SMEM sizing: per-buffer element cosizes -------------------------------------
     bytes_per_element = cfg.io_dtype.width // 8
@@ -1826,6 +1858,7 @@ def host(
         do_,
         dstate0,
         dstate_in,
+        dcomposed,
         tinv,
         work_items,
         work_count,
@@ -1858,6 +1891,7 @@ def frost_gdn_bprop_summary(
     mdO,
     mDstate0,
     mDstate_in,
+    mDcomposed,
     mTinv: cute.Tensor,
     mWorkItems: cute.Tensor,
     mCount: cute.Tensor,
@@ -1891,14 +1925,23 @@ def frost_gdn_bprop_summary(
                 stride=(mDstate_in.stride[2], mDstate_in.stride[3], mDstate_in.stride[1], mDstate_in.stride[0]),
             ),
         )
+    if cutlass.const_expr(mDcomposed is not None):
+        mDcomposed = cute.make_tensor(
+            mDcomposed.iterator,
+            cute.make_layout(
+                (mDcomposed.shape[2], mDcomposed.shape[3], mDcomposed.shape[1], mDcomposed.shape[0]),
+                stride=(mDcomposed.stride[2], mDcomposed.stride[3], mDcomposed.stride[1], mDcomposed.stride[0]),
+            ),
+        )
 
     desc_base_words = tensormap_workspace.iterator.raw_ptr()
     desc_qwords = cutlass.Int32(TENSOR_MAP_QWORDS)
     arr_words = n_desc * desc_qwords
+    family_arrays = 1 if cfg.b_t % cfg.expand_num == 0 else cfg.expand_num + 1
     desc_q_base = desc_base_words
     desc_k_base = desc_base_words + arr_words
-    desc_do_base = desc_base_words + cutlass.Int32(2) * arr_words
-    desc_tinv_base = desc_base_words + cutlass.Int32(3) * arr_words
+    desc_do_base = desc_base_words + cutlass.Int32(1 + family_arrays) * arr_words
+    desc_tinv_base = desc_base_words + cutlass.Int32(2 + family_arrays) * arr_words
 
     SMEM = cutlass.AddressSpace.smem
     bars = make_bars(cfg)
@@ -2141,8 +2184,10 @@ def frost_gdn_bprop_summary(
             bidx,
             num_ctas,
             mWorkItems,
+            cu_seqlens,
             mDstate0,
             mDstate_in,
+            mDcomposed,
             tidx,
             tmem_base_slot=tmem_base_slot,
             sCumprod=sCumprod,
@@ -2192,6 +2237,7 @@ def frost_gdn_bprop_summary(
             bars=bars,
             q_ratio=q_ratio,
             k_ratio=k_ratio,
+            arr_words=arr_words,
         )
 
     if warp_idx == cfg.load_gate_beta_warp_id:
@@ -2239,10 +2285,13 @@ class GdnBpropSummaryCfg:
     d_v: int
     log_gate: bool = False
     safe_gate: bool = False
+    dstate_table: bool = True
+    has_composed_dstate: bool = False
 
     # ---- fixed constants stamped from CFG at build time ------------------------------
     b_t: int = CFG.B_T
     expand_num: int = 1
+    k_slots: int = 1
     compute_group_0_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_0_WARP_IDS
     compute_group_1_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_1_WARP_IDS
     compute_group_2_warp_ids: Tuple[int, ...] = CFG.COMPUTE_GROUP_2_WARP_IDS
@@ -2310,12 +2359,17 @@ def build_cfg(
     d_k: int,
     d_v: int,
     expand_num: int = 1,
+    k_slots: int = 1,
+    dstate_table: Optional[bool] = None,
+    has_composed_dstate: bool = False,
 ) -> GdnBpropSummaryCfg:
     """Build the per-compile ``GdnBpropSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32)."""
     if expand_num > 1 and (CFG.SMEM_Q_STAGES != 2 or CFG.SMEM_DO_STAGES != 2):
         raise ValueError("the compact q / dO block state assumes 2-stage q and dO rings")
     cfg = GdnBpropSummaryCfg(
         use_dstate_in=use_dstate_in,
+        dstate_table=use_dstate_in if dstate_table is None else bool(dstate_table),
+        has_composed_dstate=bool(has_composed_dstate),
         io_dtype=io_dtype,
         acc_dtype=cutlass.Float32,
         max_active_clusters=max_active_clusters,
@@ -2324,6 +2378,7 @@ def build_cfg(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
+        k_slots=k_slots,
     )
     n_cg0 = len(cfg.compute_group_0_warp_ids)
     n_cg1 = len(cfg.compute_group_1_warp_ids)
@@ -2342,7 +2397,8 @@ def build_cfg(
     return cfg
 
 
-TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: Q, K, dO, tinv
+TENSORMAP_DESC_ARRAYS = 4  # per-batch runtime TMA descriptors: Q, K, dO, tinv (K as a family)
+TENSORMAP_FAMILY_OPERANDS = 1  # K: expand_num + 1 descriptor arrays when expand_num does not divide b_t
 
 
 # ---------------------------------------------------------------------------
@@ -2368,6 +2424,8 @@ def get_compiled_cache(
     run_order: bool = False,
     order_gen: bool = False,
     q_step: int = 1,
+    layout_key: tuple = (),
+    has_composed_dstate: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2383,6 +2441,7 @@ def compile(
     d_k: int,
     d_v: int,
     expand_num: int = 1,
+    k_slots: int = 1,
     q_cute,
     k_cute,
     gate_cute,
@@ -2392,6 +2451,7 @@ def compile(
     cu_seqlens_cute,
     dstate0_cute,
     dstate_in_cute=None,
+    dcomposed_cute=None,
     tinv_cute,
     work_items_cute=None,
     work_count_cute=None,
@@ -2411,6 +2471,9 @@ def compile(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
+        k_slots=k_slots,
+        dstate_table=dstate_in_cute is not None,
+        has_composed_dstate=dcomposed_cute is not None,
     )
 
     return cute.compile(
@@ -2425,6 +2488,7 @@ def compile(
         cu_seqlens_cute,
         dstate0_cute,
         dstate_in_cute,
+        dcomposed_cute,
         tinv_cute,
         work_items_cute,
         work_count_cute,
@@ -2446,6 +2510,7 @@ def chunk_gdn_bwd_summary(
     scale: float,
     *,
     d_final_state=None,
+    dcomposed=None,
     work_items=None,
     work_count=None,
     scheduler_counter=None,
@@ -2475,9 +2540,9 @@ def chunk_gdn_bwd_summary(
         l2-normalized) and dO stay on the compact token timeline
     q_step: row step of the phase rows inside ``q`` (1 = compact buffer)
     own_prologue: False skips the prologue launch when the chain prologue already ordered the table and built the descriptors
+    dcomposed: the one-row fp32 composed gradient of the context-parallel boundary sequence (the last one), read in place of its
+        ``d_final_state`` row; ``d_final_state`` may then be None (every other sequence starts from zero)
     """
-    q.shape[1]
-    k.shape[1]
     do.shape[1]
     DK = q.shape[2]
     DV = do.shape[2]
@@ -2495,6 +2560,7 @@ def chunk_gdn_bwd_summary(
     if not safe_gate:
         a_log = None
         dt_bias = None
+    k_slots = family_slots(k, expand_num, 3)
     cache = get_compiled_cache(
         str(q.dtype),
         str(cu_seqlens.dtype),
@@ -2514,6 +2580,8 @@ def chunk_gdn_bwd_summary(
         run_order,
         order_gen,
         q_step,
+        layout_key=(len(k.shape), k_slots),
+        has_composed_dstate=dcomposed is not None,
     )
 
     if "compiled" not in cache:
@@ -2525,6 +2593,7 @@ def chunk_gdn_bwd_summary(
         dstate_in_cute = None
         if d_final_state is not None:
             dstate_in_cute = from_dlpack(d_final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        dcomposed_cute = from_dlpack(dcomposed, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dcomposed is not None else None
         work_items_cute = from_dlpack(work_items, assumed_align=16)
         work_items_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_count_cute = from_dlpack(work_count, assumed_align=4).mark_layout_dynamic()
@@ -2533,15 +2602,16 @@ def chunk_gdn_bwd_summary(
         dt_bias_cute = from_dlpack(dt_bias, assumed_align=4).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None
         cache["compiled"] = compile(
             io_dtype,
-            use_dstate_in=d_final_state is not None,
+            use_dstate_in=d_final_state is not None or dcomposed is not None,
             log_gate=log_gate,
             safe_gate=safe_gate,
             num_sm=num_sm,
             d_k=DK,
             d_v=DV,
             expand_num=expand_num,
+            k_slots=k_slots,
             q_cute=from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            k_cute=from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            k_cute=from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
             gate_cute=from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=1),
             a_log_cute=a_log_cute,
             dt_bias_cute=dt_bias_cute,
@@ -2549,6 +2619,7 @@ def chunk_gdn_bwd_summary(
             cu_seqlens_cute=cu_seqlens_cute,
             dstate0_cute=dstate0_cute,
             dstate_in_cute=dstate_in_cute,
+            dcomposed_cute=dcomposed_cute,
             tinv_cute=tinv_cute,
             work_items_cute=work_items_cute,
             work_count_cute=work_count_cute,
@@ -2583,7 +2654,7 @@ def chunk_gdn_bwd_summary(
             expand_num,
             q_step,
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=len(k.shape) - 1),
             from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             cu_placeholder,
             staging_placeholder,
@@ -2593,6 +2664,7 @@ def chunk_gdn_bwd_summary(
             tinv_placeholder,
             workspace_placeholder,
             cu_stream,
+            k_slots,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
@@ -2619,6 +2691,7 @@ def chunk_gdn_bwd_summary(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         tinv,
         work_items,
         work_count,
@@ -2652,6 +2725,7 @@ def run_bwd_summary(
     *,
     tinv,
     own_prologue=True,
+    dcomposed=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -2680,6 +2754,7 @@ def run_bwd_summary(
         cu_seqlens,
         d_initial_state,
         d_final_state,
+        dcomposed,
         tinv,
         work_items,
         work_count,

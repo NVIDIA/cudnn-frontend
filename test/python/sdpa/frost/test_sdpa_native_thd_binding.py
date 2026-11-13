@@ -9,6 +9,7 @@ production fallback for native plans. No test pins a heuristic or timing.
 import sdpa_binding_reference as binding_reference
 
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,8 +30,8 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
     s.decl = {name: (h, 128, h * 128, 128, 1, h * 128) for name, h in (("q", 8), ("k", 2), ("v", 2), ("o", 8))}
-    # The native binder serves half hosts, whose K/V tables share one stride
-    # pair. The global prepared vocabulary also includes quantized-only slots.
+    # Model the existing half host ABI with one shared K/V table stride pair.
+    # Hosts declaring a separate V slot are exercised independently below.
     s.order = sorted((prep._FILLED_AT_BUILD | prep._FILLED_PER_CALL) - {"table_v_strides"})
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = [None] * len(s.order)
@@ -58,8 +59,139 @@ def _native(s, facts, workspace=0x30000, stream=17):
     return s.native.bind(prep._native_pack_from_facts(facts), prep._NATIVE_THD_INDICES, workspace, stream)
 
 
+def _physical_origin_fixture():
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    spec, facts, _ = _fixture()
+    bits = (64, 32, 64, 32, 64)
+    strides = (1024, 256, 256, 1024, 8)
+    spec.origin_specs = tuple((i, 1, stride, width) for i, (stride, width) in enumerate(zip(strides, bits)))
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    for i, (role, width) in enumerate(zip(ROLES, bits)):
+        facts[role] = prep.BufferFacts(0x50000 + i * 0x1000, f"int{width}", (2, 0), 5, (5,), (1,))
+    return spec, facts, prep._NATIVE_THD_ROLES + ROLES
+
+
+def test_physical_origin_binding_reobserves_all_five_ports():
+    spec, facts, roles = _physical_origin_fixture()
+    indices = tuple(range(len(roles)))
+    first = spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+    assert list(first) == binding_reference._bind_thd_python(spec, facts, 0x90000, 17, 17)
+    changed = {name: fact._replace(ptr=fact.ptr + 0x100000) for name, fact in facts.items()}
+    second = spec.native.bind(prep._native_pack_from_facts(changed, roles), indices, 0xA0000, 23)
+    assert list(second) == binding_reference._bind_thd_python(spec, changed, 0xA0000, 23, 23)
+    slot = spec.index["thd_origin_ptrs"]
+    assert first[slot] == tuple(facts[name].ptr for name in roles[-5:])
+    assert second[slot] == tuple(changed[name].ptr for name in roles[-5:])
+    assert spec.template[slot] is None
+    assert first[spec.index["stream"]] == 17
+    assert second[spec.index["stream"]] == 23
+
+
+@pytest.mark.parametrize("role", ["ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_stats"])
+@pytest.mark.parametrize("defect", ["missing", "dtype", "device", "short", "strided"])
+def test_physical_origins_revalidate_after_warm_binding(role, defect):
+    spec, facts, roles = _physical_origin_fixture()
+    indices = tuple(range(len(roles)))
+    spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+    if defect == "missing":
+        del facts[role]
+    else:
+        update = {"dtype": {"dtype": "float32"}, "device": {"device": (1, 0)}, "short": {"span": 4}, "strided": {"strides": (2,), "span": 9}}[defect]
+        facts[role] = facts[role]._replace(**update)
+    with pytest.raises(ValueError):
+        spec.native.bind(prep._native_pack_from_facts(facts, roles), indices, 0x90000, 17)
+
+
 def _reference(s, facts, workspace=0x30000, stream=17):
     return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
+
+
+def test_ordered_thd_rebinds_storage_and_validates_workspace_before_launch():
+    import torch
+
+    from cudnn.engines.base import ExecutionContext
+    from cudnn.sdpa._plan import _FrostSdpaPlan
+
+    spec, facts, frames = _fixture()
+    spec.scratch_bytes = 8192
+    spec.quant = spec.origin_specs = None
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    native = cudnn._pybind_module
+    roles = tuple(facts)
+    uids = tuple(range(1, len(roles) + 1))
+    layout = native.DeclaredLayout(len(roles))
+    for i, role in enumerate(roles):
+        fact = facts[role]
+        code, bits = prep._buffers.DTYPES[fact.dtype]
+        layout.set(i, fact.shape, fact.strides, fact.span * (bits // 8), code, bits)
+    schema = native._OrderedBindingSchema(uids, layout, False)
+    tensors = {role: SimpleNamespace(get_uid=lambda uid=uid: uid) for role, uid in zip(roles, uids)}
+    binding = SimpleNamespace(
+        **{role: tensors[role] for role in ("q", "k", "v", "o")},
+        cu_seq_len_q=tensors["q_lens"],
+        cu_seq_len_kv=tensors["kv_lens"],
+        stats=tensors["lse"],
+        bound_tensors=lambda: tensors.values(),
+    )
+    launch = prep.PreparedThdLaunch(spec, binding)
+    plan = _FrostSdpaPlan("thd-test", SimpleNamespace(binding=binding, prepared=launch, workspace_bytes=spec.scratch_bytes))
+    assert plan._ordered_native is spec.native
+    graph = cudnn.pygraph()
+    graph._ordered_binding_uids = uids
+    graph._slot_of_uid = dict(zip(uids, range(len(uids))))
+
+    def buffers(current):
+        result = []
+        for role, fact in current.items():
+            shape = fact.shape
+            if len(shape) == 4:
+                b, h, s, d = shape
+                shape = (b * s, h) if role == "lse" else (b * s, h, d)
+            result.append(native.make_operand_buffer(fact.ptr, shape, *prep._buffers.DTYPES[fact.dtype], fact.device[1]))
+        return tuple(result)
+
+    def call(current, workspace, stream=17):
+        return plan._execute_ordered(graph, schema, buffers(current), uids, workspace, None, None, None, stream)
+
+    for offset, stream in ((0, 17), (2**33, 23)):
+        current = {role: fact._replace(ptr=fact.ptr + offset) for role, fact in facts.items()}
+        address = 0x30000 + offset
+        expected = _reference(spec, current, address, plan._stream_handle(stream))
+        assert int(expected[spec.index["stream"]]) == stream
+        ws = native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 0)
+        result = call(current, ws, stream)
+        frame = frames.pop()
+        assert result is None
+        assert list(frame) == expected
+        for bad, message in (
+            (None, "received none"),
+            (native.make_operand_buffer(address, [0], 1, 8, 0), "got 0 bytes"),
+            (native.make_operand_buffer(address, [spec.scratch_bytes - 1], 1, 8, 0), "got 8191 bytes"),
+            (native.make_operand_buffer(address, [spec.scratch_bytes], 1, 8, 1), "workspace must be on CUDA device 0"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                call(current, bad, stream)
+            assert not frames
+        if hasattr(torch.Tensor, "__dlpack_c_exchange_api__"):
+            # CPU storage has a valid pointer and enough bytes, but its device
+            # must be rejected even after this schema has accepted CUDA storage.
+            cpu_workspace = torch.empty(spec.scratch_bytes, dtype=torch.uint8, device="cpu")
+            with pytest.raises(ValueError, match="workspace must be on CUDA device 0"):
+                call(current, cpu_workspace, stream)
+            assert not frames
+        # Unknown-capacity raw pointers use the normal Python completion path;
+        # the native entry must not launch before that path validates the call.
+        result = call(current, address, stream)
+        assert result[2] is None and not frames
+        pack = graph._finish_ordered(schema, result, address, None)
+        plan.execute(graph, pack, ExecutionContext(stream=stream, workspace=address))
+        frame = frames.pop()
+        assert list(frame) == expected
+        result = call(current, ws, stream)
+        frame = frames.pop()
+        assert result is None
+        assert list(frame) == expected
 
 
 def _equal(s, facts, **kwargs):
@@ -282,14 +414,16 @@ def test_native_asymmetric_head_dims_and_int64_runtime_token_strides():
     assert frame[s.index["problem_size"]][3] == 16
 
 
-def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2):
+def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2, v_hnd=None):
     s, facts, frames = _fixture(dtype=dtype, layout=layout)
     s.paged, s.paged_hnd, s.page_size, s.kh = True, hnd, 16, kh
+    s.paged_v_hnd = hnd if v_hnd is None else v_hnd
     s.lens_form = 1  # cumulative Q, direct per-sequence KV lengths
     facts["kv_lens"] = facts["kv_lens"]._replace(shape=(4,), strides=(1,), span=4)
     for role in ("k", "v"):
         s.decl[role] = (kh, 128, kh * 128, 128, 1, kh * 128)
-        strides = (16 * kh * 128, 16 * 128, 128, 1) if hnd else (16 * kh * 128, 128, kh * 128, 1)
+        pool_hnd = s.paged_v_hnd if role == "v" else hnd
+        strides = (16 * kh * 128, 16 * 128, 128, 1) if pool_hnd else (16 * kh * 128, 128, kh * 128, 1)
         facts[role] = facts[role]._replace(shape=(8, kh, 16, 128), strides=strides, span=8 * kh * 16 * 128)
     shape, strides = ((4, 1, 4, 1), (4, 4, 1, 1)) if table_rank == 4 else ((4, 4), (4, 1))
     for i, role in enumerate(("block_table", "block_table_v")):
@@ -298,12 +432,12 @@ def _paged_fixture(hnd=False, layout="NH", table_rank=4, dtype="bfloat16", kh=2)
     return s, facts, frames
 
 
-@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("hnd,v_hnd", [(False, False), (True, True), (False, True), (True, False)])
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("table_rank", [2, 4])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-def test_native_paged_matches_python_and_rebinds(hnd, layout, table_rank, dtype):
-    s, facts, _ = _paged_fixture(hnd, layout, table_rank, dtype)
+def test_native_paged_matches_python_and_rebinds(hnd, layout, table_rank, dtype, v_hnd):
+    s, facts, _ = _paged_fixture(hnd, layout, table_rank, dtype, v_hnd=v_hnd)
     original = tuple(s.template)
     first = _equal(s, facts)
     changed = {name: f._replace(ptr=f.ptr + 0x100000) for name, f in facts.items()}
@@ -392,6 +526,31 @@ def test_native_paged_shared_table_stride_contract(hnd, table_rank):
             bind(s, changed)
 
 
+@pytest.mark.parametrize("hnd", [False, True])
+@pytest.mark.parametrize("table_rank", [2, 4])
+def test_native_half_host_binds_declared_independent_table_strides(hnd, table_rank):
+    """A half host with a V-stride slot receives each table's current geometry."""
+    spec, facts, _ = _paged_fixture(hnd=hnd, table_rank=table_rank)
+    spec.index["table_v_strides"] = len(spec.order)
+    spec.order.append("table_v_strides")
+    spec.template.append(None)
+    spec.native = cudnn._pybind_module._SdpaThdBinder(spec)
+    first = _native(spec, facts)
+    assert first[spec.index["table_v_strides"]] == (4, 1)
+    stride = 2**33
+    shape, strides = ((4, 1, 4, 1), (1, 1, stride, 1)) if table_rank == 4 else ((4, 4), (1, stride))
+    value_table = facts["block_table_v"]._replace(ptr=0x90000, shape=shape, strides=strides, span=3 * stride + 4)
+    changed = dict(facts, block_table_v=value_table)
+    second = _native(spec, changed)
+    assert second[spec.index["table_strides"]] == (4, 1)
+    assert second[spec.index["table_v_strides"]] == (1, stride)
+    assert first[spec.index["table_v_strides"]] == (4, 1)
+    assert spec.template[spec.index["table_v_strides"]] is None
+    changed["block_table_v"] = value_table._replace(span=value_table.span - 1)
+    with pytest.raises(ValueError):
+        _native(spec, changed)
+
+
 def test_native_nonpaged_host_does_not_require_paged_slots():
     """SM120's nonpaged host omits page tables entirely."""
     s, facts, _ = _fixture()
@@ -429,6 +588,93 @@ def test_native_thd_launch_bound_retains_persistent_cap():
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
     assert _equal(s, facts)[s.index["n_thd_units"]] == 7
     assert s.template[s.index["n_thd_units"]] == 7
+
+
+@pytest.mark.parametrize("envelope", [128, 4096 * 128 * 8])
+def test_native_thd_initial_waves_track_current_capacity(envelope):
+    """A broad declaration must not hide small runtime work from the wave policy."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q = 4096, 65536, None
+    s.template[s.index["n_thd_units"]] = 102
+    s.wave_policy = (envelope, 102, 2)
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    before = list(s.template)
+    # Cross the two-wave threshold, then return to a smaller fresh binding.
+    for batch, tokens, expected_bound in [(1, 1, 8), (2, 8192, 136), (2, 11777, 200), (2, 12289, 208), (1, 8192, 128)]:
+        current = dict(facts)
+        for role in ("q", "o"):
+            current[role] = facts[role]._replace(ptr=facts[role].ptr + tokens * 4096, shape=(tokens, s.qh, 128), span=tokens * s.qh * 128)
+        for role in ("q_lens", "kv_lens"):
+            current[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+        bound = min(envelope, expected_bound)
+        expected = bound if bound <= 204 else 102
+        frame = _equal(s, current)
+        assert frame[s.index["n_thd_units"]] == expected
+        assert s.template == before and s.wave_policy == (envelope, 102, 2)
+
+
+@pytest.mark.parametrize("policy", [(0, 102, 2), (1000, 0, 2), (1000, 102, 1), (1000, 2**62, 4)])
+def test_native_thd_rejects_invalid_initial_wave_policy(policy):
+    s, _, _ = _fixture(layout=None)
+    s.wave_policy = policy
+    with pytest.raises(ValueError, match="initial-wave policy|fit in int64"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize(
+    "hq,hk,pack,bindings",
+    [
+        (64, 8, 1, [(1, 1, 64), (1, 769, 128), (1, 1025, 102), (1, 769, 128)]),
+        (64, 8, 8, [(1, 1, 8), (1, 769, 104), (1, 1025, 136), (2, 2049, 102), (1, 1025, 136)]),
+        (48, 4, 4, [(2, 1090, 120), (2, 2049, 102), (1, 1025, 108)]),
+        (16, 4, 4, [(2, 4096, 132), (2, 8194, 102), (1, 1, 4)]),
+    ],
+    ids=["unpacked", "whole_group", "partial_group", "ragged"],
+)
+def test_native_thd_initial_wave_geometry_rebinds(hq, hk, pack, bindings):
+    """Packed token tiles and an explicit work budget survive changing bindings."""
+    s, facts, _ = _fixture(layout=None, rank=3)
+    s.b, s.s_q_max, s.total_q, s.qh, s.kh = 4096, 65536, None, hq, hk
+    for role, heads in (("q", hq), ("k", hk), ("v", hk), ("o", hq)):
+        tokens = facts[role].shape[0]
+        s.decl[role] = (heads, 128, heads * 128, 128, 1, heads * 128)
+        facts[role] = facts[role]._replace(shape=(tokens, heads, 128), strides=(heads * 128, 128, 1), span=tokens * heads * 128)
+    s.template[s.index["n_thd_units"]] = 102
+    s.wave_policy = (4096 * 128 * hq, 102, 2)
+    s.wave_geometry = (512 // pack, hq // pack, 178)
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    before = list(s.template)
+    policy, geometry = s.wave_policy, s.wave_geometry
+    for batch, tokens, expected in bindings:
+        current = dict(facts)
+        for role in ("q", "o"):
+            current[role] = facts[role]._replace(ptr=facts[role].ptr + tokens * 4096, shape=(tokens, hq, 128), span=tokens * hq * 128)
+        for role in ("q_lens", "kv_lens"):
+            current[role] = facts[role]._replace(shape=(batch + 1,), span=batch + 1)
+        assert _equal(s, current)[s.index["n_thd_units"]] == expected
+        assert s.template == before and s.wave_policy == policy and s.wave_geometry == geometry
+
+
+@pytest.mark.parametrize(
+    "geometry,policy",
+    [
+        ((128, 2, 178), None),
+        ((0, 2, 178), (1000, 102, 2)),
+        ((128, 0, 178), (1000, 102, 2)),
+        ((128, 3, 178), (1000, 102, 2)),
+        ((128, 4, 178), (1000, 102, 2)),
+        ((64, 1, 178), (1000, 102, 2)),
+        ((129, 2, 178), (1000, 102, 2)),
+        ((128, 2, 101), (1000, 102, 2)),
+        ((128, 2, 205), (1000, 102, 2)),
+        ((2**62, 2, 178), (1000, 102, 2)),
+    ],
+)
+def test_native_thd_rejects_invalid_initial_wave_geometry(geometry, policy):
+    s, _, _ = _fixture(layout=None)
+    s.wave_policy, s.wave_geometry = policy, geometry
+    with pytest.raises(ValueError, match="initial-wave geometry"):
+        cudnn._pybind_module._SdpaThdBinder(s)
 
 
 def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
@@ -584,3 +830,106 @@ def test_native_paged_batch_capacity_survives_geometry_cache_hits(capacity):
         else:
             frame = _equal(s, changed)
             assert frame[s.index["problem_size"]][0] == batch
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [3, 5])
+def test_physical_paged_split_origins_bind_independent_frames(layout, splits):
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    s, facts, _ = _paged_fixture(hnd=True, layout=layout)
+    s.cga_tile_m = 128
+    s.order += ["lse_partial_ptr", "partial_o_strides"]
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template += [None, None]
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.origin_specs = ((0, 128, 1024, 64), None, None, (3, 1, 1024, 32), (4, 1, 1 if layout == "HN" else 8, 64) if layout else None)
+    for i, spec in enumerate(s.origin_specs):
+        if spec is not None:
+            facts[ROLES[i]] = prep.BufferFacts(0x50000 + i * 0x1000, f"int{spec[3]}", (2, 0), 5, (5,), (1,))
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    roles = prep._NATIVE_THD_ROLES + ROLES
+    indices = tuple(range(len(roles)))
+    original = tuple(s.template)
+    for shift, workspace in ((0, 0x4000000), (0x100000, 0x8000000)):
+        current = {name: fact._replace(ptr=fact.ptr + shift) for name, fact in facts.items()}
+        actual = s.native.bind(prep._native_pack_from_facts(current, roles), indices, workspace, 17)
+        assert list(actual) == binding_reference._bind_thd_python(s, current, workspace, 17, 17)
+        assert actual[s.index["o_partial_ptr"]] == workspace + off_o
+        assert actual[s.index["thd_origin_ptrs"]] == tuple(current[name].ptr if name in current else None for name in ROLES)
+    assert tuple(s.template) == original
+    # This still clears the old compact map bound, but overlaps the larger
+    # physical-origin map/row reservation and must be rejected before launch.
+    s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
+    with pytest.raises(ValueError, match="overlap.*physical-origin"):
+        cudnn._pybind_module._SdpaThdBinder(s)
+
+
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d576_thd_split_frames(paged, layout, splits):
+    _wide_thd_split_frames(paged, layout, splits, 576, 512)
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d192_thd_split_frames(layout, splits):
+    _wide_thd_split_frames(False, layout, splits, 192, 128)
+
+
+@pytest.mark.parametrize("layout", [None, "NH", "HN"])
+@pytest.mark.parametrize("splits", [2, 5])
+def test_native_d64_thd_split_frames(layout, splits):
+    _wide_thd_split_frames(False, layout, splits, 64, 64)
+
+
+def _wide_thd_split_frames(paged, layout, splits, d_qk, d_v):
+    """Asymmetric partial widths, origins and independent tables survive rebinding."""
+    from cudnn.sdpa.fwd.thd_origins import ROLES
+
+    s, facts, _ = _paged_fixture(hnd=True, layout=layout, v_hnd=False) if paged else _fixture(layout=layout)
+    s.d_qk, s.d_v, s.cga_tile_m = d_qk, d_v, 128
+    for role, dim in (("q", d_qk), ("k", d_qk), ("v", d_v), ("o", d_v)):
+        h, _, ts, hs, _, span = s.decl[role]
+        s.decl[role] = (h, dim, ts * dim // 128, hs * dim // 128, 1, span * dim // 128)
+        f = facts[role]
+        facts[role] = f._replace(shape=(*f.shape[:-1], dim), strides=tuple(x * dim // 128 for x in f.strides[:-1]) + (1,), span=f.span * dim // 128)
+    s.order += ["lse_partial_ptr", "partial_o_strides"] + (["table_v_strides"] if "table_v_strides" not in s.order else [])
+    s.index = {name: i for i, name in enumerate(s.order)}
+    s.template += [None] * (len(s.order) - len(s.template))
+    capacity, off_o = 16, 8192
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
+    s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
+    s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
+    s.origin_specs = tuple(
+        (
+            None
+            if (paged and i in (1, 2)) or (i == 4 and layout is None)
+            else (i, 1, s.decl[role][2] if i < 4 else (1 if layout == "HN" else s.qh), 64 if i % 2 == 0 else 32)
+        )
+        for i, role in enumerate(("q", "k", "v", "o", "stats"))
+    )
+    for i, spec in enumerate(s.origin_specs):
+        if spec is not None:
+            facts[ROLES[i]] = prep.BufferFacts(0x500000 + i * 0x1000, f"int{spec[3]}", (2, 0), 5, (5,), (1,))
+    roles = prep._NATIVE_THD_ROLES + ROLES
+    indices = tuple(range(len(roles)))
+    s.native = cudnn._pybind_module._SdpaThdBinder(s)
+    for shift, step in ((0, 2), (0x1000000, 3)):
+        current = {name: fact._replace(ptr=fact.ptr + shift) for name, fact in facts.items()}
+        if paged:
+            table = current["block_table_v"]
+            current["block_table_v"] = table._replace(shape=(4, 1, 4, 1), strides=(4 * step + 5, 1, step, 1), span=3 * (4 * step + 5) + 3 * step + 1)
+        frame = s.native.bind(prep._native_pack_from_facts(current, roles), indices, 0x4000000, 17)
+        assert list(frame) == binding_reference._bind_thd_python(s, current, 0x4000000, 17, 17)
+        assert frame[s.index["partial_o_strides"]] == (capacity * s.qh * d_v, s.qh * d_v, d_v)
+        assert frame[s.index["o_partial_ptr"]] == 0x4000000 + off_o
+        if paged:
+            assert frame[s.index["table_v_strides"]] == (4 * step + 5, step)
+    s.split_workspace = s.split_workspace._replace(off_o=s.off_o_desc + (s.b + 3) * 128)
+    with pytest.raises(ValueError, match="overlap.*physical-origin"):
+        cudnn._pybind_module._SdpaThdBinder(s)

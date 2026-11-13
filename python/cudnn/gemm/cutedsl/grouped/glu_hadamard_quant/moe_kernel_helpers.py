@@ -47,6 +47,7 @@ from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_helpers.warp_reduce import target_needs_shuffle_amax
 from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -293,8 +294,29 @@ def warp_redux_sync(
     loc=None,
     ip=None,
 ):
+    """Full-warp FP32 ``max(|x|)`` with NaN propagation.
+
+    Emits ``redux.sync.max.abs.NaN.f32`` where the target has it.  SM110 (Jetson
+    Thor) assembles the block-scaled MMA but not ``redux.f32`` (#1686), so there
+    the reduction is ``abs.f32`` followed by a five-step butterfly shuffle under
+    ``max.NaN.f32``; both forms return the same value on every lane.
+    """
     value_type = type(value)
     value_ir = value.ir_value(loc=loc, ip=ip)
+    if target_needs_shuffle_amax():
+        abs_ir = llvm.inline_asm(
+            T.f32(),
+            [value_ir],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        result = Float32(abs_ir)
+        for shift in range(5):
+            result = fmax(result, cute.arch.shuffle_sync_bfly(result, offset=1 << shift), nan=True, loc=loc, ip=ip)
+        return value_type(result)
     mask_ir = Int32(mask_and_clamp).ir_value(loc=loc, ip=ip)
     ptx_instr = f"redux.sync.max.abs.NaN.f32 $0, $1, $2;"
 

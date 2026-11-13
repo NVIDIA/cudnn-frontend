@@ -70,10 +70,11 @@ def validate_q_causal_offsets(
         return q_causal_offsets.contiguous()
 
 
-def resolve_stream(current_stream: Optional[cuda.CUstream] = None) -> cuda.CUstream:
+def resolve_stream(current_stream: Optional[cuda.CUstream] = None, device=None) -> cuda.CUstream:
     if current_stream is not None:
         return current_stream
-    return cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
+    selected_device = torch.cuda.current_device() if device is None else device
+    return cuda.CUstream(torch.cuda.current_stream(selected_device).cuda_stream)
 
 
 def torch_stream_context(current_stream: Optional[cuda.CUstream] = None, device=None):

@@ -5,12 +5,14 @@
 
 import argparse
 import difflib
+from enum import Enum
 import importlib
 import importlib.abc
 import importlib.machinery
 import inspect
 from pathlib import Path
 import sys
+from types import DynamicClassAttribute
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -56,7 +58,13 @@ def scan(package_root, modules_file):
         names.add(api)
         if not inspect.isclass(value) or value in ancestors or value.__module__.split(".")[0] != "cudnn":
             return
-        for member in dir(value):
+        members = set(dir(value))
+        if issubclass(value, Enum):
+            # Enum hides instance properties such as name/value from dir(class).
+            # Inspect descriptors without invoking them or expanding int's API.
+            for base in value.__mro__:
+                members.update(name for name, descriptor in vars(base).items() if isinstance(descriptor, DynamicClassAttribute))
+        for member in sorted(members):
             if public(member):
                 record(f"{api}.{member}", inspect.getattr_static(value, member), ancestors | {value})
 
@@ -74,6 +82,15 @@ def scan(package_root, modules_file):
                     if public(export):
                         try:
                             record(f"{name}.{export}", getattr(module, export))
+                        except (Exception, SystemExit) as error:
+                            errors.append(f"{name}.{export}: {type(error).__name__}: {error}")
+                # Lazy names stay out of __all__ so `import *` does not load optional
+                # dependencies. Their objects are indexed where defined; record the name.
+                for export in sorted(set(vars(module).get("_LAZY_OPTIONAL_IMPORTS", ())) - set(exports)):
+                    if public(export):
+                        try:
+                            getattr(module, export)
+                            names.add(f"{name}.{export}")
                         except (Exception, SystemExit) as error:
                             errors.append(f"{name}.{export}: {type(error).__name__}: {error}")
             except (Exception, SystemExit) as error:

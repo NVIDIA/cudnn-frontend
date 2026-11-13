@@ -113,3 +113,17 @@ def test_known_issue_turns_a_failure_into_an_xfail_and_leaves_a_pass_alone():
 def test_zero_output_with_zero_reference_passes():
     assert_amax_o(_amax(0.0), 0.0, torch_itype=E5M2, torch_otype=torch.bfloat16, o_gpu=_o(0.0, 0.0, dtype=torch.bfloat16))
     assert math.isfinite(p_code_step(E5M2))
+
+
+@pytest.mark.parametrize("otype", [torch.float16, torch.bfloat16, E4M3, E5M2])
+def test_empty_stored_output_requires_zero_amax(otype):
+    empty = torch.empty((0, 4, 128), dtype=otype)
+    assert_amax_o(_amax(0.0), 0.0, torch_itype=E4M3, torch_otype=otype, o_gpu=empty)
+
+
+@pytest.mark.parametrize("value", [1e-7, -1e-7, float("nan"), float("inf")])
+@pytest.mark.parametrize("saturated", [False, True])
+def test_empty_stored_output_rejects_nonzero_or_nonfinite_amax(value, saturated):
+    empty = torch.empty((0, 4, 128), dtype=torch.float16)
+    with pytest.raises(AssertionError):
+        assert_amax_o(_amax(value), 0.0, torch_itype=E4M3, torch_otype=torch.float16, o_gpu=empty, saturated=saturated)

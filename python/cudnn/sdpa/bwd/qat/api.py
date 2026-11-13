@@ -19,6 +19,8 @@ from cudnn.api_base import APIBase, TupleDict
 from ._workspace import frost_workspace_layout, nvfp4_workspace_layout
 
 _SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), (12, 0), (12, 1)}
+# The FROST kernels compile for the device's own SM100-family target.
+_FROST_CAPABILITIES = {(10, 0), (10, 3)}
 
 
 def _validate_backend_options(backend, head_chunk, workspace_limit_bytes):
@@ -105,8 +107,8 @@ class Nvfp4AttentionQatBackward(APIBase):
     def _frost_support_reason(self, capability) -> Optional[str]:
         """Known support rejections only; never import the version-specific kernel."""
         batch, _, sequence, _ = self.q_desc.shape
-        if capability != (10, 0):
-            return "NVFP4 QAT FROST backend currently supports SM100"
+        if capability not in _FROST_CAPABILITIES:
+            return "NVFP4 QAT FROST backend currently supports SM100 and SM103"
         if batch != 1 or self.is_causal:
             return "NVFP4 QAT FROST backend requires B=1 and noncausal attention"
         if sequence != self.k_desc.shape[2] or sequence % 256 != 0:
@@ -196,7 +198,8 @@ class Nvfp4AttentionQatBackward(APIBase):
             f"NVFP4 QAT Triton requires {self._workspace_bytes} workspace bytes, exceeding workspace_limit_bytes={self.workspace_limit_bytes}",
         )
 
-        optimized_sm100 = capability == (10, 0) and not self.is_causal and seqlen_kv % 16 == 0
+        # 64x64 tiles: about 2x faster than 32x32 on cc 10.3 too (B300, H3 / H12 at 8K / 32K).
+        optimized_sm100 = capability in ((10, 0), (10, 3)) and not self.is_causal and seqlen_kv % 16 == 0
         block_size = 64 if optimized_sm100 else 32
         num_warps = 8 if optimized_sm100 else 4
         fallback_stages = 2 if capability[0] == 12 and max(seqlen_q, seqlen_kv) >= 8192 else 3

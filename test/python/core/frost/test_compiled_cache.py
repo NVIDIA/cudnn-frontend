@@ -153,6 +153,43 @@ def test_the_record_carries_the_in_process_calling_convention():
     assert cc._rebuild_wrapper(lambda *a: None, None) is None  # an entry from before the record carried a spec is a miss
 
 
+def test_constexpr_dataclasses_do_not_change_the_reloaded_runtime_abi():
+    import inspect
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    import cutlass
+    from cutlass.base_dsl.jit_executor import ExecutionArgs
+
+    @dataclass
+    class Config:
+        tile: int = 64
+
+    def host(config: cutlass.Constexpr, x: int, *, stream: int):
+        pass
+
+    def runtime_wrapper(x, *, stream):
+        pass
+
+    execution_args = ExecutionArgs(inspect.signature(host), "host")
+    if not hasattr(execution_args, "get_rectified_args_from_original_args"):
+        pytest.skip("this DSL executor cannot identify constexpr dataclass arguments")
+    compiled = SimpleNamespace(execution_args=execution_args, _kwargs_wrapper=runtime_wrapper)
+    spec = cc._wrapper_spec_of(compiled, (Config(), 7), {"stream": 11, "options": "--enable-tvm-ffi"})
+    assert spec == {"arg_names": ["x"], "arg_defaults": [], "kwonly_names": ["stream"], "kwonly_defaults": {}}
+    calls = []
+    reloaded = cc._rebuild_wrapper(lambda *args: calls.append(args), spec)
+    reloaded(7, stream=11)
+    assert calls == [(7, 11)]
+
+    def runtime_host(config, x: int, *, stream: int):
+        pass
+
+    compiled.execution_args = ExecutionArgs(inspect.signature(runtime_host), "runtime_host")
+    compiled._kwargs_wrapper = runtime_host
+    assert cc._wrapper_spec_of(compiled, (Config(), 7), {"stream": 11}) is None
+
+
 def test_template_key_joins_the_digest_with_plain_arguments_only():
     g = {"FROST_SOURCE_DIGEST": "abc123"}
     key = cc.template_key(g, {"b": 2, "qh": 8, "lse_stride": (1, 2, 3), "flag": True, "opt": None}, "compile")
@@ -306,8 +343,27 @@ def test_the_memo_hands_out_the_same_object_without_a_second_compile(monkeypatch
     assert cc.memo_enabled()
 
 
+def test_refuse_compiles_raises_on_every_compile_path_but_serves_the_memo(monkeypatch, tmp_path):
+    calls = []
+    _fake_compile(monkeypatch, calls)
+    monkeypatch.setenv(cc._ENV_DISABLE, "1")
+    memo = cc.compile_cached(lambda: None, cache_key="memo", options="--enable-tvm-ffi")
+    with cc.refuse_compiles():
+        assert cc.compile_cached(lambda: None, cache_key="memo", options="--enable-tvm-ffi") is memo
+        for key, options in (("disabled", "--enable-tvm-ffi"), (None, "--enable-tvm-ffi"), ("k", "")):
+            with pytest.raises(cc.CompileRefused):
+                cc.compile_cached(lambda: None, cache_key=key, options=options)
+        monkeypatch.delenv(cc._ENV_DISABLE)
+        monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+        monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0"})
+        with pytest.raises(cc.CompileRefused):  # a miss on an enabled on-disk cache
+            cc.compile_cached(lambda: None, cache_key="miss", options="--enable-tvm-ffi")
+    assert len(calls) == 1
+    assert cc.compile_cached(lambda: None, cache_key="after", options="") is not None and len(calls) == 2
+
+
 def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_path):
-    """With the files ON, the second call never reaches them: one miss, one load attempt."""
+    """With the files ON, the second call never reaches them."""
     calls, loads = [], []
     _fake_compile(monkeypatch, calls)  # the fake object has no export_to_c: a miss stores nothing and returns it
     monkeypatch.setattr(cc, "environment_manifest", lambda device=None: {"schema": cc._SCHEMA, "cudnn_frontend": "1.30.0", "cutlass_dsl": "4.8.0"})
@@ -317,10 +373,12 @@ def test_the_memo_sits_in_front_of_an_enabled_on_disk_cache(monkeypatch, tmp_pat
     try:
         cc.reset_stats()
         first = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
+        loads_after_first = len(loads)
+        assert loads_after_first > 0
         second = cc.compile_cached(lambda: None, 1, cache_key="k", options="--enable-tvm-ffi")
     finally:
         cc.set_cache_dir(None)
-    assert second is first and len(calls) == 1 and len(loads) == 1
+    assert second is first and len(calls) == 1 and len(loads) == loads_after_first
     assert cc.stats()["misses"] == 1 and cc.stats()["hits"] == 0 and cc.stats()["memo_hits"] == 1
 
 
@@ -495,3 +553,54 @@ def test_the_memo_is_safe_under_concurrent_compiles(monkeypatch):
         assert len(results[key]) == 5 * (n_threads // len(keys)) and len({id(obj) for obj in results[key]}) == 1, key
     assert len(cc._MEMO) == len(keys) and len(compiles) >= len(keys)
     assert cc.stats()["memo_hits"] >= 5 * n_threads - len(compiles)
+
+
+def _fake_entry(root, manifest, key="k|kernel|--enable-tvm-ffi"):
+    entry = cc._entry_dir(root, manifest, key)
+    entry.mkdir(parents=True)
+    (entry.parent / cc._MANIFEST).write_text(json.dumps(manifest))
+    (entry / cc._OBJECT).write_bytes(b"\x7fELF object")
+    (entry / cc._ENTRY).write_text(json.dumps({"schema": cc._SCHEMA, "key": "k", "symbol": "kernel", "wrapper": {}}))
+    return entry
+
+
+def test_seed_installs_an_entry_only_under_an_identical_environment(tmp_path, monkeypatch):
+    manifest = {"schema": cc._SCHEMA, "cudnn_frontend": "1.0", "cuda_driver": "13020"}
+    monkeypatch.setattr(cc, "environment_manifest", lambda device=None: dict(manifest))
+    description, data = cc.read_entry(_fake_entry(tmp_path / "producer", manifest))
+    assert description["environment"] == manifest and data == b"\x7fELF object"
+    cc.reset_stats()
+
+    cc.set_cache_dir(tmp_path / "foreign")
+    try:
+        assert not cc.seed_entry(dict(description, environment=dict(manifest, cuda_driver="12090")), data)
+        assert not cc.seed_entry(dict(description, entry="../escape"), data)
+        assert cc.stats()["seed_rejected"] == 2 and not list((tmp_path / "foreign").rglob("*"))
+
+        cc.set_cache_dir(tmp_path / "consumer")
+        assert cc.seed_entry(description, data) and cc.stats()["seeded"] == 1
+        seeded = cc._entry_dir(tmp_path / "consumer", manifest, "k|kernel|--enable-tvm-ffi")
+        assert (seeded / cc._OBJECT).read_bytes() == data
+        assert json.loads((seeded / cc._ENTRY).read_text()) == description["record"]
+        assert cc.seed_entry(description, data) and cc.stats()["seeded"] == 1  # already present: not rewritten
+    finally:
+        cc.set_cache_dir(None)
+
+
+def test_record_entries_collects_only_persisted_entries(tmp_path, monkeypatch):
+    manifest = {"schema": cc._SCHEMA, "cudnn_frontend": "1.0"}
+    monkeypatch.setattr(cc, "environment_manifest", lambda device=None: dict(manifest))
+    cc.set_cache_dir(tmp_path)
+    try:
+        entry = _fake_entry(tmp_path, manifest)
+        with cc.record_entries() as outer:
+            cc._record("k", "kernel", "--enable-tvm-ffi")
+            cc._record("absent", "kernel", "--enable-tvm-ffi")
+            cc._record("k", "kernel", "")  # not exportable: never persisted
+            with cc.record_entries() as inner:
+                cc._record("k", "kernel", "--enable-tvm-ffi")
+            cc._record("k", "kernel", "--enable-tvm-ffi")
+        assert outer == [entry] and inner == [entry]
+        cc._record("k", "kernel", "--enable-tvm-ffi")  # outside any block: a no-op
+    finally:
+        cc.set_cache_dir(None)

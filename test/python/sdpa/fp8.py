@@ -29,7 +29,7 @@ from .helpers import (
     note_frost_routing,
 )
 from .random_config import packed_token_capacity
-from .fp16 import _apply_plan_pin
+from .fp16 import _apply_plan_pin, kv_packed
 
 # fmt: off
 
@@ -133,8 +133,9 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
         v = graph_fwd.tensor(uid=GraphFwdUid.v, dim=(num_blocks, h_v, block_size, d_vo), stride=(block_size * h_v * d_vo, block_size * d_vo, d_vo, 1), data_type=cudnn_itype)
 
         use_padding_mask = True
-        kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
-        q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+        if not is_ragged:
+            kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
+            q_seq_len = graph_fwd.tensor(uid=GraphFwdUid.q_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
         k_block_table = graph_fwd.tensor(uid=GraphFwdUid.k_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
         v_block_table = graph_fwd.tensor(uid=GraphFwdUid.v_block_table, dim=(b, 1, table_size, 1), stride=(table_size, table_size, 1, 1), data_type=cudnn.data_type.INT32)
 
@@ -148,19 +149,22 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
             kv_seq_len = graph_fwd.tensor(uid=GraphFwdUid.kv_seq_len, dim=(b,), stride=(1,), data_type=cudnn.data_type.INT32)
 
         q_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.q_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
-        k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
-        v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         o_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.o_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
         stats_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.stats_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64) if generate_stats else None
         q.set_ragged_offset(q_ragged_offset)
-        k.set_ragged_offset(k_ragged_offset)
-        v.set_ragged_offset(v_ragged_offset)
         if with_ragged_offset_multiplier:
             # Offsets are stored in coarser units (divided out in the allocation);
             # the engine multiplies back to element offsets.
             q.set_ragged_offset_multiplier(d_qk)
-            k.set_ragged_offset_multiplier(d_qk)
-            v.set_ragged_offset_multiplier(d_vo)
+        if block_size == 0:
+            # Only unpaged K/V are packed. Page pools never carry ragged offsets.
+            k_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.k_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+            v_ragged_offset = graph_fwd.tensor(uid=int(GraphFwdUid.v_ragged_offset), dim=(b + 1,), stride=(1,), data_type=cudnn.data_type.INT64)
+            k.set_ragged_offset(k_ragged_offset)
+            v.set_ragged_offset(v_ragged_offset)
+            if with_ragged_offset_multiplier:
+                k.set_ragged_offset_multiplier(d_qk)
+                v.set_ragged_offset_multiplier(d_vo)
 
     q_descale = graph_fwd.tensor(uid=GraphFwdUid.q_descale, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
     k_descale = graph_fwd.tensor(uid=GraphFwdUid.k_descale, dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.FLOAT)
@@ -561,6 +565,44 @@ def _explain_unfit_row(tag, kind, row, rvec, tol, ops, flip_unit, by_q_row, h_q,
     print(msg)
 
 
+def describe_flip(tag, f, fp8_dtype, flip_unit):
+    """The one-line record of a proven flip ``f`` -- an attribution dict of ``flip_evidence`` / ``assert_close_fp8_grad`` -- in the
+    vocabulary every caller prints: the d-row, the (b, hq, i, j) position, the reference's scaled value and the two adjacent codes,
+    the step as ``u x flip_unit x gain`` times the operand row, and how well that one flip reproduces the row (against the ordinary
+    tolerance, against the output's own rounding, and the least-squares flip count)."""
+    return (f"%%%% '{tag}': d-row {f['row']} is ONE flipped fp8 intermediate at (b, hq, i, j)={f['position']}: x={f['x']:+.7g} rounds to "
+            f"{fp8_dtype} code {f['c_ref']:+g}, the kernel to {f['c_alt']:+g} ({f['off_mid_spacings']:.5f} spacings from their midpoint); "
+            f"step {f['u']:+g} x flip_unit {float(flip_unit):.5g} x gain {f['gain']:.5g} = {f['step']:+.5g} x operand row {f['operand_row']} "
+            f"reproduces the row to max |residual| / tol = {f['worst']:.2f}, {f['rounding']:.2f} x the output's own rounding, "
+            f"and fits it as {f['flips']:.3f} flips"
+            + (f" ({f['n_tied']} other valid near-midpoint candidate(s) of the reduction, identical operand rows, fit equally)" if f["n_tied"] else ""))
+
+
+def flip_evidence(actual, expected, bad_rows, atol, rtol, *, tag, kind, operand, flip_unit, fp8_dtype, intermediates, out_dtype=None):
+    """The flip proof on its own, for a caller whose tolerance is NOT the row recipe's -- the gated attention block's SDPA-stage
+    pin holds the stage's bf16 dQ / dK / dV to the bf16 block's bound (``atol = 2^-7 max|ref|``, ``rtol = 2^-6``) and must still
+    accept a d-row that is one e4m3 midpoint flip of a P / dS value.  ``bad_rows`` is the caller's bool mask over the d-rows of
+    ``actual`` (``actual.shape[:-1]`` flattened: the rows outside ITS bound); ``atol`` / ``rtol`` are the ordinary tolerance the
+    exact flip term must reproduce each such row within (the per-element rounding check adds half an ``out_dtype`` code spacing
+    from each side on top of ``atol``).  Everything else is ``assert_close_fp8_grad``'s: ``kind`` one of ``_FLIP_KINDS``, a dense
+    ``[b, s, h, d]`` output, ``operand`` the dequantized BSHD operand (K for dQ, Q for dK, dO for dV, V for O), ``flip_unit`` the
+    intermediate's descale, ``intermediates(selection)`` the reference re-run on the bad rows, ``out_dtype`` the grid both sides
+    were rounded to (default ``fp8_dtype``).  Returns the attributions -- one dict per bad row: ``row``, ``position`` = (b, q head,
+    i, j), ``x``, ``c_ref``, ``c_alt``, ``u``, ``step``, ``gain``, ``operand_row``, ``worst``, ``rounding``, ``flips``, ... -- or None after
+    printing why the first row that is not one flip is not one (``_explain_unfit_row``).  It never asserts: the caller's bound
+    does.  The caller is also responsible for the ROW BUDGET (``1e-5 x rows x keys``, at least 1): the proof replaces a magnitude
+    cap, never a count."""
+    if kind not in _FLIP_KINDS:
+        raise ValueError(f"kind={kind!r} must be one of {sorted(_FLIP_KINDS)} to attribute flips")
+    if actual.dim() != 4:
+        raise ValueError(f"flip attribution needs a dense [b, s, h, d] output (got {tuple(actual.shape)})")
+    bad_rows = torch.as_tensor(bad_rows, device=actual.device).reshape(-1)
+    if bad_rows.dtype != torch.bool or bad_rows.numel() != actual.shape[:-1].numel():
+        raise ValueError(f"bad_rows must be a bool mask over the {actual.shape[:-1].numel()} d-rows of actual (got {tuple(bad_rows.shape)} {bad_rows.dtype})")
+    return _flip_evidence(actual.detach().float(), expected.detach().float(), bad_rows, float(atol), float(rtol), tag=tag, kind=kind,
+                          operand=operand, flip_unit=flip_unit, fp8_dtype=fp8_dtype, out_dtype=out_dtype or fp8_dtype, intermediates=intermediates)
+
+
 def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=None, operand=None, flip_unit=None, intermediates=None, kind=None, fp8_dtype=None, out_dtype=None):
     """assert_close for fp8 SDPA outputs/gradients with a small mismatch budget.
 
@@ -630,7 +672,9 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
     flips on a row whose ``rtol * |expected|`` is two flips wide, or a step no adjacent pair of
     codes has (8192 in e4m3) all fit a scalar-multiple test and none fits this one.  Do not
     raise the cap for a "slightly" worse flip; pass the intermediates and let the evidence
-    decide.
+    decide.  The proof is also available on its own as ``flip_evidence`` for a caller with another
+    tolerance (the gated attention block's SDPA-stage pin holds the stage's bf16 gradients to the bf16
+    block's bound and must still accept one proven e4m3 flip); ``describe_flip`` is the line printed per fit.
     """
     actual = actual.detach().float()
     expected = expected.detach().float()
@@ -667,12 +711,7 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
             fits = _flip_evidence(actual, expected, bad_rows, atol, rtol, tag=tag, kind=kind, operand=operand, flip_unit=flip_unit,
                                   fp8_dtype=fp8_dtype, out_dtype=out_dtype, intermediates=intermediates)
             for f in fits or ():
-                print(f"%%%% '{tag}': d-row {f['row']} is ONE flipped fp8 intermediate at (b, hq, i, j)={f['position']}: x={f['x']:+.7g} rounds to "
-                      f"{fp8_dtype} code {f['c_ref']:+g}, the kernel to {f['c_alt']:+g} ({f['off_mid_spacings']:.5f} spacings from their midpoint); "
-                      f"step {f['u']:+g} x flip_unit {float(flip_unit):.5g} x gain {f['gain']:.5g} = {f['step']:+.5g} x operand row {f['operand_row']} "
-                      f"reproduces the row to max |residual| / tol = {f['worst']:.2f}, {f['rounding']:.2f} x the output's own rounding, "
-                      f"and fits it as {f['flips']:.3f} flips"
-                      + (f" ({f['n_tied']} other valid near-midpoint candidate(s) of the reduction, identical operand rows, fit equally)" if f["n_tied"] else ""))
+                print(describe_flip(tag, f, fp8_dtype, flip_unit))
             within_budget = fits is not None
     if not within_budget or bool(nonfinite.any()):
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, equal_nan=False)
@@ -726,7 +765,11 @@ def assert_amax_o(amax_o_gpu, o_amax_ref, *, torch_itype, torch_otype, o_gpu=Non
             f"{tag}: |{amax_o:.6g} - reference {o_amax_ref:.6g}| = {abs(amax_o - o_amax_ref):.3g} exceeds one P code step of the reference amax ({tol_ref:.3g})"
         )
         if o_gpu is not None:
-            max_o = o_gpu.detach().float().abs().max().item()
+            if o_gpu.numel() == 0:
+                assert amax_o == 0.0, f"{tag}: empty stored O requires Amax_O = 0, got {amax_o!r}"
+                max_o = 0.0
+            else:
+                max_o = o_gpu.detach().float().abs().max().item()
             half_spacing = torch.finfo(torch_otype).eps / 2  # half a code spacing of O's dtype, relative, at the max element
             slack = half_spacing * max(amax_o, max_o) + 1e-6
             assert max_o <= amax_o + slack, f"{tag}: the stored O reaches {max_o:.6g} but the kernel reported Amax_O = {amax_o:.6g} (beyond {torch_otype} rounding {slack:.2g})"
@@ -836,6 +879,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         torch_otype = torch.float8_e4m3fn
     deterministic = cfg.is_determin if hasattr(cfg, 'is_determin') else False
     is_ragged = cfg.is_ragged if hasattr(cfg, 'is_ragged') else False
+    is_kv_packed = kv_packed(cfg)
     left_bound = cfg.left_bound if hasattr(cfg, 'left_bound') else None
     right_bound = cfg.right_bound if hasattr(cfg, 'right_bound') else None
     diag_align = cfg.diag_align if hasattr(cfg, 'diag_align') else None
@@ -857,6 +901,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     seq_len_q_list = cfg.seq_len_q if hasattr(cfg, 'seq_len_q') and cfg.seq_len_q else []
     seq_len_kv_list = cfg.seq_len_kv if hasattr(cfg, 'seq_len_kv') and cfg.seq_len_kv else []
 
+    # Paged/dense KV has no packed capacity or ragged offsets. Keep this
+    # optional state explicit before conditional allocation and binding.
+    max_t_kv = None
+    k_ragged_offset_gpu = None
+    v_ragged_offset_gpu = None
+
     if is_ragged:
         seq_len_q_gpu = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
         seq_len_kv_gpu = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
@@ -875,8 +925,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         v_off_mult = d_vo if with_ragged_offset_multiplier else 1
         o_off_mult = d_vo if with_ragged_offset_multiplier else 1
         q_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * d_qk // q_off_mult).to(torch.int64)
-        k_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_k * d_qk // k_off_mult).to(torch.int64)
-        v_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_v * d_vo // v_off_mult).to(torch.int64)
+        if is_kv_packed:
+            k_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_k * d_qk // k_off_mult).to(torch.int64)
+            v_ragged_offset_gpu = (prefix_sum(seq_len_kv_gpu) * h_v * d_vo // v_off_mult).to(torch.int64)
         o_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * d_vo // o_off_mult).to(torch.int64)
         stats_ragged_offset_gpu = (prefix_sum(seq_len_q_gpu) * h_q * 1).to(torch.int64)
         if is_cu_seq_len:
@@ -887,7 +938,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     try:
         graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, generate_stats=generate_stats, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
                                        max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
-                                       max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
+                                       max_total_seq_len_kv=max_t_kv if (is_kv_packed and getattr(cfg, "declare_total_seq_len", False)) else None,
                                        o_block_scale=o_block_scale, softmax_precision=softmax_precision)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -983,6 +1034,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     if is_ragged:
         q_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", q_fp8), torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda"), max_t_q)
+    if is_kv_packed:
         k_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", k_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv)
         v_gpu = convert_uniform_to_packed(torch.einsum("bshd->bhsd", v_fp8), torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda"), max_t_kv)
 
@@ -1039,8 +1091,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     if is_paged:
         variant_pack[int(GraphFwdUid.k)] = container_k_gpu
         variant_pack[int(GraphFwdUid.v)] = container_v_gpu
-        variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
-        variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
+        if not is_ragged:
+            variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(paged_seq_len_kv, device="cuda", dtype=torch.int32)
+            variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(paged_seq_len_q, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = k_block_table_gpu
         variant_pack[int(GraphFwdUid.v_block_table)] = v_block_table_gpu
 
@@ -1052,8 +1105,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
             variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, dtype=torch.int32, device="cuda").view(-1)
             variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, dtype=torch.int32, device="cuda").view(-1)
         variant_pack[int(GraphFwdUid.q_ragged_offset)] = q_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
+        if is_kv_packed:
+            variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
+            variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.o_ragged_offset)] = o_ragged_offset_gpu
         if generate_stats:
             variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
@@ -1070,6 +1124,12 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         profile_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
     graph_fwd.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
+    if not perf and generate_stats and is_ragged and is_paged:
+        # Packed Stats follow Q's live token prefix; the page pools remain dense.
+        # Check them before Amax_O, whose known backend defect can xfail its check.
+        stats_ref_packed = convert_uniform_to_packed(stats_ref, seq_len_q_ref, max_t_q)
+        live_q = sum(seq_len_q_list)
+        torch.testing.assert_close(stats_gpu[:live_q], stats_ref_packed[:live_q], atol=2e-2, rtol=2e-2)
     # Amax_O on a backend-served graph: a known backend defect xfails that check only (see BACKEND_AMAX_O_ISSUE).
     amax_known_issue = BACKEND_AMAX_O_ISSUE if getattr(graph_fwd, "selected_engine", None) is None else None
 

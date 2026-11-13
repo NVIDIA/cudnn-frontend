@@ -11,6 +11,31 @@ import sys
 import cudnn
 
 
+def run_artifact_child(child, args, *, env, cwd, timeout=300):
+    """Keep the child's stack and captured output when a cold-process check times out."""
+    # The parent watchdog otherwise shows only subprocess.communicate(), hiding
+    # whether the child is importing, compiling, executing or checking numerics.
+    preamble = f"import faulthandler\nfaulthandler.dump_traceback_later({timeout * 0.9!r})\n"
+    try:
+        return subprocess.run(
+            [sys.executable, "-u", "-c", preamble + child, *args],
+            env=env,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired carries bytes even with text=True; retain both streams.
+        def text(value):
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else (value or "")
+
+        raise AssertionError(
+            f"Artifact child timed out after {timeout}s; args={args!r}\n"
+            f"--- child stdout ---\n{text(exc.stdout)}\n--- child stderr / stack ---\n{text(exc.stderr)}"
+        ) from None
+
+
 def check_backward_artifact_reload(arch, route, dtype, cache_dir):
     child = r"""
 import json, sys
@@ -136,13 +161,11 @@ print(json.dumps(compiled_cache.stats()))
     env.pop("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", None)
     results = []
     for reload in (0, 1):
-        result = subprocess.run(
-            [sys.executable, "-c", child, str(Path(__file__).parent), cudnn.__file__, arch, route, dtype, str(reload)],
+        result = run_artifact_child(
+            child,
+            [str(Path(__file__).parent), cudnn.__file__, arch, route, dtype, str(reload)],
             env=env,
             cwd=cache_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,
         )
         assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-5000:]
         results.append(json.loads(result.stdout.strip().splitlines()[-1]))

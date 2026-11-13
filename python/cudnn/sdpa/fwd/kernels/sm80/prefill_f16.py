@@ -109,6 +109,9 @@ from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
+from cudnn.sdpa.fwd.kernels.sm80.paged_load import load_kv_tile
+from cudnn.sdpa.fwd.kernels.sm80.gqa import row_offset, load_q, fold_sinks
+from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import sequence_base
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
 from cudnn.frost.tile_dsl.mask import (  # noqa: E402
     MASK_NONE,
@@ -241,6 +244,15 @@ def _sdpa_kernel(
     inv_softmax_scale: cutlass.Float32,  # = 1 / scale.  Multiplies the additive bias
     # before it is added to the un-scaled S_acc
     # (consulted only when has_bias).
+    paged_k_table: Optional[cute.Tensor] = None,
+    paged_v_table: Optional[cute.Tensor] = None,
+    ragged_q: Optional[cute.Tensor] = None,
+    ragged_k: Optional[cute.Tensor] = None,
+    ragged_v: Optional[cute.Tensor] = None,
+    ragged_o: Optional[cute.Tensor] = None,
+    ragged_stats: Optional[cute.Tensor] = None,
+    origin_batch_strides: cutlass.Constexpr = (None, None, None, None, None),
+    origin_multipliers: cutlass.Constexpr = (1, 1, 1, 1, 1),
 ):
     # ---- derived shape / layout constants ---------------------------------
     # Folded at trace time — one compiled fn per (tile_m, num_warps, tile_n,
@@ -278,13 +290,19 @@ def _sdpa_kernel(
     #   block.  Best for larger SQ where K/V GMEM footprint exceeds L2.
     if cutlass.const_expr(sched_policy == SCHED_DEFAULT):
         bx, by, bz = cute.arch.block_idx()
-        q_tile_idx = bx
-        head_idx = by
-        batch_idx = bz
+        if cutlass.const_expr(PARAMS.split_kv > 1):
+            q_tiles = (Q.shape[1] * PARAMS.pack_g + tile_m - 1) // tile_m
+            q_tile_idx = bx % q_tiles
+            head_idx = (bx // q_tiles) % (Q.shape[2] // PARAMS.pack_g)
+            batch_idx = bx // (q_tiles * (Q.shape[2] // PARAMS.pack_g))
+        else:
+            q_tile_idx = bx
+            head_idx = by
+            batch_idx = bz
     else:
         bx, _, _ = cute.arch.block_idx()
-        SQ_for_decode = Q.shape[1]
-        H_for_decode = Q.shape[2]  # H_q
+        SQ_for_decode = Q.shape[1] * PARAMS.pack_g
+        H_for_decode = Q.shape[2] // PARAMS.pack_g  # H_q
         Hkv_for_decode = K.shape[2]  # H_kv (may differ)
         B_for_decode = Q.shape[0]
         heads_per_kv_decode = H_for_decode // Hkv_for_decode
@@ -309,7 +327,7 @@ def _sdpa_kernel(
             #
             # active_groups = clamp(sched_l2_bytes / per_group, 1, num_groups).
             BPE_K_V = 2  # fp16 K, fp16 V
-            SKV_i32 = cutlass.Int32(K.shape[1])
+            SKV_i32 = skv_runtime if cutlass.const_expr(PARAMS.paged_page_size) else cutlass.Int32(K.shape[1])
             per_group = SKV_i32 * cutlass.Int32((d_qk + d_v) * BPE_K_V)
             l2_budget = cutlass.Int32(sched_l2_bytes)
             num_groups = cutlass.Int32(Hkv_for_decode * B_for_decode)
@@ -382,18 +400,22 @@ def _sdpa_kernel(
     sQ_buf = cutlass.Array(io_dtype, SQ_BUF_ELEMS, alignment=128, space=cutlass.AddressSpace.smem)
     sK_buf = cutlass.Array(io_dtype, SK_BUF_ELEMS, alignment=128, space=cutlass.AddressSpace.smem)
 
+    head_idx = head_idx * PARAMS.pack_g
+
     # ---- GMEM base pointers + row strides ---------------------------------
     Q_view = cutlass.make_array_view(Q)
     K_view = cutlass.make_array_view(K)
     V_view = cutlass.make_array_view(V)
     O_view = cutlass.make_array_view(O)
+    split_idx = cute.arch.block_idx()[2] if cutlass.const_expr(PARAMS.split_kv > 1) else cutlass.Int32(0)
+    output_batch_idx = batch_idx + split_idx * Q.shape[0]
 
     # Shapes (B, S, H, D).  GQA/MQA: H_q (Q heads) may exceed H_kv (K/V
     # heads) when H_q % H_kv == 0.  ``heads_per_kv`` Q-heads share each
     # KV-head; the kernel maps ``kv_head_idx = head_idx // heads_per_kv``
     # at GMEM-offset time.  MHA is the H_q == H_kv special case.
     SQ = Q.shape[1]
-    SKV = K.shape[1]
+    SKV = skv_runtime if cutlass.const_expr(PARAMS.paged_page_size) else K.shape[1]
     H = Q.shape[2]  # H_q
     H_kv = K.shape[2]  # H_kv (== H for MHA)
     heads_per_kv = H // H_kv  # Python int — folds at trace time
@@ -415,12 +437,9 @@ def _sdpa_kernel(
     if cutlass.const_expr(has_rope):
         rope_cs_ptr = Pointer(cutlass.make_array_view(rope_cs).data_ptr(), dtype=cutlass.Float32)
 
-    # THD/varlen: read per-batch cumulative seqlens → packed seq origins +
-    # per-batch lengths.  Q/O are packed [1,T,H,D]: sequence b's rows live at
-    # [cu_q[b], cu_q[b+1]); K/V at [cu_k[b], cu_k[b+1]).  The GMEM bases below
-    # use the seq origin (in rows) instead of the dense batch*S term; the dense
-    # path keeps batch*S.  s_q_b / s_kv_b feed the per-batch eff lengths +
-    # predication below.
+    # THD lengths come from device prefixes. Physical origins below can come
+    # from independent element offsets, a declared dense batch pitch, or these
+    # packed prefixes. Gaps in storage never change the effective lengths.
     if cutlass.const_expr(THD_VARLEN):
         _cuq = Pointer(cutlass.make_array_view(cu_q).data_ptr(), dtype=cu_q.element_type)
         _cuk = Pointer(cutlass.make_array_view(cu_k).data_ptr(), dtype=cu_k.element_type)
@@ -449,18 +468,21 @@ def _sdpa_kernel(
     V_ROW_STRIDE_E = cutlass.Int64(V.stride[1])
     O_ROW_STRIDE_E = cutlass.Int64(O.stride[1])
     q_row_base = q_tile_idx * tile_m
+    q_first = cutlass.Int32(q_row_base) // PARAMS.pack_g
+    q_last = (cutlass.Int32(q_row_base) + tile_m - 1) // PARAMS.pack_g
+    base_row = q_row_base if cutlass.const_expr(PARAMS.pack_g == 1) else cutlass.Int32(0)
     if cutlass.const_expr(THD_VARLEN):
-        Q_BATCH_OFF = q_seq_origin * Q_ROW_STRIDE_E
-        O_BATCH_OFF = q_seq_origin * O_ROW_STRIDE_E
-        K_BATCH_OFF = kv_seq_origin * K_ROW_STRIDE_E
-        V_BATCH_OFF = kv_seq_origin * V_ROW_STRIDE_E
+        Q_BATCH_OFF = sequence_base(ragged_q, batch_idx, q_seq_origin * Q_ROW_STRIDE_E, origin_batch_strides[0], origin_multipliers[0])
+        O_BATCH_OFF = sequence_base(ragged_o, batch_idx, q_seq_origin * O_ROW_STRIDE_E, origin_batch_strides[3], origin_multipliers[3])
+        K_BATCH_OFF = sequence_base(ragged_k, batch_idx, kv_seq_origin * K_ROW_STRIDE_E, origin_batch_strides[1], origin_multipliers[1])
+        V_BATCH_OFF = sequence_base(ragged_v, batch_idx, kv_seq_origin * V_ROW_STRIDE_E, origin_batch_strides[2], origin_multipliers[2])
     else:
         Q_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(Q.stride[0])
-        O_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(O.stride[0])
+        O_BATCH_OFF = cutlass.Int64(output_batch_idx) * cutlass.Int64(O.stride[0])
         K_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(K.stride[0])
         V_BATCH_OFF = cutlass.Int64(batch_idx) * cutlass.Int64(V.stride[0])
-    Q_BASE = Q_BATCH_OFF + cutlass.Int64(q_row_base) * Q_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(Q.stride[2])
-    O_BASE = O_BATCH_OFF + cutlass.Int64(q_row_base) * O_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(O.stride[2])
+    Q_BASE = Q_BATCH_OFF + cutlass.Int64(base_row) * Q_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(Q.stride[2])
+    O_BASE = O_BATCH_OFF + cutlass.Int64(base_row) * O_ROW_STRIDE_E + cutlass.Int64(head_idx) * cutlass.Int64(O.stride[2])
     # LSE: dense [B, H_q, SQ]; THD packed [1, H_q, T]. Dense strides are
     # compile-time layout metadata; THD remains compact.
     # None-specialized: no Stats output ⇒ view/base/pointer are compiled out
@@ -469,12 +491,13 @@ def _sdpa_kernel(
         LSE_view = cutlass.make_array_view(LSE)
         LSE_S_STRIDE_E = cutlass.Int64(LSE.stride[2])
         if cutlass.const_expr(THD_VARLEN):
-            LSE_BASE = cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1]) + (q_seq_origin + cutlass.Int64(q_row_base)) * LSE_S_STRIDE_E
+            LSE_BATCH_OFF = sequence_base(ragged_stats, batch_idx, q_seq_origin * LSE_S_STRIDE_E, origin_batch_strides[4], origin_multipliers[4])
+            LSE_BASE = LSE_BATCH_OFF + cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1]) + cutlass.Int64(base_row) * LSE_S_STRIDE_E
         else:
             LSE_BASE = (
-                cutlass.Int64(batch_idx) * cutlass.Int64(LSE.stride[0])
+                cutlass.Int64(output_batch_idx) * cutlass.Int64(LSE.stride[0])
                 + cutlass.Int64(head_idx) * cutlass.Int64(LSE.stride[1])
-                + cutlass.Int64(q_row_base) * LSE_S_STRIDE_E
+                + cutlass.Int64(base_row) * LSE_S_STRIDE_E
             )
         lse_gmem = LSE_view.data_ptr() + LSE_BASE
 
@@ -547,7 +570,7 @@ def _sdpa_kernel(
         # K cols beyond (last_q + causal_diag) are masked, so
         # kv_right = ceil_div(last_q + 1 + causal_diag, tile_n)
         #          = ceil_div(q_row_base + tile_m + causal_diag, tile_n).
-        causal_kv_hi = (cutlass.Int32(q_row_base) + cutlass.Int32(tile_m) + causal_diag + cutlass.Int32(tile_n - 1)) // cutlass.Int32(tile_n)
+        causal_kv_hi = (q_last + cutlass.Int32(1) + causal_diag + cutlass.Int32(tile_n - 1)) // cutlass.Int32(tile_n)
         cond_caus = causal_kv_hi < kv_right
         kv_right = cutlass.Int32(
             arith.select(
@@ -564,7 +587,7 @@ def _sdpa_kernel(
         # Matches C++ `prefill_sdpa_util.cuh`: anchor = q_row_coord (the
         # CTA-base Q row), not q_row_coord + TILE_M - 1.  ``br_base`` shifts the
         # window to the bottom-right corner under BR alignment (0 for top-left).
-        swa_anchor = cutlass.Int32(q_row_base) + br_base - cutlass.Int32(swa_window)
+        swa_anchor = q_first + br_base - cutlass.Int32(swa_window)
         swa_neg = swa_anchor < cutlass.Int32(0)
         swa_lo_raw = swa_anchor // cutlass.Int32(tile_n)
         swa_lo = cutlass.Int32(
@@ -634,6 +657,16 @@ def _sdpa_kernel(
         )
     )
 
+    # Partition the already clipped tile interval. Every split owns its
+    # complete partial row, including empty intervals; no scratch clear or
+    # atomics are needed. Runtime lengths and masks retain their own bounds.
+    if cutlass.const_expr(PARAMS.split_kv > 1):
+        split_tiles = (kv_right - kv_left + PARAMS.split_kv - 1) // PARAMS.split_kv
+        split_left = kv_left + split_idx * split_tiles
+        kv_left = cutlass.Int32(arith.select((split_left < kv_right).ir_value(), split_left.ir_value(), kv_right.ir_value()))
+        split_right = split_left + split_tiles
+        kv_right = cutlass.Int32(arith.select((split_right < kv_right).ir_value(), split_right.ir_value(), kv_right.ir_value()))
+
     # ---- INTERIOR vs BOUNDARY iter split for mask pre-pass ---------------
     # ``compute_kv_loop_bounds`` already trims fully-masked iters off the
     # ends.  The REMAINING iters split into:
@@ -653,7 +686,7 @@ def _sdpa_kernel(
         # Mask needed when MAX_k_in_tile > MIN_q_in_CTA + causal_diag, i.e.,
         #   (kv_iter + 1) * tile_n > q_row_base + 1 + causal_diag
         #   kv_iter >= (q_row_base + 1 + causal_diag) // tile_n
-        causal_hi = (cutlass.Int32(q_row_base) + cutlass.Int32(1) + causal_diag) // cutlass.Int32(tile_n)
+        causal_hi = (q_first + cutlass.Int32(1) + causal_diag) // cutlass.Int32(tile_n)
         cond = causal_hi < unmasked_hi
         unmasked_hi = cutlass.Int32(
             arith.select(
@@ -667,7 +700,7 @@ def _sdpa_kernel(
         #   kv_iter * tile_n < q_row_base + tile_m - 1 - W
         #   kv_iter < (q_row_base + tile_m - 1 - W + tile_n) // tile_n
         # I.e., kv_iter < ceil((q_row_base + br_base + tile_m - W) / tile_n).
-        swa_lo_raw = (cutlass.Int32(q_row_base) + br_base + cutlass.Int32(tile_m - swa_window) + cutlass.Int32(tile_n - 1)) // cutlass.Int32(tile_n)
+        swa_lo_raw = (q_last + br_base + cutlass.Int32(1 - swa_window) + cutlass.Int32(tile_n - 1)) // cutlass.Int32(tile_n)
         # Clamp to >= kv_left.
         cond_lo = swa_lo_raw > unmasked_lo
         unmasked_lo = cutlass.Int32(
@@ -710,32 +743,47 @@ def _sdpa_kernel(
     # ``is_even_*`` flag is False — fully eliminated otherwise.
     # THD packs sequences back-to-back, so valid_rows must be the PER-BATCH
     # length (eff_sq / eff_skv) — over-reading into the next sequence's rows
-    # (or past T on the last sequence) would corrupt / fault.  Dense uses the
-    # physical SQ / SKV.
+    # (or past T on the last sequence) would corrupt / fault.  Dense bounds
+    # each load by both its live length and its physical capacity.
+    # Runtime padding is unread data: masked NaNs must never enter an MMA.
+    # In particular, a zero softmax weight does not cancel a NaN V value.
     if cutlass.const_expr(THD_VARLEN):
         q_valid_rows = eff_sq
-        kv_valid_rows = eff_skv
+    elif cutlass.const_expr(has_seq_len_q):
+        q_capacity = cutlass.Int32(sq_runtime)
+        q_valid_rows = cutlass.Int32(arith.select((eff_sq < q_capacity).ir_value(), eff_sq.ir_value(), q_capacity.ir_value()))
     else:
         q_valid_rows = None if cutlass.const_expr(is_even_mn) else sq_runtime
+    if cutlass.const_expr(THD_VARLEN):
+        kv_valid_rows = eff_skv
+    elif cutlass.const_expr(has_seq_kv_lens):
+        kv_capacity = cutlass.Int32(skv_runtime)
+        kv_valid_rows = cutlass.Int32(arith.select((eff_skv < kv_capacity).ir_value(), eff_skv.ir_value(), kv_capacity.ir_value()))
+    else:
         kv_valid_rows = None if cutlass.const_expr(is_even_mn) else skv_runtime
+    if cutlass.const_expr(PARAMS.paged_page_size):
+        kv_valid_rows = eff_skv
     valid_cols = None if cutlass.const_expr(is_even_k) else d_runtime
     q_row_base_i = cutlass.Int32(q_row_base)
-    load_tile_2d(
-        sQ_buf,
-        q_gmem,
-        rows=tile_m,
-        elems_per_row=ELEMS_PER_ROW_Q,
-        gmem_row_stride_elems=Q_ROW_STRIDE_E,
-        tidx=tidx,
-        num_threads=threads,
-        elems_per_copy=ELEMS_PER_LD,
-        elem_bytes=ELEM_BYTES,
-        cache=nvvm.LoadCacheModifier.CG,
-        swizzle=True,
-        valid_rows=q_valid_rows,
-        valid_cols=valid_cols,
-        row_base=q_row_base_i,
-    )
+    if cutlass.const_expr(PARAMS.pack_g > 1):
+        load_q(sQ_buf, q_gmem, q_row_base_i, Q_ROW_STRIDE_E, Q.stride[2], tidx, sq_runtime, valid_cols, tile_m, ELEMS_PER_ROW_Q, threads, PARAMS.pack_g)
+    else:
+        load_tile_2d(
+            sQ_buf,
+            q_gmem,
+            rows=tile_m,
+            elems_per_row=ELEMS_PER_ROW_Q,
+            gmem_row_stride_elems=Q_ROW_STRIDE_E,
+            tidx=tidx,
+            num_threads=threads,
+            elems_per_copy=ELEMS_PER_LD,
+            elem_bytes=ELEM_BYTES,
+            cache=nvvm.LoadCacheModifier.CG,
+            swizzle=True,
+            valid_rows=q_valid_rows,
+            valid_cols=valid_cols,
+            row_base=q_row_base_i,
+        )
     cp_async_commit()  # group 0: Q
     # ---- REVERSE iter direction (FA-style) ------------------------------
     # The mainloop walks kv_iter from kv_right - 1 down to kv_left.  Why
@@ -763,7 +811,7 @@ def _sdpa_kernel(
     v_prologue_off64 = prologue_kv_i64 * V_TILE_STRIDE_E.to(cutlass.Int64)
     k_prologue_gmem = k_gmem_batch_head + k_prologue_off64
     kv_prologue_row_abs = prologue_kv_iter * cutlass.Int32(tile_n)
-    load_tile_2d(
+    load_kv_tile(
         sK_buf,
         k_prologue_gmem,
         rows=tile_n,
@@ -778,6 +826,11 @@ def _sdpa_kernel(
         valid_rows=kv_valid_rows,
         valid_cols=valid_cols,
         row_base=kv_prologue_row_abs,
+        page_table=paged_k_table,
+        page_size=PARAMS.paged_page_size,
+        pool_base=K_view.data_ptr() + K_HEAD_OFF,
+        page_stride=K.stride[0],
+        batch=batch_idx,
     )
     cp_async_commit()  # group 1: K[kv_right-1]
     cp_async_wait(1)  # leave K in flight
@@ -911,7 +964,7 @@ def _sdpa_kernel(
         # v_cur_gmem advanced at iter-end below (running-pointer form).
         # row_base = kv_iter * tile_n (V[i]'s absolute starting row).
         kv_row_base_cur = kv_iter * cutlass.Int32(tile_n)
-        load_tile_2d(
+        load_kv_tile(
             sV_cur,
             v_cur_gmem,
             rows=tile_n,
@@ -924,8 +977,13 @@ def _sdpa_kernel(
             cache=nvvm.LoadCacheModifier.CG,
             swizzle=True,
             valid_rows=kv_valid_rows,
-            valid_cols=None,  # V is always the full compile-time d_v wide (asserted)
+            valid_cols=V.shape[3] if cutlass.const_expr(V.shape[3] != d_v) else None,
             row_base=kv_row_base_cur,
+            page_table=paged_v_table,
+            page_size=PARAMS.paged_page_size,
+            pool_base=V_view.data_ptr() + V_HEAD_OFF,
+            page_stride=V.stride[0],
+            batch=batch_idx,
         )
         cp_async_commit()  # group: V[i]
 
@@ -946,7 +1004,7 @@ def _sdpa_kernel(
         cp_size_bytes = not_last * cutlass.Int32(bytes_per_copy_full)
         # k_next_gmem holds iter-i's K[i-1] base (decremented at iter-end).
         kv_row_base_prev = (kv_iter - cutlass.Int32(1)) * cutlass.Int32(tile_n)
-        load_tile_2d(
+        load_kv_tile(
             sK_next,
             k_next_gmem,
             rows=tile_n,
@@ -962,6 +1020,11 @@ def _sdpa_kernel(
             valid_rows=kv_valid_rows,
             valid_cols=valid_cols,
             row_base=kv_row_base_prev,
+            page_table=paged_k_table,
+            page_size=PARAMS.paged_page_size,
+            pool_base=K_view.data_ptr() + K_HEAD_OFF,
+            page_stride=K.stride[0],
+            batch=batch_idx,
         )
         cp_async_commit()  # group: K[i-1] (no-op on first kv_iter == kv_left)
 
@@ -999,11 +1062,13 @@ def _sdpa_kernel(
                 bbase = m_block * QK_N_FRAGS * 4
                 bq_top = cutlass.Int32(q_row_base) + cutlass.Int32(warp_m_base) + cutlass.Int32(m_block * 16) + g_lane
                 bq_bot = bq_top + cutlass.Int32(8)
+                bhead_top, bhead_bot = bq_top % PARAMS.pack_g, bq_bot % PARAMS.pack_g
+                bq_top, bq_bot = bq_top // PARAMS.pack_g, bq_bot // PARAMS.pack_g
                 if cutlass.const_expr(not is_even_mn):
                     bq_top = _imin_i32(bq_top, sq_runtime - cutlass.Int32(1))
                     bq_bot = _imin_i32(bq_bot, sq_runtime - cutlass.Int32(1))
-                bq_top64 = cutlass.Int64(bq_top) * cutlass.Int64(SKV)
-                bq_bot64 = cutlass.Int64(bq_bot) * cutlass.Int64(SKV)
+                bq_top64 = cutlass.Int64(bq_top) * cutlass.Int64(SKV) + cutlass.Int64(bhead_top) * cutlass.Int64(SQ) * cutlass.Int64(SKV)
+                bq_bot64 = cutlass.Int64(bq_bot) * cutlass.Int64(SKV) + cutlass.Int64(bhead_bot) * cutlass.Int64(SQ) * cutlass.Int64(SKV)
                 for k in cutlass.range_constexpr(QK_N_FRAGS):
                     bca = bias_kv_col_base + cutlass.Int32(k * 8) + cutlass.Int32(2) * p_lane
                     bcb = bca + cutlass.Int32(1)
@@ -1114,7 +1179,8 @@ def _sdpa_kernel(
                     #   top = q_row_base + warp_m_base + m_block*16 + g_lane
                     #   bot = top + 8
                     q_top_abs = cutlass.Int32(q_row_base) + cutlass.Int32(warp_m_base) + cutlass.Int32(m_block * 16) + g_lane
-                    q_bot_abs = q_top_abs + cutlass.Int32(8)
+                    q_bot_abs = (q_top_abs + cutlass.Int32(8)) // PARAMS.pack_g
+                    q_top_abs = q_top_abs // PARAMS.pack_g
                     # SWA lower bound: keep col >= q + br_base - swa_window (br_base
                     # shifts the window to the BR corner; 0 for top-left).
                     q_top_minus_w = q_top_abs + br_base - cutlass.Int32(swa_window) if (_effective_mask & MASK_SWA) else None
@@ -1340,28 +1406,40 @@ def _sdpa_kernel(
     # denominator.  os == 1 whenever sink <= max (the common case), so the
     # O rescale is a no-op there; for a fully-masked row (max = -inf) os = 0
     # zeroes O and the denominator becomes exp2(0) = 1 → O = 0, lse = sink.
-    if cutlass.const_expr(has_sink):
+    if cutlass.const_expr(has_sink and PARAMS.split_kv == 1 and PARAMS.pack_g > 1):
+        fold_sinks(row_max, row_sum, O_acc, sinks, q_row_base, head_idx, warp_m_base, g_lane, m_blocks, SV_N_FRAGS, PARAMS.pack_g, PARAMS.sink_natural)
+    if cutlass.const_expr(has_sink and PARAMS.split_kv == 1 and PARAMS.pack_g == 1):
         _sink_ptr = cutlass.make_array_view(sinks).data_ptr()
         sink_log2_h = cutlass.Float32(Pointer(_sink_ptr, dtype=sinks.element_type)[cutlass.Int64(head_idx) * cutlass.Int64(sinks.stride[0])])
         if cutlass.const_expr(PARAMS.sink_natural):
             sink_log2_h = sink_log2_h * cutlass.Float32(1.4426950408889634)
-        for m_block in cutlass.range_constexpr(m_blocks):
-            sk_o_base = m_block * SV_N_FRAGS * 4
-            sk_lo = m_block * 2
-            sk_hi = m_block * 2 + 1
-            m_top_lift = cutlass.Float32(cute.math.max(row_max[sk_lo], sink_log2_h, ftz=True))
-            m_bot_lift = cutlass.Float32(cute.math.max(row_max[sk_hi], sink_log2_h, ftz=True))
-            os_top = cute.math.exp2(row_max[sk_lo] - m_top_lift, fastmath=True)
-            os_bot = cute.math.exp2(row_max[sk_hi] - m_bot_lift, fastmath=True)
-            row_sum[sk_lo] = row_sum[sk_lo] * os_top + cute.math.exp2(sink_log2_h - m_top_lift, fastmath=True)
-            row_sum[sk_hi] = row_sum[sk_hi] * os_bot + cute.math.exp2(sink_log2_h - m_bot_lift, fastmath=True)
-            row_max[sk_lo] = m_top_lift
-            row_max[sk_hi] = m_bot_lift
-            for n in cutlass.range_constexpr(SV_N_FRAGS):
-                O_acc[sk_o_base + n * 4 + 0] = O_acc[sk_o_base + n * 4 + 0] * os_top
-                O_acc[sk_o_base + n * 4 + 1] = O_acc[sk_o_base + n * 4 + 1] * os_top
-                O_acc[sk_o_base + n * 4 + 2] = O_acc[sk_o_base + n * 4 + 2] * os_bot
-                O_acc[sk_o_base + n * 4 + 3] = O_acc[sk_o_base + n * 4 + 3] * os_bot
+        # Sink endpoints have no finite exponential origin. A disabled sink
+        # leaves empty rows at max=-inf/sum=0; a dominating sink owns all mass.
+        # Finite logits retain the established arithmetic and rounding order.
+        if sink_log2_h == cutlass.Float32.inf:
+            for i in cutlass.range_constexpr(m_blocks * 2):
+                row_max[i] = cutlass.Float32.inf
+                row_sum[i] = cutlass.Float32(1.0)
+            for i in cutlass.range_constexpr(m_blocks * SV_N_FRAGS * 4):
+                O_acc[i] = cutlass.Float32(0.0)
+        elif sink_log2_h != -cutlass.Float32.inf:
+            for m_block in cutlass.range_constexpr(m_blocks):
+                sk_o_base = m_block * SV_N_FRAGS * 4
+                sk_lo = m_block * 2
+                sk_hi = m_block * 2 + 1
+                m_top_lift = cutlass.Float32(cute.math.max(row_max[sk_lo], sink_log2_h, ftz=True))
+                m_bot_lift = cutlass.Float32(cute.math.max(row_max[sk_hi], sink_log2_h, ftz=True))
+                os_top = cute.math.exp2(row_max[sk_lo] - m_top_lift, fastmath=True)
+                os_bot = cute.math.exp2(row_max[sk_hi] - m_bot_lift, fastmath=True)
+                row_sum[sk_lo] = row_sum[sk_lo] * os_top + cute.math.exp2(sink_log2_h - m_top_lift, fastmath=True)
+                row_sum[sk_hi] = row_sum[sk_hi] * os_bot + cute.math.exp2(sink_log2_h - m_bot_lift, fastmath=True)
+                row_max[sk_lo] = m_top_lift
+                row_max[sk_hi] = m_bot_lift
+                for n in cutlass.range_constexpr(SV_N_FRAGS):
+                    O_acc[sk_o_base + n * 4 + 0] = O_acc[sk_o_base + n * 4 + 0] * os_top
+                    O_acc[sk_o_base + n * 4 + 1] = O_acc[sk_o_base + n * 4 + 1] * os_top
+                    O_acc[sk_o_base + n * 4 + 2] = O_acc[sk_o_base + n * 4 + 2] * os_bot
+                    O_acc[sk_o_base + n * 4 + 3] = O_acc[sk_o_base + n * 4 + 3] * os_bot
 
     # ---- LSE output: lse[r] = scale * m_max[r] + ln(row_sum[r]) ----------
     # row_max stores the pre-scaled max (m * scale_log2), so scale*m_max =
@@ -1373,7 +1451,7 @@ def _sdpa_kernel(
     # Store row bound: dense writes padded rows (q < SQ) as zeros into the
     # [B,SQ,H,D] tensor; THD must NOT write rows past this sequence (they
     # belong to the next packed sequence) → bound by the per-batch eff_sq.
-    sq_store_bound = eff_sq if cutlass.const_expr(THD_VARLEN) else sq_runtime
+    sq_store_bound = eff_sq if cutlass.const_expr(THD_VARLEN) else sq_runtime * PARAMS.pack_g
     # LSE output is None-specialized: no Stats output -> the whole block
     # (compute + stores) is compiled out.
     if cutlass.const_expr(LSE is not None):
@@ -1398,16 +1476,20 @@ def _sdpa_kernel(
             # downstream.
             if cutlass.const_expr(has_seq_len_q):
                 _ninf = cutlass.Float32(float("-inf"))
-                trim_top = q_row_base_i32 + block_row_top
-                trim_bot = q_row_base_i32 + block_row_bot
+                trim_top = (q_row_base_i32 + block_row_top) // PARAMS.pack_g
+                trim_bot = (q_row_base_i32 + block_row_bot) // PARAMS.pack_g
                 lse_top = cutlass.Float32(arith.select((trim_top < eff_sq).ir_value(), lse_top.ir_value(), _ninf.ir_value()))
                 lse_bot = cutlass.Float32(arith.select((trim_bot < eff_sq).ir_value(), lse_bot.ir_value(), _ninf.ir_value()))
             # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
-            if cutlass.const_expr(PARAMS.stats_log2):
+            if cutlass.const_expr(PARAMS.stats_log2 and PARAMS.split_kv == 1):
                 lse_top = lse_top * cutlass.Float32(1.4426950408889634)
                 lse_bot = lse_bot * cutlass.Float32(1.4426950408889634)
             lse_top_ptr = lse_gmem + cutlass.Int64(block_row_top) * LSE_S_STRIDE_E
+            if cutlass.const_expr(PARAMS.pack_g > 1):
+                lse_top_ptr = lse_gmem + row_offset(q_row_base_i32 + block_row_top, PARAMS.pack_g, LSE_S_STRIDE_E, LSE.stride[1])
             lse_bot_ptr = lse_gmem + cutlass.Int64(block_row_bot) * LSE_S_STRIDE_E
+            if cutlass.const_expr(PARAMS.pack_g > 1):
+                lse_bot_ptr = lse_gmem + row_offset(q_row_base_i32 + block_row_bot, PARAMS.pack_g, LSE_S_STRIDE_E, LSE.stride[1])
 
             # Row predication for OOB Q-rows when ~is_even_mn.  All 4 lanes of a
             # threadquad share the same row → predicate is uniform within the
@@ -1491,7 +1573,8 @@ def _sdpa_kernel(
         # has_seq_len_q only; folds away on the fast path.
         if cutlass.const_expr(has_seq_len_q):
             _row_top_abs = q_row_base_i32 + warp_m_base + cutlass.Int32(m_block * 16) + g_lane
-            _row_bot_abs = _row_top_abs + cutlass.Int32(8)
+            _row_bot_abs = (_row_top_abs + cutlass.Int32(8)) // PARAMS.pack_g
+            _row_top_abs = _row_top_abs // PARAMS.pack_g
             inv_l_top = cutlass.Float32(arith.select((_row_top_abs < eff_sq).ir_value(), inv_l_top.ir_value(), cutlass.Float32(0.0).ir_value()))
             inv_l_bot = cutlass.Float32(arith.select((_row_bot_abs < eff_sq).ir_value(), inv_l_bot.ir_value(), cutlass.Float32(0.0).ir_value()))
         block_warp_row = warp_m_base + m_block * 16
@@ -1504,6 +1587,11 @@ def _sdpa_kernel(
             o_off = o_base + n_frag * 4
             h_top = fp32_to_fp16(O_acc[o_off + 0] * inv_l_top, O_acc[o_off + 1] * inv_l_top, dtype=io_dtype)
             h_bot = fp32_to_fp16(O_acc[o_off + 2] * inv_l_bot, O_acc[o_off + 3] * inv_l_bot, dtype=io_dtype)
+            if cutlass.const_expr(has_seq_len_q):
+                # Multiplying a NaN accumulator by zero still produces NaN.
+                # Select the actual stored bits for nonexistent query rows.
+                h_top = cutlass.Int32(arith.select((_row_top_abs < eff_sq).ir_value(), h_top.ir_value(), cutlass.Int32(0).ir_value()))
+                h_bot = cutlass.Int32(arith.select((_row_bot_abs < eff_sq).ir_value(), h_bot.ir_value(), cutlass.Int32(0).ir_value()))
             # chunk_idx for col = n_frag*8 + 2p (2p ∈ {0,2,4,6} < 8) is n_frag.
             swz_chunk_top = cutlass.Int32(n_frag) ^ swz_top_mask
             swz_chunk_bot = cutlass.Int32(n_frag) ^ swz_bot_mask
@@ -1534,20 +1622,24 @@ def _sdpa_kernel(
         swz_chunk = col_chunk ^ (row & cutlass.Int32(7))
         smem_addr = sO_buf.subview(row * cutlass.Int32(d_v) + swz_chunk * elems_per_chunk_i32)
         gmem_addr = o_gmem + row.to(cutlass.Int64) * row_stride64 + (col_chunk * elems_per_chunk_i32).to(cutlass.Int64)
+        if cutlass.const_expr(PARAMS.pack_g > 1):
+            gmem_addr = o_gmem + row_offset(q_row_base_i32 + row, PARAMS.pack_g, row_stride64, O.stride[2]) + cutlass.Int64(col_chunk * elems_per_chunk_i32)
         # SMEM load is unconditional — sO_buf is sized for the full tile_m ×
         # D_V and any OOB lanes wrote dummy data there.  GMEM STG.128 must
-        # skip OOB rows so we don't touch GMEM past the user tensor.  Columns
-        # are never trimmed: O is always the compile-time d_v wide (the
-        # adapter pads V up to it, and padded-V columns compute to exact
-        # zero), while d_runtime is the Q/K head dim — trimming on it dropped
-        # the real O columns [D, d_v) whenever a graph declared d_qk < d_v.
+        # skip OOB rows and columns beyond the declared O width. Q/K's
+        # d_runtime is independent: using it here would drop valid V columns
+        # whenever a graph declares D_qk < D_v.
         vec = Pointer(smem_addr.data_ptr(), dtype=cutlass.Int32).load(alignment=16, count=4)
-        if cutlass.const_expr(is_even_mn):
-            Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
-        else:
-            row_abs_i32 = q_row_base_i32 + row
-            if row_abs_i32 < sq_store_bound:
+        column_live = True
+        if cutlass.const_expr(O.shape[3] != d_v):
+            column_live = col_chunk * elems_per_chunk_i32 < cutlass.Int32(O.shape[3])
+        if column_live:
+            if cutlass.const_expr(is_even_mn):
                 Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
+            else:
+                row_abs_i32 = q_row_base_i32 + row
+                if row_abs_i32 < sq_store_bound:
+                    Pointer(gmem_addr, dtype=cutlass.Int32).store(vec, alignment=16)
 
 
 _sdpa_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1600,12 +1692,24 @@ def _sdpa_host(
     thd_q_tiles: cutlass.Int32,  # THD: ceil(max_s_q / tile_m) (over-provisioned)
     thd_n_batch: cutlass.Int32,  # THD: logical sequence count B
     stream: cuda.CUstream,
+    paged_k_table: Optional[cute.Tensor] = None,
+    paged_v_table: Optional[cute.Tensor] = None,
+    ragged_q: Optional[cute.Tensor] = None,
+    ragged_k: Optional[cute.Tensor] = None,
+    ragged_v: Optional[cute.Tensor] = None,
+    ragged_o: Optional[cute.Tensor] = None,
+    ragged_stats: Optional[cute.Tensor] = None,
+    origin_batch_strides: cutlass.Constexpr = (None, None, None, None, None),
+    origin_multipliers: cutlass.Constexpr = (1, 1, 1, 1, 1),
 ):
+    if cutlass.const_expr((paged_k_table is not None) != bool(PARAMS.paged_page_size) or (paged_v_table is not None) != bool(PARAMS.paged_page_size)):
+        raise ValueError("SM80 page tables must match the paged specialization")
     SQ = Q.shape[1]
     H = Q.shape[2]
     B = Q.shape[0]
     threads = num_warps * 32
-    q_tiles = (SQ + tile_m - 1) // tile_m
+    H = H // PARAMS.pack_g
+    q_tiles = (SQ * PARAMS.pack_g + tile_m - 1) // tile_m
     # Grid shape is policy-dependent:
     #   * THD_VARLEN → over-provisioned 3-D grid (ceil(max_s_q/tile_m), H, B)
     #     with B the LOGICAL sequence count (packed Q.shape[0] == 1); tiles past
@@ -1614,6 +1718,8 @@ def _sdpa_host(
     #   * SCHED_LPT / SCHED_LPT_L2 → 1-D grid, kernel does the decode.
     if cutlass.const_expr(THD_VARLEN):
         grid = (thd_q_tiles, cutlass.Int32(H), thd_n_batch)
+    elif cutlass.const_expr(PARAMS.split_kv > 1):
+        grid = (q_tiles * H * B, 1, PARAMS.split_kv)
     elif cutlass.const_expr(sched_policy == SCHED_DEFAULT):
         grid = (q_tiles, H, B)
     else:
@@ -1658,6 +1764,15 @@ def _sdpa_host(
         d_runtime,
         causal_band_right,
         inv_softmax_scale,
+        paged_k_table,
+        paged_v_table,
+        ragged_q,
+        ragged_k,
+        ragged_v,
+        ragged_o,
+        ragged_stats,
+        origin_batch_strides,
+        origin_multipliers,
     ).launch(
         grid=grid,
         block=(threads, 1, 1),

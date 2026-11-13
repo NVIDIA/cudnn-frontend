@@ -18,15 +18,14 @@
 import math
 
 import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-import cutlass.utils as utils
 from cudnn._cutlass_compat import SmemAllocator
-import torch
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
+import cutlass
+import cutlass.cute as cute
+
 from .block_scan import block_prefix_sum_kernel
-from .indexer_top_k_varlen_util import IndexerTopKKernelVarlen, atomicAdd
+from .indexer_top_k_varlen_util import DETERMINISTIC_BITMAP_MAX_NUM_COLS, IndexerTopKKernelVarlen, atomicAdd, resolve_deterministic_ordering
 
 
 class ComputeDynamicCTAOffsets:
@@ -134,7 +133,10 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         num_sms: int = 148,
         debug: bool = False,
         tie_break: int = 0,
+        deterministic: bool = False,
+        deterministic_ordering: str = "auto",
     ):
+        """Configure one decode specialization and its per-row resources."""
         super().__init__(
             dtype,
             max_num_cols,
@@ -146,6 +148,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             num_ctas_per_row,
             merge_blocks,
             tie_break=tie_break,
+            deterministic=deterministic,
+            deterministic_ordering=deterministic_ordering,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -225,7 +229,10 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         s_last_remain,
         num_warps,
         s_warp_sums,
+        s_cta_mbarrier,
+        s_index_bits,
     ):
+        """Derive a row's staggered length and run the shared radix selector."""
         # TODO: update row_start to align with multi-cta version.
         row_start = 0
         seq_len = seqlen[task_id // self.next_n]
@@ -255,6 +262,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             s_last_remain,
             num_warps,
             s_warp_sums,
+            s_cta_mbarrier,
+            s_index_bits,
         )
 
     @cute.kernel
@@ -332,6 +341,23 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
             layout=cute.make_ordered_layout((num_warps,), order=(0,)),
             byte_alignment=128,
         )
+        if cutlass.const_expr(self.deterministic):
+            s_cta_mbarrier = smem.allocate_tensor(
+                element_type=cute.Uint64,
+                layout=cute.make_ordered_layout((1,), order=(0,)),
+                byte_alignment=8,
+            )
+            if cutlass.const_expr(self.use_deterministic_bitmap):
+                s_index_bits = smem.allocate_tensor(
+                    element_type=cute.Uint32,
+                    layout=cute.make_ordered_layout(((self.max_num_cols + 31) // 32,), order=(0,)),
+                    byte_alignment=128,
+                )
+            else:
+                s_index_bits = None
+        else:
+            s_cta_mbarrier = None
+            s_index_bits = None
 
         if cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             # Thread and block indexing
@@ -415,6 +441,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_last_remain,
                     num_warps,
                     s_warp_sums,
+                    s_cta_mbarrier,
+                    s_index_bits,
                 )
         else:
             num_rows = input.shape[0]
@@ -466,6 +494,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                     s_last_remain,
                     num_warps,
                     s_warp_sums,
+                    s_cta_mbarrier,
+                    s_index_bits,
                 )
 
             # Subsequent tasks: dynamic work stealing via atomic counter.
@@ -510,6 +540,8 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
                         s_last_remain,
                         num_warps,
                         s_warp_sums,
+                        s_cta_mbarrier,
+                        s_index_bits,
                     )
                 work_remaining = has_work
 
@@ -568,6 +600,11 @@ class IndexerTopKKernelVarlenDecode(IndexerTopKKernelVarlen):
         return
 
 
+# Standalone Top-K is qualified on the SM120 family without adding 12.x to the
+# shared DSA architecture map (utils/compiler.py::_ARCH_MAP).
+_SM120_FAMILY_ARCH = {(12, 0): "sm_120a", (12, 1): "sm_121a"}
+
+
 def _next_positive_power_of_2(x: int) -> int:
     """Round up to the next power of 2 (returns x if already a power of 2)."""
     if x <= 0:
@@ -575,11 +612,39 @@ def _next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
-_TORCH_TO_CUTLASS_DTYPE = {
-    torch.float16: cutlass.Float16,
-    torch.bfloat16: cutlass.BFloat16,
-    torch.float32: cutlass.Float32,
-}
+def _torch_to_cutlass_dtype(torch_dtype):
+    import torch  # lazy: the JAX path imports this module without torch installed
+
+    return {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[torch_dtype]
+
+
+def _sm100_deterministic_bitmap_max_cols(dtype, top_k: int, large_occupancy: bool) -> int:
+    """Largest power-of-two column bucket where bitmap ordering wins on SM100."""
+    if top_k < 256:
+        return 0
+    if not large_occupancy:
+        return 262144
+    if dtype != cutlass.Float32 and top_k > 1024:
+        return 262144
+    return 65536 if top_k <= 512 else 131072
+
+
+def _sm103_deterministic_bitmap(bucketed_num_cols: int, top_k: int, large_occupancy: bool) -> bool:
+    """Whether bitmap ordering is the auto choice on SM103 (B300).
+
+    Measured with captured graphs on a B300 (fp32 / bf16, 1-1024 rows, 4k-256k columns, top_k 32-2048). Bitmap wins at
+    narrow rows at every top_k, unlike the SM100 rule above. Bitonic wins from 128k columns at top_k <= 128, and with
+    large occupancy at top_k <= 512, by 4-12%. Past the bitmap limit, bitonic is the only choice.
+    """
+    if bucketed_num_cols > DETERMINISTIC_BITMAP_MAX_NUM_COLS:
+        return False
+    if bucketed_num_cols >= 131072 and (top_k <= 128 or (large_occupancy and top_k <= 512)):
+        return False
+    return True
 
 
 def _bucket_num_cols(num_cols: int) -> int:
@@ -596,12 +661,16 @@ def _bucket_num_cols(num_cols: int) -> int:
 _compile_cache: dict[tuple, object] = {}
 
 # The radix scratch and the input must both be 32-byte aligned (the kernel's
-# assumed_align); torch allocations are 512-byte aligned, workspace views may not be.
+# assumed_align); torch allocations are 512-byte aligned, storage-offset views
+# and caller-owned workspace views may not be.
+INPUT_ALIGN = 32
 BUFFER_ALIGN = 32
 
 
 def buffer_numbers(torch_dtype) -> int:
     """int32 radix-scratch words per input element: two histogram passes for fp32."""
+    import torch  # lazy: the JAX path imports this module without torch installed
+
     return 2 if torch_dtype == torch.float32 else 1
 
 
@@ -615,19 +684,36 @@ def compile_topk_kernel(
     load_balance=False,
     num_copy_bits=256,
     tie_break=0,
+    deterministic=False,
+    deterministic_ordering="auto",
 ):
     """The compiled kernel for this plan-time key, from the module cache.
 
     Every operand is a fake cute tensor (R11); the kernel is compiled for the
-    CURRENT device, so callers wrap this in ``torch.cuda.device(...)``.
+    CURRENT device, which is part of the cache key; callers wrap this in
+    ``torch.cuda.device(...)``.
     """
-    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+    import torch  # lazy: the JAX path imports this module without torch installed
+
+    dtype = _torch_to_cutlass_dtype(torch_dtype)
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
     large_occupancy = num_rows > 148
+    if torch.cuda.get_device_capability() in _SM120_FAMILY_ARCH:
+        # SM120 / SM121 cannot hold the large shared-memory radix buffer even for
+        # a small row count. Reuse the existing spilling specialization.
+        sm120_smem_cols = 16384 if torch_dtype == torch.float32 else 32768
+        large_occupancy = large_occupancy or bucketed_num_cols > sm120_smem_cols
+    if deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 0):
+        bitmap_limit = _sm100_deterministic_bitmap_max_cols(dtype, top_k, large_occupancy)
+        deterministic_ordering = "bitmap" if bucketed_num_cols <= bitmap_limit else "bitonic"
+    elif deterministic and deterministic_ordering == "auto" and torch.cuda.get_device_capability() == (10, 3):
+        deterministic_ordering = "bitmap" if _sm103_deterministic_bitmap(bucketed_num_cols, top_k, large_occupancy) else "bitonic"
+    deterministic_ordering = resolve_deterministic_ordering(bucketed_num_cols, deterministic, deterministic_ordering)
     assert not load_balance
 
     key = (
+        torch.cuda.current_device(),
         dtype,
         bucketed_num_cols,
         top_k,
@@ -637,12 +723,14 @@ def compile_topk_kernel(
         load_balance,
         large_occupancy,
         tie_break,
+        deterministic,
+        deterministic_ordering,
     )
     if key not in _compile_cache:
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
         n_batch = cute.sym_int()
-        input_fake = cute.runtime.make_fake_compact_tensor(dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32)
+        input_fake = cute.runtime.make_fake_compact_tensor(dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=INPUT_ALIGN)
         buffer_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
             (cute.sym_int(), cute.sym_int(), cute.sym_int()),
@@ -678,6 +766,8 @@ def compile_topk_kernel(
             return_val=return_val,
             large_occupancy=large_occupancy,
             tie_break=tie_break,
+            deterministic=deterministic,
+            deterministic_ordering=deterministic_ordering,
         )
 
         # Compile the kernel
@@ -693,7 +783,9 @@ def compile_topk_kernel(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
-            options=compile_options(),
+            # Qualify standalone Top-K on SM120 / SM121 without enabling unrelated
+            # DSA kernels through the shared architecture/support map.
+            options=compile_options(gpu_arch=_SM120_FAMILY_ARCH.get(tuple(torch.cuda.get_device_capability()))),
         )
         _compile_cache[key] = compiled_kernel
     return _compile_cache[key]
@@ -770,6 +862,7 @@ def cute_dsl_topk_wrapper(
     load_balance=False,
     num_copy_bits=256,
     tie_break=0,
+    deterministic=False,
 ):
     """Compile (cached) for the current device, then launch into the caller's tensors."""
     num_rows, num_cols = input_values.shape
@@ -783,5 +876,6 @@ def cute_dsl_topk_wrapper(
         load_balance=load_balance,
         num_copy_bits=num_copy_bits,
         tie_break=tie_break,
+        deterministic=deterministic,
     )
     launch_topk_kernel(compiled_kernel, input_values, seq_lens, out_indices, out_values, buffer, next_n)

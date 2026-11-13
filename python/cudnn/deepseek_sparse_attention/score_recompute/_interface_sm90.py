@@ -36,7 +36,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
+from cudnn.deepseek_sparse_attention.utils.tensor_conversion import fake_cute_tensor, to_cute_tensor
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     device_major as _get_device_capability,
     resolve_stream as _resolve_stream,
@@ -69,6 +69,8 @@ _MAX_TILE_M = 64
 _TILE_N = 64
 _KV_STAGE = 2
 _SWAP_AB = True
+_SPARSE_TOPK_BUCKET = 128
+_SPARSE_TOPK_MAX = 2176
 
 
 def _compute_tile_m(qhead_per_kvhead: int) -> tuple[int, int]:
@@ -103,10 +105,103 @@ def _validate_common(
 # =============================================================================
 
 
+def _sparse_topk_capacity(physical_topk: int) -> int:
+    """Return the bounded SM90 code-generation bucket for a physical top-k width."""
+    if physical_topk <= 0 or physical_topk > _SPARSE_TOPK_MAX:
+        raise ValueError(f"SM90 sparse score topk must be in [1, {_SPARSE_TOPK_MAX}], got {physical_topk}")
+    return ((physical_topk + _SPARSE_TOPK_BUCKET - 1) // _SPARSE_TOPK_BUCKET) * _SPARSE_TOPK_BUCKET
+
+
+def compile_sparse_score_recompute(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    head_dim: int,
+    qhead_per_kvhead: int,
+    physical_topk: int,
+    is_index_scores: bool,
+    has_topk_length: bool,
+    output_log_probs: bool,
+    topk_indices_global: bool,
+):
+    """Compile one symbolic sparse-score artifact during plan preparation.
+
+    Batch and sequence extents, physical top-k width, strides, pointers, stream,
+    and softmax scale remain runtime values.  Only the finite code-generation
+    axes below participate in the cache key.
+    """
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"SM90 sparse score requires a CUDA device, got {device}")
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    cute_dtype = torch2cute_dtype_map[dtype]
+    topk_capacity = _sparse_topk_capacity(physical_topk)
+
+    if not is_index_scores and qhead_per_kvhead == 96:
+        tile_m, num_head_tiles = 48, 2
+    else:
+        tile_m, num_head_tiles = _compute_tile_m(qhead_per_kvhead)
+
+    compile_key = (
+        device_index,
+        cute_dtype,
+        head_dim,
+        qhead_per_kvhead,
+        tile_m,
+        _TILE_N,
+        _KV_STAGE,
+        256,
+        _SWAP_AB,
+        topk_capacity,
+        bool(is_index_scores),
+        bool(has_topk_length),
+        num_head_tiles,
+        bool(output_log_probs),
+        bool(topk_indices_global),
+    )
+    cache = compile_sparse_score_recompute.compile_cache
+    if compile_key not in cache:
+        kernel_obj = SparseScoreRecomputeSm90(
+            cute_dtype,
+            head_dim=head_dim,
+            qhead_per_kvhead=qhead_per_kvhead,
+            tile_m=tile_m,
+            tile_n=_TILE_N,
+            num_threads=256,
+            swap_AB=_SWAP_AB,
+            topk_max=topk_capacity,
+            is_index_scores=is_index_scores,
+            has_topk_length=has_topk_length,
+            num_head_tiles=num_head_tiles,
+            is_sparse=True,
+            output_log_probs=output_log_probs,
+            topk_indices_global=topk_indices_global,
+        )
+        aux_dtype = cute_dtype if is_index_scores else cutlass.Float32
+        with torch.cuda.device(device_index):
+            cache[compile_key] = cute.compile(
+                kernel_obj,
+                fake_cute_tensor(cute_dtype, 4),
+                fake_cute_tensor(cute_dtype, 4),
+                fake_cute_tensor(cutlass.Int32, 3, assumed_align=4),
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+                fake_cute_tensor(cutlass.Float32, 3, assumed_align=4),
+                fake_cute_tensor(aux_dtype, 3, assumed_align=4 if not is_index_scores else 16),
+                fake_cute_tensor(cutlass.Int32, 2, assumed_align=4) if has_topk_length else None,
+                None,
+                cutlass.Float32(1.0),
+                options=compile_options(),
+            )
+    return cache[compile_key]
+
+
+compile_sparse_score_recompute.compile_cache = {}
+
+
 def _sparse_score_recompute(
     q: torch.Tensor,  # (bs, seqlen_q, n_heads_q, head_dim)
     kv: torch.Tensor,  # (bs, seqlen_k, n_heads_kv, head_dim) — 4D, n_heads_kv=1
-    weights_or_lse: torch.Tensor,  # (bs, n_heads_q, seqlen_q) — already transposed to (B,H,S)
+    weights_or_lse: torch.Tensor,  # (bs, seqlen_q, n_heads_q)
     topk_indices: torch.Tensor,  # (bs, seqlen_q, topk) int32, contiguous
     is_index_scores: bool,
     softmax_scale: float,
@@ -116,11 +211,9 @@ def _sparse_score_recompute(
     nvtx_range_name: str,
     topk_indices_global: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
+    compiled_kernel=None,
 ) -> torch.Tensor:
-    """Compile + launch sparse score kernel. Internal helper used by the four
-    public entry points; they own the ``(k, weights_or_lse)`` layout conversion
-    so the kernel sees the legacy SM90 layout (kv 4D + weights (B,H,S)).
-    Layout/dtype mismatches raise ``ValueError``; nothing is copied or cast here."""
+    """Launch a plan-time compiled sparse score kernel without staging copies."""
     compute_capability = _get_device_capability()
     assert compute_capability == 9, f"SM90 kernel on compute capability {compute_capability}"
 
@@ -132,83 +225,21 @@ def _sparse_score_recompute(
     assert num_head > num_head_kv and num_head % num_head_kv == 0, f"MQA required: num_head={num_head}, num_head_kv={num_head_kv}"
     qhead_per_kvhead = num_head // num_head_kv
 
-    tile_m, num_head_tiles = _compute_tile_m(qhead_per_kvhead)
-
     _require_int32_contiguous(topk_indices, "topk_indices")
-    topk_max = topk_indices.shape[-1]
+    physical_topk = topk_indices.shape[-1]
+    _sparse_topk_capacity(physical_topk)
 
     has_topk_length = topk_length is not None
     if has_topk_length:
         _require_int32_contiguous(topk_length, "topk_length")
         assert topk_length.shape == (batch_size, seqlen_q)
 
-    _require_fp32_output(out, "out", (batch_size, seqlen_q, topk_max))
-
-    dtype = torch2cute_dtype_map[q.dtype]
-    # Sparse path: num_threads fixed at 256 (1 producer WG + 1 consumer WG).
-    num_threads = 256
-
-    compile_key = (
-        dtype,
-        head_dim,
-        qhead_per_kvhead,
-        tile_m,
-        _TILE_N,
-        _KV_STAGE,
-        num_threads,
-        _SWAP_AB,
-        topk_max,
-        is_index_scores,
-        softmax_scale,
-        has_topk_length,
-        num_head_tiles,
-        True,
-        output_log_probs,
-        bool(topk_indices_global),
-    )
-
-    cache = _sparse_score_recompute.compile_cache
-    if compile_key not in cache:
-        q_cute = to_cute_tensor(q)
-        kv_cute = to_cute_tensor(kv)
-        topk_idxs_cute = to_cute_tensor(topk_indices)
-        topk_length_cute = to_cute_tensor(topk_length) if topk_length is not None else None
-        out_cute = to_cute_tensor(out)
-        weights_cute = to_cute_tensor(weights_or_lse)
-
-        kernel_obj = SparseScoreRecomputeSm90(
-            dtype,
-            head_dim=head_dim,
-            qhead_per_kvhead=qhead_per_kvhead,
-            tile_m=tile_m,
-            tile_n=_TILE_N,
-            num_threads=num_threads,
-            swap_AB=_SWAP_AB,
-            topk_max=topk_max,
-            is_index_scores=is_index_scores,
-            softmax_scale=softmax_scale,
-            has_topk_length=has_topk_length,
-            num_head_tiles=num_head_tiles,
-            is_sparse=True,
-            output_log_probs=output_log_probs,
-            topk_indices_global=topk_indices_global,
-        )
-
-        cache[compile_key] = cute.compile(
-            kernel_obj,
-            q_cute,
-            kv_cute,
-            topk_idxs_cute,
-            current_stream,
-            out_cute,
-            weights_cute,
-            topk_length_cute,
-            None,  # mL1NormDenom (dense-only)
-            options=compile_options(),
-        )
+    _require_fp32_output(out, "out", (batch_size, seqlen_q, physical_topk))
+    if compiled_kernel is None:
+        raise RuntimeError("SM90 sparse score plan is not compiled; call compile() before execute()")
 
     with torch.cuda.nvtx.range(nvtx_range_name):
-        cache[compile_key](
+        compiled_kernel(
             q,
             kv,
             topk_indices,
@@ -217,11 +248,9 @@ def _sparse_score_recompute(
             weights_or_lse,
             topk_length,
             None,  # mL1NormDenom (dense-only)
+            cutlass.Float32(float(softmax_scale)),
         )
     return out
-
-
-_sparse_score_recompute.compile_cache = {}
 
 
 def sparse_indexer_score_recompute(
@@ -235,6 +264,7 @@ def sparse_indexer_score_recompute(
     sm_scale: float = 1.0,
     topk_indices_global: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
+    compiled_kernel=None,
 ) -> torch.Tensor:
     """Sparse indexer backward predict:
         S[b,q,i] = sm_scale * sum_h [ReLU(Q_h · K_{topk[b,q,i]}^T) · W_{b,q,h}]
@@ -245,15 +275,10 @@ def sparse_indexer_score_recompute(
     Defaults to 1.0 (identity).
     """
     kv = k_indexer.unsqueeze(2)
-    # Deferred (Rule 8 batch item D4): the SM90 kernel reads the per-head operand
-    # with S as the unit stride, so this (B,S,H)->(B,H,S) copy stays until the
-    # kernel takes the (B,S,H) stride or SM90 declines in check_support().
-    with _torch_stream_context(current_stream):
-        w_bhs = weights.transpose(1, 2).contiguous()
     return _sparse_score_recompute(
         q_indexer,
         kv,
-        w_bhs,
+        weights,
         topk_indices,
         is_index_scores=True,
         softmax_scale=sm_scale,
@@ -263,6 +288,7 @@ def sparse_indexer_score_recompute(
         nvtx_range_name="sparse_indexer_score_recompute",
         topk_indices_global=topk_indices_global,
         current_stream=current_stream,
+        compiled_kernel=compiled_kernel,
     )
 
 
@@ -276,6 +302,7 @@ def sparse_attn_score_recompute(
     topk_length: Optional[torch.Tensor] = None,
     topk_indices_global: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
+    compiled_kernel=None,
 ) -> torch.Tensor:
     """Sparse attention backward target:
     P[b,q,h,i] = exp(Q_h · K_{topk[b,q,i]}^T · scale − LSE[b,q,h])
@@ -283,13 +310,10 @@ def sparse_attn_score_recompute(
     target     = S / sum(S)  (L1-norm over topk)
     """
     kv = k_attn.unsqueeze(2)
-    # Deferred (Rule 8 batch item D4): per-head operand transpose copy, see sparse_indexer_score_recompute.
-    with _torch_stream_context(current_stream):
-        lse_bhs = lse.transpose(1, 2).contiguous()
     return _sparse_score_recompute(
         q_attn,
         kv,
-        lse_bhs,
+        lse,
         topk_indices,
         is_index_scores=False,
         softmax_scale=softmax_scale,
@@ -299,6 +323,7 @@ def sparse_attn_score_recompute(
         nvtx_range_name="sparse_attn_score_recompute",
         topk_indices_global=topk_indices_global,
         current_stream=current_stream,
+        compiled_kernel=compiled_kernel,
     )
 
 

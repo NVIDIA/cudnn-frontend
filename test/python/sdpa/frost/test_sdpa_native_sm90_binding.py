@@ -23,7 +23,7 @@ pytestmark = [pytest.mark.L0]
 def _host_order():
     path = Path(prep.__file__).parent / "kernels/sm90/prepared_host.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "host")
-    return [arg.arg for arg in host.args.args if "Constexpr" not in ast.unparse(arg.annotation)]
+    return [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
 
 
 def _spec(thd, dtype="bfloat16", layout="NH"):

@@ -153,6 +153,8 @@ def make_launcher(plan, names):
         args = dict(
             config, q=q, k=k, v=v, gate=g, beta=beta, a_log=a, dt_bias=dt, cu_seqlens=cu, checkpoints=checkpoints, work_items=w["work_items"], stream=stream
         )
+        # A JAX graph has no context-parallel ports, so the composed boundary state and the piece arms stay off.
+        args.update(composed=None, dcomposed=None, has_piece_transitions=False, has_piece_state_grads=False)
         if is_bwd:
             dq = w["dq_ho"] if hq != ho else ports["dQ"]
             dkey = w["dk_ho"] if hk != ho else ports["dK"]
@@ -167,6 +169,7 @@ def make_launcher(plan, names):
                 dstate0=ports.get("d_initial_state"),
                 gate_main=g if not log_gate and not safe_gate else None,
                 seed_checkpoints=ports.get("state_checkpoints") if coarse else None,
+                dstate_scratch=w["dstate_scratch"],
             )
         if chain:
             args.update(
@@ -235,6 +238,7 @@ def make_launcher(plan, names):
                     scheduler_bwd=w["scheduler_bwd"],
                     recompute_words=w.get("recompute_tensormaps"),
                     bprop_words=w["bwd_tensormaps"],
+                    dstate_snapshot=w.get("dstate_snapshot"),
                 )
             else:
                 args.update(
@@ -253,6 +257,7 @@ def make_launcher(plan, names):
                     prep_words=w.get("prep_tensormaps"),
                     prep_rows=w.get("prep_rows"),
                     prep_row_count=w.get("prep_row_count"),
+                    state_snapshot=w.get("state_snapshot"),
                 )
         for name, dtype in scalar_types.items():
             args[name] = dtype(args[name])

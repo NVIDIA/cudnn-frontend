@@ -1,8 +1,10 @@
 # Python API index
 
 `api_index_modules.txt` lists the checked modules as sorted, unique dotted names.
-The scanner compares their public `__all__` exports and public members of
-exported cuDNN classes against `api_index.txt`. Import failures, invalid
+The scanner compares their public `__all__` exports, the public names in a
+module's `_LAZY_OPTIONAL_IMPORTS` table, and public members of exported cuDNN
+classes against `api_index.txt`. A lazy name is recorded by name only; the
+object it resolves to is indexed in the module that defines it. Import failures, invalid
 `__all__` declarations, unresolved exports, and API additions or removals fail
 the check.
 

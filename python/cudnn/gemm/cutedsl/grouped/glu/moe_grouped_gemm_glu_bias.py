@@ -25,6 +25,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, AddressSpace
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -498,6 +499,12 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         per-expert base addresses; ``n``, ``k``, ``b_stride_size``, and
         ``b_major_mode`` describe the uniform per-expert layout.
         """
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        prob = kernel_facing_prob(prob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b)
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type

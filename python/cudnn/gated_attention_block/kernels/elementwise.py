@@ -32,6 +32,8 @@ HBM ceiling.
 Traffic: ``2*R + W`` per element with a gate, ``R + W`` without.
 """
 
+import hashlib
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -39,6 +41,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, sigmoid
@@ -58,6 +61,10 @@ DEFAULT_CONST_HEAD_COUNT = True
 re-measured per arch — an A100-derived pair was wrong for Rubin there."""
 
 _FAKE_STREAM = None
+# Imported normally (not through the template loader), so the module names its own source identity: ``template_key`` joins
+# it with a compile site's key to name the persistent object (``compiled_cache``); the cache's environment manifest covers
+# every other ``.py`` the kernel is traced from.
+FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
 def validate_shape(d: int, threads_per_cta: int) -> None:
@@ -243,13 +250,16 @@ def compile_elementwise_gate(
 
     key = (str(dtype), h, d, bool(has_gate), int(threads_per_cta), int(rows_per_group), bool(const_head_count), bool(use_pdl), current_device())
     if key not in compiled_cache:
+        # The dict stays the in-process memo; behind it sits the persistent compiled-plan cache (``cudnn.frost.compiled_cache``),
+        # keyed by this file's digest + the dict key's plain values: a second process reloads the object instead of re-tracing.
+        cache_key = template_key(globals(), {"key": key}, "compile_elementwise_gate")
         tok = cute.sym_int()
         # All three carry their own symbolic token stride: src/dst are compact
         # in the block, gate is a column slice of the fused projection.
         src = fake_rowmajor_dynamic_token_stride(dtype, tok, h, d)
         gate = fake_rowmajor_dynamic_token_stride(dtype, tok, h, d) if has_gate else None
         dst = fake_rowmajor_dynamic_token_stride(dtype, tok, h, d)
-        compiled_cache[key] = cute.compile(
+        compiled_cache[key] = compile_cached(
             elementwise_gate_launch,
             src,
             gate,
@@ -265,6 +275,8 @@ def compile_elementwise_gate(
             bool(use_pdl),
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
+            cache_key=cache_key,
+            symbol="cudnn_block_elementwise_gate",
         )
     return ElementwiseRecipe(
         compiled=compiled_cache[key],

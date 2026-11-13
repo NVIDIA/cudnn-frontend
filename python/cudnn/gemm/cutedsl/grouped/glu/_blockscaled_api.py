@@ -19,7 +19,6 @@ Discrete mode
 
 from __future__ import annotations
 
-from dataclasses import replace
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..backend_utils import rubin_single_group_offsets_kwarg
@@ -29,6 +28,7 @@ from ..canonical import (
     canonical_prob_fake,
     check_sf_shape,
     is_flat_sf,
+    layout_desc,
     make_flat_sf_fake,
     normalize_b,
     normalize_mx,
@@ -48,12 +48,6 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
-
-
-def layout_desc(api, tensor, name):
-    if tensor is None:
-        return None
-    return replace(api._make_tensor_desc(tensor, name=name, canonical=True), dtype=tensor.dtype)
 
 
 def _get_rubin_kernel():
@@ -676,10 +670,14 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
         device = torch.cuda.current_device()
+        from cudnn.tensor_adapter import has_tcgen05
+
         major, minor = torch.cuda.get_device_capability(device)
         compute_capability = major * 10 + minor
-        if compute_capability < 100:
-            raise RuntimeError(f"GroupedGemmGlu requires SM100+ compute capability, " f"but found SM{compute_capability} on device {device}")
+        if not has_tcgen05(major):
+            raise RuntimeError(
+                f"GroupedGemmGlu requires SM100+ compute capability with tcgen05 (not cc 12.x), " f"but found SM{compute_capability} on device {device}"
+            )
 
         self._is_supported = True
         self._logger.debug("check_support completed successfully")

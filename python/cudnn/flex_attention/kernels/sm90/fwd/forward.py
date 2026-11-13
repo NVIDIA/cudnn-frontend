@@ -361,7 +361,10 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 barrier_storage=storage.mbar_ptr_Mask.data_ptr(),
                 num_stages=self.mask_stages,
                 producer_group=tma_warp,
-                consumer_group=mma_warps,
+                # Each lane reads its own mask words. The producer must wait
+                # for every reader, not just one empty-barrier arrival per warp.
+                consumer_group=ThreadCooperativeGroup(self.num_mma_threads),
+                tidx=Int32(0),  # Make every reader signal the CTA-local empty barrier.
                 tx_count=mask_tx_count,
                 defer_sync=True,
             )

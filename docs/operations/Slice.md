@@ -44,11 +44,11 @@ If `set_strides` is omitted, every step defaults to `1`. If provided, the vector
 Example:
 
 ```python
-input_tensor = graph.tensor(dim=[4, 8, 16], stride=[128, 16, 1], data_type=cudnn.data_type.float)
+input_tensor = graph.tensor(dim=[4, 8, 16], stride=[128, 16, 1], data_type=cudnn.data_type.FLOAT)
 sliced_tensor = graph.slice(
     input_tensor,
     slices=[slice(1, 3), slice(2, 6, 2), slice(0, 16)],
     name="my_slice",
-    compute_data_type=cudnn.data_type.float,
+    compute_data_type=cudnn.data_type.FLOAT,
 )
 ```

@@ -8,6 +8,8 @@ from cudnn.engines.base import CompiledPlan, ExecutionContext
 if TYPE_CHECKING:
     from cudnn._pygraph import pygraph
 
+_MISSING_DEVICE = object()
+
 
 def _check_workspace(workspace, required: int, name: str) -> None:
     """A FROST executor carves its scratch out of the CALLER's workspace: no
@@ -40,9 +42,12 @@ class _FrostSdpaPlan(CompiledPlan):
         self.takes_variant_pack = self._prepared is not None
         self._stream_handles: dict = {}
         native = getattr(getattr(self._prepared, "spec", None), "native", None)
-        # Only a zero-scratch native launch can bypass the workspace guards
-        # below. This is an internal transport hook, not another plan/API step.
-        self._ordered_native = native if not self._workspace_bytes and hasattr(native, "execute_ordered") else None
+        # A scratch-using binder must validate the complete advertised workspace
+        # before bypassing the Python guards. Older extensions keep that path.
+        native_workspace = getattr(native, "ordered_workspace_bytes", None)
+        self._ordered_native = (
+            native if hasattr(native, "execute_ordered") and (not self._workspace_bytes or native_workspace == self._workspace_bytes) else None
+        )
 
     def get_workspace_size(self) -> int:
         return self._workspace_bytes
@@ -92,7 +97,15 @@ class _FrostSdpaPlan(CompiledPlan):
                         f"{self._name}: needs a {self._workspace_bytes}-byte workspace, got {nbytes} bytes (size it with graph.get_workspace_size())"
                     )
                 device = getattr(ctx.workspace, "__dlpack_device__", None)
-                if device is not None and tuple(device()) != (2, self._prepared.spec.device_index):
+                if device is None:
+                    # Python-only producers can expose placement without DLPack.
+                    # Bare addresses still carry no observable device contract.
+                    observed = getattr(ctx.workspace, "device", _MISSING_DEVICE)
+                    if observed is not _MISSING_DEVICE and (
+                        getattr(observed, "type", None) != "cuda" or getattr(observed, "index", None) != self._prepared.spec.device_index
+                    ):
+                        raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
+                elif tuple(device()) != (2, self._prepared.spec.device_index):
                     raise ValueError(f"{self._name}: workspace must be on CUDA device {self._prepared.spec.device_index}")
             cu_stream = self._stream_handle(ctx.stream)
             stream_int = int(cu_stream) if cu_stream is not None else 0

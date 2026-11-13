@@ -20,7 +20,7 @@ RUN git clone https://github.com/NVIDIA/cudnn-frontend.git
 RUN pip install -v /workspace/cudnn-frontend
 
 # Install the Cutlass DSL runtime (cuDNN FROST engines).
-RUN pip install nvidia-cutlass-dsl[cu13]==4.7.0 apache-tvm-ffi
+RUN pip install nvidia-cutlass-dsl[cu13]==4.8.0 apache-tvm-ffi
 
 # Install the cuTile runtime (cuDNN cuTile engines).
 RUN pip install cuda-tile==1.5.0
@@ -35,6 +35,10 @@ RUN pip install -v /workspace/FlashQLA
 # Install FlashKDA from source.
 RUN git clone https://github.com/MoonshotAI/FlashKDA.git
 RUN pip install -v /workspace/FlashKDA
+
+# Install mamba_ssm from source.
+RUN git clone https://github.com/state-spaces/mamba.git
+RUN pip install -v --no-deps /workspace/mamba && pip install transformers
 
 # Install the chart dependencies for plot_results.py
 RUN pip install pandas matplotlib seaborn

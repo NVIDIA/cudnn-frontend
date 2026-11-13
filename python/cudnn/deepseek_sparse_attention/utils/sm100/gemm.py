@@ -235,12 +235,15 @@ def gemm_ptx_partial_mxfp8(
     zero_init: bool | Boolean = False,
     kphase_offset: cutlass.Constexpr[int] = 0,
 ) -> None:
-    """Issue blockscaled MXFP8 QK MMA with explicit scale TMEM operands.
+    """Issue blockscaled MXFP8 or MXFP4 QK MMA with explicit scale TMEM operands.
 
     The Indexer forward path uses K as operand A and packed Q as operand B, so
-    K scales are SFA and Q scales are SFB.  Each K-slice uses a distinct scale
-    factor id in the instruction descriptor while all scale bytes live in TMEM.
-    This helper has no inline mbarrier wait path; callers must pass
+    K scales are SFA and Q scales are SFB.  All of a row's E8M0 scales share one
+    TMEM column, and the instruction descriptor's scale factor id selects the
+    ones each MMA reads: ``kind::mxf8f6f4`` (K=32) reads one scale, at id
+    ``kphase``; ``kind::mxf4`` (packed E2M1, K=64) reads two, at id
+    ``2 * kphase``.  ``kphase_offset`` is the index of this chunk's first MMA
+    along K.  This helper has no inline mbarrier wait path; callers must pass
     warp-uniform, fully populated SFA/SFB TMEM tensors for the current MMA.
     """
     sA_layout = sA.layout
@@ -271,7 +274,11 @@ def gemm_ptx_partial_mxfp8(
 
     offset_a = [cute.crd2idx((0, 0, k), tCrA.layout) for k in range(cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
-    idescs = [const_expr(sm100_desc.blockscaled_mma_op_to_idesc(op, k + kphase_offset)) for k in range(cute.size(tCrA.shape[2]))]
+    # kind::mxf4 (packed E2M1, K=64) reads two E8M0 scales per row per MMA, kind::mxf8f6f4 (K=32) one.
+    is_mxf4 = isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4Op)
+    mma_kind = "kind::mxf4.block_scale.scale_vec::2X" if const_expr(is_mxf4) else "kind::mxf8f6f4.block_scale.scale_vec::1X"
+    sf_ids_per_mma = 2 if const_expr(is_mxf4) else 1
+    idescs = [const_expr(sm100_desc.blockscaled_mma_op_to_idesc(op, (k + kphase_offset) * sf_ids_per_mma)) for k in range(cute.size(tCrA.shape[2]))]
 
     smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator))
     smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
@@ -312,7 +319,7 @@ def gemm_ptx_partial_mxfp8(
         "mov.b64 smem_desc_a, {smem_desc_a_lo_start, smem_desc_a_hi};\n\t"
         "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
         "setp.ne.b32 p, $2, 0;\n\t"
-        f"@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], {pred_str};\n\t"
+        f"@leader_thread tcgen05.mma.cta_group::1.{mma_kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], {pred_str};\n\t"
         + "".join(
             (
                 f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
@@ -320,7 +327,7 @@ def gemm_ptx_partial_mxfp8(
                 f"mov.b32 idesc, {hex(idescs[k])};\n\t"
                 f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
                 f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                "@leader_thread tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
+                f"@leader_thread tcgen05.mma.cta_group::1.{mma_kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, [tmem_sfa], [tmem_sfb], 1;\n\t"
             )
             for k in range(1, cute.size(tCrA.shape[2]))
         )

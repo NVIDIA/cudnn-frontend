@@ -207,7 +207,7 @@ def test_kernel_modules_are_present():
     assert not missing, f"kernel templates missing under kernels/: {[_KERNEL_FILES[f] for f in missing]} (plan s1)"
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
     from cudnn.engines.manifest import MANIFEST
 
@@ -215,7 +215,8 @@ def test_engine_is_registered_and_opt_in():
     fam = next(f for f in MANIFEST if f.name == _FAMILY_NAME)
     assert _ENGINE in fam.slots, f"{_ENGINE} has no manifest slot (never reuse a retired slot; plan s7 says slot {_SLOT})"
     slot = fam.slots[_ENGINE]
-    assert slot.slot == _SLOT and slot.opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # Default since 2026-10-27, behind the backend (cudnn.sdpa.bwd.heuristics.TRAIL_ONLY_ROWS).
+    assert slot.slot == _SLOT and not slot.opt_in
     assert FROST_SDPA_BWD_ID_BASE + slot.slot == _ENGINE_ID
 
 
@@ -1370,7 +1371,7 @@ def test_stage3_dq_record_groups_its_b_head_by_the_gqa_group(monkeypatch):
 def test_stage3_dq_launches_pair_every_q_head_with_its_k_head(hq, hkv, hc, bc, single):
     """The coordinate arithmetic of the dQ launches on a fake flat batch index, no GPU: the (b, h) fork decodes
     ``l -> (h = l % n_head, b = l // n_head)`` for A (dS) and C (dQ) and hands B (K) ``h // b_head_group`` (``_b_head``) against a B
-    descriptor ``n_head // b_head_group`` heads deep; ``prepared_host._stage3`` launches ``group // b_head_group`` times, launch
+    descriptor ``ceil(n_head / b_head_group)`` heads deep; ``prepared_host._stage3`` launches ``group // b_head_group`` times, launch
     ``member`` over the chunk's heads ``member :: n_launch`` against the chunk's ``kv_n`` K heads.  For every (b, h) of every
     launch the K head reached must be ``q_head // group`` -- the GQA convention the oracle, the analyzer and the kernels share --
     at ``b_head_group = group`` (one launch) exactly as at 1 (the per-member loop, the twin), and the rendered module carries the
@@ -1415,7 +1416,7 @@ def test_stage3_dq_launches_pair_every_q_head_with_its_k_head(hq, hkv, hc, bc, s
     assert body.count("tile_h_b = _b_head(tile_h)") == 1, "B's head coordinate goes through _b_head"
     assert body.count("tile_h_a = tile_h") == 1 and "(col, coord_m, tile_h, tile_b)" in body, "A and C keep the decoded head"
     assert "return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)" in body
-    assert "b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group" in body, "B's descriptor head extent"
+    assert "b_h = n_head if cutlass.const_expr(b_head_group == 1) else (n_head + b_head_group - 1) // b_head_group" in body, "B's descriptor head extent"
     assert body.count("_decode_bh(") == 7, "the flat batch decode stays where it was: the definition + the TMA / MMA / epilogue warps' init and loop-tail sites"
 
 
@@ -1855,7 +1856,7 @@ def test_stage3_b_head_group_default_folds_out_of_the_template():
         [
             "b_head_group = int(getattr(PARAMS, , 1))",  # _code_only blanks the string literal
             "return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)",
-            "b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group",
+            "b_h = n_head if cutlass.const_expr(b_head_group == 1) else (n_head + b_head_group - 1) // b_head_group",
         ]
     ), f"a use of b_head_group outside the const_expr fold reached the template: {reads}"
     # _b_head is a traced (@cute.jit) helper with that single return, applied at exactly one site: B's head coordinate
@@ -1884,6 +1885,33 @@ def test_stage3_b_head_group_default_folds_out_of_the_template():
 
     assert default_mod.b_head_group == legacy_mod.b_head_group == 1
     assert consts(default_mod) == consts(legacy_mod), "the default record and the record without the field render different module constants"
+
+
+@pytest.mark.parametrize(
+    "n_head,b_head_group",
+    [(1, 1), (3, 1), (1, 4), (2, 4), (3, 4), (4, 4), (6, 4), (8, 4), (1, 8), (4, 8), (8, 8), (9, 8)],
+)
+def test_stage3_b_descriptor_covers_partial_head_groups(n_head, b_head_group):
+    """Evaluate the template's actual descriptor expression against the K heads reached by every Q head.
+
+    A chunk smaller than its GQA group still reaches one K head. Whole groups and the default group=1 retain their extents.
+    This is a host arithmetic contract; GPU gradient tests separately cover the adapter's admitted subgroup chunks.
+    """
+    import ast
+
+    from cudnn.sdpa.bwd.api_dsl import _SM100_MATMUL_FILE, _sm100_kernel_path
+
+    path = _sm100_kernel_path(_SM100_MATMUL_FILE)
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    assignments = [node for node in ast.walk(tree) if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "b_h" for t in node.targets)]
+    assert len(assignments) == 1, "exercise the actual grouped B descriptor extent"
+    expression = compile(ast.Expression(assignments[0].value), path, "eval")
+    extent = eval(expression, {"cutlass": types.SimpleNamespace(const_expr=bool), "n_head": n_head, "b_head_group": b_head_group})
+    reached_k_heads = {q_head // b_head_group for q_head in range(n_head)}
+    assert extent == len(reached_k_heads), (n_head, b_head_group, extent, reached_k_heads)
+    assert all(0 <= k_head < extent for k_head in reached_k_heads), "every addressed K head is inside the descriptor"
+    if b_head_group == 1:
+        assert extent == n_head, "the default arm preserves the original head extent"
 
 
 def test_stage3_cluster_tile_is_the_d256_one_on_the_rubin_line_only(monkeypatch):
@@ -3688,8 +3716,21 @@ _SASS_PROBE = textwrap.dedent(r"""
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
     # The main kernel's section only: a THD build's cubin also carries the one-shot setup kernel (descriptor patching, whose
     # GENERIC->TENSORMAP release fence lowers to MEMBAR.ALL.GPU + CGAERRBAR), which the per-tile drain pin must not read.
-    main_end = next((i for i, ln in enumerate(sass) if ".text." in ln and "setup_kernel" in ln), len(sass))
-    main_sass = sass[:main_end]
+    # Select by section symbol rather than assuming main precedes setup in the disassembly.
+    sections = [(i, ln) for i, ln in enumerate(sass) if re.match(r"^\s*\.section\s+", ln)]
+    sections.append((len(sass), ""))
+    main_sass = []
+    setup_lines = 0
+    for (start, header), (stop, _) in zip(sections, sections[1:]):
+        section = re.match(r"^\s*\.section\s+\.text\.([^,\s]+)", header)
+        if section is None:
+            continue
+        symbol = section.group(1)
+        if "setup_kernel" in symbol:
+            setup_lines += stop - start
+        elif "cudnn_kernel__kernel_" in symbol:
+            main_sass.extend(sass[start:stop])
+    assert main_sass, "No main kernel .text section found in the disassembly"
     def cnt_main(*subs):
         return sum(1 for ln in main_sass if all(sb in ln for sb in subs))
     print("SASS USETMAXREG", cnt_main("USETMAXREG"))
@@ -3697,7 +3738,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     print("SASS LDL", cnt_main("LDL"))
     print("SASS MEMBAR_GPU", cnt_main("MEMBAR.ALL.GPU"))
     print("SASS CGAERRBAR", cnt_main("CGAERRBAR"))
-    print("SASS SETUP_KERNEL_LINES", len(sass) - main_end)
+    print("SASS SETUP_KERNEL_LINES", setup_lines)
     print("SASS SYNCS_PHASECHK", sum(1 for ln in sass if "SYNCS.PHASECHK" in ln and "USYNCS.PHASECHK" not in ln))
     print("SASS USYNCS_PHASECHK", cnt("USYNCS.PHASECHK"))
     print("SASS NANOSLEEP", cnt("NANOSLEEP"))

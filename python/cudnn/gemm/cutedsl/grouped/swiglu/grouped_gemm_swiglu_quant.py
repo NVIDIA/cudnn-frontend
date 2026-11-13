@@ -2565,6 +2565,9 @@ class BlockScaledContiguousGroupedGemmKernel:
                             )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         d_pipeline.producer_commit()
+                        # The next subtile overwrites sD/sD_col[(n + 1) % num_d_stage]: wait until the TMA store that
+                        # last read that buffer is done reading (cp.async.bulk.wait_group.read num_d_stage - 1).
+                        d_pipeline.producer_acquire()
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 #

@@ -1,6 +1,6 @@
 jupyter
 numpy
-pybind11[global]>=2.13,<3
+nanobind>=3.0.1,<4
 pytest
 pytest-xdist
 cuda-python

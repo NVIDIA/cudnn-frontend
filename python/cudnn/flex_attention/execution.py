@@ -57,8 +57,8 @@ def _tensor_signature(tensor: Optional[torch.Tensor]):
     )
 
 
-def _plan_signature(mask_plan: MaskPlan) -> tuple:
-    packed_plan, _, _ = mask_plan._runtime_args
+def _plan_signature(mask_plan: MaskPlan, *, deterministic: bool = False) -> tuple:
+    packed_plan, _, _ = mask_plan._backward_runtime_args(deterministic)
 
     def signature(plan):
         return validate_arbitrary_attention_plan(block_sparse_tensors=plan).compile_key if plan is not None else None
@@ -106,8 +106,8 @@ def _stream_context(stream: Optional[cuda.CUstream | torch.cuda.Stream], device:
     return torch.cuda.stream(_as_torch_stream(stream, device))
 
 
-def _plan_tensors(mask_plan: MaskPlan) -> tuple[torch.Tensor, ...]:
-    packed_plan, cu_seqlens_q, cu_seqlens_k = mask_plan._runtime_args
+def _plan_tensors(mask_plan: MaskPlan, *, deterministic: bool = False) -> tuple[torch.Tensor, ...]:
+    packed_plan, cu_seqlens_q, cu_seqlens_k = mask_plan._backward_runtime_args(deterministic)
     tensors = [cu_seqlens_q, cu_seqlens_k]
     for plan in (packed_plan, getattr(packed_plan, "bwd_tensors", None), getattr(packed_plan, "dq_tensors", None)):
         if plan is not None:
@@ -403,7 +403,7 @@ class FlexAttentionBwd(APIBase):
 
     def _call_dispatch(self, *, compile_only=False, validate_only=False, preallocated=None, compiled=None, compile_outputs=None, **runtime):
         mask_plan = runtime.pop("mask_plan")
-        packed_plan, _, _ = mask_plan._runtime_args
+        packed_plan, _, _ = mask_plan._backward_runtime_args(self.deterministic)
         cu_q, cu_k, max_q, max_k = _sequence_args(mask_plan)
         return _flex_attn_bwd(
             runtime["q"],
@@ -554,7 +554,7 @@ class FlexAttentionBwd(APIBase):
                 dv_tensor,
                 dlse_tensor,
                 workspace,
-                *_plan_tensors(mask_plan),
+                *_plan_tensors(mask_plan, deterministic=self.deterministic),
             ),
             current_stream,
             q_tensor.device,
@@ -675,7 +675,7 @@ def _flex_attention_backward(
         _tensor_signature(dk_tensor),
         _tensor_signature(dv_tensor),
         _tensor_signature(dlse_tensor),
-        _plan_signature(mask_plan),
+        _plan_signature(mask_plan, deterministic=deterministic),
         deterministic,
     )
     api = _cache_get(_BWD_CACHE, key)
