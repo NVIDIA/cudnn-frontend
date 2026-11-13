@@ -312,6 +312,48 @@ def test_tensor_memory_ledger_declines_a_parked_form_by_name():
     kcfg.validate_cfg(kcfg.resolve_form(C_OUT2, 1, Form(MMA_M=64, STAGES=2), part))
 
 
+def test_given_forms_of_the_classes_run_as_written_meet_their_bounds_by_name():
+    """The bounds a given ``form`` meets at the four classes run as written, on the reference readings.  The ring holds at most the K
+    tiles of ONE slice -- 12 at ``(5120, 6144)`` split 4, 24 at split 2, 40 at the two split-1 classes -- and one stage more is a
+    ``ValueError`` naming both counts.  The tensor-memory ledger at split 1, where no reduction mailbox pads a small CTA: a one-stage
+    ring of the 64-row weight tile would sit 22 to an SM and is declined, the same ring of the 128-row tile (12 to an SM) and two
+    stages are served.  256 tensor-memory columns fit where the table row places at most two CTAs on an SM (the split-1 classes and
+    ``(5120, 6144)`` split 2) and are declined where it places three (``(5120, 6144)`` split 4 up to 8 rows).  And a given form is
+    taken as given: it releases the tensor memory early unless it says ``HOLD_TMEM``, with which it is the pick's own rendering."""
+    part = kcfg.part_readings(SM100_READING["smem_per_sm"], SM100_READING["smem_optin"], SM100_READING["sm_count"])
+    for numerics, slice_tiles in zip(AS_WRITTEN, (12, 24, 40, 40)):
+        assert numerics.GEOM.K_TILES // numerics.SPLIT_K == slice_tiles
+        geometry, split = numerics.GEOM, numerics.SPLIT_K
+        with pytest.raises(
+            ValueError, match=rf"{slice_tiles + 1} stages exceed the {slice_tiles} K tiles of one slice of K {geometry.IN_FEATURES} at split_k {split}"
+        ):
+            entry.Fp8ProjectionDecode("cpu", geometry, split_k=split, form=Form(STAGES=slice_tiles + 1))
+        mma_m, stages = kcfg.PICKS[numerics][0][2:]
+        pick = entry.Fp8ProjectionDecode("cpu", geometry, split_k=split)
+        given = entry.Fp8ProjectionDecode("cpu", geometry, split_k=split, form=Form(MMA_M=mma_m, STAGES=stages))
+        held = entry.Fp8ProjectionDecode("cpu", geometry, split_k=split, form=Form(MMA_M=mma_m, STAGES=stages, HOLD_TMEM=True))
+        for rows in range(1, kcfg.MAX_ROWS + 1):
+            assert pick.cfg_for(rows).HOLD_TMEM and not given.cfg_for(rows).HOLD_TMEM, (cid(numerics), rows)
+            assert held.key(rows) == pick.key(rows) != given.key(rows), (cid(numerics), rows)
+    for numerics in (C_16K1, C_14K1):
+        tiny = kcfg.resolve_form(numerics, 1, Form(MMA_M=64, STAGES=1), part)
+        assert (tiny.SMEM_BYTES, tiny.SMEM_RESIDENT, tiny.MAILBOX_ELEMENTS) == (9344, 22, 0)
+        with pytest.raises(ValueError, match=r"22 CTAs of 9344 B .*704 > 512"):
+            kcfg.validate_cfg(tiny)
+        with pytest.raises(ValueError, match="the form cannot be served at 1 rows"):
+            entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=1, form=Form(MMA_M=64, STAGES=1))
+        for form, resident in ((Form(MMA_M=128, STAGES=1), 12), (Form(MMA_M=64, STAGES=2), 11), (Form(MMA_M=128, STAGES=2), 6)):
+            cfg = kcfg.resolve_form(numerics, 1, form, part)
+            kcfg.validate_cfg(cfg)
+            assert cfg.SMEM_RESIDENT == resident, (cid(numerics), form)
+    for numerics, resident in ((C_5K2, (2, 1, 1)), (C_16K1, (1, 1, 1)), (C_14K1, (1, 1, 1))):
+        mma_m, stages = kcfg.PICKS[numerics][0][2:]
+        wide = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, form=Form(MMA_M=mma_m, STAGES=stages, TMEM_COLS=256))
+        assert tuple(wide.cfg_for(rows).SMEM_RESIDENT for rows in (1, 9, 17)) == resident and {c.TMEM_COLS for c in wide.cfgs.values()} == {256}
+    with pytest.raises(ValueError, match=r"cannot be served at 1 rows .*3 CTAs of 71040 B .*768 > 512"):
+        entry.Fp8ProjectionDecode("cpu", G_5K, form=Form(MMA_M=64, STAGES=7, TMEM_COLS=256))
+
+
 def _cfg(**kw):
     base = kcfg.Cfg(GEOM=G_IN, SPLIT_K=4, ROWS=1)
     return replace(base, **kw)
