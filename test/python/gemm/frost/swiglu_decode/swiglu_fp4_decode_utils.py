@@ -152,8 +152,13 @@ def interleaved(weight):
 def make_activation(geometry, rows, device="cpu", seed=0, kind="random"):
     """``dict(codes [rows, H / 2], scales [rows, H / 16] linear bytes, global_scale)``.  ``random`` / ``raw`` as :func:`make_weight`;
     ``structured``: per row a different shape -- an all-zero row, a row with one large value per block, a row of tiny values, a
-    saturating row, a row with all-zero blocks."""
+    saturating row, a row with all-zero blocks; ``mixed``: the even rows of the ``random`` draw and the odd rows of the ``structured``
+    one (every structured shape among ordinary rows)."""
     k = geometry.HIDDEN
+    if kind == "mixed":
+        a, b = make_activation(geometry, rows, device, seed, "random"), make_activation(geometry, rows, device, seed, "structured")
+        odd = (torch.arange(rows, device=device) % 2 == 1)[:, None]
+        return dict(codes=torch.where(odd, b["codes"], a["codes"]), scales=torch.where(odd, b["scales"], a["scales"]), global_scale=a["global_scale"])
     gen = torch.Generator(device="cpu").manual_seed(2000 + seed)
     if kind == "raw":
         codes = torch.randint(0, 256, (rows, k // 2), dtype=torch.uint8, generator=gen).to(device)
@@ -208,6 +213,14 @@ def launch_operands(weight, activation, out_global_scale=1.0, alpha=None, pair=N
         alpha=scalar(alpha, device),
         out_global_scale=scalar(out_global_scale, device),
     )
+
+
+def sub_batch(ops, activation, index):
+    """The launch operands of a sub-batch -- the rows ``index`` of an activation, in that order, on the same weight and scalars -- and
+    the sub-activation's dict: ``(operands, activation)``."""
+    index = torch.as_tensor(index, device=activation["codes"].device)
+    sub = dict(codes=activation["codes"][index].contiguous(), scales=activation["scales"][index].contiguous(), global_scale=activation["global_scale"])
+    return dict(ops, activation=sub["codes"], activation_scale=to_atoms(sub["scales"])), sub
 
 
 def run(e, ops, out=None, out_scale=None, fill=0xA5):

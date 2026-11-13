@@ -7,12 +7,12 @@ tensor-memory ledgers, the barrier counts), the token-tile rule and the form tex
 the host entry (CPU tensors), the DSL gate, the load-time row interleave, the plan-time compile key, the launch facts and the lazy
 exports, and the rendering pin (a host trace-compile per claimed target).  On a cc 10.x device: the entry against an fp64 reference
 under a derived bound, exact cells byte for byte against a host-built expectation, the edge rows, the bytes it must not touch, every
-form and knob arm bitwise with the default, CUDA-graph replay, the plan-time compile, the warm call (a cache hit that reads nothing
-to the host and allocates nothing), the launch facts against the profiler's record, the launch matrix in a child process with a
-stage-aware deadline, and a warm stress with byte references.  A child interpreter runs the source overlay of this process and
-reports the files it loaded; the parent compares them.  The operand builders, the reference and the device gate live in
-``swiglu_fp4_decode_utils.py`` beside this module; replay, batch invariance per row count and the goldens live in the determinism
-suite.
+form and knob arm bitwise with the default, CUDA-graph replay, a dependent launch that waits behind the entry and copies its outputs
+(``swiglu_fp4_decode_dependent.py``), the plan-time compile, the warm call (a cache hit that reads nothing to the host and allocates
+nothing), the launch facts against the profiler's record, the launch matrix in a child process with a stage-aware deadline, and a
+warm stress with byte references.  A child interpreter runs the source overlay of this process and reports the files it loaded; the
+parent compares them.  The operand builders, the reference and the device gate live in ``swiglu_fp4_decode_utils.py`` beside this
+module; replay, batch invariance per row count and the goldens live in the determinism suite.
 
 Marked ``no_workspace_shim``: the engine suite's autouse fixture would otherwise import torch and both architecture compilers for
 every test of this direct-call entry."""
@@ -797,9 +797,7 @@ def _ops(dev, geometry, rows, kind="random", seed=1, gs=3.0):
 
 def _rows_of(ops, act, index):
     """The launch operands of a sub-batch (the rows ``index`` of an activation), sharing the weight."""
-    index = torch.as_tensor(index, device=act["codes"].device)
-    sub = dict(codes=act["codes"][index].contiguous(), scales=act["scales"][index].contiguous(), global_scale=act["global_scale"])
-    return dict(ops, activation=sub["codes"], activation_scale=U.to_atoms(sub["scales"])), sub
+    return U.sub_batch(ops, act, index)
 
 
 def _assert_reference(out, out_scale, weight, act, ops, geometry, tiles=None, label=""):
@@ -1053,6 +1051,63 @@ def test_graph_capture_replays_bitwise_with_eager():
         U.assert_same_bytes(outs[0][0], want[0], "graph replay after the activation's bytes changed")
     finally:
         ops["activation"].copy_(saved)
+
+
+def test_dependent_that_waits_reads_the_eager_bytes():
+    """The dependent-launch chain where the attribute is not inert: a predecessor on the stream that writes the activation (an operand
+    the entry reads below its wait), the entry built with ``pdl=True``, and a dependent launched with the attribute that WAITS and then
+    copies ``out`` and the scale band (``swiglu_fp4_decode_dependent.py``).  A thread block of the entry signals its dependents when
+    its loader warp has finished, before its last output tile is written, so the dependent may start while the entry still writes;
+    its wait holds its reads.  Eager and captured in a CUDA graph, at one row count per token tile: the entry's outputs and the
+    copies hold the bytes of the entry launched without the attribute.  (A dependent that reads without waiting is the documented
+    misuse; it is not run.)"""
+    dev = U.device_or_skip()
+    from swiglu_fp4_decode_dependent import DependentCopy
+
+    copy = DependentCopy(dev)
+    geometry = G_DEFAULT
+    plain, k = _entry(dev, geometry), _entry(dev, geometry, pdl=True)
+    assert k.cfg.PDL and not plain.cfg.PDL
+    k.compile()
+    for rows in (1, 12, 20, 64):
+        ops, _ = _ops(dev, geometry, rows, "random", seed=31 + rows)
+        want_out, want_scale = U.run(plain, ops)
+        source = ops["activation"].clone()
+        out, out_scale = U.new_outputs(geometry, rows, dev)
+        out_copy, scale_copy = torch.zeros_like(out), torch.zeros_like(out_scale)
+
+        def chain():
+            ops["activation"].copy_(source)  # the predecessor: a launch that writes what the entry reads below its wait
+            k(ops["weight"], ops["weight_scale"], ops["activation"], ops["activation_scale"], ops["alpha"], ops["out_global_scale"], out, out_scale)
+            copy(out, out_copy)
+            copy(out_scale, scale_copy)
+
+        def reset():
+            ops["activation"].zero_()  # the entry computes other bytes if it reads the activation ahead of its predecessor
+            out.fill_(0xA5)
+            out_scale.fill_(0xA5)
+            out_copy.zero_()
+            scale_copy.zero_()
+
+        def check(label):
+            torch.cuda.synchronize()
+            U.assert_same_bytes(out, want_out, f"{label} rows {rows}: the entry's codes")
+            U.assert_same_bytes(out_scale, want_scale, f"{label} rows {rows}: the entry's scale band")
+            U.assert_same_bytes(out_copy, want_out, f"{label} rows {rows}: the dependent's copy of the codes")
+            U.assert_same_bytes(scale_copy, want_scale, f"{label} rows {rows}: the dependent's copy of the scale band")
+
+        reset()
+        chain()  # eager (the first call also compiles the dependent)
+        check("eager chain")
+        reset()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            chain()
+        for _ in range(3):
+            reset()
+            graph.replay()
+            check("captured chain")
+        assert int((want_out != 0xA5).sum()) > 0 and int((want_scale != 0xA5).sum()) == rows * geometry.INTERMEDIATE // 16
 
 
 def test_warm_call_allocates_nothing_and_never_synchronizes(monkeypatch):
