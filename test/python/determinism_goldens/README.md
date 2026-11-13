@@ -1649,6 +1649,55 @@ eager, the chain with a dependent launch that waits behind the entry and copies 
 (`test_dependent_that_waits_reads_the_eager_bytes`, eager and captured) and the warm-launch stress with byte references on three shapes
 that refill the staging ring inside a launch (600 warm and 600 poisoned launches per shape).
 
+Golden sets: 5 files -- one per token tile at the default geometry and one at the small geometry -- recorded on cc 10.0 into
+`c84dd9abaee769b4/`, after the replay, batch-invariance and reference cases passed.  A new set is owed with a stated reason when the
+rounding chain changes (the K order of the accumulation, either rounding to bf16, the SiLU's instructions, the block-scale chain).
+
+GPU coverage: cc 10.0 (replay, batch invariance, goldens).  cc 10.3 and cc 10.7 were not run: the entry admits them, the kernel's
+rendering is pinned for their targets on a host, and the status page reads "SM103: Unverified" and, for SM107, "Unverified".  Every
+device run below is one in-process pytest run per command (an environment without pytest-xdist), one visible device, with
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`, from `test/python` of a clean tree: the recording run on the tree before the 5 golden files were
+added, every other run on the tree that carries them; `<suite>` = `gemm/frost/swiglu_decode/test_swiglu_fp4_decode_determinism.py`,
+`<module>` = `gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py`.  The device is a shared development part: these are correctness
+runs.
+
+cc 10.0 record (2026-11-13 UTC): a cc 10.0 part with 148 SMs (x86 host, Python 3.10) with torch 2.13.0+cu130, CUDA 13.0, driver API
+13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 compiling with CUDA 13.4, tvm-ffi 0.1.13.post3 (the `runtime` block of the files in
+`c84dd9abaee769b4/`).  `CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -x -q -ra` -> 182 passed: the whole suite in one
+run that stops at its first failure, so every replay, batch-invariance and reference case had passed before the first record was
+written (the golden cases are the suite's last).  The 5 records were inspected (the runtime block equals the directory's key; names,
+shapes and dtypes; the hashes of the six operands equal those of the operands rebuilt on an x86 host from the suite's CPU generator in
+5 of 5 files; the four default-geometry cases share the weight, its scales and the two scalars and differ in the activation and in
+every result) and copied.  `CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens pytest <suite> -m L0 -q -ra` -> 182 passed, 0 skipped:
+`test_replay` 20, `test_replay_across_scheduling_boundaries` 6, `test_replay_on_a_fresh_entry_and_fresh_operands` 8,
+`test_launch_on_a_side_stream_writes_the_same_bytes` 2, `test_batch_invariance` 126,
+`test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` 8, `test_duplicated_row_and_neighbour_isolation` 2,
+`test_token_tile_pick_is_byte_neutral` 2, `test_inputs_are_unmodified` 2, `test_sixty_four_to_sixty_five_rows_is_the_typed_decline` 1,
+`test_golden` 5.  `pytest <module> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 197 passed, 0 skipped: the module 193,
+the symbol-prefix test 4.
+
+Negative control (same part, same day): the suite run once with ONE launch per case given a changed operand, patched in memory -- the
+second launch of a case receives a copy of the activation whose first row has the sign of every code flipped -> 179 of the 182 cases
+fail.  The three that pass compare no launch result: `test_inputs_are_unmodified` (2) and the typed-decline case.
+
+The other compiler flavor of the DSL is a DECLINE, not a lane.  The entry's bytes follow the compiler's lowering of three
+approximate instructions and were qualified with the DSL compiling with CUDA 13.4; an older compiler is declined by name before any
+compile.  With nvidia-cutlass-dsl 4.8.0 bound to its CUDA 12.9 flavor on the same part and runtime
+(`cutlass.base_dsl.version_info.CUDA_VERSION` = 12.9; torch and the driver stay CUDA 13 -- a statement about the DSL's compiler
+flavor, not about a CUDA 12 deployment): `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs` -> 84
+passed, 295 skipped.  Every case that needs a compiled kernel (292) skips with the entry's message ("... is qualified with the CuTe
+DSL compiling with CUDA 13.4 or later; the DSL in this process compiles with CUDA 12.9 ..."), the three rendering cases skip with the
+same message, nothing is traced; the host-only cases and the symbol-prefix test pass.  Replay and batch invariance are therefore
+evidence for the CUDA 13.4 flavor only.  A probe, not a claim: with that gate lifted in the test process alone, the CUDA 12.9 flavor
+passes `<suite>` strictly against the committed set on this part (182 passed, 0 skipped); the decline stays until that flavor is
+qualified in full.
+
+Cold compile on an x86 host (a cc 8.0 device: every device case skips; fake tensors, no launch), `pytest <module> <suite>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -rs`: 87 passed, 292 skipped under CuTe DSL 4.8.0 and under 4.8.1 (the 4.8.1
+wheels put first on the path), both compiling with CUDA 13.4 -- the three rendering cases (`sm_100a`, `sm_103a`, `sm_107a`) among the
+passes; 84 passed, 295 skipped under 4.8.0 with CUDA 12.9 (the rendering cases skip with the entry's decline).  The four token-tile
+forms render byte-identical cubins under 4.8.1 and under 4.8.0 for the three targets (12 of 12).  Not run on a device: 4.8.1.
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE
