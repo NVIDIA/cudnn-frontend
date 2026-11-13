@@ -36,7 +36,19 @@ from the compiler/runtime used for the kernels. The strict run used
 `CUDNN_DETERMINISM_GOLDENS` with recording unset; the four new JSON files are
 committed without replacing earlier goldens. Source import was asserted to
 the isolated checkout. The final warm report names distinguish both dtypes.
-SM103 and SM107 execution remains unverified. Run from `test/python`:
+Native SM107 also passed 28 functional/domain/byte cases, four independent
+strict golden comparisons, and both warm cases, with no failures or skips.
+Both dtypes had 0 mismatches in 256 warm and 256 poisoned launches; the
+unsafe-ring control failed 200/200 launches. The frozen candidate was imported
+from its isolated package, using cuDNN 9.30.0.4, CuTe DSL 4.8.0,
+compiler/NVRTC 13.4 and Torch 2.14.0+cu130. Four new SM107 goldens are committed.
+B300 (SM103) passed the same 28 cases, four independent strict golden
+comparisons and two warm cases, with no failures or skips. Each dtype had
+0 mismatches in 256 warm and 256 poisoned launches, with the unsafe-ring
+control reproducing 200/200 failures. It used cuDNN 9.30.0.4, CuTe DSL 4.8.0,
+compiler/NVRTC 13.4 and Torch 2.14.1+cu130; four SM103 goldens are committed.
+The parent rejects the public dense `SWAP_AB=1` plan at build time; the
+candidate passes the same public-entry test. Run from `test/python`:
 
 ```bash
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestDenseFp8SwapAB -m L0 -q -rs
@@ -45,7 +57,22 @@ pytest sdpa/frost/test_sdpa_fp8_sm107.py::TestDenseFp8SwapAB -m L0 -q -rs
 
 The local strict command selected `-k 'not warm_refill'`; the separate warm
 command selected `-k warm_refill -s`. Independent collection of all 30 cases
-from the SM107 entry passed, which is not native SM107 execution evidence.
+from the SM107 entry passed before its native execution above. The SM107
+recording phase selected `-k 'not warm_refill'`; its separate strict phase
+selected `-k golden` with recording unset.
+
+On SM100, four graph boundary cases (split9 with empty partials, E5M2 window,
+unequal-width strided sink, and empty Q/KV) passed each of unfiltered
+memcheck, racecheck and synccheck using Compute Sanitizer 13.5: 0 errors,
+0 race hazards and 0 warnings. Eleven existing D64 paged/configuration/public
+knob regressions also passed. No production numerical tolerance was changed.
+
+A final test-only extraction moved the reference and handle helpers to
+`fp8_test_reference.py` to remove reverse imports from architecture entry
+modules. All eight moved definitions retain identical ASTs, and all four
+production files remain byte-identical to the three GPU qualifications.
+The final SM100 run passed all 30 dense cases with strict goldens plus the
+existing known-E5M2-edge scope regression (31 passed, no failures or skips).
 
 Record new goldens in a fresh directory only after numerical and replay checks
 pass, then compare them in a separate process with `CUDNN_DETERMINISM_GOLDENS`.

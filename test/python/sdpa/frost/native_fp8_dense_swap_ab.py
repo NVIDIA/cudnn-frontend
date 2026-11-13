@@ -16,14 +16,7 @@ import torch
 import cudnn
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 import test_sdpa_prepared_fp8 as shared
-
-
-def _bound_handle(handle):
-    # Import after the architecture entry has finished defining its classes:
-    # this shared module is also imported directly by the Rubin CI entry.
-    from native_fp8_cga1_split_sm107_checks import _bound_handle as bound
-
-    return bound(handle)
+from fp8_test_reference import _bound_handle, _check, _ref, _ref_kwargs
 
 
 def _arch():
@@ -144,8 +137,6 @@ def _case(
 
 
 def _reference(bufs, mask=None, *, log2=False):
-    from test_sdpa_fwd_fp8_sm100 import _check, _ref, _ref_kwargs
-
     in_key = "e4m3" if bufs["q"].dtype == torch.float8_e4m3fn else "e5m2"
     kwargs = _ref_kwargs(mask or {})
     if "sinks" in bufs:
