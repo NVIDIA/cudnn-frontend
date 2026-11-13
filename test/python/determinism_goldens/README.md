@@ -1496,7 +1496,11 @@ Golden sets, one file per byte class and token tile, each recorded after the rep
 9 files of the first three classes, recorded on cc 10.3 into the directory of the runtime that already holds the shared-expert decode
 pair's cc 10.3 set (`6451c9d94a2d4210/`), and 21 files of all seven classes, recorded on cc 10.0 on 2026-11-13 into a new runtime
 directory (`c84dd9abaee769b4/`).  A new set is owed with a stated reason when the split, the K tile (128 elements, four K-32
-tensor-core instructions) or the cast changes.
+tensor-core instructions) or the cast changes.  The cc 10.3 runtime of `6451c9d94a2d4210/` therefore has no file for the 12
+`test_golden` cases of the four classes added on 2026-11-13 (4 classes x rows 3 / 12 / 20): there they skip by default and fail under
+`CUDNN_DETERMINISM_GOLDENS` -- the strict check fails a missing file -- until a set of those classes is recorded on that runtime.  On
+a tree that carries the four classes, the strict command of the cc 10.3 record below reports those 12 cases as failed: missing files,
+not changed bytes.  The 9 cases of the first three classes compare against their unchanged files.
 
 GPU coverage.  The first three classes: cc 10.3 (replay, batch invariance, goldens), cc 10.7 (replay and batch invariance; no golden
 set is committed for a cc 10.7 runtime, so the golden comparison is not covered there) and, since 2026-11-13, cc 10.0 (replay, batch
