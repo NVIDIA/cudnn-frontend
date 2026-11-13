@@ -7,9 +7,9 @@ the plan-time-only compile key, the launch facts, the lazy export, and the kerne
 instructions that define the sum tree and the rounding chain; the position of the dependent-launch wait; the form inside the first 100
 characters of the symbol); on a cc 10.x device the bytes against the independent references of ``add_norm_quant_utils`` (the fp64
 bracket of the normalized value, the residual, the E4M3 codes, the NVFP4 block scales and code bracket), the exact cells, the edge
-rows, output ownership per output, the bit-neutral arms, the wait behind a predecessor that released early, the release beside a
-dependent launch, a chain of two steps, CUDA-graph replay, the warm path's allocation / synchronization discipline and the profiler's
-record of a launch.
+rows, rows whose sum of squares overflows, output ownership per output, the bit-neutral arms, the wait behind a predecessor that
+released early, the release beside a dependent launch, a chain of two steps, CUDA-graph replay, the warm path's allocation /
+synchronization discipline and the profiler's record of a launch.
 
 No cell arms a timer of its own: every device cell synchronizes under the suite's per-test watchdog (``CUDNN_TEST_TIMEOUT`` in
 ``test/python/conftest.py``), which a second in-process timer would replace and then disarm.  A trip of that watchdog on a launch is
@@ -40,6 +40,9 @@ from add_norm_quant_utils import (  # noqa: E402  (the form tables, the operand 
     LAUNCH_ARM_IDS,
     LAUNCH_ARMS,
     NVFP4_SCALES,
+    OVERFLOW_COLUMN,
+    OVERFLOW_ROWS,
+    OVERFLOW_TWIN_ROW,
     U8,
     _device_or_skip,
     assert_nvfp4_codes,
@@ -55,6 +58,8 @@ from add_norm_quant_utils import (  # noqa: E402  (the form tables, the operand 
     make_entry,
     make_operands,
     nvfp4_scale_bytes,
+    overflow_operands,
+    residual_reference,
     scale_bytes_layout_mask,
     scale_bytes_of_rows,
     scale_tensor,
@@ -120,7 +125,8 @@ def test_config_constants_and_tables():
 def test_form_text_is_compact_unique_and_inside_the_first_100_characters_of_the_symbol():
     """``str(cfg)`` -- the text the DSL appends to the kernel's name -- states the form (width, residual mode, outputs, launch arm,
     the fp32 bits of eps), differs between any two forms and arms, and ends inside the first 100 characters of the symbol; ``repr``
-    stays the field list."""
+    stays the field list.  The eps text is the fp32 value the kernel adds: two eps values that round to one fp32 value are unequal
+    configs with one text."""
     texts = {}
     for form in FORMS:
         for arm, arm_id in zip(LAUNCH_ARMS, LAUNCH_ARM_IDS):
@@ -137,6 +143,8 @@ def test_form_text_is_compact_unique_and_inside_the_first_100_characters_of_the_
     assert texts[("none-bf16-nvfp4", "wait")] == "h5120_none_bf16_nvfp4_wait_eps358637bd"
     assert str(_cfg(eps=1e-5)) != str(_cfg()) and str(replace(_cfg(), HIDDEN=2048)).startswith("h2048_")
     assert kcfg.eps_bits(1e-6) == 0x358637BD
+    near = _cfg(eps=1.00000001e-6)  # another double with the same fp32 value: an unequal config and compile key, the same text
+    assert near != _cfg() and near.EPS != EPS and kcfg.eps_bits(near.EPS) == kcfg.eps_bits(EPS) and str(near) == str(_cfg())
 
 
 def test_cfg_knobs_validate_by_name():
@@ -160,9 +168,16 @@ def test_cfg_knobs_validate_by_name():
     for hidden in (256, 2048, 4096, 8192):
         with pytest.raises(NotImplementedError, match=f"serves hidden 5120 .validated.; got hidden {hidden}"):
             entry.make_cfg(hidden, EPS, **ok)
-    for eps in (0.0, -1e-6, float("nan"), float("inf"), "1e-6", None, True, 1e-50, 1e39):
-        with pytest.raises(ValueError, match="eps must be a finite positive float"):
+    import numpy
+
+    # the decline names the type it got: an fp32 scalar that is not a Python float is declined as its type, never converted
+    for eps in (0.0, -1e-6, float("nan"), float("inf"), "1e-6", None, True, 1e-50, 1e39, numpy.float32(1e-6), torch.tensor(1e-6)):
+        with pytest.raises(ValueError, match="eps must be a finite positive float") as declined:
             entry.make_cfg(HIDDEN, eps, **ok)
+        assert str(declined.value).endswith(f"its fp32 value is the kernel's constant), got {type(eps).__name__} {eps!r}"), str(declined.value)
+    assert (
+        entry.make_cfg(HIDDEN, numpy.float64(1e-6), **ok).EPS == 1e-6 and entry.make_cfg(HIDDEN, 1, **ok).EPS == 1.0
+    ), "a Python float (a subclass too) or int"
     with pytest.raises(ValueError, match="store_residual initializes the residual from x and cannot be combined with add"):
         entry.make_cfg(HIDDEN, EPS, add=True, bf16=True, quant=None, store_residual=True)
     for quant in ("fp8", "e4m3", "e4m3_row", "NVFP4", 8, ("nvfp4",)):
@@ -402,13 +417,15 @@ def _mutations():
         "add-e4m3",
         put("codes", lambda ops: _misaligned(E4M3, (rows, HIDDEN))),
         ValueError,
-        "codes must start at a 16-byte aligned address",
+        "codes must start at a 16-byte aligned address .the alignment every multi-element operand is bound with; "
+        "the kernel stores codes as bytes, NVFP4 codes as 32-bit words., got data_ptr % 16 = 1",
     )
     cases["scales-misaligned"] = (
         "add-nvfp4",
         put("scales", lambda ops: _misaligned(E4M3, (128, 320))),
         ValueError,
-        "scales must start at a 16-byte aligned address",
+        "scales must start at a 16-byte aligned address .the alignment every multi-element operand is bound with; "
+        "the kernel stores scales as bytes., got data_ptr % 16 = 1",
     )
     cases["scale-misaligned"] = (
         "add-e4m3",
@@ -1319,6 +1336,56 @@ def test_edge_rows():
             assert torch.equal(scale_bytes_of_rows(bad["scales"], rows)[clean], scale_bytes_of_rows(got["scales"], rows)[clean])
 
 
+def test_rows_whose_sum_of_squares_overflows_normalize_to_zeros():
+    """The documented behaviour of a FINITE row whose sum of squares overflows fp32 (the entry's docstring, the operation page): the
+    row's total is +infinity, its reciprocal root is zero, and the row normalizes to zeros.  Two such rows between plain ones
+    (``overflow_operands``): one element of 1e20 beside zeros, whose own square overflows, and a row of +-1e18, whose squares are
+    finite and whose sum overflows only in the tree.  Their ``out`` is bitwise the signed zero with the sign of ``v x (1 + w)``; the
+    E4M3 codes are the zero's code with that sign; the NVFP4 block scales are zero and the codes the signed zero's; the residual is
+    still bitwise ``bf16(x + residual)``, or ``x`` under the store (it is written in front of the normalization).  Every OTHER row is
+    byte-identical to the call in which the two rows are zero rows, and that call is inside the references -- its rows include the
+    in-domain twin, one element of 1e19 beside zeros, which stays finite and not zero: the boundary is the fp32 overflow, not the
+    magnitude."""
+    dev = _device_or_skip()
+    x, res0, w = overflow_operands(dev)
+    rows, over = x.shape[0], list(OVERFLOW_ROWS)
+    others = [r for r in range(rows) if r not in over]
+    largest = torch.finfo(torch.float32).max
+    squares = x.cpu().double().pow(2)
+    assert bool((squares.sum(dim=1)[over] > largest).all()) and bool((squares.sum(dim=1)[others] < largest).all()), "the premise: which rows overflow"
+    assert float(squares[1].max()) > largest, "row 1: one square overflows on its own"
+    assert float(squares[3].max()) < largest and float(squares[3].reshape(-1, 256).sum(dim=1).max()) < largest, "row 3: only the sum over the warps overflows"
+    assert float(1.0 + w.float()[OVERFLOW_COLUMN]) != 0.0, "the premise of the in-domain twin: its one element has a non-zero gain"
+    clean_x = x.clone()
+    clean_x[over] = 0.0
+    gain_negative = torch.signbit(1.0 + w.float().cpu())
+    for form in ("add-bf16-e4m3", "add-bf16-nvfp4", "none-bf16-e4m3", "store-bf16-nvfp4", "add-bf16"):
+        add, store, bf16, quant = FORMS[form]
+        k = _entry(dev, form)
+        scale = None if quant is None else scale_tensor(0.02 if quant == "e4m3_static" else 37.0, dev)
+        got = _snap(k, x, res0, w, scale)
+        clean = _snap(k, clean_x, res0, w, scale)
+        assert_reference(form, clean, clean_x, res0, w, scale, label=f"{form}: the call without the overflowing rows")
+        v = (x.float() + res0.float()).cpu() if add else x.float().cpu()
+        negative = (torch.signbit(v) ^ gain_negative)[over]
+        zeros = torch.where(negative, -32768, 0).to(I16)
+        assert torch.equal(_bits(got["out"].cpu())[over], zeros), f"{form}: a row whose sum of squares overflows normalizes to signed zeros"
+        if quant == "e4m3_static":
+            assert torch.equal(got["codes"].view(U8).cpu()[over], negative.to(U8) << 7), f"{form}: the zero's E4M3 code, by sign"
+        if quant == "nvfp4":
+            assert bool((scale_bytes_of_rows(got["scales"], rows)[over] == 0).all()), f"{form}: zero block scales"
+            assert torch.equal(unpack_e2m1(got["codes"].cpu())[over], negative.to(U8) << 3), f"{form}: the signed zero's E2M1 code"
+        if add or store:
+            assert torch.equal(_bits(got["residual"].cpu())[over], _bits(residual_reference(x, res0, add))[over]), f"{form}: the residual of an overflowing row"
+        for name in ("out", "codes", "residual"):
+            if name in got:
+                assert _same(got[name][others], clean[name][others]), f"{form}: {name} of the rows beside an overflowing row"
+        if quant == "nvfp4":
+            assert torch.equal(scale_bytes_of_rows(got["scales"], rows)[others], scale_bytes_of_rows(clean["scales"], rows)[others])
+        twin = got["out"][OVERFLOW_TWIN_ROW].float().cpu()
+        assert bool(torch.isfinite(twin).all()) and float(twin[OVERFLOW_COLUMN]) != 0.0, f"{form}: the in-domain twin is finite and not zero"
+
+
 def _outs(cfg, rows, dev, extra=3):
     """Caller-owned outputs of a form filled with sentinel bytes: ``extra`` rows taller than the call (and one more scale tile) when
     ``extra`` is not zero, exactly the call's shapes otherwise."""
@@ -1497,15 +1564,18 @@ def test_release_overlaps_a_dependent_without_changing_bytes():
             _bits(t).fill_(0)
         residual.copy_(res0)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            chain()
-        for _ in range(3):
-            for t in (out_copy, codes_copy):
-                _bits(t).fill_(0)
-            residual.copy_(res0)
-            graph.replay()
-            torch.cuda.synchronize()
-            _assert_same(got, want, f"captured chain rows {rows}")
+        try:
+            with torch.cuda.graph(graph):
+                chain()
+            for _ in range(3):
+                for t in (out_copy, codes_copy):
+                    _bits(t).fill_(0)
+                residual.copy_(res0)
+                graph.replay()
+                torch.cuda.synchronize()
+                _assert_same(got, want, f"captured chain rows {rows}")
+        finally:
+            graph.reset()  # a test-owned graph is reset before the cell ends, also when it fails
 
 
 def test_wait_holds_every_read_behind_a_predecessor_that_released_early():
@@ -1560,9 +1630,12 @@ def test_wait_holds_every_read_behind_a_predecessor_that_released_early():
     torch.cuda.synchronize()
     eager = early_starts(control)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        control()
-    captured = early_starts(graph.replay)
+    try:
+        with torch.cuda.graph(graph):
+            control()
+        captured = early_starts(graph.replay)
+    finally:
+        graph.reset()
     key = "add + RMSNorm + quantize decode step, the wait behind an early-releasing predecessor"
     seen_text = f"the control (a dependent without a wait) read other bytes than the written ones in {eager} of 4 eager launches and {captured} of 4 replays"
     if eager + captured == 0:
@@ -1604,12 +1677,15 @@ def test_wait_holds_every_read_behind_a_predecessor_that_released_early():
                 chain()
                 compare("eager")
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                chain()
-            for _ in range(2):
-                restore()
-                graph.replay()
-                compare("captured")
+            try:
+                with torch.cuda.graph(graph):
+                    chain()
+                for _ in range(2):
+                    restore()
+                    graph.replay()
+                    compare("captured")
+            finally:
+                graph.reset()
     text = f"{compared - len(differing)} of {compared} launches of the step equal the plain step; {seen_text}"
     frost_routing.measured(key, ("COMPARED, equal: " if not differing else "FAILED: ") + text)
     assert not differing, f"behind the early-releasing writer {len(differing)} of {compared} launches differ from the plain step:\n" + "\n".join(differing)
@@ -1655,13 +1731,16 @@ def test_chain_of_two_steps_writes_the_bytes_of_the_plain_pair():
             torch.cuda.synchronize()
             _assert_same(got, want, f"none-bf16 -> {form} {arm_id}: eager chain")
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                chain()
-            for _ in range(3):
-                restore()
-                graph.replay()
-                torch.cuda.synchronize()
-                _assert_same(got, want, f"none-bf16 -> {form} {arm_id}: captured chain")
+            try:
+                with torch.cuda.graph(graph):
+                    chain()
+                for _ in range(3):
+                    restore()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    _assert_same(got, want, f"none-bf16 -> {form} {arm_id}: captured chain")
+            finally:
+                graph.reset()
 
 
 def test_one_compile_serves_every_row_count(monkeypatch):
@@ -1731,9 +1810,6 @@ def test_graph_capture_replays_bitwise_with_eager():
 
     want = eager()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for k, (x, _, w), s, res, o in zip(entries, layers, scales, residuals, outs):
-            _launch(k, x, res, w, s, **o)
 
     def replay():
         for (_, r, _), res, o in zip(layers, residuals, outs):
@@ -1744,18 +1820,24 @@ def test_graph_capture_replays_bitwise_with_eager():
         torch.cuda.synchronize()
         return [dict(o, **({"residual": res} if (k.cfg.ADD or k.cfg.STORE_RESIDUAL) else {})) for k, res, o in zip(entries, residuals, outs)]
 
-    for _ in range(3):
-        for got, ref in zip(replay(), want):
-            _assert_same(got, ref, "graph replay bitwise with eager")
-    for i, (x, r, w) in enumerate(layers):  # new values in the same storage
-        nx, nr, nw = make_operands(rows, HIDDEN, dev, seed=500 + i)
-        x.copy_(nx)
-        r.copy_(nr)
-        w.copy_(nw)
-        scales[i].fill_((1.0, 0.25, 0.02, 37.0)[i])
-    got_all = [{n: t.clone() for n, t in got.items()} for got in replay()]
-    for got, ref in zip(got_all, eager()):
-        _assert_same(got, ref, "the replay reads the operands' current values")
+    try:
+        with torch.cuda.graph(graph):
+            for k, (x, _, w), s, res, o in zip(entries, layers, scales, residuals, outs):
+                _launch(k, x, res, w, s, **o)
+        for _ in range(3):
+            for got, ref in zip(replay(), want):
+                _assert_same(got, ref, "graph replay bitwise with eager")
+        for i, (x, r, w) in enumerate(layers):  # new values in the same storage
+            nx, nr, nw = make_operands(rows, HIDDEN, dev, seed=500 + i)
+            x.copy_(nx)
+            r.copy_(nr)
+            w.copy_(nw)
+            scales[i].fill_((1.0, 0.25, 0.02, 37.0)[i])
+        got_all = [{n: t.clone() for n, t in got.items()} for got in replay()]
+        for got, ref in zip(got_all, eager()):
+            _assert_same(got, ref, "the replay reads the operands' current values")
+    finally:
+        graph.reset()
 
 
 def test_warm_call_allocates_nothing_and_never_synchronizes():

@@ -137,6 +137,30 @@ def edge_operands(device="cpu", hidden=HIDDEN, seed=0):
     return x.to(device), residual.to(device), weight.to(device)
 
 
+#: the rows of :func:`overflow_operands` whose sum of squares overflows fp32, their in-domain twin, and the twin's one element
+OVERFLOW_ROWS = (1, 3)
+OVERFLOW_TWIN_ROW = 4
+OVERFLOW_COLUMN = 777
+
+
+def overflow_operands(device="cpu", hidden=HIDDEN, seed=0):
+    """``(x, residual, weight)`` of six FINITE rows on top of a random draw.  Rows 1 and 3 have a sum of squares above the largest
+    fp32 value: 1 one element of 1e20 beside zeros (its own square overflows); 3 every element +-1e18 (every square is finite, and so
+    is the sum over any 256 of them -- one warp's share at ``hidden`` 5120 -- so the sum overflows only where the warps are
+    combined).  Row 4 is row 1's in-domain twin: one element of 1e19, whose square is finite, beside zeros.  The residual of rows 1,
+    3 and 4 is zero (``v = x`` under the add too).  Rows 0, 2 and 5 are plain random rows (the neighbours that must not notice the
+    others)."""
+    x, residual, weight = make_operands(6, hidden, "cpu", seed, "random")
+    signs = torch.where(torch.signbit(x[3].float()), -1.0, 1.0)
+    for row in (*OVERFLOW_ROWS, OVERFLOW_TWIN_ROW):
+        x[row], residual[row] = 0.0, 0.0
+    x[1, OVERFLOW_COLUMN] = 1.0e20
+    x[3] = (signs * 1.0e18).bfloat16()
+    x[OVERFLOW_TWIN_ROW, OVERFLOW_COLUMN] = 1.0e19
+    assert bool(torch.isfinite(x.float()).all()) and bool(torch.isfinite(residual.float()).all())
+    return x.to(device), residual.to(device), weight.to(device)
+
+
 def bf16_exact(values):
     """``values`` (fp32 tensor) as bf16 after asserting that every one IS a bf16 value."""
     out = values.float().bfloat16()
