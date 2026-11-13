@@ -28,6 +28,14 @@ The kernel implements key optimizations including:
   with no per-sequence descriptors: Q/O use direct addressing and K/V bias a
   single TMA descriptor's seq coordinate
 
+Paged half-storage shared buffers:
+  K/V payload: producers publish through tracked copy-completion mbarriers;
+    consumers wait for completion, load matrix fragments, then store a result
+    depending on every fragment before arriving at the named reuse barrier.
+  Completion barriers: separate static storage, initialized before all copies.
+  Consume scratch: one private word per compute lane, reused for its K and V
+    result stores; no other lane reads or writes that word.
+
 Constraints:
 - Supported input dtypes: Float16 and BFloat16, output dtype must match input dtype
 - Runtime head dimensions must be multiples of 8 up to 256 (TMA 16-byte
@@ -49,6 +57,7 @@ import cuda.bindings.driver as cuda_driver
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3, DTYPE_E5M2
@@ -401,6 +410,8 @@ class SM120FusedMultiHeadAttentionForward:
                 self.head_tile_v if is_v else self.head_tile_qk,
                 self.v_swizzle_chunk_elems if is_v else self.k_swizzle_chunk_elems,
                 producer_warps=self.num_load_warps,
+                # K copies can overlap the V issue; the V drain still retires both.
+                async_publication=not is_v,
             )
         else:
             chunks = self.v_tma_swizzle_chunks if is_v else self.k_tma_swizzle_chunks
@@ -782,6 +793,21 @@ class SM120FusedMultiHeadAttentionForward:
                 )
 
     @cute.jit
+    def store_consumed_result(self, values, count: cutlass.Constexpr[int], scratch):
+        """Keep every MMA input read ahead of the named stage release.
+
+        Each compute lane owns one scratch word. The volatile store depends
+        on every result fragment, so the assembler must consume all K/V
+        fragments before it can release their shared-memory stage. Legacy
+        cp.async refills use the generic proxy; an async-proxy fence alone
+        would not provide this ordering.
+        """
+        word = cutlass.Int32(0)
+        for i in cutlass.range_constexpr(count):
+            word = word + values[i].bitcast(cutlass.Int32)
+        inline_ptx("st.volatile.shared.b32 [{$r0}], {$r1};", read_only_args=[scratch, word])
+
+    @cute.jit
     def compute_one_kv_tile(
         self,
         basic_params: SimpleNamespace,
@@ -815,6 +841,8 @@ class SM120FusedMultiHeadAttentionForward:
             pass
 
         s_regs = self.mma_qk(basic_params, mma_params, q_regs)
+        if cutlass.const_expr(mma_params.consume_scratch is not None):
+            self.store_consumed_result(s_regs, self.qk_k_frags * 4, mma_params.consume_scratch)
         prims.barrier_cta_arrive(self.bar_k_consumed, self.threads_kv_pipeline)
 
         while not prims.mbarrier_try_wait_parity(basic_params.v_tma_mbar, tma_phase):
@@ -848,6 +876,8 @@ class SM120FusedMultiHeadAttentionForward:
                 )
             prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs)
+        if cutlass.const_expr(mma_params.consume_scratch is not None):
+            self.store_consumed_result(mma_params.o_regs, self.pv_d_frags * 4, mma_params.consume_scratch)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
     @cute.jit
@@ -881,6 +911,7 @@ class SM120FusedMultiHeadAttentionForward:
         block_table_v,
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
+        consume_scratch=None,
     ) -> cutlass.Int32:
         """One unit of work: the (Q tile, sequence, head) triple named by the
         last three arguments.
@@ -1153,6 +1184,7 @@ class SM120FusedMultiHeadAttentionForward:
                 sK=sK,
                 sV=sV,
                 o_regs=o_regs,
+                consume_scratch=(consume_scratch + compute_warp_idx * 32 + lane) if cutlass.const_expr(consume_scratch is not None) else None,
             )
             softmax_params = SimpleNamespace(
                 row_max=row_max,
@@ -1466,9 +1498,16 @@ class SM120FusedMultiHeadAttentionForward:
         )
         sK = sKV
         sV = sKV.subview(self.k_tile_elems)
-        tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
-        k_tma_mbar = tma_mbar
-        v_tma_mbar = tma_mbar.subview(1)
+        consume_scratch = None
+        if cutlass.const_expr(self.page_size > 0 and k.dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+            # Keep asynchronous copy completion barriers separate from the dynamic payload.
+            full_ptr = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)
+            consume_scratch = cute.arch.alloc_smem(cutlass.Int32, self.threads_compute, alignment=16)
+        else:
+            tma_mbar = cutlass.Array(cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8)
+            full_ptr = tma_mbar.data_ptr()
+        k_tma_mbar = full_ptr
+        v_tma_mbar = full_ptr + 1
 
         # Initialize the TMA completion barriers before any load or compute warp
         # can touch the K/V pipeline.
@@ -1538,6 +1577,7 @@ class SM120FusedMultiHeadAttentionForward:
                     block_table_v,
                     thd_origins=thd_origins,
                     thd_origin_specs=thd_origin_specs,
+                    consume_scratch=consume_scratch,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -1613,6 +1653,7 @@ class SM120FusedMultiHeadAttentionForward:
                 block_table_v,
                 thd_origins=thd_origins,
                 thd_origin_specs=thd_origin_specs,
+                consume_scratch=consume_scratch,
             )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
