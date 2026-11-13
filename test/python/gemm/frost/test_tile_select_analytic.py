@@ -623,6 +623,7 @@ def test_joint_planner_runs_real_support_gates(monkeypatch, batch, M, N, K):
         assert by_name(config.name) == config
 
 
+@pytest.mark.L0
 def test_swap_ab_is_a_named_tile_config_option():
     base = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
     swapped = replace(base, swap_ab=True)
@@ -632,6 +633,7 @@ def test_swap_ab_is_a_named_tile_config_option():
     assert as_pipeline(swapped, "sm120").swap_ab is True
 
 
+@pytest.mark.L0
 def test_swap_ab_transforms_the_fusion_ir_without_moving_storage():
     from cudnn.gemm.frost.fusion_ir import FusionChain, FusionOp, MatmulSpec, OutputSpec, TensorRef, swap_ab
 
@@ -655,6 +657,7 @@ def test_swap_ab_transforms_the_fusion_ir_without_moving_storage():
     assert not swapped.mainloop_a_ops and swapped.mainloop_b_ops == chain.mainloop_a_ops
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("block_scale", [False, True])
 def test_analytic_selection_is_always_runnable(block_scale):
     for M in MS:
@@ -668,6 +671,7 @@ def test_analytic_selection_is_always_runnable(block_scale):
                     assert cfg.cta_tile_m % 128 == 0 and cfg.cta_tile_n % 128 == 0
 
 
+@pytest.mark.L0
 def test_omitting_k_is_accepted():
     """K is optional for callers that do not have it to hand: the small-K bias goes
     neutral and everything else still resolves to a real CATALOG entry."""
@@ -680,6 +684,7 @@ def test_omitting_k_is_accepted():
                     assert cfg.cga_size_m % 2 == 0
 
 
+@pytest.mark.L0
 def test_multi_gemm_budget_and_constraints():
     """One selection path, but the multi-GEMM support constraints still hold: the N
     tile is capped by the shared 256-wide budget, and only the 1ctamma template
@@ -925,6 +930,7 @@ def test_non_quantizing_graph_keeps_default_cta_policy(monkeypatch):
     assert config.cta_group == 2
 
 
+@pytest.mark.L0
 def test_n_major_b_lifts_the_n_tile():
     """N-major B is TMA-loaded a swizzle group at a time, so the per-CTA N extent must
     be a whole number of groups -- under the analytic tile choice too."""
@@ -935,6 +941,7 @@ def test_n_major_b_lifts_the_n_tile():
             assert cfg.cta_tile_n % (group_elems * cfg.cta_group) == 0
 
 
+@pytest.mark.L0
 def test_a_new_pipeline_must_register_its_hardware_facts():
     """A family that registers a config class but forgets a per-pipeline table
     must raise, not inherit another family's value: the tables are hardware
