@@ -11,7 +11,16 @@ traced pass (GPU busy, idle and launches per step from kernel activity records, 
 bytes of a step.  The
 verdict line, the stack, the versions and the wall time are recorded through ``frost_routing.measured``, so the result -- or
 the skip -- reaches the job log of a passing run.  L0 runs the two-layer model (one linear-attention + one attention layer), L1
-the four-layer one (three + one)."""
+the four-layer one (three + one).
+
+The ``fe-entries`` cell runs the same default run on the stack ``fe-entries``: every cuDNN Frontend row of the stack ``native``
+(the fused linear-attention step in its wait + release form; on compute capability 10.x the attention gate + quantise
+entry, judged against its twin) with every other block on its fallback row -- no package beyond cuDNN Frontend and PyTorch.
+That stack always checks its kernels: the profiler's record of every launch of the traced steps is held against the plan,
+the entries' own launch facts and, where the family's kernel census has a section for the GPU, the recorded launch shapes.
+Where the profiler's records cannot be had the sample ends in ``[00] RAN fe-entries stack (kernels not observed: <reason>)``:
+the cell then passes on the other checks and the recorded line says that the kernels were not observed -- uncovered
+there, not verified."""
 
 import importlib.util
 import os
@@ -45,7 +54,15 @@ def sample(monkeypatch):
         del sys.modules[name]
 
 
-def _run(sample, capsys, arguments):
+FE_CUBLAS = "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2"
+#: with the gate entry (compute capability 10.x) one more block is cuDNN Frontend's and one reference chain fewer is a fallback
+FE_ENTRIES = "by provider: cuDNN FE 2 | fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3) | PyTorch 2"
+
+
+def _run(sample, capsys, arguments, stack="fe-cublas", by_provider=FE_CUBLAS, unobserved=False):
+    """Run the sample's ``main()`` and hold its output.  ``unobserved`` accepts, beside ``[00] PASS``, the verdict of a run
+    whose kernel check could not look (``RAN <stack> stack (kernels not observed: ...)``, exit code 0): the line is recorded
+    as it is, so a lane without the profiler's records shows as such in the job log."""
     start = time.perf_counter()
     code = sample.main(arguments)
     seconds = time.perf_counter() - start
@@ -55,13 +72,14 @@ def _run(sample, capsys, arguments):
     device = next((line[5:].split(" | ")[0] for line in tagged if " SMs)" in line), "no device line")
     verdict = tagged[-1] if tagged else "no output"
     key = "model sample qwen_dense 00_decode " + (" ".join(arguments) or "(default)")
-    frost_routing.measured(key, f"{verdict}; stack fe-cublas; {device}; {versions}; {seconds:.0f} s")
+    frost_routing.measured(key, f"{verdict}; stack {stack}; {device}; {versions}; {seconds:.0f} s")
     if verdict.startswith("[00] SKIP"):
         assert " FAIL" not in out and "[00] ERROR" not in out, out[-6000:]  # a skip never covers a failed check
         pytest.skip(verdict)
-    assert code == 0 and verdict == "[00] PASS", out[-6000:]
+    held = verdict == "[00] PASS" or (unobserved and verdict.startswith(f"[00] RAN {stack} stack (kernels not observed: "))
+    assert code == 0 and held, out[-6000:]
     assert "distribution" in versions and "source hash" in versions, "the environment check ran and its line was printed"
-    assert "by provider: cuDNN FE 1 | fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4) | PyTorch 2" in out
+    assert by_provider in out
     for check in ("replay", "blocks", "tokens"):
         assert out.count(f"  {check} ") == 2 and f"  {check} " in out, f"the {check} check ran at both sequence counts"
     assert "linear_attention.step equal (gated)" in out or "REPORTED" in out, "batch invariance was checked at 4 sequences"
@@ -74,6 +92,25 @@ def _run(sample, capsys, arguments):
 def test_default_run_passes_its_own_checks(sample, capsys):
     out = _run(sample, capsys, [])
     assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "20 block calls per step" in out
+
+
+@pytest.mark.L0
+def test_default_run_on_the_fe_entries_stack_passes_its_own_checks_and_its_kernel_check(sample, capsys):
+    """The cuDNN Frontend rows of the stack ``native``, on real launches: the fused step in its wait + release form and, on
+    compute capability 10.x, the gate + quantise entry inside its band against its twin; the kernel check on every launch
+    of the traced steps; the census line, which claims nothing while a row is a fallback."""
+    gate = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10  # the gate entry serves compute capability 10.x
+    out = _run(sample, capsys, ["--stack", "fe-entries"], "fe-entries", FE_ENTRIES if gate else FE_CUBLAS, unobserved=True)
+    assert "2 of 64 layers (1 linear-attention + 1 attention)" in out and "stack fe-entries" in out
+    assert "cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True]" in out, "the fused step in the target's form"
+    assert out.count("\nkernels, planned (decided before the load") == 2 and out.count("\n  kernels  ") == 2, "the kernel check ran at both sequence counts"
+    assert out.count(": NOT CLAIMED (") == 2 and ": EQUAL" not in out, "nothing is claimed while a row of the stack is a fallback"
+    if gate:
+        assert "cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True]" in out
+        assert out.count("[band: gate_fp8]  PASS") == 2, "the gate entry was judged against its twin at both sequence counts"
+        assert "attention.gate_quantize equal (gated)" in out or "REPORTED" in out
+    observed = [line for line in out.splitlines() if line.startswith("  kernels  ")]
+    frost_routing.measured("model sample qwen_dense 00_decode --stack fe-entries: the kernel check", "; ".join(line.split("    ")[-1] for line in observed))
 
 
 @pytest.mark.L1
