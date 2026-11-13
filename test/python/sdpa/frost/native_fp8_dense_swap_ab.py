@@ -17,6 +17,7 @@ import cudnn
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 import test_sdpa_prepared_fp8 as shared
 from fp8_test_reference import _bound_handle, _check, _ref, _ref_kwargs
+from sdpa.fp8 import assert_amax_o
 
 
 def _arch():
@@ -156,6 +157,17 @@ def _reference(bufs, mask=None, *, log2=False):
         **kwargs,
     )
     am = ref.abs().max().item()
+    if "amax_o" in bufs:
+        stored = bufs["o"].float()
+        saturated = bufs["o"].dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and stored.abs().max().item() >= torch.finfo(bufs["o"].dtype).max
+        assert_amax_o(
+            bufs["amax_o"],
+            am,
+            torch_itype=bufs["q"].dtype,
+            torch_otype=bufs["o"].dtype,
+            o_gpu=stored / bufs["scale_o"],
+            saturated=saturated,
+        )
     _check(bufs["o"], ref * bufs["scale_o"], bufs["o"].dtype, in_key, bufs["amax_o"].item() if "amax_o" in bufs else am, am)
     assert torch.isfinite(bufs["o"].float()).all()
     if "lse" in bufs:
@@ -199,23 +211,38 @@ def test_rebind_capture(options, cudnn_handle):
                 bufs["scale_o"].fill_(1.9)
                 ws = torch.empty_like(ws)
             inputs = snapshot({name: value for name, value in bufs.items() if name not in (*_outputs(bufs), "o_storage")})
-            _poison(bufs)
-            execute(g, vp, ws)
-            baseline = snapshot(_reference(bufs, options.get("mask")))
+            baseline = None
+            for pattern in (0, 255):
+                ws.fill_(pattern)
+                _poison(bufs)
+                execute(g, vp, ws)
+                actual = _reference(bufs, options.get("mask"))
+                if baseline is None:
+                    baseline = snapshot(actual)
+                else:
+                    assert_bitwise(actual, baseline, "eager workspace initialization")
             with shared._cuda_graph() as capture:
                 with torch.cuda.graph(capture):
                     execute(g, vp, ws)
                 saved = bufs["v"].clone()
                 bufs["v"].copy_((-saved.float()).to(saved.dtype))
-                _poison(bufs)
-                ws.fill_(255)
-                capture.replay()
-                changed = snapshot(_reference(bufs, options.get("mask")))
-                assert not torch.equal(changed["o"].view(torch.uint8), baseline["o"].view(torch.uint8))
+                changed = None
+                for pattern in (0, 255):
+                    ws.fill_(pattern)
+                    _poison(bufs)
+                    capture.replay()
+                    actual = _reference(bufs, options.get("mask"))
+                    if changed is None:
+                        changed = snapshot(actual)
+                    else:
+                        assert_bitwise(actual, changed, "changed replay workspace initialization")
+                    assert not torch.equal(actual["o"].view(torch.uint8), baseline["o"].view(torch.uint8))
                 bufs["v"].copy_(saved)
-                _poison(bufs)
-                capture.replay()
-                assert_bitwise(_reference(bufs, options.get("mask")), baseline, "restored capture")
+                for pattern in (0, 255):
+                    ws.fill_(pattern)
+                    _poison(bufs)
+                    capture.replay()
+                    assert_bitwise(_reference(bufs, options.get("mask")), baseline, "restored capture")
             assert_bitwise({name: bufs[name] for name in inputs}, inputs, "input mutation")
 
 
@@ -321,6 +348,7 @@ def test_domain(cc):
     knobs = engines.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=True, swap_ab=1)
     for valid, choice in (
         (facts, knobs),
+        (replace(facts, softmax_precision=cudnn.data_type.FLOAT), knobs),
         # Keep Rubin's independent unsplit working-set limit satisfied while
         # testing the decode grid's batch endpoint, without GPU allocation.
         (replace(facts, b=65535, h_q=8, h_kv=1, s_kv=1), replace(knobs, split_kv=1)),
@@ -347,6 +375,8 @@ def test_domain(cc):
         dict(has_kv_mask=True),
         dict(o_block_scale=True),
         dict(attn_scale_prefolded=True),
+        dict(softmax_precision=cudnn.data_type.HALF),
+        dict(softmax_precision=cudnn.data_type.BFLOAT16),
     ):
         assert engines.effective_swap_abs(caps, replace(facts, **change), knobs) == frozenset(), change
     for change in (dict(cga=2), dict(cga=None), dict(tile_n=64)):
