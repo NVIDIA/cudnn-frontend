@@ -9,8 +9,10 @@ at import time."""
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "SwigluFp4Decode": ("cudnn.gemm.frost.swiglu_decode.swiglu_fp4_decode", "SwigluFp4Decode"),
     "Geometry": ("cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_config", "Geometry"),
     "Cfg": ("cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_config", "Cfg"),
+    "interleave_gate_up": ("cudnn.gemm.frost.swiglu_decode.swiglu_fp4_decode", "interleave_gate_up"),
 }
 
 

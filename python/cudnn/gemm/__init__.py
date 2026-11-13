@@ -9,6 +9,7 @@ Layout::
     cudnn.gemm.cutedsl.grouped.<fusion>          MoE grouped GEMM + fused epilogue
     cudnn.gemm.cutedsl.discrete_grouped.<fusion> discrete-weight grouped GEMM
     cudnn.gemm.frost.projection_decode           FP8 split-K projection for decode rows (direct-call entry)
+    cudnn.gemm.frost.swiglu_decode               FP4 gate / up product with SwiGLU for decode rows (direct-call entry)
     cudnn.gemm.ops                               backend-independent op contracts
     cudnn.gemm.reference                         pure-PyTorch correctness engine
 
@@ -28,6 +29,8 @@ _LAZY_EXPORTS = {
     "situ_mlp": ("cudnn.gemm.ops", "situ_mlp"),
     "swiglu_mlp": ("cudnn.gemm.ops", "swiglu_mlp"),
     "swiglu_moe": ("cudnn.gemm.ops", "swiglu_moe"),
+    "SwigluFp4Decode": ("cudnn.gemm.frost.swiglu_decode.swiglu_fp4_decode", "SwigluFp4Decode"),
+    "SwigluGeometry": ("cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_config", "Geometry"),
 }
 
 

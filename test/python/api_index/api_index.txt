@@ -158,6 +158,7 @@ cudnn.RmsNormRhtAmaxSm100
 cudnn.RmsNormSiluPadSm100
 cudnn.RopeQDQInplace
 cudnn.SharedExpertDecode
+cudnn.SwigluFp4Decode
 cudnn.TailRoPEForward
 cudnn.Tensor
 cudnn.Tensor.alignment_value
@@ -762,6 +763,18 @@ cudnn.gemm.ProjectionForm.TOKEN_TILE
 cudnn.gemm.ProjectionGeometry
 cudnn.gemm.ProjectionGeometry.K_TILES
 cudnn.gemm.ProjectionGeometry.describe
+cudnn.gemm.SwigluFp4Decode
+cudnn.gemm.SwigluFp4Decode.cfg_for
+cudnn.gemm.SwigluFp4Decode.compile
+cudnn.gemm.SwigluFp4Decode.form_for
+cudnn.gemm.SwigluFp4Decode.kernel_symbols_for
+cudnn.gemm.SwigluFp4Decode.key
+cudnn.gemm.SwigluFp4Decode.launch_shape_for
+cudnn.gemm.SwigluGeometry
+cudnn.gemm.SwigluGeometry.K_BLOCKS
+cudnn.gemm.SwigluGeometry.WEIGHT_ROWS
+cudnn.gemm.SwigluGeometry.WEIGHT_TILES
+cudnn.gemm.SwigluGeometry.describe
 cudnn.gemm.cutedsl.dense.amax
 cudnn.gemm.cutedsl.dense.amax.GemmAmaxSm100
 cudnn.gemm.cutedsl.dense.amax.GemmAmaxSm100.check_support
