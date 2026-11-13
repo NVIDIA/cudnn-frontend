@@ -27,12 +27,11 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
-from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
-from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, gen_interval_items, order_body
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, expanded_cu_seqlen, gen_interval_items, order_body
 from . import gdn2_bprop_f16, gdn2_bprop_summary_f16, gdn2_prefill_f16, gdn2_recompute_f16, gdn2_summary_f16
 
 USE_PDL = True
@@ -44,6 +43,7 @@ def frost_gdn2_chain_prologue(
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
+    num_ctas: cutlass.Constexpr[int],
     heads_out: cutlass.Int32,
     base_q: cutlass.GridConstant[tma.TensorMap],
     base_k: cutlass.GridConstant[tma.TensorMap],
@@ -96,6 +96,14 @@ def frost_gdn2_chain_prologue(
     dgate: Optional[cute.Tensor],
     dw: Optional[cute.Tensor],
     dbeta: Optional[cute.Tensor],
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    tail: cutlass.Constexpr[bool] = False,
+    first_head_lo: cutlass.Int32 = 0,
+    cu_full: Optional[cute.Tensor] = None,
+    batch_base: cutlass.Int32 = 0,
+    seed_every_n: cutlass.Int32 = 0,
+    seed_row_base: Optional[cute.Tensor] = None,
+    tail_enable: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -103,6 +111,9 @@ def frost_gdn2_chain_prologue(
     widx = tidx // cutlass.Int32(32)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
     n_heads_out = cutlass.Int32(heads_out)
+    head_floor = None
+    if cutlass.const_expr(tail):
+        head_floor = first_head_lo
 
     # ---- piece table -----------------------------------------------------------------
     piece_table_body(
@@ -120,8 +131,28 @@ def frost_gdn2_chain_prologue(
         main_rows,
         summary_rows,
     )
+    if tidx == cutlass.Int32(0):
+        main_count[0] = cutlass.Int32(main_rows[num_seqs]) - first_head_lo * (cutlass.Int32(main_rows[1]) // n_heads_out)
+        summary_count[0] = cutlass.Int32(summary_rows[num_seqs]) - first_head_lo * (cutlass.Int32(summary_rows[1]) // n_heads_out)
     nvvm.barrier_cta_sync()
     n_pieces = num_seqs * cutlass.Int32(pieces)
+    if cutlass.const_expr(tail_enable is not None):
+        n_pieces = n_pieces if cutlass.Int32(tail_enable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
+        if tidx == cutlass.Int32(0):
+            if cutlass.Int32(tail_enable[0]) == cutlass.Int32(0):
+                main_count[0] = cutlass.Int32(0)
+                summary_count[0] = cutlass.Int32(0)
+        nvvm.barrier_cta_sync()
+    n_items = n_heads_out * n_pieces
+    if cutlass.const_expr(tail and seed_row_base is not None):
+        if bidx == cutlass.Int32(1) and tidx == cutlass.Int32(0):
+            seed_rows = cutlass.Int32(0)
+            seed_b = cutlass.Int32(0)
+            while seed_b < batch_base:
+                seed_len = expanded_cu_seqlen(1, cu_full, seed_b + 1) - expanded_cu_seqlen(1, cu_full, seed_b)
+                seed_rows = seed_rows + (seed_len + seed_every_n - cutlass.Int32(1)) // seed_every_n
+                seed_b = seed_b + cutlass.Int32(1)
+            seed_row_base[0] = seed_rows
 
     if bidx == cutlass.Int32(0):
         # ---- work-item tables --------------------------------------------------------
@@ -135,7 +166,7 @@ def frost_gdn2_chain_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_pieces,
+            n_items,
             cu_pieces,
             None,
             main_count,
@@ -144,8 +175,10 @@ def frost_gdn2_chain_prologue(
             sKey,
             sIdx,
             sSpread,
+            num_ctas=num_ctas,
             chain=True,
             mRowBase=main_rows,
+            first_head_lo=head_floor,
         )
         if cutlass.const_expr(work_items_summary is not None):
             nvvm.barrier_cta_sync()
@@ -156,7 +189,7 @@ def frost_gdn2_chain_prologue(
                 ORDER_ELEMENTS,
                 tidx,
                 n_heads_out,
-                n_heads_out * n_pieces,
+                n_items,
                 cu_pieces,
                 None,
                 summary_count,
@@ -165,14 +198,40 @@ def frost_gdn2_chain_prologue(
                 sKey,
                 sIdx,
                 sSpread,
+                num_ctas=num_ctas,
                 chain=True,
                 mRowBase=summary_rows,
                 mSlotRows=main_rows,
+                first_head_lo=head_floor,
             )
         if cutlass.const_expr(series_items is not None):
-            gen_interval_items(b_t, ORDER_THREADS, tidx, n_heads_out, n_heads_out * n_pieces, series_span_chunks, cu_pieces, series_count, series_items, None)
+            gen_interval_items(
+                b_t,
+                ORDER_THREADS,
+                tidx,
+                n_heads_out,
+                n_items,
+                series_span_chunks,
+                cu_pieces,
+                series_count,
+                series_items,
+                None,
+                first_head_lo=head_floor,
+                first_head_slots=cutlass.Int32(main_rows[1]) // n_heads_out if cutlass.const_expr(tail) else None,
+            )
     else:
         # ---- descriptor arrays -------------------------------------------------------
+        checkpoint_row_base = None
+        if cutlass.const_expr(tail and checkpoints is not None):
+            checkpoint_row_base = cutlass.Int32(0)
+            seq_b = cutlass.Int32(0)
+            while seq_b < batch_base:
+                seq_len = expanded_cu_seqlen(1, cu_full, seq_b + 1) - expanded_cu_seqlen(1, cu_full, seq_b)
+                if cutlass.const_expr(checkpoint_after_block):
+                    checkpoint_row_base = checkpoint_row_base + seq_len // checkpoint_every_n
+                else:
+                    checkpoint_row_base = checkpoint_row_base + (seq_len + checkpoint_every_n - cutlass.Int32(1)) // checkpoint_every_n
+                seq_b = seq_b + cutlass.Int32(1)
         if cutlass.const_expr(summary_words is not None):
             gdn2_summary_f16.build_descs_body(widx, base_k, base_v, base_gate, base_beta, base_w, summary_words, cu_pieces, k, v, gate, beta, w, n_pieces)
         if cutlass.const_expr(recompute_h_words is not None):
@@ -234,6 +293,7 @@ def frost_gdn2_chain_prologue(
                 checkpoints,
                 n_pieces,
                 checkpoint_every_n,
+                checkpoint_row_base=checkpoint_row_base,
             )
         if cutlass.const_expr(prefill_words is not None):
             gdn2_prefill_f16.build_descs_body(
@@ -258,6 +318,8 @@ def frost_gdn2_chain_prologue(
                 checkpoints,
                 n_pieces,
                 checkpoint_every_n,
+                checkpoint_after_block=checkpoint_after_block,
+                checkpoint_row_base=checkpoint_row_base,
             )
         if cutlass.const_expr(bprop_words is not None):
             for pass_offset in cutlass.range_constexpr(2):
@@ -295,6 +357,7 @@ def frost_gdn2_chain_prologue(
                     checkpoints,
                     n_pieces,
                     checkpoint_every_n,
+                    checkpoint_row_base=checkpoint_row_base,
                 )
         if cutlass.const_expr(bprop_summary_words is not None):
             gdn2_bprop_summary_f16.build_descs_body(
@@ -321,6 +384,7 @@ def chain_prologue(
     unit_chunks: cutlass.Constexpr[int],
     b_t: cutlass.Constexpr[int],
     length_rule: cutlass.Constexpr[bool],
+    num_ctas: cutlass.Constexpr[int],
     heads_out: cutlass.Int32,
     series_span_chunks: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
@@ -358,8 +422,25 @@ def chain_prologue(
     dw: Optional[cute.Tensor],
     dbeta: Optional[cute.Tensor],
     stream: cuda.CUstream,
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    checkpoint_box_elems: cutlass.Constexpr[int] = 0,
+    tail: cutlass.Constexpr[bool] = False,
+    first_head_lo=None,
+    cu_full=None,
+    batch_base=None,
+    seed_every_n=None,
+    seed_row_base=None,
+    tail_enable=None,
 ) -> None:
     swizzle_128b = tma.TensorMapSwizzle.s128b
+    head_floor = cutlass.Int32(0)
+    base_seq = cutlass.Int32(0)
+    seed_n = cutlass.Int32(0)
+    if cutlass.const_expr(tail):
+        head_floor = first_head_lo
+        base_seq = batch_base
+        if cutlass.const_expr(seed_every_n is not None):
+            seed_n = seed_every_n
     k_headed = cute.make_tensor(k.iterator, cute.make_layout((k.shape[2], k.shape[1], k.shape[0]), stride=(1, k.stride[1], k.stride[0])))
     base_k = tma.create_tensor_map_tiled_from_view(
         k_headed, box_dims=(128 // (k.element_type.width // 8), 1, b_t), stride_order=(0, 1, 2), swizzle=swizzle_128b
@@ -417,11 +498,19 @@ def chain_prologue(
                 stride=(checkpoints.stride[3], checkpoints.stride[2], checkpoints.stride[0], checkpoints.stride[1]),
             ),
         )
+        checkpoint_elem_bytes = checkpoints.element_type.width // 8
+        checkpoint_box_width = checkpoint_box_elems
+        if cutlass.const_expr(checkpoint_box_elems == 0):
+            checkpoint_box_width = 128 // checkpoint_elem_bytes
+        if cutlass.const_expr(checkpoint_box_width * checkpoint_elem_bytes == 64):
+            checkpoint_swizzle_mode = tma.TensorMapSwizzle.s64b
+        else:
+            checkpoint_swizzle_mode = swizzle_128b
         base_checkpoint = tma.create_tensor_map_tiled_from_view(
             checkpoint_view,
-            box_dims=(128 // (checkpoints.element_type.width // 8), checkpoints.shape[2], 1, 1),
+            box_dims=(checkpoint_box_width, checkpoints.shape[2], 1, 1),
             stride_order=(0, 1, 2, 3),
-            swizzle=swizzle_128b,
+            swizzle=checkpoint_swizzle_mode,
         )
     if cutlass.const_expr(dq is not None):
         dq_headed = cute.make_tensor(dq.iterator, cute.make_layout((dq.shape[2], dq.shape[1], dq.shape[0]), stride=(1, dq.stride[1], dq.stride[0])))
@@ -462,6 +551,7 @@ def chain_prologue(
         unit_chunks,
         b_t,
         length_rule,
+        num_ctas,
         heads_out,
         base_q,
         base_k,
@@ -514,156 +604,12 @@ def chain_prologue(
         dgate,
         dw,
         dbeta,
+        checkpoint_after_block,
+        tail,
+        head_floor,
+        cu_full,
+        base_seq,
+        seed_n,
+        seed_row_base,
+        tail_enable,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
-
-
-def run_chain_prologue(
-    cache,
-    *,
-    pieces,
-    unit_chunks,
-    b_t,
-    length_rule,
-    heads_out,
-    series_span_tokens=0,
-    checkpoint_every_n_tokens=0,
-    cu_seqlens,
-    cu_pieces,
-    main_rows,
-    summary_rows,
-    main_count,
-    summary_count,
-    work_items,
-    work_items_summary=None,
-    scheduler,
-    series_items=None,
-    series_count=None,
-    summary_words=None,
-    recompute_h_words=None,
-    recompute_m_words=None,
-    series_words=None,
-    prefill_words=None,
-    bprop_summary_words=None,
-    bprop_words=None,
-    q=None,
-    k,
-    v=None,
-    gate,
-    beta,
-    w=None,
-    o=None,
-    do=None,
-    checkpoints=None,
-    dq=None,
-    dk=None,
-    dv=None,
-    dgate=None,
-    dw=None,
-    dbeta=None,
-    stream,
-) -> None:
-    """Launch the chain prologue (compiled into ``cache`` on the first call).  Each ``*_words`` region
-    is the descriptor workspace of one consumer kernel (None for a kernel the chain does not launch);
-    the tensors are the consumers' operands; ``series_items`` / ``series_count`` request the
-    checkpoint-seeded series items of ``series_span_tokens`` per item."""
-    cu_stream = cuda.CUstream(int(stream))
-    series_span_chunks = int(series_span_tokens) // int(b_t)
-    if "compiled" not in cache:
-        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
-        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        work_items_summary_placeholder = None
-        if work_items_summary is not None:
-            work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
-            work_items_summary_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        series_items_placeholder = None
-        if series_items is not None:
-            series_items_placeholder = from_dlpack(series_items, assumed_align=16)
-            series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
-        cache["compiled"] = cute.compile(
-            chain_prologue,
-            cutlass.Int32(int(pieces)),
-            int(unit_chunks),
-            int(b_t),
-            bool(length_rule),
-            cutlass.Int32(int(heads_out)),
-            cutlass.Int32(series_span_chunks),
-            cutlass.Int32(checkpoint_every_n_tokens),
-            from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
-            from_dlpack(cu_pieces, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(main_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(summary_rows, assumed_align=16).mark_layout_dynamic(),
-            from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
-            from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
-            work_items_placeholder,
-            work_items_summary_placeholder,
-            from_dlpack(scheduler, assumed_align=4).mark_layout_dynamic(),
-            series_items_placeholder,
-            from_dlpack(series_count, assumed_align=4).mark_layout_dynamic() if series_count is not None else None,
-            from_dlpack(summary_words, assumed_align=128).mark_layout_dynamic() if summary_words is not None else None,
-            from_dlpack(recompute_h_words, assumed_align=128).mark_layout_dynamic() if recompute_h_words is not None else None,
-            from_dlpack(recompute_m_words, assumed_align=128).mark_layout_dynamic() if recompute_m_words is not None else None,
-            from_dlpack(series_words, assumed_align=128).mark_layout_dynamic() if series_words is not None else None,
-            from_dlpack(prefill_words, assumed_align=128).mark_layout_dynamic() if prefill_words is not None else None,
-            from_dlpack(bprop_summary_words, assumed_align=128).mark_layout_dynamic() if bprop_summary_words is not None else None,
-            from_dlpack(bprop_words, assumed_align=128).mark_layout_dynamic() if bprop_words is not None else None,
-            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2) if q is not None else None,
-            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2) if v is not None else None,
-            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(beta, assumed_align=16).mark_layout_dynamic(leading_dim=2),
-            from_dlpack(w, assumed_align=16).mark_layout_dynamic(leading_dim=2) if w is not None else None,
-            from_dlpack(o, assumed_align=16).mark_layout_dynamic(leading_dim=2) if o is not None else None,
-            from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2) if do is not None else None,
-            from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
-            from_dlpack(dq, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dq is not None else None,
-            from_dlpack(dk, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dk is not None else None,
-            from_dlpack(dv, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dv is not None else None,
-            from_dlpack(dgate, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dgate is not None else None,
-            from_dlpack(dw, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dw is not None else None,
-            from_dlpack(dbeta, assumed_align=16).mark_layout_dynamic(leading_dim=2) if dbeta is not None else None,
-            cu_stream,
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-    cache["compiled"](
-        int(pieces),
-        int(heads_out),
-        series_span_chunks,
-        checkpoint_every_n_tokens,
-        cu_seqlens,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-        main_count,
-        summary_count,
-        work_items,
-        work_items_summary,
-        scheduler,
-        series_items,
-        series_count,
-        summary_words,
-        recompute_h_words,
-        recompute_m_words,
-        series_words,
-        prefill_words,
-        bprop_summary_words,
-        bprop_words,
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        w,
-        o,
-        do,
-        checkpoints,
-        dq,
-        dk,
-        dv,
-        dgate,
-        dw,
-        dbeta,
-        cu_stream,
-    )
-
-
-frost_gdn2_chain_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)

@@ -148,7 +148,10 @@ def generate_charts(
                 ax_fwd = None
 
             heads = sub["num_kv_heads"].iloc[0] if variant == "mamba2" else sub["num_q_heads"].iloc[0]
-            groups_label = f", B / C Groups = {sub['num_q_heads'].iloc[0]}" if variant == "mamba2" else ""
+            groups_label = f", B / C Heads = {sub['num_q_heads'].iloc[0]}" if variant == "mamba2" else ""
+            if variant != "mamba2" and sub["num_q_heads"].iloc[0] != sub["num_kv_heads"].iloc[0]:
+                heads = sub["num_kv_heads"].iloc[0]
+                groups_label = f", Q / K Heads = {sub['num_q_heads'].iloc[0]}"
             head_dim = sub["head_dim"].iloc[0]
             gpu_info = f" ({gpu_name})" if gpu_name else ""
             group_label = f"Batch = {group_val}" if x_axis == "seqlen" else f"Sequence Length = {group_val}"

@@ -70,6 +70,7 @@ from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, softplus
 
 from .host import get_dtype
+from .tail import gate_body
 from cudnn.frost.device import current_device
 
 USE_PDL = True
@@ -473,6 +474,8 @@ def frost_split_k_plan(
     mChunkVals: cute.Tensor,
     mCount: cute.Tensor,
     n_scan_ctas: cutlass.Int32,
+    mItemLimit: cute.Tensor | None = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One CTA: settle the batch-wide span once and leave it in the chunk
     scratch's plan row for the scan and the walk, -1 there when no tile of the
@@ -486,6 +489,10 @@ def frost_split_k_plan(
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
+    if cutlass.const_expr(mItemLimit is not None):
+        if cutlass.const_expr(gate_sms > 0):
+            gate_body(PLAN_THREADS, tidx, n_heads_out, gate_sms, mCuSeqlens, mItemLimit)
+        n_tiles = cutlass.Int32(mItemLimit[1])
     sCut = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
     sPlan = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
     if tidx == 0:
@@ -652,6 +659,7 @@ def frost_split_k_walk(
     mStaging: cute.Tensor,
     mCount: cute.Tensor,
     n_scan_ctas: cutlass.Int32,
+    mItemLimit: cute.Tensor | None = None,
 ):
     """One CTA per (batch, head).  The CTA first sums the tile's chunk values: a tile that does not saturate even as a whole stays
     uncut, otherwise the mean decay gives the warmup every piece will
@@ -664,6 +672,8 @@ def frost_split_k_walk(
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
+    if cutlass.const_expr(mItemLimit is not None):
+        n_tiles = cutlass.Int32(mItemLimit[1])
     tile = cutlass.Int32(cute.arch.block_idx()[0])
     lane_idx = tidx % cutlass.Int32(WARP_SIZE)
     widx = tidx // cutlass.Int32(WARP_SIZE)
@@ -690,6 +700,8 @@ def frost_split_k_walk(
         word = cutlass.Int32(2) * n_scan_ctas + cutlass.Int32(2) * batch_idx
         span = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, word)
         num_blocks = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, word + cutlass.Int32(1))
+    if cutlass.const_expr(mItemLimit is not None):
+        num_blocks = num_blocks if tile < n_tiles else cutlass.Int32(1)
 
     if num_blocks > 1:
         # ---- whole-tile decay: no cut can saturate if the tile does not ---------------
@@ -733,7 +745,10 @@ def frost_split_k_walk(
 
     if num_blocks <= 1:
         # ---- nothing to cut: emit the whole sequence ---------------------------------
-        if tidx == 0:
+        emit = tidx == 0
+        if cutlass.const_expr(mItemLimit is not None):
+            emit = emit and tile < n_tiles
+        if emit:
             emit_item(
                 mStaging,
                 mCount,
@@ -856,6 +871,7 @@ def piece_item_bounds(
     mSlotRows,
     item,
     expand_num: cutlass.Constexpr[int] = 1,
+    first_head_lo=None,
 ):
     """(slot, head, row_start, row_end, num_chunks, final_dst, dstate_dst) of piece-table
     row ``item``: the owning sequence by binary search over ``mRowBase`` (each sequence's
@@ -865,6 +881,11 @@ def piece_item_bounds(
     the sequence's first slot ``mSlotRows[seq] // n_heads_out`` (the main table's row bases)
     plus the slot within the sequence; the kernel rows are the slot's ``cu_pieces``; the
     last filled slot stores ``final_state``, slot 0 ``d_initial_state``."""
+    if cutlass.const_expr(first_head_lo is not None):
+        live = n_heads_out - first_head_lo
+        split_slots = mRowBase[1] // n_heads_out
+        split_row = (item // live) * n_heads_out + first_head_lo + item % live
+        item = split_row if item < split_slots * live else item + split_slots * first_head_lo
     lo = cutlass.Int32(0)
     hi = cutlass.Int32(mRowBase.shape[0]) - cutlass.Int32(2)
     while lo < hi:
@@ -904,13 +925,15 @@ def write_item(
     chain: cutlass.Constexpr[bool] = False,
     mRowBase=None,
     mSlotRows=None,
+    first_head_lo=None,
+    item_base=None,
 ):
     """Final-table row ``dst`` from source item ``src``: the walk's staged row, (``gen``) the
     synthesized uncut item ``(0, nc, 0, nc)``, or (``chain``) the piece item regenerated from
     ``mCuSeqlens`` (then the piece-wise ``cu_pieces``), ``mRowBase`` and ``mSlotRows``."""
     if cutlass.const_expr(chain):
         slot, head_idx, row_start, row_end, num_chunks, final_dst, dstate_dst = piece_item_bounds(
-            b_t, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, src, expand_num
+            b_t, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, src, expand_num, first_head_lo
         )
         mWorkItems[dst, 0] = slot
         mWorkItems[dst, 1] = head_idx
@@ -923,7 +946,10 @@ def write_item(
         mWorkItems[dst, WORK_ITEM_FINAL_DST] = final_dst
         mWorkItems[dst, WORK_ITEM_DSTATE_DST] = dstate_dst
     elif cutlass.const_expr(gen):
-        batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, src, expand_num)
+        item = src
+        if cutlass.const_expr(item_base is not None):
+            item = src + item_base
+        batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, item, expand_num)
         mWorkItems[dst, 0] = batch_idx
         mWorkItems[dst, 1] = head_idx
         mWorkItems[dst, 2] = cutlass.Int32(0)
@@ -952,6 +978,8 @@ def gen_interval_items(
     mWorkItems: cute.Tensor,
     mScheduler: cute.Tensor | None,
     expand_num: cutlass.Constexpr[int] = 1,
+    first_head_lo=None,
+    first_head_slots=None,
 ):
     """Checkpoint-seeded item synthesis: one work item per ``span_chunks``
     chunks of every (batch, head) tile, ``compute_start == write_start``
@@ -969,6 +997,9 @@ def gen_interval_items(
     item = cutlass.Int32(tidx)
     while item < n_tiles:
         batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, item, expand_num)
+        if cutlass.const_expr(first_head_lo is not None):
+            if batch_idx < first_head_slots and head_idx < first_head_lo:
+                batch_num_chunks = cutlass.Int32(0)
         j = cutlass.Int32(0)
         while j < batch_num_chunks:
             j_end = j + span_chunks
@@ -1001,6 +1032,8 @@ def order_body(
     chain: cutlass.Constexpr[bool] = False,
     mRowBase: cute.Tensor | None = None,
     mSlotRows: cute.Tensor | None = None,
+    first_head_lo=None,
+    item_base=None,
 ):
     """Bitonic-sort the staged items by ``compute_end - compute_start``,
     longest first, into ``work_items``; with ``gen`` synthesize the uncut item
@@ -1032,7 +1065,7 @@ def order_body(
     if (n > cutlass.Int32(capacity)) or (n <= cutlass.Int32(num_ctas)):
         i = tidx
         while i < n:
-            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i, expand_num, chain, mRowBase, mSlotRows)
+            write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, i, expand_num, chain, mRowBase, mSlotRows, first_head_lo, item_base)
             i = i + cutlass.Int32(n_threads)
     else:
         if tidx == 0:
@@ -1050,10 +1083,13 @@ def order_body(
             if i < n:
                 if cutlass.const_expr(chain):
                     slot, head_idx, row_start, row_end, key, final_dst, dstate_dst = piece_item_bounds(
-                        b_t, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, i, expand_num
+                        b_t, n_heads_out, mCuSeqlens, mRowBase, mSlotRows, i, expand_num, first_head_lo
                     )
                 elif cutlass.const_expr(gen):
-                    batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, i, expand_num)
+                    item = i
+                    if cutlass.const_expr(item_base is not None):
+                        item = i + item_base
+                    batch_idx, head_idx, batch_start, batch_end, batch_num_chunks = gen_item_bounds(b_t, n_heads_out, mCuSeqlens, item, expand_num)
                     key = batch_num_chunks
                 else:
                     key = mStaging[i, 5] - mStaging[i, 4]
@@ -1072,7 +1108,7 @@ def order_body(
             # ---- every key equal and nothing to sort ---------------------------------
             i2 = tidx
             while i2 < n:
-                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2, expand_num, chain, mRowBase, mSlotRows)
+                write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i2, i2, expand_num, chain, mRowBase, mSlotRows, first_head_lo, item_base)
                 i2 = i2 + cutlass.Int32(n_threads)
         else:
             # ---- bitonic sort, descending: k = subsequence width, j = distance -------
@@ -1105,7 +1141,9 @@ def order_body(
                 i = tidx + cutlass.Int32(e * n_threads)
                 if i < n:
                     src = sIdx[i]
-                    write_item(gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src, expand_num, chain, mRowBase, mSlotRows)
+                    write_item(
+                        gen, b_t, n_heads_out, mCuSeqlens, mStaging, mWorkItems, i, src, expand_num, chain, mRowBase, mSlotRows, first_head_lo, item_base
+                    )
 
 
 @cute.jit
@@ -1136,6 +1174,8 @@ def launch(
     n_scan_ctas: cutlass.Int32,
     n_walk_ctas: cutlass.Int32,
     stream: cuda.CUstream,
+    item_limit_word: cute.Tensor | None = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     if cutlass.const_expr(split):
         frost_split_k_plan(
@@ -1151,6 +1191,8 @@ def launch(
             mChunkVals,
             mCount,
             n_scan_ctas,
+            item_limit_word,
+            gate_sms,
         ).launch(grid=(1, 1, 1), block=(PLAN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
         frost_split_k_scan_scalar(
             b_t,
@@ -1192,6 +1234,7 @@ def launch(
             mStaging,
             mCount,
             n_scan_ctas,
+            item_limit_word,
         ).launch(
             grid=(n_walk_ctas, 1, 1),
             block=(THREADS_PER_BLOCK, 1, 1),
@@ -1270,7 +1313,9 @@ class TableRecipe(NamedTuple):
     expand_num: int
 
 
-def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, work_items, work_count, scheduler_counter, stream, *, expand_num=1) -> None:
+def run_table(
+    r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, work_items, work_count, scheduler_counter, stream, *, expand_num=1, item_limit_word=None
+) -> None:
     """The lowered split-table launch: no validation, no key build.  Only
     buffers move between calls; every scalar comes from the recipe
     (``expand_num`` is compiled in)."""
@@ -1292,6 +1337,7 @@ def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, 
         r.n_scan_ctas,
         r.n_walk_ctas,
         cuda.CUstream(int(stream)),
+        item_limit_word,
     )
 
 
@@ -1318,6 +1364,7 @@ def build_split_table(
     expand_num=1,
     opt_level,
     stream,
+    item_limit_word=None,
 ) -> "TableRecipe":
     """Fill ``work_items``/``work_count`` with the split-K partition of the
     scalar ``gate (total_tokens, HO)`` / ``cu_seqlens (B+1,) int32``;
@@ -1338,9 +1385,7 @@ def build_split_table(
     ``scheduler_counter`` cells are zeroed by the order phase, the count by the
     plan.  ``expand_num`` scales every device-side ``cu_seqlens`` read onto
     GDP's expanded sub-token timeline, so the gate and all chunk geometry are
-    in ``cu * expand_num`` units without materializing that array (1 = off).
-    Runs entirely on device, no host synchronization.  ``opt_level`` is the family's main-kernel level, so the
-    standalone table is the one the family's warmup hosts nest."""
+    in ``cu * expand_num`` units without materializing that array (1 = off)."""
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -1362,6 +1407,7 @@ def build_split_table(
     n_scan_ctas, n_walk_ctas = f.n_scan_ctas, f.n_walk_ctas
     overhead_chunks, warmup_cap = f.overhead_chunks, f.warmup_cap
     cu_stream = cuda.CUstream(int(stream))
+    gate_sms = int(num_sms) if item_limit_word is not None else 0
 
     key = (
         bool(split),
@@ -1377,6 +1423,7 @@ def build_split_table(
         int(expand_num),
         current_device(),
         int(opt_level),
+        item_limit_word is not None,
     )
     if key not in compiled_cache:
 
@@ -1423,6 +1470,8 @@ def build_split_table(
             cutlass.Int32(n_scan_ctas),
             cutlass.Int32(n_walk_ctas),
             cu_stream,
+            from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
+            gate_sms,
             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
         )
     compiled_cache[key](
@@ -1443,6 +1492,7 @@ def build_split_table(
         n_scan_ctas,
         n_walk_ctas,
         cu_stream,
+        item_limit_word,
     )
     return TableRecipe(
         compiled_cache[key],

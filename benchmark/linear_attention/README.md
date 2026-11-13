@@ -28,7 +28,7 @@ docker run -it --gpus all --rm cudnn_linear_attention_benchmark
 # cuDNN Frontend (BF16, GDN, forward + backward)
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend cudnn --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
@@ -72,14 +72,14 @@ python benchmark_single_linear_attention.py \
 # FLA (flash-linear-attention) comparison point
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend fla --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
 # FlashQLA (TileLang) comparison point (gdn variant only)
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend flash_qla --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
@@ -100,7 +100,7 @@ python benchmark_single_linear_attention.py \
 # Input initial state and dump state for every chunk
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
-    --num_q_heads 8 --num_kv_heads 64 --head_dim 128 \
+    --num_q_heads 16 --num_kv_heads 64 --head_dim 128 \
     --la_backend cudnn --variant gdn --data_type bfloat16 \
     --skip_ref --fwd_bwd --initial_state --store_on
 ```
@@ -123,7 +123,7 @@ The decay gates are all ones (alpha = 1, log gate 0) for every variant and backe
 
 The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-SM103 and SM107, the cuTile engines elsewhere. `gdn2`, `gdp` and `mamba2` are FROST-only.
 
-Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, and the `mamba2` x heads; Mamba-2's B / C default to 8 groups, `--num_q_heads` being the group count).  For Mamba-2 only, `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`). 
+Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, and the `mamba2` x heads; Mamba-2's B / C default to 8 groups, `--num_q_heads` being the group count; GDN's q / k heads default to 16, one per 4 value heads).  For Mamba-2 only, `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`). 
 
 ## Results
 

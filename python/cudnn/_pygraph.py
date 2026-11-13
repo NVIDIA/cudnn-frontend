@@ -1966,8 +1966,9 @@ class pygraph:
         return self._lowered_graph.get_workspace_size(to_backend_handle(handle), override_uids, override_shapes, override_strides)
 
     def get_context_size(self) -> int:
-        """Bytes of the selected plan's context: what a summary plan writes for the apply of the same tokens, or what an
-        apply plan reads; the caller allocates it like the workspace and passes it to ``execute(context=...)`` of both.
+        """Bytes of the selected plan's context: what a summary plan writes for the apply of the same tokens (a forward plan
+        for the backward), or what an apply plan reads; the caller allocates it like the workspace and passes it to
+        ``execute(context=...)`` of both.
         0 for a plan without one (every backend plan)."""
         if not self._is_built:
             raise RuntimeError("Call build() first")
@@ -2193,9 +2194,10 @@ class pygraph:
                          is cached internally by value, while buffer observations,
                          workspace and the handle's stream remain per call.
             context: the buffer of ``get_context_size()`` bytes a summary plan
-                     writes for the apply plan of the same tokens, or the one an
-                     apply plan reads; sized and owned like the workspace, kept
-                     between the two calls.  Python plans with one require it;
+                     writes for the apply plan of the same tokens (a forward plan
+                     for the backward), or the one an apply plan reads; sized and
+                     owned like the workspace, kept between the two calls.  Python
+                     plans with one require it;
                      every other plan rejects it.
         """
         return self._execute(tensor_dict, workspace, handle, override_uids, override_shapes, override_strides, tensor_uids, context=context)
@@ -3305,7 +3307,9 @@ def _linear_attention_state_checkpoints_dims(node):
     cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
     if not n or not q or not v or not cu:
         return None
-    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + (cu[0] - 1), 1), max(q[-2], v[-2]), v[-1], q[-1]]
+    # capacity: ceil(L / n) rows per sequence for the pre-state series, floor(L / n) for the after-block series
+    slack = 0 if node.params.get("checkpoint_after_block") else cu[0] - 1
+    return [max((v[0] * v[1] if len(v) == 4 else v[0]) // n + slack, 1), max(q[-2], v[-2]), v[-1], q[-1]]
 
 
 def _linear_attention_composed_state_dims(node):
@@ -3576,6 +3580,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3583,6 +3588,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -3621,6 +3627,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3628,6 +3635,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3692,6 +3700,7 @@ _STRUCTURED_OPS = {
         attrs=(
             "output_final_state",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "dt_softplus",
             "dt_min",
             "dt_max",
@@ -3738,6 +3747,7 @@ _STRUCTURED_OPS = {
         ),
         attrs=(
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "dt_softplus",
             "dt_min",
             "dt_max",
@@ -3805,6 +3815,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3812,6 +3823,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -3851,6 +3863,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3858,6 +3871,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -3939,6 +3953,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -3984,6 +3999,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "safe_gate",
@@ -4073,6 +4089,7 @@ _STRUCTURED_OPS = {
             "output_final_state",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "beta_guard",
@@ -4120,6 +4137,7 @@ _STRUCTURED_OPS = {
             "scale",
             "use_qk_l2norm",
             "checkpoint_every_n_tokens",
+            "checkpoint_after_block",
             "use_beta_sigmoid",
             "allow_neg_eigval",
             "beta_guard",

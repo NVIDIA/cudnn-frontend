@@ -84,7 +84,7 @@ Warp assignments (16 warps = 512 threads):
 
 import dataclasses
 from dataclasses import dataclass
-from typing import NamedTuple, Type
+from typing import NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -95,6 +95,7 @@ import cutlass.cute as cute
 from ..common.beta_guard import beta_guard
 from ..common.gdn2_operands import scan_gate_prefixes, load_qk_beta_row, load_operand_scales, key_operand_half, query_operand_half
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
+from ..common.tail import gate_body
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.steep_decay import (
     STEEP_EXACT,
@@ -122,13 +123,15 @@ from cudnn.frost.tile_dsl.barrier import (
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_step, mma_ts_step
-from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b, swizzle_xor_32b
+from cudnn.frost.tile_dsl.swizzle import swizzle_xor, swizzle_xor_128b, swizzle_xor_32b
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.pointwise import (
     opaque_i32,
     fmul2,
     opaque_f32_zero,
     fp32_to_fp16,
+    fp32_to_fp8_pack,
+    fp32_to_fp8x2,
 )
 
 from ..common.residual import residual_operand
@@ -361,7 +364,7 @@ def epilogue_warp(
         if elect_one:
             tma_tensormap_acquire(desc_o_slot)
         num_tile_chunks = write_end - compute_start
-        if cutlass.const_expr(cfg.enable_checkpoints):
+        if cutlass.const_expr(cfg.enable_checkpoints and not cfg.checkpoint_after_block):
             if num_tile_chunks > 0 and write_start == 0:
                 checkpoint_stage = checkpoint_ready_index.idx
                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
@@ -445,10 +448,15 @@ def epilogue_warp(
                 if cutlass.const_expr(cfg.enable_checkpoints):
                     # ---- checkpoint store --------------------------------------------
                     do_checkpoint = checkpoint_remainder == 0
-                    do_checkpoint = do_checkpoint and chunk_idx >= write_start
+                    if cutlass.const_expr(cfg.checkpoint_after_block):
+                        do_checkpoint = do_checkpoint and chunk_idx > write_start
+                    else:
+                        do_checkpoint = do_checkpoint and chunk_idx >= write_start
                     checkpoint_stage = checkpoint_ready_index.idx
                     if do_checkpoint:
                         checkpoint_entry = checkpoint_quotient
+                        if cutlass.const_expr(cfg.checkpoint_after_block):
+                            checkpoint_entry = checkpoint_quotient - cutlass.Int32(1)
                         bars.mb_checkpoint_tmastg_ready[checkpoint_ready_index.idx].wait(checkpoint_ready_index.phase)
                         checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                         checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), v_offset, checkpoint_entry, head_o)
@@ -502,6 +510,19 @@ def epilogue_warp(
             tma_store_wait(0)
             if nvvm.elect_sync():
                 bars.mb_o_tmastg_done[o_stage].arrive()
+            if cutlass.const_expr(cfg.enable_checkpoints and cfg.checkpoint_after_block):
+                if (write_end % checkpoint_chunks == 0) and (write_end * cutlass.Int32(cfg.b_t) <= batch_seqlen):
+                    checkpoint_stage = checkpoint_ready_index.idx
+                    bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
+                    checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
+                    checkpoint_slice = tma_slice_runtime_desc(
+                        desc_checkpoint_slot, cutlass.Int32(0), v_offset, write_end // checkpoint_chunks - cutlass.Int32(1), head_o
+                    )
+                    tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
+                    tma_store_commit()
+                    tma_store_wait(0)
+                    if nvvm.elect_sync():
+                        bars.mb_checkpoint_tmastg_done[checkpoint_stage].arrive()
         global_chunk_base += num_tile_chunks
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1095,8 +1116,12 @@ def compute0_warp_group(
         num_tile_chunks = write_end - compute_start
         if cutlass.const_expr(cfg.enable_checkpoints):
             checkpoint_lo = compute_start + cutlass.Int32(1)
-            checkpoint_lo = write_start if write_start > checkpoint_lo else checkpoint_lo
-            checkpoint_seed_rows = cutlass.Int32(1) if write_start == 0 else cutlass.Int32(0)
+            if cutlass.const_expr(cfg.checkpoint_after_block):
+                checkpoint_lo = write_start + cutlass.Int32(1) if write_start + cutlass.Int32(1) > checkpoint_lo else checkpoint_lo
+                checkpoint_seed_rows = cutlass.Int32(0)
+            else:
+                checkpoint_lo = write_start if write_start > checkpoint_lo else checkpoint_lo
+                checkpoint_seed_rows = cutlass.Int32(1) if write_start == 0 else cutlass.Int32(0)
             checkpoint_lo_quotient = (checkpoint_lo - cutlass.Int32(1)) // checkpoint_chunks
         if cutlass.const_expr(cfg.safe_gate and (mA_log is not None or mDt_bias is not None)):
             if num_tile_chunks > 0:
@@ -1385,7 +1410,10 @@ def compute0_warp_group(
                 # ---- checkpoint row, left key half: the packed operand words ---------
                 if cutlass.const_expr(cfg.enable_checkpoints):
                     checkpoint_row = chunk_idx % checkpoint_chunks == 0
-                    checkpoint_row = checkpoint_row and chunk_idx >= write_start
+                    if cutlass.const_expr(cfg.checkpoint_after_block):
+                        checkpoint_row = checkpoint_row and chunk_idx > write_start
+                    else:
+                        checkpoint_row = checkpoint_row and chunk_idx >= write_start
                     if checkpoint_row:
                         checkpoint_row_idx = (
                             checkpoint_row_base + checkpoint_seed_rows + (chunk_idx - cutlass.Int32(1)) // checkpoint_chunks - checkpoint_lo_quotient
@@ -1404,12 +1432,21 @@ def compute0_warp_group(
                                             checkpoint_row_addr
                                             + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
                                             + checkpoint_row_dim * cfg.checkpoint_box_elems
-                                            + swizzle_xor_128b(checkpoint_row_dim, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
+                                            + swizzle_xor(
+                                                checkpoint_row_dim,
+                                                dk % cfg.checkpoint_box_elems,
+                                                row_stride=cfg.checkpoint_box_elems,
+                                                elem_bytes=cfg.checkpoint_elem_bytes,
+                                            )
                                         )
                                         if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
                                             row_vec = cutlass.Vector.from_elements(
                                                 tuple(l_packed_blocks[b][g * 4 + t] for t in range(4)), cutlass.Int32
                                             ).bitcast(cfg.io_dtype)
+                                        elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                                            row_vec = fp32_to_fp8_pack([l_state_vecs[b][g * 16 + t] for t in range(16)], dtype=cfg.checkpoint_dtype).bitcast(
+                                                cfg.checkpoint_dtype
+                                            )
                                         else:
                                             row_vec = cutlass.Vector.from_elements(tuple(l_state_vecs[b][g * 4 + t] for t in range(4)), cutlass.Float32)
                                         (sCheckpoint_ptr + row_addr).store(row_vec, alignment=16)
@@ -1421,14 +1458,20 @@ def compute0_warp_group(
                                         checkpoint_row_addr
                                         + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
                                         + (checkpoint_row_dim + 8 * h) * cfg.checkpoint_box_elems
-                                        + swizzle_xor_128b(
+                                        + swizzle_xor(
                                             (checkpoint_row_dim + 8 * h),
                                             dk % cfg.checkpoint_box_elems + 2 * (lane_idx % 4),
+                                            row_stride=cfg.checkpoint_box_elems,
                                             elem_bytes=cfg.checkpoint_elem_bytes,
                                         )
                                     )
                                     if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
                                         row_vec = cutlass.Vector.from_elements((l_packed[2 * m + h],), cutlass.Int32).bitcast(cfg.io_dtype)
+                                    elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                                        row_vec = cutlass.Vector.from_elements(
+                                            (fp32_to_fp8x2(l_state[4 * m + 2 * h], l_state[4 * m + 2 * h + 1], dtype=cfg.checkpoint_dtype).to(cutlass.Int16),),
+                                            cutlass.Int16,
+                                        ).bitcast(cfg.checkpoint_dtype)
                                     else:
                                         row_vec = cutlass.Vector.from_elements((l_state[4 * m + 2 * h], l_state[4 * m + 2 * h + 1]), cutlass.Float32)
                                     (sCheckpoint_ptr + row_addr).store(row_vec, alignment=2 * cfg.checkpoint_elem_bytes)
@@ -1441,6 +1484,9 @@ def compute0_warp_group(
         if cutlass.const_expr(cfg.enable_checkpoints):
             if num_tile_chunks > 0:
                 checkpoint_row_base = checkpoint_row_base + checkpoint_seed_rows + (write_end - cutlass.Int32(1)) // checkpoint_chunks - checkpoint_lo_quotient
+                if cutlass.const_expr(cfg.checkpoint_after_block):
+                    if (write_end % checkpoint_chunks == 0) and (write_end * cutlass.Int32(cfg.b_t) <= batch_seqlen):
+                        checkpoint_row_base = checkpoint_row_base + cutlass.Int32(1)
         global_chunk_base += num_tile_chunks
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
 
@@ -1626,7 +1672,7 @@ def compute1_warp_group(
                             )
 
                         # ---- seed checkpoint row half: the packed operand words ------
-                        if cutlass.const_expr(cfg.enable_checkpoints):
+                        if cutlass.const_expr(cfg.enable_checkpoints and not cfg.checkpoint_after_block):
                             if write_start == 0:
                                 if cutlass.const_expr(init_half == 0):
                                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_stage_parity)
@@ -1638,19 +1684,28 @@ def compute1_warp_group(
                                                 seed_stage_base
                                                 + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
                                                 + state_gmem_row * cfg.checkpoint_box_elems
-                                                + swizzle_xor_128b(state_gmem_row, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
+                                                + swizzle_xor(
+                                                    state_gmem_row,
+                                                    dk % cfg.checkpoint_box_elems,
+                                                    row_stride=cfg.checkpoint_box_elems,
+                                                    elem_bytes=cfg.checkpoint_elem_bytes,
+                                                )
                                             )
                                             if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
                                                 seed_vec = cutlass.Vector.from_elements(
                                                     tuple(seed_packed_blocks[i - init_blocks_lo][g * 4 + t] for t in range(4)), cutlass.Int32
                                                 ).bitcast(cfg.io_dtype)
+                                            elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                                                seed_vec = fp32_to_fp8_pack(
+                                                    [seed_vecs[i - init_blocks_lo][g * 16 + t] for t in range(16)], dtype=cfg.checkpoint_dtype
+                                                ).bitcast(cfg.checkpoint_dtype)
                                             else:
                                                 seed_vec = cutlass.Vector.from_elements(
                                                     tuple(seed_vecs[i - init_blocks_lo][g * 4 + t] for t in range(4)), cutlass.Float32
                                                 )
                                             (sCheckpoint_ptr + seed_row_addr).store(seed_vec, alignment=16)
                     nvvm.tcgen05_wait("store")
-                    if cutlass.const_expr(cfg.enable_checkpoints):
+                    if cutlass.const_expr(cfg.enable_checkpoints and not cfg.checkpoint_after_block):
                         if write_start == 0:
                             nvvm.fence_proxy("async.shared", space="cta")
                             if nvvm.elect_sync():
@@ -1658,12 +1713,14 @@ def compute1_warp_group(
                                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].arrive()
                             checkpoint_row_count = checkpoint_row_count + cutlass.Int32(1)
 
-            if cutlass.const_expr(cfg.enable_checkpoints and not cfg.use_initial_state):
+            if cutlass.const_expr(cfg.enable_checkpoints and not cfg.use_initial_state and not cfg.checkpoint_after_block):
                 if write_start == 0:
                     bars.mb_checkpoint_tmastg_done[checkpoint_stage].wait(checkpoint_stage_parity)
                     checkpoint_stage_base = checkpoint_stage * cfg.checkpoint_stage_elems
                     if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
                         zero_vec = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32).bitcast(cfg.io_dtype)
+                    elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                        zero_vec = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32).bitcast(cfg.checkpoint_dtype)
                     else:
                         zero_vec = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(4)), cutlass.Float32)
                     for c in cutlass.range_constexpr(cfg.d_k // cfg.checkpoint_store_elems):
@@ -1672,7 +1729,9 @@ def compute1_warp_group(
                             checkpoint_stage_base
                             + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
                             + state_gmem_row * cfg.checkpoint_box_elems
-                            + swizzle_xor_128b(state_gmem_row, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
+                            + swizzle_xor(
+                                state_gmem_row, dk % cfg.checkpoint_box_elems, row_stride=cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes
+                            )
                         )
                         if state_row_valid:
                             (sCheckpoint_ptr + checkpoint_addr).store(zero_vec, alignment=16)
@@ -2031,7 +2090,10 @@ def compute1_warp_group(
             # ---- checkpoint row, right key half: the packed operand words ------------
             if cutlass.const_expr(cfg.enable_checkpoints):
                 checkpoint_row = checkpoint_phase == 0
-                checkpoint_row = checkpoint_row and chunk_idx >= write_start
+                if cutlass.const_expr(cfg.checkpoint_after_block):
+                    checkpoint_row = checkpoint_row and chunk_idx > write_start
+                else:
+                    checkpoint_row = checkpoint_row and chunk_idx >= write_start
                 if checkpoint_row:
                     checkpoint_row_idx = checkpoint_row_count
                     checkpoint_row_stage = checkpoint_row_idx % cutlass.Int32(cfg.smem_checkpoint_stages)
@@ -2052,12 +2114,21 @@ def compute1_warp_group(
                                         checkpoint_row_addr
                                         + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
                                         + state_gmem_row * cfg.checkpoint_box_elems
-                                        + swizzle_xor_128b(state_gmem_row, dk % cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes)
+                                        + swizzle_xor(
+                                            state_gmem_row,
+                                            dk % cfg.checkpoint_box_elems,
+                                            row_stride=cfg.checkpoint_box_elems,
+                                            elem_bytes=cfg.checkpoint_elem_bytes,
+                                        )
                                     )
                                     if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
                                         row_vec = cutlass.Vector.from_elements(
                                             tuple(right_words[i - state_blocks_per_half][g * 4 + t] for t in range(4)), cutlass.Int32
                                         ).bitcast(cfg.io_dtype)
+                                    elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                                        row_vec = fp32_to_fp8_pack(
+                                            [state_vecs[i - state_blocks_per_half][g * 16 + t] for t in range(16)], dtype=cfg.checkpoint_dtype
+                                        ).bitcast(cfg.checkpoint_dtype)
                                     else:
                                         row_vec = cutlass.Vector.from_elements(
                                             tuple(state_vecs[i - state_blocks_per_half][g * 4 + t] for t in range(4)), cutlass.Float32
@@ -2071,12 +2142,24 @@ def compute1_warp_group(
                                     checkpoint_row_addr
                                     + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
                                     + (pack_row + 8 * h) * cfg.checkpoint_box_elems
-                                    + swizzle_xor_128b(
-                                        (pack_row + 8 * h), dk % cfg.checkpoint_box_elems + 2 * (lane_idx % 4), elem_bytes=cfg.checkpoint_elem_bytes
+                                    + swizzle_xor(
+                                        (pack_row + 8 * h),
+                                        dk % cfg.checkpoint_box_elems + 2 * (lane_idx % 4),
+                                        row_stride=cfg.checkpoint_box_elems,
+                                        elem_bytes=cfg.checkpoint_elem_bytes,
                                     )
                                 )
                                 if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
                                     row_vec = cutlass.Vector.from_elements((packed_right[2 * m + h],), cutlass.Int32).bitcast(cfg.io_dtype)
+                                elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                                    row_vec = cutlass.Vector.from_elements(
+                                        (
+                                            fp32_to_fp8x2(state_right[4 * m + 2 * h], state_right[4 * m + 2 * h + 1], dtype=cfg.checkpoint_dtype).to(
+                                                cutlass.Int16
+                                            ),
+                                        ),
+                                        cutlass.Int16,
+                                    ).bitcast(cfg.checkpoint_dtype)
                                 else:
                                     row_vec = cutlass.Vector.from_elements((state_right[4 * m + 2 * h], state_right[4 * m + 2 * h + 1]), cutlass.Float32)
                                 (sCheckpoint_ptr + row_addr).store(row_vec, alignment=2 * cfg.checkpoint_elem_bytes)
@@ -2141,6 +2224,46 @@ def compute1_warp_group(
                 bars.mb_o_tmastg_ready[final_o_stage].arrive()
             o_drain_index = advance(o_drain_index, cfg.smem_o_stages)
             q_state_drain_index = advance(q_state_drain_index, cfg.tmem_q_state_acc_stages)
+
+        if cutlass.const_expr(cfg.enable_checkpoints and cfg.checkpoint_after_block):
+            if num_tile_chunks > 0:
+                if (write_end % checkpoint_chunks == 0) and (write_end * cutlass.Int32(cfg.b_t) <= batch_seqlen):
+                    checkpoint_row_stage = checkpoint_row_count % cutlass.Int32(cfg.smem_checkpoint_stages)
+                    bars.mb_checkpoint_tmastg_done[checkpoint_row_stage].wait(
+                        (checkpoint_row_count // cutlass.Int32(cfg.smem_checkpoint_stages) + cutlass.Int32(1)) % 2
+                    )
+                    checkpoint_row_addr = checkpoint_row_stage * cfg.checkpoint_stage_elems
+                    for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
+                        loaded = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(row_lo_addr + state_col_id + key_block_start, cutlass.Float32), num=32)
+                        nvvm.tcgen05_wait("load")
+                        if state_row_valid:
+                            for g in cutlass.range_constexpr(32 // cfg.checkpoint_store_elems):
+                                dk = key_block_start + g * cfg.checkpoint_store_elems
+                                row_addr = (
+                                    checkpoint_row_addr
+                                    + (dk // cfg.checkpoint_box_elems) * (cfg.d_v * cfg.checkpoint_box_elems)
+                                    + state_gmem_row * cfg.checkpoint_box_elems
+                                    + swizzle_xor(
+                                        state_gmem_row, dk % cfg.checkpoint_box_elems, row_stride=cfg.checkpoint_box_elems, elem_bytes=cfg.checkpoint_elem_bytes
+                                    )
+                                )
+                                if cutlass.const_expr(cfg.checkpoint_dtype.width == 16):
+                                    row_vec = cutlass.Vector.from_elements(
+                                        tuple(fp32_to_fp16(loaded[g * 8 + 2 * t], loaded[g * 8 + 2 * t + 1], dtype=cfg.io_dtype) for t in range(4)),
+                                        cutlass.Int32,
+                                    ).bitcast(cfg.io_dtype)
+                                elif cutlass.const_expr(cfg.checkpoint_dtype.width == 8):
+                                    row_vec = fp32_to_fp8_pack([loaded[g * 16 + t] for t in range(16)], dtype=cfg.checkpoint_dtype).bitcast(
+                                        cfg.checkpoint_dtype
+                                    )
+                                else:
+                                    row_vec = cutlass.Vector.from_elements(tuple(loaded[g * 4 + t] for t in range(4)), cutlass.Float32)
+                                (sCheckpoint_ptr + row_addr).store(row_vec, alignment=16)
+                    nvvm.fence_proxy("async.shared", space="cta")
+                    if nvvm.elect_sync():
+                        bars.mb_checkpoint_tmastg_ready[checkpoint_row_stage].arrive()
+                        bars.mb_checkpoint_tmastg_ready[checkpoint_row_stage].arrive()
+                    checkpoint_row_count = checkpoint_row_count + cutlass.Int32(1)
 
         final_dst = mWorkItems[tile_idx, WORK_ITEM_FINAL_DST]
 
@@ -2224,6 +2347,8 @@ def build_descs_body(
     state_checkpoints: cute.Tensor | None,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    checkpoint_row_base=None,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (warp ``i``
     emits array ``i`` and release-fences its slots; heads are load
@@ -2263,7 +2388,18 @@ def build_descs_body(
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if cutlass.const_expr(state_checkpoints is not None):
         if widx == 7:
-            emit_checkpoint_seq_descs(base_checkpoint, sub7, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, lanes=32)
+            emit_checkpoint_seq_descs(
+                base_checkpoint,
+                sub7,
+                cu_seqlens,
+                state_checkpoints,
+                n_batch,
+                checkpoint_every_n,
+                2,
+                lanes=32,
+                after_block=checkpoint_after_block,
+                row_base=checkpoint_row_base,
+            )
             nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
@@ -2294,6 +2430,12 @@ def frost_gdn2_prefill_prologue(
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    n_items: cutlass.Int32,
+    item_base: cutlass.Int32,
+    mItemLimit: Optional[cute.Tensor] = None,
+    mTailEnable: Optional[cute.Tensor] = None,
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue. Block 0 synthesizes and LPT-orders the uncut work-item table and zeroes the
     scheduler rings via :func:`order_body`; block 1 builds the per-batch
@@ -2311,6 +2453,12 @@ def frost_gdn2_prefill_prologue(
         n_heads_out = cutlass.Int32(gate.shape[1])
         if cutlass.const_expr(tiles_per_head > 1):
             n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
+        if cutlass.const_expr(mItemLimit is not None):
+            if cutlass.const_expr(gate_sms > 0):
+                gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+            n_items = cutlass.Int32(mItemLimit[1])
+        if cutlass.const_expr(mTailEnable is not None):
+            n_items = n_items if cutlass.Int32(mTailEnable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
         order_body(
             True,
             b_t,
@@ -2318,7 +2466,7 @@ def frost_gdn2_prefill_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_batch,
+            n_items,
             cu_seqlens,
             None,
             mCount,
@@ -2327,6 +2475,7 @@ def frost_gdn2_prefill_prologue(
             sKey,
             sIdx,
             sSpread,
+            item_base=item_base,
         )
     else:
         build_descs_body(
@@ -2351,6 +2500,7 @@ def frost_gdn2_prefill_prologue(
             state_checkpoints,
             n_batch,
             checkpoint_every_n,
+            checkpoint_after_block=checkpoint_after_block,
         )
 
 
@@ -2374,6 +2524,13 @@ def prologue(
     checkpoint_every_n: cutlass.Int32,
     stream: cuda_driver.CUstream,
     tiles_per_head: cutlass.Constexpr[int] = 1,
+    item_limit=None,
+    item_base=None,
+    item_limit_word=None,
+    tail_enable=None,
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    checkpoint_box_elems: cutlass.Constexpr[int] = 0,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue. Synthesizes and LPT-orders the uncut work items and builds the 8
     per-batch TMA-descriptor arrays (q, k, v, gate, beta, w, o,
@@ -2426,12 +2583,26 @@ def prologue(
                 stride=(state_checkpoints.stride[3], state_checkpoints.stride[2], state_checkpoints.stride[0], state_checkpoints.stride[1]),
             ),
         )
+        checkpoint_elem_bytes = state_checkpoints.element_type.width // 8
+        checkpoint_box_width = checkpoint_box_elems
+        if cutlass.const_expr(checkpoint_box_elems == 0):
+            checkpoint_box_width = 128 // checkpoint_elem_bytes
+        if cutlass.const_expr(checkpoint_box_width * checkpoint_elem_bytes == 64):
+            checkpoint_swizzle_mode = cuda.TensorMapSwizzle.s64b
+        else:
+            checkpoint_swizzle_mode = swizzle
         base_checkpoint = cuda.create_tensor_map_tiled_from_view(
             checkpoint_view,
-            box_dims=(128 // (state_checkpoints.element_type.width // 8), d_v // tiles_per_head, 1, 1),
+            box_dims=(checkpoint_box_width, d_v // tiles_per_head, 1, 1),
             stride_order=(0, 1, 2, 3),
-            swizzle=swizzle,
+            swizzle=checkpoint_swizzle_mode,
         )
+    n_items = cutlass.Int32(n_heads_out * tiles_per_head) * cutlass.Int32(batch_size)
+    if cutlass.const_expr(item_limit is not None):
+        n_items = item_limit
+    base_item = cutlass.Int32(0)
+    if cutlass.const_expr(item_base is not None):
+        base_item = item_base
     frost_gdn2_prefill_prologue(
         b_t,
         tiles_per_head,
@@ -2458,6 +2629,12 @@ def prologue(
         scheduler_counter,
         cutlass.Int32(batch_size),
         checkpoint_every_n,
+        n_items,
+        base_item,
+        item_limit_word,
+        tail_enable,
+        checkpoint_after_block,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -2922,6 +3099,7 @@ class Gdn2PrefillCfg:
     checkpoint_stage_elems: int = 0
     checkpoint_elem_bytes: int = 2
     checkpoint_store_elems: int = 8
+    checkpoint_after_block: bool = False
     smem_o_stages: int = CFG.SMEM_O_STAGES
     smem_decay_stages: int = CFG.SMEM_DECAY_STAGES
     smem_intermediate_stages: int = CFG.SMEM_INTERMEDIATE_STAGES
@@ -2978,6 +3156,7 @@ def build_cfg(
     store_final_state: bool,
     enable_checkpoints: bool,
     checkpoint_dtype=None,
+    checkpoint_after_block: bool = False,
     l2norm: bool,
     safe_gate: bool,
     gate_scale_log2: float,
@@ -3017,7 +3196,8 @@ def build_cfg(
         tiles_per_head=tiles_per_head,
     )
     cfg.checkpoint_dtype = io_dtype if checkpoint_dtype is None else checkpoint_dtype
-    cfg.checkpoint_box_elems = 128 // (cfg.checkpoint_dtype.width // 8)
+    cfg.checkpoint_after_block = bool(enable_checkpoints and checkpoint_after_block)
+    cfg.checkpoint_box_elems = min(128 // (cfg.checkpoint_dtype.width // 8), d_k)
     cfg.checkpoint_elem_bytes = cfg.checkpoint_dtype.width // 8
     cfg.checkpoint_store_elems = 16 // cfg.checkpoint_elem_bytes
     cfg.checkpoint_stage_elems = cfg.d_k * cfg.d_v

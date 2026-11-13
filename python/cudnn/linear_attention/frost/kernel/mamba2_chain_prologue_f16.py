@@ -30,7 +30,7 @@ from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
 from ..common.gate_bwd import exit_base_table_body, exit_slot_table_body
-from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, order_body
+from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, expanded_cu_seqlen, order_body
 from . import mamba2_bprop_f16, mamba2_prefill_f16
 
 USE_PDL = True
@@ -81,6 +81,14 @@ def frost_mamba2_chain_prologue(
     dv: Optional[cute.Tensor],
     exit_slots: Optional[cute.Tensor],
     exit_base: Optional[cute.Tensor],
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    tail: cutlass.Constexpr[bool] = False,
+    first_head_lo: cutlass.Int32 = 0,
+    cu_full: Optional[cute.Tensor] = None,
+    batch_base: cutlass.Int32 = 0,
+    seed_every_n: cutlass.Int32 = 0,
+    seed_row_base: Optional[cute.Tensor] = None,
+    tail_enable: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -88,6 +96,9 @@ def frost_mamba2_chain_prologue(
     widx = tidx // cutlass.Int32(32)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
     n_heads_out = cutlass.Int32(heads_out)
+    head_floor = None
+    if cutlass.const_expr(tail):
+        head_floor = first_head_lo
 
     # ---- piece table -----------------------------------------------------------------
     piece_table_body(
@@ -105,13 +116,38 @@ def frost_mamba2_chain_prologue(
         main_rows,
         summary_rows,
     )
+    if tidx == cutlass.Int32(0):
+        main_count[0] = cutlass.Int32(main_rows[num_seqs]) - first_head_lo * (cutlass.Int32(main_rows[1]) // n_heads_out)
+        summary_count[0] = cutlass.Int32(summary_rows[num_seqs]) - first_head_lo * (cutlass.Int32(summary_rows[1]) // n_heads_out)
     nvvm.barrier_cta_sync()
     n_pieces = num_seqs * cutlass.Int32(pieces)
-    if cutlass.const_expr(exit_slots is not None):
+    if cutlass.const_expr(tail_enable is not None):
+        n_pieces = n_pieces if cutlass.Int32(tail_enable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
+        if tidx == cutlass.Int32(0):
+            if cutlass.Int32(tail_enable[0]) == cutlass.Int32(0):
+                main_count[0] = cutlass.Int32(0)
+                summary_count[0] = cutlass.Int32(0)
+        nvvm.barrier_cta_sync()
+    n_items = n_heads_out * n_pieces
+    if cutlass.const_expr(tail and seed_row_base is not None):
+        if bidx == cutlass.Int32(1) and tidx == cutlass.Int32(0):
+            seed_rows = cutlass.Int32(0)
+            seed_b = cutlass.Int32(0)
+            while seed_b < batch_base:
+                seed_len = expanded_cu_seqlen(1, cu_full, seed_b + 1) - expanded_cu_seqlen(1, cu_full, seed_b)
+                seed_rows = seed_rows + (seed_len + seed_every_n - cutlass.Int32(1)) // seed_every_n
+                seed_b = seed_b + cutlass.Int32(1)
+            seed_row_base[0] = seed_rows
+    if cutlass.const_expr(exit_slots is not None and not tail):
         # ---- exit-slot table + exit slot bases ---------------------------------------
         if bidx == cutlass.Int32(1):
             exit_slot_table_body(b_t, tidx, ORDER_THREADS, num_seqs, cu_seqlens, exit_slots)
             exit_base_table_body(b_t, tidx, ORDER_THREADS, n_heads_out, n_pieces, cu_seqlens, cu_pieces, main_rows, exit_base)
+    if cutlass.const_expr(exit_slots is not None and tail):
+        if bidx == cutlass.Int32(1):
+            exit_base_table_body(
+                b_t, tidx, ORDER_THREADS, n_heads_out, n_pieces, cu_seqlens, cu_pieces, main_rows, exit_base, slot_base=cutlass.Int32(2) * batch_base
+            )
 
     if bidx == cutlass.Int32(0):
         # ---- work-item tables --------------------------------------------------------
@@ -125,7 +161,7 @@ def frost_mamba2_chain_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_pieces,
+            n_items,
             cu_pieces,
             None,
             main_count,
@@ -137,6 +173,7 @@ def frost_mamba2_chain_prologue(
             num_ctas=num_ctas,
             chain=True,
             mRowBase=main_rows,
+            first_head_lo=head_floor,
         )
         nvvm.barrier_cta_sync()
         order_body(
@@ -146,7 +183,7 @@ def frost_mamba2_chain_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_pieces,
+            n_items,
             cu_pieces,
             None,
             summary_count,
@@ -159,9 +196,21 @@ def frost_mamba2_chain_prologue(
             chain=True,
             mRowBase=summary_rows,
             mSlotRows=main_rows,
+            first_head_lo=head_floor,
         )
     else:
         # ---- descriptor arrays -------------------------------------------------------
+        checkpoint_row_base = None
+        if cutlass.const_expr(tail and checkpoints is not None):
+            checkpoint_row_base = cutlass.Int32(0)
+            seq_b = cutlass.Int32(0)
+            while seq_b < batch_base:
+                seq_len = expanded_cu_seqlen(1, cu_full, seq_b + 1) - expanded_cu_seqlen(1, cu_full, seq_b)
+                if cutlass.const_expr(checkpoint_after_block):
+                    checkpoint_row_base = checkpoint_row_base + seq_len // checkpoint_every_n
+                else:
+                    checkpoint_row_base = checkpoint_row_base + (seq_len + checkpoint_every_n - cutlass.Int32(1)) // checkpoint_every_n
+                seq_b = seq_b + cutlass.Int32(1)
         if cutlass.const_expr(desc_workspace is not None):
             mamba2_prefill_f16.build_descs_body(
                 widx,
@@ -184,6 +233,8 @@ def frost_mamba2_chain_prologue(
                 n_pieces,
                 checkpoint_every_n,
                 b_t,
+                checkpoint_after_block=checkpoint_after_block,
+                checkpoint_row_base=checkpoint_row_base,
             )
         if cutlass.const_expr(bprop_words is not None):
             mamba2_bprop_f16.build_descs_body(
@@ -208,6 +259,7 @@ def frost_mamba2_chain_prologue(
                 dv,
                 n_pieces,
                 b_t,
+                checkpoint_row_base=checkpoint_row_base,
             )
 
 
@@ -245,9 +297,25 @@ def chain_prologue(
     exit_slots: Optional[cute.Tensor],
     exit_base: Optional[cute.Tensor],
     stream: cuda.CUstream,
+    checkpoint_after_block: cutlass.Constexpr[bool] = False,
+    tail: cutlass.Constexpr[bool] = False,
+    first_head_lo=None,
+    cu_full=None,
+    batch_base=None,
+    seed_every_n=None,
+    seed_row_base=None,
+    tail_enable=None,
 ) -> None:
     """One-launch chain prologue: the piece table, the LPT-ordered work-item tables, the per-piece TMA-descriptor
     arrays of the prefill and the bprop, and in the backward the exit-slot table and the per-piece exit slot bases."""
+    head_floor = cutlass.Int32(0)
+    base_seq = cutlass.Int32(0)
+    seed_n = cutlass.Int32(0)
+    if cutlass.const_expr(tail):
+        head_floor = first_head_lo
+        base_seq = batch_base
+        if cutlass.const_expr(seed_every_n is not None):
+            seed_n = seed_every_n
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
@@ -349,6 +417,14 @@ def chain_prologue(
         dv,
         exit_slots,
         exit_base,
+        checkpoint_after_block,
+        tail,
+        head_floor,
+        cu_full,
+        base_seq,
+        seed_n,
+        seed_row_base,
+        tail_enable,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 

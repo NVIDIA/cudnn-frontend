@@ -9,7 +9,7 @@ TENSOR_MAP_QWORDS = 128 // 8
 
 
 def get_dtype(dtype):
-    """dtype string -> cutlass DSL type (bf16/fp16 io, fp32/bf16/fp16 states)."""
+    """dtype string -> cutlass DSL type (bf16/fp16 io; fp32/bf16/fp16/fp8 states and checkpoint rows)."""
     import cutlass
 
     name = str(dtype)
@@ -19,7 +19,11 @@ def get_dtype(dtype):
         return cutlass.Float16
     if "float32" in name:
         return cutlass.Float32
-    raise ValueError(f"Unsupported dtype {dtype}, expected bfloat16, float16, or float32")
+    if "float8_e4m3" in name:
+        return cutlass.Float8E4M3FN
+    if "float8_e5m2" in name:
+        return cutlass.Float8E5M2
+    raise ValueError(f"Unsupported dtype {dtype}, expected bfloat16, float16, float32, float8_e4m3fn or float8_e5m2")
 
 
 def tensormap_workspace_bytes(mod, B: int, expand_num: int = 1) -> int:

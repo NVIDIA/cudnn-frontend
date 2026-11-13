@@ -24,8 +24,10 @@ Requires an SM100 / SM103 / SM107 GPU (Blackwell data center) and the CuTe DSL r
 | write / erase gates | `beta [T, HO]` | `beta [T, HO]` | `beta [T, HO, K]`, `w [T, HO, V]` | `beta [T * n, HO]` | none (`dt` is both the decay exponent and the write strength) |
 | gate forms | `gate_domain` log or linear, `safe_gate` (`-exp(a_log) softplus(g + dt_bias)`), `use_beta_sigmoid_in_kernel`, `allow_neg_eigval` | same plus `gate_lower_bound` | same plus `beta_guard` (needs `use_qk_l2norm_in_kernel`) | same as GDN | `dt_softplus`, `dt_bias`, `dt_min`, `dt_max`, `A [H]`, skip `D [H]` or `[H, P]`, output gate `z` |
 | `use_qk_l2norm_in_kernel` | ✅ | ✅ | ✅ | ✅ | n/a |
+| `output_context` (forward intermediates kept for the backward) | ✅ | n/a | n/a | ✅ | n/a |
 | recurrent state | `initial_state` / `final_state`, `[N, HO, V, K]` | same | same | same | `[N, H, P, N]` |
 | `state_checkpoints` (`checkpoint_every_n_tokens`) | multiple of 16 | multiple of 16 | multiple of 16 | multiple of 64 expanded sub-tokens | multiple of 128 |
+| `checkpoint_after_block` (rows hold the state after each block) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `state_indices` (paged state pool, forward only) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `overwrite_initial_state` (in place, inference) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `batch_invariant` | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -40,7 +42,9 @@ Operands may be strided views, as the engines build their TMA descriptors from t
 
 ## Additional Semantics
 
-- **States and checkpoints.** `output_final_state=True` returns the per-sequence state after the last token. `checkpoint_every_n_tokens > 0` also returns the state series, one entry every `n` tokens strictly before each sequence end, as a non-differentiable checkpoint that the backward can reuse instead of recomputing. `state_indices` turns `initial_state` into a pool `[N_pool, ...]` addressed per sequence, written back in place.
+- **States and checkpoints.** `output_final_state=True` returns the per-sequence state after the last token. `checkpoint_every_n_tokens > 0` also returns the state series, one entry every `n` tokens strictly before each sequence end, as a non-differentiable checkpoint that the backward can reuse instead of recomputing. `state_indices` turns `initial_state` into a pool `[N_pool, ...]` addressed per sequence, written back in place. The rows are io dtype by default and fp32 with `checkpoint_dtype=torch.float32`; in the forward the states and the rows may also be fp8 (e4m3fn, e5m2). `state_indices` takes int32 or int64 indices and composes with checkpoints; the pool may be a strided view with a unit-stride innermost axis and 16-byte aligned, non-overlapping outer strides.
+- **Forward context.** `output_context=True` (GDN, GDP) also returns the uint8 context the forward leaves for the backward of the same tokens: the normalized `q` / `k` rows under `use_qk_l2norm_in_kernel` (GDP at `V = 64`) and the chunk factors of a chained forward. Autograd hands it to the backward, which reads them instead of recomputing; the gradients are bitwise the same with and without it.
+- **Checkpoint conventions.** By default row `j` of a sequence of `L` tokens is the state before block `j` (after `j * n` tokens): row 0 is the incoming state, the sequence end is excluded, `ceil(L / n)` rows per sequence and `T // n + N` rows of capacity. With `checkpoint_after_block=True` row `j` is the state after block `j` (after `(j + 1) * n` tokens): the incoming state is never stored, an aligned sequence end is stored and equals `final_state`, `floor(L / n)` rows per sequence (none for a sequence shorter than `n`) and `T // n` rows of capacity. A backward node given after-block rows does not seed from them; it recomputes the series as it does without checkpoints.
 - **batch_invariant.** Each sequence's results are bitwise independent of the batch composition (whole-sequence scheduling; split-K load balancing is disabled).
 - **Clamps and guards.** Mamba-2's `dt` clamp zeroes the gate gradient where active. GDN-2's `beta_guard` is recomputed, not differentiated, in the backward.
 - **Engines.** The FROST engines are the only engines for these nodes and are pure pass-through: `check_support` verifies the kernel-native dtypes and head dims listed above and declines everything else. A plan can be pinned by name through `plan_name` (for example `gdn_frost`, `mamba2_frost`, `mamba2_summary_frost`).

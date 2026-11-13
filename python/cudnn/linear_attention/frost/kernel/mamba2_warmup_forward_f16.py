@@ -29,9 +29,45 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from cudnn.frost.buffers import DeviceView
+
 from ..common import split_k
 from ..common.host import get_dtype
-from . import mamba2_prefill_f16, mamba2_recompute_f16
+from ..common.piece_chain import CHAIN_THREADS, dtype_name, launch_scalar_state_chain
+from . import mamba2_chain_forward_f16, mamba2_prefill_f16, mamba2_recompute_f16
+
+TAIL_BUFFERS = (
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "work_items_summary",
+    "scheduler_all",
+    "scheduler_summary",
+    "scheduler_prefill",
+    "words",
+    "state_h",
+    "transition",
+    "state_x",
+    "seed",
+)
+SUMMARY_TAIL_BUFFERS = (
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "work_items_summary",
+    "scheduler",
+    "words",
+    "state_h",
+    "slot_transition",
+    "seed",
+    "final_state",
+)
 
 warmup_forward_cache = {}
 recompute_cache = {}
@@ -89,7 +125,59 @@ def warmup_forward_host(
     transition: Optional[cute.Tensor],
     workspace: cute.Tensor,
     stream: cuda.CUstream,
+    item_limit_word: Optional[cute.Tensor] = None,
+    fold_rows: cutlass.Constexpr[int] = 0,
+    fold_update: Optional[cute.Tensor] = None,
+    fold_transition: Optional[cute.Tensor] = None,
+    fold_seed: Optional[cute.Tensor] = None,
+    fold_composed: Optional[cute.Tensor] = None,
+    tail_unit_chunks: cutlass.Constexpr[int] = 0,
+    tail_chain_rows: cutlass.Constexpr[int] = 0,
+    tail_summary_cfg: cutlass.Constexpr = None,
+    tail_prefill_cfg: cutlass.Constexpr = None,
+    tail_pieces: cutlass.Int32 = 0,
+    tail_num_seqs: cutlass.Int32 = 0,
+    tail_batch_base: cutlass.Int32 = 0,
+    tail_first_head_lo: cutlass.Int32 = 0,
+    tail_cu_pieces: Optional[cute.Tensor] = None,
+    tail_main_rows: Optional[cute.Tensor] = None,
+    tail_summary_rows: Optional[cute.Tensor] = None,
+    tail_main_count: Optional[cute.Tensor] = None,
+    tail_summary_count: Optional[cute.Tensor] = None,
+    tail_work_items: Optional[cute.Tensor] = None,
+    tail_work_items_summary: Optional[cute.Tensor] = None,
+    tail_scheduler_all: Optional[cute.Tensor] = None,
+    tail_scheduler_summary: Optional[cute.Tensor] = None,
+    tail_scheduler_prefill: Optional[cute.Tensor] = None,
+    tail_words: Optional[cute.Tensor] = None,
+    tail_state_h: Optional[cute.Tensor] = None,
+    tail_transition: Optional[cute.Tensor] = None,
+    tail_state_x: Optional[cute.Tensor] = None,
+    tail_seed: Optional[cute.Tensor] = None,
 ) -> None:
+    if cutlass.const_expr(fold_update is not None):
+        launch_scalar_state_chain(
+            n_heads_out,
+            prefill_cfg.d_v,
+            prefill_cfg.d_k,
+            fold_rows,
+            cutlass.Int32(fold_update.shape[0]),
+            fold_seed is not None,
+            False,
+            True,
+            False,
+            cutlass.Int32(1),
+            fold_update,
+            fold_transition,
+            None,
+            fold_seed,
+            fold_composed,
+            None,
+            None,
+            None,
+            stream,
+        )
+    gate_sms = num_sms if cutlass.const_expr(item_limit_word is not None) else 0
     if cutlass.const_expr(split):
         split_k.launch(
             split,
@@ -118,7 +206,10 @@ def warmup_forward_host(
             n_scan_ctas,
             n_walk_ctas,
             stream,
+            item_limit_word,
+            gate_sms=gate_sms,
         )
+        gate_sms = 0
     mamba2_prefill_f16.prologue(
         io_dtype,
         b_t,
@@ -138,6 +229,9 @@ def warmup_forward_host(
         checkpoint_every_n,
         workspace,
         stream,
+        checkpoint_after_block=prefill_cfg.checkpoint_after_block,
+        item_limit_word=item_limit_word,
+        gate_sms=gate_sms,
     )
     mamba2_prefill_f16.host(
         prefill_cfg,
@@ -167,6 +261,60 @@ def warmup_forward_host(
         workspace,
         stream,
     )
+    if cutlass.const_expr(tail_summary_cfg is not None):
+        mamba2_chain_forward_f16.chain_forward_host(
+            tail_unit_chunks,
+            b_t,
+            False,
+            tail_summary_cfg,
+            tail_prefill_cfg,
+            tail_prefill_cfg.d_v,
+            tail_prefill_cfg.d_k,
+            tail_chain_rows,
+            tail_seed is not None,
+            True,
+            tail_pieces,
+            n_heads_out,
+            tail_num_seqs,
+            checkpoint_every_n,
+            dt_min,
+            dt_max,
+            tail_batch_base,
+            tail_first_head_lo,
+            q,
+            k,
+            v,
+            gate,
+            a,
+            dt_bias,
+            d,
+            z,
+            o,
+            o_pre,
+            cu_seqlens,
+            tail_cu_pieces,
+            tail_main_rows,
+            tail_summary_rows,
+            tail_main_count,
+            tail_summary_count,
+            tail_work_items,
+            tail_work_items_summary,
+            tail_scheduler_all,
+            tail_scheduler_summary,
+            tail_scheduler_prefill,
+            tail_words,
+            tail_state_h,
+            tail_transition,
+            tail_state_x,
+            tail_seed,
+            None,
+            seed_indices,
+            state_out,
+            final_indices,
+            checkpoints,
+            stream,
+            item_limit_word,
+        )
 
 
 def build_warmup_forward(
@@ -203,9 +351,16 @@ def build_warmup_forward(
     dt_min,
     dt_max,
     checkpoint_every_n_tokens,
+    checkpoint_after_block=False,
     device,
     stream,
     transition=None,
+    item_limit_word=None,
+    tail=None,
+    tail_chain_rows=0,
+    tail_scalars=(),
+    tail_buffers=(),
+    fold_buffers=(None,) * 4,
 ):
     """Compile (cached per static config) the warmup or uncut forward launch over the buffers of one plan."""
     _HQ, DK = q.shape[1], q.shape[2]
@@ -247,11 +402,15 @@ def build_warmup_forward(
         state_in is not None,
         composed is not None,
         state_out is not None,
-        seed_indices is not None,
-        final_indices is not None,
+        str(seed_indices.dtype) if seed_indices is not None else "none",
+        str(final_indices.dtype) if final_indices is not None else "none",
         int(checkpoint_every_n_tokens) > 0,
         str(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else "none",
+        bool(checkpoint_after_block),
         transition is not None,
+        item_limit_word is not None,
+        (int(tail.unit_chunks), int(tail_chain_rows)) if tail is not None else None,
+        tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers),
     )
     if key not in warmup_forward_cache:
         prefill_cfg = mamba2_prefill_f16.build_cfg(
@@ -264,6 +423,7 @@ def build_warmup_forward(
             store_final_state=state_out is not None,
             enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
             checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
+            checkpoint_after_block=bool(checkpoint_after_block),
             dt_softplus=dt_softplus,
             has_d=d is not None,
             d_per_channel=d is not None and len(d.shape) == 2,
@@ -309,6 +469,63 @@ def build_warmup_forward(
         d_placeholder = None
         if d is not None:
             d_placeholder = from_dlpack(d, assumed_align=4).mark_layout_dynamic(leading_dim=len(d.shape) - 1)
+        tail_constexprs = ()
+        tail_placeholders = ()
+        if tail is not None:
+            buffers = dict(zip(TAIL_BUFFERS, tail_buffers))
+            tail_summary_cfg, tail_prefill_cfg = mamba2_chain_forward_f16.build_configs(
+                io_dtype,
+                store_final_state=state_out is not None,
+                enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+                checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
+                checkpoint_after_block=bool(checkpoint_after_block),
+                dt_softplus=dt_softplus,
+                has_d=d is not None,
+                d_per_channel=d is not None and len(d.shape) == 2,
+                has_z=z is not None,
+                store_pre_gate=o_pre is not None,
+                max_active_clusters=num_sm,
+                d_k=DK,
+                d_v=DV,
+            )
+            tail_items = from_dlpack(buffers["work_items"], assumed_align=16)
+            tail_items.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            tail_items_summary = from_dlpack(buffers["work_items_summary"], assumed_align=16)
+            tail_items_summary.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            tail_constexprs = (int(tail.unit_chunks), int(tail_chain_rows), tail_summary_cfg, tail_prefill_cfg)
+            tail_placeholders = [
+                *(cutlass.Int32(int(value)) for value in tail_scalars),
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["main_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                tail_items,
+                tail_items_summary,
+                from_dlpack(buffers["scheduler_all"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_prefill"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["state_h"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["transition"], assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                from_dlpack(buffers["state_x"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["seed"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["seed"] is not None else None,
+            ]
+        fold_update, fold_transition, fold_seed, fold_composed = fold_buffers
+        fold_rows = 4 * CHAIN_THREADS // DK if fold_update is not None else 0
+        fold_placeholders = [None] * 4
+        if fold_update is not None:
+            fold_shape = (1, gate.shape[1], DV, DK)
+            fold_placeholders = [
+                from_dlpack(DeviceView(256, fold_shape, "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, fold_shape[:2], "float32", int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                (
+                    from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_seed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3)
+                    if fold_seed is not None
+                    else None
+                ),
+                from_dlpack(DeviceView(256, fold_shape, dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
+            ]
         warmup_forward_cache[key] = cute.compile(
             warmup_forward_host,
             facts.split,
@@ -361,6 +578,11 @@ def build_warmup_forward(
             from_dlpack(transition, assumed_align=4).mark_layout_dynamic(leading_dim=1) if transition is not None else None,
             from_dlpack(workspace, assumed_align=128).mark_layout_dynamic(),
             cuda.CUstream(int(stream)),
+            from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
+            fold_rows,
+            *fold_placeholders,
+            *tail_constexprs,
+            *tail_placeholders,
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_forward_cache[key]
@@ -399,6 +621,10 @@ def run_warmup_forward(
     dt_max,
     stream,
     transition=None,
+    item_limit_word=None,
+    tail_scalars=(),
+    tail_buffers=(),
+    fold_buffers=(None,) * 4,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches."""
     compiled(
@@ -444,6 +670,10 @@ def run_warmup_forward(
         transition,
         workspace,
         cuda.CUstream(int(stream)),
+        item_limit_word,
+        *fold_buffers,
+        *tail_scalars,
+        *tail_buffers,
     )
 
 
@@ -494,8 +724,30 @@ def recompute_host(
     transition: Optional[cute.Tensor],
     workspace: cute.Tensor,
     stream: cuda.CUstream,
+    item_limit_word: Optional[cute.Tensor] = None,
+    tail_unit_chunks: cutlass.Constexpr[int] = 0,
+    tail_chain_rows: cutlass.Constexpr[int] = 0,
+    tail_summary_cfg: cutlass.Constexpr = None,
+    tail_pieces: cutlass.Int32 = 0,
+    tail_num_seqs: cutlass.Int32 = 0,
+    tail_batch_base: cutlass.Int32 = 0,
+    tail_first_head_lo: cutlass.Int32 = 0,
+    tail_cu_pieces: Optional[cute.Tensor] = None,
+    tail_main_rows: Optional[cute.Tensor] = None,
+    tail_summary_rows: Optional[cute.Tensor] = None,
+    tail_main_count: Optional[cute.Tensor] = None,
+    tail_summary_count: Optional[cute.Tensor] = None,
+    tail_work_items: Optional[cute.Tensor] = None,
+    tail_work_items_summary: Optional[cute.Tensor] = None,
+    tail_scheduler: Optional[cute.Tensor] = None,
+    tail_words: Optional[cute.Tensor] = None,
+    tail_state_h: Optional[cute.Tensor] = None,
+    tail_slot_transition: Optional[cute.Tensor] = None,
+    tail_seed: Optional[cute.Tensor] = None,
+    tail_final_state: Optional[cute.Tensor] = None,
 ) -> None:
     """The state chain alone: the split-K table (warmup only), the recompute prologue and the recompute kernel."""
+    gate_sms = num_sms if cutlass.const_expr(item_limit_word is not None) else 0
     if cutlass.const_expr(split):
         split_k.launch(
             split,
@@ -524,7 +776,10 @@ def recompute_host(
             n_scan_ctas,
             n_walk_ctas,
             stream,
+            item_limit_word,
+            gate_sms=gate_sms,
         )
+        gate_sms = 0
     mamba2_recompute_f16.prologue(
         io_dtype,
         b_t,
@@ -540,6 +795,8 @@ def recompute_host(
         checkpoint_every_n,
         workspace,
         stream,
+        item_limit_word=item_limit_word,
+        gate_sms=gate_sms,
     )
     mamba2_recompute_f16.host(
         recompute_cfg,
@@ -568,6 +825,47 @@ def recompute_host(
         workspace,
         stream,
     )
+    if cutlass.const_expr(tail_summary_cfg is not None):
+        mamba2_chain_forward_f16.chain_summary_host(
+            tail_unit_chunks,
+            b_t,
+            False,
+            tail_summary_cfg,
+            tail_summary_cfg.d_v,
+            tail_summary_cfg.d_k,
+            tail_chain_rows,
+            tail_seed is not None,
+            True,
+            tail_pieces,
+            n_heads_out,
+            tail_num_seqs,
+            dt_min,
+            dt_max,
+            tail_batch_base,
+            tail_first_head_lo,
+            k,
+            v,
+            gate,
+            a,
+            dt_bias,
+            cu_seqlens,
+            tail_cu_pieces,
+            tail_main_rows,
+            tail_summary_rows,
+            tail_main_count,
+            tail_summary_count,
+            tail_work_items,
+            tail_work_items_summary,
+            tail_scheduler,
+            tail_words,
+            tail_state_h,
+            tail_slot_transition,
+            tail_seed,
+            tail_final_state,
+            transition,
+            stream,
+            item_limit_word,
+        )
 
 
 def build_recompute(
@@ -602,6 +900,11 @@ def build_recompute(
     device,
     stream,
     transition=None,
+    item_limit_word=None,
+    tail=None,
+    tail_chain_rows=0,
+    tail_scalars=(),
+    tail_buffers=(),
 ):
     """Compile (cached per static config) the recompute launch (the state chain alone) over the buffers of one plan."""
     _HK, DK = k.shape[1], k.shape[2]
@@ -639,10 +942,16 @@ def build_recompute(
         state_in is not None,
         composed is not None,
         state_out is not None,
-        seed_indices is not None,
-        final_indices is not None,
+        str(seed_indices.dtype) if seed_indices is not None else "none",
+        str(final_indices.dtype) if final_indices is not None else "none",
         int(checkpoint_every_n_tokens) > 0,
         str(transition.dtype) if transition is not None else "none",
+        item_limit_word is not None,
+        (
+            (int(tail.unit_chunks), int(tail_chain_rows), *(str(buffer.dtype) if buffer is not None else None for buffer in tail_buffers))
+            if tail is not None
+            else None
+        ),
     )
     if key not in recompute_cache:
         recompute_cfg = mamba2_recompute_f16.build_cfg(
@@ -692,6 +1001,42 @@ def build_recompute(
         state_out_placeholder = None
         if state_out is not None:
             state_out_placeholder = from_dlpack(state_out, assumed_align=16).mark_layout_dynamic(leading_dim=3)
+        tail_constexprs = ()
+        tail_placeholders = ()
+        if tail is not None:
+            buffers = dict(zip(SUMMARY_TAIL_BUFFERS, tail_buffers))
+            tail_summary_cfg = mamba2_recompute_f16.build_cfg(
+                io_dtype,
+                cutlass.Float32,
+                max_active_clusters=num_sm,
+                use_initial_state=False,
+                store_final_state=True,
+                enable_checkpoints=False,
+                dt_softplus=dt_softplus,
+                d_k=DK,
+                d_v=DV,
+            )
+            tail_items = from_dlpack(buffers["work_items"], assumed_align=16)
+            tail_items.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            tail_items_summary = from_dlpack(buffers["work_items_summary"], assumed_align=16)
+            tail_items_summary.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            tail_constexprs = (int(tail.unit_chunks), int(tail_chain_rows), tail_summary_cfg)
+            tail_placeholders = [
+                *(cutlass.Int32(int(value)) for value in tail_scalars),
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["main_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                tail_items,
+                tail_items_summary,
+                from_dlpack(buffers["scheduler"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["state_h"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["slot_transition"], assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                from_dlpack(buffers["seed"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["seed"] is not None else None,
+                from_dlpack(buffers["final_state"], assumed_align=4).mark_layout_dynamic(leading_dim=3),
+            ]
         recompute_cache[key] = cute.compile(
             recompute_host,
             facts.split,
@@ -739,6 +1084,9 @@ def build_recompute(
             from_dlpack(transition, assumed_align=4).mark_layout_dynamic(leading_dim=1) if transition is not None else None,
             from_dlpack(workspace, assumed_align=128).mark_layout_dynamic(),
             cuda.CUstream(int(stream)),
+            from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
+            *tail_constexprs,
+            *tail_placeholders,
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = recompute_cache[key]
@@ -772,6 +1120,9 @@ def run_recompute(
     dt_max,
     stream,
     transition=None,
+    item_limit_word=None,
+    tail_scalars=(),
+    tail_buffers=(),
 ) -> None:
     """Replay the recompute: one crossing into the DSL for the table, prologue and kernel launches."""
     compiled(
@@ -812,4 +1163,7 @@ def run_recompute(
         transition,
         workspace,
         cuda.CUstream(int(stream)),
+        item_limit_word,
+        *tail_scalars,
+        *tail_buffers,
     )

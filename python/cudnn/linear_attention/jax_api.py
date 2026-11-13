@@ -31,6 +31,7 @@ class KdaConfig:
     batch_invariant: bool = False
     checkpoint_every_n_tokens: int = 0
     gate_domain: str = "log"
+    checkpoint_after_block: bool = False
 
 
 @partial(

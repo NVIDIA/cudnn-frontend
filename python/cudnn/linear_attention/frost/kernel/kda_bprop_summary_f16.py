@@ -74,7 +74,7 @@ Warp assignments (16 warps = 512 threads):
 import dataclasses
 from dataclasses import dataclass
 import functools
-from typing import NamedTuple, Type
+from typing import NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda_driver
 import cutlass
@@ -84,6 +84,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
+from ..common.tail import gate_body
 from ..common.host import get_dtype
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.gdn2_state_grad import pack_dstate_operand, store_steep_keys, add_steep_du
@@ -1679,6 +1680,8 @@ def frost_kda_bprop_summary_prologue(
     mWorkItems: cute.Tensor | None,
     mScheduler: cute.Tensor | None,
     n_batch: cutlass.Int32,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue: under ``run_order`` block 0 synthesizes and LPT-orders the uncut work-item table and zeroes both consumers' scheduler
     rings (:func:`order_body`); block 1 builds the per-batch TMA-descriptor arrays (:func:`build_descs_body`), one warp per array."""
@@ -1694,6 +1697,11 @@ def frost_kda_bprop_summary_prologue(
             sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(gate.shape[1])
+            n_items = n_heads_out * n_batch
+            if cutlass.const_expr(mItemLimit is not None):
+                if cutlass.const_expr(gate_sms > 0):
+                    gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+                n_items = cutlass.Int32(mItemLimit[1])
             order_body(
                 True,
                 b_t,
@@ -1701,7 +1709,7 @@ def frost_kda_bprop_summary_prologue(
                 ORDER_ELEMENTS,
                 tidx,
                 n_heads_out,
-                n_heads_out * n_batch,
+                n_items,
                 cu_seqlens,
                 None,
                 mCount,
@@ -1743,6 +1751,8 @@ def prologue(
     scheduler_all: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
     stream: cuda_driver.CUstream,
+    item_limit_word=None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: synthesize and LPT-order the uncut work items (``run_order``) and build the 4 per-(batch, head) capped TMA-descriptor
     arrays into ``tensormap_workspace`` (sequence-relative coordinates; tail loads zero-fill in hardware)."""
@@ -1785,6 +1795,8 @@ def prologue(
         work_items,
         scheduler_all,
         cutlass.Int32(batch_size),
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -2337,6 +2349,7 @@ def get_compiled_cache(
     allow_neg_eigval: bool,
     run_order: bool,
     has_composed_dstate: bool = False,
+    has_item_limit: bool = False,
 ):
     return {}
 
@@ -2446,6 +2459,7 @@ def chunk_kda_bwd_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    item_limit_word=None,
 ) -> None:
     """BT=16 chunked KDA reverse state-gradient summary: writes ``d_initial_state`` (fp32 / bf16, same dtype as
     ``d_final_state``) for every work item; contiguous tensors on one CUDA device.  d_final_state: dL/d(final state) seed, zero
@@ -2499,6 +2513,7 @@ def chunk_kda_bwd_summary(
         allow_neg_eigval,
         run_order,
         has_composed_dstate=has_composed_dstate,
+        has_item_limit=item_limit_word is not None,
     )
 
     if "compiled" not in cache:
@@ -2586,6 +2601,8 @@ def chunk_kda_bwd_summary(
             scheduler_placeholder,
             workspace_placeholder,
             cu_stream,
+            from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
+            num_sm if item_limit_word is not None else 0,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
@@ -2600,6 +2617,7 @@ def chunk_kda_bwd_summary(
             scheduler_all if run_order else None,
             tensormap_workspace,
             cu_stream,
+            item_limit_word,
         )
     cache["compiled"](
         cutlass.Int32(HO // HQ),
@@ -2645,6 +2663,7 @@ def run_bwd_summary(
     *,
     dstate_scratch,
     dcomposed=None,
+    item_limit_word=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build,
     so nothing here raises."""
@@ -2661,6 +2680,7 @@ def run_bwd_summary(
             scheduler_all if cache["prologue_scheduler_all"] else None,
             tensormap_workspace,
             cu_stream,
+            item_limit_word,
         )
     cache["compiled"](
         cutlass.Int32(gate.shape[1] // q.shape[1]),
