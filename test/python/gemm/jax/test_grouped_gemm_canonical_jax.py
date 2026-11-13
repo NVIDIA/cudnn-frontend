@@ -1159,23 +1159,15 @@ def test_canonical_jax_situ_rejects_unsupported_gpu(backward, capability, monkey
         entry(**inputs, act_func="dsituglu" if backward else "situglu", d_dtype=ml_dtypes.float8_e4m3fn)
 
 
-@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
-@pytest.mark.parametrize("situ_betas", [(4.0, 25.0), (2.0, 8.0)], ids=["default-caps", "custom-caps"])
-def test_canonical_jax_situ_matches_math_reference(backward, situ_betas):
-    skip_unless_situ_supported()
-    import cudnn
+def assert_situ_math_reference(arrays, result, backward, situ_betas):
     from gemm.cutedsl.test_discrete_grouped_gemm_swiglu_utils import run_discrete_grouped_gemm_ref
     from gemm.cutedsl.test_discrete_grouped_gemm_dswiglu_utils import run_discrete_dswiglu_ref
     from gemm.cutedsl.test_grouped_gemm_dswiglu_utils import compute_reference_row_quant
 
-    arrays = problem(backward, 2, False, False, n=512)
-    arrays["sfa_tensor"].fill(127)
-    arrays["sfb_tensor"].fill(127)
-    arrays["alpha_tensor"] = np.array([0.5, 1.0], np.float32)
-    if backward:
-        arrays["beta_tensor"] = np.array([0.5, 1.5], np.float32)
+    assert np.all(arrays["sfa_tensor"] == 127) and np.all(arrays["sfb_tensor"] == 127)
+    rows = int(arrays["padded_offsets"][-1])
     tensors = torch_inputs(arrays)
-    a = tensors["a_tensor"].float().unsqueeze(-1)
+    a = tensors["a_tensor"][:rows].float().unsqueeze(-1)
     weights = [b.float().unsqueeze(-1) for b in tensors["b_tensor"]]
     act_func = "dsituglu" if backward else "situglu"
     caps = dict(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
@@ -1185,28 +1177,46 @@ def test_canonical_jax_situ_matches_math_reference(backward, situ_betas):
         sfa_ref=torch.ones_like(a),
         sfb_ref_list=[torch.ones_like(b) for b in weights],
         alpha_tensor=tensors["alpha_tensor"],
-        prob_tensor=tensors["prob_tensor"].view(-1, 1, 1),
-        aligned_group_m_list=[256, 256],
-        valid_m=512,
+        prob_tensor=tensors["prob_tensor"][:rows].view(-1, 1, 1),
+        aligned_group_m_list=np.diff(np.r_[0, arrays["padded_offsets"]]).tolist(),
+        valid_m=rows,
         act_func=act_func,
         **caps,
     )
     if backward:
-        reference = run_discrete_dswiglu_ref(**ref_options, c_ref=tensors["c_tensor"].float().unsqueeze(-1), beta_tensor=tensors["beta_tensor"])
+        reference = run_discrete_dswiglu_ref(**ref_options, c_ref=tensors["c_tensor"][:rows].float().unsqueeze(-1), beta_tensor=tensors["beta_tensor"])
     else:
         reference = run_discrete_grouped_gemm_ref(**ref_options)
     _, quantized = compute_reference_row_quant(reference["d_ref"], torch.float8_e4m3fn, torch.float8_e8m0fnu, 32, float(arrays["norm_const_tensor"][0]))
+    name = "d_row_tensor" if backward else "d_tensor"
+    actual = torch.from_numpy(np.asarray(result[name])[:rows].astype(np.float32))
+    torch.testing.assert_close(actual, quantized.squeeze(-1).cpu(), atol=0.125, rtol=0.125)
+    name = "dprob_tensor" if backward else "c_tensor"
+    expected = reference["dprob_ref" if backward else "c_ref"].cpu()
+    expected = expected.reshape(-1) if backward else expected.squeeze(-1)
+    torch.testing.assert_close(torch.from_numpy(np.asarray(result[name])[:rows].astype(np.float32)), expected, atol=0.1, rtol=0.01)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("situ_betas", [(4.0, 25.0), (2.0, 8.0)], ids=["default-caps", "custom-caps"])
+def test_canonical_jax_situ_matches_math_reference(backward, situ_betas):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 2, False, False, n=512)
+    arrays["sfa_tensor"].fill(127)
+    arrays["sfb_tensor"].fill(127)
+    arrays["alpha_tensor"] = np.array([0.5, 1.0], np.float32)
+    if backward:
+        arrays["beta_tensor"] = np.array([0.5, 1.5], np.float32)
+    act_func = "dsituglu" if backward else "situglu"
+    caps = dict(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
     options = dict(act_func=act_func, discrete_col_sfd=False, d_dtype=ml_dtypes.float8_e4m3fn, **caps)
     if not backward:
         options["generate_c"] = True
     entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
     result = jax.block_until_ready(jax.jit(partial(entry, **options))(**{name: jnp.asarray(array) for name, array in arrays.items()}))
-    name = "d_row_tensor" if backward else "d_tensor"
-    actual = torch.from_numpy(np.asarray(result[name]).astype(np.float32))
-    torch.testing.assert_close(actual, quantized.squeeze(-1).cpu(), atol=0.125, rtol=0.125)
-    name = "dprob_tensor" if backward else "c_tensor"
-    expected = reference["dprob_ref" if backward else "c_ref"].squeeze(-1).cpu()
-    torch.testing.assert_close(torch.from_numpy(np.asarray(result[name]).astype(np.float32)), expected, atol=0.1, rtol=0.01)
+    assert_situ_math_reference(arrays, result, backward, situ_betas)
 
 
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
