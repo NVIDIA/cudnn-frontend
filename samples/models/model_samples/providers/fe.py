@@ -13,12 +13,18 @@ The entry compiles once per (rows, operand strides) per process; ``compile`` bui
 (``split_qkvz`` and ``state.RecurrentSlots``) and launches the compiled form once on them, so the first step of a run finds the
 kernel compiled and launched.  That first launch is measured: on some GPU classes it reserves device memory outside PyTorch's
 allocator (``first_launch``), which the plan's memory sentence allows for per class before anything is loaded.
+
+The provider row says in which form the entry is called (``row.form``: fields of the entry's own form, under the entry's names).
+The adapter passes exactly those to the entry (``FORM_ARGUMENTS``) and nothing else that fixes the kernel, so the row is the
+whole statement; ``launch_facts`` hands the kernel check the entry's own answers for a row count -- the symbols of the kernels it
+compiled, its form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / ``launch_shape_for``).
 """
 
 from __future__ import annotations
 
 import re
 
+from ..census import Facts, Kernel
 from ..state import RecurrentSlots
 from ..weights import ScaledTensor
 from . import BlockBase, GdnParams, split_qkvz
@@ -30,7 +36,12 @@ SOURCE_FILES = (
     "linear_attention/frost/kernel/gdn_decode_fused_config.py",
     "linear_attention/frost/kernel/gdn_decode_fused_f16.py",
     "linear_attention/frost/kernel/gdn_geometry.py",
+    "frost/launch_facts.py",
 )
+#: a field of the entry's form a provider row may name -> the constructor argument of ``cudnn.GdnDecodeFused`` that sets it
+FORM_ARGUMENTS = {"PDL": "pdl", "PDL_RELEASE": "pdl_release"}
+#: the entry's three launch facts: what the kernel check reads
+LAUNCH_FACTS = ("kernel_symbols_for", "form_for", "launch_shape_for")
 #: the first cuDNN Frontend version that carries the fused decode step, and the CuTe DSL floor its page states
 FIRST_VERSION = "1.33.0"
 DSL_FLOOR = (4, 8, 0)
@@ -47,7 +58,7 @@ def serves_floor(installed: str, floor: tuple) -> bool:
     return release > tuple(floor) or (release == tuple(floor) and not before)
 
 
-#: one entry per (device, geometry, epsilon) of the process: the entry compiles once per rows count, and every session shares it
+#: one entry per (device, geometry, epsilon, form) of the process: the entry compiles once per rows count, and every session shares it
 _ENTRIES: dict = {}
 #: rows -> device bytes the first launch of that form took outside PyTorch's allocator in this process, as measured
 _FIRST_LAUNCH: dict = {}
@@ -67,7 +78,7 @@ def _outside_pool(device, launch) -> int:
 
 class GdnDecodeFusedBlock(BlockBase):
     provider = "cuDNN FE"
-    kernels = ("gdn_decode_fused",)
+    kernels = (Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=1, shape="entry"),)  # one launch per layer and step
     per_row = (0, 1, 2, 3)
     state_args = (5,)
     compiles = True
@@ -76,6 +87,15 @@ class GdnDecodeFusedBlock(BlockBase):
         import cudnn  # before torch in a sample's own imports; here torch is already loaded by the sample
 
         return cudnn
+
+    def _arguments(self) -> dict:
+        """The constructor arguments the row's form stands for.  A field this adapter cannot pass is a wrong table."""
+        unknown = [name for name, _ in self.row.form if name not in FORM_ARGUMENTS]
+        if unknown:
+            raise ValueError(
+                f"provider row {self.row.key}: its form names {', '.join(unknown)}; this adapter passes {', '.join(FORM_ARGUMENTS)} to cudnn.GdnDecodeFused"
+            )
+        return {FORM_ARGUMENTS[name]: value for name, value in self.row.form}
 
     def check_support(self, sequences: int, tokens: int) -> None:
         cudnn = self._cudnn()
@@ -86,6 +106,12 @@ class GdnDecodeFusedBlock(BlockBase):
                 f"needs nvidia-cudnn-frontend with the fused linear-attention decode step (>= {FIRST_VERSION}); this is {cudnn.__version__}: "
                 "install from the checkout (see README)"
             ) from None
+        self._arguments()
+        if self.options.get("check_kernels") and not all(hasattr(cudnn.GdnDecodeFused, fact) for fact in LAUNCH_FACTS):
+            raise NotImplementedError(
+                f"the kernel check needs the launch facts of cudnn.GdnDecodeFused ({', '.join(LAUNCH_FACTS)}); this nvidia-cudnn-frontend "
+                f"{cudnn.__version__} has none: install from the checkout (see README), or run without --check-kernels"
+            )
         if tokens != 1:
             raise NotImplementedError(f"cudnn.GdnDecodeFused is the one-token decode step; this run has {tokens} tokens per sequence")
         import importlib.metadata as metadata
@@ -116,13 +142,27 @@ class GdnDecodeFusedBlock(BlockBase):
 
         g = self.model.geometry
         device = torch.device(device)
-        key = (str(device), g.la_key_heads, g.la_value_heads, g.hidden, self.model.norm_eps)
+        key = (str(device), g.la_key_heads, g.la_value_heads, g.hidden, self.model.norm_eps, tuple(self.row.form))
         if key not in _ENTRIES:
             cudnn = self._cudnn()
             from cudnn.linear_attention.frost import GdnGeometry
 
-            _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden))
+            geometry = GdnGeometry(g.la_key_heads, g.la_value_heads, g.hidden)
+            _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
+        self._instance = list(_ENTRIES).index(key) + 1
         return _ENTRIES[key]
+
+    def serving(self):
+        """The entry instance of this adapter (one per device, geometry, epsilon and form of the process) and the row's form."""
+        instance = getattr(self, "_instance", None)
+        return (f"{self.entry} #{instance}" if instance else self.entry), tuple(self.row.form)
+
+    def launch_facts(self, rows: int) -> Facts:
+        """The entry's own answers for ``rows``: the symbols of the kernels it has compiled for that row count, its form as plain
+        data and its launch shape.  The entry's typed declines pass through: a row that claims a row count the entry does not
+        serve is a wrong table."""
+        entry = self._build(self.options.get("device", "cuda"))
+        return Facts(tuple(entry.kernel_symbols_for(rows)), entry.form_for(rows), tuple(entry.launch_shape_for(rows)))
 
     def compile(self, sequences: int, tokens: int) -> None:
         import torch

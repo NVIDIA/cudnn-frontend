@@ -22,9 +22,14 @@ from __future__ import annotations
 
 import torch
 
+from ..census import Kernel
 from ..weights import Dequantized, dequantize
 from . import BlockBase
 from .torch_ref import silu_mul_quantize
+
+#: what a multiply over a bf16 copy launches: the kernels cuBLAS picks for it (by shape, rows and GPU: a library's choice,
+#: printed by the kernel check and never gated) and PyTorch's own for the dequantisation, the scales and the casts
+CUBLAS_OVER_COPIES = (Kernel("cublas", "cuBLAS"), Kernel("pytorch", "PyTorch"))
 
 
 def matmul_bf16(qx, weight: Dequantized) -> torch.Tensor:
@@ -44,7 +49,7 @@ def matmul_bf16(qx, weight: Dequantized) -> torch.Tensor:
 
 class CublasLinear(BlockBase):
     provider = "cuBLAS"
-    kernels = ("gemm (bf16)",)
+    kernels = CUBLAS_OVER_COPIES
 
     def __call__(self, qx, weight):
         return matmul_bf16(qx, weight)
@@ -54,7 +59,7 @@ class CublasGateUp(BlockBase):
     """The merged gate / up multiply on cuBLAS, then ``SiLU(gate) * up`` and the 4-bit quantisation in PyTorch."""
 
     provider = "cuBLAS + PyTorch"
-    kernels = ("gemm (bf16)",)
+    kernels = CUBLAS_OVER_COPIES
 
     def __call__(self, qx, weight, quant):
         self.product = matmul_bf16(qx, weight)

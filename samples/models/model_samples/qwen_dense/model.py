@@ -247,6 +247,22 @@ class QwenDense:
     def calls_per_step(self) -> int:
         return sum(sum(c) for c in self.calls().values())
 
+    def wiring(self) -> Tuple[Tuple[str, int], ...]:
+        """The block calls of one decode step in the order ``step`` makes them, as ``(block, layer)``: the wiring order the
+        kernel check holds a step's launches against.  A block outside the layers has layer -1; the final norm is the call
+        after the last layer."""
+        kinds = self.geometry.layer_kinds
+        calls = [("embedding", -1)]
+        for i, kind in enumerate(kinds):
+            calls += [("add_norm_quantize", i), ("projection.fp8.in", i)]
+            if kind == "linear_attention":
+                calls.append(("linear_attention.step", i))
+            else:
+                calls += [("attention.prepare", i), ("attention.core", i), ("attention.gate_quantize", i)]
+            calls += [("projection.fp8.out", i), ("add_norm_quantize", i), ("mlp.gate_up", i), ("mlp.down", i)]
+        calls += [("add_norm_quantize", len(kinds)), ("output_head", -1), ("token_choice", -1)]
+        return tuple(calls)
+
     def calls_text(self) -> Dict[str, str]:
         return {block: " / ".join(str(c) for c in count) for block, count in self.calls().items()}
 

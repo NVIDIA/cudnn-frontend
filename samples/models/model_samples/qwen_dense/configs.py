@@ -6,7 +6,9 @@
 For every block the rows are ordered; the first row whose GPU classes, sequence range, tokens-per-sequence range and stack
 contain the run serves the block.  The whole table is printed before every run.  A row with a ``fallback`` reason is a
 reference chain or a multiply over a dequantised copy; ``band`` is the tie-out band of the row against the reference block
-(``model_samples.tie_out.BANDS``) and is never widened in place.  The next stack adds its rows here; it removes none.
+(``model_samples.tie_out.BANDS``) and is never widened in place.  ``form`` is what the row's adapter passes to its entry: fields
+of the entry's own form, which the kernel check compares with the entry's answer.  The next stack adds its rows here; it
+removes none.
 
 ``readme_table()`` renders the tables as the family README shows them; a host test keeps the two in agreement.
 """
@@ -36,6 +38,9 @@ PROVIDERS = {
             measured=("cc 10.0, 1 row",),
             band="gdn_step",
             batch_invariant=("cc10.0", "cc10.3", "cc12.0"),
+            # the entry's own pick per rows, launched without a wait on its predecessor and without an early release of its
+            # successor.  Both are what the entry does when nothing is passed; the row says so, and the kernel check holds it
+            form=(("PDL", False), ("PDL_RELEASE", False)),
         ),
         ProviderRow(*ANY, "torch_ref.gdn_decode_step", "reference", serves="any", fallback="reference"),
     ],

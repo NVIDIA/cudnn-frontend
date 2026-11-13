@@ -7,12 +7,18 @@ reference of every block (``torch_ref``).
 ``KEYS`` is the closed list of provider keys a provider table may name; it changes only together with a kernel.  The operand
 containers below are what the blocks of a family pass to each other.  Nothing here imports a provider module, PyTorch or
 cuDNN Frontend until :func:`factories` is called.
+
+Every adapter declares its census entries (``kernels``, :class:`model_samples.census.Kernel`): the kernels one call launches.
+An adapter to an entry that states its launch also answers ``launch_facts(rows)`` and names the entry instance that serves a call
+(``serving()``), which a traced step writes into its call log.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
+
+from ..census import Kernel
 
 #: provider key -> what is called, as the served-by table prints it
 ENTRY_NAMES: Dict[str, str] = {
@@ -79,12 +85,18 @@ def split_qkvz(slab, qkv_channels: int, value_heads: int, head_dim: int):
     return slab[:, :qkv_channels], slab[:, qkv_channels:].unflatten(1, (value_heads, head_dim))
 
 
+#: the census entries of a chain of PyTorch operators, and of one that also multiplies through cuBLAS: fallback families
+PYTORCH_CHAIN = (Kernel("pytorch", "PyTorch"),)
+PYTORCH_CHAIN_WITH_MULTIPLY = (Kernel("pytorch", "PyTorch"), Kernel("cublas", "cuBLAS"))
+
+
 class BlockBase:
-    """Defaults of a block: stateless, one leading row per sequence on its first operand, nothing to build or reserve."""
+    """Defaults of a block: stateless, one leading row per sequence on its first operand, nothing to build or reserve, no
+    kernel declared and no entry that states its launch."""
 
     entry = ""
     provider = "PyTorch"
-    kernels: Tuple[str, ...] = ()
+    kernels: Tuple[Kernel, ...] = ()
     per_row: Tuple[int, ...] = (0,)
     state_args: Tuple[int, ...] = ()
 
@@ -110,6 +122,15 @@ class BlockBase:
         """What the tie-out compares of a call's result against the reference block: the result itself, unless the block
         ends in a chain it shares with the reference (then the tensor that enters that chain)."""
         return out
+
+    def serving(self) -> Tuple[str, tuple]:
+        """``(entry instance, form)`` of what serves a call of this block, for the call log of a traced step: no entry
+        instance, and the row's form."""
+        return "", tuple(self.row.form)
+
+    def launch_facts(self, rows: int):
+        """What the block's entry states about its launch at ``rows``; ``None``: this block has no entry that states one."""
+        return None
 
 
 def factories() -> Dict[str, Callable]:

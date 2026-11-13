@@ -16,9 +16,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ..census import Kernel
 from ..sampling import greedy
 from ..weights import Dequantized, ScaledTensor, _e4m3, dequantize, quantize_fp8, quantize_nvfp4
-from . import BlockBase, acc_dtype
+from . import PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
 
 BF16 = torch.bfloat16
 
@@ -156,7 +157,10 @@ def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> Scaled
 
 
 class _Reference(BlockBase):
-    """A block served by this module.  ``eps`` is the model's norm epsilon; ``acc`` the accumulation dtype of the run."""
+    """A block served by this module.  ``eps`` is the model's norm epsilon; ``acc`` the accumulation dtype of the run.  Its
+    census entry is the family of PyTorch's own kernels; a chain that multiplies (``matmul``, ``einsum``) adds cuBLAS's."""
+
+    kernels = PYTORCH_CHAIN
 
     def __init__(self, row, model, facts, options):
         super().__init__(row, model, facts, options)
@@ -165,11 +169,19 @@ class _Reference(BlockBase):
 
 
 class Embedding(_Reference):
+    """One gather per call: an exact kernel, known by its name.  Its launch shape is PyTorch's and is declared nowhere."""
+
+    kernels = (Kernel("embedding_gather", "PyTorch", "exact", launches=1),)
+
     def __call__(self, ids, table):
         return table.index_select(0, ids)
 
 
 class TokenChoice(_Reference):
+    """The sample's host path: what it launches is listed by the kernel check and compared with nothing."""
+
+    kernels = (Kernel("pytorch", "PyTorch", "host"),)
+
     def __call__(self, logits):
         return greedy(logits)
 
@@ -182,11 +194,15 @@ class AddNormQuantize(_Reference):
 
 
 class Linear(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+
     def __call__(self, qx, weight):
         return linear(qx, weight, self.acc)
 
 
 class GateUp(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+
     def __call__(self, qx, weight, quant):
         self.product = linear(qx, weight, self.acc)
         return silu_mul_quantize(self.product, quant)
@@ -204,6 +220,7 @@ class AttentionPrepare(_Reference):
 
 
 class Attention(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
     per_row = (0, 1)
 
     def __call__(self, q, cache, position):
@@ -218,6 +235,7 @@ class GateQuantize(_Reference):
 
 
 class GdnDecodeStep(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
     per_row = (0, 1, 2, 3)
     state_args = (5,)
 
