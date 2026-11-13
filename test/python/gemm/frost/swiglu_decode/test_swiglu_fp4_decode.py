@@ -826,9 +826,9 @@ def test_matches_the_fp64_reference_within_the_bound(geometry, rows, kind):
         assert chk["zero_blocks"] > 0, "the structured operands reach the zero rule"
 
 
-@pytest.mark.L1
 @pytest.mark.parametrize("rows", (1, 64))
 def test_matches_the_fp64_reference_on_every_weight_tile(rows):
+    """The reference of the cell above on all 272 weight tiles of the default geometry (sixteen tiles per comparison)."""
     dev = U.device_or_skip()
     k = _entry(dev, G_DEFAULT)
     ops, act = _ops(dev, G_DEFAULT, rows, "random", seed=100 + rows)
