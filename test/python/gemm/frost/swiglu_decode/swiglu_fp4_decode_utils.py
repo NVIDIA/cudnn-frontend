@@ -192,11 +192,12 @@ def scalar(value, device):
     return torch.tensor([value], dtype=torch.float32, device=device)
 
 
-def launch_operands(weight, activation, out_global_scale=1.0, alpha=None):
-    """The eight launch arguments of the entry (in its order, without the two outputs) for a weight and an activation of the builders:
-    the weight interleaved, the activation's scales in one atom band, ``alpha`` = the reciprocal of the two global scales."""
+def launch_operands(weight, activation, out_global_scale=1.0, alpha=None, pair=None):
+    """The launch arguments of the entry (without the two outputs) for a weight and an activation of the builders: the weight
+    interleaved (``pair`` = an :func:`interleaved` result to reuse), the activation's scales in one atom band, ``alpha`` = the
+    reciprocal of the two global scales."""
     device = weight["codes"].device
-    w, ws = interleaved(weight)
+    w, ws = interleaved(weight) if pair is None else pair
     if alpha is None:
         alpha = 1.0 / (weight["global_scale"] * activation["global_scale"])
     return dict(
@@ -268,9 +269,14 @@ def reference(weight, activation, alpha, tiles):
 
 
 def e4m3_round(x):
-    """fp64 values -> E4M3 bytes, round to nearest even, saturating at 448 (through fp32: the operand of the cast is rounded once
-    more, which the interval's ``1 +- 2^-21`` factors cover)."""
-    return x.clamp(max=448.0).float().to(E4M3).view(torch.uint8)
+    """Non-negative fp64 values -> E4M3 bytes, round to nearest even, saturating at 448: a table search over the 127 finite
+    non-negative codes (their values ascend with the byte), independent of any framework cast."""
+    values = e4m3_values(torch.arange(0, E4M3_NAN, dtype=torch.uint8, device=x.device))
+    x = x.clamp(max=448.0)
+    hi = torch.searchsorted(values, x.contiguous()).clamp(max=E4M3_MAX)
+    lo = (hi - 1).clamp(min=0)
+    d_lo, d_hi = x - values[lo], values[hi] - x
+    return torch.where((d_hi < d_lo) | ((d_hi == d_lo) & (hi % 2 == 0)), hi, lo).to(torch.uint8)
 
 
 def check_against_reference(out, out_scale, weight, activation, alpha, gs, tiles):
@@ -316,3 +322,88 @@ def device_or_skip():
     if msg is not None:
         pytest.skip(msg)
     return dev
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# exact cells: operands whose every intermediate is exact, so the kernel's bytes equal a host-built expectation
+# ---------------------------------------------------------------------------------------------------------------------------
+EXACT_BLOCKS = (0, 1, 2, 100, 200, 319)  # the 16-column blocks of the hidden axis that carry the non-zero elements (several K stages)
+EXACT_GS = 2.0**-8
+#: (gate terms, up terms) of the first channels: each term is one weight element (an E4M3-representable value) in one block
+EXACT_CHANNELS = (
+    ((256, 256, 2), (3,)),  # first rounding, tie down: 514 -> 512
+    ((256, 256, 6), (1,)),  # first rounding, tie up: 518 -> 520
+    ((32, 5), (14,)),  # second rounding, tie up: 37 x 14 = 518 -> 520
+    ((28, 1), (18,)),  # second rounding, tie down: 29 x 18 = 522 -> 520
+    ((), (5,)),  # a zero gate: silu(0) = 0, the product is +0
+    ((), (-5,)),  # a zero gate under a negative up: the product is -0 and its code keeps the sign
+    ((20,), (-6,)),
+    ((448,), (0.5,)),
+)
+
+
+def exact_case(device="cpu", rows=5, seed=0):
+    """Integer-valued operands at the small geometry with every partial sum exact in fp32, gate pre-activations that are 0 or >= 18
+    (where the kernel's SiLU is the identity: ``2^(-x log2 e)`` is below half a unit of 1.0 and the sum rounds to 1) and a
+    power-of-two output scale.  Each weight row holds one element per block of :data:`EXACT_BLOCKS`; activation row ``t`` is
+    ``2^(t % 3)`` at the first column of those blocks, the last row is all zero.  Returns ``(weight, activation, alpha, gs)`` in the
+    builders' form (natural row order)."""
+    geometry = G_SMALL
+    n, k, inter = geometry.WEIGHT_ROWS, geometry.HIDDEN, geometry.INTERMEDIATE
+    gen = torch.Generator(device="cpu").manual_seed(4000 + seed)
+    small = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28], dtype=torch.float64)  # E4M3-representable integers
+    values = torch.zeros(n, len(EXACT_BLOCKS), dtype=torch.float64)
+    values[:inter] = small[torch.randint(0, len(small), (inter, len(EXACT_BLOCKS)), generator=gen)]
+    values[:inter, 0] = 32.0  # every random gate is at least 32
+    signs = torch.where(torch.randint(0, 2, (inter, len(EXACT_BLOCKS)), generator=gen) == 0, 1.0, -1.0).double()
+    values[inter:] = small[torch.randint(0, len(small), (inter, len(EXACT_BLOCKS)), generator=gen)] * signs
+    for c, (gate, up) in enumerate(EXACT_CHANNELS):
+        values[c] = 0.0
+        values[inter + c] = 0.0
+        values[c, : len(gate)] = torch.tensor(gate, dtype=torch.float64)
+        values[inter + c, : len(up)] = torch.tensor(up, dtype=torch.float64)
+    scales = torch.full((n, k // SF_VEC), 0x38, dtype=torch.uint8)  # 1.0 everywhere else
+    codes = torch.zeros(n, k // 2, dtype=torch.uint8)
+    for j, b in enumerate(EXACT_BLOCKS):
+        byte = e4m3_round(values[:, j].abs())
+        assert torch.equal(e4m3_values(byte), values[:, j].abs()), "every weight element is an E4M3 value"
+        scales[:, b] = torch.where(values[:, j] == 0, torch.tensor(0x38, dtype=torch.uint8), byte)
+        codes[:, b * 8] = torch.where(values[:, j] == 0, 0, torch.where(values[:, j] > 0, 0x2, 0xA)).to(torch.uint8)  # +1.0 / -1.0 in the low nibble
+    a_scales = torch.full((rows, k // SF_VEC), 0x38, dtype=torch.uint8)
+    a_codes = torch.zeros(rows, k // 2, dtype=torch.uint8)
+    for t in range(rows - 1):
+        for b in EXACT_BLOCKS:
+            a_scales[t, b] = (0x38, 0x40, 0x48)[t % 3]  # 1, 2, 4
+            a_codes[t, b * 8] = 0x2
+    a_scales[rows - 1] = 0
+    weight = dict(codes=codes.to(device), scales=scales.to(device), global_scale=1.0)
+    activation = dict(codes=a_codes.to(device), scales=a_scales.to(device), global_scale=1.0)
+    return weight, activation, 1.0, EXACT_GS
+
+
+def exact_expectation(weight, activation, alpha, gs):
+    """``(out [rows, I / 2], scale bytes [rows, I / 16])`` of an :func:`exact_case` from exact host arithmetic: the pre-activations in
+    fp64 (exact), the two bf16 roundings by the host's round-to-nearest-even cast, the block scale in fp32 as the kernel orders it
+    (``gs * (amax * fp32(1/6))``) and rounded by the table, the codes from the exact quotient -- after asserting that no quotient sits
+    within 2^-16 (relative) of a rounding boundary, so the kernel's one approximate reciprocal cannot move a code."""
+    cpu = {name: (v.cpu() if isinstance(v, torch.Tensor) else v) for name, v in weight.items()}
+    act = {name: (v.cpu() if isinstance(v, torch.Tensor) else v) for name, v in activation.items()}
+    inter = cpu["codes"].shape[0] // 2
+    w = unpack_fp4(cpu["codes"]) * e4m3_values(cpu["scales"]).repeat_interleave(SF_VEC, dim=1)
+    x = unpack_fp4(act["codes"]) * e4m3_values(act["scales"]).repeat_interleave(SF_VEC, dim=1)
+    gate, up = alpha * (x @ w[:inter].t()), alpha * (x @ w[inter:].t())
+    assert float(gate.abs().max()) < 2**24 and float(up.abs().max()) < 2**24 and bool((gate == gate.round()).all())
+    gate, up = gate.float().to(torch.bfloat16).float(), up.float().to(torch.bfloat16).float()  # the first rounding
+    assert bool(((gate == 0) | (gate >= 18)).all()), "the SiLU premise: every gate is 0 or at least 18"
+    v = (gate * up).to(torch.bfloat16).float()  # silu(gate) = gate (or +0); the product is exact in fp32; the second rounding
+    rows = v.shape[0]
+    amax = v.abs().reshape(rows, -1, SF_VEC).amax(dim=-1)
+    sixth = torch.tensor([0x3E2AAAAB], dtype=torch.int32).view(torch.float32)
+    byte = e4m3_round((torch.tensor(gs, dtype=torch.float32) * (amax * sixth)).double())
+    value = e4m3_values(byte).repeat_interleave(SF_VEC, dim=1)
+    q = torch.where(value > 0, v.double().abs() * gs / value.clamp(min=1e-300), torch.zeros_like(value))
+    edges = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float64)
+    margin = ((q[..., None] - edges).abs() / edges).min()
+    assert float(margin) > 2.0**-16, f"an exact cell sits {float(margin):.3e} (relative) from a rounding boundary"
+    codes = torch.bucketize(q, edges).to(torch.uint8) | (torch.signbit(v).to(torch.uint8) << 3)
+    return pack_fp4(codes), byte
