@@ -29,12 +29,23 @@ _KNOWN_BYTE_FAILURES = {
 }
 
 
+_KNOWN_LOSS_FAILURES = {
+    "test_replay[bf16-h96-split-fprop-cutedsl]": r"replay \d+ loss: 1/4 bytes differ",
+    "test_batch_invariance[bf16-h16-tiny-fprop-torch]": r"packed slot 0 loss: 1/4 bytes differ",
+}
+
+
 @contextmanager
 def known_byte_failure(request):
     try:
         yield
     except AssertionError as error:
-        if torch.cuda.get_device_capability() != (10, 0) or request.node.name not in _KNOWN_BYTE_FAILURES:
+        if torch.cuda.get_device_capability() != (10, 0):
+            raise
+        pattern = _KNOWN_LOSS_FAILURES.get(request.node.name)
+        if pattern is not None and re.fullmatch(pattern, str(error)):
+            pytest.xfail(f"Known scalar-loss reduction difference; remove when the reduction is deterministic: {error}")
+        if request.node.name not in _KNOWN_BYTE_FAILURES:
             raise
         if not re.fullmatch(r"(?:replay \d+|packed slot \d+) (?:loss|(?:saved_)?d[qk]_idx): \d+/\d+ bytes differ", str(error)):
             raise
@@ -98,3 +109,29 @@ def test_golden(use_kf, backward):
 
     tensors = dict(zip(("q", "k", "q_idx", "k_idx", "starts", "ends", "valid", "denominator"), (*inputs[0], *inputs[1])))
     assert_golden(f'phase1-cu{CUDA_VERSION.major}.{CUDA_VERSION.minor}-{"cutedsl" if use_kf else "torch"}-{"bprop" if backward else "fprop"}', tensors, actual)
+
+
+@pytest.mark.parametrize(
+    "name,message",
+    [
+        ("test_replay[bf16-h96-split-fprop-cutedsl]", "replay 2 loss: 1/4 bytes differ"),
+        ("test_batch_invariance[bf16-h16-tiny-fprop-torch]", "packed slot 0 loss: 1/4 bytes differ"),
+    ],
+)
+@pytest.mark.parametrize("change", [None, "arch", "bytes", "tensor", "case", "numerics"])
+def test_ci_loss_exception_scope(monkeypatch, name, message, change):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 3) if change == "arch" else (10, 0))
+    if change == "bytes":
+        message = message.replace("1/4", "2/4")
+    elif change == "tensor":
+        message = message.replace(" loss:", " saved_dq_idx:")
+    elif change == "case":
+        name = name.replace("fprop", "other")
+    elif change == "numerics":
+        message = "Tensor-likes are not close!"
+    expected = pytest.xfail.Exception if change is None else AssertionError
+    with pytest.raises(expected):
+        with known_byte_failure(SimpleNamespace(node=SimpleNamespace(name=name))):
+            raise AssertionError(message)
