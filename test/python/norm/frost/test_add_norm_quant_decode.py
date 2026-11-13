@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The add + RMSNorm + quantize decode step (``cudnn.norm.frost.add_norm_quant_decode``): on the host the config's limits and tables,
-the fifteen forms and three launch arms, every typed decline of the entry (CPU tensors), the DSL gates (version, target, compiler), the
-plan-time-only compile key, the launch facts, the lazy export, and the kernel's RENDERING for the claimed targets (the instructions
-that define the sum tree and the rounding chain; the form inside the first 100 characters of the symbol); on a cc 10.x device the
-bytes against the independent references of ``add_norm_quant_utils`` (the fp64 bracket of the normalized value, the residual, the
-E4M3 codes, the NVFP4 block scales and code bracket), the exact cells, the edge rows, output ownership per output, the bit-neutral
-arms, the release beside a dependent launch, CUDA-graph replay, the warm path's allocation / synchronization discipline and the
-profiler's record of a launch.
+the fifteen forms and three launch arms, every typed decline of the entry (CPU tensors), the DSL gates (version, target, compiler),
+the plan-time-only compile key, the launch facts, the lazy export, and the kernel's RENDERING for the claimed targets (the
+instructions that define the sum tree and the rounding chain; the position of the dependent-launch wait; the form inside the first 100
+characters of the symbol); on a cc 10.x device the bytes against the independent references of ``add_norm_quant_utils`` (the fp64
+bracket of the normalized value, the residual, the E4M3 codes, the NVFP4 block scales and code bracket), the exact cells, the edge
+rows, output ownership per output, the bit-neutral arms, the wait behind a predecessor that released early, the release beside a
+dependent launch, a chain of two steps, CUDA-graph replay, the warm path's allocation / synchronization discipline and the profiler's
+record of a launch.
 
 No cell arms a timer of its own: every device cell synchronizes under the suite's per-test watchdog (``CUDNN_TEST_TIMEOUT`` in
 ``test/python/conftest.py``), which a second in-process timer would replace and then disarm.  A trip of that watchdog on a launch is
@@ -505,6 +506,37 @@ def test_declines_cpu_operands_when_no_capability_is_given():
         _check("add-bf16-e4m3", ops)
 
 
+def test_compile_declines_an_unserved_part_on_the_entrys_own_path(monkeypatch):
+    """The capability decline a CALLER reaches.  An entry never runs ``check_support``: its calls run the binding checks, and the part
+    is gated in ``compile()`` -- at plan time, or behind the first call.  On MODELLED part facts (an entry for ``cuda:0`` with the
+    device's compute capability patched: no device is touched) ``compile()``, ``compile(rows)`` and the first call on an unserved part
+    are the typed decline by name, raised in front of the DSL gates, and nothing is compiled or allocated.  A served capability passes
+    this gate and reaches the next one (the DSL, modelled as missing)."""
+    from cudnn.frost import buffers
+
+    form = "add-nvfp4"
+    ops = _host_operands(form, own=False)
+    for cc in ((12, 0), (9, 0), (8, 0)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None, cc=cc: cc)
+        k = make_entry("cuda:0", form)
+        text = rf"serves compute capability 10\.x \(SM100-class\); this device is {cc[0]}\.{cc[1]}"
+        for rows in (None, 3):
+            with pytest.raises(NotImplementedError, match=text):
+                k.compile(rows)
+        with monkeypatch.context() as bound:  # the first call compiles: with the binding checks stood in for, it reaches the same gate
+            bound.setattr(entry, "check_binding", lambda *args, **kwargs: 3)
+            with pytest.raises(NotImplementedError, match=text):
+                k(ops["x"], ops["residual"], ops["weight"], ops["scale"])
+        assert not k.compiled and not k.buffers and not k._buffer_views, "a declined compile builds and allocates nothing"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (False, None))
+    for cc in ((10, 0), (10, 3), (10, 7)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None, cc=cc: cc)
+        k = make_entry("cuda:0", form)
+        with pytest.raises(NotImplementedError, match="requires nvidia-cutlass-dsl >= 4.8.0; the CuTe DSL is not installed"):
+            k.compile()
+        assert not k.compiled and not k.buffers
+
+
 def test_compile_key_is_plan_time_only():
     """One key per entry whatever the row count; it changes with each field of the config."""
     k = make_entry("cpu", "add-bf16-e4m3", (True, None))
@@ -847,6 +879,51 @@ def _without_pdl_blocks(text):
     return "\n".join(keep)
 
 
+def _global_loads(lines):
+    """``[(line index, parameter position)]`` of a rendering's global loads in text order.  Each load's address register is traced back
+    to the kernel parameter it was formed from -- the parameter's own register, or one ``add.s64`` of an offset to it -- in one forward
+    pass over the text; ``None`` for an address that does not trace (the caller fails on it)."""
+    base, loads = {}, []
+    for i, ln in enumerate(lines):
+        param = re.match(r"\s*ld\.param\.b64\s+(%rd\d+), \[\w+_param_(\d+)\];", ln)
+        if param:
+            base[param.group(1)] = int(param.group(2))
+            continue
+        add = re.match(r"\s*add\.s64\s+(%rd\d+), (%rd\d+), (%rd\d+);", ln)
+        if add:
+            origin = base.get(add.group(2), base.get(add.group(3)))
+            base.pop(add.group(1), None)
+            if origin is not None:
+                base[add.group(1)] = origin
+            continue
+        load = re.match(r"\s*ld\.global\.\S+\s.*\[(%rd\d+)(?:\+\d+)?\];", ln)
+        if load:
+            loads.append((i, base.get(load.group(1))))
+    return loads
+
+
+def _assert_wait_position(lines, form, release, what):
+    """The dependent-launch sites of a rendering that waits, read from the PTX text.  The wait sits in the kernel's entry block (no
+    label and no branch in front of it, so the text order in front of it is the execution order).  In front of it: the 128-bit load of
+    ``weight`` and, in a quantizing form, the 32-bit load of ``scale`` -- nothing else is read from global memory and nothing is
+    stored.  Behind it: the loads of ``x`` and, under the add, of the residual, and every global store.  With the release:
+    ``griddepcontrol.launch_dependents`` is the very next instruction."""
+    add, store, bf16, quant = FORMS[form]
+    operands = ["x"] + ["residual"] * int(add or store) + ["weight"] + ["scale"] * int(quant is not None)  # the leading kernel parameters, in order
+    at = next(i for i, ln in enumerate(lines) if "griddepcontrol.wait" in ln)
+    head = lines[lines.index("{") + 1 : at]
+    assert not any(re.match(r"\s*(\$\w+:|bra\b|call\b|ret\b)", ln) for ln in head), f"{what}: the wait is not in the kernel's entry block"
+    loads = _global_loads(lines)
+    assert all(p is not None and p < len(operands) for _, p in loads), f"{what}: a global load whose address does not trace to an input operand: {loads}"
+    before = sorted(operands[p] for i, p in loads if i < at)
+    behind = sorted(operands[p] for i, p in loads if i > at)
+    assert before == sorted(["weight"] + ["scale"] * int(quant is not None)), f"{what}: the global loads in front of the wait are {before}"
+    assert behind == sorted(["x"] + ["residual"] * int(add)), f"{what}: the global loads behind the wait are {behind}"
+    assert not any("st.global" in ln for ln in head), f"{what}: a global store in front of the wait"
+    following = next(ln.strip() for ln in lines[at + 1 :] if "inline asm" not in ln)
+    assert (following == "griddepcontrol.launch_dependents;") == release, f"{what}: the instruction behind the wait is {following!r}"
+
+
 @pytest.mark.parametrize("arch, cc", (("sm_100a", (10, 0)), ("sm_103a", (10, 3)), ("sm_107a", (10, 7))))
 def test_rendering_pins_the_convention(arch, cc, tmp_path):
     """Trace-compile the kernel for a claimed target on this box (fake tensors with symbolic extents: no device needed) in all fifteen
@@ -860,10 +937,15 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
     ``cvt.rn.satfinite.e4m3x2.f32`` and eight one-byte stores; NVFP4: ONE E4M3 convert (the block scale), two ``rcp.approx.ftz.f32``,
     fp32(1/6) as the bits ``0x3E2AAAAB``, four ``cvt.rn.satfinite.e2m1x2.f32``, one 32-bit store of the codes and one one-byte store of
     the scale; ``griddepcontrol.wait`` exactly under ``pdl`` and ``launch_dependents`` exactly under ``pdl_release``; the kernel's
-    parameters = ``x`` and ``weight`` plus the form's live optional operands (a dead operand is dropped, never bound).  Within a form
-    the three arms differ ONLY in the ``griddepcontrol`` blocks (the launch knobs move no arithmetic).  With an nvdisasm that decodes
-    the cubin, also the SASS: one ``BAR.SYNC``, one shared store and load, no spill, ``ACQBULK`` / ``PREEXIT`` as the arm says.  A
-    compile failure FAILS; a DSL that does not serve the target (version, target list, compiler) SKIPS with the gate's text."""
+    parameters = ``x`` and ``weight`` plus the form's live optional operands (a dead operand is dropped, never bound).  THE POSITION
+    OF THE WAIT (the contract of ``pdl``; ``_assert_wait_position``), in every rendering that waits: it sits in the kernel's entry
+    block; the loads of ``weight`` and of ``scale`` are the only global accesses in front of it; the loads of ``x`` and of the
+    residual and every global store follow it; the release, where the arm has one, is the very next instruction.  Within a form the
+    three arms differ ONLY in the ``griddepcontrol`` blocks (the launch knobs move no arithmetic).  With an nvdisasm that decodes the
+    cubin, also the SASS: one ``BAR.SYNC``, one shared store and load, no spill, ``ACQBULK`` / ``PREEXIT`` as the arm says, and the
+    same order in the compiled kernel (the weight's and the scale's ``LDG`` in front of ``ACQBULK``, every other ``LDG`` and every
+    ``STG`` behind it, no global access between ``ACQBULK`` and ``PREEXIT``).  A compile failure FAILS; a DSL that does not serve
+    the target (version, target list, compiler) SKIPS with the gate's text."""
     msg = entry._dsl_error(cc)
     if msg is not None:
         pytest.skip(msg)
@@ -919,6 +1001,8 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
         symbol = re.search(r"\.entry\s+(\w+)", ptx).group(1)
         head = SYMBOL + str(_cfg(form, arm))
         assert symbol.startswith(head + "_") and len(head) <= 100, f"{what}: the symbol {symbol[:120]} does not carry the form in its first 100 characters"
+        if wait:
+            _assert_wait_position(lines, form, release, what)
         bodies[(form, arm_id)] = _body(ptx)
         cubins = [f for f in files if f.endswith(".cubin")]
         sass = _sass(cubins[0]) if cubins else None
@@ -929,6 +1013,16 @@ def test_rendering_pins_the_convention(arch, cc, tmp_path):
             assert n("ACQBULK") == int(wait) and n("PREEXIT") == int(release), what
             assert n("STG.E.128") == stores128 and n("STG.E.U8") == (8 if e4 else (1 if fp4 else 0)), f"{what}: the store forms in the SASS"
             assert n("FCHK") == (2 if e4 else 1) and n("MUFU.RSQ") >= 1, f"{what}: the IEEE divisions and the reciprocal root in the SASS"
+            if wait:  # the compiled order: the constants' loads, the wait, the release, then every other global access
+                acq = next(i for i, ln in enumerate(sass) if "ACQBULK" in ln)
+                head = sass[:acq]
+                assert not any(re.match(r"\s*\.L_x_\d+:", ln) or " BRA " in ln for ln in head), f"{what}: the wait is not in the entry block of the SASS"
+                assert sum("LDG" in ln for ln in head) == 1 + int(quant is not None), f"{what}: the global loads in front of the wait in the SASS"
+                assert not any("STG" in ln for ln in head), f"{what}: a global store in front of the wait in the SASS"
+                assert sum("LDG" in ln for ln in sass[acq:]) == 1 + int(add), f"{what}: the global loads behind the wait in the SASS"
+                if release:
+                    pre = next(i for i, ln in enumerate(sass) if "PREEXIT" in ln)
+                    assert acq < pre and not any("LDG" in ln or "STG" in ln for ln in sass[acq:pre]), f"{what}: the release is not directly behind the wait"
     for form in FORMS:
         plain = _without_pdl_blocks(bodies[(form, "plain")])
         for arm_id in ("wait", "wait-release"):
@@ -1332,10 +1426,13 @@ def test_caller_owned_scales_keep_the_owners_bytes_past_the_live_rows():
 @pytest.mark.parametrize("quant", (None, "e4m3_static", "nvfp4"))
 def test_bit_neutral_arms_write_the_default_bytes(quant, rows):
     """What never changes a byte: the launch arms (wait; wait + release) against the plain launch; writing the bf16 value or not;
-    storing ``x`` to the residual or not.  The launch arms run BEHIND a real predecessor on the same stream -- a torch copy that
-    rewrites ``x`` and the residual right before the launch -- so the wait has something to wait for: a kernel that read ``x`` before
-    its wait would see the previous values.  The release has no dependent in this cell (inert here; the cell below gives it one).
-    Over the three quant parameters the cell launches every one of the fifteen forms under every one of the three launch arms."""
+    storing ``x`` to the residual or not.  The launch arms run behind torch copies on the same stream that rewrite ``x`` and the
+    residual right before the launch.  Such a copy never releases its dependents, so the kernel starts only after it has completed:
+    this cell shows that an arm's bytes are the plain launch's, and nothing about WHERE the wait sits.  The wait's position is pinned
+    in the kernel's text by the rendering cell (``_assert_wait_position``) and on a device by
+    ``test_wait_holds_every_read_behind_a_predecessor_that_released_early``.  The release has no dependent in this cell (inert here;
+    a later cell gives it one).  Over the three quant parameters the cell launches every one of the fifteen forms under every one of
+    the three launch arms."""
     dev = _device_or_skip()
     tail = {None: "", "e4m3_static": "-e4m3", "nvfp4": "-nvfp4"}[quant]
     scale = None if quant is None else scale_tensor(0.02 if quant == "e4m3_static" else 37.0, dev)
@@ -1348,7 +1445,7 @@ def test_bit_neutral_arms_write_the_default_bytes(quant, rows):
             k = _entry(dev, base_form, arm)
             x, residual = stale_x.clone(), stale_r.clone()
             _launch(k, x, residual, w, scale)  # warm (compile outside the measured sequence), on the stale values
-            x.copy_(xs)  # the predecessors on the stream: they WRITE the operands this launch reads behind its wait
+            x.copy_(xs)  # stream predecessors that write the operands: ordinary copies, complete before this launch starts
             residual.copy_(rs)
             out, codes, scales = _launch(k, x, residual, w, scale)
             torch.cuda.synchronize()
@@ -1409,6 +1506,162 @@ def test_release_overlaps_a_dependent_without_changing_bytes():
             graph.replay()
             torch.cuda.synchronize()
             _assert_same(got, want, f"captured chain rows {rows}")
+
+
+def test_wait_holds_every_read_behind_a_predecessor_that_released_early():
+    """The POSITION of the dependent-launch wait, on a device.  The stream predecessor is a launch that releases its dependents as
+    its FIRST statement and only then writes ``x`` and the residual (``pdl_dependent_copy.EarlyReleaseWriter``: one thread block
+    walks 1024 rows of both in many passes, of which only the last leaves the written values -- far longer than a launch needs to
+    start).  The step's kernel therefore STARTS while its operands hold other bytes, and its wait is the only thing that holds its
+    reads.
+
+    The positive control comes first: a dependent WITHOUT a wait copies the buffer's last row behind the same writer and must read
+    other bytes than the written ones, launched eagerly and replayed from a CUDA graph.  Only behind that observation does a pass
+    of the step show anything; where the early start does not reproduce at all, the cell SKIPS (a coverage gap, not a pass), and
+    either outcome is one line of the run's "measured" section.
+
+    Then the step, in the wait and the wait + release arm, for a form that reads ``x`` and the residual and a form that reads ``x``
+    and stores it, eager and captured: the residual and every output are bitwise those of the plain step on the written values.  A
+    kernel that read ``x`` or the residual in front of its wait fails here in every row of its first scheduling wave.  The eager
+    launches are WARM ones: the first launch of a freshly compiled kernel returns to the host only when the work in flight on the
+    stream has completed, so it never starts early and would show nothing.  Every launch is compared before the cell fails, so a
+    failure names each arm and mode that differs."""
+    dev = _device_or_skip()
+    import frost_routing
+    from pdl_dependent_copy import DependentCopy, EarlyReleaseWriter
+
+    rows = kcfg.MAX_ROWS
+    xs, rs, w = make_operands(rows, HIDDEN, dev, seed=67)
+    stale_x, stale_r, _ = make_operands(rows, HIDDEN, dev, seed=68)
+    new, stale = torch.cat([xs, rs]), torch.cat([stale_x, stale_r])
+    buf = stale.clone()  # ONE allocation -- x its first rows, the residual its last -- so ONE predecessor writes both operands
+    x, residual = buf[:rows], buf[rows:]
+    writer, unwaited = EarlyReleaseWriter(dev), DependentCopy(dev, wait=False)
+    seen = torch.zeros(HIDDEN, dtype=BF16, device=dev)
+
+    def control():
+        writer(new, buf)
+        unwaited(buf[-1], seen)  # no wait: it reads whatever the last row holds when it starts
+
+    def early_starts(run):
+        """How many of four runs of the control read other bytes than the written ones (the dependent started in front of the write)."""
+        count = 0
+        for _ in range(4):
+            buf.copy_(stale)
+            _bits(seen).fill_(0)
+            torch.cuda.synchronize()  # an idle stream: the writer is the dependent's only predecessor in flight
+            run()
+            torch.cuda.synchronize()
+            assert _same(buf, new), "the writer leaves the written bytes"
+            count += int(not _same(seen, new[-1]))
+        return count
+
+    control()  # compiles both launches
+    torch.cuda.synchronize()
+    eager = early_starts(control)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        control()
+    captured = early_starts(graph.replay)
+    key = "add + RMSNorm + quantize decode step, the wait behind an early-releasing predecessor"
+    seen_text = f"the control (a dependent without a wait) read other bytes than the written ones in {eager} of 4 eager launches and {captured} of 4 replays"
+    if eager + captured == 0:
+        frost_routing.measured(key, f"NOT COMPARED: {seen_text} -- the early start did not reproduce on this device")
+        pytest.skip(f"{seen_text}: the early start did not reproduce on this device (a coverage gap, not a pass)")
+    compared, differing = 0, []
+    for form in ("add-bf16-e4m3", "store-bf16-nvfp4"):
+        scale = scale_tensor(0.02 if FORMS[form][3] == "e4m3_static" else 37.0, dev)
+        want = _snap(_entry(dev, form), xs, rs, w, scale)
+        for arm, arm_id in zip(LAUNCH_ARMS[1:], LAUNCH_ARM_IDS[1:]):
+            k = _entry(dev, form, arm)
+            k.compile(rows)
+            outs = _outs(k.cfg, rows, dev, extra=0)
+            got = dict(outs, residual=residual)
+
+            def chain():
+                writer(new, buf)  # releases at its entry, then writes x and the residual
+                _launch(k, x, residual, w, scale, **outs)  # may start at once; every read of x / the residual is behind its wait
+
+            def restore():
+                buf.copy_(stale)
+                for t in outs.values():
+                    _bits(t).fill_(0)
+                torch.cuda.synchronize()  # an idle stream: the writer is the step's only predecessor in flight
+
+            def compare(label):
+                nonlocal compared
+                torch.cuda.synchronize()
+                compared += 1
+                try:
+                    _assert_same(got, want, f"{form} {arm_id}, {label}")
+                except AssertionError as err:
+                    differing.append(str(err))
+
+            restore()
+            chain()  # the kernel's first launch cannot start early (the docstring): warm-up only
+            for _ in range(2):
+                restore()
+                chain()
+                compare("eager")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                chain()
+            for _ in range(2):
+                restore()
+                graph.replay()
+                compare("captured")
+    text = f"{compared - len(differing)} of {compared} launches of the step equal the plain step; {seen_text}"
+    frost_routing.measured(key, ("COMPARED, equal: " if not differing else "FAILED: ") + text)
+    assert not differing, f"behind the early-releasing writer {len(differing)} of {compared} launches differ from the plain step:\n" + "\n".join(differing)
+
+
+def test_chain_of_two_steps_writes_the_bytes_of_the_plain_pair():
+    """Two steps back to back on one stream, as a decode chain has them.  The first (no residual, bf16 out; wait + release) writes a
+    caller-owned ``out`` and releases its dependents directly behind its own wait, so the second (``pdl=True``), which takes that
+    buffer as its ``x``, may start while the first still runs; the second's wait holds its reads and the first's release obligation
+    is met.  At 1024 rows (more than one scheduling wave of either), for two forms of the second step in both waiting arms, eager and
+    captured in a CUDA graph: the link buffer, the residual and every output are bitwise those of the two plain steps run one after
+    the other.  A functional chain: it shows the pair's bytes, not the wait's position (the cell above and the rendering cell do)."""
+    dev = _device_or_skip()
+    rows = kcfg.MAX_ROWS
+    xa, rs, wa = make_operands(rows, HIDDEN, dev, seed=73)
+    _, _, wb = make_operands(1, HIDDEN, dev, seed=74)
+    first = _entry(dev, "none-bf16", (True, None))
+    assert first.cfg.PDL and first.cfg.PDL_RELEASE
+    first.compile(rows)
+    mid = _snap(_entry(dev, "none-bf16"), xa, rs, wa, None)["out"]
+    link = torch.zeros(rows, HIDDEN, dtype=BF16, device=dev)  # caller-owned: the first step's out IS the second step's x
+    residual = rs.clone()
+    for form in ("add-bf16-e4m3", "add-nvfp4"):
+        scale = scale_tensor(0.02 if FORMS[form][3] == "e4m3_static" else 37.0, dev)
+        want = dict(_snap(_entry(dev, form), mid, rs, wb, scale), link=mid)
+        for arm, arm_id in zip(LAUNCH_ARMS[1:], LAUNCH_ARM_IDS[1:]):
+            second = _entry(dev, form, arm)
+            second.compile(rows)
+            outs = _outs(second.cfg, rows, dev, extra=0)
+            got = dict(outs, residual=residual, link=link)
+
+            def chain():
+                first(xa, None, wa, None, out=link)
+                _launch(second, link, residual, wb, scale, **outs)
+
+            def restore():
+                residual.copy_(rs)
+                for t in (link, *outs.values()):
+                    _bits(t).fill_(0)
+
+            restore()
+            chain()
+            torch.cuda.synchronize()
+            _assert_same(got, want, f"none-bf16 -> {form} {arm_id}: eager chain")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                chain()
+            for _ in range(3):
+                restore()
+                graph.replay()
+                torch.cuda.synchronize()
+                _assert_same(got, want, f"none-bf16 -> {form} {arm_id}: captured chain")
 
 
 def test_one_compile_serves_every_row_count(monkeypatch):
