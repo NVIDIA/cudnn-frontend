@@ -394,18 +394,21 @@ class pygraph:
                 out.append(engine)
         return out
 
-    def _barred_indices(self) -> set:
+    def _barred_indices(self, indices=None) -> set:
         """Plan INDICES excluded by ``deselect_engines()`` (classic: match by
         name substring) or by a note filter. Per index, not per engine: one
         engine proposes several knob configurations and a name may match only
-        one of them."""
+        one of them. Restrict indexed queries to their entry: resolving an
+        unrelated backend name can materialize a configuration that declines."""
+        indices = range(len(self._plans)) if indices is None else tuple(indices)
         barred = set()
         if self._barred_names:
-            barred |= {i for i in range(len(self._plans)) if any(p in self.get_plan_name_at_index(i) for p in self._barred_names)}
+            barred |= {i for i in indices if any(p in self.get_plan_name_at_index(i) for p in self._barred_names)}
         # Same rule the backend applies per note (plans.h::filter_behavior_notes):
         # bar a plan that HAS the note when deselecting, or LACKS it when selecting.
         for kind, note, keep in self._note_filters:
-            for i, cfg in enumerate(self._plans):
+            for i in indices:
+                cfg = self._plans[i]
                 if self._engine_for(cfg) is None:
                     continue  # backend entry: the backend already filtered it
                 if (note in self._notes_of(cfg, kind)) != keep:
@@ -1515,6 +1518,17 @@ class pygraph:
         self._lower_backend_plan()
         return self._lowered_graph.get_plan_name_at_index(cfg.cpp_index)
 
+    def _plan_description_at_index(self, index: int) -> str:
+        """Describe a failed candidate without asking the backend to create it again."""
+        from .engines.base import public_knobs_repr
+        from .engines.engine_ids import BACKEND_HEURISTIC_ENGINE_ID
+
+        cfg = self._plans[index]
+        if self._engine_for(cfg) is not None:
+            return self.get_plan_name_at_index(index)
+        name = "backend_heuristics" if cfg.engine_id == BACKEND_HEURISTIC_ENGINE_ID else f"backend engine {cfg.engine_id}"
+        return f"{name}[{public_knobs_repr(cfg.knobs)}]" if cfg.knobs else name
+
     def select_plan(self, index: int) -> "pygraph":
         """Pin the plan at ``index`` in the ranked list (``graph.plans``).
 
@@ -1547,7 +1561,7 @@ class pygraph:
         self._barred_names.update(engine_names)
         if self._lowered_graph is not None:
             self._lowered_graph.deselect_engines(list(engine_names))
-        if self._is_built and self._planning_done and self._plan_index in self._barred_indices():
+        if self._is_built and self._planning_done and self._plan_index in self._barred_indices((self._plan_index,)):
             self._is_built = False  # the built plan is no longer allowed to run
         return self
 
@@ -1581,7 +1595,7 @@ class pygraph:
         # set earlier is replayed by _create_backend_plans().
         if self._backend_has_plans():
             getattr(self._lowered_graph, f"{'select' if keep else 'deselect'}_{'behavior' if kind == 'behavior' else 'numeric'}_notes")(list(notes))
-        if self._is_built and self._planning_done and self._plan_index in self._barred_indices():
+        if self._is_built and self._planning_done and self._plan_index in self._barred_indices((self._plan_index,)):
             self._is_built = False  # the built plan is no longer allowed to run
         return self
 
@@ -1799,13 +1813,12 @@ class pygraph:
         A python plan re-affirms its engine's check_support() (already passed
         when it proposed the plan); a backend plan asks C++.
 
-        A decline from the SELECTED entry is only fatal when no other entry
-        could serve the graph. The backend's ``check_support()`` is aggregate —
-        it answers for the backend as a whole, not for one plan — so letting it
-        raise here would abort ``build()`` before the walk ever reached a python
-        entry that can run. Tolerating it and letting ``build_plans()`` walk is
-        what makes "backend first, python next" actually reachable; if nothing
-        builds, the walk raises with every failure listed.
+        For an unpinned backend selection, tolerate a decline if a later entry
+        remains for the build walk. The backend's ``check_support()`` is
+        aggregate over its materialized configurations; later native entries
+        may not exist there yet. Materialization itself can also decline.
+        Let ``build_plans()`` try the remaining entries from either provider;
+        if nothing builds, the walk raises with every failure listed.
         """
         from .engines.base import decline_types
 
@@ -1813,18 +1826,18 @@ class pygraph:
         if eng is not None:
             eng.check_support(self)
             return
-        if self._plans and self._plans[self._plan_index].cpp_index is None:
-            self._materialize_backend_plan(self._plan_index)  # else C++ is asked about a plan it has never seen
-        elif self._lowered_graph is None:
-            self._lower_backend_plan()
         try:
+            if self._plans and self._plans[self._plan_index].cpp_index is None:
+                self._materialize_backend_plan(self._plan_index)  # else C++ is asked about a plan it has never seen
+            elif self._lowered_graph is None:
+                self._lower_backend_plan()
             self._lowered_graph.check_support()
         except decline_types() as exc:
-            others = [i for i, cfg in enumerate(self._plans) if i != self._plan_index and self._engine_for(cfg) is not None]
-            if self._plan_pinned or not others:
+            others = len(self._plans) - self._plan_index - 1
+            if self._plan_pinned or others <= 0:
                 raise
             self._backend_declined = _detached_exception(exc)
-            _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d python entr(y|ies)", exc, len(others))
+            _LOG.info("backend check_support declined the graph (%s); the plan walk still has %d candidate entr(y|ies)", exc, others)
 
     def build_plans(self, *args, ctx: Any = None, **kwargs) -> None:
         """Walk the ranked plan list from the selected index and finalize the
@@ -1852,20 +1865,21 @@ class pygraph:
         # the default stops at the first that builds.
         build_all = any(a == cudnn.build_plan_policy.ALL for a in args) or kwargs.get("policy") == cudnn.build_plan_policy.ALL
         strict = self._plan_pinned
-        barred = self._barred_indices()  # once: resolving names can lower the backend
         failures = []
         previous_index = self._plan_index
         selected_index = None
         self._is_built = False  # requalify the selection against the current filters
         for index in range(0 if build_all else previous_index, len(self._plans)):
-            if index in barred:
-                if strict and index == previous_index:  # select_plan and deselect_engines contradict each other
-                    raise ValueError(
-                        f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
-                        f"excluded by deselect_engines(); drop one of the two instructions"
-                    )
-                continue
             try:
+                # Name filters can materialize a backend candidate, so their
+                # declines belong to the same per-entry walk as build declines.
+                if index in self._barred_indices((index,)):
+                    if strict and index == previous_index:  # select_plan and deselect_engines contradict each other
+                        raise ValueError(
+                            f"plan {index} ({self.get_plan_name_at_index(index)!r}) is pinned by select_plan() but "
+                            f"excluded by deselect_engines(); drop one of the two instructions"
+                        )
+                    continue
                 self._build_plan_at(index, *args, ctx=ctx, **kwargs)
                 if self._workspace_limit is not None and self._engine_for(self._plans[index]) is not None:
                     need = self._compiled_plans[index].get_workspace_size()
@@ -1874,7 +1888,7 @@ class pygraph:
             except decline_types() as exc:
                 if strict and index == previous_index:
                     raise
-                failures.append(f"[{index}] {self.get_plan_name_at_index(index)}: {exc}")
+                failures.append(f"[{index}] {self._plan_description_at_index(index)}: {exc}")
                 _LOG.info("plan %d declined at build time (%s); trying the next entry", index, exc)
                 continue
             if not build_all:
@@ -1999,7 +2013,7 @@ class pygraph:
     def _reject_if_barred(self, index: int) -> None:
         """The ranked list is never filtered (indices stay stable), so every
         path that reaches a plan BY INDEX has to apply the exclusions itself."""
-        if index in self._barred_indices():
+        if index in self._barred_indices((index,)):
             raise ValueError(f"plan {index} ({self.get_plan_name_at_index(index)!r}) is excluded by deselect_engines()/a note filter")
 
     def build_plan_at_index(self, index: int) -> "pygraph":
