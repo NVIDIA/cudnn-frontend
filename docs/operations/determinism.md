@@ -397,11 +397,11 @@ The SM90 D64 / D128 half-precision backward chain (`sdpa_bwd_sm90`) owns dK and
 dV per key tile and reduces every query tile's dQ over its key tiles in index
 order through per-tile turn counters, so the deterministic flag and the default
 request run the same arithmetic. Repeatability: dQ / dK / dV bytes are compared
-across repeated executions with a poisoned workspace and across CUDA Graph
-replays, on causal and unmasked MHA and GQA graphs at D64 and D128, including
-grids beyond one CTA wave. Batch invariance: the same bytes are compared across
-reordered and duplicated batches and against the sequence declared alone, for
-causal GQA at D128 and unmasked MHA at D64.
+across repeated executions with a poisoned workspace on causal and unmasked MHA
+and GQA graphs at D64 and D128, including grids beyond one CTA wave, and across
+CUDA Graph replays for causal GQA at D128. Batch invariance: the same bytes are
+compared across reordered and duplicated batches and against the sequence
+declared alone, for causal GQA at D128 and unmasked MHA at D64.
 
 ## Split-combine zero-weight qualification
 
