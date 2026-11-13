@@ -119,7 +119,6 @@ class Sm107Mxfp8DgluDfc21Kernel:
         dfc1_weight_l2_prefetch_depth: int = 0,
         use_scaled_cvt: bool = False,
         weight_storage_mode: WeightStorageMode = "contiguous",
-        target_arch: Optional[str] = None,
     ) -> None:
         if (type(phase_interleave_defer_linear1_until_input_ready) is not bool
                 or type(prefetch_tma_descriptors) is not bool
@@ -224,9 +223,8 @@ class Sm107Mxfp8DgluDfc21Kernel:
             # scaled::n1::ue8m0 is accepted by ptxas only for the
             # architecture-specific Rubin target, not sm_107/sm_107f.
             from cutlass.cutlass_dsl import CuTeDSL
-            from cutlass.base_dsl import Arch
 
-            target = CuTeDSL._get_dsl().get_arch_enum() if target_arch is None else Arch.from_string(target_arch)
+            target = CuTeDSL._get_dsl().get_arch_enum()
             target_tuple = (
                 int(target.major),
                 int(target.minor),
@@ -406,7 +404,7 @@ class Sm107Mxfp8DgluDfc21Kernel:
         self.tmem_dealloc_sync_bar_id = 3
         self.epi_subtile_bar_ids = (4, 5, 6, 7)
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(None if target_arch is None else target_arch.rstrip("af"))
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(
             self.arch
         )

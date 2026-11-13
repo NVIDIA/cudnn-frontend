@@ -11,22 +11,14 @@ allocation, compilation, or collectives.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import torch
 
 from .._config import ResolvedMoeEpConfig
-from .._metadata import MoeFormat
-
-if TYPE_CHECKING:
-    import torch
-
-    from .._contracts import _ForwardCall
+from .._contracts import _ForwardCall
+from .._types import BlockScaledTensor, MoeFormat
 
 
 def _validate_operand(name, tensor) -> None:
-    import torch
-
-    from .._types import BlockScaledTensor
-
     if isinstance(tensor, BlockScaledTensor):
         if tensor.format is MoeFormat.MXFP8:
             return
@@ -40,8 +32,6 @@ def _validate_operand(name, tensor) -> None:
 
 
 def _validate_device(device: torch.device) -> None:
-    import torch
-
     if device.type != "cuda":
         raise NotImplementedError(f"MoeEp MegaMoE backend requires a CUDA device, got {device}")
 
@@ -52,7 +42,6 @@ def _validate_device(device: torch.device) -> None:
 
 def _is_cuda_stream_capturing(device: torch.device) -> bool:
     """Return capture state for the request device."""
-    import torch
 
     with torch.cuda.device(device):
         return torch.cuda.is_current_stream_capturing()

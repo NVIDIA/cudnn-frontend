@@ -53,6 +53,9 @@ rely on that. `entry.cfg_for(rows)` returns the rendering of a row count and `en
 
 ## JAX
 
+The JAX entry requires CuTeDSL >= 4.9.0 for experimental-launcher support in
+`cutlass.jax`. Earlier versions are declined with a version-specific error.
+
 ```python
 import jax
 from cudnn.ops import fp8_projection_decode_forward_jax
@@ -74,8 +77,8 @@ architecture-specific planning. Unrelated visible GPUs and JAX process count
 do not restrict local calls. Automatic differentiation and `vmap` are
 unsupported. JAX coverage is in
 `test/python/gemm/jax/test_fp8_projection_decode_jax.py`.
-The JAX entry builds a native FFI bridge on first use and requires a C++17
-compiler and CUDA toolkit. Set `CUDA_HOME` if the toolkit is not on `PATH`.
+It uses the standard `cudnn.jax.call` / `cutlass.jax` bridge. GPU qualification
+of this CuTeDSL 4.9 bridge path remains pending.
 
 ## Numerics contract
 

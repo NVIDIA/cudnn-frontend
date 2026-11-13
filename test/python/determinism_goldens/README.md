@@ -422,6 +422,12 @@ python -m pytest -m L0 -q sdpa/frost/test_sdpa_fwd_decode_live_columns_sm100.py
 
 ### JAX MoE and decode bindings — 2026-11-12 (UTC)
 
+The FP8 projection and expert-parallel MoE measurements below describe the
+removed custom FFI prototype at `3c10e577`. FP8 projection now uses CuTeDSL's JAX bridge
+with a 4.9.0 runtime floor and has not been requalified. Expert-parallel MoE
+JAX preparation is temporarily disabled pending native bridge integration.
+The unchanged shared-expert decode measurements still apply.
+
 Candidate branch `mgoldfarb/jax-moe-decode` is based on
 `fb53e410233d27f4ce4f3a650b519bbd0edddbcb`. Imports resolved to its uploaded
 source throughout. B300/SM103, JAX 0.9.1, CuTe DSL 4.8.1 with its CUDA 13.4
@@ -465,8 +471,9 @@ The final defined-byte replay case passes with JAX **0.9.1**, without skips:
 three fresh executions under concurrent GPU work compare every primary result,
 valid preactivation/payload row, used unswizzled scale byte and metadata field.
 Together with the numerical case this is **two passing EP2 cases**. Batch
-invariance remains unmeasured, so the support page retains Unverified for EP's
-combined repeatability/batch-invariance contract. Reproduce from `test/python`:
+invariance was unmeasured, so the prototype's combined repeatability/batch-invariance
+contract was Unverified. To reproduce these historical results, check out
+`3c10e577` and run from `test/python`:
 
 ```bash
 PYTHONNOUSERSITE=1 JAX_PLATFORMS=cuda PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \

@@ -456,6 +456,9 @@ DSL satisfies your kernel.**
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
   `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
   the JAX dependency group and runtime guard enforce this higher floor.
+  JAX calls to `@cute.experimental.jit` launchers → 4.9.0; earlier JAX bridges
+  wrap them in regular `@cute.jit`, mixing compiler contexts. Gate execution,
+  keeping the public symbol importable for API inspection on older versions.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
   `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
@@ -1247,15 +1250,6 @@ Select an appropriate `jax.default_device` in architecture-specific tests withou
 hiding other GPUs. Cover tracing with unrelated hardware properties and reuse
 jitted functions on non-default devices with changed inputs and gradients (see
 `test/python/norm/jax/test_norm_jax.py`).
-
-Symmetric communication storage must retain its address outside XLA buffer
-assignment. Bind it through an owning native launch context, close explicitly,
-and chain distributed calls through array dependencies in the same order on
-every PE. `has_side_effect=True` prevents elimination but does not order calls.
-The MoeEP JAX EP2 tests cover this lifecycle and saved-state reuse.
-For side-effecting FFI calls, verify reuse with `jax.jit(fn).lower(...).compile()`.
-`jax.no_tracing` on the Python JIT wrapper rejects its required slow dispatch
-before checking the compilation cache, even when no compilation is needed.
 
 ## Adding a new frontend-only API — required checklist
 

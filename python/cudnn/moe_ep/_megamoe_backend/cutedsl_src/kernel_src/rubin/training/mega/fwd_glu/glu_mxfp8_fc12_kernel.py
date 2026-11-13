@@ -122,7 +122,6 @@ class Sm107Mxfp8GluFc12Kernel:
         fc2_use_bulk: bool = False,
         fc2_tma_stages: Optional[int] = None,
         weight_storage_mode: WeightStorageMode = "contiguous",
-        target_arch: Optional[str] = None,
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -258,7 +257,7 @@ class Sm107Mxfp8GluFc12Kernel:
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(None if target_arch is None else target_arch.rstrip("af"))
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(
             self.arch
         )

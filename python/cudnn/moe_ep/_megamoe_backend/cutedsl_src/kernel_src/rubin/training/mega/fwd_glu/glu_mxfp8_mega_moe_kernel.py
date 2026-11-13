@@ -284,8 +284,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
         # leaves a fractional resident wave.
         col_quant_num_ctas: int = -1,
         weight_storage_mode: WeightStorageMode = "contiguous",
-        target_arch: Optional[str] = None,
-        sm_count: Optional[int] = None,
     ) -> "Sm107MegaMoEMxfp8GluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
         if static_expert_shape is None:
@@ -354,16 +352,9 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 ),
             }
         )
-        return cls(problem_desc, impl_desc, target_arch=target_arch, sm_count=sm_count)
+        return cls(problem_desc, impl_desc)
 
-    def __init__(
-        self,
-        problem_desc: ProblemDesc,
-        impl_desc: ImplDesc,
-        *,
-        target_arch: Optional[str] = None,
-        sm_count: Optional[int] = None,
-    ) -> None:
+    def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         self._validate_desc_inputs(problem_desc, impl_desc)
 
         # -- Extract descriptors into locals matching the legacy param names so the body below
@@ -459,7 +450,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
             fc2_use_bulk=fc2_use_bulk,
             fc2_tma_stages=fc2_tma_stages,
             weight_storage_mode=weight_storage_mode,
-            target_arch=target_arch,
         )
 
         # --- Warp topology: expand to 12 warps (or 16 for standalone token-back). ---
@@ -594,8 +584,6 @@ class Sm107MegaMoEMxfp8GluKernel(Sm107Mxfp8GluFc12Kernel, KernelClass):
                 sf_padding_block=self.sf_padding_block,
                 # Local integration ABI consumed by MoeEP WGrad operands.
                 dst_k_major=False,
-                target_arch=target_arch,
-                sm_count=sm_count,
             )
 
     def get_aux_output_shapes(self) -> dict:

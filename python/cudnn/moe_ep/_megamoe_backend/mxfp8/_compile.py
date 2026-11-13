@@ -138,9 +138,58 @@ def prepare_kernel(
 ) -> PreparedMxfp8Kernel:
     """Instantiate the kernel and derive exact allocation requirements."""
 
-    from ._native_kernel import make_forward_kernel
+    import cutlass
 
-    kernel = make_forward_kernel(config)
+    from ..cutedsl_src.kernel_src.rubin.training.mega.fwd_glu.glu_mxfp8_mega_moe_kernel import (
+        Sm107MegaMoEMxfp8GluKernel,
+    )
+    from ..cutedsl_src.quant_def import CombineFormat
+
+    kernel_kwargs = dict(
+        mma_tiler_mnk=config.mma_tiler_mnk,
+        cluster_shape_mnk=config.cluster_shape_mnk,
+        use_2cta_instrs=config.use_2cta_instrs,
+        group_hint=config.group_hint,
+        token_padding_block=config.token_padding_block,
+        sf_padding_block=config.sf_padding_block,
+        load_balance_mode=config.load_balance_mode,
+        static_expert_shape=(
+            config.num_experts,
+            config.fc1_out,
+            config.hidden,
+        ),
+        force_static_sched=config.force_static_sched,
+        clc_bundle_size=config.clc_bundle_size,
+        num_sched_stages=config.num_sched_stages,
+        ab_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=config.sf_vec_size,
+        world_size=config.world_size,
+        # Runtime rank is carried by SymmetricBufferHost. Keeping this
+        # descriptor rank-independent allows every EP rank to compile the
+        # same Rubin kernel.
+        local_rank=0,
+        num_topk=config.top_k,
+        max_tokens_per_rank=config.max_tokens_per_rank,
+        max_recv_size_per_rank=config.max_recv_size_per_rank,
+        data_token_capacity=config.physical_recv_pool_size,
+        hidden=config.hidden,
+        launch_cluster_count=config.launch_cluster_count,
+        drop_on_overflow=config.kernel_drop_on_overflow,
+        fc2_in_kernel_topk_reduce=config.fc2_in_kernel_topk_reduce,
+        token_back_mode=config.token_back_mode,
+        epi_flag_batch=config.epi_flag_batch,
+        flag_batch=config.flag_batch,
+        gate_up_clamp=config.gate_up_clamp,
+        generate_c=config.generate_c,
+        combine_format=CombineFormat.parse(config.combine_format),
+        act_func=config.act_func,
+        fc2_use_bulk=config.fc2_use_bulk,
+        fc2_tma_stages=config.fc2_tma_stages,
+        enable_col_quant=config.enable_col_quant,
+        col_quant_num_ctas=config.col_quant_num_ctas,
+        weight_storage_mode=config.weight_storage_mode,
+    )
+    kernel = Sm107MegaMoEMxfp8GluKernel.from_kwargs(**kernel_kwargs)
     local_bytes, shared_bytes = kernel.get_workspace_sizes()
     local_zero_bytes, shared_zero_bytes = kernel.require_zero_workspace_leading_bytes
     for name, zero_bytes, total_bytes in (

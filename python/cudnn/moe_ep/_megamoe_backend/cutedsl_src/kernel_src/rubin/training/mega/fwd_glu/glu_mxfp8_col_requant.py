@@ -41,10 +41,8 @@ def _lcm(a: int, b: int) -> int:
     return a * b // gcd(a, b)
 
 
-def _smem_capacity(target_arch: "str | None" = None) -> int:
+def _smem_capacity() -> int:
     """Max dynamic SMEM per CTA, from CUTLASS's per-arch table."""
-    if target_arch is not None:
-        return int(utils.get_smem_capacity_in_bytes(target_arch.rstrip("af")))
     try:
         from cutlass.utils import get_smem_capacity_in_bytes
 
@@ -58,18 +56,17 @@ def _smem_capacity(target_arch: "str | None" = None) -> int:
 _SCALED_CVT_ARCHS = frozenset({(10, 7)})
 
 
-def _target_arch_tuple(target_arch: "str | None" = None) -> "tuple[int, int, str]":
+def _target_arch_tuple() -> "tuple[int, int, str]":
     """``(major, minor, suffix)`` of the active cuTeDSL compilation target."""
     from cutlass.cutlass_dsl import CuTeDSL
-    from cutlass.base_dsl import Arch
 
-    arch = CuTeDSL._get_dsl().get_arch_enum() if target_arch is None else Arch.from_string(target_arch)
+    arch = CuTeDSL._get_dsl().get_arch_enum()
     return int(arch.major), int(arch.minor), (getattr(arch, "suffix", "") or "")
 
 
-def _scaled_cvt_available(target_arch: "str | None" = None) -> bool:
+def _scaled_cvt_available() -> bool:
     """Can this target assemble ``cvt...scaled::n1::ue8m0.e4m3x2.bf16x2``?"""
-    major, minor, suffix = _target_arch_tuple(target_arch)
+    major, minor, suffix = _target_arch_tuple()
     if (major, minor) not in _SCALED_CVT_ARCHS:
         return False
     if suffix != "a":
@@ -404,8 +401,6 @@ class Mxfp8ColRequant:
         *,
         scaled_cvt: "bool | None" = None,
         dst_k_major: bool = False,
-        target_arch: "str | None" = None,
-        sm_count: "int | None" = None,
     ) -> None:
         """``scaled_cvt`` selects the requant path: ``None`` asks the
         compilation target, ``True`` and ``False`` force the block-scaled and
@@ -427,10 +422,10 @@ class Mxfp8ColRequant:
             )
 
         if scaled_cvt is None:
-            self.scaled_cvt = _scaled_cvt_available(target_arch)
+            self.scaled_cvt = _scaled_cvt_available()
         elif scaled_cvt:
-            if not _scaled_cvt_available(target_arch):
-                _major, _minor, _suffix = _target_arch_tuple(target_arch)
+            if not _scaled_cvt_available():
+                _major, _minor, _suffix = _target_arch_tuple()
                 raise ValueError(
                     f"scaled_cvt=True forces the block-scaled cvt consumer, but "
                     f"the target is sm_{_major}{_minor}{_suffix} and "
@@ -499,7 +494,7 @@ class Mxfp8ColRequant:
 
         self.sf_in_pad = self.SfInPad
         self.sf_out_pad = self.SfOutPad
-        self.smem_capacity = _smem_capacity(target_arch)
+        self.smem_capacity = _smem_capacity()
         self.NumStages = self.KMajorStages if self.dst_k_major else self.NSTAGE
         while (
             self._smem_bytes_for(self.TILE_HID, self.NumStages) > self.smem_capacity
@@ -563,9 +558,7 @@ class Mxfp8ColRequant:
         # grid that is not a multiple of RES leaves a fractional resident wave,
         # which is a large loss.  Across multiples of RES the curve is broad and
         # flat, so one tuned wave count serves every production size.
-        if sm_count is not None and sm_count <= 0:
-            raise ValueError("sm_count must be positive")
-        self.SmCount = _resolve_sm_count(type(self).SmCount) if sm_count is None else int(sm_count)
+        self.SmCount = _resolve_sm_count(type(self).SmCount)
         # Both gates: SMEM, and the 8-warps-per-scheduler cap (warps go to the
         # 4 schedulers round robin, so one CTA occupies ceil(warps/4) slots).
         _warp_gate = 8 // -(-self.WarpsPerCta // 4)

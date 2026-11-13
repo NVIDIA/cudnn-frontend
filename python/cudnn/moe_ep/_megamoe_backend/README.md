@@ -12,14 +12,6 @@ The private backend provides Rubin SM107 MXFP8 execution for `cudnn.moe_ep`.
 - positive `max_tokens_per_rank`
 - `apply_topk_in_fc1=True`
 
-The JAX binding prepares kernels with explicit `target_arch="sm_107a"` and
-the selected GPU's SM count. The native host constructors accept these as
-optional, appended arguments and forward them to FC12 shared-memory sizing
-and column requantization. This avoids consulting CuTeDSL's cached default
-architecture or GPU 0 while describing a JAX plan on another device. Omitted
-arguments preserve the existing native preparation behavior; no device math
-or communication protocol changes.
-
 Inference accepts BF16/FP16/FP32 or MXFP8 operands. Training accepts
 BF16/FP32 or MXFP8 activation and grad-output, contiguous Int32 routing
 indices, contiguous FP32 routing weights, and independent native forward and

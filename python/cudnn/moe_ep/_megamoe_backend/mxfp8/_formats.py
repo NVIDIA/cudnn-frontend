@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from ..._metadata import MoeFormat, parse_format
+from ..._types import MoeFormat, parse_format
 
 _COMBINE_WIRE_FORMATS = {
     MoeFormat.BF16: "bf16",

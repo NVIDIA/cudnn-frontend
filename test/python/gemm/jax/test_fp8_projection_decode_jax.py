@@ -19,6 +19,11 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
 
 @pytest.fixture
 def device():
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    requirement = cutedsl_requirement_error("JAX FP8 projection decode tests", floor=(4, 9, 0))
+    if requirement:
+        pytest.skip(requirement)
     target = next((d for d in jax.local_devices() if d.platform == "gpu" and str(getattr(d, "compute_capability", "")).startswith("10.")), None)
     if target is None:
         pytest.skip("FP8 projection decode requires an SM10x GPU")

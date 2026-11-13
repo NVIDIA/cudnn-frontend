@@ -6,17 +6,10 @@
 from functools import lru_cache
 from numbers import Integral
 
-from cudnn.frost.buffers import cutedsl_requirement_error
-
-_requirement_error = cutedsl_requirement_error("JAX FP8 projection decode", floor=(4, 8, 0))
-if _requirement_error:
-    raise ImportError(_requirement_error)
-
 import jax
 import jax.numpy as jnp
 
-from cudnn._cake.jax import TensorRef, make_call
-from cudnn._device import ensure_current_context
+from cudnn.frost.buffers import cutedsl_requirement_error
 
 from .fp8_projection_decode import cc_supported, dsl_error
 from .kernel.fp8_projection_decode_config import Geometry, check_numerics, part_readings, pick, resolve_form, token_tile_for, validate_cfg
@@ -57,32 +50,29 @@ def _configuration(rows, numerics, device, capability):
 
 @lru_cache(maxsize=128)
 def _call(cfg, device, gpu_arch):
-    import cutlass
     import cutlass.cute as cute
+
+    from cudnn.jax import TensorSpec, call
 
     from .kernel.fp8_projection_decode_e4m3 import Fp8ProjectionDecodeKernel, launch as launch_projection
 
-    ensure_current_context(device=device)
-    fake = cute.runtime.make_fake_compact_tensor
-    compiled = cute.experimental.compile(
-        launch_projection,
-        Fp8ProjectionDecodeKernel(cfg),
-        fake(cutlass.Uint8, (cfg.N, cfg.K), stride_order=(1, 0), assumed_align=16),
-        # Preserve the one-row activation's rank in its TMA descriptor.
-        fake(cutlass.Uint8, (cute.sym_int32(), cfg.K), stride_order=(1, 0), assumed_align=16),
-        fake(cutlass.BFloat16, (cfg.ROWS, cfg.N), stride_order=(1, 0), assumed_align=16),
-        fake(cutlass.Float32, (1,), assumed_align=16),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options=f"--enable-tvm-ffi --gpu-arch={gpu_arch}",
+    kernel = Fp8ProjectionDecodeKernel(cfg)
+
+    @cute.experimental.jit
+    def launch(stream, weight, activation, alpha, out):
+        # A static singleton row folds the TMA descriptor to the wrong rank.
+        activation = cute.make_tensor(activation.iterator, cute.make_layout((activation.shape[0], cfg.K), stride=(cfg.K, 1)))
+        alpha = cute.make_tensor(alpha.iterator, cute.make_layout(1))
+        launch_projection(kernel, weight, activation, out, alpha, stream)
+
+    return call(
+        launch,
+        output_shape_dtype=(jax.ShapeDtypeStruct((cfg.ROWS, cfg.N), jnp.bfloat16),),
+        input_spec=(TensorSpec(static=True), TensorSpec(static=False), TensorSpec(static=True)),
+        output_spec=(TensorSpec(static=True),),
+        use_static_tensors=True,
+        compile_options=f"--gpu-arch={gpu_arch}",
     )
-    arguments = (
-        TensorRef(0, (cfg.N, cfg.K), "uint8"),
-        TensorRef(1, (cfg.ROWS, cfg.K), "uint8"),
-        TensorRef(3, (cfg.ROWS, cfg.N), "bfloat16"),
-        TensorRef(2, (1,), "float32"),
-    )
-    outputs = (jax.ShapeDtypeStruct((cfg.ROWS, cfg.N), jnp.bfloat16),)
-    return make_call(((compiled, arguments),), 3, outputs, device)
 
 
 def fp8_projection_decode_forward_jax(weight, activation, alpha, *, split_k=None):
@@ -91,8 +81,12 @@ def fp8_projection_decode_forward_jax(weight, activation, alpha, *, split_k=None
     Weight is ``[N,K]``, activation ``[T,K]``, and alpha scalar or ``[1]``.
     T is 1..32. Supported (N,K,split_k) are (4608,8192,4), (4608,8192,2),
     and (8192,2048,2). The default split depends only on geometry, never T.
+    Requires CuTeDSL >= 4.9.0 for experimental-launcher support in cutlass.jax.
     The function supports eager calls and JIT; differentiation is unsupported.
     """
+    requirement_error = cutedsl_requirement_error("JAX FP8 projection decode", floor=(4, 9, 0))
+    if requirement_error:
+        raise NotImplementedError(requirement_error)
     arrays = (weight, activation, alpha)
     for name, value in zip(("weight", "activation", "alpha"), arrays):
         if not isinstance(value, (jax.Array, jax.core.Tracer)):

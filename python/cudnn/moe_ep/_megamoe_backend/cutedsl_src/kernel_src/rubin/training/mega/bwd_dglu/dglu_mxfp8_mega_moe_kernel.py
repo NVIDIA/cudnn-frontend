@@ -457,8 +457,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         dfc1_m_group: int = _UNSPECIFIED,
         dgrad_schedule: Optional[str] = None,
         token_in_async_flags: bool = _UNSPECIFIED,
-        target_arch: Optional[str] = None,
-        sm_count: Optional[int] = None,
     ) -> "Sm107MegaMoEMxfp8DgluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
         if static_expert_shape is None:
@@ -539,16 +537,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 "dgrad_schedule": dgrad_schedule,
             }
         )
-        return cls(problem_desc, impl_desc, target_arch=target_arch, sm_count=sm_count)
+        return cls(problem_desc, impl_desc)
 
-    def __init__(
-        self,
-        problem_desc: ProblemDesc,
-        impl_desc: ImplDesc,
-        *,
-        target_arch: Optional[str] = None,
-        sm_count: Optional[int] = None,
-    ) -> None:
+    def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
         resolved = self._resolve_tuning(problem_desc, impl_desc)
         self.resolved_dgrad_config = MappingProxyType(resolved)
         self.enable_dgrad_optimizations = resolved["enable_dgrad_optimizations"]
@@ -665,7 +656,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             act_func=act_func,
             gate_up_clamp=gate_up_clamp,
             weight_storage_mode=weight_storage_mode,
-            target_arch=target_arch,
         )
 
         # --- Warp topology (realigned for next's TokenCommDeterministic). ---
@@ -887,8 +877,6 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
                 token_padding_block=self.token_padding_block,
                 sf_padding_block=self.sf_padding_block,
                 dst_k_major=True,
-                target_arch=target_arch,
-                sm_count=sm_count,
             )
 
     def _smem_misc_budget_bytes(self) -> int:
