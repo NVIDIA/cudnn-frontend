@@ -32,7 +32,7 @@ names the kernel is written on.  ``out`` / ``out_scale`` overlapping an input is
 Launch knob: ``pdl`` (default off) puts the programmatic-stream-serialization attribute on every launch.  AS A DEPENDENT the kernel
 then waits for its predecessor before it reads ``activation``, ``activation_scale``, ``alpha`` and ``out_global_scale``; with the
 config's two pre-wait stages the first weight tiles are read ahead of that wait.  CALLER OBLIGATION: no kernel that can still be
-running when the launch starts -- the immediate stream predecessor and every earlier launch of an unbroken chain of early releases --
+running when the launch starts -- the immediate stream predecessor and every earlier launch of an uninterrupted chain of early releases --
 writes ``weight`` or ``weight_scale``.  AS A PREDECESSOR a thread block signals its dependents when its loader warp has finished,
 BEFORE the block's last output tile is written: a kernel launched behind this entry with the attribute may start while ``out`` and
 ``out_scale`` are still being written and must issue its own wait before it reads them; a kernel launched without the attribute

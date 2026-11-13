@@ -130,7 +130,7 @@ wait for the predecessor at once; the loader warp waits after it has issued its 
 
 **As a dependent.** The kernel reads `activation`, `activation_scale`, `alpha` and `out_global_scale` below its wait, so
 they may be the predecessor's outputs. **Caller obligation:** no kernel that can still be running when the launch starts
--- the immediate stream predecessor and every earlier launch of an unbroken chain of early releases -- writes `weight` or
+-- the immediate stream predecessor and every earlier launch of an uninterrupted chain of early releases -- writes `weight` or
 `weight_scale` (static weights satisfy it). The tensor-memory allocation is below the wait: a waiting thread block holds
 shared memory and no tensor memory.
 
