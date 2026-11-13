@@ -3534,3 +3534,15 @@ class TestD64ThdPackedUnsplit:
     test_standalone = staticmethod(_checks.test_standalone)
     test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)
     test_warm_refill = staticmethod(_checks.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(not 100 <= _SM <= 106, reason="SM100-family entry; native SM107 entry owns Rubin")
+class TestSplitCombineZeroWeight:
+    """The fixed-order combine excludes zero-weight payloads before multiplication."""
+
+    import split_combine_zero_weight_checks as _checks
+
+    test_partial_and_chain = staticmethod(_checks.test_zero_weight_partial_and_chain_are_excluded)
+    test_replay_and_batch_invariance = staticmethod(_checks.test_zero_weight_replay_and_batch_invariance)
