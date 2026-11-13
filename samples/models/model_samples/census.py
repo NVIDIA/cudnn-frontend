@@ -42,6 +42,19 @@ that the launch is the entry's and has the shape the entry states.
 Where the profiler cannot run, or its records carry no launch arguments, nothing was observed: the check then says so and a
 sample reports ``RAN ... (kernels not observed: <reason>)`` instead of ``PASS``.  A form that does not hold fails either way.
 
+**A stack that declares a target kernel set** is also held against a recorded census of that set (:class:`Target`, read from
+the family's ``kernel_census.json``): per block call of a step the kernel the target launches there, its form and -- per GPU
+class, SM count and row count -- its recorded launch shape.  How a block call stands to the target is data of that file,
+never a property of an adapter: :meth:`Target.claim` gives every call of the plan an :class:`Identity` (``target``,
+``stand-in``, ``not yet (<fallback reason>)``, ``not the target``), counts them (always as three numbers: the target's own
+compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins) and lists every reason the class is
+not claimed.  The check then has a seventh item:
+
+7. Every launch of a block call whose identity is ``target`` has the launch shape the census recorded for it on this GPU
+   class, SM count and row count.
+
+and one more line: ``target census <configuration> / <class> (recorded <date>): EQUAL``, or ``NOT CLAIMED (<reasons>)``.
+
 This module imports nothing beyond the standard library.
 """
 
@@ -49,6 +62,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
 import statistics
 from collections import Counter
@@ -143,6 +157,7 @@ class Site:
 #: pattern in the same change: an unnamed kernel fails the kernel check by name.
 FAMILIES: Tuple[Tuple[str, "re.Pattern"], ...] = (
     ("gdn_decode_fused", re.compile(r"^cudnn_kernel_frost_gdn_decode_fused_")),
+    ("gate_quant", re.compile(r"^cudnn_kernel_frost_attention_gate_quant_")),
     ("cudnn_fe", re.compile(r"^cudnn_kernel_frost_")),  # a kernel of cuDNN Frontend that no entry above names: never a family member
     ("embedding_gather", re.compile(r"\bat::native::(?:\(anonymous namespace\)::)?indexSelect(?:Small|Large)Index<")),
     ("cublas", re.compile(r"cublas|^nvjet_|\bcutlass::Kernel2?<cutlass_|^(?:maxwell|volta|ampere)_\w*gem[mv]", re.IGNORECASE)),
@@ -374,10 +389,17 @@ def _span(counts: Sequence[int]) -> str:
     return "0" if not counts else (f"{min(counts):,}" if min(counts) == max(counts) else f"{min(counts):,} to {max(counts):,}")
 
 
-def compare(steps: Sequence[Sequence[Launch]], sites: Sequence[Site], call_log: Sequence[Sequence[Call]] = ()) -> Comparison:
-    """Items 1 to 6 of the kernel check: the launch records of every traced step (each list ends with the step's host read,
+def compare(
+    steps: Sequence[Sequence[Launch]],
+    sites: Sequence[Site],
+    call_log: Sequence[Sequence[Call]] = (),
+    recorded: Optional[Mapping[int, tuple]] = None,
+    census: str = "the target census",
+) -> Comparison:
+    """Items 1 to 7 of the kernel check: the launch records of every traced step (each list ends with the step's host read,
     as :func:`split_steps` cuts them) against the sites of one step in wiring order (:func:`expected`); and, where a call log
-    is given, the block calls each step made against the wiring."""
+    is given, the block calls each step made against the wiring.  ``recorded`` (item 7) maps the index of a site to the
+    launch shape a target census recorded for it (:attr:`Claim.recorded`); ``census`` names that census in a sentence."""
     anchors = [(index, kernel) for index, site in enumerate(sites) for kernel in site.kernels if kernel.relation == "exact" for _ in range(kernel.launches)]
     planned = [kernel.id for _, kernel in anchors]
     anchor_ids = set(planned)
@@ -455,6 +477,12 @@ def compare(steps: Sequence[Sequence[Launch]], sites: Sequence[Site], call_log: 
                 picks[name] = max(picks[name], count)
         for position, (site_index, kernel) in zip(at, anchors):
             record, site = body[position], sites[site_index]
+            target = None if recorded is None else recorded.get(site_index)
+            if target is not None:  # item 7: the launch shape the census recorded for the target's kernel at this place
+                if None in record.shape:
+                    result.unobserved = "the profiler's kernel records carry no launch arguments (grid, block, shared memory)"
+                elif record.shape != tuple(target):
+                    fail((index, f"{site.name} launched {kernel.id} with {shape_text(record.shape)}; {census} has {shape_text(target)}"))
             if kernel.shape != "entry" or site.facts is None:
                 continue
             if record.name not in site.facts.symbols:  # two symbols of one kernel differ late in their text: both are printed whole
@@ -499,6 +527,339 @@ def _sequence_sentences(planned, found, anchors, sites, records) -> List[str]:
     return sentences
 
 
+# ---------------------------------------------------------------------------------------------------------- the target
+SCHEMA = 2
+#: how a block call of a plan stands to the target kernel set
+TARGET, STAND_IN, NOT_YET, OTHER, HOST = "target", "stand-in", "not yet", "not the target", "host"
+#: the kinds of a target kernel, in the words a run counts them by (one, several)
+KINDS = {
+    "code": ("the target's own compiled kernel", "the target's own compiled kernels"),
+    "port": ("cuDNN Frontend entry with byte-equal results", "cuDNN Frontend entries with byte-equal results"),
+}
+
+
+def _counted(count: int, kind: str) -> str:
+    return f"{count} {KINDS[kind][count != 1]}"
+
+
+BASES = ("recorded", "planned")
+#: the parts of a step in a census section besides its layers: before them, after them, after the step
+PARTS = ("prologue", "epilogue", "after_step")
+#: the packages the providers of this area import, as a run names them: of the versions a census records, these are
+#: compared with what is installed.  A slice that brings a provider of another package adds the package here
+PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
+
+
+class Identity(NamedTuple):
+    """How one block call of a plan stands to the target kernel set: it launches the target's kernel in the target's form
+    (``target``, of kind ``code`` or ``port``), a declared stand-in for it, a fallback row (``not yet``), another kernel or
+    another form than the target's (``not the target``), or it is the sample's host path."""
+
+    relation: str  # TARGET | STAND_IN | NOT_YET | OTHER | HOST
+    kernel: str = ""  # the target's kernel at this place
+    kind: str = ""  # of that kernel: "code" | "port"; "" for a stand-in and for the host path
+    reason: str = ""  # of NOT_YET: the row's fallback reason; of OTHER: what differs
+    launch: Optional[tuple] = None  # the launch shape the census recorded for the target's kernel at this place
+
+    def text(self) -> str:
+        if self.relation in (NOT_YET, OTHER):
+            return f"{self.relation} ({self.reason})"
+        return "host path, not compared" if self.relation == HOST else self.relation
+
+
+def _class_text(key: str) -> str:
+    """``"cc10.0/sm148"`` as a run prints it: ``cc 10.0 / 148 SMs``."""
+    cc, sms = key.split("/")
+    return f"cc {cc[2:]} / {sms[2:]} SMs"
+
+
+def installed_versions(packages: Sequence[str]) -> Dict[str, Optional[str]]:
+    """The installed version of every package of ``packages`` (``None``: not installed), read from the distributions'
+    metadata: no package is imported for it."""
+    import importlib.metadata as metadata
+
+    found: Dict[str, Optional[str]] = {}
+    for package in packages:
+        try:
+            found[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            found[package] = None
+    return found
+
+
+@dataclass
+class Claim:
+    """What one run can say about the target kernel set: the identity of every block call of its plan, the three numbers,
+    and every reason its GPU class is not claimed."""
+
+    census: str  # the census file, by its own name
+    configuration: str
+    device: str  # "cc 10.0 / 148 SMs"
+    rows: int
+    recorded_on: str = ""  # the date of the section's record
+    basis: str = ""  # of the section: "recorded" | "planned"; "" where the census has no section for the device
+    claimed: bool = False  # what the section says
+    blocks: List[str] = field(default_factory=list)  # the block of every call of the wiring
+    identities: List[Identity] = field(default_factory=list)  # one per call; empty where no section holds this run's row count
+    absent: List[Tuple[str, str, str]] = field(default_factory=list)  # (block, kernel, kind) of the target that the plan has no block for
+    reasons: List[str] = field(default_factory=list)  # why the class is not claimed; empty: it is
+
+    @property
+    def known(self) -> bool:
+        """Whether the census holds this run (its device and its row count): only then is an identity stated."""
+        return bool(self.identities)
+
+    @property
+    def name(self) -> str:
+        if not self.basis:
+            return f"target census {self.configuration}"
+        how = f"recorded {self.recorded_on}" if self.basis == "recorded" else self.basis
+        return f"target census {self.configuration} / {self.device} ({how})"
+
+    @property
+    def recorded(self) -> Dict[int, tuple]:
+        """Index of a block call in the wiring -> the launch shape the census holds for it: the calls whose identity is
+        ``target`` or ``stand-in`` and whose launch the census records (item 7 of the kernel check)."""
+        return {index: identity.launch for index, identity in enumerate(self.identities) if identity.relation in (TARGET, STAND_IN) and identity.launch}
+
+    def of(self, block: str) -> str:
+        """The identity column of a block: the identity of its calls (one for every block of a family so far); ``--`` for the
+        host path."""
+        mine = [identity for name, identity in zip(self.blocks, self.identities) if name == block]
+        return "; ".join(dict.fromkeys("--" if identity.relation == HOST else identity.text() for identity in mine))
+
+    def numbers(self) -> dict:
+        """The three numbers of the target for this model, and of what the plan reaches of them."""
+        calls = [(block, identity.relation, identity.kind) for block, identity in zip(self.blocks, self.identities) if identity.relation != HOST]
+        calls += [(block, NOT_YET, kind) for block, _, kind in self.absent]
+        not_yet: Counter = Counter(block for block, relation, kind in calls if kind and relation == NOT_YET)
+        other: Counter = Counter(block for block, relation, kind in calls if kind and relation == OTHER)
+        return {
+            "launches": len(calls),
+            "code": sum(kind == "code" for _, _, kind in calls),
+            "port": sum(kind == "port" for _, _, kind in calls),
+            "stand_ins": sum(not kind for _, _, kind in calls),
+            "target_code": sum(relation == TARGET and kind == "code" for _, relation, kind in calls),
+            "target_port": sum(relation == TARGET and kind == "port" for _, relation, kind in calls),
+            "not_yet": dict(not_yet),
+            "not_the_target": dict(other),
+            "stand_ins_not_yet": list(dict.fromkeys(block for block, relation, kind in calls if not kind and relation != STAND_IN)),
+        }
+
+    def coverage(self) -> List[str]:
+        """The identity lines of the kernel table: what the target is for this model, always as three numbers, and how much of
+        it the plan launches."""
+        if not self.known:
+            why = next((reason for reason in self.reasons if reason.startswith("no recorded section")), "no recorded section")
+            return [f"kernel identity: not stated for this run ({why})"]
+        n = self.numbers()
+        stand = f"{n['stand_ins']} declared stand-in{'s' if n['stand_ins'] != 1 else ''}"
+        whole = f"{n['launches']} launches per step = {_counted(n['code'], 'code')} + {_counted(n['port'], 'port')} + {stand}"
+        reached = n["target_code"] + n["target_port"]
+        if reached == n["code"] + n["port"] and not n["stand_ins_not_yet"]:
+            return [f"kernel identity, as planned: {whole}"]
+        text = (
+            f"kernel identity, as planned: {reached} of {n['launches']} launches of a step are target kernels "
+            f"({_counted(n['target_code'], 'code')} + {_counted(n['target_port'], 'port')})"
+        )
+        for words, blocks in (("not yet", n["not_yet"]), ("not the target", n["not_the_target"])):
+            if blocks:
+                text += f"; {words}: " + ", ".join(f"{block} {count}" for block, count in blocks.items())
+        text += f"; {stand}" + (f" (not yet: {', '.join(n['stand_ins_not_yet'])})" if n["stand_ins_not_yet"] else "")
+        return [f"the target kernel set of a step of this model, when a stack reproduces all of it: {whole}", text]
+
+    def line(self, status: str = "") -> str:
+        """The census line of the kernel check, given the check's own verdict."""
+        compared = len(self.recorded)
+        if self.reasons:
+            text = f"{self.name}: NOT CLAIMED ({'; '.join(self.reasons)})"
+            if compared and status == PASS:
+                text += (
+                    f"; the {compared} target launch{'es' if compared != 1 else ''} of a step {'have' if compared != 1 else 'has'} the recorded launch shape"
+                )
+            elif compared and status == NOT_OBSERVED:
+                text += "; the launch shapes of its target launches were not observed"
+            return text
+        verdicts = {PASS: "EQUAL", FAIL: "NOT EQUAL (the kernel check did not hold)", NOT_OBSERVED: "NOT OBSERVED"}
+        return f"{self.name}: {verdicts.get(status, 'not compared')}"
+
+    def dump(self) -> dict:
+        n = self.numbers() if self.known else {}
+        return {
+            "census": self.census,
+            "configuration": self.configuration,
+            "device": self.device,
+            "rows": self.rows,
+            "basis": self.basis,
+            "recorded": self.recorded_on,
+            "claimed": self.claimed and not self.reasons,
+            "not_claimed": list(self.reasons),
+            "numbers": n,
+        }
+
+
+class Target:
+    """A census of a target kernel set, as a family checks it in (``kernel_census.json``): the kernels a decode step launches
+    when every block runs on that set.
+
+    * ``kernels``: per canonical kernel id its origin, its relation -- ``target`` of kind ``code`` (the target's own compiled
+      kernel: an entry, a library call or a framework operator the sample calls as the target does) or ``port`` (a cuDNN
+      Frontend entry with byte-equal results), or ``stand-in`` -- and, once a stack serves it, the entry and the form the
+      target calls it in;
+    * ``layers``: which entry list of a section a layer kind of the model reads;
+    * ``configurations``: per configuration and per ``ccMAJOR.MINOR/smCOUNT`` a section: ``claimed``, its ``basis``
+      (``recorded`` or ``planned``), what was recorded, and per row count the entries of a step as
+      ``[block, kernel id, {"launch": [grid, block, shared memory]}]`` -- before the layers, per layer kind, after the
+      layers, after the step.
+
+    ``ValueError`` for a file that is not such a census, and for a section that says ``claimed`` on a basis that is not
+    ``recorded``."""
+
+    def __init__(self, data: Mapping, name: str = "kernel_census.json"):
+        self.name = name
+        self.data = self._checked(data)
+
+    @classmethod
+    def load(cls, path: str) -> "Target":
+        name = os.path.basename(os.path.normpath(path))
+        try:
+            with open(path, encoding="utf-8") as census:
+                data = json.load(census)
+        except OSError as error:
+            raise ValueError(f"{name}: {error.strerror or type(error).__name__}") from None
+        except ValueError as error:
+            raise ValueError(f"{name}: not JSON ({error})") from None
+        return cls(data, name)
+
+    def _checked(self, data) -> Mapping:
+        def wrong(what: str):
+            raise ValueError(f"{self.name}: {what}")
+
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+            wrong(f"not a kernel census of schema {SCHEMA}")
+        kernels, layers, configurations = data.get("kernels"), data.get("layers"), data.get("configurations")
+        if not all(isinstance(part, dict) for part in (kernels, layers, configurations)):
+            wrong("a kernel census holds kernels, layers and configurations")
+        for kernel_id, meta in kernels.items():
+            relation = meta.get("relation") if isinstance(meta, dict) else None
+            if relation not in (TARGET, STAND_IN) or (relation == TARGET and meta.get("kind") not in KINDS) or not isinstance(meta.get("form", {}), dict):
+                wrong(f"kernel {kernel_id}: a kernel is a target of kind {' or '.join(KINDS)}, or a stand-in; its form is an object")
+        for configuration, sections in configurations.items():
+            for key, section in sections.items():
+                where = f"{configuration} / {key}"
+                if not re.fullmatch(r"cc\d+\.\d+/sm\d+", key):
+                    wrong(f"{where}: a section is keyed by ccMAJOR.MINOR/smCOUNT")
+                if not isinstance(section.get("claimed"), bool) or section.get("basis") not in BASES or not isinstance(section.get("rows"), dict):
+                    wrong(f"{where}: a section holds claimed (true or false), basis ({' or '.join(BASES)}) and rows")
+                if section["claimed"] and section["basis"] != "recorded":
+                    wrong(f"{where}: claimed on the basis {section['basis']}; only a recorded section can be claimed")
+                for rows, parts in section["rows"].items():
+                    for part in (*PARTS, *layers.values()):
+                        if not isinstance(parts.get(part), list):
+                            wrong(f"{where}, {rows} rows: no entry list {part}")
+                        for entry in parts[part]:
+                            if not isinstance(entry, list) or len(entry) != 3 or entry[1] not in kernels or not isinstance(entry[2], dict):
+                                wrong(f"{where}, {rows} rows, {part}: {entry!r} is not [block, kernel of the kernels table, facts]")
+        return data
+
+    def sequence(self, parts: Mapping, layer_kinds: Sequence[str]) -> List[Tuple[str, str, Mapping]]:
+        """The entries of one step of a model with these layer kinds, in step order: ``(block, kernel id, facts)``."""
+        try:
+            layers = [entry for kind in layer_kinds for entry in parts[self.data["layers"][kind]]]
+        except KeyError as error:
+            raise ValueError(f"{self.name}: the census has no entry list for the layer kind {error.args[0]!r}") from None
+        return [tuple(entry) for entry in (*parts["prologue"], *layers, *parts["epilogue"], *parts["after_step"])]
+
+    def kind(self, kernel_id: str) -> str:
+        """``code`` or ``port`` for a target kernel, ``""`` for a stand-in."""
+        return self.data["kernels"][kernel_id].get("kind", "") if self.data["kernels"][kernel_id]["relation"] == TARGET else ""
+
+    def numbers(self, parts: Mapping, layer_kinds: Sequence[str]) -> Tuple[int, int, int, int]:
+        """``(launches, the target's own compiled kernels, ports, stand-ins)`` of one step of a model with these layer kinds."""
+        kinds = [self.kind(kernel_id) for _, kernel_id, _ in self.sequence(parts, layer_kinds)]
+        return len(kinds), kinds.count("code"), kinds.count("port"), kinds.count("")
+
+    def claim(self, plan, model, configuration: str = "plain", rows: Optional[int] = None, installed: Optional[Mapping[str, Optional[str]]] = None) -> Claim:
+        """What a run of ``plan`` can say about this target: see :class:`Claim`.  ``installed`` replaces the installed versions
+        of the packages the census records (tests).  ``ValueError`` when the census does not follow the model's wiring."""
+        rows = plan.sequences * plan.tokens if rows is None else rows
+        wiring = list(model.wiring())
+        key = f"cc{plan.facts.cc[0]}.{plan.facts.cc[1]}/sm{plan.facts.sm_count}"
+        sections = self.data["configurations"].get(configuration, {})
+        section = sections.get(key)
+        claim = Claim(self.name, configuration, _class_text(key), rows, blocks=[block for block, _ in wiring])
+        reasons = [f"not the target set: {block} selected by --provider" for block in getattr(plan, "overridden", ())]
+        if any(plan.rows[block].fallback for block in dict.fromkeys(claim.blocks)):
+            reasons.append("fallback rows present")
+        if section is None:
+            have = ", ".join(_class_text(other) for other in sections) or "none"
+            reasons.append(f"no recorded section for {claim.device}: recorded is {have}")
+        else:
+            claim.recorded_on, claim.basis, claim.claimed = str(section.get("recorded", {}).get("date", "")), section["basis"], section["claimed"]
+            parts = section["rows"].get(str(rows))
+            if parts is None:
+                have = [f"{count} row{'s' if count != '1' else ''}" for count in section["rows"]]
+                reasons.append(f"no recorded section for {rows} row{'s' if rows != 1 else ''} on {claim.device}: recorded is {' and '.join(have) or 'none'}")
+            else:
+                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds))
+                for block, identity in dict(zip(claim.blocks, claim.identities)).items():
+                    if identity.relation == OTHER and block not in getattr(plan, "overridden", ()):
+                        reasons.append(f"not the target set: {block} ({identity.reason})")
+                reasons += [f"the plan has no block for {block}" for block in dict.fromkeys(block for block, _, _ in claim.absent)]
+                if not reasons and not section["claimed"]:
+                    reasons.append("the census does not claim this class yet")
+        recorded = {package: version for package, version in self.data.get("validated", {}).get("recorded", {}).items() if package in PACKAGES}
+        installed = installed_versions(tuple(recorded)) if installed is None else installed
+        other = [
+            f"{PACKAGES[package]} {installed[package].split('+')[0]} (recorded with {version})"
+            for package, version in recorded.items()
+            if installed.get(package) is not None and installed[package].split("+")[0] != version
+        ]
+        if other:
+            reasons.append("versions other than the recorded ones: " + ", ".join(other))
+        claim.reasons = reasons
+        return claim
+
+    def _identify(self, claim: Claim, plan, wiring, sequence) -> None:
+        """Walk the wiring beside the census's entries of a step and give every block call its identity.  A census entry whose
+        block the plan does not have is kept as absent; any other disagreement of the two orders is a ``ValueError``."""
+        position = 0
+        for index, (block, _) in enumerate(wiring):
+            declared = tuple(plan[block].kernels)
+            if declared and all(kernel.relation == "host" for kernel in declared):
+                claim.identities.append(Identity(HOST))
+                continue
+            while position < len(sequence) and sequence[position][0] not in plan:
+                claim.absent.append((sequence[position][0], sequence[position][1], self.kind(sequence[position][1])))
+                position += 1
+            if position >= len(sequence) or sequence[position][0] != block:
+                have = sequence[position][0] if position < len(sequence) else "nothing"
+                raise ValueError(
+                    f"{self.name}: the census does not follow this model's wiring: call {index + 1} of a step is {block}, the census has {have} there"
+                )
+            _, kernel_id, facts = sequence[position]
+            position += 1
+            claim.identities.append(self._identity(plan, block, kernel_id, facts))
+        for block, kernel_id, _ in sequence[position:]:
+            if block in plan:
+                raise ValueError(f"{self.name}: the census does not follow this model's wiring: it has {block} after the last call of a step")
+            claim.absent.append((block, kernel_id, self.kind(kernel_id)))
+
+    def _identity(self, plan, block: str, kernel_id: str, facts: Mapping) -> Identity:
+        meta, row, kind = self.data["kernels"][kernel_id], plan.rows[block], self.kind(kernel_id)
+        exact = [kernel for kernel in plan[block].kernels if kernel.relation == "exact"]
+        if not exact:
+            return Identity(NOT_YET, kernel_id, kind, row.fallback or "no kernel of its own")
+        if len(exact) != 1 or exact[0].id != kernel_id:
+            return Identity(OTHER, kernel_id, kind, f"the row launches {', '.join(kernel.id for kernel in exact)}, the target {kernel_id}")
+        want = tuple(meta.get("form", {}).items())
+        if dict(row.form) != dict(want):
+            return Identity(OTHER, kernel_id, kind, f"the row's form is{form_text(row.form) or ' []'}, the target's{form_text(want) or ' []'}")
+        launch = facts.get("launch")
+        shape = None if launch is None else (tuple(launch[0]), tuple(launch[1]), int(launch[2]))  # JSON lists: rebuilt before any comparison
+        return Identity(STAND_IN if meta["relation"] == STAND_IN else TARGET, kernel_id, kind, "", shape)
+
+
 # ---------------------------------------------------------------------------------------------------------- a traced pass
 @dataclass
 class Traced:
@@ -515,16 +876,17 @@ class Traced:
     unobserved: str = ""  # the reason of NOT OBSERVED
     differences: int = 0  # the lines judge() returned
     result: Optional[Comparison] = None
+    claim: Optional[Claim] = None  # of a stack that declares a target kernel set: what this run can say about it
 
     @classmethod
-    def of(cls, sites, call_log, records: Sequence[Launch], count: int, missing: str, rows: int) -> "Traced":
+    def of(cls, sites, call_log, records: Sequence[Launch], count: int, missing: str, rows: int, claim: Optional[Claim] = None) -> "Traced":
         """From the launch records of a pass of ``count`` steps (``records`` empty: ``missing`` says why)."""
         if not records:
-            return cls(sites, call_log, missing=missing or "the profiler recorded no kernel activity on this GPU", rows=rows)
+            return cls(sites, call_log, missing=missing or "the profiler recorded no kernel activity on this GPU", rows=rows, claim=claim)
         steps, _ = split_steps(records)
         if len(steps) != count:  # a block read the device inside a step: an undeclared copy, and no step can be told from the next
-            return cls(sites, call_log, undeclared=f"the records show {len(steps)} host reads for {count} traced steps", rows=rows)
-        return cls(sites, call_log, steps, rows=rows)
+            return cls(sites, call_log, undeclared=f"the records show {len(steps)} host reads for {count} traced steps", rows=rows, claim=claim)
+        return cls(sites, call_log, steps, rows=rows, claim=claim)
 
     def judge(self) -> Tuple[str, List[str]]:
         """Run the kernel check on this pass: ``(PASS | FAIL | NOT OBSERVED, the lines under the check's own line)``."""
@@ -533,7 +895,8 @@ class Traced:
         if self.undeclared:
             lines.append(f"copies: {self.undeclared}: a block reads the device inside a step, and only the one host read of a step is declared")
         if self.steps is not None:
-            self.result = compare(self.steps, self.sites, self.call_log)
+            recorded, name = (None, "") if self.claim is None else (self.claim.recorded, f"the {self.claim.name}")
+            self.result = compare(self.steps, self.sites, self.call_log, recorded, name)
             lines += self.result.sentences()
             self.unobserved = self.result.unobserved
         else:
@@ -586,6 +949,8 @@ class Traced:
                 chosen = ", ".join(f"{name if len(name) <= 72 else name[:69] + '...'} x {count}" for name, count in picks.most_common(6))
                 more = f", and {len(picks) - 6} more" if len(picks) > 6 else ""
                 lines.append(f"chosen by a library inside the fallback rows (printed, not gated): {family}: {chosen}{more}")
+        if self.claim is not None:  # a stack that declares a target: how much of it this run launched, and the census line
+            lines += [*self.claim.coverage(), self.claim.line(self.status)]
         return lines
 
     def dump(self) -> dict:
@@ -600,15 +965,18 @@ class Traced:
             )
         logged = {(call.block, call.layer): call for calls in self.call_log for call in calls}
         unlogged = Call("", -1, self.rows, "", ())  # of a pass that made no traced step
+        stated = self.claim is not None and self.claim.known
         return {
             "rows": self.rows,
             "check": self.status,
             "not_observed": self.unobserved,
+            "target": None if self.claim is None else self.claim.dump(),
             "sites": [
                 {
                     "block": site.block,
                     "layer": site.layer,
                     "entry": site.entry,
+                    "identity": self.claim.identities[index].text() if stated else "",
                     "instance": logged.get((site.block, site.layer), unlogged).instance,
                     "form": {name: value for name, value in site.form},
                     "served": {name: value for name, value in logged.get((site.block, site.layer), unlogged).form},
@@ -619,7 +987,7 @@ class Traced:
                         else {"symbols": list(site.facts.symbols), "launch": [list(part) if isinstance(part, tuple) else part for part in site.facts.shape]}
                     ),
                 }
-                for site in self.sites
+                for index, site in enumerate(self.sites)
             ],
             "names": list(names),
             "fields": ["name", "kernel", "kind", "grid", "block", "shared_memory", "registers", "graph_id", "graph_node_id", "bytes"],
@@ -632,10 +1000,13 @@ def _total(calls: str) -> int:
     return sum(int(part) for part in calls.split("/") if part.strip().isdigit())
 
 
-def table(plan) -> str:
+def table(plan, claim: Optional[Claim] = None) -> str:
     """The kernel table, first part: planned.  Per block the census entries of its row -- which kernels a call launches and
-    how the kernel check will judge them -- decided from the plan alone, before anything is loaded."""
-    head = ("block", "calls", "provider", "entry [form]", "kernel", "launches", "checked")
+    how the kernel check will judge them -- decided from the plan alone, before anything is loaded.  With the ``claim`` of a
+    stack that declares a target kernel set, a last column says how each block stands to the target, and the lines under the
+    table how much of the target the plan launches."""
+    stated = claim is not None and claim.known  # the identity column is printed where the census holds this run
+    head = ("block", "calls", "provider", "entry [form]", "kernel", "launches", "checked") + (("identity",) if stated else ())
     lines = [head]
     exact = rows = chains = 0
     for name, block in plan.items():
@@ -651,8 +1022,9 @@ def table(plan) -> str:
             checked = "host path, not compared"
         elif kernels:
             chains += _total(calls)
-            checked = "by family" + (f"; fallback: {row.fallback}" if row.fallback else "")
-        lines.append((name, calls, block.provider, block.entry + form_text(row.form), ", ".join(kernel.id for kernel in kernels) or "--", launches, checked))
+            checked = "by family" + (f"; fallback: {row.fallback}" if row.fallback and claim is None else "")
+        cells = (name, calls, block.provider, block.entry + form_text(row.form), ", ".join(kernel.id for kernel in kernels) or "--", launches, checked)
+        lines.append(cells + ((claim.of(name),) if stated else ()))
     widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
     sms = f", {plan.facts.sm_count} SMs" if plan.facts.sm_count else ""
     run = f"stack {plan.stack}, {plan.sequences} sequence{'s' if plan.sequences > 1 else ''}, {plan.facts.class_text}{sms}"
@@ -662,6 +1034,8 @@ def table(plan) -> str:
         f"  per step: {exact} launch{'es' if exact != 1 else ''} on {rows} exact row{'s' if rows != 1 else ''}, checked one by one in the wiring order; "
         f"the launches of {chains} fallback call{'s' if chains != 1 else ''} and of the host path are attributed by family"
     )
+    if claim is not None:
+        text += [f"  {line}" for line in claim.coverage()]
     return "\n".join(text)
 
 
