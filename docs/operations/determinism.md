@@ -81,7 +81,8 @@ arbitrary user callbacks.
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | FROST native D512 dense-Q split forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
-| FROST native D128/D256 dense-Q forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
+| FROST native D128/D256 dense-Q forward on the D512 body (64 x 64 tile; standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
+| FROST SM90 D128 template forward (exact dense D128, 128 x 128 tile; unpadded, unsplit, unpacked, no sink or window) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported | Unsupported |
 | FROST grid / lean-walk split-combine component (fixed reducer form and split count) | fprop combine only | FP32 partial O/LSE, FP16/BF16 O | Unverified | Supported (tested configurations) | Supported (tested configurations) |
 | FROST native D576/V512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
@@ -497,11 +498,24 @@ forward-only evidence; SM121 and other runtimes remain unverified.
 
 SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.
 
-SM90 native D128/D256 forward also preserves O/Stats bytes under those batch changes
-for FP16/BF16, with unsplit unpacked and split3 PackGQA plans. The tested declarations
-include padding, a bottom-right causal window and sinks. This is fixed-plan,
-fixed-runtime forward qualification; THD batch invariance and backward remain
-outside this addition.
+SM90 native D128/D256 forward on the D512 body (its head_tile 128/256 path at the
+64 x 64 tile) also preserves O/Stats bytes under those batch changes for FP16/BF16,
+with unsplit unpacked and split3 PackGQA plans. The tested declarations include
+padding, a bottom-right causal window and sinks. This is fixed-plan, fixed-runtime
+forward qualification; THD batch invariance and backward remain outside this
+addition. An exact dense (128, 128) declaration with no tile pinned runs the
+dedicated D128 template instead (next paragraph); these results describe the
+64 x 64 tile only.
+
+The dedicated SM90 D128 template (the SM90 row's 128 x 128 tile) has its own
+forward suite: replay with fresh storage under concurrent work; a sequence alone
+against first, reordered, duplicated and changed-neighbor batches whose plans run
+different records of the template (the persistent loop, the paired causal walk,
+the NATURAL stride and the claim counter); an FP64 reference; goldens; and warm
+stress on the K/V stages (the claim counter's ring has its own in the main suite). Its H100 run (2026-11-13) passed replay and batch invariance
+on every arrangement, so its status is supported for the tested configurations. It serves only uniform-length dense declarations
+(no THD, paged KV, split-KV, PackGQA, sinks, windows or per-batch lengths) and
+has no backward.
 
 
 

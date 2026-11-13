@@ -119,6 +119,54 @@ pytest core/test_determinism_utils.py
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 | `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
+| `sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` | the SM90 D128 template (`SdpaFwdDslSm90`, the 128 x 128 tile pinned) | O, Stats | none (forward-only template; no backward) |
+
+### SM90 D128 template forward (issue #378): validation, 2026-11-13 (UTC)
+
+`sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` adds nine L0 forward-only
+cases for the dedicated SM90 D128 template (`sm90/prefill_d128_f16.py`, the SM90
+row's 128 x 128 tile). Every case builds the direct adapter with the tile pinned,
+so a declaration the template does not serve fails instead of running the D512
+body, and checks the compiled template before it compares a byte.
+
+- Four replay and batch-invariance cells
+  (`test_d128_forward_replay_and_batch_invariance`): no mask, MHA, FP16, S 500
+  (partial Q and KV tiles); causal top-left, GQA 4, BF16, S_q 1280, S_kv 1500;
+  causal bottom-right, MHA, FP16, S_q 448, S_kv 1000; causal bottom-right, GQA 4,
+  BF16, S 256. Each plans the sequence alone and inside a batch of 40, 8, 16 or
+  256 whose plan is another record of the template on an H100 (the persistent
+  loop with several items per CTA, the paired causal walk, the NATURAL stride and
+  the claim counter). Fresh storage and a poisoned workspace on every replay,
+  under concurrent work; first, reordered, duplicated and changed-neighbor
+  arrangements; an FP64 O and Stats reference; input bytes unchanged. The record
+  each arrangement ran is recorded through `frost_routing.measured`, not asserted.
+- Four goldens (`test_d128_forward_golden`), one per cell on the sequence alone,
+  named `sdpa-sm90-dense-d128-t128-<mask>-<layout>-<dtype>` so they cannot
+  collide with the D512 body's d128 records.
+- One warm stress cell (`gpu_exclusive`): the K/V stages of the persistent loop
+  (16 KV tiles per item, items wrapping each CTA's ring), 1000 warm and 1000
+  poisoned launches. The claim counter's id ring has its warm stress in
+  `test_sdpa_fwd_d128_sm90.py` (`test_d128_claim_ring_warm_stress`).
+
+Results: NVIDIA H100 80GB HBM3 (132 SMs), CUDA driver API 13.0, CUDA 13.0, Torch
+2.14.0+cu130, cuDNN 9.27.0, CuTe DSL 4.8.0; goldens recorded under runtime key
+`d704b9829f609ace` (4 files). Strict run: 9 passed, 0 skipped,
+0 failed. The record each arrangement ran was not captured by this run. Warm stress: the K/V stages passed; the claim counter's ring (test_sdpa_fwd_d128_sm90.py) passed.
+
+```bash
+cd test/python
+CUDNN_DETERMINISM_RECORD=/tmp/d128 python -m pytest -m L0 -q -rs sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py -k golden
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -m L0 -q -rs sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py
+```
+
+The branch also edits code the D512 body shares (`sm90/_common_hopper.py`,
+`frost/tile_dsl/wgmma.py`, `config_sm90.py`). The D512 body's SM90 golden suites were recorded at develop into a new directory (127 tests) and
+checked strictly against this branch: 127 passed, 0 failed, bytes identical.
+
+Forward only: the template has no backward. THD, paged KV, split-KV, PackGQA,
+sinks, windows, per-batch lengths and `s_q == 1` are declined by the template and
+not covered here.
 
 ### Grid/walk split-combine zero weights — 2026-11-13
 
