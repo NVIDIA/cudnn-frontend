@@ -112,6 +112,16 @@ block-scaled O, and THD split/PackGQA remain governed by their existing gates.
 `test_sdpa_fwd_paged_thd_fp8.py` covers independent origins, pool layouts,
 rebinding, retained capture, changed scales/tables/lengths and empty work.
 
+SM100/SM103 exact half D64 THD supports **unsplit whole-group PackGQA**
+at CGA1/2 and N128 with dense or paged K/V. The shared physical-width64
+prefill body writes final O/Stats directly, without partial buffers or combine.
+Standalone compact prefixes and graph physical Q/K/V/O/Stats offsets share
+sequence-local maps; paging keeps independent K/V tables and pool strides.
+The N64 small-tile factory remains dense-only on this architecture, so both
+capability and standalone checks decline N64 for D64 THD before compilation.
+`TestD64ThdPackedUnsplit` covers direct stores, origins, replay, batch changes,
+FP16/BF16 and refill stress. Existing split and proper-divisor domains remain.
+
 SM100/SM103 half D256 paged THD also supports **combined PackGQA and split-KV**
 at CGA2, including partial head groups. The setup retains physical Q origins,
 while partial O/Stats use compact FP32 scratch and the final combine applies

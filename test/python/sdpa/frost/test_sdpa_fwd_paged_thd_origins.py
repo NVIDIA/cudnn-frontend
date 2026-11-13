@@ -79,7 +79,7 @@ def test_paged_thd_origins_rebind_and_capture(
     if rubin and not ((native_rubin_shape and splits == 1) or native_rubin_split):
         pytest.skip("native SM107 paged origins: D64/D128 CGA1/2 or D192/V128 CGA2 unsplit, or D64 CGA1 split")
     engine = "sdpa_fwd_prefill_sm107" if rubin else "sdpa_fwd_prefill_sm100"
-    if cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
+    if dim != 64 and cga == 1 and splits == 1 and torch.cuda.get_device_capability() not in ((10, 0), (10, 7)):
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
@@ -257,7 +257,7 @@ def test_paged_thd_origins_rebind_and_capture(
     assert graph.get_plan_name_at_index(graph._plan_index).startswith(engine)
     if not rubin and (d_qk == 64 or (d_qk == 256 and splits > 1)):
         plan = graph._compiled_plans[graph._plan_index]
-        decode_tile = splits > 1 or (cga != 2 and maximum * (heads // kv_heads if pack_gqa else 1) <= 128)
+        decode_tile = splits > 1 or (cga != 2 and not pack_gqa and maximum <= 128)
         expected_template = ("decode_d128_f16" if decode_tile else "prefill_d128_f16") if d_qk == 64 else "prefill_d256_f16"
         assert plan._compiled.kernel_template == expected_template
         assert plan._prepared.spec.native is not None

@@ -4719,3 +4719,75 @@ common-release fix and are refreshed; the three SM107 score-off records stay
 byte-identical. PTX and SASS are retained for attribution, and the existing
 spill and score-store detectors remain active. CUDA 13.5 disassembles the
 SM107 cubins. Native SM103 execution is unverified by this follow-up.
+
+## SM100/SM103 D64 packed THD prefill (2026-11-13)
+
+The new L0 `TestD64ThdPackedUnsplit` entry checks exact D64 with whole-group
+PackGQA, N128, CGA1/2 and SPLIT_KV=1. Both graph and standalone calls assert
+the direct native prefill body, native binding, independent origin metadata
+and absent split workspace. Coverage includes FP16/BF16, HND/NHD/mixed pools,
+GQA2/4/8/16, pages8/16/64/256, short-query routing, window/sink/Stats handling,
+fresh strides, changed device lengths/tables, empty replay and tail canaries.
+The graph batch tests hold sequence payloads fixed across reorder, duplication,
+changed neighbors and B1/B3/B5/B129 under one capacity4096 plan. The refill
+checks validate both cold O/Stats baselines with CPU FP64 before stressing
+the four-stage KV ring with exact byte comparisons.
+No backward kernel is changed or qualified by these tests.
+
+```bash
+cd test/python
+python -m pytest sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestD64ThdPackedUnsplit \
+  -o addopts= -m L0 -q -rs
+```
+
+B200 (148 SMs) and B300 (148 SMs), with CuTeDSL4.8.0, compiler/NVRTC13.4,
+FE backend9.30.0 and Torch2.14.1+cu130, each pass all **22 unique cases**:
+16 contract/functional cases, four bytewise batch/golden cases and two warm
+refill cases. Each run additionally passes four strict golden rechecks and
+two cases under each of memcheck, synccheck and racecheck: **32 successful
+test executions per GPU**, no failures or skips. Sanitizers report zero
+errors/hazards. Complete allocations took 2m52s and 2m53s respectively.
+Four new golden records per GPU are committed; existing records are unchanged.
+Both precisions pass256 warm and256 poisoned launches; the unsafe ring
+control fails200/200. The actual persistent grid has one CTA per SM, below
+the control's three-CTA geometry, so the rate bound is specific to that grid.
+Forty-two existing host config/capability regressions and eight new contract
+checks also pass locally. Changed-file pre-commit and fern check pass.
+
+The original qualification snapshot's production and test bytes match
+`e4e1e46c53567673b1c728e388e890f6f0e04083`, based on
+`fed09b0fa691273435e993676f4bfb28c28a0461`. The review follow-up adds the FP64
+checks to the two actual cold launches; it changes no production code or
+golden bytes. Its two updated stress cases pass on each B200 and B300, with
+no skips, using the same runtime and unchanged 256 warm/256 poisoned counts.
+The qualified helper SHA256 is `ceef49f454fc3ff386680d00eb728b78a862e7b3b0320ab149c688ea9713847f`.
+The phase commands are below (from `test/python`, using the runtime above). The recording test writes only after its numerical and
+bytewise batch checks pass. Strict rechecks always disable recording.
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export CUDNN_TEST_NO_ISOLATION=1
+entry=sdpa/frost/test_sdpa_fwd_dsl_sm100.py::TestD64ThdPackedUnsplit
+golden_dir=$(mktemp -d)
+env -u CUDNN_DETERMINISM_RECORD -u CUDNN_DETERMINISM_GOLDENS \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short \
+  -k 'not batch_and_golden and not warm_refill'
+env -u CUDNN_DETERMINISM_GOLDENS CUDNN_DETERMINISM_RECORD="$golden_dir" \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short -k batch_and_golden
+env -u CUDNN_DETERMINISM_RECORD CUDNN_DETERMINISM_GOLDENS="$golden_dir" \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short -k batch_and_golden
+env -u CUDNN_DETERMINISM_RECORD -u CUDNN_DETERMINISM_GOLDENS \
+  python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short -k warm_refill
+for sanitizer in memcheck synccheck racecheck; do
+  env -u CUDNN_DETERMINISM_RECORD -u CUDNN_DETERMINISM_GOLDENS \
+    compute-sanitizer --tool "$sanitizer" --error-exitcode 91 --report-api-errors no \
+    python -m pytest "$entry" -o addopts= -m L0 -q -rs -x --tb=short \
+    -k 'test_paged_origins and (g2 or g4)'
+done
+```
+
+The retained development smoke passed two N128 paged origin/replay cases;
+it also exposed the existing N64 dense-only factory boundary, which is now
+rejected by capability and standalone checks before compilation. An earlier
+config admission failure and a synthetic fixture missing its padding flag
+are retained as development failures; neither is a successful GPU test.

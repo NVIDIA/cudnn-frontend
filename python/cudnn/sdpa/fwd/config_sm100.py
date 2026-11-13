@@ -91,7 +91,7 @@ from cudnn.sdpa.fwd.config_d128_family import (
 )
 
 # Native half THD flavors whose worklist and Stats stores use packed heads.
-SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128), (576, 512)})
+SM100_THD_PACK_GQA_SHAPES = frozenset({(64, 64), (128, 128), (576, 512)})
 
 # Native per-tensor FP8 bodies that compose page pools with THD Q/O maps.
 SM100_PAGED_FP8_THD_SHAPES = frozenset({(128, 128), (256, 256)})
@@ -740,7 +740,7 @@ def _validate_params(
         if k.thd_varlen and not (
             not fp8
             and (
-                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.split_kv > 1)
+                (flavor == "d64" and ((not k.decode_tile and k.cta_mma in (1, 2) and k.split_kv == 1) or (k.decode_tile and k.cta_mma == 1 and k.split_kv > 1)))
                 or (
                     flavor == "d128"
                     and (
@@ -753,7 +753,8 @@ def _validate_params(
             )
         ):
             raise ValueError(
-                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1 split, " "paged half d256 cga2, or native half d576 cga2"
+                f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, half d64 cga1/2 unsplit or cga1 split, "
+                "paged half d256 cga2, or native half d576 cga2"
             )
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid

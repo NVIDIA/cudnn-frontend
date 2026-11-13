@@ -1157,8 +1157,15 @@ def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     if sm80_domains is not None:
         return sm80_domains[1]
     selected = _selected_d_shape(capabilities, facts, knobs)
-    if selected == (64, 64) and facts.thd and knobs is not None and (knobs.split_kv or 1) > 1 and not (facts.is_fp8 or facts.is_mxfp8):
-        return frozenset({128})  # the packed split host selects the single-Q body
+    if (
+        selected == (64, 64)
+        and facts.thd
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and (capabilities.sm_lo == 100 or (knobs is not None and (knobs.split_kv or 1) > 1))
+    ):
+        # Native SM100 D64 THD and the shared split body use N128. The N64
+        # small-tile factory serves dense, unpacked inputs on SM100 only.
+        return frozenset({128})
     if capabilities.sm_lo == 107 and facts.is_fp8 and not facts.is_mxfp8:
         # Explicit per-tensor widths do not inherit the half-precision resident-arm
         # default picker. Keep the row's default128 while admitting the D64 option.
@@ -3905,7 +3912,7 @@ def lower_dsl_prefill(
             )
         )
         or (
-            # Paged D64 shares the origin-aware single-CTA body with D128.
+            # D64 paging and packed prefill share D128's origin-aware body.
             # Explicit live lengths must not replace the graph's Q/O/Stats
             # addresses, including when the split scratch is compact.
             facts.thd
@@ -3915,7 +3922,7 @@ def lower_dsl_prefill(
             and facts.device_cc in ((10, 0), (10, 3))
             and (facts.d_qk, facts.d_v) == (64, 64)
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
-            and facts.has_paged_kv
+            and (facts.has_paged_kv or api.pack_gqa)
         )
         or (
             # Native D64 and paged D192 use the same per-port origins as native D128.
