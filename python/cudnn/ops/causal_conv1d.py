@@ -9,6 +9,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from cudnn._device import ensure_current_context
+from cudnn._torch_stream import device_context
+
 _TORCH_DTYPE_TO_CUDNN = {
     torch.float32: 0,  # CUDNN_DATA_FLOAT
     torch.float64: 1,  # CUDNN_DATA_DOUBLE
@@ -95,19 +98,22 @@ def _fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str) -> 
 
     import cudnn
 
-    cudnn.causal_conv1d_forward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        y_contiguous.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_forward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            y_contiguous.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _activation_to_int(activation),
+        )
     return _match_causal_conv1d_output_layout(y_contiguous, public_x)
 
 
@@ -168,23 +174,26 @@ def _bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor, ac
 
     import cudnn
 
-    cudnn.causal_conv1d_backward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        grad_out.data_ptr(),
-        dx.data_ptr(),
-        dweight.data_ptr(),
-        dbias.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _dtype_to_int(grad_dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_backward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            grad_out.data_ptr(),
+            dx.data_ptr(),
+            dweight.data_ptr(),
+            dbias.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _dtype_to_int(grad_dtype),
+            _activation_to_int(activation),
+        )
     return [dx, dweight.to(x.dtype), dbias.to(x.dtype)]
 
 
@@ -690,6 +699,7 @@ def causal_conv1d(
     initial_states: Optional[Tensor] = None,
     return_final_states: bool = False,
     final_states_out: Optional[Tensor] = None,
+    backend: str = "auto",
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     r"""Apply depthwise causal convolution to ``x[B, D, T]``.
 
@@ -710,16 +720,33 @@ def causal_conv1d(
     modes fail explicitly without changing the public state shape to match a
     backend cache convention.
 
-    ``final_states_out`` must not share memory with any input. The backward
+    ``backend="cake"`` opts into deterministic Cake training kernels on
+    SM100a/SM103a/SM107a with CUDA 13.4+. This route requires native channel-last
+    BF16 storage, width four, SiLU, channels divisible by eight, FP32 or BF16
+    parameters, and no initial/final states. Backward requires a native
+    channel-last gradient. See the causal-convolution API guide for details.
+
+    ``final_states_out`` must not share memory with any input. The default backend backward
     honors ``torch.use_deterministic_algorithms``: bias-free calls switch to a
     deterministic dweight schedule, while calls with ``bias`` raise (or warn
     under ``warn_only=True``) because dbias accumulates with FP32 atomics.
     """
 
+    if backend not in ("auto", "cake"):
+        raise ValueError("backend must be 'auto' or 'cake'")
     _reset_causal_conv1d_last_route()
     normalized_activation = _normalize_causal_conv1d_activation(activation)
     if seq_idx is not None and cu_seqlens is not None:
         raise ValueError("seq_idx and cu_seqlens are mutually exclusive")
+    if backend == "cake":
+        _validate_causal_conv1d_sequence_contract(x, weight, bias, seq_idx, cu_seqlens, initial_states, return_final_states, final_states_out)
+        if normalized_activation != "silu" or seq_idx is not None or initial_states is not None or return_final_states or final_states_out is not None:
+            raise NotImplementedError("Cake causal_conv1d supports SiLU with zero initial history and no returned state")
+        from cudnn.causal_conv1d_cake.autograd import causal_conv1d as cake_causal_conv1d
+
+        output = cake_causal_conv1d(x, weight, bias, cu_seqlens)
+        _record_causal_conv1d_route("cake")
+        return output
     state_or_seq_idx_call = seq_idx is not None or initial_states is not None or return_final_states or final_states_out is not None
     if state_or_seq_idx_call:
         _validate_causal_conv1d_sequence_contract(
@@ -827,19 +854,22 @@ def _nwh_fwd_primitive(x: Tensor, weight: Tensor, bias: Tensor, activation: str)
 
     import cudnn
 
-    cudnn.causal_conv1d_nwh_forward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        y.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_nwh_forward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            y.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _activation_to_int(activation),
+        )
     return y
 
 
@@ -900,23 +930,26 @@ def _nwh_bwd_primitive(grad_out: Tensor, x: Tensor, weight: Tensor, bias: Tensor
 
     import cudnn
 
-    cudnn.causal_conv1d_nwh_backward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weight.data_ptr(),
-        bias.data_ptr(),
-        grad_out.data_ptr(),
-        dx.data_ptr(),
-        dweight.data_ptr(),
-        dbias.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size,
-        _dtype_to_int(x.dtype),
-        _dtype_to_int(grad_dtype),
-        _activation_to_int(activation),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.causal_conv1d_nwh_backward(
+            stream,
+            x.data_ptr(),
+            weight.data_ptr(),
+            bias.data_ptr(),
+            grad_out.data_ptr(),
+            dx.data_ptr(),
+            dweight.data_ptr(),
+            dbias.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size,
+            _dtype_to_int(x.dtype),
+            _dtype_to_int(grad_dtype),
+            _activation_to_int(activation),
+        )
     return [dx, dweight.to(x.dtype), dbias.to(x.dtype)]
 
 
@@ -1049,21 +1082,24 @@ def _b2b_fwd_primitive(x: Tensor, weights_proj: Tensor, weights_mixer: Tensor, s
 
     import cudnn
 
-    cudnn.b2b_causal_conv1d_forward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weights_proj.data_ptr(),
-        weights_mixer.data_ptr(),
-        skip_bias.data_ptr(),
-        y.data_ptr(),
-        y_gated.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size_proj,
-        kernel_size_mixer,
-        _dtype_to_int(x.dtype),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.b2b_causal_conv1d_forward(
+            stream,
+            x.data_ptr(),
+            weights_proj.data_ptr(),
+            weights_mixer.data_ptr(),
+            skip_bias.data_ptr(),
+            y.data_ptr(),
+            y_gated.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size_proj,
+            kernel_size_mixer,
+            _dtype_to_int(x.dtype),
+        )
     return y, y_gated
 
 
@@ -1149,26 +1185,29 @@ def _b2b_bwd_primitive(
 
     import cudnn
 
-    cudnn.b2b_causal_conv1d_backward(
-        torch.cuda.current_stream().cuda_stream,
-        x.data_ptr(),
-        weights_proj.data_ptr(),
-        weights_mixer.data_ptr(),
-        skip_bias.data_ptr(),
-        y.data_ptr(),
-        grad_y.data_ptr(),
-        dx.data_ptr(),
-        dweights_proj.data_ptr(),
-        dweights_mixer.data_ptr(),
-        dskip_bias.data_ptr(),
-        batch,
-        dim,
-        seq_len,
-        kernel_size_proj,
-        kernel_size_mixer,
-        _dtype_to_int(x.dtype),
-        _dtype_to_int(grad_dtype),
-    )
+    with device_context(x.device):
+        stream = torch.cuda.current_stream(x.device).cuda_stream
+        ensure_current_context(stream, x.device.index)
+        cudnn.b2b_causal_conv1d_backward(
+            stream,
+            x.data_ptr(),
+            weights_proj.data_ptr(),
+            weights_mixer.data_ptr(),
+            skip_bias.data_ptr(),
+            y.data_ptr(),
+            grad_y.data_ptr(),
+            dx.data_ptr(),
+            dweights_proj.data_ptr(),
+            dweights_mixer.data_ptr(),
+            dskip_bias.data_ptr(),
+            batch,
+            dim,
+            seq_len,
+            kernel_size_proj,
+            kernel_size_mixer,
+            _dtype_to_int(x.dtype),
+            _dtype_to_int(grad_dtype),
+        )
     return [
         dx,
         dweights_proj.to(x.dtype),

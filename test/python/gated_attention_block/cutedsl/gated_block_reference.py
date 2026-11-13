@@ -97,9 +97,6 @@ class RefGeometry:
 # over 2 KV heads (GQA 16x), head dim 256 of which the leading 64 rotate.
 GEOMETRY_D4096_H32_KV2_D256 = RefGeometry(d_model=4096, h_q=32, h_kv=2, d_head=256, rope_dim=64)
 
-# A shrunk shape with the same structure, for oracle-speed correctness runs.
-GEOMETRY_SMALL = RefGeometry(d_model=256, h_q=4, h_kv=2, d_head=64, rope_dim=16)
-
 
 def build_rope_tables(
     seq_len: int,
@@ -1041,11 +1038,6 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False
     mx["w_o"] = packed.view(torch.float4_e2m1fn_x2)
     mx["w_o_sf"] = mx_swizzle_sf_rowwise_padded(e, block)
     return mx, dict(descale_w_o=1.0)
-
-
-def make_mxfp8_inputs(geom: RefGeometry, batch: int, seq_len: int, *, device: torch.device | str = "cuda", seed: int = 0) -> Tuple[dict, dict]:
-    """bf16 inputs from :func:`make_inputs`, then :func:`quantize_block_inputs_mxfp8`."""
-    return quantize_block_inputs_mxfp8(make_inputs(geom, batch=batch, seq_len=seq_len, device=device, dtype=torch.bfloat16, seed=seed))
 
 
 def mx_fake_quant_rowwise(x: torch.Tensor) -> torch.Tensor:

@@ -17,7 +17,7 @@ import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
 from cudnn._cutlass_compat import Arch
@@ -352,6 +352,68 @@ def cpasync_reduce_bulk_add_f32(
         [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
         "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
         "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def cpasync_bulk_store_s2g(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: int | Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Plain shared::cta -> global bulk copy (bulk_group completion): the non-reducing twin of the add above."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def ld_acquire_gpu_s32(gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """ld.acquire.gpu of one int32 flag; the asm has side effects so a polling loop re-issues it every iteration."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [gmem_ptr.llvm_ptr],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def st_release_gpu_s32(gmem_ptr: cute.Pointer, value: int | Int32, *, loc=None, ip=None):
+    """st.release.gpu of one int32 flag: publishes this thread's prior (generic-proxy-ordered) writes at GPU scope."""
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, Int32(value).ir_value()],
+        "st.release.gpu.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def fence_proxy_async_global(*, loc=None, ip=None):
+    """fence.proxy.async.global: orders this thread's async-proxy (bulk copy) and generic-proxy global accesses."""
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async.global;",
+        "",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

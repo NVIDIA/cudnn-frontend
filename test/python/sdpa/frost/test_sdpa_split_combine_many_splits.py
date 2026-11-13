@@ -19,9 +19,12 @@ from frost_test_utils import requires_blackwell, requires_dsl
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell]
 
 
-@pytest.mark.parametrize("group", [2, 4, 8])
+@pytest.mark.parametrize(
+    "group,splits,d",
+    [(2, 2, 128), (4, 3, 128), (8, 7, 128), (16, 9, 64), (16, 15, 128), (16, 16, 256), (16, 17, 64)],
+)
 @pytest.mark.parametrize("sink", [False, True])
-def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, sink):
+def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, splits, d, sink):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     # Select an explicit reducer specialization, independently of placement.
@@ -33,7 +36,7 @@ def test_packed_prefetch_excludes_zero_weight_partials(monkeypatch, group, sink)
 
     monkeypatch.setattr(comb, "_compile_cached", specialized)
     comb.compile_ptr.cache_clear()
-    splits, h, rows, d = max(2, group - 1), 2, 3, 128
+    h, rows = 2, 3
     op = torch.arange(splits * rows * h * d, device="cuda", dtype=torch.float32).reshape(splits, rows, h, d) / 1024
     lp = torch.zeros(splits, h, rows, device="cuda")
     lp[:, :, 0] = -torch.inf

@@ -786,6 +786,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _native_half_d192(self) -> bool:
         return self._FAMILY == _cfg.FAMILY_F16 and (self.head_dim_qk, self.head_dim_v) == (192, 128)
 
+    def _native_fp8_d192(self) -> bool:
+        return self._FAMILY == _cfg.FAMILY_FP8 and (self.head_dim_qk, self.head_dim_v) == (192, 128)
+
     def _check_head_dims(self) -> None:
         if self._native_half_d192():
             return
@@ -1101,6 +1104,8 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """The stage-3 cluster tile: ``_stage3_cgrp_tile_mn`` (the Rubin-line rule; the SM100 d256 row passes its tile explicitly)."""
         if self._native_half_d192():
             return (128, 192)
+        if self._native_fp8_d192():
+            return (256, 192)
         return _stage3_cgrp_tile_mn(sm, _SM107_D)
 
     @staticmethod

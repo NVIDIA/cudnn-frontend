@@ -647,10 +647,13 @@ class SM120DecodeForward:
         warp = cute.arch.warp_idx()
 
         ring = cutlass.Array(self.in_dtype, self.ring_elems, space=cutlass.AddressSpace.smem, alignment=DECODE_REGION_ALIGN)
-        full_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
+        if cutlass.const_expr(self.page_size > 0 and k.dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+            full_ptr = cute.arch.alloc_smem(cutlass.Int64, self.num_stages, alignment=8)
+        else:
+            full_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
+            full_ptr = full_bar.data_ptr()
         empty_bar = cutlass.Array(cutlass.Int64, self.num_stages, space=cutlass.AddressSpace.smem, alignment=8)
         ring_ptr = ring.data_ptr()
-        full_ptr = full_bar.data_ptr()
         empty_ptr = empty_bar.data_ptr()
 
         if warp == self.load_warp_id:
@@ -751,7 +754,8 @@ class SM120DecodeForward:
                         prims.mbarrier_arrive(full_ptr + slot)
                     else:
                         prims.cp_async_commit_group()
-                        prims.cp_async_wait_group(0)
+                        # The full barrier tracks copy completion; the empty
+                        # barrier still gates reuse of each ring region.
                         # Async arrivals publish the half cp.async copies.
                         prims.cp_async_mbarrier_arrive(full_ptr + slot, noinc=True)
                 else:

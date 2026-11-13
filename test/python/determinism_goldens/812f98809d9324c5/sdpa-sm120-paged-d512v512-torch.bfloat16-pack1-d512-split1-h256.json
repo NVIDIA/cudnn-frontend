@@ -1,0 +1,107 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "0a5b1ca452c6bda7d54f6fbf5b8f697dde5809fa38732d2ec5b796b3a8ca0a95",
+      "shape": [
+        37,
+        2,
+        16,
+        512
+      ]
+    },
+    "kl": {
+      "dtype": "torch.int32",
+      "sha256": "2db923c39e877130df9d1ecd36548273b610d53157cea0153dffdd80d694c570",
+      "shape": [
+        5
+      ]
+    },
+    "kt": {
+      "dtype": "torch.int32",
+      "sha256": "ca98bee2a44400f7b29aafd9187fb04a49c969b6167c85f7efe1d7aa913ae3e2",
+      "shape": [
+        5,
+        5
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "de6d63dccd5c204852fa177e4aafd047fa596c81b70a31c1f2aeb16bc219da87",
+      "shape": [
+        5,
+        256,
+        17,
+        512
+      ]
+    },
+    "ql": {
+      "dtype": "torch.int32",
+      "sha256": "a974b3d9980e87cdea80a0339e1a73ac63607aa603167ae94ad97b028e8def33",
+      "shape": [
+        5
+      ]
+    },
+    "sinks": {
+      "dtype": "torch.float32",
+      "sha256": "0187199961de2f5a0e6bcf1ab7980e24ce01a35cecd495cfd01015be5ac88ea5",
+      "shape": [
+        256
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "288d7d58826abd0773dcff85312da61b7717e8b4cf028a758c1f696d94884d22",
+      "shape": [
+        37,
+        2,
+        16,
+        512
+      ]
+    },
+    "vt": {
+      "dtype": "torch.int32",
+      "sha256": "1564d852f94b3c4872058c09f25cf26e24a6f7bac716666f6eb29223d608dc01",
+      "shape": [
+        5,
+        5
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "b1261a2443616b6a4b0659daa4bb7f06fb606b926ce58084852e0dd4ad6be21f",
+      "shape": [
+        3,
+        256,
+        17
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "ceee983afab1d22ad7ff0b7256377ad0f60195be045d8865d8cb08f2c3f7ffd9",
+      "shape": [
+        3,
+        256,
+        17,
+        512
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "sm": [
+      12,
+      0
+    ],
+    "sm_count": 188,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

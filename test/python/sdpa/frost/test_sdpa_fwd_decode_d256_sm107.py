@@ -184,7 +184,8 @@ def test_sm107_decode_body_matches_the_sm100_body():
     """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits and the header prose. The optional cluster reducer and
+    keyword on the ring waits, the SM100-only live-column specialization, and the
+    header prose. The optional cluster reducer and
     its host/compiler bindings are separate implementations, exercised by the cluster
     binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
@@ -213,6 +214,29 @@ def test_sm107_decode_body_matches_the_sm100_body():
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
 
     a, b = _body(sm100), _body(sm107)
+    # Pin the exact SM100-only specialization before comparing the shared body.
+    # Removing an arbitrary AST branch would hide edits to its zero-fill/fence.
+    sm100_only = {
+        'COLS = getattr(PARAMS, "decode_live_columns", 0) or 16': "COLS = 16",
+        "COL_GROUPS = N_Q // 16": "COL_GROUPS = N_Q // COLS",
+        'if COLS not in (8, 16) or (COLS == 8 and N_Q != 16):\n    raise ValueError("swap-AB decode: a reduced softmax width needs a single 16-column MMA group")': "",
+        "{4 * COL_GROUPS} softmax warps": "{4 * (N_Q // COLS)} softmax warps",
+        "\n".join(
+            (
+                "        if cutlass.const_expr(COLS < 16):",
+                "            zero4 = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32)",
+                "            for slot in cutlass.range_constexpr(2):",
+                "                offset = cutlass.Int32(slot * pBufferWords + COLS // 2) + tidx * cutlass.Int32(P_ROW_WORDS)",
+                "                Pointer(sP_raw.subview(offset).data_ptr(), dtype=cutlass.Int32).store_swizzled(zero4, _P_SMEM_SWIZZLE, alignment=16)",
+                '            nvvm.fence_proxy("async.shared", space="cta")',
+            )
+        ): "",
+    }
+    a_src = "\n".join(a)
+    for specialized, shared in sm100_only.items():
+        assert a_src.count(specialized) == 1, f"the declared SM100-only live-column delta changed:\n{specialized}"
+        a_src = a_src.replace(specialized, shared)
+    a = [ln for ln in a_src.splitlines() if ln.strip()]
     b = [ln for ln in b if ln.strip() not in ("desc_version=DESC_VERSION,",)]
     b = [ln.replace(", spin=SPIN_RING_WAITS)", ")") for ln in b]
     b = [
