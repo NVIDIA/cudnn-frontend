@@ -33,8 +33,9 @@ from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
 
+from ..common import gate_bwd, head_reduce
 from ..common.host import get_dtype
-from ..common.piece_chain import dtype_name, launch_state_chain
+from ..common.piece_chain import chain_rows_per_cta, dtype_name, launch_state_chain
 from . import kda_bprop_f16, kda_bprop_summary_f16, kda_chain_prologue_f16, kda_recompute_f16, kda_summary_f16
 
 chain_backward_cache = {}
@@ -59,6 +60,7 @@ def chain_backward_host(
     chain_rows: cutlass.Constexpr[int],
     has_seed: cutlass.Constexpr[bool],
     has_dseed: cutlass.Constexpr[bool],
+    tail: cutlass.Constexpr[bool],
     pieces: cutlass.Int32,
     heads_out: cutlass.Int32,
     num_seqs: cutlass.Int32,
@@ -66,6 +68,8 @@ def chain_backward_host(
     checkpoint_every_n: cutlass.Int32,
     seed_every_n: cutlass.Int32,
     scale: cutlass.Float32,
+    batch_base: cutlass.Int32,
+    first_head_lo: cutlass.Int32,
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -122,17 +126,84 @@ def chain_backward_host(
     dseed: Optional[cute.Tensor],
     dcomposed: Optional[cute.Tensor],
     dstate0: Optional[cute.Tensor],
+    seed_row_base: Optional[cute.Tensor],
     stream: cuda.CUstream,
+    tail_enable: Optional[cute.Tensor] = None,
+    gate_lower_bound: cutlass.Constexpr[float] = 0.0,
+    gate_bwd_dgate: Optional[cute.Tensor] = None,
+    gate_bwd_gate: Optional[cute.Tensor] = None,
+    gate_bwd_a_log: Optional[cute.Tensor] = None,
+    gate_bwd_dt_bias: Optional[cute.Tensor] = None,
+    gate_part_a: Optional[cute.Tensor] = None,
+    gate_part_dt: Optional[cute.Tensor] = None,
+    d_a_log: Optional[cute.Tensor] = None,
+    d_dt_bias: Optional[cute.Tensor] = None,
+    reduce_dq_src: Optional[cute.Tensor] = None,
+    reduce_dq: Optional[cute.Tensor] = None,
+    reduce_dk_src: Optional[cute.Tensor] = None,
+    reduce_dk: Optional[cute.Tensor] = None,
+    reduce_dv_src: Optional[cute.Tensor] = None,
+    reduce_dv: Optional[cute.Tensor] = None,
+    fold_rows: cutlass.Constexpr[int] = 0,
+    fold_update: Optional[cute.Tensor] = None,
+    fold_transition: Optional[cute.Tensor] = None,
+    fold_seed: Optional[cute.Tensor] = None,
+    fold_composed: Optional[cute.Tensor] = None,
 ) -> None:
+    if cutlass.const_expr(fold_update is not None):
+        if cutlass.const_expr(fold_seed is not None):
+            fold_seed = cute.make_tensor(fold_seed.iterator + (cutlass.Int32(fold_seed.shape[0]) - cutlass.Int32(1)) * fold_seed.stride[0], fold_seed.layout)
+        launch_state_chain(
+            cutlass.Int32(gate.shape[1]),
+            dim_v,
+            dim_k,
+            fold_rows,
+            cutlass.Int32(fold_update.shape[0]),
+            True,
+            False,
+            fold_seed is not None,
+            True,
+            False,
+            False,
+            cutlass.Int32(1),
+            fold_update,
+            fold_transition,
+            None,
+            fold_seed,
+            fold_composed,
+            None,
+            None,
+            None,
+            None,
+            stream,
+        )
     heads_out = cutlass.Int32(gate.shape[1])
     q_ratio = heads_out // cutlass.Int32(q.shape[1])
     k_ratio = heads_out // cutlass.Int32(k.shape[1])
     v_ratio = heads_out // cutlass.Int32(v.shape[1])
+    cu_full = None
+    if cutlass.const_expr(tail):
+        cu_full = cu_seqlens
+        cu_seqlens = cute.make_tensor(cu_seqlens.iterator + batch_base, cute.make_layout((num_seqs + cutlass.Int32(1),), stride=(1,)))
+        if cutlass.const_expr(seed is not None):
+            seed = cute.make_tensor(
+                seed.iterator + batch_base * seed.stride[0], cute.make_layout((num_seqs, seed.shape[1], seed.shape[2], seed.shape[3]), stride=seed.stride)
+            )
+        if cutlass.const_expr(dseed is not None):
+            dseed = cute.make_tensor(
+                dseed.iterator + batch_base * dseed.stride[0], cute.make_layout((num_seqs, dseed.shape[1], dseed.shape[2], dseed.shape[3]), stride=dseed.stride)
+            )
+        if cutlass.const_expr(dstate0 is not None):
+            dstate0 = cute.make_tensor(
+                dstate0.iterator + batch_base * dstate0.stride[0],
+                cute.make_layout((num_seqs, dstate0.shape[1], dstate0.shape[2], dstate0.shape[3]), stride=dstate0.stride),
+            )
     kda_chain_prologue_f16.chain_prologue(
         pieces,
         unit_chunks,
         b_t,
         length_rule,
+        bprop_cfg.max_active_clusters,
         heads_out,
         series_span_chunks,
         checkpoint_every_n,
@@ -166,6 +237,13 @@ def chain_backward_host(
         dv,
         dgate,
         stream,
+        tail=tail,
+        first_head_lo=first_head_lo,
+        cu_full=cu_full,
+        batch_base=batch_base,
+        seed_every_n=seed_every_n,
+        seed_row_base=seed_row_base,
+        tail_enable=tail_enable,
     )
     if cutlass.const_expr(fused_h_m):
         kda_summary_f16.host(
@@ -210,6 +288,8 @@ def chain_backward_host(
             None,
             composed,
             stream,
+            mTailEnable=tail_enable,
+            first_head_lo=first_head_lo,
         )
     else:
         if cutlass.const_expr(not has_piece_transitions):
@@ -277,6 +357,8 @@ def chain_backward_host(
         None,
         dcomposed,
         stream,
+        mTailEnable=tail_enable,
+        first_head_lo=first_head_lo,
     )
     if cutlass.const_expr(series):
         kda_recompute_f16.host(
@@ -299,6 +381,7 @@ def chain_backward_host(
             checkpoint_every_n,
             seed_every_n,
             stream,
+            seed_row_base,
         )
     kda_bprop_f16.host(
         bprop_cfg,
@@ -324,6 +407,69 @@ def chain_backward_host(
         scale,
         stream,
     )
+    if cutlass.const_expr(gate_bwd_dgate is not None):
+        gate_tokens = cutlass.Int32(gate_bwd_dgate.shape[0])
+        gate_bwd.channel_gate_bwd_launch(
+            bprop_cfg.d_k,
+            gate_bwd_dgate,
+            gate_bwd_gate,
+            gate_bwd_a_log,
+            gate_bwd_dt_bias,
+            gate_part_a,
+            gate_part_dt,
+            d_a_log,
+            d_dt_bias,
+            gate_tokens,
+            cutlass.Int32(gate_bwd_dgate.shape[1]),
+            (gate_tokens + cutlass.Int32(gate_bwd.GATE_BWD_BLOCKS - 1)) // cutlass.Int32(gate_bwd.GATE_BWD_BLOCKS),
+            cutlass.Float32(gate_lower_bound),
+            stream,
+        )
+    if cutlass.const_expr(reduce_dq is not None):
+        dq_words = cutlass.Int64(reduce_dq.shape[0]) * cutlass.Int64(reduce_dq.shape[1]) * cutlass.Int64(bprop_cfg.d_k // 2)
+        head_reduce.launch(
+            reduce_dq_src,
+            reduce_dq,
+            dq_words,
+            cutlass.Int64(reduce_dq.stride[0]) // cutlass.Int64(2),
+            cutlass.Int64(reduce_dq.stride[1]) // cutlass.Int64(2),
+            cutlass.Int32((dq_words + cutlass.Int64(head_reduce.BLOCK - 1)) // cutlass.Int64(head_reduce.BLOCK)),
+            cutlass.Int32(reduce_dq.shape[1]),
+            cutlass.Int32(reduce_dq_src.shape[1]) // cutlass.Int32(reduce_dq.shape[1]),
+            bprop_cfg.d_k // 2,
+            bprop_cfg.io_dtype,
+            stream,
+        )
+    if cutlass.const_expr(reduce_dk is not None):
+        dk_words = cutlass.Int64(reduce_dk.shape[0]) * cutlass.Int64(reduce_dk.shape[1]) * cutlass.Int64(bprop_cfg.d_k // 2)
+        head_reduce.launch(
+            reduce_dk_src,
+            reduce_dk,
+            dk_words,
+            cutlass.Int64(reduce_dk.stride[0]) // cutlass.Int64(2),
+            cutlass.Int64(reduce_dk.stride[1]) // cutlass.Int64(2),
+            cutlass.Int32((dk_words + cutlass.Int64(head_reduce.BLOCK - 1)) // cutlass.Int64(head_reduce.BLOCK)),
+            cutlass.Int32(reduce_dk.shape[1]),
+            cutlass.Int32(reduce_dk_src.shape[1]) // cutlass.Int32(reduce_dk.shape[1]),
+            bprop_cfg.d_k // 2,
+            bprop_cfg.io_dtype,
+            stream,
+        )
+    if cutlass.const_expr(reduce_dv is not None):
+        dv_words = cutlass.Int64(reduce_dv.shape[0]) * cutlass.Int64(reduce_dv.shape[1]) * cutlass.Int64(bprop_cfg.d_v // 2)
+        head_reduce.launch(
+            reduce_dv_src,
+            reduce_dv,
+            dv_words,
+            cutlass.Int64(reduce_dv.stride[0]) // cutlass.Int64(2),
+            cutlass.Int64(reduce_dv.stride[1]) // cutlass.Int64(2),
+            cutlass.Int32((dv_words + cutlass.Int64(head_reduce.BLOCK - 1)) // cutlass.Int64(head_reduce.BLOCK)),
+            cutlass.Int32(reduce_dv.shape[1]),
+            cutlass.Int32(reduce_dv_src.shape[1]) // cutlass.Int32(reduce_dv.shape[1]),
+            bprop_cfg.d_v // 2,
+            bprop_cfg.io_dtype,
+            stream,
+        )
 
 
 def build_configs(io_dtype, state_dtype, transition_dtype, gate_dtype, *, fused_h_m, series, coarse, use_dstate0, **flags):
@@ -432,8 +578,13 @@ def build_chain_backward(
     device,
     num_sm,
     stream,
+    tail=False,
+    seed_row_base=None,
+    tail_enable=None,
     has_piece_transitions=False,
     has_piece_state_grads=False,
+    post_buffers=(None,) * 14,
+    fold_buffers=(None,) * 4,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
@@ -454,6 +605,7 @@ def build_chain_backward(
     has_dseed = dseed is not None
     seed_name = dtype_name(seed.dtype) if has_seed else "float32"
     dseed_name = dtype_name(dseed.dtype) if has_dseed else "float32"
+    fold_rows = chain_rows_per_cta(DV, DK, 1, gate.shape[1], num_sm) if fold_buffers[0] is not None else 0
     key = (
         str(q.dtype),
         str(seed_checkpoints.dtype) if coarse else "none",
@@ -486,8 +638,13 @@ def build_chain_backward(
         composed is not None,
         dcomposed is not None,
         int(chain_rows),
+        bool(tail),
+        seed_row_base is not None,
+        tail_enable is not None,
         bool(has_piece_transitions),
         bool(has_piece_state_grads),
+        tuple(str(buffer.dtype) if buffer is not None else None for buffer in post_buffers),
+        (int(fold_rows), tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers)),
     )
     if key not in chain_backward_cache:
         summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = build_configs(
@@ -517,6 +674,30 @@ def build_chain_backward(
         if series_items is not None:
             series_items_placeholder = from_dlpack(series_items, assumed_align=16)
             series_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        gate_align = 4 * (gate_dtype.width // 8)
+        post_placeholders = [
+            from_dlpack(buffer, assumed_align=gate_align).mark_layout_dynamic(leading_dim=2) if buffer is not None else None for buffer in post_buffers[:2]
+        ] + [
+            from_dlpack(buffer, assumed_align=4).mark_layout_dynamic(leading_dim=len(buffer.shape) - 1) if buffer is not None else None
+            for buffer in post_buffers[2:]
+        ]
+        fold_update, fold_transition, fold_seed, fold_composed = fold_buffers
+        fold_placeholders = [None] * 4
+        if fold_update is not None:
+            fold_placeholders = [
+                from_dlpack(DeviceView(256, (1, gate.shape[1], DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, (1, gate.shape[1], DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                (
+                    from_dlpack(DeviceView(256, (1, gate.shape[1], DV, DK), dtype_name(fold_seed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(
+                        leading_dim=3
+                    )
+                    if fold_seed is not None
+                    else None
+                ),
+                from_dlpack(DeviceView(256, (1, gate.shape[1], DV, DK), dtype_name(fold_composed.dtype), int(device)), assumed_align=4).mark_layout_dynamic(
+                    leading_dim=3
+                ),
+            ]
         chain_backward_cache[key] = cute.compile(
             chain_backward_host,
             int(unit_chunks),
@@ -536,6 +717,7 @@ def build_chain_backward(
             int(chain_rows),
             has_seed,
             has_dseed,
+            bool(tail),
             cutlass.Int32(int(pieces)),
             cutlass.Int32(int(heads_out)),
             cutlass.Int32(int(num_seqs)),
@@ -543,6 +725,8 @@ def build_chain_backward(
             cutlass.Int32(int(b_t)),
             cutlass.Int32(int(seed_every_n_tokens)),
             float(scale),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
             from_dlpack(v, assumed_align=16).mark_layout_dynamic(leading_dim=2),
@@ -607,7 +791,13 @@ def build_chain_backward(
                 else None
             ),
             from_dlpack(dstate0, assumed_align=16).mark_layout_dynamic(leading_dim=3) if dstate0 is not None else None,
+            from_dlpack(seed_row_base, assumed_align=4).mark_layout_dynamic() if seed_row_base is not None else None,
             cuda.CUstream(int(stream)),
+            from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
+            float(gate_lower_bound),
+            *post_placeholders,
+            fold_rows,
+            *fold_placeholders,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_backward_cache[key]
@@ -676,8 +866,14 @@ def run_chain_backward(
     safe_gate,
     scale,
     stream,
+    batch_base=0,
+    first_head_lo=0,
+    seed_row_base=None,
+    tail_enable=None,
     has_piece_transitions=False,
     has_piece_state_grads=False,
+    post_buffers=(None,) * 14,
+    fold_buffers=(None,) * 4,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its seven launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
@@ -689,6 +885,8 @@ def run_chain_backward(
         int(b_t),
         int(seed_every_n_tokens),
         float(scale),
+        int(batch_base),
+        int(first_head_lo),
         q,
         k,
         v,
@@ -745,5 +943,472 @@ def run_chain_backward(
         dseed,
         dcomposed,
         dstate0,
+        seed_row_base,
         cuda.CUstream(int(stream)),
+        tail_enable,
+        *post_buffers,
+        *fold_buffers,
+    )
+
+
+CHAIN_SUMMARY_BACKWARD_BUFFERS = (
+    "q",
+    "k",
+    "do",
+    "gate",
+    "beta",
+    "a_log",
+    "dt_bias",
+    "cu_seqlens",
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "scheduler_all",
+    "scheduler_m",
+    "scheduler_summary",
+    "recompute_m_words",
+    "bprop_summary_words",
+    "dstate_scratch",
+    "state_m",
+    "state_m",
+    "state_g",
+    "state_g",
+    "state_x",
+    "dstate_in",
+    "dstate0",
+    "transition",
+)
+
+chain_summary_backward_cache = {}
+
+
+@cute.jit
+def chain_summary_backward_host(
+    unit_chunks: cutlass.Constexpr[int],
+    b_t: cutlass.Constexpr[int],
+    length_rule: cutlass.Constexpr[bool],
+    transition_cfg: cutlass.Constexpr,
+    bprop_summary_cfg: cutlass.Constexpr,
+    dim_v: cutlass.Constexpr[int],
+    dim_k: cutlass.Constexpr[int],
+    chain_rows: cutlass.Constexpr[int],
+    has_seed: cutlass.Constexpr[bool],
+    emit_summary: cutlass.Constexpr[bool],
+    tail: cutlass.Constexpr[bool],
+    pieces: cutlass.Int32,
+    heads_out: cutlass.Int32,
+    num_seqs: cutlass.Int32,
+    scale: cutlass.Float32,
+    batch_base: cutlass.Int32,
+    first_head_lo: cutlass.Int32,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    do: cute.Tensor,
+    gate: cute.Tensor,
+    beta: cute.Tensor,
+    a_log: Optional[cute.Tensor],
+    dt_bias: Optional[cute.Tensor],
+    cu_seqlens: cute.Tensor,
+    cu_pieces: cute.Tensor,
+    main_rows: cute.Tensor,
+    summary_rows: cute.Tensor,
+    main_count: cute.Tensor,
+    summary_count: cute.Tensor,
+    work_items: cute.Tensor,
+    scheduler_all: cute.Tensor,
+    scheduler_m: cute.Tensor,
+    scheduler_summary: cute.Tensor,
+    recompute_m_words: cute.Tensor,
+    bprop_summary_words: cute.Tensor,
+    dstate_scratch: cute.Tensor,
+    state_m_main: cute.Tensor,
+    state_m_chain: cute.Tensor,
+    state_g: cute.Tensor,
+    state_g_chain: cute.Tensor,
+    state_x_chain: cute.Tensor,
+    dstate_in: Optional[cute.Tensor],
+    dstate0: cute.Tensor,
+    transition: Optional[cute.Tensor],
+    stream: cuda.CUstream,
+    tail_enable: Optional[cute.Tensor] = None,
+) -> None:
+    """The chain of the backward summary node."""
+    heads_out = cutlass.Int32(gate.shape[1])
+    q_ratio = heads_out // cutlass.Int32(q.shape[1])
+    k_ratio = heads_out // cutlass.Int32(k.shape[1])
+    cu_full = None
+    if cutlass.const_expr(tail):
+        cu_full = cu_seqlens
+        cu_seqlens = cute.make_tensor(cu_seqlens.iterator + batch_base, cute.make_layout((num_seqs + cutlass.Int32(1),), stride=(1,)))
+        if cutlass.const_expr(dstate_in is not None):
+            dstate_in = cute.make_tensor(
+                dstate_in.iterator + batch_base * dstate_in.stride[0],
+                cute.make_layout((num_seqs, dstate_in.shape[1], dstate_in.shape[2], dstate_in.shape[3]), stride=dstate_in.stride),
+            )
+        dstate0 = cute.make_tensor(
+            dstate0.iterator + batch_base * dstate0.stride[0],
+            cute.make_layout((num_seqs, dstate0.shape[1], dstate0.shape[2], dstate0.shape[3]), stride=dstate0.stride),
+        )
+        if cutlass.const_expr(transition is not None):
+            transition = cute.make_tensor(
+                transition.iterator + batch_base * transition.stride[0],
+                cute.make_layout((num_seqs, transition.shape[1], transition.shape[2], transition.shape[3]), stride=transition.stride),
+            )
+    kda_chain_prologue_f16.chain_prologue(
+        pieces,
+        unit_chunks,
+        b_t,
+        length_rule,
+        bprop_summary_cfg.max_active_clusters,
+        heads_out,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cu_seqlens,
+        cu_pieces,
+        main_rows,
+        summary_rows,
+        main_count,
+        summary_count,
+        work_items,
+        None,
+        scheduler_all,
+        None,
+        None,
+        None,
+        None,
+        recompute_m_words,
+        None,
+        None,
+        bprop_summary_words,
+        None,
+        q,
+        k,
+        None,
+        gate,
+        None,
+        do,
+        None,
+        None,
+        None,
+        None,
+        None,
+        stream,
+        tail=tail,
+        first_head_lo=first_head_lo,
+        cu_full=cu_full,
+        batch_base=batch_base,
+        tail_enable=tail_enable,
+    )
+    kda_recompute_f16.host(
+        transition_cfg,
+        k,
+        k,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        cu_pieces,
+        None,
+        None,
+        state_m_main,
+        None,
+        work_items,
+        main_count,
+        scheduler_m,
+        recompute_m_words,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        stream,
+    )
+    kda_bprop_summary_f16.host(
+        bprop_summary_cfg,
+        q_ratio,
+        k_ratio,
+        a_log,
+        dt_bias,
+        beta,
+        cu_pieces,
+        state_g,
+        None,
+        None,
+        work_items,
+        main_count,
+        scheduler_summary,
+        bprop_summary_words,
+        dstate_scratch,
+        scale,
+        stream,
+    )
+    head_floor = None
+    if cutlass.const_expr(tail):
+        head_floor = first_head_lo
+    launch_state_chain(
+        heads_out,
+        dim_v,
+        dim_k,
+        chain_rows,
+        pieces,
+        True,
+        True,
+        has_seed,
+        True,
+        emit_summary,
+        True,
+        num_seqs,
+        state_g_chain,
+        state_m_chain,
+        state_x_chain,
+        dstate_in,
+        dstate0,
+        transition,
+        main_rows,
+        None,
+        None,
+        stream,
+        mTailEnable=tail_enable,
+        first_head_lo=head_floor,
+    )
+
+
+def build_chain_summary_backward(
+    *,
+    q,
+    k,
+    do,
+    gate,
+    beta,
+    a_log,
+    dt_bias,
+    cu_seqlens,
+    cu_pieces,
+    main_rows,
+    summary_rows,
+    main_count,
+    summary_count,
+    work_items,
+    scheduler_all,
+    scheduler_m,
+    scheduler_summary,
+    recompute_m_words,
+    bprop_summary_words,
+    dstate_scratch,
+    state_m,
+    state_g,
+    state_x,
+    dstate_in,
+    dstate0,
+    transition,
+    pieces,
+    heads_out,
+    num_seqs,
+    unit_chunks,
+    b_t,
+    length_rule,
+    log_gate,
+    safe_gate,
+    gate_lower_bound,
+    use_qk_l2norm,
+    use_beta_sigmoid,
+    allow_neg_eigval,
+    scale,
+    chain_rows,
+    device,
+    num_sm,
+    stream,
+    tail=False,
+    tail_enable=None,
+):
+    """Compile (cached per static config) the backward summary chain launch over the buffers of one plan; ``pieces``,
+    ``heads_out`` and ``num_seqs`` are launch arguments."""
+    DK = q.shape[2]
+    DV = do.shape[2]
+    HO = gate.shape[1]
+    if not safe_gate:
+        a_log = None
+        dt_bias = None
+    io_dtype = get_dtype(q.dtype)
+    gate_dtype = get_dtype(gate.dtype)
+    has_seed = dstate_in is not None
+    emit_summary = transition is not None
+    seed_name = dtype_name(dstate_in.dtype) if has_seed else "float32"
+    tail_name = dtype_name(dstate0.dtype)
+    summary_name = dtype_name(transition.dtype) if emit_summary else "float32"
+    gate_scale_log2 = float(gate_lower_bound) * kda_bprop_summary_f16.LOG2_E
+    key = (
+        str(q.dtype),
+        str(cu_seqlens.dtype),
+        str(gate.dtype),
+        str(beta.dtype),
+        str(a_log.dtype) if a_log is not None else "none",
+        str(dt_bias.dtype) if dt_bias is not None else "none",
+        seed_name,
+        tail_name,
+        summary_name,
+        int(device),
+        int(num_sm),
+        DK,
+        DV,
+        int(unit_chunks),
+        int(b_t),
+        bool(length_rule),
+        bool(log_gate),
+        bool(safe_gate),
+        float(gate_lower_bound),
+        bool(use_qk_l2norm),
+        bool(use_beta_sigmoid),
+        bool(allow_neg_eigval),
+        has_seed,
+        emit_summary,
+        int(chain_rows),
+        bool(tail),
+        tail_enable is not None,
+    )
+    if key not in chain_summary_backward_cache:
+        transition_cfg = kda_recompute_f16.build_cfg(
+            io_dtype,
+            get_dtype(state_m.dtype),
+            gate_dtype,
+            use_initial_state=False,
+            store_final_state=True,
+            enable_checkpoints=False,
+            seed_checkpoints=False,
+            seed_identity=True,
+            v_is_zero=True,
+            l2norm=use_qk_l2norm,
+            safe_gate=safe_gate,
+            gate_scale_log2=gate_scale_log2,
+            log_gate=log_gate,
+            beta_sigmoid=use_beta_sigmoid,
+            allow_neg_eigval=allow_neg_eigval,
+            max_active_clusters=num_sm,
+            d_k=DK,
+            d_v=DK,
+        )
+        bprop_summary_cfg = kda_bprop_summary_f16.build_cfg(
+            io_dtype,
+            gate_dtype,
+            use_dstate_in=False,
+            l2norm=use_qk_l2norm,
+            safe_gate=safe_gate,
+            gate_scale_log2=gate_scale_log2,
+            log_gate=log_gate,
+            beta_sigmoid=use_beta_sigmoid,
+            allow_neg_eigval=allow_neg_eigval,
+            max_active_clusters=num_sm,
+            d_k=DK,
+            d_v=DV,
+        )
+        work_items_placeholder = from_dlpack(work_items, assumed_align=16)
+        work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+        chain_summary_backward_cache[key] = cute.compile(
+            chain_summary_backward_host,
+            int(unit_chunks),
+            int(b_t),
+            bool(length_rule),
+            transition_cfg,
+            bprop_summary_cfg,
+            DV,
+            DK,
+            int(chain_rows),
+            has_seed,
+            emit_summary,
+            bool(tail),
+            cutlass.Int32(int(pieces)),
+            cutlass.Int32(int(heads_out)),
+            cutlass.Int32(int(num_seqs)),
+            float(scale),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            from_dlpack(q, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(k, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(do, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(gate, assumed_align=16).mark_layout_dynamic(leading_dim=2),
+            from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(a_log, assumed_align=4).mark_layout_dynamic() if a_log is not None else None,
+            from_dlpack(dt_bias, assumed_align=16).mark_layout_dynamic(leading_dim=len(dt_bias.shape) - 1) if dt_bias is not None else None,
+            from_dlpack(cu_seqlens, assumed_align=8 if str(cu_seqlens.dtype).endswith("int64") else 4).mark_layout_dynamic(),
+            from_dlpack(cu_pieces, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(main_rows, assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(summary_rows, assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
+            work_items_placeholder,
+            from_dlpack(scheduler_all, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(scheduler_m, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(scheduler_summary, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(recompute_m_words, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(bprop_summary_words, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(dstate_scratch, assumed_align=16).mark_layout_dynamic(),
+            from_dlpack(state_m, assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(state_g, assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, DV, DK), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
+            from_dlpack(DeviceView(256, (1, HO, DV, DK), tail_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3),
+            (
+                from_dlpack(DeviceView(256, (1, HO, DK, DK), summary_name, int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+                if emit_summary
+                else None
+            ),
+            cuda.CUstream(int(stream)),
+            from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
+            options="--enable-tvm-ffi --opt-level 2",
+        )
+    return chain_summary_backward_cache[key]
+
+
+def run_chain_summary_backward(
+    compiled,
+    *,
+    q,
+    k,
+    do,
+    gate,
+    beta,
+    a_log,
+    dt_bias,
+    cu_seqlens,
+    cu_pieces,
+    main_rows,
+    summary_rows,
+    main_count,
+    summary_count,
+    work_items,
+    scheduler_all,
+    scheduler_m,
+    scheduler_summary,
+    recompute_m_words,
+    bprop_summary_words,
+    dstate_scratch,
+    state_m,
+    state_g,
+    state_x,
+    dstate_in,
+    dstate0,
+    transition,
+    pieces,
+    heads_out,
+    num_seqs,
+    scale,
+    stream,
+    batch_base=0,
+    first_head_lo=0,
+    tail_enable=None,
+) -> None:
+    """Replay the backward summary chain: one crossing into the DSL for the four launches."""
+    buffers = locals()
+    compiled(
+        int(pieces),
+        int(heads_out),
+        int(num_seqs),
+        float(scale),
+        int(batch_base),
+        int(first_head_lo),
+        *(buffers[name] for name in CHAIN_SUMMARY_BACKWARD_BUFFERS),
+        cuda.CUstream(int(stream)),
+        tail_enable,
     )

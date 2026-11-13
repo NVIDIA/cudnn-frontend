@@ -89,6 +89,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_QWORDS
 from ..common.gate_bwd import exit_slot_table_body
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, WORK_ITEM_FINAL_DST, decode_head, decode_work_item, order_body
+from ..common.tail import gate_body
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log decays -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -2305,6 +2306,7 @@ def build_descs_body(
     dv: cute.Tensor,
     n_batch: cutlass.Int32,
     b_t: cutlass.Constexpr[int],
+    checkpoint_row_base=None,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array, inside the prologue kernel after its order pass."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -2330,7 +2332,7 @@ def build_descs_body(
         emit_seq_descs(base_do, sub3, cu_seqlens, do, n_batch, 2, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 4:
-        emit_checkpoint_seq_descs(base_checkpoint, sub4, cu_seqlens, state_checkpoints, n_batch, cutlass.Int32(b_t), 2, lanes=32)
+        emit_checkpoint_seq_descs(base_checkpoint, sub4, cu_seqlens, state_checkpoints, n_batch, cutlass.Int32(b_t), 2, lanes=32, row_base=checkpoint_row_base)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 5:
         emit_seq_descs(base_dq, sub5, cu_seqlens, dq, n_batch, 2, lanes=32)
@@ -2371,6 +2373,8 @@ def frost_mamba2_bprop_prologue(
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     mSlots: cute.Tensor,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the scheduler rings via
     :func:`order_body`, block 1 builds the per-batch TMA-descriptor arrays via :func:`build_descs_body`,
@@ -2386,6 +2390,11 @@ def frost_mamba2_bprop_prologue(
         sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
         sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= do.shape[1] else do.shape[1])
+        n_items = n_heads_out * n_batch
+        if cutlass.const_expr(mItemLimit is not None):
+            if cutlass.const_expr(gate_sms > 0):
+                gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+            n_items = cutlass.Int32(mItemLimit[1])
         order_body(
             order_gen,
             b_t,
@@ -2393,7 +2402,7 @@ def frost_mamba2_bprop_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_batch,
+            n_items,
             cu_seqlens,
             mStaging,
             mCount,
@@ -2506,6 +2515,8 @@ def prologue(
     tensormap_workspace: cute.Tensor,
     exit_slots: cute.Tensor,
     stream: cuda.CUstream,
+    item_limit_word=None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: LPT-order the work items, build the per-(b,h) TMA-descriptor arrays
     (Q, K, V, dO, checkpoints, dQ, dK, dV) into ``tensormap_workspace`` and write the gate backward's exit-slot table."""
@@ -2540,6 +2551,8 @@ def prologue(
         scheduler_counter,
         cutlass.Int32(batch_size),
         exit_slots,
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 

@@ -65,6 +65,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_checkpoint_seq_descs, emit_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_head, decode_work_item, order_body
+from ..common.tail import gate_body
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log decays -> the kernel's log2 domain
 from cudnn.frost.tile_dsl.barrier import (
@@ -560,6 +561,7 @@ def compute1_warp_group(
     seed_every_n_tokens,
     sScheduler,
     bars,
+    mSeedRowBase=None,
 ):
     """Compute warp-group 1 role (warps 0-3): the state seed, the checkpoint copy, the in-place rescale, the U' build and
     the final-state store; one state row per thread, one key token per thread in the U' build.  Under
@@ -613,6 +615,8 @@ def compute1_warp_group(
         if cutlass.const_expr(cfg.seed_checkpoints):
             # the item's checkpoint row: its start over the row cadence, past the rows of the earlier sequences
             seed_row = write_start // (seed_every_n_tokens // cutlass.Int32(cfg.b_t))
+            if cutlass.const_expr(mSeedRowBase is not None):
+                seed_row = seed_row + cutlass.Int32(mSeedRowBase[0])
             seed_b = cutlass.Int32(0)
             while seed_b < batch_idx:
                 seed_len = cutlass.Int32(cu_seqlens[seed_b + 1]) - cutlass.Int32(cu_seqlens[seed_b])
@@ -835,6 +839,7 @@ def frost_mamba2_recompute(
     beta_smem_layout_staged: cute.Layout,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
+    mSeedRowBase: Optional[cute.Tensor],
 ):
     """Mamba-2 recompute kernel: warp-specialized persistent tile loop over the state chain alone.  The descriptor array
     indices select K, V and the checkpoints inside ``tensormap_workspace``: (0, 1, 2) for this module's own prologue,
@@ -968,6 +973,7 @@ def frost_mamba2_recompute(
             seed_every_n_tokens=seed_every_n_tokens,
             sScheduler=sScheduler,
             bars=bars,
+            mSeedRowBase=mSeedRowBase,
         )
     elif warp_idx == cfg.load_gate_warp_id:
         gate_warp(
@@ -1195,6 +1201,8 @@ def frost_mamba2_recompute_prologue(
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the scheduler rings via
     :func:`order_body`, block 1 builds the per-batch TMA-descriptor arrays via :func:`build_descs_body`,
@@ -1210,6 +1218,11 @@ def frost_mamba2_recompute_prologue(
         sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
         sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         n_heads_out = cutlass.Int32(k.shape[1] if k.shape[1] >= v.shape[1] else v.shape[1])
+        n_items = n_heads_out * n_batch
+        if cutlass.const_expr(mItemLimit is not None):
+            if cutlass.const_expr(gate_sms > 0):
+                gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+            n_items = cutlass.Int32(mItemLimit[1])
         order_body(
             order_gen,
             b_t,
@@ -1217,7 +1230,7 @@ def frost_mamba2_recompute_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_batch,
+            n_items,
             cu_seqlens,
             mStaging,
             mCount,
@@ -1300,6 +1313,8 @@ def prologue(
     checkpoint_every_n: cutlass.Int32,
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
+    item_limit_word=None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: LPT-order the work items and build the per-(b,h) TMA-descriptor arrays (K, V, checkpoints)
     into ``tensormap_workspace``."""
@@ -1322,6 +1337,8 @@ def prologue(
         scheduler_counter,
         cutlass.Int32(batch_size),
         checkpoint_every_n,
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -1352,6 +1369,7 @@ def host(
     dt_max: cutlass.Float32,
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
+    seed_row_base: Optional[cute.Tensor] = None,
 ):
     batch_size = cu_seqlens.shape[0] - 1
     heads_out = cutlass.Int32(gate.shape[1])
@@ -1432,6 +1450,7 @@ def host(
         beta_smem_layout_staged,
         tensormap_workspace,
         cutlass.Int32(num_descs),
+        seed_row_base,
     ).launch(
         grid=grid_shape,
         block=(cfg.threads_per_cta, 1, 1),

@@ -703,12 +703,16 @@ def emit_tinv_rows(
     mRows: cute.Tensor,
     mCount: cute.Tensor,
     lane_idx,
+    seq_lo=None,
 ) -> None:
     """One warp: the chunk-factor pass's row table, one (chunk, batch, batch_start, batch_end) entry per valid chunk row in
     tile-row order, and the valid row count; lanes scan the chunk counts of 32 sequences at a time and write their rows."""
+    first = 0
+    if cutlass.const_expr(seq_lo is not None):
+        first = seq_lo
     n_batch = cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(1)
     carry = cutlass.Int32(0)
-    for b0 in cutlass.range(0, n_batch, 32, unroll=1):
+    for b0 in cutlass.range(first, n_batch, 32, unroll=1):
         b = b0 + lane_idx
         n_chunks = cutlass.Int32(0)
         batch_start = cutlass.Int32(0)
@@ -1383,13 +1387,6 @@ def chunk_gdn_tinv(
 
     cache["compiled"](k, workspace, gate, a_log, dt_bias, beta, cu_seqlens, tinv, row_table, row_count, cu_stream)
     return cache
-
-
-def run_tinv(cache, k, gate, beta, cu_seqlens, tinv, workspace, stream, a_log=None, dt_bias=None, *, row_table, row_count) -> None:
-    """Replay the compiled plan (the prologue launch, then the pass).  The caller owns the
-    contract, which the plan validated at build, so nothing here raises."""
-    cu_stream = cuda.CUstream(int(stream))
-    cache["compiled"](k, workspace, gate, a_log, dt_bias, beta, cu_seqlens, tinv, row_table, row_count, cu_stream)
 
 
 frost_gdn_tinv_prologue.set_name_prefix("cudnn", remove_cutlass_symbol=False)
