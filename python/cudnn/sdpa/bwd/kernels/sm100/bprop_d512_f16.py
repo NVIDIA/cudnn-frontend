@@ -72,7 +72,7 @@ from cudnn.frost.tile_dsl.tma import (
 from cudnn.frost.tile_dsl.pointwise import tmem_load_tile
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.sdpa.bwd.kernels.sm100._common import make_bwd_decode
-from cudnn.frost.tile_dsl.thd import emit_clamped_desc
+from cudnn.frost.tile_dsl.thd import emit_clamped_desc, emit_seq_descs, thd_port_origin
 from cudnn.sdpa.bwd.config_sm100 import (
     TemplateParams,
     cast_bytes,
@@ -120,6 +120,16 @@ _PADDED = bool(CFG.MASK_FLAGS & MASK_PADDED)
 # THD/predecode retains local schedulers and broadcast credits.
 if not _THD:
     from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
+@cute.jit
+def _seq_slot(port: cutlass.Constexpr, n_batch, seq_slot, physical_origins: cutlass.Constexpr):
+    """Descriptor slot of ``port``: the port's packed-total map on the compact contract, the sequence's own map
+    (``port * B + batch``) under independent physical origins."""
+    slot = cutlass.Int32(port)
+    if cutlass.const_expr(physical_origins):
+        slot = cutlass.Int32(port) * n_batch + seq_slot
+    return slot
 
 
 @cute.jit
@@ -540,11 +550,12 @@ def _tmaldg_warp_group(
     head_base,
     batch_base,
     dbg,
+    physical_origins: cutlass.Constexpr = False,
 ):
     q_block, head_idx, batch_idx, q_tok, kv_tok, ws_row, seqlen_q, seqlen_kv = _decode_initial(
         sched.bidx_init, sched.bidy_init, sched.bidz_init, cta_in_pair, meta_t, n_batch, n_qh, seqlen_q, seqlen_kv
     )
-    if cutlass.const_expr(_THD):
+    if cutlass.const_expr(_THD and not physical_origins):
         # ONE acquire per descriptor per CTA, not one per tile: the setup launch
         # writes these once and never rewrites them, so the per-call fences
         # `tma_load_tile` would otherwise emit are pure hot-path cost.
@@ -588,11 +599,27 @@ def _tmaldg_warp_group(
         # sequence reached by adding cu_q[b] to the SEQUENCE coord with the
         # batch coord pinned to 0.
         op_row_thd = q_tok + q_row_base
+        seq_slot = cutlass.Int32(0)
+        if cutlass.const_expr(_THD and physical_origins):
+            # Independent physical origins: every sequence owns one map per port, based at that port's own token origin
+            # and clipped to the sequence, so the coordinate is sequence-local and a tile tail reads exact zeros instead
+            # of a storage gap.  Slot = port * B + batch (`_seq_thd_input_descs`).  The maps change with the unit, so
+            # they are acquired per unit.  A dead unit decodes batch == B: clamp it onto a valid map.
+            seq_slot = cute.math.min(batch_idx, n_batch - cutlass.Int32(1))
+            op_row_thd = q_row_base
+            if is_sg0:
+                tma_tensormap_acquire(_rt_desc(desc_words, _seq_slot(Q_SLOT, n_batch, seq_slot, True)))
+                tma_tensormap_acquire(_rt_desc(desc_words, _seq_slot(K_SLOT, n_batch, seq_slot, True)))
+            else:
+                tma_tensormap_acquire(_rt_desc(desc_words, _seq_slot(DO_SLOT, n_batch, seq_slot, True)))
+                tma_tensormap_acquire(_rt_desc(desc_words, _seq_slot(V_SLOT, n_batch, seq_slot, True)))
         if is_sg0:
             tma_load_tile(
                 sOperand[0],
                 (
-                    tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(Q_SLOT)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
+                    tma_slice_runtime_desc(
+                        _rt_desc(desc_words, _seq_slot(Q_SLOT, n_batch, seq_slot, physical_origins)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0)
+                    )
                     if cutlass.const_expr(_THD)
                     else tma_q(cutlass.Int32(0), head_g, q_row_base, batch_g)
                 ),
@@ -605,7 +632,9 @@ def _tmaldg_warp_group(
             tma_load_tile(
                 sOperand[0],
                 (
-                    tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(DO_SLOT)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0))
+                    tma_slice_runtime_desc(
+                        _rt_desc(desc_words, _seq_slot(DO_SLOT, n_batch, seq_slot, physical_origins)), cutlass.Int32(0), head_g, op_row_thd, cutlass.Int32(0)
+                    )
                     if cutlass.const_expr(_THD)
                     else tma_do(cutlass.Int32(0), head_g, q_row_base, batch_g)
                 ),
@@ -633,12 +662,18 @@ def _tmaldg_warp_group(
                 t_issue = cute.arch.clock64()
             bars.mb_tma_ring_full[ring_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())
             ring_row = kv_row_base + RING_ROW_OFFSET_PEER
-            ring_row_thd = kv_tok + ring_row
+            ring_row_thd = ring_row if cutlass.const_expr(physical_origins) else kv_tok + ring_row
             if is_sg0:
                 tma_load_tile(
                     sRing[ring_state.idx],
                     (
-                        tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(K_SLOT)), cutlass.Int32(0), kv_head_g, ring_row_thd, cutlass.Int32(0))
+                        tma_slice_runtime_desc(
+                            _rt_desc(desc_words, _seq_slot(K_SLOT, n_batch, seq_slot, physical_origins)),
+                            cutlass.Int32(0),
+                            kv_head_g,
+                            ring_row_thd,
+                            cutlass.Int32(0),
+                        )
                         if cutlass.const_expr(_THD)
                         else tma_k(cutlass.Int32(0), kv_head_g, ring_row, batch_g)
                     ),
@@ -651,7 +686,13 @@ def _tmaldg_warp_group(
                 tma_load_tile(
                     sRing[ring_state.idx],
                     (
-                        tma_slice_runtime_desc(_rt_desc(desc_words, cutlass.Int32(V_SLOT)), cutlass.Int32(0), kv_head_g, ring_row_thd, cutlass.Int32(0))
+                        tma_slice_runtime_desc(
+                            _rt_desc(desc_words, _seq_slot(V_SLOT, n_batch, seq_slot, physical_origins)),
+                            cutlass.Int32(0),
+                            kv_head_g,
+                            ring_row_thd,
+                            cutlass.Int32(0),
+                        )
                         if cutlass.const_expr(_THD)
                         else tma_v(cutlass.Int32(0), kv_head_g, ring_row, batch_g)
                     ),
@@ -1142,6 +1183,8 @@ def _compute_warp_group(
     head_base,
     batch_base,
     dbg,
+    thd_origins=None,
+    stats_origin_row: cutlass.Constexpr = -1,
 ):
     """sg0: S = exp2(scale*S_acc - lse), store bf16 S, ship fp32 S to sg1.
     sg1: dS = (scale*dS_acc - do_dot) * S_recv, store bf16 dS.
@@ -1211,11 +1254,27 @@ def _compute_warp_group(
         # do_dot is ours and stays head-major.
         if cutlass.const_expr(_THD):
             _row_pk = q_tok + q_row_safe
-            if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
+            # Stats is the caller's: under independent origins its rows start at the Stats port's own token origin.
+            # do_dot is the chain's compact scratch and stays at the packed prefix.
+            if cutlass.const_expr(thd_origins is not None):
+                # Dead initial units have no scalar row. Clamping their batch to the last sequence is unsafe:
+                # an empty final sequence may place its Stats origin exactly at the allocation's end.
+                # Predicate the reads, keeping every role in the existing barrier protocol.
+                lse_q_log2e = cutlass.Float32(0.0)
+                scaled_do_dot_q = cutlass.Float32(0.0)
+                if batch_idx < n_batch and seqlen_q > cutlass.Int32(0):
+                    _row_lse = cutlass.Int32(thd_port_origin(thd_origins, stats_origin_row, batch_idx, q_tok)) + q_row_safe
+                    if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                        lse_q_log2e = lse_tensor[_row_lse, head_g] * cutlass.Float32(LOG2E)
+                    else:
+                        lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_lse] * cutlass.Float32(LOG2E)
+                    scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
             else:
-                lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
-            scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
+                if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                    lse_q_log2e = lse_tensor[_row_pk, head_g] * cutlass.Float32(LOG2E)
+                else:
+                    lse_q_log2e = lse_tensor[cutlass.Int32(0), head_g, _row_pk] * cutlass.Float32(LOG2E)
+                scaled_do_dot_q = do_dot_tensor[cutlass.Int32(0), head_g, _row_pk] * attn_scale_in
         else:
             lse_q_log2e = lse_tensor[batch_g, head_g, q_row_safe] * cutlass.Float32(LOG2E)
             scaled_do_dot_q = do_dot_tensor[batch_g, head_g, q_row_safe] * attn_scale_in
@@ -1347,6 +1406,10 @@ def _kernel(
     # lse/do_dot); the chunk-local S/dS workspace stays at origin.
     head_base: cutlass.Int32,
     batch_base: cutlass.Int32,
+    # THD independent physical origins (None = the compact packed contract, whose body is unchanged): the Int64 [9, B]
+    # token origins the chain's setup launch materialized, and the Stats port's row in it (-1 = Stats is compact).
+    thd_origins,
+    stats_origin_row: cutlass.Constexpr,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1511,6 +1574,8 @@ def _kernel(
             head_base,
             batch_base,
             dbg,
+            thd_origins,
+            stats_origin_row,
         )
     elif warp_idx == CFG.MMA_WARP_ID:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
@@ -1546,6 +1611,7 @@ def _kernel(
             head_base,
             batch_base,
             dbg,
+            thd_origins is not None,
         )
     elif warp_idx == CFG.TMASTG_WARP_ID:
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
@@ -1656,6 +1722,68 @@ def _clamp_thd_input_descs(base_q_desc, base_do_desc, base_k_desc, base_v_desc, 
     )
 
 
+@cute.kernel
+def _seq_thd_input_descs_kernel(
+    base_q_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_do_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_k_desc: cutlass.GridConstant[tmap.TensorMap],
+    base_v_desc: cutlass.GridConstant[tmap.TensorMap],
+    desc_words: cute.Tensor,
+    meta_t: cute.Tensor,
+    n_batch: cutlass.Int32,
+    n_clusters: cutlass.Int32,
+    q_tensor: cute.Tensor,
+    do_tensor: cute.Tensor,
+    k_tensor: cute.Tensor,
+    v_tensor: cute.Tensor,
+    thd_origins: cute.Tensor,
+    thd_origin_rows: cutlass.Constexpr,
+) -> None:
+    """The independent-origins sibling of :func:`_clamp_thd_input_descs_kernel`: ``4 * B`` sequence-local input maps
+    (slot ``port * B + batch``, ports in ``Q_SLOT .. V_SLOT`` order) instead of four maps clamped to the packed totals.
+
+    Each map is based at its port's own token origin for that sequence (``thd_origin_rows`` in the shared port order
+    q, k, v, o, do, ...; a port bound without offsets keeps its compact prefix) and its sequence extent is the sequence's
+    length, so a tile tail is TMA-clipped to exact zeros and never reads a storage gap or the next sequence.  The
+    claim counter is re-seeded here for the same reason as in the compact kernel.  One elected thread per warp writes a
+    disjoint batch range; the release fence and the kernel boundary publish the maps to the main launch.
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    nthreads, _, _ = cute.arch.block_dim()
+    warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+    step = cutlass.Int32(nthreads) // cutlass.Int32(32)
+    if nvvm.elect_sync():
+        meta = cutlass.make_array_view(meta_t)
+        cu_q0 = n_batch
+        cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+        emit_seq_descs(
+            base_q_desc, desc_words, meta, cu_q0, q_tensor, n_batch, cutlass.Int64(q_tensor.stride[1]), seq_ord=_THD_SEQ_ORD,
+            slot_base=cutlass.Int32(Q_SLOT) * n_batch, first_batch=warp, batch_step=step, origins=thd_origins, origin_row=thd_origin_rows[0],
+        )  # fmt: skip
+        emit_seq_descs(
+            base_do_desc, desc_words, meta, cu_q0, do_tensor, n_batch, cutlass.Int64(do_tensor.stride[1]), seq_ord=_THD_SEQ_ORD,
+            slot_base=cutlass.Int32(DO_SLOT) * n_batch, first_batch=warp, batch_step=step, origins=thd_origins, origin_row=thd_origin_rows[4],
+        )  # fmt: skip
+        emit_seq_descs(
+            base_k_desc, desc_words, meta, cu_k0, k_tensor, n_batch, cutlass.Int64(k_tensor.stride[1]), seq_ord=_THD_SEQ_ORD,
+            slot_base=cutlass.Int32(K_SLOT) * n_batch, first_batch=warp, batch_step=step, origins=thd_origins, origin_row=thd_origin_rows[1],
+        )  # fmt: skip
+        emit_seq_descs(
+            base_v_desc, desc_words, meta, cu_k0, v_tensor, n_batch, cutlass.Int64(v_tensor.stride[1]), seq_ord=_THD_SEQ_ORD,
+            slot_base=cutlass.Int32(V_SLOT) * n_batch, first_batch=warp, batch_step=step, origins=thd_origins, origin_row=thd_origin_rows[2],
+        )  # fmt: skip
+        if warp == cutlass.Int32(0):
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_clusters
+        nvvm.fence_proxy_release(
+            nvvm.MemScope.GPU,
+            from_proxy=nvvm.Proxy.GENERIC,
+            to_proxy=nvvm.Proxy.TENSORMAP,
+        )
+
+
+_seq_thd_input_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _host(
     q_tensor: cute.Tensor,
@@ -1678,6 +1806,37 @@ def _host(
     head_base: cutlass.Int32,
     batch_base: cutlass.Int32,
     stream: _cuda_driver.CUstream = None,
+) -> None:
+    """Preserve the compact exported runtime frame."""
+    _host_chain(
+        q_tensor, k_tensor, v_tensor, do_tensor, s_tensor, ds_tensor, lse_tensor, do_dot_tensor, seq_kv_lens_tensor, desc_words,
+        problem_size, attn_scale_in, attn_scale_log2e, attn_scale_for_dS, head_base, batch_base, stream,
+    )  # fmt: skip
+
+
+@cute.jit
+def _host_chain(
+    q_tensor: cute.Tensor,
+    k_tensor: cute.Tensor,
+    v_tensor: cute.Tensor,
+    do_tensor: cute.Tensor,
+    s_tensor: cute.Tensor,
+    ds_tensor: cute.Tensor,
+    lse_tensor: cute.Tensor,
+    do_dot_tensor: cute.Tensor,
+    seq_kv_lens_tensor: cute.Tensor,
+    desc_words: cute.Tensor,
+    problem_size: Tuple[int, int, int, int, int, int, int, int, int],
+    attn_scale_in: cutlass.Float32,
+    attn_scale_log2e: cutlass.Float32,
+    attn_scale_for_dS: cutlass.Float32,
+    head_base: cutlass.Int32,
+    batch_base: cutlass.Int32,
+    stream: _cuda_driver.CUstream = None,
+    # THD independent physical origins (trailing, defaulted: the compact call shape is unchanged): the Int64 [9, B] token
+    # origins and each port's row in them, in the shared port order (q, k, v, o, do, dq, dk, dv, stats; -1 = compact).
+    thd_origins=None,
+    thd_origin_rows: cutlass.Constexpr = (-1,) * 9,
 ) -> None:
     # SQ / SKV are the TILE-ROUNDED extents the grid and the workspace use;
     # SQ_REAL / SKV_REAL are the lengths the masks compare against. They differ
@@ -1728,16 +1887,34 @@ def _host(
         # Ahead of the main launch, on the same stream: kernel-boundary
         # ordering is what makes the patched descriptors (and the re-seeded
         # claim counter) visible below.
-        _clamp_thd_input_descs_kernel(
-            tma_q_desc,
-            tma_do_desc,
-            tma_k_desc,
-            tma_v_desc,
-            desc_words,
-            seq_kv_lens_tensor,
-            cutlass.Int32(B),
-            cutlass.Int32(N_THD_UNITS),
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        if cutlass.const_expr(thd_origins is not None):
+            _seq_thd_input_descs_kernel(
+                tma_q_desc,
+                tma_do_desc,
+                tma_k_desc,
+                tma_v_desc,
+                desc_words,
+                seq_kv_lens_tensor,
+                cutlass.Int32(B),
+                cutlass.Int32(N_THD_UNITS),
+                q_tensor,
+                do_tensor,
+                k_tensor,
+                v_tensor,
+                thd_origins,
+                thd_origin_rows,
+            ).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+        else:
+            _clamp_thd_input_descs_kernel(
+                tma_q_desc,
+                tma_do_desc,
+                tma_k_desc,
+                tma_v_desc,
+                desc_words,
+                seq_kv_lens_tensor,
+                cutlass.Int32(B),
+                cutlass.Int32(N_THD_UNITS),
+            ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
     else:
         grid_shape = (q_clusters * CFG.CGA_M, QH_CHUNK, B)
 
@@ -1764,6 +1941,8 @@ def _host(
         attn_scale_for_dS,
         head_base,
         batch_base,
+        thd_origins,
+        thd_origin_rows[8],
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -1772,4 +1951,4 @@ def _host(
     )
 
 
-__all__ = ["CFG", "PARAMS", "Bars", "LAYOUT", "STORAGE_DTYPE", "WORKSPACE_DTYPE", "_kernel", "_host"]
+__all__ = ["CFG", "PARAMS", "Bars", "LAYOUT", "STORAGE_DTYPE", "WORKSPACE_DTYPE", "_kernel", "_host", "_host_chain"]

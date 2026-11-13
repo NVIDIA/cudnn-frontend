@@ -577,6 +577,14 @@ production kernels gain no debug knob or timing-dependent assertion.
   all query lengths to zero. Check O/Stats canaries and run memcheck; ordinary
   live-row numerical comparisons do not cover the dead-unit path.
 
+- Physical-origin Stats and other raw per-row scalar loads need their own live-unit
+  guard if dead units remain in the barrier protocol. Clamping to the last batch
+  is not sufficient: its final sequence can be empty with its origin at capacity.
+  A zero numerical contribution does not make an out-of-range read safe.
+  Run `test_empty_final_origin_stats_guard` under initcheck with a retained,
+  uninitialized backing guard; initialized-guard and interior-origin controls
+  distinguish this read from unrelated uninitialized accesses.
+
 **Rule S12 — Placement grows by measured table entries, not by new hand-written boxes.**
 
 - `cudnn/sdpa/placement_table.py` answers first in both `fwd/placement.place` and `bwd/heuristics._leads`. Its entries are
