@@ -474,7 +474,7 @@ def test_warm_refill(dtype, cudnn_handle):
         _reference(bufs)
         assert_warm_stress(
             StressCase(
-                name="dense FP8 eight-column decode",
+                name=f"dense FP8 eight-column decode {dtype}",
                 launch=lambda: execute(g, vp, ws),
                 outputs={"o": bufs["o"].transpose(1, 2), "lse": bufs["lse"], "amax_o": bufs["amax_o"]},
                 thread_blocks=b * 16,

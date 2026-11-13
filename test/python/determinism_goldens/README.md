@@ -20,14 +20,32 @@ D128 padded dense splits keep their existing typed decline; unsplit padding
 and unpadded split execution are qualified separately. Warm stress includes
 multiple ring refills and the shared unsafe-ring control.
 
-Qualification is in progress. SM100, SM103 and SM107 determinism claims remain
-unverified until the corresponding results below are recorded. Run from
-`test/python` with the correct imported checkout and CUDA 13.4 or 13.5:
+The local SM100 engineering GPU (148 SMs) passed all 28 functional/domain/byte
+cases in 58.38 s, including four newly recorded golden paths. A separate
+process passed the same 28 cases in strict golden-check mode in 56.30 s:
+0 failures, 0 skips; the two warm cases were run separately. Both E4M3 and E5M2
+warm cases passed in 13.51 s, each with 0 wrong outputs in 256 warm and 256
+shared-memory-poisoned launches. The unsafe-ring control failed 200/200 launches.
+The workload has 2,048 CTAs and 13 ring refills per launch. Its numerical
+reference is checked before stress; the stress reference itself is the
+byte-stable cold launch. This is a finite rate check, not a proof of race freedom.
+
+Runtime: cuDNN 9.30.0.4, CuTe DSL 4.8.0 with compiler and NVRTC 13.4,
+Torch 2.14.1+cu130, driver API 13020. The Torch CUDA build label is distinct
+from the compiler/runtime used for the kernels. The strict run used
+`CUDNN_DETERMINISM_GOLDENS` with recording unset; the four new JSON files are
+committed without replacing earlier goldens. Source import was asserted to
+the isolated checkout. The final warm report names distinguish both dtypes.
+SM103 and SM107 execution remains unverified. Run from `test/python`:
 
 ```bash
 pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestDenseFp8SwapAB -m L0 -q -rs
 pytest sdpa/frost/test_sdpa_fp8_sm107.py::TestDenseFp8SwapAB -m L0 -q -rs
 ```
+
+The local strict command selected `-k 'not warm_refill'`; the separate warm
+command selected `-k warm_refill -s`. Independent collection of all 30 cases
+from the SM107 entry passed, which is not native SM107 execution evidence.
 
 Record new goldens in a fresh directory only after numerical and replay checks
 pass, then compare them in a separate process with `CUDNN_DETERMINISM_GOLDENS`.
