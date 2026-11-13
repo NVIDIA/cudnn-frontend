@@ -87,13 +87,16 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     `model_samples/census.py`): the kernels one call launches, as `exact` (judged one by one: name, order, count, and the
     launch shape where the entry states one), or as the families of a `fallback` row or of the `host` path. A provider row
     names the form its entry is called in (`form`: fields of the entry's own form), the adapter passes exactly those, and
-    the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. It then holds the
-    profiler's record of every launch of the traced steps against the plan. Where those records cannot be had the run
-    ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check stays `FAIL`. A new
-    adapter comes with its census entries, and a chain that gains an operator whose kernel no pattern of
-    `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name. The host
-    tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there must fail
-    with its own sentence.
+    the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. A row of an entry that
+    states its launch names at least one field: with none the entry runs on its own pick and nothing is compared, so
+    the check fails it. The call log of a traced step is an observation: after each call the adapter says which entry
+    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. The
+    check then holds the profiler's record of every launch of the traced steps against the plan. Where those records
+    cannot be had the run ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check
+    stays `FAIL`. A new adapter comes with its census entries, and a chain that gains an operator whose kernel no
+    pattern of `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name.
+    The host tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there
+    must fail with its own sentence, and the last line of a run is held by running `main()` to its end.
 
 ## What the first GPU run of this area taught
 
@@ -207,3 +210,18 @@ behind; the host tests hold each.
   kernel than the same step launched from Python.
 - A check that could not look must not read as one that looked and found nothing: a run without the profiler's records
   is `RAN`, and the reason is in its last line.
+
+## What the review of the kernel check taught
+
+Each of these passed every test of the first version; the host tests now hold the defect that shows it.
+
+- A log line that is copied from the plan cannot disagree with the plan. The call log's form was the row's own tuple,
+  so "every logged call carries the row's form" could fail on a hand-built line only. Write the line after the call,
+  from the object that was called.
+- An empty statement compares equal to anything. A row without a form passed the form check with nothing compared
+  while its entry ran on its own pick. Fail an entry row that names no field.
+- The last line of a run is code. The verdict function and the check were each tested; that `main()` hands the reason
+  from one to the other was not, and one dropped line turned `RAN` into `PASS` with every test green. Run `main()` to
+  its last line in a host test, with stand-in providers and a stand-in profiler.
+- The text of an `OSError` carries the path of its file. A reason built from it put a temporary path into the last
+  line of a run. Say the system's words for the error number, and name a file by its own name or not at all.

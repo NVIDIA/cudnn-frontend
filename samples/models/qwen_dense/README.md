@@ -251,7 +251,7 @@ On the stack `fe-cublas` two blocks launch a kernel that is judged one by one:
 
 | block | kernel | held |
 |---|---|---|
-| linear-attention step | `gdn_decode_fused`, the kernel of `cudnn.GdnDecodeFused` | one launch per layer and step, in the wiring order; its name is the symbol the entry compiled for this run's row count; grid, block and shared memory equal the entry's own launch shape exactly; and the form the provider row names (`PDL False`, `PDL_RELEASE False`: the entry's pick per row count, launched without a wait on its predecessor and without an early release of its successor) equals the entry's own form, compared on the objects |
+| linear-attention step | `gdn_decode_fused`, the kernel of `cudnn.GdnDecodeFused` | one launch per layer and step, in the wiring order; its name is the symbol the entry compiled for this run's row count; grid, block and shared memory equal the entry's own launch shape exactly; and the form the provider row names (`PDL False`, `PDL_RELEASE False`: the entry's pick per row count, launched without a wait on its predecessor and without an early release of its successor) equals the entry's own form, compared on the objects, and the entry instance that served each call of the traced steps states the same (the call log, written after each call from the object that was called) |
 | token embedding lookup | `embedding_gather`, PyTorch's index-select kernel | one launch per step, first in the step, known by its name; no launch shape is declared for it |
 
 Every other block of this stack is a fallback row: a reference chain or a multiply over a bf16 copy. What such a row
@@ -266,10 +266,10 @@ text of its compile-time arguments, cut at a fixed length, so two forms can shar
 why the form is compared on the objects and the name only against the entry's own symbol. Registers per thread are
 recorded in `--dump-census` and compared with nothing. Nothing here is a timing.
 
-Where the profiler's launch records cannot be had (no profiler library in the environment, another profiler attached,
-records without launch arguments), the line reads `NOT OBSERVED` with the reason and the run ends in
-`[00] RAN fe-cublas stack (kernels not observed: <reason>)` with exit code 0: its other checks held, the one that was
-asked for observed nothing. A failed check is `[00] FAIL` either way.
+Where the profiler's launch records cannot be had (no profiler library in the environment, another profiler attached, a
+trace that cannot be exported or read, records without launch arguments), the line reads `NOT OBSERVED` with the reason
+and the run ends in `[00] RAN fe-cublas stack (kernels not observed: <reason>)` with exit code 0: its other checks
+held, the one that was asked for observed nothing. The reason names no path. A failed check is `[00] FAIL` either way.
 
 The default run with `--check-kernels` was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch
 2.13.0, CuTe DSL 4.8.0): `[00] PASS` at 1 and at 4 sequences, with the ids hash, the replay and the batch invariance of
