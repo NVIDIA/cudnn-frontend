@@ -80,6 +80,9 @@ DEFAULT_NWW = 4
 # autotune policy) sets ``select_hints(kernel, cache_key, configs)``: it returns one of ``configs`` and the timed search
 # is skipped, or None to let the search run. ``record_hint(kernel, cache_key, config)`` is told each timed winner, so
 # the host can record a table and pin from it later. ``cache_key`` is the caller's shape key, without the device.
+# The hooks are consulted only when a launch misses ``launch_hint_cache``: install them before the first launch, or
+# clear the cache when the policy changes. A search that fails or times out launches the first candidate and tells
+# ``record_hint`` nothing, so a host that pins from recorded winners decides what a missing record means.
 select_hints = None
 record_hint = None
 
@@ -120,7 +123,6 @@ def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nw
         configs = launch_hint_configs(occ_choices, nww_choices)
         best = select_hints(kernel, cache_key, configs) if select_hints is not None else None
         if best is None:
-            best = configs[0]
             try:
                 with ct.compiler_timeout(timeout):
                     result = exhaustive_search(
@@ -132,10 +134,11 @@ def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nw
                         lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
                     )
                 best = result.best.config
-                if record_hint is not None:
-                    record_hint(kernel, cache_key, best)
             except Exception:
-                pass  # the first candidate
+                best = configs[0]  # the first candidate; nothing is recorded
+            else:
+                if record_hint is not None:
+                    record_hint(kernel, cache_key, best)  # outside the handler: the host's errors are the host's
         launch_hint_cache[slot] = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
 
     ct.launch(stream, grid, launch_hint_cache[slot], args)

@@ -250,7 +250,10 @@ a row alone and inside a batch under the entry's own picks.
   through the hooks in `cutile/kernels/common.py`: `record_hint` is told each
   timed winner, `select_hints` returns the candidate to run and skips the
   timing (Megatron-LM's `megatron.core.tuning` records a table and pins from
-  it). The cuTile engine is not on this page's table: per-candidate replay and
+  it). The hooks are read only when a launch misses the in-process hint
+  cache, so a host installs them before the first launch or clears
+  `launch_hint_cache` when its policy changes; a failed or timed-out search
+  launches the first candidate and records nothing. The cuTile engine is not on this page's table: per-candidate replay and
   the hooks are verified on cc 10.3 by `test_la.py`'s determinism tests, batch
   invariance is not claimed.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
