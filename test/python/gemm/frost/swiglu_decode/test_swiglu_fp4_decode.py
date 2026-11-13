@@ -570,6 +570,48 @@ def test_cudnn_level_export_resolves_to_the_entry():
     assert {"SwigluFp4Decode", "SwigluGeometry"} <= set(gemm.__all__) and "interleave_gate_up" not in gemm.__all__ and "SwigluCfg" not in gemm.__all__
 
 
+REPO = Path(__file__).resolve().parents[5]  # <repo>/test/python/gemm/frost/swiglu_decode/<this file>
+
+
+def test_docs_rows_exist_for_the_api():
+    """The determinism status page carries the API's row -- SM90 unsupported (declined by type); SM100/103 verified on cc 10.0 only,
+    so the cell names the cc 10.3 gap inside the shared column; SM107 unverified (not run on cc 10.7) -- and its required-settings
+    bullet; the goldens README carries the suite's section; the operation page, its navigation entry, the overview line and the
+    ``llms.txt`` line exist; the page's tables name exactly the geometries, the token tiles and the config fields the entry has;
+    and the package guide's layout names the subpackage."""
+    det = (REPO / "docs" / "operations" / "determinism.md").read_text()
+    row = [line for line in det.splitlines() if line.startswith("| `SwigluFp4Decode`")]
+    assert len(row) == 1, "one SwigluFp4Decode row on the status page"
+    cells = [c.strip() for c in row[0].strip("|").split("|")]
+    assert cells[1] == "fprop (inference step)" and cells[3] == "Unsupported", cells
+    assert cells[4] == "SM100: Supported; SM103: Unverified" and cells[5] == "Unverified", cells
+    assert "SwiGLU FP4 gate / up product for decode rows (`SwigluFp4Decode`): no" in det
+    readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
+    assert "`cudnn.SwigluFp4Decode`" in readme and "test_swiglu_fp4_decode_determinism.py" in readme
+    assert "### SwiGLU FP4 gate / up product for decode rows" in readme
+    page = REPO / "docs" / "operations" / "gemm_fusions" / "swiglu_fp4_decode.md"
+    assert page.exists()
+    text = page.read_text()
+    for geometry in kcfg.SERVED_GEOMETRIES:
+        assert f"`SwigluGeometry({geometry.HIDDEN}, {geometry.INTERMEDIATE})`" in text, geometry
+    table = [[c.strip() for c in line.strip("|").split("|")] for line in text.splitlines() if line.startswith("| ")]
+    knobs = [cells[0].strip("`") for cells in table if cells[0].strip("`") in kcfg.PERFORMANCE_FIELDS]
+    assert tuple(knobs) == kcfg.PERFORMANCE_FIELDS, knobs
+    forms = [cells for cells in table if re.fullmatch(r"\d+ \.\. \d+", cells[0])]
+    assert len(forms) == len(TILES)
+    for tile, cells in zip(TILES, forms):
+        operand, staging, smem, _, tmem, _ = FIGURES[tile]
+        lo = 1 if tile == TILES[0] else TILES[TILES.index(tile) - 1] + 1
+        assert cells == [f"{lo} .. {tile}", str(tile), str(operand), str(staging), f"{smem:,} B", str(tmem)], cells
+    for token in ("rows 1 .. 64", "compute capability 10.x", f"nvidia-cutlass-dsl >= {entry.DSL_FLOOR_TEXT}", "interleave_gate_up", "FlashInfer"):
+        assert token in text, token
+    assert f"CUDA {kcfg.QUALIFIED_MIN_COMPILER[0]}.{kcfg.QUALIFIED_MIN_COMPILER[1]}" in text
+    assert "swiglu_fp4_decode" in (REPO / "docs" / "fern" / "versions" / "latest.yml").read_text()
+    assert "swiglu_fp4_decode" in (REPO / "docs" / "operations" / "overview.md").read_text()
+    assert "swiglu_fp4_decode" in (REPO / "llms.txt").read_text()
+    assert "swiglu_decode/" in (REPO / "python" / "cudnn" / "AGENTS.md").read_text()
+
+
 # Child interpreters.  A child is a fresh process: nothing of this process's import setup carries over, so ``import cudnn`` there is the
 # installed package, while this process may run the entry from a source tree laid over that package.  A child that imports the entry
 # therefore runs CHILD_TREE first -- the same overlay, with the source directory THIS process loaded the entry from -- and every child

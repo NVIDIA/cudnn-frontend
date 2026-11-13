@@ -1608,6 +1608,47 @@ committed; `pytest <module> -m L0 -q -rs -n 0 -k "not performance_arms"` -> 417 
 passed.  With its CUDA 12.9 compiler flavor: the same determinism command -> 531 passed, and its 21 records hold the committed
 hashes too; the functional module was not run in that combination.
 
+### SwiGLU FP4 gate / up product for decode rows: replay and batch invariance at every row count, goldens per token tile
+
+`gemm/frost/swiglu_decode/test_swiglu_fp4_decode_determinism.py` pins `cudnn.SwigluFp4Decode` (the gate / up product of a block-scaled
+FP4 MLP with SiLU(gate) x up and the FP4 re-quantization of the result: FP4 E2M1 weight and activation with E4M3 block scales, two fp32
+scalars, FP4 E2M1 `out` with E4M3 block scales; 1 .. 64 rows, one launch) at its two served geometries, `SwigluGeometry(5120, 17408)`
+and `SwigluGeometry(5120, 128)`.  Forward only: the entry is an inference step with no backward entry point, so there is no backward
+case.  Every comparison is raw bytes over the entry's two results: the packed codes `out`, the live rows' block scales gathered from
+their positions in the 128 x 4 scale layout and -- where one call is compared with itself -- the whole caller-owned scale band, whose
+bytes outside the live rows must keep the sentinel the buffer was filled with.  The independent fp64 reference of the dequantized
+operands is a separate check under a derived bound (an interval of admissible bytes per block scale and a bound per code; the
+utilities module beside the suite), and operands whose every intermediate is exact are compared byte for byte with a host-built
+expectation in `test_swiglu_fp4_decode.py`.  The kernel has no split and no reduction across rows.  One compiled kernel per token
+tile (8 / 16 / 32 / 64 tokens) serves every row count the tile holds, so replay has one case per token tile and launch arm, and batch
+invariance one case per served row count.  Operands come from a CPU generator, so an operand set has the same bytes on every device;
+the activation set alternates ordinary rows with an all-zero row, a row with one large value per block, a row of tiny values, a
+saturating row and a row with all-zero blocks, so every batch holds rows that take the zero rule and rows that saturate.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | geometry x rows 1 / 9 / 17 / 33 / 64 (the first row count of each token tile, and the ceiling) x launch attribute off / on; eight executions into fresh buffers under side-stream contention; the sentinel outside the live rows; then the fp64 reference under its bound | 20 |
+| `test_replay_across_scheduling_boundaries` | L0 | default geometry x rows 20 / 64 x grid cap 1 (one thread block runs all 272 work tiles), 8 (34 work tiles per block: the staging ring is refilled inside the launch) and twice the SM count (one block per work tile: a second wave); eight executions, then the default entry's bytes | 6 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | geometry x rows 3 / 12 / 20 / 40 (one per token tile); two entries, two identical operand sets drawn afresh | 8 |
+| `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | geometry; rows 1 / 9 / 17 / 33 / 64 under a side stream ordered behind the operands' stream against the default stream | 2 |
+| `test_batch_invariance` | L0 | geometry x R 2 .. 64; the R-row call replayed three times; every row equals the same row launched alone (one row: the 8-token tile, token position 0); the reversed batch and a shuffled batch | 126 |
+| `test_inserting_or_removing_a_row_keeps_the_other_rows_bytes` | L0 | geometry x 8 / 16 / 32 / 63 rows; one new row inserted at the head, in the middle and at the tail (8 -> 9, 16 -> 17 and 32 -> 33 change the token tile, 63 -> 64 reaches the ceiling): the original rows keep their bytes, the inserted row writes its alone bytes; read from the larger batch it is the removal; then a permutation of the grown batch | 8 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | geometry; a row twice in one batch (both copies = alone); the other rows redrawn around it -- another draw, raw random codes and scales, rows whose scale bytes hold NaN codes -- at the head, middle and tail of 8-, 16-, 32- and 64-row batches | 2 |
+| `test_token_tile_pick_is_byte_neutral` | L0 | geometry; every row count 1 .. 64 on every token tile that holds it, against the narrowest (56 comparisons over the six tile pairs) | 2 |
+| `test_inputs_are_unmodified` | L0 | geometry; every operand holds its bytes after 24 launches (both sides of each token-tile boundary; the launch attribute; a grid cap that refills the staging ring) | 2 |
+| `test_sixty_four_to_sixty_five_rows_is_the_typed_decline` | L0 | the row ceiling is a `NotImplementedError` at the launch and at the plan-time compile, never another provider; the declined call writes nothing | 1 |
+| `test_golden` | L0 | default geometry x rows 3 / 12 / 20 / 40 (one per token tile) and the small geometry x rows 20; three executions on a fresh entry, the reference, the saved hashes (`swiglu-fp4-decode-h<HIDDEN>-i<INTERMEDIATE>-tile<T>`) | 5 |
+
+Collected: 182 cases, all on a device.  Replay executions: `test_replay` 20 x 8, `test_replay_across_scheduling_boundaries` 6 x 8,
+`test_batch_invariance` 126 x 3 of the batch, 126 x 2 of the permuted batches and 2 x 64 of a row alone; `test_golden` 5 x 3.
+
+The remaining performance knobs (no pre-wait stages, the default L2 policy of the weight stream, a grid cap of one block, of a partial
+wave, of the part's SM count and of twice that, the launch attribute) are bitwise with the default in `test_swiglu_fp4_decode.py`
+(`test_form_and_knob_arms_write_the_default_bytes`, 12 arms at 14 row counts each), which also holds the CUDA-graph replay against
+eager, the chain with a dependent launch that waits behind the entry and copies its outputs
+(`test_dependent_that_waits_reads_the_eager_bytes`, eager and captured) and the warm-launch stress with byte references on three shapes
+that refill the staging ring inside a launch (600 warm and 600 poisoned launches per shape).
+
 ### QSA: 42 cases
 
 QSA uses BF16 Q/K/V with head dimension 256. The saved FP32 output and LSE

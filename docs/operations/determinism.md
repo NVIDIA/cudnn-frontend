@@ -32,6 +32,8 @@ under `cudnn.moe.frost`), `AttentionGateQuantDecode` (the attention gate +
 quantize decode step, also under `cudnn.attention_gate.frost`) and
 `Fp8ProjectionDecode` (the FP8 projection for decode rows, also under
 `cudnn.gemm`) are the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+`SwigluFp4Decode` (the FP4 gate / up product with SwiGLU for decode rows, also
+under `cudnn.gemm`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
@@ -51,6 +53,7 @@ arbitrary user callbacks.
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
+| `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -289,6 +292,28 @@ a row alone and inside a batch under the entry's own picks.
   status rests on the replay and batch-invariance cells and the golden
   comparison is not covered. No backward entry point exists. SM90 and SM120
   are declined by type.
+- SwiGLU FP4 gate / up product for decode rows (`SwigluFp4Decode`): no
+  determinism switch and no numerics knob. The kernel has no split and no
+  reduction across rows: an output element is one fp32 chain in ascending K,
+  and a block scale is a function of its own row's 16 channels (the two lanes
+  that own a block exchange under a mask of one token's lanes). A row's packed
+  codes and block scales alone equal its bytes among up to 64 rows at any
+  position, across the 8- / 16- / 32- / 64-token tiles; one compiled kernel
+  per token tile serves every row count the tile holds, and replay and batch
+  invariance are verified at every row count 1 .. 64 of both served
+  geometries (`SwigluGeometry(5120, 17408)`, `SwigluGeometry(5120, 128)`).
+  Every config field (the token tile, the pre-wait stages, the L2 policy, the
+  grid cap, the launch attribute) writes the same bytes. SM100 is verified on
+  cc 10.0 (148 SMs) with the committed goldens of that one runtime, under the
+  CUDA 13.4 compiler of CuTe DSL 4.8.0; an older DSL compiler is declined by
+  name. cc 10.3 and cc 10.7 have not been run, so SM103 and SM107 are
+  unverified: the entry admits compute capability 10.x and the kernel's
+  rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets.
+  SM90 and SM120 are declined by type. The bytes follow the part's
+  approximate exponential, division and reciprocal: the status holds on a
+  fixed runtime, equal bytes across GPU architectures are not claimed, and a
+  golden recorded on one runtime does not qualify another. No backward entry
+  point exists.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
