@@ -366,6 +366,30 @@ def test_every_constructed_defect_fails_with_its_own_sentence():
     assert _compare([step, _step()]).ok, "the control: the clean step passes"
 
 
+def test_nothing_sits_between_two_launches_of_one_exact_row():
+    """A block whose call launches its kernel twice: the two launches follow each other.  A launch between them fails, also
+    where the same row declares a family for a chain of its own -- that chain runs before or after the pair, not inside it."""
+    from model_samples.census import Kernel, Site, compare
+
+    at = _Clock()
+    pair = Kernel("gdn_decode_fused", "cuDNN FE", "exact", launches=2)
+    host = Site("token_choice", -1, (Kernel("pytorch", "PyTorch", "host"),), "torch.argmax")
+    alone = [Site("pair", 0, (pair,), "an entry that launches twice"), host]
+    with_chain = [Site("pair", 0, (pair, Kernel("pytorch", "PyTorch")), "an entry that launches twice, and a chain"), host]
+    first, second, choice, read = at(SYMBOL, SHAPE), at(SYMBOL, SHAPE), at(ARGMAX), at(HOST_READ, kind="copy")
+    inside = (
+        f"step 0: launched {ELEMENTWISE[:93] + '...'!r} inside the launches of pair (layer 0): a kernel of the fallback family pytorch, "
+        "which no row there declares; nothing may sit between two exact rows"
+    )
+    for sites in (alone, with_chain):
+        assert compare([[first, second, choice, read]], sites).ok and compare([[first, second, choice, read]], sites).exact == 2
+        assert compare([[first, at(ELEMENTWISE), second, choice, read]], sites).sentences() == [inside]
+    assert compare([[at(ELEMENTWISE), first, second, at(ELEMENTWISE), choice, read]], with_chain).ok, "the row's own chain, around the pair"
+    assert compare([[first, choice, read]], alone).sentences() == [
+        "step 0: pair (layer 0) did not launch gdn_decode_fused: the step has 1 launch(es) of gdn_decode_fused, the plan 2 = 1 call(s) x 2 per call"
+    ]
+
+
 def test_a_second_host_read_and_a_call_log_that_is_not_the_wiring_fail():
     from model_samples import census
     from model_samples.census import Call
