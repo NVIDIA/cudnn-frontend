@@ -14,11 +14,18 @@ pytestmark = pytest.mark.L0
 
 
 def test_vendor_files():
-    root = Path(api.__file__).resolve().parents[1] / "_cake"
-    for package, record in json.loads((root / "VENDORED_MHC.json").read_text())["packages"].items():
+    repo_root = Path(__file__).resolve().parents[3]
+    source_root = repo_root / "python" / "cudnn" / "_cake"
+    wheel_root = Path(api.__file__).resolve().parents[1] / "_cake"
+    metadata_files = {".gitignore", ".clang-format"}
+    for package, record in json.loads((source_root / "VENDORED_MHC.json").read_text())["packages"].items():
         for name, expected in record["files"].items():
-            data = (root / "_vendor" / package / name).read_bytes()
-            assert hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() == expected
+            source_data = (source_root / "_vendor" / package / name).read_bytes()
+            assert hashlib.sha1(f"blob {len(source_data)}\0".encode() + source_data).hexdigest() == expected
+            if Path(name).name in metadata_files:
+                continue
+            wheel_data = (wheel_root / "_vendor" / package / name).read_bytes()
+            assert hashlib.sha1(f"blob {len(wheel_data)}\0".encode() + wheel_data).hexdigest() == expected
 
 
 def test_cpu_rejected_before_load(monkeypatch):

@@ -155,7 +155,7 @@ include = ["**/*"]
 "cudnn.linear_attention.cake.kernels" = ["*.cu", "SHA256SUMS", "UPSTREAM.md"]
 "cudnn.linear_attention.hopper" = ["cuda_kernels/*.cu"]
 
-"cudnn._cake._vendor" = ["**/*.json", "**/*.cu", "**/*.cuh", "**/*.h", "**/*.hpp", "**/*.cpp", "**/*.md", "**/LICENSE*", "**/.gitignore", "**/.clang-format"]
-"cudnn._cake" = ["UPSTREAM.md", "VENDORED_MHC.json", "jax_ffi.cc"]
+"cudnn._cake._vendor" = ["**/*.json", "**/*.cu", "**/*.cuh", "**/*.h", "**/*.hpp", "**/*.cpp", "**/*.md", "**/LICENSE*"]
+"cudnn._cake" = ["UPSTREAM.md", "jax_ffi.cc"]
 
 "cudnn.causal_conv1d_cake" = ["*.cu"]
