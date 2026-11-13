@@ -856,12 +856,15 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
 #if KDA_FUSED_SCALAR_GATE
                     // Only the strict lower triangle is read by the inverse below.
                     const float* cs_ = &R.g[kChunk];
-                    const float cr   = cs_[row];
                     // The mask is applied to the EXPONENT as well as to the product, so a
                     // masked entry never forms exp2 of a large positive number (--use_fast_math
                     // may evaluate both arms of the select), while a live entry is not clamped:
                     // a positive gate (alpha > 1) is out of contract but still exact.
                     const bool m0 = col < row, m1 = col + 1 < row;
+                    // Loaded only where m0 (m1 implies m0) reads it, and volatile so the load is
+                    // neither hoisted nor shared with warp 1's: a lane whose entries are all masked
+                    // must not reach the barrier below with a load of this stage unread (Rule 11).
+                    const float cr               = m0 ? *reinterpret_cast<const volatile float*>(&cs_[row]) : 0.0f;
                     sm.prod[row * kPS + col]     = m0 ? acc[2 * e] * exp2f(m0 ? cr - cs_[col] : 0.0f) : 0.0f;
                     sm.prod[row * kPS + col + 1] = m1 ? acc[2 * e + 1] * exp2f(m1 ? cr - cs_[col + 1] : 0.0f) : 0.0f;
 #else
@@ -880,8 +883,9 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                     const int tr = 8 * (e >> 1) + 2 * tg;
 #if KDA_FUSED_SCALAR_GATE
                     const float* cs_ = &R.g[kChunk];
-                    const float cq   = cs_[tq];
                     const bool m0 = tr <= tq, m1 = tr + 1 <= tq;  // masked in the exponent too, as for M
+                    // As for cr above: loaded only where m0 (m1 implies m0) reads it.
+                    const float cq = m0 ? *reinterpret_cast<const volatile float*>(&cs_[tq]) : 0.0f;
                     const float v0 = m0 ? acc[2 * e] * q_scale * exp2f(m0 ? cq - cs_[tr] : 0.0f) : 0.0f;
                     const float v1 = m1 ? acc[2 * e + 1] * q_scale * exp2f(m1 ? cq - cs_[tr + 1] : 0.0f) : 0.0f;
 #else
