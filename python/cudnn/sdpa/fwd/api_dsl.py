@@ -144,6 +144,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_supported,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
+    supports_mxfp8_split_sink,
     HEAD_TILE_GRANULE as _SM120_HEAD_TILE_GRANULE,
     SEQ_KV_TILES as _SM120_KV_TILES,
     SEQ_Q_TILES as _SM120_Q_TILES,
@@ -6471,20 +6472,31 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             # on this arch, so there is no room to widen the O tile the way the
             # SM100 kernels do.
             #
-            # Half templates and qualified per-tensor FP8 lowering write
+            # Half templates and qualified per-tensor FP8/MXFP8 lowering write
             # sink-free partials; only the final combine folds the sink.
             self._not_implemented_error_if(self.thd, "split_kv > 1 is dense-only (THD packs its own flat grid)")
             self._value_error_if(
                 self.has_sink
                 and self._fp8
-                and not supports_quantized_split_sink(
-                    device_cc=self.compute_capability,
-                    pertensor=self._pertensor,
-                    thd=self.thd,
-                    d_shape=(int(d_q), int(d_v)),
-                    paged=self.paged,
+                and not (
+                    supports_quantized_split_sink(
+                        device_cc=self.compute_capability,
+                        pertensor=self._pertensor,
+                        thd=self.thd,
+                        d_shape=(int(d_q), int(d_v)),
+                        paged=self.paged,
+                    )
+                    or (
+                        not self._pertensor
+                        and supports_mxfp8_split_sink(
+                            device_cc=self.compute_capability,
+                            d_shape=(int(d_q), int(d_v)),
+                            thd=self.thd,
+                            paged=self.paged,
+                        )
+                    )
                 ),
-                "SM120 split_kv > 1 with an attention sink requires exact D128 dense per-tensor FP8 or FP16/BF16",
+                "SM120 split_kv > 1 with an attention sink requires FP16/BF16 or exact D128 dense per-tensor FP8/MXFP8",
             )
             self._value_error_if(
                 (self.seq_kv_lens_present or self.seq_q_lens_present) and not (self.paged and (decode_tile or self.flavor in _SM120_WIDE_F16_FLAVORS)),

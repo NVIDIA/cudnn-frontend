@@ -103,6 +103,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     head_tiles as _sm120_head_tiles,
     is_decode_tile as _sm120_is_decode_tile,
     tile_domain as _sm120_tile_domain,
+    supports_mxfp8_split_sink,
 )
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
@@ -1968,12 +1969,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     and (
                         (
                             (facts.is_fp8 or facts.is_mxfp8)
-                            and not supports_quantized_split_sink(
-                                device_cc=facts.device_cc,
-                                pertensor=facts.is_fp8,
-                                thd=facts.thd,
-                                d_shape=(facts.d_qk, facts.d_v),
-                                paged=facts.has_paged_kv,
+                            and not (
+                                supports_quantized_split_sink(
+                                    device_cc=facts.device_cc,
+                                    pertensor=facts.is_fp8,
+                                    thd=facts.thd,
+                                    d_shape=(facts.d_qk, facts.d_v),
+                                    paged=facts.has_paged_kv,
+                                )
+                                or (
+                                    facts.is_mxfp8
+                                    and supports_mxfp8_split_sink(
+                                        device_cc=facts.device_cc,
+                                        d_shape=(facts.d_qk, facts.d_v),
+                                        thd=facts.thd,
+                                        paged=facts.has_paged_kv,
+                                    )
+                                )
                             )
                         )
                         or facts.has_epilogue_gate
