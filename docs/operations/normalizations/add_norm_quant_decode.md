@@ -147,8 +147,9 @@ owner clears it when the row count shrinks: after a call with more rows, a call 
 bytes in the rows between the new `rows` and `ceil(rows / 128) * 128`.
 
 Everything the entry does not serve is declined by name: `TypeError` for a non-tensor, a dtype, a `hidden` that is not
-an `int`, a flag that is not a `bool`, or a `rows` of `compile` / `outputs` that is not an `int`; `ValueError` for a width outside the kernel's structure (a multiple of 256 in
-256 .. 8192), an `eps` that is not finite and positive, `add` with `store_residual`, a `quant` outside the vocabulary, a
+an `int`, a flag that is not a `bool`, or a `rows` of `compile` / `outputs` that is not an `int`; `ValueError` for a
+width outside the kernel's structure (a multiple of 256 in 256 .. 8192), an `eps` that is not a finite positive Python
+`float` or `int` (the message names the type it got), `add` with `store_residual`, a `quant` outside the vocabulary, a
 form without an output, `pdl_release=True` without `pdl=True`, an operand the form requires and did not get or got and
 does not use, a shape, an alignment, a device mismatch, an overlap, or an empty call; `NotImplementedError` for a
 structurally valid width other than 5120, a row count above 1024, a non-contiguous operand, a compute capability
@@ -183,7 +184,7 @@ The entry states what a row count launches without launching it: three read-only
 
 | fact | answer |
 | --- | --- |
-| `kernel_symbols_for(rows)` | the symbol of the entry's compiled kernel as a one-element tuple; empty until the entry is compiled. One compiled kernel serves every row count. The symbol carries the form directly behind the kernel's name -- `cudnn_kernel_frost_add_rms_norm_quant_h5120_add_bf16_e4m3_static_wait_release_eps358637bd_...`: the width, the residual mode, the outputs, the launch arm and the fp32 bits of `eps` -- so two forms never share a symbol |
+| `kernel_symbols_for(rows)` | the symbol of the entry's compiled kernel as a one-element tuple; empty until the entry is compiled. One compiled kernel serves every row count. The symbol carries the form directly behind the kernel's name -- `cudnn_kernel_frost_add_rms_norm_quant_h5120_add_bf16_e4m3_static_wait_release_eps358637bd_...`: the width, the residual mode, the outputs, the launch arm and the fp32 bits of `eps` -- so two forms whose kernels differ never share a symbol. The `eps` text is the fp32 value the kernel adds: two `eps` values that round to one fp32 value give two entries that compile the same kernel under one symbol |
 | `form_for(rows)` | the form as plain data: the eight fields of the entry's config (`HIDDEN`, `EPS`, `ADD`, `STORE_RESIDUAL`, `BF16_OUT`, `QUANT`, `PDL`, `PDL_RELEASE`). The compile key is the config alone, so nothing else is part of it. A fresh `dict` on every call |
 | `launch_shape_for(rows)` | `(grid, block, shared_memory)`: one thread block per row, `hidden / 8` threads, one fp32 slot of shared memory per warp -- `((3, 1, 1), (640, 1, 1), 80)` for three rows. A profiler's kernel record of the launch reads the same three values |
 

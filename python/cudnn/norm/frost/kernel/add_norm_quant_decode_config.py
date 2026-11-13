@@ -28,7 +28,9 @@ specialized kernel, so an appended arm adds no parameter to today's forms).
 
 THE FORM IS IN THE KERNEL SYMBOL.  ``str(cfg)`` is a compact text (``h5120_add_bf16_e4m3_static_wait_release_eps358637bd``: the
 width, the residual mode, the outputs, the launch arm and the fp32 bits of ``eps``); the DSL appends it to the kernel's name, so two
-forms never share a symbol and the form is readable inside the first 100 characters.  ``repr(cfg)`` stays the field list.
+forms whose kernels differ never share a symbol and the form is readable inside the first 100 characters.  The ``eps`` text is the
+fp32 value the kernel adds, while ``EPS`` keeps the caller's ``float``: two configs whose ``EPS`` round to one fp32 value are unequal
+compile keys of one kernel with one symbol.  ``repr(cfg)`` stays the field list.
 """
 
 import math
@@ -142,7 +144,8 @@ def validate_hidden(hidden) -> int:
 
 
 def validate_eps(eps) -> float:
-    """``eps`` as a ``float`` when the kernel's constant -- its fp32 value -- is finite and positive; ``ValueError`` otherwise."""
+    """``eps`` as a ``float`` when it is a Python ``float`` or ``int`` whose fp32 value -- the kernel's constant -- is finite and
+    positive; ``ValueError`` otherwise, naming the type it got (a value of another type is declined, never converted)."""
     ok = isinstance(eps, (int, float)) and not isinstance(eps, bool) and math.isfinite(eps) and eps > 0
     if ok:
         try:
@@ -150,7 +153,10 @@ def validate_eps(eps) -> float:
         except (struct.error, OverflowError):
             ok = False
     if not ok:
-        raise ValueError(f"{NAME}: eps must be a finite positive float (its fp32 value is the kernel's constant), got {eps!r}")
+        raise ValueError(
+            f"{NAME}: eps must be a finite positive float (a Python float or int; its fp32 value is the kernel's constant), "
+            f"got {type(eps).__name__} {eps!r}"
+        )
     return float(eps)
 
 

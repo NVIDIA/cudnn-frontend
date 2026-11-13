@@ -280,8 +280,15 @@ def check_binding(cfg: Cfg, x, residual, weight, scale, out=None, codes=None, sc
     for name, t in tensors.items():
         align = SCALE_ALIGN_BYTES if name == "scale" else ALIGN_BYTES
         if t.data_ptr() % align:
-            what = "its 32-bit load" if name == "scale" else "its 128-bit loads / stores"
-            raise ValueError(f"{NAME}: {name} must start at a {align}-byte aligned address for {what}, got data_ptr % {align} = {t.data_ptr() % align}")
+            if name == "scale":
+                why = "for its 32-bit load"
+            elif name == "codes":
+                why = "(the alignment every multi-element operand is bound with; the kernel stores codes as bytes, NVFP4 codes as 32-bit words)"
+            elif name == "scales":
+                why = "(the alignment every multi-element operand is bound with; the kernel stores scales as bytes)"
+            else:
+                why = "for its 128-bit loads / stores"
+            raise ValueError(f"{NAME}: {name} must start at a {align}-byte aligned address {why}, got data_ptr % {align} = {t.data_ptr() % align}")
     # the bytes a launch touches of each operand: the live rows of a slab (the whole padded scale tiles), the weight row, the one scale
     touched = dict(x=rows * hidden, residual=rows * hidden, weight=hidden, scale=1, out=rows * hidden, codes=rows * codes_width)
     touched["scales"] = scale_rows(rows) * (hidden // SF_BLOCK)
@@ -376,14 +383,17 @@ class AddNormQuantDecode:
     def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
         """The symbol of the kernel this entry has compiled: a one-element tuple, empty until the entry is compiled.  One compiled
         kernel serves every row count.  The symbol carries the form (``str`` of the config: the width, the residual mode, the
-        outputs, the launch arm, the fp32 bits of ``eps``) directly behind the kernel's name, so two forms never share a symbol."""
+        outputs, the launch arm, the fp32 bits of ``eps``) directly behind the kernel's name, so two forms whose kernels differ
+        never share a symbol; the ``eps`` text is the fp32 value the kernel adds."""
         self._fact_cfg(rows)
         fn = self.compiled.get(self.key())
         return kernel_symbols(() if fn is None else (fn,), NAME)
 
     def form_for(self, rows: int) -> Dict[str, Any]:
         """The form of ``rows`` as plain data: the fields of the entry's config.  The compile key is the config alone, so nothing
-        else is part of it: the row count is a runtime fact of a launch (:meth:`launch_shape_for`)."""
+        else is part of it: the row count is a runtime fact of a launch (:meth:`launch_shape_for`).  ``EPS`` is the caller's
+        ``float`` as given: two entries whose ``eps`` round to one fp32 value compile the same kernel (one symbol) and report
+        unequal forms."""
         return plain_form(self._fact_cfg(rows))
 
     def launch_shape_for(self, rows: int) -> LaunchShape:
