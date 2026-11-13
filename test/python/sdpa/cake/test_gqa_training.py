@@ -43,13 +43,18 @@ def test_host_rejection_precedes_compilation(monkeypatch):
 
 
 def test_vendor_files_match_record():
-    root = Path(api.__file__).resolve().parents[2] / "_cake"
-    record = json.loads((root / "VENDORED_GQA.json").read_text())
+    source_root = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "_cake"
+    wheel_root = Path(api.__file__).resolve().parents[2] / "_cake"
+    record = json.loads((source_root / "VENDORED_GQA.json").read_text())
     for package, info in record["packages"].items():
         for relative, expected in info["files"].items():
             expected = info.get("local_modifications", {}).get(relative, {}).get("blob", expected)
-            data = (root / "_vendor" / package / relative).read_bytes()
-            assert hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() == expected
+            source_data = (source_root / "_vendor" / package / relative).read_bytes()
+            assert hashlib.sha1(f"blob {len(source_data)}\0".encode() + source_data).hexdigest() == expected
+            if Path(relative).name in {".gitignore", ".clang-format"}:
+                continue
+            wheel_data = (wheel_root / "_vendor" / package / relative).read_bytes()
+            assert hashlib.sha1(f"blob {len(wheel_data)}\0".encode() + wheel_data).hexdigest() == expected
 
 
 @pytest.fixture

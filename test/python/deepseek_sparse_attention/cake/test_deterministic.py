@@ -14,12 +14,17 @@ pytestmark = pytest.mark.L0
 
 
 def test_vendor_files():
-    root = Path(api.__file__).resolve().parents[2] / "_cake"
-    for package, record in json.loads((root / "VENDORED_DSA_DET.json").read_text())["packages"].items():
+    source_root = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "_cake"
+    wheel_root = Path(api.__file__).resolve().parents[2] / "_cake"
+    for package, record in json.loads((source_root / "VENDORED_DSA_DET.json").read_text())["packages"].items():
         for name, expected in record["files"].items():
             expected = record.get("local_modifications", {}).get(name, {}).get("blob", expected)
-            data = (root / "_vendor" / package / name).read_bytes()
-            assert hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest() == expected
+            source_data = (source_root / "_vendor" / package / name).read_bytes()
+            assert hashlib.sha1(f"blob {len(source_data)}\0".encode() + source_data).hexdigest() == expected
+            if Path(name).name in {".gitignore", ".clang-format"}:
+                continue
+            wheel_data = (wheel_root / "_vendor" / package / name).read_bytes()
+            assert hashlib.sha1(f"blob {len(wheel_data)}\0".encode() + wheel_data).hexdigest() == expected
 
 
 def test_segments_stable_and_exclude_holes():
