@@ -89,6 +89,7 @@ from ..common.thd import (
     TENSOR_MAP_QWORDS,
 )
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_head, decode_work_item, order_body
+from ..common.tail import gate_body
 from ..common.host import get_dtype, family_slots
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
@@ -366,13 +367,13 @@ def tcgen05_mma_warp(
     nvvm.tcgen05_alloc(tmem_base_slot, cutlass.Int32(512), group=nvvm.CTAGroup.CTA_1)
     nvvm.barrier_cta_sync_aligned(cfg.tmem_lifecycle_barrier_id, thread_count=cfg.tmem_user_threads)
 
-    # ---- chunk-invariant GEMM descriptors (rows = DV for chain H, DK for chain M) ----
+    # ---- chunk-invariant GEMM descriptors (rows = DV for chain H, d_m for chain M) ----
     bytes_per_element = cfg.io_dtype.width // 8
     instruction_descriptor_k_state_h = nvvm.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=cfg.b_t, m_dim=cfg.d_v
     )
     instruction_descriptor_k_state_m = nvvm.Tcgen05InstrDesc.build(
-        c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=cfg.b_t, m_dim=cfg.d_k
+        c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=cfg.b_t, m_dim=cfg.d_m
     )
     bmm_state_k_desc_h = MmaDesc(
         M=cfg.d_v,
@@ -388,7 +389,7 @@ def tcgen05_mma_warp(
         kind=nvvm.Tcgen05MMAKind.F16,
     )
     bmm_state_k_desc_m = MmaDesc(
-        M=cfg.d_k,
+        M=cfg.d_m,
         N=cfg.b_t,
         K=cfg.d_k,
         bpe_a=bytes_per_element,
@@ -414,7 +415,7 @@ def tcgen05_mma_warp(
         kind=nvvm.Tcgen05MMAKind.F16,
     )
     bmm_y_t_inv_desc_m = MmaDesc(
-        M=cfg.d_k,
+        M=cfg.d_m,
         N=cfg.b_t,
         K=cfg.b_t,
         bpe_a=bytes_per_element,
@@ -430,7 +431,7 @@ def tcgen05_mma_warp(
         c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=cfg.d_k, m_dim=cfg.d_v, b_major=1
     )
     instruction_descriptor_kv_m = nvvm.Tcgen05InstrDesc.build(
-        c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=cfg.d_k, m_dim=cfg.d_k, b_major=1
+        c_dtype=cutlass.Float32, a_dtype=cfg.io_dtype, b_dtype=cfg.io_dtype, n_dim=cfg.d_k, m_dim=cfg.d_m, b_major=1
     )
     bmm_decay_u_k_desc_h = MmaDesc(
         M=cfg.d_v,
@@ -446,7 +447,7 @@ def tcgen05_mma_warp(
         kind=nvvm.Tcgen05MMAKind.F16,
     )
     bmm_decay_u_k_desc_m = MmaDesc(
-        M=cfg.d_k,
+        M=cfg.d_m,
         N=cfg.d_k,
         K=cfg.b_t,
         bpe_a=bytes_per_element,
@@ -723,7 +724,7 @@ def chain_warp_group(
     ldtm_width = 32
     sttm_width = 16
     num_ldtms = cutlass.const_expr(cfg.d_k // ldtm_width)
-    rows = cutlass.const_expr(cfg.d_v if is_h else cfg.d_k)
+    rows = cutlass.const_expr(cfg.d_v if is_h else cfg.d_m)
     row_halves = cutlass.const_expr(rows // 64)
     v_row = group_tidx % 8 + (group_tidx // 16 % 2) * 8
     if cutlass.const_expr(rows == 128):
@@ -762,6 +763,9 @@ def chain_warp_group(
         )
         head_o, v_offset = decode_head(cfg, head_idx)
         if cutlass.const_expr(is_h):
+            gmem_row = state_gmem_row + v_offset
+            row_store = state_row_valid
+        elif cutlass.const_expr(cfg.d_m != cfg.d_k):
             gmem_row = state_gmem_row + v_offset
             row_store = state_row_valid
         elif cutlass.const_expr(cfg.tiles_per_head > 1):
@@ -818,7 +822,7 @@ def chain_warp_group(
                     for i in cutlass.range_constexpr(num_ldtms):
                         words = []
                         for k in cutlass.range_constexpr(32):
-                            words.append(one if state_gmem_row == i * ldtm_width + k else cutlass.Float32(0.0))
+                            words.append(one if gmem_row == i * ldtm_width + k else cutlass.Float32(0.0))
                         nvvm.tcgen05_st(
                             "32x32b",
                             nvvm.make_tmem_ptr(row_lo_addr + tmem_state_col + i * ldtm_width, cutlass.Float32),
@@ -1037,6 +1041,7 @@ def build_descs_body(
     expand_num: cutlass.Constexpr[int],
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    piece_seq=None,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (K, V), the tinv array on the K warp."""
     arr_words = n_batch * cutlass.Int32(TENSOR_MAP_QWORDS)
@@ -1048,7 +1053,7 @@ def build_descs_body(
     if widx == 0:
         emit_family_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, b_t, k_slots, expand_num, lanes=32)
         if cutlass.const_expr(tinv is not None):
-            emit_tile_seq_descs(base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32)
+            emit_tile_seq_descs(base_tinv, desc_tinv_arr, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32, piece_seq=piece_seq)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
         emit_family_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, b_t, v_slots, expand_num, lanes=32)
@@ -1078,6 +1083,8 @@ def frost_gdn_summary_prologue(
     n_batch: cutlass.Int32,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue: under ``run_order`` block 0 LPT-orders the work-item table and zeroes the scheduler rings
     (:func:`order_body`); block 1 builds the per-batch K and V TMA-descriptor arrays (:func:`build_descs_body`)."""
@@ -1095,6 +1102,11 @@ def frost_gdn_summary_prologue(
             n_heads_out = cutlass.Int32(gate.shape[1])
             if cutlass.const_expr(tiles_per_head > 1):
                 n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
+            n_items = n_heads_out * n_batch
+            if cutlass.const_expr(mItemLimit is not None):
+                if cutlass.const_expr(gate_sms > 0):
+                    gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+                n_items = cutlass.Int32(mItemLimit[1])
             order_body(
                 order_gen,
                 b_t,
@@ -1102,7 +1114,7 @@ def frost_gdn_summary_prologue(
                 ORDER_ELEMENTS,
                 tidx,
                 n_heads_out,
-                n_heads_out * n_batch,
+                n_items,
                 cu_seqlens,
                 mStaging,
                 mCount,
@@ -1138,6 +1150,8 @@ def prologue(
     tiles_per_head: cutlass.Constexpr[int] = 1,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    item_limit_word: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: order the work items (``run_order``) and build the
     2 per-batch TMA-descriptor arrays (K, V) into ``tensormap_workspace``."""
@@ -1203,6 +1217,8 @@ def prologue(
         cutlass.Int32(batch_size),
         k_slots,
         v_slots,
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -1575,6 +1591,7 @@ class GdnSummaryCfg:
     log_gate: bool = False
     safe_gate: bool = False
     tiles_per_head: int = 1
+    d_m: int = 0
     state_table: bool = True
     has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES
@@ -1642,7 +1659,8 @@ def build_cfg(
     has_composed: bool = False,
 ) -> GdnSummaryCfg:
     """Build the per-compile ``GdnSummaryCfg`` (io_dtype in {Float16, BFloat16}; acc is always Float32).  ``tiles_per_head`` > 1
-    runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value columns of H each; chain M is stored by the first tile."""
+    runs every gate head as ``tiles_per_head`` tiles of ``d_v`` value columns of H each; with a square state every tile also
+    runs its own ``d_m = d_k // tiles_per_head`` rows of chain M, otherwise chain M runs whole and the first tile stores it."""
     if d_k not in STATE_DIMS or d_v not in STATE_DIMS:
         raise ValueError(f"fused GDN summary serves DK, DV in {STATE_DIMS}, got DK={d_k} DV={d_v}")
     cfg = GdnSummaryCfg(
@@ -1662,6 +1680,7 @@ def build_cfg(
         v_slots=v_slots,
         tiles_per_head=tiles_per_head,
     )
+    cfg.d_m = d_v if tiles_per_head > 1 and d_k == tiles_per_head * d_v else d_k
     n_chain = len(cfg.chain_h_warp_ids) + len(cfg.chain_m_warp_ids)
     cfg.threads_per_cta = cfg.threads_per_warp * (4 + n_chain)
     cfg.tmem_user_threads = cfg.threads_per_warp * (1 + n_chain)
@@ -1706,6 +1725,7 @@ def get_compiled_cache(
     layout_key: tuple = (),
     has_composed: bool = False,
     state_table: bool = False,
+    has_item_limit: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -1813,6 +1833,7 @@ def chunk_gdn_summary(
     stream,
     own_prologue: bool = True,
     composed=None,
+    item_limit_word=None,
 ) -> None:
     """Execute the fused GDN state-summary kernel (H and M in one launch, THD / varlen entry), compiled once per static
     config and replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``initial_state`` None = zero seed;
@@ -1881,6 +1902,7 @@ def chunk_gdn_summary(
         layout_key=(len(k.shape), len(v.shape), k_slots, v_slots),
         has_composed=has_composed,
         state_table=state_table,
+        has_item_limit=item_limit_word is not None,
     )
 
     if "compiled" not in cache:
@@ -1982,6 +2004,8 @@ def chunk_gdn_summary(
             tiles_per_head,
             k_slots,
             v_slots,
+            from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
+            num_sm if item_limit_word is not None and order_gen else 0,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
@@ -1997,6 +2021,7 @@ def chunk_gdn_summary(
             tinv,
             workspace,
             cu_stream,
+            item_limit_word,
         )
     compiled(
         k,
@@ -2040,6 +2065,7 @@ def run_summary(
     dt_bias=None,
     own_prologue=True,
     composed=None,
+    item_limit_word=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -2057,6 +2083,7 @@ def run_summary(
             tinv,
             tensormap_workspace,
             cu_stream,
+            item_limit_word,
         )
     cache["compiled"](
         k,

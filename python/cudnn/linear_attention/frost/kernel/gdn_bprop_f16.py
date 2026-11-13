@@ -127,6 +127,7 @@ from ..common.thd import (
     TENSOR_MAP_QWORDS,
 )
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, WORK_ITEM_DSTATE_DST, decode_work_item, order_body
+from ..common.tail import gate_body
 from ..common.host import get_dtype, family_slots
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,
@@ -3277,6 +3278,8 @@ def build_descs_body(
     expand_num: cutlass.Constexpr[int],
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    checkpoint_row_base=None,
+    piece_seq=None,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp). Runs inside the
     prologue kernel after its order pass; warps past the array count fall
@@ -3299,7 +3302,7 @@ def build_descs_body(
     if widx == 1:
         emit_family_descs(base_k, sub1, cu_seqlens, k, n_batch, b_t, k_slots, expand_num, lanes=32)
         if cutlass.const_expr(tinv is not None):
-            emit_tile_seq_descs(base_tinv, sub8, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32)
+            emit_tile_seq_descs(base_tinv, sub8, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32, piece_seq=piece_seq)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 2:
         emit_family_descs(base_v, sub2, cu_seqlens, v, n_batch, b_t, v_slots, expand_num, lanes=32)
@@ -3308,7 +3311,9 @@ def build_descs_body(
         emit_seq_descs(base_do, sub3, cu_seqlens, do_, n_batch, 2, expand_num, lanes=32)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 4:
-        emit_checkpoint_seq_descs(base_checkpoint, sub4, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, expand_num, lanes=32)
+        emit_checkpoint_seq_descs(
+            base_checkpoint, sub4, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, expand_num, lanes=32, row_base=checkpoint_row_base
+        )
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 5:
         emit_seq_descs(base_dq, sub5, cu_seqlens, dq, n_batch, 2, expand_num, lanes=32)
@@ -3355,6 +3360,8 @@ def frost_gdn_bprop_prologue(
     checkpoint_every_n: cutlass.Int32,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue. Under ``run_order`` this kernel is the first
     work-item-table consumer, so block 0 LPT-orders the table and zeroes both
@@ -3373,6 +3380,11 @@ def frost_gdn_bprop_prologue(
             sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(do_.shape[1])
+            n_items = n_heads_out * n_batch
+            if cutlass.const_expr(mItemLimit is not None):
+                if cutlass.const_expr(gate_sms > 0):
+                    gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+                n_items = cutlass.Int32(mItemLimit[1])
             order_body(
                 order_gen,
                 b_t,
@@ -3380,7 +3392,7 @@ def frost_gdn_bprop_prologue(
                 ORDER_ELEMENTS,
                 tidx,
                 n_heads_out,
-                n_heads_out * n_batch,
+                n_items,
                 cu_seqlens,
                 mStaging,
                 mCount,
@@ -3537,6 +3549,8 @@ def prologue(
     stream: cuda.CUstream,
     k_slots: cutlass.Constexpr[int] = 1,
     v_slots: cutlass.Constexpr[int] = 1,
+    item_limit_word=None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: LPT-order the work items (with ``run_order``, when
     this kernel is the backward pair's first table consumer) and build the
@@ -3579,6 +3593,8 @@ def prologue(
         cutlass.Int32(b_t),
         k_slots,
         v_slots,
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 

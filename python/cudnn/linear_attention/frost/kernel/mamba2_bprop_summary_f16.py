@@ -64,6 +64,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_seq_descs, TENSOR_MAP_QWORDS
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_head, decode_work_item, order_body
+from ..common.tail import gate_body
 from cudnn.frost.tile_dsl.barrier import (
     MBarrier,
     Producer,
@@ -967,6 +968,8 @@ def frost_mamba2_bprop_summary_prologue(
     mWorkItems: cute.Tensor,
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the scheduler rings via
     :func:`order_body`, block 1 builds the per-batch TMA-descriptor arrays via :func:`build_descs_body`,
@@ -982,6 +985,11 @@ def frost_mamba2_bprop_summary_prologue(
         sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
         sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         n_heads_out = cutlass.Int32(q.shape[1] if q.shape[1] >= do.shape[1] else do.shape[1])
+        n_items = n_heads_out * n_batch
+        if cutlass.const_expr(mItemLimit is not None):
+            if cutlass.const_expr(gate_sms > 0):
+                gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+            n_items = cutlass.Int32(mItemLimit[1])
         order_body(
             order_gen,
             b_t,
@@ -989,7 +997,7 @@ def frost_mamba2_bprop_summary_prologue(
             ORDER_ELEMENTS,
             tidx,
             n_heads_out,
-            n_heads_out * n_batch,
+            n_items,
             cu_seqlens,
             mStaging,
             mCount,
@@ -1026,6 +1034,8 @@ def prologue(
     scheduler_counter: cute.Tensor,
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
+    item_limit_word=None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: LPT-order the work items and build the per-(b,h) TMA-descriptor arrays (Q, dO) into
     ``tensormap_workspace``."""
@@ -1057,6 +1067,8 @@ def prologue(
         work_items,
         scheduler_counter,
         cutlass.Int32(batch_size),
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 

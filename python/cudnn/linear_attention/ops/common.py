@@ -15,6 +15,8 @@ TORCH_DTYPE_TO_CUDNN = {
     torch.float32: cudnn.data_type.FLOAT,
     torch.int32: cudnn.data_type.INT32,
     torch.int64: cudnn.data_type.INT64,
+    torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
+    torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
 }
 
 

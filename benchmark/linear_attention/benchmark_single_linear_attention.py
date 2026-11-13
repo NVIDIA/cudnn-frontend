@@ -126,7 +126,7 @@ def parse_args():
         "--num_q_heads",
         default=None,
         type=int,
-        help="Number of query/key heads to input to the layer (default: 96 for kda, 40 for gdp, 8 for mamba2 = the B / C group count, 64 otherwise)",
+        help="Number of query/key heads to input to the layer (default: 96 for kda, 40 for gdp, 16 for gdn = one per 4 value heads, 8 for mamba2 = the B / C group count, 64 otherwise)",
     )
     parser.add_argument(
         "--num_kv_heads",
@@ -530,7 +530,7 @@ else:
     batch_size = args.batch_size
     seqlen = args.seqlen
     if args.num_q_heads is None:
-        args.num_q_heads = {"kda": 96, "gdp": 40, "mamba2": 8}.get(args.variant, 64)
+        args.num_q_heads = {"kda": 96, "gdp": 40, "gdn": 16, "mamba2": 8}.get(args.variant, 64)
     if args.num_kv_heads is None:
         args.num_kv_heads = {"kda": 96, "gdp": 40}.get(args.variant, 64)
     num_q_heads = args.num_q_heads
@@ -688,6 +688,7 @@ else:
                     checkpoint_every_n_tokens=ckpt_tokens,
                     checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
+                    output_context=True,
                 )
             elif args.variant == "gdp":
                 out = gated_delta_product(
@@ -705,6 +706,7 @@ else:
                     checkpoint_every_n_tokens=ckpt_tokens,
                     checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
+                    output_context=True,
                 )
             elif args.variant == "kda":
                 out = kimi_delta_attention(

@@ -93,6 +93,7 @@ from ..common.thd import (
     TENSOR_MAP_QWORDS,
 )
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, decode_work_item, order_body
+from ..common.tail import gate_body
 from ..common.host import get_dtype, family_slots
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
@@ -1605,6 +1606,7 @@ def build_descs_body(
     expand_num: cutlass.Constexpr[int],
     q_step: cutlass.Constexpr[int] = 1,
     k_slots: cutlass.Constexpr[int] = 1,
+    piece_seq=None,
 ) -> None:
     """Per-batch descriptor-array build, one warp per array (the tinv array on the K warp), after the prologue's order pass.
     q and dO address the compact
@@ -1629,7 +1631,7 @@ def build_descs_body(
     if widx == 1:
         emit_family_descs(base_k, sub1, cu_seqlens, k, n_batch, b_t, k_slots, expand_num, lanes=32)
         if cutlass.const_expr(tinv is not None):
-            emit_tile_seq_descs(base_tinv, sub3, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32)
+            emit_tile_seq_descs(base_tinv, sub3, cu_seqlens, tinv, n_batch, b_t, 3, expand_num, lanes=32, piece_seq=piece_seq)
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 2:
         emit_seq_descs(base_do, sub2, cu_seqlens, do_, n_batch, 2, 1, lanes=32)
@@ -1659,6 +1661,8 @@ def frost_gdn_bprop_summary_prologue(
     mScheduler: Optional[cute.Tensor],
     n_batch: cutlass.Int32,
     k_slots: cutlass.Constexpr[int] = 1,
+    mItemLimit: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Two-CTA prologue: under ``run_order`` (this kernel is the first work-item-table consumer) block 0 LPT-orders the
     table and zeroes both consumers' scheduler rings (:func:`order_body`); block 1 builds the per-batch TMA-descriptor
@@ -1675,6 +1679,11 @@ def frost_gdn_bprop_summary_prologue(
             sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(do_.shape[1])
+            n_items = n_heads_out * n_batch
+            if cutlass.const_expr(mItemLimit is not None):
+                if cutlass.const_expr(gate_sms > 0):
+                    gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+                n_items = cutlass.Int32(mItemLimit[1])
             order_body(
                 order_gen,
                 b_t,
@@ -1682,7 +1691,7 @@ def frost_gdn_bprop_summary_prologue(
                 ORDER_ELEMENTS,
                 tidx,
                 n_heads_out,
-                n_heads_out * n_batch,
+                n_items,
                 cu_seqlens,
                 mStaging,
                 mCount,
@@ -1719,6 +1728,8 @@ def prologue(
     tensormap_workspace: cute.Tensor,
     stream: cuda.CUstream,
     k_slots: cutlass.Constexpr[int] = 1,
+    item_limit_word: Optional[cute.Tensor] = None,
+    gate_sms: cutlass.Constexpr[int] = 0,
 ):
     """One-launch prologue: LPT-order the work items (``run_order``, when this kernel is the backward pair's first table
     consumer) and build the per-(b,h) TMA-descriptor arrays (Q, K, dO) into ``tensormap_workspace``."""
@@ -1788,6 +1799,8 @@ def prologue(
         scheduler_all,
         cutlass.Int32(batch_size),
         k_slots,
+        item_limit_word,
+        gate_sms,
     ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
@@ -2426,6 +2439,7 @@ def get_compiled_cache(
     q_step: int = 1,
     layout_key: tuple = (),
     has_composed_dstate: bool = False,
+    has_item_limit: bool = False,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -2529,6 +2543,7 @@ def chunk_gdn_bwd_summary(
     num_sm: int,
     stream,
     own_prologue: bool = True,
+    item_limit_word=None,
 ) -> None:
     """Execute the chunked GDN bprop state-summary kernel (THD / varlen entry), compiled once per static config and
     replayed; tensors are DLPack CUDA tensors with a stride-1 innermost dim.  ``d_initial_state`` is the only output.
@@ -2582,6 +2597,7 @@ def chunk_gdn_bwd_summary(
         q_step,
         layout_key=(len(k.shape), k_slots),
         has_composed_dstate=dcomposed is not None,
+        has_item_limit=item_limit_word is not None,
     )
 
     if "compiled" not in cache:
@@ -2665,6 +2681,8 @@ def chunk_gdn_bwd_summary(
             workspace_placeholder,
             cu_stream,
             k_slots,
+            from_dlpack(item_limit_word, assumed_align=16).mark_layout_dynamic() if item_limit_word is not None else None,
+            num_sm if item_limit_word is not None and order_gen else 0,
             options="--enable-tvm-ffi --opt-level 2",
         )
     if own_prologue:
@@ -2680,6 +2698,7 @@ def chunk_gdn_bwd_summary(
             tinv,
             workspace,
             cu_stream,
+            item_limit_word,
         )
     compiled(
         q,
@@ -2726,6 +2745,7 @@ def run_bwd_summary(
     tinv,
     own_prologue=True,
     dcomposed=None,
+    item_limit_word=None,
 ) -> None:
     """Replay the compiled plan: the prologue launch, then the main launch.  The plan validated the contract at build, so
     nothing here raises."""
@@ -2743,6 +2763,7 @@ def run_bwd_summary(
             tinv,
             tensormap_workspace,
             cu_stream,
+            item_limit_word,
         )
     cache["compiled"](
         q,

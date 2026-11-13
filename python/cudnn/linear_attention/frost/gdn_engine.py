@@ -17,8 +17,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
-from .common.context import backward_context, forward_context
-from .common.host import family_slots
+from .common.context import backward_context, forward_apply_context, forward_context
 from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
 
@@ -49,21 +48,21 @@ def gdn_support_gates(engine: str, facts) -> None:
     """The GDN kernel family's dtype/attribute gates, shared with the GDP engine."""
     import cudnn
 
-    if facts.is_bwd and facts.input_context:
+    if facts.is_bwd and facts.input_context and not facts.context_from_forward:
         context_gate(engine, facts, b_t=64, expand_num=facts.num_householder)
     checkpoint = facts.checkpoint_every_n_tokens
     checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
+    if not facts.is_bwd:
+        checkpoint_dtypes = checkpoint_dtypes + (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
     if checkpoint and checkpoint % 64 != 0:
         raise NotImplementedError(f"{engine}: checkpoint_every_n_tokens must be a positive multiple of 64 (got {checkpoint})")
     if not facts.gates_at_ho:
         raise NotImplementedError(f"{engine}: g/beta must carry HO = max(q, v) heads ({facts.h_o})")
     if facts.has_state_indices:
-        if facts.state_indices_dtype != cudnn.data_type.INT32:
-            raise NotImplementedError(f"{engine}: 'state_indices' must be int32, got {facts.state_indices_dtype}")
+        if facts.state_indices_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64):
+            raise NotImplementedError(f"{engine}: 'state_indices' must be int32 or int64, got {facts.state_indices_dtype}")
         if facts.is_bwd:
             raise NotImplementedError(f"{engine}: 'state_indices' is a forward-only pool addressing mode")
-        if checkpoint:
-            raise NotImplementedError(f"{engine}: 'state_indices' cannot be combined with checkpoint_every_n_tokens")
     io = (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     state_dtypes = (cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
     beta_wants = (cudnn.data_type.FLOAT, facts.io_dtype)
@@ -73,9 +72,11 @@ def gdn_support_gates(engine: str, facts) -> None:
     for port, got in (("a_log", facts.a_log_dtype), ("dt_bias", facts.dt_bias_dtype)):
         if got not in gate_param_dtypes + (None,):
             raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
+    fp8 = (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+    forward_state_dtypes = state_dtypes if facts.is_bwd else state_dtypes + fp8
     for port, got in (("initial_state", facts.state_dtype), ("final_state", facts.final_state_dtype)):
-        if got not in state_dtypes + (None,):
-            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16, got {got}")
+        if got not in forward_state_dtypes + (None,):
+            raise NotImplementedError(f"{engine}: '{port}' must be fp32/bf16/fp16 (fp8 in a forward graph), got {got}")
     if not facts.state_pair_match:
         raise NotImplementedError(f"{engine}: initial_state and final_state dtypes must match")
     if facts.is_bwd:
@@ -127,71 +128,6 @@ class GdnFrostEngine(BaseEngine):
             return FrostLaPlan(build_gdn(graph))
 
 
-def chunk_factor_pass(
-    cache,
-    k,
-    g,
-    beta,
-    cu,
-    tinv,
-    workspace,
-    *,
-    log_gate,
-    safe_gate,
-    a_log,
-    dt_bias,
-    use_beta_sigmoid,
-    allow_neg_eigval,
-    expand_num,
-    device,
-    stream,
-    tinv_rows,
-    tinv_row_count,
-    publish_desc=True,
-):
-    """Run the T pass over ``cu`` (compile on the first call; ``workspace`` holds its per-batch K and tinv
-    descriptor arrays, emitted by the pass itself or, ``publish_desc=False``, by the caller's prologue) and return its
-    compiled cache."""
-    from .kernel import gdn_tinv_f16 as tinv_module
-
-    if cache is None:
-        return tinv_module.chunk_gdn_tinv(
-            k,
-            g,
-            beta,
-            cu,
-            tinv,
-            log_gate=log_gate,
-            safe_gate=safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            use_beta_sigmoid=use_beta_sigmoid,
-            allow_neg_eigval=allow_neg_eigval,
-            expand_num=expand_num,
-            workspace=workspace,
-            row_table=tinv_rows,
-            row_count=tinv_row_count,
-            device=device,
-            stream=stream,
-            publish_desc=publish_desc,
-        )
-    tinv_module.run_tinv(
-        cache,
-        k,
-        g,
-        beta,
-        cu,
-        tinv,
-        workspace,
-        stream,
-        a_log=a_log if safe_gate else None,
-        dt_bias=dt_bias if safe_gate else None,
-        row_table=tinv_rows,
-        row_count=tinv_row_count,
-    )
-    return cache
-
-
 class CompiledGdn:
     """Compiled FROST GDN / GDP plan over the resolved node buffers.  ``choose_pieces`` and ``is_dv_split`` fix the scheme at build: ``uncut``
     (one item per sequence and head), ``warmup`` (decay-warmup split-K), ``dv_split`` (two uncut items per sequence and head,
@@ -200,16 +136,24 @@ class CompiledGdn:
     plans."""
 
     def __init__(self, node, kernel_module):
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import (
+            DV_SPLIT_TILES,
+            chain_rows_per_cta,
+            choose_pieces,
+            is_dv_split,
+            piece_table_layout,
+        )
         from cuda.bindings.driver import CUstream
 
         from .kernel.gdn_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
-        from .kernel.gdn_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
+        from .kernel.gdn_warmup_forward_f16 import TAIL_BUFFERS, build_warmup_forward, run_warmup_forward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
         self.chain_rows_per_cta = chain_rows_per_cta
         self.warmup_launch = None
+        self.tail_buffer_names = TAIL_BUFFERS
         self.build_warmup_forward = build_warmup_forward
         self.run_warmup_forward = run_warmup_forward
         self.build_chain_forward = build_chain_forward
@@ -219,11 +163,6 @@ class CompiledGdn:
         self.stream_type = CUstream
         self.plan_name = "GdpFrostEngine (GDP)" if node.node_type.name == "GDP" else "GdnFrostEngine (GDN)"
         self.device = current_device()
-        from .common.l2norm import build_l2norm_qk, run_l2norm_qk
-
-        self.build_l2norm_qk = build_l2norm_qk
-        self.run_l2norm_qk = run_l2norm_qk
-        self.l2norm = None
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.expand_num = self.num_householder
         self.use_qk_l2norm = bool(node.params.get("use_qk_l2norm", False))
@@ -248,6 +187,7 @@ class CompiledGdn:
         B = node.inputs["cu_seqlens"].dim[0] - 1
         self.has_final_state = "final_state" in node.outputs
         self.checkpoint = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        self.checkpoint_after_block = bool(node.params.get("checkpoint_after_block", False))
         self.has_state_checkpoints = "state_checkpoints" in node.outputs
         self.has_context = bool(node.params.get("input_context", False))
         self.context = (
@@ -289,13 +229,49 @@ class CompiledGdn:
         )
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
+        self.tail = None
+        if not self.chain and not self.dv_split and not self.batch_invariant:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=self.q_rows,
+                b_t=self.b_t,
+                cadence_tokens=self.checkpoint,
+                expand_num=self.expand_num,
+                dim_v=V,
+            )
+            if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
+                self.tail = None
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         self.tinv_pass = self.chain
-        from .common.piece_chain import build_boundary_fold, run_boundary_fold
+        self.output_context = bool(node.params.get("output_context", False))
+        if self.output_context:
+            from .kernel import gdn_tinv_f16 as tinv_module
 
-        self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
-        self.composed_fold = None
+            self.context = forward_apply_context(
+                self.plan_name,
+                total=total,
+                num_householder=self.num_householder,
+                num_seqs=B,
+                h_q=HQ,
+                h_k=HK,
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=self.checkpoint,
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+                tinv_rows=tinv_module.tinv_rows,
+            )
+            self.context_size = self.context.size
+            self.has_context = self.context_size > 0
+        self.output_normalized_rows = self.output_context and self.context.has_rows
+        self.output_chunk_factors = self.output_context and self.context.has_tables
 
         layout = WorkspaceLayout()
         from .common.host import tensormap_workspace_bytes
@@ -345,20 +321,72 @@ class CompiledGdn:
                 self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.tail is not None:
+                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
             if self.split:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
+        if self.tail is not None and self.tail.dv_split:
+            tail = self.tail
+            self.tail_ctas = tail.tiles * DV_SPLIT_TILES
+            self.tail_item_base = tail.prefix_tiles * DV_SPLIT_TILES
+            tail_words = tensormap_workspace_bytes(kernel_module, B, self.num_householder) // 8
+            regions += [
+                ("tail_tensormaps", layout.add(tail_words * 8), "int64", (tail_words,)),
+                ("tail_scheduler", layout.add(8), "int32", (2,)),
+                ("tail_work_items", layout.add(self.tail_ctas * WORK_ITEM_FIELDS * 4), "int32", (self.tail_ctas, WORK_ITEM_FIELDS)),
+                ("tail_work_count", layout.add(4), "int32", (1,)),
+            ]
+        elif self.tail is not None:
+            from .kernel import gdn_summary_f16 as tail_summary_module
+            from .kernel import gdn_tinv_f16 as tail_tinv_module
+
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            tail_tiles = self.tail_pieces_total * HO
+            tail_words = tensormap_workspace_bytes(kernel_module, self.tail_pieces_total, self.num_householder) // 8
+            tail_fused_words = tensormap_workspace_bytes(tail_summary_module, self.tail_pieces_total, self.num_householder) // 8
+            off_tail_scheduler = layout.add(24)
+            regions += [
+                ("tail_scheduler_prefill", off_tail_scheduler, "int32", (2,)),
+                ("tail_scheduler_h", off_tail_scheduler + 8, "int32", (2,)),
+                ("tail_scheduler_m", off_tail_scheduler + 16, "int32", (2,)),
+                ("tail_scheduler_all", off_tail_scheduler, "int32", (6,)),
+                ("tail_tensormaps", layout.add(tail_words * 8), "int64", (tail_words,)),
+                ("tail_work_items", layout.add(tail_tiles * WORK_ITEM_FIELDS * 4), "int32", (tail_tiles, WORK_ITEM_FIELDS)),
+                ("tail_fused_tensormaps", layout.add(tail_fused_words * 8), "int64", (tail_fused_words,)),
+            ]
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_h", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_state_m", layout.add(self.tail_pieces_total * HO * K * K * 4), "float32", (self.tail_pieces_total, HO, K, K)),
+                ("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+            ]
+            rows = tail_tinv_module.tinv_rows(self.q_rows, self.tail_pieces_total, self.expand_num, self.b_t)
+            regions.append(("tail_tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+            tail_tinv_words = tensormap_workspace_bytes(tail_tinv_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_tinv_tensormaps", layout.add(tail_tinv_words * 8, align=128), "int64", (tail_tinv_words,)))
+            regions.append(("tail_tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("tail_tinv_row_count", layout.add(4), "int32", (1,)))
         if self.tinv_pass:
             from .kernel import gdn_tinv_f16 as tinv_module
 
             rows = tinv_module.tinv_rows(self.q_rows, self.num_pieces, self.expand_num, self.b_t)
-            regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+            if not self.output_chunk_factors:
+                regions.append(("tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
             tinv_words = tensormap_workspace_bytes(tinv_module, self.num_pieces, self.num_householder) // 8
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
             regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
             regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
-        if self.use_qk_l2norm:
+        if self.use_qk_l2norm and not self.output_normalized_rows:
             regions.append(("q_n", layout.add(self.q_rows * HQ * K * 2), self.io_name, (self.q_rows, HQ, K)))
             if not self.has_k_normalized:
                 regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
@@ -406,43 +434,61 @@ class CompiledGdn:
             }
             if self.use_qk_l2norm:
                 aliases |= {"q": "q_n", "k": "context_k_n" if self.has_k_normalized else "k_n"}
-                self.carve_index_q_n = self.carve_names.index("q_n")
-                self.carve_index_k_n = None if self.has_k_normalized else self.carve_names.index("k_n")
-                self.context_index_k_n = self.context.names.index("k_n") if self.has_k_normalized else None
+            if self.output_normalized_rows:
+                aliases |= {"q": "context_q_n", "k": "context_k_n"}
+            if self.output_chunk_factors:
+                aliases |= {"tinv": "context_tinv"}
             absent = len(names) + len(self.carve_names) + (len(self.context.names) if self.has_context else 0)
             if not self.safe_gate:
                 positions.pop("a_log", None)
                 positions.pop("dt_bias", None)
             indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
             self.chain_buffers = itemgetter(*indices)
-            self.chain_scalars = (int(self.pieces), int(self.n_heads_out), int(self.num_seqs), int(self.checkpoint or 0), float(self.scale))
+            fold = "preceding_state_update" in pos
+            lead = ("preceding_state_update", "preceding_transition", "initial_state", "composed_initial_state") if fold else (None,) * 4
+            lead += ("q", "k") if self.use_qk_l2norm else (None, None)
+            lead += ("context_inv_q", "context_inv_k") if self.output_normalized_rows else (None, None)
+            self.chain_lead = itemgetter(*(positions.get(name, absent) for name in lead))
+            self.chain_scalars = (int(self.pieces), int(self.n_heads_out), int(self.num_seqs), int(self.checkpoint or 0), float(self.scale), 0, 0)
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_summary": "tail_scheduler_h",
+                "tinv_words": "tail_tinv_tensormaps",
+                "summary_words": "tail_fused_tensormaps",
+                "state_h_summary": "tail_state_h",
+                "state_m_summary": "tail_state_m",
+                "state_h_chain": "tail_state_h",
+                "state_m_chain": "tail_state_m",
+                "state_x_chain": "tail_state_x",
+                "state_x_prefill": "tail_state_x",
+                "seed": "initial_state",
+                "work_count": "tail_work_count" if self.tail.dv_split else "tail_main_count",
+                "scheduler": "tail_scheduler" if self.tail.dv_split else "tail_scheduler_prefill",
+                "workspace": "tail_tensormaps",
+            }
+            absent = len(names) + len(self.carve_names)
+            if self.tail.dv_split:
+                positions.pop("initial_state", None)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (
+                int(self.tail.pieces),
+                int(self.tail.num_seqs),
+                int(self.tail.batch_base),
+                int(self.tail.first_head_lo),
+                self.tail_ctas if self.tail.dv_split else 0,
+                self.tail_item_base if self.tail.dv_split else 0,
+            )
 
     def run(self, views, workspace, stream, context=None) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
-        if self.index_preceding_state_update is not None:
-            table = views[self.index_initial_state] if self.index_initial_state is not None else None
-            summaries = views[self.index_preceding_state_update]
-            if self.composed_fold is None:
-                self.composed_fold = self.build_boundary_fold(
-                    composed, summaries, reverse=False, num_sm=self.num_sm, device=self.device, seed_dtype=table.dtype if table is not None else None
-                )
-            self.run_boundary_fold(self.composed_fold, table, composed, summaries, views[self.index_preceding_transition], int(stream or 0))
         q = views[self.index_q]
         if self.chain and self.chain_launch is not None:
             carved = workspace.carve(self.carve)
             context_views = context.carve(self.context.carve) if self.has_context else ()
-            if self.use_qk_l2norm:
-                self.run_l2norm_qk(
-                    self.l2norm,
-                    views[self.index_q],
-                    views[self.index_k],
-                    carved[self.carve_index_q_n],
-                    context_views[self.context_index_k_n] if self.has_k_normalized else carved[self.carve_index_k_n],
-                    None,
-                    None,
-                    int(stream or 0),
-                )
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, *context_views, None)), self.stream_type(int(stream or 0)))
+            merged = (*views, *carved, *context_views, None)
+            self.chain_launch(*self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *self.chain_lead(merged))
             return
         k = views[self.index_k]
         v = views[self.index_v]
@@ -459,17 +505,26 @@ class CompiledGdn:
         stream = stream if stream is not None else 0
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_context else {}
+        fold = self.index_preceding_state_update is not None
+        lead_buffers = (
+            views[self.index_preceding_state_update] if fold else None,
+            views[self.index_preceding_transition] if fold else None,
+            state0 if fold else None,
+            composed if fold else None,
+            q if self.use_qk_l2norm else None,
+            k if self.use_qk_l2norm else None,
+            context_region["inv_q"] if self.output_normalized_rows else None,
+            context_region["inv_k"] if self.output_normalized_rows else None,
+        )
         if self.use_qk_l2norm:
-            q_n, k_n = region["q_n"], (context_region["k_n"] if self.has_k_normalized else region["k_n"])
-            if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(
-                    q, k, q_n, k_n, None, None, skip_k=self.has_k_normalized, k_slots=family_slots(k, self.num_householder, 3), stream=stream
-                )
-            else:
-                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, None, None, stream)
-            q, k = q_n, k_n
+            rows = context_region if self.output_normalized_rows else region
+            q, k = rows["q_n"], (context_region["k_n"] if self.has_k_normalized else rows["k_n"])
+        if self.output_chunk_factors:
+            region["tinv"] = context_region["tinv"]
         if self.chain:
-            self.run_chain(q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream)
+            self.run_chain(
+                q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream, lead_buffers
+            )
             return
 
         buffers = dict(
@@ -494,10 +549,22 @@ class CompiledGdn:
             chunk_scratch=region.get("chunk_scratch"),
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
+            item_limit_word=region.get("gate"),
+            tail_scalars=self.tail_scalars if self.tail is not None else (),
+            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
+            lead_buffers=lead_buffers,
         )
         if self.warmup_launch is None:
+            tail = self.tail
             self.warmup_launch = self.build_warmup_forward(
                 **buffers,
+                l2norm_skip_k=self.has_k_normalized,
+                tail=tail,
+                tail_chain_rows=(
+                    self.chain_rows_per_cta(self.dim_v, self.dim_k, tail.num_seqs, self.n_heads_out, self.num_sm)
+                    if tail is not None and not tail.dv_split
+                    else 0
+                ),
                 split=self.split,
                 tiles_per_head=self.tiles_per_head,
                 n_tiles=self.n_tiles,
@@ -510,13 +577,16 @@ class CompiledGdn:
                 allow_neg_eigval=self.allow_neg_eigval,
                 expand_num=self.expand_num,
                 checkpoint_every_n_tokens=self.checkpoint,
+                checkpoint_after_block=self.checkpoint_after_block,
                 scale=self.scale,
                 device=self.device,
                 stream=stream,
             )
         self.run_warmup_forward(*self.warmup_launch, **buffers, checkpoint_every_n_tokens=self.checkpoint, scale=self.scale, stream=stream)
 
-    def run_chain(self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
+    def run_chain(
+        self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream, lead_buffers
+    ) -> None:
         """Chain prologue, T pass, fused H and M summaries, fp32 state chain seeded with initial_state, prefill over the
         pieces seeded with X, all five launched from one compiled host (kernel/gdn_chain_forward_f16.py); the checkpoint
         series keeps its unsplit layout."""
@@ -555,10 +625,12 @@ class CompiledGdn:
             final_state=final_state,
             final_indices=state_indices,
             checkpoints=state_checkpoints,
+            lead_buffers=lead_buffers,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_forward(
                 **buffers,
+                l2norm_skip_k=self.has_k_normalized,
                 pieces=self.pieces,
                 heads_out=self.n_heads_out,
                 num_seqs=self.num_seqs,
@@ -571,6 +643,7 @@ class CompiledGdn:
                 use_beta_sigmoid=self.use_beta_sigmoid,
                 allow_neg_eigval=self.allow_neg_eigval,
                 checkpoint_every_n_tokens=self.checkpoint,
+                checkpoint_after_block=self.checkpoint_after_block,
                 scale=self.scale,
                 chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
                 device=self.device,
@@ -600,31 +673,25 @@ class CompiledGdnBwd:
     def __init__(self, node, bwd_module, recompute_module):
         from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
         from .kernel.gdn_chain_backward_f16 import build_chain_backward, run_chain_backward
-        from .kernel.gdn_warmup_backward_f16 import build_warmup_backward, run_warmup_backward
+        from .kernel.gdn_warmup_backward_f16 import TAIL_BUFFERS, build_warmup_backward, run_warmup_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
         self.bwd = bwd_module
         self.chain_rows_per_cta = chain_rows_per_cta
-        self.kernel_cache = None
         self.build_chain_backward = build_chain_backward
         self.run_chain_backward = run_chain_backward
         self.build_warmup_backward = build_warmup_backward
         self.run_warmup_backward = run_warmup_backward
         self.chain_launch = None
+        self.tail_buffer_names = TAIL_BUFFERS
         self.warmup_launch = None
         self.plan_name = "GdpFrostEngine (GDP_BWD)" if node.node_type.name == "GDP_BWD" else "GdnFrostEngine (GDN_BWD)"
         self.device = current_device()
-        from .common.gate_bwd import scalar_gate_bwd, scalar_gate_blocks
-        from .common.head_reduce import head_group_reduce
+        from .common.gate_bwd import scalar_gate_blocks
         from .common.host import tensormap_workspace_bytes
-        from .common.l2norm import build_l2norm_qk, run_l2norm_qk
 
-        self.head_group_reduce = head_group_reduce
-        self.scalar_gate_bwd = scalar_gate_bwd
-        self.build_l2norm_qk = build_l2norm_qk
-        self.run_l2norm_qk = run_l2norm_qk
-        self.l2norm = None
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
         self.expand_num = self.num_householder
         self.compact_qdo = self.num_householder > 1 and int(node.inputs["v"].dim[-1]) == 64
@@ -649,8 +716,9 @@ class CompiledGdnBwd:
         HQ, HV = q.dim[1], v.dim[-2]
         HO = g.dim[1]
         B = node.inputs["cu_seqlens"].dim[0] - 1
-        self.has_state_checkpoints = "state_checkpoints" in node.inputs
-        self.checkpoint_cadence = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
+        after_block = bool(node.params.get("checkpoint_after_block", False))
+        self.has_state_checkpoints = "state_checkpoints" in node.inputs and not after_block
+        self.checkpoint_cadence = 0 if after_block else int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
         self.coarse_checkpoints = self.has_state_checkpoints and (
             self.checkpoint_cadence > self.b_t or node.inputs["state_checkpoints"].get_data_type().name == "FLOAT"
         )
@@ -676,6 +744,19 @@ class CompiledGdnBwd:
             reverse=True,
         )
         self.chain = self.pieces > 0
+        self.tail = None
+        if not self.chain and not self.batch_invariant:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=self.q_rows,
+                b_t=self.b_t,
+                cadence_tokens=self.checkpoint_cadence,
+                expand_num=self.expand_num,
+            )
+            if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
+                self.tail = None
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
@@ -684,8 +765,30 @@ class CompiledGdnBwd:
         self.summary_q_step = self.num_householder if self.pack_bwd_needed and self.use_qk_l2norm else 1
         self.tinv_pass = self.chain or self.needs_recompute
         self.has_context = bool(node.params.get("input_context", False))
+        self.context_from_forward = self.has_context and bool(node.params.get("context_from_forward", False))
         self.context = None
-        if self.has_context:
+        if self.context_from_forward:
+            from .kernel import gdn_tinv_f16 as tinv_module
+
+            self.context = forward_apply_context(
+                self.plan_name,
+                total=total,
+                num_householder=self.num_householder,
+                num_seqs=B,
+                h_q=HQ,
+                h_k=HK,
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=int(node.params.get("checkpoint_every_n_tokens", 0) or 0),
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+                tinv_rows=tinv_module.tinv_rows,
+            )
+        elif self.has_context:
             from .kernel import gdn_tinv_f16 as tinv_module
 
             self.context = backward_context(
@@ -708,25 +811,15 @@ class CompiledGdnBwd:
             )
         self.context_size = self.context.size if self.has_context else 0
         same_cut = (
-            self.has_context and self.context.has_tables and B == 1 and (self.pieces, self.unit_chunks) == (self.context.pieces, self.context.unit_chunks)
+            self.has_context
+            and self.context.has_tables
+            and (B == 1 or self.context_from_forward)
+            and (self.pieces, self.unit_chunks) == (self.context.pieces, self.context.unit_chunks)
         )
         self.has_normalized_rows = self.has_context and self.context.has_rows
         self.has_chunk_factors = same_cut and self.chain
-        self.has_piece_tables = same_cut and self.chain
+        self.has_piece_tables = same_cut and self.chain and not self.context_from_forward
         self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
-        from .common.piece_chain import build_boundary_fold, run_boundary_fold
-
-        self.build_boundary_fold, self.run_boundary_fold = build_boundary_fold, run_boundary_fold
-        self.composed_fold = None
-        if self.pack_bwd_needed:
-            from .common.expand import build_gather_dq, build_pack_bwd, run_gather_dq, run_pack_bwd
-
-            self.build_pack_bwd = build_pack_bwd
-            self.run_pack_bwd = run_pack_bwd
-            self.build_gather_dq = build_gather_dq
-            self.run_gather_dq = run_gather_dq
-            self.pack_bwd = None
-            self.gather_dq = None
 
         layout = WorkspaceLayout()
         regions = []
@@ -816,6 +909,8 @@ class CompiledGdnBwd:
             self.work_item_rows = self.n_tiles
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
+        if self.tail is not None:
+            regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
         if self.split:
             self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
             regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
@@ -850,6 +945,65 @@ class CompiledGdnBwd:
             regions.append(("tinv_tensormaps", layout.add(tinv_words * 8, align=128), "int64", (tinv_words,)))
             regions.append(("tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
             regions.append(("tinv_row_count", layout.add(4), "int32", (1,)))
+        if self.tail is not None:
+            from .kernel import gdn_bprop_summary_f16 as tail_summary_module
+            from .kernel import gdn_tinv_f16 as tail_tinv_module
+
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            tail_tiles = self.tail_pieces_total * HO
+            off_tail_scheduler = layout.add(40)
+            regions += [
+                ("tail_scheduler_recompute", off_tail_scheduler, "int32", (2,)),
+                ("tail_scheduler_bwd", off_tail_scheduler + 8, "int32", (2,)),
+                ("tail_scheduler_summary", off_tail_scheduler + 16, "int32", (2,)),
+                ("tail_scheduler_m", off_tail_scheduler + 24, "int32", (2,)),
+                ("tail_scheduler_series", off_tail_scheduler + 32, "int32", (2,)),
+                ("tail_scheduler_all", off_tail_scheduler, "int32", (10,)),
+            ]
+            words = tensormap_workspace_bytes(tail_summary_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_summary_tensormaps", layout.add(words * 8), "int64", (words,)))
+            words = tensormap_workspace_bytes(bwd_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_tensormaps", layout.add(words * 8), "int64", (words,)))
+            words = tensormap_workspace_bytes(recompute_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_recompute_tensormaps_m", layout.add(words * 8), "int64", (words,)))
+            if self.needs_recompute:
+                regions.append(("tail_recompute_tensormaps_series", layout.add(words * 8), "int64", (words,)))
+            if not self.has_state_checkpoints:
+                from .kernel import gdn_summary_f16 as tail_fused_module
+
+                words = tensormap_workspace_bytes(tail_fused_module, self.tail_pieces_total, self.num_householder) // 8
+                regions.append(("tail_fused_tensormaps", layout.add(words * 8), "int64", (words,)))
+            if self.coarse_checkpoints:
+                rows = max((total // self.recompute_span_tokens + 2 * self.tail_pieces_total) * HO, 1)
+                regions.append(("tail_work_items_recompute", layout.add(rows * WORK_ITEM_FIELDS * 4), "int32", (rows, WORK_ITEM_FIELDS)))
+                regions.append(("tail_work_count_recompute", layout.add(4), "int32", (1,)))
+                regions.append(("tail_seed_row_base", layout.add(4), "int32", (1,)))
+            regions.append(("tail_work_items", layout.add(tail_tiles * WORK_ITEM_FIELDS * 4), "int32", (tail_tiles, WORK_ITEM_FIELDS)))
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes)
+            state_shape = (self.tail_pieces_total, HO, V, K)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_m", layout.add(self.tail_pieces_total * HO * K * K * 4), "float32", (self.tail_pieces_total, HO, K, K)),
+                ("tail_state_g", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", state_shape),
+                ("tail_state_dx_end", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", state_shape),
+            ]
+            if not self.has_state_checkpoints:
+                regions.append(("tail_state_h", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", state_shape))
+                regions.append(("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", state_shape))
+            if not self.tinv_pass:
+                rows = tail_tinv_module.tinv_rows(self.q_rows, self.tail_pieces_total, self.expand_num, self.b_t)
+                regions.append(("tail_tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+                words = tensormap_workspace_bytes(tail_tinv_module, self.tail_pieces_total, self.num_householder) // 8
+                regions.append(("tail_tinv_tensormaps", layout.add(words * 8, align=128), "int64", (words,)))
+                regions.append(("tail_tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+                regions.append(("tail_tinv_row_count", layout.add(4), "int32", (1,)))
         self.recompute_orders = self.needs_recompute and not self.coarse_checkpoints
         self.bwd_orders = not self.recompute_orders
         self.workspace_size = layout.size
@@ -884,6 +1038,45 @@ class CompiledGdnBwd:
         self.index_following_state_grad = pos.get("following_state_grad")
         self.index_following_transition = pos.get("following_transition")
         self.index_composed = pos.get("composed_initial_state")
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            if self.has_context:
+                positions |= {"context_" + name: len(names) + len(self.carve_names) + i for i, name in enumerate(self.context.names)}
+            coarse = self.coarse_checkpoints
+            rows = "context_" if self.has_normalized_rows else ""
+            aliases = {
+                "series_items": "tail_work_items_recompute",
+                "series_count": "tail_work_count_recompute",
+                "recompute_items": ("tail_work_items_recompute" if coarse else "tail_work_items") if self.needs_recompute else None,
+                "recompute_count": ("tail_work_count_recompute" if coarse else "tail_main_count") if self.needs_recompute else None,
+                "tinv_words": "tail_tinv_tensormaps",
+                "summary_words": "tail_fused_tensormaps",
+                "recompute_m_words": "tail_recompute_tensormaps_m",
+                "series_words": "tail_recompute_tensormaps_series",
+                "bprop_summary_words": "tail_summary_tensormaps",
+                "bprop_words": "tail_tensormaps",
+                "summary_q": "q" if self.pack_expands_q or not self.use_qk_l2norm else rows + "q_n",
+                "summary_do": "dO",
+                "tinv": "tinv" if self.tinv_pass else "tail_tinv",
+                "state_h_summary": "tail_state_h",
+                "state_m_main": "tail_state_m",
+                "state_h_chain": "tail_state_h",
+                "state_m_chain": "tail_state_m",
+                "state_x_chain": "tail_state_x",
+                "seed": "initial_state",
+                "state_x_series": "tail_state_x",
+                "dseed": "d_final_state",
+            }
+            absent = len(names) + len(self.carve_names) + (len(self.context.names) if self.has_context else 0)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (
+                int(self.tail.pieces),
+                int(self.tail.num_seqs),
+                int(self.recompute_span_tokens if coarse else 0) // self.b_t,
+                int(self.tail.batch_base),
+                int(self.tail.first_head_lo),
+            )
 
     def run(self, views, workspace, stream, context=None) -> None:
         q = views[self.index_q]
@@ -918,52 +1111,35 @@ class CompiledGdnBwd:
         tinv = context_region["tinv"] if self.has_chunk_factors else region.get("tinv")
         state_m = context_region["state_m"] if self.has_piece_transitions else region.get("state_m")
         state_g = context_region["state_g"] if self.has_piece_tables else region.get("state_g")
-        dcomposed = None
-        if self.index_following_state_grad is not None:
-            dcomposed = region["composed_dstate"]
-            table = dstate_in
-            summaries = views[self.index_following_state_grad]
-            if self.composed_fold is None:
-                self.composed_fold = self.build_boundary_fold(
-                    dcomposed, summaries, reverse=True, num_sm=self.num_sm, device=self.device, seed_dtype=table.dtype if table is not None else None
-                )
-            self.run_boundary_fold(self.composed_fold, table, dcomposed, summaries, views[self.index_following_transition], int(stream or 0))
+        fold = self.index_following_state_grad is not None
+        dcomposed = region["composed_dstate"] if fold else None
         scheduler_recompute = region["scheduler_recompute"]
         scheduler_bwd = region["scheduler_bwd"]
         work_items = region["work_items"]
         work_count = region["work_count"]
         dq_node = None
         q_compact, do_compact = q, do
-        l2norm_kw = {}
+        normalize = self.use_qk_l2norm and not self.has_normalized_rows
+        lead_buffers = (
+            views[self.index_following_state_grad] if fold else None,
+            views[self.index_following_transition] if fold else None,
+            dstate_in if fold else None,
+            dcomposed,
+            q if self.pack_expands_q else None,
+            region["q_x"] if self.pack_expands_q else None,
+            do if self.pack_bwd_needed else None,
+            region["do_x"] if self.pack_bwd_needed else None,
+            q if normalize else None,
+            k if normalize else None,
+            inv_q if normalize else None,
+            inv_k if normalize else None,
+        )
         if self.pack_bwd_needed:
-            pack_q = q if self.pack_expands_q else None
-            pack_q_x = region["q_x"] if self.pack_expands_q else None
-            if self.pack_bwd is None:
-                self.pack_bwd = self.build_pack_bwd(pack_q, pack_q_x, do, region["do_x"], self.num_householder, stream)
-            else:
-                self.run_pack_bwd(self.pack_bwd, pack_q, pack_q_x, do, region["do_x"], stream)
             do = region["do_x"]
             if self.pack_expands_q:
                 q = region["q_x"]
-            else:
-                l2norm_kw = dict(expand_num=self.num_householder, expand_phase=self.num_householder - 1, expand_fill=True)
             dq_node = dq
             dq = region["dq_x"]
-        if self.use_qk_l2norm and not self.has_normalized_rows:
-            if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(
-                    q,
-                    k,
-                    q_n,
-                    k_n,
-                    inv_q,
-                    inv_k,
-                    **l2norm_kw,
-                    k_slots=family_slots(k, self.num_householder, 3),
-                    stream=stream,
-                )
-            else:
-                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
         if self.use_qk_l2norm:
             q, k = q_n, k_n
         summary_q = q_compact if self.pack_expands_q else q
@@ -971,7 +1147,13 @@ class CompiledGdnBwd:
         dq_out = region["dq_ho"] if self.fold_dq else dq
         dk_out = region["dk_ho"] if self.fold_dk else dk
         dv_out = region["dv_ho"] if self.fold_dv else dv
-        bwd_tinv = {} if self.compact_qdo else dict(tinv=tinv)
+        post_buffers = (
+            *((dg, g, a_log, dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), d_a_log, d_dt_bias) if self.safe_gate else (None,) * 8),
+            *((dq_out, dq) if self.fold_dq else (None, None)),
+            *((dk_out, dk) if self.fold_dk else (None, None)),
+            *((dv_out, dv) if self.fold_dv else (None, None)),
+            *((dq, dq_node) if dq_node is not None else (None, None)),
+        )
 
         if self.chain:
             self.run_chain(
@@ -1004,6 +1186,8 @@ class CompiledGdnBwd:
                 state_g,
                 inv_q,
                 inv_k,
+                lead_buffers,
+                post_buffers,
             )
         else:
             checkpoint_series = state_checkpoints if (self.has_state_checkpoints and not self.coarse_checkpoints) else region["state_checkpoints"]
@@ -1039,16 +1223,36 @@ class CompiledGdnBwd:
                 scheduler_recompute=scheduler_recompute,
                 recompute_words=region.get("recompute_tensormaps"),
                 bprop_words=region["tensormaps"],
+                dgate=dg,
+                dbeta=dbeta,
+                dstate0=dstate0,
+                dstate_in=dstate_in,
+                dcomposed=dcomposed,
+                inv_q=inv_q,
+                inv_k=inv_k,
+                scheduler_bwd=scheduler_bwd,
+                item_limit_word=region.get("gate"),
+                tail_scalars=self.tail_scalars if self.tail is not None else (),
+                tail_buffers=self.tail_buffers((*views, *region.values(), *context_region.values(), None)) if self.tail is not None else (),
+                lead_buffers=lead_buffers,
+                gate_blocks=self.gate_bwd_blocks,
+                post_buffers=post_buffers,
             )
             seeds = dict(
                 seed_span_tokens=self.recompute_span_tokens if coarse else 0,
                 seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
             )
             if self.warmup_launch is None:
+                tail = self.tail
                 self.warmup_launch = self.build_warmup_backward(
                     bprop_module=self.bwd,
                     **buffers,
                     **seeds,
+                    scale=self.scale,
+                    use_initial_state=state0 is not None or composed is not None,
+                    tail=tail,
+                    tail_chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, tail.num_seqs, self.n_heads_out, self.num_sm) if tail is not None else 0,
+                    tail_summary_q_step=self.summary_q_step,
                     split=self.split,
                     n_tiles=self.n_tiles,
                     ideal_chunks=self.ideal,
@@ -1072,6 +1276,7 @@ class CompiledGdnBwd:
                 *self.warmup_launch,
                 **buffers,
                 **seeds,
+                scale=self.scale,
                 b_t=self.b_t,
                 tinv_pass=self.tinv_pass,
                 recompute=self.needs_recompute,
@@ -1081,91 +1286,6 @@ class CompiledGdnBwd:
                 compact_qdo=self.compact_qdo,
                 stream=stream,
             )
-            if self.kernel_cache is not None:
-                self.bwd.run_bwd(
-                    self.kernel_cache,
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    do,
-                    checkpoint_series,
-                    dq_out,
-                    dk_out,
-                    dv_out,
-                    dg,
-                    dbeta,
-                    cu,
-                    dstate0,
-                    dstate_in,
-                    work_items,
-                    work_count,
-                    scheduler_bwd,
-                    None,
-                    None,
-                    region["tensormaps"],
-                    self.scale,
-                    stream,
-                    dcomposed=dcomposed,
-                    a_log=a_log if self.safe_gate else None,
-                    dt_bias=dt_bias if self.safe_gate else None,
-                    inv_q=inv_q,
-                    inv_k=inv_k,
-                    own_prologue=False,
-                    **bwd_tinv,
-                )
-            else:
-                self.kernel_cache = self.bwd.chunk_gdn_bwd(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    do,
-                    checkpoint_series,
-                    dq_out,
-                    dk_out,
-                    dv_out,
-                    dg,
-                    dbeta,
-                    cu,
-                    self.scale,
-                    use_initial_state=state0 is not None or composed is not None,
-                    d_initial_state=dstate0,
-                    d_final_state=dstate_in,
-                    dcomposed=dcomposed,
-                    safe_gate=self.safe_gate,
-                    a_log=a_log,
-                    dt_bias=dt_bias,
-                    use_beta_sigmoid=self.use_beta_sigmoid,
-                    allow_neg_eigval=self.allow_neg_eigval,
-                    work_items=work_items,
-                    work_count=work_count,
-                    scheduler_counter=scheduler_bwd,
-                    log_gate=self.log_gate,
-                    inv_q=inv_q,
-                    inv_k=inv_k,
-                    expand_num=self.expand_num,
-                    workspace=region["tensormaps"],
-                    device=self.device,
-                    num_sm=self.num_sm,
-                    stream=stream,
-                    own_prologue=False,
-                    **bwd_tinv,
-                )
-
-        if self.safe_gate:
-            self.scalar_gate_bwd(dg, g, a_log, dt_bias, d_a_log, d_dt_bias, region.get("gate_part_a"), region.get("gate_part_dt"), stream=stream)
-        if self.fold_dq or self.fold_dk or self.fold_dv:
-            for src_ho, dst in ((dq_out, dq), (dk_out, dk), (dv_out, dv)):
-                if src_ho is not dst:
-                    self.head_group_reduce(src_ho, dst, stream=stream)
-        if dq_node is not None:
-            if self.gather_dq is None:
-                self.gather_dq = self.build_gather_dq(dq, dq_node, self.num_householder, stream)
-            else:
-                self.run_gather_dq(self.gather_dq, dq, dq_node, stream)
         return None
 
     def run_chain(
@@ -1199,6 +1319,8 @@ class CompiledGdnBwd:
         state_g,
         inv_q,
         inv_k,
+        lead_buffers,
+        post_buffers,
     ) -> None:
         """Chain prologue, T pass, H and M summaries (M alone when the series is passed back), forward chain X, G summary,
         reverse chain seeded with d_final_state, dense series (the forward's or the seeded recompute), bprop over the
@@ -1260,6 +1382,9 @@ class CompiledGdnBwd:
             dstate0=dstate0,
             inv_q=inv_q,
             inv_k=inv_k,
+            lead_buffers=lead_buffers,
+            gate_blocks=self.gate_bwd_blocks,
+            post_buffers=post_buffers,
         )
         schedule = dict(
             pieces=self.pieces,
@@ -1341,35 +1466,29 @@ class GdnSummaryFrostEngine(BaseEngine):
 class CompiledGdnSummary:
     """Compiled summary plan.  With ``transition`` bound the fused H + M summary kernel writes ``final_state`` (initial_state
     honored) and ``M_buf = M^T`` (``X_final = X_init @ M_buf + X_H``), each in its own dtype, in one pass over K: on the uncut,
-    split or ``dv_split`` table (two items per sequence and head, each owning half of d_v of H; M stored once), or in ``chain``
+    split or ``dv_split`` table (two items per sequence and head, each owning half of d_v of H and, with a square state, half
+    of the rows of M; otherwise M is stored once), or in ``chain``
     plans per filled piece, composed by one fp32 state chain whose tail is ``final_state`` and whose running product is
     ``transition``.  Without ``transition`` the state-only recompute kernel writes ``final_state`` alone.  The chunk factor T
     comes from the T pass."""
 
     def __init__(self, node, recompute_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.l2norm import build_l2norm_qk, run_l2norm_qk
-        from .common.piece_chain import DV_SPLIT_TILES, build_state_chain, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout, run_state_chain
-        from .kernel.gdn_chain_prologue_f16 import run_chain_prologue
-        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, compute_ideal_chunks, max_work_items, split_scratch_rows, run_table
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
+        from .kernel.gdn_chain_forward_f16 import build_chain_summary, run_chain_summary
+        from .kernel.gdn_warmup_forward_f16 import SUMMARY_TAIL_BUFFERS, build_warmup_summary, run_warmup_summary
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
-        self.recompute = recompute_module
-        self.build_split_table = build_split_table
-        self.run_table = run_table
-        self.build_state_chain = build_state_chain
+        self.build_chain_summary = build_chain_summary
+        self.run_chain_summary = run_chain_summary
+        self.build_warmup_summary = build_warmup_summary
+        self.run_warmup_summary = run_warmup_summary
         self.chain_rows_per_cta = chain_rows_per_cta
-        self.run_state_chain = run_state_chain
-        self.build_l2norm_qk = build_l2norm_qk
-        self.run_l2norm_qk = run_l2norm_qk
-        self.table = None
-        self.final_cache = None
-        self.l2norm = None
-        self.tinv_cache = None
-        self.run_chain_prologue = run_chain_prologue
-        self.chain_prologue = {}
-        self.fused_cache = None
-        self.chain_summary = None
+        self.chain_launch = None
+        self.warmup_launch = None
+        self.tail_buffer_names = SUMMARY_TAIL_BUFFERS
         self.plan_name = "GdpSummaryFrostEngine (GDP_SUMMARY)" if node.node_type.name == "GDP_SUMMARY" else "GdnSummaryFrostEngine (GDN_SUMMARY)"
         self.device = current_device()
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
@@ -1425,12 +1544,20 @@ class CompiledGdnSummary:
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.n_tiles = B * HO * self.tiles_per_head
+        self.tail = None
+        if not self.chain and not self.dv_split and not self.batch_invariant and self.has_transition:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=total // self.num_householder,
+                b_t=self.b_t,
+                cadence_tokens=0,
+                expand_num=self.num_householder,
+            )
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
         from .kernel import gdn_summary_f16 as summary_module
-
-        self.fused_summary = summary_module
-        self.fused_direct = self.has_transition and not self.chain
 
         layout = WorkspaceLayout()
         regions = []
@@ -1491,10 +1618,36 @@ class CompiledGdnSummary:
                 self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.tail is not None:
+                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
             if self.split:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
+        if self.tail is not None:
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            off_tail_scheduler = layout.add(24)
+            regions += [
+                ("tail_scheduler_h", off_tail_scheduler, "int32", (2,)),
+                ("tail_scheduler_m", off_tail_scheduler + 8, "int32", (2,)),
+                ("tail_scheduler_all", off_tail_scheduler, "int32", (6,)),
+            ]
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_h", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_state_m", layout.add(self.tail_pieces_total * HO * K * K * 4), "float32", (self.tail_pieces_total, HO, K, K)),
+                ("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+            ]
+            words = tensormap_workspace_bytes(summary_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_fused_tensormaps", layout.add(words * 8, align=128), "int64", (words,)))
         self.has_context = bool(node.params.get("output_context", False))
         self.context = (
             forward_context(self.plan_name, total=total, h_k=HK, d_k=K, io_name=self.io_name, use_qk_l2norm=self.use_qk_l2norm) if self.has_context else None
@@ -1503,7 +1656,6 @@ class CompiledGdnSummary:
         self.has_k_normalized = self.has_context and self.use_qk_l2norm
         if self.use_qk_l2norm and not self.has_k_normalized:
             regions.append(("k_n", layout.add(total * HK * K * 2), self.io_name, (total, HK, K)))
-        self.needs_table = self.split
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -1523,6 +1675,24 @@ class CompiledGdnSummary:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_final_state = pos["final_state"]
         self.index_transition = pos.get("transition")
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_summary": "tail_scheduler_h",
+                "summary_words": "tail_fused_tensormaps",
+                "state_h_summary": "tail_state_h",
+                "state_m_summary": "tail_state_m",
+                "state_h_chain": "tail_state_h",
+                "state_m_chain": "tail_state_m",
+                "state_x_chain": "tail_state_x",
+                "seed": "initial_state",
+                "final_state": "final_state",
+                "transition": "transition",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
 
     def run(self, views, workspace, stream, context=None) -> None:
         k = views[self.index_k]
@@ -1539,305 +1709,120 @@ class CompiledGdnSummary:
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
         context_region = self.context.regions(context) if self.has_k_normalized else {}
+        l2norm_k = None
         if self.use_qk_l2norm:
-            k_n = context_region["k_n"] if self.has_k_normalized else region["k_n"]
-            if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(k, k, k_n, k_n, None, None, skip_q=True, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
-            else:
-                self.run_l2norm_qk(self.l2norm, k_n, k, k_n, k_n, None, None, stream)
-            k = k_n
+            l2norm_k = k
+            k = context_region["k_n"] if self.has_k_normalized else region["k_n"]
         if self.chain:
-            self.run_chain(k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream)
+            self.run_chain(k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream, l2norm_k)
             return
-        tinv = region["tinv"]
-        self.tinv_cache = chunk_factor_pass(
-            self.tinv_cache,
-            k,
-            g,
-            beta,
-            cu,
-            tinv,
-            region["tinv_tensormaps"],
-            tinv_rows=region["tinv_rows"],
-            tinv_row_count=region["tinv_row_count"],
-            log_gate=self.log_gate,
-            safe_gate=self.safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            use_beta_sigmoid=self.use_beta_sigmoid,
-            allow_neg_eigval=self.allow_neg_eigval,
-            expand_num=self.num_householder,
-            device=self.device,
-            stream=stream,
-        )
-        work_items = region["work_items"]
-        work_count = region["work_count"]
-        item_scratch = region.get("item_scratch")
-
-        state_cache = self.fused_cache if self.fused_direct else self.final_cache
-        if state_cache is not None and (self.table is not None or not self.needs_table):
-            if self.needs_table:
-                self.run_table(
-                    self.table,
-                    g,
-                    a_log,
-                    dt_bias,
-                    cu,
-                    region.get("chunk_scratch"),
-                    item_scratch,
-                    work_items,
-                    work_count,
-                    region["scheduler_all"],
-                    stream,
-                    expand_num=self.num_householder,
-                )
-            if self.fused_direct:
-                self.fused_summary.run_summary(
-                    self.fused_cache,
-                    k,
-                    v,
-                    g,
-                    cu,
-                    tinv,
-                    state0,
-                    final_state,
-                    transition,
-                    work_items,
-                    work_count,
-                    region["scheduler_final"],
-                    region["scheduler_all"],
-                    item_scratch,
-                    region["tensormaps"],
-                    stream,
-                    a_log=a_log if self.safe_gate else None,
-                    dt_bias=dt_bias if self.safe_gate else None,
-                )
-                return
-            self.recompute.run_recompute(
-                self.final_cache,
-                k,
-                v,
-                g,
-                cu,
-                state0,
-                final_state,
-                None,
-                work_items,
-                work_count,
-                region["scheduler_final"],
-                region["scheduler_all"],
-                item_scratch,
-                region["tensormaps"],
-                0,
-                stream,
-                a_log=a_log if self.safe_gate else None,
-                dt_bias=dt_bias if self.safe_gate else None,
-                tinv=tinv,
-            )
-            return
-
-        if not self.needs_table:
-            self.table = None
-        else:
-            self.table = self.build_split_table(
-                g,
-                cu,
-                work_items,
-                work_count,
-                ideal_chunks=self.ideal,
-                n_tiles=self.n_tiles,
-                num_sms=self.num_sm,
-                b_t=self.b_t,
-                chunk_scratch=region.get("chunk_scratch"),
-                item_scratch=item_scratch,
-                log_gate=self.log_gate,
-                safe_gate=self.safe_gate,
-                a_log=a_log if self.safe_gate else None,
-                dt_bias=dt_bias if self.safe_gate else None,
-                scheduler_counter=region["scheduler_all"],
-                split=self.split,
-                expand_num=self.num_householder,
-                opt_level=2,
-                stream=stream,
-            )
-
-        if self.fused_direct:
-            self.fused_cache = self.fused_summary.chunk_gdn_summary(
-                k,
-                v,
-                g,
-                cu,
-                tinv,
-                state0,
-                final_state,
-                transition,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=region["scheduler_final"],
-                scheduler_all=region["scheduler_all"],
-                work_item_scratch=item_scratch,
-                order_in_prologue=True,
-                log_gate=self.log_gate,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                expand_num=self.num_householder,
-                tiles_per_head=self.tiles_per_head,
-                workspace=region["tensormaps"],
-                device=self.device,
-                num_sm=self.num_sm,
-                stream=stream,
-            )
-            return
-        self.final_cache = self.recompute.chunk_gdn_recompute(
-            k,
-            v,
-            g,
-            cu,
-            state0,
-            final_state,
-            safe_gate=self.safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            work_items=work_items,
-            work_count=work_count,
-            scheduler_counter=region["scheduler_final"],
-            scheduler_all=region["scheduler_all"],
-            work_item_scratch=item_scratch,
-            order_in_prologue=True,
-            log_gate=self.log_gate,
-            expand_num=self.num_householder,
-            tiles_per_head=self.tiles_per_head,
-            workspace=region["tensormaps"],
-            device=self.device,
-            num_sm=self.num_sm,
-            stream=stream,
-            tinv=tinv,
-        )
-        return None
-
-    def run_chain(self, k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream) -> None:
-        """Chain prologue, T pass, fused H and M summaries of every filled piece, one fp32 state chain seeded with
-        initial_state whose tail is final_state and whose running product is transition."""
-        cu_pieces = region["cu_pieces"]
-        work_items, work_count = region["work_items"], region["main_count"]
-        state_h, state_m, state_x = region["state_h"], region["state_m"], region["state_x"]
-        tinv = region["tinv"]
-        gate_params = dict(a_log=a_log if self.safe_gate else None, dt_bias=dt_bias if self.safe_gate else None)
-        warm = self.chain_summary is not None
-        self.run_chain_prologue(
-            self.chain_prologue,
-            pieces=self.pieces,
-            unit_chunks=self.unit_chunks,
-            b_t=self.b_t,
-            expand_num=self.num_householder,
-            length_rule=self.length_rule,
-            heads_out=self.n_heads_out,
-            cu_seqlens=cu,
-            cu_pieces=cu_pieces,
-            main_rows=region["main_rows"],
-            summary_rows=region["summary_rows"],
-            main_count=work_count,
-            summary_count=region["summary_count"],
-            work_items=work_items,
-            scheduler=region["scheduler_all"],
-            tinv_words=region["tinv_tensormaps"],
-            tinv=tinv,
-            tinv_rows=region["tinv_rows"],
-            tinv_row_count=region["tinv_row_count"],
-            summary_words=region.get("fused_tensormaps"),
+        tail = self.tail
+        buffers = dict(
             k=k,
             v=v,
-            stream=stream,
-        )
-        self.tinv_cache = chunk_factor_pass(
-            self.tinv_cache,
-            k,
-            g,
-            beta,
-            cu_pieces,
-            tinv,
-            region["tinv_tensormaps"],
+            gate=g,
+            beta=beta,
+            a_log=a_log if self.safe_gate else None,
+            dt_bias=dt_bias if self.safe_gate else None,
+            cu_seqlens=cu,
+            state_in=state0,
+            state_out=final_state,
+            transition=transition,
+            work_items=region["work_items"],
+            work_count=region["work_count"],
+            item_scratch=region.get("item_scratch"),
+            chunk_scratch=region.get("chunk_scratch"),
+            scheduler=region["scheduler_final"],
+            scheduler_all=region["scheduler_all"],
+            workspace=region["tensormaps"],
+            tinv=region["tinv"],
+            tinv_words=region["tinv_tensormaps"],
             tinv_rows=region["tinv_rows"],
             tinv_row_count=region["tinv_row_count"],
-            log_gate=self.log_gate,
-            safe_gate=self.safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            use_beta_sigmoid=self.use_beta_sigmoid,
-            allow_neg_eigval=self.allow_neg_eigval,
-            expand_num=self.num_householder,
-            device=self.device,
-            stream=stream,
-            publish_desc=False,
+            item_limit_word=region.get("gate"),
+            l2norm_k=l2norm_k,
+            tail_scalars=self.tail_scalars if tail is not None else (),
+            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if tail is not None else (),
         )
-        if warm:
-            self.fused_summary.run_summary(
-                self.fused_cache,
-                k,
-                v,
-                g,
-                cu_pieces,
-                tinv,
-                None,
-                state_h,
-                state_m,
-                work_items,
-                work_count,
-                region["scheduler_h"],
-                region["scheduler_all"],
-                None,
-                region["fused_tensormaps"],
-                stream,
-                own_prologue=False,
-                **gate_params,
-            )
-        else:
-            self.fused_cache = self.fused_summary.chunk_gdn_summary(
-                k,
-                v,
-                g,
-                cu_pieces,
-                tinv,
-                None,
-                state_h,
-                state_m,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=region["scheduler_h"],
-                scheduler_all=region["scheduler_all"],
+        if self.warmup_launch is None:
+            self.warmup_launch = self.build_warmup_summary(
+                **buffers,
+                tail=tail,
+                tail_chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, tail.num_seqs, self.n_heads_out, self.num_sm) if tail is not None else 0,
+                split=self.split,
+                tiles_per_head=self.tiles_per_head,
+                n_tiles=self.n_tiles,
+                ideal_chunks=self.ideal,
+                num_sm=self.num_sm,
+                b_t=self.b_t,
                 log_gate=self.log_gate,
                 safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
+                use_beta_sigmoid=self.use_beta_sigmoid,
+                allow_neg_eigval=self.allow_neg_eigval,
                 expand_num=self.num_householder,
-                workspace=region["fused_tensormaps"],
+                device=self.device,
+                stream=stream,
+            )
+        self.run_warmup_summary(*self.warmup_launch, **buffers, stream=stream)
+
+    def run_chain(self, k, v, g, beta, cu, state0, final_state, transition, a_log, dt_bias, region, stream, l2norm_k) -> None:
+        """Chain prologue, T pass, fused H and M summaries of every filled piece, one fp32 state chain seeded with
+        initial_state whose tail is final_state and whose running product is transition."""
+        buffers = dict(
+            k=k,
+            v=v,
+            gate=g,
+            beta=beta,
+            a_log=a_log if self.safe_gate else None,
+            dt_bias=dt_bias if self.safe_gate else None,
+            cu_seqlens=cu,
+            cu_pieces=region["cu_pieces"],
+            main_rows=region["main_rows"],
+            summary_rows=region["summary_rows"],
+            main_count=region["main_count"],
+            summary_count=region["summary_count"],
+            work_items=region["work_items"],
+            scheduler_all=region["scheduler_all"],
+            scheduler_summary=region["scheduler_h"],
+            tinv_words=region["tinv_tensormaps"],
+            tinv_rows=region["tinv_rows"],
+            tinv_row_count=region["tinv_row_count"],
+            summary_words=region["fused_tensormaps"],
+            tinv=region["tinv"],
+            state_h=region["state_h"],
+            state_m=region["state_m"],
+            state_x=region["state_x"],
+            seed=state0,
+            final_state=final_state,
+            transition=transition,
+            l2norm_k=l2norm_k,
+        )
+        if self.chain_launch is None:
+            self.chain_launch = self.build_chain_summary(
+                **buffers,
+                pieces=self.pieces,
+                heads_out=self.n_heads_out,
+                num_seqs=self.num_seqs,
+                unit_chunks=self.unit_chunks,
+                b_t=self.b_t,
+                expand_num=self.num_householder,
+                length_rule=self.length_rule,
+                log_gate=self.log_gate,
+                safe_gate=self.safe_gate,
+                use_beta_sigmoid=self.use_beta_sigmoid,
+                allow_neg_eigval=self.allow_neg_eigval,
+                chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
                 device=self.device,
                 num_sm=self.num_sm,
                 stream=stream,
-                own_prologue=False,
             )
-        if not warm:
-            self.chain_summary = self.build_state_chain(
-                heads_out=self.n_heads_out,
-                dim_v=self.dim_v,
-                dim_k=self.dim_k,
-                pieces=self.pieces,
-                rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
-                reverse=False,
-                transpose=False,
-                has_seed=state0 is not None,
-                has_tail=True,
-                emit_summary=self.has_transition,
-                filled_only=True,
-                seed_dtype=str(state0.dtype) if state0 is not None else "float32",
-                tail_dtype=str(final_state.dtype),
-                summary_dtype=str(transition.dtype) if transition is not None else "float32",
-                device=self.device,
-                opt_level=2,
-            )
-        self.run_state_chain(
-            self.chain_summary, self.num_seqs, state_h, state_m, state_x, state0, final_state, transition, stream, main_rows=region["main_rows"]
+        self.run_chain_summary(
+            self.chain_launch,
+            **buffers,
+            pieces=self.pieces,
+            heads_out=self.n_heads_out,
+            num_seqs=self.num_seqs,
+            stream=stream,
         )
 
 
@@ -1849,31 +1834,21 @@ class CompiledGdnSummaryBwd:
 
     def __init__(self, node, summary_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.l2norm import build_l2norm_qk, run_l2norm_qk
-        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
-        from .kernel.gdn_chain_prologue_f16 import run_chain_prologue
-        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, compute_ideal_chunks, max_work_items, split_scratch_rows, run_table
+        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .kernel.gdn_chain_backward_f16 import build_chain_summary_backward, run_chain_summary_backward
+        from .kernel.gdn_warmup_backward_f16 import SUMMARY_TAIL_BUFFERS, build_warmup_summary_backward, run_warmup_summary_backward
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
+        from .common.tail import GATE_WORDS, choose_tail
 
         self.node = node
-        self.summary = summary_module
-        self.build_split_table = build_split_table
-        self.run_table = run_table
-        self.build_state_chain = build_state_chain
         self.chain_rows_per_cta = chain_rows_per_cta
-        self.run_state_chain = run_state_chain
-        self.build_l2norm_qk = build_l2norm_qk
-        self.run_l2norm_qk = run_l2norm_qk
-        self.table = None
-        self.kernel_cache = None
-        self.l2norm = None
-        self.tinv_cache = None
-        self.run_chain_prologue = run_chain_prologue
-        self.chain_prologue = {}
-        self.state_g_cache = None
-        self.state_m_cache = None
-        self.chain_reverse = None
-        self.transition_cache = None
-        self.transition_chain = None
+        self.build_chain_summary_backward = build_chain_summary_backward
+        self.run_chain_summary_backward = run_chain_summary_backward
+        self.build_warmup_summary_backward = build_warmup_summary_backward
+        self.run_warmup_summary_backward = run_warmup_summary_backward
+        self.chain_launch = None
+        self.warmup_launch = None
+        self.tail_buffer_names = SUMMARY_TAIL_BUFFERS
         self.plan_name = "GdpSummaryFrostEngine (GDP_SUMMARY_BWD)" if node.node_type.name == "GDP_SUMMARY_BWD" else "GdnSummaryFrostEngine (GDN_SUMMARY_BWD)"
         self.device = current_device()
         self.num_householder = int(node.params.get("num_householder", 1) or 1)
@@ -1942,6 +1917,17 @@ class CompiledGdnSummaryBwd:
             )
         self.context_size = self.context.size if self.has_context else 0
         self.chain = self.pieces > 0
+        self.tail = None
+        if not self.chain and not self.batch_invariant:
+            self.tail = choose_tail(
+                num_seqs=B,
+                heads_out=HO,
+                num_sm=self.num_sm,
+                total_tokens=total // self.num_householder,
+                b_t=self.b_t,
+                cadence_tokens=0,
+                expand_num=self.num_householder,
+            )
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
         self.num_pieces = B * self.pieces if self.chain else B
@@ -1953,7 +1939,6 @@ class CompiledGdnSummaryBwd:
         if self.chain:
             from .kernel import gdn_recompute_f16 as recompute_module
 
-            self.recompute = recompute_module
             off_scheduler = layout.add(24)
             regions += [
                 ("scheduler_g", off_scheduler, "int32", (2,)),
@@ -1999,7 +1984,6 @@ class CompiledGdnSummaryBwd:
             if self.has_transition:
                 from .kernel import gdn_recompute_f16 as recompute_module
 
-                self.recompute = recompute_module
                 recompute_words = tensormap_workspace_bytes(recompute_module, B, self.num_householder) // 8
                 regions.append(("recompute_tensormaps", layout.add(recompute_words * 8, align=128), "int64", (recompute_words,)))
                 regions.append(("transition_m", layout.add(B * HO * K * K * 4), "float32", (B, HO, K, K)))
@@ -2025,11 +2009,40 @@ class CompiledGdnSummaryBwd:
                 self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
+            if self.tail is not None:
+                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
             if self.split:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
-        self.needs_table = self.split
+        if self.tail is not None:
+            from .kernel import gdn_recompute_f16 as tail_recompute_module
+
+            tail = self.tail
+            self.tail_pieces_total = tail.num_seqs * tail.pieces
+            off_tail_scheduler = layout.add(24)
+            regions += [
+                ("tail_scheduler_g", off_tail_scheduler, "int32", (2,)),
+                ("tail_scheduler_m", off_tail_scheduler + 8, "int32", (2,)),
+                ("tail_scheduler_all", off_tail_scheduler, "int32", (6,)),
+            ]
+            table = piece_table_layout(tail.num_seqs, tail.pieces, HO)
+            off_tail_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("tail_main_rows", off_tail_table + table.main_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_summary_rows", off_tail_table + table.summary_rows, "int32", (tail.num_seqs + 1,)),
+                ("tail_cu_pieces", off_tail_table + table.cu_pieces, "int32", (self.tail_pieces_total + 1,)),
+                ("tail_main_count", off_tail_table + table.main_count, "int32", (1,)),
+                ("tail_summary_count", off_tail_table + table.summary_count, "int32", (1,)),
+                ("tail_work_items", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_state_g", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", (self.tail_pieces_total, HO, V, K)),
+                ("tail_state_m", layout.add(self.tail_pieces_total * HO * K * K * 4), "float32", (self.tail_pieces_total, HO, K, K)),
+            ]
+            words = tensormap_workspace_bytes(summary_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_summary_tensormaps", layout.add(words * 8, align=128), "int64", (words,)))
+            words = tensormap_workspace_bytes(tail_recompute_module, self.tail_pieces_total, self.num_householder) // 8
+            regions.append(("tail_recompute_tensormaps_m", layout.add(words * 8, align=128), "int64", (words,)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -2050,6 +2063,23 @@ class CompiledGdnSummaryBwd:
         self.index_dt_bias = pos.get("dt_bias")
         self.index_d_initial_state = pos["d_initial_state"]
         self.index_transition = pos.get("transition")
+        if self.tail is not None:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_summary": "tail_scheduler_g",
+                "recompute_m_words": "tail_recompute_tensormaps_m",
+                "bprop_summary_words": "tail_summary_tensormaps",
+                "state_m_main": "tail_state_m",
+                "state_m_chain": "tail_state_m",
+                "state_g_chain": "tail_state_g",
+                "state_x_chain": "tail_state_x",
+                "dstate_in": "d_final_state",
+                "dstate0": "d_initial_state",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
+            self.tail_buffers = itemgetter(*indices)
+            self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
 
     def run(self, views, workspace, stream, context=None) -> None:
         q = views[self.index_q]
@@ -2074,374 +2104,128 @@ class CompiledGdnSummaryBwd:
         tinv = context_region["tinv"] if self.has_chunk_factors else region.get("tinv")
         state_m = context_region["state_m"] if self.has_piece_tables else region.get("state_m")
         state_g = context_region["state_g"] if self.has_piece_tables else region.get("state_g")
+        l2norm_buffers = (q, k, inv_q, inv_k) if self.use_qk_l2norm else (None,) * 4
         if self.use_qk_l2norm:
-            if self.l2norm is None:
-                self.l2norm = self.build_l2norm_qk(q, k, q_n, k_n, inv_q, inv_k, k_slots=family_slots(k, self.num_householder, 3), stream=stream)
-            else:
-                self.run_l2norm_qk(self.l2norm, q, k, q_n, k_n, inv_q, inv_k, stream)
             q, k = q_n, k_n
         if self.chain:
-            self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, tinv, state_m, state_g)
+            self.run_chain(q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, tinv, state_m, state_g, l2norm_buffers)
             return
-        self.tinv_cache = chunk_factor_pass(
-            self.tinv_cache,
-            k,
-            g,
-            beta,
-            cu,
-            tinv,
-            region["tinv_tensormaps"],
+        tail = self.tail
+        buffers = dict(
+            q=q,
+            k=k,
+            do=do,
+            gate=g,
+            beta=beta,
+            a_log=a_log if self.safe_gate else None,
+            dt_bias=dt_bias if self.safe_gate else None,
+            cu_seqlens=cu,
+            dstate0=dstate0,
+            dstate_in=dstate_in,
+            work_items=region["work_items"],
+            work_count=region["work_count"],
+            item_scratch=region.get("item_scratch"),
+            chunk_scratch=region.get("chunk_scratch"),
+            scheduler=region["scheduler_main"],
+            scheduler_all=region["scheduler_all"],
+            workspace=region["tensormaps"],
+            tinv=tinv,
+            tinv_words=region["tinv_tensormaps"],
             tinv_rows=region["tinv_rows"],
             tinv_row_count=region["tinv_row_count"],
-            log_gate=self.log_gate,
-            safe_gate=self.safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            use_beta_sigmoid=self.use_beta_sigmoid,
-            allow_neg_eigval=self.allow_neg_eigval,
-            expand_num=self.num_householder,
-            device=self.device,
-            stream=stream,
+            transition_m=region.get("transition_m"),
+            transition=transition,
+            scheduler_transition=region["scheduler_transition"] if self.has_transition else None,
+            transition_words=region.get("recompute_tensormaps"),
+            item_limit_word=region.get("gate"),
+            l2norm_buffers=l2norm_buffers,
+            tail_scalars=self.tail_scalars if tail is not None else (),
+            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if tail is not None else (),
         )
-        work_items = region["work_items"]
-        work_count = region["work_count"]
-
-        if self.kernel_cache is not None and (self.table is not None or not self.needs_table):
-            if self.needs_table:
-                self.run_table(
-                    self.table,
-                    g,
-                    a_log,
-                    dt_bias,
-                    cu,
-                    region.get("chunk_scratch"),
-                    region.get("item_scratch"),
-                    work_items,
-                    work_count,
-                    region["scheduler_all"],
-                    stream,
-                    expand_num=self.num_householder,
-                )
-            self.summary.run_bwd_summary(
-                self.kernel_cache,
-                q,
-                k,
-                g,
-                do,
-                cu,
-                dstate0,
-                dstate_in,
-                work_items,
-                work_count,
-                region["scheduler_main"],
-                region["scheduler_all"],
-                region.get("item_scratch"),
-                region["tensormaps"],
-                self.scale,
-                stream,
-                a_log=a_log if self.safe_gate else None,
-                dt_bias=dt_bias if self.safe_gate else None,
-                tinv=tinv,
-            )
-            if self.has_transition:
-                self.run_transition(k, g, cu, transition, a_log, dt_bias, tinv, region, stream)
-            return
-
-        if not self.needs_table:
-            self.table = None
-        else:
-            self.table = self.build_split_table(
-                g,
-                cu,
-                work_items,
-                work_count,
-                ideal_chunks=self.ideal,
-                n_tiles=self.n_tiles,
-                num_sms=self.num_sm,
-                b_t=self.b_t,
-                chunk_scratch=region.get("chunk_scratch"),
-                item_scratch=region.get("item_scratch"),
-                log_gate=self.log_gate,
-                safe_gate=self.safe_gate,
-                a_log=a_log if self.safe_gate else None,
-                dt_bias=dt_bias if self.safe_gate else None,
-                scheduler_counter=region["scheduler_all"],
+        if self.warmup_launch is None:
+            self.warmup_launch = self.build_warmup_summary_backward(
+                **buffers,
+                tail=tail,
+                tail_chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, tail.num_seqs, self.n_heads_out, self.num_sm) if tail is not None else 0,
+                transition_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
                 split=self.split,
-                expand_num=self.num_householder,
-                opt_level=2,
-                stream=stream,
-            )
-
-        self.kernel_cache = self.summary.chunk_gdn_bwd_summary(
-            q,
-            k,
-            g,
-            do,
-            dstate0,
-            cu,
-            self.scale,
-            d_final_state=dstate_in,
-            work_items=work_items,
-            work_count=work_count,
-            scheduler_counter=region["scheduler_main"],
-            scheduler_all=region["scheduler_all"],
-            work_item_scratch=region.get("item_scratch"),
-            order_in_prologue=True,
-            log_gate=self.log_gate,
-            safe_gate=self.safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            expand_num=self.num_householder,
-            workspace=region["tensormaps"],
-            device=self.device,
-            num_sm=self.num_sm,
-            stream=stream,
-            tinv=tinv,
-        )
-        if self.has_transition:
-            self.run_transition(k, g, cu, transition, a_log, dt_bias, tinv, region, stream)
-        return None
-
-    def run_transition(self, k, g, cu, transition, a_log, dt_bias, tinv, region, stream) -> None:
-        """The recompute's transition arm over the work-item table writes M into
-        ``transition_m``; a one-slot reverse state chain emits its product,
-        ``M^T``, into ``transition``."""
-        transition_m = region["transition_m"]
-        if self.transition_cache is not None:
-            self.recompute.run_recompute(
-                self.transition_cache,
-                k,
-                k,
-                g,
-                cu,
-                None,
-                transition_m,
-                None,
-                region["work_items"],
-                region["work_count"],
-                region["scheduler_transition"],
-                region["scheduler_all"],
-                region.get("item_scratch"),
-                region["recompute_tensormaps"],
-                0,
-                stream,
-                a_log=a_log if self.safe_gate else None,
-                dt_bias=dt_bias if self.safe_gate else None,
-                tinv=tinv,
-            )
-        else:
-            self.transition_cache = self.recompute.chunk_gdn_recompute(
-                k,
-                k,
-                g,
-                cu,
-                None,
-                transition_m,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                seed_identity=True,
-                v_is_zero=True,
-                work_items=region["work_items"],
-                work_count=region["work_count"],
-                scheduler_counter=region["scheduler_transition"],
-                scheduler_all=region["scheduler_all"],
-                work_item_scratch=region.get("item_scratch"),
-                order_in_prologue=True,
-                log_gate=self.log_gate,
-                expand_num=self.num_householder,
-                workspace=region["recompute_tensormaps"],
-                device=self.device,
+                n_tiles=self.n_tiles,
+                ideal_chunks=self.ideal,
                 num_sm=self.num_sm,
-                stream=stream,
-                tinv=tinv,
-            )
-            self.transition_chain = self.build_state_chain(
-                heads_out=self.n_heads_out,
-                dim_v=self.dim_v,
-                dim_k=self.dim_k,
-                pieces=1,
-                rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
-                reverse=True,
-                transpose=True,
-                has_seed=False,
-                has_tail=False,
-                emit_summary=True,
-                summary_dtype=str(transition.dtype),
+                b_t=self.b_t,
+                log_gate=self.log_gate,
+                safe_gate=self.safe_gate,
+                use_beta_sigmoid=self.use_beta_sigmoid,
+                allow_neg_eigval=self.allow_neg_eigval,
+                expand_num=self.num_householder,
+                scale=self.scale,
                 device=self.device,
-                opt_level=2,
+                stream=stream,
             )
-        self.run_state_chain(self.transition_chain, self.num_seqs, None, transition_m, None, None, None, transition, stream)
+        self.run_warmup_summary_backward(*self.warmup_launch, **buffers, scale=self.scale, stream=stream)
 
-    def run_chain(self, q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, tinv, state_m, state_g) -> None:
+    def run_chain(self, q, k, g, beta, do, cu, dstate_in, dstate0, transition, a_log, dt_bias, region, stream, tinv, state_m, state_g, l2norm_buffers) -> None:
         """Chain prologue, T pass, M (recompute transition arm) and G (zero-seeded bprop summary) of every filled piece, one
         reverse fp32 state chain seeded with d_final_state whose tail is d_initial_state and whose running product is
         transition."""
-        cu_pieces = region["cu_pieces"]
-        work_items, work_count = region["work_items"], region["main_count"]
-        state_x = region["state_x"]
-        gate_params = dict(a_log=a_log if self.safe_gate else None, dt_bias=dt_bias if self.safe_gate else None)
-        warm = self.chain_reverse is not None
-        self.run_chain_prologue(
-            self.chain_prologue,
-            pieces=self.pieces,
-            unit_chunks=self.unit_chunks,
-            b_t=self.b_t,
-            expand_num=self.num_householder,
-            length_rule=self.length_rule,
-            heads_out=self.n_heads_out,
+        buffers = dict(
+            q=q,
+            k=k,
+            do=do,
+            gate=g,
+            beta=beta,
+            a_log=a_log if self.safe_gate else None,
+            dt_bias=dt_bias if self.safe_gate else None,
             cu_seqlens=cu,
-            cu_pieces=cu_pieces,
+            cu_pieces=region["cu_pieces"],
             main_rows=region["main_rows"],
             summary_rows=region["summary_rows"],
-            main_count=work_count,
+            main_count=region["main_count"],
             summary_count=region["summary_count"],
-            work_items=work_items,
-            scheduler=region["scheduler_all"],
+            work_items=region["work_items"],
+            scheduler_all=region["scheduler_all"],
+            scheduler_m=region["scheduler_m"],
+            scheduler_summary=region["scheduler_g"],
             tinv_words=region["tinv_tensormaps"],
-            tinv=tinv,
             tinv_rows=region["tinv_rows"],
             tinv_row_count=region["tinv_row_count"],
             recompute_m_words=region["recompute_tensormaps_m"],
             bprop_summary_words=region["summary_tensormaps"],
-            k=k,
-            summary_q=q,
-            summary_do=do,
-            stream=stream,
+            tinv=tinv,
+            state_m=state_m,
+            state_g=state_g,
+            state_x=region["state_x"],
+            dstate_in=dstate_in,
+            dstate0=dstate0,
+            transition=transition,
+            l2norm_buffers=l2norm_buffers,
         )
-        self.tinv_cache = chunk_factor_pass(
-            self.tinv_cache,
-            k,
-            g,
-            beta,
-            cu_pieces,
-            tinv,
-            region["tinv_tensormaps"],
-            tinv_rows=region["tinv_rows"],
-            tinv_row_count=region["tinv_row_count"],
-            log_gate=self.log_gate,
-            safe_gate=self.safe_gate,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            use_beta_sigmoid=self.use_beta_sigmoid,
-            allow_neg_eigval=self.allow_neg_eigval,
-            expand_num=self.num_householder,
-            device=self.device,
-            stream=stream,
-            publish_desc=False,
-        )
-        if warm:
-            self.recompute.run_recompute(
-                self.state_m_cache,
-                k,
-                k,
-                g,
-                cu_pieces,
-                None,
-                state_m,
-                None,
-                work_items,
-                work_count,
-                region["scheduler_m"],
-                region["scheduler_all"],
-                None,
-                region["recompute_tensormaps_m"],
-                0,
-                stream,
-                own_prologue=False,
-                **gate_params,
-                tinv=tinv,
-            )
-            self.summary.run_bwd_summary(
-                self.state_g_cache,
-                q,
-                k,
-                g,
-                do,
-                cu_pieces,
-                state_g,
-                None,
-                work_items,
-                work_count,
-                region["scheduler_g"],
-                region["scheduler_all"],
-                None,
-                region["summary_tensormaps"],
-                self.scale,
-                stream,
-                tinv=tinv,
-                own_prologue=False,
-                **gate_params,
-            )
-        else:
-            self.state_m_cache = self.recompute.chunk_gdn_recompute(
-                k,
-                k,
-                g,
-                cu_pieces,
-                None,
-                state_m,
-                seed_identity=True,
-                v_is_zero=True,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=region["scheduler_m"],
-                scheduler_all=region["scheduler_all"],
-                log_gate=self.log_gate,
-                expand_num=self.num_householder,
-                workspace=region["recompute_tensormaps_m"],
-                device=self.device,
-                num_sm=self.num_sm,
-                stream=stream,
-                own_prologue=False,
-                tinv=tinv,
-            )
-            self.state_g_cache = self.summary.chunk_gdn_bwd_summary(
-                q,
-                k,
-                g,
-                do,
-                state_g,
-                cu_pieces,
-                self.scale,
-                d_final_state=None,
-                work_items=work_items,
-                work_count=work_count,
-                scheduler_counter=region["scheduler_g"],
-                scheduler_all=region["scheduler_all"],
-                log_gate=self.log_gate,
-                safe_gate=self.safe_gate,
-                a_log=a_log,
-                dt_bias=dt_bias,
-                tinv=tinv,
-                expand_num=self.num_householder,
-                workspace=region["summary_tensormaps"],
-                device=self.device,
-                num_sm=self.num_sm,
-                stream=stream,
-                own_prologue=False,
-            )
-            self.chain_reverse = self.build_state_chain(
-                heads_out=self.n_heads_out,
-                dim_v=self.dim_v,
-                dim_k=self.dim_k,
+        if self.chain_launch is None:
+            self.chain_launch = self.build_chain_summary_backward(
+                **buffers,
                 pieces=self.pieces,
-                rows_per_cta=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
-                reverse=True,
-                transpose=True,
-                has_seed=dstate_in is not None,
-                has_tail=True,
-                emit_summary=self.has_transition,
-                filled_only=True,
-                seed_dtype=str(dstate_in.dtype) if dstate_in is not None else "float32",
-                tail_dtype=str(dstate0.dtype),
-                summary_dtype=str(transition.dtype) if transition is not None else "float32",
+                heads_out=self.n_heads_out,
+                num_seqs=self.num_seqs,
+                unit_chunks=self.unit_chunks,
+                b_t=self.b_t,
+                expand_num=self.num_householder,
+                length_rule=self.length_rule,
+                log_gate=self.log_gate,
+                safe_gate=self.safe_gate,
+                use_beta_sigmoid=self.use_beta_sigmoid,
+                allow_neg_eigval=self.allow_neg_eigval,
+                scale=self.scale,
+                chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
                 device=self.device,
-                opt_level=2,
+                num_sm=self.num_sm,
+                stream=stream,
             )
-        self.run_state_chain(
-            self.chain_reverse, self.num_seqs, state_g, state_m, state_x, dstate_in, dstate0, transition, stream, main_rows=region["main_rows"]
+        self.run_chain_summary_backward(
+            self.chain_launch,
+            **buffers,
+            pieces=self.pieces,
+            heads_out=self.n_heads_out,
+            num_seqs=self.num_seqs,
+            scale=self.scale,
+            stream=stream,
         )

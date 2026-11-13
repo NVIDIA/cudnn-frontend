@@ -121,6 +121,8 @@ class KdaCakeEngine(BaseEngine):
             _decline("recurrent states must be fp32")
         if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
             _decline(f"'cu_seqlens' must be int32/int64, got {facts.cu_dtype}")
+        if facts.checkpoint_after_block:
+            _decline("writes the state before each block only (checkpoint_after_block is not supported)")
         if facts.checkpoint_every_n_tokens != 16:
             _decline(f"requires checkpoint_every_n_tokens=16 (the route's checkpoint cadence), got {facts.checkpoint_every_n_tokens}")
         if facts.is_bwd:
