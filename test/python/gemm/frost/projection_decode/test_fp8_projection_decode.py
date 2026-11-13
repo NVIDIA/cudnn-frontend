@@ -971,17 +971,26 @@ def test_cudnn_level_export_resolves_to_the_entry():
 
 
 def test_docs_rows_exist_for_the_api():
-    """The determinism status page carries the API's row -- SM90 unsupported (declined by type); SM100/103 verified on cc 10.3 only, so
-    the cell names the cc 10.0 gap inside the shared column; SM107 supported (verified on cc 10.7) -- and its required-settings bullet;
-    the goldens README carries the suite's row and section; the operation page, its navigation entry, the overview line and the
-    ``llms.txt`` line exist; and the page's byte-class table names exactly the classes the entry serves."""
+    """The determinism status page carries the API's row -- one row for the one scale form (a single fp32 scale); SM90 unsupported
+    (declined by type); the evidence differs by class, so each GPU cell states its limit inside the existing column: cc 10.0 ran every
+    served class, cc 10.3 and cc 10.7 the classes of ``(4608, 8192)`` and ``(8192, 2048)`` only, and every class a part did not run
+    reads Unverified there -- and its required-settings bullet, which names every served geometry; the goldens README carries the
+    suite's row and section; the operation page, its navigation entry, the overview line and the ``llms.txt`` line exist; and the
+    page's byte-class table names exactly the classes the entry serves."""
     det = (REPO / "docs" / "operations" / "determinism.md").read_text()
     row = [line for line in det.splitlines() if line.startswith("| `Fp8ProjectionDecode`")]
     assert len(row) == 1, "one Fp8ProjectionDecode row on the status page"
     cells = [c.strip() for c in row[0].strip("|").split("|")]
     assert cells[1] == "fprop (inference step)" and cells[3] == "Unsupported", cells
-    assert cells[4] == "SM100: Unverified; SM103: Supported" and cells[5] == "Supported", cells
+    assert cells[2] == "FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate", cells
+    verified_everywhere = "`ProjectionGeometry(4608, 8192)` and `(8192, 2048)`"
+    assert cells[4] == f"SM100: Supported; SM103: Supported at {verified_everywhere}, Unverified at the other served geometries", cells
+    assert cells[5] == f"Supported at {verified_everywhere}; Unverified at the other served geometries", cells
     assert "FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism" in det
+    bullet = " ".join(det[det.index("FP8 projection for decode rows (`Fp8ProjectionDecode`): no determinism") :].split("\n- ")[0].split())
+    for geometry in kcfg.SERVED_GEOMETRIES:
+        assert f"`ProjectionGeometry({geometry.OUT_FEATURES}, {geometry.IN_FEATURES})`" in bullet, geometry
+    assert "verified on cc 10.0 only" in bullet and "not been run" in bullet
     readme = (REPO / "test" / "python" / "determinism_goldens" / "README.md").read_text()
     assert "`Fp8ProjectionDecode`" in readme and "test_fp8_projection_decode_determinism.py" in readme
     assert "### FP8 projection for decode rows" in readme

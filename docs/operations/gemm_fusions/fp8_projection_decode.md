@@ -15,9 +15,10 @@ out         [rows, OUT_FEATURES]         torch.bfloat16, caller-owned
 The sum is accumulated in fp32 on the tensor core (`tcgen05` FP8 MMA), scaled once and cast once to bf16 (round to
 nearest even; no saturation -- a value past the bf16 range is an infinity of its sign). The K axis is cut into `split_k`
 slices, one CTA of a cluster each; a slice is one accumulation chain over its 128-element K tiles in ascending K, and the
-slice sums are added in slice order through DSMEM (`st.async`) on the cluster's first CTA. Under dependent launch the
-weight stream is issued BEFORE the kernel waits for its predecessor, so the weight bytes are already moving while the
-kernel that produces `activation` still runs.
+slice sums are added in slice order through DSMEM (`st.async`) on the cluster's first CTA. At `split_k=1` a CTA walks
+the whole K axis as one chain: there is no cluster and no reduction. Under dependent launch the weight stream is issued
+BEFORE the kernel waits for its predecessor, so the weight bytes are already moving while the kernel that produces
+`activation` still runs.
 
 It is a direct-call step entry, the same kind as the fused GDN decode step and the shared-expert decode pair: an inference
 step with no backward, called by an engine that owns the tensors. It is not a graph node and it does not touch the GEMM
@@ -37,6 +38,15 @@ out = entry(weight, activation, scale, out)                               # laun
 
 # another split is another byte class and another entry:
 entry_split2 = cudnn.Fp8ProjectionDecode(dev, ProjectionGeometry(4608, 8192), split_k=2)
+
+# a geometry whose default split is not a served class is built with an explicit split (the default declines by name):
+entry_wide = cudnn.Fp8ProjectionDecode(dev, ProjectionGeometry(16384, 5120), split_k=1)
+
+# a given form is taken as given -- it states the late tensor-memory release if it wants the pick's order there:
+from cudnn.gemm import ProjectionForm
+entry_given = cudnn.Fp8ProjectionDecode(
+    dev, ProjectionGeometry(16384, 5120), split_k=1, form=ProjectionForm(MMA_M=128, STAGES=8, HOLD_TMEM=True)
+)
 ```
 
 Nothing is captured at construction: the four tensors are launch arguments, so one entry serves every layer of its
@@ -57,14 +67,16 @@ The output bytes are a function of `(geometry, split_k)` on one runtime, and of 
 
 - `split_k` changes the fp32 association (the number of slice sums and adds), so it is a NUMERICS attribute. It is fixed
   at construction -- given, or `split_k_for(geometry)`, a function of the geometry alone (4 at
-  `ProjectionGeometry(4608, 8192)`, 2 at `ProjectionGeometry(8192, 2048)`) -- and never depends on the row count or on
-  the part. The entry never switches the split by itself.
+  `ProjectionGeometry(4608, 8192)`, 2 at `ProjectionGeometry(8192, 2048)`, 4 at the other three served geometries) --
+  and never depends on the row count or on the part. The entry never switches the split by itself. The default is not
+  a served class at every geometry: `ProjectionGeometry(16384, 5120)` and `ProjectionGeometry(14336, 5120)` are served
+  at split 1 only, so their entries are built with an explicit `split_k=1`, and the decline of the default says so.
 - Everything else is a performance form (`cudnn.gemm.ProjectionForm`): the weight rows per CTA (`MMA_M`), the depth of
   the operand ring (`STAGES`), the tensor-memory columns a CTA allocates (`TMEM_COLS`), the token tile (`TOKEN_TILE`),
   whether the weight stream runs ahead of the dependent-launch wait (`PREWAIT_WEIGHTS`) and when the epilogue releases
-  the tensor memory (`HOLD_TMEM`). No field of a form enters a sum. Without `form=` the entry takes a measured pick per
-  row count on the part's own readings; `form=ProjectionForm(...)` overrides the pick as a whole for every row count and
-  cannot name a split.
+  the tensor memory (`HOLD_TMEM`). No field of a form enters a sum. Without `form=` the entry takes its pick per row
+  count on the part's own readings (the two sections below); `form=ProjectionForm(...)` overrides the pick as a whole
+  for every row count and cannot name a split.
 - A row's bytes are the same alone and among up to 32 rows, at any position, with any neighbours (batch invariance), and
   identical across repeated launches. See [determinism](/operations/determinism).
 
@@ -83,7 +95,8 @@ Served byte classes -- every other pair is declined by name:
 On the validated cc 10.3 part, split 2 measured faster than split 4 at 17 .. 32 rows of
 `ProjectionGeometry(4608, 8192)`. The entry still never changes the split with the row count: a caller that wants
 split 2 in that band builds a second entry and owns the statement that the two bands are different byte classes; one
-entry is batch-invariant over all of 1 .. 32 rows.
+entry is batch-invariant over all of 1 .. 32 rows. `ProjectionGeometry(5120, 6144)` is served at split 4 and at split 2
+in the same way: two entries, two byte classes, each batch-invariant over all of 1 .. 32 rows.
 
 Against an fp64 reference of the E4M3 operands every finite element satisfies
 `|out - ref| <= half a bf16 ulp + |scale| * sum_k |activation| |weight| * (IN_FEATURES + split_k + 1) * 2^-23`; operands
@@ -94,9 +107,10 @@ untouched; a NaN code in a weight row makes that output column NaN.
 ## The measured pick
 
 The pick reads the row count and the part (SM count, shared memory per SM, per-CTA opt-in) and returns a form. The token
-tile is the smallest of 8 / 16 / 32 that holds the rows, a CTA allocates the 32 tensor-memory columns that tile needs,
-and the ring depth comes from a table measured on a cc 10.3 part (152 SMs); it is lowered until the grid fits one wave
-on the part. On the cc 10.3 readings:
+tile is the smallest of 8 / 16 / 32 that holds the rows and a CTA allocates the 32 tensor-memory columns that tile needs,
+at every served class. At `ProjectionGeometry(4608, 8192)` (either split) and `ProjectionGeometry(8192, 2048)` the ring
+depth comes from a table measured on a cc 10.3 part (152 SMs); it is lowered until the grid fits one wave on the part.
+On the cc 10.3 readings:
 
 | class | rows | weight tile, stages, token tile | shared memory per CTA | CTAs | CTAs per SM |
 | --- | --- | --- | ---: | ---: | ---: |
@@ -114,9 +128,42 @@ stay one wave on 148 and 212 SMs is a slot-count model (SMs times CTAs per SM), 
 placement measurement. Other ring depths, the 128-row weight tile, 64 / 128 columns, a wider token tile and the knobs
 below are reachable through `form=` where the ledger admits them, and every one of them writes the default's bytes.
 
-`HOLD_TMEM` (default off): off, the epilogue releases the tensor memory right after its accumulator read; on, it holds
-the columns until every register read from them is consumed, which moves the deallocation behind the output store.
-Measured on a cc 10.3 part the held form is the slower one, so it stays an opt-in.
+## The classes run as written -- not measured with this entry
+
+At `ProjectionGeometry(5120, 6144)` (either split), `ProjectionGeometry(16384, 5120)` and
+`ProjectionGeometry(14336, 5120)` the pick is one table row per class, run as written on every part: it does not follow
+the SM count, and the ring is lowered only until a CTA fits the part's per-CTA shared-memory limit. **No row of this
+table was measured with this entry**; the rows are admitted for their bytes and carry no performance claim. On the
+readings of the table above:
+
+| class | rows | weight tile, stages, token tile | shared memory per CTA | CTAs | CTAs per SM |
+| --- | --- | --- | ---: | ---: | ---: |
+| `(5120, 6144)`, split 4 | 1 .. 8 / 9 .. 16 / 17 .. 32 | 64, 7, 8 / 16 / 32 | 71,040 / 84,352 / 110,976 B | 320 | 3 / 2 / 2 |
+| `(5120, 6144)`, split 2 | 1 .. 8 / 9 .. 16 / 17 .. 32 | 64, 11, 8 / 16 / 32 | 103,808 / 117,120 / 143,744 B | 160 | 2 / 1 / 1 |
+| `(16384, 5120)`, split 1 | 1 .. 8 / 9 .. 16 / 17 .. 32 | 128, 8, 8 / 16 / 32 | 139,520 / 147,712 / 164,096 B | 128 | 1 |
+| `(14336, 5120)`, split 1 | 1 .. 8 / 9 .. 16 / 17 .. 32 | 128, 8, 8 / 16 / 32 | 139,520 / 147,712 / 164,096 B | 112 | 1 |
+
+These grids are not held to one wave. By the slot count (SMs times CTAs per SM -- the same model as above, not a
+placement measurement) `(5120, 6144)` takes two waves from 9 rows on 148 and on 152 SMs at either split (320 CTAs at two
+per SM, 160 at one per SM) and one wave on 212 SMs; every other row of the table fits one wave on all three. A grid of
+more than one wave is admitted without a performance claim. The ledger of the previous section holds at every row (at
+most 96 columns per SM), and the other forms are reachable through `form=` in the same way.
+
+## The tensor-memory release (`HOLD_TMEM`)
+
+`HOLD_TMEM` off: the epilogue releases the tensor memory right after its accumulator read; on: it holds the columns
+until every register read from them is consumed, which moves the deallocation behind the output store. Both orders write
+the same bytes.
+
+- At `ProjectionGeometry(4608, 8192)` and `ProjectionGeometry(8192, 2048)` the pick leaves it off: measured on a
+  cc 10.3 part the held form is the slower one, so it stays an opt-in there.
+- At the four classes run as written the pick sets it. Their grids can take more than one wave, so the columns one CTA
+  deallocates can be allocated by another CTA of the same launch; with the late release a CTA's registers are consumed
+  (the remote stores of a slice sum, the output store) before its columns are released -- the order the tensor-memory
+  paragraph of Rule 11 in `python/cudnn/AGENTS.md` asks for. The two orders were not timed against each other at these
+  classes; the tests compare their bytes at every row count.
+- A given `form=` is taken as given at every class: `ProjectionForm(MMA_M=128, STAGES=8)` releases early, and
+  `ProjectionForm(MMA_M=128, STAGES=8, HOLD_TMEM=True)` is the rendering the pick of a split-1 class compiles.
 
 ## Dependent launch
 
@@ -139,7 +186,7 @@ The entry states what a row count launches without launching it: three read-only
 | --- | --- |
 | `kernel_symbols_for(rows)` | the symbol of the kernel compiled for `rows`, as a one-element tuple; empty until that row count is compiled |
 | `form_for(rows)` | the form as plain data: every field of the rendering `cfg_for` returns under its own name -- `GEOM` (a nested `dict`), `SPLIT_K`, `ROWS`, the resolved performance form (`MMA_M`, `STAGES`, `TOKEN_TILE`, `TMEM_COLS`, `PREWAIT_WEIGHTS`, `HOLD_TMEM`), the launch knobs `PDL` / `PDL_RELEASE` and the part's readings. A fresh `dict` on every call |
-| `launch_shape_for(rows)` | `(grid, block, shared_memory)`: grid `(OUT_FEATURES / MMA_M, split_k, 1)`, block `(256, 1, 1)` and the shared memory the launch reserves per thread block (the "shared memory per CTA" column of the pick table above) -- `((72, 4, 1), (256, 1, 1), 107904)` for one row of `ProjectionGeometry(4608, 8192)` at split 4 under the pick above. A profiler's kernel record of the launch reads the same three values |
+| `launch_shape_for(rows)` | `(grid, block, shared_memory)`: grid `(OUT_FEATURES / MMA_M, split_k, 1)`, block `(256, 1, 1)` and the shared memory the launch reserves per thread block (the "shared memory per CTA" column of the pick tables above) -- `((72, 4, 1), (256, 1, 1), 107904)` for one row of `ProjectionGeometry(4608, 8192)` at split 4 under the pick above. A profiler's kernel record of the launch reads the same three values |
 
 At `ProjectionGeometry(4608, 8192)` and `ProjectionGeometry(8192, 2048)` the symbol names the weight's shape and
 nothing of the split, the form or the row count: every rendering of one geometry shares it. Compare the form, not the
@@ -155,12 +202,12 @@ count outside 1 .. 32 is a typed decline (`ValueError` for one that is not a pos
 
 | question | answer |
 | --- | --- |
-| device | compute capability 10.x (validated on cc 10.3 and cc 10.7; cc 10.0 is admitted and unverified); every other capability is declined by name |
+| device | compute capability 10.x; every other capability is declined by name. Validated per class: `ProjectionGeometry(4608, 8192)` and `ProjectionGeometry(8192, 2048)` on cc 10.0, cc 10.3 and cc 10.7; the other three geometries on cc 10.0 only -- they are admitted and unverified on cc 10.3 and cc 10.7 |
 | geometry and split | the seven byte classes above; any other geometry or split is declined by name, and the decline of a served geometry names the splits it is served at |
 | rows | 1 .. 32 per call (a compile key; `compile()` covers all 32); 33 and up declined by name, never served by another kernel |
 | dtypes | FP8 E4M3 weight and activation; one fp32 scale (per tensor); bf16 out; fp32 accumulation |
 | layouts | contiguous operands, 32-byte aligned storage (4-byte for `scale`), every operand on the entry's device; `out` exactly `[rows, OUT_FEATURES]` |
-| determinism | bitwise replay and batch invariance at every row count 1 .. 32 (the [status page](/operations/determinism)) |
+| determinism | bitwise replay and batch invariance at every row count 1 .. 32 of every class, on the parts each class was validated on (the [status page](/operations/determinism)) |
 | backward | none: an inference step |
 | DSL | nvidia-cutlass-dsl >= 4.8.0 that provides the `cutlass.cute.experimental` layer the kernel is written on; the layer is probed by name before the kernel module is imported, and a DSL without it is declined by name. On cc 10.7 the DSL must compile with CUDA 13.4 or newer (its cu13 flavor); its CUDA 12 flavor has no target for that part and is declined by name before any compile |
 
@@ -172,6 +219,7 @@ The kernel is derived from FlashInfer's cluster split-K dense GEMM (Apache-2.0);
 `THIRD_PARTY_LICENSES.txt` carry the notice and the list of changes.
 
 Tests: `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py` (host declines, config and pick pins,
-the launch facts against the configuration arithmetic and against the profiler's record of a launch, the device cells)
-and `test_fp8_projection_decode_determinism.py` (replay, batch invariance, the pick's byte neutrality, goldens).
+the launch facts against the configuration arithmetic and against the profiler's record of a launch, the device cells,
+the warm stress behind the GPU's positive control) and `test_fp8_projection_decode_determinism.py` (replay, batch
+invariance, the pick's byte neutrality with both tensor-memory release orders, goldens).
 Source: `python/cudnn/gemm/frost/projection_decode/`.
