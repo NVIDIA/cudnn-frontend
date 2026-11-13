@@ -119,6 +119,12 @@ reads ``out``; a consumer launched without the attribute is unaffected.  When a 
 precede this CTA's own ``tcgen05.alloc``: a consumer that allocates tensor memory above its wait must fit beside this kernel's columns
 (at most ``SMEM_RESIDENT x TMEM_COLS`` per SM, 96 at the default forms) -- with the default 32 columns two instances of this kernel
 chain by construction.
+
+THE SYMBOL.  ``cudnn_kernel_frost_fp8_projection_decode_<text>_...``: the DSL appends the text of the kernel object and of the operand
+types to the kernel's name and cuts the result.  ``<text>`` is the rendering's ``Cfg.SYMBOL_TEXT`` (geometry, split, rows, weight
+tile, stages, token tile, tensor-memory columns and the four switches) for every class but those of ``SHAPE_SYMBOL_CLASSES``, whose
+symbol names the weight's shape only -- there every rendering of one geometry shares a symbol, and the form is what the host entry's
+``form_for`` states.
 """
 
 from __future__ import annotations
@@ -230,6 +236,13 @@ class Fp8ProjectionDecodeKernel:
             )
         self.mailbox_elements = cfg.MAILBOX_ELEMENTS
         self.expected_transaction_bytes = cfg.REDUCE_TX_BYTES
+
+    def __str__(self) -> str:
+        """The text the DSL writes into the kernel symbol for this object.  A kernel symbol is the kernel's name followed by the text of
+        its arguments -- this object first -- cut at a fixed length; with the rendering's ``SYMBOL_TEXT`` here the symbol names the
+        rendering in its first 100 characters.  A class whose ``SYMBOL_TEXT`` is empty keeps the default text of an object, i.e. the
+        symbol its renderings were validated with."""
+        return self.cfg.SYMBOL_TEXT or object.__repr__(self)
 
     def _check_mmas_per_k_tile(self, mma_inst_tile_k: int) -> int:
         """Trace-time: one K tile is ``MMAS_PER_K_TILE`` MMA instructions (the accumulation order the bytes are a function of)."""

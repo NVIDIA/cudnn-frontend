@@ -358,8 +358,10 @@ class Fp8ProjectionDecode:
     # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served row count ----
     def kernel_symbols_for(self, rows: int) -> Tuple[str, ...]:
         """The symbol of the kernel this entry has compiled for ``rows``: a one-element tuple, empty until that row count is compiled.
-        The symbol names the weight's shape and nothing of the split, the form or the row count -- every rendering of one geometry
-        shares it -- so it never proves a form (:meth:`form_for` states it)."""
+        At a class of ``SHAPE_SYMBOL_CLASSES`` the symbol names the weight's shape and nothing of the split, the form or the row count
+        -- every rendering of one geometry shares it -- so it never proves a form (:meth:`form_for` states it).  At every other class
+        the symbol carries the rendering's ``Cfg.SYMBOL_TEXT`` right behind the kernel's name (inside its first 100 characters): two
+        renderings that differ in a field the kernel depends on have two symbols, and :meth:`form_for` still states the form."""
         fn = self.compiled.get(self.cfg_for(rows))
         return kernel_symbols(() if fn is None else (fn,), NAME)
 

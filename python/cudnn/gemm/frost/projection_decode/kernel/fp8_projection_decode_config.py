@@ -22,7 +22,8 @@ TWO KINDS OF SERVED CLASSES, by how their pick was obtained.  The classes of ``O
 that goes with it: the ring is lowered until the grid fits one wave on the part.  Every other served class runs its table row AS WRITTEN
 -- the row was not measured with this entry, the ring is lowered only until a CTA fits the part's per-CTA shared memory, and the grid may
 take more than one wave -- and its pick releases the tensor memory late (``HOLD_TMEM_CLASSES``), so that a CTA's accumulator registers
-are consumed before another CTA of the same launch can be given its columns.
+are consumed before another CTA of the same launch can be given its columns.  ``Cfg.SYMBOL_TEXT`` is the text a rendering of those
+classes carries in its kernel symbol (the classes of ``SHAPE_SYMBOL_CLASSES`` keep the symbol they were validated with).
 
 LEDGERS.  Shared memory: :func:`smem_bytes` mirrors the kernel's allocation order (the buffer table of the kernel module) and is what the
 launch reserves; ``Cfg.SMEM_RESIDENT`` = how many CTAs of that footprint shared memory lets the launcher place on one SM (an upper
@@ -140,6 +141,9 @@ ONE_WAVE_CLASSES = frozenset(SERVED_CLASSES[:3])
 #: registers read from those columns are consumed (the remote stores, the output store) before the release.  A performance pick like
 #: any other: no byte depends on it.
 HOLD_TMEM_CLASSES = frozenset(SERVED_CLASSES[3:])
+#: the classes whose kernel symbol names the weight's shape only: the symbol their renderings were validated and recorded with (a
+#: compiled kernel's bytes depend on its symbol).  A rendering of every other class carries ``Cfg.SYMBOL_TEXT`` in its symbol.
+SHAPE_SYMBOL_CLASSES = frozenset(SERVED_CLASSES[:3])
 
 
 @dataclass(frozen=True)
@@ -291,6 +295,17 @@ class Cfg:
     @property
     def WAVES(self) -> int:
         return -(-self.CTAS // (self.SM_COUNT * max(self.RUNNING, 1)))
+
+    @property
+    def SYMBOL_TEXT(self) -> str:
+        """The text of this rendering in its kernel symbol, right behind the kernel's name: ``n<OUT_FEATURES>k<IN_FEATURES>s<SPLIT_K>
+        r<ROWS>_m<MMA_M>g<STAGES>t<TOKEN_TILE>c<TMEM_COLS>_w<PREWAIT_WEIGHTS>h<HOLD_TMEM>p<PDL>q<PDL_RELEASE>`` -- every field the
+        rendered kernel depends on (the part's readings are not among them), at most 41 characters, so two renderings that differ in
+        one of them never share a symbol.  Empty for a class of ``SHAPE_SYMBOL_CLASSES``, whose symbol names the weight's shape only."""
+        if self.NUMERICS in SHAPE_SYMBOL_CLASSES:
+            return ""
+        flags = f"w{int(self.PREWAIT_WEIGHTS)}h{int(self.HOLD_TMEM)}p{int(self.PDL)}q{int(self.PDL_RELEASE)}"
+        return f"n{self.N}k{self.K}s{self.SPLIT_K}r{self.ROWS}_m{self.MMA_M}g{self.STAGES}t{self.TOKEN_TILE}c{self.TMEM_COLS}_{flags}"
 
     def describe(self) -> str:
         return (

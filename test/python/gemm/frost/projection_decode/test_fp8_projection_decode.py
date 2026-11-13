@@ -4,7 +4,7 @@
 """The FP8 split-K projection for decode rows (``cudnn.Fp8ProjectionDecode``).  Host: the config's ledgers and derived constants (the
 shared-memory mirror, the barrier counts, the tensor-memory ledger), the measured pick and its structural separation from the numerics,
 the pick of the classes run as written (their table rows on every part, the late tensor-memory release, the wave counts as numbers),
-the splits each geometry is served at, the typed declines of the host entry (CPU
+the splits each geometry is served at, the text a rendering carries in its kernel symbol, the typed declines of the host entry (CPU
 tensors), the DSL gate, the plan-time compile key and the lazy exports.  On a cc 10.x device:
 the entry against an fp64 reference of the E4M3 operands under a per-element bound, exact-integer cells byte for byte against the host,
 the edge rows (zeros, NaN, overflow), the output rows it must not touch, every performance arm bitwise with the default, a row alone
@@ -765,6 +765,42 @@ def test_launch_shape_and_form_of_the_classes_run_as_written():
         assert early.launch_shape_for(rows) == want and early.form_for(rows)["HOLD_TMEM"] is False, "a given form is taken as given"
 
 
+def test_symbol_text_names_the_rendering_of_a_class_run_as_written():
+    """``Cfg.SYMBOL_TEXT``: empty for the classes whose symbol names the weight's shape only; for every other class a text of at most 41
+    characters of ``[a-z0-9_]`` (the DSL drops other characters from a symbol) that differs whenever a field the kernel depends on
+    differs -- across the classes, the 32 row counts, the dependent-launch knobs and the form arms -- and does not move with the
+    part's readings.  The kernel's name is 41 characters, so the text ends inside the first 100 characters of the symbol."""
+    assert kcfg.SHAPE_SYMBOL_CLASSES == {C_IN4, C_IN2, C_OUT2}
+    for numerics in (C_IN4, C_IN2, C_OUT2):
+        for arm in (dict(), dict(pdl=True), dict(form=Form(MMA_M=128, STAGES=4))):
+            k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+            assert {k.cfg_for(rows).SYMBOL_TEXT for rows in range(1, 33)} == {""}
+    kernel_name = "cudnn_kernel_frost_fp8_projection_decode_"
+    arms = [dict(), dict(pdl=True), dict(pdl=True, pdl_release=False), dict(pdl_release=True)]
+    arms += [dict(form=Form(MMA_M=m, STAGES=g)) for m, g in ((64, 7), (64, 8), (128, 4))]
+    arms += [
+        dict(form=Form(MMA_M=64, STAGES=7, HOLD_TMEM=True)),
+        dict(form=Form(MMA_M=64, STAGES=7, TMEM_COLS=64)),
+        dict(form=Form(MMA_M=64, STAGES=7, TOKEN_TILE=16)),
+    ]
+    arms += [dict(form=Form(MMA_M=64, STAGES=7, PREWAIT_WEIGHTS=False), pdl=True)]
+    texts = {}
+    for numerics in AS_WRITTEN:
+        for arm in arms:
+            k = entry.Fp8ProjectionDecode("cpu", numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+            for rows in range(1, 33):
+                cfg = k.cfg_for(rows)
+                text = cfg.SYMBOL_TEXT
+                assert text and len(text) <= 41 and len(kernel_name) + len(text) <= 100 and set(text) <= set("abcdefghijklmnopqrstuvwxyz0123456789_"), text
+                rendering = replace(cfg, SMEM_PER_SM_BYTES=0, SMEM_OPTIN_BYTES=0, SM_COUNT=0)  # everything of the compile key but the part
+                assert texts.setdefault(text, rendering) == rendering, f"two renderings share the text {text}"
+                assert replace(cfg, SM_COUNT=64, SMEM_PER_SM_BYTES=1 << 20).SYMBOL_TEXT == text
+    assert len(texts) == len({r for r in texts.values()}) > 4 * 32 * 6
+    cfg = entry.Fp8ProjectionDecode("cpu", G_16K, split_k=1, pdl=True).cfg_for(6)
+    assert cfg.SYMBOL_TEXT == "n16384k5120s1r6_m128g8t8c32_w1h1p1q1"
+    assert entry.Fp8ProjectionDecode("cpu", G_5K, split_k=2, form=Form(MMA_M=64, STAGES=11)).cfg_for(8).SYMBOL_TEXT == "n5120k6144s2r8_m64g11t8c32_w1h0p0q0"
+
+
 def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
     """The facts are plain data, a fresh object per call (a caller's edit reaches nothing of the entry) and the entry's typed declines
     for a row count outside 1 .. 32."""
@@ -1516,9 +1552,39 @@ def test_launch_facts_equal_the_profilers_record_of_a_launch(numerics, rows, arm
     assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
     record = assert_facts_equal_the_launch(k, lambda: k(ops["weight"], ops["activation"][:rows], ops["scale"], out), rows, what=entry.NAME)
     assert record.name.startswith("cudnn_kernel_frost_fp8_projection_decode_"), record.name
+    text = k.cfg_for(rows).SYMBOL_TEXT
+    if numerics in kcfg.SHAPE_SYMBOL_CLASSES:
+        assert text == "" and "Fp8ProjectionDecodeKernel" in record.name, record.name
+    else:  # the launched kernel's name carries the rendering's text inside its first 100 characters
+        assert text and record.name[:100].startswith(f"cudnn_kernel_frost_fp8_projection_decode_{text}_"), (record.name, text)
     other = 32 if rows != 32 else 1
     assert k.kernel_symbols_for(other) == (), "a row count that was not compiled names nothing"
     assert k.form_for(rows) == asdict(k.cfg_for(rows)) and (k.form_for(rows)["PDL"], k.form_for(rows)["ROWS"]) == (bool(arm.get("pdl")), rows)
+
+
+def test_renderings_of_a_class_run_as_written_have_a_symbol_each():
+    """Compiled, not launched: at one class and row count the pick, the pick under dependent launch, the pick without the release and
+    the given form of the pick's tile and depth (the early tensor-memory release) are four renderings with four symbols, each
+    carrying its ``SYMBOL_TEXT``; two row counts of one entry differ too.  At a one-wave class the same four share one symbol."""
+    dev = device_or_skip()
+
+    def symbols(numerics, rows):
+        pick = entry.Fp8ProjectionDecode(dev, numerics.GEOM, split_k=numerics.SPLIT_K).cfg_for(rows)
+        arms = (dict(), dict(pdl=True), dict(pdl=True, pdl_release=False), dict(form=Form(MMA_M=pick.MMA_M, STAGES=pick.STAGES)))
+        found = []
+        for arm in arms:
+            k = entry.Fp8ProjectionDecode(dev, numerics.GEOM, split_k=numerics.SPLIT_K, **arm)
+            k.compile(rows)
+            (symbol,) = k.kernel_symbols_for(rows)
+            found.append((symbol, k.cfg_for(rows).SYMBOL_TEXT))
+        return found
+
+    for numerics in (C_5K4, C_14K1):
+        found = symbols(numerics, 6) + symbols(numerics, 7)[:1]
+        assert len({symbol for symbol, _ in found}) == len(found) == 5, found
+        assert all(text and symbol[:100].startswith(f"cudnn_kernel_frost_fp8_projection_decode_{text}_") for symbol, text in found), found
+    shared = symbols(C_OUT2, 6)
+    assert len({symbol for symbol, _ in shared}) == 1 and {text for _, text in shared} == {""}, shared
 
 
 # (class, rows, arm).  The classes run as written, at their pick: the 8- and the 32-row token tile, and nine rows where the grid first

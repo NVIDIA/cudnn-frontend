@@ -141,10 +141,15 @@ The entry states what a row count launches without launching it: three read-only
 | `form_for(rows)` | the form as plain data: every field of the rendering `cfg_for` returns under its own name -- `GEOM` (a nested `dict`), `SPLIT_K`, `ROWS`, the resolved performance form (`MMA_M`, `STAGES`, `TOKEN_TILE`, `TMEM_COLS`, `PREWAIT_WEIGHTS`, `HOLD_TMEM`), the launch knobs `PDL` / `PDL_RELEASE` and the part's readings. A fresh `dict` on every call |
 | `launch_shape_for(rows)` | `(grid, block, shared_memory)`: grid `(OUT_FEATURES / MMA_M, split_k, 1)`, block `(256, 1, 1)` and the shared memory the launch reserves per thread block (the "shared memory per CTA" column of the pick table above) -- `((72, 4, 1), (256, 1, 1), 107904)` for one row of `ProjectionGeometry(4608, 8192)` at split 4 under the pick above. A profiler's kernel record of the launch reads the same three values |
 
-The symbol names the weight's shape and nothing of the split, the form or the row count: every rendering of one
-geometry shares it. Compare the form, not the name. A row count outside 1 .. 32 is a typed decline (`ValueError` for
-one that is not a positive `int`, `NotImplementedError` past 32), and none of the three compiles, launches or touches
-device memory.
+At `ProjectionGeometry(4608, 8192)` and `ProjectionGeometry(8192, 2048)` the symbol names the weight's shape and
+nothing of the split, the form or the row count: every rendering of one geometry shares it. Compare the form, not the
+name. At the other served geometries the symbol carries the rendering right behind the kernel's name, inside its first
+100 characters -- `cudnn_kernel_frost_fp8_projection_decode_n16384k5120s1r6_m128g8t8c32_w1h1p1q1_...` reads out features
+16384, in features 5120, split 1, 6 rows; weight tile 128, 8 stages, token tile 8, 32 tensor-memory columns; the
+weight stream ahead of the wait, the late tensor-memory release, the dependent-launch attribute and the release, each
+as 0 or 1 -- so two renderings that differ in any of these have two symbols; `form_for` still states the form. A row
+count outside 1 .. 32 is a typed decline (`ValueError` for one that is not a positive `int`, `NotImplementedError` past
+32), and none of the three compiles, launches or touches device memory.
 
 ## Support matrix
 
