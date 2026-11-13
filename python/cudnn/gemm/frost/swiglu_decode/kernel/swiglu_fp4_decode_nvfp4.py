@@ -137,10 +137,12 @@ is a constant checked against the DSL, and the traced layout is checked against 
 between releases are bound through ``cudnn._cutlass_compat``; (10) the five named barriers of the warp-role branches are the
 unaligned form (the source: the aligned one); (11) the tensor map of C, its prefetch, its store pipeline and the store itself are
 gone: the null-pointer C tensor carries the shape and the staging dtype only; (12) ``alpha`` is read in the epilogue role below its
-wait (the source: by every thread above every wait).
+wait (the source: by every thread above every wait); (13) the arms this step never selects are removed -- a per-row alpha, the
+192-token scale path, the two-CTA MMA, cluster multicast, the overlapped accumulator, descriptor prefetch, the other L2 policies,
+the plain and no-op epilogues and the source's own configuration validators (the host entry's typed declines replace them).
 """
 
-from typing import Optional, Tuple, Type, Union
+from typing import Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -191,54 +193,6 @@ from .swiglu_fp4_decode_config import (
 def _dsl_text() -> str:
     _, version = cutedsl_state()
     return " ".join(version) if version else "unknown version"
-
-
-def _per_token_fragment_plan(shape, stride, token_axis):
-    """Static analysis of a t2r fragment of the identity tensor over C.
-
-    ``shape``/``stride`` are the (hierarchical, static) layout of the
-    per-thread fragment; strides are ``ScaledBasis`` values ``k@axis`` or 0.
-    Returns ``(offsets, distinct)``: for every fragment element (in the
-    colexicographic order the fragment is indexed with) its token-axis
-    offset relative to element 0, and the sorted distinct offsets. Returns
-    ``None`` when the layout is not fully static, so the caller falls back
-    to one load per element.
-    """
-    leaves = []
-
-    def walk(sh, st):
-        if isinstance(sh, (tuple, list)):
-            if not isinstance(st, (tuple, list)) or len(sh) != len(st):
-                return False
-            return all(walk(a, b) for a, b in zip(sh, st, strict=True))
-        if not isinstance(sh, int):
-            return False
-        mode = getattr(st, "mode", None)
-        value = getattr(st, "value", st)
-        if mode is None:
-            if not isinstance(value, int) or value != 0:
-                return sh == 1 or value == 0
-            leaves.append((sh, 0))
-            return True
-        if not isinstance(value, int):
-            return False
-        leaves.append((sh, value if list(mode)[0] == token_axis else 0))
-        return True
-
-    if not walk(shape, stride):
-        return None
-    offsets = []
-    total = 1
-    for extent, _ in leaves:
-        total *= extent
-    for i in range(total):
-        rem = i
-        off = 0
-        for extent, scale in leaves:
-            off += (rem % extent) * scale
-            rem //= extent
-        offsets.append(off)
-    return offsets, sorted(set(offsets))
 
 
 @dsl_user_op
@@ -300,36 +254,14 @@ class SwigluFp4DecodeKernel:
     kernel.  ``str(kernel)`` is the form's compact text followed by the class name: the DSL writes it into the kernel symbol right
     behind the kernel's name, so the symbol's head names the form."""
 
-    # Largest kernel N a narrow (< 64) N tile may run at. A narrow tile is a
-    # sub-tile of the 128-token SFB tile: the mainloop shifts the MMA's SFB
-    # TMEM column by tok_off // 32, and an odd shift makes tcgen05.mma fault,
-    # so every sub-tile must stay within the first 32 tokens. See can_implement.
-    NARROW_TILE_MAX_N = 32
-
-    @classmethod
-    def narrow_tile_ok(cls, tile_n: int, kernel_n: int) -> bool:
-        """Whether an MMA N tile of width ``tile_n`` may run at ``kernel_n``.
-
-        Tiles of 64 or wider are unrestricted; narrow tiles must stay within
-        ``NARROW_TILE_MAX_N`` kernel-N columns (kernel N is the token count
-        under swap_ab). Shared by can_implement and by the mm_mxfp8 / mm_fp4
-        runners, which re-check a tactic before launching it.
-        """
-        return tile_n >= 64 or kernel_n <= cls.NARROW_TILE_MAX_N
-
     def __init__(self, cfg: Cfg):
         validate_cfg(cfg)
         self.cfg = cfg
-        self.epilogue_mode = "quant"
         # Weight (A/SFA) stages the TMA warp loads before the PDL wait (0: none).
         self.prewait_stages = cfg.PREWAIT_STAGES
-        self.per_token_alpha = None
         # MMA K instructions per pipeline stage: 8 (K tile 512, a 256 B TMA row per operand row).
         self.mma_inst_tile_k = K_TILES
-        self.a_l2_evict_last = False
         self.a_l2_evict_first = cfg.L2_EVICT_FIRST
-        self.b_l2_evict_last = False
-        self.b_l2_evict_first = False
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = SF_VEC
         mma_tiler_mn = (WEIGHT_TILE_ROWS, cfg.TOKEN_TILE)
@@ -337,7 +269,6 @@ class SwigluFp4DecodeKernel:
         self.cluster_shape_mn = (1, 1)
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.use_prefetch = False
         self.enable_pdl = cfg.PDL
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -527,20 +458,11 @@ class SwigluFp4DecodeKernel:
             self.num_c_stage,
         )
 
-        self.overlapping_accum = self.num_acc_stage == 1
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
-        self.num_accumulator_tmem_cols = (
-            self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
-        )
-
-        # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
-        self.iter_acc_early_release_in_epilogue = self.num_sf_tmem_cols // self.epi_tile_n
-
-        # TODO: [alel] Currently set prefetch dist to num_ab_stage, we may have more options for prefetch dist auto tuning
-        self.prefetch_dist = self.num_ab_stage
+        self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage
 
     def _prepare_tma(
         self,
@@ -648,24 +570,6 @@ class SwigluFp4DecodeKernel:
             self.cluster_layout_sfb_vmnk.shape,
             internal_type=cutlass.Int16,
         )
-        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
-            x = tma_tensor_sfb.stride[0][1]
-            y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
-
-            new_shape = (
-                (tma_tensor_sfb.shape[0][0], ((2, 2), y)),
-                tma_tensor_sfb.shape[1],
-                tma_tensor_sfb.shape[2],
-            )
-            # Use right multiplication for ScaledBasis (3 * x instead of x * 3)
-            x_times_3 = 3 * x
-            new_stride = (
-                (tma_tensor_sfb.stride[0][0], ((x, x), x_times_3)),
-                tma_tensor_sfb.stride[1],
-                tma_tensor_sfb.stride[2],
-            )
-            tma_tensor_sfb_new_layout = cute.make_layout(new_shape, stride=new_stride)
-            tma_tensor_sfb = cute.make_tensor(tma_tensor_sfb.iterator, tma_tensor_sfb_new_layout)
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
@@ -992,7 +896,7 @@ class SwigluFp4DecodeKernel:
             ab_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
-            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_dealloc_mbar_ptr: cutlass.Int64  # unused (the two-CTA form's barrier); kept so that every buffer keeps its offset
             tmem_holding_buf: cutlass.Int32
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sC: cute.struct.Align[
@@ -1132,7 +1036,6 @@ class SwigluFp4DecodeKernel:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
         tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -1160,17 +1063,7 @@ class SwigluFp4DecodeKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
         )
 
-        # Tensor memory dealloc barrier init
-        if use_2cta_instrs:
-            if warp_idx == self.tma_warp_id:
-                num_tmem_dealloc_threads = 32
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads)
         cute.arch.mbarrier_init_fence()
-
-        # Cluster arrive after barrier init
-        if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_arrive_relaxed(aligned=True)
 
         #
         # Setup smem tensor A/B/SFA/SFB/C
@@ -1193,11 +1086,6 @@ class SwigluFp4DecodeKernel:
         b_full_mcast_mask = None
         sfa_full_mcast_mask = None
         sfb_full_mcast_mask = None
-        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
-            a_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1)
-            sfa_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
-            sfb_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_sfb_vmnk, block_in_cluster_coord_sfb_vmnk, mcast_mode=1)
 
         #
         # Local_tile partition global tensors
@@ -1233,17 +1121,6 @@ class SwigluFp4DecodeKernel:
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
-
-        if cutlass.const_expr(self.per_token_alpha is not None):
-            # Identity tensor over C, partitioned like tCgC, so the epilogue can
-            # recover each accumulator element's (m, n) coordinate.
-            cC_mnl = cute.local_tile(
-                cute.make_identity_tensor(mC_mnl.shape),
-                cute.slice_(self.mma_tiler, (None, None, 0)),
-                (None, None, None),
-            )
-            # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
-            tCcC = thr_mma.partition_C(cC_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1309,33 +1186,13 @@ class SwigluFp4DecodeKernel:
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # (MMA, MMA_M, MMA_N, STAGE)
-        if cutlass.const_expr(self.overlapping_accum):
-            num_acc_stage_overlapped = 2
-            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage_overlapped))
-            # (MMA, MMA_M, MMA_N, STAGE)
-            tCtAcc_fake = cute.make_tensor(
-                tCtAcc_fake.iterator,
-                cute.make_layout(
-                    tCtAcc_fake.shape,
-                    stride=(
-                        tCtAcc_fake.stride[0],
-                        tCtAcc_fake.stride[1],
-                        tCtAcc_fake.stride[2],
-                        (256 - self.num_sf_tmem_cols) * tCtAcc_fake.stride[0][1],
-                    ),
-                ),
-            )
-        else:
-            # (MMA, MMA_M, MMA_N, STAGE)
-            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
+        # (MMA, MMA_M, MMA_N, STAGE)
+        tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
         #
         # Cluster wait before tensor memory alloc
         #
-        if cute.size(self.cluster_shape_mn) > 1:
-            cute.arch.cluster_wait()
-        else:
-            cute.arch.barrier(barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta)
+        cute.arch.barrier(barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta)
 
         # PDL bookend: griddepcontrol_wait is always emitted; the actual PDL
         # behavior is controlled by use_pdl= in .launch(). The griddepcontrol
@@ -1365,12 +1222,6 @@ class SwigluFp4DecodeKernel:
             b_cache_policy = None
             if cutlass.const_expr(self.a_l2_evict_first):
                 a_cache_policy = _l2_cache_policy("evict_first")
-            if cutlass.const_expr(self.a_l2_evict_last):
-                a_cache_policy = _l2_cache_policy("evict_last")
-            if cutlass.const_expr(self.b_l2_evict_last):
-                b_cache_policy = _l2_cache_policy("evict_last")
-            if cutlass.const_expr(self.b_l2_evict_first):
-                b_cache_policy = _l2_cache_policy("evict_first")
 
             first_work_tile = cutlass.Boolean(True)
             while work_tile.is_valid_tile:
@@ -1401,26 +1252,6 @@ class SwigluFp4DecodeKernel:
                     slice_n = mma_tile_coord_mnl[1] // self.sfb_sub_tiles_per_tile
                 # ((atom_v, rest_v), RestK)
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
-
-                if cutlass.const_expr(self.use_prefetch):
-                    # Prefetch both A and B (default behavior)
-                    for pf_k_block in cutlass.range(0, min(self.prefetch_dist, k_block_cnt), unroll=1):
-                        cute.prefetch(
-                            tma_atom_a,
-                            tAgA_slice[(None, pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_b,
-                            tBgB_slice[(None, pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_sfa,
-                            tAgSFA_slice[(None, pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_sfb,
-                            tBgSFB_slice[(None, pf_k_block)],
-                        )
 
                 if cutlass.const_expr(self.prewait_stages > 0):
                     # No new storage: prime only initial empty stages.
@@ -1498,28 +1329,6 @@ class SwigluFp4DecodeKernel:
                         mcast_mask=sfb_full_mcast_mask,
                         cache_policy=b_cache_policy,
                     )
-
-                    # Prefetch: Rolling prefetch for next tiles
-                    if cutlass.const_expr(self.use_prefetch):
-                        if k_block < k_block_cnt - self.prefetch_dist:
-                            future_k_block = ab_producer_state.count + self.prefetch_dist
-                            # Prefetch both A and B (default behavior)
-                            cute.prefetch(
-                                tma_atom_a,
-                                tAgA_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_b,
-                                tBgB_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_sfa,
-                                tAgSFA_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_sfb,
-                                tBgSFB_slice[(None, future_k_block)],
-                            )
 
                     # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
                     ab_producer_state.advance()
@@ -1615,10 +1424,7 @@ class SwigluFp4DecodeKernel:
                     cur_tile_coord[2],
                 )
 
-                if cutlass.const_expr(self.overlapping_accum):
-                    acc_stage_index = acc_producer_state.phase ^ 1
-                else:
-                    acc_stage_index = acc_producer_state.index
+                acc_stage_index = acc_producer_state.index
 
                 # Set tensor memory buffer for current tile
                 # (MMA, MMA_M, MMA_N)
@@ -1638,15 +1444,7 @@ class SwigluFp4DecodeKernel:
 
                 tCtSFB_mma = tCtSFB
                 tCsSFB_s2t_tile = tCsSFB_compact_s2t
-                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
-                    # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
-                    offset = cutlass.Int32(2) if mma_tile_coord_mnl[1] % 2 == 1 else cutlass.Int32(0)
-                    shifted_ptr = cute.recast_ptr(
-                        acc_tmem_ptr + self.num_accumulator_tmem_cols + self.num_sfa_tmem_cols + offset,
-                        dtype=self.sf_dtype,
-                    )
-                    tCtSFB_mma = cute.make_tensor(shifted_ptr, tCtSFB_layout)
-                elif cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     # Move in increments of 64 columns of SFB
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
@@ -1660,10 +1458,10 @@ class SwigluFp4DecodeKernel:
                     # by one column per 32 tokens and start the S2T copy's smem
                     # source at the remaining token row (16 B per row of the
                     # 32x4 SF block) so the sub-tile's first token lands in lane 0.
-                    # can_implement limits narrow tiles to a kernel-N extent of
-                    # 32, so the column shift below is always 0 in practice: an
-                    # odd column shift makes tcgen05.mma fault (misaligned
-                    # address), the 64-wide tile above shifts by two columns.
+                    # The host entry runs ONE token tile per call, so the column shift
+                    # below is always 0 here: an odd column shift makes tcgen05.mma
+                    # fault (misaligned address), the 64-wide tile above shifts by
+                    # two columns.
                     tok_off = (mma_tile_coord_mnl[1] % self.sfb_sub_tiles_per_tile) * self.cta_tile_shape_mnk[1]
                     offset = cutlass.Int32(tok_off // 32)
                     shifted_ptr = cute.recast_ptr(
@@ -1781,10 +1579,7 @@ class SwigluFp4DecodeKernel:
             # once the output coordinate is known, so this stays neutral.
             # Read HERE, in the only role that uses it and below that role's
             # dependent-launch wait: a predecessor may write alpha.
-            if cutlass.const_expr(self.per_token_alpha is not None):
-                alpha_value = cutlass.Float32(1.0)
-            else:
-                alpha_value = alpha[0].to(cutlass.Float32)
+            alpha_value = alpha[0].to(cutlass.Float32)
 
             #
             # Alloc tensor memory buffer
@@ -1819,22 +1614,6 @@ class SwigluFp4DecodeKernel:
             epi_tidx = tidx
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = self.epilog_tmem_copy_and_partition(epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs)
 
-            if cutlass.const_expr(self.per_token_alpha is not None):
-                # Partitioned like tCgC, so this mirrors the t2r register
-                # fragment element for element.
-                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
-                tTR_cC_partitioned = tiled_copy_t2r.get_slice(epi_tidx).partition_D(cute.flat_divide(tCcC[((None, None), 0, 0, None, None, None)], epi_tile))
-                alpha_extent = mC_mnl.shape[0] if cutlass.const_expr(self.per_token_alpha == "m") else mC_mnl.shape[1]
-                token_axis = 0 if self.per_token_alpha == "m" else 1
-                # Static plan: which fragment elements share a token, and
-                # whether the token is constant across the epilogue subtiles.
-                _frag_layout = tTR_cC_partitioned.layout
-                _frag_shape = _frag_layout.shape
-                _frag_stride = _frag_layout.stride
-                alpha_plan = _per_token_fragment_plan(tuple(_frag_shape[0:3]), tuple(_frag_stride[0:3]), token_axis)
-                _subtile_plan = _per_token_fragment_plan(tuple(_frag_shape[3:5]), tuple(_frag_stride[3:5]), token_axis)
-                alpha_token_per_tile = alpha_plan is not None and len(alpha_plan[1]) == 1 and _subtile_plan is not None and _subtile_plan[1] == [0]
-
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(tiled_copy_t2r, tTR_rC, epi_tidx, sC)
 
@@ -1855,32 +1634,7 @@ class SwigluFp4DecodeKernel:
                     cur_tile_coord[2],
                 )
 
-                if cutlass.const_expr(self.per_token_alpha is not None):
-                    # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
-                    tTR_cC = tTR_cC_partitioned[
-                        (
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            *mma_tile_coord_mnl,
-                        )
-                    ]
-                    tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
-                    if cutlass.const_expr(alpha_token_per_tile):
-                        # Every element this thread holds in this tile has
-                        # the same token: one clamped load per tile, applied
-                        # through the scalar alpha multiply below.
-                        tile_token = tTR_cC[(0, 0, 0, 0)][token_axis]
-                        tile_token = cutlass.min(tile_token, alpha_extent - 1)
-                        alpha_value = alpha[tile_token].to(cutlass.Float32)
-
-                if cutlass.const_expr(self.overlapping_accum):
-                    acc_stage_index = acc_consumer_state.phase
-                    reverse_subtile = cutlass.Boolean(True) if acc_stage_index == 0 else cutlass.Boolean(False)
-                else:
-                    acc_stage_index = acc_consumer_state.index
+                acc_stage_index = acc_consumer_state.index
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
@@ -1901,9 +1655,6 @@ class SwigluFp4DecodeKernel:
 
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if reverse_subtile:
-                            real_subtile_idx = self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
@@ -1911,39 +1662,9 @@ class SwigluFp4DecodeKernel:
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     #
-                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
-                    if cutlass.const_expr(self.overlapping_accum):
-                        if subtile_idx == self.iter_acc_early_release_in_epilogue:
-                            # Fence for TMEM load
-                            cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
-                            acc_consumer_state.advance()
                     #
-                    # Fold the per-token scale into the accumulators
                     #
-                    if cutlass.const_expr(self.per_token_alpha is not None and not alpha_token_per_tile):
-                        tTR_cC_subtile = tTR_cC[(None, None, None, real_subtile_idx)]
-                        if cutlass.const_expr(alpha_plan is not None):
-                            # The fragment's token offsets are static: load
-                            # each distinct token once per subtile (clamped so
-                            # the rows past the token extent, which the TMA
-                            # store drops, never read alpha out of bounds).
-                            offsets, distinct = alpha_plan
-                            token0 = tTR_cC_subtile[0][token_axis]
-                            loaded = {}
-                            for d in distinct:
-                                tok = cutlass.min(token0 + d, alpha_extent - 1)
-                                loaded[d] = alpha[tok].to(cutlass.Float32)
-                            for i in cutlass.range_constexpr(len(offsets)):
-                                tTR_rAcc[i] = tTR_rAcc[i] * loaded[offsets[i]]
-                        else:
-                            for i in cutlass.range_constexpr(cute.size(tTR_cC_subtile)):
-                                coord = tTR_cC_subtile[i]
-                                token = coord[token_axis]
-                                token = cutlass.min(token, alpha_extent - 1)
-                                tTR_rAcc[i] = tTR_rAcc[i] * alpha[token].to(cutlass.Float32)
 
                     #
                     # Convert to C type
@@ -1973,32 +1694,30 @@ class SwigluFp4DecodeKernel:
                     #
                     # SwiGLU + block quantisation of the staged tile, stored to global memory
                     #
-                    if cutlass.const_expr(self.epilogue_mode == "quant"):
-                        # One CTA contains [gate64, up64]. The first BF16
-                        # rounding was performed by the ordinary GEMM epilogue.
-                        # Quantization preserves the second BF16 rounding after SiLU.
-                        swiglu_quant_epilogue(
-                            sC,
-                            out,
-                            out_scale,
-                            out_global_scale,
-                            tidx,
-                            c_buffer,
-                            mma_tile_coord_mnl[0] * 64,
-                            mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1] + real_subtile_idx * self.epi_tile_n,
-                            mC_mnl.shape[1],
-                            mC_mnl.shape[0] // 2,
-                            self.epi_tile_n,
-                        )
+                    # One CTA contains [gate64, up64]. The first BF16
+                    # rounding was performed by the ordinary GEMM epilogue.
+                    # Quantization preserves the second BF16 rounding after SiLU.
+                    swiglu_quant_epilogue(
+                        sC,
+                        out,
+                        out_scale,
+                        out_global_scale,
+                        tidx,
+                        c_buffer,
+                        mma_tile_coord_mnl[0] * 64,
+                        mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1] + real_subtile_idx * self.epi_tile_n,
+                        mC_mnl.shape[1],
+                        mC_mnl.shape[0] // 2,
+                        self.epi_tile_n,
+                    )
                     barrier.named_barrier_sync_unaligned(self.epilog_sync_bar_id, EPILOGUE_THREADS)
 
                 #
                 # Async arrive accumulator buffer empty
                 #
-                if cutlass.const_expr(not self.overlapping_accum):
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
-                    acc_consumer_state.advance()
+                with cute.arch.elect_one():
+                    acc_pipeline.consumer_release(acc_consumer_state)
+                acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
@@ -2013,9 +1732,6 @@ class SwigluFp4DecodeKernel:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
             barrier.named_barrier_sync_unaligned(self.epilog_sync_bar_id, EPILOGUE_THREADS)
             if warp_idx == self.epilog_warp_id[0]:
-                if use_2cta_instrs:
-                    cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, cta_rank_in_cluster ^ 1)
-                    cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
                 cute.arch.dealloc_tmem(acc_tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=use_2cta_instrs)
         griddepcontrol_launch_dependents()
 
@@ -2054,239 +1770,6 @@ class SwigluFp4DecodeKernel:
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
-
-    @staticmethod
-    def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-    ) -> bool:
-        """Checks if the data types and scale factor vector size are a valid combination.
-
-        Args:
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
-            sf_vec_size (int): Vector size of the scale factors.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-
-        Returns:
-            bool: True if the combination is valid, False otherwise.
-        """
-        is_valid = True
-
-        # Check valid ab_dtype
-        if ab_dtype not in {
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        # Check valid sf_vec_size
-        if sf_vec_size not in {16, 32}:
-            is_valid = False
-
-        # Check valid sf_dtype
-        if sf_dtype not in {cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN}:
-            is_valid = False
-
-        # Check valid sf_dtype and sf_vec_size combinations
-        if sf_dtype == cutlass.Float8E4M3FN and sf_vec_size == 32:
-            is_valid = False
-        if ab_dtype in {cutlass.Float8E5M2, cutlass.Float8E4M3FN} and sf_vec_size == 16:
-            is_valid = False
-
-        # Check valid c_dtype
-        if c_dtype not in {
-            cutlass.Float32,
-            cutlass.Float16,
-            cutlass.BFloat16,
-            cutlass.Float8E5M2,
-            cutlass.Float8E4M3FN,
-        }:
-            is_valid = False
-
-        return is_valid
-
-    @staticmethod
-    def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """Checks if the tensor layouts are valid for the given data types.
-
-        Args:
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-            a_major (str): The major layout of tensor A ('k' or 'm').
-            b_major (str): The major layout of tensor B ('k' or 'n').
-            c_major (str): The major layout of tensor C ('n' or 'm').
-
-        Returns:
-            bool: True if the layouts are valid, False otherwise.
-        """
-        is_valid = True
-
-        if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
-    def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-    ) -> bool:
-        """Checks if the MMA tiler and cluster shape are a valid combination.
-
-        Args:
-            mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
-            cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA cluster.
-
-        Returns:
-            bool: True if the combination is valid, False otherwise.
-        """
-        is_valid = True
-        # Skip invalid mma tile shape
-        if mma_tiler_mn[0] not in [128, 256]:
-            is_valid = False
-        if mma_tiler_mn[1] not in [8, 16, 32, 64, 128, 192, 256]:
-            is_valid = False
-        # Skip illegal cluster shape
-        if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
-            is_valid = False
-        # Skip invalid cluster shape
-        _is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        if (
-            cluster_shape_mn[0] * cluster_shape_mn[1] > 16
-            or cluster_shape_mn[0] <= 0
-            or cluster_shape_mn[1] <= 0
-            # Special cluster shape check for scale factor multicasts.
-            # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
-            or cluster_shape_mn[0] > 4
-            or cluster_shape_mn[1] > 4
-            or not _is_power_of_2(cluster_shape_mn[0])
-            or not _is_power_of_2(cluster_shape_mn[1])
-        ):
-            is_valid = False
-        return is_valid
-
-    @staticmethod
-    def is_valid_tensor_alignment(
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
-        l: cutlass.Int64,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """Checks if the tensor dimensions are valid for memory alignment.
-
-        Args:
-            m (cutlass.Int64): The M dimension of the GEMM problem.
-            n (cutlass.Int64): The N dimension of the GEMM problem.
-            k (cutlass.Int64): The K dimension of the GEMM problem.
-            l (cutlass.Int64): The batch dimension (L) of the GEMM problem.
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-            a_major (str): The major layout of tensor A ('k' or 'm').
-            b_major (str): The major layout of tensor B ('k' or 'n').
-            c_major (str): The major layout of tensor C ('n' or 'm').
-
-        Returns:
-            bool: True if the tensor alignment is valid, False otherwise.
-        """
-        is_valid = True
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
-
-        if (
-            not check_contigous_16B_alignment(ab_dtype, a_major == "m", (m, k, l))
-            or not check_contigous_16B_alignment(ab_dtype, b_major == "n", (n, k, l))
-            or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
-        ):
-            is_valid = False
-        return is_valid
-
-    @classmethod
-    def can_implement(
-        cls,
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
-        sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
-        l: cutlass.Int64,
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """Checks if the kernel can implement the given GEMM problem.
-
-        This method aggregates checks for data types, layouts, tile shapes,
-        and alignment to determine if the configuration is supported.
-
-        Args:
-            ab_dtype (Type[cutlass.Numeric]): Data type of operands A and B.
-            sf_dtype (Type[cutlass.Numeric]): Data type of the scale factors.
-            sf_vec_size (int): Vector size of the scale factors.
-            c_dtype (Type[cutlass.Numeric]): Data type of the output tensor C.
-            mma_tiler_mn (Tuple[int, int]): The (M, N) shape of the MMA tiler.
-            cluster_shape_mn (Tuple[int, int]): The (M, N) shape of the CTA
-                cluster.
-            m (cutlass.Int64): The M dimension of the GEMM problem.
-            n (cutlass.Int64): The N dimension of the GEMM problem.
-            k (cutlass.Int64): The K dimension of the GEMM problem.
-            l (cutlass.Int64): The batch dimension (L) of the GEMM problem.
-            a_major (str): The major layout of tensor A ('k' or 'm').
-            b_major (str): The major layout of tensor B ('k' or 'n').
-            c_major (str): The major layout of tensor C ('n' or 'm').
-
-        Returns:
-            bool: True if the configuration is supported, False otherwise.
-        """
-        can_implement = True
-        # Skip unsupported types
-        if not cls.is_valid_dtypes_and_scale_factor_vec_size(ab_dtype, sf_dtype, sf_vec_size, c_dtype):
-            can_implement = False
-        # Skip unsupported layouts
-        if not cls.is_valid_layouts(ab_dtype, c_dtype, a_major, b_major, c_major):
-            can_implement = False
-        # Skip invalid mma tile shape and cluster shape
-        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
-            can_implement = False
-        # Skip illegal problem shape for load/store alignment
-        if not cls.is_valid_tensor_alignment(m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major):
-            can_implement = False
-
-        # Narrow N tiles (8/16/32) read their tokens' scale factors out of the
-        # 128-wide SFB tile through the sub-tile addressing in the mainloop:
-        # the S2T copy's smem source moves by whole token rows inside the
-        # first 32-token group and the MMA's SFB TMEM address moves by one
-        # column per 32 tokens. tcgen05.mma faults with a misaligned address
-        # when that column shift is odd (offsets 1 and 3 fault; the 64-wide
-        # tile's two-column shift is fine), so every sub-tile has to stay in
-        # the first 32-token group: the kernel-N extent is limited to 32 and
-        # the SFB tile is never multicast. Wider N takes the 64-wide or
-        # 128-wide tiles. narrow_tile_ok holds the 32-column bound, shared with
-        # the mm_mxfp8 / mm_fp4 runners' pre-launch re-check of replayed tactics.
-        if not cls.narrow_tile_ok(mma_tiler_mn[1], n) or (mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1):
-            can_implement = False
-        return can_implement
 
 
 @cute.jit
