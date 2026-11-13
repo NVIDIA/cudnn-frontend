@@ -50,7 +50,7 @@ invariance are recorded in `docs/operations/determinism.md`.
 * dense compact-BSHD `Q/K/V/O/dO/dQ/dK/dV`, contiguous FP32 `Stats` of shape `(B, H_q, S_q, 1)`;
 * `D_QK = D_V` in {64, 128}; BF16 or FP16 throughout;
 * MHA, or GQA / MQA with an integral head ratio (the kernel walks the group's query heads);
-* unmasked or top-left causal attention, any sequence lengths (tail tiles zero-fill, tail stores clip);
+* unmasked or top-left causal attention, positive sequence lengths of any size (tail tiles zero-fill, tail stores clip);
 * batch and query-head counts of at most 65535;
 * a positive finite `attn_scale`.
 
