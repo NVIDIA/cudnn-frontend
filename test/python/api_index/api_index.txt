@@ -3,6 +3,7 @@ cudnn.AlignedHCABackward
 cudnn.AttentionGateQuantDecode
 cudnn.BSA
 cudnn.BlockScaledTensor
+cudnn.BsaBackwardMetadata
 cudnn.CSA
 cudnn.CSACompressorBackward
 cudnn.CSACompressorForward
@@ -218,16 +219,21 @@ cudnn.behavior_note.name
 cudnn.behavior_note.value
 cudnn.block_sparse_attention
 cudnn.block_sparse_attention.BSA
+cudnn.block_sparse_attention.BsaBackwardMetadata
+cudnn.block_sparse_attention.BsaBackwardMetadata.arch
+cudnn.block_sparse_attention.BsaBackwardMetadata.sparse_block_size
 cudnn.block_sparse_attention.KPageLayout
 cudnn.block_sparse_attention.KPageLayout.build_backward
 cudnn.block_sparse_attention.KPageLayout.sparse_block_size
 cudnn.block_sparse_attention.block_sparse_attention_backward
 cudnn.block_sparse_attention.block_sparse_attention_forward
 cudnn.block_sparse_attention.block_sparse_attention_fp8_forward
+cudnn.block_sparse_attention.block_sparse_attention_prepare_backward
 cudnn.block_sparse_attention.kpage_prepare_layout
 cudnn.block_sparse_attention_backward
 cudnn.block_sparse_attention_forward
 cudnn.block_sparse_attention_fp8_forward
+cudnn.block_sparse_attention_prepare_backward
 cudnn.build_plan_policy
 cudnn.build_plan_policy.ALL
 cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -1445,6 +1451,9 @@ cudnn.numerical_note.name
 cudnn.numerical_note.value
 cudnn.nvfp4_attention_qat_backward
 cudnn.ops
+cudnn.ops.BsaBackwardMetadata
+cudnn.ops.BsaBackwardMetadata.arch
+cudnn.ops.BsaBackwardMetadata.sparse_block_size
 cudnn.ops.KPageLayout
 cudnn.ops.KPageLayout.build_backward
 cudnn.ops.KPageLayout.sparse_block_size
@@ -1470,6 +1479,7 @@ cudnn.ops.block_sparse_attention_backward_jax
 cudnn.ops.block_sparse_attention_forward
 cudnn.ops.block_sparse_attention_forward_jax
 cudnn.ops.block_sparse_attention_fp8_forward
+cudnn.ops.block_sparse_attention_prepare_backward
 cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
