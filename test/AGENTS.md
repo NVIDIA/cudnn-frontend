@@ -35,12 +35,14 @@ Remap global Top-K IDs when batches move and preserve negative padding.
 Keep API-by-dtype/GPU support in [the status page](../docs/operations/determinism.md).
 Put test counts, commands, runtimes, and failure diagnostics in
 [the test report](python/determinism_goldens/README.md), not the status page.
-When widening SDPA eligibility, also run the GPU-free
+When widening SDPA eligibility, also run the host contract
 `sdpa/frost/test_heuristic_geometry.py` and
 `sdpa/frost/test_sdpa_graph_analyzer.py` suites. Older negative assertions in
 these files can contradict the new contract even when the feature's GPU tests
 pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
 THD now accepts unsplit N128, while N64 still declines.
+Use the normal test environment: some analyzer cases also validate the C++
+graph and require a CUDA device and backend handle.
 When a CUDA-graph check can select a backend plan, supply an explicit cuDNN handle and bind it to the same
 capture stream used by Torch. A Python-engine path may follow Torch's current stream while a backend handle
 stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
