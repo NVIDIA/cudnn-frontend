@@ -2655,7 +2655,14 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
     // Internal function - do not use directly in application code
     void
     _auto_select_implementation(const detail::Context& context) {
-        if (verify_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::UNIFIED).is_good()) {
+        auto const q       = inputs.find(input_names::Q);
+        auto const q_dtype = q != inputs.end() && q->second ? q->second->get_data_type() : DataType_t::NOT_SET;
+        bool const fp32_io =
+            (q_dtype == DataType_t::NOT_SET ? context.get_io_data_type() : q_dtype) == DataType_t::FLOAT;
+        // Preserve FP32 AUTO's composite coverage across architectures and shapes.
+        // Explicit UNIFIED can use the narrower FP32 support of newer backends.
+        if (!fp32_io &&
+            verify_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::UNIFIED).is_good()) {
             implementation = AttentionImplementation_t::UNIFIED;
             CUDNN_FE_LOG_LABEL_ENDL("INFO: Auto-selected SDPA implementation UNIFIED");
         } else if (verify_sdpa_support_surface_for_implementation(context, AttentionImplementation_t::COMPOSITE)

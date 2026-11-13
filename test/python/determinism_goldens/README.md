@@ -5224,3 +5224,63 @@ it also exposed the existing N64 dense-only factory boundary, which is now
 rejected by capability and standalone checks before compilation. An earlier
 config admission failure and a synthetic fixture missing its padding flag
 are retained as development failures; neither is a successful GPU test.
+
+### Unified FP32 forward on SM120 (2026-11-13)
+
+`sdpa/graph/test_sdpa_fp32_determinism.py` pins explicit UNIFIED SDPA to backend
+engine 21 with STREAM_K=1 and its direct-output FP32 plan. This requires a
+cuDNN 9.30+ runtime containing and enabling that implementation; a version
+label alone is insufficient. AUTO/composite routing is outside this suite.
+FP32 backward, causal masks, split reduction and widths above 128 are not
+provided by this path. Other GPU architectures remain unverified here.
+
+Six L0 parameter cases compare FP32 O and saved LSE across eight executions
+with fresh input/output allocations and concurrent GPU work. Each case keeps
+sequence 0 fixed while running it alone, with neighbors, reordered, duplicated,
+and with changed neighbors. All outputs also pass an independent CPU FP64
+attention reference at atol=1e-5, rtol=1e-4. Inputs remain byte-identical.
+Shapes straddle Q15/16/17 and K31/32/33, include GQA and independent QK/V
+widths 16/32, 32/16, 56/80, and 128/96, and reach Q257/K129/H16. Bias cases cover
+FP16, BF16 and FP32, including O=0/LSE=-inf rows checked against the reference.
+
+The seventh L0 case checks shared-stage reuse at B2/H16/Hkv2/Q257/K129/D64:
+516 CTAs, four refills per launch. Its independent numerical reference passes
+before stress; the stress byte reference is a pair of cache-flushed launches.
+Both the recording and strict runs had zero wrong outputs in 256 warm plus 256
+shared-memory-poisoned launches. The unsafe-ring control failed 200/200 launches
+in each process. This is a measured rate bound, not a proof of race freedom.
+
+Hardware/runtime: RTX PRO 6000 Blackwell Server Edition, SM120, 188 SMs;
+cuDNN 9.30.0, Torch 2.15.0+cu132, CUDA driver API 13040, CuTe DSL 4.8.1 using
+CUDA 13.4, TVM FFI 0.1.15.post2. Source: develop
+`e0153b09b4bc7d71448be7d0399258b6a64a2538` plus this PR. The isolated build's
+Python package and compiled module were selected explicitly and verified.
+
+Collection found 7 cases. Recording passed 7/7 in 2.96s; a separate process with
+recording unset passed 7/7 in 2.55s: zero failures and zero skips. Four new JSON
+baselines cover unbiased FP32 and each bias datatype. Their input/output
+hashes were reviewed after reference/replay/batch checks; no older baseline
+was replaced. The numerical reason for new baselines is newly admitted FP32
+I/O on this explicit unified engine.
+
+From `test/python`, with the matching runtime and built package selected:
+
+```bash
+export CUDNN_FORT_SASS_DBG=1 CUDNN_LIB_CONFIG=JIT
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 NVIDIA_TF32_OVERRIDE=0
+export CUDNN_TEST_NO_ISOLATION=1 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
+python -c 'import cudnn; print(cudnn.__file__, cudnn.backend_version())'
+python -m pytest sdpa/graph/test_sdpa_fp32_determinism.py -m L0 --collect-only -q
+CUDNN_DETERMINISM_RECORD=/tmp/new-fp32-goldens \
+  python -m pytest sdpa/graph/test_sdpa_fp32_determinism.py -m L0 -q -rs -s
+# Review the new files, then copy them into determinism_goldens without replacing older files.
+unset CUDNN_DETERMINISM_RECORD
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest sdpa/graph/test_sdpa_fp32_determinism.py -m L0 -q -rs -s
+```
+
+Local frontend compilation retained warnings-as-errors except for GCC 15's
+`free-nonheap-object` diagnostic in unchanged upstream `cudnn_interface.h`;
+that diagnostic remained visible. Python.h was preincluded to resolve the
+local Python/glibc feature-macro mismatch. Both adjustments affected only
+generated local build files, not the source or shipped compiler settings.
