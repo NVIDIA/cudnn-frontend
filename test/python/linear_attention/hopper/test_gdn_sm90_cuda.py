@@ -14,10 +14,12 @@ here is what that fixture does not reach:
   so the gate regimes below run from "no decay at all" through "every token
   wipes the state" to hard resets (-1e8, -inf) in the middle of a chunk,
   against the fp64 recurrence, in both directions;
-* every kernel variant the hosts can select: the forward with one piece per
-  sequence and with many, the three backward scan tilings (16, 32 and 64 value
-  columns), single-sequence and packed launches, with and without a partial
-  last chunk;
+* every kernel variant the hosts can select: the unsplit forward, the three
+  backward scan tilings (16, 32 and 64 value columns), single-sequence and
+  packed launches, with and without a partial last chunk;
+* inputs the gate alone does not bound: raw (un-normalised) keys and a very
+  large carried state, where a forward that truncated history by the gate
+  would drop state that matters;
 * that the scalar-gate build computes the same function as the per-channel
   one wherever the latter is valid, with ``dG`` equal to its sum over channels;
 * that the GDN heuristics hook makes this engine the default on Hopper without
@@ -197,12 +199,9 @@ def test_matches_the_fp64_recurrence(gate, lengths, heads):
 @requires_hopper
 @pytest.mark.parametrize("gate", ["init", "slow"])
 @pytest.mark.L0
-def test_split_forward_with_wide_scan_matches_the_fp64_recurrence(gate):
-    """Four sequences of sixteen chunks at 32 (sequence, head) pairs: eight forward pieces each, and scan<64>.
-
-    On ``init`` a piece warms up from one chunk of history; on ``slow`` no piece can truncate and
-    every one walks back to the start of its sequence.
-    """
+def test_few_pairs_with_wide_scan_matches_the_fp64_recurrence(gate):
+    """Four sequences of sixteen chunks at 32 (sequence, head) pairs: the shape at which a split forward
+    would cut each sequence into eight pieces (this engine does not split), and scan<64>."""
     tensors, cu, d_out = make_case([256] * 4, 8, gate, seed=11)
     got = run_engine(tensors, cu, d_out)
     ref = run_reference(tensors, cu, d_out)
@@ -230,21 +229,15 @@ def test_agrees_with_the_per_channel_kernels_on_a_bounded_gate(lengths, heads):
 
 @requires_hopper
 @pytest.mark.L0
-def test_a_slow_gate_walks_back_to_the_start():
-    """Pieces that cannot truncate their history must replay it, not drop it.
-
-    One sequence and one head gives the forward as many pieces as it has
-    chunks. With a gate this slow no piece ever accumulates enough decay to
-    start from zero, so every one walks back to token 0; the answer has to be
-    the one a single piece would give.
-    """
+def test_one_head_alone_equals_the_same_head_among_300():
+    """The forward's bytes for one (sequence, head) do not depend on how many share the launch: one head
+    alone (a launch a split forward would cut into 64 pieces) against the same head as one of 300."""
     tensors, cu, _ = make_case([1024], 1, "slow", seed=3)
-    split, _ = run_engine(tensors, cu)
-    # The same tokens as 300 heads' worth of launch have no room to split: P == 1.
+    alone, _ = run_engine(tensors, cu)
     wide = [t.repeat(1, 300, *([1] * (t.dim() - 2))).contiguous() for t in tensors]
-    whole, _ = run_engine(wide, cu)
+    among, _ = run_engine(wide, cu)
     torch.cuda.synchronize()
-    assert rms_ratio(split[:, 0], whole[:, 0]) <= 2e-3
+    assert torch.equal(alone[:, 0].contiguous().view(torch.uint8), among[:, 0].contiguous().view(torch.uint8))
 
 
 @requires_hopper
@@ -448,7 +441,7 @@ def test_declined_graph_falls_through(launches):
 
 
 @requires_hopper
-@pytest.mark.parametrize("kwargs", [{"use_qk_l2norm_in_kernel": True}, {"batch_invariant": True}], ids=["l2norm", "batch_invariant"])
+@pytest.mark.parametrize("kwargs", [{"use_qk_l2norm_in_kernel": True}, {"use_beta_sigmoid_in_kernel": True}], ids=["l2norm", "beta_sigmoid"])
 @pytest.mark.L0
 def test_out_of_scope_graphs_are_declined(kwargs):
     """Pinning the engine on a graph outside its scope raises instead of mis-serving it."""
@@ -869,3 +862,88 @@ def test_a_plan_built_for_one_device_refuses_another():
         pack, _ = _pack(ports, tensors, cu, d_out)
         with pytest.raises(ValueError, match="the plan was built for cuda:0"):
             graph.execute(pack, workspace.to("cuda:1"), handle=common.get_handle(torch.device("cuda:1")))
+
+
+# ----------------------------------------------------------------------------- inputs the gate does not bound
+def _single_head_case(k_row, q_rows, g, beta, seed_value, scale):
+    """One sequence of 64 tokens and one head, built by hand: every key ``k_row``, ``q_rows(t)`` per token,
+    zero values, a constant gate and beta, and a seed with a single non-zero entry at [0, 0, 0, 0]."""
+    T = 64
+    q = torch.stack([q_rows(t) for t in range(T)]).reshape(T, 1, DIM).to(torch.bfloat16).cuda()
+    k = k_row.reshape(1, 1, DIM).expand(T, 1, DIM).to(torch.bfloat16).contiguous().cuda()
+    v = torch.zeros(T, 1, DIM, dtype=torch.bfloat16, device="cuda")
+    g_t = torch.full((T, 1), g, dtype=torch.float32, device="cuda")
+    beta_t = torch.full((T, 1), beta, dtype=torch.float32, device="cuda")
+    cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
+    state = torch.zeros(1, 1, DIM, DIM, dtype=torch.float32, device="cuda")
+    state[0, 0, 0, 0] = seed_value
+    return (q, k, v, g_t, beta_t), cu, state
+
+
+def _unit(i):
+    e = torch.zeros(DIM)
+    e[i] = 1.0
+    return e
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Raw keys: beta * |k|^2 = 3.6, so I - beta k k^T expands (factor -2.6) the state the gate is decaying.
+        # Badly conditioned for this kernel (see the docstring), so only the probe value is checked, loosely.
+        dict(k_row=2 * _unit(0), q_rows=lambda t: _unit(0), g=-1.0, beta=0.9, seed_value=1.0, scale=1.0, probe=(48, 0), probe_tol=0.2, full=False),
+        # Normalised keys orthogonal to the seed and a seed of 1e30: the gate alone says it is gone by token 48.
+        dict(
+            k_row=_unit(1),
+            q_rows=lambda t: _unit(2) if t < 48 else _unit(0),
+            g=-1.0,
+            beta=0.5,
+            seed_value=1e30,
+            scale=1.0,
+            probe=(48, 0),
+            probe_tol=1e-2,
+            full=True,
+        ),
+    ],
+    ids=["raw_keys", "large_seed"],
+)
+def test_state_the_gate_alone_does_not_bound_is_kept(case):
+    """The two cases from the review of NVIDIA/cudnn-frontend#2539: a forward that cut history by the gate alone
+    returned zero at the probe; the fp64 recurrence does not.
+
+    The raw-key case expands the state, and there this kernel is less accurate than FLA or gdn_cutile: on H100,
+    12% off at the probe and 0.15 rms on the final state, against 0.2% / 0.003 for FLA and 1.5% / 4e-5 for
+    gdn_cutile. A truncating forward is 100% off (it returns zero), which is what this case guards against.
+    """
+    tensors, cu, state = _single_head_case(case["k_row"], case["q_rows"], case["g"], case["beta"], case["seed_value"], case["scale"])
+    out, final = gated_delta_net(*tensors, cu, scale=case["scale"], initial_state=state, output_final_state=True, plan_name=ENGINE)[:2]
+    ref_out, ref_final = gdn_reference(*(t.unsqueeze(0).double() for t in tensors), scale=case["scale"], initial_state=state.double(), cu_seqlens=cu)
+    torch.cuda.synchronize()
+    t, j = case["probe"]
+    want = ref_out[0, t, 0, j].item()
+    assert want != 0.0
+    got = out[t, 0, j].float().item()
+    assert abs(got - want) <= case["probe_tol"] * abs(want), f"o[{t}, 0, {j}] = {got}, the fp64 recurrence gives {want}"
+    if case["full"]:
+        assert rms_ratio(out, ref_out.squeeze(0)) <= FWD_TOL
+        assert rms_ratio(final, ref_final) <= STATE_TOL
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
+def test_batch_invariant_graphs_run_on_this_engine(backward, launches):
+    """``batch_invariant=True`` needs no other engine: the forward is unsplit and the backward's arithmetic per
+    (sequence, head) does not depend on the batch. The flag must route here and give the same bytes."""
+    tensors, cu, d_out = make_case([300, 65], 4, "init")
+    leaves = [t.clone().requires_grad_(backward) for t in tensors]
+    flagged = gated_delta_net(*leaves, cu, plan_name=ENGINE, batch_invariant=True)[0]
+    grads = torch.autograd.grad(flagged, leaves, grad_outputs=d_out) if backward else ()
+    plain = run_engine(tensors, cu, d_out if backward else None)
+    torch.cuda.synchronize()
+    assert torch.equal(flagged.detach().view(torch.uint8), plain[0].view(torch.uint8))
+    for name, a, b in zip(GRAD_NAMES, grads, plain[1] or ()):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+    assert launches[0] == ("fwd", True)

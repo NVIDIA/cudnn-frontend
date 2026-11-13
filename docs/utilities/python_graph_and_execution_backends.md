@@ -381,10 +381,12 @@ are close.
   (`-DKDA_FUSED_SCALAR_GATE`, `-DKDA_BWD_SCALAR_GATE`), which reads `g` and
   writes `dG` at `[total_T, HV]`. It serves packed THD bf16 q/k/v with equal
   head counts and K = V = 128, a log-space fp32 gate, a post-sigmoid fp32
-  `beta`, caller-normalized q/k and an optional fp32 or bf16 state; it
-  declines `use_qk_l2norm`, `safe_gate`, `use_beta_sigmoid`, `"linear"`,
-  `batch_invariant`, checkpoints, `state_indices` and the context-parallel
-  ports, which then fall through to the cuTile engine.
+  `beta` and an optional fp32 or bf16 state. The forward runs one unsplit
+  chain per (sequence, head), so the results do not depend on the rest of the
+  batch and `batch_invariant=True` is served too. It declines
+  `use_qk_l2norm`, `safe_gate`, `use_beta_sigmoid`, `"linear"`, checkpoints,
+  `state_indices` and the context-parallel ports, which then fall through to
+  the cuTile engine.
 - `KdaFrostEngine` / `KdaCuTileEngine` do the same for the single-node
   `kda` / `kda_bwd` ops (Kimi Delta Attention). KDA is GDN with a
   per-key-channel decay: its `g` is the log-space vector gate

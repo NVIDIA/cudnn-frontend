@@ -36,13 +36,31 @@ pytest linear_attention/hopper/test_gdn_sm90_cuda_determinism.py -m L0  # SM90 o
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM90 GDN engine (`gdn_hopper_cuda`) — unsplit forward, 2026-11-13 (UTC)
+
+The engine's forward no longer cuts a sequence into pieces: a piece after the
+first warmed up from a history cut by a gate-only bound, which raw keys or a
+large state could break (review of NVIDIA/cudnn-frontend#2539). With one chain
+per (sequence, head) the forward's bytes no longer depend on the rest of the
+batch, and the suite now asserts batch invariance in both directions and runs
+with `batch_invariant=True`, which the engine now accepts. It has 34 L0 cases.
+
+Same runtime and commands as the record below, on the branch with this change:
+`CUDNN_DETERMINISM_RECORD` then `CUDNN_DETERMINISM_GOLDENS` give 2 recorded and
+**34 passed, 0 failed, 0 skipped**. The two new golden records have the same
+input and output hashes as the committed ones, field for field, so the files are
+unchanged. A probe comparing one sequence alone with the same sequence packed
+among three others (2 and 16 heads) found every output, final-state and gradient
+byte equal. Not covered: other SM90 parts, FP16 (served by `gdn_cutile`), warm
+stress.
+
 ### SM90 GDN engine (`gdn_hopper_cuda`) — validation, 2026-11-12 (UTC)
 
 `linear_attention/hopper/test_gdn_sm90_cuda_determinism.py` covers
 `gated_delta_net` pinned to `gdn_hopper_cuda`: BF16 Q/K/V with K=V=128,
 L2-normalised Q/K, FP32 gate, beta, initial state and state gradient, packed
-THD with int32 offsets. It has 28 L0 cases; the method table is under
-[How to read the test cases](#sm90-gdn-engine-gdn_hopper_cuda-28-cases).
+THD with int32 offsets. It had 28 L0 cases; the current method table is under
+[How to read the test cases](#sm90-gdn-engine-gdn_hopper_cuda-34-cases).
 
 H100 80GB HBM3 (SXM, 132 SMs); Torch `2.14.0a0+b2c75dd062.nv26.09`, CUDA
 `13.4`, driver API `13040`, cuDNN `92600`, CuTe DSL `4.8.1`, TVM FFI `0.1.11`.
@@ -817,22 +835,20 @@ executions, then compare every sequence alone, the reversed batch, and a
 duplicated first sequence. GDP slices K/V/Beta gradients on the expanded
 Householder axis. State tensors use `[sequence, output heads, V, K]`.
 
-### SM90 GDN engine (`gdn_hopper_cuda`): 28 cases
+### SM90 GDN engine (`gdn_hopper_cuda`): 34 cases
 
 `linear_attention/hopper/test_gdn_sm90_cuda_determinism.py` pins
-`gdn_hopper_cuda`. Inputs are drawn on the CPU per sequence: BF16 Q/K/V with
-K=V=128, L2-normalised Q/K, FP32 gate (Megatron initialisation unless listed),
-beta, initial state and state gradient. The forward is not batch invariant
-(see the validation record above), so forward cases check replay and neighbor
-isolation only.
+`gdn_hopper_cuda` with `batch_invariant=True`. Inputs are drawn on the CPU per
+sequence: BF16 Q/K/V with K=V=128, L2-normalised Q/K, FP32 gate (Megatron
+initialisation unless listed), beta, initial state and state gradient.
 
 | Test method | Level | Parameters and purpose | Cases |
 | --- | --- | --- | ---: |
 | `test_replay` | L0 | fprop/bprop × Megatron-init/slow gate; lengths 65, 0, 17, 1; eight executions; input mutation check | 4 |
-| `test_replay_across_launch_geometries` | L0 | fprop/bprop × split forward with the 64-column scan, unsplit forward, deep split with the 32-column scan, one 17001-token sequence, more work items than SMs, lengths 1 to 65; four executions | 12 |
+| `test_replay_across_launch_geometries` | L0 | fprop/bprop × 48 and 160 pairs on the 64-column scan, 2 pairs on the 32-column scan, one 17001-token sequence, more work items than SMs, lengths 1 to 65; four executions | 12 |
 | `test_empty_sequence_passes_its_state_through` | L0 | fprop/bprop; a zero-length sequence returns its initial state and its state gradient | 2 |
 | `test_neighbor_isolation` | L0 | fprop/bprop × 2/16 heads; changed neighbors, fixed lengths, target and upstream gradients | 4 |
-| `test_backward_batch_invariance` | L0 | 2/16 heads; removal, reorder, duplication; gradients only | 2 |
+| `test_batch_invariance` | L0 | fprop/bprop × 2/16 heads × Megatron-init/slow gate; removal, reorder, duplication; every output and gradient | 8 |
 | `test_gradient_source` | L0 | bprop with output loss only or final-state loss only; FP64 reference | 2 |
 | `test_golden` | L0 | fprop/bprop; lengths 17, 3; three executions, FP64 reference, saved hashes | 2 |
 

@@ -32,26 +32,18 @@ per-channel build in two ways, and both matter:
 So this is not ``kda_hopper_cuda`` behind a gate expansion, and must not be
 turned into one: that path is both slower and wrong for GDN's gate range.
 
-Measured on H100 (bf16, K = V = 128, 4 x 4096 tokens x 32 heads, a freshly
-initialised gate), forward + backward through the op runs at about 1.1x the
-speed of FLA's Triton kernels and 2.8x that of ``gdn_cutile``, with about 12%
-less transient memory than FLA.
+The forward runs unsplit: one chain per (sequence, head), from the start of
+the sequence. The kernel can also cut a sequence into pieces (``kda_hopper_cuda``
+does, when a launch has 132 or fewer (sequence, head) pairs), but a piece after
+the first warms up from a history cut by a gate-only bound. That bound holds
+only for L2-normalised keys and a bounded state, which ``check_support`` cannot
+see, so a split forward could drop state that matters. Unsplit, the forward is
+exact for every admitted input and its bytes do not depend on the rest of the
+batch. The cost is the forward's speed when a launch has few (sequence, head)
+pairs; see the pull request for measurements.
 
-Known limit, inherited from the forward kernel: it cuts each sequence into
-``264 // pairs`` pieces, so a launch with 132 or fewer (sequence, head) pairs
-splits, each piece warming up from a truncated history, and a piece that cannot
-accumulate enough decay walks back to the start of its sequence and replays it.
-The truncation assumes L2-normalised keys and beta in (0, 1), which
-``check_support`` cannot see. The replay computes the same recurrence, but on a
-slow gate (a per-chunk log decay above about -2.4) every piece does it, and the
-forward kernel then costs more than not splitting at all; on one 32K-token
-sequence the forward takes about 2.6x as long as FLA's. The piece count is
-chosen on the host, which cannot see the gate; choosing it per (sequence,
-head) from the gate, on the device, would remove the replay but not reach FLA
-there (about 2.2x FLA's forward unsplit), and is not done.
-
-Scope: THD q/k/v in bf16 with equal head counts and head dim 128, pre-normalised
-q/k, a log-space fp32 gate and a post-sigmoid fp32 beta, with or without carried
+Scope: THD q/k/v in bf16 with equal head counts and head dim 128, q/k as given
+(the in-kernel L2 norm is declined), a log-space fp32 gate and a post-sigmoid fp32 beta, with or without carried
 state. Everything else is declined in ``check_support`` so another GDN engine
 serves it.
 """
@@ -216,6 +208,10 @@ class GdnHopperCudaPlan(_GdnHopperCudaPlanBase):
             n_heads=self.h,
             q_scale=self.q_scale,
             scalar_gate=True,
+            # One chain per (sequence, head), from the sequence's start. A split forward warms each
+            # later piece up from a history cut by a gate-only bound, which is exact only for
+            # L2-normalised keys and a bounded state; this engine cannot check either.
+            pieces=1,
         )
         # A bf16 final_state was written through an fp32 staging buffer.
         marshal.write_back(staged_fs, caller_fs, stream)
@@ -309,7 +305,7 @@ class GdnHopperCudaEngine(BaseEngine):
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph: "pygraph") -> None:
-        import cudnn
+        from cudnn import data_type
 
         facts = graph._facts_for(analyze)
         if facts is None or facts.op != "GDN":
@@ -337,7 +333,7 @@ class GdnHopperCudaEngine(BaseEngine):
         except Exception as exc:  # noqa: BLE001 -- any import/toolkit failure is a decline
             raise NotImplementedError(f"{ENGINE} needs NVRTC and a CUDA include tree: {exc}") from exc
 
-        fp32, bf16 = cudnn.data_type.FLOAT, cudnn.data_type.BFLOAT16
+        fp32, bf16 = data_type.FLOAT, data_type.BFLOAT16
         (node,) = graph.nodes
 
         # --- geometry: the kernels are built for one head dim and index packed THD operands.
@@ -370,7 +366,7 @@ class GdnHopperCudaEngine(BaseEngine):
             raise NotImplementedError(f"{ENGINE}: 'g' must be fp32, got {facts.g_dtype}")
         if facts.beta_dtype not in (fp32, None):
             raise NotImplementedError(f"{ENGINE}: 'beta' must be fp32, got {facts.beta_dtype}")
-        if facts.cu_dtype not in (cudnn.data_type.INT32, cudnn.data_type.INT64, None):
+        if facts.cu_dtype not in (data_type.INT32, data_type.INT64, None):
             raise NotImplementedError(f"{ENGINE}: cu_seqlens must be int32 or int64, got {facts.cu_dtype}")
         state = (fp32, bf16)
         ports = [("initial_state", facts.state_dtype, state)]
@@ -395,20 +391,20 @@ class GdnHopperCudaEngine(BaseEngine):
         if facts.has_composed_summaries or facts.has_composed_state or facts.output_context or facts.input_context:
             raise NotImplementedError(f"{ENGINE}: context-parallel ports (composed summaries/state, context) are unsupported")
 
-        # --- attributes. The kernels take a log-space gate, post-sigmoid beta and pre-normalised q/k.
+        # --- attributes. The kernels take a log-space gate, a post-sigmoid beta and q/k as given.
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias or facts.gate_lower_bound is not None:
             raise NotImplementedError(f"{ENGINE}: safe_gate/a_log/dt_bias are unsupported; pass the log-space gate")
         if facts.gate_domain != "log":
             raise NotImplementedError(f"{ENGINE}: gate_domain='linear' is unsupported")
         if facts.use_qk_l2norm or facts.use_beta_sigmoid:
-            raise NotImplementedError(f"{ENGINE}: q/k must be pre-normalised and beta post-sigmoid")
+            raise NotImplementedError(f"{ENGINE}: the in-kernel q/k L2 norm and beta sigmoid are unsupported")
         if facts.allow_neg_eigval or facts.beta_guard:
             raise NotImplementedError(f"{ENGINE}: allow_neg_eigval/beta_guard are unsupported; beta must lie in (0, 1)")
         if facts.num_householder != 1:
             raise NotImplementedError(f"{ENGINE}: num_householder must be 1, got {facts.num_householder}")
-        if facts.batch_invariant:
-            # The forward splits a sequence into pieces by how many (sequence, head) pairs the launch has.
-            raise NotImplementedError(f"{ENGINE}: batch_invariant is not guaranteed by the sm90 kernels")
+        # batch_invariant needs no decline: the forward runs one chain per (sequence, head) whatever else
+        # is in the launch, and the backward's per-(sequence, head) arithmetic does not depend on the
+        # batch either (the 64-column scan only groups value columns differently per CTA).
 
     def build_plan(self, graph, plan, ctx=None) -> CompiledPlan:
         (node,) = graph.nodes

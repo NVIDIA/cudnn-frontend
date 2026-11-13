@@ -59,10 +59,12 @@ def _defines(flags: int, gqa: bool = False, scalar_gate: bool = False):
     compile_cubin keys its on-disk cache on the option list, so each combination
     gets its own cubin and they cannot collide.
     """
-    defines = (*_SMEM_DEFINE, f"-DKDA_FUSED_FLAGS={int(flags)}", f"-DKDA_FUSED_GQA={int(bool(gqa))}")
+    defines = [*_SMEM_DEFINE, f"-DKDA_FUSED_FLAGS={int(flags)}", f"-DKDA_FUSED_GQA={int(bool(gqa))}"]
     # Appended only when set, so the per-channel kernels keep the option list they have always
     # had (the cache key also hashes the source, so they recompile once after any source edit).
-    return (*defines, "-DKDA_FUSED_SCALAR_GATE=1") if scalar_gate else defines
+    if scalar_gate:
+        defines.append("-DKDA_FUSED_SCALAR_GATE=1")
+    return tuple(defines)
 
 
 # The campaign kernel targets ~264 resident CTAs; a launch splits each sequence
@@ -134,6 +136,7 @@ def launch(
     q_scale: float = DEFAULT_Q_SCALE,
     n_qk_heads: int = 0,
     scalar_gate: bool = False,
+    pieces: int = 0,
 ) -> None:
     """One ``kda_fused`` launch. All tensor arguments are device addresses.
 
@@ -141,10 +144,14 @@ def launch(
     ``dt_bias`` are read only when ``FLAG_SAFE_GATE`` is set and may be 0
     otherwise. ``scalar_gate`` selects the kernel built for a ``[T, H]`` gate
     (Gated DeltaNet) in place of the per-channel ``[T, H, 128]`` one.
+    ``pieces`` fixes how many pieces each sequence is cut into; 0 picks
+    ``pieces_per_sequence``. A piece after the first warms up from a history
+    truncated by a gate-only bound, so only ``pieces=1`` computes the full
+    recurrence for every input.
     """
     smem = SMEM_BYTES
     func = _library(device, flags, (n_qk_heads or n_heads) != n_heads, scalar_gate).function(KERNEL_NAME, dynamic_smem=smem)
-    p = pieces_per_sequence(total_tokens, n_seqs, n_heads)
+    p = pieces if pieces > 0 else pieces_per_sequence(total_tokens, n_seqs, n_heads)
 
     params = compiler.Params()
     for address in (q, k, v, g, beta, cu_seqlens, initial_state, o, final_state):

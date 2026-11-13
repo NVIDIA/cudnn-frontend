@@ -40,7 +40,7 @@ arbitrary user callbacks.
 | --- | --- | --- | --- | --- | --- |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | BF16 (`gdn_hopper_cuda`): Replay only; FP16: Unverified | Supported | Supported |
+| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | BF16 (`gdn_hopper_cuda`): Supported; FP16: Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
@@ -182,11 +182,10 @@ a row alone and inside a batch under the entry's own picks.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
 - `gated_delta_net` on SM90: `gdn_hopper_cuda` is the default engine, for BF16
-  Q/K/V with K=V=128, FP32 gate, beta and state, and L2-normalised Q/K. Replay
-  is verified in both directions. Backward gradients kept their bytes under every
-  measured batch change. Forward output bytes can change with the number of
-  (sequence, head) pairs in the launch, because the forward splits sequences by
-  that count. The engine declines `batch_invariant=True`. Other SM90 GDN
+  Q/K/V with K=V=128 and an FP32 gate, beta and state. It accepts
+  `batch_invariant=True`, and its bytes are the same with or without it: the
+  forward runs one unsplit chain per (sequence, head), and the backward's
+  per-(sequence, head) arithmetic does not depend on the batch. Other SM90 GDN
   configurations run on `gdn_cutile` and are unverified.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
