@@ -10,6 +10,8 @@ Four checks, run after the timed loop on the ids the loop produced:
    the reference block on the SAME operands and the same state, so an error cannot accumulate and a wiring error is told apart
    from rounding.  The band of a block is named in its provider row (``BANDS``) and is never widened here.  Every band is
    judged element by element and asks for finite values first: a NaN is a failure of the block that produced it, never a tie.
+   A run in which no block is a provider's (every judged block selected onto its reference row) has nothing to judge: the
+   line is then REPORTED, ``Checks.judged`` is 0, and a sample does not print ``PASS`` for it.
 3. **tokens** -- end to end: the reference stack runs the same inputs with its own state.  The largest distance between the
    logits of the two stacks must be finite and inside the logits band, which the family declares beforehand in bf16 units of
    the run's largest reference logit (``logits_band_units``); and the greedy token must equal the reference's at every step
@@ -17,7 +19,10 @@ Four checks, run after the timed loop on the ids the loop produced:
    counted and printed as near-ties; they are not failures and not hidden.  The band is declared, not taken from the run: a
    band that follows the run's own distance can never fail.  The check cannot be sharper than the two stacks are close: a
    chain of 8-bit and 4-bit quantisers turns a one-unit rounding difference into different codes, so the logits of two
-   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.
+   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.  Where a
+   family can declare no band for a model -- none that passes two correct stacks and fails a wrong one -- it declares
+   ``None``: the line is then REPORTED, prints the distance and the count of equal tokens, and fails only on a logit that
+   is not finite.  A line that cannot fail on a finite value is not printed as PASS.
 4. **batch invariance** -- with more than one sequence, every block is run again on ONE sequence alone, on the same operands
    and state; the bytes of that sequence must be equal.  The sequence that runs alone rotates with the step (step ``t``:
    sequence ``t`` modulo the count), so every row of the batch is covered at no extra launch.  A gate for a block whose
@@ -59,7 +64,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -311,25 +316,31 @@ class BlockTap:
         stats.ok = stats.ok and stats.finite
 
 
-def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: float) -> Tuple[bool, str]:
+def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:
     """The end-to-end check of a run's greedy tokens against the reference stack's: ``(held, the text of its line)``.
 
     ``band_units`` is the declared logits band in bf16 units of the largest reference logit of the run.  The check holds when
     every logit is finite, the largest distance between the two stacks' logits is inside the band, and the token equals the
-    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band."""
+    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band.
+
+    ``band_units=None`` is a model whose family declares no band: the line is then a reported one.  It holds when every
+    logit of both stacks is finite; the distance is printed and judged against nothing."""
     a, r = logits.float(), ref_logits.float()
     finite = bool(torch.isfinite(a).all()) and bool(torch.isfinite(r).all())
     top = float(r.abs().amax()) if finite else float("nan")
     unit = 2.0 ** (math.frexp(top)[1] - 8) if top > 0.0 else float("nan")  # False for a NaN
-    band = band_units * unit
     distance = float((a - r).abs().amax())
+    measured = f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit"
+    if band_units is None:
+        return finite, measured + "  [no band is declared for this model: reported, gated on finite logits]" + ("" if finite else "; NON-FINITE LOGITS")
+    band = band_units * unit
     decidable = margin(ref_logits) > LOGITS_FACTOR * band  # nowhere when the band is not a number
     wrong = int((decidable & ~(ids == ref_ids)).sum())
     count, near = int(decidable.sum()), int((~decidable).sum())
     held = finite and distance <= band and wrong == 0
     text = (
         f"{count - wrong} of {count} decidable greedy tokens equal to the reference; {near} near-ties (margin not above {LOGITS_FACTOR:g} x the band); "
-        f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit  [band: {band_units:g} units = {band:.4g}, declared]"
+        f"{measured}  [band: {band_units:g} units = {band:.4g}, declared]"
     )
     return held, text + ("" if finite else "; NON-FINITE LOGITS")
 
@@ -338,6 +349,7 @@ def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tenso
 class Checks:
     lines: List[str]
     ok: bool
+    judged: int = 0  # provider blocks compared with the reference; 0: every block of the run was the reference chain itself
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -347,10 +359,18 @@ def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
 
 
-def run_checks(session: Session, prompt_tokens: int) -> Checks:
-    """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded.  Leaves the session reset."""
+def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False) -> Checks:
+    """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
+    ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
+
+    ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
+    reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
+    on how many greedy tokens the two agree.  It is a scale, printed and not gated: on a trained checkpoint with 4-bit
+    activations two stacks that differ only in rounding end up tens of bf16 units apart (see the family's logits band)."""
     main = session.record
     steps = min(main.count, main.inputs.shape[0])
+    if max_steps is not None:
+        steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
     facts = session.plan.facts
     reference = Session(
@@ -362,6 +382,7 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
         reference_precision=session.reference_precision,
         capacity=session.capacity,
         share=session,
+        record_steps=steps,
     )
     reference.load()
 
@@ -379,23 +400,61 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
     reference.reset(fresh=True)
     for t in range(steps):
         reference._advance(inputs[t])
-    band_units = float(session.model.logits_band_units)  # declared by the family, in its configs.py
-    tokens_ok, tokens_text = token_check(logits, reference.record.logits[:steps], ids, reference.record.outputs[:steps], band_units)
+    band_units = session.model.logits_band_units  # declared by the family, in its configs.py; None: the token line is reported
+    band_units = None if band_units is None else float(band_units)
+    ref_logits, ref_ids = reference.record.logits[:steps], reference.record.outputs[:steps]
+    tokens_ok, tokens_text = token_check(logits, ref_logits, ids, ref_ids, band_units)
+    tokens_text = f"{int((ids == ref_ids).sum())} of {ids.numel()} greedy tokens equal to the reference stack's; " + tokens_text
+    if second_reference:
+        other = "ieee-fp32" if session.reference_precision == "fp64" else "fp64"
+        second = Session(
+            session.model,
+            session.text,
+            session.sequences,
+            stack="reference",
+            device=session.device,
+            reference_precision=other,
+            capacity=session.capacity,
+            share=session,
+            record_steps=steps,
+        )
+        matmul = torch.backends.cuda.matmul
+        kept = getattr(matmul, "fp32_precision", None)  # a session with IEEE fp32 accumulation sets it for the process
+        try:
+            second.load()
+            second.reset(fresh=True)
+            for t in range(steps):
+                second._advance(inputs[t])
+        finally:
+            if kept is not None:
+                matmul.fp32_precision = kept
+        _, scale_text = token_check(second.record.logits[:steps], ref_logits, second.record.outputs[:steps], ref_ids, band_units)
+        distance = scale_text.split("largest logit distance ", 1)[1].split("  [", 1)[0]
+        tokens_text += (
+            f"; for scale, the reference stack with {other} accumulation is {distance} from the one with {session.reference_precision} "
+            f"and agrees with it on {int((second.record.outputs[:steps] == ref_ids).sum())} of {ids.numel()} greedy tokens (printed, not gated)"
+        )
 
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
     lines = [
-        f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {steps} steps: {prompt_tokens} prompt + {steps - prompt_tokens} decode)"
+        f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {'the first ' if steps < main.count else ''}{steps} steps: "
+        f"{min(prompt_tokens, steps)} prompt + {max(steps - prompt_tokens, 0)} decode)"
     ]
     lines.append(f"  replay            ids and logits byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     inside = sum(s.ok for s in judged.values())
-    lines.append(
-        f"  blocks            {inside} of {len(judged)} provider blocks inside their bands against the {session.reference_precision}-accumulated "
-        f"reference, teacher-forced    {_verdict(blocks_ok)}"
-    )
+    if judged:
+        lines.append(
+            f"  blocks            {inside} of {len(judged)} provider blocks inside their bands against the {session.reference_precision}-accumulated "
+            f"reference, teacher-forced    {_verdict(blocks_ok)}"
+        )
+    else:  # a line that compares nothing cannot fail: it is not printed as a pass
+        lines.append("  blocks            no provider block to judge: every block of this run is the reference chain itself    REPORTED")
     for name, s in judged.items():
-        lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {BANDS[s.band]}]  {_verdict(s.ok)}")
-    lines.append(f"  tokens            {tokens_text}    {_verdict(tokens_ok)}")
+        lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {s.band}]  {_verdict(s.ok)}")
+    for band in dict.fromkeys(s.band for s in judged.values()):  # each band's text once, on a line of its own
+        lines.append(f"    band {band}: {BANDS[band]}")
+    lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
     batch_ok = True
     if session.sequences > 1:
         cls = f"cc{facts.cc[0]}.{facts.cc[1]}"
@@ -410,10 +469,9 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
         gate_text = "; ".join(gated) if gated else f"no block is gated on {facts.class_text}"
         rest = f"{len(tap.stats) - len(differs)} of {len(tap.stats)} blocks equal" + (f"; differs: {', '.join(differs)}" if differs else "")
         verdict = _verdict(batch_ok) if gated else "REPORTED"
-        lines.append(
-            f"  batch invariance  one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences}): {gate_text}; {rest}    {verdict}"
-        )
+        rotation = f"one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences})"
+        lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
     session.reset(fresh=True)
-    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok)
+    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok, len(judged))

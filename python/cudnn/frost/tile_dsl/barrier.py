@@ -483,3 +483,19 @@ class MBarrier:
     def arrive_on_peer(self, peer_cta_id, pred=None, release_cta: bool = False):
         # release_cta=True = the .release.cta cluster arrive of a READ-then-credit across CTAs (see mbar_arrive_on_peer); appended, default off.
         mbar_arrive_on_peer(self.smem_ptr, peer_cta_id, pred=pred, release_cta=release_cta)
+
+
+@cute.jit
+def named_barrier_sync_unaligned(barrier_id: cutlass.Constexpr[int], thread_count: cutlass.Constexpr[int]):
+    """``barrier.sync id, n`` WITHOUT the aligned-CTA promise: the named barrier of a warp-role SUBSET.
+
+    ``bar.sync`` -- what :func:`named_barrier_fence` emits and what the DSL's named-barrier helpers lower to by default -- is
+    ``barrier.sync.aligned``: it promises that EVERY thread of the CTA executes the same barrier instruction, even with an
+    explicit participant count.  A barrier reached only from a warp-role branch (the producer, MMA, epilogue or reduction
+    warps of a warp-specialized kernel) breaks that promise and is undefined; this is its form (the DSL's own unaligned
+    barrier op).  ``thread_count`` is the number of participating threads -- a positive multiple of 32, the same at every use
+    of ``barrier_id`` -- and ``barrier_id`` one of the CTA's sixteen slots, kept disjoint from the kernel's other named
+    barriers.  Like any barrier it synchronizes the participants and orders their memory accesses; it is not a scheduling
+    fence (:func:`named_barrier_fence`) and it elects nobody.  Numerics tests pass with either form: pin ``barrier.sync`` in
+    the kernel's rendering test and run the kernel under the sanitizer's synchronization check."""
+    nvvm.barrier_cta_sync(barrier_id, thread_count=thread_count)

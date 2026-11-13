@@ -52,9 +52,7 @@ from .bprop_sm100 import (
     DP_TM_PA,
     DP_TM_SD,
     DP_TT,
-    DS_BYTES,
     F32,
-    GAP01,
     GAP12,
     GQ,
     HALF_BLK,
@@ -71,11 +69,6 @@ from .bprop_sm100 import (
     QSLAB,
     SLAB,
     TM_COLS,
-    TM_DP,
-    TM_DQ,
-    TM_KA,
-    TM_S,
-    TM_VA,
     _PbLayout as _PbLayout100,
     _active_key,
     _band_groups,
@@ -89,7 +82,6 @@ from .bprop_sm100 import (
     _dq_done,
     _dq_turn,
     _item_meta,
-    _koff,
     _kv_done,
     _kv_order,
     _kv_turn,
@@ -104,6 +96,23 @@ from .bprop_sm100 import (
     _st_async16,
     _tile_groups,
 )
+
+# The SM100 query kernel has moved on (K^T in TMEM for dQ^T, a 48-column TMEM pitch, one dS^T row group per slot, no
+# pad between its first two K stages). This flavor keeps the layout it was built with.
+GAP01 = 1024  # the zero pad between K stages 0 and 1
+DS_BYTES = 2 * CHB * 384  # one bf16 part of dS^T: two row groups per slot
+TM_S = 0
+TM_DP = 32
+TM_DQ = 128
+TM_KA = 192
+TM_VA = 320
+
+
+@cute.jit
+def _koff(st):
+    # byte offset of K stage st from OFF_K: the regions between the stages differ in size
+    return st * K_STAGE + ((st + 1) >> 1) * GAP01 + (st >> 1) * GAP12
+
 
 # the dense pair kernel's K^T half follows the 512 columns of the SM100 TMEM map
 DP_TM_KT = 512

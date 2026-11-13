@@ -251,7 +251,19 @@ def _chain(
         # FIRST launch; stage 2's clamp kernel re-seeds it before each launch.
         if cutlass.const_expr(physical):
             thd_bwd_setup_host(
-                meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream, org_t=origins, origin_offsets=offsets, origin_specs=origin_specs
+                meta,
+                q_lens,
+                kv_lens,
+                lens_form,
+                chunk,
+                batch,
+                128,
+                granularity,
+                units,
+                stream,
+                org_t=origins,
+                origin_offsets=offsets,
+                origin_specs=origin_specs,
             )
         else:
             thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream)

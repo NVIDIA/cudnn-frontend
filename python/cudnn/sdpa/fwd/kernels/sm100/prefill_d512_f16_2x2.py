@@ -523,6 +523,11 @@ def _kernel(
     cga_arrive()
     cga_wait()
 
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= cutlass.Int32(CFG.SOFTMAX_WG0_BASE) and warp_idx < cutlass.Int32(CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS):
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
@@ -569,7 +574,6 @@ def _kernel(
         )
 
     elif warp_idx == cutlass.Int32(CFG.MMA_WARP_ID):
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if is_leader:
             _mma_warp_group(
                 seqlen_q=seqlen_q,
@@ -595,7 +599,6 @@ def _kernel(
             _mma_warp_quiet(tmem_ptr_i32, bars)
 
     elif warp_idx == cutlass.Int32(CFG.TMALDG_WARP_ID):
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -631,7 +634,6 @@ def _kernel(
         )
 
     elif warp_idx == cutlass.Int32(CFG.TMASTG_WARP_ID):
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -648,7 +650,6 @@ def _kernel(
         )
 
     else:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.THD_VARLEN):
             scheduler_warp_loop_persistent(
                 sched,
@@ -2315,8 +2316,8 @@ def compile(  # noqa: A001
     """Compile the host entry for one layout kind (same key surface as sm100/prefill_d512_f16.py: the
     head-dim ENVELOPE, whether the Stats store exists, the Stats layout kind)."""
     if thd_origin_specs is not None:
-        if not CFG.THD_VARLEN or SPLIT_KV != 1 or CFG.TILE_K != 576:
-            raise ValueError("physical origins require native unsplit D576 THD")
+        if not CFG.THD_VARLEN or SPLIT_KV != 1:
+            raise ValueError("physical origins require native unsplit THD")
         if len(thd_origin_specs) != 5:
             raise ValueError("physical THD origins require five port declarations")
     if paged_v_hnd is None:

@@ -568,9 +568,8 @@ def test_sm120_direct_template_stats_base(fp8, q_tile, splits, stats_log2):
         amax = torch.zeros(1, device="cuda", dtype=torch.int32)
         unit_scale = torch.ones(1, device="cuda")
         args += [unit_scale.data_ptr()] * 4 + [amax.data_ptr(), None]
-    else:
-        # Dense half hosts retain the two optional THD-origin ABI slots.
-        args += [None, None]
+    # Dense half and FP8 hosts retain both optional THD-origin ABI slots.
+    args += [None, None]
     raw = positional_entry(kernel)
     assert raw is not None
     raw(*args, stream)

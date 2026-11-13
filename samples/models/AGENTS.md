@@ -31,8 +31,14 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    A block's `__call__` launches on the current stream and neither reads the device nor synchronises.
 5. **No downloads.** Weights and tokenizer files come from a local path and are read without pickle. Every reduction (depth,
    vocabulary, seeded weights) is printed; a seeded run prints a hash of the produced ids and "the output is not language".
+   A checkpoint is described from its `config.json` and shard headers first (`Checkpoint.describe`, the family's
+   `describe`): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
+   a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
+   the tests generate what they read.
 6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `--stack
-   reference` reports `[NN] RAN reference stack (no provider checked)`, never `PASS`.
+   reference` reports `[NN] RAN reference stack (no provider checked)`, never `PASS`. So does a run whose `--provider`
+   flags leave no provider block to judge (`[NN] RAN (no provider block was judged)`, the blocks line `REPORTED`):
+   `PASS` is kept for a run in which provider blocks were compared with the reference and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
    classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. To add a provider: add its
    key to `providers.KEYS` with its factory, add its row above the rows it should win against, name its tie-out band, and
@@ -44,7 +50,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
-   from the run's own measurement: the family declares its logits band (`logits_band_units` in `configs.py`).
+   from the run's own measurement: the family declares its logits band (`logits_band_units` in `configs.py`). Where no
+   band both passes two correct stacks and fails a wrong one, the family declares none (`None`) and the line is printed
+   as `REPORTED`, gated on finite values only: a line that cannot fail on a finite value is never printed as `PASS`.
 9. **A default run is a test.** Each sample's default run is loaded by path and run by a GPU test that records its verdict in
    the job log; a required run that skips is uncovered, not passing. Host-only behaviour is tested under `test/python/misc/`.
 10. **The reference accumulates in fp64** and keeps every intermediate cast of the chain it models
@@ -53,6 +61,27 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
 11. **No performance table in a sample README.** Timings a sample prints are for orientation only; numbers are published
     through the `benchmark/` folder's formal mode. A licence header on every file; the repository's formatter settings; no
     absolute local path in any output.
+12. **Sample-only packages stay at the edge.** `samples/models/requirements.txt` holds them with lower bounds, never pins,
+    and a "Validated with" line; none is a dependency of the package. Each is imported inside the functions that need it
+    (`TextIO.from_checkpoint` and the stream decoder: `tokenizers`, `jinja2`; `Checkpoint.describe` and the tensor read:
+    `safetensors`), never at module import, and a missing one is a `SKIP` that names the requirement file. A lower bound
+    is a version the host tests of the text and weight readers were run against; raise it with evidence, in the same
+    change as the code that needs it (for `jinja2`, whose sandbox a checkpoint's template runs in, with a sandbox fix). The
+    family README states the checkpoint (repository, size, licence field as on its card, date read, manifest hash), the
+    package versions and the GPU class of the last run with a checkpoint. Dependency alerts come through the `pip` entry for
+    `/samples/models` in `.github/dependabot.yml` and are handled by the repository's maintainers.
+13. **The report's GPU side comes from kernel activity records, never from a pair of CUDA events.** An event is stamped
+    when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
+    (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
+    host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
+    Only the profiler's own start and stop are reported as a missing trace; an error of a step under it propagates.
+14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
+    file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
+    that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
+    for, a request file that is not JSON, messages a template cannot render or renders to no token,
+    an output file that cannot be written: each is raised as a `ValueError` whose text names the file by its own name, and
+    the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
+    untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
 
 ## What the first GPU run of this area taught
 
@@ -89,3 +118,60 @@ defect that shows it.
   against the format definitions in a test of their own.
 - A `SKIP` printed after a check has failed turns a failure into a skip for whoever reads the last line. Plan everything
   that can decline before the first load.
+
+## What the first run on a real checkpoint taught
+
+- An end-to-end comparison of logits or tokens is weak on a model with 4-bit activations, and no band makes it sharp. On
+  the published checkpoint two reference stacks that differ only in accumulation precision (fp64 against IEEE fp32) were up
+  to 52 bf16 units of the largest logit apart within 80 steps and disagreed on the greedy token at 13 of them, at margins of
+  up to several logits. Verify providers per block, teacher-forced; print a second reference's distance beside the
+  provider's instead of pretending the token check gates more than it does.
+- The first call of a tokenizer and of a compiled chat template pays for caches the libraries build, tens of times the
+  repeated call. A sample that times one call times the caches; print the first call and the repeated call apart.
+- A streaming decoder is a library feature with its own history: the incremental decoder of `tokenizers` 0.21.0 fails on
+  inputs 0.21.1 decodes. A lower bound in the requirement file is a version the host tests ran against, not a guess.
+- The profiler's tracing library logs to stderr at start and stop, and once per kernel it cannot rate on a GPU it does not
+  know. The sample sets its log level before PyTorch is imported unless one is set in the environment; the report says itself when the
+  records are missing.
+
+## What the review of the checkpoint path taught
+
+Each of these survived the first set of tests; the host tests now hold the defect or the input that shows it.
+
+- A band in units of the run's largest value changes its absolute width with that value's binade. 128 bf16 units of the
+  largest logit are 8 logits where that logit is below 16 and 16 where it is below 32, while two correct stacks were 8.7 to
+  13.5 logits apart whatever the binade. Such a band fails a correct stack on the next prompt, and its token half is never
+  reached: a token is decidable only above twice the band, which is more than the largest logit. A gate that can fail a
+  correct stack and cannot fail a wrong token is worse than none; print the line as `REPORTED`.
+- Count distinct inputs, not runs. A chat template that opens with a fixed preamble makes the first 16 steps of every
+  plain prompt the same 16 tokens: four prompts were three checked windows. Say which steps a check covers.
+- A setting no test fails without is a setting a refactor drops. The template sandbox, block trimming, encoding without
+  added special tokens and the precedence of the template file each needed a template or a tokenizer that renders
+  differently, or escapes, when the setting is gone. Inject the defect; if the tests stay green, write the test.
+- An `except` around a loop that runs the workload reports the workload's failure as the tool's. Catch around the tool's
+  own start and stop.
+- "Installed by the README" means the README's lines and no other. One unlisted `pip install --upgrade pip` hid that the
+  pip of a new virtual environment has no `--group` option.
+- Both stacks of the tie-out read a checkpoint through the same loader, so `PASS` cannot see a wrong reading. Say what
+  does verify it (the text, read by a person; a comparison of the dumped ids), and do not let the verdict line imply more.
+
+## What the second review of the checkpoint path taught
+
+Found by reading the run as somebody who had never seen it, and by feeding it what a download or a hand edit leaves
+behind; the host tests hold each.
+
+- A header that parses says nothing about the bytes behind it. A shard cut after its header passed the description, the
+  binding and the plan and failed in the load, without a file name. Compare every shard's size with what its header
+  describes, and the directory with what its index file lists, before the plan.
+- A check with nothing to judge cannot fail. "0 of 0 blocks inside their bands" is the reference compared with itself;
+  count what was judged, print the line as `REPORTED` and the run as `RAN` where the count is zero.
+- A sentence about what bounds a step, printed as a constant, will one day stand under a measurement that says the
+  opposite. Word it from the run's own figures.
+- One label for two units misleads on the line that decides whether a run starts: 52.4 GiB printed as "GB" is 56.3 GB.
+  Say GiB where the divisor is 2^30, and state an allowance that covers what a run was seen to take.
+- A run that prints nothing for a minute reads as a hang, and a budget cuts it. Say what comes next before a phase that
+  prints nothing, outside every timed interval, and flush the line.
+- A file a library saved carries the settings of the call before the save. A `tokenizer.json` with truncation or padding
+  switched on cuts or pads a prompt without a word; switch both off, and hold it with a tokenizer saved that way.
+- A command block is typed as it is written. A step that stands in a sentence elsewhere, such as fetching the checkpoint,
+  is a step the reader does not take: put it in the block, in order, with what it costs.

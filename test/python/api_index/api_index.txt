@@ -737,7 +737,10 @@ cudnn.gemm
 cudnn.gemm.Fp8ProjectionDecode
 cudnn.gemm.Fp8ProjectionDecode.cfg_for
 cudnn.gemm.Fp8ProjectionDecode.compile
+cudnn.gemm.Fp8ProjectionDecode.form_for
+cudnn.gemm.Fp8ProjectionDecode.kernel_symbols_for
 cudnn.gemm.Fp8ProjectionDecode.key
+cudnn.gemm.Fp8ProjectionDecode.launch_shape_for
 cudnn.gemm.MhcProjectionBackward
 cudnn.gemm.MhcProjectionBackward.check_support
 cudnn.gemm.MhcProjectionBackward.compile
@@ -1465,6 +1468,7 @@ cudnn.ops.block_sparse_attention_fp8_forward
 cudnn.ops.causal_conv1d
 cudnn.ops.causal_conv1d_nwh
 cudnn.ops.causal_conv1d_update
+cudnn.ops.dense_gemm_backward
 cudnn.ops.dense_indexer_kl
 cudnn.ops.dsa
 cudnn.ops.dsa.compressor_backward
@@ -1495,6 +1499,7 @@ cudnn.ops.hstu_lmsd_forward_jax
 cudnn.ops.kimi_delta_attention_backward_jax
 cudnn.ops.kimi_delta_attention_forward_jax
 cudnn.ops.kpage_prepare_layout
+cudnn.ops.layer_norm_forward_jax
 cudnn.ops.nsa
 cudnn.ops.nsa.compression_attention_forward
 cudnn.ops.nsa.compression_attention_forward_jax
@@ -1512,6 +1517,7 @@ cudnn.ops.qsa_indexed_forward
 cudnn.ops.qsa_select_decode_forward
 cudnn.ops.qsa_select_decode_paged_forward
 cudnn.ops.qsa_select_forward
+cudnn.ops.rms_norm_forward_jax
 cudnn.ops.simplified_sparse_attention
 cudnn.ops.simplified_sparse_attention_jax
 cudnn.ops.simplified_sparse_attention_reserve

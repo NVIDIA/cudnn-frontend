@@ -32,6 +32,7 @@ The experimental API catalog includes:
 - [Shared-Expert Decode Pair (SM100-class)](/operations/MoeGroupedMatmul/shared_expert_decode) — the bf16 shared expert next to a routed MoE at decode-time token counts (1 .. 24) as two FROST launches (gate_up + SiLU-mul with the gate logit, down + sigmoid gate), bitwise repeatable and batch-invariant
 - [Attention Gate + Quantize Decode Step (SM100-class)](/operations/Attention/gate_quant_decode) — the sigmoid output gate of an attention block fused with the static FP8 (E4M3) quantization of the following projection's input, at decode-time row counts (1 .. 160), as one FROST launch (bf16 in, E4M3 out), bitwise repeatable and batch-invariant
 - [FP8 Projection for Decode Rows (SM100-class)](/operations/Matmul/gemm_fusions/fp8_projection_decode) — an FP8 E4M3 weight times FP8 E4M3 activations to bf16 at decode-time row counts (1 .. 32) as one FROST launch with split-K clusters and the weight stream ahead of the dependent-launch wait; the split is a numerics attribute fixed per entry, bitwise repeatable and batch-invariant
+- [LayerNorm and RMSNorm in JAX](/operations/Normalizations/norm_jax) ([GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/normalizations/norm_jax.md))
 - [GEMM + Amax](/operations/Matmul/gemm_fusions/gemm_amax)
 - [GEMM + RoPE + MXFP8 Projection](/operations/Matmul/gemm_fusions/gemm_proj_rope_mxfp8)
 - [Gated Attention Block (SM107)](/operations/Attention/gated_attention_block) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) with the in-block indexer's decode and extend steps over the paged side caches, and write-through into a paged KV cache
@@ -69,6 +70,7 @@ The experimental API catalog includes:
 - [DSv4.1 Vision RoPE Backward](/operations/RoPE/vision_rope_backward)
 - [Engram Saved-State Gate](/operations/Pointwise/engram_saved_gate)
 - [RMSNorm + RHT + Amax](/operations/Normalizations/rmsnorm_rht_amax)
+- [Ahead-of-time attention for SM120 (C/C++ API)](/operations/Attention/aot_sm120_attention)
 - [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](/operations/Attention/sdpa_bwd_sm100_d128)
 - [SDPA Backward (SM120)](/operations/Attention/sdpa_bwd_sm120)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](/operations/Attention/sdpa_bwd_sm107)
@@ -87,6 +89,11 @@ The experimental API catalog includes:
 - [SiLU-gated RMSNorm training](/operations/gated_rmsnorm)
 
 - [Zero-centered RMSNorm training](/operations/zero_centered_rmsnorm): deterministic Cake forward and backward.
+- [Cake LM-head log-probabilities](/operations/cake_lm_head): prepared execution and JAX JIT/gradients.
+
+- [Cake MoK training](/operations/cake_mok)
+
+- [Cake mHC training](/operations/mhc_training): explicit stages and JAX branch composition/gradients.
 
 ## Installation and setup
 

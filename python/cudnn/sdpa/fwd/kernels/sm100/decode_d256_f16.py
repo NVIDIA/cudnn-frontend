@@ -1,7 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Decode-shaped SDPA forward for the SM100 d256 f16/bf16 flavor: the swap-AB tile.
+"""Decode-shaped SDPA forward for the SM100 d128/d256 f16/bf16 flavors: the swap-AB tile.
+
+The D128 paged lowering uses this same body with a physical 128-wide head
+envelope when at most eight query rows are live in the unit. Its MMA still
+has N_Q = 16, but softmax, accumulator rescaling and stores cover eight
+columns; the unused half of each P slot is zeroed once before MMA can read it.
+Other records retain the original 16-column work per softmax warpgroup.
 
 Why a second template.  The prefill tile (sm100/prefill_d256_f16.py) issues
 BMM1 / BMM2 over a 256-row collective Q tile per 128-key KV tile whatever the
@@ -190,20 +196,22 @@ while TMEM_COLS < 4 * N_Q:
     TMEM_COLS *= 2
 O_BLOCKS = TILE_O // 128
 
-# Softmax column groups: a 4-warp group owns COLS = 16 S^T / O^T columns (the
+# Softmax column groups: a 4-warp group owns up to 16 S^T / O^T columns (the
 # f16 UMMA N granule), so N_Q = 32 runs two groups that read the same 128 TMEM
 # lanes (tcgen05.ld lane access is by warp_id % 4) and the per-thread work is
 # independent of the tile width.  Group g = tidx // 128 owns columns
 # [16 g, 16 g + 16) and the matching P^T words / O^T columns / LSE rows.
-COLS = 16
-COL_GROUPS = N_Q // COLS
+COLS = getattr(PARAMS, "decode_live_columns", 0) or 16
+COL_GROUPS = N_Q // 16
+if COLS not in (8, 16) or (COLS == 8 and N_Q != 16):
+    raise ValueError("swap-AB decode: a reduced softmax width needs a single 16-column MMA group")
 # This group's slice of a P^T key row: COLS half values = COLS / 2 words.
 P_GROUP_WORDS = COLS // 2
 P_CHUNKS_PER_GROUP = (COLS * BPE) // 16
 SOFTMAX_WARPS = CFG.SOFTMAX_WARPS
 SOFTMAX_LANES = SOFTMAX_WARPS * 32
 if N_Q % COLS != 0 or SOFTMAX_WARPS != 4 * COL_GROUPS:
-    raise ValueError(f"decode_d256_f16: N_Q={N_Q} needs {4 * (N_Q // COLS)} softmax warps (4 per 16 columns); config says {SOFTMAX_WARPS}")
+    raise ValueError(f"decode_d256_f16: N_Q={N_Q} needs {4 * COL_GROUPS} softmax warps (4 per 16 columns); config says {SOFTMAX_WARPS}")
 MMA_WARP_ID = CFG.MMA_WARP_ID
 TMALDG_WARP_ID = CFG.TMALDG_WARP_ID
 # Named barriers: 1 = TMEM base hand-off (softmax warps + MMA warp), 2 = the
@@ -1034,6 +1042,15 @@ def _kernel(
             nvvm.fence_proxy("async.shared", space="cta")
 
     if warp_idx < SOFTMAX_WARPS:
+        if cutlass.const_expr(COLS < 16):
+            # The declared graph uses at most eight columns. Keep the MMA
+            # operand's unused columns initialized while processing only the
+            # live half in softmax; each lane owns one complete key row.
+            zero4 = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32)
+            for slot in cutlass.range_constexpr(2):
+                offset = cutlass.Int32(slot * pBufferWords + COLS // 2) + tidx * cutlass.Int32(P_ROW_WORDS)
+                Pointer(sP_raw.subview(offset).data_ptr(), dtype=cutlass.Int32).store_swizzled(zero4, _P_SMEM_SWIZZLE, alignment=16)
+            nvvm.fence_proxy("async.shared", space="cta")
         # Arm every max-key slot (one word per lane): the first MAX_RED_SLOTS tiles find them at the smallest key.
         if tidx < cutlass.Int32(MAX_RED_WORDS):
             (Pointer(mred_smem.data_ptr(), dtype=cutlass.Int32) + tidx).store(cutlass.Int32(INT32_MIN))

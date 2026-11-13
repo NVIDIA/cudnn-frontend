@@ -12,7 +12,6 @@ import torch
 
 import cudnn.sdpa.bwd.api_dsl as api_dsl
 import test_sdpa_bwd_thd_d256_sm100 as thd
-from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 from test_sdpa_bwd_thd_sm100 import stage2_datapath  # noqa: F401  (fixture: pins and checks the stage-2 body)
 
@@ -89,9 +88,9 @@ def test_graph_deterministic_origins_repeat_bitwise():
 @pytest.mark.parametrize("surface", ["standalone", "graph"])
 def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
     # The shared harness forces two GQA groups through reused scratch; this chain's chunk rule is a module function.
-    monkeypatch.setattr(SdpaBwdDslSm100, "_ws_budget_bytes", None, raising=False)
+    monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "_ws_budget_bytes", None, raising=False)
     monkeypatch.setattr(api_dsl, "_sm100_head_chunk_thd", lambda *args, **kwargs: 4)
-    thd.check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, d=512, d_v=512, api_type=SdpaBwdDslSm100, engine=_ENGINE)
+    thd.check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, d=512, d_v=512, api_type=api_dsl.SdpaBwdDslSm100, engine=_ENGINE)
 
 
 @pytest.mark.L0
@@ -103,7 +102,7 @@ def test_origin_ports_are_optional_per_port():
     for key in ("data", "starts", "live"):
         p[key]["dq"] = compact[key]["dq"]
     del p["offsets"]["dq"], p["spec"]["dq"]
-    api = thd.make_adapter(p, True, api_type=SdpaBwdDslSm100)
+    api = thd.make_adapter(p, True, api_type=api_dsl.SdpaBwdDslSm100)
     p["ws"] = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     p["snapshots"] = thd.snapshots(p)
     thd.poison(p)
@@ -116,7 +115,7 @@ def test_origin_ports_are_optional_per_port():
 def test_compact_standalone_plan_is_unchanged_by_the_origin_contract():
     """No declared offsets: the packed-prefix artifact, its frame and its workspace carve are the pre-existing ones."""
     p = thd.make_payload(torch.bfloat16, True, _LQ, _LK, 0, False, hq=2, hkv=2, d=512, d_v=512, physical_origins=False)
-    api = thd.make_adapter(p, True, api_type=SdpaBwdDslSm100)
+    api = thd.make_adapter(p, True, api_type=api_dsl.SdpaBwdDslSm100)
     assert api._thd_origins is None and len(api._prepared.operands) == 11
     p["ws"] = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     p["snapshots"] = thd.snapshots(p)
@@ -165,7 +164,7 @@ def test_empty_final_origin_stats_guard(stage2_datapath, surface, token_major, a
         graph, execute = thd.make_graph(p, token_major, engine=_ENGINE)
         workspace_size = graph.get_workspace_size()
     else:
-        api = thd.make_adapter(p, token_major, api_type=SdpaBwdDslSm100)
+        api = thd.make_adapter(p, token_major, api_type=api_dsl.SdpaBwdDslSm100)
         workspace_size = api.scratch_workspace_bytes()
 
         def execute(payload):
