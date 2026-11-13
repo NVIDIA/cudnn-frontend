@@ -492,6 +492,25 @@ def supports_d64_fp8_swap_ab(shape, *, device_cc, paged, thd, batch_size, s_q, h
     )
 
 
+def supports_dense_fp8_swap_ab(shape, *, device_cc, paged, thd, batch_size, s_q, h_q, h_kv, pack_gqa, cga, tile_n):
+    """Dense D128 decode with all live query rows in one eight-column unit."""
+    group = h_q // h_kv if pack_gqa and h_kv else 1
+    return (
+        device_cc in ((10, 0), (10, 3), (10, 7))
+        and shape == (128, 128)
+        and not paged
+        and not thd
+        and 0 < batch_size <= 65535
+        and cga == 1
+        and tile_n in (None, 128)
+        and h_kv > 0
+        and h_q > 0
+        and h_q % h_kv == 0
+        and 0 < group <= 8
+        and 0 < s_q * group <= 8
+    )
+
+
 @dataclass(frozen=True)
 class TemplateParamsDecode(TemplateParams):
     """Extra geometry for the new swap-AB route, without changing legacy records' cache keys."""
@@ -1810,7 +1829,7 @@ class CfgD128Fp8Decode(CfgD256Decode):
 
 
 def make_cfg_d128_fp8_decode(params: TemplateParamsDecode) -> Tuple[CfgD128Fp8Decode, TmaIters]:
-    """Native per-tensor FP8 paged decode, retaining common graph-semantic checks."""
+    """Native per-tensor FP8 dense or paged decode, retaining common graph-semantic checks."""
     # decode_q_tile selects this body instead of the prefill body. Validate
     # the remaining public semantics with the common D128 predicates.
     _validate_params("d128", replace(params, decode_q_tile=0))
@@ -1818,7 +1837,7 @@ def make_cfg_d128_fp8_decode(params: TemplateParamsDecode) -> Tuple[CfgD128Fp8De
     checks = (
         (params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2), "FP8 inputs required"),
         (dtype_o in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16), "FP8 or half output required"),
-        (params.cta_mma == 1 and params.paged_kv, "one CTA and paged KV required"),
+        (params.cta_mma == 1, "one CTA required"),
         (not params.thd_varlen and not params.ragged_q, "THD queries use the prefill tile"),
         (not params.pv_bf16 and not params.softmax_f16, "FP8 P and FP32 softmax required"),
         (not params.dual_kv_stream, "dual_kv_stream selects the prefill pipeline"),

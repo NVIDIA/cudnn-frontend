@@ -40,6 +40,7 @@ from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains as _sm80_graph_tile_do
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     supports_d64_fp8_swap_ab,
+    supports_dense_fp8_swap_ab,
     SM100_SCORE_STATS_SHAPES,
     SM100_THD_PACK_GQA_SHAPES,
     SM100_PAGED_FP8_THD_SHAPES,
@@ -1150,12 +1151,12 @@ def _sm80_explicit_tile_domains(capabilities: Capabilities, facts: "ga.SdpaGraph
 
 def effective_swap_abs(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: SdpaFwdKnobs) -> frozenset[int]:
     """The existing prefill and swap-AB decode bodies on the same legal graph."""
-    if not capabilities.swap_abs or not facts.is_fp8 or facts.o_block_scale:
+    if not capabilities.swap_abs or not facts.is_fp8 or facts.o_block_scale or facts.softmax_precision not in (None, cudnn.data_type.FLOAT):
         return frozenset()
     if facts.has_bias or facts.has_kv_mask or facts.has_epilogue_gate or facts.has_score_max or facts.has_score_sum_exp or facts.attn_scale_prefolded:
         return frozenset()
-    if not supports_d64_fp8_swap_ab(
-        _selected_d_shape(capabilities, facts, knobs),
+    shape = _selected_d_shape(capabilities, facts, knobs)
+    geometry = dict(
         device_cc=facts.device_cc,
         paged=facts.has_paged_kv,
         thd=facts.thd,
@@ -1165,7 +1166,8 @@ def effective_swap_abs(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", k
         h_kv=facts.h_kv,
         pack_gqa=knobs.pack_gqa,
         cga=knobs.cga,
-    ):
+    )
+    if not (supports_d64_fp8_swap_ab(shape, **geometry) or supports_dense_fp8_swap_ab(shape, **geometry, tile_n=knobs.tile_n)):
         return frozenset()
     return capabilities.swap_abs
 
@@ -3370,7 +3372,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
             split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((192, 128), frozenset({2})))),
-            swap_abs=frozenset() if rubin_row else frozenset({0, 1}),
+            swap_abs=frozenset({0, 1}),
             # f16x2-softmax arm: only the cc 10.7 sibling kernels carry the
             # path, in every per-tensor FP8 flavor (MUFU EX2.F16x2 exists below
             # cc10.7 but no other file wires it). FLOAT is the f32 pipeline

@@ -4,6 +4,90 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Dense D128 FP8 swap-AB qualification (2026-11-13)
+
+`sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`
+in the existing SM100/SM103 and SM107 FP8 CI entry files. It pins the public
+`SWAP_AB=1` plan, the actual shared decode module, and the five-stage,
+eight-live-column geometry. Forward only; no backward path is added.
+Packing and split count are fixed during byte comparisons. Fixed CPU-quantized
+E4M3/E5M2 payloads feed FP8 and half outputs, with O/Stats batch invariance,
+whole-batch Amax replay, fresh bindings, scheduling pressure, duplicated and
+changed neighbors, independent numerical references and per-path goldens.
+The functional matrix covers masks, sink, unequal logical head widths,
+row gaps, optional Stats/Amax, empty actual lengths and current-scale capture.
+D128 padded dense splits keep their existing typed decline; unsplit padding
+and unpadded split execution are qualified separately. Warm stress includes
+multiple ring refills and the shared unsafe-ring control.
+
+The local SM100 engineering GPU (148 SMs) passed all 28 functional/domain/byte
+cases in 58.38 s, including four newly recorded golden paths. A separate
+process passed the same 28 cases in strict golden-check mode in 56.30 s:
+0 failures, 0 skips; the two warm cases were run separately. Both E4M3 and E5M2
+warm cases passed in 13.51 s, each with 0 wrong outputs in 256 warm and 256
+shared-memory-poisoned launches. The unsafe-ring control failed 200/200 launches.
+The workload has 2,048 CTAs and 13 ring refills per launch. Its numerical
+reference is checked before stress; the stress reference itself is the
+byte-stable cold launch. This is a finite rate check, not a proof of race freedom.
+
+Runtime: cuDNN 9.30.0.4, CuTe DSL 4.8.0 with compiler and NVRTC 13.4,
+Torch 2.14.1+cu130, driver API 13020. The Torch CUDA build label is distinct
+from the compiler/runtime used for the kernels. The strict run used
+`CUDNN_DETERMINISM_GOLDENS` with recording unset; the four new JSON files are
+committed without replacing earlier goldens. Source import was asserted to
+the isolated checkout. The final warm report names distinguish both dtypes.
+Native SM107 also passed 28 functional/domain/byte cases, four independent
+strict golden comparisons, and both warm cases, with no failures or skips.
+Both dtypes had 0 mismatches in 256 warm and 256 poisoned launches; the
+unsafe-ring control failed 200/200 launches. The frozen candidate was imported
+from its isolated package, using cuDNN 9.30.0.4, CuTe DSL 4.8.0,
+compiler/NVRTC 13.4 and Torch 2.14.0+cu130. Four new SM107 goldens are committed.
+B300 (SM103) passed the same 28 cases, four independent strict golden
+comparisons and two warm cases, with no failures or skips. Each dtype had
+0 mismatches in 256 warm and 256 poisoned launches, with the unsafe-ring
+control reproducing 200/200 failures. It used cuDNN 9.30.0.4, CuTe DSL 4.8.0,
+compiler/NVRTC 13.4 and Torch 2.14.1+cu130; four SM103 goldens are committed.
+The parent rejects the public dense `SWAP_AB=1` plan at build time; the
+candidate passes the same public-entry test. Run from `test/python`:
+
+```bash
+pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestDenseFp8SwapAB -m L0 -q -rs
+pytest sdpa/frost/test_sdpa_fp8_sm107.py::TestDenseFp8SwapAB -m L0 -q -rs
+```
+
+The local strict command selected `-k 'not warm_refill'`; the separate warm
+command selected `-k warm_refill -s`. Independent collection of all 30 cases
+from the SM107 entry passed before its native execution above. The SM107
+recording phase selected `-k 'not warm_refill'`; its separate strict phase
+selected `-k golden` with recording unset.
+
+On SM100, four graph boundary cases (split9 with empty partials, E5M2 window,
+unequal-width strided sink, and empty Q/KV) passed each of unfiltered
+memcheck, racecheck and synccheck using Compute Sanitizer 13.5: 0 errors,
+0 race hazards and 0 warnings. Eleven existing D64 paged/configuration/public
+knob regressions also passed. No production numerical tolerance was changed.
+
+A final test-only extraction moved the reference and handle helpers to
+`fp8_test_reference.py` to remove reverse imports from architecture entry
+modules. All eight moved definitions retain identical ASTs, and all four
+production files remain byte-identical to the three GPU qualifications.
+The final SM100 run passed all 30 dense cases with strict goldens plus the
+existing known-E5M2-edge scope regression (31 passed, no failures or skips).
+
+Review follow-up on the same B300 runtime passed all 30 cases with recording
+unset and the four existing goldens unchanged. Graph cases now poison outputs
+and initialize workspace to both zero and `0xff` for eager execution and
+changed/restored-input replay. Every declared Amax is also checked with
+`sdpa.fp8.assert_amax_o` against the unscaled reference and stored output in
+pre-scale units; the existing output check is retained. The 26 CPU-tensor
+Amax checker regressions also pass. A 12-cell host precision-domain check
+reproduced six incorrect HALF/BFLOAT16 admissions before the fix and passes
+after aligning the public SWAP_AB domain with the lowering's None/FLOAT limit.
+This changes no kernel arithmetic or default selection.
+
+Record new goldens in a fresh directory only after numerical and replay checks
+pass, then compare them in a separate process with `CUDNN_DETERMINISM_GOLDENS`.
+
 These suites check six attention families and the DSA indexer APIs. Run from `test/python`:
 
 ```bash
