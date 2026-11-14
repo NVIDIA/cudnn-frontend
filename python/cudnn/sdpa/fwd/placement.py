@@ -717,6 +717,13 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation == SM120_D512_PAIRED:
         spec = sm100_legacy_policy_spec(SM120_LEGACY_ROW)
 
+    from .kernels.sm120.d512_fp8_paired import contract as fp8_wide
+    from .kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
+
+    for wide in (fp8_wide, mxfp8_wide):
+        if spec.capabilities.implementation == wide.NAME:
+            spec = sm100_legacy_policy_spec(wide.LEGACY_ROW)
+
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
         # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);
         # a shallow copy, as dataclasses.replace re-runs every field's init.

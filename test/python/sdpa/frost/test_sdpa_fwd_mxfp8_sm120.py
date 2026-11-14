@@ -43,7 +43,7 @@ import cudnn
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, offers_engine, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine
+from frost_test_utils import make_dense_stats, offers_engine, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, sm120_owner
 from sdpa.fp8 import assert_amax_o
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
@@ -378,13 +378,13 @@ def _run(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if quantized_qkv is None:
-        chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+        chosen = _select_engine(g, sm120_owner(_ENGINE, d_qk, d_v), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
     else:
         # Kernel qualification holds the plan fixed independently of ranked offerings.
         from cudnn.engines.manifest import family_for
 
         g.create_execution_plan(
-            family_for(g).offered_ids()[_ENGINE],
+            family_for(g).offered_ids()[sm120_owner(_ENGINE, d_qk, d_v)],
             {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
         )
         g.select_plan(len(g.plans) - 1)
@@ -902,7 +902,7 @@ def test_mxfp8_sm120_d512_flavor_routing():
         with pytest.raises(ValueError):
             _api(d_qk, d_v).check_support()
     mod = api_dsl._load_sm120_kernel_module((512, 512), TemplateParams(dtype_qkv=DTYPE_E4M3, q_tile=64, kv_tile=64), fp8=True)
-    assert mod.__file__.replace("\\", "/").endswith("sm120/prefill_d512_mxfp8.py")
+    assert mod.__file__.replace("\\", "/").endswith("sm120/d512_mxfp8_paired/kernel.py")
     with pytest.raises(ValueError, match="head dimensions must both be in"):
         mod.compile(compute_capability=torch.cuda.get_device_capability(), b=1, qh=1, kh=1, sq=128, skv=128, d_qk=256, d_v=256, has_lse=False)
 
@@ -1008,7 +1008,7 @@ def _graph_offers(d_qk=128, d_v=128):
     except cudnn.cudnnGraphNotSupportedError:
         # No engine at all serves the graph: for "this engine must not claim it" that is the same answer.
         return False
-    return offers_engine(g, _ENGINE)
+    return offers_engine(g, sm120_owner(_ENGINE, d_qk, d_v))
 
 
 @pytest.mark.L0
@@ -1202,7 +1202,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, _ENGINE, tiles=tiles)
+    _select_engine(g, sm120_owner(_ENGINE, d_qk, d_v), tiles=tiles)
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amax_o: amax})
