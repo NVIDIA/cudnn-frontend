@@ -576,7 +576,9 @@ def _try_load(entry: Path, key: str, symbol: str):
         wrapper._compiled_cache_module = module  # keep the engine alive as long as the callable
         wrapper._compiled_cache_entry = str(entry)
         wrapper._compiled_cache_raw = raw  # positional-only tvm_ffi.Function, for a prepared lane
-        return wrapper
+        from cudnn.launch_plan import watch
+
+        return watch(wrapper)
     except Exception as exc:  # noqa: BLE001 -- a stale or foreign artifact is a miss
         _count("invalid")
         _LOG.warning("compiled-plan cache: could not reload %s (%s); recompiling", obj, exc)
