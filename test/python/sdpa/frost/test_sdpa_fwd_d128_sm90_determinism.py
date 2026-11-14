@@ -32,6 +32,7 @@ import torch
 
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 from frost_test_utils import _SM, requires_dsl
+import frost_routing
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 90, reason="requires native SM90")]
 
@@ -128,12 +129,7 @@ def _reference(record, mask):
 
 
 def _note(cell, text):
-    try:
-        import frost_routing
-
-        frost_routing.measured(f"d128 determinism {cell}", text)
-    except Exception:
-        pass
+    frost_routing.measured(f"d128 determinism {cell}", text)
 
 
 def _replayed_alone(heads, mask, dtype, target, repeats):
