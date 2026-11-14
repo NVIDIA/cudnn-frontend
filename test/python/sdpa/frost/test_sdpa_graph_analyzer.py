@@ -476,7 +476,7 @@ def test_probe_envelope_mixed_dims_pick_covering_flavor():
 
 
 def test_d192_fp8_sink_dtype_support():
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm100_d192_fp8_multi_q")
 
     def facts(dtype, *, sink):
         return ga.SdpaGraphFacts(
@@ -2799,7 +2799,10 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8_d256, d256_facts) is None
     assert "owned by the explicit implementation engines" in engines.mismatch(fp8, d256_facts)
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
-    assert "wired on the d64, d128, d256, d512 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
+    fp8_d192 = spec["sdpa_fwd_sm100_d192_fp8_multi_q"].capabilities
+    d192_facts = paged_facts(is_fp8=True, d_qk=192, d_v=128)
+    assert "owned by the explicit implementation engines" in engines.mismatch(fp8, d192_facts)
+    assert "paged attention" in engines.mismatch(fp8_d192, d192_facts)
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
         assert engines.mismatch(fp8, sink_facts) is None
