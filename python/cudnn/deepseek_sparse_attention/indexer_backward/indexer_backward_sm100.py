@@ -72,9 +72,9 @@ Barriers for kernel 2:
   mbar[8-10]: K_loaded_0/1/2  (K-load arrives            → MMA waits, 3-stage)
   mbar[11-13]:K_consumed_0/1/2(MMA commits after GEMM3  → K-load waits, 3-stage)
   mbar[14]:   W_loaded        (Load arrives              → Compute waits)
-  mbar[15]:   dQ_done         (MMA commits after GEMM3    → Compute waits)
-  mbar[16]:   reduce_done     (Reduce arrives after T2R  → TMEM owner waits)
-  mbar[17-18]:dS_half_0/1    (TopK=512 first-half dS publication)
+  mbar[15-16]:dQ_done_0/1    (MMA commits after GEMM3    → Load/Compute wait)
+  mbar[17]:   reduce_done     (Reduce arrives after T2R  → TMEM owner waits)
+  mbar[18-19]:dS_half_0/1    (TopK=512 first-half dS publication)
 
 Each warp/warpgroup has its own independent loop, communicating via barriers.
 TopK=128/256/384/512 can use a grid-stride persistent CTA path capped at one
@@ -164,17 +164,18 @@ MBAR_K_CONSUMED_0 = 11
 MBAR_K_CONSUMED_1 = 12
 MBAR_K_CONSUMED_2 = 13
 MBAR_W_LOADED = 14
-MBAR_DQ_DONE = 15
-MBAR_REDUCE_DONE = 16
-MBAR_DS_HALF_0 = 17
-MBAR_DS_HALF_1 = 18
-MBAR_ROW_FREE_0 = 19
-MBAR_ROW_FREE_1 = 20
-MBAR_DQ_FREE_0 = 21
-MBAR_DQ_FREE_1 = 22
-MBAR_GW_READY_0 = 23
-MBAR_GW_READY_1 = 24
-NUM_BARRIERS = 25
+MBAR_DQ_DONE_0 = 15
+MBAR_DQ_DONE_1 = 16
+MBAR_REDUCE_DONE = 17
+MBAR_DS_HALF_0 = 18
+MBAR_DS_HALF_1 = 19
+MBAR_ROW_FREE_0 = 20
+MBAR_ROW_FREE_1 = 21
+MBAR_DQ_FREE_0 = 22
+MBAR_DQ_FREE_1 = 23
+MBAR_GW_READY_0 = 24
+MBAR_GW_READY_1 = 25
+NUM_BARRIERS = 26
 
 CLIP_LOG_MIN = -100.0
 CLIP_PROB_MIN = math.exp(CLIP_LOG_MIN)
@@ -1008,7 +1009,8 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
             cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, self.WARP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE_0, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE_1, 1)
             cute.arch.mbarrier_init(
                 mbar + MBAR_REDUCE_DONE,
                 self.WARPGROUP_SIZE,
@@ -1129,6 +1131,7 @@ class IndexerBackwardSm100:
                 Int32(0),
                 Int32(0),
                 Int32(0),
+                mbar + MBAR_DQ_DONE_0,
                 mbar,
                 Int32(0),
             )
@@ -1163,6 +1166,7 @@ class IndexerBackwardSm100:
                 warp_idx,
                 mbar,
                 Int32(0),
+                mbar + MBAR_DQ_DONE_0,
                 mbar + MBAR_W_LOADED,
                 Int32(0),
                 mbar,
@@ -1400,7 +1404,8 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
             cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, self.WARP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE_0, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE_1, 1)
             cute.arch.mbarrier_init(
                 mbar + MBAR_DS_HALF_0,
                 self.WARPGROUP_SIZE,
@@ -1469,14 +1474,17 @@ class IndexerBackwardSm100:
                     cute.select(self.gemm1_tiler, mode=[0, 2]),
                     (None, None, seq_idx, batch_idx),
                 )
-                # Q's last reader is the MMA warp.  Its DQ_DONE commit is
-                # ordered after every Q-consuming GEMM for row it-2, so Q can
-                # be refilled before the slower compute/K-load/reduce roles
-                # collectively release the rest of this operand parity.
+                # Q's last reader is the MMA warp.  Each Q parity has its own
+                # DQ_DONE barrier: sharing one phase bit lets row it-1's commit
+                # wrap past row it-2 before this load warp observes it (ABA),
+                # leaving the load warp waiting for a row it alone can publish.
+                # The matching-parity commit is ordered after every Q-consuming
+                # GEMM, so Q can be refilled before the slower roles collectively
+                # release the rest of this operand parity.
                 if it >= 2:
                     cute.arch.mbarrier_wait(
-                        mbar + MBAR_DQ_DONE,
-                        Int32((it - 2) & 1),
+                        mbar + MBAR_DQ_DONE_0 + parity,
+                        Int32((epoch - 1) & 1),
                     )
                 if parity == 0:
                     self._issue_cross_row_q(
@@ -1598,6 +1606,7 @@ class IndexerBackwardSm100:
                         Int32(it & 1),
                         it,
                         Int32(epoch & 1),
+                        mbar + MBAR_DQ_DONE_0,
                         mbar + MBAR_DQ_FREE_0,
                         Int32((epoch - 1) & 1),
                     )
@@ -1630,6 +1639,7 @@ class IndexerBackwardSm100:
                         Int32(it & 1),
                         it,
                         Int32(epoch & 1),
+                        mbar + MBAR_DQ_DONE_1,
                         mbar + MBAR_DQ_FREE_1,
                         Int32((epoch - 1) & 1),
                     )
@@ -1705,6 +1715,7 @@ class IndexerBackwardSm100:
                     warp_idx,
                     mbar,
                     Int32(it & 1),
+                    mbar + MBAR_DQ_DONE_0 + parity,
                     mbar + MBAR_GW_READY_0 + parity,
                     Int32(epoch & 1),
                     mbar + MBAR_DQ_FREE_0 + parity,
@@ -1917,7 +1928,8 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_1, 1)
             cute.arch.mbarrier_init(mbar + MBAR_K_CONSUMED_2, 1)
             cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, self.WARP_SIZE)
-            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE_0, 1)
+            cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE_1, 1)
             cute.arch.mbarrier_init(
                 mbar + MBAR_REDUCE_DONE,
                 self.WARPGROUP_SIZE,
@@ -1992,6 +2004,7 @@ class IndexerBackwardSm100:
                 Int32(0),
                 Int32(0),
                 Int32(0),
+                mbar + MBAR_DQ_DONE_0,
                 mbar,
                 Int32(0),
             )
@@ -2025,6 +2038,7 @@ class IndexerBackwardSm100:
                 warp_idx,
                 mbar,
                 Int32(0),
+                mbar + MBAR_DQ_DONE_0,
                 mbar + MBAR_W_LOADED,
                 Int32(0),
                 mbar,
@@ -2185,6 +2199,7 @@ class IndexerBackwardSm100:
         persistent_row_phase,
         row_iteration,
         q_ready_phase,
+        dq_done_barrier,
         dq_free_barrier,
         dq_free_phase,
     ):
@@ -2550,7 +2565,7 @@ class IndexerBackwardSm100:
                 tmma3.set(tcgen05.Field.ACCUMULATE, True)
             self._commit_k_consumed(mbar, last_sk_stage)
             with cute.arch.elect_one():
-                tcgen05.commit(mbar + MBAR_DQ_DONE)
+                tcgen05.commit(dq_done_barrier)
         else:
             if const_expr(self.use_ds_half):
                 cute.arch.mbarrier_wait(
@@ -2601,7 +2616,7 @@ class IndexerBackwardSm100:
                 tmma3.set(tcgen05.Field.ACCUMULATE, True)
             self._commit_k_consumed(mbar, last_sk_stage)
             with cute.arch.elect_one():
-                tcgen05.commit(mbar + MBAR_DQ_DONE)
+                tcgen05.commit(dq_done_barrier)
 
     # =========================================================================
     # Warps 4-7: Compute/Epilogue warpgroup (2-stage S readback + sdS write)
@@ -2629,6 +2644,7 @@ class IndexerBackwardSm100:
         warp_idx,
         mbar,
         persistent_row_phase,
+        dq_done_barrier,
         gw_ready_barrier,
         gw_ready_phase,
         dq_free_barrier,
@@ -2901,8 +2917,8 @@ class IndexerBackwardSm100:
 
         # Wait for MMA warp to finish the final GEMM3 (dQ accumulation).
         cute.arch.mbarrier_wait(
-            mbar + MBAR_DQ_DONE,
-            Int32(persistent_row_phase),
+            dq_done_barrier,
+            Int32(gw_ready_phase),
         )
         _tcgen05_fence_after_thread_sync()
 
