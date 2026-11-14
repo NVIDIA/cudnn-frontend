@@ -287,10 +287,11 @@ class _Ranked(Exception):
     """Raised by the probe once the runner's graph is ranked: nothing is built or launched."""
 
 
-def _ranking(sm100, monkeypatch, check):
+def _ranking(sm100, monkeypatch, check, *, unsupported_as_verdict=True):
     """Swap the runners' pin for ``check(graph)``, then stop; return a function that runs one runner and gives back the
     check's value. A graph no engine at all can plan raises before the pin, with every python engine's reason in its
-    message, so that message stands for the row's reason."""
+    message, so that message stands for the row's reason. Callers with a different verdict shape must set
+    ``unsupported_as_verdict=False`` to preserve the original exception instead of receiving a two-field verdict."""
     seen = []
 
     def probe(graph, name, **_):
@@ -306,6 +307,8 @@ def _ranking(sm100, monkeypatch, check):
         except _Ranked:
             return seen.pop()
         except cudnn.cudnnGraphNotSupportedError as exc:
+            if not unsupported_as_verdict:
+                raise
             return False, str(exc)
         raise AssertionError("the runner never reached its pin")
 
@@ -381,7 +384,7 @@ def test_d128_graph_pinned_pack_gqa_runs_on_the_64_tile(sm100, monkeypatch):
         facts = engines.analyze_for(spec, graph)[0]
         return offers_engine(graph, _ROW), pinned, engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128, pack_gqa=True))
 
-    rank = _ranking(sm100, monkeypatch, packed)
+    rank = _ranking(sm100, monkeypatch, packed, unsupported_as_verdict=False)
 
     def run(d):
         q = sm100._bhsd(1, 8, 96, d, torch.float16)
