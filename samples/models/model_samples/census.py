@@ -48,12 +48,16 @@ class, SM count and row count -- its recorded launch shape.  How a block call st
 never a property of an adapter: :meth:`Target.claim` gives every call of the plan an :class:`Identity` (``target``,
 ``stand-in``, ``not yet (<fallback reason>)``, ``not the target``), counts them (always as three numbers: the target's own
 compiled kernels, cuDNN Frontend entries with byte-equal results, declared stand-ins) and lists every reason the class is
-not claimed.  The check then has a seventh item:
+not claimed.  A section holds for the GPU class, the SM count, the row count and the layer widths it was recorded with: a
+run that differs in one of them is told that no identity is stated, never held to another run's kernels.  The check then
+has a seventh item:
 
 7. Every launch of a block call whose identity is ``target`` has the launch shape the census recorded for it on this GPU
    class, SM count and row count.
 
-and one more line: ``target census <configuration> / <class> (recorded <date>): EQUAL``, or ``NOT CLAIMED (<reasons>)``.
+and one more line: ``target census <configuration> / <class> (recorded <date>): EQUAL (<what was compared>)``, or
+``NOT CLAIMED (<reasons>)``.  Either way the line says how many launches of a step were compared by launch shape -- as three
+numbers -- and how many by membership alone: ``EQUAL`` never stands for a comparison that was not made.
 
 This module imports nothing beyond the standard library.
 """
@@ -545,6 +549,10 @@ def _counted(count: int, kind: str) -> str:
 BASES = ("recorded", "planned")
 #: the parts of a step in a census section besides its layers: before them, after them, after the step
 PARTS = ("prologue", "epilogue", "after_step")
+#: what an entry of a section may state beside its block and its kernel: ``launch`` = [grid, block, shared memory in bytes]
+#: of one launch at the section's row count; ``at`` = the fields of the model's geometry, beyond the section's layer widths,
+#: that this one launch shape was recorded with (the output head's: the vocabulary)
+ENTRY_FACTS = ("launch", "at")
 #: the packages the providers of this area import, as a run names them: of the versions a census records, these are
 #: compared with what is installed.  A change that brings a provider of another package adds the package here
 PACKAGES = {"torch": "PyTorch", "nvidia-cutlass-dsl": "CuTe DSL"}
@@ -558,7 +566,7 @@ class Identity(NamedTuple):
     relation: str  # TARGET | STAND_IN | NOT_YET | OTHER | HOST
     kernel: str = ""  # the target's kernel at this place
     kind: str = ""  # of that kernel: "code" | "port"; "" for a stand-in and for the host path
-    reason: str = ""  # of NOT_YET: the row's fallback reason; of OTHER: what differs
+    reason: str = ""  # of NOT_YET: the row's fallback reason; of OTHER: what differs; of TARGET / STAND_IN: why ``launch`` is not held
     launch: Optional[tuple] = None  # the launch shape the census recorded for the target's kernel at this place
 
     def text(self) -> str:
@@ -571,6 +579,26 @@ def _class_text(key: str) -> str:
     """``"cc10.0/sm148"`` as a run prints it: ``cc 10.0 / 148 SMs``."""
     cc, sms = key.split("/")
     return f"cc {cc[2:]} / {sms[2:]} SMs"
+
+
+def _other_widths(recorded: Mapping[str, int], geometry) -> str:
+    """The fields of a model's geometry that are not the recorded ones, as a run names them: ``hidden 4096 (recorded 5120)``;
+    empty where every recorded field is the model's."""
+    return ", ".join(
+        f"{name} {getattr(geometry, name, 'none')} (recorded {value})" for name, value in recorded.items() if getattr(geometry, name, None) != value
+    )
+
+
+def _launch_shape(value) -> bool:
+    """Whether ``value`` is a launch shape as a census file writes it: ``[grid of three, block of three, shared memory in bytes]``."""
+
+    def whole(n, least):
+        return isinstance(n, int) and not isinstance(n, bool) and n >= least
+
+    def triple(t):
+        return isinstance(t, list) and len(t) == 3 and all(whole(n, 1) for n in t)
+
+    return isinstance(value, list) and len(value) == 3 and triple(value[0]) and triple(value[1]) and whole(value[2], 0)
 
 
 def installed_versions(packages: Sequence[str]) -> Dict[str, Optional[str]]:
@@ -666,21 +694,35 @@ class Claim:
             if blocks:
                 text += f"; {words}: " + ", ".join(f"{block} {count}" for block, count in blocks.items())
         text += f"; {stand}" + (f" (not yet: {', '.join(n['stand_ins_not_yet'])})" if n["stand_ins_not_yet"] else "")
-        return [f"the target kernel set of a step of this model, when a stack reproduces all of it: {whole}", text]
+        return [f"the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): {whole}", text]
+
+    def compared(self) -> Tuple[int, str, int]:
+        """What item 7 holds of a step: ``(launches compared by launch shape, the same as three numbers, launches held by
+        membership alone)``.  A target launch is compared by launch shape where the census records one for it; where it
+        records none (a kernel a library's tuner selects, a stand-in) the launch is held as a member of its kernel's
+        family or entry and in no shape."""
+        held = [identity for identity in self.identities if identity.relation in (TARGET, STAND_IN)]
+        shaped = [identity for identity in held if identity.launch]
+        stand = sum(identity.relation == STAND_IN for identity in shaped)
+        split = " + ".join(_counted(sum(identity.relation == TARGET and identity.kind == kind for identity in shaped), kind) for kind in KINDS)
+        text = f"{len(shaped)} launch{'es' if len(shaped) != 1 else ''} of a step compared by launch shape ({split} + {stand} declared stand-in{'s' if stand != 1 else ''})"
+        return len(shaped), text, len(held) - len(shaped)
 
     def line(self, status: str = "") -> str:
-        """The census line of the kernel check, given the check's own verdict."""
-        compared = len(self.recorded)
+        """The census line of the kernel check, given the check's own verdict.  It says what was compared: ``EQUAL`` and the
+        sentence under ``NOT CLAIMED`` both carry the number of launches of a step that were held to a recorded launch
+        shape, as three numbers, and the number held by membership alone."""
+        count, compared, loose = self.compared()
         if self.reasons:
             text = f"{self.name}: NOT CLAIMED ({'; '.join(self.reasons)})"
-            if compared and status == PASS:
-                text += (
-                    f"; the {compared} target launch{'es' if compared != 1 else ''} of a step {'have' if compared != 1 else 'has'} the recorded launch shape"
-                )
-            elif compared and status == NOT_OBSERVED:
+            if count and status == PASS:
+                text += f"; {compared}: each in the recorded one" + (f"; {loose} more by membership alone" if loose else "")
+            elif count and status == NOT_OBSERVED:
                 text += "; the launch shapes of its target launches were not observed"
             return text
-        verdicts = {PASS: "EQUAL", FAIL: "NOT EQUAL (the kernel check did not hold)", NOT_OBSERVED: "NOT OBSERVED"}
+        if status == PASS:
+            return f"{self.name}: EQUAL ({compared}, {loose} by membership alone)"
+        verdicts = {FAIL: "NOT EQUAL (the kernel check did not hold)", NOT_OBSERVED: "NOT OBSERVED"}
         return f"{self.name}: {verdicts.get(status, 'not compared')}"
 
     def dump(self) -> dict:
@@ -703,17 +745,22 @@ class Target:
     when every block runs on that set.
 
     * ``kernels``: per canonical kernel id its origin, its relation -- ``target`` of kind ``code`` (the target's own compiled
-      kernel: an entry, a library call or a framework operator the sample calls as the target does) or ``port`` (a cuDNN
-      Frontend entry with byte-equal results), or ``stand-in`` -- and, once a stack serves it, the entry and the form the
-      target calls it in;
+      kernel: an entry, a library call or a framework operator the sample calls as the target does) or ``port`` (a kernel
+      whose home is cuDNN Frontend: an entry with byte-equal results), or ``stand-in`` -- and, once a stack serves it, the
+      entry and the form the target calls it in.  A kernel with ``selection`` is chosen by a library's tuner: no launch
+      shape is recorded for it;
     * ``layers``: which entry list of a section a layer kind of the model reads;
     * ``configurations``: per configuration and per ``ccMAJOR.MINOR/smCOUNT`` a section: ``claimed``, its ``basis``
-      (``recorded`` or ``planned``), what was recorded, and per row count the entries of a step as
-      ``[block, kernel id, {"launch": [grid, block, shared memory]}]`` -- before the layers, per layer kind, after the
-      layers, after the step.
+      (``recorded`` or ``planned``), what was recorded, ``geometry`` -- the layer widths of the model it holds for, under
+      the names of the family's geometry -- and per row count the entries of a step as ``[block, kernel id, facts]``,
+      before the layers, per layer kind, after the layers, after the step.  The facts of an entry (:data:`ENTRY_FACTS`):
+      ``launch`` = ``[grid, block, shared memory]``, and ``at`` = further fields of the geometry that this one launch
+      shape was recorded with.
 
-    ``ValueError`` for a file that is not such a census, and for a section that says ``claimed`` on a basis that is not
-    ``recorded``."""
+    ``ValueError`` for a file that is not such a census; for a section that says ``claimed`` on a basis that is not
+    ``recorded``, without the widths it holds for, or with a target kernel whose launch shape it does not record (only a
+    kernel a tuner selects and a stand-in have none); and for an entry with a fact this reader does not know or a
+    ``launch`` that is not a launch shape -- a misspelt key would otherwise read as "nothing recorded"."""
 
     def __init__(self, data: Mapping, name: str = "kernel_census.json"):
         self.name = name
@@ -753,6 +800,11 @@ class Target:
                     wrong(f"{where}: a section holds claimed (true or false), basis ({' or '.join(BASES)}) and rows")
                 if section["claimed"] and section["basis"] != "recorded":
                     wrong(f"{where}: claimed on the basis {section['basis']}; only a recorded section can be claimed")
+                geometry = section.get("geometry")
+                if not isinstance(geometry, dict) or not all(isinstance(v, int) and not isinstance(v, bool) for v in geometry.values()):
+                    wrong(f"{where}: a section holds geometry, the layer widths of the model it was taken on (name: whole number)")
+                if section["claimed"] and not geometry:
+                    wrong(f"{where}: claimed without the layer widths it holds for")
                 for rows, parts in section["rows"].items():
                     for part in (*PARTS, *layers.values()):
                         if not isinstance(parts.get(part), list):
@@ -760,6 +812,21 @@ class Target:
                         for entry in parts[part]:
                             if not isinstance(entry, list) or len(entry) != 3 or entry[1] not in kernels or not isinstance(entry[2], dict):
                                 wrong(f"{where}, {rows} rows, {part}: {entry!r} is not [block, kernel of the kernels table, facts]")
+                            block, kernel_id, facts = entry
+                            unknown = sorted(set(facts) - set(ENTRY_FACTS))
+                            if unknown:
+                                wrong(f"{where}, {rows} rows, {part}: {block} states {', '.join(unknown)}; an entry states {' and '.join(ENTRY_FACTS)}")
+                            if "launch" in facts and not _launch_shape(facts["launch"]):
+                                wrong(f"{where}, {rows} rows, {part}: the launch of {block} is not [grid of three, block of three, shared memory in bytes]")
+                            at = facts.get("at", {})
+                            if not isinstance(at, dict) or not all(isinstance(v, int) and not isinstance(v, bool) for v in at.values()):
+                                wrong(f"{where}, {rows} rows, {part}: at of {block} is not an object of geometry fields (name: whole number)")
+                            meta = kernels[kernel_id]
+                            if section["claimed"] and "launch" not in facts and meta["relation"] == TARGET and "selection" not in meta:
+                                wrong(
+                                    f"{where}, {rows} rows, {part}: claimed without the launch shape of {block} ({kernel_id}); "
+                                    "only a kernel a library's tuner selects and a stand-in have none"
+                                )
         return data
 
     def sequence(self, parts: Mapping, layer_kinds: Sequence[str]) -> List[Tuple[str, str, Mapping]]:
@@ -797,14 +864,19 @@ class Target:
         else:
             claim.recorded_on, claim.basis, claim.claimed = str(section.get("recorded", {}).get("date", "")), section["basis"], section["claimed"]
             parts = section["rows"].get(str(rows))
-            if parts is None:
+            widths = _other_widths(section["geometry"], model.geometry)
+            if widths:  # a model of the family with other layer widths: other grids, and where an entry picks by width other kernels
+                reasons.append(f"no recorded section for this model's widths on {claim.device}: {widths}")
+            elif parts is None:
                 have = [f"{count} row{'s' if count != '1' else ''}" for count in section["rows"]]
                 reasons.append(f"no recorded section for {rows} row{'s' if rows != 1 else ''} on {claim.device}: recorded is {' and '.join(have) or 'none'}")
             else:
-                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds))
+                self._identify(claim, plan, wiring, self.sequence(parts, model.geometry.layer_kinds), model.geometry)
                 for block, identity in dict(zip(claim.blocks, claim.identities)).items():
                     if identity.relation == OTHER and block not in getattr(plan, "overridden", ()):
                         reasons.append(f"not the target set: {block} ({identity.reason})")
+                    elif identity.relation in (TARGET, STAND_IN) and identity.reason:
+                        reasons.append(f"no recorded launch shape of {block} for this model: {identity.reason}")
                 reasons += [f"the plan has no block for {block}" for block in dict.fromkeys(block for block, _, _ in claim.absent)]
                 if not reasons and not section["claimed"]:
                     reasons.append("the census does not claim this class yet")
@@ -820,7 +892,7 @@ class Target:
         claim.reasons = reasons
         return claim
 
-    def _identify(self, claim: Claim, plan, wiring, sequence) -> None:
+    def _identify(self, claim: Claim, plan, wiring, sequence, geometry=None) -> None:
         """Walk the wiring beside the census's entries of a step and give every block call its identity.  A census entry whose
         block the plan does not have is kept as absent; any other disagreement of the two orders is a ``ValueError``."""
         position = 0
@@ -839,13 +911,13 @@ class Target:
                 )
             _, kernel_id, facts = sequence[position]
             position += 1
-            claim.identities.append(self._identity(plan, block, kernel_id, facts))
+            claim.identities.append(self._identity(plan, block, kernel_id, facts, geometry))
         for block, kernel_id, _ in sequence[position:]:
             if block in plan:
                 raise ValueError(f"{self.name}: the census does not follow this model's wiring: it has {block} after the last call of a step")
             claim.absent.append((block, kernel_id, self.kind(kernel_id)))
 
-    def _identity(self, plan, block: str, kernel_id: str, facts: Mapping) -> Identity:
+    def _identity(self, plan, block: str, kernel_id: str, facts: Mapping, geometry=None) -> Identity:
         meta, row, kind = self.data["kernels"][kernel_id], plan.rows[block], self.kind(kernel_id)
         exact = [kernel for kernel in plan[block].kernels if kernel.relation == "exact"]
         if not exact:
@@ -857,7 +929,10 @@ class Target:
             return Identity(OTHER, kernel_id, kind, f"the row's form is{form_text(row.form) or ' []'}, the target's{form_text(want) or ' []'}")
         launch = facts.get("launch")
         shape = None if launch is None else (tuple(launch[0]), tuple(launch[1]), int(launch[2]))  # JSON lists: rebuilt before any comparison
-        return Identity(STAND_IN if meta["relation"] == STAND_IN else TARGET, kernel_id, kind, "", shape)
+        # a launch shape recorded with a field of the geometry this model does not share (the output head's: the vocabulary) is
+        # not this model's: it is held by nothing, and the claim says so
+        other = _other_widths(facts.get("at", {}), geometry) if shape is not None else ""
+        return Identity(STAND_IN if meta["relation"] == STAND_IN else TARGET, kernel_id, kind, other, None if other else shape)
 
 
 # ---------------------------------------------------------------------------------------------------------- a traced pass

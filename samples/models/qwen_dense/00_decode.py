@@ -232,10 +232,12 @@ def _verdict(stack: str, passed: bool, judged: int, unobserved: str = "") -> str
     return "PASS" if judged else "RAN (no provider block was judged)"
 
 
-def _decode(session, text, rule, prompts, tie_out, check, checked_steps, kernels=False):
+def _decode(session, text, rule, prompts, tie_out, check, checked_steps):
     """One prompt set: prefill, the decode loop (the one host read of a step is here), the traced pass, the report and the
-    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.  With ``kernels`` the traced pass keeps its
-    launch records and the checks include the kernel check; its outcome stays on the session (``session.traced``).
+    checks.  Returns ``(passed, provider blocks judged, tokens per sequence)``.  Whether the kernels are checked is the
+    session's decision (``session.check_kernels``: the flag, or a stack that declares a target kernel set) and is read
+    there, in one place: the traced pass then keeps its launch records and the checks include the kernel check; its
+    outcome stays on the session (``session.traced``).
 
     Two lines say what comes next before the phases that print nothing for a while (the prompt and the decode loop; the
     checks).  They are printed outside every timed interval, and flushed, so a run through a pipe shows them too."""
@@ -265,7 +267,8 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps, kernels
         next_ids = session.step(next_ids)  # embedding, the layers, the output head, token choice: ids stay on the GPU
         tokens = session.read(next_ids)  # the one host read of a step: 4 bytes per sequence
     session.report().text_path["text_out"] = text_seconds / max(sum(len(ids) for ids in produced), 1)
-    session.trace(TRACED_STEPS, records=kernels)  # the first steps again, under the profiler: GPU busy, idle, launches per step
+    kernels = session.check_kernels
+    session.trace(TRACED_STEPS)  # the first steps again, under the profiler: GPU busy, idle, launches per step; launch records where the kernels are checked
     print(session.report().text())
     if getattr(text, "synthetic_text", True):
         print(f"text out              sequence 0, {len(produced[0])} tokens (seeded weights: not language): {pieces[0][:48]!r}")
@@ -281,9 +284,7 @@ def _decode(session, text, rule, prompts, tie_out, check, checked_steps, kernels
         f"{TAG} checks on {steps} against the {session.reference_precision}-accumulated reference (replay, every provider block, the tokens){also}",
         flush=True,
     )
-    checks = tie_out.run_checks(
-        session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None, kernels=kernels
-    )
+    checks = tie_out.run_checks(session, prompt_tokens=int(prompts[0].numel()), max_steps=checked_steps, second_reference=checked_steps is not None)
     print(checks.text())
     return checks.ok, checks.judged, produced
 
@@ -304,8 +305,6 @@ def main(argv=None) -> int:
     if not torch.cuda.is_available():
         print(f"{TAG} SKIP needs a CUDA GPU")
         return 0
-    # a stack that declares a target kernel set makes a statement about its kernels: it always checks them
-    args.check_kernels = args.check_kernels or args.stack in QwenDense.target_stacks
     device = torch.device("cuda", torch.cuda.current_device())
     real = args.model is not None
     checkpoint, requests, described = None, [], 0.0
@@ -403,6 +402,12 @@ def main(argv=None) -> int:
     # Every sequence count is planned before the first load, and the memory sentence covers the whole run: a GPU class, a
     # library version or a free-memory budget this sample does not serve is a SKIP here, and nothing skips after it.
     first, later = runs[0][0], [session for session, _ in runs[1:]]
+    if args.stack != "reference":  # said before a phase that prints nothing, outside its timed interval
+        print(
+            f"{TAG} planning: on a GPU an entry of this stack builds its kernel for each sequence count now, before anything is loaded "
+            "(what it needs of the installed toolchain is asked here; a first build prints nothing while it runs)",
+            flush=True,
+        )
     planning = time.perf_counter()
     try:
         tables = [first.plan_table(later)] + [session.resolve().table() for session in later]
@@ -430,11 +435,11 @@ def main(argv=None) -> int:
     for (session, prompt_sets), table, claim in zip(runs, tables, claims):
         print()
         print(table)
-        if args.check_kernels:  # the kernel table, first part: from the plan alone, before the load
+        if session.check_kernels:  # the kernel table, first part: from the plan alone, before the load
             print(census.table(session.plan, claim))
         session.load()
         print(f"{TAG} {session.stages.line()}")
-        if args.check_kernels:  # second part: what the entries, now built, state about their launches
+        if session.check_kernels:  # second part: what the entries, now built, state about their launches
             print(census.stated(session.plan))
         for index, (prompts, seconds) in enumerate(prompt_sets):
             if index:  # a session keeps nothing between two prompt sets
@@ -453,10 +458,9 @@ def main(argv=None) -> int:
                 tie_out,
                 check=args.stack != "reference",
                 checked_steps=CHECKED_STEPS if real else None,
-                kernels=args.check_kernels,
             )
             passed, judged = passed and ok, judged + blocks_judged
-            if args.check_kernels:
+            if session.check_kernels:
                 unobserved = unobserved or session.traced.unobserved
                 censuses.append({"sequences": session.sequences, "prompt": index, **session.traced.dump()})
             for ids in produced:

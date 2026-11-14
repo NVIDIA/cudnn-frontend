@@ -75,11 +75,22 @@ that follow. It claims no number.
 `--stack native` is defined by a kernel set, not by what is installed: the target kernel set of this model's decode
 step, the kernels a specialised decode path launches for it, block by block. The set is checked in as data,
 `model_samples/qwen_dense/kernel_census.json`: per block call of a step the kernel, the form it is called in, and per GPU
-class, SM count and row count the launch shape that was recorded for it. For the plain step of the 64-layer model that is
-484 launches. A statement about this stack is three numbers, never one: of those 484, 210 are the target's own compiled
-kernels (the fused linear-attention step of cuDNN Frontend, library calls of FlashInfer and of cuBLASLt, a Triton kernel,
-PyTorch's gather), 273 have a cuDNN Frontend entry with byte-equal results, and 1 is an operation that lives inside a
-serving engine and gets a declared stand-in.
+class, SM count and row count the launch shape that was recorded for it, with the layer widths of the model it was
+recorded on. For the plain step of the 64-layer model that is 484 launches. A statement about this stack is three
+numbers, never one: of those 484, 210 are the target's own compiled kernels (the fused linear-attention step of cuDNN
+Frontend, library calls of FlashInfer and of cuBLASLt, a Triton kernel, PyTorch's gather), 273 are launches of kernels
+whose home is cuDNN Frontend -- for each of them an entry that reproduces the target kernel's results byte for byte,
+which is why a run counts them as "cuDNN Frontend entries with byte-equal results" -- and 1 is an operation that lives
+inside a serving engine and gets a declared stand-in.
+
+These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 16 today, the gate entry's.
+The other 257 (residual add + RMSNorm + quantise 129, the 8-bit in-projection 64, the MLP gate / up multiply 64) are
+not called through an entry by any stack of this sample yet: they stay on fallback rows, and each row arrives with a
+change of its own. And "byte-equal" is the entry's own record, not something this sample measures: the comparison of an
+entry's bytes with the target kernel's is made when the entry is written and needs the target's kernel. The census
+file says for each entry a stack calls where that comparison stands and on which GPU class it was made (`tie_out`,
+`differences`); for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0. What this
+sample holds an entry to is its documented numerics contract (the band of its row) and its launch facts.
 
 The stack is built block by block. A block whose target kernel is not served here yet stays on the fallback row it has in
 `fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today two entries are on their target forms:
@@ -95,12 +106,17 @@ The stack is built block by block. A block whose target kernel is not served her
 So a run with a checkpoint prints under its kernel table:
 
 ```text
-the target kernel set of a step of this model, when a stack reproduces all of it: 484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
+the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
 kernel identity, as planned: 65 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 16 cuDNN Frontend entries with byte-equal results); not yet: add_norm_quantize 129, projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
 ```
 
 and with its checks the census line, `target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12): NOT CLAIMED (fallback
-rows present; ...)`. The default run on the two-layer model counts 3 of 20.
+rows present; ...); 65 launches of a step compared by launch shape (49 the target's own compiled kernels + 16 cuDNN
+Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded one`. The default run on the
+two-layer model counts 3 of 20 (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results;
+the declared stand-in not yet). The line always says what was compared: `EQUAL`, once a class is claimed, carries the
+number of launches that were held to a recorded launch shape and the number held by membership alone (a kernel a
+library's tuner selects, a stand-in), so it never stands for a comparison that was not made.
 
 **Nothing is claimed yet.** A GPU class is claimed only when its section of the census says so, and that needs every
 block of a step on its target kernel, a census recorded on that compute capability and SM count, and the package versions
@@ -108,9 +124,11 @@ of the record. Until then the line reads `NOT CLAIMED` with every reason that ap
 (`not the target set: <block> selected by --provider`), fallback rows present, a kernel of the target the plan has no
 block for, no recorded section for this compute capability and SM count (the line names both) or for this row count,
 versions other than the recorded ones. The census file has one section today: compute capability 10.0 with 148 SMs, at
-1 row, recorded on 2026-11-12. On another GPU class, another SM count or another sequence count a run says `kernel
-identity: not stated for this run`: the kernels of the target are recorded per class and are never copied from one class
-to another.
+1 row, for the layer widths of the published 27B-class model, recorded on 2026-11-12. On another GPU class, another SM
+count, another sequence count or a checkpoint of the family with other layer widths a run says `kernel identity: not
+stated for this run` and names what differs: the kernels of the target are recorded per class, row count and model, and
+are never copied from one to another. The reduced default model keeps the published widths, so the section holds for it;
+the launch shape of the output head is recorded with the vocabulary as well and will hold for that vocabulary only.
 
 **What is checked already**, in every run of this stack (its kernel check cannot be switched off), for every launch on a
 target kernel: the provider row's form is the census's form of that kernel and the entry's own form, compared on the
@@ -141,10 +159,10 @@ line of every run names the PyTorch version as other than the recorded 2.14.0):
 
 | run | result |
 |---|---|
-| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 460 kernel launches and 37 copies; 3 are judged one by one. At 1 sequence the gather, the fused step and the gate have the recorded launch shapes; at 4 no identity is stated. The gate entry was inside its band with every byte the code of the nearest bf16 value (350,208 bytes at 1 sequence, 1,400,832 at 4), and equal alone and among 4 |
-| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 65 launches of every one of the 32 traced steps on target kernels, in the wiring order (the gather, then three fused steps and one gate, 16 times), each in the recorded launch shape; 11,574 kernel launches and 968 copies per traced step in all. Replay held; 7 of 7 provider blocks inside their bands; the gate entry over 256 calls with all of its 1,572,864 bytes the code of the nearest bf16 value; the token line reported |
+| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 460 kernel launches and 37 copies; 3 are judged one by one. At 1 sequence the gather, the fused step and the gate (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The gate entry was inside its band with every byte the code of the nearest bf16 value (350,208 bytes at 1 sequence, 1,400,832 at 4), and equal alone and among 4 |
+| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 65 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 16 of a cuDNN Frontend entry with byte-equal results; the declared stand-in has no block yet), in the wiring order (the gather, then three fused steps and one gate, 16 times), each in the recorded launch shape; 11,574 kernel launches and 968 copies per traced step in all. Replay held; 7 of 7 provider blocks inside their bands; the gate entry over 256 calls with all of its 1,572,864 bytes the code of the nearest bf16 value; the token line reported |
 | the default run, `--stack fe-entries` | `[00] PASS`, the same lines; also as the L0 cell of the area's GPU test |
-| `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 2 remaining target launches in the recorded shape |
+| `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 2 remaining target launches (1 the target's own compiled kernel + 1 of a cuDNN Frontend entry with byte-equal results) in the recorded shape |
 
 The fused step has the same launch shape in both of its forms, grid (96, 1, 1), block (256, 1, 1), 42,112 B at 1 row:
 that it waits and releases shows in its symbol and in its form, not in a launch record. The stack has not run on
@@ -184,8 +202,11 @@ another architecture or in other storage formats is a `SKIP` that names the firs
 
 What happens, in order: the tokenizer, the template and the shard headers are read (no weights); every prompt is rendered
 and encoded; the plan is resolved and printed with the memory the run needs, and a GPU with less free memory is a `SKIP`
-with exit code 0 before a tensor is read; then the weights are read, merged (query, key and value; `qkv` and `z`; the
-beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, the fused step is compiled, and each prompt
+with exit code 0 before a tensor is read. As part of the plan every cuDNN Frontend entry of the stack builds its kernel
+for the run's sequence counts on scratch operands: an entry asks what it needs of the installed toolchain where it
+builds, so a CuTe DSL that cannot build for the GPU is a `SKIP` in the entry's own words here, not an error after the
+weights are read. Then the weights are read, merged (query, key and value; `qkv` and `z`; the
+beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, each entry's kernel is launched once, and each prompt
 is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
 printed; reasoning the model writes before its answer is part of that text.
 
@@ -432,6 +453,7 @@ prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
 6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
-Blackwell GPU: about 5 s to draw the weights, about a second to compile the fused step for the first sequence count (0.5
-to 2.4 s in the runs so far) and 0.3 to 0.4 s for the next, the rest for the decode and its checks. These are orientation
-values of single runs, not measurements of record.
+Blackwell GPU: a few seconds to plan, which includes building the entries' kernels for both sequence counts (3.6 s in
+the one run of `native` since that build became part of the plan; built after the load, the fused step's kernel took
+0.5 to 2.4 s for the first sequence count and 0.3 to 0.4 s for the next), about 5 s to draw the weights, the rest for
+the decode and its checks. These are orientation values of single runs, not measurements of record.

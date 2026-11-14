@@ -139,7 +139,8 @@ def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
     twice); ``other`` is the bf16 value on the other side of the quotient (``nearest`` itself where the quotient is a bf16
     value); ``margin`` is the distance of the quotient from the midpoint of the two, in fp32 units of the quotient (+inf
     where it is a bf16 value).  A kernel that forms the same quotient in fp32 rounds to ``nearest`` wherever the margin
-    exceeds its own fp32 error, and to one of the two everywhere."""
+    exceeds its own fp32 error, and to one of the two everywhere.  The exponential is formed as the kernel forms it: where
+    it overflows fp32 it is +inf and the gated value +-0, whatever ``acc`` could still represent."""
     exponential = torch.exp(-gate.to(acc))
     exponential = torch.where(exponential > FP32_MAX, torch.full_like(exponential, float("inf")), exponential)
     t = o.to(acc) / (1.0 + exponential)
@@ -153,8 +154,9 @@ def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
     oa = other.to(acc)
     exact = t == va
     to_v, to_other = (t - va).abs(), (t - oa).abs()
-    tie = (to_v == to_other) & ~exact  # the quotient on the midpoint at the resolution of ``acc``: nearest-even decides
-    nearest = torch.where(exact | (to_v < to_other) | (tie & ((bits & 1) == 0)), v, other)
+    # ``v`` unless the other end is strictly nearer.  A quotient ON the midpoint is exact in fp32, so the cast above has
+    # already rounded it to the even end: at equal distances ``v`` is the nearest-even value
+    nearest = torch.where(exact | (to_v <= to_other), v, other)
     exponent = torch.frexp(t.abs()).exponent.clamp(min=-125)
     unit = torch.pow(torch.tensor(2.0, dtype=acc, device=t.device), (exponent - 24).to(acc))  # one fp32 unit of the quotient
     margin = torch.where(exact, torch.full_like(t, float("inf")), (t - (va + oa) * 0.5).abs() / unit)

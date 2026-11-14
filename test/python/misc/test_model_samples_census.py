@@ -49,6 +49,16 @@ GATE_SHAPE = ((3, 1, 1), (256, 1, 1), 0)
 GATHER_SHAPE = ((40, 1, 1), (128, 1, 1), 0)
 RECORDED = {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"}  # installed versions equal to the census's recorded ones
 CENSUS = "target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12)"
+#: what the census line says was compared when the gather, the fused step and the gate of the two-layer model held: three numbers
+COMPARED_3 = (
+    "3 launches of a step compared by launch shape (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results "
+    "+ 0 declared stand-ins)"
+)
+COMPARED_2 = (
+    "2 launches of a step compared by launch shape (2 the target's own compiled kernels + 0 cuDNN Frontend entries with byte-equal results "
+    "+ 0 declared stand-ins)"
+)
+WHOLE = "the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): "
 GATHER = "void at::native::(anonymous namespace)::indexSelectSmallIndex<BFloat16, int, unsigned int, 2, 2, -2>(at::cuda::detail::TensorInfo<...>)"
 ELEMENTWISE = "void at::native::vectorized_elementwise_kernel<2, at::native::CUDAFunctorOnSelf_add<double>, std::array<char*, 2ul> >(int, ...)"
 ARGMAX = "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<BFloat16, at::native::ArgMaxOps<BFloat16>, unsigned int, long, 4, 4> >(...)"
@@ -766,6 +776,20 @@ def _tiny_model():
     return QwenDense(geometry, reductions=("tiny geometry",))
 
 
+def _census_of(model):
+    """The family's census with its one section re-stated for the layer widths of ``model``: the stand-in providers of this
+    module launch the recorded shapes whatever the widths, so a run of the tiny geometry is a run the section holds for."""
+    import copy
+
+    from model_samples import census
+    from model_samples.qwen_dense import QwenDense
+
+    data = copy.deepcopy(QwenDense.target().data)
+    for section in data["configurations"]["plain"].values():
+        section["geometry"] = {name: getattr(model.geometry, name) for name in section["geometry"]}
+    return census.Target(data)
+
+
 def _tiny_session(sequences, stack="reference"):
     from model_samples import Session, TextIO
 
@@ -889,19 +913,22 @@ def _stand_ins(monkeypatch, step_launches=None, declares=None, profiler="records
     return dict(factories(), **stand_ins)
 
 
-def _recorded_run(monkeypatch, sequences=2, stack="fe-cublas", **stand_in):
+def _recorded_run(monkeypatch, sequences=2, stack="fe-cublas", check_kernels=True, **stand_in):
     """A decode of the tiny geometry on the CPU through the rows of ``stack``, on the stand-in providers and the stand-in
     profiler of :func:`_stand_ins` (``stand_in``: its options).  Returns ``(session, text, prompts)`` with the run recorded
     and the traced pass not yet made."""
     from model_samples import Session, TextIO, blocks, census
 
+    from model_samples.qwen_dense import QwenDense
+
     build = _stand_ins(monkeypatch, **stand_in)
     monkeypatch.setattr(census, "installed_versions", lambda packages: dict(RECORDED))
     model = _tiny_model()
+    monkeypatch.setattr(QwenDense, "_target", _census_of(model))
     text = TextIO.synthetic(model.geometry.vocab)
-    session = Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=16, check_kernels=True)
+    session = Session(model, text, sequences=sequences, stack=stack, device="cpu", capacity=16, check_kernels=check_kernels)
     facts = blocks.DeviceFacts((10, 0), "stated device", 148, 0, 0)
-    options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": True}
+    options = {"reference_precision": "fp64", "device": "cpu", "check_kernels": session.check_kernels}
     session.plan = blocks.plan(model.provider_table, model.regimes, facts, sequences, 1, stack, model=model, options=options, factories=build)
     session.load()
     prompts = [text.encode("ab" + str(s)) for s in range(sequences)]
@@ -945,11 +972,19 @@ def test_the_kernel_check_of_a_run_holds_on_clean_stand_ins(monkeypatch):
     assert site["block"] == "linear_attention.step" and site["instance"] == "cudnn.GdnDecodeFused #1" and site["form"] == {"PDL": False, "PDL_RELEASE": False}
     assert site["served"] == {"PDL": False, "PDL_RELEASE": False} and dumped["sites"][0]["served"] == {}, "from the call log: what the instance states"
     assert site["stated"] == {"symbols": [SYMBOL], "launch": [[96, 2, 1], [256, 1, 1], 42112]} and site["kernels"][0]["relation"] == "exact"
-    session = _recorded_run(monkeypatch)[0]
-    session.trace(4, records=False)
+    session = _recorded_run(monkeypatch, check_kernels=False)[0]
+    session.trace(4)  # the session's decision: no launch records
     quiet = tie_out.run_checks(session, prompt_tokens=3)
     assert session.traced is None and quiet.ok and quiet.kernels == "", "a pass that was not asked for launch records keeps none"
     assert not any(line.strip().startswith("kernels") for line in quiet.lines), "and the fifth check is printed only where it was asked for"
+    session = _recorded_run(monkeypatch)[0]
+    session.trace(4)
+    own = tie_out.run_checks(session, prompt_tokens=3)  # the argument left out: the session's own decision
+    assert own.ok and own.kernels == census.PASS and _line(own, "kernels").endswith("    PASS"), "a session that checks its kernels is checked unasked"
+    session = _recorded_run(monkeypatch)[0]
+    session.trace(4)
+    off = tie_out.run_checks(session, prompt_tokens=3, kernels=False)
+    assert off.ok and off.kernels == "", "a stack without a target may leave the check out"
     session = _recorded_run(monkeypatch)[0]
     session.trace(4, records=False)
     unasked = tie_out.run_checks(session, prompt_tokens=3, kernels=True)
@@ -1048,13 +1083,16 @@ def test_without_a_profiler_the_run_is_reported_and_never_a_pass(monkeypatch, ca
     session.reset(fresh=True)
     session.new_report()
     capsys.readouterr()
-    ok, judged, _ = sample._decode(session, text, StopRule(text.eos_ids, force_tokens=4), prompts, tie_out, check=True, checked_steps=None, kernels=True)
+    ok, judged, _ = sample._decode(session, text, StopRule(text.eos_ids, force_tokens=4), prompts, tie_out, check=True, checked_steps=None)
     out = capsys.readouterr().out
     assert ok and judged == 6 and session.traced.status == census.NOT_OBSERVED and session.traced.unobserved == "needs a recorded step on a CUDA device"
     assert "the tokens); the kernels of the traced steps against the plan" in out, "the line before the checks says that the kernels are checked too"
     assert "  kernels           not observed: needs a recorded step on a CUDA device    NOT OBSERVED" in out
+    # whether the kernels are checked is the session's decision, read in one place: a session that does not check them prints no line
+    session, text, prompts = _recorded_run(monkeypatch, check_kernels=False, profiler="needs a recorded step on a CUDA device")
     session.reset(fresh=True)
     session.new_report()
+    capsys.readouterr()
     ok, judged, _ = sample._decode(session, text, StopRule(text.eos_ids, force_tokens=4), prompts, tie_out, check=True, checked_steps=None)
     assert ok and "  kernels  " not in capsys.readouterr().out, "without the flag the run prints no kernel line"
 
@@ -1243,6 +1281,7 @@ def _sample_run(monkeypatch, capsys, arguments, **stand_in):
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples, "Session", session)
     monkeypatch.setattr(QwenDense, "reduced", classmethod(lambda cls, layers=None: _tiny_model()))
+    monkeypatch.setattr(QwenDense, "_target", _census_of(_tiny_model()))  # unless a caller has named another census
     paths = list(sys.path)
     spec = importlib.util.spec_from_file_location("model_sample_qwen_dense_00_decode_census_run", MODELS / "qwen_dense" / "00_decode.py")
     module = importlib.util.module_from_spec(spec)
@@ -1359,6 +1398,7 @@ def test_the_census_file_of_the_target_kernel_set():
     """The checked-in census against itself and against the model: its three numbers are the sums over its own entry lists
     for 48 + 16 layers; its entries follow the wiring of the two-layer, the four-layer and the 64-layer model; every exact
     kernel of the ``native`` rows is a kernel of the file, in the file's form."""
+    from model_samples import census
     from model_samples.qwen_dense import QwenDense, configs
 
     target = QwenDense.target()
@@ -1392,6 +1432,40 @@ def test_the_census_file_of_the_target_kernel_set():
         ), f"{block}: the form of its native row in configs.py and of {kernel_id} in the census differ; {same}"
         assert meta["entry"] == plan[block].entry, block
     assert configs.TARGET_STACKS == QwenDense.target_stacks == ("native", "fe-entries")
+    # which kernels a stack of this repository calls an entry for is said per kernel, and held here: the three numbers count
+    # the complete stack, and a reader of the file must be able to tell what exists today
+    kernels = target.data["kernels"]
+    assert {kernel_id for kernel_id, meta in kernels.items() if meta["entry"] is not None} == set(served.values())
+    assert all("entry" in meta for meta in kernels.values()), "null where no stack calls an entry for the kernel yet"
+    for kernel_id, meta in kernels.items():
+        ported = meta.get("kind") == "port" and meta["entry"] is not None
+        assert ("tie_out" in meta) == ("differences" in meta) == ported, f"{kernel_id}: a port a stack calls says where its byte equality is recorded"
+        if ported:
+            assert isinstance(meta["tie_out"], str) and "is not a test of this repository" in meta["tie_out"] and meta["differences"], kernel_id
+            for path in ("docs/operations/attention/gate_quant_decode.md", "test/python/attention_gate/frost"):
+                assert path in meta["tie_out"] and (MODELS.parents[1] / path).exists(), f"{kernel_id}: what the repository holds for the entry"
+    assert [kernel_id for kernel_id, meta in kernels.items() if meta.get("kind") == "port" and meta["entry"] is None] == [
+        "add_norm_quant",
+        "fp8_projection",
+        "swiglu_fp4",
+    ], "the ports no stack calls yet: 257 of the 273 launches"
+    readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split())
+    for sentence in (
+        "These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 16 today, the gate entry's.",
+        'And "byte-equal" is the entry\'s own record, not something this sample measures',
+        "for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0",
+    ):
+        assert sentence in readme, sentence
+    about = " ".join(target.data["about"])
+    assert "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file" in about
+    assert "They count what a complete stack launches" in about
+    # every target kernel of the section but a tuner's pick has its launch shape: the section can be claimed without further data
+    for key, section in sections.items():
+        for rows, parts in section["rows"].items():
+            for block, kernel_id, facts in target.sequence(parts, QwenDense().geometry.layer_kinds):
+                free = kernels[kernel_id]["relation"] == "stand-in" or "selection" in kernels[kernel_id]
+                assert ("launch" in facts) != free, f"{key}, {rows} rows: {block} ({kernel_id})"
+                assert set(facts) <= set(census.ENTRY_FACTS), block
 
 
 def test_the_identity_of_every_block_call_and_the_three_numbers():
@@ -1419,9 +1493,8 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert sum(numbers["not_yet"].values()) + 49 + 16 + 1 == 484 and numbers["stand_ins_not_yet"] == ["output_head.quantize"]
     whole, reached = claim.coverage()
     assert whole == (
-        "the target kernel set of a step of this model, when a stack reproduces all of it: 484 launches per step = 210 the target's own compiled kernels "
-        "+ 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
-    )
+        WHOLE + "484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
+    ), "the three numbers of the complete stack, said to be that: the 273 are not all launched by a stack today"
     assert reached == (
         "kernel identity, as planned: 65 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 16 cuDNN Frontend entries "
         "with byte-equal results); not yet: add_norm_quantize 129, projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, "
@@ -1445,6 +1518,8 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         "with byte-equal results); not yet: add_norm_quantize 5, "
     )
     kinds = {block: (identity.relation, identity.kind) for block, identity in zip(claim.blocks, claim.identities)}
+    for block in ("linear_attention.step", "attention.gate_quantize"):  # the class their target forms ran on: a run of 2 or more sequences gates them
+        assert plan.rows[block].batch_invariant == ("cc10.0",), f"{block}: batch invariance of its native row is a gate on compute capability 10.0"
     assert kinds["embedding"] == kinds["linear_attention.step"] == ("target", "code") and kinds["attention.gate_quantize"] == ("target", "port")
     assert kinds["token_choice"] == ("host", "") and kinds["mlp.down"] == ("not yet", "code") and kinds["add_norm_quantize"] == ("not yet", "port")
     table = census.table(plan, claim).splitlines()
@@ -1506,7 +1581,8 @@ def test_every_reason_a_class_is_not_claimed():
     claim = target.claim(plan, model, installed=RECORDED)
     fallback, absent = "fallback rows present", "the plan has no block for output_head.quantize"
     assert claim.reasons == [fallback, absent] and claim.name == CENSUS and (claim.basis, claim.claimed, claim.rows) == ("recorded", False, 1)
-    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); the 3 target launches of a step have the recorded launch shape"
+    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); {COMPARED_3}: each in the recorded one"
+    assert claim.compared() == (3, COMPARED_3, 0), "what item 7 compares: a count of target launches is three numbers here too"
     assert claim.line(census.NOT_OBSERVED) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); the launch shapes of its target launches were not observed"
     assert claim.line(census.FAIL) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent})", "a failed check says nothing about the recorded shapes"
     selected, model, _ = _target_plan(overrides={"linear_attention.step": "fe.gdn_decode_fused", "mlp.down": "torch_ref.linear"})
@@ -1562,6 +1638,7 @@ def _small_census(claimed=True, basis="recorded", form=None):
                     "claimed": claimed,
                     "basis": basis,
                     "recorded": {"date": "2026-11-12"},
+                    "geometry": {"hidden": 5120},
                     "rows": {
                         "1": {
                             "prologue": [["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]],
@@ -1601,7 +1678,8 @@ def _small_plan(step_row=None, overridden=()):
     }
     plan = Plan(blocks, rows, {}, DeviceFacts((10, 0), "stated device", 148, 0, 0), 1, 1, "native", None, "a test", overridden)
     model = SimpleNamespace(
-        geometry=SimpleNamespace(layer_kinds=("linear_attention",)), wiring=lambda: (("embedding", -1), ("linear_attention.step", 0), ("token_choice", -1))
+        geometry=SimpleNamespace(layer_kinds=("linear_attention",), hidden=5120, vocab=272),
+        wiring=lambda: (("embedding", -1), ("linear_attention.step", 0), ("token_choice", -1)),
     )
     return plan, model
 
@@ -1619,7 +1697,7 @@ def test_a_complete_census_is_equal_and_a_claimed_section_needs_a_recorded_basis
 
     plan, model = _small_plan()
     complete = census.Target(_small_census()).claim(plan, model, installed=RECORDED)
-    assert complete.reasons == [] and complete.claimed and complete.line(census.PASS) == f"{CENSUS}: EQUAL"
+    assert complete.reasons == [] and complete.claimed and complete.line(census.PASS) == f"{CENSUS}: EQUAL ({COMPARED_2}, 0 by membership alone)"
     assert (
         complete.line(census.FAIL) == f"{CENSUS}: NOT EQUAL (the kernel check did not hold)" and complete.line(census.NOT_OBSERVED) == f"{CENSUS}: NOT OBSERVED"
     )
@@ -1635,8 +1713,7 @@ def test_a_complete_census_is_equal_and_a_claimed_section_needs_a_recorded_basis
     planned = census.Target(_small_census(claimed=False, basis="planned")).claim(plan, model, installed=RECORDED)
     assert planned.name == "target census plain / cc 10.0 / 148 SMs (planned)" and planned.reasons == ["the census does not claim this class yet"]
     assert census.Target(_small_census()).claim(plan, model, installed={"torch": "2.15.0"}).line(census.PASS) == (
-        f"{CENSUS}: NOT CLAIMED (versions other than the recorded ones: PyTorch 2.15.0 (recorded with 2.14.0)); the 2 target launches of a step have the recorded "
-        "launch shape"
+        f"{CENSUS}: NOT CLAIMED (versions other than the recorded ones: PyTorch 2.15.0 (recorded with 2.14.0)); {COMPARED_2}: each in the recorded one"
     )
     # another form than the census's, without --provider: the table is not the target, and the line says which block
     row = plan.rows["linear_attention.step"]
@@ -1717,7 +1794,9 @@ def test_a_complete_census_is_equal_and_a_claimed_section_needs_a_recorded_basis
     ):
         census.Target(swapped).claim(plan, model, installed=RECORDED)
     longer = _small_census()
-    longer["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["after_step"].append(["embedding", "embedding_gather", {}])
+    longer["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["after_step"].append(
+        ["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]
+    )
     with pytest.raises(ValueError, match="the census does not follow this model's wiring: it has embedding after the last call of a step"):
         census.Target(longer).claim(plan, model, installed=RECORDED)
     with pytest.raises(ValueError, match="the census has no entry list for the layer kind 'full_attention'"):
@@ -1765,11 +1844,10 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
         "grid (40, 1, 1), block (128, 1, 1), shared memory 0 B"
     )
     assert clean.details()[-3:] == [
-        "the target kernel set of a step of this model, when a stack reproduces all of it: 4 launches per step = 3 the target's own compiled kernels "
-        "+ 1 cuDNN Frontend entry with byte-equal results + 0 declared stand-ins",
+        WHOLE + "4 launches per step = 3 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results + 0 declared stand-ins",
         "kernel identity, as planned: 2 of 4 launches of a step are target kernels (2 the target's own compiled kernels + 0 cuDNN Frontend entries "
         "with byte-equal results); not yet: add_norm_quantize 1, projection.fp8.out 1; 0 declared stand-ins",
-        f"{CENSUS}: NOT CLAIMED (fallback rows present); the 2 target launches of a step have the recorded launch shape",
+        f"{CENSUS}: NOT CLAIMED (fallback rows present); {COMPARED_2}: each in the recorded one",
     ]
     assert clean.dump()["target"]["not_claimed"] == ["fallback rows present"] and [site["identity"] for site in clean.dump()["sites"]] == [
         "target",
@@ -1789,6 +1867,19 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
         f"the {CENSUS} has grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B"
     ]
     assert traced.details()[-1] == f"{CENSUS}: NOT CLAIMED (fallback rows present)"
+    # ... and so for each of the three parts of a launch shape: another block, another shared memory, the grid as recorded
+    for other, text in (
+        (((96, 1, 1), (128, 1, 1), 42112), "grid (96, 1, 1), block (128, 1, 1), shared memory 42,112 B"),
+        (((96, 1, 1), (256, 1, 1), 42128), "grid (96, 1, 1), block (256, 1, 1), shared memory 42,128 B"),
+    ):
+        moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
+        status, lines = census.Traced.of(moved, [], _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge()
+        assert status == census.FAIL and lines == [
+            f"step 0: linear_attention.step (layer 0) launched gdn_decode_fused with {text}; "
+            f"the {CENSUS} has grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B"
+        ], text
+    other = ((48, 1, 1), (256, 1, 1), 42112)
+    moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
     # the gather in another shape than the recorded one: no entry states a shape for it, the census does
     step = _step()
     step[0] = step[0]._replace(grid=(80, 1, 1))
@@ -2028,6 +2119,21 @@ def test_the_gates_twin_and_its_band_on_stated_tensors():
         nearest[0, 8:10].tolist() == [1.5, 0.5] and nearest[0, 4].item() == 0.0 and nearest[0, 6].item() == 0.0
     ), "an fp32 exponential that overflows gives +-0"
     assert bool(((nearest.double() - other.double()).abs() <= 2.0 ** (torch.frexp(nearest.double().abs()).exponent.clamp(min=-125) - 8)).all()), "neighbours"
+    # the exponential of a gate below about -88.7 overflows in fp32, where the kernel forms it: the gated value is then +-0,
+    # however large the attention output.  In fp64 alone that quotient is a finite value of ordinary size
+    large = torch.tensor([3.3895e38, -3.3895e38, 448.0]).to(torch.bfloat16)
+    below = torch.tensor([-89.0, -89.0, -90.0]).to(torch.bfloat16)
+    assert bool((large.double() / (1.0 + torch.exp(-below.double()))).abs()[:2].gt(0.5).all()), "in fp64 the first two quotients are of order one"
+    zero, zero_other, zero_margin = torch_ref.gate_quotient_bracket(large, below, torch.float64)
+    assert zero.tolist() == [0.0, -0.0, 0.0] and bool((zero_margin == float("inf")).all()) and torch.equal(zero, zero_other), "the fp32 overflow, also in fp64"
+    assert torch.signbit(zero).tolist() == [False, True, False], "the sign of the attention output is kept"
+    # a quotient exactly on the midpoint of two bf16 values: half of an odd subnormal.  The nearest value is the even one of
+    # the two, the other the odd one, and the margin is zero -- either code is the kernel's own arithmetic there
+    odd = torch.tensor([1, 3, 5, 0x8001, 0x8003], dtype=torch.int32).to(torch.int16).view(torch.bfloat16)  # the bit patterns
+    halves = torch.zeros(5).to(torch.bfloat16)  # a gate of 0: the quotient is half the attention output
+    even, uneven, on_midpoint = torch_ref.gate_quotient_bracket(odd, halves, torch.float64)
+    bits = lambda values: (values.view(torch.int16).to(torch.int32) & 0xFFFF).tolist()  # noqa: E731
+    assert bits(even) == [0, 2, 2, 0x8000, 0x8002] and bits(uneven) == [1, 1, 3, 0x8001, 0x8001] and on_midpoint.tolist() == [0.0] * 5, "nearest-even"
     assert judged(kernel_chain(attn, gate), "ieee-fp32")[0].equal_bytes == codes.numel(), "an fp32-accumulated twin is the kernel's chain itself"
     other_codes, margin = twin.bracket
     twin_codes = quantize_fp8(nearest, quant.scale).codes
@@ -2106,13 +2212,13 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
     planned = lines.index(next(line for line in lines if line.startswith("kernels, planned (decided before the load")))
     assert lines[planned + 1].split()[-1] == "identity" and "stack native" in lines[planned]
-    assert lines[planned + 15].strip().startswith("the target kernel set of a step of this model, when a stack reproduces all of it: 20 launches per step = 9 ")
+    assert lines[planned + 15].strip().startswith(WHOLE + "20 launches per step = 9 ")
     reached = "kernel identity, as planned: 3 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 1 cuDNN Frontend entry with "
     assert lines[planned + 16].strip().startswith(reached + "byte-equal results); not yet: add_norm_quantize 5, ")
     (kernels,) = _kernel_lines(lines)
     assert kernels.endswith("    PASS") and "3 on exact rows, in the wiring order" in kernels
     not_claimed = f"    {CENSUS}: NOT CLAIMED (fallback rows present; the plan has no block for output_head.quantize)"
-    assert not_claimed + "; the 3 target launches of a step have the recorded launch shape" in lines
+    assert not_claimed + f"; {COMPARED_3}: each in the recorded one" in lines
     gate = next(line for line in lines if line.strip().startswith("attention.gate_quantize ") and "calls" in line)
     assert gate.endswith("[band: gate_fp8]  PASS") and "0 the code of neither" in gate, gate
     assert any(line.startswith("  blocks            7 of 7 provider blocks inside their bands") and line.endswith("PASS") for line in lines)
@@ -2147,7 +2253,8 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
     assert (
         f"    {CENSUS}: NOT CLAIMED (not the target set: linear_attention.step selected by --provider; fallback rows present; the plan has no block for "
-        "output_head.quantize); the 2 target launches of a step have the recorded launch shape"
+        "output_head.quantize); 2 launches of a step compared by launch shape (1 the target's own compiled kernel + 1 cuDNN Frontend entry with "
+        "byte-equal results + 0 declared stand-ins): each in the recorded one"
     ) in lines
     assert any("not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" in line for line in lines)
 
@@ -2163,7 +2270,8 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     unstated = "no recorded section for 2 rows on cc 10.0 / 148 SMs: recorded is 1 row"
     assert f"  kernel identity: not stated for this run ({unstated})" in lines
     assert f"    {CENSUS}: NOT CLAIMED (fallback rows present; {unstated})" in lines
-    assert any(line.startswith("  batch invariance  ") and "attention.gate_quantize equal (gated)" in line and line.endswith("PASS") for line in lines)
+    invariance = next(line for line in lines if line.startswith("  batch invariance  "))
+    assert "linear_attention.step equal (gated)" in invariance and "attention.gate_quantize equal (gated)" in invariance and invariance.endswith("PASS")
 
     # the default stack is untouched by all of this: no kernel line without the flag
     code, lines = _sample_run(monkeypatch, capsys, ["--sequences", "1"])
@@ -2242,3 +2350,353 @@ print("TABLE", "gate_quant" in table, "3 of 20" in table, claim.reasons[0])
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "ADDED []" in done.stdout and "TABLE True True fallback rows present" in done.stdout, done.stdout + done.stderr
+
+
+# ----------------------------------------------------------------------------------------------- what the review of the stack found
+def test_a_count_of_target_launches_in_the_readmes_carries_its_split():
+    """A count of target launches is three numbers, never one, wherever it stands.  In the READMEs and the guide of this
+    area every "N of the M launches of a step" -- and every count of launches "on target kernels" or of "target launches" --
+    is followed by its split into the target's own compiled kernels and cuDNN Frontend entries."""
+    import re
+
+    counts = (
+        r"\b\d+ of (?:the )?(?:484|20)\b(?! block calls)",  # of the launches of a step: the 64-layer and the two-layer model
+        r"\b\d+ launches of every one of the \d+ traced steps on target kernels",
+        r"\bthe \d+ (?:remaining )?target launch(?:es)?\b",
+    )
+    split = re.compile(r"\d+ (?:of )?the target's own compiled kernels? \+ \d+ (?:of a )?cuDNN Frontend entr(?:y|ies)|=\s*49 \+ 16\b")
+    found = 0
+    for name in ("README.md", "AGENTS.md", "qwen_dense/README.md"):
+        text = " ".join((MODELS / name).read_text().split())
+        for pattern in counts:
+            for match in re.finditer(pattern, text):
+                found += 1
+                after = text[match.start() : match.end() + 260]
+                assert split.search(after), f"{name}: {after[:120]!r} gives a count of target launches without its split"
+    assert found >= 5, "the patterns still find the counts of the READMEs"
+    area = " ".join((MODELS / "README.md").read_text().split())
+    assert "64 of the 484 launches of a step of the 64-layer model, 48 of the target's own compiled kernels + 16 of a cuDNN Frontend entry" in area
+    assert "65 of the 484" not in area, "the two entries are 64 launches; the 65th is PyTorch's gather"
+    for wrong in ("counts 3 of 20.", "(65 of the 484 launches of a step of the 64-layer model)"):  # the two sentences the review found
+        assert not split.search(wrong + " " * 10), "the rule sees a count without its split"
+
+
+def test_a_section_holds_for_the_layer_widths_it_was_recorded_with():
+    """A census section is keyed by the GPU class, the SM count, the row count -- and the layer widths of the model: a
+    checkpoint of the family with other widths has other grids (and, where an entry picks by width, other kernels).  Such
+    a run is told that no identity is stated and is held to no recorded launch shape; the reduced default model keeps the
+    published widths, so the section holds for it.  A launch shape that also depends on a field beyond the layer widths
+    (the output head's: the vocabulary) names it, and is held only for a model that shares it."""
+    import copy
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from model_samples import census
+    from model_samples.blocks import DeviceFacts, plan as make_plan
+    from model_samples.qwen_dense import Geometry, QwenDense
+
+    target = QwenDense.target()
+    section = target.data["configurations"]["plain"]["cc10.0/sm148"]
+    full = Geometry()
+    widths = ("hidden", "mlp", "la_key_heads", "la_value_heads", "la_head_dim", "attn_heads", "attn_kv_heads", "attn_head_dim")
+    assert section["geometry"] == {name: getattr(full, name) for name in widths}, "the widths every recorded launch shape of a layer depends on"
+    reduced = QwenDense.reduced(2).geometry
+    assert all(getattr(reduced, name) == getattr(full, name) for name in widths) and reduced.vocab != full.vocab, "the reduced model keeps the widths"
+    plan, model, _ = _target_plan(2)
+    assert target.claim(plan, model, installed=RECORDED).known and len(target.claim(plan, model, installed=RECORDED).recorded) == 3
+
+    stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)  # stated facts: no entry is built for these widths
+    other = QwenDense(replace(reduced, hidden=4096, la_key_heads=8, la_value_heads=32, attn_heads=16), ("other widths",))
+    planned = make_plan(other.provider_table, other.regimes, stated, 1, 1, "native", model=other, options={"device": "cpu"})
+    claim = target.claim(planned, other, installed=RECORDED)
+    reason = (
+        "no recorded section for this model's widths on cc 10.0 / 148 SMs: hidden 4096 (recorded 5120), la_key_heads 8 (recorded 16), "
+        "la_value_heads 32 (recorded 48), attn_heads 16 (recorded 24)"
+    )
+    assert not claim.known and claim.identities == [] and claim.recorded == {}, "no identity, and no recorded launch shape is held against the run"
+    assert claim.reasons == ["fallback rows present", reason]
+    assert claim.coverage() == [f"kernel identity: not stated for this run ({reason})"]
+    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED (fallback rows present; {reason})"
+    assert "identity" not in census.table(planned, claim).splitlines()[1]
+    # the launches of such a run, in the shapes its own entries state, hold: nothing of the 27B's is asked of them
+    sites = _sites()
+    grids = {"gdn_decode_fused": ((64, 1, 1), (256, 1, 1), 42112)}
+    sites[2].facts = census.Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, grids["gdn_decode_fused"])
+    step = _step(fused=(SYMBOL, grids["gdn_decode_fused"]))
+    step[0] = step[0]._replace(grid=(32, 1, 1))  # the gather of a model 4,096 wide
+    unheld = Claim = census.Claim(
+        "kernel_census.json", "plain", "cc 10.0 / 148 SMs", 1, "2026-11-12", "recorded", False, [s.block for s in sites], [], reasons=[reason]
+    )
+    assert Claim.recorded == {} and census.Traced.of(sites, [], step, 1, "", rows=1, claim=unheld).judge() == (census.PASS, [])
+    # with the wide model's row count missing as well, the widths are what is said: the model comes first
+    four = make_plan(other.provider_table, other.regimes, stated, 4, 1, "native", model=other, options={"device": "cpu"})
+    assert target.claim(four, other, installed=RECORDED).reasons == ["fallback rows present", reason]
+
+    # a launch shape recorded with one more field of the geometry: held for a model that shares it, said for one that does not
+    small_plan, small_model = _small_plan()
+    data = _small_census()
+    data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"][0][2]["at"] = {"vocab": 248320}
+    apart = census.Target(copy.deepcopy(data)).claim(small_plan, small_model, installed=RECORDED)
+    said = "no recorded launch shape of linear_attention.step for this model: vocab 272 (recorded 248320)"
+    assert apart.known and apart.reasons == [said] and apart.recorded == {0: GATHER_SHAPE} and apart.identities[1].relation == census.TARGET
+    assert apart.line(census.PASS).startswith(
+        f"{CENSUS}: NOT CLAIMED ({said}); 1 launch of a step compared by launch shape (1 the target's own compiled kernel + "
+    )
+    assert apart.line(census.PASS).endswith(": each in the recorded one; 1 more by membership alone")
+    shared = SimpleNamespace(geometry=SimpleNamespace(layer_kinds=("linear_attention",), hidden=5120, vocab=248320), wiring=small_model.wiring)
+    together = census.Target(copy.deepcopy(data)).claim(small_plan, shared, installed=RECORDED)
+    assert together.reasons == [] and together.recorded == {0: GATHER_SHAPE, 1: SHAPE}
+    head = [entry for entry in section["rows"]["1"]["after_step"] if entry[0] == "output_head"]
+    assert head[0][2]["at"] == {"vocab": full.vocab}, "the output head's launch shape is recorded with the vocabulary"
+    # a section without its widths is no section; a claimed one names at least one
+    for change, sentence in (
+        (lambda s: s.pop("geometry"), "plain / cc10.0/sm148: a section holds geometry, the layer widths of the model it was taken on"),
+        (lambda s: s.update(geometry={"hidden": "5120"}), "plain / cc10.0/sm148: a section holds geometry, the layer widths of the model it was taken on"),
+        (lambda s: s.update(geometry={}), "plain / cc10.0/sm148: claimed without the layer widths it holds for"),
+        (lambda s: s["rows"]["1"]["layer"][0][2].update(at={"vocab": "many"}), "at of linear_attention.step is not an object of geometry fields"),
+    ):
+        lacking = _small_census()
+        change(lacking["configurations"]["plain"]["cc10.0/sm148"])
+        with pytest.raises(ValueError) as refused:
+            census.Target(lacking)
+        assert str(refused.value).startswith("kernel_census.json: ") and sentence in str(refused.value), sentence
+
+
+def test_the_checks_of_a_target_stack_look_at_its_kernels_unasked(monkeypatch):
+    """Whether a run checks its kernels is the session's decision, read in one place.  A caller that follows the helper API
+    -- ``Session(stack="native")``, ``trace``, ``run_checks`` -- without naming the kernel check gets it: the kernels line
+    is printed and a launch under another symbol than the entry's fails the run.  The check of such a stack cannot be
+    switched off."""
+    from model_samples import census, tie_out
+
+    other_form = [(SYMBOL, ((96, 1, 1), (256, 1, 1), 42112))]  # the symbol of the form WITHOUT wait and release; the entry states the target's
+
+    def run(**stand_in):
+        session = _recorded_run(monkeypatch, sequences=1, stack="native", check_kernels=False, **stand_in)[0]
+        assert session.check_kernels is True, "a stack that declares a target kernel set checks its kernels, whatever it was told"
+        session.trace(4)  # no argument: the session's decision
+        return session
+
+    checks = tie_out.run_checks(run(step_launches=other_form), prompt_tokens=3)  # as the next script of this stack would call it
+    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
+    assert _line(checks, "kernels ").endswith("    FAIL")
+    (sentence,) = [line.strip() for line in checks.lines if line.strip().startswith("kernels: step 0")]
+    assert f"linear_attention.step (layer 0) launched {SYMBOL!r}; cudnn.GdnDecodeFused names {TARGET_SYMBOL!r} for this run" in sentence
+    held = tie_out.run_checks(run(), prompt_tokens=3)
+    assert held.ok and held.kernels == census.PASS and _line(held, "kernels ").endswith("    PASS"), held.text()
+    assert any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_3 in line for line in held.lines), "and the census line with what was compared"
+    with pytest.raises(ValueError, match=r"^stack native declares a target kernel set: its kernel check cannot be switched off$"):
+        tie_out.run_checks(run(), prompt_tokens=3, kernels=False)
+
+
+def test_equal_says_what_was_compared_and_a_file_that_records_less_is_refused():
+    """``EQUAL`` never stands for a comparison that was not made.  A section that says ``claimed`` records the launch shape
+    of every target kernel -- only a kernel a library's tuner selects and a stand-in have none; an entry with a fact the
+    reader does not know (a misspelt ``launch``) or with a ``launch`` that is no launch shape is refused in every section;
+    and the census line says how many launches of a step were compared by launch shape, as three numbers, and how many
+    by membership alone."""
+    from model_samples import census
+
+    plan, model = _small_plan()
+
+    def step_facts(data):
+        return data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]["layer"][0][2]
+
+    def refused(data):
+        with pytest.raises(ValueError) as error:
+            census.Target(data)
+        assert str(error.value).startswith("kernel_census.json: plain / cc10.0/sm148, 1 rows, layer: "), str(error.value)
+        return str(error.value).split("layer: ", 1)[1]
+
+    bare = _small_census()
+    step_facts(bare).pop("launch")
+    assert refused(bare) == (
+        "claimed without the launch shape of linear_attention.step (gdn_decode_fused); only a kernel a library's tuner selects and a stand-in have none"
+    )
+    for claimed in (True, False):  # a misspelt key is a fact the reader does not know: never "nothing recorded"
+        misspelt = _small_census(claimed=claimed)
+        step_facts(misspelt)["lauch"] = step_facts(misspelt).pop("launch")
+        assert refused(misspelt) == "linear_attention.step states lauch; an entry states launch and at"
+    for bad in (
+        [[96, 1], [256, 1, 1], 42112],
+        [[96, 1, 1], [256, 1, 1]],
+        [[96, 1, 1], [256, 1, 1], "42112"],
+        [[96, 1, 1], [256, 1, 1], -1],
+        [[0, 1, 1], [256, 1, 1], 0],
+        [[96, 1, 1.0], [256, 1, 1], 0],
+        [[True, 1, 1], [256, 1, 1], 0],
+        {"grid": [96, 1, 1]},
+    ):
+        wrong = _small_census(claimed=False)
+        step_facts(wrong)["launch"] = bad
+        assert refused(wrong) == "the launch of linear_attention.step is not [grid of three, block of three, shared memory in bytes]", bad
+
+    one = "1 launch of a step compared by launch shape (1 the target's own compiled kernel + 0 cuDNN Frontend entries with byte-equal results + 0 declared stand-ins)"
+    # a section that claims nothing may record less: the launch is then held by membership alone, and the line says so
+    loose = _small_census(claimed=False)
+    step_facts(loose).pop("launch")
+    claim = census.Target(loose).claim(plan, model, installed=RECORDED)
+    assert claim.recorded == {0: GATHER_SHAPE} and claim.compared() == (1, one, 1)
+    assert (
+        claim.line(census.PASS)
+        == f"{CENSUS}: NOT CLAIMED (the census does not claim this class yet); {one}: each in the recorded one; 1 more by membership alone"
+    )
+    # a kernel a library's tuner selects, in a section that says claimed: by membership, and EQUAL carries both counts
+    tuned = _small_census()
+    tuned["kernels"]["gdn_decode_fused"]["selection"] = "the library's tuner chooses the kernel"
+    step_facts(tuned).pop("launch")
+    claim = census.Target(tuned).claim(plan, model, installed=RECORDED)
+    assert claim.reasons == [] and claim.line(census.PASS) == f"{CENSUS}: EQUAL ({one}, 1 by membership alone)"
+    complete = census.Target(_small_census()).claim(plan, model, installed=RECORDED)
+    assert complete.line(census.PASS) == f"{CENSUS}: EQUAL ({COMPARED_2}, 0 by membership alone)" and complete.compared() == (2, COMPARED_2, 0)
+    # the wrong launch under such a claim: the fused step at half the recorded grid, which its entry states too -- NOT EQUAL
+    sites = [site for site in _sites() if site.block in ("embedding", "linear_attention.step", "token_choice")]  # the calls of the small plan
+    other = ((48, 1, 1), (256, 1, 1), 42112)
+    sites[1].facts = census.Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)
+    at = _Clock()
+    step = [at(GATHER, GATHER_SHAPE), at(SYMBOL, other), at(ARGMAX), at(HOST_READ, kind="copy")]
+    assert census.compare([step], sites).ok, "without a census nothing is wrong with it"
+    traced = census.Traced.of(sites, [], step, 1, "", rows=1, claim=complete)
+    status, lines = traced.judge()
+    assert status == census.FAIL and len(lines) == 1 and f"the {CENSUS} has grid (96, 1, 1)" in lines[0], lines
+    assert traced.details()[-1] == f"{CENSUS}: NOT EQUAL (the kernel check did not hold)"
+
+
+def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
+    """An entry gates the installed toolchain where it builds its kernel.  On a device where a kernel can be built the
+    adapter makes that first use while the run is planned, on scratch operands of the run's row count: a decline is then a
+    ``NotImplementedError`` -- a SKIP before the load, in the entry's own words -- where the installation does not meet a
+    requirement the adapter can name (the part's target by cuDNN Frontend's public probe; on compute capability 10.7 the
+    CUDA 13 flavour of the CuTe DSL for the gate entry), and a ``ValueError`` -- an ERROR -- for any other decline: those
+    are the adapter's own operands, and a faulty adapter must not read as an unsupported GPU."""
+    from types import SimpleNamespace
+
+    import cudnn
+    import cudnn.frost
+    import cutlass.base_dsl.version_info as dsl_version
+
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.providers import fe
+    from model_samples.qwen_dense import QwenDense, configs
+
+    flavour = "the attention gate + quantize decode step on compute capability 10.7 requires a CuTe DSL whose compiler is CUDA 13.4 or later"
+    layout = "the fused step needs x rows contiguous with a 16-byte-multiple row stride"
+    calls = []
+
+    class Gate:
+        decline = ""
+
+        def __init__(self, device, width, cfg=None, *, pdl_release=None):
+            self.width = width
+
+        def compile(self, attn, gate, scale, out=None):
+            calls.append(("gate compile", tuple(attn.shape), str(attn.device), tuple(out.shape)))
+            if self.decline:
+                raise NotImplementedError(self.decline)
+
+        def __call__(self, attn, gate, scale, out=None):
+            calls.append(("gate launch", tuple(attn.shape)))
+            return out
+
+        def kernel_symbols_for(self, rows):
+            return (GATE_SYMBOL,)
+
+        def form_for(self, rows):
+            return {"THREADS": 256, "PDL_RELEASE": True}
+
+        def launch_shape_for(self, rows):
+            return ((3 * rows, 1, 1), (256, 1, 1), 0)
+
+    class Step:
+        decline = ""
+
+        def __init__(self, device, eps, geometry=None, **knobs):
+            pass
+
+        def compile(self, rows, *operands):
+            calls.append(("step compile", rows, tuple(operands[0].shape)))
+            if self.decline:
+                raise NotImplementedError(self.decline)
+
+        def __call__(self, rows, *operands):
+            calls.append(("step launch", rows))
+            return operands[10]
+
+        def kernel_symbols_for(self, rows):
+            return (TARGET_SYMBOL,)
+
+        def form_for(self, rows):
+            return {"PDL": True, "PDL_RELEASE": True}
+
+        def launch_shape_for(self, rows):
+            return ((96, rows, 1), (256, 1, 1), 42112)
+
+    monkeypatch.setattr(cudnn, "AttentionGateQuantDecode", Gate, raising=False)
+    monkeypatch.setattr(cudnn, "GdnDecodeFused", Step, raising=False)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
+    monkeypatch.setattr(fe, "_outside_pool", lambda device, launch: (launch(), 0)[1])
+    model = QwenDense.reduced(2)
+    options = {"device": "cpu", "check_kernels": True}
+    assert fe.EntryBlock.first_use_devices == ("cuda",), "a kernel is built for a CUDA device only"
+
+    def planned(cc=(10, 0), sequences=4, total=180 * GIB):
+        return plan(
+            model.provider_table, model.regimes, DeviceFacts(cc, "stated device", 148, total, 80 * GIB), sequences, 1, "native", model=model, options=options
+        )
+
+    planned()
+    assert calls == [], "on a host device nothing is built while the run is planned"
+    monkeypatch.setattr(fe.EntryBlock, "first_use_devices", ("cuda", "cpu"))  # this test's device: the stand-ins build nothing
+    planned(total=0)
+    assert calls == [], "nor on stated device facts"
+    table = planned()
+    assert calls == [("step compile", 4, (4, 10240)), ("gate compile", (4, 6144), "cpu", (4, 6144))], "the first use of each entry, at the run's row count"
+    del calls[:]
+    table["linear_attention.step"].compile(4, 1)
+    table["attention.gate_quantize"].compile(4, 1)
+    assert [call[0] for call in calls] == [
+        "step compile",
+        "step launch",
+        "gate compile",
+        "gate launch",
+    ], "after the load: the build again (the entry finds its kernel), one launch"
+
+    # (1) compute capability 10.7 with the CUDA 12 flavour of the CuTe DSL: the gate entry's own sentence, as a SKIP of the plan
+    monkeypatch.setattr(Gate, "decline", flavour)
+    monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=12, minor=9))
+    monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
+    with pytest.raises(NotImplementedError) as skipped:
+        planned(cc=(10, 7))
+    assert str(skipped.value) == flavour, "the entry's own words: they name the fix"
+    # (2) the same decline where the adapter can name no unmet requirement: the adapter's operands, an ERROR -- never a SKIP
+    monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=13, minor=4))
+    for cc in ((10, 7), (10, 0)):
+        with pytest.raises(ValueError) as wrong:
+            planned(cc=cc)
+        assert str(wrong.value) == f"cudnn.AttentionGateQuantDecode declined the operands this adapter built for its first use: {flavour}", cc
+    monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=12, minor=9))
+    with pytest.raises(ValueError, match=r"^cudnn.AttentionGateQuantDecode declined the operands this adapter built for its first use: "):
+        planned(cc=(10, 3))  # either flavour serves 10.0 and 10.3: there the flavour explains nothing
+    # (3) a CuTe DSL without the part's target (cuDNN Frontend's public probe): the fused step's decline is a SKIP too
+    monkeypatch.setattr(Gate, "decline", "")
+    monkeypatch.setattr(Step, "decline", "SM107 requires a CuTe DSL build supporting sm_107a; found 4.8.0 without that target")
+    monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: tuple(cc) != (10, 7))
+    with pytest.raises(NotImplementedError, match=r"^SM107 requires a CuTe DSL build supporting sm_107a"):
+        planned(cc=(10, 7))
+    # (4) a layout decline of the fused step on an installation that serves the part: the adapter's operands
+    monkeypatch.setattr(Step, "decline", layout)
+    with pytest.raises(ValueError) as wrong:
+        planned()
+    assert str(wrong.value) == f"cudnn.GdnDecodeFused declined the operands this adapter built for its first use: {layout}"
+    # (5) after the plan nothing skips: a decline at the first launch is an error of the run, and the sentence says whose it is
+    monkeypatch.setattr(Step, "decline", "")
+    table = planned()
+    monkeypatch.setattr(Step, "decline", layout)
+    with pytest.raises(RuntimeError, match=r"^cudnn.GdnDecodeFused declined the operands this adapter built for its first launch: the fused step needs"):
+        table["linear_attention.step"].compile(4, 1)
+    monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: False)
+    with pytest.raises(RuntimeError, match=r"^cudnn.GdnDecodeFused declines this installation at its first launch: the fused step needs"):
+        table["linear_attention.step"].compile(4, 1)
+    row = configs.PROVIDERS["attention.gate_quantize"][0]
+    assert row.classes == ("cc10.x",), "the row claims every compute capability 10.x: what the entry needs there beyond the class is asked at plan time"

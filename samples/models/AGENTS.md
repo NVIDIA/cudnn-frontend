@@ -22,7 +22,10 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    is an error, never a skip (a faulty adapter must not look like an unsupported GPU), and no `SKIP` can follow a check that
    ran. A test that honours a `SKIP` looks for a failed check in the output first. An entry that declines the geometry or
    the row count of a row that claims the device is an `ERROR`: a wrong table. An adapter to an entry asks it at plan
-   time, on the real device, for the launch of the run's row count.
+   time, on the real device, for the launch of the run's row count, and builds the entry's kernel for that row count on
+   scratch operands: an entry asks what it needs of the installed toolchain where it builds, not where it is
+   constructed, and that answer is a `SKIP` in the entry's own words before the load. A decline at that point which no
+   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`.
 2. **State the environment before the first load.** `check_environment()` compares the installed distribution of cuDNN
    Frontend with `cudnn.__version__`, says whether `cudnn` is an editable checkout and prints a source hash (never a path). A
    mismatch is an error that names both. It runs after the plan, so a GPU the sample does not serve still skips.
@@ -113,9 +116,15 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
     `not the target`) is decided against that file from the row's kernel and form, never written into an adapter or a
     row. A count of target launches is always given as three numbers -- the target's own compiled kernels, cuDNN
-    Frontend entries with byte-equal results, declared stand-ins -- never as one. A section is `claimed` only on a
-    `recorded` basis and only when no row selected on it is a fallback; until then a run prints `NOT CLAIMED` with every
-    reason that applies, and a section of one GPU class, SM count or row count is never used for another. A pull request
+    Frontend entries with byte-equal results, declared stand-ins -- never as one, wherever it stands: a sentence of a
+    README, a cell of a table, the line in which a run says what it compared. The three numbers of the set count what a
+    complete stack launches; a text that gives them says how many of the entries a stack calls today. Byte equality
+    with a target kernel is the entry's own record (the census names where it stands: `tie_out`, `differences`), never
+    a measurement of the sample. A section is `claimed` only on a `recorded` basis and only when no row selected on it
+    is a fallback; until then a run prints `NOT CLAIMED` with every reason that applies, and a section of one GPU
+    class, SM count, row count or set of layer widths is never used for another. `EQUAL` says what was compared: a
+    claimed section records the launch shape of every target kernel but a tuner's pick and a stand-in, and a fact the
+    reader of the file does not know is refused, never read as "nothing recorded". A pull request
     that changes a form the kernel census names updates the census in the same commit. Public text of this area calls
     it "the target kernel set" and names no product, repository or person for it.
 
@@ -275,3 +284,25 @@ Each of these passed every test of the first version; the host tests now hold th
   kernel check fails by one name only, and the name is another form of the same entry, look for an unload before the
   run before looking for a wrong launch -- and then look for the wrong launch.
 
+## What the review of the native stack taught
+
+Each of these passed every test and every GPU run of the first version; a host test now holds each.
+
+- A count given as one number was attributed wrongly in the next clause: "two entries (65 launches)" where the two
+  entries are 64 and the 65th is PyTorch's gather. The split is what makes a count checkable; a host test refuses a
+  count of target launches in the READMEs that is not followed by it.
+- "273 have an entry" was the number of the complete stack in the present tense: 257 of them were not called through
+  an entry by any stack. Say whose number it is, and how much of it exists today.
+- A record holds for what it was taken on, and the model is part of that. The census was keyed by GPU class, SM count
+  and row count; a checkpoint of the family with other layer widths was told `target` and then failed on the 27B's
+  grids. A section names the widths it holds for, and a launch shape that depends on one more field names that field.
+- A decision taken in two places is taken in neither. "A target stack always checks its kernels" held in the script,
+  which set its own flag; the helper's check function defaulted to off, so the next script of the stack would have
+  printed `PASS` for a run that never looked. The decision is the session's, and the helper reads it there.
+- `EQUAL` printed for a comparison that was not made. An entry without its launch shape, or with the key misspelt, was
+  read as "nothing recorded" and the line still said `EQUAL`. Refuse the file; print what was compared.
+- A comparison of three fields tested by varying one field holds one field. Weakening "grid, block and shared memory
+  are equal" to the grid alone left every host test green. Vary each field in a case of its own.
+- An entry gates the installed toolchain where it builds its kernel, not where it is constructed or asked for a launch
+  shape. Planned without a build, a GPU whose target the installed CuTe DSL cannot assemble passed the plan, read 55 GiB
+  of weights and ended in a traceback that blamed the adapter. The entry's first use belongs to the plan.

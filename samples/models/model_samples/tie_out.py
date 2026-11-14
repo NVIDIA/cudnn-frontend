@@ -436,17 +436,24 @@ def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
     return status, traced.unobserved if status == census.NOT_OBSERVED else "", lines
 
 
-def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False, kernels: bool = False) -> Checks:
+def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False, kernels: Optional[bool] = None) -> Checks:
     """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
     ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
 
     ``kernels`` adds the kernel check on the traced pass the session made before this call (``Session.trace`` with launch
     records): a failure fails the run; kernels that could not be observed are reported, and ``Checks.unobserved`` says why.
+    Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that declares a target
+    kernel set is checked without being asked, so no caller can print a verdict for such a run that never looked at its
+    kernels.  For such a session ``kernels=False`` is refused.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
     on how many greedy tokens the two agree.  It is a scale, printed and not gated: on a trained checkpoint with 4-bit
     activations two stacks that differ only in rounding end up tens of bf16 units apart (see the family's logits band)."""
+    if kernels is None:
+        kernels = session.check_kernels
+    elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
+        raise ValueError(f"stack {session.stack} declares a target kernel set: its kernel check cannot be switched off")
     main = session.record
     steps = min(main.count, main.inputs.shape[0])
     if max_steps is not None:

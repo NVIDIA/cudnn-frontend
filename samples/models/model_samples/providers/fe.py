@@ -28,6 +28,15 @@ form and its launch shape (the entry's ``kernel_symbols_for`` / ``form_for`` / `
 served the last call: the entry instance ``__call__`` launched and the row's fields as that instance states them.  On a real
 device an adapter asks its entry, while the run is planned, for the launch of the run's row count: an entry that declines what its row claims is a
 ``ValueError`` -- the provider table is wrong, which a sample reports as an ``ERROR``, never as a ``SKIP``.
+
+**First use is part of the plan.**  An entry gates the installed toolchain where it builds its kernel (the CuTe DSL's target
+list, on some GPU classes its compiler), not where it is constructed.  So on a CUDA device an adapter builds the kernel of
+the run's row count on scratch operands while the run is planned (``_first_use``), before anything is loaded: what the
+entry needs of the installation is then a ``SKIP`` that names the fix, in the entry's own words, and the build after the
+load finds its kernel built.  A decline at that point is the installation's only where this adapter can name a
+requirement the installation does not meet (``_unmet``: the part's target by cuDNN Frontend's public probe, and what the
+entry's page states beyond it); any other decline is of the operands this adapter built -- a ``ValueError``, an ``ERROR``
+before the load, because a faulty adapter must not read as an unsupported GPU.
 """
 
 from __future__ import annotations
@@ -151,6 +160,46 @@ class EntryBlock(BlockBase):
                 f"capability {cc[0]}.{cc[1]}), and {self.entry} declines it: {error}"
             ) from None
 
+    #: the device types on which the plan makes the entry's first use: a kernel can be built for a CUDA device only (a host
+    #: test names its own device here to run the step on a stand-in entry)
+    first_use_devices = ("cuda",)
+
+    def _scratch(self, sequences: int, tokens: int):
+        """``(entry, operands)``: the entry of this row and scratch operands in the layout a step hands it."""
+        raise NotImplementedError
+
+    def _unmet(self) -> bool:
+        """Whether the installation lacks something the entry needs on this GPU class, as far as this adapter can tell without
+        the entry: the CuTe DSL's target of the part, by cuDNN Frontend's public probe.  A subclass adds what its entry's
+        page states beyond that."""
+        from cudnn.frost import cutedsl_runtime_available
+
+        return not cutedsl_runtime_available(tuple(self.facts.cc))
+
+    def _declined(self, error, what: str) -> str:
+        """The sentence for a typed decline of the entry at ``what``: the installation's where this adapter can name an unmet
+        requirement, else the operands this adapter built."""
+        if self._unmet():
+            return f"{self.entry} declines this installation at {what}: {error}"
+        return f"{self.entry} declined the operands this adapter built for {what}: {error}"
+
+    def _first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a CUDA device: build the entry's kernel for the run's row count on scratch operands.
+        The entry gates the installed toolchain there, so its decline comes before the load: a ``NotImplementedError`` (a
+        SKIP, in the entry's own words) where the installation does not meet a requirement this adapter can name
+        (``_unmet``), a ``ValueError`` (an ERROR) for any other decline -- then the operands are this adapter's."""
+        import torch
+
+        if torch.device(self.options["device"]).type not in self.first_use_devices:
+            return
+        entry, operands = self._scratch(sequences, tokens)
+        try:
+            entry.compile(*operands)
+        except NotImplementedError as error:
+            if self._unmet():
+                raise
+            raise ValueError(self._declined(error, "its first use")) from None
+
     def serving(self):
         """What served the last call of this block: the entry instance ``__call__`` launched (its place among the entries of
         its kind in this process: one per device, geometry and form) and the fields of the row's form as THAT instance states
@@ -201,8 +250,9 @@ class GdnDecodeFusedBlock(EntryBlock):
             raise NotImplementedError(f"cudnn.GdnDecodeFused is the one-token decode step; this run has {tokens} tokens per sequence")
         if self.facts.total_bytes and "device" in self.options:
             # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP; once it is built, a row
-            # count it does not serve is a wrong table
+            # count it does not serve is a wrong table; then its first use, where it gates the installed toolchain
             self._check_claim(self._build(self.options["device"]), sequences * tokens)
+            self._first_use(sequences, tokens)
 
     def reserve_bytes(self) -> int:
         """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
@@ -229,7 +279,7 @@ class GdnDecodeFusedBlock(EntryBlock):
             _ENTRIES[key] = cudnn.GdnDecodeFused(device, eps=self.model.norm_eps, geometry=geometry, **self._arguments())
         return _ENTRIES[key]
 
-    def compile(self, sequences: int, tokens: int) -> None:
+    def _scratch(self, sequences: int, tokens: int):
         import torch
 
         g = self.model.geometry
@@ -252,13 +302,19 @@ class GdnDecodeFusedBlock(EntryBlock):
             1.0,
         )
         slot_ids = torch.arange(1, rows + 1, dtype=torch.int32, device=device)
-        entry, operands = self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots)
+        return self._build(device), self._operands(x, z, torch.zeros((rows, g.hidden), **bf16), slot_ids, params, slots)
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        import torch
+
+        device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
+        entry, operands = self._scratch(sequences, tokens)
         try:
-            entry.compile(*operands)
+            entry.compile(*operands)  # built while the run was planned (``_first_use``): the entry finds its kernel
             if rows not in _FIRST_LAUNCH:
                 _FIRST_LAUNCH[rows] = _outside_pool(device, lambda: entry(*operands))
-        except NotImplementedError as error:  # the plan found the part and the versions served: what is left is this adapter's own layout
-            raise RuntimeError(f"cudnn.GdnDecodeFused declined the operands this adapter built: {error}") from error
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
 
     @staticmethod
     def _operands(x, z, hidden, slot_ids, p, slots):
@@ -315,6 +371,18 @@ class AttentionGateQuantDecodeBlock(EntryBlock):
         self._arguments()
         if self.facts.total_bytes and "device" in self.options:
             self._check_claim(self._build(self.options["device"]), sequences * tokens)
+            self._first_use(sequences, tokens)
+
+    def _unmet(self) -> bool:
+        """Beyond the part's target: on compute capability 10.7 the entry's page asks for the CUDA 13 flavour of the CuTe DSL
+        (the CUDA 12 flavour lists the target and cannot assemble it)."""
+        if super()._unmet():
+            return True
+        if tuple(self.facts.cc) != (10, 7):
+            return False
+        from cutlass.base_dsl.version_info import CUDA_VERSION  # the compiler the installed CuTe DSL bound; the entry has imported the DSL by now
+
+        return int(CUDA_VERSION.major) < 13
 
     def _build(self, device):
         import torch
@@ -347,20 +415,22 @@ class AttentionGateQuantDecodeBlock(EntryBlock):
             self._twin = torch_ref.GateQuantizeQuotient(reference.row, self.model, self.facts, self.options)
         return self._twin
 
-    def compile(self, sequences: int, tokens: int) -> None:
+    def _scratch(self, sequences: int, tokens: int):
         import torch
 
         device = torch.device(self.options.get("device", "cuda"))
         rows, width = sequences * tokens, self._width()
-        entry = self._build(device)
         attn = torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
         out = torch.empty((rows, width), dtype=torch.float8_e4m3fn, device=device)
-        operands = (attn, torch.zeros_like(attn), self._scale(1.0, device), out)
+        return self._build(device), (attn, torch.zeros_like(attn), self._scale(1.0, device), out)
+
+    def compile(self, sequences: int, tokens: int) -> None:
+        entry, operands = self._scratch(sequences, tokens)
         try:
-            entry.compile(*operands)
+            entry.compile(*operands)  # built while the run was planned (``_first_use``): the entry finds its kernel
             entry(*operands)  # the first launch of the compiled kernel, before the first step
-        except NotImplementedError as error:  # the plan found the part and the versions served: what is left is this adapter's own layout
-            raise RuntimeError(f"cudnn.AttentionGateQuantDecode declined the operands this adapter built: {error}") from error
+        except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
+            raise RuntimeError(self._declined(error, "its first launch")) from error
 
     def __call__(self, o, gate, quant):
         import torch

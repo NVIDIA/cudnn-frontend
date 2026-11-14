@@ -14,8 +14,9 @@ out on a checkpoint from local disk, with the checkpoint's own tokenizer and cha
 stack `fe-cublas`, which is a reference path: it holds every quantised weight as a bf16 copy and issues every launch from
 Python. The second stack, `native`, is defined by a kernel set instead: the target kernel set of the model's decode step,
 checked in as a recorded kernel census, per block the kernel and the form it is called in. It is built block by block;
-today two cuDNN Frontend entries are on their target forms (65 of the 484 launches of a step of the 64-layer model) and
-every other block is still on its fallback row, printed as `not yet`. Kernels on the stored 8-bit and 4-bit formats,
+today two cuDNN Frontend entries are on their target forms: 64 of the 484 launches of a step of the 64-layer model, 48
+of the target's own compiled kernels + 16 of a cuDNN Frontend entry with byte-equal results (65 = 49 + 16 with PyTorch's
+gather; the 1 declared stand-in has no block yet). Every other block is still on its fallback row, printed as `not yet`. Kernels on the stored 8-bit and 4-bit formats,
 FlashInfer where the target has it, and a captured decode step (a step recorded once and replayed without Python between
 its launches) follow in that stack. The destination is a runnable performance reference. Until a sample reaches it, its
 README says what the sample measures and what it does not, and no README here carries a performance table: numbers are
