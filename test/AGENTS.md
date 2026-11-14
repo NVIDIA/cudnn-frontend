@@ -61,6 +61,9 @@ Moving a kernel requires checking dynamic fixture paths as well as full-path
 imports. The D256 implementation contract's `test_dynamic_kernel_fixture_paths_exist`
 checks the actual paged-kernel and service-register-release case providers;
 their deeper numerical/PTX tests may not run in a bounded smoke selection.
+Splitting an engine also updates the shared `test_mhas_v2` routing assertions
+and explicit plan pins, not only the architecture-local FROST suites. Keep
+concrete owner/body assertions so native fallback cannot count as a pass.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.

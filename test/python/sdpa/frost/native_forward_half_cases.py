@@ -241,7 +241,8 @@ api, tensors, storage = _case(int(d), int(dv), q_seq=int(q_seq))
 workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 api.compile()
 if int(q_seq) > 32 and int(d) == 256:
-    assert Path(api._k_mod.__file__).name == "prefill_d256_f16.py", api._k_mod.__file__
+    expected = "sm100/d256_f16_lookahead/kernel.py" if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else "sm107/prefill_d256_f16.py"
+    assert Path(api._k_mod.__file__).as_posix().endswith(expected), api._k_mod.__file__
 owner = api._dense_spec.owner
 if reload == "1":
     assert hasattr(owner, "_compiled_cache_raw")

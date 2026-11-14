@@ -562,23 +562,32 @@ def _exec_sdpa_on_frost(
     ``tensor_initializer`` is exec_sdpa's (a sink-value override, for one);
     ``tensor_checker`` too (an exact check on the outputs before the tolerance
     compare)."""
-    keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
-    before = [frost_routing.snapshot().get(k, 0) for k in keys]
+    engines = (engine,)
+    if engine == "sdpa_fwd_prefill_sm100" and (cfg.d_qk, cfg.d_v) == (256, 256):
+        # Exact D256 has two explicit owners. Preserve the requested main-body
+        # assertion; when no body is pinned, either concrete owner may serve.
+        owners = {"prefill_d256_f16": "sdpa_fwd_sm100_d256_lookahead",
+                  "decode_d256_f16": "sdpa_fwd_sm100_d256_swap_ab"}
+        engines = (owners[template],) if template in owners else tuple(owners.values())
+    keys = [[f"frost:{name}" for name in engines]]
+    if template:
+        keys.append([f"frost:{name}:{template}" for name in engines])
+    before = [sum(frost_routing.snapshot().get(k, 0) for k in group) for group in keys]
     # The assertion is "FROST served it": opt FROST in for the call so the placement
     # tree (sdpa/fwd/placement.py) ranks ours first even on a shard measured behind
     # the backend -- the routing, not the default winner, is under test here.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
         exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=tensor_initializer, plan_hook=plan_hook, tensor_checker=tensor_checker)
-    after  = [frost_routing.snapshot().get(k, 0) for k in keys]
+    after = [sum(frost_routing.snapshot().get(k, 0) for k in group) for group in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
     if cga is not None:
         served, got = frost_routing.LAST_PLAN
-        assert served == engine and got is not None and got.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {got}"
+        assert served in engines and got is not None and got.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {got}"
     if knobs is not None:
         served, got = frost_routing.LAST_PLAN
-        assert served == engine and got is not None, f"expected {knobs} on {engine!r}, got {served} {got}"
+        assert served in engines and got is not None, f"expected {knobs} on {engine!r}, got {served} {got}"
         for name, want in knobs.items():
             have = getattr(got, name)
             assert (bool(have) if isinstance(want, bool) else have) == want, f"expected {name}={want} on {engine!r}, got {got}"
@@ -3204,6 +3213,8 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
     want = engine_name(arch="sm107" if sm >= 107 else "sm100")
+    if sm in (100, 103) and (d_qk, d_v) == (256, 256):
+        want = "sdpa_fwd_sm100_d256_lookahead"
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
     graph.check_support()
