@@ -433,6 +433,12 @@ class SdpaGraphFacts:
     # on the raw QK^T.  A fact the capability rows gate on
     # (attn_scale_prefolded_d_shapes); attn_scale must be unset alongside it.
     attn_scale_prefolded: bool = False
+    # The GRAPH's python-only op attribute sdpa_mxfp8(causal_exclude_own_block=B):
+    # the causal bound tightened to keys j < B * floor(i / B), so every V scale
+    # block the kernel reads is fully visible to the query.  0 = off (plain
+    # causal).  A fact the capability rows gate on
+    # (causal_exclude_own_block_d_shapes); requires top-left causal, no window.
+    causal_exclude_own_block: int = 0
 
     # Epilogue gate: the three-node tail ``sdpa(virtual O_v) -> sigmoid(G) ->
     # mul(O_v, s)`` (cudnn._sdpa_tail.match_gate_tail).  A FACT, not a verdict:
@@ -1119,6 +1125,35 @@ def _as_bool_flag(value):
     return None
 
 
+def _own_block_fact(node, facts: SdpaGraphFacts) -> SdpaGraphFacts:
+    """``sdpa_mxfp8(causal_exclude_own_block=B)``: the python-only op attribute that tightens
+    the causal bound to keys ``j < B * floor(i / B)``.  Validates the request (a malformed
+    one is ``invalid``); whether an engine serves it is the rows' call (mismatch)."""
+    raw = node.params.get("causal_exclude_own_block")
+    if raw is None or (isinstance(raw, numbers.Integral) and not isinstance(raw, bool) and int(raw) == 0):
+        return facts  # 0 = plain causal, as in the kernel's TemplateParams
+    if isinstance(raw, bool) or not isinstance(raw, numbers.Integral) or int(raw) <= 0 or int(raw) & (int(raw) - 1):
+        return replace(facts, invalid=f"cudnn.sdpa_mxfp8: causal_exclude_own_block must be a positive power-of-two block size; got {raw!r}")
+    if not facts.is_mxfp8:
+        # Only sdpa_mxfp8 declares it (python_only_attrs): on another op it would be forwarded to the C++ binding.
+        return replace(facts, invalid="causal_exclude_own_block is an sdpa_mxfp8 op attribute (the MXFP8 V scale block); other SDPA ops do not take it")
+    if facts.is_backward:
+        # The backward recomputes P from the forward's O / Stats; no backward engine carries the bound.
+        return replace(facts, invalid="cudnn.sdpa_mxfp8_backward: causal_exclude_own_block is a forward-only op attribute; leave it unset")
+    # The bound is defined on top of the plain causal diagonal: query i, key j, both zero-based
+    # from the first token.  A widened band, a left window or an offset diagonal has no such block.
+    if not facts.causal or facts.right_band_widening or facts.window_left is not None:
+        return replace(
+            facts,
+            invalid="cudnn.sdpa_mxfp8: causal_exclude_own_block requires a causal mask (use_causal_mask=True or diagonal_band_right_bound=0) without a sliding window",
+        )
+    if facts.bottom_right and facts.s_q != facts.s_kv:
+        return replace(
+            facts, invalid="cudnn.sdpa_mxfp8: causal_exclude_own_block requires a top-left causal diagonal (S_q == S_kv under bottom-right alignment)"
+        )
+    return replace(facts, causal_exclude_own_block=int(raw))
+
+
 def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
     """Facts for a single-SDPA graph -- optionally followed by the epilogue-gate
     tail ``O * sigmoid(G)`` -- or None if the graph is anything else.
@@ -1136,6 +1171,9 @@ def analyze(graph: "cudnn.pygraph") -> Optional[SdpaGraphFacts]:
         facts = replace(facts, shape_overrides=True)
     if getattr(graph, "is_cuda_graph_replay_expected", False):
         facts = replace(facts, cuda_graph_replay=True)
+    if facts.invalid is not None:
+        return facts
+    facts = _own_block_fact(node, facts)
     if facts.invalid is not None:
         return facts
     # sdpa(..., softmax_precision=...) is a python-only op attribute (see

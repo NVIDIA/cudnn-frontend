@@ -424,6 +424,14 @@ def parse_args():
         help="thd only: each sequence's Q length is drawn (seeded) from [min_fill * q_seqlen, q_seqlen], its KV length "
         "scaled by kv_seqlen / q_seqlen; sequences are packed back to back. 1.0 = equal-length sequences",
     )
+    parser.add_argument(
+        "--causal_exclude_own_block",
+        default=0,
+        type=int,
+        help="mxfp8 top_left forward only: the sdpa_mxfp8 op attribute of the same name, which limits query i to keys "
+        "j < B * floor(i / B) (B = 32, the V scale block). 0 = plain causal. TFLOPS still count the plain causal mask, "
+        "so they compare directly with a plain causal run",
+    )
     return parser.parse_args()
 
 
@@ -721,6 +729,11 @@ else:
     if o_block_scale and (head_dim_qk != 128 or head_dim_vo != 128):
         exit_unsupported("block-scaled O is served by the d128 fp8 / mxfp8 kernel flavors only")
     enable_gqa = num_q_heads != num_kv_heads
+    if args.causal_exclude_own_block:
+        if args.data_type != "mxfp8" or args.attn_mask != "top_left" or args.sliding_window_size is not None:
+            raise ValueError("--causal_exclude_own_block requires --data_type mxfp8 --attn_mask top_left without a sliding window")
+        if run_bwd:
+            exit_unsupported("--causal_exclude_own_block is a forward-only op attribute (no backward engine carries the bound)")
     if args.data_type == "mxfp8":
         if not is_cudnn_fe:
             raise ValueError("mxfp8 is only supported with the 'cudnn'/'cudnn_oss'/'cudnn_auto' backends")
@@ -1001,6 +1014,7 @@ else:
                 diagonal_band_right_bound=right_bound,
                 generate_stats=True,
                 **({"sf_o": sf_o_fwd} if o_block_scale else {}),
+                **({"causal_exclude_own_block": args.causal_exclude_own_block} if args.causal_exclude_own_block else {}),
                 **({"scale_o": scale_o_fwd} if scale_o_fwd is not None else {}),
             )
         else:

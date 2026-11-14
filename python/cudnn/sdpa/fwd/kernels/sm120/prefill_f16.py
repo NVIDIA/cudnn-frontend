@@ -28,7 +28,7 @@ The kernel implements key optimizations including:
   with no per-sequence descriptors: Q/O use direct addressing and K/V bias a
   single TMA descriptor's seq coordinate
 
-Paged half-storage shared buffers:
+Paged half-storage and dense additive-bias shared buffers:
   K/V payload: producers publish through tracked copy-completion mbarriers;
     consumers wait for completion, load matrix fragments, then store a result
     depending on every fragment before arriving at the named reuse barrier.
@@ -98,7 +98,13 @@ from cudnn.sdpa.fwd.config_sm120 import (
     validate_params,
 )
 
-from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _dense_host, paged_host as _paged_host, compile_host as _compile_prepared_host
+from cudnn.sdpa.fwd.kernels.sm120 import prepared_host as _prepared_host
+
+# Module exports inspected dynamically by prepared._positional_order.
+_dense_host = _prepared_host.host
+_paged_host = _prepared_host.paged_host
+_host_bias = _prepared_host.bias_host
+_compile_prepared_host = _prepared_host.compile_host
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
@@ -640,6 +646,18 @@ class SM120FusedMultiHeadAttentionForward:
                 s_off = k_frag * 4
                 s0 = s_regs[s_off + s_reg_idx_lo]
                 s1 = s_regs[s_off + s_reg_idx_hi]
+                if cutlass.const_expr(basic_params.bias is not None):
+                    # Bias belongs to the scaled score, before either masking or softmax.
+                    # Only live logical coordinates may load from the caller's storage.
+                    k_col0 = kv_seq_idx + k_frag * 8 + 2 * (lane % 4)
+                    bias = basic_params.bias
+                    bb = cutlass.Int64(cute.math.min(basic_params.batch_idx, bias.shape[0] - 1))
+                    bh = cutlass.Int64(cute.math.min(basic_params.head_idx, bias.shape[1] - 1))
+                    qr = cutlass.Int64(q_position)
+                    if q_position < basic_params.seqlen_q and k_col0 < basic_params.seqlen_k:
+                        s0 = s0 * basic_params.score_scale + cutlass.Float32(bias[bb, bh, qr, cutlass.Int64(k_col0)])
+                    if q_position < basic_params.seqlen_q and k_col0 + 1 < basic_params.seqlen_k:
+                        s1 = s1 * basic_params.score_scale + cutlass.Float32(bias[bb, bh, qr, cutlass.Int64(k_col0 + 1)])
                 if cutlass.const_expr(in_mask_steps):
                     k_col0 = kv_seq_idx + k_frag * 8 + 2 * (lane % 4)
                     k_col1 = k_col0 + 1
@@ -664,7 +682,7 @@ class SM120FusedMultiHeadAttentionForward:
                 row_max_prev = row_max[row_half]
                 new_max = cute.arch.fmax(row_max_prev, cur_max)
                 need_correct = True
-                if cutlass.const_expr(in_mask_steps):
+                if cutlass.const_expr(in_mask_steps or basic_params.bias is not None):
                     need_correct = new_max > -cutlass.Float32.inf
                 if need_correct:
                     old_scale = cute.math.exp2(
@@ -675,7 +693,7 @@ class SM120FusedMultiHeadAttentionForward:
 
             # Compute P, accumulate the per-lane partial sum, and stage P.
             exp_max = new_max
-            if cutlass.const_expr(in_mask_steps):
+            if cutlass.const_expr(in_mask_steps or basic_params.bias is not None):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
             neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
@@ -684,11 +702,17 @@ class SM120FusedMultiHeadAttentionForward:
                 s_off = k_frag * 4
                 s0 = s_regs[s_off + s_reg_idx_lo]
                 s1 = s_regs[s_off + s_reg_idx_hi]
-                in0, in1 = fma2(
-                    (s0, s1),
-                    (softmax_scale_log2, softmax_scale_log2),
-                    (neg_exp_max_scaled, neg_exp_max_scaled),
-                )
+                if cutlass.const_expr(basic_params.bias is not None):
+                    # Subtract in natural units before converting the difference
+                    # to base 2: a finite near-FP32-max bias must stay finite.
+                    in0 = (s0 - exp_max) * softmax_scale_log2
+                    in1 = (s1 - exp_max) * softmax_scale_log2
+                else:
+                    in0, in1 = fma2(
+                        (s0, s1),
+                        (softmax_scale_log2, softmax_scale_log2),
+                        (neg_exp_max_scaled, neg_exp_max_scaled),
+                    )
                 p0 = cute.math.exp2(in0, fastmath=True)
                 p1 = cute.math.exp2(in1, fastmath=True)
                 tile_sum = tile_sum + (p0 + p1)
@@ -912,9 +936,11 @@ class SM120FusedMultiHeadAttentionForward:
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
         consume_scratch=None,
+        bias=None,
+        score_scale=None,
     ) -> cutlass.Int32:
-        """One unit of work: the (Q tile, sequence, head) triple named by the
-        last three arguments.
+        """One unit of work: the (Q tile, sequence, head) triple named by
+        q_tile_idx, batch_idx and head_idx.
 
         Split out of ``kernel`` so the persistent THD path can call it once per
         claimed unit. SMEM and the per-warp register budget belong to the CTA,
@@ -1159,6 +1185,8 @@ class SM120FusedMultiHeadAttentionForward:
                 o_regs[i] = 0.0
 
             basic_params = SimpleNamespace(
+                bias=bias,
+                score_scale=score_scale,
                 phase_base=phase_base,
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
@@ -1289,6 +1317,8 @@ class SM120FusedMultiHeadAttentionForward:
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
+                if cutlass.const_expr(bias is not None):
+                    row_max_nat = row_max[row_half]
                 if cutlass.const_expr(self.has_sink and self.split_kv == 1):
                     sinks_arr = cutlass.make_array_view(sinks)
                     _sink_head = (
@@ -1299,10 +1329,22 @@ class SM120FusedMultiHeadAttentionForward:
                     # alpha re-normalizes the loop's accumulator and sum from
                     # row_max_nat to the sink-extended max; it is 0 for a row
                     # with no visible key, so O := 0 falls out.
-                    alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
-                    new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
-                    row_sum_inv[row_half] = alpha / new_sum
-                    row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
+                    if cutlass.const_expr(bias is not None):
+                        # An infinite sink is either a zero-mass empty row or
+                        # dominates every finite attention logit. Avoid inf-inf.
+                        if sink_logit == cutlass.Float32.inf or (row_max_nat == -cutlass.Float32.inf and sink_logit == -cutlass.Float32.inf):
+                            row_sum_inv[row_half] = 0.0
+                            row_lse[row_half] = sink_logit
+                        else:
+                            alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
+                            new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
+                            row_sum_inv[row_half] = alpha / new_sum
+                            row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
+                    else:
+                        alpha = cute.math.exp(row_max_nat - new_max, fastmath=True)
+                        new_sum = row_sum[row_half] * alpha + cute.math.exp(sink_logit - new_max, fastmath=True)
+                        row_sum_inv[row_half] = alpha / new_sum
+                        row_lse[row_half] = new_max + cute.math.log(new_sum, fastmath=True)
                     if cutlass.const_expr(self.page_size > 0):
                         # Extended sink limits: +inf owns all virtual-key mass;
                         # -inf contributes none, including an empty denominator.
@@ -1461,6 +1503,8 @@ class SM120FusedMultiHeadAttentionForward:
         block_table_v,
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
+        bias=None,
+        score_scale=None,
     ) -> None:
         """SM120 FMHA prefill kernel.
 
@@ -1499,7 +1543,9 @@ class SM120FusedMultiHeadAttentionForward:
         sK = sKV
         sV = sKV.subview(self.k_tile_elems)
         consume_scratch = None
-        if cutlass.const_expr(self.page_size > 0 and k.dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
+        if cutlass.const_expr((self.page_size > 0 and k.dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)) or bias is not None):
+            # Bias arithmetic can delay the MMA consumption past the stage credit.
+            # Use the existing result-dependent stores for this arm as well as paging.
             # Keep asynchronous copy completion barriers separate from the dynamic payload.
             full_ptr = cute.arch.alloc_smem(cutlass.Int64, 2, alignment=8)
             consume_scratch = cute.arch.alloc_smem(cutlass.Int32, self.threads_compute, alignment=16)
@@ -1578,6 +1624,8 @@ class SM120FusedMultiHeadAttentionForward:
                     thd_origins=thd_origins,
                     thd_origin_specs=thd_origin_specs,
                     consume_scratch=consume_scratch,
+                    bias=bias,
+                    score_scale=score_scale,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -1654,6 +1702,8 @@ class SM120FusedMultiHeadAttentionForward:
                 thd_origins=thd_origins,
                 thd_origin_specs=thd_origin_specs,
                 consume_scratch=consume_scratch,
+                bias=bias,
+                score_scale=score_scale,
             )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1681,6 +1731,8 @@ class SM120FusedMultiHeadAttentionForward:
         block_table_v=None,
         thd_origins=None,
         thd_origin_specs: cutlass.Constexpr = None,
+        bias: Optional[cute.Tensor] = None,
+        score_scale: Optional[cutlass.Float32] = None,
     ) -> None:
         """Launch the SM120 cutlass FMHA kernel.
 
@@ -1888,6 +1940,8 @@ class SM120FusedMultiHeadAttentionForward:
             block_table_v,
             thd_origins=thd_origins,
             thd_origin_specs=thd_origin_specs,
+            bias=bias,
+            score_scale=score_scale,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -1918,6 +1972,7 @@ def compile(  # noqa: A001
     prepared: bool = True,
     persistent_ctas: int = 0,
     thd_origin_specs=None,
+    bias_dtype: Optional[str] = None,
 ) -> Callable:
     """Compile the dense/packed pointer host; geometry binds at execution."""
 
@@ -1926,6 +1981,12 @@ def compile(  # noqa: A001
         raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
     if PARAMS.page_size and not paged_head_dims_supported(d_qk, d_v):
         raise NotImplementedError("SM120 paged KV requires head dims divisible by 8 through 128")
+    if bias_dtype is not None and (
+        (d_qk, d_v) != (128, 128) or PARAMS.thd_varlen or PARAMS.page_size or PARAMS.pack_gqa or PARAMS.split_kv != 1 or thd_origin_specs is not None
+    ):
+        raise NotImplementedError("SM120 additive bias requires dense exact D128, unpaged, unsplit, unpacked prefill")
+    if bias_dtype not in (None, "float32", "io"):
+        raise ValueError("SM120 bias dtype must be float32 or io")
     kernel = SM120FusedMultiHeadAttentionForward(
         in_dtype=STORAGE_DTYPE,
         out_dtype=STORAGE_DTYPE,
@@ -1964,4 +2025,5 @@ def compile(  # noqa: A001
         thd_max_sq=sq if PARAMS.thd_varlen else 0,
         kv_dtype=KV_STORAGE_DTYPE,
         thd_origin_specs=thd_origin_specs,
+        bias_dtype=(cutlass.Float32 if bias_dtype == "float32" else STORAGE_DTYPE) if bias_dtype is not None else None,
     )

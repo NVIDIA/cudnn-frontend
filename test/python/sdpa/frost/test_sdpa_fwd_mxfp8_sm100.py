@@ -413,6 +413,8 @@ def _ref_from_sdpa(sdpa_kwargs):
     lb = sdpa_kwargs.get("diagonal_band_left_bound")
     if lb is not None:
         out["swa_window"] = lb - 1  # cuDNN length - 1
+    if sdpa_kwargs.get("causal_exclude_own_block"):
+        out["exclude_own_block"] = sdpa_kwargs["causal_exclude_own_block"]
     return out
 
 

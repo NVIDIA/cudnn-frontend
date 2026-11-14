@@ -113,6 +113,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa` / standalone FROST D64 packed THD prefill (CGA1/2, N128, unsplit, independent origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (tested configurations) | Unverified by this suite |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 
@@ -399,6 +400,7 @@ a row alone and inside a batch under the entry's own picks.
   batch schedule to the default schedule. Forward is therefore Replay only. Replay and
   committed goldens cover the generic ratio-2, generic ratio-4 overlap, and dedicated
   ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
+- `sdpa_mxfp8(causal_exclude_own_block=32)`: no determinism switch. Every plan is repeatable. PackGQA does not change a row's bytes. A split-KV plan adds its per-split partials in a fixed order, so its bytes follow the split count; the heuristics choose that count from the launch grid (on B200 only a single sequence at one or two KV heads splits), so a row keeps its bytes across batches while the plan keeps its split count. The option is forward-only: `sdpa_mxfp8_backward` refuses it, so there is no bprop row. It is served by the SM100/SM103 MXFP8 D128 kernel only; SM90 and SM107 decline it. Rows 0-31 keep no key and return O = 0 and Stats = -inf, which the tests accept as the declared sentinel.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
@@ -508,6 +510,20 @@ that cross tile boundaries, unsplit and fixed-split plans. O and FP32 Stats
 retain bytewise identity under replay, reordered/duplicated batches and changed
 neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
 this forward result does not establish a backward or cross-runtime guarantee.
+
+## SM120 D128 additive-bias forward
+
+FP16/BF16 dense D128 forward with FP32 or matching-input bias is repeatable
+and batch invariant for the tested fixed M64 dense and M128 causal plans.
+O and FP32 Stats preserve their bytes across fresh allocations, concurrent
+work, isolated/reordered/duplicated batches, changed neighbors and CUDA Graph
+replay on SM120 (cc 12.0). The M128 path also passes sustained K/V stage-refill
+stress with its result-dependent stores before stage reuse.
+
+This covers unpaged, unpacked, unsplit forward with no physical origins;
+bias backward is unsupported. SM121 execution and cross-GPU, cross-plan or
+cross-runtime bitwise identity remain unverified. The coverage report records
+both tested DSL compiler flavors and the original stress failure.
 
 ## SM120 paged SDPA
 

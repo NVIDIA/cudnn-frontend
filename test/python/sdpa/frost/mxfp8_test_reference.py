@@ -49,8 +49,12 @@ def _ref(
     seq_lens_q=None,
     seq_lens_kv=None,
     return_stats=False,
+    exclude_own_block=0,
 ):
-    """fp32 reference matching the kernel's mask + sink semantics (BHSD; GQA-aware)."""
+    """fp32 reference matching the kernel's mask + sink semantics (BHSD; GQA-aware).
+
+    ``exclude_own_block`` = B > 0 (sdpa_mxfp8(causal_exclude_own_block=B)) also masks the query's own aligned
+    B-key block: keys j >= B * floor(i / B) (rows 0 .. B-1 keep no key: O = 0, Stats = -inf)."""
     b, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = vd.shape
     dev = qd.device
@@ -71,6 +75,8 @@ def _ref(
     if is_causal:
         lim = i + diag
         masked = masked | (j > lim + right_bound)
+    if exclude_own_block:
+        masked = masked | (j >= (i // exclude_own_block) * exclude_own_block + diag)
     if swa_window is not None:
         swa_base = i + diag
         masked = masked | (j < swa_base - swa_window)

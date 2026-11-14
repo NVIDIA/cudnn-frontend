@@ -238,6 +238,15 @@ python benchmark_single_sdpa.py \
     --sdpa_backend cudnn_oss --data_type mxfp8_mxfp8 \
     --attn_mask no_mask --profile_pass fwd
 
+# cuDNN OSS FROST engine, MXFP8 causal forward that stops at the completed 32-token
+# V scale block (sdpa_mxfp8 causal_exclude_own_block=32); compare with the same
+# command without the flag. Forward only, d = 128.
+python benchmark_single_sdpa.py \
+    --batch_size 2 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 16 --num_kv_heads 16 --head_dim 128 \
+    --sdpa_backend cudnn_oss --data_type mxfp8 \
+    --attn_mask top_left --profile_pass fwd --causal_exclude_own_block 32
+
 # cuDNN Frontend, packed THD: 64 sequences of 4096-8192 tokens (seeded), causal
 python benchmark_single_sdpa.py \
     --batch_size 64 --q_seqlen 8192 --kv_seqlen 8192 \

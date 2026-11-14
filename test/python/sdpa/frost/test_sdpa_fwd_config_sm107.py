@@ -656,7 +656,7 @@ def test_index_list_fields_are_appended_with_inert_defaults():
     start = names.index("qsa_block_topk")
     assert names[start : start + 5] == index_list, "append-only: the four index-list fields + the softmax-split knob stay contiguous, in landing order"
     # Later tuning and storage fields remain appended in their landing order.
-    assert names[start + 5 :] == [
+    assert names[start + 5 : names.index("dtype_kv") + 1] == [
         "bias_mode",
         "kv_mask_form",
         "tile_n",
@@ -675,6 +675,8 @@ def test_index_list_fields_are_appended_with_inert_defaults():
     )
     d = TemplateParams()
     assert d.dtype_kv == -1  # Inherit the Q dtype unless mixed KV is requested.
+    # The sdpa_mxfp8 op attribute causal_exclude_own_block is appended after dtype_kv and defaults off.
+    assert names[names.index("dtype_kv") + 1] == "causal_exclude_own_block" and d.causal_exclude_own_block == 0
     assert (d.qsa_block_topk, d.qsa_block_size, d.qsa_include_open_block, d.qsa_list_per_sequence, d.qsa_softmax_groups) == (0, 0, True, False, 0)
 
 
