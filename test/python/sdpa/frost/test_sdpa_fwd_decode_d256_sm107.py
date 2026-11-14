@@ -214,7 +214,7 @@ def test_sm107_decode_body_matches_the_sm100_body():
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
 
     a, b = _body(sm100), _body(sm107)
-    a = [ln for ln in a if ln != "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME"]
+    a = [ln for ln in a if ln != "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME"]
     # Pin the exact SM100-only specialization before comparing the shared body.
     # Removing an arbitrary AST branch would hide edits to its zero-fill/fence.
     sm100_only = {
