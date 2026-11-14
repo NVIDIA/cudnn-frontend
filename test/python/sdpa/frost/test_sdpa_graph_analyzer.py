@@ -2723,17 +2723,26 @@ def test_paged_fp8_probe_accepts_and_declines():
         assert fp8_name in elig and engines.engine_name() not in elig
     assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
     assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == fp8_name)
+    d256_name = "sdpa_fwd_sm100_d256_fp8_single_q"
+    rows = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
     for d in (192, 224, 256):
         for hnd in (True, False):
             graph = _mk_paged_graph_fp8(d=d, hnd=hnd)
-            assert fp8_name in _eligible(graph)
-            assert engines._selected_d_shape(row, _facts(graph)) == (256, 256)
+            owner = d256_name if d == 256 else fp8_name
+            eligible = _eligible(graph)
+            assert owner in eligible
+            if d == 256:
+                assert fp8_name not in eligible
+            assert engines._selected_d_shape(rows[owner], _facts(graph)) == (256, 256)
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=225)), "FP8 head widths must be 16-aligned"
     assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
     for d in (128, 256):
         for hnd in (True, False):
-            assert fp8_name in _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
+            owner = d256_name if d == 256 else fp8_name
+            eligible = _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
+            assert owner in eligible
+            if d == 256:
+                assert fp8_name not in eligible
     for d in (64, 192, 224):
         assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=d, thd=True))
 
@@ -2775,14 +2784,20 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert "d512 kernel flavors only" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
     assert engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512)) is None
     assert "native per-tensor D128/D256 on SM100/SM103" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512, thd=True))
+    fp8_d256 = spec["sdpa_fwd_sm100_d256_fp8_single_q"].capabilities
     for cc in ((10, 0), (10, 3)):
         for d in (128, 256):
-            assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
+            facts = paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)
+            assert engines.mismatch(fp8_d256 if d == 256 else fp8, facts) is None
+            if d == 256:
+                assert "owned by the explicit implementation engines" in engines.mismatch(fp8, facts)
     assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
     fp8_d512 = spec["sdpa_fwd_sm100_d512_fp8_role_split"].capabilities
     assert "native per-tensor D128/D256" in engines.mismatch(fp8_d512, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
     # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
-    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
+    d256_facts = paged_facts(is_fp8=True, d_qk=256, d_v=256)
+    assert engines.mismatch(fp8_d256, d256_facts) is None
+    assert "owned by the explicit implementation engines" in engines.mismatch(fp8, d256_facts)
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
     assert "wired on the d64, d128, d256, d512 kernel flavors only" in engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=128))
     for d in (64, 128):
