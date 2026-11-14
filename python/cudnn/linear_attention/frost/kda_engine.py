@@ -138,7 +138,7 @@ class CompiledKda:
         from cuda.bindings.driver import CUstream
 
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, is_dv_split, piece_capacity, piece_table_layout
         from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
@@ -222,7 +222,7 @@ class CompiledKda:
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
             off_scheduler = layout.add(24)
@@ -233,7 +233,7 @@ class CompiledKda:
                 ("scheduler_all", off_scheduler, "int32", (6,)),
                 ("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -513,7 +513,7 @@ class CompiledKdaBwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, piece_capacity, piece_table_layout
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -584,7 +584,7 @@ class CompiledKdaBwd:
             enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
         self.chain = self.pieces > 0
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
         self.has_context = bool(node.params.get("input_context", False))
         self.context = (
@@ -695,7 +695,7 @@ class CompiledKdaBwd:
         if self.safe_gate and self.has_dt_bias:
             regions.append(("gate_part_dt", layout.add(self.gate_bwd_blocks * HO * K * 4), "float32", (self.gate_bwd_blocks * HO * K,)))
         if self.chain:
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             state_shape = (self.num_pieces, HO, V, K)
             regions += [
@@ -1068,7 +1068,7 @@ class CompiledKdaSummary:
     def __init__(self, node, recompute_module):
         """Resolve graph attributes and select the forward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
+        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
         from .common.split_k import WORK_ITEM_FIELDS
 
@@ -1122,7 +1122,7 @@ class CompiledKdaSummary:
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         from .kernel import kda_summary_f16 as summary_module
 
         self.fused_summary = summary_module
@@ -1137,7 +1137,7 @@ class CompiledKdaSummary:
                 ("scheduler_m", off_scheduler + 8, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (6,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -1419,7 +1419,7 @@ class CompiledKdaSummaryBwd:
     def __init__(self, node, summary_module):
         """Resolve graph attributes and select the backward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
+        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
         from .common.split_k import WORK_ITEM_FIELDS
 
@@ -1499,7 +1499,7 @@ class CompiledKdaSummaryBwd:
         self.context_size = self.context.size if self.has_context else 0
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         self.has_piece_tables = self.has_context and self.context.has_tables
         layout = WorkspaceLayout()
         regions = []
@@ -1525,7 +1525,7 @@ class CompiledKdaSummaryBwd:
                 ("scheduler_m", off_scheduler + 8, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (6,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),

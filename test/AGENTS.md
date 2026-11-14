@@ -205,6 +205,13 @@ CI may run source tests against an installed wheel while the source checkout
 contains no native extension; prepending `<checkout>/python` then fails before
 compilation. The native FP8 decode score-release probe exercises this contract.
 
+For original-versus-candidate linear-attention tests, use a separate test tree
+for each source tree. `linear_attention/conftest.py` prepends its own checkout
+to `cudnn.__path__`, so `cudnn.__file__` alone does not prove that child modules
+come from the intended baseline. Check the loaded kernel/helper paths (and
+source hashes for benchmark records); copy only the identical test harness
+into the baseline tree when a new regression must run against old production code.
+
 
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its

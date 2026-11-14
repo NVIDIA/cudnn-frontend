@@ -234,6 +234,12 @@ a row alone and inside a batch under the entry's own picks.
   other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
+  KDA's packed workspace uses a shape-only bound on the number of piece slots;
+  it preserves the per-sequence split rule and arithmetic. Compact-workspace
+  output, gradient and CP-summary byte parity is additionally checked on SM103
+  for BF16/FP16, including changed-length CUDA Graph replay. This additional
+  workspace regression has not been rerun on SM100 or SM107; their earlier
+  determinism coverage remains recorded in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

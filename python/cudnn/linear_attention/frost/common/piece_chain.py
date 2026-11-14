@@ -16,15 +16,16 @@ sequence fills slots in proportion to its length; their summaries ``H_j`` (state
 context-parallel backward fold only ``reverse`` since the backward summary's transition is ``M_buf^T`` as stored.
 ``emit_states`` stores every slot's entry state into ``X``; a fold that only needs ``tail`` turns it off and binds no ``X``.
 ``emit_summary`` also composes the running product ``summary_m`` so ``tail = seed @ summary_m + tail_zero_seed``.
-Layouts, fp32 unless stated: ``H``, ``X`` ``[num_seqs * pieces, HO, V, K]``; ``M`` ``[num_seqs * pieces, HO, K, K]``;
+Layouts, fp32 unless stated: ``H``, ``X`` ``[capacity, HO, V, K]``; ``M`` ``[capacity, HO, K, K]``;
 ``seed`` / ``tail`` ``[num_seqs, HO, V, K]`` (fp32 or bf16); ``summary_m`` ``[num_seqs, HO, K, K]``.  Slots are flat in
 sequence order: sequence ``b`` owns ``main_rows[b] // HO .. main_rows[b + 1] // HO``, its piece ``j`` being slot
 ``main_rows[b] // HO + j`` (the public summary chain without a piece table keeps the fixed grid ``b * pieces + j``).
 Empty pieces carry ``H = 0``, ``M = I`` and fall through exactly.  Piece table workspace (``piece_table_layout``):
 ``main_rows`` / ``summary_rows`` int32 ``[num_seqs + 1]`` (row bases of each sequence in the main and summary work-item
-tables, entry ``num_seqs`` the row count) and ``cu_pieces`` int32 ``[num_seqs * pieces + 1]`` in real tokens, the flat
+tables, entry ``num_seqs`` the row count) and ``cu_pieces`` int32 ``[capacity + 1]`` in real tokens, the flat
 slot starts followed by the batch end, each 16-byte aligned; the rows of a sequence's last filled piece carry
 ``final_dst`` and those of its first ``dstate_dst``, so the main kernels write ``final_state`` / ``d_initial_state`` in place.
+Capacity defaults to ``num_seqs * pieces``; length-rule KDA plans use the tighter shape-only ``piece_capacity`` bound.
 """
 
 import math
@@ -213,6 +214,20 @@ def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand
     return budget == DV_SPLIT_TILES and int(dim_v) == 128
 
 
+def piece_capacity(*, num_seqs: int, pieces: int, total_tokens: int, batch_invariant: bool) -> int:
+    """Shape-only slot capacity; independent of the per-sequence split rule.
+
+    A length-rule sequence of length ``L`` uses at most ``max(1, ceil(L / 8192))`` slots, including an empty sequence's
+    identity slot.  This is at most ``1 + floor(L / 8192)``; summing over the batch bounds the capacity by
+    ``num_seqs + floor(total_tokens / 8192)`` as well as the original ``num_seqs * pieces``.  Chunk/cadence rounding
+    can only reduce the filled count.  No sequence lengths need to be read back from the device.
+    """
+    capacity = int(num_seqs) * int(pieces)
+    if batch_invariant:
+        capacity = min(capacity, int(num_seqs) + int(total_tokens) // LENGTH_RULE_PIECE_TOKENS)
+    return capacity
+
+
 # ---- piece table ----------------------------------------------------------------------------------
 
 
@@ -228,16 +243,18 @@ class PieceTableLayout(NamedTuple):
     nbytes: int
 
 
-def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTableLayout:
+def piece_table_layout(num_seqs: int, pieces: int, heads_out: int, *, capacity: int | None = None) -> PieceTableLayout:
     """``main_rows`` / ``summary_rows`` int32 ``[num_seqs + 1]`` (each sequence's first row; entry ``num_seqs``
     is the table's row count, the ``main_count`` / ``summary_count`` region) and ``cu_pieces`` int32
-    ``[num_seqs * pieces + 1]``, each 16-aligned; 256-aligned total.  ``item_rows`` is the work-item capacity."""
+    ``[capacity + 1]``, each 16-aligned; 256-aligned total.  ``item_rows`` is the work-item capacity.  The default
+    capacity is ``num_seqs * pieces``; length-rule callers may supply the tighter ``piece_capacity`` bound."""
     num_seqs = int(num_seqs)
+    capacity = num_seqs * int(pieces) if capacity is None else int(capacity)
     rows_bytes = -(-4 * (num_seqs + 1) // 16) * 16
     cu_pieces = 2 * rows_bytes
-    cu_bytes = -(-4 * (num_seqs * int(pieces) + 1) // 16) * 16
+    cu_bytes = -(-4 * (capacity + 1) // 16) * 16
     nbytes = -(-(cu_pieces + cu_bytes) // PIECE_TABLE_ALIGN) * PIECE_TABLE_ALIGN
-    return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, num_seqs * int(pieces) * int(heads_out), nbytes)
+    return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, capacity * int(heads_out), nbytes)
 
 
 @cute.jit
@@ -319,8 +336,9 @@ def piece_table_body(
     is ``main_rows[b] // heads_out`` and ``cu_pieces[slot + j] = cu[b] + min(j * span_b, len_b)``; ``main_rows`` /
     ``summary_rows`` are the per-sequence row bases of the main table (one row per filled slot and head, slot 0 of an
     empty sequence included) and of the summary table (sequences with two or more filled slots).  The entries from the
-    batch end to ``cu_pieces[num_seqs * pieces]`` all hold the batch end, so the table stays monotone over the whole wave
-    for the consumers that size the slots from its shape.  Deterministic, no host sync."""
+    batch end to the last element of ``cu_pieces`` all hold the batch end, so the table stays monotone over its capacity
+    for the consumers that size the slots from its shape.  The length rule permits a capacity smaller than the wave
+    without changing any sequence's split.  Deterministic, no host sync."""
     num_warps = cutlass.const_expr(n_threads // 32)
     sWarpMain = cutlass.Array(cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16)
     sWarpSummary = cutlass.Array(cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16)
@@ -430,7 +448,7 @@ def piece_table_body(
     total_slots = running_main // cutlass.Int32(heads_out)
     batch_end = cutlass.Int32(mCu[num_seqs])
     tail = total_slots + tidx
-    while tail <= num_seqs * cutlass.Int32(pieces):
+    while tail < cutlass.Int32(mCuPieces.shape[0]):
         mCuPieces[tail] = batch_end
         tail = tail + cutlass.Int32(n_threads)
     if tidx == 0:
@@ -1154,11 +1172,12 @@ def build_state_chain(
 
 
 def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None, seed_indices=None, composed=None) -> None:
-    """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[num_seqs * pieces, HO, V, K]``
-    (``H`` None for a product-only chain, ``X`` None without ``emit_states``), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``,
+    """Chain ``num_seqs`` sequences: ``H`` / ``X`` fp32 ``[capacity, HO, V, K]``
+    (``H`` None for a product-only chain, ``X`` None without ``emit_states``), ``M`` fp32 ``[capacity, HO, K, K]``,
     ``seed`` / ``tail`` ``[num_seqs, HO, V, K]`` and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when
     not built), the piece table's ``main_rows`` int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in
-    sequence order), ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
+    sequence order, with capacity covering its filled slots; otherwise ``capacity = num_seqs * compiled.pieces``),
+    ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
     ``has_composed`` (the context-parallel boundary sequence's entry state)."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
     compiled.compiled(

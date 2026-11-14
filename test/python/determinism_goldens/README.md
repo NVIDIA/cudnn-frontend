@@ -205,6 +205,140 @@ For a runtime without an existing golden environment, use the standard
 parent-record/strict-compare protocol. Never record the old paths from the
 candidate merely to remove a missing-golden failure.
 
+### KDA compact batch-invariant workspace — B300, 2026-11-13–14
+
+The FROST KDA length rule preserves each document's pieces while reserving
+`min(B * P, B + total_tokens // 8192)` slots instead of `B * P`.
+Empty documents retain an identity slot; checkpoint-cadence rounding can only
+reduce the filled count. This bound depends only on declared shapes, so it
+remains valid when device lengths change during captured replay. Non-invariant
+plans and other linear-attention families keep their previous capacity.
+
+The performance table and final CP8 precision matrix use upstream
+`a9b1e43ec4071dc0ce08574b8b11d8c5a571aab8`, after #2560 was merged.
+Initial qualification used `eb99ae8c6b5d4ec95b30733e46e778731a341581`.
+Rebase preserves the new upstream non-invariant SM100 ragged schedule;
+1,152 host-choice comparisons confirm the B300 choices are unchanged.
+The additional workspace regression is measured on B300 only; SM100 and SM107
+have not been rerun for this change. Hopper code is unchanged, and no new H20
+measurement is claimed. No numerical threshold is relaxed.
+
+Real CP8 measurements use 1,048,576 packed tokens, KDA H32/K128/V128,
+BF16 Q/K/V and FP32 gates/beta/CP merge, with `batch_invariant=True` in both
+arms. The downstream benchmark contains one KDA layer and one complete CSA
+layer, both forward/backward, including ratio-4 pooling, Top-K512 selection,
+sparse attention, teacher KL, gradients, layout conversion and communication.
+It is not a whole-model or 7+1-layer measurement. One-time CPU planning and
+JIT compilation are excluded; execution is eager.
+
+Each arm/case runs in a fresh process with five warmups and 21 samples, then
+repeats with reversed baseline/candidate order. Time is the per-iteration
+slowest-rank median followed by the median of the two rounds; memory is the
+maximum across ranks, measured iterations and rounds. KDA forward/backward
+times are summed on each rank before selecting the maximum.
+
+| Global THD documents | Peak allocated GiB, old → new | Saved | KDA fwd+bwd ms, old → new | KDA change | Complete benchmark ms, old → new | Time change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 mixed, two 256K long | 142.284 → 72.812 | 48.8% | 29.614 → 29.726 | +0.38% | 417.534 → 416.818 | -0.17% |
+| 1,000 mixed, one 512K long | 114.554 → 72.882 | 36.4% | 30.769 → 30.222 | -1.78% | 470.033 → 469.371 | -0.14% |
+| 1,024 × 1K | 86.813 → 66.350 | 23.6% | 14.127 → 12.928 | -8.49% | 120.450 → 119.212 | -1.03% |
+| 20 × 1K + two 502K | 74.432 → 71.218 | 4.3% | 32.795 → 32.881 | +0.26% | 529.003 → 529.186 | +0.03% |
+| One 1M | 72.956 → 72.956 | 0.0% | 29.613 → 29.673 | +0.20% | 672.316 → 672.651 | +0.05% |
+
+K means 1,024 tokens. Peak reserved memory for these rows is respectively
+155.535→87.309, 140.527→85.332, 118.389→68.707, 88.143→81.746, 75.803→75.803 GiB. The single-document allocation is unchanged.
+These are real allocation reductions; arithmetic and dtypes are unchanged.
+
+The largest aggregate changes are **+0.38% KDA** and
+**+0.05% complete benchmark**. Every individual round also meets
+the 5% gate: maximum changes are **+0.54% KDA** and
+**+0.098% complete benchmark**. Small timing changes are
+noise-level observations, not a claim that the unchanged CSA kernel became faster.
+
+Initial qualification uses Torch 2.12.1+cu130 and cuDNN 9.20.0. CuTeDSL 4.8.0 and
+4.8.1 each pass **39 non-stress cases** under both native compiler flavors,
+CUDA 12.9 and 13.4. CUDA 12 compiler testing here is not a full CUDA 12
+framework deployment; Torch remains the cu130 build. CUDA 13 installations
+use `nvidia-cutlass-dsl[cu13]`.
+
+After rebase, **46 workspace/piece-selection cases**, **28 determinism
+cases**, both isolated 16-case native comparisons, and the complete two-round
+CP8 performance/precision matrix pass again. The 92 kernel/tile-DSL files
+are byte-identical to the earlier qualification, so the compiler, sanitizer,
+warm-stress and PTX/SASS evidence below remains attached to those exact bodies.
+The current native comparisons verify 86 baseline and 89 candidate module
+paths/hashes; both also reproduce the original upstream output bytes.
+
+The regression covers all four graph phases (forward, backward, summary,
+backward summary), BF16/FP16 with log/safe gates, K/V widths 64/128, grouped
+heads, FP32 caller checkpoints at cadence 16/64, empty and ragged documents,
+workspace canaries and changed-length/input CUDA Graph replay. A single
+symbolic prologue compilation handles varying batch/token/capacity extents,
+including 1,028 documents. Allocation/compile tripwires and sync-debug mode
+protect the prepared execute path. The capacity regression fails on the
+original full-allocation behavior.
+
+**28 existing KDA determinism cases** and **43 existing long/ragged/steep-gate
+compatibility cases** pass. Two goldens under `e9b64a40b0600a6d` are new
+runtime records made with isolated original upstream production sources and
+an independent CPU FP64 reference; the candidate reproduces both unchanged.
+No existing golden is replaced. The initial isolated original-versus-candidate comparison
+also gives raw-byte equality for **16/16 cases**, covering all output,
+gradient, state and summary-transition results, with all 86 imported source
+module paths/hashes verified. The baseline uses its own test tree: the
+linear-attention conftest otherwise prepends the candidate checkout to
+`cudnn.__path__` even when the root package appears to come from the baseline.
+
+Six CP8 full-versus-compact comparisons (the five distributions above plus
+one weak-gate single-document case) preserve every byte of KDA O, dQ, dK,
+dV, dG and dBeta on all eight ranks. This is measured coverage, not a
+cross-runtime bitwise guarantee. The unchanged CSA atomic backward is
+checked with its numerical tolerance, not claimed bitwise.
+
+Source review removed the prologue's duplicate GMEM metadata writers by
+using one CTA. It also corrected generic shared-memory barrier credits in
+prefill, recompute and summary, retained the generic-to-async proxy fences
+and warp-granular TMEM/TMA completion contracts, and ordered ticket loads
+before scheduler-slot release with `consume_then_arrive`. Beta release
+follows the dependent inverse store; the FP32 gate/prefix alias has a
+pre-store warp synchronization. No arithmetic or precision mode is changed.
+
+With Compute Sanitizer 13.4.92, Memcheck, Synccheck and Racecheck each pass
+**18 cases with zero errors/hazards**. The genuinely isolated original
+upstream Racecheck control reports 22 hazards (8 errors, 14 warnings).
+Four warm-stress cases pass 3,000 warm and 3,000 shared-memory-poisoned
+native graph executions each (**24,000 total**, zero mismatches); the unsafe
+control fails 200/200. Their deliberately two-CTA grid forces persistent
+scheduler wrapping and is not full-occupancy evidence. The actual PTX/SASS
+for 32 production kernel bodies retains all 160 scheduler release
+read-before-arrive dependencies. GMEM writer safety additionally relies on
+the single-CTA ownership proof; Racecheck alone does not establish it.
+
+Reproduce the in-repository checks from `test/python` with recording disabled:
+
+```bash
+export CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8
+python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s -k 'not warm_stress'
+python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s -k warm_stress
+python -m pytest linear_attention/frost/test_kda_determinism.py -q -s
+python -m pytest linear_attention/test_la.py -q -s -k 'kda and (long_fwd_batch_invariant_bitwise or long_bwd_batch_invariant_bitwise or long_odd_chunk_count_batch_invariant_bitwise or summary_chain_batch_invariant_length_rule_bitwise or summary_bwd_chain_batch_invariant_length_rule_bitwise or long_zero_length_sequences_pass_through or context_parallel_context_geometry or steep_summary_matches_reference or steep_fp16_inverse_range_without_normalization or steep_cuda_graph_gate_transitions or steep_channel_decay_initial_state or steep_narrow_gate_ragged_tail)'
+for tool in memcheck synccheck racecheck; do
+  compute-sanitizer --tool "$tool" --error-exitcode 99 --report-api-errors no \
+    python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s \
+    -k 'shared_stage_reuse or piece_prologue'
+done
+```
+
+The measured sanitizer environment places a task-local `ldconfig` symlink to
+`/sbin/ldconfig.real` ahead of the system shell wrapper. This avoids a child
+process injection startup failure before GPU APIs, produces identical linker
+cache output and changes no kernel filtering or validation. Initial failed
+startup logs are retained separately from the successful qualification.
+
+Compatibility, docstring, compile-cache, CUDA Graph and fence audits pass.
+Changed-file pre-commit and syntax checks pass; Fern validation has zero
+errors (the unauthenticated redirect check is skipped).
+
 ## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
 
