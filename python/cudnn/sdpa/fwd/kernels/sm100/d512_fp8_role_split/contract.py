@@ -53,6 +53,8 @@ class Geometry:
 
 
 def mismatch(facts, knobs):
+    if facts.device_cc not in ((10, 0), (10, 3)):
+        return f"requires SM100/SM103; current device is {facts.device_cc}"
     if not in_domain(facts):
         return "requires exact D512/V512 per-tensor FP8 on SM100/SM103"
     if knobs is not None:
