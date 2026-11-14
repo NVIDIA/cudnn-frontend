@@ -15,6 +15,10 @@ whether it serves the run.  Nothing is chosen at run time and nothing falls back
 The stack is explicit (``"fe-cublas"``, ``"reference"``, later ``"native"``): a row outside the requested stack is never
 selected, whatever is installed.  ``--provider BLOCK=KEY`` selects one declared row of a block for an A/B.
 
+A row also says in which FORM its entry is called (``form``: the fields of the entry's form the row fixes, which the adapter
+passes on and the kernel check compares with the entry's own answer), and a block declares the kernels it launches as census
+entries (``Block.kernels``, :mod:`model_samples.census`).
+
 This module imports nothing beyond the standard library: a plan on stated device facts (:class:`DeviceFacts`) needs no GPU.
 """
 
@@ -22,6 +26,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple, Union
+
+from .census import Kernel
 
 GIB = 1024**3
 
@@ -41,6 +47,8 @@ class ProviderRow:
     band: str = "same"  # the tie-out band against the reference block (tie_out.BANDS); never widened in place
     batch_invariant: Tuple[str, ...] = ()  # GPU classes on which "a sequence alone = the sequence in a batch" is a gate
     ci: bool = True  # False for a row that no test of this repository runs: the table prints "unverified in CI"
+    form: Tuple[Tuple[str, object], ...] = ()  # what the adapter passes to the entry: (field of the entry's form, value) pairs
+    rows: Tuple[int, Optional[int]] = (1, None)  # a third selection range: rows = sequences x tokens per sequence
 
     @property
     def stacks(self) -> Tuple[str, ...]:
@@ -50,7 +58,7 @@ class ProviderRow:
         return any(c == "any" or c == f"cc{cc[0]}.{cc[1]}" or c == f"cc{cc[0]}.x" for c in self.classes)
 
     def serves_run(self, sequences: int, tokens: int) -> bool:
-        return _inside(self.sequences, sequences) and _inside(self.tokens, tokens)
+        return _inside(self.sequences, sequences) and _inside(self.tokens, tokens) and _inside(self.rows, sequences * tokens)
 
     def classes_text(self) -> str:
         if "any" in self.classes:
@@ -96,7 +104,7 @@ class Block(Protocol):
     row: ProviderRow
     entry: str  # what is called, as printed in the table
     provider: str  # "cuDNN FE" | "cuBLAS" | "PyTorch" | ...
-    kernels: Tuple[str, ...]  # kernel names in launch order: the key of a traced pass's attribution (empty until one exists)
+    kernels: Tuple[Kernel, ...]  # the block's census entries: the kernels a call launches, or the families of a fallback row
     per_row: Tuple[int, ...]  # the operands that have one leading row per sequence
     state_args: Tuple[int, ...]  # the operands the call updates in place
 
@@ -111,6 +119,16 @@ class Block(Protocol):
 
     def first_launch(self) -> dict:
         """What the first launch of each compiled form took, measured at load."""
+
+    def serving(self) -> Tuple[str, tuple]:
+        """``(entry instance, form)`` of what served the block's last call: the line a traced step writes into its call log
+        after the call.  The form is read from the object that was called -- the fields of the row's form as that entry
+        instance states them -- and never copied from the row; a block without an entry has no instance and passed nothing."""
+
+    def launch_facts(self, rows: int):
+        """What the block's entry states about its launch at ``rows`` (``census.Facts``: the symbols of its compiled kernels, its
+        form, its launch shape), or ``None`` for a block without such an entry.  ``ValueError`` / ``NotImplementedError`` when
+        the entry declines to state them for a row count the row claims."""
 
     def __call__(self, *operands):
         """Launch the block on the current stream."""

@@ -74,7 +74,8 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
-    Only the profiler's own start and stop are reported as a missing trace; an error of a step under it propagates.
+    Only the profiler's own start and stop -- and, where launch records are asked for, the export and the read of its
+    trace -- are reported as a missing trace, in a sentence that names no path; an error of a step under it propagates.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
@@ -82,6 +83,21 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     an output file that cannot be written: each is raised as a `ValueError` whose text names the file by its own name, and
     the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
     untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
+
+15. **A kernel is declared, then observed; a name proves no form.** Every adapter declares its census entries (`kernels`,
+    `model_samples/census.py`): the kernels one call launches, as `exact` (judged one by one: name, order, count, and the
+    launch shape where the entry states one), or as the families of a `fallback` row or of the `host` path. A provider row
+    names the form its entry is called in (`form`: fields of the entry's own form), the adapter passes exactly those, and
+    the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. A row of an entry that
+    states its launch names at least one field: with none the entry runs on its own pick and nothing is compared, so
+    the check fails it. The call log of a traced step is an observation: after each call the adapter says which entry
+    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. The
+    check then holds the profiler's record of every launch of the traced steps against the plan. Where those records
+    cannot be had the run ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check
+    stays `FAIL`. A new adapter comes with its census entries, and a chain that gains an operator whose kernel no
+    pattern of `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name.
+    The host tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there
+    must fail with its own sentence, and the last line of a run is held by running `main()` to its end.
 
 ## What the first GPU run of this area taught
 
@@ -175,3 +191,38 @@ behind; the host tests hold each.
   switched on cuts or pads a prompt without a word; switch both off, and hold it with a tokenizer saved that way.
 - A command block is typed as it is written. A step that stands in a sentence elsewhere, such as fetching the checkpoint,
   is a step the reader does not take: put it in the block, in order, with what it costs.
+
+## What building the kernel check taught
+
+- A generated kernel symbol is the kernel's name and the text of its compile-time arguments, cut at a fixed length. Two
+  forms of one kernel can share a symbol, and a launch shape too: the grid, the block and the shared memory of a launch
+  do not say whether the kernel waits for its predecessor. Compare the form on the objects (the row's fields against the
+  entry's own form), and use the name and the launch shape for what they do show: whose kernel it is, and in which shape.
+- In a stack with reference chains the kernel names of a step are not the same in every step, although their number is:
+  the softmax kernel of the reference attention is instantiated by the length of the cache, and its fp64 multiplies
+  over a cache of one position are served by other kernels than over a longer one. So only the kernels of an entry are
+  judged one by one; a chain is attributed by family, and no test may assume one name sequence per step for a plan that
+  has chains.
+- The profiler's `events()` carry names and times; the grid, the block and the shared memory of a launch are in its
+  exported trace. That trace grows with the launches of a step (32 steps of the two-layer model: about 30 MB), so it
+  is read event by event and never held as a whole.
+- A copy inside a launch graph that was captured before the process's first profiler pass was seen to be replayed as a
+  kernel record, not as a copy record (PyTorch 2.14). Count a copy by either spelling, or a captured step has one more
+  kernel than the same step launched from Python.
+- A check that could not look must not read as one that looked and found nothing: a run without the profiler's records
+  is `RAN`, and the reason is in its last line.
+
+## What the review of the kernel check taught
+
+Each of these passed every test of the first version; the host tests now hold the defect that shows it.
+
+- A log line that is copied from the plan cannot disagree with the plan. The call log's form was the row's own tuple,
+  so "every logged call carries the row's form" could fail on a hand-built line only. Write the line after the call,
+  from the object that was called.
+- An empty statement compares equal to anything. A row without a form passed the form check with nothing compared
+  while its entry ran on its own pick. Fail an entry row that names no field.
+- The last line of a run is code. The verdict function and the check were each tested; that `main()` hands the reason
+  from one to the other was not, and one dropped line turned `RAN` into `PASS` with every test green. Run `main()` to
+  its last line in a host test, with stand-in providers and a stand-in profiler.
+- The text of an `OSError` carries the path of its file. A reason built from it put a temporary path into the last
+  line of a run. Say the system's words for the error number, and name a file by its own name or not at all.

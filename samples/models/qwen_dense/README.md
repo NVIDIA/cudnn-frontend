@@ -15,6 +15,7 @@ global scale). Area rules, the helper layer and the words a run uses: [../README
 python samples/models/qwen_dense/00_decode.py                          # 2 layers, 1 and 4 sequences, 32 tokens each
 python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
+python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
 
 # A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
 # with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
@@ -37,6 +38,8 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
 | `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header. `ieee-fp32` sets `torch.backends.cuda.matmul.fp32_precision` for the rest of the process, which ends with the run |
 | `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
+| `--check-kernels` | off | adds the kernel check: prints the kernel table, keeps the profiler's record of every launch of the traced steps and holds them against the plan ("The kernel check" below). Not with `--stack reference`, which checks nothing |
+| `--dump-census FILE` | -- | the launch records of the traced steps as JSON (per launch its kernel id, name, grid, block, shared memory, registers per thread), with the block calls of a step, what the entries state, and per call site the entry instance that served it and the form that instance states (`served`, beside the row's `form`), for a comparison made elsewhere; implies `--check-kernels` |
 
 A `--messages` file (the `chat.json` of the last command above), here with a system turn and the reasoning switched off:
 
@@ -233,6 +236,51 @@ The provider stack and the reference stack read the same bf16 copies of the weig
 checks above cannot see an error in either. `test/python/misc/test_model_samples_weights.py` pins them against a decode
 written from the format definitions.
 
+## The kernel check
+
+`--check-kernels` adds a fifth check to a run. The other four compare the stack with the reference; this one compares
+what was launched with what the provider table says is launched. It prints two tables and one line of `checks`:
+
+| | printed | what it says |
+|---|---|---|
+| `kernels, planned` | before the load, from the plan alone | per block the kernels one call launches (its census entries) and how each is judged |
+| `kernels, as the entries state them` | after the load | for every block that an entry of cuDNN Frontend serves: the launch shape the entry states for this run's row count (grid, block, shared memory of a thread block) and the symbol of the kernel it compiled |
+| `kernels` | with the checks | the profiler's record of every launch of the traced steps (the first 32 steps of the run, replayed) against the two |
+
+On the stack `fe-cublas` two blocks launch a kernel that is judged one by one:
+
+| block | kernel | held |
+|---|---|---|
+| linear-attention step | `gdn_decode_fused`, the kernel of `cudnn.GdnDecodeFused` | one launch per layer and step, in the wiring order; its name is the symbol the entry compiled for this run's row count; grid, block and shared memory equal the entry's own launch shape exactly; and the form the provider row names (`PDL False`, `PDL_RELEASE False`: the entry's pick per row count, launched without a wait on its predecessor and without an early release of its successor) equals the entry's own form, compared on the objects, and the entry instance that served each call of the traced steps states the same (the call log, written after each call from the object that was called) |
+| token embedding lookup | `embedding_gather`, PyTorch's index-select kernel | one launch per step, first in the step, known by its name; no launch shape is declared for it |
+
+Every other block of this stack is a fallback row: a reference chain or a multiply over a bf16 copy. What such a row
+launches is PyTorch's and cuBLAS's own choice by shape, row count and GPU, so its launches are attributed by family
+(`pytorch`, `cublas`) to the fallback rows that sit between two judged kernels in the wiring order, and their number is
+not a fact of the row. A launch that belongs to no declared family there, a kernel of an entry that no block declares,
+and a copy between two judged kernels with no fallback row between them each fail the check by name. The kernels cuBLAS
+chose are printed under the line and are not gated. The token choice is the sample's host path: listed, not compared.
+
+What the check cannot say. A kernel name does not prove a form: a generated symbol is the kernel's name followed by the
+text of its compile-time arguments, cut at a fixed length, so two forms can share a symbol and a launch shape. That is
+why the form is compared on the objects and the name only against the entry's own symbol. Registers per thread are
+recorded in `--dump-census` and compared with nothing. Nothing here is a timing.
+
+Where the profiler's launch records cannot be had (no profiler library in the environment, another profiler attached, a
+trace that cannot be exported or read, records without launch arguments), the line reads `NOT OBSERVED` with the reason
+and the run ends in `[00] RAN fe-cublas stack (kernels not observed: <reason>)` with exit code 0: its other checks
+held, the one that was asked for observed nothing. The reason names no path. A failed check is `[00] FAIL` either way.
+
+The default run with `--check-kernels` was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch
+2.13.0, CuTe DSL 4.8.0): `[00] PASS` at 1 and at 4 sequences, with the ids hash, the replay and the batch invariance of
+the run without the flag. A traced step of the two-layer model is 471 kernel launches and 40 copies there. Two are
+judged one by one: the gather, and the fused step, which the entry states and the profiler recorded as grid (96, 1, 1),
+block (256, 1, 1) and 42,112 B of shared memory at 1 row, and grid (48, 4, 1), block (256, 1, 1) and 74,848 B at 4
+rows. The other 469 are attributed by family: 16 or 17 of them are cuBLAS's, by the length of the cache, the rest
+PyTorch's. The 40 copies are the host read and copies inside the fallback rows. The check has not been run on
+another GPU class, and not with a checkpoint (where a traced step of this stack has about twelve thousand launches
+and the trace the check reads grows accordingly): a class or a model it has not run on is uncovered, not passing.
+
 ## Support per GPU class
 
 `cudnn.GdnDecodeFused` serves compute capability 10.x and 12.x and declines elsewhere; the sample then prints
@@ -242,7 +290,7 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on |
 | 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
 | 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
 | 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |

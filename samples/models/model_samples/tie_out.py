@@ -28,6 +28,12 @@ Four checks, run after the timed loop on the ids the loop produced:
    sequence ``t`` modulo the count), so every row of the batch is covered at no extra launch.  A gate for a block whose
    provider row lists the GPU class under ``batch_invariant``; a printed fact for the rest.
 
+A fifth check, asked for by the run (``run_checks(..., kernels=True)``; a sample's ``--check-kernels``), is not against the
+reference but against the plan: **kernels** -- every launch of the traced steps is held against the census entries of the
+blocks (``model_samples.census``: the form on the objects, attribution, count, order, launch record, copies).  It reads what
+the traced pass kept (``Session.traced``).  Where the profiler's records cannot be had it is neither PASS nor FAIL: the line
+says ``NOT OBSERVED`` with the reason, ``Checks.unobserved`` carries it, and a sample then ends in ``RAN``, never in ``PASS``.
+
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
@@ -68,6 +74,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from . import census
 from .loop import Session
 from .sampling import margin
 
@@ -350,6 +357,8 @@ class Checks:
     lines: List[str]
     ok: bool
     judged: int = 0  # provider blocks compared with the reference; 0: every block of the run was the reference chain itself
+    kernels: str = ""  # the kernel check, when it was asked for: PASS | FAIL | NOT OBSERVED
+    unobserved: str = ""  # why the kernels were not observed
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -359,9 +368,26 @@ def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
 
 
-def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False) -> Checks:
+def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
+    """The kernel check on what the session's traced pass kept: ``(PASS | FAIL | NOT OBSERVED, why not observed, lines)``.  A
+    session whose traced pass kept no launch records (it was not asked to) has observed nothing."""
+    traced = session.traced
+    if traced is None:
+        reason = "the traced pass kept no launch records"
+        return census.NOT_OBSERVED, reason, [f"  kernels           not observed: {reason}    {census.NOT_OBSERVED}"]
+    status, sentences = traced.judge()
+    lines = [f"  kernels           {traced.summary()}    {status}"]
+    lines += [f"    kernels: {sentence}" for sentence in sentences]
+    lines += [f"    {detail}" for detail in traced.details()]
+    return status, traced.unobserved if status == census.NOT_OBSERVED else "", lines
+
+
+def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False, kernels: bool = False) -> Checks:
     """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
     ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
+
+    ``kernels`` adds the kernel check on the traced pass the session made before this call (``Session.trace`` with launch
+    records): a failure fails the run; kernels that could not be observed are reported, and ``Checks.unobserved`` says why.
 
     ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
     reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
@@ -473,5 +499,9 @@ def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = 
         lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
+    status, unobserved = "", ""
+    if kernels:
+        status, unobserved, kernel_lines = kernel_check(session)
+        lines += kernel_lines
     session.reset(fresh=True)
-    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok, len(judged))
+    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok and status != census.FAIL, len(judged), status, unobserved)
