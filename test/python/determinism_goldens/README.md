@@ -822,6 +822,73 @@ CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_gold
   -k paged_vector_loop_determinism -q -x
 ```
 
+### SM90 CUDA KDA FP32 P — H20 validation, 2026-11-11
+
+Follow-up on **2026-11-12**: the packed 16x8 FP32 P layout and asynchronous
+shared-memory prefetch pass the same command below: **47 passed, 1 skipped,
+5 warnings in 10.60 s**. All 23 precision/determinism cases pass, including
+the unchanged strict golden, 3,000 warm and 3,000 poisoned launches; the
+unsafe control fails 200/200. No golden was rerecorded or tolerance changed.
+All six gradients also match the initial FP32 commit `719e5111` bytewise in
+the six performance workloads through 128K/H32 and THD22. All five FP64
+precision-case error records are identical to that commit. The same prepared
+sanitizer harness reports zero memcheck/synccheck errors and zero racecheck
+errors/warnings across all five scan specializations. Generated SASS retains
+seed consumption before release and consumes every P load through FP32 adds
+before branching to the next iteration. Final source hashes, samples and the
+SASS audit are in the [H20 report](../../../benchmark/linear_attention/sm90_kda_fp32_p_results.md).
+The support scope below is unchanged; this is an H20 rerun, not coverage of
+another GPU or distributed training.
+
+`linear_attention/hopper/test_kda_sm90_precision.py` adds **23 L0 cases** for
+`plan_name="kda_hopper_cuda"`, `batch_invariant=True`, BF16 Q/K/V and FP32
+gates/beta/state, K=V=128. Every replay/reference/batch check includes O,
+final state, dQ, dK, dV, dG, dBeta and dInitialState. The two scan widths,
+full/partial chunks, empty documents, fresh allocations, changed neighbors,
+isolation/reordering/duplication, a 17,001-token sequence, and concurrent work
+are covered. FP16 and grouped-head backward are outside this provider's
+contract; composed CP summaries and safe-gate backward are not added.
+
+H20-3e, PyTorch 2.9.1+cu128, CUDA Toolkit 12.8, driver 570.133.20,
+cuDNN 91002, CuTe DSL 4.8.1. Baseline is `8348887bd`; CUDA source/host hashes
+were checked before comparing. Other GPUs and distributed training are
+unverified for this change; SM100 kernels are unchanged.
+
+```bash
+cd test/python
+CUDA_HOME=/usr/local/cuda-12.8 CUDNN_TEST_NO_ISOLATION=1 \
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+python -m pytest -o addopts= -q -rs \
+  linear_attention/hopper/test_kda_sm90_precision.py \
+  linear_attention/hopper/test_kda_sm90_cuda.py \
+  linear_attention/hopper/test_hopper_marshal_stream.py
+```
+
+Result: **47 passed, 1 skipped** in 10.73 s. The skip is the existing optional
+`cuda.tile` routing case; it is not a pass for cuTile. Five warnings are the
+existing `xdist_group` markers without pytest-xdist on this host. The new
+23-case suite passes completely. The cancellation regression alone produced
+**10 failures on the baseline and 10 passes with FP32 P**: an exact `2^-10`
+state-gradient residual is zeroed by BF16 P storage.
+
+The new `32cb2f58db95235f/kda-sm90-fp32-p-fwd-bwd-bf16.json` golden was recorded
+in a new directory only after its independent FP64 recurrence check, then
+strictly checked without recording enabled. Its numerical reason is retaining
+P in FP32 until state-gradient addition. It records all forward results and
+all six gradients, not only the precision regression's selected element.
+
+Warm stress: 256 scan CTAs (3.28 per SM), 14 stage refills on the longest
+sequence, **0 wrong / 3,000 warm** and **0 wrong / 3,000 shared-memory-poisoned**
+launches. The unsafe control failed **200 / 200** launches on the same GPU.
+This is a stability check against a cold byte reference; numerical accuracy is
+checked separately against FP64. The unchanged input and output byte checks
+also pass with concurrent GPU work.
+
+The prepared-launch sanitizer harness and the full precision/performance/memory
+comparison are in the [H20 report](../../../benchmark/linear_attention/sm90_kda_fp32_p_results.md).
+The public provider's determinism status is qualified only for these tested
+configurations; no cross-runtime or cross-provider byte equivalence is claimed.
+
 ### SM120 wide partial PackGQA — validation, 2026-11-11 (UTC)
 
 The new L0 cases qualify explicit native forward plans for D512/V512 and

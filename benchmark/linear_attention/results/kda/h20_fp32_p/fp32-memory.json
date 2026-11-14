@@ -1,0 +1,46 @@
+{
+  "source": "/root/cudnn-sm90-fp32-p/python/cudnn/__init__.py",
+  "baseline_host": "/root/cudnn-sm90-la-precision-audit/python/cudnn/linear_attention/hopper/cuda_bwd_host.py",
+  "torch": "2.9.1+cu128",
+  "mode": "fp32",
+  "source_hashes": {
+    "baseline": {
+      "host": "327cf25a6da76ae080134942d189fee46d6428abc4f7fbf67037ed60b9bca970",
+      "kernel": "3dfeeb4d7341c30d97eb08c77ce17869c678bb9dbf998ad7ab47162697684c40"
+    },
+    "fp32": {
+      "host": "28bffaec434a95e382e919cf365890b7b3f0895b229d83be1f0b0349e0621deb",
+      "kernel": "6b7c7040d3df109999c549de0551b8d80ed18ee9a45bc80bde4e6e7183763c84"
+    }
+  },
+  "rows": [
+    {
+      "case": "16k-h8",
+      "inputs_resident_bytes": 202899968,
+      "peak_allocated_bytes": 1063256576,
+      "peak_additional_bytes": 860356608,
+      "live_after_bytes": 405799424
+    },
+    {
+      "case": "128k-h8",
+      "inputs_resident_bytes": 1615856128,
+      "peak_allocated_bytes": 8479327232,
+      "peak_additional_bytes": 6863471104,
+      "live_after_bytes": 3231711744
+    },
+    {
+      "case": "128k-h32",
+      "inputs_resident_bytes": 6463422976,
+      "peak_allocated_bytes": 33917256704,
+      "peak_additional_bytes": 27453833728,
+      "live_after_bytes": 12926845440
+    },
+    {
+      "case": "128k-thd22-h8",
+      "inputs_resident_bytes": 1637876224,
+      "peak_allocated_bytes": 8557860352,
+      "peak_additional_bytes": 6919984128,
+      "live_after_bytes": 3275751936
+    }
+  ]
+}

@@ -47,6 +47,7 @@ arbitrary user callbacks.
 | --- | --- | --- | --- | --- | --- |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `kimi_delta_attention`, `plan_name="kda_hopper_cuda"` | fprop, bprop | BF16 Q/K/V; FP32 gates and state | Supported for the qualified configurations below | Unsupported | Unsupported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
@@ -204,6 +205,18 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+The SM90 CUDA KDA qualification uses `batch_invariant=True`, K=V=128, equal
+head counts, FP32 log gates/beta/state, and fixed upstream gradients. It covers
+full and partial 64-token chunks, empty documents inside nonempty packs,
+sequence isolation/reordering/duplication, changed neighbors, fresh-buffer
+replay, and concurrent work. This row applies only to the pinned CUDA provider;
+FP16 and grouped-head backward are outside its contract. BF16 P was replaced
+by FP32 P in the backward state-gradient addition, so its output hashes change.
+Packing P into MMA tiles and prefetching it asynchronously preserve those
+FP32-P hashes. The other BF16 intermediates retain their existing precision. See the
+[H20 precision and cost report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/benchmark/linear_attention/sm90_kda_fp32_p_results.md)
+for the tested shapes and limitations.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
