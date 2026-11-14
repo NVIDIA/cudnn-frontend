@@ -78,8 +78,9 @@ contract/config does not load a kernel body or the tensor/DSL runtimes.
 
 The small-head FP8 owners have independent configuration records. Multi-Q
 and dual-KV keep separate copies of their main pipeline while sharing pure
-layout helpers. The legacy small-head files remain for dense envelopes and
-the existing SM107 shared swap-AB consumer. The common immutable decode
+layout helpers. The legacy small-head files remain for the existing standalone
+auto-routing entry, dense envelopes and the SM107 shared swap-AB consumer.
+Those compatibility consumers are not migrated by the exact-shape graph owners. The common immutable decode
 parameter record lives in `fwd/config_fp8_decode_common.py`; it does not
 select an implementation. Only central heuristics applies the old short-Q
 crossover. Explicit records can name either admitted prefill body directly.
