@@ -74,6 +74,11 @@ class EngineSlot:
 
     slot: int
     opt_in: bool = False
+    # Python-only op attributes (spec ``python_only_attrs``) that ONLY this slot serves.  A graph that
+    # SETS one is offered the slot even while it is opt-in: the backend cannot lower such a graph and no
+    # sibling serves it, so withholding the slot leaves the graph with no plan at all rather than with
+    # the backend's.  Every other graph still sees the slot only under the opt-in flag.
+    unlocked_by: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -133,14 +138,31 @@ class EngineFamily:
     def owns(self, engine_id: int) -> bool:
         return self.engine_id <= engine_id < self.id_end
 
-    def offered_ids(self) -> Dict[str, int]:
+    def offered_ids(self, graph=None) -> Dict[str, int]:
         """``{engine name: engine id}`` for the engines on offer.
 
         Maturity only -- no arch range. Whether an engine suits a device is the
-        engine's own check_support().
+        engine's own check_support().  With ``graph``, an opt-in slot is also on
+        offer when the graph sets one of its ``unlocked_by`` attributes.
         """
         enabled = opt_in_engines_enabled()
-        return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in}
+        set_attrs = _set_params(graph) if graph is not None else frozenset()
+        return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in or not set_attrs.isdisjoint(s.unlocked_by)}
+
+
+def _set_params(graph) -> frozenset:
+    """Names of the op parameters the graph's nodes hold with a non-None value -- what
+    ``EngineSlot.unlocked_by`` is matched against.  Pure python IR, no engine import."""
+    return frozenset(name for node in graph.nodes for name, value in (getattr(node, "params", None) or {}).items() if _param_is_set(value))
+
+
+def _param_is_set(value) -> bool:
+    # An integer 0 is an attribute's off value (``causal_exclude_own_block=0`` is plain causal); a bool is never 0-valued here.
+    if value is None:
+        return False
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value != 0
+    return True
 
 
 # Node types that NAME a family -- not a list of what a family can serve.
@@ -280,7 +302,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7),
             "sdpa_fwd_prefill_sm80": EngineSlot(8),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
-            "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
+            # Opt-in, except for a graph setting causal_exclude_own_block: this slot is its only server
+            # (backend-unlowerable; the SM107/SM120 MXFP8 rows decline it), so that graph is offered it unasked.
+            "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True, unlocked_by=("causal_exclude_own_block",)),
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14),
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
@@ -494,23 +518,24 @@ def engines_for(graph):
     family = family_for(graph)
     if family is None:
         return []
-    ids = family.offered_ids()  # availability is a separate question from kind
+    ids = family.offered_ids(graph)  # availability is a separate question from kind
     return list(instantiate(family, ids)) if ids else []
 
 
-def engine_for_id(engine_id: int):
+def engine_for_id(engine_id: int, graph=None):
     """The engine that owns ``engine_id``, or None.
 
     An engine id is fully decodable from this table: the family owning the id
     block, then the slot within it. Nothing has to be registered first, which is
     what lets create_execution_plan() replay an autotune result on a fresh graph
     -- including an engine that is not a candidate for THAT graph, where the
-    replay is a deliberate pin rather than a routing decision.
+    replay is a deliberate pin rather than a routing decision.  ``graph`` (the
+    graph being pinned) lets a slot it unlocks be pinned without the opt-in.
     """
     for family in MANIFEST:
         if not family.owns(engine_id):
             continue
-        ids = family.offered_ids()
+        ids = family.offered_ids(graph)
         if engine_id not in ids.values():
             return None  # a real slot, but gated off in this process
         return next((e for e in instantiate(family, ids) if e.engine_id == engine_id), None)

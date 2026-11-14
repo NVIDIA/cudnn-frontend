@@ -1108,6 +1108,11 @@ class SdpaFwdDsl(APIBase):
         bias_max_form: Optional[int] = None,
         softmax_wgs: Optional[int] = None,
         swap_ab: Optional[int] = None,
+        # APPENDED: the graph op attribute sdpa_mxfp8(causal_exclude_own_block=B) -- the causal bound tightened to keys
+        # j < B * floor(i / B), so query i never reads its own B-token block (rows 0 .. B-1 read no key: O = 0,
+        # Stats = -inf).  0 = plain causal.  Numerics-changing, compile-time; served by the SM100 MXFP8 dense d128 body
+        # (cc 10.0 / 10.3) at B = 32, the MXFP8 V scale block, and declined typed everywhere else.
+        causal_exclude_own_block: int = 0,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -1362,6 +1367,7 @@ class SdpaFwdDsl(APIBase):
         # kernel tradeoff before exposing an API contract. It writes BF16 O;
         # Amax_O is compiled only when ``sample_amax_o`` declares that output.
         self.pv_bf16 = bool(pv_bf16)
+        self.causal_exclude_own_block = int(causal_exclude_own_block or 0)
         self._device_cc = None  # (major, minor); set in check_support
         # Tuning-knob choice, already validated against the engine's
         # Capabilities domain by the probe (engines.mismatch). None means the
@@ -3185,6 +3191,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.pv_bf16 and (self.flavor not in ((128, 128), (192, 128)) or self.thd or self.split_kv != 1 or self.paged),
             "pv_bf16 is an experimental direct-only MXFP8 D128 or D192xD128 dense specialization (THD, split-KV and paged KV are not wired)",
         )
+        if self.causal_exclude_own_block:
+            # The twin of the engine row's gates (engines.mismatch) for direct callers.
+            self._value_error_if(
+                self.causal_exclude_own_block != 32,
+                f"causal_exclude_own_block must be 32 (the MXFP8 V scale block); got {self.causal_exclude_own_block}",
+            )
+            self._value_error_if(
+                not self.is_causal or self.window_left is not None or bool(self.window_right),
+                "causal_exclude_own_block requires is_causal=True without a sliding window or a widened right band",
+            )
+            self._value_error_if(
+                self.causal_bottom_right and self.q_desc.shape[2] != self.k_desc.shape[2],
+                "causal_exclude_own_block requires a top-left causal diagonal (S_q == S_kv under bottom-right alignment)",
+            )
+            self._not_implemented_error_if(
+                self._device_cc not in ((10, 0), (10, 3)) or not self._fp8 or self._pertensor or self.pv_bf16 or self.flavor != (128, 128),
+                "causal_exclude_own_block is served by the SM100 (cc 10.0 / 10.3) MXFP8 D128 kernel only",
+            )
+            self._not_implemented_error_if(
+                self.thd or self.paged or self.has_sink or self.seq_kv_lens_present or self.seq_q_lens_present or self.kv_mask_desc is not None,
+                "causal_exclude_own_block is wired on the dense unpadded body only (no THD, paged KV, sink, padding or kv_mask)",
+            )
         if self.score_max_desc is not None or self.score_sum_exp_desc is not None:
             # Score side outputs: the twin of the engine row's gates (engines.mismatch; rule 8b) through
             # the SAME shape constant (rule 8b').  The store lives in the f16/bf16 d128 prefill file's
@@ -3892,6 +3920,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             _br = int(self.window_size_right or 0)
             causal_covers_tail = self.is_causal and ((self.causal_bottom_right and _br == 0) or (not self.causal_bottom_right and int(s_qo) + _br <= int(s_kv)))
             self._kv_tail_mask = not (self.seq_kv_lens_present or causal_covers_tail)
+            self._not_implemented_error_if(
+                self._kv_tail_mask and self.causal_exclude_own_block,
+                "causal_exclude_own_block is not wired with the scalar KV-tail mask (S_kv not a KV-tile multiple and not covered by the causal band)",
+            )
             self._value_error_if(
                 self._kv_tail_mask
                 and (self.split_kv or 1) > 1
@@ -4307,6 +4339,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             paged_kv=self.paged,
             page_size=self.paged_page_size,
             pv_bf16=self.pv_bf16,
+            causal_exclude_own_block=self.causal_exclude_own_block,
             # Preserve the existing MXFP8 kernel contract. The hybrid path
             # compiles the atomic reduction only when its plan declares the
             # output, so a runtime execute() argument cannot silently change
@@ -5868,6 +5901,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         refusals = (
             (self.gate_desc is not None, "epilogue gate fusion (served by the SM107 d256 SDPA engines only)"),
             (self._pertensor or self.pv_bf16, "FP8 or PV BF16 inputs"),
+            (bool(self.causal_exclude_own_block), "causal_exclude_own_block (served by the SM100 MXFP8 D128 kernel only)"),
             # has_amax_o is a quantized-path flag; inert here, so only the declared output is refused.
             (self.amax_o_desc is not None, "an Amax_O output"),
             (self.dtype_o is not None and self.dtype_o != self.q_desc.dtype, "an output dtype different from Q"),
@@ -6384,6 +6418,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._not_implemented_error_if(
             self.pv_bf16,
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
+        )
+        self._not_implemented_error_if(
+            bool(self.causal_exclude_own_block),
+            "causal_exclude_own_block is served by the SM100 (cc 10.0 / 10.3) MXFP8 D128 kernel only",
         )
         if self.paged:
             self._not_implemented_error_if(self.thd, "SM120 paged KV requires dense Q")
@@ -7529,6 +7567,10 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
         self._not_implemented_error_if(
             self.pv_bf16,
             "pv_bf16 is supported only by the pre-Rubin SM100 implementation (cc 10.0/10.3)",
+        )
+        self._not_implemented_error_if(
+            bool(self.causal_exclude_own_block),
+            "causal_exclude_own_block is served by the SM100 (cc 10.0 / 10.3) MXFP8 D128 kernel only",
         )
         self._not_implemented_error_if(
             self.sf_o_desc is not None or self.o_desc.dtype == _torch_fp4(),

@@ -682,6 +682,19 @@ class Capabilities:
     # SM90).  APPENDED after warp_spec_cfgs (append-only contract above; the same test pins
     # it).
     tile_ms_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+    # Shapes whose kernel flavors carry the own-block-excluded causal bound (the op
+    # attribute sdpa_mxfp8(causal_exclude_own_block=32): keys j < 32 * floor(i / 32)).
+    # None = unserved (the default: a row opts in).  Matched on the flavor the
+    # lowering SELECTS (_selected_d_shape).  Dense, unpadded, unpaged
+    # plans only (split-KV and PackGQA included) -- mismatch() holds those conditions.  APPENDED after
+    # tile_ms_by_d_shape (append-only contract above).
+    causal_exclude_own_block_d_shapes: Optional[frozenset] = None
+
+
+# The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V
+# scale block.  Any power of two dividing the q sub-tile would keep the kernel's
+# unmasked-segment split exact; only the size with a use is claimed.
+CAUSAL_EXCLUDE_OWN_BLOCK_SIZES = frozenset({32})
 
 
 def _sm90_d128_tile_mismatch(facts: "ga.SdpaGraphFacts", knobs: "SdpaFwdKnobs") -> Optional[str]:
@@ -1892,6 +1905,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if _selected_d_shape(capabilities, facts) not in capabilities.attn_scale_prefolded_d_shapes:
             return (
                 f"attn_scale_prefolded is wired only in the {sorted(capabilities.attn_scale_prefolded_d_shapes)} kernel flavors; "
+                f"graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            )
+    if facts.causal_exclude_own_block:
+        # The op attribute sdpa_mxfp8(causal_exclude_own_block=B): numerics-changing (the
+        # query's own block is dropped from the softmax), so only a row whose selected
+        # flavor carries the bound serves it -- never degraded to plain causal.
+        if capabilities.causal_exclude_own_block_d_shapes is None:
+            return "causal_exclude_own_block (keys j < B * floor(i / B)) is not wired in this engine's kernels"
+        if facts.causal_exclude_own_block not in CAUSAL_EXCLUDE_OWN_BLOCK_SIZES:
+            return f"causal_exclude_own_block={facts.causal_exclude_own_block} is outside the wired block sizes {sorted(CAUSAL_EXCLUDE_OWN_BLOCK_SIZES)}"
+        if facts.thd or facts.has_paged_kv or facts.padded or facts.has_sink or facts.has_kv_mask:
+            return "causal_exclude_own_block is wired on the dense unpadded prefill body only (no THD, paged KV, padding, sink or kv_mask)"
+        if _synth_kv_padding(capabilities, facts):
+            return "causal_exclude_own_block is not wired with the scalar KV-tail mask (S_kv not a KV-tile multiple and not covered by the causal band)"
+        if _selected_d_shape(capabilities, facts) not in capabilities.causal_exclude_own_block_d_shapes:
+            return (
+                f"causal_exclude_own_block is wired only in the {sorted(capabilities.causal_exclude_own_block_d_shapes)} kernel flavors; "
                 f"graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
     if knobs is not None:
@@ -3418,6 +3448,9 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             # the rest.  The other flavors keep the one-atom TMA path.
             pack_gqas=frozenset({False, True}),
             pack_gqa_d_shapes=frozenset({(128, 128)}),
+            # sdpa_mxfp8(causal_exclude_own_block=32): keys j < 32 * floor(i / 32) on the
+            # dense d128 body (TemplateParams.causal_exclude_own_block).
+            causal_exclude_own_block_d_shapes=frozenset({(128, 128)}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -4278,6 +4311,9 @@ def lower_dsl_prefill(
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
         # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
         softmax_scale_prefolded=facts.attn_scale_prefolded,
+        # Op attribute causal_exclude_own_block -> the adapter's kwarg of the same name.  Forwarded only when
+        # SET: the row's causal_exclude_own_block_d_shapes claim gated it, so only an adapter declaring it sees it.
+        **({"causal_exclude_own_block": facts.causal_exclude_own_block} if facts.causal_exclude_own_block else {}),
         # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
         # feature-detected on the adapter's constructor, see the helper.
         **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),

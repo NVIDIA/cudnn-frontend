@@ -23,6 +23,7 @@ import atexit
 import ctypes
 from dataclasses import dataclass
 import logging
+import numbers
 import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -80,6 +81,8 @@ atexit.register(_destroy_default_handles)
 
 
 _PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded", "adaptive"})
+# Integer python-only attributes whose 0 is the default (off): ``causal_exclude_own_block=0`` is plain causal.
+_PYTHON_ONLY_ZERO_OFF_ATTRS = frozenset({"causal_exclude_own_block"})
 
 
 def _python_only_attr_is_set(attr: str, value) -> bool:
@@ -92,6 +95,8 @@ def _python_only_attr_is_set(attr: str, value) -> bool:
         return False
     if attr in _PYTHON_ONLY_BOOL_ATTRS:
         return bool(value)
+    if attr in _PYTHON_ONLY_ZERO_OFF_ATTRS and isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value) != 0
     return True
 
 
@@ -389,7 +394,7 @@ class pygraph:
             # recorded (engine_id, knobs) on a fresh graph.
             from .engines import manifest
 
-            engine = manifest.engine_for_id(engine_id)
+            engine = manifest.engine_for_id(engine_id, self)
             if engine is not None:
                 out.append(engine)
         return out
@@ -1290,7 +1295,7 @@ class pygraph:
         from .engines import manifest
 
         family = manifest.family_for(self)
-        if family is not None and family.offered_ids():
+        if family is not None and family.offered_ids(self):
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)
@@ -4590,13 +4595,23 @@ _CAPTURED_OPS = {
         # The same two op attributes as "sdpa".  Without this entry a SET
         # softmax_precision would be forwarded to the C++ sdpa_mxfp8 (which has
         # no such argument) instead of keeping the node on the python engines.
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
+        # ``causal_exclude_own_block`` (int block size, None = off): the causal
+        # mask also drops the query's own aligned block of that many keys, so
+        # query i reads keys j < B * floor(i / B) only (rows 0 .. B-1 read none:
+        # O = 0, Stats = -inf, the FROST empty-row contract).  With B = 32, the
+        # MXFP8 V scale block, every V scale the kernel reads covers fully
+        # visible tokens only: the completed-block half of causal MXFP8
+        # attention whose PV stays MXFP8 (NVIDIA/TransformerEngine#3248); the
+        # caller adds the query's own block separately.  Numerics-changing,
+        # hence an op attribute; the backend has no field for it.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
+        # forward-only, see "sdpa_backward" and "sdpa_mxfp8"
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         pos=(
             "q",
             "q_T",
