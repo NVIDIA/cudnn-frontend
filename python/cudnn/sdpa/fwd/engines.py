@@ -86,6 +86,10 @@ from .kernels.sm100.d512_f16_contract import (
     IMPLEMENTATIONS as _D512_IMPLEMENTATIONS,
     mismatch as _d512_implementation_mismatch,
 )
+from .kernels.sm100.d192_fp8_multi_q.contract import (
+    NAME as _D192_FP8_MULTI_Q,
+    mismatch as _d192_fp8_implementation_mismatch,
+)
 from .kernels.sm100.d256_fp8_single_q.contract import (
     NAME as _D256_FP8_SINGLE_Q,
     mismatch as _d256_fp8_implementation_mismatch,
@@ -1808,6 +1812,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _d512_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
+    if capabilities.implementation == _D192_FP8_MULTI_Q:
+        reason = _d192_fp8_implementation_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation == _D256_FP8_SINGLE_Q:
         reason = _d256_fp8_implementation_mismatch(facts, knobs)
         if reason is not None:
@@ -3380,7 +3388,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     One broad legacy row per ARCH LINE (``arch``: "sm100" = pre-Rubin Blackwell 100-106,
     "sm107" = Rubin line 107-119): the two lowerings genuinely diverge and a
     shared row could only describe their union with knob x arch notches.
-    Exact SM100/SM103 D256/D512 have explicit implementation owners. On the
+    Exact SM100/SM103 D192/V128, D256 and D512 have explicit implementation owners. On the
     remaining legacy domain, the adapter picks the kernel flavor covering the graph. Each row declares
     exactly what its own kernels carry:
 
@@ -3424,7 +3432,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
-            delegated_exact=(frozenset() if rubin_row else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((256, 256), (512, 512)))),
+            delegated_exact=(
+                frozenset() if rubin_row else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((192, 128), (256, 256), (512, 512)))
+            ),
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
@@ -3630,6 +3640,33 @@ def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
     """
     legacy = next(s for s in ENGINE_SPECS if s.name == name)
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
+def _sm100_d192_fp8_spec() -> EngineSpec:
+    """One per-tensor FP8 body; shared graph binding and launch construction."""
+    from .kernels.sm100.d192_fp8_multi_q.host import lower
+
+    shape = frozenset({(192, 128)})
+    capabilities = replace(
+        _sm100_fp8_spec().capabilities,
+        implementation=_D192_FP8_MULTI_Q,
+        delegated_exact=frozenset(),
+        d_shapes=shape,
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        thd_d_shapes=shape,
+        paged_kv=False,
+        paged_d_shapes=frozenset(),
+        split_d_shapes=shape,
+        pack_gqa_d_shapes=shape,
+        out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        o_block_scales=frozenset({0}),
+        cgas=frozenset({1, 2}),
+        cgas_by_d_shape=(),
+        split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
+        swap_abs=frozenset(),
+    )
+    return EngineSpec(_D192_FP8_MULTI_Q, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
 
 
 def _sm100_d256_fp8_spec() -> EngineSpec:
@@ -4361,7 +4398,7 @@ def lower_dsl_prefill(
         )
         or (
             facts.thd
-            and spec.name in ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_prefill_sm100_mxfp8")
+            and lowering_row_name in ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_prefill_sm100_mxfp8")
             and api.flavor == (192, 128)
             and not facts.has_paged_kv
             and facts.epilogue_gate_t is None
@@ -4941,6 +4978,7 @@ ENGINE_SPECS = (
     _sm100_fp8_spec(),
     _sm100_d512_fp8_spec(),
     _sm100_d256_fp8_spec(),
+    _sm100_d192_fp8_spec(),
     _sm100_fp8_spec(arch="sm107"),
     _sm107_spec(),
     _sm107_mxfp8_spec(),

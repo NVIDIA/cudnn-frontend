@@ -4,6 +4,8 @@
 
 from dataclasses import replace
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -22,13 +24,13 @@ def test_fp8_d192_padded_heads_rebind_replay(d, dv, split, pack, sched, sink, dt
 
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     seen = []
-    load = api_dsl._load_kernel_template
+    load = api_dsl.load_template
 
-    def record(filename, params, tag, part=None):
-        seen.append(filename)
-        return load(filename, params, tag, part=part)
+    def record(path, params, tag="template", extra_key=None):
+        seen.append(Path(path).relative_to(Path(api_dsl.__file__).parent / "kernels").as_posix())
+        return load(path, params, tag=tag, extra_key=extra_key)
 
-    monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
+    monkeypatch.setattr(api_dsl, "load_template", record)
     b, sq, skv = 2, 129 if split == 1 else 17, 256
     sinks = torch.linspace(-5, 8, 4, device="cuda").view(1, 4, 1, 1) if sink else None
     g, vp, ws, bufs, tensors = shared._case(
@@ -51,7 +53,8 @@ def test_fp8_d192_padded_heads_rebind_replay(d, dv, split, pack, sched, sink, dt
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    assert f"{arch}/prefill_d192_d128_fp8.py" in seen
+    expected = "sm100/d192_fp8_multi_q/kernel.py" if arch == "sm100" else f"{arch}/prefill_d192_d128_fp8.py"
+    assert expected in seen
     assert all(name.startswith(arch + "/") for name in seen)
     for name in ("q", "k", "v"):
         view = bufs[name]

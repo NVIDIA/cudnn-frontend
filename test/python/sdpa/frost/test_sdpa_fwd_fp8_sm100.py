@@ -3,9 +3,9 @@
 
 """End-to-end tests for the FROST SM100 DSL per-tensor FP8 SDPA-forward engine.
 
-Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) routed to
-the unified SM100 engine, which selects the d128/d128, d192/d128, or d256/d256
-kernel flavor. The d128 flavor also serves the dense d<=128 head-dim envelope via
+Drives ``graph.sdpa_fp8`` (FP8 E4M3/E5M2 Q/K/V + scalar per-tensor descales) through
+the architecture's per-tensor FP8 owners. Exact SM100/SM103 D192/V128, D256 and
+D512 use explicit implementation engines. The d128 flavor also serves the dense d<=128 head-dim envelope via
 TMA zero-padding. O is validated against an fp32-dequant reference, and ``Amax_O``
 is checked against pre-cast fp32 values.
 
@@ -54,9 +54,9 @@ _ref_kwargs = fp8_reference._ref_kwargs
 
 pytestmark = [requires_blackwell, requires_dsl]
 
-# ONE per-tensor FP8 engine per arch line (sm100 = pre-Rubin Blackwell
-# 100-106, sm107 = the Rubin line): pin the engine that serves the device
-# under test.  Both lines carry all four native flavors -- d128, d192xd128,
+# The owner helper follows the device's architecture line and its migrated
+# implementation engines. Routing tests below additionally pin the exact body.
+# Both lines carry all four native flavors -- d128, d192xd128,
 # d256 and d512 (api_dsl._SM107_FP8_KERNEL_FILES mirrors _SM100_FP8_KERNEL_FILES)
 # -- so every flavor test below runs on both. Rubin D64/D128/D192x128 now
 # serve PackGQA, as does the native D256 pipeline. D512 remains unpacked.
@@ -2342,7 +2342,7 @@ def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
     loaded = {}
 
     def load_skewed(path, params, tag="template", extra_key=None):
-        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+        if not Path(path).as_posix().endswith("sm100/d192_fp8_multi_q/kernel.py"):
             return original_loader(path, params, tag=tag, extra_key=extra_key)
         key = (path, params, extra_key)
         if key not in loaded:

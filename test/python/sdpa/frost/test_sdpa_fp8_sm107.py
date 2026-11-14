@@ -789,12 +789,14 @@ def test_fp8_envelope_mismatch_rules():
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps[engines.engine_name(fp8=True)]
+    d192 = caps["sdpa_fwd_sm100_d192_fp8_multi_q"]
     d256 = caps["sdpa_fwd_sm100_d256_fp8_single_q"]
     d512 = caps["sdpa_fwd_sm100_d512_fp8_role_split"]
     assert engines.mismatch(sm100, _fp8_facts()) is None
     assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
     # D192 and D256 serve their aligned dense head envelopes.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128)) is None
+    assert engines.mismatch(d192, _fp8_facts(d_qk=192, d_v=128)) is None
+    assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128))
     assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None
     for dq, dv in ((16, 144), (224, 16), (160, 160), (224, 208)):
         for arch, cc in (("sm100", (10, 0)), ("sm107", (10, 7))):
@@ -811,7 +813,7 @@ def test_fp8_envelope_mismatch_rules():
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
     # SM100 carries THD at each native per-tensor FP8 shape.
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
+    assert engines.mismatch(d192, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
     assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None
     assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256, thd=True, padded=True)) is None
     # d512 is a NATIVE shape (accepted exactly, dense and THD) and serves the

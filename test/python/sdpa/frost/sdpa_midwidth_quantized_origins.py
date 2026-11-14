@@ -13,6 +13,8 @@ def origin_checks(family, arch="sm100", shapes=None):
     def engine_for(dims):
         if arch == "sm100" and family == "fp8" and dims in (256, (256, 256)):
             return "sdpa_fwd_sm100_d256_fp8_single_q"
+        if arch == "sm100" and family == "fp8" and dims in (192, (192, 128)):
+            return "sdpa_fwd_sm100_d192_fp8_multi_q"
         return f"sdpa_fwd_prefill_{arch}_{family}"
 
     if shapes is None:
@@ -24,6 +26,8 @@ def origin_checks(family, arch="sm100", shapes=None):
         plan = graph._compiled_plans[graph._plan_index]
         assert plan._compiled.kernel_template == f"prefill_{flavor}_{family}"
         expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" and family == "fp8" and width == 256 else f"{arch}/prefill_{flavor}_{family}.py"
+        if arch == "sm100" and family == "fp8" and width == 192:
+            expected = "sm100/d192_fp8_multi_q/kernel.py"
         assert plan._compiled.kernel_module.__file__.endswith(expected)
         assert graph.selected_engine.name == engine_for(width)
         assert plan._prepared.spec.origin_specs is not None and plan._prepared.spec.native is not None
