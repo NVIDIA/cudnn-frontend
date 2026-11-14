@@ -16,6 +16,7 @@ python samples/models/qwen_dense/00_decode.py                          # 2 layer
 python samples/models/qwen_dense/00_decode.py --sequences 4 --layers 4
 python samples/models/qwen_dense/00_decode.py --stack reference        # every block on the reference: RAN, never PASS
 python samples/models/qwen_dense/00_decode.py --check-kernels          # also: every launch of the traced steps against the plan
+python samples/models/qwen_dense/00_decode.py --stack native           # the target kernel set, as far as it is served here
 
 # A checkpoint is your own download: the sample fetches nothing. 22 GB of disk; a GPU of compute capability 10.x or 12.x
 # with about 57 GiB free (about 60 GiB on 12.x); about two and a half minutes for the first run below ("A checkpoint from local disk" has the details).
@@ -34,12 +35,12 @@ python samples/models/qwen_dense/00_decode.py --model /data/Qwen3.8-27B-NVFP4 --
 | `--force-tokens N` | `32` without `--model`, off with it | decode exactly N tokens per sequence, ignoring the end token; not together with `--max-new-tokens` |
 | `--sequences N[,N...]` | `1,4` without `--model`, `1` with it | sequences per run, fixed before the first step; a list repeats the run per count; with `--model` every sequence of a run gets the same prompt |
 | `--layers N` | `2` | layers of the reduced model: the last N of the published order, so the model ends in an attention layer; not with `--model` |
-| `--stack fe-cublas\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
+| `--stack fe-cublas\|native\|fe-entries\|reference` | `fe-cublas` | `fe-cublas`: cuDNN Frontend + cuBLAS + PyTorch, checked against the reference. `native`: the target kernel set of the decode step ("The stack `native`" below); the kernel check is always on. `fe-entries`: the cuDNN Frontend rows of `native`, everything else on fallback rows. `reference`: every block in PyTorch, nothing checked. Explicit, never chosen by what is installed |
 | `--provider BLOCK=KEY` | -- | selects one declared provider row of a block; the key list is closed. Block names are in the table a run prints, keys in the table below; an unknown block or key is an `ERROR` that lists the declared ones |
 | `--reference-precision fp64\|ieee-fp32` | `fp64` | accumulation of the reference blocks; printed in the header. `ieee-fp32` sets `torch.backends.cuda.matmul.fp32_precision` for the rest of the process, which ends with the run |
 | `--dump-tokens FILE` | -- | per prompt, the prompt ids and the produced ids of every sequence as JSON, for a comparison made elsewhere |
-| `--check-kernels` | off | adds the kernel check: prints the kernel table, keeps the profiler's record of every launch of the traced steps and holds them against the plan ("The kernel check" below). Not with `--stack reference`, which checks nothing |
-| `--dump-census FILE` | -- | the launch records of the traced steps as JSON (per launch its kernel id, name, grid, block, shared memory, registers per thread), with the block calls of a step, what the entries state, and per call site the entry instance that served it and the form that instance states (`served`, beside the row's `form`), for a comparison made elsewhere; implies `--check-kernels` |
+| `--check-kernels` | off; always on with `--stack native` and `--stack fe-entries` | adds the kernel check: prints the kernel table, keeps the profiler's record of every launch of the traced steps and holds them against the plan ("The kernel check" below). Not with `--stack reference`, which checks nothing |
+| `--dump-census FILE` | -- | the launch records of the traced steps as JSON (per launch its kernel id, name, grid, block, shared memory, registers per thread), with the block calls of a step, what the entries state, and per call site the entry instance that served it and the form that instance states (`served`, beside the row's `form`), for a comparison made elsewhere; implies `--check-kernels`. In a stack that declares a target, also each call's identity and the run's three numbers (`target`) |
 
 A `--messages` file (the `chat.json` of the last command above), here with a system turn and the reasoning switched off:
 
@@ -68,6 +69,104 @@ every multiply runs on cuBLAS over a bf16 copy of the quantised weights, which m
 stored formats hold 1 or 0.56; the rest runs in PyTorch; and every launch is issued from Python, one block after the other.
 It exists to prove the loader, the loop, the state handling and the tie-out, and it is the correctness oracle of the stacks
 that follow. It claims no number.
+
+## The stack `native`: the target kernel set
+
+`--stack native` is defined by a kernel set, not by what is installed: the target kernel set of this model's decode
+step, the kernels a specialised decode path launches for it, block by block. The set is checked in as data,
+`model_samples/qwen_dense/kernel_census.json`: per block call of a step the kernel, the form it is called in, and per GPU
+class, SM count and row count the launch shape that was recorded for it, with the layer widths of the model it was
+recorded on. For the plain step of the 64-layer model that is 484 launches. A statement about this stack is three
+numbers, never one: of those 484, 210 are the target's own compiled kernels (the fused linear-attention step of cuDNN
+Frontend, library calls of FlashInfer and of cuBLASLt, a Triton kernel, PyTorch's gather), 273 are launches of kernels
+whose home is cuDNN Frontend -- for each of them an entry that reproduces the target kernel's results byte for byte,
+which is why a run counts them as "cuDNN Frontend entries with byte-equal results" -- and 1 is an operation that lives
+inside a serving engine and gets a declared stand-in.
+
+These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 16 today, the gate entry's.
+The other 257 (residual add + RMSNorm + quantise 129, the 8-bit in-projection 64, the MLP gate / up multiply 64) are
+not called through an entry by any stack of this sample yet: they stay on fallback rows, and each row arrives with a
+change of its own. And "byte-equal" is the entry's own record, not something this sample measures: the comparison of an
+entry's bytes with the target kernel's is made when the entry is written and needs the target's kernel. The census
+file says for each entry a stack calls where that comparison stands and on which GPU class it was made (`tie_out`,
+`differences`); for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0. What this
+sample holds an entry to is its documented numerics contract (the band of its row) and its launch facts.
+
+The stack is built block by block. A block whose target kernel is not served here yet stays on the fallback row it has in
+`fe-cublas`, and a run prints it as `not yet (<fallback reason>)`. Today two entries are on their target forms:
+
+| block | launches per step (64 layers) | what `native` launches | identity |
+|---|---|---|---|
+| token embedding lookup | 1 | PyTorch's gather | target: the target's own compiled kernel |
+| linear-attention step | 48 | `cudnn.GdnDecodeFused` launched as a dependent of the launch before it and releasing the launch after it at entry (`PDL True`, `PDL_RELEASE True`) | target: the target's own compiled kernel |
+| gate + quantise | 16 | `cudnn.AttentionGateQuantDecode` with 256 threads per thread block, releasing the launch after it at entry (`THREADS 256`, `PDL_RELEASE True`); compute capability 10.x | target: a cuDNN Frontend entry with byte-equal results |
+| every other block of the table below | 418 | the fallback rows of `fe-cublas` | not yet |
+| the 4-bit quantise in front of the output head | 1 | nothing: this sample has no block for it yet | the target's declared stand-in, not yet |
+
+So a run with a checkpoint prints under its kernel table:
+
+```text
+the whole target kernel set of a step of this model (what a complete stack launches; this stack's share is the next line): 484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in
+kernel identity, as planned: 65 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 16 cuDNN Frontend entries with byte-equal results); not yet: add_norm_quantize 129, projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)
+```
+
+and with its checks the census line, `target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12): NOT CLAIMED (fallback
+rows present; ...); 65 launches of a step compared by launch shape (49 the target's own compiled kernels + 16 cuDNN
+Frontend entries with byte-equal results + 0 declared stand-ins): each in the recorded one`. The default run on the
+two-layer model counts 3 of 20 (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results;
+the declared stand-in not yet). The line always says what was compared: `EQUAL`, once a class is claimed, carries the
+number of launches that were held to a recorded launch shape and the number held by membership alone (a kernel a
+library's tuner selects, a stand-in), so it never stands for a comparison that was not made.
+
+**Nothing is claimed yet.** A GPU class is claimed only when its section of the census says so, and that needs every
+block of a step on its target kernel, a census recorded on that compute capability and SM count, and the package versions
+of the record. Until then the line reads `NOT CLAIMED` with every reason that applies: a row selected with `--provider`
+(`not the target set: <block> selected by --provider`), fallback rows present, a kernel of the target the plan has no
+block for, no recorded section for this compute capability and SM count (the line names both) or for this row count,
+versions other than the recorded ones. The census file has one section today: compute capability 10.0 with 148 SMs, at
+1 row, for the layer widths of the published 27B-class model, recorded on 2026-11-12. On another GPU class, another SM
+count, another sequence count or a checkpoint of the family with other layer widths a run says `kernel identity: not
+stated for this run` and names what differs: the kernels of the target are recorded per class, row count and model, and
+are never copied from one to another. The reduced default model keeps the published widths, so the section holds for it;
+the launch shape of the output head is recorded with the vocabulary as well and will hold for that vocabulary only.
+
+**What is checked already**, in every run of this stack (its kernel check cannot be switched off), for every launch on a
+target kernel: the provider row's form is the census's form of that kernel and the entry's own form, compared on the
+objects; the launch carries the entry's own symbol and exactly the launch shape the entry states; and where the census
+has a section for the run, the launch shape is the recorded one -- grid (96, 1, 1), block (256, 1, 1) and 42,112 B of
+shared memory for the fused step, grid (3, 1, 1), block (256, 1, 1) and no shared memory for the gate, at 1 row on
+compute capability 10.0 with 148 SMs. A difference fails the run with a sentence that names the block.
+
+**What this stack is not, today.** It is not a fast path: it holds the same bf16 copies as `fe-cublas`, needs the same
+memory and issues every launch from Python. No timing of it means anything. And a target kernel between fallback rows
+does not run in the target's surroundings: the fused step waits for the launch before it and releases the launch after
+it, the gate releases the launch after it, but the launches around them here are PyTorch's and cuBLAS's, which neither
+release early nor start early, so both knobs are exercised and change nothing. With `--provider
+linear_attention.step=fe.gdn_decode_fused` the stack runs the fused step in its `fe-cublas` form instead (no wait, no
+release); the table then prints `not the target (...)` for the block and the census line says why the run is not the
+target set.
+
+`--stack fe-entries` is every cuDNN Frontend row of `native` with each block that a library or a temporary kernel will
+serve there on its fallback row. It needs no package beyond cuDNN Frontend and PyTorch, and it is the stack the GPU test
+of this area runs, so the rows of the entries stay verified wherever that test runs. Until `native` has a row a library
+serves, the two stacks are the same rows.
+
+On compute capability 12.x the gate entry does not serve; the block then stays on its reference chain (`not yet (reference
+chain)`) in both stacks, and the census has no section for that class.
+
+The stack was last run on compute capability 10.0 (2026-11-13, a 148-SM part, PyTorch 2.13.0, CuTe DSL 4.8.0; the census
+line of every run names the PyTorch version as other than the recorded 2.14.0):
+
+| run | result |
+|---|---|
+| the default run, `--stack native` | `[00] PASS` at 1 and at 4 sequences, with the ids hash of the default stack. A traced step of the two-layer model is 460 kernel launches and 37 copies; 3 are judged one by one. At 1 sequence the gather, the fused step and the gate (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results) have the recorded launch shapes; at 4 no identity is stated. The gate entry was inside its band with every byte the code of the nearest bf16 value (350,208 bytes at 1 sequence, 1,400,832 at 4), and equal alone and among 4 |
+| the checkpoint, one sequence, the default prompt, 32 new tokens | `[00] PASS`: 65 launches of every one of the 32 traced steps on target kernels (49 the target's own compiled kernels + 16 of a cuDNN Frontend entry with byte-equal results; the declared stand-in has no block yet), in the wiring order (the gather, then three fused steps and one gate, 16 times), each in the recorded launch shape; 11,574 kernel launches and 968 copies per traced step in all. Replay held; 7 of 7 provider blocks inside their bands; the gate entry over 256 calls with all of its 1,572,864 bytes the code of the nearest bf16 value; the token line reported |
+| the default run, `--stack fe-entries` | `[00] PASS`, the same lines; also as the L0 cell of the area's GPU test |
+| `--stack native --provider linear_attention.step=fe.gdn_decode_fused`, 1 sequence | `[00] PASS`; `NOT CLAIMED (not the target set: linear_attention.step selected by --provider; ...)`; the 2 remaining target launches (1 the target's own compiled kernel + 1 of a cuDNN Frontend entry with byte-equal results) in the recorded shape |
+
+The fused step has the same launch shape in both of its forms, grid (96, 1, 1), block (256, 1, 1), 42,112 B at 1 row:
+that it waits and releases shows in its symbol and in its form, not in a launch record. The stack has not run on
+another GPU class.
 
 ## A checkpoint from local disk
 
@@ -103,8 +202,11 @@ another architecture or in other storage formats is a `SKIP` that names the firs
 
 What happens, in order: the tokenizer, the template and the shard headers are read (no weights); every prompt is rendered
 and encoded; the plan is resolved and printed with the memory the run needs, and a GPU with less free memory is a `SKIP`
-with exit code 0 before a tensor is read; then the weights are read, merged (query, key and value; `qkv` and `z`; the
-beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, the fused step is compiled, and each prompt
+with exit code 0 before a tensor is read. As part of the plan every cuDNN Frontend entry of the stack builds its kernel
+for the run's sequence counts on scratch operands: an entry asks what it needs of the installed toolchain where it
+builds, so a CuTe DSL that cannot build for the GPU is a `SKIP` in the entry's own words here, not an error after the
+weights are read. Then the weights are read, merged (query, key and value; `qkv` and `z`; the
+beta and alpha rows, beta first; gate and up) and dequantised to bf16 copies, each entry's kernel is launched once, and each prompt
 is fed through the decode step and decoded greedily to an end token or to `--max-new-tokens`. The text of sequence 0 is
 printed; reasoning the model writes before its answer is part of that text.
 
@@ -163,12 +265,12 @@ comparison made elsewhere, and greedy decoding is not the checkpoint's own defau
 
 ## Who serves each block (stack `fe-cublas`)
 
-| block | calls per step (64 layers) | provider key | entry |
+| block | calls per step (64 layers) | provider key | entry [form] |
 |---|---|---|---|
 | token embedding lookup | 1 | `torch.index_select` | torch.index_select |
 | residual add + RMSNorm + quantise | 129 | `torch_ref.add_norm_quantize` | torch_ref.add_norm_quantize, fallback: reference chain |
 | 8-bit in-projection (linear attention QKVZ / attention QKV) | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
-| linear-attention step | 48 | `fe.gdn_decode_fused` | cudnn.GdnDecodeFused |
+| linear-attention step | 48 | `fe.gdn_decode_fused` | cudnn.GdnDecodeFused [PDL False, PDL_RELEASE False] |
 | 8-bit out-projection | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
 | MLP gate / up + SiLU x up + quantise | 64 | `cublas.bf16_dequantized+torch_ref.silu_mul_quantize` | torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize, fallback: bf16 copy of 4-bit weights |
 | MLP down | 64 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 4-bit weights |
@@ -180,6 +282,26 @@ comparison made elsewhere, and greedy decoding is not the checkpoint's own defau
 
 484 block calls per step on the full model, 20 on the two-layer model and 34 on the four-layer one. By provider: cuDNN
 Frontend 1; fallbacks 8 (cuBLAS over copies 4, PyTorch chains 4); PyTorch as the natural provider 2.
+
+## Who serves each block (stacks `native` and `fe-entries`, compute capability 10.x)
+
+| block | calls per step (64 layers) | provider key | entry [form] |
+|---|---|---|---|
+| token embedding lookup | 1 | `torch.index_select` | torch.index_select |
+| residual add + RMSNorm + quantise | 129 | `torch_ref.add_norm_quantize` | torch_ref.add_norm_quantize, fallback: reference chain |
+| 8-bit in-projection (linear attention QKVZ / attention QKV) | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
+| linear-attention step | 48 | `fe.gdn_decode_fused` | cudnn.GdnDecodeFused [PDL True, PDL_RELEASE True] |
+| 8-bit out-projection | 48 / 16 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 8-bit weights |
+| MLP gate / up + SiLU x up + quantise | 64 | `cublas.bf16_dequantized+torch_ref.silu_mul_quantize` | torch.matmul over a bf16 copy + torch_ref.silu_mul_quantize, fallback: bf16 copy of 4-bit weights |
+| MLP down | 64 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 4-bit weights |
+| attention preparation | 16 | `torch_ref.attention_prepare` | torch_ref.attention_prepare, fallback: reference chain |
+| attention core | 16 | `torch_ref.attention` | torch_ref.attention, fallback: reference chain over a plain per-layer cache |
+| gate + quantise | 16 | `fe.attention_gate_quant_decode` | cudnn.AttentionGateQuantDecode [THREADS 256, PDL_RELEASE True] |
+| output head | 1 | `cublas.bf16_dequantized` | torch.matmul over a bf16 copy, fallback: bf16 copy of 4-bit weights |
+| token choice | 1 | `torch.argmax` | torch.argmax |
+
+By provider: cuDNN Frontend 2; fallbacks 7 (cuBLAS over copies 4, PyTorch chains 3); PyTorch as the natural provider 2.
+On compute capability 12.x the gate + quantise row is the reference chain of `fe-cublas`.
 
 | GPU classes | sequences | regime | note |
 |---|---|---|---|
@@ -193,9 +315,9 @@ Against the plain-PyTorch reference of every block, which keeps the chain's cast
 | check | what must hold |
 |---|---|
 | replay | the same inputs from a fresh state give byte-identical ids and logits |
-| blocks, teacher-forced | every value finite; every multiply within one bf16 rounding of the reference, element by element; the linear-attention step inside its band (below) |
+| blocks, teacher-forced | every value finite; every multiply within one bf16 rounding of the reference, element by element; the linear-attention step inside its band (below); in the stacks `native` and `fe-entries`, the gate + quantise entry inside its band against its twin (below) |
 | tokens | the logits of the two stacks, each run end to end on its own state, are finite. On the reduced seeded model they are also within the declared logits band (`configs.py`: 4 bf16 units of the run's largest reference logit), and the greedy token equals the reference stack's at every step whose margin exceeds twice that band; steps below it are counted and printed as near-ties. On a checkpoint no band is declared and the line is `REPORTED` (the section on checkpoints says why). The largest logit distance and the number of equal greedy tokens are printed either way |
-| batch invariance | one sequence alone gives the bytes it has among 4; the sequence that runs alone rotates with the step, so every row of the batch is covered: a gate for the linear-attention step on compute capability 10.0, 10.3 and 12.0, a printed fact for every other block and class |
+| batch invariance | one sequence alone gives the bytes it has among 4; the sequence that runs alone rotates with the step, so every row of the batch is covered: a gate for the linear-attention step on compute capability 10.0, 10.3 and 12.0 (in its `native` form on 10.0, the class that form has run on) and for the gate + quantise entry on 10.0, a printed fact for every other block and class |
 
 The band of the linear-attention step is judged twice. Over the whole run: more than 99.9 % of its 8-bit output bytes
 equal, more than 99.9 % of its recurrent state within 1e-4 and all of it within two bf16 units of the state's largest
@@ -213,6 +335,17 @@ allows. The band still catches a value head of one sequence that is wrong at eve
 slot; and any element beyond the cap. One wrong output byte of one head at every step stays inside it. The step's line also
 prints the state's rms ratio (the rms of the difference over the rms of the reference state, at the worst call) as a second
 view of the same comparison; it is printed, not gated.
+
+The gate + quantise entry is not compared with the reference chain of its block but with its twin, the same gate
+written at the kernel's rounding points (`model_samples/providers/torch_ref.py`: `GateQuantizeQuotient`). The reference
+chain rounds the sigmoid to bf16 and then the product; the kernel forms the gated value as the quotient
+`attn / (1 + exp(-gate))`, rounds it once to bf16 and once to an 8-bit code, which is another function, one code apart on
+rare elements. Its band (`gate_fp8`) is the numerics contract on the entry's page
+(`docs/operations/attention/gate_quant_decode.md`), not a share: the twin forms the quotient in the reference's
+accumulation precision and keeps the two bf16 values around it; every byte must be the code of one of the two, and the
+code of the nearest one wherever the quotient is more than 2.5 fp32 units from their midpoint; every value finite. Inside
+that margin the kernel's fp32 quotient may fall on the other side of the midpoint. The line prints how many bytes did;
+one byte outside the two codes, or off the nearest one beyond the margin, fails the block.
 
 The token check has a declared band because a band taken from the run's own logit distance cannot fail. With seeded
 weights it guards the path, not the layers: the layers move the logits by little (the two stacks are 1.0 to 1.4 units apart
@@ -266,6 +399,17 @@ text of its compile-time arguments, cut at a fixed length, so two forms can shar
 why the form is compared on the objects and the name only against the entry's own symbol. Registers per thread are
 recorded in `--dump-census` and compared with nothing. Nothing here is a timing.
 
+The names themselves come from the profiler, and the profiler names a kernel wrongly in one situation: after a kernel
+module was unloaded in the same process, a kernel loaded where the unloaded one had been can be recorded under the
+unloaded kernel's name. Two raw CUDA kernels loaded, launched and unloaded in turn were recorded under each other's name
+on about every second launch, while each wrote its own output; with every module kept loaded, never (PyTorch 2.13.0,
+CUDA 13.0, a compute capability 8.0 GPU; the fused step in its two forms showed it on compute capability 10.0). The
+kernel that runs is the right one; the name of its record is not. A run of this sample unloads nothing: its entries live
+until the process ends, so its names are right. A longer process that builds and frees entries before it runs the check
+-- a test session that runs two stacks one after the other -- can fail the check by name alone. It errs to that side
+only: the expected symbols are read from the entry object that was called, so a stale name cannot make another kernel
+pass. The area's GPU test runs the `fe-entries` sample in a fresh interpreter for this reason.
+
 Where the profiler's launch records cannot be had (no profiler library in the environment, another profiler attached, a
 trace that cannot be exported or read, records without launch arguments), the line reads `NOT OBSERVED` with the reason
 and the run ends in `[00] RAN fe-cublas stack (kernels not observed: <reason>)` with exit code 0: its other checks
@@ -290,13 +434,18 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 | compute capability | the default run of this sample |
 |---|---|
-| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on |
+| 10.0 (data-center Blackwell, for example a GB200) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; the checkpoint run of the section above. With `--check-kernels`: `[00] PASS` at 1 and 4 sequences, the only class the kernel check has run on. The stacks `native` and `fe-entries`: `[00] PASS` at 1 and 4 sequences and with the checkpoint, batch invariance of the fused step and of the gate entry gated and equal; the only class these stacks have run on |
 | 10.3 (for example a GB300) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal; a checkpoint run before the one of the section above |
 | 10.7 (a VR200-class part) | `[00] PASS`; batch invariance of the fused step is printed on this class (`REPORTED`), not gated: every block was equal in the runs so far |
 | 12.0 (for example an RTX 5090) | `[00] PASS`, verified at 1 and 4 sequences; batch invariance of the fused step gated and equal. The checkpoint does not fit a 32 GB card: on one, the sample printed the memory sentence (about 59.7 GiB needed) and exited 0 |
 | any other | `[00] SKIP`, by design. `--stack reference` runs the reduced model there on PyTorch alone, with the whole report, and ends in `[00] RAN reference stack (no provider checked)`: nothing is verified (seen on compute capability 8.0) |
 
-A class the current checks have not run on is uncovered, not passing.
+A class the current checks have not run on is uncovered, not passing. That holds for the stacks `native` and
+`fe-entries` on every class but 10.0: the gate entry inside this sample, the fused step in its wait + release form, and
+the kernel patterns of the check have run on 10.0 only. So has the build of the entries' kernels while a run is
+planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
+held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
+decline, not on such an installation.
 
 Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
 reserved 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
@@ -307,6 +456,7 @@ prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
 6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
-Blackwell GPU: about 5 s to draw the weights, about a second to compile the fused step for the first sequence count (0.5
-to 2.4 s in the runs so far) and 0.3 to 0.4 s for the next, the rest for the decode and its checks. These are orientation
-values of single runs, not measurements of record.
+Blackwell GPU: a second or two to plan, which includes building the entries' kernels for both sequence counts (1.1 to
+1.7 s in the runs since that build became part of the plan, 3.6 s in the first of them; built after the load, the fused
+step's kernel took 0.5 to 2.4 s for the first sequence count and 0.3 to 0.4 s for the next), about 5 s to draw the
+weights, the rest for the decode and its checks. These are orientation values of single runs, not measurements of record.

@@ -35,6 +35,7 @@ tensor is checked for its storage format and shape before anything is read.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -123,6 +124,18 @@ class QwenDense:
     first_launch_reserve = configs.FIRST_LAUNCH_RESERVE
     logits_band_units = configs.LOGITS_BAND_UNITS
     table_source = "model_samples/qwen_dense/configs.py"
+    target_stacks = configs.TARGET_STACKS  # the stacks a run of which is held against the census of the target kernel set
+    _target = None  # that census, read once per process
+
+    @classmethod
+    def target(cls):
+        """The family's census of the target kernel set of a decode step (``kernel_census.json`` beside ``configs.py``):
+        ``model_samples.census.Target``.  ``ValueError`` when the file is not such a census."""
+        if cls._target is None:
+            from ..census import Target
+
+            cls._target = Target.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_census.json"))
+        return cls._target
 
     @classmethod
     def reduced(cls, layers: int = 2, vocab: int = 15520) -> "QwenDense":
@@ -320,7 +333,7 @@ class QwenDense:
         return specs
 
     def copy_bytes(self) -> int:
-        """Bytes of the bf16 copies the ``fe-cublas`` and ``reference`` stacks hold: 2 per weight element."""
+        """Bytes of the bf16 copies every stack of this family holds so far: 2 per weight element."""
         return sum(2 * s.numel for s in self.tensor_specs() if s.fmt != "scalar")
 
     def state_bytes(self, sequences: int, capacity: int) -> int:
@@ -349,7 +362,7 @@ class QwenDense:
 
         * ``weights``: every weight the step reads in full, in its stored format (8-bit: 1 byte per element; 4-bit: 0.5 byte
           per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per sequence;
-        * ``copies``: the same weights as the ``fe-cublas`` and ``reference`` stacks hold them, bf16 at 2 bytes per element;
+        * ``copies``: the same weights as the stacks of this family hold them so far, bf16 at 2 bytes per element;
         * ``state``: the recurrent state and the conv history of every linear-attention layer, read and written, and the
           cached keys and values of every attention layer up to ``positions`` positions, read."""
         g = self.geometry

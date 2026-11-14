@@ -12,8 +12,9 @@ whether it serves the run.  Nothing is chosen at run time and nothing falls back
   ``[NN] SKIP <sentence>`` and exits 0;
 * ``ValueError`` means the caller violated a contract (an unknown stack, a provider key that is not a declared row).
 
-The stack is explicit (``"fe-cublas"``, ``"reference"``, later ``"native"``): a row outside the requested stack is never
-selected, whatever is installed.  ``--provider BLOCK=KEY`` selects one declared row of a block for an A/B.
+The stack is explicit (``"fe-cublas"``, ``"native"``, ``"fe-entries"``, ``"reference"``): a row outside the requested stack is
+never selected, whatever is installed.  ``--provider BLOCK=KEY`` selects one declared row of a block for an A/B; the plan
+keeps which blocks were selected that way (``Plan.overridden``).
 
 A row also says in which FORM its entry is called (``form``: the fields of the entry's form the row fixes, which the adapter
 passes on and the kernel check compares with the entry's own answer), and a block declares the kernels it launches as census
@@ -40,7 +41,7 @@ class ProviderRow:
     sequences: Tuple[int, Optional[int]]  # the selection key is (GPU class, sequences, tokens per sequence):
     tokens: Tuple[int, Optional[int]]  # some entries have a two-dimensional limit
     key: str  # "fe.gdn_decode_fused" | "cublas.bf16_dequantized" | ...: one of the closed list in providers.KEYS
-    stack: Union[str, Tuple[str, ...]]  # "fe-cublas" | "native" | "reference" | "selectable" (only through --provider), or several
+    stack: Union[str, Tuple[str, ...]]  # "fe-cublas" | "native" | "fe-entries" | "reference" | "selectable" (only through --provider), or several
     serves: str  # what the entry admits, in rows
     measured: Tuple[str, ...] = ()  # where a published record of the entry exists (GPU class, rows); the table prints "none" otherwise
     fallback: str = ""  # non-empty for a reference chain or a dequantised copy: the reason printed in the table
@@ -109,7 +110,13 @@ class Block(Protocol):
     state_args: Tuple[int, ...]  # the operands the call updates in place
 
     def check_support(self, sequences: int, tokens: int) -> None:
-        """Raise the provider's typed decline when it does not serve this run; return otherwise."""
+        """Raise the provider's typed decline when it does not serve this run; return otherwise.  Allocates nothing on the
+        GPU: the memory sentence of the plan comes after it."""
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """What the block builds on the GPU before the load so that a decline still comes with the plan (an adapter to an
+        entry builds the entry's kernel on scratch operands of the run's row count).  Made after the memory sentence held
+        (``Plan.first_use``), so a run that does not fit allocates nothing.  Raises as ``check_support`` does."""
 
     def compile(self, sequences: int, tokens: int) -> None:
         """Build everything the run needs before its first step."""
@@ -150,7 +157,7 @@ class Regime:
 class Plan(dict):
     """Block name -> :class:`Block`, with what was decided: the selected rows, the device facts and the run."""
 
-    def __init__(self, blocks, rows, calls, facts, sequences, tokens, stack, regime, source):
+    def __init__(self, blocks, rows, calls, facts, sequences, tokens, stack, regime, source, overridden=()):
         super().__init__(blocks)
         self.rows: Dict[str, ProviderRow] = rows
         self.calls: Mapping[str, str] = calls
@@ -158,14 +165,27 @@ class Plan(dict):
         self.sequences, self.tokens, self.stack = sequences, tokens, stack
         self.regime: Optional[Regime] = regime
         self.source = source
+        self.overridden: Tuple[str, ...] = tuple(overridden)  # the blocks whose row ``--provider`` selected: not the stack's own choice
+        self.first_used = False  # whether the blocks have made their first use on the GPU (``first_use``)
+
+    def first_use(self) -> None:
+        """The first use every block makes of its entry on the GPU (``Block.first_use``), once per plan.  It is the one step
+        of a plan that allocates on the GPU, so it is a step of its own: ``plan`` resolves the table and builds nothing, the
+        memory sentence (``memory``) says whether the run fits, and only a run that fits comes here -- before anything is
+        loaded.  Raises as ``plan`` does: ``NotImplementedError`` (a SKIP) where the installation does not serve an entry,
+        ``ValueError`` where an entry declines what its adapter built."""
+        if not self.first_used:
+            for block in self.values():
+                block.first_use(self.sequences, self.tokens)
+            self.first_used = True
 
     def __eq__(self, other):
         """Two plans are equal when they hold the same blocks and the same decisions.  Against a plain mapping the comparison is
         the mapping's own (the blocks alone)."""
         if not isinstance(other, Plan):
             return NotImplemented
-        mine = (self.rows, self.calls, self.facts, self.sequences, self.tokens, self.stack, self.regime, self.source)
-        theirs = (other.rows, other.calls, other.facts, other.sequences, other.tokens, other.stack, other.regime, other.source)
+        mine = (self.rows, self.calls, self.facts, self.sequences, self.tokens, self.stack, self.regime, self.source, self.overridden)
+        theirs = (other.rows, other.calls, other.facts, other.sequences, other.tokens, other.stack, other.regime, other.source, other.overridden)
         return dict.__eq__(self, other) and mine == theirs
 
     __hash__ = None  # a mapping with decisions attached: unhashable, like the dict it extends
@@ -313,4 +333,4 @@ def plan(
         blocks[block], selected[block] = built, row
     regime = next((r for r in regimes if r.serves(facts.cc, sequences)), None)
     calls = model.calls_text() if model is not None else {}
-    return Plan(blocks, selected, calls, facts, sequences, tokens, stack, regime, source)
+    return Plan(blocks, selected, calls, facts, sequences, tokens, stack, regime, source, tuple(overrides))

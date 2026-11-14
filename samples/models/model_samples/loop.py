@@ -5,14 +5,17 @@
 
 A session decides everything before it loads anything: ``plan_table()`` resolves the family's provider table for this GPU, the
 number of sequences and the stack, and states the memory the run needs -- for this session and for the sessions that will
-follow it on its weights, so that nothing can decline once the first of them has loaded.  ``load()`` then reads (or draws),
+follow it on its weights, so that nothing can decline once the first of them has loaded.  Only a run that fits then lets its
+entries build their kernels on scratch operands (their first use, where an entry asks what it needs of the installed
+toolchain): the memory sentence comes before the first allocation on the GPU.  ``load()`` then reads (or draws),
 merges and dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one
 warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
 chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
 no ``generate()`` here.  ``trace`` replays the first steps of the recorded run under the profiler for the report's GPU-side
 lines (``timing``); it leaves the run's state and record as they were.  Asked for launch records, the same pass also keeps
 what the kernel check needs (``census.Traced``): the sites of a step in wiring order, the log of every block call of the
-traced steps and the profiler's record of every launch.
+traced steps and the profiler's record of every launch -- and, for a stack that declares a target kernel set, what the run can
+say about that set (``claim``).
 
 The set of sequences is fixed before the first step: a sequence that reaches its end token stays in the batch, so the number of
 rows, and with it the kernel path, does not change inside a run.  A session keeps no state between two prompt sets other than
@@ -30,7 +33,7 @@ from .sampling import GREEDY
 from .state import DecodeState
 from .timing import Report, Stages, now, trace_steps
 
-STACKS = ("fe-cublas", "reference")
+STACKS = ("fe-cublas", "native", "fe-entries", "reference")
 PREFILL_ROUTES = ("decode-step",)
 
 
@@ -93,7 +96,8 @@ class Session:
         model's seeded weights.  ``share`` reuses another session's loaded weights (the reference session of the tie-out).
         ``record_steps`` bounds the steps whose ids and logits are kept on the GPU for the checks (default: every step).
         ``check_kernels`` says that the run will check its kernels: what that needs of a provider is then part of the plan
-        (a decline is a SKIP before the load), and the traced pass keeps its launch records."""
+        (a decline is a SKIP before the load), and the traced pass keeps its launch records.  A stack that declares a target
+        kernel set (the family's ``target_stacks``) always checks its kernels: its statement is about them."""
         if sampling is not GREEDY:
             raise ValueError("this stack chooses tokens greedily; pass sampling=GREEDY")
         if prefill not in PREFILL_ROUTES:
@@ -105,7 +109,7 @@ class Session:
         self.overrides, self.reference_precision, self.capacity = dict(overrides or {}), reference_precision, int(capacity)
         self.checkpoint, self.seed, self.merge_rule, self._share = checkpoint, seed, merge_rule, share
         self.record_steps = self.capacity if record_steps is None else max(1, min(int(record_steps), self.capacity))
-        self.check_kernels = bool(check_kernels)
+        self.check_kernels = bool(check_kernels) or stack in getattr(model, "target_stacks", ())
         self.traced: Optional[census.Traced] = None  # of the last traced pass that kept its launch records
         self._call_log: Optional[list] = None  # the block calls of the traced step that is running
         self.stages = Stages(sync=lambda: torch.cuda.synchronize(self.device) if self.device.type == "cuda" else None)
@@ -137,26 +141,44 @@ class Session:
             )
         return self.plan
 
+    def claim(self) -> Optional[census.Claim]:
+        """What this session's run can say about the target kernel set of its stack -- the identity of every block call, the
+        three numbers, the reasons its GPU class is not claimed (``census.Claim``) -- or ``None`` for a stack that declares no
+        target.  Decided from the plan and the family's census file: before anything is loaded.  ``ValueError`` when that
+        file is not a census of this model."""
+        if self.stack not in getattr(self.model, "target_stacks", ()):
+            return None
+        return self.model.target().claim(self.resolve(), self.model)
+
     def plan_table(self, later: Sequence["Session"] = ()) -> str:
         """The served-by table and the memory sentence; raises ``NotImplementedError`` (a SKIP) before anything is loaded.
 
         ``later`` are the sessions that will run after this one in the same process on its weights (``share=self``).  Their
         plans are resolved here too, and the memory sentence then covers the whole run -- this session's need plus their
-        state -- against what is free now: every decline of a run comes before its first load, none after it."""
+        state -- against what is free now: every decline of a run comes before its first load, none after it.
+
+        In this order: the tables of every session are resolved, which allocates nothing; the memory sentence says whether
+        the whole run fits; and only then do the entries of each plan make their first use (``Plan.first_use``: an entry
+        builds its kernel on scratch operands as large as the run's, and asks there what it needs of the installed
+        toolchain).  A run that does not fit is a SKIP with its estimate, and nothing was allocated for it."""
         plan = self.resolve()
         for session in later:
             session.resolve()
-        if self.device.type != "cuda":
-            return plan.table()
-        need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
-        need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
-        counts = [self.sequences, *(session.sequences for session in later)]
-        what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
-        return plan.table() + "\n  " + plan.memory(need, what)
+        sentence = ""
+        if self.device.type == "cuda":
+            need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
+            need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
+            counts = [self.sequences, *(session.sequences for session in later)]
+            what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
+            sentence = "\n  " + plan.memory(need, what)  # before anything is built on the GPU: this is where a run that does not fit ends
+        for session in (self, *later):
+            session.plan.first_use()
+        return plan.table() + sentence
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
         plan = self.resolve()
+        plan.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
             torch.backends.cuda.matmul.fp32_precision = "ieee"
         if self._share is not None:
@@ -251,11 +273,12 @@ class Session:
         none."""
         records = self.check_kernels if records is None else bool(records)
         sites = census.expected(self.plan, self.model) if records else []
+        claim = self.claim() if records else None
         count = min(steps, self.record.count, self.record.inputs.shape[0])
         if count < 1:
             self._report.trace_missing = "needs a recorded step on a CUDA device"
             if records:
-                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences)
+                self.traced = census.Traced(sites, [], missing=self._report.trace_missing, rows=self.sequences, claim=claim)
             return
         inputs, kept, calls = self.record.inputs[:count], (self.state, self.record), self._calls
         self.state = DecodeState(self.model.geometry.layer_kinds, self.sequences, self.capacity, self.model.state_shapes(), self.device)
@@ -277,7 +300,7 @@ class Session:
         finally:
             (self.state, self.record), self._calls, self._call_log = kept, calls, None
         if records:
-            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences)
+            self.traced = census.Traced.of(sites, call_log, launches, count, self._report.trace_missing, self.sequences, claim)
 
     def new_report(self) -> None:
         """A fresh report for the next prompt set of this session; the block calls per step stay the session's."""
