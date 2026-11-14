@@ -8,7 +8,7 @@ import pytest
 import torch
 import cudnn
 
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine, sm120_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
 
@@ -55,7 +55,7 @@ def test_runtime_kv_padding_nan_rebind_replay(d, dv, dtype, sq, sk, causal, cudn
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_fwd_prefill_sm120")
+    select_engine(graph, sm120_half_owner(d, dv))
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
@@ -114,7 +114,7 @@ def test_d512_dense_sink_limits(sink_value):
     tensors["sinks"].fill_(sink_value)
     tensors["seq_kv_lens"][1] = 0
     api.compile()
-    assert api._k_mod.__file__.endswith("sm120/prefill_d512_f16.py")
+    assert api._k_mod.__file__.endswith("sm120/d512_f16_paired/kernel.py")
     assert api._k_mod.PARAMS.page_size == 0
     workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
     graph = torch.cuda.CUDAGraph()

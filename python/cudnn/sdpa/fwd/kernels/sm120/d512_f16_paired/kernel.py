@@ -5,7 +5,7 @@
 A fused multi-head attention (FMHA) FP16/BF16 kernel for D512 and D576/V512 on the
 NVIDIA Blackwell SM120 family (SM120 and SM121) using dense TMA or paged K/V loads.
 
-This is the D=512 variant of ``prefill_f16.py``: the same fused Q*K^T,
+This is the D=512 variant of ``sm120/prefill_f16.py``: the same fused Q*K^T,
 softmax, and softmax(Q*K^T)*V pipeline on SM80-era ``mma.sync.aligned.m16n8k16``
 tensor cores, with (512, 512) head tiles. A 16-row Q slab's fp32 O accumulator
 is 16 x 512 / 32 lanes = 256 registers per lane, more than the whole register
@@ -127,6 +127,9 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _dense_host, paged_host as _paged_host, compile_host as _compile_prepared_host
+from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults.
