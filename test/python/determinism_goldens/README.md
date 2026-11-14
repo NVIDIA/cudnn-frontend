@@ -5966,9 +5966,11 @@ The base is `5913f355354bd35d5be54494b91b1227b01917bb`.
 
 New native evidence uses H100 NVL (cc 9.0, 132 SMs), Python 3.12,
 Torch 2.14.1+cu130, cuDNN 9.30.0 and CuTe DSL 4.8.0 compiling CUDA 13.4.
-The import path was asserted to be the isolated source checkout. The native
-extension was reused after checking that its native source matched the base;
-it was not rebuilt for this Python-only change.
+The import path was asserted to be the isolated source checkout. The initial run reused a native extension, but a later capability check found
+that it lacked the claim-counter property present in current C++ source.
+A matching extension was then built from the frozen source with cuDNN 9.30
+headers; `supports_claim_counter=True` was verified. The final native result
+below uses that fresh extension.
 
 `test_sdpa_fwd_sm90_implementation_determinism.py` adds 16 L0 cases:
 
@@ -6014,3 +6016,18 @@ Two negative compiled-parameter identity tests first failed with shared
 legacy records and passed after checking implementation-local record types.
 The final 3,000-launch stress result is newer than those initial 256-launch
 runs. No missing golden is counted as a strict-golden pass.
+
+With the freshly built native extension, source `6985f58c1` passed **85 tests
+with 2 missing-runtime-golden skips** in the new contract/determinism suites
+and the complete `test_sdpa_prepared_sm90.py` suite. This includes the D128
+claim-counter control and all fresh-process artifact reloads. An earlier
+frozen-source sweep on the reused binary gave **2129 passed, 10 skipped,
+15 deselected**; its skips were eight missing goldens and two SM100-only cases,
+and the deselections were 14 cross-compile cases plus the then-unqualified
+claim-counter control. That control is qualified by the fresh-extension run.
+
+Six omitted-scheduler host controls first gave four failures and two passes:
+causal plans had been incorrectly assigned NATURAL. Both new hosts now resolve
+an omitted scheduler through the unchanged adapter rule. All six controls,
+plus native/paged public-record rebuilds with omitted knobs, pass. Ranked
+candidate schedules and thresholds are unchanged.
