@@ -5512,3 +5512,114 @@ it also exposed the existing N64 dense-only factory boundary, which is now
 rejected by capability and standalone checks before compilation. An earlier
 config admission failure and a synthetic fixture missing its padding flag
 are retained as development failures; neither is a successful GPU test.
+
+## 2026-11-10 — JAX grouped SiTU integration
+
+Added `gemm/jax/test_grouped_gemm_situ_determinism.py`: eight L0 cases covering
+forward/backward, 256/1024/32768 active rows, fresh buffers, concurrent work,
+empty experts, poisoned capacity tails, expert packing/reordering/duplication
+and changed neighbors. Active data and scale outputs use raw-byte comparisons.
+Atomic dprob is excluded from bitwise claims; canonical parity checks it
+against the Torch result numerically. General dprob determinism is not claimed.
+
+New GB200 SM100 measurements: native cuDNN builds and imports passed;
+73 canonical parity/validation cases passed, two new golden recordings passed,
+and all eight strict replay/invariance/golden cases passed (zero skips).
+
+Runtime: JAX 0.12.0.dev20261014, Torch 2.16.0.dev20261030+cu130, CUDA toolkit
+13.5, CuTeDSL 4.8.0/compiler CUDA13.4; cuDNN backend 9.26 (Torch reports 9.27).
+New goldens are under runtime key `ec5f7cd6b51a0ce3`; no existing golden changed.
+They were recorded into a new candidate directory after numerical parity,
+then checked in a separate run with recording disabled. FP8 E5M2, SM103,
+cu12 and other runtime combinations remain unverified.
+
+Commands (from `test/python`, with `CUDA_VISIBLE_DEVICES=0` and
+`XLA_PYTHON_CLIENT_PREALLOCATE=false`):
+
+```bash
+python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -m L0 -q -x \
+  -k 'canonical_jax_glu_parity or canonical_jax_dglu_parity or situ or jax_glu_rejects_unsupported_options or jax_dglu_rejects_unsupported_options'
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest gemm/jax/test_grouped_gemm_situ_determinism.py -m L0 -q -x
+```
+
+### 2026-11-13 follow-up
+
+Tested source revision: `f9619cedc5d8631654ee789d01d1eb8e1fdd04cb`.
+All 85 selected canonical cases and eight strict replay/invariance/golden
+cases passed, with zero failures or skips. The canonical total includes four
+independent Torch-reference cases and eight changed-data/routing cases.
+Both small golden cases also check their actual inputs and outputs against
+the shared numerical reference before checking or recording hashes.
+
+Runtime: GB200 SM100 (152 SMs), driver CUDA API 13050,
+JAX 0.12.0.dev20261014, Torch 2.16.0.dev20261030+cu130 (CUDA 13.0),
+cuDNN 9.26, CuTeDSL 4.8.0/compiler CUDA 13.4 and apache-tvm-ffi 0.1.15.post2.
+Use the commands above with `CUBLAS_WORKSPACE_CONFIG=:4096:8` and
+`CUDNN_DETERMINISM_RECORD` unset. Both golden JSONs are byte-identical to
+`5593a9f3816b918896f5ba526c0097ccdffa7f75`; no baseline was regenerated.
+
+Two earlier reference-harness failures involved dprob singleton dimensions
+and inputs beyond the active row range. These were fixed without changing
+numerical tolerances or golden bytes; the complete suites then passed.
+
+Atomic dprob remains outside bytewise/golden guarantees. SM103, E5M2 and other
+runtime combinations remain unverified. No shared-memory kernel body changed;
+dedicated warm-stress qualification of the underlying GEMM is not claimed.
+
+### 2026-11-13 CI-environment reference correction
+
+Tested source revision: `97993e6879182a6693f9307c9b8bf96a02f06447`.
+The original CI runtime reproduced 124 failing raw FP8 elements in the
+256-row backward math-reference check. Replay and capacity isolation passed.
+Torch's default `high` FP32 matmul mode permitted TF32 in the independent
+reference GEMMs. Four reference scale blocks crossed an MXFP8 exponent
+boundary: raw -224 versus -448 used scales 1/256 versus 1/512, respectively,
+and both dequantized to -87.5 with normalization 0.01. With the same native
+output, `highest` reference precision removed all 124 mismatches and all
+four scale mismatches. Relative L2 error against the quantized reference
+after dequantization fell from 0.005990 to 0.000127.
+
+The helper now uses `highest` only for reference GEMMs and restores the
+caller's precision in `finally`. Kernel code, numerical tolerances and
+previous golden records are unchanged. Explicit `high` and `highest`
+small-case coverage increases the dedicated L0 suite from eight to ten
+cases and checks precision restoration.
+
+GB200 SM100 (152 SMs), driver CUDA API 13040, Torch
+2.15.0a0+875d815502.nv26.10 (CUDA 13.4), JAX 0.12.0.1, cuDNN 9.28.1,
+CuTeDSL 4.8.0/compiler CUDA 13.4 and apache-tvm-ffi 0.1.16:
+two candidate recordings passed, ten strict dedicated cases passed with
+recording disabled, and all 335 full JAX L0 cases passed, with two pre-existing packed-FP4 xfails
+and zero skips. The original CI-built native ARM
+extension was used. All six implementation/test source hashes matched.
+The tests retained the image's default `high` matmul mode outside the
+reference guard.
+
+The two new records under `7685f6b6976b350d` cover this CI runtime.
+They were recorded into a new candidate directory after the independent
+reference passed, then inspected before a separate strict check. Every
+input/output hash, shape and dtype equals the corresponding original
+`ec5f7cd6b51a0ce3` record; only runtime metadata differs. The old records
+remain untouched.
+
+On a second SM100 device (148 SMs), the same Torch/CUDA/JAX/cuDNN/DSL
+versions and apache-tvm-ffi 0.1.15.post2 passed two candidate recordings,
+ten strict dedicated cases and 54 selected canonical SiTU cases. This
+run used a native extension built from the matching source. Its private
+candidate records are not included. Both devices ran the dedicated suite
+with recording disabled after candidate generation.
+
+Commands (from `test/python`, with `CUDA_VISIBLE_DEVICES=0`,
+`XLA_PYTHON_CLIENT_PREALLOCATE=false` and `CUDNN_DETERMINISM_RECORD` unset):
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest gemm/jax/test_grouped_gemm_situ_determinism.py -m L0 -q -x
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest gemm/jax -m L0 -q -x
+python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -m L0 -q -x -k situ
+```
+
+This corrects the test reference; it does not establish broader kernel
+coverage. SM103, E5M2 and atomic dprob determinism remain unverified.
