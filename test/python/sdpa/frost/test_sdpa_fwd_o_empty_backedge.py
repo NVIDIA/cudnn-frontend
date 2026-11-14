@@ -38,7 +38,7 @@ _TWO_WARPGROUP_KERNELS = (
     "sm100/prefill_d128_f16.py",
     "sm100/prefill_d128_fp8.py",
     "sm100/prefill_d128_mxfp8.py",
-    "sm100/prefill_d192_d128_fp8.py",
+    "sm100/d192_fp8_multi_q/kernel.py",
     "sm100/prefill_d192_d128_mxfp8.py",
     "sm107/prefill_d128_f16.py",
     "sm107/prefill_d128_fp8.py",

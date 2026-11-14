@@ -52,11 +52,14 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d192
+from cudnn.sdpa.fwd.kernels.sm100.d192_fp8_multi_q.config import TemplateParams, make_cfg_d192
+from cudnn.sdpa.fwd.kernels.sm100.d192_fp8_multi_q import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
-PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
 CFG, _TMA = make_cfg_d192(PARAMS)
 # Test-only schedule skew; no plan/runtime API sets this, so ordinary builds
 # compile the delay out. Detector: test_fp8_d192_final_p1_reuse_under_mma_skew.

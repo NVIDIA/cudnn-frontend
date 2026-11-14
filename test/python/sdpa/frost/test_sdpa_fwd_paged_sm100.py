@@ -2003,7 +2003,7 @@ def test_paged_graph_fp8_declines_off_contract():
 # The SM100 d192x128 quantized files are listed because config_sm100._PAGED_KV_FLAVORS
 # names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
-    ("sm100/prefill_d192_d128_fp8.py", 0, 1),
+    ("sm100/d192_fp8_multi_q/kernel.py", 0, 1),
     ("sm100/d512_f16_2x2/kernel.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
     ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),

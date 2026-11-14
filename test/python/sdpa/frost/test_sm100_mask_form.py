@@ -42,7 +42,7 @@ _KERNELS = {
     ("f16", (256, 256)): ("d256_f16_lookahead/kernel.py", 3),  # fused correction masks its P1 slice independently
     ("f16", (512, 512)): ("d512_f16_role_split/kernel.py", 1),
     ("fp8", (128, 128)): ("prefill_d128_fp8.py", 1),
-    ("fp8", (192, 128)): ("prefill_d192_d128_fp8.py", 2),
+    ("fp8", (192, 128)): ("d192_fp8_multi_q/kernel.py", 2),
     ("fp8", (256, 256)): ("d256_fp8_single_q/kernel.py", 4),
     ("fp8", (512, 512)): ("d512_fp8_role_split/kernel.py", 1),
     ("mxfp8", (128, 128)): ("prefill_d128_mxfp8.py", 2),
@@ -121,7 +121,8 @@ def test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain(rubin):
     ), f"window_right={params.window_right} is not below MASK_BOUND_LIMIT={MASK_BOUND_LIMIT}"
     assert params.window_right >= 1 << 28, f"window_right={params.window_right} no longer exceeds every dense d192 sequence a TMA coordinate can address"
     mod = _load_sm100_kernel_module((192, 128), params, fp8=True, pertensor=True, rubin=rubin)
-    assert mod.__file__.endswith("prefill_d192_d128_fp8.py") and (("/sm107/" in mod.__file__) == rubin), mod.__file__
+    expected = "sm107/prefill_d192_d128_fp8.py" if rubin else "sm100/d192_fp8_multi_q/kernel.py"
+    assert mod.__file__.endswith(expected), mod.__file__
     assert int(mod.CFG.MASK_FLAGS) & MASK_CAUSAL, "the dense fp8 d192 plan is expected to lower through the causal arm"
     assert int(mod.CFG.WINDOW_RIGHT) == params.window_right < MASK_BOUND_LIMIT
     # a graph-stated right band is passed through untouched, and the canonicalization stays confined to the dense plan

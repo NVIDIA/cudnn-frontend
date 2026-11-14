@@ -68,6 +68,19 @@ The old candidate order, budget and placement are preserved. Explicit records
 pin the body; old exact-D256 20513 recipes must be replanned. No additional
 Stats override note, determinism or batch-invariance guarantee is introduced.
 
+**SM100/SM103 exact per-tensor FP8 D192/V128 implementation engine:**
+`sdpa_fwd_sm100_d192_fp8_multi_q` (20525) owns exact D192/V128
+E4M3/E5M2 with existing scalar FP16/BF16/E4M3/E5M2 outputs. The legacy
+20513 row delegates this exact domain and retains dense head envelopes.
+The independent `sm100/d192_fp8_multi_q/` body/configuration/contract/host
+keeps one/two-CTA multi-Q variants and uses the shared graph binder/launcher.
+Public TILE_M=128 and TILE_CGA_M=1/2 name the physical cluster and MMA group;
+existing split plans require two CTAs. Paging and block-scaled O remain
+unsupported. Dense and nonpaged THD retain existing mask, packing, split,
+Stats and physical-origin restrictions. Central policy preserves candidate
+order and placement. Old exact-D192 20513 recipes must be replanned.
+No additional numerical, stride-override or determinism guarantee is introduced.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;

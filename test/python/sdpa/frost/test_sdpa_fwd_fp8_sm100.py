@@ -2342,7 +2342,7 @@ def test_fp8_d192_final_p1_reuse_under_mma_skew(monkeypatch, mask, s_kv):
     loaded = {}
 
     def load_skewed(path, params, tag="template", extra_key=None):
-        if Path(path).name != "prefill_d192_d128_fp8.py" or Path(path).parent.name != "sm100":
+        if not Path(path).as_posix().endswith("sm100/d192_fp8_multi_q/kernel.py"):
             return original_loader(path, params, tag=tag, extra_key=extra_key)
         key = (path, params, extra_key)
         if key not in loaded:
