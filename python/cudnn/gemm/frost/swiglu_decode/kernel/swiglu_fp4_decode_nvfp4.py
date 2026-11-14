@@ -1262,7 +1262,7 @@ class SwigluFp4DecodeKernel:
                     prewait_count = min(self.prewait_stages, self.num_ab_stage, k_block_cnt)
                     if first_work_tile:
                         prewait_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
-                        for prewait_block in cutlass.range(0, prewait_count, 1, unroll=1):
+                        for _ in cutlass.range(0, prewait_count, 1, unroll=1):
                             ab_pipeline.producer_acquire(prewait_state)
                             cute.copy(
                                 tma_atom_a,
@@ -1291,7 +1291,7 @@ class SwigluFp4DecodeKernel:
                 #
                 # Tma load loop
                 #
-                for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
+                for _ in cutlass.range(0, k_block_cnt, 1, unroll=1):
                     weight_ops = cutlass.Boolean(True)
                     if cutlass.const_expr(self.prewait_stages > 0):
                         # Primed stages already own their full-byte barrier.
