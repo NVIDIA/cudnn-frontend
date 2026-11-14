@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# CLI reduction adapted from https://github.com/021ai/cudnn-frontend at
+# b7dabce8ff4cce93f98470be608b5923defd291d (Apache-2.0, this source file).
 
 
 import math
@@ -617,6 +619,7 @@ class FlashAttentionDSABackwardSm90:
         relay_cluster_size: int = 1,
         q_wave_ctas: int = 1,
         padded_head_dim: int = 0,
+        emit_cli_target: bool = False,
     ):
         """Specialize the Hopper backward kernel and optional deterministic relay."""
         self.dtype = dtype
@@ -643,6 +646,7 @@ class FlashAttentionDSABackwardSm90:
         self.dQ_swapAB = dQ_swapAB
         self.have_topk_length = have_topk_length
         self.max_topk = max_topk
+        self.emit_cli_target = emit_cli_target
         self.deterministic = deterministic
         self.num_dkv_shards = num_dkv_shards
         self.relay_cluster_size = relay_cluster_size
@@ -849,6 +853,8 @@ class FlashAttentionDSABackwardSm90:
         sLSE_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64)], 128]
         sdPsum_struct = cute.struct.Align[cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64)], 128]
         sValid_struct = cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, 16], 16]
+        sCliTarget_struct = cute.struct.Align[cute.struct.MemRange[Float32, 4 * self.tile_n], 16]
+        emit_cli_target = self.emit_cli_target
 
         @cute.struct
         class SharedStorage:
@@ -862,6 +868,8 @@ class FlashAttentionDSABackwardSm90:
             sdO: sdO_struct
             sP: sP_struct
             sdS: sdS_struct
+            if emit_cli_target:
+                sCliTarget: sCliTarget_struct
 
         return SharedStorage
 
@@ -877,6 +885,8 @@ class FlashAttentionDSABackwardSm90:
         mdKV: cute.Tensor,
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
+        mCliTarget: Optional[cute.Tensor],
+        cli_target_head_count: Int32,
         num_waves: Int32,
         padded_seqlen_kv: Int32,
         softmax_scale: Float32,
@@ -1023,6 +1033,8 @@ class FlashAttentionDSABackwardSm90:
                         mdKV,
                         mTopkIdxs,
                         mTopkLength,
+                        mCliTarget,
+                        cli_target_head_count,
                         tma_atom_Q,
                         tma_atom_dO,
                         tma_atom_dQ,
@@ -1077,6 +1089,8 @@ class FlashAttentionDSABackwardSm90:
         mdKV: cute.Tensor,
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topK_max) int32
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
+        mCliTarget: Optional[cute.Tensor],
+        cli_target_head_count: Int32,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
         tma_atom_dQ: cute.CopyAtom,
@@ -1142,6 +1156,11 @@ class FlashAttentionDSABackwardSm90:
         sValid = storage.sValid.get_tensor(cute.make_layout((4, 4)))
         sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
         sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+        sCliTarget = None
+        if const_expr(self.emit_cli_target):
+            sCliTarget = storage.sCliTarget.get_tensor(
+                cute.make_layout((4, self.tile_n), stride=(self.tile_n, 1))
+            )
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sLSE = storage.sLSE.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
         sdPsum = storage.sdPsum.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
@@ -1190,6 +1209,9 @@ class FlashAttentionDSABackwardSm90:
                 mdPsum,
                 mTopkIdxs,
                 mTopkLength,
+                mCliTarget,
+                cli_target_head_count,
+                sCliTarget,
                 mdQ,
                 sQ,
                 sKV,
@@ -1360,6 +1382,9 @@ class FlashAttentionDSABackwardSm90:
         mdPsum: cute.Tensor,
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
+        mCliTarget: Optional[cute.Tensor],
+        cli_target_head_count: Int32,
+        sCliTarget: Optional[cute.Tensor],
         mdQ: cute.Tensor,
         sQ: cute.Tensor,
         sKV: cute.Tensor,
@@ -1614,6 +1639,12 @@ class FlashAttentionDSABackwardSm90:
                     mma_dsk_fn_1=mma_dsk_fn_1,
                     tLSErLSE=tLSErLSE,
                     tLSErdPsum=tLSErdPsum,
+                    mCliTarget=mCliTarget,
+                    cli_target_head_count=cli_target_head_count,
+                    sCliTarget=sCliTarget,
+                    batch_idx=batch_idx,
+                    seq_idx=seq_idx,
+                    topK=topK,
                     tPsP=tPsP,
                     tdSsdS=tdSsdS,
                     tScS_mn=tScS_mn,
@@ -1852,6 +1883,12 @@ class FlashAttentionDSABackwardSm90:
         smem_thr_copy_PdS: cute.TiledCopy,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
+        mCliTarget: Optional[cute.Tensor],
+        cli_target_head_count: Int32,
+        batch_idx: Int32,
+        seq_idx: Int32,
+        topK: Int32,
+        sCliTarget: Optional[cute.Tensor],
         dQ_accumulate: Boolean = False,
         num_valid_rows: Int32 = 64,
         gather: cutlass.Constexpr[bool] = True,
@@ -1897,6 +1934,43 @@ class FlashAttentionDSABackwardSm90:
                 row_is_valid = self._topk_row_is_valid(sValid, col)
                 p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
                 acc_S_mn[r, c] = self._select_valid_probability(p, row_is_valid)
+
+        if const_expr(mCliTarget is not None):
+            # WGMMA's native C fragment has heads on M and Top-K slots on N.
+            # A fixed N column spans stride-4 lanes within each warp, then
+            # all four WG0 warps. Transposing the register view alone does
+            # not change that thread ownership. Each warp writes a distinct
+            # partial; one thread then combines them in a fixed order.
+            tidx = cute.arch.thread_idx()[0] % self.num_threads_per_warp_group
+            lane = tidx % 32
+            warp = tidx // 32
+            for c in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[1])):
+                partial = Float32(0.0)
+                for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
+                    partial = partial + acc_S_mn[r, c]
+                partial = partial + cute.arch.shuffle_sync_bfly(partial, offset=4)
+                partial = partial + cute.arch.shuffle_sync_bfly(partial, offset=8)
+                partial = partial + cute.arch.shuffle_sync_bfly(partial, offset=16)
+                col = tScS_mn[0, c][COL]
+                if lane < 4:
+                    sCliTarget[warp, col] = partial
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierBwd.WG0_producer_sync),
+                number_of_threads=self.num_threads_per_warp_group,
+            )
+            if tidx < self.tile_n:
+                total = Float32(0.0)
+                for w in cutlass.range_constexpr(4):
+                    total = total + sCliTarget[w, tidx]
+                pos = n_block * self.tile_n + tidx
+                if pos < topK:
+                    mCliTarget[batch_idx, seq_idx, pos] = total / Float32(cli_target_head_count)
+            # No warp may overwrite the partials for the next tile before
+            # the output threads have read the current tile's four values.
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierBwd.WG0_producer_sync),
+                number_of_threads=self.num_threads_per_warp_group,
+            )
 
         # Convert P f32 -> bf16
         tdKVrP = cvt_f16(make_acc_tensor_frgA_view(acc_S), self.dtype)
@@ -1962,7 +2036,7 @@ class FlashAttentionDSABackwardSm90:
         # (9) Wait G4_half_0 + G4_half_1 done. WG0's KV usage is complete.
         # WG0 does NOT explicitly arrive KV_empty — the next iteration's
         # barrier_sync(KV_empty, 256) at the top serves as WG0's arrive + wait.
-        warpgroup.wait_group(0)
+        warpgroup.wait_group(0)  # GEMM2 done
 
     @cute.jit
     def mma_wg1(
