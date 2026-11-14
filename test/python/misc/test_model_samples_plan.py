@@ -121,8 +121,8 @@ def test_a_declined_row_is_a_skip_and_a_contract_violation_a_value_error():
     with pytest.raises(NotImplementedError, match=r"cudnn.GdnDecodeFused serves compute capability 10.x or 12.x; this device is 9.0"):
         _plan(cc=(9, 0))
     assert _plan(cc=(12, 0)).rows["linear_attention.step"].key == "fe.gdn_decode_fused"
-    with pytest.raises(ValueError, match="unknown stack"):
-        _plan(stack="native")
+    with pytest.raises(ValueError, match="unknown stack 'captured'; this family declares: fe-cublas, fe-entries, native, reference"):
+        _plan(stack="captured")
     with pytest.raises(ValueError, match="no such block"):
         _plan(overrides={"nothing": "torch.argmax"})
     with pytest.raises(ValueError, match="not a declared row"):

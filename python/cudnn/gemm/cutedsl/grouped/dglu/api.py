@@ -1420,6 +1420,8 @@ def grouped_gemm_dglu_wrapper_sm100(
             glu_clamp_min=glu_clamp_min,
             generate_dbias=generate_dbias,
             sf_vec_size=sf_vec_size,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
         )
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and

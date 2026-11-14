@@ -12,8 +12,13 @@ whether it serves the run.  Nothing is chosen at run time and nothing falls back
   ``[NN] SKIP <sentence>`` and exits 0;
 * ``ValueError`` means the caller violated a contract (an unknown stack, a provider key that is not a declared row).
 
-The stack is explicit (``"fe-cublas"``, ``"reference"``, later ``"native"``): a row outside the requested stack is never
-selected, whatever is installed.  ``--provider BLOCK=KEY`` selects one declared row of a block for an A/B.
+The stack is explicit (``"fe-cublas"``, ``"native"``, ``"fe-entries"``, ``"reference"``): a row outside the requested stack is
+never selected, whatever is installed.  ``--provider BLOCK=KEY`` selects one declared row of a block for an A/B; the plan
+keeps which blocks were selected that way (``Plan.overridden``).
+
+A row also says in which FORM its entry is called (``form``: the fields of the entry's form the row fixes, which the adapter
+passes on and the kernel check compares with the entry's own answer), and a block declares the kernels it launches as census
+entries (``Block.kernels``, :mod:`model_samples.census`).
 
 This module imports nothing beyond the standard library: a plan on stated device facts (:class:`DeviceFacts`) needs no GPU.
 """
@@ -22,6 +27,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple, Union
+
+from .census import Kernel
 
 GIB = 1024**3
 
@@ -34,13 +41,15 @@ class ProviderRow:
     sequences: Tuple[int, Optional[int]]  # the selection key is (GPU class, sequences, tokens per sequence):
     tokens: Tuple[int, Optional[int]]  # some entries have a two-dimensional limit
     key: str  # "fe.gdn_decode_fused" | "cublas.bf16_dequantized" | ...: one of the closed list in providers.KEYS
-    stack: Union[str, Tuple[str, ...]]  # "fe-cublas" | "native" | "reference" | "selectable" (only through --provider), or several
+    stack: Union[str, Tuple[str, ...]]  # "fe-cublas" | "native" | "fe-entries" | "reference" | "selectable" (only through --provider), or several
     serves: str  # what the entry admits, in rows
     measured: Tuple[str, ...] = ()  # where a published record of the entry exists (GPU class, rows); the table prints "none" otherwise
     fallback: str = ""  # non-empty for a reference chain or a dequantised copy: the reason printed in the table
     band: str = "same"  # the tie-out band against the reference block (tie_out.BANDS); never widened in place
     batch_invariant: Tuple[str, ...] = ()  # GPU classes on which "a sequence alone = the sequence in a batch" is a gate
     ci: bool = True  # False for a row that no test of this repository runs: the table prints "unverified in CI"
+    form: Tuple[Tuple[str, object], ...] = ()  # what the adapter passes to the entry: (field of the entry's form, value) pairs
+    rows: Tuple[int, Optional[int]] = (1, None)  # a third selection range: rows = sequences x tokens per sequence
 
     @property
     def stacks(self) -> Tuple[str, ...]:
@@ -50,7 +59,7 @@ class ProviderRow:
         return any(c == "any" or c == f"cc{cc[0]}.{cc[1]}" or c == f"cc{cc[0]}.x" for c in self.classes)
 
     def serves_run(self, sequences: int, tokens: int) -> bool:
-        return _inside(self.sequences, sequences) and _inside(self.tokens, tokens)
+        return _inside(self.sequences, sequences) and _inside(self.tokens, tokens) and _inside(self.rows, sequences * tokens)
 
     def classes_text(self) -> str:
         if "any" in self.classes:
@@ -96,12 +105,18 @@ class Block(Protocol):
     row: ProviderRow
     entry: str  # what is called, as printed in the table
     provider: str  # "cuDNN FE" | "cuBLAS" | "PyTorch" | ...
-    kernels: Tuple[str, ...]  # kernel names in launch order: the key of a traced pass's attribution (empty until one exists)
+    kernels: Tuple[Kernel, ...]  # the block's census entries: the kernels a call launches, or the families of a fallback row
     per_row: Tuple[int, ...]  # the operands that have one leading row per sequence
     state_args: Tuple[int, ...]  # the operands the call updates in place
 
     def check_support(self, sequences: int, tokens: int) -> None:
-        """Raise the provider's typed decline when it does not serve this run; return otherwise."""
+        """Raise the provider's typed decline when it does not serve this run; return otherwise.  Allocates nothing on the
+        GPU: the memory sentence of the plan comes after it."""
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """What the block builds on the GPU before the load so that a decline still comes with the plan (an adapter to an
+        entry builds the entry's kernel on scratch operands of the run's row count).  Made after the memory sentence held
+        (``Plan.first_use``), so a run that does not fit allocates nothing.  Raises as ``check_support`` does."""
 
     def compile(self, sequences: int, tokens: int) -> None:
         """Build everything the run needs before its first step."""
@@ -111,6 +126,16 @@ class Block(Protocol):
 
     def first_launch(self) -> dict:
         """What the first launch of each compiled form took, measured at load."""
+
+    def serving(self) -> Tuple[str, tuple]:
+        """``(entry instance, form)`` of what served the block's last call: the line a traced step writes into its call log
+        after the call.  The form is read from the object that was called -- the fields of the row's form as that entry
+        instance states them -- and never copied from the row; a block without an entry has no instance and passed nothing."""
+
+    def launch_facts(self, rows: int):
+        """What the block's entry states about its launch at ``rows`` (``census.Facts``: the symbols of its compiled kernels, its
+        form, its launch shape), or ``None`` for a block without such an entry.  ``ValueError`` / ``NotImplementedError`` when
+        the entry declines to state them for a row count the row claims."""
 
     def __call__(self, *operands):
         """Launch the block on the current stream."""
@@ -132,7 +157,7 @@ class Regime:
 class Plan(dict):
     """Block name -> :class:`Block`, with what was decided: the selected rows, the device facts and the run."""
 
-    def __init__(self, blocks, rows, calls, facts, sequences, tokens, stack, regime, source):
+    def __init__(self, blocks, rows, calls, facts, sequences, tokens, stack, regime, source, overridden=()):
         super().__init__(blocks)
         self.rows: Dict[str, ProviderRow] = rows
         self.calls: Mapping[str, str] = calls
@@ -140,14 +165,27 @@ class Plan(dict):
         self.sequences, self.tokens, self.stack = sequences, tokens, stack
         self.regime: Optional[Regime] = regime
         self.source = source
+        self.overridden: Tuple[str, ...] = tuple(overridden)  # the blocks whose row ``--provider`` selected: not the stack's own choice
+        self.first_used = False  # whether the blocks have made their first use on the GPU (``first_use``)
+
+    def first_use(self) -> None:
+        """The first use every block makes of its entry on the GPU (``Block.first_use``), once per plan.  It is the one step
+        of a plan that allocates on the GPU, so it is a step of its own: ``plan`` resolves the table and builds nothing, the
+        memory sentence (``memory``) says whether the run fits, and only a run that fits comes here -- before anything is
+        loaded.  Raises as ``plan`` does: ``NotImplementedError`` (a SKIP) where the installation does not serve an entry,
+        ``ValueError`` where an entry declines what its adapter built."""
+        if not self.first_used:
+            for block in self.values():
+                block.first_use(self.sequences, self.tokens)
+            self.first_used = True
 
     def __eq__(self, other):
         """Two plans are equal when they hold the same blocks and the same decisions.  Against a plain mapping the comparison is
         the mapping's own (the blocks alone)."""
         if not isinstance(other, Plan):
             return NotImplemented
-        mine = (self.rows, self.calls, self.facts, self.sequences, self.tokens, self.stack, self.regime, self.source)
-        theirs = (other.rows, other.calls, other.facts, other.sequences, other.tokens, other.stack, other.regime, other.source)
+        mine = (self.rows, self.calls, self.facts, self.sequences, self.tokens, self.stack, self.regime, self.source, self.overridden)
+        theirs = (other.rows, other.calls, other.facts, other.sequences, other.tokens, other.stack, other.regime, other.source, other.overridden)
         return dict.__eq__(self, other) and mine == theirs
 
     __hash__ = None  # a mapping with decisions attached: unhashable, like the dict it extends
@@ -295,4 +333,4 @@ def plan(
         blocks[block], selected[block] = built, row
     regime = next((r for r in regimes if r.serves(facts.cc, sequences)), None)
     calls = model.calls_text() if model is not None else {}
-    return Plan(blocks, selected, calls, facts, sequences, tokens, stack, regime, source)
+    return Plan(blocks, selected, calls, facts, sequences, tokens, stack, regime, source, tuple(overrides))

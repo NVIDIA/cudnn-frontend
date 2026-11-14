@@ -32,6 +32,10 @@ under `cudnn.moe.frost`), `AttentionGateQuantDecode` (the attention gate +
 quantize decode step, also under `cudnn.attention_gate.frost`) and
 `Fp8ProjectionDecode` (the FP8 projection for decode rows, also under
 `cudnn.gemm`) are the same kind of entry. QSA APIs are in `cudnn.ops`. `DSA` is imported from `cudnn`.
+`AddNormQuantDecode` (the add + RMSNorm + quantize decode step, also under
+`cudnn.norm.frost`) is a direct-call step entry of the same kind.
+`SwigluFp4Decode` (the FP4 gate / up product with SwiGLU for decode rows, also
+under `cudnn.gemm`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_prepare_backward`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
@@ -50,7 +54,9 @@ arbitrary user callbacks.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
-| `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in; BF16 out; FP32 accumulate | Unsupported | SM100: Unverified; SM103: Supported | Supported |
+| `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
+| `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
+| `SwigluFp4Decode` (block-scaled FP4 gate / up product with SwiGLU for decode rows) | fprop (inference step) | FP4 E2M1 in / out with E4M3 block scales; FP32 accumulate; BF16 intermediate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
 | `simplified_sparse_attention` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Unverified | Unsupported |
 | `simplified_sparse_attention_jax` | fprop | BF16 output; FP32 indexer loss | Unsupported | SM100: Replay only; SM103: Unverified | Unsupported |
@@ -107,6 +113,8 @@ arbitrary user callbacks.
 | `pygraph.sdpa` / standalone FROST D64 packed THD prefill (CGA1/2, N128, unsplit, independent origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (tested configurations) | Unverified by this suite |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
+| `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -227,6 +235,12 @@ a row alone and inside a batch under the entry's own picks.
   other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
+  KDA's packed workspace uses a shape-only bound on the number of piece slots;
+  it preserves the per-sequence split rule and arithmetic. Compact-workspace
+  output, gradient and CP-summary byte parity is additionally checked on SM103
+  for BF16/FP16, including changed-length CUDA Graph replay. This additional
+  workspace regression has not been rerun on SM100 or SM107; their earlier
+  determinism coverage remains recorded in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
@@ -270,19 +284,72 @@ a row alone and inside a batch under the entry's own picks.
   switch. The result bytes are a function of `(geometry, split_k)` on one
   runtime: the number of K slices is fixed when the entry is built (given, or
   a function of the geometry alone -- never of the row count or of the part),
-  and every other knob, including the measured pick per row count and part, is
-  a performance form that writes the same bytes. A row's bytes alone equal its
-  bytes among up to 32 rows at any position, across the 8- / 16- / 32-row
-  token tiles; the kernel is specialised on the row count, so replay and batch
-  invariance are verified at every row count 1 .. 32 of each served class
+  and every other knob, including the pick per row count and part and the
+  order in which the epilogue releases the tensor memory, is a performance
+  form that writes the same bytes. A row's bytes alone equal its bytes among
+  up to 32 rows at any position, across the 8- / 16- / 32-row token tiles; the
+  kernel is specialised on the row count, so replay and batch invariance are
+  verified at every row count 1 .. 32 of each served class
   (`ProjectionGeometry(4608, 8192)` at split 4 and at split 2,
-  `ProjectionGeometry(8192, 2048)` at split 2). Another split is another byte
-  class and another entry; the status holds per entry. SM100/103 is verified
-  on cc 10.3 (a GB300, 152 SMs) only -- cc 10.0 is admitted by the entry and
-  unverified; SM107 on cc 10.7 (a VR200-class part, 212 SMs). The committed
-  goldens belong to one cc 10.3 runtime; on any other runtime the status rests
-  on the replay and batch-invariance cells and the golden comparison is not
-  covered. No backward entry point exists. SM90 and SM120 are declined by type.
+  `ProjectionGeometry(8192, 2048)` at split 2, `ProjectionGeometry(5120, 6144)`
+  at split 4 and at split 2, `ProjectionGeometry(16384, 5120)` and
+  `ProjectionGeometry(14336, 5120)` at split 1). Another split is another byte
+  class and another entry; the status holds per entry. The evidence differs by
+  class. `ProjectionGeometry(4608, 8192)` and `ProjectionGeometry(8192, 2048)`
+  are verified on cc 10.0 (148 SMs), cc 10.3 (a GB300, 152 SMs) and cc 10.7 (a
+  VR200-class part, 212 SMs). The other three geometries are verified on
+  cc 10.0 only: the entry admits them on cc 10.3 and cc 10.7, where they have
+  not been run. Goldens are committed for one cc 10.3 runtime (the first three
+  classes) and for one cc 10.0 runtime (all seven); on any other runtime the
+  status rests on the replay and batch-invariance cells and the golden
+  comparison is not covered. No backward entry point exists. SM90 and SM120
+  are declined by type.
+- Add + RMSNorm + quantize decode step (`AddNormQuantDecode`): no
+  determinism switch and no numerics knob. A row's sum of squares is one
+  fixed tree whose shape is a function of `hidden` alone (a fused chain over
+  a thread's eight elements, a butterfly over a warp's lanes, a butterfly
+  over the warps) -- never of the row count, of the part or of a knob -- and
+  nothing of another row enters a row's thread block. A row alone writes the
+  bytes it writes inside a call of up to 1024 rows, at any position and among
+  any neighbours: the residual update, the bf16 output, the codes and the
+  row's NVFP4 block scales (a block scale's position in the 128 x 4 scale
+  layout follows the row index; its value does not). The output set (`bf16`,
+  `store_residual`), the launch knobs (`pdl`, `pdl_release`) and the owner of
+  an output write the same bytes. SM100 is verified on cc 10.0 (148 SMs)
+  with the committed goldens of that one runtime, under both compiler
+  flavours of CuTe DSL 4.8.0. cc 10.3 and cc 10.7 have not been run, so
+  SM103 and SM107 are unverified: the entry admits compute capability 10.x,
+  the kernel's rendering is pinned for the `sm_100a`, `sm_103a` and
+  `sm_107a` targets, and cc 10.7 needs the DSL's CUDA 13 compiler flavour.
+  SM90 and SM120 are declined by type. The bytes follow the part's
+  approximate reciprocal square root and approximate reciprocal: the status
+  holds on a fixed runtime, equal bytes across GPU architectures are not
+  claimed (an NVFP4 code at an exact rounding tie under a block scale that is
+  not a power of two follows the approximate reciprocal), and a golden
+  recorded on one runtime does not qualify another. No backward entry point
+  exists.
+- SwiGLU FP4 gate / up product for decode rows (`SwigluFp4Decode`): no
+  determinism switch and no numerics knob. The kernel has no split and no
+  reduction across rows: an output element is one fp32 chain in ascending K,
+  and a block scale is a function of its own row's 16 channels (the two lanes
+  that own a block exchange under a mask of one token's lanes). A row's packed
+  codes and block scales alone equal its bytes among up to 64 rows at any
+  position, across the 8- / 16- / 32- / 64-token tiles; one compiled kernel
+  per token tile serves every row count the tile holds, and replay and batch
+  invariance are verified at every row count 1 .. 64 of both served
+  geometries (`SwigluGeometry(5120, 17408)`, `SwigluGeometry(5120, 128)`).
+  Every config field (the token tile, the pre-wait stages, the L2 policy, the
+  grid cap, the launch attribute) writes the same bytes. SM100 is verified on
+  cc 10.0 (148 SMs) with the committed goldens of that one runtime, under the
+  CUDA 13.4 compiler of CuTe DSL 4.8.0; an older DSL compiler is declined by
+  name. cc 10.3 and cc 10.7 have not been run, so SM103 and SM107 are
+  unverified: the entry admits compute capability 10.x and the kernel's
+  rendering is pinned for the `sm_100a`, `sm_103a` and `sm_107a` targets.
+  SM90 and SM120 are declined by type. The bytes follow the part's
+  approximate exponential, division and reciprocal: the status holds on a
+  fixed runtime, equal bytes across GPU architectures are not claimed, and a
+  golden recorded on one runtime does not qualify another. No backward entry
+  point exists.
 - DSA sparse attention backward and sparse indexer backward: set
   `deterministic=True`. Sparse attention backward requires unique active
   indices per query, except in SM100/SM103 plans that store dKV in
