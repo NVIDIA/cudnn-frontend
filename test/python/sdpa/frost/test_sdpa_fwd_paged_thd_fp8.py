@@ -171,14 +171,15 @@ def test_paged_thd_fp8_origins_rebind_and_capture(
         nodes["amax_o"] = amax_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
+    engine = "sdpa_fwd_sm100_d256_fp8_single_q" if dim == 256 else "sdpa_fwd_prefill_sm100_fp8"
     graph.create_execution_plan(
-        family_for(graph).offered_ids()["sdpa_fwd_prefill_sm100_fp8"],
+        family_for(graph).offered_ids()[engine],
         {cudnn.knob_type.TILE_CGA_M: 2 if dim == 128 else 1, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 0},
     )
     graph.select_plan(0)
     graph.check_support()
     graph.build_plans()
-    assert graph.get_plan_name_at_index(graph._plan_index).startswith("sdpa_fwd_prefill_sm100_fp8")
+    assert graph.selected_engine.name == engine
     prepared = graph._compiled_plans[graph._plan_index]._prepared
     assert prepared.spec.origin_specs is not None
     assert prepared.spec.quant is not None

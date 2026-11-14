@@ -10,7 +10,11 @@ from sdpa.frost.test_sdpa_fwd_thd_origins_fp8_sm120 import _check_routes_and_inv
 
 
 def origin_checks(family, arch="sm100", shapes=None):
-    engine = f"sdpa_fwd_prefill_{arch}_{family}"
+    def engine_for(dims):
+        if arch == "sm100" and family == "fp8" and dims in (256, (256, 256)):
+            return "sdpa_fwd_sm100_d256_fp8_single_q"
+        return f"sdpa_fwd_prefill_{arch}_{family}"
+
     if shapes is None:
         shapes = [((192, 128), 1), ((192, 128), 2), (256, 1)]
 
@@ -19,7 +23,9 @@ def origin_checks(family, arch="sm100", shapes=None):
         flavor = "d192_d128" if width == 192 else f"d{width}"
         plan = graph._compiled_plans[graph._plan_index]
         assert plan._compiled.kernel_template == f"prefill_{flavor}_{family}"
-        assert plan._compiled.kernel_module.__file__.endswith(f"{arch}/prefill_{flavor}_{family}.py")
+        expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" and family == "fp8" and width == 256 else f"{arch}/prefill_{flavor}_{family}.py"
+        assert plan._compiled.kernel_module.__file__.endswith(expected)
+        assert graph.selected_engine.name == engine_for(width)
         assert plan._prepared.spec.origin_specs is not None and plan._prepared.spec.native is not None
         _check_routes_and_invariance(graph, nodes, values, state, workspace, overrides, flat, stats_layout)
         pack = {nodes[name]: value for name, value in values.items()}
@@ -42,12 +48,12 @@ def origin_checks(family, arch="sm100", shapes=None):
     @pytest.mark.parametrize("stats", ["token", "head"])
     def test_independent_origins_rebind_replay(dims, cga, dtype, stats, monkeypatch):
         monkeypatch.setenv("FROST_THD_CLUSTERS", "2")
-        _check_origins(dims, dtype, stats, True, False, 1, engine_name=engine, cga=cga, extra_checks=check_route)
+        _check_origins(dims, dtype, stats, True, False, 1, engine_name=engine_for(dims), cga=cga, extra_checks=check_route)
 
     @shape_dtype
     def test_origins_without_total_hints(dims, cga, dtype, monkeypatch):
         monkeypatch.setenv("FROST_THD_CLUSTERS", "2")
-        _check_origins(dims, dtype, "token", False, False, 1, engine_name=engine, cga=cga, extra_checks=check_route)
+        _check_origins(dims, dtype, "token", False, False, 1, engine_name=engine_for(dims), cga=cga, extra_checks=check_route)
 
     @shape_dtype
     @pytest.mark.parametrize("stats", ["token", "head"])
@@ -75,7 +81,7 @@ def origin_checks(family, arch="sm100", shapes=None):
                     "stats": stats_view[origins["stats"][0] : origins["stats"][0] + ql[0]].clone(),
                 }
 
-        _check_origins(dims, dtype, stats, True, False, 1, engine_name=engine, cga=cga, extra_checks=collect)
+        _check_origins(dims, dtype, stats, True, False, 1, engine_name=engine_for(dims), cga=cga, extra_checks=collect)
         shape = "192x128" if isinstance(dims, tuple) else str(dims)
         assert_golden(f"sdpa-{arch}-{family}-thd-origins-d{shape}-{dtype}-{stats}-cga{cga}", record["inputs"], record["outputs"])
 

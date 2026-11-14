@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,13 +21,16 @@ def _record_route(monkeypatch):
     from cudnn.sdpa.fwd import api_dsl
 
     seen = []
-    load = api_dsl._load_kernel_template
+    load = api_dsl.load_template
+    kernels = Path(api_dsl.__file__).parent / "kernels"
 
-    def record(filename, params, tag, part=None):
-        seen.append(filename)
-        return load(filename, params, tag, part=part)
+    def record(filename, *args, **kwargs):
+        # Explicit owners enter this common loader directly; the legacy
+        # flavor dispatcher is no longer on every graph's compile path.
+        seen.append(Path(filename).relative_to(kernels).as_posix())
+        return load(filename, *args, **kwargs)
 
-    monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
+    monkeypatch.setattr(api_dsl, "load_template", record)
     return seen
 
 
@@ -240,7 +244,8 @@ def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_righ
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    assert f"{arch}/prefill_d256_fp8.py" in seen and all(n.startswith(arch + "/") for n in seen), seen
+    expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" else f"{arch}/prefill_d256_fp8.py"
+    assert expected in seen and all(n.startswith(arch + "/") for n in seen), seen
     for name in ("q", "k", "v"):
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
@@ -335,7 +340,7 @@ def test_paged_rebind_replay(d, dv, page, k_hnd, v_hnd, split, dtype, output, mo
         d_v=dv,
         head_padding=True,
     )
-    assert "sm100/prefill_d256_fp8.py" in seen and all(n.startswith("sm100/") for n in seen), seen
+    assert "sm100/d256_fp8_single_q/kernel.py" in seen and all(n.startswith("sm100/") for n in seen), seen
     storage = bufs["o"]._base
     assert torch.all(storage[..., dv:] == 12)
     with dense._cuda_graph() as capture:

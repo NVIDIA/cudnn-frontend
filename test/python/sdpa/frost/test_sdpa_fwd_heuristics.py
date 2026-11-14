@@ -39,6 +39,7 @@ _OFFERED = {
     ROLE_SPLIT: 20521,
     TWO_BY_TWO: 20522,
     "sdpa_fwd_sm100_d512_fp8_role_split": 20523,
+    "sdpa_fwd_sm100_d256_fp8_single_q": 20524,
 }
 _HALF_IDS = (20500, 20519, 20520, 20521, 20522)
 
@@ -703,9 +704,9 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
     ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
 def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected_cga):
-    """A unified dtype-family engine must advertise the geometry it launches."""
+    """Each selected owner must advertise the geometry it launches."""
 
-    name = engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    name = "sdpa_fwd_sm100_d256_fp8_single_q" if not mxfp8 and d_qk == 256 else engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
     facts = _facts(
         d_qk=d_qk,
         d_v=d_v,
@@ -737,7 +738,8 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     if (d_qk, d_v) == (128, 128):
         assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
-        assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
+        reason = "outside this engine's domain" if mxfp8 else "requires TILE_CGA_M=1"
+        assert reason in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
 
 @pytest.mark.L0
@@ -779,10 +781,11 @@ def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
 def test_per_tensor_fp8_envelope_uses_d256_cga1():
     """Exact and aligned padded heads use the D256 flavor with CGA1."""
     name = engines.engine_name(fp8=True)
-    row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
     for d in (256, 224):
+        owner = "sdpa_fwd_sm100_d256_fp8_single_q" if d == 256 else name
+        row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == owner)
         facts = _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-        plans = recommend("A", facts, {name: 20510})
+        plans = recommend("A", facts, {owner: 20524 if d == 256 else 20513})
         assert plans
         assert {plan.knobs.cga for plan in plans} == {1}
         assert all(engines._selected_d_shape(row, facts, plan.knobs) == (256, 256) for plan in plans)
@@ -829,7 +832,7 @@ def test_d256_config_honors_explicit_scheduler(mxfp8, sched_policy):
     ids=["per_tensor_lpt_l2", "block_scale_lpt"],
 )
 def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
-    name = engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    name = engines.engine_name(mxfp8=True) if mxfp8 else "sdpa_fwd_sm100_d256_fp8_single_q"
     facts = _facts(
         s_q=8192,
         d_qk=256,

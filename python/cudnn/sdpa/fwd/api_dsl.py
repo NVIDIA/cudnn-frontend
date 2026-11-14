@@ -445,7 +445,7 @@ _SM100_FP8_KERNEL_FILES = {
     # instead of zero-filling a 128-wide tile for gpt-oss-class head dims.
     (64, 64): "sm100/prefill_d128_fp8.py",
     (192, 128): "sm100/prefill_d192_d128_fp8.py",
-    (256, 256): "sm100/prefill_d256_fp8.py",
+    (256, 256): "sm100/d256_fp8_single_q/kernel.py",
     (512, 512): "sm100/d512_fp8_role_split/kernel.py",
 }
 

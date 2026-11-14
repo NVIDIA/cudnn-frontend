@@ -53,6 +53,21 @@ budget and placement; explicit records pin this body. Old exact-D512 20513
 recipes must be invalidated and replanned. No additional numerical, Stats
 stride-override, determinism or batch-invariance claim is introduced.
 
+**SM100/SM103 exact per-tensor FP8 D256 implementation engine:**
+`sdpa_fwd_sm100_d256_fp8_single_q` (20524) owns exact D256/V256
+E4M3/E5M2 inputs and scalar FP16/BF16/E4M3/E5M2 outputs. The legacy 20513
+row delegates these exact cells, retaining smaller flavors and head envelopes.
+The independent body/configuration/contract/host directory is
+`sm100/d256_fp8_single_q/`; one/two softmax warpgroup schedules remain local
+variants, while half and MXFP8 retain their own configuration owners. Public
+geometry is TILE_M=128/CGA1 with one-CTA MMA. Dense and paged dense-Q
+packing/splits retain the existing domain. Nonpaged and paged THD retain
+independent origins, unsplit/unpacked execution and their existing Stats
+contracts; this split does not widen THD packing, splits or block-scaled O.
+The old candidate order, budget and placement are preserved. Explicit records
+pin the body; old exact-D256 20513 recipes must be replanned. No additional
+Stats override note, determinism or batch-invariance guarantee is introduced.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;
@@ -3862,7 +3877,7 @@ green (the sm107 module and the native MXFP8 binder test are not on that lane's 
 a maintainers' follow-up); the SM100 / SM103 FROST lanes were red on the PR's pipeline with a
 pre-existing, develop-wide failure under the public DSL 4.7.0 -- `TYPE_UNSTABLE_JOIN` on `k_row` /
 `kv_row_base` ("has type None on one path and Int32 on another") in the untouched
-`sm100/prefill_d256_fp8.py`, `sm100/prefill_d256_mxfp8.py` and `sm100/prefill_d512_mxfp8.py`, whose
+`sm100/d256_fp8_single_q/kernel.py`, `sm100/prefill_d256_mxfp8.py` and `sm100/prefill_d512_mxfp8.py`, whose
 K/V row bindings are first bound inside the dynamic empty-KV `else:`; the same cells fail on develop's
 own pipeline. The sm107 ports copy that construct (it compiles under 4.8.0a0), so the binding hoist is
 ONE shared follow-up for the sm100 kernels and their sm107 siblings (sibling lockstep, S6).

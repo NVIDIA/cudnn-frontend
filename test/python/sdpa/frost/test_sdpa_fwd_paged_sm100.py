@@ -1962,18 +1962,22 @@ def test_paged_graph_fp8_declines_off_contract():
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
 
-    def _offers(g):
-        return g is not None and offers_engine(g, engine_name(fp8=True))
+    def _offers(g, d=D):
+        owner = {
+            256: "sdpa_fwd_sm100_d256_fp8_single_q",
+            512: "sdpa_fwd_sm100_d512_fp8_role_split",
+        }.get(d, engine_name(fp8=True))
+        return g is not None and offers_engine(g, owner)
 
     assert _offers(_build_fp8_paged_graph(16))
     assert _offers(_build_fp8_paged_graph(128, hnd=True))
     assert not _offers(_build_fp8_paged_graph(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
-    assert _offers(_build_fp8_paged_graph(16, d=256))
-    assert _offers(_build_fp8_paged_graph(16, d=512))
-    assert not _offers(_build_fp8_paged_graph(16, d=512, thd=True)), "paged D512 FP8 requires dense Q"
+    assert _offers(_build_fp8_paged_graph(16, d=256), d=256)
+    assert _offers(_build_fp8_paged_graph(16, d=512), d=512)
+    assert not _offers(_build_fp8_paged_graph(16, d=512, thd=True), d=512), "paged D512 FP8 requires dense Q"
     for d in (128, 256):
-        assert _offers(_build_fp8_paged_graph(16, d=d, thd=True))
-    assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True)), "THD requires an exact native FP8 width"
+        assert _offers(_build_fp8_paged_graph(16, d=d, thd=True), d=d)
+    assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True), d=64), "THD requires an exact native FP8 width"
     # Masks ride the same row: a causal bound (either alignment) and a left window are
     # offered.  Bottom-right alignment is a property of the band's diagonal: with no band
     # at all it is inert (the analyzer records an unmasked graph, which is offered); with a
