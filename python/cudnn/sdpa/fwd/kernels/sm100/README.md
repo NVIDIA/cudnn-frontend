@@ -1,7 +1,7 @@
 # SM100 forward implementations
 
 Each migrated main implementation has a local owner directory. Half D256,
-exact half D512/D576 and per-tensor FP8 D256/D512 graph plans use explicit engines;
+exact half D512/D576 and per-tensor FP8 D192/D256/D512 graph plans use explicit engines;
 other SM100 implementations remain at their existing paths.
 
 ```text
