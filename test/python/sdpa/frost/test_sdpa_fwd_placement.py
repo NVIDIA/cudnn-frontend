@@ -247,6 +247,20 @@ def test_sm120_paged_prefill_body_trails(s_q):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("d_qk", [512, 576])
+@pytest.mark.parametrize("h_q", [8, 16, 128])
+@pytest.mark.parametrize("s_q", [2, 4])
+def test_sm120_paged_wide_mla_mtp_leads(d_qk, h_q, s_q):
+    """The paged prefill-body TRAIL covers head dims the decode tile can take (d <= 256): paged d512 / D576xV512 MTP over one
+    KV head leads, 0.04-0.40 of the backend over 108 nightly cells (deepseek_v4, kimi_k3; module docstring)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM120)
+    shape = dict(b=1, h_q=h_q, h_kv=1, s_q=s_q, s_kv=131072, d_qk=d_qk, d_v=512, causal=True, bottom_right=True, device_cc=(12, 0), device_sm_count=188)
+    assert placement.place(spec, _facts(has_paged_kv=True, page_size=64, padded=True, **shape)) == placement.LEAD
+
+
+@pytest.mark.L0
 def test_paged_d512_decode_follows_the_generated_entry_and_trails_without_one():
     """Paged d512 at s_q == 1 on cc 10.0 follows the generated entry (study sm100_d512_paged_decode_b100_20261030): it
     leads past the cost threshold and trails tiny launches. Without an entry (an SM100-row part no study or transfer check covers) the hand rule's
