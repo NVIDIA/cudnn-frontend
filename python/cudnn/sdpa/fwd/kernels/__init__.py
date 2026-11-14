@@ -23,7 +23,7 @@ and MXFP8 siblings (multiples of 16).
 three warpgroups, for every head dim up to it at multiples of eight.
 A ``decode_`` phase is a second template for the SAME flavor and contract,
 selected by the adapter when the graph is decode-shaped:
-``sm100/decode_d256_f16.py`` takes the f16/bf16 d256 graphs whose S_q x packed
+``sm100/d256_f16_swap_ab/kernel.py`` takes the f16/bf16 d256 graphs whose S_q x packed
 heads fit 16 rows (``TemplateParams.decode_q_tile``; its 32-row tile compiles but
 is not routed on the Blackwell line, ``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``),
 the prefill template the rest.  ``sm107/decode_d256_f16.py`` is that tile's Rubin

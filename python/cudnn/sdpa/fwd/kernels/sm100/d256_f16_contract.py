@@ -10,10 +10,12 @@ chooses a geometry; support and build consume that same immutable choice.
 from dataclasses import dataclass, replace
 
 from cudnn import data_type
-from cudnn.sdpa.fwd.config_common import pack_gqa_supported
+from .d256_f16_lookahead import contract as lookahead
+from .d256_f16_swap_ab import contract as swap_ab
 
-LOOKAHEAD = "sdpa_fwd_sm100_d256_lookahead"
-SWAP_AB = "sdpa_fwd_sm100_d256_swap_ab"
+LOOKAHEAD = lookahead.NAME
+SWAP_AB = swap_ab.NAME
+_CONTRACTS = {LOOKAHEAD: lookahead, SWAP_AB: swap_ab}
 IMPLEMENTATIONS = frozenset({LOOKAHEAD, SWAP_AB})
 
 
@@ -35,7 +37,7 @@ class D256Geometry:
 
     @property
     def cga(self):
-        return 1 if self.implementation == SWAP_AB else 2
+        return _CONTRACTS[self.implementation].CGA
 
     @property
     def decode_q_tile(self):
@@ -43,7 +45,11 @@ class D256Geometry:
 
     @property
     def template(self):
-        return "decode_d256_f16" if self.implementation == SWAP_AB else "prefill_d256_f16"
+        return _CONTRACTS[self.implementation].TEMPLATE_NAME
+
+    @property
+    def kernel_file(self):
+        return _CONTRACTS[self.implementation].KERNEL_FILE
 
     def canonical_knobs(self, knobs):
         return replace(
@@ -72,22 +78,9 @@ def mismatch(implementation, facts, knobs):
     if facts.has_epilogue_gate or facts.attn_scale_prefolded:
         return "the SM100 D256 half implementations do not carry a gate or pre-folded scale"
     geometry = explicit_geometry(implementation, knobs)
-    if implementation == SWAP_AB:
-        if facts.thd:
-            return "the D256 swap-AB implementation requires dense queries; THD uses lookahead"
-        if geometry.query_tile not in (16, 32):
-            return "D256 swap-AB TILE_M (N_Q) must be 16 or 32"
-        if facts.h_kv <= 0 or facts.h_q <= 0 or facts.h_q % facts.h_kv:
-            return "D256 swap-AB requires positive heads and an integral Q/KV head ratio"
-        group = facts.h_q // facts.h_kv if knobs is not None and knobs.pack_gqa else 1
-        if group > geometry.query_tile:
-            return "D256 swap-AB packs a whole KV-head group, which must fit TILE_M (N_Q)"
-        if knobs is not None and knobs.pack_gqa and not pack_gqa_supported(facts.h_q, facts.h_kv, partial=True):
-            return "D256 swap-AB retains the SM100 half PackGQA head-ratio domain"
-        if knobs is not None and knobs.sched_policy not in (None, 0):
-            return "D256 swap-AB has the direct grid only (SCHED_POLICY=0)"
-    elif geometry.query_tile != 128:
-        return "D256 lookahead TILE_M must be 128"
+    reason = _CONTRACTS[implementation].mismatch(facts, knobs)
+    if reason is not None:
+        return reason
     if knobs is not None and knobs.cga not in (None, geometry.cga):
         return f"{implementation} requires TILE_CGA_M={geometry.cga}"
     return None

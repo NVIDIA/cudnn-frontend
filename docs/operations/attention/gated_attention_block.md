@@ -1073,7 +1073,7 @@ inside the write kernel and the in-kernel dequant are the levers a later change 
 Served for bf16 / f16 activations (`quant=None`) and, since 2026-10-30, under the FP8-projection + bf16-attention mode
 (`QuantSpec(attention_dtype=torch.bfloat16)` with e4m3 `h` / weights over the same bf16 pools: the section below; cc 10.7 and cc 10.0).
 Served on cc 10.7 (the cells below) and, since 2026-10-29, on cc 10.0 through the same binding -- the shared SM100 d256 paged THD body
-(`sm100/prefill_d256_f16.py`: CGA2, unsplit, unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate as its
+(`sm100/d256_f16_lookahead/kernel.py`: CGA2, unsplit, unpacked, NATURAL, no gate, no LSE), the write-through before it, the sigmoid gate as its
 own launch; functional only, unmeasured there, `fuse_gate=True` and `fuse_norm_rope=True` typed declines by name (the part table at the
 top; `test_block_serving_extend.py`'s `requires_blackwell` cells ran 2026-10-29 on a cc 10.0 part of the 152-SM class: 82 passed / 0
 failed in the module's cc 10.0 selection, within the suites' 351 / 0 record).
@@ -1252,7 +1252,7 @@ part: 1.1-1.5 us per decode step at B 1 (B 1 x KV 4K +5.0 %, 32K +4.0 %, 128K +2
 the control pair where the tile dominates; with the write-through folded in, B 1 x KV 4K 32.3 -> 29.3 us (+10.2 %) against the plain
 seven-launch chain. The fused kernel the stage runs is a declaration fact:
 
-**On cc 10.0 (2026-10-29; `DENSE_SERVING_CCS`)** the same form runs the SM100 d256 decode tile (`sm100/decode_d256_f16.py`) under the
+**On cc 10.0 (2026-10-29; `DENSE_SERVING_CCS`)** the same form runs the SM100 d256 decode tile (`sm100/d256_f16_swap_ab/kernel.py`) under the
 SM100 LINE's route -- `decode_route(geometry, S_q, device_cc=(10, 0), batch=, max_kv_len=)`, the SDPA adapter's own rule off cc 10.7,
 input for input (`config_sm100.decode_d256_q_tile` with the wide-launch reading `config_sm100.d256_wide_decode_launch(batch, groups,
 max_kv_len)`: at least 8 units streaming at least 4096 128-key tiles between them; `groups` = `H_kv` packed, `H_q` unpacked): packed rows
@@ -1306,7 +1306,7 @@ the envelope's `routes` are the reading without a batch, `serving_envelope().dec
 | `(group = H_q / H_kv, S_q)` | stage (4) | `decode_route(geometry, S_q)` |
 |---|---|---|
 | `S_q x group` within a width of the table `(16, 32, 64)` | the Rubin d256 **decode tile** (`sm107/decode_d256_f16.py`, the swap-AB tile at that width), the whole group packed, ONE token unit | `tile = "decode_d256_f16"`, `n_q` 16 / 32 / 64, `token_units = 1`, `kv_streams = 1`, `pack_gqa = True` |
-| past the table, a group dividing 128 (16 = 32 / 2 and 16 / 1, 8 = 8 / 1, 4 = 4 / 1, 32 = 64 / 2, ...) with `S_q x group <= 128`, the step filling the part (`B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64) or no two-unit route holding it | the paged d256 **prefill tile** (the shared `sm100/prefill_d256_f16.py` body on its paged THD arm: the EXTEND form's binding at the dense step's `(B, S_q)` envelope, the whole group packed, unsplit, the gate in its epilogue): one Q tile per (sequence, KV head) | `tile = "prefill_d256_f16"`, `n_q = 0`, `token_units = 0`, `kv_streams = 1`, `pack_gqa = True`, `batch` = the declared batch |
+| past the table, a group dividing 128 (16 = 32 / 2 and 16 / 1, 8 = 8 / 1, 4 = 4 / 1, 32 = 64 / 2, ...) with `S_q x group <= 128`, the step filling the part (`B x H_kv >= DECODE_PREFILL_ROUTE_MIN_CTAS` = 64) or no two-unit route holding it | the paged d256 **prefill tile** (the shared `sm100/d256_f16_lookahead/kernel.py` body on its paged THD arm: the EXTEND form's binding at the dense step's `(B, S_q)` envelope, the whole group packed, unsplit, the gate in its epilogue): one Q tile per (sequence, KV head) | `tile = "prefill_d256_f16"`, `n_q = 0`, `token_units = 0`, `kv_streams = 1`, `pack_gqa = True`, `batch` = the declared batch |
 | past the table, below that fill (32 / 2 at `S_q` 5 .. 8 under 32 sequences, 8 / 1 at 9 .. 16 and 4 / 1 at 17 .. 32 under 64), a group the prefill tile cannot pack (12), or a step past its 128 rows: up to two TOKEN UNITS of `64 // group` tokens (24 / 2 at `S_q` 6 .. 10) | the 64-column decode tile in token units, `ceil(S_q / (64 // group))` CTAs per (KV head, sequence, split), each streaming the KV range once, split over the part by the decode split model | `n_q = 64`, `token_units = 2`, `kv_streams = 2`, `pack_gqa = True` |
 | ... and past two units, up to `S_q = DECODE_MAX_ROWS = 32` (32 / 2 from `S_q` 9, 24 / 2 from 11, 8 / 1 from 17, 24 / 4 from 21; 64 / 2 from 5, 128 / 2 from 3) | the decode tile UNPACKED (the SDPA adapter's own rule, the arm every group had before the table landed): one Q head per CTA, one token unit, `S_q` live rows of the 16-column tile (to 16 tokens) or the 32-column tile (17 .. 32) -- declared, unmeasured | `n_q = 16` / `32`, `token_units = 1`, `kv_streams = group`, `pack_gqa = False` |
 | MHA (`group = 1`), `S_q <= 32` | the 16-column tile unpacked (the bit-exact unpacked fold; the 32-column tile from 17 tokens) | `n_q = 16` / `32`, `kv_streams = 1`, `pack_gqa = False` |

@@ -3063,7 +3063,7 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
     sliding-window / band masks, mixed per-batch lengths (zeros included); inference
     graphs (the harness runs a backward otherwise, and paged KV is forward-only).
     The FROST engine row must serve every config -- the decode tile
-    (sm100/decode_d256_f16.py) while S_q x group <= 16 rows, the prefill d256 tile
+    (sm100/d256_f16_swap_ab/kernel.py) while S_q x group <= 16 rows, the prefill d256 tile
     above that -- so the routing tally is asserted: a decline would fall back to
     the backend silently and pass on the wrong kernel, and a decode-shaped draw
     quietly served by the prefill tile would pass on the slower one.

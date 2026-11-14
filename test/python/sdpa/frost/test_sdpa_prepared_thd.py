@@ -2943,15 +2943,23 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("python_binding", [False, True], ids=["native", "python"])
-def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
+@pytest.mark.parametrize("d", [128, 256], ids=["legacy", "explicit-lookahead"])
+def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding, d):
     """Vary compact HN stride, then replay older independent captures with no compile or adaptation."""
-    b, qmax, kl, hq, hk, d = 2, 16, 64, 8, 2, 128
+    b, qmax, kl, hq, hk = 2, 16, 64, 8, 2
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
     arch = "sm100"
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g, t = _thd_graph(b, qmax, kl, hq, hk, d, override_enabled=True, dtype=dt, arch=arch, stats_head_stride=b * qmax)
+    note = cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
+    assert note in g.get_behavior_notes()
+    assert cudnn.behavior_note.RUNTIME_COMPILATION in g.get_behavior_notes()
+    assert g.get_behavior_notes() == g.get_behavior_notes_for_plan_at_index(g._plan_index)
+    if d == 256:
+        assert g.selected_engine.name == "sdpa_fwd_sm100_d256_lookahead"
     prepared = _plan(g)._prepared
+    assert prepared.supports_stats_stride_override
     assert prepared.spec.native is not None
     if python_binding:
         binding_reference.use_reference(prepared.spec)
@@ -2959,7 +2967,9 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
     retained = []
     for i, ql in enumerate((16, 9, 13, 16)):
         bufs = _buffers(b, ql, kl, hq, hk, d, seed=17 + i, dtype=dtype)
-        bufs["lse"] = torch.full((hq, b * ql), float("nan"), device=DEV)
+        bufs["lse_storage"] = torch.full((hq * b * ql + 8,), -12345.0, device=DEV)
+        bufs["lse"] = bufs["lse_storage"][4:-4].view(hq, b * ql)
+        bufs["lse"].fill_(float("nan"))
         bufs["off_lse"] = bufs["cu_q"]
         kwargs = dict(
             override_uids=[t["stats"].get_uid()],
@@ -2976,7 +2986,15 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
         torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
         assert _plan(g)._prepared is prepared
+        torch.testing.assert_close(bufs["lse_storage"][:4], torch.full_like(bufs["lse_storage"][:4], -12345.0))
+        torch.testing.assert_close(bufs["lse_storage"][-4:], torch.full_like(bufs["lse_storage"][-4:], -12345.0))
         retained.append((cg, bufs, ql))
+    # Another graph/config from the same engine cannot change retained plans'
+    # note or binder state. This graph deliberately disables runtime overrides.
+    other, _ = _thd_graph(b, 8, kl, hq, hk, d, override_enabled=False, dtype=dt, arch=arch, stats_head_stride=b * 8)
+    assert note not in other.get_behavior_notes()
+    assert not _plan(other)._prepared.supports_stats_stride_override
+    assert note in g.get_behavior_notes()
     try:
         for cg, bufs, ql in reversed(retained):
             bufs["q"].mul_(0.75)
@@ -2988,6 +3006,8 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
             expected_o, expected_lse = _reference(bufs, b, ql, kl, hq, hk, d)
             torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
             torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(bufs["lse_storage"][:4], torch.full_like(bufs["lse_storage"][:4], -12345.0))
+            torch.testing.assert_close(bufs["lse_storage"][-4:], torch.full_like(bufs["lse_storage"][-4:], -12345.0))
     finally:
         for cg, _, _ in retained:
             cg.reset()

@@ -86,7 +86,7 @@ def test_half_fused_correction_rebind_and_capture(b, sq, sk, hq, hkv, pack, sink
 
     def load(*args, **kwargs):
         mod = original(*args, **kwargs)
-        if str(mod.__file__).endswith("/sm100/prefill_d256_f16.py"):
+        if str(mod.__file__).endswith("/sm100/d256_f16_lookahead/kernel.py"):
             loaded.append(mod)
         return mod
 

@@ -3,7 +3,7 @@
 
 """Explicit lookahead entry, sharing the existing graph binder/launch builder."""
 
-from .d256_f16_contract import LOOKAHEAD, explicit_geometry
+from ..d256_f16_contract import LOOKAHEAD, explicit_geometry
 
 
 def lower(spec, facts, knobs):

@@ -149,7 +149,7 @@ class CfgD256:
     PAGE_SIZE: int = 0
 
     # Fused epilogue gate (O := O * sigmoid(G), TemplateParams.epilogue_gate), read by the SHARED f16/bf16 d256 body only
-    # (sm100/prefill_d256_f16.py; every seam folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the pre-gate
+    # (sm100/d256_f16_lookahead/kernel.py; every seam folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the pre-gate
     # instruction stream byte for byte -- the render gate of the paged gate).  Appended: every existing record
     # keeps its value.  GATE_BPE: bytes per gate element -- the gate is Q-dtype on the half body (2 B); every gate
     # constant in the kernel (TMA box, swizzle, subtile walk) derives from THIS, never from BPE_O (config_sm107 has the

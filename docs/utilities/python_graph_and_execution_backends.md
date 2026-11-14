@@ -1121,3 +1121,32 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   kernel's persistent schedule to save the launch on that path. The dense
   padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks
   CUDA-graph capture; decide it at `check_support` or drop it.
+
+### Plan-specific Stats stride override note
+
+After selecting the final plan, query
+`graph.get_behavior_notes()` (or `get_behavior_notes_for_plan_at_index(i)`).
+`cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` declares that the plan
+accepts legal execution-time Stats stride overrides, including changes to the
+head stride of packed HN Stats. It does not permit changing the packing, dtype,
+or storage capacity, or bypass the plan's ragged-offset and override bounds.
+
+The initial declaration covers admitted override-enabled FP16/BF16 THD plans
+with packed HN Stats through the prepared THD binder on SM100/103, SM107 and
+SM120. This includes the explicit D256 lookahead engine and eligible legacy
+half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
+quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
+not serve THD. Backend plans retain their existing notes and do not inherit this
+frontend declaration. `RUNTIME_COMPILATION` remains present on FROST plans.
+
+Callers should use the selected plan's note to choose direct HN execution or
+retain their existing NH fallback. Do not infer support from the engine name or
+from FROST membership. Selecting/deselecting behavior notes uses the same
+per-plan declaration, but integrations should not filter the candidate pool just
+to choose a Stats layout. Consumers of this new enum must require an FE release
+that supplies it.
+
+The note has frontend-only integer value **1000**, in the band starting at
+`FRONTEND_BEHAVIOR_NOTE_BASE`; existing values 0–5 are unchanged. It serializes
+as `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE`. Backend enum conversion rejects it;
+it is never passed as a `cudnnBackendBehaviorNote_t`.

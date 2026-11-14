@@ -204,7 +204,7 @@ class TemplateParamsDecode(TemplateParams):
 SM100_NATIVE_D576_SHAPE = (576, 512)
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature.  ONE body of this line reads
-# CFG.EPILOGUE_GATE: the SHARED f16/bf16 d256 prefill (sm100/prefill_d256_f16.py), whose paged / THD / PackGQA
+# CFG.EPILOGUE_GATE: the SHARED f16/bf16 d256 prefill (sm100/d256_f16_lookahead/kernel.py), whose paged / THD / PackGQA
 # arms the Rubin paged half (256, 256) route loads for sm_107a -- its gate seams (sGate, mb_gate_full / mb_gate_empty,
 # the TMA-LDG issue after the KV loop, the packed tanh epilogue) are the sm107 d256 body's, through the shared hook in
 # _common_blackwell; the gated rendering needs ~258 KiB of SMEM, so it exists on the 327 KiB Rubin carveout only (the
@@ -565,7 +565,7 @@ class CfgD256:
     PAGE_SIZE: int = 0
 
     # Fused epilogue gate (O := O * sigmoid(G), TemplateParams.epilogue_gate), read by the SHARED f16/bf16 d256 body only
-    # (sm100/prefill_d256_f16.py; every seam folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the pre-gate
+    # (sm100/d256_f16_lookahead/kernel.py; every seam folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the pre-gate
     # instruction stream byte for byte -- the render gate of the paged gate).  Appended: every existing record
     # keeps its value.  GATE_BPE: bytes per gate element -- the gate is Q-dtype on the half body (2 B); every gate
     # constant in the kernel (TMA box, swizzle, subtile walk) derives from THIS, never from BPE_O (config_sm107 has the
@@ -868,7 +868,7 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
 
 def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
     if params.dtype_qkv in (DTYPE_BF16, DTYPE_FP16):
-        from cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16_config import make_cfg_d256 as make_half_cfg
+        from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.config import make_cfg_d256 as make_half_cfg
 
         return make_half_cfg(params)
     return _make_cfg_d256(params, mxfp8=False)

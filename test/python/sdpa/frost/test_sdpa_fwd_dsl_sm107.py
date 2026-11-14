@@ -2385,7 +2385,7 @@ def test_sm107_gate_template_loads_for_d256_only():
     # ~258 KiB of SMEM (the 64 KiB gate tile after the 192 KiB of operands), so it is a cc 10.7 rendering -- the adapter
     # routes it there only -- but the CONFIG admits the record on either line (one config, one body).
     sm100_gate = _load(_D256, rubin=False, epilogue_gate=True)
-    assert sm100_gate.CFG.EPILOGUE_GATE == 1 and sm100_gate.CFG.GATE_BPE == 2 and sm100_gate.__file__.endswith("sm100/prefill_d256_f16.py")
+    assert sm100_gate.CFG.EPILOGUE_GATE == 1 and sm100_gate.CFG.GATE_BPE == 2 and sm100_gate.__file__.endswith("sm100/d256_f16_lookahead/kernel.py")
     for quant_kw in (_FP8_LOAD_KW, _MXFP8_LOAD_KW):
         with pytest.raises(ValueError, match="epilogue_gate"):
             _load(_D256, rubin=False, epilogue_gate=True, **quant_kw)
@@ -2406,7 +2406,7 @@ def test_sm107_gate_template_loads_for_d256_only():
     for extra in ({}, dict(thd_varlen=True), dict(thd_varlen=True, pack_gqa=True, qh_per_kh=4)):
         pg = _load(_D256, rubin=True, epilogue_gate=True, **paged, **extra)
         # the module TAG is the Rubin route's (sdpa_fwd_sm107_<tag>_paged); the BODY is the shared SM100 file
-        assert pg.CFG.EPILOGUE_GATE == 1 and pg.CFG.PAGED_KV == 1 and pg.__file__.endswith("sm100/prefill_d256_f16.py"), (extra, pg.__file__)
+        assert pg.CFG.EPILOGUE_GATE == 1 and pg.CFG.PAGED_KV == 1 and pg.__file__.endswith("sm100/d256_f16_lookahead/kernel.py"), (extra, pg.__file__)
         assert pg.CFG.PACK_GQA == int(bool(extra.get("pack_gqa"))) and pg.CFG.THD_VARLEN == int(bool(extra.get("thd_varlen")))
     with pytest.raises(ValueError, match="epilogue_gate"):
         _load(_D256, rubin=True, epilogue_gate=True, **{**_MXFP8_LOAD_KW, **paged})
@@ -3671,7 +3671,7 @@ def test_shared_d256_body_gate_is_wired_through_every_layer():
     # the body: the gate geometry from the shared hook, the staging tile after the V ring, the appended Optional arguments
     mod = _load(_D256, rubin=True, epilogue_gate=True, **paged)
     src = inspect.getsource(mod._kernel)
-    assert mod.__file__.endswith("sm100/prefill_d256_f16.py") and mod.EPILOGUE_GATE and mod.gateTmaTransactionBytes == 64 * 1024
+    assert mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py") and mod.EPILOGUE_GATE and mod.gateTmaTransactionBytes == 64 * 1024
     assert src.index("sV_raw = cutlass.Array") < src.index("sGate_raw = (") < src.index("bars = make_d256_bars(")
     assert "epilogue_gate=EPILOGUE_GATE" in src and src.count("issue_gate_load(") == 0  # the issue sites live in the TMA-LDG group
     assert inspect.getsource(mod._tmaldg_warp_group).count("issue_gate_load(sGate, tma_gate, bars.mb_gate_full") == 2, "both arms of the tile loop"
@@ -3839,7 +3839,7 @@ def _run_paged_thd_gated(pr, lens_q, lens_kv, *, page, gate_on=True, pack_gqa=Fa
     assert api.check_support()
     api.compile()
     cfg = api._k_mod.CFG
-    assert api._k_mod.__file__.endswith("sm100/prefill_d256_f16.py") and cfg.THD_VARLEN == 1 and cfg.PAGED_KV == 1
+    assert api._k_mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py") and cfg.THD_VARLEN == 1 and cfg.PAGED_KV == 1
     assert int(cfg.EPILOGUE_GATE) == int(gate_on) and int(cfg.PACK_GQA) == int(pack_gqa)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     run_kw = dict(

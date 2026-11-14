@@ -215,7 +215,7 @@ _SM100_PARTIAL_PACK_GQA_FLAVORS = ((128, 128), (256, 256), SM100_NATIVE_D576_SHA
 _SM100_KERNEL_FILES = {
     SM100_NATIVE_D576_SHAPE: "sm100/prefill_d512_f16_2x2.py",
     (512, 512): "sm100/prefill_d512_f16.py",
-    (256, 256): "sm100/prefill_d256_f16.py",
+    (256, 256): "sm100/d256_f16_lookahead/kernel.py",
     (192, 128): "sm100/prefill_d192_d128_f16.py",
     (128, 128): "sm100/prefill_d128_f16.py",
     # Same file as (128, 128): one pipeline, two head-dim geometries, selected
@@ -259,7 +259,7 @@ _EARLY_Q_CC: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
 # The two decode tiles are disjoint by flavor -- (128, 128) rides the cga1 knob
 # above, (256, 256) this record -- so _load_sm100_kernel_module tests both.
 _SM100_DECODE_KERNEL_FILES = {
-    (256, 256): "sm100/decode_d256_f16.py",
+    (256, 256): "sm100/d256_f16_swap_ab/kernel.py",
 }
 # The Rubin (cc 10.7) sibling of the d256 decode tile: the same swap-AB body under
 # config_sm107.make_cfg_d256_decode (the Rubin SMEM-carveout and descriptor-window
@@ -3649,7 +3649,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # d256_decode_tile_selected(..., split_kv) -- keep them in lockstep.
             _gate_in_combine = self._gate_in_combine_for(int(s_qo), int(h_qo), int(h_kv))
             # The gate on the PAGED d256 half PREFILL body: a Rubin paged half (256, 256) plan that is not a decode-shaped one
-            # loads the SHARED SM100 body (_load_sm100_kernel_module's paged arm: sm100/prefill_d256_f16.py compiled for sm_107a),
+            # loads the SHARED SM100 body (_load_sm100_kernel_module's paged arm: sm100/d256_f16_lookahead/kernel.py compiled for sm_107a),
             # whose paged / THD / PackGQA arms carry the gate seams -- the serving EXTEND form's SDPA (packed queries over the
             # pools, PackGQA on or off) and dense paged queries past the decode tile alike; unsplit only (the split's partials
             # bypass the gated epilogue).  The GRAPH rows keep their narrower claim (the graph's THD lowering binds no gate):
@@ -3882,7 +3882,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _decode_q_tile(self) -> int:
         """N extent of the decode tile (config_sm100.decode_d256_q_tile) when this
-        plan lowers onto the d256 decode tile -- sm100/decode_d256_f16.py on the
+        plan lowers onto the d256 decode tile -- sm100/d256_f16_swap_ab/kernel.py on the
         Blackwell line, sm107/decode_d256_f16.py on cc 10.7 -- else 0 (the prefill tile).
 
         A LOWERING choice, like the flavor pick: the decode tile serves the same
@@ -4359,16 +4359,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if selected_kernel is not None:
             # Fixed implementation entry: no ordered body dispatch, and no
             # unrelated architecture's mutable sweep state in its module key.
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "sm100", selected_kernel.template + ".py")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", selected_kernel.kernel_file)
             self._k_mod = load_template(path, params, tag=selected_kernel.template, extra_key=("part", self._device_cc))
         else:
             self._k_mod = _load_sm100_kernel_module(
                 self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
             )
-        # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
+        # Which template serves this plan (logical identity, e.g. "prefill_d256_f16" /
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.
-        self.kernel_template = os.path.splitext(os.path.basename(self._k_mod.__file__))[0]
+        self.kernel_template = getattr(self._k_mod, "TEMPLATE_NAME", os.path.splitext(os.path.basename(self._k_mod.__file__))[0])
         # ... and the softmax arms it traced (softmax_arms_of): the executor exposes both.
         self.softmax_arms = softmax_arms_of(self._k_mod, has_lse=self.lse_desc is not None)
         # The kernel compile() keyword surface, read ONCE per plan (like

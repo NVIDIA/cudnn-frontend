@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The d256 DECODE tile of the FROST SM100 f16/bf16 engine (sm100/decode_d256_f16.py).
+"""The d256 DECODE tile of the FROST SM100 f16/bf16 engine (sm100/d256_f16_swap_ab/kernel.py).
 
 Decode-shaped d256 graphs (S_q x packed heads <= 16 rows,
 ``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``) lower onto the swap-AB tile --

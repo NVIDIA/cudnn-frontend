@@ -202,7 +202,7 @@ class TemplateParams:
     # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g within the arch line's routed
     # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's table (16, 32, 64) on
     # cc 10.7, where the 32- and 64-column tiles serve the MTP step in token units) lower onto
-    # sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride the MMA M axis
+    # sm100/d256_f16_swap_ab/kernel.py, the swap-AB tile: the KV tokens ride the MMA M axis
     # and the packed Q rows ride N, so the MMA and exp work scale with the LIVE
     # rows instead of a 128-row Q tile.  The value is the N extent the kernel is
     # compiled for -- the rows of ONE token unit (16; 32 at the template level, 32
@@ -466,7 +466,7 @@ def _validate_params(
             f"{flavor}: dual_kv_stream is the per-tensor FP8 d128 cga1 dense/paged decode specialization; got dtype_qkv={k.dtype_qkv} cta_mma={k.cta_mma} thd={k.thd_varlen}"
         )
     if k.decode_q_tile:
-        # The loader routes a decode_q_tile record to sm100/decode_d256_f16.py
+        # The loader routes a decode_q_tile record to sm100/d256_f16_swap_ab/kernel.py
         # (make_cfg_d256_decode); a prefill template must never consume one.
         raise ValueError(f"{flavor}: decode_q_tile={k.decode_q_tile} selects the d256 decode tile; the prefill templates do not consume it")
     # A flavor must explicitly consume split_kv / cta_mma. Accepting either

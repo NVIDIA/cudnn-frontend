@@ -805,7 +805,7 @@ def _facts_decode_form_kw(facts: "ga.SdpaGraphFacts") -> dict:
 
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 DECODE tile -- the
-    swap-AB tile, ``sm100/decode_d256_f16.py`` on the Blackwell row and
+    swap-AB tile, ``sm100/d256_f16_swap_ab/kernel.py`` on the Blackwell row and
     ``sm107/decode_d256_f16.py`` on the Rubin row -- the facts-level twin of
     ``SdpaFwdDslSm100._decode_q_tile`` (and of the heuristics' cost-model gate):
     half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
@@ -2868,8 +2868,8 @@ def _sm100_spec() -> EngineSpec:
 
 def _sm100_d256_specs():
     """Two explicit main implementations; common graph support stays shared."""
-    from .kernels.sm100.prefill_d256_f16_host import lower as lower_lookahead
-    from .kernels.sm100.decode_d256_f16_host import lower as lower_swap_ab
+    from .kernels.sm100.d256_f16_lookahead.host import lower as lower_lookahead
+    from .kernels.sm100.d256_f16_swap_ab.host import lower as lower_swap_ab
 
     base = replace(
         _sm100_spec().capabilities,
@@ -2969,7 +2969,7 @@ def _sm107_spec() -> EngineSpec:
       (``d256_decode_tile_selected``), which walks the block table itself.
     - ``decode``: stated, not inherited -- ``S_q == 1`` is served on every
       flavor, and on d256 it is the decode tile above (the swap-AB body ported
-      from ``sm100/decode_d256_f16.py``), with the SM100 tile's whole-group
+      from ``sm100/d256_f16_swap_ab/kernel.py``), with the SM100 tile's whole-group
       PackGQA (24/2: 12 live rows + 4 zero tail rows per unit) and dense / paged
       split-KV -- validated on cc 10.7 against the fp32 reference, paged == dense
       bitwise, packed == unpacked bitwise, split == unsplit within a derived
@@ -3772,6 +3772,32 @@ def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
     if facts is None:
         return None, "graph is not a single sdpa() forward node (optionally followed by O * sigmoid(G))"
     return facts, mismatch(spec.capabilities, facts, knobs)
+
+
+def supports_stats_stride_override(spec: EngineSpec, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
+    """Plan-time contract of the prepared half THD HN binder, after admission.
+
+    This describes changing a packed head stride within the declared override
+    domain, not changing Stats packing, dtype, or storage capacity. Quantized,
+    padded-Stats and ragged-Q dense-decode binders have separate contracts.
+    """
+    if not (facts.shape_overrides and facts.thd and facts.wants_stats and facts.uniform_dtype):
+        return False
+    if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        return False
+    if spec.capabilities.sm_lo not in (100, 107, 120):
+        return False
+    stats = facts.stats_t
+    if stats is None or stats.ragged_offset is None:
+        return False
+    stride = stats.get_stride()
+    if ga.thd_stats_packing(stride[1], stride[2], facts.h_q) != "head_major":
+        return False
+    if _thd_decode_leg(spec.capabilities, facts):
+        return False
+    if _prepared_decline_reason(spec.capabilities, facts, _decode_tile_split_kv(knobs)) is not None:
+        return False
+    return bool(getattr(cudnn._pybind_module._SdpaThdBinder, "supports_stats_stride_override", False))
 
 
 def build(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):

@@ -103,7 +103,7 @@ def _validate_cfg_d256_decode(cfg: CfgD256Decode, q_tiles: Tuple[int, ...] = _D2
 
 
 def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D256_DECODE_Q_TILES) -> Tuple[CfgD256Decode, TmaIters]:
-    """Config for sm100/decode_d256_f16.py from the adapter's TemplateParams.
+    """Config for sm100/d256_f16_swap_ab/kernel.py from the adapter's TemplateParams.
 
     Backstop only (see TemplateParams): the adapter selects this tile for
     decode-shaped f16/bf16 d256 graphs and keeps every other graph on the

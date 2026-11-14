@@ -461,7 +461,7 @@ def choose_split_kv(
 
 
 # --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
-# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# sm100/d256_f16_swap_ab/kernel.py is not the machine choose_split_kv was fitted on: one
 # cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
 # tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
 # kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
@@ -2276,7 +2276,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/decode_d256_f16.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
@@ -2290,7 +2290,7 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv:
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
     """The heads the DECODE tile packs per token for a set whose prefill-tile
     group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
-    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    ratio.  sm100/d256_f16_swap_ab/kernel.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
     one unit per (KV head, batch) with every head of the group in its 16-column
     tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
     the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not

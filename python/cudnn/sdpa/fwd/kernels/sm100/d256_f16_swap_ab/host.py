@@ -3,7 +3,7 @@
 
 """Explicit swap-AB entry, sharing the existing graph binder/launch builder."""
 
-from .d256_f16_contract import SWAP_AB, explicit_geometry
+from ..d256_f16_contract import SWAP_AB, explicit_geometry
 
 
 def lower(spec, facts, knobs):

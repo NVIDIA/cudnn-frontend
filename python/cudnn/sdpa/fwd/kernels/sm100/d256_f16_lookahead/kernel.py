@@ -20,12 +20,13 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from cudnn.sdpa.fwd.config_common import TemplateParams
-from cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16_config import make_cfg_d256
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.contract import TEMPLATE_NAME
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.config import make_cfg_d256
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes; a plain import gets
 # the all-defaults config (dense fp16), which is what the standalone
-# `python sm100/prefill_d256_f16.py` benchmark path uses.
+# `python sm100/d256_f16_lookahead/kernel.py` benchmark path uses.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256(PARAMS)
 Cfg = type(CFG)

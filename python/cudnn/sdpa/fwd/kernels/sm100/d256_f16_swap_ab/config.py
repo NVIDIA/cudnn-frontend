@@ -6,7 +6,7 @@
 from cudnn.sdpa.fwd.config_common import TemplateParams
 from cudnn.sdpa.fwd.config_swap_ab import make_cfg_d256_decode as _make_cfg
 
-QUERY_TILES = (16, 32)
+from .contract import QUERY_TILES
 
 
 def make_cfg_d256_decode(params: TemplateParams):

@@ -107,7 +107,9 @@ def test_new_names_and_explicit_alternatives_do_not_inherit_generic_lead():
     assert placement.place(SPECS[LOOKAHEAD], f, lookahead) == placement.TRAIL
 
 
-@pytest.mark.parametrize("module", ["d256_f16_contract", "prefill_d256_f16_config", "decode_d256_f16_config"])
+@pytest.mark.parametrize(
+    "module", ["d256_f16_contract", "d256_f16_lookahead.contract", "d256_f16_lookahead.config", "d256_f16_swap_ab.contract", "d256_f16_swap_ab.config"]
+)
 def test_implementation_contracts_import_without_other_bodies_or_heavy_runtimes(module):
     code = f"""import importlib, json, sys
 sys.meta_path[:] = [f for f in sys.meta_path if 'editable' not in str(f).lower()]
@@ -121,7 +123,7 @@ print(json.dumps(sorted(sys.modules)))
         "cutlass",
         "cudnn.sdpa.fwd.api_dsl",
         "cudnn.sdpa.fwd.config_sm100",
-        "cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16",
-        "cudnn.sdpa.fwd.kernels.sm100.decode_d256_f16",
+        "cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.kernel",
+        "cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.kernel",
     )
     assert not set(forbidden).intersection(loaded)
