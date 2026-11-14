@@ -113,7 +113,7 @@ The graph setup runs on the host. Reuse the built graph when shapes, layouts, an
 <Tab title="C++">
 The C++ example uses the same batched matrix multiplication pattern as the Python example: tensors shaped `[B, M, K]` and `[1, K, N]`, with bf16 on the device.
 
-The device tensors use `nv_bfloat16`. The host-side reference math uses `float` because many host CPUs lack fast bf16 paths and `std::bfloat16_t` remains optional even in recent C++ standards.
+The input tensors use `nv_bfloat16`; the output tensor and host reference computation use `float`.
 
 **Full Listing**
 
@@ -184,7 +184,7 @@ int main() {
     std::vector<float> A_host(b * m * k);
     std::vector<float> B_host(1 * k * n);
 
-    // Initialize the CPU reference tensors with random values, then make a copy to the GPU.
+    // Fill the reference tensors, then convert them to BF16 in unified memory.
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
@@ -213,7 +213,7 @@ int main() {
                             .set_stride({m * k, k, 1})
                             .set_data_type(fe::DataType_t::BFLOAT16));
 
-    // Input tensor B: BF16, shape [b, k, n], row-major strides
+    // Input tensor B: BF16, shape [1, k, n], row-major strides
     auto B = graph.tensor(fe::graph::Tensor_attributes()
                             .set_name("B")
                             .set_dim({1, k, n})
@@ -318,7 +318,7 @@ The row-major packing is implied by the stride tuples in the graph and not by po
 
 **Allocation**
 
-`main` fixes `b,m,n,k`, allocates unified memory for `A_dev`, `B_dev`, and `C_dev`, and mirrors random data in the host `float` vectors before downcasting to bf16 on the device.
+`main` sets `b,m,n,k` and allocates unified memory for `A_dev`, `B_dev`, and `C_dev`. The CPU initializes the inputs in this shared allocation; the GPU uses the same pointers during execution.
 
 ```cpp
 nv_bfloat16* A_dev;
@@ -333,9 +333,9 @@ The layout is a contract with the graph description: The same flat length can re
 
 **Host Reference Buffers**
 
-- `A_host` and `B_host` store random `float` seeds.
-- The loops copy into `A_dev` and `B_dev` by using `__float2bfloat16`.
-- After host-to-device fills, `cudaDeviceSynchronize()` ensures the copies finish before graph work begins.
+- `A_host` and `B_host` store random `float` values for the CPU reference.
+- The CPU loops convert these values with `__float2bfloat16` and write them directly into the unified-memory buffers `A_dev` and `B_dev`. No explicit host-to-device copy is needed.
+- After `graph.execute(...)`, `cudaDeviceSynchronize()` waits for GPU work to finish before the CPU reads `C_dev`.
 
 **Graph Object**
 

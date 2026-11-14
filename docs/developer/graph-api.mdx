@@ -41,7 +41,7 @@ The recommended workflow is to query either mode A or B and check for support. T
 
 You can "auto-tune", that is, iterate over the list and time for each engine config and choose the best one for a particular problem on a particular device. Both the C++ and Python APIs have utility functions for doing this.
 
-If all the engine configs are not supported, then use the mode fallback to find the functional fallbacks.
+If no engine configuration is supported, use Fallback Heuristics Mode to find functional fallbacks.
 
 Expert users may also want to filter engine configs based on properties of the engine, such as numerical notes, behavior notes, or adjustable knobs. Numerical notes inform the user about the numerical properties of the engine such as whether it does datatype down conversion at the input or during output reduction. The behavior notes can signal something about the underlying implementation like whether or not it uses runtime compilation. The adjustable knobs allow fine grained control of the engine's behavior and performance.
 
@@ -1019,7 +1019,7 @@ cuDNN JIT is a configuration of cuDNN sub-libraries that provides a significant 
 
 - cuDNN JIT requires GPUs based on the NVIDIA Ampere GPU architecture and later architectures (compute capability 80 and above). Earlier GPU architectures are not supported.
 - cuDNN JIT supports only the runtime fusion engines, namely, [generic runtime fusion engines](/developer/graph-api#generic-runtime-fusion-engines) and [specialized runtime fusion engines](/developer/graph-api#specialized-runtime-fusion-engines).
-- [Pre-complied single-operation engines](/developer/graph-api#pre-compiled-single-operation-engines) and [specialized pre-compiled fusion engines](/developer/graph-api#specialized-pre-compiled-engines) are not supported.
+- [Pre-compiled single-operation engines](/developer/graph-api#pre-compiled-single-operation-engines) and [specialized pre-compiled fusion engines](/developer/graph-api#specialized-pre-compiled-engines) are not supported.
 - The [cuDNN JIT support surface](/developer/graph-api#cudnn-jit-support-surface) is narrower than the cuDNN FULL support surface.
 - cuDNN JIT is supported only with the cuDNN dynamic libraries. Static libraries are not supported.
 
