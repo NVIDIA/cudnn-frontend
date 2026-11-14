@@ -98,6 +98,12 @@ from .kernels.sm100.d512_fp8_role_split.contract import (
     NAME as _D512_FP8_ROLE_SPLIT,
     mismatch as _d512_fp8_implementation_mismatch,
 )
+from .kernels.sm100.d128_fp8_multi_q import contract as _small_fp8_multi_q
+from .kernels.sm100.d128_fp8_dual_kv import contract as _small_fp8_dual_kv
+from .kernels.sm100.d128_fp8_swap_ab import contract as _small_fp8_swap_ab
+
+_SMALL_FP8_CONTRACTS = {module.NAME: module for module in (_small_fp8_multi_q, _small_fp8_dual_kv, _small_fp8_swap_ab)}
+
 from .kernels.sm120.d512_f16_paired.contract import (
     DEVICE_CCS as _SM120_DEVICE_CCS,
     NAME as _SM120_D512_PAIRED,
@@ -1827,6 +1833,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         precision = "FP8" if capabilities.is_fp8 else "half"
         major, minor = facts.device_cc
         return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
+    if capabilities.implementation in _SMALL_FP8_CONTRACTS:
+        reason = _SMALL_FP8_CONTRACTS[capabilities.implementation].mismatch(facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation in _D256_IMPLEMENTATIONS:
         reason = _d256_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
@@ -3507,7 +3517,9 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
             delegated_exact=(
-                frozenset() if rubin_row else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((192, 128), (256, 256), (512, 512)))
+                frozenset()
+                if rubin_row
+                else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
             ),
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
@@ -3714,6 +3726,60 @@ def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
     """
     legacy = next(s for s in ENGINE_SPECS if s.name == name)
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
+def _sm100_small_fp8_specs():
+    """Three fixed pipelines, each reusing the common graph lowering service."""
+    from .kernels.sm100.d128_fp8_multi_q.host import lower as lower_multi_q
+    from .kernels.sm100.d128_fp8_dual_kv.host import lower as lower_dual_kv
+    from .kernels.sm100.d128_fp8_swap_ab.host import lower as lower_swap_ab
+
+    shapes = frozenset({(64, 64), (128, 128)})
+    d128 = frozenset({(128, 128)})
+    base = replace(
+        _sm100_fp8_spec().capabilities,
+        delegated_exact=frozenset(),
+        d_shapes=shapes,
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        thd_d_shapes=d128,
+        paged_d_shapes=shapes,
+        split_d_shapes=shapes,
+        pack_gqa_d_shapes=shapes,
+        cgas=frozenset({1, 2}),
+        cgas_by_d_shape=(((64, 64), frozenset({1})),),
+        split_cgas_by_d_shape=(),
+        swap_abs=frozenset(),
+    )
+    multi_q = replace(base, implementation=_small_fp8_multi_q.NAME)
+    dual_kv = replace(
+        base,
+        implementation=_small_fp8_dual_kv.NAME,
+        d_shapes=d128,
+        paged_d_shapes=d128,
+        thd=False,
+        thd_padded_stats=False,
+        thd_d_shapes=frozenset(),
+        cgas=frozenset({1}),
+        cgas_by_d_shape=(),
+    )
+    swap_ab = replace(
+        base,
+        implementation=_small_fp8_swap_ab.NAME,
+        thd=False,
+        thd_padded_stats=False,
+        thd_d_shapes=frozenset(),
+        cgas=frozenset({1}),
+        cgas_by_d_shape=(),
+        tile_ms=frozenset({16}),
+        sched_policies=frozenset({SCHED_NATURAL}),
+        out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        o_block_scales=frozenset({0}),
+    )
+    return tuple(
+        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+        for caps, lower in ((multi_q, lower_multi_q), (dual_kv, lower_dual_kv), (swap_ab, lower_swap_ab))
+    )
 
 
 def _sm100_d192_fp8_spec() -> EngineSpec:
@@ -5079,6 +5145,7 @@ ENGINE_SPECS = (
     _sm100_d512_fp8_spec(),
     _sm100_d256_fp8_spec(),
     _sm100_d192_fp8_spec(),
+    *_sm100_small_fp8_specs(),
     _sm100_fp8_spec(arch="sm107"),
     _sm107_spec(),
     _sm107_mxfp8_spec(),

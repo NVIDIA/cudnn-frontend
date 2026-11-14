@@ -89,6 +89,7 @@ from cudnn.sdpa.fwd.config_swap_ab import (
     _validate_cfg_d256_decode as _validate_cfg_d256_decode,
     make_cfg_d256_decode as make_cfg_d256_decode,
 )
+from cudnn.sdpa.fwd.config_fp8_decode_common import TemplateParamsDecode as TemplateParamsDecode
 
 # The arch-NEUTRAL half of the d128-file small-tile configuration (the field block, the TMEM map formula, the budgets and the
 # validators, each taking the arch BUDGET as a parameter) -- shared with config_sm107; this module adds the SM100 budget
@@ -207,14 +208,6 @@ def supports_dense_fp8_swap_ab(shape, *, device_cc, paged, thd, batch_size, s_q,
         and 0 < group <= 8
         and 0 < s_q * group <= 8
     )
-
-
-@dataclass(frozen=True)
-class TemplateParamsDecode(TemplateParams):
-    """Extra geometry for the new swap-AB route, without changing legacy records' cache keys."""
-
-    decode_head_dim: int = 128
-    decode_live_columns: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

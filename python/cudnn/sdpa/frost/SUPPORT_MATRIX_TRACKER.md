@@ -81,6 +81,26 @@ Stats and physical-origin restrictions. Central policy preserves candidate
 order and placement. Old exact-D192 20513 recipes must be replanned.
 No additional numerical, stride-override or determinism guarantee is introduced.
 
+**SM100/SM103 exact small-head per-tensor FP8 implementation engines:**
+`sdpa_fwd_sm100_d128_fp8_multi_q` (20527) serves D64/D128 with the existing
+multi-Q body, M128 and one CTA for D64 or one/two CTAs for D128.
+`sdpa_fwd_sm100_d128_fp8_dual_kv` (20528) serves D128 dense queries with
+one CTA and two KV streams over each M128 query tile. Nonpaged/paged D128
+THD retains the multi-Q owner. Dense and paged masks, sinks, packing, splits
+and output formats retain their common eligibility checks.
+`sdpa_fwd_sm100_d128_fp8_swap_ab` (20529) has a 16-column MMA tile with
+eight live softmax columns, CGA1 and NATURAL scheduling. It serves the
+existing SM100 D64 paged (up to four token units), SM100 D128 paged and
+SM100/SM103 D128 dense (one unit) domains with scalar half/FP8 output.
+THD, block-scaled output and extra score/output epilogues remain declined.
+The legacy 20513 row delegates exact D64/D128 on SM100/SM103; envelopes
+and SM107 retain their previous owners. Each new entry fixes the main
+pipeline and owns a separate kernel/configuration/contract/host directory.
+Central selection retains prior effective candidates and order; duplicate
+swap-AB records that differed only in an unused scheduler are canonicalized.
+Old exact-width recipes must be replanned. No new numerical or behavior-note
+guarantee accompanies this ownership migration.
+
 **SM120-family exact wide half implementation engine:**
 `sdpa_fwd_sm120_d512_paired` (20526) owns exact FP16/BF16 D512/V512 and
 D576/V512, including paged FP8-KV storage. The legacy 20505 row delegates
