@@ -3577,6 +3577,62 @@ def select_sm100_d512_geometry(facts, knobs):
     )
 
 
+def select_sm100_small_fp8_geometry(facts, knobs):
+    """Resolve the existing small-head FP8 policy before compiling an engine.
+
+    The explicit swap-AB request and automatic SM100 paged D128 route precede
+    the dual-KV policy, matching the legacy adapter's final parameter override.
+    This selector is not used when replaying a fixed implementation record.
+    """
+    from .config_sm100 import supports_d64_fp8_swap_ab, supports_dense_fp8_swap_ab
+    from .kernels.sm100.d128_fp8_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
+    from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+
+    shape = (facts.d_qk, facts.d_v)
+    if (
+        facts.device_cc not in ((10, 0), (10, 3))
+        or shape not in ((64, 64), (128, 128))
+        or not facts.is_fp8
+        or facts.is_mxfp8
+        or not facts.uniform_dtype
+        or facts.invalid
+        or facts.is_backward
+        or facts.dtype not in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+    ):
+        raise ValueError("small-head FP8 selection requires exact SM100/SM103 D64 or D128 per-tensor inputs")
+    cga = knobs.cga if knobs.cga is not None else 1 if facts.d_qk == 64 else 2
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    rows = facts.s_q * group
+    decode_semantics = (
+        facts.o_block_scale == 0
+        and facts.dtype_o in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.softmax_precision in (None, cudnn.data_type.FLOAT)
+        and not facts.attn_scale_prefolded
+        and not (facts.has_epilogue_gate or facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp)
+    )
+    geometry = dict(
+        device_cc=facts.device_cc,
+        paged=facts.has_paged_kv,
+        thd=facts.thd,
+        batch_size=facts.b,
+        s_q=facts.s_q,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        pack_gqa=knobs.pack_gqa,
+        cga=knobs.cga,
+    )
+    explicit_decode = knobs.swap_ab == 1 and (supports_d64_fp8_swap_ab(shape, **geometry) or supports_dense_fp8_swap_ab(shape, **geometry, tile_n=knobs.tile_n))
+    automatic_decode = (
+        facts.device_cc == (10, 0) and shape == (128, 128) and cga == 1 and facts.has_paged_kv and not facts.thd and 0 < rows <= 8 and facts.b <= 65535
+    )
+    if decode_semantics and (explicit_decode or automatic_decode):
+        return SwapAB(d_flavor=facts.d_qk)
+    if fp8_dual_kv_stream_routed() and shape == (128, 128) and knobs.cga == 1 and not facts.thd and rows <= FP8_DUAL_KV_STREAM_MAX_ROWS:
+        return DualKV()
+    return MultiQ(d_flavor=facts.d_qk, cga=cga)
+
+
 def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
     """Retain the existing candidate budget/order, naming each actual body.
 

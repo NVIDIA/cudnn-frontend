@@ -5,10 +5,16 @@
 
 from dataclasses import asdict
 import importlib
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
+import cudnn
 from cudnn.sdpa.fwd import config_sm100 as legacy
+from cudnn.sdpa.fwd import engines, heuristics
+from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
 
@@ -64,3 +70,92 @@ def test_factories_do_not_call_legacy_implementations(variant, monkeypatch):
         if variant == "multi_q":
             config, _ = module.make_cfg_d64(params)
             assert config.TILE_K == 64
+
+
+def _facts(**overrides):
+    values = dict(
+        b=2,
+        h_q=8,
+        h_kv=2,
+        s_q=1,
+        s_kv=4096,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_fp8=True,
+        uniform_dtype=True,
+        device_cc=(10, 0),
+    )
+    values.update(overrides)
+    return SdpaGraphFacts(**values)
+
+
+@pytest.mark.parametrize(
+    "overrides,knobs,expected",
+    [
+        ({}, dict(cga=1, pack_gqa=True), "dual_kv"),
+        ({}, dict(cga=1, pack_gqa=True, swap_ab=1), "swap_ab"),
+        ({}, dict(cga=2, pack_gqa=True), "multi_q"),
+        ({}, dict(pack_gqa=True), "multi_q"),
+        ({"s_q": 33}, dict(cga=1, pack_gqa=True), "multi_q"),
+        ({"s_q": 32}, dict(cga=1, pack_gqa=True), "dual_kv"),
+        ({"has_paged_kv": True}, dict(cga=1, pack_gqa=True), "swap_ab"),
+        ({"has_paged_kv": True, "s_q": 3}, dict(cga=1, pack_gqa=True), "dual_kv"),
+        ({"has_paged_kv": True, "device_cc": (10, 3)}, dict(cga=1, pack_gqa=True), "dual_kv"),
+        ({"has_paged_kv": True, "b": 65536}, dict(cga=1, pack_gqa=True), "dual_kv"),
+        ({"has_paged_kv": True, "thd": True}, dict(cga=1, pack_gqa=True), "multi_q"),
+        ({"has_paged_kv": True, "o_block_scale": 32}, dict(cga=1, pack_gqa=True), "dual_kv"),
+        ({"has_paged_kv": True, "d_qk": 64, "d_v": 64, "s_q": 8}, dict(cga=1, pack_gqa=True, swap_ab=1), "swap_ab"),
+        ({"has_paged_kv": True, "d_qk": 64, "d_v": 64, "s_q": 8}, dict(cga=1, pack_gqa=True, swap_ab=0), "multi_q"),
+    ],
+)
+def test_central_selection_preserves_body_boundaries(overrides, knobs, expected, monkeypatch):
+    monkeypatch.setattr(legacy, "FP8_DUAL_KV_STREAM_ROUTED", True)
+    selected = heuristics.select_sm100_small_fp8_geometry(_facts(**overrides), engines.SdpaFwdKnobs(**knobs))
+    assert selected.implementation == f"sdpa_fwd_sm100_d128_fp8_{expected}"
+
+
+@pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
+def test_fixed_host_never_reenters_selection(variant, monkeypatch):
+    host = importlib.import_module(f"cudnn.sdpa.fwd.kernels.sm100.d128_fp8_{variant}.host")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fixed host reentered implementation selection")
+
+    monkeypatch.setattr(heuristics, "select_sm100_small_fp8_geometry", forbidden)
+    monkeypatch.setattr(heuristics, "recommend", forbidden)
+    calls = []
+    host.lower(None, _facts(), engines.SdpaFwdKnobs(cga=1), lower_impl=lambda *args, **kwargs: calls.append((args, kwargs)), knob_type=engines.SdpaFwdKnobs)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    selected = kwargs["selected_kernel"]
+    assert selected.implementation.endswith(variant)
+    assert engines.SdpaFwdKnobs.from_public(args[2].to_public()) == args[2]
+    params = selected.configure_params(legacy.TemplateParams(dtype_qkv=0, dtype_o=2))
+    # Existing global routing switches cannot change a retained implementation.
+    monkeypatch.setattr(legacy, "FP8_DUAL_KV_STREAM_ROUTED", False)
+    assert selected.configure_params(params) == params
+    cfg_mod = importlib.import_module(f"cudnn.sdpa.fwd.kernels.sm100.d128_fp8_{variant}.config")
+    factory = cfg_mod.make_cfg_d128_fp8_decode if variant == "swap_ab" else cfg_mod.make_cfg_d128
+    cfg, _ = factory(params)
+    if variant == "swap_ab":
+        assert (args[2].tile_m, cfg.N_Q, params.decode_live_columns) == (16, 16, 8)
+        assert args[2].sched_policy == 0
+    else:
+        assert bool(cfg.DUAL_KV_STREAM) == (variant == "dual_kv")
+
+
+@pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
+def test_cold_host_import_does_not_import_registry(variant):
+    package_root = str(Path(cudnn.__file__).resolve().parent.parent)
+    code = "\n".join(
+        (
+            "import sys",
+            "sys.meta_path[:] = [f for f in sys.meta_path if 'editable' not in str(f).lower()]",
+            f"sys.path.insert(0, {package_root!r})",
+            f"import cudnn.sdpa.fwd.kernels.sm100.d128_fp8_{variant}.host",
+            "assert 'cudnn.sdpa.fwd.engines' not in sys.modules",
+        )
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
