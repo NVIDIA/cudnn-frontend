@@ -1042,6 +1042,9 @@ Exact D64/D128 per-tensor FP8 recipes move to multi-Q (20527), dual-KV
 three engines because the engine id already fixes the implementation.
 Regenerate the full recipe instead of changing an old id in place.
 Dense head envelopes keep their legacy owner.
+Exact SM120-family half D512/V512 and D576/V512 recipes move from 20505 to
+the explicit paired-warp engine 20526 with unchanged knobs; the padded head
+envelopes keep 20505.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
 the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 

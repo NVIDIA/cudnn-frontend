@@ -251,7 +251,8 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
         monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     else:
         monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm120"))
+    owner = "sdpa_fwd_sm120_d512_paired" if d == 512 else engines.engine_name(arch="sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == owner)
     lower = Mock(side_effect=AssertionError("capability checking must not compile"))
     engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
     graph = _mk_graph(is_override_shape_enabled=True)
@@ -1128,13 +1129,23 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
     native_sm120 = engines.engine_name(arch="sm120")
     assert by_name[native_sm120].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})
+    assert by_name["sdpa_fwd_sm120_d512_paired"].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})
     assert by_name["sdpa_fwd_sm100_d256_lookahead"].pack_gqa_partial_d_shapes == frozenset({(256, 256)})
     assert by_name["sdpa_fwd_sm100_d512_2x2"].pack_gqa_partial_d_shapes == frozenset({(576, 512)})
     assert by_name["sdpa_fwd_sm100_d512_role_split"].pack_gqa_partial_d_shapes is None
     others = {
         name: caps.pack_gqa_partial_d_shapes
         for name, caps in by_name.items()
-        if name not in (engines.engine_name(), "sdpa_fwd_sm100_d256_lookahead", "sdpa_fwd_sm100_d512_2x2", native_sm107, native_sm90, native_sm120)
+        if name
+        not in (
+            engines.engine_name(),
+            "sdpa_fwd_sm100_d256_lookahead",
+            "sdpa_fwd_sm100_d512_2x2",
+            native_sm107,
+            native_sm90,
+            native_sm120,
+            "sdpa_fwd_sm120_d512_paired",
+        )
     }
     assert all(v is None for v in others.values()), others
 
@@ -1803,6 +1814,12 @@ def test_knob_request_pack_gqa_outside_domain_rejects_row():
 # ---------------------------------------------------------------------------
 
 _SM120 = engines.engine_name(arch="sm120")
+_SM120_PAIRED = "sdpa_fwd_sm120_d512_paired"
+
+
+def _sm120_half(d_qk, d_v):
+    """The SM120 half row that owns these head dims: exact native wide tiles have their own engine."""
+    return _SM120_PAIRED if (d_qk, d_v) in ((512, 512), (576, 512)) else _SM120
 
 
 def _mk_sm120_graph(d: int = 128, *, d_v: int | None = None, **sdpa_kwargs):
@@ -1926,7 +1943,7 @@ def test_sm120_probe_head_dim_envelope(monkeypatch):
     assert _SM120 in _eligible(_mk_sm120_graph(d=192))
     assert _SM120 in _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
     assert not _eligible(_mk_sm120_graph(d=132))  # multiple of 4, not of 8
-    assert _SM120 in _eligible(_mk_sm120_graph(d=512))
+    assert _SM120_PAIRED in _eligible(_mk_sm120_graph(d=512))
     assert _SM120 in _eligible(_mk_sm120_graph(d=504))
     assert _SM120 in _eligible(_mk_sm120_graph(d=264))
     assert _SM120 in _eligible(_mk_sm120_graph(d=496))
@@ -1937,7 +1954,7 @@ def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     for d_qk in range(264, 513, 8):
         for d_v in range(264, 513, 8):
-            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+            assert _sm120_half(d_qk, d_v) in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
     for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (584, 512), (512, 520)):
         assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
 
@@ -1954,7 +1971,7 @@ def test_sm120_probe_d576_envelope_pairs(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     for d_qk in range(520, 577, 8):
         for d_v in range(264, 513, 8):
-            assert _SM120 in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+            assert _sm120_half(d_qk, d_v) in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
             assert pick_flavor(d_qk, d_v, False) == (576, 512)
             assert pick_flavor(d_qk, d_v, True) is None
             assert smem_bytes(d_qk, d_v, 64, 32) == 98328
@@ -1963,7 +1980,7 @@ def test_sm120_probe_d576_envelope_pairs(monkeypatch):
     flags.pop("supports_d576_envelope")
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
     assert _SM120 not in _eligible(_mk_sm120_graph(d=520, d_v=504))
-    assert _SM120 in _eligible(_mk_sm120_graph(d=576, d_v=512))
+    assert _SM120_PAIRED in _eligible(_mk_sm120_graph(d=576, d_v=512))
 
 
 def test_sm120_probe_accepts_right_band_widening(monkeypatch):

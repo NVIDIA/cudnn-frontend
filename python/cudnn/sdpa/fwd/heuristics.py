@@ -3711,6 +3711,11 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_small_fp8_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_fp8_geometry, policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+
+    from .kernels.sm120.d512_f16_paired.contract import Geometry as Sm120PairedGeometry, LEGACY_ROW as SM120_LEGACY_ROW, in_domain as in_sm120_paired_domain
+
+    if in_sm120_paired_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Sm120PairedGeometry(), policy=sm100_legacy_policy_spec(SM120_LEGACY_ROW))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

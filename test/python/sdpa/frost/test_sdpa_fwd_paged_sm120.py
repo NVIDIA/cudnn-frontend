@@ -9,8 +9,7 @@ import cudnn
 import pytest
 import torch
 
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine, sm120_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
 
@@ -121,11 +120,11 @@ def _case(
 
         # Native qualification may request a legal tile that the ranking does
         # not propose for this Q length. Keep ordinary-candidate tests separate.
-        selected = next(engine for engine in engines_for(g) if engine.name == engine_name(arch="sm120"))
+        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(d_qk, d_v))
         knobs = SdpaFwdKnobs(cga=1, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
     else:
         g.create_execution_plans([cudnn.heur_mode.A])
-        selected = select_engine(g, engine_name(arch="sm120"))
+        selected = select_engine(g, sm120_half_owner(d_qk, d_v))
         knobs = replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
     g.create_execution_plan(selected.engine_id, knobs)
     g.select_plan(len(g.plans) - 1)
@@ -247,7 +246,7 @@ def test_sm120_frost_paged_native_rebind_replay(
     api.check_support()
     api.compile()
     assert api.compute_capability in ((12, 0), (12, 1))
-    kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 else "prefill_f16.py")
+    kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("d512_f16_paired/kernel.py" if min(dims) > 256 else "prefill_f16.py")
     assert api._k_mod.__file__.endswith("/sm120/" + kernel_file)
     assert api._k_mod.PARAMS.split_kv == split_kv
     assert api._k_mod.PARAMS.page_size == page
@@ -558,7 +557,8 @@ def test_sm120_frost_paged_width_determinism(
             )
             api.check_support()
             api.compile()
-            kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("prefill_d512_f16.py" if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
+            wide_file = "prefill_d512_f16.py" if arch == "sm90" else "d512_f16_paired/kernel.py"
+            kernel_file = "decode_f16.py" if tile_m in (16, 32) else (wide_file if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
             assert api._k_mod.__file__.endswith(arch + "/" + kernel_file)
             assert api._k_mod.PARAMS.split_kv == split_kv
             assert api._k_mod.PARAMS.page_size == page
@@ -855,21 +855,26 @@ def test_sm120_frost_paged_d512_determinism(dtype, packed, split_kv):
 
 
 def test_sm120_frost_paged_d512_admission():
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
     from cudnn.sdpa.graph_analyzer import analyze
 
     # Ordinary graph candidates must expose the newly legal native path.
     g, _, _, _, _, _ = _case(torch.float16, 2, 16, True, False, dims=(512, 512), tile_m=64, tile_n=32, sq=1)
-    facts, caps = analyze(g), _sm120_spec().capabilities
+    facts = analyze(g)
+    rows = {s.name: s.capabilities for s in ENGINE_SPECS}
+
+    def caps(dims):
+        return rows[sm120_half_owner(*dims)]
+
     for dims in ((512, 512), (264, 504), (504, 264)):
         for split in (1, 3):
-            assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
+            assert mismatch(caps(dims), replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=split)) is None
     for dims in ((264, 256), (256, 512), (584, 512), (257, 512)):
-        assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+        assert mismatch(caps(dims), replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
     for changes in ({"thd": True}, {"is_fp8": True}, {"is_mxfp8": True}):
-        assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+        assert mismatch(caps((512, 512)), replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
     for tile_m, tile_n in ((16, 16), (32, 16), (64, 64), (128, 32)):
-        assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n)) is not None
+        assert mismatch(caps((512, 512)), facts, SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n)) is not None
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

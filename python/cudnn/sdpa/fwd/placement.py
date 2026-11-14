@@ -684,6 +684,8 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d128_fp8_dual_kv.contract import NAME as SMALL_FP8_DUAL_KV
     from .kernels.sm100.d128_fp8_swap_ab.contract import NAME as SMALL_FP8_SWAP_AB
 
+    from .kernels.sm120.d512_f16_paired.contract import NAME as SM120_D512_PAIRED, LEGACY_ROW as SM120_LEGACY_ROW
+
     # Studies for an explicit implementation take precedence over inherited
     # placement, including a measured TRAIL and non-default legal variants.
     measured = placement_table.lookup(spec.name, facts)
@@ -731,6 +733,9 @@ def place(spec, facts, knobs=None) -> str:
         if selected.implementation != spec.capabilities.implementation:
             return TRAIL
         spec = policy
+
+    if spec.capabilities.implementation == SM120_D512_PAIRED:
+        spec = sm100_legacy_policy_spec(SM120_LEGACY_ROW)
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
         # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);

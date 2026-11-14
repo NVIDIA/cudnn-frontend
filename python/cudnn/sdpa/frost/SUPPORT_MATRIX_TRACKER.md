@@ -101,6 +101,19 @@ swap-AB records that differed only in an unused scheduler are canonicalized.
 Old exact-width recipes must be replanned. No new numerical or behavior-note
 guarantee accompanies this ownership migration.
 
+**SM120-family exact wide half implementation engine:**
+`sdpa_fwd_sm120_d512_paired` (20526) owns exact FP16/BF16 D512/V512 and
+D576/V512, including paged FP8-KV storage. The legacy 20505 row delegates
+these exact cells and retains the general/D256 tiles and the eight-aligned
+head envelopes the same body pads. The explicit row reports TILE_M=64,
+TILE_N=32 and TILE_CGA_M=1. Its kernel, contract and host entry live in
+`sm120/d512_f16_paired/`; FP8 and MXFP8 wide kernels keep separate owners.
+Capabilities, masks, sinks, partial PackGQA, split-KV, paging and THD are
+the legacy row's at these shapes. Central selection preserves the old
+candidate order, budget and placement; explicit records pin this body. Old
+exact-wide 20505 recipes must be invalidated and replanned. No additional
+numerical, determinism or batch-invariance claim is introduced.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;
@@ -3021,7 +3034,7 @@ kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
 with the same support).
 
-D512 FP16/BF16 FPROP (`sm120/prefill_d512_f16.py`) supports **both D_QK and D_V
+D512 FP16/BF16 FPROP (`sm120/d512_f16_paired/kernel.py`) supports **both D_QK and D_V
 in (256, 512]**, in multiples of 8. It uses a 64 x 32 CTA and 512 x 512 head
 tiles: (512, 512) is **native**; smaller shapes are **envelope-served** by
 zero-padding, with the same MMA and on-chip storage cost.

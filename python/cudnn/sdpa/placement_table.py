@@ -78,12 +78,16 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm100.d192_fp8_multi_q.contract import in_domain as in_d192_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.small_fp8_contract import in_domain as in_small_fp8_domain
 
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired.contract import LEGACY_ROW as SM120_LEGACY_ROW, in_domain as in_sm120_paired_domain
+
     caps = (
         heuristics.sm100_legacy_policy_spec().capabilities
         if row == "sdpa_fwd_prefill_sm100" and (in_pilot_domain(facts) or in_wide_half_domain(facts))
         else spec.capabilities
     )
-    if row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts)):
+    if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts))) or (
+        row == SM120_LEGACY_ROW and in_sm120_paired_domain(facts)
+    ):
         caps = heuristics.sm100_legacy_policy_spec(row).capabilities
     return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
 

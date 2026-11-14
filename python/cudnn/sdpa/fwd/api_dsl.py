@@ -481,8 +481,8 @@ _SM100_TILE_N = 128
 # family has a dedicated d512 flavor above the general template's head range.
 _SM120_KERNEL_FILES = {
     _SM120_D256_FLAVOR: "sm120/prefill_d256_f16.py",
-    _SM120_D512_FLAVOR: "sm120/prefill_d512_f16.py",
-    _SM120_D576_FLAVOR: "sm120/prefill_d512_f16.py",
+    _SM120_D512_FLAVOR: "sm120/d512_f16_paired/kernel.py",
+    _SM120_D576_FLAVOR: "sm120/d512_f16_paired/kernel.py",
     None: "sm120/prefill_f16.py",
 }
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
@@ -6854,7 +6854,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             page_size=self.paged_page_size,
             dtype_kv=_SM120_DTYPE_QKV_CODE[self.k_desc.dtype] if self._mixed_fp8_kv else -1,
         )
-        self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        if selected_kernel is not None:
+            # Fixed implementation entry: the selected body, never a flavor walk.
+            self._k_mod = _load_kernel_template(selected_kernel.kernel_file, params, tag=f"sdpa_fwd_sm120_{_flavor_tag(self.flavor)}")
+            self.kernel_template = self._k_mod.TEMPLATE_NAME
+        else:
+            self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
         direct_layout = self._can_prepare_layout()
         self._prepared_fp8 = self._can_prepare_fp8()
