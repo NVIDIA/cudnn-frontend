@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SM120 half DECODE tile (``sm120/decode_f16.py``, ``tile_m`` 16 / 32).
+"""The SM120 half DECODE tile (``sm120/decode_f16_key_group/kernel.py``, ``tile_m`` 16 / 32).
 
 KNOB ROUTE: the adapter runs the decode tile when the plan's ``tile_m`` names
 it, exactly as ``lower_dsl_prefill`` forwards a plan's knobs; the kernel tests

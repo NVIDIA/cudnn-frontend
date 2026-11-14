@@ -246,7 +246,7 @@ def test_sm120_frost_paged_native_rebind_replay(
     api.check_support()
     api.compile()
     assert api.compute_capability in ((12, 0), (12, 1))
-    kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("d512_f16_paired/kernel.py" if min(dims) > 256 else "prefill_f16.py")
+    kernel_file = "decode_f16_key_group/kernel.py" if tile_m in (16, 32) else ("d512_f16_paired/kernel.py" if min(dims) > 256 else "prefill_f16.py")
     assert api._k_mod.__file__.endswith("/sm120/" + kernel_file)
     assert api._k_mod.PARAMS.split_kv == split_kv
     assert api._k_mod.PARAMS.page_size == page
@@ -558,7 +558,7 @@ def test_sm120_frost_paged_width_determinism(
             api.check_support()
             api.compile()
             wide_file = "prefill_d512_f16.py" if arch == "sm90" else "d512_f16_paired/kernel.py"
-            kernel_file = "decode_f16.py" if tile_m in (16, 32) else (wide_file if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
+            kernel_file = "decode_f16_key_group/kernel.py" if tile_m in (16, 32) else (wide_file if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
             assert api._k_mod.__file__.endswith(arch + "/" + kernel_file)
             assert api._k_mod.PARAMS.split_kv == split_kv
             assert api._k_mod.PARAMS.page_size == page
