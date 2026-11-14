@@ -240,7 +240,8 @@ def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_righ
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    assert f"{arch}/prefill_d256_fp8.py" in seen and all(n.startswith(arch + "/") for n in seen), seen
+    expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" else f"{arch}/prefill_d256_fp8.py"
+    assert expected in seen and all(n.startswith(arch + "/") for n in seen), seen
     for name in ("q", "k", "v"):
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
@@ -335,7 +336,7 @@ def test_paged_rebind_replay(d, dv, page, k_hnd, v_hnd, split, dtype, output, mo
         d_v=dv,
         head_padding=True,
     )
-    assert "sm100/prefill_d256_fp8.py" in seen and all(n.startswith("sm100/") for n in seen), seen
+    assert "sm100/d256_fp8_single_q/kernel.py" in seen and all(n.startswith("sm100/") for n in seen), seen
     storage = bufs["o"]._base
     assert torch.all(storage[..., dv:] == 12)
     with dense._cuda_graph() as capture:

@@ -892,7 +892,9 @@ def make_cfg_d256(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
         from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.config import make_cfg_d256 as make_half_cfg
 
         return make_half_cfg(params)
-    return _make_cfg_d256(params, mxfp8=False)
+    from cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q.config import make_cfg_d256 as make_fp8_cfg
+
+    return make_fp8_cfg(params)
 
 
 def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
