@@ -32,6 +32,7 @@ def _sm100_half_owner(graph):
     f = ga.analyze(graph)
     if f is not None and f.device_cc in ((10, 0), (10, 3)):
         return {
+            (192, 128): "sdpa_fwd_sm100_d192_multi_q",
             (256, 256): "sdpa_fwd_sm100_d256_lookahead",
             (512, 512): "sdpa_fwd_sm100_d512_role_split",
             (576, 512): "sdpa_fwd_sm100_d512_2x2",
