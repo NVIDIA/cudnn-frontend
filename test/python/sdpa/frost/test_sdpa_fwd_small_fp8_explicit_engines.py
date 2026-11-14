@@ -23,7 +23,7 @@ OWNERS = {"multi_q": 20527, "dual_kv": 20528, "swap_ab": 20529}
         ("multi_q", 64, 17, 1, 1, False),
         ("multi_q", 128, 1, 1, 1, False),
         ("multi_q", 128, 129, 2, 4, False),
-        ("multi_q", 128, 17, 1, 1, True),
+        ("multi_q", 128, 17, 2, 1, True),
         ("dual_kv", 128, 1, 1, 4, False),
         ("dual_kv", 128, 257, 1, 1, False),
         ("swap_ab", 128, 4, 1, 1, False),

@@ -31,6 +31,11 @@ from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
 from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import ROLE_SPLIT, TWO_BY_TWO
 
 _F16 = "sdpa_fwd_prefill_sm100"
+_SMALL_FP8 = {
+    "sdpa_fwd_sm100_d128_fp8_multi_q": 20527,
+    "sdpa_fwd_sm100_d128_fp8_dual_kv": 20528,
+    "sdpa_fwd_sm100_d128_fp8_swap_ab": 20529,
+}
 _OFFERED = {
     _F16: 20500,
     "sdpa_fwd_prefill_sm100_fp8": 20501,
@@ -41,6 +46,7 @@ _OFFERED = {
     "sdpa_fwd_sm100_d512_fp8_role_split": 20523,
     "sdpa_fwd_sm100_d256_fp8_single_q": 20524,
     "sdpa_fwd_sm100_d192_fp8_multi_q": 20525,
+    **_SMALL_FP8,
 }
 _HALF_IDS = (20500, 20519, 20520, 20521, 20522)
 
@@ -114,7 +120,7 @@ def test_recommend_packs_gqa_under_a_band_on_sm100():
     llama = dict(b=2, h_q=64, h_kv=8, s_q=2048, s_kv=2048)
     rows = (
         (20500, dict(dtype=cudnn.data_type.HALF)),
-        (20501, dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True)),
+        (20527, dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True)),
     )
     for eid, dt in rows:
         plans = [p for p in recommend("A", _facts(causal=True, **dt, **llama), _OFFERED) if p.engine_id == eid]
@@ -708,6 +714,9 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     """Each selected owner must advertise the geometry it launches."""
 
     name = "sdpa_fwd_sm100_d256_fp8_single_q" if not mxfp8 and d_qk == 256 else engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    small_fp8 = not mxfp8 and d_qk == 128
+    if small_fp8:
+        name = "sdpa_fwd_sm100_d128_fp8_multi_q"
     facts = _facts(
         d_qk=d_qk,
         d_v=d_v,
@@ -716,7 +725,7 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
         is_mxfp8=mxfp8,
         is_fp8=not mxfp8,
     )
-    plans = recommend("A", facts, {name: 20510})
+    plans = recommend("A", facts, _SMALL_FP8 if small_fp8 else {name: 20510})
     assert plans
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
@@ -754,7 +763,6 @@ def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
     from types import SimpleNamespace
 
     pool = SimpleNamespace(get_dim=lambda: [1024, 8, 128, 128], get_stride=lambda: [8 * 128 * 128, 128 * 128, 128, 1])
-    name = engines.engine_name(fp8=True)
     facts = _facts(
         b=batch,
         h_q=64,
@@ -771,7 +779,7 @@ def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
         k_t=pool,
         v_t=pool,
     )
-    plans = recommend("A", facts, {name: 20513})
+    plans = recommend("A", facts, _SMALL_FP8)
     assert plans, "paged per-tensor fp8 d128 decode must be served"
     assert all(plan.knobs.cga == 1 for plan in plans), [plan.knobs for plan in plans]
     if batch == 1:
@@ -938,7 +946,7 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    mx_name, fp8_name = engines.engine_name(mxfp8=True), engines.engine_name(fp8=True)
+    mx_name, fp8_name = engines.engine_name(mxfp8=True), "sdpa_fwd_sm100_d128_fp8_multi_q"
     quant = dict(s_q=8192, h_q=24, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16)
     for h_kv in (8, 24):  # GQA 3 and no GQA, both measured
         mx = _facts(is_mxfp8=True, h_kv=h_kv, **quant)
@@ -953,7 +961,7 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
         # packed equal); above 8 MiB per head it keeps the L2-budget arm.
         fp8 = _facts(is_fp8=True, h_kv=h_kv, **quant)
         assert _sched_points(caps[fp8_name], fp8) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL], h_kv
-        assert recommend("A", fp8, {fp8_name: 20501})[0].knobs.sched_policy == SCHED_LPT
+        assert recommend("A", fp8, _SMALL_FP8)[0].knobs.sched_policy == SCHED_LPT
         fp8_long = _facts(is_fp8=True, h_kv=h_kv, **{**quant, "s_q": 65536, "s_kv": 65536})
         assert _sched_points(caps[fp8_name], fp8_long) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
     # Scope: d128 only, SM100 row only, causal only.
@@ -2155,10 +2163,10 @@ def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
 @pytest.mark.L0
 @pytest.mark.parametrize("quant", ["fp8", "mxfp8"])
 def test_quantized_thd_proposals_are_admissible(quant):
-    name = engines.engine_name(**{quant: True})
+    name = "sdpa_fwd_sm100_d128_fp8_multi_q" if quant == "fp8" else engines.engine_name(**{quant: True})
     facts = _facts(thd=True, padded=True, s_q=2048, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, **{"is_" + quant: True})
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
-    plans = recommend("A", facts, {name: 20501 if quant == "fp8" else 20510})
+    plans = recommend("A", facts, {name: 20527 if quant == "fp8" else 20510})
     assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
 
 

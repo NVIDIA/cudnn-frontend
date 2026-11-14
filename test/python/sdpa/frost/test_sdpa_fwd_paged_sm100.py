@@ -1970,7 +1970,7 @@ def test_paged_graph_fp8_declines_off_contract():
         owner = {
             256: "sdpa_fwd_sm100_d256_fp8_single_q",
             512: "sdpa_fwd_sm100_d512_fp8_role_split",
-        }.get(d, engine_name(fp8=True))
+        }.get(d, fp8_engine_names())
         return g is not None and offers_engine(g, owner)
 
     assert _offers(_build_fp8_paged_graph(16))
@@ -1995,7 +1995,7 @@ def test_paged_graph_fp8_declines_off_contract():
     assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(right_bound=0, left_bound=64)))
     assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(diagonal_alignment=br)))
     g_br_window_only = _build_fp8_paged_graph(16, mask_kw=dict(left_bound=64, diagonal_alignment=br))
-    assert g_br_window_only is not None and not offers_engine(g_br_window_only, engine_name(fp8=True)), "bottom-right alignment requires a causal upper bound"
+    assert g_br_window_only is not None and not offers_engine(g_br_window_only, fp8_engine_names()), "bottom-right alignment requires a causal upper bound"
     # The f16/bf16 engine never sees an sdpa_fp8 graph: its row is a different quantization family.
     assert not offers_engine(_build_fp8_paged_graph(16), engine_name())
 

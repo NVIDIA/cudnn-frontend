@@ -231,3 +231,14 @@ def test_manual_alternate_has_no_inherited_lead_claim(monkeypatch):
     knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=1, sched_policy=0)
     assert placement.place(SPECS[PREFIX + "multi_q"], _facts(), knobs) == placement.TRAIL
     assert placement.place(SPECS[PREFIX + "dual_kv"], _facts(), knobs) == placement.LEAD
+
+
+def test_unsplit_thd_keeps_the_existing_two_cta_requirement():
+    facts = _facts(s_q=17, thd=True, padded=True)
+    knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1, sched_policy=0)
+    policy = engines.sm100_legacy_policy_spec("sdpa_fwd_prefill_sm100_fp8")
+    before = engines.mismatch(policy.capabilities, facts, knobs)
+    after = engines.mismatch(SPECS[PREFIX + "multi_q"].capabilities, facts, knobs)
+    assert before is not None and "other THD graphs run the cga2" in before
+    assert after == before
+    assert engines.mismatch(SPECS[PREFIX + "multi_q"].capabilities, facts, replace(knobs, cga=2)) is None
