@@ -5955,3 +5955,62 @@ The ordinary numerical and integration controls are
 `test_frost_sdpa_bias_sm120.py`, `test_sdpa_fwd_api_contract.py`,
 `test_sdpa_graph_analyzer.py`, `test_heuristic_geometry.py` and
 `test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_native_rebind_replay`.
+
+## SM90 explicit D64 forward owners (2026-11-14)
+
+This implementation-isolation batch moves exact D64/V64 graph records to
+`sdpa_fwd_sm90_d64_one_wg` (20539, native nonpaged body) and
+`sdpa_fwd_sm90_f16_three_wg` (20540, existing paged body). Wider three-WG
+shapes and dedicated D128 are outside this batch. Backward is unchanged.
+The base is `5913f355354bd35d5be54494b91b1227b01917bb`.
+
+New native evidence uses H100 NVL (cc 9.0, 132 SMs), Python 3.12,
+Torch 2.14.1+cu130, cuDNN 9.30.0 and CuTe DSL 4.8.0 compiling CUDA 13.4.
+The import path was asserted to be the isolated source checkout. The native
+extension was reused after checking that its native source matched the base;
+it was not rebuilt for this Python-only change.
+
+`test_sdpa_fwd_sm90_implementation_determinism.py` adds 16 L0 cases:
+
+- Twelve FP16/BF16 x unmasked/top-left-causal x three-scheduler cases check
+  O and FP32 Stats bytes across four replays, alone/reordered/duplicated
+  sequences and changed neighbors. The B3/Hq4/Hkv1/Q65/K257 inputs cross
+  Q/K tile boundaries; FP64 attention provides a separate numerical reference.
+- Two dtype cases use B8/Hq16/Hkv1/Q129/K257, 384 CTAs (2.91 per SM), four
+  K/V stage refills, and actual physical output storage. Each passed 3,000
+  warm and 3,000 poisoned launches without a byte mismatch. The unsafe ring
+  control failed 200/200 launches. This bounds the observed per-launch error
+  rate below 0.0998% at 95% confidence for each tested arm; it is not a
+  hardware-refinement proof. FP64 reference checks precede the helper; the
+  helper's cold byte reference measures launch stability.
+- Two runtime-golden cases passed their replay/reference preconditions but
+  skipped for missing baselines. No golden was generated or replaced.
+
+The new public-contract suite separately checks explicit record rebuilds,
+fixed body selection with legacy selection poisoned, captured changed input,
+and the retired 20517 exact-D64 recipe rejection. Existing paged tests retain
+independent table pitches, refreshed storage, padded O/Stats sentinels and
+capture checks. They do not establish new batch-invariance claims for the
+paged owner. Only the native nonpaged D64 row is added to the support page;
+other GPUs are outside these SM90 owners' architecture contract.
+
+Reproduce on Hopper with the stated dependencies, the source import verified,
+and the matching cuDNN library loaded before Torch:
+
+```bash
+cd test/python
+CUDNN_TEST_NO_ISOLATION=1 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest -o addopts= -m L0 -q -rs \
+  sdpa/frost/test_sdpa_fwd_sm90_implementation_determinism.py \
+  sdpa/frost/test_sdpa_fwd_sm90_implementation_contract.py
+```
+
+The initial combined native D64/paged/determinism run gave 142 passed,
+8 missing-runtime-golden skips and 14 cross-compile deselections. The skips
+were six existing paged baselines plus the two new D64 baselines. A later
+identity-fix run gave 69 passed, 2 missing-runtime-golden skips and 6 existing
+paged-golden deselections. These runs overlap and are not additive coverage.
+Two negative compiled-parameter identity tests first failed with shared
+legacy records and passed after checking implementation-local record types.
+The final 3,000-launch stress result is newer than those initial 256-launch
+runs. No missing golden is counted as a strict-golden pass.

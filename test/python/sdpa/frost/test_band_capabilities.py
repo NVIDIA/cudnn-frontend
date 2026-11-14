@@ -135,6 +135,10 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     dtype / envelope / layout rejection can never stand in for a mask decision.
     """
     values = _values(kind, caps, *_dims(kind, caps))
+    if kind == "fwd" and caps.implementation == "sdpa_fwd_sm90_f16_three_wg":
+        # This batch's three-WG owner serves only the D64 paged leg. Its mask
+        # samples must preserve that non-mask declaration, including page size.
+        values.update(has_paged_kv=True, page_size=16, padded=True)
     values.update(overrides)
     # Wide native rows validate the actual binding declarations even without
     # shape overrides. Keep the non-mask baseline legal after geometry changes.
@@ -549,7 +553,10 @@ def test_negative_right_bound_is_still_refused_by_the_forward_probe():
         caps = spec.capabilities
         reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, **band_right(-1)))
         if kind == "fwd":
-            assert reason == "negative diagonal_band_right_bound (-1) is not supported", spec.name
+            # A row that has no finite-band path rejects that feature before
+            # validating its bound; rows serving it retain the value diagnostic.
+            expected = "negative diagonal_band_right_bound (-1) is not supported" if caps.right_band_widening else band.feature_reason(band.LABEL_RIGHT_FINITE)
+            assert reason == expected, spec.name
         else:
             # The backward probe has no such early value guard: the row's band
             # claim decides, so a row that serves widening still serves -1 (the

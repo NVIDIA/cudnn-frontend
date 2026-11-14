@@ -37,6 +37,8 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import band
+from .kernels.sm90.d64_f16_one_wg import contract as _sm90_d64_owner
+from .kernels.sm90.f16_three_wg import contract as _sm90_three_wg_owner
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains as _sm80_graph_tile_domains
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -1859,7 +1861,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
-    if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
+    if capabilities.sm_lo == 90 and capabilities.implementation != _sm90_d64_owner.NAME and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
         why = native_d64_mismatch(
@@ -2388,6 +2390,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
         return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
+    for owner in (_sm90_d64_owner, _sm90_three_wg_owner):
+        if capabilities.implementation == owner.NAME:
+            reason = owner.mismatch(facts, knobs)
+            if reason is not None:
+                return reason
     installed, version = cutedsl_state()
     if not installed:
         # Said HERE, not when lowering imports the adapter: a decline at build
@@ -5023,6 +5030,7 @@ def _sm90_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm90",
         capabilities=Capabilities(
+            delegated_exact=frozenset({((9, 0), (64, 64))}),
             zero_scale=True,
             sm_lo=90,
             sm_hi=90,
@@ -5070,6 +5078,44 @@ def _sm90_spec() -> EngineSpec:
     )
 
 
+def _sm90_d64_specs():
+    """Exact D64 owners: native nonpaged and the existing three-WG paged body."""
+    from .kernels.sm90.d64_f16_one_wg.host import lower as native_lower
+    from .kernels.sm90.f16_three_wg.host import lower as paged_lower
+
+    legacy = _sm90_spec().capabilities
+    specs = []
+    for owner, lower in ((_sm90_d64_owner, native_lower), (_sm90_three_wg_owner, paged_lower)):
+        capabilities = replace(
+            legacy,
+            implementation=owner.NAME,
+            delegated_exact=frozenset(),
+            d_shapes=frozenset({(64, 64)}),
+            d_pad_multiple=0,
+            d_envelope_floors=(),
+            tile_ms_by_d_shape=(),
+            tile_ns_by_d_shape=(),
+            pack_gqa_partial_d_shapes=None,
+            pack_gqas=frozenset({False}),
+            split_kv_supported=False,
+            thd=False,
+            cu_seq_len=False,
+        )
+        if owner is _sm90_d64_owner:
+            capabilities = replace(
+                capabilities,
+                right_band_widening=False,
+                swa=False,
+                padded=False,
+                paged_kv=False,
+                sink=False,
+                band=None,
+                declaration_check=owner.declaration_mismatch,
+            )
+        specs.append(EngineSpec(owner.NAME, capabilities, partial(lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM90), knob_type=SdpaFwdKnobs)))
+    return tuple(specs)
+
+
 ENGINE_SPECS = (
     _sm100_spec(),
     *_sm100_d256_specs(),
@@ -5090,6 +5136,7 @@ ENGINE_SPECS = (
     _sm120_d512_mxfp8_paired_spec(),
     _sm80_spec(),
     _sm90_spec(),
+    *_sm90_d64_specs(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

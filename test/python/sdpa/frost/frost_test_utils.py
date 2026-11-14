@@ -166,6 +166,8 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
         )
     if arch == "sm120":
         return ("sdpa_fwd_prefill_sm120", "sdpa_fwd_sm120_d512_paired")
+    if arch == "sm90":
+        return ("sdpa_fwd_prefill_sm90", "sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg")
     return (f"sdpa_fwd_prefill_{arch}",)
 
 
@@ -178,6 +180,12 @@ def sm120_owner(row, d_qk, d_v) -> str:
     wide = {half.LEGACY_ROW: (half.NAME, half.SHAPES), fp8.LEGACY_ROW: (fp8.NAME, (fp8.SHAPE,)), mxfp8.LEGACY_ROW: (mxfp8.NAME, (mxfp8.SHAPE,))}
     owner, shapes = wide.get(row, (row, ()))
     return owner if (d_qk, d_v) in shapes else row
+
+
+def sm90_half_owner(d_qk, d_v, *, paged=False) -> str:
+    if (d_qk, d_v) == (64, 64):
+        return "sdpa_fwd_sm90_f16_three_wg" if paged else "sdpa_fwd_sm90_d64_one_wg"
+    return "sdpa_fwd_prefill_sm90"
 
 
 def sm120_half_owner(d_qk, d_v) -> str:

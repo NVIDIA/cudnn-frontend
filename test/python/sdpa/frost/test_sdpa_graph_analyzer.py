@@ -165,7 +165,7 @@ def test_zero_attn_scale_claims():
     (score_sign / SCALE_ZERO) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
-    assert fwd == {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"}
+    assert fwd == {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90", "sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg"}
     assert bwd == {
         "sdpa_bwd_sm80",
         "sdpa_bwd_sm100",
