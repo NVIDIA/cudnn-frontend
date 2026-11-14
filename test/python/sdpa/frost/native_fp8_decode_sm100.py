@@ -405,16 +405,16 @@ def test_native_fp8_decode_direct_partial_log_base(in_key, monkeypatch):
     original = api_dsl.load_template
     observed = []
 
-    def direct_params(flavor, params, **kwargs):
+    def direct_params(path, params, **kwargs):
         # The normal adapter clears this flag for partials. Exercise a direct
         # template declaration that still requests log2, as allowed by its ABI.
         assert params.split_kv == 4
-        mod = original(flavor, replace(params, stats_log2=True), **kwargs)
+        mod = original(path, replace(params, stats_log2=True), **kwargs)
         assert mod.CFG.STATS_LOG2 and mod.SPLIT_KV == 4
         observed.append(mod)
         return mod
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", direct_params)
+    monkeypatch.setattr(api_dsl, "load_template", direct_params)
     paged._run_graph_fp8(
         3, 8, 1, 128, 16, 33, [513, 77, 0], True, in_key=in_key, out_dt=torch.bfloat16, stats_log2=True, explicit_pack=True, explicit_split=4, explicit_cga=1
     )
