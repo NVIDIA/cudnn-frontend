@@ -86,7 +86,11 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8_wide
     from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
 
-    sm120_wide = ((SM120_LEGACY_ROW, in_sm120_paired_domain),) + tuple((m.LEGACY_ROW, m.in_domain) for m in (fp8_wide, mxfp8_wide))
+    from cudnn.sdpa.fwd.kernels.sm120 import d256_f16_contract as sm120_d256
+
+    sm120_wide = ((SM120_LEGACY_ROW, in_sm120_paired_domain), (sm120_d256.LEGACY_ROW, sm120_d256.in_domain)) + tuple(
+        (m.LEGACY_ROW, m.in_domain) for m in (fp8_wide, mxfp8_wide)
+    )
     if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts))) or any(
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):

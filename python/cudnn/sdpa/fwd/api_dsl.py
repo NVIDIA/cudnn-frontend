@@ -480,12 +480,12 @@ _SM100_TILE_N = 128
 # Keyed by kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template. The fp8
 # family has a dedicated d512 flavor above the general template's head range.
 _SM120_KERNEL_FILES = {
-    _SM120_D256_FLAVOR: "sm120/prefill_d256_f16.py",
+    _SM120_D256_FLAVOR: "sm120/d256_f16_all_compute/kernel.py",
     _SM120_D512_FLAVOR: "sm120/d512_f16_paired/kernel.py",
     _SM120_D576_FLAVOR: "sm120/d512_f16_paired/kernel.py",
     None: "sm120/prefill_f16.py",
 }
-_SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
+_SM120_DECODE_KERNEL_FILE = "sm120/decode_f16_key_group/kernel.py"
 _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_fp8_paired/kernel.py", None: "sm120/prefill_fp8.py"}
 _SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_mxfp8_paired/kernel.py", None: "sm120/prefill_mxfp8.py"}
 # Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
@@ -6395,7 +6395,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     ``tile_m`` / ``tile_n`` are honored on every template within its kernel
     table (``config_sm120.tile_domain``); left unset, each runs the first KV
     tile of ``config_sm120.kv_tile_preference`` in that table that fits SMEM.
-    ``tile_m`` 16 / 32 runs the decode tile (``sm120/decode_f16.py``), whose
+    ``tile_m`` 16 / 32 runs the decode tile (``sm120/decode_f16_key_group/kernel.py``), whose
     KV tile is its stage width (``config_sm120.decode_kv_stage``).
     """
 

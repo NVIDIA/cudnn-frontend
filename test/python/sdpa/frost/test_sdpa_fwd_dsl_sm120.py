@@ -336,14 +336,14 @@ def _run_dsl_graph(
         from cudnn.engines.manifest import engines_for
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-        selected = next(engine for engine in engines_for(graph) if engine.name == sm120_half_owner(q_gpu.shape[3], v_gpu.shape[3]))
+        selected = next(engine for engine in engines_for(graph) if engine.name == sm120_half_owner(q_gpu.shape[3], v_gpu.shape[3], q_tile))
         knobs = SdpaFwdKnobs(cga=1, tile_m=q_tile, tile_n=kv_tile, sched_policy=0, split_kv=1, pack_gqa=pack_gqa)
         graph.create_execution_plan(selected.engine_id, knobs)
         graph.select_plan(0)
         plan = graph.plans[0]
     else:
         graph.create_execution_plans([cudnn.heur_mode.A])
-        plan = _select_engine(graph, sm120_half_owner(q_gpu.shape[3], v_gpu.shape[3]), tiles=tiles, pack_gqa=pack_gqa)
+        plan = _select_engine(graph, sm120_half_owner(q_gpu.shape[3], v_gpu.shape[3], tiles[0] if tiles else None), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Native dense plans have no dummy LSE scratch. Split plans add the

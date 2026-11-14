@@ -120,11 +120,11 @@ def _case(
 
         # Native qualification may request a legal tile that the ranking does
         # not propose for this Q length. Keep ordinary-candidate tests separate.
-        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(d_qk, d_v))
+        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(d_qk, d_v, tile_m))
         knobs = SdpaFwdKnobs(cga=1, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
     else:
         g.create_execution_plans([cudnn.heur_mode.A])
-        selected = select_engine(g, sm120_half_owner(d_qk, d_v))
+        selected = select_engine(g, sm120_half_owner(d_qk, d_v, tile_m))
         knobs = replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
     g.create_execution_plan(selected.engine_id, knobs)
     g.select_plan(len(g.plans) - 1)

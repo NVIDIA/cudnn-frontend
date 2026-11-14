@@ -74,7 +74,8 @@ def test_independent_thd_origins_rebind_and_capture(
     if sm120:
         from frost_test_utils import sm120_owner
 
-        engine_name = sm120_owner(engine_name, d_qk, d_v)
+        # THD never runs the decode tile, so exact half D256 is the all-compute owner.
+        engine_name = sm120_owner(engine_name, d_qk, d_v, tile_m=128)
     batch, heads, kv_heads, maximum = 4, (heads_override or (24 if d_qk == 576 else 8)), 2, 256
     if batch_override is not None:
         assert batch_override == 1

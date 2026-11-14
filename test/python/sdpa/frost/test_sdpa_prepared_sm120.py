@@ -356,9 +356,10 @@ def test_sm120_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    want = sm120_half_owner(d_qk, d_v)
+    owners = sm120_half_owner(d_qk, d_v)
+    want = owners if isinstance(owners, tuple) else (owners,)
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
-    graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
+    graph.select_plan(next(i for i, name in enumerate(names) if name.split("[")[0] in want))
     graph.check_support()
     graph.build_plans()
     spec = graph._compiled_plans[graph._plan_index]._prepared.spec

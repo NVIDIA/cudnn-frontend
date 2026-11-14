@@ -22,7 +22,7 @@ def bias_decline(d_qk, d_v, *, thd=False, paged=False, split_kv=1, pack_gqa=Fals
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64, 32)
-# Q tiles of the DECODE tile (sm120/decode_f16.py): 16 or 32 packed rows per CTA,
+# Q tiles of the DECODE tile (sm120/decode_f16_key_group/kernel.py): 16 or 32 packed rows per CTA,
 # the consumer warps spread over the KEY axis instead of the rows.
 DECODE_Q_TILES = (16, 32)
 HEAD_TILE_GRANULE = 16
@@ -126,7 +126,7 @@ def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
 
 
 def is_decode_tile(q_tile: int) -> bool:
-    """Whether a Q tile names the decode tile (sm120/decode_f16.py) rather than a prefill template."""
+    """Whether a Q tile names the decode tile (sm120/decode_f16_key_group/kernel.py) rather than a prefill template."""
     return q_tile in DECODE_Q_TILES
 
 
@@ -363,7 +363,7 @@ def validate_params(
     quantizing epilogue); the FP8 template passes its own — FP8 in, any of its
     four quantizing-store epilogues out. ``allow_right_band=False`` rejects a
     widened right band for templates that do not plumb one. ``decode_tile``
-    names the decode tile (sm120/decode_f16.py), which takes the
+    names the decode tile (sm120/decode_f16_key_group/kernel.py), which takes the
     ``DECODE_Q_TILES`` at its stage-width KV tile; every other template is
     built for the ``SEQ_Q_TILES``.
     """
