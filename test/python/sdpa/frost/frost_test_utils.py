@@ -170,7 +170,7 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
 def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
     """Per-tensor FP8 owners for feature tests; routing tests pin one name."""
     if arch == "sm100":
-        return ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_sm100_d512_fp8_role_split")
+        return ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_sm100_d512_fp8_role_split", "sdpa_fwd_sm100_d256_fp8_single_q")
     return (f"sdpa_fwd_prefill_{arch}_fp8",)
 
 
