@@ -315,11 +315,12 @@ def test_row_ceiling_is_the_typed_decline():
 
 
 def _golden_operands(case, rows, dev):
-    """The operands of a golden case: a host draw, or the exact construction whose block scales 1.5 and 1.75 put fourteen elements
-    of two blocks on exact E2M1 ties."""
+    """The operands of a golden case, ``(x, residual, weight, y)``: a host draw (``y`` is ``None``), or the exact construction whose
+    block scales 1.5 and 1.75 put fourteen elements of two blocks on exact E2M1 ties (``y`` is the output it places)."""
     if case == "ties":
         return exact_operands(exact_targets(), exact_signs(rows), dev)
-    return (*make_operands(rows, HIDDEN, dev, seed=500 + rows, kind=case), None)
+    x, res0, w = make_operands(rows, HIDDEN, dev, seed=500 + rows, kind=case)
+    return x, res0, w, None
 
 
 @pytest.mark.parametrize(
