@@ -1175,6 +1175,13 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
     q, k, v = (q, k, v) if layout == "bhsd" else (q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     b, h, sq, d = q.shape
     dv = v.shape[-1]
+    variable = counts is not None
+    # Variable list lengths without KV splits: each head runs its Q tiles longest list first, so the grid's tail is
+    # short lists and lists nested in each other are walked together (P7 of the SM90 blk64 forward). The stable
+    # descending argsort per (b, h) keeps equal lengths in their natural order; it stays on the device (no host
+    # synchronization, CUDA-graph safe) and is issued here so its small kernels run while the host prepares the launch.
+    has_tile_order = variable and splits == 1
+    order = torch.argsort(counts, dim=-1, descending=True, stable=True) if has_tile_order else None
     if splits == 1:
         out = torch.empty((b, h, sq, dv) if layout == "bhsd" else (b, sq, h, dv), device=q.device, dtype=q.dtype)
         out_bh = out if layout == "bhsd" else out.transpose(1, 2)
@@ -1190,8 +1197,9 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
         indices.permute(3, 2, 1, 0),
         counts.permute(2, 1, 0) if counts is not None else indices,
         sizes if sizes is not None else indices,
+        # An unused tile-order slot aliases the index tensor, like the count and size slots; the kernel never reads it.
+        order.permute(2, 1, 0) if has_tile_order else indices,
     )
-    variable = counts is not None
     stages = 1 if not variable and (count + splits - 1) // splits <= 1 else 2
     has_kv_tail = k.shape[2] % 128 != 0
     scale_nonpositive = scale is not None and scale <= 0
@@ -1206,12 +1214,22 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
         splits,
         stages,
         has_kv_tail,
+        has_tile_order,
         *map(_sm90_blk128_tensor_key, args),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     if key not in _bsa_attn_fwd_sm90_blk128.compile_cache:
         kernel = BlockSparseAttnForwardSm90Blk128(
-            d, dv, h // k.shape[1], variable, sizes.ndim if sizes is not None else 0, splits, stages, scale_nonpositive, has_kv_tail
+            d,
+            dv,
+            h // k.shape[1],
+            variable,
+            sizes.ndim if sizes is not None else 0,
+            splits,
+            stages,
+            scale_nonpositive,
+            has_kv_tail,
+            has_tile_order=has_tile_order,
         )
         _bsa_attn_fwd_sm90_blk128.compile_cache[key] = cute.compile(
             kernel,
@@ -1222,7 +1240,8 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
             options="--enable-tvm-ffi",
         )
     with torch.cuda.nvtx.range("cudnn_bsa_sm90_blk128_fwd"):
-        _bsa_attn_fwd_sm90_blk128.compile_cache[key](*(t.detach() for t in args), d**-0.5 if scale is None else scale, count, stream)
+        # The launch records no autograd and DLPack export rejects tensors that require grad, so detach such views.
+        _bsa_attn_fwd_sm90_blk128.compile_cache[key](*(t.detach() if t.requires_grad else t for t in args), d**-0.5 if scale is None else scale, count, stream)
     if splits > 1:
         out, lse = _combine_blk64_kv_bucketed_partials(q, out_bh, lse, splits)
         if layout == "bshd":

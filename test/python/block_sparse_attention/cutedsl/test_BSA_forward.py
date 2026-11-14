@@ -24,6 +24,7 @@ from block_sparse_attention.cutedsl.bsa_utils import (
     import_bsa,
     make_fixed_metadata,
     make_variable_metadata,
+    no_host_sync,
     require_arch,
     supported_block_size,
 )
@@ -507,25 +508,29 @@ def test_sm90_blk128_partial_prologue(scale, variable):
     torch.testing.assert_close(result["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
 
 
-def _sm90_blk128_forward_with_flags(monkeypatch, call, *variants):
+def _sm90_blk128_forward_with_flags(monkeypatch, call, *variants, built=None):
     """Run ``call()`` once per dict of kernel-constructor flags in ``variants``, each on a freshly built SM90 blk128
-    forward kernel (empty compile cache), and return the cloned ``(O, LSE)`` of every run."""
+    forward kernel (empty compile cache), and return the cloned ``(O, LSE)`` of every run.  ``built`` (a list) receives
+    the keyword arguments each kernel was constructed with, the overriding flags included."""
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     fwd = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm90_blk128.bsa_fwd_sm90")
-    base = fwd.BlockSparseAttnForwardSm90Blk128
+    # The module's own kernel class, also when an earlier call of this helper left a subclass in its place.
+    base = next(cls for cls in fwd.BlockSparseAttnForwardSm90Blk128.__mro__ if cls.__module__ == fwd.__name__)
     results = []
     for flags in variants:
         builds = []
 
         class Kernel(base):
             def __init__(self, *args, **kwargs):
-                builds.append(flags)
+                builds.append({**kwargs, **flags})
                 super().__init__(*args, **{**kwargs, **flags})
 
         monkeypatch.setattr(fwd, "BlockSparseAttnForwardSm90Blk128", Kernel)
         monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
         result = call()
         assert builds, "the forward did not build the SM90 blk128 kernel"
+        if built is not None:
+            built.extend(builds)
         results.append((result["o_tensor"].clone(), result["lse_tensor"].clone()))
     return results
 
@@ -635,6 +640,69 @@ def test_sm90_blk128_lean_consumer_loop_rescale_vote(monkeypatch, with_block_siz
     o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, None, sizes, kv_blocks, None, "bhsd")
     torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
     torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_blocks, layout", [pytest.param(11, "bhsd", id="small_sort"), pytest.param(4100, "bshd", id="large_sort")])
+@torch_fork_set_rng(seed=130)
+def test_sm90_blk128_tile_order_matches_identity_order(monkeypatch, q_blocks, layout):
+    """Longest-list-first CTA order (variable counts, kv_splits == 1): CTA x of a head runs the Q tile at rank x of the
+    head's stable descending list-length order, which the wrapper sorts on the device.  Which CTA computes a tile does
+    not change the tile's arithmetic, so O and LSE are the bits of the identity-order kernel.  The counts tie and
+    include empty lists, the last Q tile has one row and the heads are grouped.  A CUDA graph is then replayed after
+    the counts and the lists changed at the same addresses: the replay sorts the new counts, without a host
+    synchronization or a new compile.  4100 Q tiles take torch's sort for more than 4096 elements (no FP64 reference
+    at that size; the identity-order kernel is the reference)."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    small = q_blocks <= 4096
+    batch, heads, kv_heads, dim, value_dim = (2, 4, 2, 128, 96) if small else (1, 2, 1, 64, 64)
+    kv_blocks, width = 8, 5
+    seqlen_q, seqlen_k = (q_blocks - 1) * 128 + 1, (kv_blocks - 1) * 128 + 37
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, seqlen_k, value_dim), device="cuda", dtype=torch.bfloat16)
+    inputs = [q, k, v] if layout == "bhsd" else [t.transpose(1, 2).contiguous() for t in (q, k, v)]
+    # Every slot of a list holds a valid block id, so that any count up to the width is legal after the lists change.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    counts = torch.randint(0, width + 1, (batch, heads, q_blocks), device="cuda", dtype=torch.int32)
+    sizes = torch.tensor([128, 1, 127, 128, 3, 96, 64, 37], device="cuda", dtype=torch.int32)
+    tiles = torch.arange(q_blocks, device="cuda")
+    assert (counts == 0).any() and (torch.argsort(counts, dim=-1, descending=True, stable=True) != tiles).any()
+
+    def call():
+        return ops.block_sparse_attention_forward(
+            *inputs, indices, width, sizes, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128, layout=layout
+        )
+
+    built = []
+    (o_identity, lse_identity), (o_order, lse_order) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(has_tile_order=False), {}, built=built)
+    assert [flags["has_tile_order"] for flags in built] == [False, True], "the wrapper must ask for the tile order with variable counts"
+    assert torch.isfinite(o_order).all()
+    assert torch.equal(o_order, o_identity) and torch.equal(lse_order, lse_identity)
+
+    cache = interface._bsa_attn_fwd_sm90_blk128.compile_cache
+    compiled = dict(cache)
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            captured = call()
+        counts.copy_(counts.flip(-1))
+        indices.copy_(indices.flip(-2))
+        assert (torch.argsort(counts, dim=-1, descending=True, stable=True) != tiles).any()
+        captured["o_tensor"].fill_(float("nan"))
+        captured["lse_tensor"].fill_(float("nan"))
+        with no_host_sync():
+            graph.replay()
+            eager = call()
+        o_graph, lse_graph = captured["o_tensor"].clone(), captured["lse_tensor"].clone()
+    assert cache == compiled, "new counts must not compile another kernel"
+    assert torch.equal(o_graph, eager["o_tensor"]) and torch.equal(lse_graph, eager["lse_tensor"])
+    ((o_identity, lse_identity),) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(has_tile_order=False))
+    assert torch.equal(o_graph, o_identity) and torch.equal(lse_graph, lse_identity)
+    if small:
+        o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, counts, sizes, width, None, "bhsd")
+        torch.testing.assert_close(o_graph.double(), o_ref, atol=8e-3, rtol=8e-3)
+        torch.testing.assert_close(lse_graph.double(), lse_ref, atol=1e-4, rtol=1e-5)
 
 
 # ---- SM100/SM110 blk64
