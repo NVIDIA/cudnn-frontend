@@ -525,6 +525,8 @@ def setup_flashinfer(args, dtype, fi_backend=None):
     if args.phase == "context" and args.kv_layout == "paged":
         return _flashinfer_paged_prefill(flashinfer, args, dtype, fi_backend, workspace)
     if args.phase == "context":
+        if args.has_sink:
+            raise NotImplementedError("the flashinfer ragged prefill leg does not pass sinks")
         # Ragged (contiguous) batch prefill, per-request lengths.
         q_lens, kv_lens = request_lens(args)
         q_gpu = torch.randn(int(q_lens.sum()), hq, dqk, device="cuda", dtype=dtype) * 0.1
@@ -586,6 +588,8 @@ def setup_flashinfer(args, dtype, fi_backend=None):
 
         return fn, f"flashinfer mla backend={getattr(wrapper, '_backend', mla_backend)}"
 
+    if dvo != dqk:
+        raise NotImplementedError("the flashinfer decode legs run V / O at the Q / K width")
     kv_dtype = torch.float8_e4m3fn if args.kv_cache_dtype == "fp8_e4m3" else dtype
     _, kv_lens = request_lens(args)
     total, kv_indptr, kv_indices, last_page_len, block_tables = _paged_kv_layout(kv_lens, args.page_size)
