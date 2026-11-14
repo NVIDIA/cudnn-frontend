@@ -1085,7 +1085,7 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
 @pytest.mark.parametrize(
     "row, cc, sms, quant",
     [
-        ("sdpa_fwd_prefill_sm100", (10, 0), 148, {}),
+        ("sdpa_fwd_sm100_d512_2x2", (10, 0), 148, {}),
         ("sdpa_fwd_prefill_sm100_fp8", (10, 0), 148, _SM107_FP8_QUANT),
         ("sdpa_fwd_prefill_sm90", (9, 0), 132, {}),
         ("sdpa_fwd_prefill_sm107", (10, 7), 216, {}),

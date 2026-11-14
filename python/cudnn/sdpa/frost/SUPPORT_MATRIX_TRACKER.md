@@ -33,8 +33,8 @@ TILE_CGA_M reports that physical cluster (4 for D512, 2 for D576); the
 MMA group is fixed at two CTAs and recorded separately in plan metadata.
 The retired 20511 D512 pair encoding is not a recipe for these new rows. D512 2x2 declines paging/split-KV and packs
 whole groups dividing 64; role-split preserves D512 paging and whole-group
-packing into 128. D576 retains its existing paged/THD/partial-packing
-contract. Common dtype, mask, split, Stats and binding checks remain shared.
+packing into 128, with no partial-packing shapes. Only the 2x2 row declares
+D576 partial packing and retains its existing paged/THD contract. Common dtype, mask, split, Stats and binding checks remain shared.
 Default policy retains the prior body choices, order and candidate budget;
 explicit replay fixes the implementation without a second body crossover.
 No additional determinism or batch-invariance guarantee is introduced.

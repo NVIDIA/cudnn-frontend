@@ -92,7 +92,9 @@ def test_d512_model_counts_all_roles_in_split_and_unsplit(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(heur, "choose_split_kv", recording)
-    plans = heur.recommend("A", _facts(h_kv=1, s_q=1, s_kv=131072, d_qk=512, d_v=512), {SPEC.name: 20500})
+    plans = heur.recommend(
+        "A", _facts(h_kv=1, s_q=1, s_kv=131072, d_qk=512, d_v=512), {"sdpa_fwd_sm100_d512_role_split": 20521, "sdpa_fwd_sm100_d512_2x2": 20522}
+    )
     assert plans and seen
     # D512 is scored twice per leg: with the physical 4-CTA cluster and with the
     # MMA width the constants were fitted with; the physical count may only

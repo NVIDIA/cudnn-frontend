@@ -219,7 +219,13 @@ def _run_graph(
     else:
         from cudnn.engines.manifest import family_for
 
-        explicit_name = "sdpa_fwd_sm100_d256_lookahead" if arch == "sm100" and (d, d_v) == (256, 256) else engine_name(arch=arch)
+        explicit_name = engine_name(arch=arch)
+        if arch == "sm100":
+            explicit_name = {
+                (256, 256): "sdpa_fwd_sm100_d256_lookahead",
+                (512, 512): "sdpa_fwd_sm100_d512_role_split",
+                (576, 512): "sdpa_fwd_sm100_d512_2x2",
+            }.get((d, d_v), explicit_name)
         g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
     plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:

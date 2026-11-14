@@ -2960,7 +2960,15 @@ def _sm100_d512_specs():
         tile_ns_by_d_shape=(),
         sched_policies_by_d_shape=(),
     )
-    role_split = replace(base, implementation=_D512_ROLE_SPLIT, d_shapes=frozenset({(512, 512)}), tile_ms=frozenset({128}), cgas=frozenset({4}))
+    role_split = replace(
+        base,
+        implementation=_D512_ROLE_SPLIT,
+        d_shapes=frozenset({(512, 512)}),
+        tile_ms=frozenset({128}),
+        cgas=frozenset({4}),
+        pack_gqa_partial_d_shapes=None,
+        thd_pack_gqa_d_shapes=frozenset(),
+    )
     two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return (
         EngineSpec(_D512_ROLE_SPLIT, role_split, lower_role_split),

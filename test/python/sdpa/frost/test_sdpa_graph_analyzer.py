@@ -27,6 +27,18 @@ def _eligible(graph, knobs=None):
     return {s.name for s in engines.ENGINE_SPECS if engines.analyze_for(s, graph, knobs)[1] is None}
 
 
+def _sm100_half_owner(graph):
+    """Concrete owner used by these capability tests; keep retired rows visible as failures."""
+    f = ga.analyze(graph)
+    if f is not None and f.device_cc in ((10, 0), (10, 3)):
+        return {
+            (256, 256): "sdpa_fwd_sm100_d256_lookahead",
+            (512, 512): "sdpa_fwd_sm100_d512_role_split",
+            (576, 512): "sdpa_fwd_sm100_d512_2x2",
+        }.get((f.d_qk, f.d_v), engines.engine_name())
+    return engines.engine_name()
+
+
 # The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
 pytestmark = pytest.mark.L0
 
@@ -140,7 +152,7 @@ def test_zero_attn_scale_declined_where_the_kernel_cannot_run_it(attn_scale):
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=attn_scale, is_inference=True)
     _finish_output(o, dims, strides)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _sm100_half_owner(g))
     reason = engines.analyze_for(spec, g, None)[1]
     if attn_scale:
         assert reason is None, reason
@@ -171,7 +183,7 @@ def test_probe_accepts_dsv4_causal():
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, dims, strides)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 @pytest.mark.parametrize("unsupported", ["sm80"])
@@ -413,7 +425,7 @@ def test_probe_accepts_bf16():
     v = g.tensor(dim=dims, stride=strides, data_type=cudnn.data_type.BFLOAT16, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides, dtype=cudnn.data_type.BFLOAT16)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_rejects_uncoverable_head_dim():
@@ -565,7 +577,7 @@ def test_probe_accepts_seq_len_q_with_padding_mask():
         seq_len_q=seq_q,
     )
     _finish_output(o, dims, strides)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_rejects_non_int32_seq_len():
@@ -610,7 +622,7 @@ def test_probe_accepts_bottom_right_with_padded_seq_len_q():
         seq_len_q=seq_q,
     )
     _finish_output(o, dims, strides)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_rejects_seq_len_q_without_padding_mask():
@@ -653,7 +665,7 @@ def _mk_thd_qkvo(g, *, mask_kwargs, d: int = D):
 def test_probe_accepts_thd_top_left_causal():
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask=True))
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_accepts_thd_bottom_right():
@@ -661,7 +673,7 @@ def test_probe_accepts_thd_bottom_right():
     # own (seq_len_q[b], seq_len_kv[b]) via the cu_seqlen metadata.
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask_bottom_right=True))
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_accepts_thd_stats():
@@ -698,7 +710,7 @@ def test_probe_accepts_thd_stats():
     stats.set_data_type(cudnn.data_type.FLOAT)
     stats_ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="stats_ro")
     stats.set_ragged_offset(stats_ro)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_accepts_right_band_widening():
@@ -708,7 +720,7 @@ def test_probe_accepts_right_band_widening():
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, diagonal_band_right_bound=16)
     _finish_output(o, dims, strides)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
     facts = ga.analyze(g)
     assert facts.right_band_widening and facts.right_bound == 16 and not facts.causal
 
@@ -800,7 +812,7 @@ def test_resolve_padding_mask_with_seq_len_kv():
     _finish_output(o, dims, strides)
     cfg = _facts(g)
     assert cfg.padded is True
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_resolve_generate_stats():
@@ -846,7 +858,7 @@ def test_probe_accepts_ragged_skv_via_synth_padding():
     v = g.tensor(dim=(B, H, s_kv, D), stride=(s_kv * H * D, D, H * D, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, D), (S * H * D, D, H * D, 1))
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_probe_accepts_ragged_skv_with_top_left_causal():
@@ -858,7 +870,7 @@ def test_probe_accepts_ragged_skv_with_top_left_causal():
     v = g.tensor(dim=(B, H, s_kv, D), stride=(s_kv * H * D, D, H * D, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, (B, H, S, D), (S * H * D, D, H * D, 1))
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def _mk_eligible_graph():
@@ -871,7 +883,7 @@ def _mk_eligible_graph():
 
 def test_knob_request_within_domain_keeps_engine_eligible():
     g = _mk_eligible_graph()
-    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2))
+    assert _sm100_half_owner(g) in _eligible(g, engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=4))
 
 
 def test_knob_request_outside_domain_rejects_engine():
@@ -1007,7 +1019,7 @@ def test_knob_request_lpt_sched_is_in_domain():
     # The SM100 rows advertise all three scheduler policies (the static/CLC
     # remap serves them); an explicit LPT request stays eligible.
     g = _mk_eligible_graph()
-    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+    assert _sm100_half_owner(g) in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
 
 
 def test_knob_request_unsupported_tile_rejects_engine():
@@ -1017,7 +1029,7 @@ def test_knob_request_unsupported_tile_rejects_engine():
 
 def test_knob_request_unsupported_q_tile_rejects_engine():
     g = _mk_eligible_graph()
-    assert not _eligible(g, engines.SdpaFwdKnobs(tile_m=64))
+    assert not _eligible(g, engines.SdpaFwdKnobs(tile_m=32))
 
 
 def test_knob_request_wrong_vocabulary_rejects_engine():
@@ -1028,7 +1040,7 @@ def test_knob_request_wrong_vocabulary_rejects_engine():
 
 def test_knob_request_none_fields_are_no_preference():
     g = _mk_eligible_graph()
-    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs())
+    assert _sm100_half_owner(g) in _eligible(g, engines.SdpaFwdKnobs())
 
 
 def _mk_gqa_graph(h_q, h_kv, d=128):
@@ -1048,14 +1060,14 @@ def test_knob_request_pack_gqa_eligible_on_gqa():
     # The f16 SM100 rows declare pack_gqas={False, True}; a dense GQA graph
     # with a power-of-2 group admits the packed request.
     g = _mk_gqa_graph(8, 2)
-    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert _sm100_half_owner(g) in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
 
 
 def test_knob_request_pack_gqa_on_mha_is_identity():
     # MHA: G == 1 compiles the identity (bit-exact unpacked fold), so an
     # explicit pack_gqa=True is honorable and the engine stays eligible.
     g = _mk_eligible_graph()
-    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert _sm100_half_owner(g) in _eligible(g, engines.SdpaFwdKnobs(pack_gqa=True))
 
 
 def test_knob_request_pack_gqa_no_pow2_group_rejects_engine():
@@ -1071,15 +1083,15 @@ def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
     # shares a factor with tile_m but does not divide it packs that factor on
     # the d128 and d256 f16 flavors (G=12 -> 4 heads per row group, G=6 -> 2) ...
     for h_q, h_kv in ((24, 2), (12, 2)):
-        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
+        assert _sm100_half_owner(_mk_gqa_graph(h_q, h_kv)) in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
         assert "sdpa_fwd_sm100_d256_lookahead" in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
     # ... while the d512 flavor keeps the full-ratio contract (its kernel packs
     # HEADS_PER_TILE = G), so the same request is declined there.
     assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
-    assert engines.engine_name() in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert _sm100_half_owner(_mk_gqa_graph(32, 2, d=512)) in _eligible(_mk_gqa_graph(32, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
     # A group larger than the tile (256/1 MQA) packs the whole tile (p = 128,
     # two packed heads per KV head) on the partial flavors; declined on d512.
-    assert engines.engine_name() in _eligible(_mk_gqa_graph(256, 1), engines.SdpaFwdKnobs(pack_gqa=True))
+    assert _sm100_half_owner(_mk_gqa_graph(256, 1)) in _eligible(_mk_gqa_graph(256, 1), engines.SdpaFwdKnobs(pack_gqa=True))
     assert not _eligible(_mk_gqa_graph(256, 1, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
 
 
@@ -1104,10 +1116,12 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     native_sm120 = engines.engine_name(arch="sm120")
     assert by_name[native_sm120].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})
     assert by_name["sdpa_fwd_sm100_d256_lookahead"].pack_gqa_partial_d_shapes == frozenset({(256, 256)})
+    assert by_name["sdpa_fwd_sm100_d512_2x2"].pack_gqa_partial_d_shapes == frozenset({(576, 512)})
+    assert by_name["sdpa_fwd_sm100_d512_role_split"].pack_gqa_partial_d_shapes is None
     others = {
         name: caps.pack_gqa_partial_d_shapes
         for name, caps in by_name.items()
-        if name not in (engines.engine_name(), "sdpa_fwd_sm100_d256_lookahead", native_sm107, native_sm90, native_sm120)
+        if name not in (engines.engine_name(), "sdpa_fwd_sm100_d256_lookahead", "sdpa_fwd_sm100_d512_2x2", native_sm107, native_sm90, native_sm120)
     }
     assert all(v is None for v in others.values()), others
 
@@ -1757,8 +1771,8 @@ def test_thd_pack_gqa_unsupported_flavors_decline(changed, knobs):
 
 def test_knob_request_pack_gqa_false_always_eligible():
     # Running unpacked is trivially honorable — on MHA graphs too.
-    assert engines.engine_name() in _eligible(_mk_eligible_graph(), engines.SdpaFwdKnobs(pack_gqa=False))
-    assert engines.engine_name() in _eligible(_mk_gqa_graph(8, 2), engines.SdpaFwdKnobs(pack_gqa=False))
+    assert _sm100_half_owner(_mk_eligible_graph()) in _eligible(_mk_eligible_graph(), engines.SdpaFwdKnobs(pack_gqa=False))
+    assert _sm100_half_owner(_mk_gqa_graph(8, 2)) in _eligible(_mk_gqa_graph(8, 2), engines.SdpaFwdKnobs(pack_gqa=False))
 
 
 def test_knob_request_pack_gqa_outside_domain_rejects_row():
@@ -1876,7 +1890,7 @@ def test_probe_accepts_bottom_right_with_swa():
     q, k, v, dims, strides = _mk_qkv(g)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask_bottom_right=True, sliding_window_length=64)
     _finish_output(o, dims, strides)
-    assert engines.engine_name() in _eligible(g)
+    assert _sm100_half_owner(g) in _eligible(g)
 
 
 def test_sm120_probe_accepts_bottom_right_with_swa(monkeypatch):
@@ -2158,7 +2172,7 @@ def test_probe_accepts_thd_cu_seq_len():
     """THD with the (B+1,) cu_seq_len prefix-sum form (cuDNN 9.24+) is served:
     the lowering derives per-batch lengths host-side from its inherent tolist
     round-trip."""
-    assert engines.engine_name() in _eligible(_mk_thd_cu_graph())
+    assert _sm100_half_owner(_mk_thd_cu_graph()) in _eligible(_mk_thd_cu_graph())
 
 
 def test_probe_rejects_thd_cu_plus_seq_len():
@@ -2610,30 +2624,32 @@ def test_paged_facts_hnd_and_nhd():
         assert facts.s_kv == 8 * 16 and facts.h_kv == 2 and facts.padded
         assert tuple(facts.paged_k_table_t.get_dim()) == (B, 1, 8, 1)
         assert facts.paged_k_table_t is not None and facts.paged_v_table_t is not None
-        assert engines.engine_name() in _eligible(_mk_paged_graph(hnd=hnd))
+        assert _sm100_half_owner(_mk_paged_graph(hnd=hnd)) in _eligible(_mk_paged_graph(hnd=hnd))
 
 
 def test_paged_facts_declared_max_seq_len_and_single_table():
     facts = _facts(_mk_paged_graph(max_seq_len=100, one_table=True))
     assert facts.s_kv == 100
     assert facts.paged_k_table_t is facts.paged_v_table_t
-    assert engines.engine_name() in _eligible(_mk_paged_graph(max_seq_len=100, one_table=True))
+    assert _sm100_half_owner(_mk_paged_graph(max_seq_len=100, one_table=True)) in _eligible(_mk_paged_graph(max_seq_len=100, one_table=True))
 
 
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
-    assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
+    assert _sm100_half_owner(_mk_paged_graph(d=192)) in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
     # Inverted when the d512 flavor was wired (kept, not deleted); d=384 rides its (256, 512]
     # envelope, (512, 128) selects d512 zero-padded on V, d=576 (absorbed MLA) has no envelope.
-    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512)), "paged KV is wired on the d512 flavor"
-    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, zero-padded on V"
-    assert engines.engine_name() in _eligible(_mk_paged_graph(d=384)), "d=384 rides the d512 flavor envelope"
+    assert _sm100_half_owner(_mk_paged_graph(d=512)) in _eligible(_mk_paged_graph(d=512)), "paged KV is wired on the d512 flavor"
+    assert _sm100_half_owner(_mk_paged_graph(d=512, d_v=128)) in _eligible(
+        _mk_paged_graph(d=512, d_v=128)
+    ), "(512, 128) selects the d512 flavor, zero-padded on V"
+    assert _sm100_half_owner(_mk_paged_graph(d=384)) in _eligible(_mk_paged_graph(d=384)), "d=384 rides the d512 flavor envelope"
     assert not _eligible(_mk_paged_graph(d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
     # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
     facts = _facts(_mk_paged_graph(sink=True))
     assert facts.has_paged_kv and facts.has_sink and facts.s_q == 1
-    assert engines.engine_name() in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
+    assert _sm100_half_owner(_mk_paged_graph(sink=True)) in _eligible(_mk_paged_graph(sink=True)), "paged KV with an attention sink at decode is served"
     facts = ga.analyze(_mk_paged_graph(max_seq_len=8 * 16 + 1))
     assert facts.invalid is not None, "a declared max S_kv beyond the block table's reach is invalid"
 
@@ -2645,7 +2661,7 @@ def test_paged_mixed_head_dims_are_served():
     d192x128 envelopes. The previous "exactly one dim > 128" approximation
     declined all of them (INVERTED from a decline)."""
     for d_qk, d_v in ((192, 128), (256, 128), (64, 192), (136, 72)):
-        assert engines.engine_name() in _eligible(_mk_paged_graph(d=d_qk, d_v=d_v)), f"paged ({d_qk}, {d_v}) must be served"
+        assert _sm100_half_owner(_mk_paged_graph(d=d_qk, d_v=d_v)) in _eligible(_mk_paged_graph(d=d_qk, d_v=d_v)), f"paged ({d_qk}, {d_v}) must be served"
 
 
 def _mk_paged_graph_fp8(*, d=128, page_size=16, max_pages=8, hnd=True, thd=False):
@@ -2813,7 +2829,7 @@ def test_paged_split_kv_is_proposed_with_a_ragged_declared_max(monkeypatch, max_
     assert facts.s_kv == max_seq_len and facts.s_kv % 128 != 0 and facts.padded and facts.has_paged_kv
     knob_sets = _knob_sets(spec, facts)
     assert any(k.split_kv and k.split_kv > 1 for k in knob_sets), knob_sets
-    assert engines.engine_name() in _eligible(g, engines.SdpaFwdKnobs(split_kv=2))
+    assert _sm100_half_owner(g) in _eligible(g, engines.SdpaFwdKnobs(split_kv=2))
 
 
 def test_packed_layout_ignores_the_batch_stride_a_ragged_tensor_never_reads():
@@ -3603,7 +3619,14 @@ def test_native_d576_admission_preserves_other_head_envelopes(shape, thd, admitt
     from dataclasses import replace
 
     facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    spec = next(
+        s
+        for s in engines.ENGINE_SPECS
+        if s.name
+        == (
+            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
+        )
+    )
     reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
     assert (reason is None) == admitted, reason
 
@@ -3613,7 +3636,14 @@ def test_native_d576_thd_requires_matching_native_extension(monkeypatch):
     from types import SimpleNamespace
 
     facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    caps = next(
+        s.capabilities
+        for s in engines.ENGINE_SPECS
+        if s.name
+        == (
+            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
+        )
+    )
     knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=False)
     assert engines.mismatch(caps, facts, knobs) is None
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(supports_physical_origins=True))
@@ -3626,8 +3656,15 @@ def test_native_d576_dense_padding_split_admission(shape, admitted):
     from dataclasses import replace
 
     facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], padded=True)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
-    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
+    caps = next(
+        s.capabilities
+        for s in engines.ENGINE_SPECS
+        if s.name
+        == (
+            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
+        )
+    )
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2 if shape[0] == 576 else 4, split_kv=4, pack_gqa=False))
     assert (reason is None) == admitted, reason
 
 
@@ -3638,7 +3675,14 @@ def test_native_d576_thd_split_admission(monkeypatch, cc, packed, splits):
     from dataclasses import replace
 
     facts = replace(_facts(_mk_eligible_graph()), device_cc=cc, d_qk=576, d_v=512, thd=True, stats_t=None)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    caps = next(
+        s.capabilities
+        for s in engines.ENGINE_SPECS
+        if s.name
+        == (
+            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
+        )
+    )
     reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=2, split_kv=splits, pack_gqa=packed))
     assert reason is None, reason
 
@@ -3679,7 +3723,14 @@ def test_native_d576_thd_split_requires_matching_extension(monkeypatch):
     from types import SimpleNamespace
 
     facts = replace(_facts(_mk_eligible_graph()), d_qk=576, d_v=512, thd=True, stats_t=None)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    caps = next(
+        s.capabilities
+        for s in engines.ENGINE_SPECS
+        if s.name
+        == (
+            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
+        )
+    )
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
     assert engines.mismatch(caps, facts, knobs) is None
     # Preserve every parent extension capability; omit only this new ABI.
@@ -3701,7 +3752,14 @@ def test_native_d576_thd_split_scope(paged, sink):
 
     graph = _mk_paged_graph(d=576, d_v=512, sink=sink) if paged else _mk_eligible_graph()
     facts = replace(_facts(graph), d_qk=576, d_v=512, thd=True, stats_t=None, has_sink=sink)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    caps = next(
+        s.capabilities
+        for s in engines.ENGINE_SPECS
+        if s.name
+        == (
+            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
+        )
+    )
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=5, pack_gqa=True)
     assert engines.mismatch(caps, facts, knobs) is None
     assert engines.mismatch(caps, facts, replace(knobs, cga=1)) is not None
