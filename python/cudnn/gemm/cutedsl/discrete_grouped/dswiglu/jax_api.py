@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for the discrete-weight block-scaled
-grouped GEMM dGLU backward (dSwiGLU/dGeGLU), built on :func:`cudnn.jax.call`.
+grouped GEMM dGLU backward (dSwiGLU/dGeGLU), built on :func:`cudnn._jax.call`.
 
 FP8 inputs only (the packed-fp4 uint8 container dtype is not expressible as JAX
 arrays). This discrete kernel is JAX-expressible where the contiguous block-scaled
@@ -33,7 +33,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cudnn.api_base import ceil_div
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import framework_dtype
-from cudnn.jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
+from cudnn._jax import TensorSpec, call, gemm_operand_spec, neg_inf_init, zeros_init
 from ...grouped.unfused.jax_api import _pointer_count, _prob_spec
 from ..swiglu.jax_api import _as_e8m0_array, _sf_atom_spec, _sf_byte_zeros_init, _JAX_FP4_ERROR
 from .discrete_B_blockscaled_grouped_gemm_dglu_dbias import BlockScaledDiscreteWeightDgluDbiasGroupedGemmKernel

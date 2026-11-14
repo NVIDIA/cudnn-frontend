@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Contiguous grouped MXFP8 SwiGLU with quantization through cudnn.jax.call."""
+"""Contiguous grouped MXFP8 SwiGLU with quantization through cudnn._jax.call."""
 
 import cutlass
 

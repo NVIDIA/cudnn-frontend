@@ -8,7 +8,7 @@ from functools import lru_cache, partial
 import math
 from numbers import Integral, Real
 
-from cudnn.jax import call, zeros_init
+from cudnn._jax import call, zeros_init
 
 import jax
 import jax.numpy as jnp

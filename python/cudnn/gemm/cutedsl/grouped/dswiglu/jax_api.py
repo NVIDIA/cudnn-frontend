@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Contiguous grouped MXFP8 dSwiGLU with quantization through cudnn.jax.call."""
+"""Contiguous grouped MXFP8 dSwiGLU with quantization through cudnn._jax.call."""
 
 import cutlass
 import cutlass.cute as cute
 
 from cudnn.api_base import TupleDict
-from cudnn.jax import zeros_init
+from cudnn._jax import zeros_init
 from ..canonical_jax import check_jax_inputs, grouped_call, grouped_plan, output_type, sf_array, sf_shape
 from .api import GroupedGemmDswigluSm100
 

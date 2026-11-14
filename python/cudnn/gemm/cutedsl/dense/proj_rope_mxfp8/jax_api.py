@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for the fused projection GEMM + RoPE +
-dual-direction MXFP8 quantize, built on :func:`cudnn.jax.call`."""
+dual-direction MXFP8 quantize, built on :func:`cudnn._jax.call`."""
 
 from typing import Any, Optional, Tuple
 
@@ -15,7 +15,7 @@ import cutlass.cute as cute
 import cutlass.utils
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.jax import call, row_major_desc as _make_desc
+from cudnn._jax import call, row_major_desc as _make_desc
 from .api import GemmProjRopeMxfp8Bf16InSm100, GemmProjRopeMxfp8Mxfp8InSm100
 from .gemm_proj_rope_mxfp8_bf16in import HEAD_DIM, BLOCK, TILE_M, gemm_proj_rope_mxfp8_host as _bf16in_host
 from .gemm_proj_rope_mxfp8_mxfp8in import gemm_proj_rope_mxfp8_host as _mxfp8in_host

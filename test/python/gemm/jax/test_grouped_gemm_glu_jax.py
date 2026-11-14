@@ -105,7 +105,7 @@ def test_grouped_gemm_glu_jax_discrete_matches_torch(act_func):
 
 @pytest.mark.L0
 def test_grouped_gemm_glu_jax_jit_matches_eager():
-    """XLA custom-call entry point (cudnn.jax.call): bit-identical to the eager JAX wrapper."""
+    """XLA custom-call entry point (cudnn._jax.call): bit-identical to the eager JAX wrapper."""
     import cutlass.jax
 
     if not cutlass.jax.is_available():

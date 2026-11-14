@@ -116,7 +116,7 @@ torch = [
     "torch",
     "torch-c-dlpack-ext",
 ]
-# The jax.jit-compatible XLA custom-call entry points (cudnn.jax, e.g.
+# The jax.jit-compatible XLA custom-call entry points (e.g.
 # gemm_amax_jax_sm100) build on the CuTeDSL JAX extensions (cutlass.jax,
 # shipped with nvidia-cutlass-dsl). The shared floor covers every JAX kernel,
 # including block sparse attention.

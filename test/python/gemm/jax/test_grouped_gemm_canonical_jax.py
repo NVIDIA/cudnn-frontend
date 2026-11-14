@@ -885,7 +885,7 @@ def test_canonical_jax_without_torch(shared_wrapper):
         import ml_dtypes
         import numpy as np
         from functools import partial
-        import cudnn.jax
+        import cudnn._jax
         assert "cudnn.gemm.cutedsl.grouped.swiglu.jax_api" not in sys.modules
         assert "cudnn.gemm.cutedsl.grouped.glu.jax_api" not in sys.modules
         from cudnn.gemm.cutedsl.grouped.swiglu.jax_api import grouped_gemm_swiglu

@@ -12,7 +12,7 @@ import pytest
 jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 
-from cudnn.jax import block_sparse_attention as attention
+from cudnn.block_sparse_attention.jax_api import block_sparse_attention as attention
 from cudnn.ops import block_sparse_attention_forward_jax as forward
 from cudnn.ops import block_sparse_attention_backward_jax as backward
 
@@ -189,19 +189,16 @@ class NoTorch:
 sys.meta_path.insert(0, NoTorch())
 import cudnn
 import cudnn.block_sparse_attention as bsa
-import cudnn.jax as cj
 assert "cudnn.block_sparse_attention.jax_api" not in sys.modules
-assert callable(cj.block_sparse_attention)
 import cudnn.ops
 assert callable(cudnn.ops.block_sparse_attention_forward_jax)
 assert callable(cudnn.ops.block_sparse_attention_backward_jax)
-for name in ("block_sparse_attention_forward", "block_sparse_attention_backward"):
-    assert not hasattr(cj, name)
+assert not hasattr(cudnn, "jax")
 assert not hasattr(bsa, "block_sparse_attention")
 assert not hasattr(cudnn.BSA, "block_sparse_attention")
 assert "cudnn.block_sparse_attention.api" not in sys.modules
 for name in ("block_sparse_attention_forward_jax", "block_sparse_attention_backward_jax", "block_sparse_attention_jax"):
-    for namespace in (cudnn, cudnn.BSA, bsa, cj):
+    for namespace in (cudnn, cudnn.BSA, bsa):
         assert not hasattr(namespace, name)
 assert "torch" not in sys.modules
 """
@@ -326,7 +323,7 @@ class NoTorch:
 sys.meta_path.insert(0, NoTorch())
 import jax
 import jax.numpy as jnp
-from cudnn.jax import block_sparse_attention as attention
+from cudnn.block_sparse_attention.jax_api import block_sparse_attention as attention
 from cudnn.tensor_adapter import get_compute_capability
 assert get_compute_capability() in ((10, 0), (10, 3))
 assert get_compute_capability(0) == get_compute_capability()
