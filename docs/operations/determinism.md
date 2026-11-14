@@ -115,6 +115,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+| `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -204,6 +205,18 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- `grouped_gemm_glu_hadamard_wrapper_sm100` with `act_func="srelu"`: no deterministic
+  mode is needed for replay. The qualified case sets `tanh_clamp_scale` and
+  `rht_sign_mask`, covers both `use_tmem_post_rht_amax` paths, and uses unequal
+  expert sizes with one empty expert; C, D, Amax and PostRhtAmax keep identical
+  bytes across repeated calls under concurrent work on another stream. Batch
+  invariance is not established: Amax and PostRhtAmax are whole-expert
+  reductions and PostRhtAmax depends on 16-token block membership. Unclamped
+  SReLU D is additionally bit-identical to the activation recomputed from the
+  saved C for BF16 and FP16 C/D. The clamped path's approximate `tanh` is not
+  bitwise equal to a host `tanh`. Other activations and SM107 are not covered
+  by this row.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed

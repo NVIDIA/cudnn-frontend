@@ -1427,6 +1427,12 @@ class BlockScaledMoEGroupedGemmGluHadamardQuantKernel:
 
     @cute.jit
     def srelu_act(self, tCompute, acc_vec, mProb):
+        # Backward and activation recomputation consume the saved C, which is
+        # stored in c_dtype. Evaluate the activation from that same rounded value
+        # so the dsrelu kernel's d_srelu regeneration is bit-identical to D,
+        # while retaining FP32 activation arithmetic. This mirrors the plain
+        # grouped SReLU kernel (moe_blockscaled_grouped_gemm_srelu_quant.py).
+        acc_vec = acc_vec.to(self.c_dtype).to(self.acc_dtype)
         acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
         if cutlass.const_expr(self.vectorized_f32):
             for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):

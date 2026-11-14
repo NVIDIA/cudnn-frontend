@@ -66,6 +66,7 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     fmin,
     fmax,
+    tanh_clamp_unit,
     atomic_max_float32,
     silu_f32,
     silu_f32_geglu_scaled,
@@ -151,6 +152,8 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         situ_beta1: float = 4.0,
         enable_bias: bool = False,
         use_tmem_post_rht_amax: bool = False,
+        tanh_clamp_scale: Optional[float] = None,
+        rht_sign_mask: int = 0,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -241,6 +244,18 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
         self.situ_beta1 = float(situ_beta1)
         if act_func not in ["swiglu", "geglu", "situglu", "srelu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
+        # Soft-clamp scale ``s`` for the SReLU epilogue: computes (s * tanh(relu(x) / s))^2
+        # in place of relu(x)^2. A trace-time constant, like in the plain SReLU kernel.
+        if tanh_clamp_scale is not None and act_func != "srelu":
+            raise ValueError("tanh_clamp_scale is only supported with act_func='srelu'")
+        self.tanh_clamp_scale = float(tanh_clamp_scale) if tanh_clamp_scale is not None else None
+        # Random sign mask of the consumer's randomized Hadamard transform: bit ``i`` negates
+        # input element ``i`` of each 16-token block before the transform. The post-RHT amax
+        # is computed for that transform (with the TMEM path, the signs are folded into the
+        # Hadamard tensor by the API). Trace-time constant.
+        if not isinstance(rht_sign_mask, int) or not 0 <= rht_sign_mask < (1 << HADAMARD_SIZE):
+            raise ValueError(f"rht_sign_mask must be a {HADAMARD_SIZE}-bit integer, got {rht_sign_mask!r}")
+        self.rht_sign_mask = int(rht_sign_mask)
 
     def _setup_attributes(self):
         """Set up configurations dependent on GEMM inputs (called inside __call__)."""
@@ -1136,24 +1151,66 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
 
     @cute.jit
     def srelu_act(self, tCompute, acc_vec, mProb):
-        acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
-        if cutlass.const_expr(self.vectorized_f32):
-            for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
-                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                    (acc_relu[i], acc_relu[i + 1]),
-                    (acc_relu[i], acc_relu[i + 1]),
-                    rnd="rn",
-                    ftz=False,
-                )
-                tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
-                    (tCompute[i], tCompute[i + 1]),
-                    (mProb, mProb),
-                    rnd="rn",
-                    ftz=False,
-                )
+        # Backward and activation recomputation consume the saved C, which is
+        # stored in c_dtype. Evaluate the activation from that same rounded value
+        # so the dsrelu kernel's d_srelu regeneration is bit-identical to D,
+        # while retaining FP32 activation arithmetic. This mirrors the plain
+        # grouped SReLU kernel (moe_blockscaled_grouped_gemm_srelu_quant.py).
+        acc_vec = acc_vec.to(self.c_dtype).to(self.acc_dtype)
+        if cutlass.const_expr(self.tanh_clamp_scale is not None):
+            # Soft-clamped squared ReLU: out = (s * tanh(relu(x) / s))^2 * w, computed as
+            # t^2 * prob_scale with t = tanh(relu(x) / s) and prob_scale = s^2 * w. This is
+            # the same expression, in the same order, as the plain SReLU kernel and the
+            # dsrelu kernel's d_srelu regeneration (clamp_k_srelu); keep them identical.
+            # tanh_clamp_unit is relu, tanh and the defensive t <= 1 cap (negative x -> 0).
+            clamp_s_rcp = cutlass.Float32(1.0 / self.tanh_clamp_scale)
+            clamp_s2 = cutlass.Float32(self.tanh_clamp_scale * self.tanh_clamp_scale)
+            prob_scale = cutlass.Float32(mProb) * clamp_s2
+            if cutlass.const_expr(self.vectorized_f32):
+                for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                    u0, u1 = cute.arch.mul_packed_f32x2(
+                        (acc_vec[i], acc_vec[i + 1]),
+                        (clamp_s_rcp, clamp_s_rcp),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                    t0 = tanh_clamp_unit(u0)
+                    t1 = tanh_clamp_unit(u1)
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (t0, t1),
+                        (t0, t1),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (prob_scale, prob_scale),
+                        rnd="rn",
+                        ftz=False,
+                    )
+            else:
+                for i in cutlass.range_constexpr(cute.size(tCompute)):
+                    t = tanh_clamp_unit(acc_vec[i] * clamp_s_rcp)
+                    tCompute[i] = (t * t) * prob_scale
         else:
-            for i in cutlass.range_constexpr(cute.size(tCompute)):
-                tCompute[i] = acc_relu[i] * acc_relu[i] * mProb
+            acc_relu = cute.where(acc_vec > 0, acc_vec, cute.full_like(acc_vec, 0))
+            if cutlass.const_expr(self.vectorized_f32):
+                for i in cutlass.range_constexpr(0, cute.size(tCompute), 2):
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (acc_relu[i], acc_relu[i + 1]),
+                        (acc_relu[i], acc_relu[i + 1]),
+                        rnd="rn",
+                        ftz=False,
+                    )
+                    tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(
+                        (tCompute[i], tCompute[i + 1]),
+                        (mProb, mProb),
+                        rnd="rn",
+                        ftz=False,
+                    )
+            else:
+                for i in cutlass.range_constexpr(cute.size(tCompute)):
+                    tCompute[i] = acc_relu[i] * acc_relu[i] * mProb
 
     @cute.jit
     def query_hadamard_tmem_a_ptr(self, tile_idx, reverse_subtile, tmem_ptr):
@@ -2256,7 +2313,16 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                         self.situglu_act(tCompute, acc_vec_up, acc_vec_gate, mProb, situ_beta1, situ_beta2)
 
                     if cutlass.const_expr(self.generate_amax):
-                        thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
+                        # The amax describes D as it is stored in d_dtype, not the FP32 values
+                        # in registers: round-to-nearest can lift the largest element above
+                        # the FP32 maximum, and it would then saturate when D is quantized
+                        # with this amax.
+                        if cutlass.const_expr(self.d_dtype in (cutlass.BFloat16, cutlass.Float16)):
+                            tComputeD = cute.make_rmem_tensor(tCompute.shape, self.acc_dtype)
+                            tComputeD.store(tCompute.load().to(self.d_dtype).to(self.acc_dtype))
+                            thread_tile_amax = self.amax_reduction_per_thread(tComputeD, thread_tile_amax)
+                        else:
+                            thread_tile_amax = self.amax_reduction_per_thread(tCompute, thread_tile_amax)
 
                     #
                     # Store post-activation output to D.
@@ -2522,6 +2588,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                 0,
                                 epi_tidx,
                                 thread_tile_post_rht_amax,
+                                self.rht_sign_mask,
                             )
                             thread_tile_post_rht_amax = hadamard_smem_transpose_fwht_amax(
                                 sD,
@@ -2529,6 +2596,7 @@ class BlockScaledMoEGroupedGemmGluHadamardKernel:
                                 HADAMARD_SIZE,
                                 epi_tidx,
                                 thread_tile_post_rht_amax,
+                                self.rht_sign_mask,
                             )
 
                     #
