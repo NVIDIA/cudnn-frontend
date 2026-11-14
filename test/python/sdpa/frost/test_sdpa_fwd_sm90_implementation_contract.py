@@ -201,4 +201,35 @@ def test_paged_public_recipe_keeps_three_wg_body(monkeypatch, dtype):
         bufs[name].fill_(float("nan"))
     graph.execute(vp, ws)
     assert_bitwise({n: bufs[n] for n in ("o", "stats")}, expected, "paged public record rebuild")
+    graph.create_execution_plan(20540, {})
+    graph.select_plan(graph.get_execution_plan_count() - 1)
+    graph.check_support()
+    graph.build_plans()
+    assert graph._compiled_plans[graph._plan_index]._compiled.implementation_config["scheduler"] == 2
+    graph.execute(vp, ws)
+    assert_bitwise({n: bufs[n] for n in ("o", "stats")}, expected, "paged omitted scheduler")
     assert loaded and set(loaded) == {paged.KERNEL_FILE}
+
+
+@pytest.mark.parametrize("owner", [native, paged])
+@pytest.mark.parametrize("causal,skv,expected", [(False, 100, 0), (True, 100, 2), (True, 300000, 1)])
+def test_omitted_scheduler_keeps_adapter_default(owner, causal, skv, expected):
+    from importlib import import_module
+
+    lower = import_module(owner.__package__ + ".host").lower
+    f = facts(causal=causal, s_kv=skv, has_paged_kv=owner is paged, padded=owner is paged, page_size=16 if owner is paged else 0)
+    result = lower(SPECS[owner.NAME], f, None, lower_impl=lambda spec, facts, knobs, **kw: knobs, knob_type=engines.SdpaFwdKnobs)
+    assert result.sched_policy == expected
+
+
+@pytest.mark.skipif(_SM != 90, reason="requires native Hopper")
+def test_native_public_omitted_scheduler():
+    torch.manual_seed(1759)
+    q = torch.randn(2, 70, 4, 64, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    k, v = (torch.randn(2, 100, 1, 64, device="cuda", dtype=q.dtype).transpose(1, 2) for _ in range(2))
+    graph, vp, ws, output, _ = _graph(q, k, v, causal=True, record=(20539, {}))
+    assert graph._compiled_plans[graph._plan_index]._compiled.implementation_config["scheduler"] == 2
+    graph.execute(vp, ws)
+    explicit, vp2, ws2, expected, _ = _graph(q, k, v, causal=True, scheduler=2)
+    explicit.execute(vp2, ws2)
+    assert_bitwise(output, expected, "native omitted scheduler")
