@@ -3290,10 +3290,15 @@ def _sm90_d128_knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     exists there alone and leads the D512 body's 64 x 64 sets (:func:`_knob_sets`). One CTA, unsplit, unpacked, in the
     order the template's route proposes (_sched_points with ``d128``): its other orders measured slower on causal
     graphs on H100 SXM, so the remaining slots go to the D512 body's sets, split and packed runners among them. Empty on
-    every other row and graph."""
+    every other row and graph, and below config_sm90.D128_LEAD_MIN_SQ query rows, where the D512 body's 64-row and
+    packed decode tiles keep the row's order (the template stays reachable by pinning its tile)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
+
     caps = spec.capabilities
     lead = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
     if caps.sm_lo != 90 or 128 not in effective_tile_ms(caps, facts, lead) or mismatch(caps, facts, lead) is not None:
+        return []
+    if facts.s_q < D128_LEAD_MIN_SQ:
         return []
     scheds = _sched_points(caps, facts, d128=True)
     first, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)

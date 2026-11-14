@@ -57,6 +57,27 @@ def _facts(d=128, **kw):
     return ga.SdpaGraphFacts(**base)
 
 
+def test_sm90_d128_set_leads_only_from_its_query_row_floor():
+    """heuristics._sm90_d128_knob_sets offers the D128 template's 128 x 128 set on an exact dense (128, 128) graph the
+    template serves only from config_sm90.D128_LEAD_MIN_SQ query rows: one row below, the set is empty and the D512
+    body's sets (its packed and split decode runners among them) keep the SM90 row's order; at the floor and above it
+    leads with one set at the 128 x 128 tile. The floor's value is a measured tuning choice and is read, not pinned
+    (test/AGENTS.md). Decode and multi-token shapes, MHA and GQA, mask-free and bottom-right causal."""
+    from cudnn.sdpa.fwd import engines, heuristics
+    from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _ROW)
+    floor = D128_LEAD_MIN_SQ
+    for h_q, h_kv in ((16, 16), (32, 8)):
+        for mask in (dict(), dict(causal=True, bottom_right=True)):
+            for s_q in sorted({2, 4, 16, floor - 1}):
+                facts = _facts(h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=4096, **mask)
+                assert heuristics._sm90_d128_knob_sets(spec, facts) == [], (h_q, h_kv, mask, s_q)
+            for s_q in (floor, max(floor, 512)):
+                sets = heuristics._sm90_d128_knob_sets(spec, _facts(h_q=h_q, h_kv=h_kv, s_q=s_q, s_kv=4096, **mask))
+                assert len(sets) == 1 and (sets[0].tile_m, sets[0].tile_n) == (128, 128), (h_q, h_kv, mask, s_q, sets)
+
+
 def test_sm90_d128_sched_proposals_stay_in_the_legal_domain():
     """The graph route's scheduler proposal on the SM90 row (heuristics._sched_points), with and without the D128
     template's ``d128`` flag, is a non-empty, duplicate-free subset of the row's legal scheduler domain

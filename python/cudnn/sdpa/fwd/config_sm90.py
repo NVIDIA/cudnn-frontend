@@ -87,6 +87,15 @@ NOT_SERVED = {D128_FLAVOR: D128_NOT_SERVED}
 # and the graph route proposed it), so heuristics._sched_points proposes that order for a routed plan.
 D128_ROUTE_MAX_L = 48
 
+# The D128 template's 128 x 128 set leads the SM90 row's proposals only from this many query rows per request
+# (heuristics._sm90_d128_knob_sets). Below it the template's 128-row Q tile is at most half full, and the D512 body's
+# 64-row tile and its packed decode tile ran faster: on 258 training cells of a frozen H100 SXM study (cuDNN 9.27, bf16,
+# exact dense (128, 128), the repo drivers' timing with an L2 flush), the D512 body's own plan order ran 1.2 to 2.5
+# times the template's speed at S_q 16 or less (geomean by head layout and mask, up to 29 times on one GQA decode
+# cell) and 0.93 to 1.46 times at S_q 17 to 64, while the template ran 1.1 to 2.4 times the D512 body's speed at S_q
+# 65 to 256.
+D128_LEAD_MIN_SQ = 65
+
 
 # The SCHED_LPT_L2 budget of the SM90 templates (D512 and D128 read it through kernels/sm90/_common_hopper; api_dsl and
 # heuristics keep their own copies): here, so that the D128 planner below reads the same value without the DSL.
