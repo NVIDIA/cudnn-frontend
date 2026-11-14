@@ -98,6 +98,11 @@ from .kernels.sm100.d512_fp8_role_split.contract import (
     NAME as _D512_FP8_ROLE_SPLIT,
     mismatch as _d512_fp8_implementation_mismatch,
 )
+from .kernels.sm120.d512_f16_paired.contract import (
+    DEVICE_CCS as _SM120_DEVICE_CCS,
+    NAME as _SM120_D512_PAIRED,
+    mismatch as _sm120_d512_paired_mismatch,
+)
 
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
@@ -1797,7 +1802,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
     if (facts.device_cc, (facts.d_qk, facts.d_v)) in capabilities.delegated_exact:
         precision = "FP8" if capabilities.is_fp8 else "half"
-        return f"exact SM100/SM103 {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
+        major, minor = facts.device_cc
+        return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
     if capabilities.implementation in _D256_IMPLEMENTATIONS:
         reason = _d256_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
@@ -1816,6 +1822,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return reason
     if capabilities.implementation == _D512_FP8_ROLE_SPLIT:
         reason = _d512_fp8_implementation_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation == _SM120_D512_PAIRED:
+        reason = _sm120_d512_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
     if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
@@ -3980,9 +3990,29 @@ def _sm120_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
+            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
+
+
+def _sm120_d512_paired_spec() -> EngineSpec:
+    """The SM120 wide-head half body on exact native head tiles; shared graph binding and launch."""
+    from cudnn.sdpa.fwd.config_sm120 import D512_TILE
+
+    from .kernels.sm120.d512_f16_paired.host import lower
+
+    capabilities = replace(
+        _sm120_spec().capabilities,
+        implementation=_SM120_D512_PAIRED,
+        delegated_exact=frozenset(),
+        d_shapes=WIDE_F16_FLAVORS,
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        tile_ms=frozenset({D512_TILE[0]}),
+        tile_ns=frozenset({D512_TILE[1]}),
+    )
+    return EngineSpec(_SM120_D512_PAIRED, capabilities, partial(lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs))
 
 
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -4382,7 +4412,7 @@ def lower_dsl_prefill(
             and facts.epilogue_gate_t is None
             and api.split_kv == 1
         )
-        or (facts.thd and spec.name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
+        or (facts.thd and lowering_row_name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
         or (facts.thd and spec.name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
@@ -4410,7 +4440,11 @@ def lower_dsl_prefill(
     # really runs: HEADS_PER_TILE, CFG.SPLIT_KV, PAGED_KV), when the adapter keeps one.
     kernel_module = getattr(api, "_k_mod", None)
     implementation_config = None
-    if selected_kernel is not None:
+    if hasattr(selected_kernel, "compiled_mismatch"):
+        implementation_config, why = selected_kernel.compiled_mismatch(kernel_template, kernel_module.PARAMS, knobs)
+        if why is not None:
+            raise RuntimeError(f"{spec.name}: compiled implementation disagrees with the selected configuration ({why}): {implementation_config}")
+    elif selected_kernel is not None:
         cfg = kernel_module.CFG
         params = kernel_module.PARAMS
         implementation_config = dict(
@@ -4949,6 +4983,7 @@ ENGINE_SPECS = (
     _sm107_spec(),
     _sm107_mxfp8_spec(),
     _sm120_spec(),
+    _sm120_d512_paired_spec(),
     _sm120_fp8_spec(),
     _sm120_mxfp8_spec(),
     _sm80_spec(),

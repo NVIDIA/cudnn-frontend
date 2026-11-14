@@ -1037,6 +1037,9 @@ the single-Q engine 20524, with `TILE_CGA_M=1` and a one-CTA MMA group.
 Exact D192/V128 per-tensor FP8 recipes move to the multi-Q engine 20525,
 with matching physical-cluster/MMA widths of one or two CTAs.
 Dense head envelopes keep their legacy owner.
+Exact SM120-family half D512/V512 and D576/V512 recipes move from 20505 to
+the explicit paired-warp engine 20526 with unchanged knobs; the padded head
+envelopes keep 20505.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
 the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 

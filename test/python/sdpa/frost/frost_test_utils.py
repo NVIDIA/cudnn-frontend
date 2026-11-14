@@ -164,7 +164,16 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
             "sdpa_fwd_sm100_d512_role_split",
             "sdpa_fwd_sm100_d512_2x2",
         )
+    if arch == "sm120":
+        return ("sdpa_fwd_prefill_sm120", "sdpa_fwd_sm120_d512_paired")
     return (f"sdpa_fwd_prefill_{arch}",)
+
+
+def sm120_half_owner(d_qk, d_v) -> str:
+    """The SM120 half engine that may serve these head dims (legality only, no ranking)."""
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired.contract import NAME, SHAPES
+
+    return NAME if (d_qk, d_v) in SHAPES else "sdpa_fwd_prefill_sm120"
 
 
 def fp8_engine_names(arch="sm100") -> tuple[str, ...]:

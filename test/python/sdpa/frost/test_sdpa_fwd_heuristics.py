@@ -381,15 +381,14 @@ def test_sm120_d512_flavor_pins_its_one_cta_tile():
     the largest-fitting tile_n both yield to the kernel table
     (config_sm120.tile_domain) on full and underfilled grids, and no runner-up
     proposes another tile. At d128 the same table keeps kv_tile 32 out."""
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120")
-    offered = {"sdpa_fwd_prefill_sm120": 20504}
+    offered = _SM120_HALF_OFFERED
     for d_qk, d_v in ((264, 264), (264, 512), (512, 264), (272, 320), (384, 448), (496, 504), (512, 512)):
         for s in (128, 16384):
             facts = _facts(s_q=s, s_kv=s, h_q=64, h_kv=1, d_qk=d_qk, d_v=d_v, device_cc=(12, 0), device_sm_count=188)
             plans = recommend("A", facts, offered)
             assert plans
             assert {(p.knobs.tile_m, p.knobs.tile_n) for p in plans} == {(64, 32)}
-            assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+            assert all(engines.mismatch(_sm120_half_caps(d_qk, d_v), facts, p.knobs) is None for p in plans)
     facts = _facts(d_qk=128, d_v=128, device_cc=(12, 0), device_sm_count=188)
     plans = recommend("A", facts, offered)
     assert plans and all(p.knobs.tile_n != 32 for p in plans)
@@ -403,13 +402,13 @@ def test_sm120_d512_sliding_window_packs_gqa():
     group cannot pack into 64 rows, MHA has nothing to pack, and without a
     window the decode rule (s_q < tile) and the L2 scheduler rule decide as
     before."""
-    offered = {"sdpa_fwd_prefill_sm120": 20504}
+    offered = _SM120_HALF_OFFERED
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm120")
 
     def primary(**over):
         facts = _facts(**{**dict(s_q=16384, s_kv=16384, h_q=64, h_kv=1, d_qk=512, d_v=512, device_cc=(12, 0), device_sm_count=188), **over})
         plans = recommend("A", facts, offered)
-        assert plans and engines.mismatch(spec.capabilities, facts, plans[0].knobs) is None
+        assert plans and engines.mismatch(_sm120_half_caps(facts.d_qk, facts.d_v), facts, plans[0].knobs) is None
         return plans[0].knobs
 
     packed = primary(window_left=128)
@@ -431,6 +430,17 @@ def test_sm120_d512_sliding_window_packs_gqa():
 
 def _sm120_spec(name="sdpa_fwd_prefill_sm120"):
     return next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+
+
+_SM120_PAIRED = "sdpa_fwd_sm120_d512_paired"
+# The legacy half row and the exact wide-head owner it delegates to.
+_SM120_HALF_OFFERED = {"sdpa_fwd_prefill_sm120": 20505, _SM120_PAIRED: 20526}
+
+
+def _sm120_half_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120"):
+    """Capabilities of the SM120 row that owns these head dims."""
+    owned = row == "sdpa_fwd_prefill_sm120" and (d_qk, d_v) in ((512, 512), (576, 512))
+    return _sm120_spec(_SM120_PAIRED if owned else row).capabilities
 
 
 # Graph facts of each SM120 row's input type.
@@ -461,7 +471,8 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
 
     def reason(tile, **over):
         knobs = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=tile[0], tile_n=tile[1], cga=1, pack_gqa=True, split_kv=1)
-        return engines.mismatch(caps, _sm120_gqa6_facts(**_SM120_ROW_FACTS[row], **over), knobs)
+        facts = _sm120_gqa6_facts(**_SM120_ROW_FACTS[row], **over)
+        return engines.mismatch(_sm120_half_caps(facts.d_qk, facts.d_v, row), facts, knobs)
 
     for d in (128, 256, 512):
         for tile in sorted(tile_domain(d, d, quantized)):
@@ -475,7 +486,7 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
 
     def unset(h_q, d):
         facts = _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=h_q, h_kv=1, d_qk=d, d_v=d)})
-        return engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=True))
+        return engines.mismatch(_sm120_half_caps(d, d, row), facts, engines.SdpaFwdKnobs(pack_gqa=True))
 
     refused = unset(96, 512)
     if engines.pack_gqa_partial(caps, _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=96, h_kv=1, d_qk=512, d_v=512)})):
@@ -542,7 +553,8 @@ def test_sm120_pack_gqa_tile_q_not_divisible_proposals_are_admissible(row, over)
     all G heads of a token in its tile (G <= tile_m)."""
     from cudnn.sdpa.fwd import heuristics
 
-    spec = _sm120_spec(row)
+    # The candidate policy domain: exact wide half resolves these sets to its explicit owner.
+    spec = heuristics.sm100_legacy_policy_spec(row)
     facts = _sm120_gqa6_facts(**_SM120_ROW_FACTS[row], **over)
     sets = heuristics._knob_sets(spec, facts)
     assert sets
