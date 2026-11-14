@@ -418,6 +418,37 @@ Qualification on B300, driver 580.173.02, Torch 2.12.1+cu130 and cuDNN 9.20.0:
   new ownership edges are the inter-kernel queues, phase-arena reuse and
   generic shared-memory prefix counts. The three emitted queue kernels retain
   shared stores → `barrier.sync` → shared loads → `barrier.sync` before reuse.
+  A follow-up SASS operand audit additionally verifies that all eight words
+  from the two `LDS.128` instructions are consumed before the retirement
+  barrier, including the eighth count used only in the total. The consumption
+  precedes the valid-row branch, so tail lanes are covered. Barrier placement
+  alone would not prove this obligation; no extra fence was added to the
+  unchanged numerical kernels.
+
+The 2026-11-14 line-by-line review adds **six boundary tests**, all passing on
+the same B300 / DSL 4.8.1 / compiler 13.4 environment in 306.15 s (51 deselected,
+no failures or skips). The seven production files are unchanged from the
+original qualification; the earlier test totals above are retained evidence,
+not a new rerun of those suites.
+
+- Four runtime-head tests compare all backward outputs with the unsplit D=1
+  reference for 16 shape/configuration pairs, including 6 and 12 heads. Both
+  storage modes and divisors are covered. Each case retains exactly two
+  compiled launch objects (D=1 and its wave configuration) as head count changes;
+  all comparisons are byte-identical and workspace canaries remain intact.
+- Two independent-stream tests use separate preallocated workspaces, explicit
+  handles/streams and captured graphs sharing compiled code. Each stream runs
+  64 poisoned replays per storage mode: 256 replays total. Both streams are
+  submitted before waiting, with comparisons every eight replays. All gradient
+  bytes match the D=1 reference, input ports remain unchanged, and all canaries
+  pass. This covers concurrent submissions; it does not claim a measured
+  percentage of hardware overlap or permit shared workspace across streams.
+
+Run only these additions with:
+
+```bash
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -x -rs -k 'runtime_heads or independent_streams'
+```
 
 Reproduce the new checks from `test/python`:
 
@@ -489,6 +520,17 @@ the table and this repeat is **3.36%**. Full-tensor SHA256 records match
 for all six inputs and O/dQ/dK/dV/dG/dBeta on all eight ranks, in every paired
 case and the reversed-order repeat. Hashing is outside the timed region.
 The weak-gate control uses one 1M document with gates scaled by 0.01.
+
+The expanded low-document matrix on the same unchanged production code exposes
+a performance exception: global **256 × 4K** at real CP8 takes
+12.663 → 13.557 ms (**+7.06%**), reproduced with candidate-first arm order at
+12.656 → 13.563 ms (**+7.16%**). All output and input-gradient byte hashes still
+match on every rank. Disabling head waves diagnostically recovers latency to
+12.659 ms, but raises candidate allocated memory from 16.285 to 20.309 GiB.
+This is not a production fix. The initial eight-case table remains valid, but
+the <=5% criterion is **not met over the expanded coverage**; PR #2577 remains
+Draft pending a scheduling-policy improvement. The full 13-case matrix and
+Nsight Systems attribution are retained in the PR description.
 
 Compatibility, docstring, compile-cache, CUDA Graph and fence audits pass.
 Changed-file pre-commit and syntax checks pass; Fern reports zero errors and

@@ -241,7 +241,9 @@ a row alone and inside a batch under the entry's own picks.
   plans can also reuse checkpoint and owned-state storage across independent
   head waves. This preserves each head's recurrence, FP32 state and reduction
   order; BF16/FP16 grouped heads, rectangular states and external contexts have
-  additional SM103 byte-parity coverage. This additional
+  additional SM103 byte-parity coverage. Runtime-head reuse of compiled code
+  and independent CUDA Graph replays on two streams with separate workspaces
+  are also checked against the unsplit backward path on SM103. This additional
   workspace regression has not been rerun on SM100 or SM107; their earlier
   determinism coverage remains recorded in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism

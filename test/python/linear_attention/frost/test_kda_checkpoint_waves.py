@@ -143,6 +143,115 @@ def test_checkpoint_wave_compile_count(monkeypatch):
         cudnn.destroy_handle(handle)
 
 
+@pytest.mark.parametrize("divisor", [2, 4])
+@pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
+def test_checkpoint_wave_runtime_heads(monkeypatch, divisor, state_waves):
+    """A compiled wave must use the current head count, including non-power-of-two counts."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    from cudnn.linear_attention.frost.kernel import kda_chain_backward_f16 as chain
+
+    monkeypatch.setattr(chain, "chain_backward_cache", {})
+    monkeypatch.setattr(kda_engine, "_KDA_STATE_WAVE_BYTES", 0 if state_waves else 1024**3)
+    handle = cudnn.create_handle()
+    cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
+    try:
+        compiled = None
+        for heads in (divisor, 3 * divisor, 2 * divisor, 4 * divisor):
+            inputs = pack(sequences("kda", [0, 8193, 17, 513], heads=heads))
+            inputs["cu_seqlens"] = inputs.pop("cu")
+            inputs["dO"] = inputs.pop("do")
+            inputs["d_final_state"] = inputs.pop("dfs")
+            inputs["g"].fill_(-0.001)
+            monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args: 1)
+            baseline_call, baseline_result, baseline_storage, full_size = _prepared(inputs, "bwd", False, handle)
+            baseline_call()
+            expected = snapshot(baseline_result)
+            monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args: divisor)
+            execute, result, storage, size = _prepared(inputs, "bwd", False, handle)
+            assert size < full_size
+            storage[:size].fill_(0xFF)
+            execute()
+            assert_bitwise(snapshot(result), expected, f"runtime heads={heads}, divisor={divisor}")
+            assert (storage[size:] == 0xA5).all()
+            assert (baseline_storage[full_size:] == 0xA5).all()
+            assert len(chain.chain_backward_cache) == 2, "head count must not specialize the baseline or wave"
+            current = tuple(chain.chain_backward_cache.values())
+            if compiled is not None:
+                assert all(a is b for a, b in zip(current, compiled)), "runtime heads must reuse the same compiled launches"
+            compiled = current
+            del baseline_call, baseline_result, baseline_storage, execute, result, storage
+    finally:
+        torch.cuda.synchronize()
+        cudnn.destroy_handle(handle)
+
+
+@pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
+def test_checkpoint_wave_independent_streams(monkeypatch, state_waves):
+    """Shared compiled code must not share queues or state across independent graph replays."""
+    reason = frost_la_unavailable()
+    if reason:
+        pytest.skip(reason)
+    from cudnn.linear_attention.frost.kernel import kda_chain_backward_f16 as chain
+
+    monkeypatch.setattr(chain, "chain_backward_cache", {})
+    monkeypatch.setattr(kda_engine, "_KDA_STATE_WAVE_BYTES", 0 if state_waves else 1024**3)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    handles = [cudnn.create_handle(), cudnn.create_handle()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    plans = []
+    try:
+        for index, (stream, handle, graph) in enumerate(zip(streams, handles, graphs)):
+            stream.wait_stream(torch.cuda.current_stream())
+            cudnn.set_stream(handle=handle, stream=stream.cuda_stream)
+            with torch.cuda.stream(stream):
+                inputs = pack(sequences("kda", [0, 1, 15, 16, 17, 8193] + [33] * (31 + index), heads=8))
+                inputs["cu_seqlens"] = inputs.pop("cu")
+                inputs["dO"] = inputs.pop("do")
+                inputs["d_final_state"] = inputs.pop("dfs")
+                inputs["g"].fill_(-0.001)
+                if index:
+                    inputs["dO"].neg_()
+                original_inputs = snapshot(inputs)
+                monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args: 1)
+                baseline_call, baseline_result, baseline_storage, full_size = _prepared(inputs, "bwd", False, handle)
+                baseline_call()
+                expected = snapshot(baseline_result)
+                assert (baseline_storage[full_size:] == 0xA5).all()
+                monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args: 4)
+                execute, result, storage, size = _prepared(inputs, "bwd", False, handle)
+                execute()
+                with torch.cuda.graph(graph, stream=stream):
+                    execute()
+                plans.append((execute, result, storage, size, expected, inputs, original_inputs))
+                del baseline_call, baseline_result, baseline_storage
+        assert len(chain.chain_backward_cache) == 2, "independent streams must reuse compiled code"
+        a, b = (plan[2] for plan in plans)
+        assert a.data_ptr() + a.numel() <= b.data_ptr() or b.data_ptr() + b.numel() <= a.data_ptr()
+        for _ in range(8):
+            for _ in range(8):
+                for stream, graph, (_, result, storage, size, _, _, _) in zip(streams, graphs, plans):
+                    with torch.cuda.stream(stream):
+                        storage[:size].fill_(0xFF)
+                        for value in result.values():
+                            value.fill_(float("nan"))
+                        graph.replay()
+            # Submit both streams before waiting; comparisons must not serialize the replays.
+            for stream in streams:
+                stream.synchronize()
+            for _, result, storage, size, expected, inputs, original_inputs in plans:
+                assert_bitwise(snapshot(result), expected, "independent stream replay")
+                assert_bitwise(snapshot(inputs), original_inputs, "read-only input ports")
+                assert (storage[size:] == 0xA5).all()
+    finally:
+        for stream, graph, handle in zip(streams, graphs, handles):
+            stream.synchronize()
+            graph.reset()
+            torch.cuda.current_stream().wait_stream(stream)
+            cudnn.destroy_handle(handle)
+
+
 def test_state_wave_warm_stress(monkeypatch):
     reason = frost_la_unavailable()
     if reason:
