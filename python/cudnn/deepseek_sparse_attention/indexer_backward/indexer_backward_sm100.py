@@ -1751,12 +1751,14 @@ class IndexerBackwardSm100:
                     mbar,
                     Int32(it),
                 )
-                # A short-row gather can reach the row-release barrier before
+                # K gather can reach the row-release barrier before
                 # compute/reduce have completed the preceding row that used
-                # the same operand parity.  Observe that older completion
-                # before publishing this row's gather arrival, otherwise the
-                # arrival can be counted in the still-open prior phase.
-                if const_expr(self.num_topk_blocks < 4) and it >= 2:
+                # the same operand parity, including the four-block TopK=512
+                # path when Reduce is delayed by global dK updates.  Observe
+                # that older completion before publishing this row's gather
+                # arrival, otherwise the arrival can be counted in the
+                # still-open prior phase.
+                if it >= 2:
                     cute.arch.mbarrier_wait(
                         mbar + MBAR_ROW_FREE_0 + parity,
                         Int32((it // 2 - 1) & 1),
