@@ -135,6 +135,7 @@ def frost_add_rms_norm_quant(
 
     xv = ld_global_v4((x.iterator + idx).toint(), INT32)
     sumsq = FP32(0)
+    rv = None  # bound on every path; the residual's words under cfg.ADD only (the same compile-time condition reads them)
     if cutlass.const_expr(cfg.ADD):
         rv = ld_global_v4((res.iterator + idx).toint(), INT32)
     for p in cutlass.range_constexpr(PAIRS):
