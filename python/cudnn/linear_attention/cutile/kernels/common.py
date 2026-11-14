@@ -66,13 +66,34 @@ def opt(t, bufs, dtype_name: str = "float32"):
 # --- Launch tuning --------------------------------------------------------------------------------
 
 
-# Only the @ct.kernel launch hints (occupancy x num_worker_warps) are explored;
-# the grid, args and algorithm are unchanged, so tuning never moves numerics.
+# Only the @ct.kernel launch hints (occupancy x num_worker_warps) are explored; the grid, args and algorithm are
+# unchanged. Occupancy never moves numerics. The worker-warp count does for a kernel that reduces a tile with ct.sum
+# (cuTile splits the sum across the worker warps and combines the partials, so the count picks the summation tree), so
+# two processes that time their candidates can write different bytes. The cache is per device.
 launch_hint_cache: dict = {}
 
+# The first candidate of every sweep. cuTile's own default is None (auto, compiler-chosen), so the tuning-failure
+# fallback launches this value explicitly rather than the unhinted kernel.
+DEFAULT_NWW = 4
 
-def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
-    """occupancy x num_worker_warps grid; deduped, default (occ=1,nww=4) first."""
+# Host hooks on the pick. A host that needs the same bytes on every rank and in every run (a training framework's
+# autotune policy) sets ``select_hints(kernel, cache_key, configs)``: it returns one of ``configs`` and the timed search
+# is skipped, or None to let the search run. ``record_hint(kernel, cache_key, config)`` is told each timed winner, so
+# the host can record a table and pin from it later. ``cache_key`` is the caller's shape key, without the device.
+# The hooks are consulted only when a launch misses ``launch_hint_cache``: install them before the first launch, or
+# clear the cache when the policy changes. A search that fails or times out launches the first candidate and tells
+# ``record_hint`` nothing, so a host that pins from recorded winners decides what a missing record means.
+select_hints = None
+record_hint = None
+
+
+def kernel_name(kernel):
+    """The ``@ct.kernel``'s function name."""
+    return getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
+
+
+def launch_hint_configs(occ_choices, nww_choices=(DEFAULT_NWW, 8)):
+    """occupancy x num_worker_warps grid; deduped, default (occ_choices[0], DEFAULT_NWW) first."""
     seen = set()
     cfgs = []
     for occ in occ_choices:
@@ -85,41 +106,42 @@ def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
     return cfgs
 
 
-def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(4, 8), timeout=30, stream=None):
+def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(DEFAULT_NWW, 8), timeout=30, stream=None):
     """Launch ``kernel`` with the best launch hints for ``cache_key``.
 
     Tune-once/cache/launch over launch hints only (grid, args and signature are
-    fixed). Falls back to the base kernel when tuning fails or times out.
-    Default config (occ=1, nww=4) is explored first so a no-improvement shape
-    keeps the base behaviour. ``cache_key`` is qualified
-    by the kernel's own name, so two kernels sharing a key shape stay apart.
+    fixed). The host's ``select_hints`` is asked first; otherwise the candidates
+    are timed. The first candidate (``occ_choices[0]``, ``nww_choices[0]``) is
+    explored first so a no-improvement shape keeps it, and it is the fallback
+    when tuning fails or times out, so a failed tuning runs the same partition
+    as a successful one. ``cache_key`` is the caller's shape key; the cache
+    qualifies it by the kernel's own name and the current device.
     """
     stream = 0 if stream is None else stream
-    cache_key = (getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel)), cache_key)
-    if cache_key not in launch_hint_cache:
-        tuned = None
-        try:
-            configs = launch_hint_configs(occ_choices, nww_choices)
-            with ct.compiler_timeout(timeout):
-                result = exhaustive_search(
-                    configs,
-                    stream,
-                    lambda cfg: grid,
-                    kernel,
-                    lambda cfg: args,
-                    lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
-                )
-            best = result.best.config
-            tuned = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
-        except Exception:
-            tuned = None
-        launch_hint_cache[cache_key] = tuned
+    slot = (kernel_name(kernel), cache_key, current_device_id())
+    if slot not in launch_hint_cache:
+        configs = launch_hint_configs(occ_choices, nww_choices)
+        best = select_hints(kernel, cache_key, configs) if select_hints is not None else None
+        if best is None:
+            try:
+                with ct.compiler_timeout(timeout):
+                    result = exhaustive_search(
+                        configs,
+                        stream,
+                        lambda cfg: grid,
+                        kernel,
+                        lambda cfg: args,
+                        lambda cfg: {"occupancy": cfg.occupancy, "num_worker_warps": cfg.num_worker_warps},
+                    )
+                best = result.best.config
+            except Exception:
+                best = configs[0]  # the first candidate; nothing is recorded
+            else:
+                if record_hint is not None:
+                    record_hint(kernel, cache_key, best)  # outside the handler: the host's errors are the host's
+        launch_hint_cache[slot] = kernel.replace_hints(occupancy=best.occupancy, num_worker_warps=best.num_worker_warps)
 
-    tuned = launch_hint_cache[cache_key]
-    if tuned is None:
-        ct.launch(stream, grid, kernel, args)
-    else:
-        ct.launch(stream, grid, tuned, args)
+    ct.launch(stream, grid, launch_hint_cache[slot], args)
 
 
 # --- Device helpers -------------------------------------------------------------------------------
@@ -320,11 +342,11 @@ def l2norm_fwd(x, eps: float = 1e-6, out=None, rstd_out=None, stream=None):
         grid = (cdiv(T, BT),)
         autotuned_launch(
             l2norm_fwd_kernel,
-            ("l2norm_fwd_kernel", D, BD, BT, str(x.dtype), current_device_id()),
+            ("l2norm_fwd_kernel", D, BD, BT, str(x.dtype)),
             grid,
             (x, y, rstd, float(eps), T, D, BD, BT),
             occ_choices=L2NORM_TUNE_OCC,
-            nww_choices=(4,),
+            nww_choices=(DEFAULT_NWW,),
             stream=stream,
         )
     else:
@@ -357,11 +379,11 @@ def l2norm_bwd(
         grid = (cdiv(T, BT),)
         autotuned_launch(
             l2norm_bwd_kernel,
-            ("l2norm_bwd_kernel", D, BD, BT, str(y.dtype), int(dy2 is not None), current_device_id()),
+            ("l2norm_bwd_kernel", D, BD, BT, str(y.dtype), int(dy2 is not None)),
             grid,
             (y, rstd_flat, dy, dy2_arg, dx, float(eps), T, D, BD, BT, int(dy2 is not None)),
             occ_choices=L2NORM_TUNE_OCC,
-            nww_choices=(4,),
+            nww_choices=(DEFAULT_NWW,),
             stream=stream,
         )
     else:
