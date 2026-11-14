@@ -119,7 +119,9 @@ The SM120 hand rule TRAILs paged K/V on the prefill body (no 16 / 32-row decode 
 first for the classes they measured. On the RTX PRO 6000 (cuDNN 9.30.0.4, profiler kernel time)
 paged d128 runs 15-27x behind the backend at s_q 8-2048 (b1 q2048 kv2048 32/8: 2.92 ms vs 0.159 ms, against 0.133 ms on FROST's
 dense body), and a 72-cell seeded holdout's verify rows came out 0.04-0.09x of today's default with the backend. Paged
-decode-shaped graphs that fit the decode tile keep the rules below and study sm120_decode_20261112's entries.
+decode-shaped graphs that fit the decode tile keep the rules below and study sm120_decode_20261112's entries. The rule covers
+head dims the decode tile can take (d <= 256): wide paged MLA (d512 / D576xV512) runs a different body and leads its MTP rows,
+0.04-0.40 of the backend over 108 nightly cells (deepseek_v4, kimi_k3, s_q 2-4, groups 8-128, run 534 and run 540).
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -1051,9 +1053,10 @@ def _place_sm90_f16(caps: Capabilities, facts) -> str:
 
 
 def _place_sm120_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _sm120_decode_tile_m
+    from .heuristics import _SM120_GENERAL_HEAD_TILE_MAX, _sm120_decode_tile_m
 
-    if facts.has_paged_kv and _sm120_decode_tile_m(caps, facts) == 0:
+    narrow_paged = facts.has_paged_kv and max(facts.d_qk, facts.d_v) <= _SM120_GENERAL_HEAD_TILE_MAX
+    if narrow_paged and _sm120_decode_tile_m(caps, facts) == 0:
         return TRAIL  # paged KV on the prefill body: 15-27x behind the backend at s_q 8-2048 (module docstring)
     if not facts.thd and facts.s_q == 1:
         units = facts.b * facts.h_kv
