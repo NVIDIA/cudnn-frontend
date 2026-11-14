@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import requires_blackwell_geforce, requires_dsl
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, sm120_owner
 import test_sdpa_prepared_fp8 as shared
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
@@ -39,7 +39,9 @@ def test_sm120_fp8_sink_split_exact_dense_domain(dtype):
         reason = mismatch(caps, replace(facts, **over), knobs)
         assert reason is not None, over
         if "d_qk" in over or "d_v" in over:
-            assert mismatch(caps, replace(facts, has_sink=False, **over), knobs) is None
+            plain = replace(facts, has_sink=False, **over)
+            owner = sm120_owner("sdpa_fwd_prefill_sm120_fp8", plain.d_qk, plain.d_v)
+            assert mismatch(next(s.capabilities for s in ENGINE_SPECS if s.name == owner), plain, knobs) is None
 
 
 def _check(bufs, *, sq, skv, stats_log2):
