@@ -487,7 +487,17 @@ DSL satisfies your kernel.**
   the entry's probe names it) and
   `test_trace_raises_no_deprecation_warning_from_the_kernel_package` (device: a real trace) in
   `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py`; the pytest warnings
-  summary of a kernel suite shows the same reads by file and line.
+  summary of a kernel suite shows the same reads by file and line. The first detector sees a
+  name that warns when it is READ. An object the DSL deprecates in place warns only when it is
+  USED: on 4.8.0 `cutlass.utils.StaticPersistentTileScheduler` and
+  `PersistentTileSchedulerParams` resolve silently, and a trace that deals its tiles with them
+  raises 63 `DeprecationWarning`s per compiled form (one attributed to the kernel's line, the
+  rest inside the wheel) -- an exception from inside the trace under
+  `-W error::DeprecationWarning`. Only a trace shows it: take the tree's vendored copy
+  (`cudnn._cutlass_helpers.static_persistent_tile_scheduler`) and pin the trace on a host as
+  well as on a device (`test_rendering_pins_the_convention` and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` in
+  `test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py`).
 - **A kernel on the `cutlass.cute.experimental` layer reads TWO environment namespaces.** The
   target check of `cutlass.utils.blackwell_helpers` reads `CUTE_DSL_ARCH`; the layer's own
   lowering, dump and cache settings read `CUTE_EXPERIMENTAL_DSL_*`. A cross-target render
@@ -986,7 +996,8 @@ python/cudnn/gemm/
 │   ├── epilogue_codegen.py          # facade for the active family's codegen
 │   ├── kernel_templates/           # template code shared by architecture families
 │   ├── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
-│   └── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
+│   ├── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
+│   └── swiglu_decode/              # direct-call FP4 gate / up product with SwiGLU for decode rows: host entry + kernel/ (same)
 └── ops/                            # backend-independent torch custom-op contracts
 ```
 
@@ -1072,6 +1083,50 @@ The same rule applies to inline PTX: `bar.sync` is an alias for
 `barrier.sync` for a warp-role subset and inspect the emitted PTX; successful
 replay and synccheck runs do not establish that the aligned-CTA promise is
 valid. D192 dense and THD backward share this Stats-publication barrier.
+
+A kernel taken over from another source carries this defect silently. With the
+aligned form at its five warp-role sites the SwiGLU FP4 decode kernel
+(`gemm/frost/swiglu_decode`) wrote the bytes the unaligned form writes in every
+byte comparison run on cc 10.0, while `synccheck` reported `Barrier error
+detected. Divergent thread(s) in block` in its first launch and aborted it.
+Spell a subset barrier through `tile_dsl.barrier.named_barrier_sync_unaligned`
+and pin the statement counts in the rendering:
+`test_rendering_pins_the_convention` in
+`test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py` requires five
+`barrier.sync` and three `bar.sync`.
+
+**The assembler folds an approximate reciprocal of a constant.**
+`rcp.approx.ftz.f32` of an immediate -- 6.0 in an NVFP4 block scale -- never
+reaches the kernel: the compiled code multiplies by the fp32 value the
+assembler computed. State such a factor as its bits
+(`tile_dsl.pointwise.opaque_fp4_max_rcp()` is fp32(1/6), `0x3E2AAAAB`), so the
+value is the source's and not one assembler's. Detector: the rendering pins
+count the bits once and exactly two `rcp.approx.ftz.f32` per block-scale chain
+(`test_rendering_of_every_helper` in
+`test/python/sdpa/frost/test_tile_dsl_quant_helpers.py`;
+`test_rendering_pins_the_convention` of the SwiGLU FP4 decode suite).
+
+**An approximate reciprocal spelled as a DSL intrinsic can be speculated across
+a branch.** `cute.arch.rcp_approx` is the same PTX instruction as
+`tile_dsl.pointwise.rcp_approx_ftz`, but as an intrinsic call the optimizer may
+hoist it above a zero test and turn the branch into a select: the bytes are
+equal, the instruction stream is not (both reciprocals then run for every
+block). Where a kernel must keep a reference instruction stream, use the opaque
+inline form. Detector: with a disassembler, the SwiGLU FP4 decode rendering pin
+requires the two reciprocals of each block-scale chain to be predicated.
+
+**`griddepcontrol.launch_dependents` behind warp-role branches fires at the
+FIRST role that reaches it.** One statement behind the role dispatch of a
+warp-specialised kernel is executed by each role as it finishes, and a thread
+block has signalled once its first role has -- in a persistent GEMM the loader
+warp, when its operand ring has drained and BEFORE the block's last output tile
+is written. "Released at the end" must name the role, and the entry's
+documentation must state the consumer's obligation: a kernel launched behind it
+with the programmatic-stream-serialization attribute issues its own wait before
+it reads the outputs. Detector: `test_dependent_that_waits_reads_the_eager_bytes`
+(SwiGLU FP4 decode suite: a waiting dependent behind the entry copies the
+outputs, eager and captured); the rendering pin counts one
+`launch_dependents`.
 
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel

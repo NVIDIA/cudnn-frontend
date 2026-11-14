@@ -163,6 +163,9 @@ navigation:
               - page: FP8 Projection for Decode Rows (SM100-class)
                 path: ../../operations/gemm_fusions/fp8_projection_decode.md
                 slug: fp8_projection_decode
+              - page: SwiGLU FP4 Gate / Up Product for Decode Rows (SM100-class)
+                path: ../../operations/gemm_fusions/swiglu_fp4_decode.md
+                slug: swiglu_fp4_decode
               - page: GEMM + Amax (SM100)
                 path: ../../operations/gemm_fusions/gemm_amax.md
                 slug: gemm_amax
