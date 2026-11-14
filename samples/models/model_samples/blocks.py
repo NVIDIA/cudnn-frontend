@@ -110,7 +110,13 @@ class Block(Protocol):
     state_args: Tuple[int, ...]  # the operands the call updates in place
 
     def check_support(self, sequences: int, tokens: int) -> None:
-        """Raise the provider's typed decline when it does not serve this run; return otherwise."""
+        """Raise the provider's typed decline when it does not serve this run; return otherwise.  Allocates nothing on the
+        GPU: the memory sentence of the plan comes after it."""
+
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """What the block builds on the GPU before the load so that a decline still comes with the plan (an adapter to an
+        entry builds the entry's kernel on scratch operands of the run's row count).  Made after the memory sentence held
+        (``Plan.first_use``), so a run that does not fit allocates nothing.  Raises as ``check_support`` does."""
 
     def compile(self, sequences: int, tokens: int) -> None:
         """Build everything the run needs before its first step."""
@@ -160,6 +166,18 @@ class Plan(dict):
         self.regime: Optional[Regime] = regime
         self.source = source
         self.overridden: Tuple[str, ...] = tuple(overridden)  # the blocks whose row ``--provider`` selected: not the stack's own choice
+        self.first_used = False  # whether the blocks have made their first use on the GPU (``first_use``)
+
+    def first_use(self) -> None:
+        """The first use every block makes of its entry on the GPU (``Block.first_use``), once per plan.  It is the one step
+        of a plan that allocates on the GPU, so it is a step of its own: ``plan`` resolves the table and builds nothing, the
+        memory sentence (``memory``) says whether the run fits, and only a run that fits comes here -- before anything is
+        loaded.  Raises as ``plan`` does: ``NotImplementedError`` (a SKIP) where the installation does not serve an entry,
+        ``ValueError`` where an entry declines what its adapter built."""
+        if not self.first_used:
+            for block in self.values():
+                block.first_use(self.sequences, self.tokens)
+            self.first_used = True
 
     def __eq__(self, other):
         """Two plans are equal when they hold the same blocks and the same decisions.  Against a plain mapping the comparison is

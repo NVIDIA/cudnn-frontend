@@ -109,6 +109,9 @@ class BlockBase:
     def check_support(self, sequences: int, tokens: int) -> None:
         return None
 
+    def first_use(self, sequences: int, tokens: int) -> None:
+        return None
+
     def compile(self, sequences: int, tokens: int) -> None:
         return None
 

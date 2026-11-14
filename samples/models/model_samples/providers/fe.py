@@ -31,12 +31,18 @@ device an adapter asks its entry, while the run is planned, for the launch of th
 
 **First use is part of the plan.**  An entry gates the installed toolchain where it builds its kernel (the CuTe DSL's target
 list, on some GPU classes its compiler), not where it is constructed.  So on a CUDA device an adapter builds the kernel of
-the run's row count on scratch operands while the run is planned (``_first_use``), before anything is loaded: what the
+the run's row count on scratch operands while the run is planned (``first_use``), before anything is loaded: what the
 entry needs of the installation is then a ``SKIP`` that names the fix, in the entry's own words, and the build after the
 load finds its kernel built.  A decline at that point is the installation's only where this adapter can name a
 requirement the installation does not meet (``_unmet``: the part's target by cuDNN Frontend's public probe, and what the
 entry's page states beyond it); any other decline is of the operands this adapter built -- a ``ValueError``, an ``ERROR``
 before the load, because a faulty adapter must not read as an unsupported GPU.
+
+**The memory sentence comes first.**  The scratch operands of a first use are as large as the run's own (rows + 1 slots of
+recurrent state for the fused step), so the first use is not made where a block is asked whether it serves
+(``check_support`` allocates nothing): a plan makes it as a step of its own (``Plan.first_use``), after the memory
+sentence has said that the run fits and before anything is loaded.  A run that does not fit is a ``SKIP`` with its
+estimate, and nothing was allocated for it.
 """
 
 from __future__ import annotations
@@ -183,13 +189,19 @@ class EntryBlock(BlockBase):
             return f"{self.entry} declines this installation at {what}: {error}"
         return f"{self.entry} declined the operands this adapter built for {what}: {error}"
 
-    def _first_use(self, sequences: int, tokens: int) -> None:
-        """While the run is planned, on a CUDA device: build the entry's kernel for the run's row count on scratch operands.
+    def first_use(self, sequences: int, tokens: int) -> None:
+        """While the run is planned, on a real CUDA device: build the entry's kernel for the run's row count on scratch operands.
         The entry gates the installed toolchain there, so its decline comes before the load: a ``NotImplementedError`` (a
         SKIP, in the entry's own words) where the installation does not meet a requirement this adapter can name
-        (``_unmet``), a ``ValueError`` (an ERROR) for any other decline -- then the operands are this adapter's."""
+        (``_unmet``), a ``ValueError`` (an ERROR) for any other decline -- then the operands are this adapter's.
+
+        The scratch operands are the size of the run (the fused step's recurrent state at 65,535 rows is 192 GiB), so this
+        is not part of ``check_support``: a plan makes it after its memory sentence has held (``Plan.first_use``), and a
+        run that does not fit the GPU is a SKIP with its estimate before anything is allocated for it."""
         import torch
 
+        if not self.facts.total_bytes or "device" not in self.options:  # a plan on stated device facts builds nothing
+            return
         if torch.device(self.options["device"]).type not in self.first_use_devices:
             return
         entry, operands = self._scratch(sequences, tokens)
@@ -250,9 +262,9 @@ class GdnDecodeFusedBlock(EntryBlock):
             raise NotImplementedError(f"cudnn.GdnDecodeFused is the one-token decode step; this run has {tokens} tokens per sequence")
         if self.facts.total_bytes and "device" in self.options:
             # on a real device: the entry's own typed decline (a part that holds no form) is a SKIP; once it is built, a row
-            # count it does not serve is a wrong table; then its first use, where it gates the installed toolchain
+            # count it does not serve is a wrong table.  Its first use, where it gates the installed toolchain, allocates
+            # scratch operands of the run's size and is made after the memory sentence has held (``first_use``)
             self._check_claim(self._build(self.options["device"]), sequences * tokens)
-            self._first_use(sequences, tokens)
 
     def reserve_bytes(self) -> int:
         """Device memory the kernel's first launch reserves outside PyTorch's allocator: the family's allowance for the GPU
@@ -310,7 +322,7 @@ class GdnDecodeFusedBlock(EntryBlock):
         device, rows = torch.device(self.options.get("device", "cuda")), sequences * tokens
         entry, operands = self._scratch(sequences, tokens)
         try:
-            entry.compile(*operands)  # built while the run was planned (``_first_use``): the entry finds its kernel
+            entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
             if rows not in _FIRST_LAUNCH:
                 _FIRST_LAUNCH[rows] = _outside_pool(device, lambda: entry(*operands))
         except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
@@ -370,8 +382,7 @@ class AttentionGateQuantDecodeBlock(EntryBlock):
         self._check_package()
         self._arguments()
         if self.facts.total_bytes and "device" in self.options:
-            self._check_claim(self._build(self.options["device"]), sequences * tokens)
-            self._first_use(sequences, tokens)
+            self._check_claim(self._build(self.options["device"]), sequences * tokens)  # the first use follows the memory sentence
 
     def _unmet(self) -> bool:
         """Beyond the part's target: on compute capability 10.7 the entry's page asks for the CUDA 13 flavour of the CuTe DSL
@@ -427,7 +438,7 @@ class AttentionGateQuantDecodeBlock(EntryBlock):
     def compile(self, sequences: int, tokens: int) -> None:
         entry, operands = self._scratch(sequences, tokens)
         try:
-            entry.compile(*operands)  # built while the run was planned (``_first_use``): the entry finds its kernel
+            entry.compile(*operands)  # built while the run was planned (``first_use``): the entry finds its kernel
             entry(*operands)  # the first launch of the compiled kernel, before the first step
         except NotImplementedError as error:  # after the plan nothing skips: the sentence says whose the decline is
             raise RuntimeError(self._declined(error, "its first launch")) from error

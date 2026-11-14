@@ -1194,8 +1194,9 @@ def test_the_samples_flags_for_the_kernel_check(monkeypatch, capsys):
         sample._writable("--dump-census", "/nowhere/at/all/census.json")
 
 
-def _sample_main(monkeypatch, capsys, arguments):
-    """``main()`` of the sample script on stated device facts (compute capability 10.0), up to its first load."""
+def _sample_main(monkeypatch, capsys, arguments, total=0, free=80 * GIB):
+    """``main()`` of the sample script on stated device facts (compute capability 10.0), up to its first load.  ``total``:
+    the device's memory as a real device reports it; 0 states the facts only, and nothing is asked of an entry."""
     import importlib.util
 
     from model_samples import blocks
@@ -1207,7 +1208,7 @@ def _sample_main(monkeypatch, capsys, arguments):
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, 0, 80 * GIB)))
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, total, free)))
     monkeypatch.setattr(model_samples, "check_environment", lambda: model_samples.Environment("1.33.0", "1.33.0", True, "0123456789ab", "2.13.0", "4.8.0"))
     monkeypatch.setattr(model_samples.Session, "load", no_load)
     paths = list(sys.path)
@@ -2735,18 +2736,28 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     options = {"device": "cpu", "check_kernels": True}
     assert fe.EntryBlock.first_use_devices == ("cuda",), "a kernel is built for a CUDA device only"
 
-    def planned(cc=(10, 0), sequences=4, total=180 * GIB):
+    def resolved(cc=(10, 0), sequences=4, total=180 * GIB):
         return plan(
             model.provider_table, model.regimes, DeviceFacts(cc, "stated device", 148, total, 80 * GIB), sequences, 1, "native", model=model, options=options
         )
+
+    def planned(**run):
+        """The table resolved and the first use of its entries made: what a session does once its memory sentence has held."""
+        table = resolved(**run)
+        table.first_use()
+        return table
 
     planned()
     assert calls == [], "on a host device nothing is built while the run is planned"
     monkeypatch.setattr(fe.EntryBlock, "first_use_devices", ("cuda", "cpu"))  # this test's device: the stand-ins build nothing
     planned(total=0)
     assert calls == [], "nor on stated device facts"
-    table = planned()
+    table = resolved()
+    assert calls == [] and not table.first_used, "resolving the table builds nothing: the first use is a step of its own, after the memory sentence"
+    table.first_use()
     assert calls == [("step compile", 4, (4, 10240)), ("gate compile", (4, 6144), "cpu", (4, 6144))], "the first use of each entry, at the run's row count"
+    table.first_use()
+    assert len(calls) == 2 and table.first_used, "made once per plan"
     del calls[:]
     table["linear_attention.step"].compile(4, 1)
     table["attention.gate_quantize"].compile(4, 1)
@@ -2795,3 +2806,142 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
         table["linear_attention.step"].compile(4, 1)
     row = configs.PROVIDERS["attention.gate_quantize"][0]
     assert row.classes == ("cc10.x",), "the row claims every compute capability 10.x: what the entry needs there beyond the class is asked at plan time"
+
+
+def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(monkeypatch, capsys):
+    """The first use of an entry builds its kernel on scratch operands as large as the run's own: at the 65,535 rows the row
+    of the fused step admits, 192 GiB for the recurrent state alone.  So the memory sentence comes first.  On a real CUDA
+    device a session resolves the tables of every sequence count, which allocates nothing, asks whether the whole run
+    fits, and only then lets the entries make their first use -- still before anything is loaded.  A GPU that is too
+    small gets the SKIP with the estimate on every provider stack, from the session and as the last line of the sample's
+    ``main()``, and nothing was built for it.  A toolchain an entry declines stays a SKIP before the weights, also for a
+    session that is loaded without its table."""
+    import cudnn
+    import cudnn.frost
+
+    from model_samples import Session, TextIO, blocks
+    from model_samples.providers import fe
+    from model_samples.qwen_dense import QwenDense, configs
+
+    events = []
+
+    class Entry:
+        """A stand-in entry: it builds nothing and says when it was asked to."""
+
+        name, decline = "", ""
+
+        def __init__(self, *arguments, **knobs):
+            pass
+
+        def compile(self, *operands):
+            events.append(("build", self.name))
+            if self.decline:
+                raise NotImplementedError(self.decline)
+
+        def kernel_symbols_for(self, rows):
+            return (SYMBOL,)
+
+        def form_for(self, rows):
+            return {}
+
+        def launch_shape_for(self, rows):
+            return SHAPE
+
+    class Step(Entry):
+        name = "cudnn.GdnDecodeFused"
+
+    class Gate(Entry):
+        name = "cudnn.AttentionGateQuantDecode"
+
+    def scratch(block, sequences, tokens):  # in place of the adapters' scratch operands: what would be allocated, and when
+        events.append(("scratch", block.entry, sequences * tokens))
+        return block._build(block.options["device"]), ()
+
+    sentence = blocks.Plan.memory
+
+    def memory(plan, need_bytes, what=""):
+        events.append(("memory sentence", plan.stack))
+        return sentence(plan, need_bytes, what)
+
+    def no_weights(model, *arguments, **options):
+        raise AssertionError("reached a load")
+
+    gpu = {"total": 180 * GIB, "free": 1 * GIB}  # a real device, as it reports itself
+    monkeypatch.setattr(cudnn, "GdnDecodeFused", Step, raising=False)
+    monkeypatch.setattr(cudnn, "AttentionGateQuantDecode", Gate, raising=False)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
+    monkeypatch.setattr(fe.GdnDecodeFusedBlock, "_scratch", scratch)
+    monkeypatch.setattr(fe.AttentionGateQuantDecodeBlock, "_scratch", scratch)
+    monkeypatch.setattr(blocks.Plan, "memory", memory)
+    monkeypatch.setattr(blocks.DeviceFacts, "probe", classmethod(lambda cls, device: cls((10, 0), "stated device", 148, gpu["total"], gpu["free"])))
+    monkeypatch.setattr(QwenDense, "load", no_weights)
+    model = QwenDense.reduced(2)
+    text = TextIO.synthetic(model.geometry.vocab)
+    state, conv = 65536 * 48 * 128 * 128 * 4, 65536 * 3 * 10240 * 2
+    assert state == 192 * GIB and model.state_bytes(65535, 256) > state + conv, "the scratch state of a first use at 65,535 rows: one slot pool of the run"
+    assert configs.PROVIDERS["linear_attention.step"][0].sequences == (1, 65535), "the row count the fused step's rows admit"
+
+    def run(stack, *counts):
+        del events[:]
+        first = Session(model, text, sequences=counts[0], stack=stack, device="cuda:0")
+        later = [Session(model, text, sequences=count, stack=stack, device="cuda:0", share=first) for count in counts[1:]]
+        return first, first.plan_table(later)
+
+    def first_uses(stack, *counts):
+        entries = ("cudnn.GdnDecodeFused",) if stack == "fe-cublas" else ("cudnn.GdnDecodeFused", "cudnn.AttentionGateQuantDecode")
+        return [event for rows in counts for entry in entries for event in (("scratch", entry, rows), ("build", entry))]
+
+    target = "SM100 requires a CuTe DSL build supporting sm_100a; found 4.8.0 without that target"
+    assert configs.PROVIDER_STACKS == ("fe-cublas", "native", "fe-entries")
+    for stack in configs.PROVIDER_STACKS:
+        # (1) the run needs more than the GPU has in total: the estimate, and not one scratch operand
+        gpu.update(total=180 * GIB, free=1 * GIB)
+        with pytest.raises(NotImplementedError) as skipped:
+            run(stack, 65535)
+        assert str(skipped.value) == (
+            f"stack {stack} needs about 263.5 GiB on this GPU; this GPU has 180.0 GiB in total: the run does not fit on it "
+            "(CUDA_VISIBLE_DEVICES selects another GPU)"
+        )
+        assert events == [("memory sentence", stack)], f"{stack}: nothing is built for a run that does not fit"
+        # (2) the default run where too little is free: the same, for both sequence counts of the run
+        few = rf"^stack {stack} needs about 3\.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 1\.0 GiB are free: free memory on this GPU"
+        with pytest.raises(NotImplementedError, match=few):
+            run(stack, 1, 4)
+        assert events == [("memory sentence", stack)], stack
+        del events[:]
+        with monkeypatch.context() as scoped:  # the sample's own run on such a device; what it patches ends with it
+            code, out = _sample_main(scoped, capsys, ["--stack", stack], total=180 * GIB, free=1 * GIB)
+        assert code == 0 and out.splitlines()[-1] == (
+            f"[00] SKIP stack {stack} needs about 3.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 1.0 GiB are free: "
+            "free memory on this GPU, or select another one with CUDA_VISIBLE_DEVICES"
+        ), out
+        assert events == [("memory sentence", stack)], f"{stack}: the sample's own run builds nothing either"
+        # (3) with room: the memory sentence, then the first use of every entry for every sequence count, then nothing more
+        gpu.update(free=80 * GIB)
+        first, table = run(stack, 1, 4)
+        assert "this stack needs about 3.7 GiB on this GPU for 1 and 4 sequences, one count after the other; 80.0 GiB are free" in table
+        assert events == [("memory sentence", stack), *first_uses(stack, 1, 4)], f"{stack}: the budget first, then the builds"
+        with pytest.raises(AssertionError, match="reached a load"):
+            first.load()
+        assert events == [("memory sentence", stack), *first_uses(stack, 1, 4)], "the load finds the first use made"
+        # (4) a toolchain the entry declines, with room: a SKIP in the entry's own words before any weight is loaded -- from
+        # the table, from the sample's last line, and from a session that is loaded without its table
+        monkeypatch.setattr(Step, "decline", target)
+        monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: False)
+        with pytest.raises(NotImplementedError) as skipped:
+            run(stack, 1, 4)
+        assert str(skipped.value) == target and events == [
+            ("memory sentence", stack),
+            ("scratch", "cudnn.GdnDecodeFused", 1),
+            ("build", "cudnn.GdnDecodeFused"),
+        ]
+        with monkeypatch.context() as scoped:
+            code, out = _sample_main(scoped, capsys, ["--stack", stack], total=180 * GIB, free=80 * GIB)
+        assert code == 0 and out.splitlines()[-1] == f"[00] SKIP {target}", out
+        del events[:]
+        with pytest.raises(NotImplementedError) as skipped:
+            Session(model, text, sequences=1, stack=stack, device="cuda:0").load()
+        assert str(skipped.value) == target and events == [("scratch", "cudnn.GdnDecodeFused", 1), ("build", "cudnn.GdnDecodeFused")], stack
+        monkeypatch.setattr(Step, "decline", "")
+        monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)

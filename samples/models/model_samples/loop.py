@@ -5,7 +5,9 @@
 
 A session decides everything before it loads anything: ``plan_table()`` resolves the family's provider table for this GPU, the
 number of sequences and the stack, and states the memory the run needs -- for this session and for the sessions that will
-follow it on its weights, so that nothing can decline once the first of them has loaded.  ``load()`` then reads (or draws),
+follow it on its weights, so that nothing can decline once the first of them has loaded.  Only a run that fits then lets its
+entries build their kernels on scratch operands (their first use, where an entry asks what it needs of the installed
+toolchain): the memory sentence comes before the first allocation on the GPU.  ``load()`` then reads (or draws),
 merges and dequantises the weights, compiles what a provider compiles (a compiled form is launched once) and runs one
 warm-up step, each as a timed stage.  ``prefill`` feeds the prompts and ``step`` advances every sequence by one token; the
 chosen ids stay on the GPU, and the one host read of a step is the caller's (``read``), in the sample's own loop -- there is
@@ -153,21 +155,30 @@ class Session:
 
         ``later`` are the sessions that will run after this one in the same process on its weights (``share=self``).  Their
         plans are resolved here too, and the memory sentence then covers the whole run -- this session's need plus their
-        state -- against what is free now: every decline of a run comes before its first load, none after it."""
+        state -- against what is free now: every decline of a run comes before its first load, none after it.
+
+        In this order: the tables of every session are resolved, which allocates nothing; the memory sentence says whether
+        the whole run fits; and only then do the entries of each plan make their first use (``Plan.first_use``: an entry
+        builds its kernel on scratch operands as large as the run's, and asks there what it needs of the installed
+        toolchain).  A run that does not fit is a SKIP with its estimate, and nothing was allocated for it."""
         plan = self.resolve()
         for session in later:
             session.resolve()
-        if self.device.type != "cuda":
-            return plan.table()
-        need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
-        need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
-        counts = [self.sequences, *(session.sequences for session in later)]
-        what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
-        return plan.table() + "\n  " + plan.memory(need, what)
+        sentence = ""
+        if self.device.type == "cuda":
+            need = self.model.memory_bytes(self.sequences, self.capacity) - (self.model.copy_bytes() if self._share is not None else 0)
+            need += sum(session.model.state_bytes(session.sequences, session.capacity) for session in later)
+            counts = [self.sequences, *(session.sequences for session in later)]
+            what = f" for {', '.join(str(n) for n in counts[:-1])} and {counts[-1]} sequences, one count after the other" if later else ""
+            sentence = "\n  " + plan.memory(need, what)  # before anything is built on the GPU: this is where a run that does not fit ends
+        for session in (self, *later):
+            session.plan.first_use()
+        return plan.table() + sentence
 
     # ------------------------------------------------------------------ load
     def load(self) -> None:
         plan = self.resolve()
+        plan.first_use()  # made with the table (``plan_table``); a session that is loaded without one makes it here, before the weights
         if self.reference_precision == "ieee-fp32" and hasattr(torch.backends.cuda.matmul, "fp32_precision"):
             torch.backends.cuda.matmul.fp32_precision = "ieee"
         if self._share is not None:
