@@ -1443,6 +1443,20 @@ chunks cannot reuse the same scheme. `TestMixedFp8Kv.test_d512_admission`
 checks the chunk counts and rejects that geometry; numerical/replay cases
 include empty KV and multiple scheduler waves.
 
+### Mixed-family shared-artifact qualification
+
+A portable SDPA core artifact can be shared by SM80 and SM89 plans. Test native
+d64 and d32 on SM80 and SM89 in both orders, then return to the first family
+with JIT forbidden, and compare O and LSE with independent references. Assert
+the plan reused the first family's artifact (`_sm80_spec.artifact`) so a fresh
+compile cannot stand in for the shared one.
+
+When an architecture row adopts a native adapter, test graph admission against
+that adapter's width and declared-stride restrictions before plan construction.
+The SM89 regression `test_sm89_probe_matches_native_width_and_stride_contract`
+keeps aligned d32/d64 controls and rejects d33 and a 65-element sequence stride.
+A staging-era capability envelope must not survive removal of the staging path.
+
 Capability-matrix fixtures must sample a shape that serves the feature under
 comparison. Adding a smaller native flavor can change sorted shape order
 without changing the larger envelope's band support. Keep the general band
