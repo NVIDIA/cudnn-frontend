@@ -4,6 +4,9 @@
 """Host contracts for the exact per-tensor FP8 D512 implementation owner."""
 
 from dataclasses import replace
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -94,6 +97,20 @@ def test_explicit_lowering_does_not_consult_candidate_selection(monkeypatch):
     assert len(calls) == 1
     assert calls[0][3].implementation == NAME
     assert calls[0][3].lowering_row_name == LEGACY_ROW
+
+
+def test_cold_host_import_does_not_import_registry():
+    source_root = str(Path(__file__).resolve().parents[4] / "python")
+    code = "\n".join(
+        (
+            "import sys",
+            "sys.meta_path[:] = [f for f in sys.meta_path if 'editable' not in str(f).lower()]",
+            f"sys.path.insert(0, {source_root!r})",
+            "import cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.host",
+            "assert 'cudnn.sdpa.fwd.engines' not in sys.modules",
+        )
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
 
 @pytest.mark.parametrize("verdict", [False, True])
