@@ -1907,7 +1907,8 @@ class SM120FusedMultiHeadAttentionForward:
                 )
                 _uid = self._next_dense_unit(_uid)
 
-    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+    # nsys / profiler name: the owning engine (a symbol, not a program change).
+    kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(
