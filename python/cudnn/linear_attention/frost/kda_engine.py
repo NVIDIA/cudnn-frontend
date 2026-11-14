@@ -23,6 +23,24 @@ from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_ga
 
 # the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
 PREP_TILE_FRACTION = 0.475
+_KDA_STATE_WAVE_BYTES = 1024**3
+_KDA_CHECKPOINT_WAVE_BYTES = 5 * 1024**3
+
+
+def _checkpoint_head_divisor(heads: int, checkpoint_bytes: int, num_pieces: int, num_sm: int) -> int:
+    """Limit checkpoint storage with three bounded codegen variants.
+
+    Each wave retains a complete recurrence per head. Avoid further splitting
+    a wave below half the SM count: a few long sequences need their head-level
+    parallelism. The storage budget is a preference, not an allocation limit.
+    """
+    selected = 1
+    for divisor in (2, 4):
+        if checkpoint_bytes <= selected * _KDA_CHECKPOINT_WAVE_BYTES:
+            break
+        if heads % divisor == 0 and num_pieces * heads // divisor >= max(1, num_sm // 2):
+            selected = divisor
+    return selected
 
 
 def build_kda(graph):
@@ -655,11 +673,36 @@ class CompiledKdaBwd:
         regions.append(("work_count", layout.add(4), "int32", (1,)))
         if "following_state_grad" in node.inputs:
             regions.append(("composed_dstate", layout.add(HO * V * K * 4, align=16), "float32", (1, HO, V, K)))
+        self.checkpoint_head_divisor = 1
+        self.state_head_divisor = 1
+        checkpoint_bytes = 0
         if self.needs_recompute:
             self.state_checkpoints_rows = max(total // self.b_t + self.num_pieces, 1)
-            regions.append(
-                ("state_checkpoints", layout.add(self.state_checkpoints_rows * HO * K * V * 2), self.io_name, (self.state_checkpoints_rows, HO, V, K))
-            )
+            # Bound the internal dense series by reusing it across independent
+            # heads. Caller checkpoints and coarse seeds retain their ABI.
+            if self.chain and not self.coarse_checkpoints:
+                checkpoint_bytes = self.state_checkpoints_rows * HO * K * V * 2
+                state_bytes = self.num_pieces * HO * max(V, K) * K * 4
+                capacity_bytes = max(checkpoint_bytes, 4 * state_bytes) if not self.has_context else checkpoint_bytes
+                self.checkpoint_head_divisor = _checkpoint_head_divisor(HO, capacity_bytes, self.num_pieces, self.num_sm)
+                if not self.has_context and state_bytes > _KDA_STATE_WAVE_BYTES:
+                    self.state_head_divisor = self.checkpoint_head_divisor
+            checkpoint_heads = HO // self.checkpoint_head_divisor
+            checkpoint_bytes = self.state_checkpoints_rows * checkpoint_heads * K * V * 2
+        if self.state_head_divisor > 1:
+            # Main/summary counts alias the last row-base entries. Keep those
+            # immutable: a wave has its own two counters.
+            regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
+        # H/G and M are dead after the two state chains. The dense checkpoint
+        # series is produced only after that point, so it reuses their arena.
+        # X and dX remain live through recompute/backward and stay disjoint.
+        state_heads = HO // self.state_head_divisor
+        reuse_phase_arena = self.chain and not self.has_state_checkpoints
+        phase_m_bytes = self.num_pieces * state_heads * K * K * 4 if reuse_phase_arena and not self.has_piece_transitions else 0
+        phase_hg_bytes = self.num_pieces * state_heads * V * K * 4 if reuse_phase_arena else 0
+        phase_offset = layout.add(max(checkpoint_bytes, phase_m_bytes + phase_hg_bytes))
+        if self.needs_recompute:
+            regions.append(("state_checkpoints", phase_offset, self.io_name, (self.state_checkpoints_rows, checkpoint_heads, V, K)))
         self.recompute_tensormap_bytes = tensormap_workspace_bytes(recompute_module, self.num_pieces)
         if self.needs_recompute and not self.chain:
             regions.append(("recompute_tensormaps", layout.add(self.recompute_tensormap_bytes, align=128), "int64", (self.recompute_tensormap_bytes // 8,)))
@@ -697,7 +740,7 @@ class CompiledKdaBwd:
         if self.chain:
             table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
-            state_shape = (self.num_pieces, HO, V, K)
+            state_shape = (self.num_pieces, state_heads, V, K)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
                 ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
@@ -705,15 +748,29 @@ class CompiledKdaBwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_dx_end", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
+                ("state_dx_end", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", state_shape),
             ]
             if not self.has_piece_transitions:
-                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+                regions.append(
+                    (
+                        "state_m",
+                        phase_offset if reuse_phase_arena else layout.add(self.num_pieces * state_heads * K * K * 4),
+                        "float32",
+                        (self.num_pieces, state_heads, K, K),
+                    )
+                )
             if not self.has_piece_tables:
-                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(
+                    (
+                        "state_g",
+                        phase_offset + phase_m_bytes if reuse_phase_arena else layout.add(self.num_pieces * state_heads * V * K * 4),
+                        "float32",
+                        state_shape,
+                    )
+                )
             if not self.has_state_checkpoints:
-                regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
-                regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(("state_h", phase_offset + phase_m_bytes, "float32", state_shape))
+                regions.append(("state_x", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", state_shape))
         self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, self.num_pieces)
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
         d_final = node.inputs.get("d_final_state")
@@ -949,6 +1006,7 @@ class CompiledKdaBwd:
             summary_rows=region["summary_rows"],
             main_count=region["main_count"],
             summary_count=region["summary_count"],
+            state_wave_counts=region.get("state_wave_counts"),
             work_items=region["work_items"],
             work_items_summary=region["work_items_summary"],
             series_items=region.get("work_items_recompute"),
@@ -998,6 +1056,8 @@ class CompiledKdaBwd:
             scale=self.scale,
             has_piece_transitions=self.has_piece_transitions,
             has_piece_state_grads=self.has_piece_tables,
+            checkpoint_head_divisor=self.checkpoint_head_divisor,
+            state_head_divisor=self.state_head_divisor,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(

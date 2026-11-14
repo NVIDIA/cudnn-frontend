@@ -482,6 +482,8 @@ def frost_state_chain(
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
     mComposed: cute.Tensor | None,
+    head_divisor: cutlass.Constexpr[int] = 1,
+    head_phase: cutlass.Int32 = 0,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
@@ -491,7 +493,11 @@ def frost_state_chain(
     ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``; without it the fixed grid ``seq * pieces + j``.  ``emit_states``
     stores every slot's entry state into ``X``.  A one-slot walk copies the seed into ``X`` when there is no tail or summary
     and otherwise yields ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is
-    walked."""
+    walked. ``head_divisor`` partitions independent heads; this launch handles
+    ``h = state_h * head_divisor + head_phase``. Internal H/M/X buffers have
+    ``HO // head_divisor`` heads, while caller seed/composed/tail/summary ports
+    retain all HO heads. Row tables always retain the original HO stride.
+    Divisor one and phase zero preserve the ordinary full-head launch."""
     K = cutlass.const_expr(dim_k)
     V = cutlass.const_expr(dim_v)
     HO = heads_out
@@ -518,7 +524,8 @@ def frost_state_chain(
     col0 = lane * cutlass.Int32(cols_per_lane)
     bid = cute.arch.block_idx()
     seq = cutlass.Int32(bid[0])
-    h = cutlass.Int32(bid[1])
+    state_h = cutlass.Int32(bid[1])
+    h = state_h * head_divisor + head_phase
     seed_seq = seq
     if cutlass.const_expr(mSeedIndices is not None):
         seed_seq = cutlass.Int32(mSeedIndices[seq])
@@ -601,7 +608,7 @@ def frost_state_chain(
                 seed_x_row = row0 + seed_row
                 seed_x_offset = (
                     cutlass.Int64(seq_base) * cutlass.Int64(mX.stride[0])
-                    + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
+                    + cutlass.Int64(state_h) * cutlass.Int64(mX.stride[1])
                     + cutlass.Int64(seed_x_row) * cutlass.Int64(mX.stride[2])
                     + cutlass.Int64(col0)
                 )
@@ -687,8 +694,8 @@ def frost_state_chain(
             m_chunk = chunk_id % cutlass.Int32(K // 4)
             m_dst_words.append(m_row * K + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
             m_src_elems.append(cutlass.Int64(m_row) * cutlass.Int64(K) + cutlass.Int64(m_chunk) * cutlass.Int64(4))
-        m_slot_elems = cutlass.Int64(HO) * cutlass.Int64(K * K)
-        m_head_elems = cutlass.Int64(h) * cutlass.Int64(K * K)
+        m_slot_elems = cutlass.Int64(HO // head_divisor) * cutlass.Int64(K * K)
+        m_head_elems = cutlass.Int64(state_h) * cutlass.Int64(K * K)
         x_row_addrs = []
         h_row_addrs = []
         x_slot_bytes = cutlass.Int64(0)
@@ -701,13 +708,13 @@ def frost_state_chain(
                 row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
                 h_row_addrs.append(
                     mH.iterator.toint()
-                    + (cutlass.Int64(h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
+                    + (cutlass.Int64(state_h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
                     * cutlass.Int64(mH.element_type.width // 8)
                 )
                 if cutlass.const_expr(emit_states):
                     x_row_addrs.append(
                         mX.iterator.toint()
-                        + (cutlass.Int64(h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
+                        + (cutlass.Int64(state_h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
                         * cutlass.Int64(mX.element_type.width // 8)
                     )
         first_step = cutlass.Int32(0) if cutlass.const_expr(not reverse) else count - cutlass.Int32(1)
@@ -990,6 +997,8 @@ def launch_state_chain(
     mSeedIndices: cute.Tensor | None,
     mComposed: cute.Tensor | None,
     stream: cuda.CUstream,
+    head_divisor: cutlass.Constexpr[int] = 1,
+    head_phase: cutlass.Int32 = 0,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
     frost_state_chain(
@@ -1014,7 +1023,9 @@ def launch_state_chain(
         mMainRows,
         mSeedIndices,
         mComposed,
-    ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+        head_divisor,
+        head_phase,
+    ).launch(grid=(num_seqs, heads_out // head_divisor, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 state_chain_cache = {}
