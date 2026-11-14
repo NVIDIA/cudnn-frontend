@@ -401,6 +401,34 @@ def test_backward_sm90_blk128_host_entry_rejects_q_block_count(monkeypatch, q_bl
         _interface._bsa_attn_bwd_sm90_blk128(q, q, q, q, q, lse, ids, 1)
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("bucket,csr_groups", [(256, 2), (1, 1)], ids=["csr_has_more", "csr_has_fewer"])
+def test_backward_sm90_blk128_host_entry_rejects_csr_group_count(monkeypatch, bucket, csr_groups):
+    """The SM90 blk128 host entry lays out and zeroes the FP32 workspace from its own Q-group count before the CSR is
+    built.  A CSR with another group count raises before a kernel is looked up, compiled or launched, and not through
+    an ``assert`` (``python -O`` removes it): a multi-group kernel on a workspace without dK/dV accumulators would
+    reduce out of bounds."""
+    import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    from cudnn.block_sparse_attention import _interface
+
+    def csr(indices, *args, **kwargs):
+        batch, heads = indices.shape[:2]
+        offsets = torch.zeros((batch, heads, csr_groups, 2), device=indices.device, dtype=torch.int32)
+        return offsets, torch.zeros(1, device=indices.device, dtype=torch.int32), None, None
+
+    class NoKernel(dict):
+        def __contains__(self, key):
+            pytest.fail("a CSR with another Q-group count reached the kernel lookup")
+
+    monkeypatch.setattr(_interface, "build_bucketed_k2q_csr_cutedsl", csr)
+    monkeypatch.setattr(_interface._bsa_attn_bwd_sm90_blk128, "compile_cache", NoKernel())
+    q = torch.zeros((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    lse = torch.zeros((1, 1, 256), device="cuda", dtype=torch.float32)
+    ids = torch.zeros((1, 1, 2, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=f"CSR has {csr_groups} Q groups, but the backward workspace was prepared for {3 - csr_groups}"):
+        _interface._bsa_attn_bwd_sm90_blk128(q, q, q, q, q, lse, ids, 1, bucket=bucket)
+
+
 @pytest.mark.L1
 @pytest.mark.parametrize("bucket,groups", [(1, 2), (256, 1)], ids=["groups", "direct_kv"])
 def test_backward_sm90_blk128_zeroes_workspace_before_csr_build(monkeypatch, bucket, groups):
@@ -484,6 +512,28 @@ def test_fp8_cutedsl_version_parser(monkeypatch, version, expected):
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     monkeypatch.setattr(interface.cutlass, "__version__", version)
     assert interface._cutlass_dsl_version() == expected
+
+
+@pytest.mark.L0
+def test_cutedsl_version_parse_is_memoised_per_version_string(monkeypatch):
+    """The entry points gate on the DSL version before every launch, so a version string is parsed once and then
+    served from the memo.  Another version string is parsed again, and a malformed or non-string version is never
+    stored: it raises on every call."""
+    import_bsa()
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    memo = {}
+    monkeypatch.setattr(interface, "_CUTLASS_DSL_VERSIONS", memo)
+    monkeypatch.setattr(interface.cutlass, "__version__", "4.9.3+cu13")
+    assert interface._cutlass_dsl_version() == (4, 9, 3) and memo == {"4.9.3+cu13": (4, 9, 3)}
+    assert interface._cutlass_dsl_version() is memo["4.9.3+cu13"]
+    monkeypatch.setattr(interface.cutlass, "__version__", "4.10.0")
+    assert interface._cutlass_dsl_version() == (4, 10, 0)
+    for malformed in ("4.x.1", "4.9", None, 4.9):
+        monkeypatch.setattr(interface.cutlass, "__version__", malformed)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="Cannot parse CUTLASS DSL version"):
+                interface._cutlass_dsl_version()
+    assert memo == {"4.9.3+cu13": (4, 9, 3), "4.10.0": (4, 10, 0)}
 
 
 @pytest.mark.L0

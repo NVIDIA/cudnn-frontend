@@ -1282,7 +1282,7 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
     # One Q group stores dK/dV directly and needs no FP32 dK/dV accumulators. Several groups reduce into them, so they
     # must start at zero: that memset (1 GB, 0.3 ms on a 255k-token, 4-head problem) depends on nothing the CSR build
     # produces and is the first device work of the call. The host side of the CSR build then runs under it instead of
-    # ahead of it with an idle GPU. The group count is the CSR builder's own formula (asserted below).
+    # ahead of it with an idle GPU. The group count is the CSR builder's own formula (checked below).
     num_q_groups = (indices.shape[2] + bucket - 1) // bucket
     direct_kv = num_q_groups == 1
     workspace = _empty_bwd_workspace_with_zeroed_accum(
@@ -1302,7 +1302,10 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
     offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
         indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
     )
-    assert offsets.shape[2] == num_q_groups
+    if offsets.shape[2] != num_q_groups:
+        # Not an assert, which `python -O` removes: the workspace above was sized and zeroed for num_q_groups, and a
+        # multi-group kernel on a workspace without dK/dV accumulators would reduce out of bounds.
+        raise RuntimeError(f"the bucketed K2Q CSR has {offsets.shape[2]} Q groups, but the backward workspace was prepared for {num_q_groups}")
     dq = torch.empty_like(q) if dq is None else dq
     dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv

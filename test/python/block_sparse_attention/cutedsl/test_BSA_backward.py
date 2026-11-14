@@ -653,12 +653,13 @@ def _assert_blk128_gradients(gradients, reference, mask):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("sq,sk", [(1536, 1152), (1466, 1090)], ids=["full_blocks", "q_and_kv_tails"])
-@pytest.mark.parametrize("bucket", [1, 3])
+@pytest.mark.parametrize("bucket", [1, 3, 256])
 def test_sm90_blk128_empty_groups_and_unattended_blocks(sq, sk, bucket):
-    """Multi-group FP32-workspace route where most (KV block, Q group) CTAs have no edges and leave before the
-    prologue: KV blocks nothing attends (dK/dV exactly zero from the workspace memset alone), Q groups without any
-    edge, a (batch, head) without any edge and blocks several groups reduce into, twice into poisoned gradient
-    buffers, against the FP64 reference."""
+    """Multi-group FP32-workspace route (buckets 1 and 3) where most (KV block, Q group) CTAs have no edges and leave
+    before the prologue: KV blocks nothing attends (dK/dV exactly zero from the workspace memset alone), Q groups
+    without any edge, a (batch, head) without any edge and blocks several groups reduce into, twice into poisoned
+    gradient buffers, against the FP64 reference.  Bucket 256 puts every Q block into one group, the direct_kv route,
+    whose CTAs must not take that exit: an empty tile there stores the zeros over the poisoned dK/dV itself."""
     ops = import_bsa(families=(9,), reason=SM90_BLK128)
     torch.manual_seed(128001)
     b, h, width, scale = 2, 2, 3, 0.11
