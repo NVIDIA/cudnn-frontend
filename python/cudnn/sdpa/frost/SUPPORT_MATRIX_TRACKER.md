@@ -152,6 +152,19 @@ candidate order, budget and placement; explicit records pin this body. Old
 exact-wide 20505 recipes must be invalidated and replanned. No additional
 numerical, determinism or batch-invariance claim is introduced.
 
+**SM120-family exact general-tile FP8 and MXFP8 implementation engines:**
+`sdpa_fwd_sm120_fp8_general` (20542) and `sdpa_fwd_sm120_mxfp8_general` (20543)
+own their rows' exact general head tiles (both dims multiples of 32 up to 256)
+on cc 12.x, E4M3/E5M2. The legacy 20507 / 20518 rows delegate those cells and
+keep the sixteen-aligned envelopes. Kernels, contracts and hosts live in
+`sm120/fp8_general/` and `sm120/mxfp8_general/`; `sm120/quantized_general_contract.py`
+holds the shared identity. Capabilities (outputs, block-scaled O, split-KV and
+the exact-D128 sink split, masks, THD, PackGQA) are the legacy rows' at these
+shapes. Central selection preserves the old candidate order, budget and
+placement; explicit records pin the body. Old exact general-tile 20507/20518
+recipes must be replanned. No additional numerical, determinism or
+batch-invariance claim is introduced.
+
 **SM120-family exact D256 half implementation engines:**
 `sdpa_fwd_sm120_d256_all_compute` (20537) and `sdpa_fwd_sm120_decode_key_group`
 (20538) own exact FP16/BF16 D256/V256 on cc 12.x; TILE_M names the body
@@ -3106,7 +3119,7 @@ FP8 FPROP (`sm120/d512_fp8_paired/kernel.py`) adds the same independent band wit
 **multiples of 16** and a **64 x 64 CTA**. Half, per-tensor E4M3 and MXFP8
 BPROP extend through D512 under their respective contracts described below.
 
-MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
+MXFP8 FPROP (`sm120/mxfp8_general/kernel.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
 16**; both head dims in (256, 512] run `sm120/d512_mxfp8_paired/kernel.py`, the d512
 FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.

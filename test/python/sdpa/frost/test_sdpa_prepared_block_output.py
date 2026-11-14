@@ -163,6 +163,10 @@ def _fp8_case(
     name = engine_name(arch=arch, fp8=not mxfp8, mxfp8=mxfp8)
     if arch == "sm100" and not mxfp8:
         name = "sdpa_fwd_sm100_d128_fp8_multi_q"
+    if arch == "sm120":
+        from frost_test_utils import sm120_owner
+
+        name = sm120_owner(name, d, d)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     knobs = SdpaFwdKnobs(tile_m=max(caps.tile_ms), tile_n=max(caps.tile_ns), cga=max(caps.cgas), sched_policy=0, pack_gqa=False, split_kv=1)

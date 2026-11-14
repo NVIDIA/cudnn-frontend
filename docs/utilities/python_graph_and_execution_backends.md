@@ -1048,6 +1048,8 @@ envelopes keep 20505. Exact SM120-family per-tensor FP8 and MXFP8 D512/V512
 recipes likewise move from 20507 and 20518 to 20533 and 20534. Exact
 SM120-family half D256/V256 recipes move from 20505 to 20537 (TILE_M 64 / 128)
 or 20538 (TILE_M 16 / 32) with unchanged knobs.
+Exact SM120-family per-tensor FP8 and MXFP8 general-tile recipes (both dims
+multiples of 32 up to 256) move from 20507 / 20518 to 20542 / 20543.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
 the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 

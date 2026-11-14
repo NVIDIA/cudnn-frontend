@@ -310,9 +310,9 @@ def test_sm120_knob_admission_for_the_decode_tile():
     # Unequal small widths can require a48-key stage, not only powers of two.
     assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(16, 48, split=3)) is None
     assert mismatch(half, _facts(d_qk=24, d_v=40), knobs(64, 48)) is not None
-    fp8 = next(s for s in _fp8_specs()).capabilities
     fp8_facts = _facts(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    assert "outside this engine's domain" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
+    fp8 = next(s.capabilities for s in _fp8_specs() if mismatch(s.capabilities, fp8_facts) is None)
+    assert "runs TILE_M in (64, 128)" in mismatch(fp8, fp8_facts, knobs(16, 16, pack=False))
 
 
 def _fp8_specs():

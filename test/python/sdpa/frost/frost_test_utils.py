@@ -186,6 +186,12 @@ def sm120_owner(row, d_qk, d_v, tile_m=None):
         if tile_m is None:
             return (d256.ALL_COMPUTE, d256.KEY_GROUP)
         return d256.KEY_GROUP if tile_m in d256.key_group.QUERY_TILES else d256.ALL_COMPUTE
+    from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as quant
+
+    if (d_qk, d_v) in quant.SHAPES:
+        general = {quant.fp8.LEGACY_ROW: quant.FP8, quant.mxfp8.LEGACY_ROW: quant.MXFP8}
+        if row in general:
+            return general[row]
     wide = {half.LEGACY_ROW: (half.NAME, half.SHAPES), fp8.LEGACY_ROW: (fp8.NAME, (fp8.SHAPE,)), mxfp8.LEGACY_ROW: (mxfp8.NAME, (mxfp8.SHAPE,))}
     owner, shapes = wide.get(row, (row, ()))
     return owner if (d_qk, d_v) in shapes else row
@@ -214,7 +220,7 @@ def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
             "sdpa_fwd_sm100_d128_fp8_swap_ab",
         )
     if arch == "sm120":
-        return ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_sm120_d512_fp8_paired")
+        return ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_sm120_d512_fp8_paired", "sdpa_fwd_sm120_fp8_general")
     return (f"sdpa_fwd_prefill_{arch}_fp8",)
 
 

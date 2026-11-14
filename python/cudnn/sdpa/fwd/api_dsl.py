@@ -486,8 +486,8 @@ _SM120_KERNEL_FILES = {
     None: "sm120/prefill_f16.py",
 }
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16_key_group/kernel.py"
-_SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_fp8_paired/kernel.py", None: "sm120/prefill_fp8.py"}
-_SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_mxfp8_paired/kernel.py", None: "sm120/prefill_mxfp8.py"}
+_SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_fp8_paired/kernel.py", None: "sm120/fp8_general/kernel.py"}
+_SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_mxfp8_paired/kernel.py", None: "sm120/mxfp8_general/kernel.py"}
 # Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
 # selectable only once it has an entry here: SdpaFwdDslSm90.check_support builds the
 # config_sm90.pick_flavor pool from these keys.
@@ -6389,7 +6389,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     FP8 Q/K/V constructed without ``pertensor_fp8`` select block-scaled MXFP8
     (the ``sdpa_mxfp8`` op): ``execute()`` takes ``sf_q`` / ``sf_k`` / ``sf_v``
     E8M0 scale factors in the F8_128x4 order instead of per-tensor descales,
-    on the MXFP8 template ``sm120/prefill_mxfp8.py`` (both head dims up to
+    on the MXFP8 template ``sm120/mxfp8_general/kernel.py`` (both head dims up to
     256, multiples of 16) or its d512 flavor ``sm120/d512_mxfp8_paired/kernel.py``
     (both head dims in (256, 512], multiples of 16).
     Supported layouts bind their declared strides through the prepared MXFP8

@@ -15,7 +15,7 @@ files retain ``<phase>_d<dim>_<dtype-family>.py`` until their engine boundary
 is made explicit.
 
 A file omits the dimension when one implementation covers a range of head
-dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
+dims: ``sm120/prefill_f16.py`` and ``sm120/fp8_general/kernel.py`` do, while
 ``sm120/d256_f16_all_compute/kernel.py`` is the d256 flavor (head dims that tile at 256 on
 both sides). ``sm120/d512_f16_paired/kernel.py`` serves both head dims in (256, 512]
 at multiples of eight, with two warps per Q slab splitting the head dimension;

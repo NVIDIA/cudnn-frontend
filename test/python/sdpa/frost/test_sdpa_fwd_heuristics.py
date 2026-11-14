@@ -25,6 +25,7 @@ from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as sm120_quant_general
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
@@ -285,12 +286,10 @@ def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
         device_cc=(12, 0),
         device_sm_count=84,
     )
-    offered = {engine_name: 20504}
-    plans = recommend("A", facts, offered)
+    plans = recommend("A", facts, _sm120_offered(engine_name, 20504))
     assert plans
     assert all(plan.knobs.cga == 1 for plan in plans)
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == engine_name)
-    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+    assert all(engines.mismatch(_sm120_owner_caps(192, 128, engine_name), facts, plan.knobs) is None for plan in plans)
 
 
 @pytest.mark.L0
@@ -324,8 +323,8 @@ def test_sm120_mxfp8_d256_admits_both_kv_tiles():
     from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes, tile_domain
 
     name = "sdpa_fwd_prefill_sm120_mxfp8"
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     for d_qk, d_v in ((256, 256), (240, 256)):
+        caps = _sm120_owner_caps(d_qk, d_v, name)
         domain = tile_domain(d_qk, d_v, fp8=True)
         assert {(128, 128), (128, 64), (64, 128), (64, 64)} <= domain, (d_qk, d_v)
         for s_q, causal in ((2048, True), (16384, False)):
@@ -343,14 +342,14 @@ def test_sm120_mxfp8_d256_admits_both_kv_tiles():
                 device_cc=(12, 0),
                 device_sm_count=188,
             )
-            plans = recommend("A", facts, {name: 20518})
+            plans = recommend("A", facts, _sm120_offered(name, 20518))
             assert plans, (d_qk, d_v, s_q)
             for plan in plans:
-                assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+                assert engines.mismatch(caps, facts, plan.knobs) is None
                 assert (plan.knobs.tile_m, plan.knobs.tile_n) in domain
                 assert smem_bytes(256, 256, plan.knobs.tile_m, plan.knobs.tile_n, itemsize=1, out_itemsize=2, mxfp8=True) <= SMEM_CAPACITY_BYTES
             for tile_n in (64, 128):
-                assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=tile_n)) is None, (d_qk, d_v, tile_n)
+                assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=tile_n)) is None, (d_qk, d_v, tile_n)
 
 
 @pytest.mark.L0
@@ -375,11 +374,11 @@ def test_sm120_mxfp8_packed_sets_ride_the_rule_kv_tile(d_qk, d_v):
         device_cc=(12, 0),
         device_sm_count=188,
     )
-    plans = recommend("A", facts, {name: 20518})
+    plans = recommend("A", facts, _sm120_offered(name, 20518))
     packed = [plan for plan in plans if plan.knobs.pack_gqa]
     assert packed, "a 32-token GQA-8 graph is packing-eligible"
     assert packed[0].knobs.tile_n == _sm120_tiles(spec.capabilities, facts)[1]
-    assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+    assert all(engines.mismatch(_sm120_owner_caps(d_qk, d_v, name), facts, plan.knobs) is None for plan in plans)
 
 
 @pytest.mark.L0
@@ -439,17 +438,22 @@ def _sm120_spec(name="sdpa_fwd_prefill_sm120"):
     return next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
 
 
-# Each legacy SM120 row and the exact wide-head owner it delegates to.
-_SM120_WIDE_OWNERS = {
-    "sdpa_fwd_prefill_sm120": ("sdpa_fwd_sm120_d512_paired", 20526, ((512, 512), (576, 512))),
-    "sdpa_fwd_prefill_sm120_fp8": ("sdpa_fwd_sm120_d512_fp8_paired", 20533, ((512, 512),)),
-    "sdpa_fwd_prefill_sm120_mxfp8": ("sdpa_fwd_sm120_d512_mxfp8_paired", 20534, ((512, 512),)),
+# Each legacy SM120 row and the exact-shape owners it delegates to: (owner, id, shapes).
+_SM120_OWNERS = {
+    "sdpa_fwd_prefill_sm120": (("sdpa_fwd_sm120_d512_paired", 20526, ((512, 512), (576, 512))),),
+    "sdpa_fwd_prefill_sm120_fp8": (
+        ("sdpa_fwd_sm120_d512_fp8_paired", 20533, ((512, 512),)),
+        ("sdpa_fwd_sm120_fp8_general", 20542, sm120_quant_general.SHAPES),
+    ),
+    "sdpa_fwd_prefill_sm120_mxfp8": (
+        ("sdpa_fwd_sm120_d512_mxfp8_paired", 20534, ((512, 512),)),
+        ("sdpa_fwd_sm120_mxfp8_general", 20543, sm120_quant_general.SHAPES),
+    ),
 }
 
 
 def _sm120_offered(row, row_id):
-    owner, owner_id, _ = _SM120_WIDE_OWNERS[row]
-    return {row: row_id, owner: owner_id}
+    return {row: row_id, **{owner: owner_id for owner, owner_id, _ in _SM120_OWNERS[row]}}
 
 
 _SM120_HALF_OFFERED = _sm120_offered("sdpa_fwd_prefill_sm120", 20505)
@@ -459,8 +463,7 @@ def _sm120_owner_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120", tile_m=None):
     """Capabilities of the SM120 row that owns these head dims (exact half D256: the TILE_M-named owner)."""
     if row == "sdpa_fwd_prefill_sm120" and (d_qk, d_v) == (256, 256):
         return _sm120_spec("sdpa_fwd_sm120_decode_key_group" if tile_m in (16, 32) else "sdpa_fwd_sm120_d256_all_compute").capabilities
-    owner, _, shapes = _SM120_WIDE_OWNERS.get(row, (row, None, ()))
-    return _sm120_spec(owner if (d_qk, d_v) in shapes else row).capabilities
+    return _sm120_spec(next((owner for owner, _, shapes in _SM120_OWNERS.get(row, ()) if (d_qk, d_v) in shapes), row)).capabilities
 
 
 # Graph facts of each SM120 row's input type.
