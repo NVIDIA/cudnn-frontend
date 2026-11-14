@@ -44,7 +44,7 @@ _KERNELS = {
     ("fp8", (128, 128)): ("prefill_d128_fp8.py", 1),
     ("fp8", (192, 128)): ("prefill_d192_d128_fp8.py", 2),
     ("fp8", (256, 256)): ("prefill_d256_fp8.py", 4),
-    ("fp8", (512, 512)): ("prefill_d512_fp8.py", 1),
+    ("fp8", (512, 512)): ("d512_fp8_role_split/kernel.py", 1),
     ("mxfp8", (128, 128)): ("prefill_d128_mxfp8.py", 2),
     ("mxfp8", (192, 128)): ("prefill_d192_d128_mxfp8.py", 3),
     ("mxfp8", (256, 256)): ("prefill_d256_mxfp8.py", 3),

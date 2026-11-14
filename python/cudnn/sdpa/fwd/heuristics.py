@@ -108,6 +108,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,
     EngineSpec,
@@ -3559,16 +3560,6 @@ def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
     )
 
 
-def sm100_legacy_policy_spec():
-    """Historical policy domain for migrated candidate generation and study keys.
-
-    This is never an offered engine. Delegation changes ownership, not the
-    pack/split decisions on which the existing placement studies were fitted.
-    """
-    legacy = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
-    return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
-
-
 def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
     """Central wide-half body choice; explicit implementation replay never calls it."""
     from .kernels.sm100.d512_f16_contract import D512Geometry, ROLE_SPLIT, TWO_BY_TWO
@@ -3586,7 +3577,7 @@ def select_sm100_d512_geometry(facts, knobs):
     )
 
 
-def _recommend_sm100_implementation(kind, facts, offered, select_geometry):
+def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
     """Retain the existing candidate budget/order, naming each actual body.
 
     The old row's policy domain generates pack/split and scheduler combinations.
@@ -3594,7 +3585,7 @@ def _recommend_sm100_implementation(kind, facts, offered, select_geometry):
     implementation before being returned, and its split model consumes the
     same selected geometry.
     """
-    policy = sm100_legacy_policy_spec()
+    policy = sm100_legacy_policy_spec() if policy is None else policy
     if mismatch(policy.capabilities, facts) is not None:
         return []
     sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
@@ -3656,6 +3647,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_wide_half_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
+    from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
+
+    if in_d512_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

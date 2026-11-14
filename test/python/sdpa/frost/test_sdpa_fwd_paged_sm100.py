@@ -26,7 +26,7 @@ empty ranges, cga1, page sizes across the 128-row tile.
 import math
 import os
 
-from frost_test_utils import half_engine_names
+from frost_test_utils import fp8_engine_names, half_engine_names
 
 import pytest
 
@@ -1554,7 +1554,7 @@ def _run_graph_fp8(
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
-    target_engine = engine_name(arch="sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100", fp8=True)
+    target_engine = fp8_engine_names(arch="sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100")
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
     d_v = d if d_v is None else d_v
@@ -1857,7 +1857,7 @@ def _is_frost_fp8(g, index) -> bool:
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import _is_plan_for
 
-    return _is_plan_for(g.get_plan_name_at_index(index), engine_name(fp8=True))
+    return _is_plan_for(g.get_plan_name_at_index(index), fp8_engine_names())
 
 
 def _assert_frost_fp8_led_and_served(g):
@@ -1865,7 +1865,7 @@ def _assert_frost_fp8_led_and_served(g):
 
     names = _plan_names(g)
     assert _is_frost_fp8(g, 0), names
-    assert g.selected_engine is not None and g.selected_engine.name == engine_name(fp8=True), names
+    assert g.selected_engine is not None and g.selected_engine.name in fp8_engine_names(), names
 
 
 @pytest.mark.L0

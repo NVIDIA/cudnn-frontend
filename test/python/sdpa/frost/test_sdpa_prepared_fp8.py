@@ -11,8 +11,7 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import fp8_engine_names, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
@@ -50,6 +49,7 @@ def _case(
     heads=(4, 2),
     seq_lens=None,
     independent_o_offsets=False,
+    record=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -152,8 +152,11 @@ def _case(
         tensors["amax_o"], vp[am] = am, buffers["amax_o"]
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = select_engine(g, engine_name(arch=arch, fp8=True), **({"pack_gqa": False} if arch == "sm120" else {}))
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        g.create_execution_plan(*record)
+    chosen = select_engine(g, fp8_engine_names(arch), **({"pack_gqa": False} if arch == "sm120" else {}))
     if (chosen.knobs.split_kv or 1) != split_kv:
         from dataclasses import replace
 
@@ -167,7 +170,7 @@ def _case(
             from cudnn.sdpa import graph_analyzer as ga
             from cudnn.sdpa.fwd import engines
 
-            spec = next(s for s in engines.ENGINE_SPECS if s.name == engine_name(arch=arch, fp8=True))
+            spec = next(s for s in engines.ENGINE_SPECS if s.name == g.get_plan_name_at_index(g._plan_index).split("[")[0])
             domain = engines.effective_cgas(spec.capabilities, g._facts_for(ga.analyze), split_kv)
             if domain and knobs.cga not in domain:
                 knobs = replace(knobs, cga=min(domain))

@@ -135,6 +135,7 @@ def release_cases(arch):
             "prefill_d256_f16.py": "d256_f16_lookahead/kernel.py",
             "prefill_d512_f16.py": "d512_f16_role_split/kernel.py",
             "prefill_d512_f16_2x2.py": "d512_f16_2x2/kernel.py",
+            "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
         }
         path = moved.get(name, name) if arch == "sm100" else name
         cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))

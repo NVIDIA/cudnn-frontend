@@ -7,6 +7,13 @@ never renumber.
 
 ## Hard rules
 
+An isolated implementation's thin host entry must not import the engine
+registry that imports it. Inject common lowering and knob construction from
+the registry. Keep historical-domain metadata with engine definitions so
+placement need not import the candidate generator to retrieve it. The cold
+host-import and explicit-lowering tests in
+`test_sdpa_fwd_d512_fp8_implementation_contract.py` detect these boundaries.
+
 For explicit implementation records, distinguish the physical CTA cluster
 (`TILE_CGA_M/N`) from the MMA group (`CTA_GROUP`). D512 uses a four-CTA
 cluster containing two-CTA MMA groups; D576 uses a single pair. Translate

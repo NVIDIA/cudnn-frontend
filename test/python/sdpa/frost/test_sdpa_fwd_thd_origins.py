@@ -58,9 +58,11 @@ def test_independent_thd_origins_rebind_and_capture(
     import cudnn
     import torch
 
-    sm120 = engine_name in ("sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8")
-    fp8 = engine_name.endswith("_fp8")
-    mxfp8 = engine_name.endswith("_mxfp8")
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == engine_name)
+    sm120 = caps.sm_lo == 120
+    fp8, mxfp8 = caps.is_fp8, caps.is_mxfp8
     quantized = fp8 or mxfp8
     arches = ((12, 0), (12, 1)) if sm120 else (((10, 7),) if "sm107" in engine_name else ((10, 0), (10, 3)))
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in arches:
