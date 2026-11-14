@@ -372,6 +372,28 @@ def test_backward_blk128_block_sizes_rejects_unsupported_arch_before_dispatch(mo
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("q_blocks", [1, 3], ids=["too_few", "too_many"])
+def test_backward_sm90_blk128_host_entry_rejects_q_block_count(monkeypatch, q_blocks):
+    """A direct call of the SM90 blk128 host entry with metadata for another number of Q128 blocks raises before
+    anything is built or launched.  The compute warps of the kernel look for a missing second Q64 half only when the
+    Q64 tile count is odd, so a CSR row past the last Q128 block would make them wait for a stage the loader warps
+    skip: a hang instead of an error."""
+    import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    from cudnn.block_sparse_attention import _interface
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("malformed metadata reached the backward's device work")
+
+    monkeypatch.setattr(_interface, "build_bucketed_k2q_csr_cutedsl", unexpected)
+    monkeypatch.setattr(_interface, "_empty_bwd_workspace_with_zeroed_accum", unexpected)
+    q = torch.zeros((1, 1, 256, 128), device="cuda", dtype=torch.bfloat16)
+    lse = torch.zeros((1, 1, 256), device="cuda", dtype=torch.float32)
+    ids = torch.zeros((1, 1, q_blocks, 1), device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="must list 2 query blocks for seqlen_q=256"):
+        _interface._bsa_attn_bwd_sm90_blk128(q, q, q, q, q, lse, ids, 1)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("num_q_blocks", [1, 2999, 3000, 4097, 8192, 65536])
 def test_backward_sm100_blk64_auto_bucket_is_a_valid_choice(num_q_blocks):
     """The automatic bucket is a performance heuristic, so only its contract is asserted: the choice is either

@@ -1537,67 +1537,61 @@ class BlockSparseAttnBackwardSm90Blk128:
                     read_dO.advance()
                     accumulate = True
             else:
-                for step in cutlass.range(steps, unroll=1):
+                # Every Q128 index of the CSR is below ceil(seqlen_q / 128) (the host entry checks the metadata
+                # shape), so a step can be out of range only as the second Q64 half of the last Q128 block, and only
+                # when the number of Q64 tiles is odd. The three producer warps need the Q64 index of every step
+                # anyway; the compute warps only paid for it: a dependent CSR index load and a seqlen compare per
+                # warp and step, at the one point of the step where no GEMM is in flight (ncu pc sampling: 236 cycles
+                # per step). Two loops over the same step, exactly one with a non-zero trip count: the first keeps
+                # the load and the test and runs only for an odd tile count, the second has neither. A loop-invariant
+                # flag inside one loop is not hoisted by the compiler and keeps ~86 cycles per step (-4.0% instead of
+                # -4.8..-5.3% of the kernel's cycles).
+                check_q_tail = ((seqlen.seqlen_q + self.tile_m - 1) // self.tile_m) % 2 == 1
+                steps_tail = steps if check_q_tail else Int32(0)
+                steps_fast = Int32(0) if check_q_tail else steps
+                step_args = (
+                    tiled_mma_SdP,
+                    tiled_mma_dK,
+                    tiled_mma_dV,
+                    tiled_mma_dQ,
+                    tSrQ,
+                    tSrK,
+                    tdPrdO,
+                    tdPrV,
+                    tdVrdO,
+                    tdKrQ,
+                    tdQrdS,
+                    tdQrK,
+                    tLSEsLSE,
+                    tdPsums,
+                    tdQsdQ,
+                    acc_dK,
+                    acc_dV,
+                    copy_dS_r2s,
+                    pipeline_Q,
+                    pipeline_dO,
+                    pipeline_stats,
+                    mask,
+                    thr_mma_SdP,
+                    wg,
+                    n_block,
+                    head_idx,
+                    batch_idx,
+                    block_size_k,
+                    softmax_scale_log2,
+                )
+                for step in cutlass.range(steps_tail, unroll=1):
                     m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
                     if m_block * self.tile_m < seqlen.seqlen_q:
-                        stage = read_Q.index
-                        pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
-                        acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
-                        pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
-                        rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
-                        pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
-                        acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
-                        # QK is complete; dP can overlap exp2 and the statistics load.
-                        if const_expr(self.scale_nonpositive):
-                            acc_S.store(acc_S.load() * softmax_scale_log2)
-                        if const_expr(mBlockSizes is not None or self.has_kv_tail):
-                            if const_expr(self.paired):
-                                mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
-                            else:
-                                mask.apply_mask(acc_S, batch_idx, head_idx, m_block, n_block, thr_mma_SdP, block_size_k=block_size_k)
-                        scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
-                        for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
-                            lse = rLSE[r]
-                            for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
-                                scores[r, c] = (
-                                    cute.math.exp2(
-                                        scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
-                                        fastmath=True,
-                                    )
-                                    if lse != Float32.inf
-                                    else Float32(0.0)
-                                )
-                        rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
-                        rDelta = copy_utils.load_s2r(tdPsums[None, stage])
-                        warpgroup.wait_group(0)
-                        dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
-                        for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
-                            for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
-                                # Keep FP32 P for dS, independent of the BF16 dV operand.
-                                dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
-                        rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
-                        copy_dS_r2s(rdS, dst_idx=stage)
-                        gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
-                        cute.arch.fence_view_async_shared()
-                        named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
-                        # The memory-clobbering cross-WG barrier orders both normal
-                        # shared reads before either WG returns the statistics slot.
-                        pipeline_stats.consumer_release(read_Q)
-                        # dQ consumes both WG-produced KV halves. Wait only for the
-                        # preceding dV before releasing dO; dK then overlaps dQ store.
-                        acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=1)
-                        pipeline_dO.consumer_release(read_dO)
-                        gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
-                        named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
-                        rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
-                        cute.autovec_copy(rflat, tdQsdQ)
-                        cute.arch.fence_view_async_shared()
-                        named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
-                        warpgroup.wait_group(0)
-                        pipeline_Q.consumer_release(read_Q)
+                        self.mma_q64_step(read_Q, read_dO, accumulate, *step_args)
                         read_Q.advance()
                         read_dO.advance()
                         accumulate = True
+                for step in cutlass.range(steps_fast, unroll=1):
+                    self.mma_q64_step(read_Q, read_dO, accumulate, *step_args)
+                    read_Q.advance()
+                    read_dO.advance()
+                    accumulate = True
             if const_expr(self.paired and pair_sync is not None):
                 # First-arriver protocol (see epilogue_paired_kv): thread 0 of each WG draws its KV64 block's ticket
                 # before the barrier so the L2 round trip overlaps the fragment staging. WG1 owns no block when the
@@ -1649,6 +1643,104 @@ class BlockSparseAttnBackwardSm90Blk128:
                 else:
                     self.epilogue_accum_kv(acc_dK, mdK, sdO, tidx, n_block * 2 + 1, head_idx, batch_idx)
                     self.epilogue_accum_kv(acc_dV, mdV, sdO, tidx, n_block * 2 + 1, head_idx, batch_idx)
+
+    @cute.jit
+    def mma_q64_step(
+        self,
+        read_Q,
+        read_dO,
+        accumulate,
+        tiled_mma_SdP,
+        tiled_mma_dK,
+        tiled_mma_dV,
+        tiled_mma_dQ,
+        tSrQ,
+        tSrK,
+        tdPrdO,
+        tdPrV,
+        tdVrdO,
+        tdKrQ,
+        tdQrdS,
+        tdQrK,
+        tLSEsLSE,
+        tdPsums,
+        tdQsdQ,
+        acc_dK,
+        acc_dV,
+        copy_dS_r2s,
+        pipeline_Q,
+        pipeline_dO,
+        pipeline_stats,
+        mask,
+        thr_mma_SdP,
+        wg,
+        n_block,
+        head_idx,
+        batch_idx,
+        block_size_k,
+        softmax_scale_log2,
+    ):
+        """One Q64 step of a compute WG on the regular (non-paired) route, on the stage at ``read_Q`` / ``read_dO``:
+        S = Q K^T and dP = dO V^T, P and dS in registers, dV += P^T dO, dQ = dS K, dK += dS^T Q.
+
+        Traced inline at each call site (the two loops of ``mma``). The caller advances both read states and sets
+        ``accumulate`` after the call: the DSL carries a variable through a loop only when the loop body itself
+        assigns it or calls a method on it."""
+        shape_S = (self.tile_m, self.tile_n)
+        shape_dQ = (self.tile_m, self.tile_hdim)
+        stage = read_Q.index
+        pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+        acc_S = gemm_zero_init(tiled_mma_SdP, shape_S, tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
+        pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+        rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
+        pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+        acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S, tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
+        # QK is complete; dP can overlap exp2 and the statistics load.
+        if const_expr(self.scale_nonpositive):
+            acc_S.store(acc_S.load() * softmax_scale_log2)
+        if const_expr(block_size_k is not None or self.has_kv_tail):
+            # apply_mask clips KV columns only and never reads its Q tile index.
+            mask.apply_mask(acc_S, batch_idx, head_idx, Int32(0), n_block, thr_mma_SdP, block_size_k=block_size_k)
+        scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+        for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+            lse = rLSE[r]
+            for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
+                scores[r, c] = (
+                    cute.math.exp2(
+                        scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
+                        fastmath=True,
+                    )
+                    if lse != Float32.inf
+                    else Float32(0.0)
+                )
+        rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+        rDelta = copy_utils.load_s2r(tdPsums[None, stage])
+        warpgroup.wait_group(0)
+        dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+        for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
+            for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
+                # Keep FP32 P for dS, independent of the BF16 dV operand.
+                dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
+        rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+        copy_dS_r2s(rdS, dst_idx=stage)
+        gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
+        cute.arch.fence_view_async_shared()
+        named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+        # The memory-clobbering cross-WG barrier orders both normal
+        # shared reads before either WG returns the statistics slot.
+        pipeline_stats.consumer_release(read_Q)
+        # dQ consumes both WG-produced KV halves. Wait only for the
+        # preceding dV before releasing dO; dK then overlaps dQ store.
+        acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ, tdQrdS, tdQrK, A_idx=stage, wg_wait=1)
+        pipeline_dO.consumer_release(read_dO)
+        gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
+        named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+        rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+        cute.autovec_copy(rflat, tdQsdQ)
+        cute.arch.fence_view_async_shared()
+        named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+        warpgroup.wait_group(0)
+        pipeline_Q.consumer_release(read_Q)
 
     @cute.jit
     def epilogue_direct_kv(self, acc, output, scratch, tma_atom, tiled_mma, tidx, n_block, head_idx, batch_idx, scale):

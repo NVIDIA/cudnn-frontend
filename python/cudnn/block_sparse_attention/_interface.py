@@ -1266,6 +1266,11 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
     bucket = 256 if bucket is None else bucket
     if bucket <= 0:
         raise ValueError("bucket_size_blocks must be positive")
+    if indices.shape[2] != (sq + 127) // 128:
+        # The CSR lists one Q128 row per row of this tensor. The kernel's compute warps look for a missing second Q64
+        # half only when ceil(sq / 64) is odd, so a row past the last Q128 block would leave them waiting for a Q stage
+        # that the loader warps skip (a hang); a missing row would silently drop its edges.
+        raise ValueError(f"q2k_block_index must list {(sq + 127) // 128} query blocks for seqlen_q={sq} and sparse_block_size=128, got {tuple(indices.shape)}")
     offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
         indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
     )

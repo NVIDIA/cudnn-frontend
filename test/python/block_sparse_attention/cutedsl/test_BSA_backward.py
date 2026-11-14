@@ -825,6 +825,44 @@ def test_sm90_blk128_empty_grid_stream_order(monkeypatch):
     assert len(poisoned) == len(calls) == 4 * 201
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize("tail", [1, 64], ids=["one_token", "full_half"])
+@pytest.mark.parametrize("bucket", [1, 256], ids=["groups", "direct_kv"])
+def test_sm90_blk128_q_tail_loop_matches_even_tile_count(bucket, tail):
+    """The compute warps run one of two loops: for an odd number of Q64 tiles the one that looks for the missing second
+    half of the last Q128 block, otherwise the one without that test.  The same problem runs with the last Q128 block
+    cut after ``tail`` tokens of its first half (odd) and completed by rows whose Q, dO and O are zero (even).  Every Q
+    block attends one KV block that no other Q block attends, so each gradient element is the deterministic result of
+    one CTA and the two runs must agree bit for bit; the odd run is also checked against the FP64 reference."""
+    ops = import_bsa(families=(9,), reason=SM90_BLK128)
+    torch.manual_seed(128004)
+    b, h, blocks, scale = 2, 2, 5, 0.09
+    sq_odd, sq_even, sk = (blocks - 1) * 128 + tail, blocks * 128, blocks * 128
+    q = torch.randn((b, h, sq_even, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((b, h, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    q[:, :, sq_odd:] = 0
+    do[:, :, sq_odd:] = 0
+    ids = torch.rand(b, h, blocks, device="cuda").argsort(-1).int()[..., None].contiguous()  # one permutation per head
+    opts = dict(block_sparse_num=1, sparse_block_size=128, softmax_scale=scale)
+    q_odd, do_odd = q[:, :, :sq_odd].contiguous(), do[:, :, :sq_odd].contiguous()
+    forward = ops.block_sparse_attention_forward(q_odd, k, v, ids, **opts)
+    o = torch.zeros_like(q)
+    o[:, :, :sq_odd] = forward["o_tensor"]
+    lse = torch.zeros(q.shape[:-1], device="cuda", dtype=torch.float32)
+    lse[:, :, :sq_odd] = forward["lse_tensor"]
+    odd = ops.block_sparse_attention_backward(do_odd, q_odd, k, v, forward["o_tensor"], forward["lse_tensor"], ids, bucket_size_blocks=bucket, **opts)
+    even = ops.block_sparse_attention_backward(do, q, k, v, o, lse, ids, bucket_size_blocks=bucket, **opts)
+
+    mask = block_sparse_mask(ids, 1, None, sq_odd, sk, 128)
+    _, _, *reference = attention_reference(q_odd, k, v, mask, scale, do=do_odd, dtype=torch.float64)
+    _assert_blk128_gradients(odd, reference, mask)
+    assert torch.equal(odd["dq_tensor"], even["dq_tensor"][:, :, :sq_odd])
+    assert torch.count_nonzero(even["dq_tensor"][:, :, sq_odd:]) == 0
+    assert torch.equal(odd["dk_tensor"], even["dk_tensor"])
+    assert torch.equal(odd["dv_tensor"], even["dv_tensor"])
+
+
 # ---- SM100/SM110 blk64
 
 
