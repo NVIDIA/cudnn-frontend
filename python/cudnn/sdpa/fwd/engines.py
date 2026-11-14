@@ -3604,6 +3604,16 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     )
 
 
+def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
+    """Historical policy domain for migrated candidate generation and study keys.
+
+    This is never an offered engine. Delegation changes ownership, not the
+    pack/split decisions on which the existing placement studies were fitted.
+    """
+    legacy = next(s for s in ENGINE_SPECS if s.name == name)
+    return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
 def _sm100_d512_fp8_spec() -> EngineSpec:
     """One per-tensor FP8 body; shared graph binding and launch construction."""
     from .kernels.sm100.d512_fp8_role_split.host import lower
@@ -3627,7 +3637,7 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         split_cgas_by_d_shape=(),
         swap_abs=frozenset(),
     )
-    return EngineSpec(_D512_FP8_ROLE_SPLIT, capabilities, lower)
+    return EngineSpec(_D512_FP8_ROLE_SPLIT, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
 
 
 def _sm107_mxfp8_spec() -> EngineSpec:

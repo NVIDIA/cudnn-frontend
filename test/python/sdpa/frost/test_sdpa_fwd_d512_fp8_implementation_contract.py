@@ -89,7 +89,8 @@ def test_explicit_lowering_does_not_consult_candidate_selection(monkeypatch):
     monkeypatch.setattr(heuristics, "recommend", forbidden)
     calls = []
     monkeypatch.setattr(engines, "lower_dsl_prefill", lambda spec, f, k, *, selected_kernel: calls.append((spec, f, k, selected_kernel)))
-    SPECS[NAME].lower(SPECS[NAME], facts(), None)
+    spec = engines._sm100_d512_fp8_spec()
+    spec.lower(spec, facts(), None)
     assert len(calls) == 1
     assert calls[0][3].implementation == NAME
     assert calls[0][3].lowering_row_name == LEGACY_ROW

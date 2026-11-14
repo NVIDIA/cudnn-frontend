@@ -486,7 +486,7 @@ import copy
 
 import cudnn
 
-from .engines import Capabilities, _selected_d_shape, _synth_kv_padding, d256_decode_tile_selected, rubin_dense_d128_shared_leg
+from .engines import Capabilities, _selected_d_shape, _synth_kv_padding, d256_decode_tile_selected, rubin_dense_d128_shared_leg, sm100_legacy_policy_spec
 
 LEAD = "lead"  # FROST's proposals ahead of the backend block
 TRAIL = "trail"  # the backend block ahead of FROST's proposals
@@ -691,7 +691,7 @@ def place(spec, facts, knobs=None) -> str:
         # An explicitly requested alternative has no inherited LEAD claim.
         if knobs is None:
             return TRAIL
-        from .heuristics import select_sm100_d256_geometry, sm100_legacy_policy_spec
+        from .heuristics import select_sm100_d256_geometry
 
         selected = select_sm100_d256_geometry(facts, knobs.pack_gqa)
         if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
@@ -701,7 +701,7 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in WIDE_IMPLEMENTATIONS:
         if knobs is None:
             return TRAIL
-        from .heuristics import select_sm100_d512_geometry, sm100_legacy_policy_spec
+        from .heuristics import select_sm100_d512_geometry
 
         selected = select_sm100_d512_geometry(facts, knobs)
         if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
@@ -709,8 +709,6 @@ def place(spec, facts, knobs=None) -> str:
         spec = sm100_legacy_policy_spec()
 
     if spec.capabilities.implementation == D512_FP8_ROLE_SPLIT:
-        from .heuristics import sm100_legacy_policy_spec
-
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
@@ -728,7 +726,6 @@ def place(spec, facts, knobs=None) -> str:
     if spec.name == "sdpa_fwd_prefill_sm100":
         from .kernels.sm100.d256_f16_contract import in_pilot_domain
         from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
-        from .heuristics import sm100_legacy_policy_spec
 
         if in_pilot_domain(facts) or in_wide_half_domain(facts):
             # Historical study queries can still use the old row name. Its

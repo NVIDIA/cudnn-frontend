@@ -61,7 +61,9 @@ from cutlass.base_dsl.typing import Pointer
 import cuda.bindings.driver as _cuda_driver
 
 from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.config import TemplateParams, make_cfg_d512
-from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.contract import TEMPLATE_NAME as TEMPLATE_NAME
+from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes.  A plain import would get

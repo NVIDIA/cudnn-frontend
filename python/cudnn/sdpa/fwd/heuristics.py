@@ -108,6 +108,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,
     EngineSpec,
@@ -3557,16 +3558,6 @@ def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
         prefolded=facts.attn_scale_prefolded,
         gated=facts.has_epilogue_gate,
     )
-
-
-def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
-    """Historical policy domain for migrated candidate generation and study keys.
-
-    This is never an offered engine. Delegation changes ownership, not the
-    pack/split decisions on which the existing placement studies were fitted.
-    """
-    legacy = next(s for s in ENGINE_SPECS if s.name == name)
-    return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
 
 
 def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):

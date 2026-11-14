@@ -53,11 +53,11 @@ from cudnn.sdpa.fwd.kernels.sm100.d512_f16_2x2.config import (
     _validate_cfg_d512_2x2 as _validate_cfg_d512_2x2,
 )
 from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.config import make_cfg_d512 as _make_cfg_d512_half
-from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.config import (
-    CfgD512 as CfgD512,
-    _validate_cfg_d512 as _validate_cfg_d512,
-    make_cfg_d512 as _make_cfg_d512_fp8,
-)
+from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split import config as _d512_fp8_config
+
+CfgD512 = _d512_fp8_config.CfgD512
+_validate_cfg_d512 = _d512_fp8_config._validate_cfg_d512
+_make_cfg_d512_fp8 = _d512_fp8_config.make_cfg_d512
 
 # Compatibility re-exports: definitions have one owner in the lightweight modules.
 from cudnn.sdpa.fwd.config_common import (
