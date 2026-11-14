@@ -5840,3 +5840,29 @@ comparisons preserved input/output hashes, actual body/config and workspace
 against parent `ae3d4e4425c563a159af2acb5f873a5a0dcc6022`; independent FP64
 references and changed-input replay also passed. This bounded comparison is
 not a replacement for the full batch-invariance or golden contract.
+
+### SM100/SM103 wide half explicit-engine migration — 2026-11-14
+
+The D512 role-split and D512/D576 2x2 implementations now have explicit graph
+owners. The existing physical-origin suite pins each owner and its physical
+cluster width, retaining the original numerical, raw-byte, batch and retained
+capture checks. The kernel algorithms and golden files are unchanged.
+
+On B200/SM100 and B300/SM103, CUDA 13.4 compiler, CuTe DSL 4.8.0,
+cuDNN 9.30 and Torch 2.14.1+cu130, all eight cases in
+`sdpa/frost/test_sdpa_fwd_d512_explicit_engines.py` pass: FP16/BF16,
+role-split unsplit/split4, D512 2x2 and D576 2x2. They export the public
+record, rebuild a fresh graph, retain the intended body despite the legacy
+A/B switch, and check changed-input CUDA Graph replay against a reference.
+These cases do not establish general batch invariance.
+
+An additional B300 run passes all eight half cases in
+`sdpa/frost/sdpa_fwd_thd_origins_d512_sm100.py::test_independent_origins_rebind_replay`
+(`-m L0 -k 'fp16 or bf16'`). Both implementations and token/head-major Stats
+retain O/Stats bytes through replay, reordered/duplicated batches, an isolated
+sequence and changed neighbors, with independent numerical checks and physical
+origin changes. Production source is `615798010c6378b22c92c141614e2ec01d24d67a`;
+the follow-up fixture changes only migrate other test owners and the split
+capability inventory. FP8 on SM103, strict runtime-golden comparisons, other
+architectures and backward are not qualified by this migration. No support
+status is upgraded from these bounded identity/replay checks.
