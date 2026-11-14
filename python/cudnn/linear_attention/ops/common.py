@@ -130,6 +130,39 @@ def execute_graph(graph, variant_pack, workspace, handle, context=None):
     graph.execute(variant_pack, workspace=workspace, handle=handle, context=context)
 
 
+try:
+    EAGER_PROBES = (
+        torch.autograd._profiler_enabled,
+        torch._C._is_tracing,
+        torch._C._len_torch_dispatch_stack,
+        torch._C._len_torch_function_stack,
+        torch._C._functorch.peek_interpreter_stack,
+    )
+except AttributeError:
+    EAGER_PROBES = None
+
+
+def eager_dispatch(args) -> bool:
+    """Whether a call may bypass its custom op: eager, plain tensors, and no torch function or
+    dispatch mode or functorch transform or ``torch.jit.trace`` or autograd profiler that has to see the op.  The custom op's
+    own dispatch costs more host time than the op's Python (its autograd wrapper re-reads the op's schema once per
+    argument).  A trace records the dispatcher's ops, so without the custom op it would keep the allocations and
+    miss the kernels; a profile names its ranges after the ops (``cudnn::<op>_fwd`` / ``_bwd``).  The queries are private
+    to torch (``EAGER_PROBES``); on a torch without them every call takes the custom op."""
+    if EAGER_PROBES is None:
+        return False
+    profiling, tracing, dispatch_modes, function_modes, functorch_level = EAGER_PROBES
+    return (
+        not torch.compiler.is_compiling()
+        and not profiling()
+        and not tracing()
+        and dispatch_modes() == 0
+        and function_modes() == 0
+        and functorch_level() is None
+        and all(type(a) in (torch.Tensor, torch.nn.Parameter) for a in args if isinstance(a, torch.Tensor))
+    )
+
+
 def torch_dtype_to_cudnn(dtype: torch.dtype):
     """Map a PyTorch dtype to a cuDNN data_type enum."""
     return TORCH_DTYPE_TO_CUDNN[dtype]

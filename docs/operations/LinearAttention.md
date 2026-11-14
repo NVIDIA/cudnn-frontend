@@ -44,6 +44,7 @@ Operands may be strided views, as the engines build their TMA descriptors from t
 - **batch_invariant.** Each sequence's results are bitwise independent of the batch composition (whole-sequence scheduling; split-K load balancing is disabled).
 - **Clamps and guards.** Mamba-2's `dt` clamp zeroes the gate gradient where active. GDN-2's `beta_guard` is recomputed, not differentiated, in the backward.
 - **Engines.** The FROST engines are the only engines for these nodes and are pure pass-through: `check_support` verifies the kernel-native dtypes and head dims listed above and declines everything else. A plan can be pinned by name through `plan_name` (for example `gdn_frost`, `mamba2_frost`, `mamba2_summary_frost`).
+- **Custom-op dispatch.** In eager mode `kimi_delta_attention` and `gated_delta_net` skip the `torch.library` custom-op dispatch, which costs more host time than the op's own Python, and apply the same forward and autograd formula through a plain `torch.autograd.Function` (the output's `grad_fn` is `EagerKdaBackward` / `EagerGdnBackward`). Under `torch.compile`, `torch.jit.trace`, the autograd profiler (so traces show `cudnn::<op>_fwd` / `_bwd`), a torch function or dispatch mode, a functorch transform, or tensor subclasses they call the custom op, and a `create_graph=True` backward runs the custom backward op, so differentiating it again raises as before.
 
 ## Example
 
