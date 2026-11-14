@@ -165,23 +165,30 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
             "sdpa_fwd_sm100_d512_2x2",
         )
     if arch == "sm120":
-        return ("sdpa_fwd_prefill_sm120", "sdpa_fwd_sm120_d512_paired")
+        return ("sdpa_fwd_prefill_sm120", "sdpa_fwd_sm120_d512_paired", "sdpa_fwd_sm120_d256_all_compute", "sdpa_fwd_sm120_decode_key_group")
     return (f"sdpa_fwd_prefill_{arch}",)
 
 
-def sm120_owner(row, d_qk, d_v) -> str:
-    """The SM120 forward engine that may serve these head dims for ``row``'s input type (legality only, no ranking)."""
+def sm120_owner(row, d_qk, d_v, tile_m=None):
+    """The SM120 forward engine that may serve these head dims for ``row``'s input type (legality only, no ranking).
+
+    Exact D256 half has two owners named by TILE_M; without one, both are returned for a ranked pin."""
+    from cudnn.sdpa.fwd.kernels.sm120 import d256_f16_contract as d256
     from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as half
     from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8
     from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8
 
+    if row == d256.LEGACY_ROW and (d_qk, d_v) == d256.SHAPE:
+        if tile_m is None:
+            return (d256.ALL_COMPUTE, d256.KEY_GROUP)
+        return d256.KEY_GROUP if tile_m in d256.key_group.QUERY_TILES else d256.ALL_COMPUTE
     wide = {half.LEGACY_ROW: (half.NAME, half.SHAPES), fp8.LEGACY_ROW: (fp8.NAME, (fp8.SHAPE,)), mxfp8.LEGACY_ROW: (mxfp8.NAME, (mxfp8.SHAPE,))}
     owner, shapes = wide.get(row, (row, ()))
     return owner if (d_qk, d_v) in shapes else row
 
 
-def sm120_half_owner(d_qk, d_v) -> str:
-    return sm120_owner("sdpa_fwd_prefill_sm120", d_qk, d_v)
+def sm120_half_owner(d_qk, d_v, tile_m=None):
+    return sm120_owner("sdpa_fwd_prefill_sm120", d_qk, d_v, tile_m)
 
 
 def fp8_engine_names(arch="sm100") -> tuple[str, ...]:

@@ -447,8 +447,10 @@ def _sm120_offered(row, row_id):
 _SM120_HALF_OFFERED = _sm120_offered("sdpa_fwd_prefill_sm120", 20505)
 
 
-def _sm120_owner_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120"):
-    """Capabilities of the SM120 row that owns these head dims."""
+def _sm120_owner_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120", tile_m=None):
+    """Capabilities of the SM120 row that owns these head dims (exact half D256: the TILE_M-named owner)."""
+    if row == "sdpa_fwd_prefill_sm120" and (d_qk, d_v) == (256, 256):
+        return _sm120_spec("sdpa_fwd_sm120_decode_key_group" if tile_m in (16, 32) else "sdpa_fwd_sm120_d256_all_compute").capabilities
     owner, _, shapes = _SM120_WIDE_OWNERS.get(row, (row, None, ()))
     return _sm120_spec(owner if (d_qk, d_v) in shapes else row).capabilities
 
@@ -482,7 +484,7 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     def reason(tile, **over):
         knobs = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=tile[0], tile_n=tile[1], cga=1, pack_gqa=True, split_kv=1)
         facts = _sm120_gqa6_facts(**_SM120_ROW_FACTS[row], **over)
-        return engines.mismatch(_sm120_owner_caps(facts.d_qk, facts.d_v, row), facts, knobs)
+        return engines.mismatch(_sm120_owner_caps(facts.d_qk, facts.d_v, row, tile[0]), facts, knobs)
 
     for d in (128, 256, 512):
         for tile in sorted(tile_domain(d, d, quantized)):

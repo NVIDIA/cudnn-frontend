@@ -238,8 +238,11 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
         monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     else:
         monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
+
     owner = "sdpa_fwd_sm120_d512_paired" if d == 512 else engines.engine_name(arch="sm120")
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == owner)
+    # Exact D256 spans two TILE_M-named owners; the row's policy domain states the combined contract.
+    spec = sm100_legacy_policy_spec(owner) if d == 256 else next(s for s in engines.ENGINE_SPECS if s.name == owner)
     lower = Mock(side_effect=AssertionError("capability checking must not compile"))
     engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
     graph = _mk_graph(is_override_shape_enabled=True)
@@ -1132,6 +1135,8 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
             native_sm90,
             native_sm120,
             "sdpa_fwd_sm120_d512_paired",
+            "sdpa_fwd_sm120_d256_all_compute",
+            "sdpa_fwd_sm120_decode_key_group",
         )
     }
     assert all(v is None for v in others.values()), others

@@ -369,6 +369,8 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_sm120_d512_paired",
         "sdpa_fwd_sm120_d512_fp8_paired",
         "sdpa_fwd_sm120_d512_mxfp8_paired",
+        "sdpa_fwd_sm120_d256_all_compute",
+        "sdpa_fwd_sm120_decode_key_group",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"
 
 

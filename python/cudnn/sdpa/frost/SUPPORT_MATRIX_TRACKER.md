@@ -94,6 +94,21 @@ candidate order, budget and placement; explicit records pin this body. Old
 exact-wide 20505 recipes must be invalidated and replanned. No additional
 numerical, determinism or batch-invariance claim is introduced.
 
+**SM120-family exact D256 half implementation engines:**
+`sdpa_fwd_sm120_d256_all_compute` (20537) and `sdpa_fwd_sm120_decode_key_group`
+(20538) own exact FP16/BF16 D256/V256 on cc 12.x; TILE_M names the body
+(64 / 128 all-compute, 16 / 32 key-group decode). The legacy 20505 row
+delegates exact D256 and keeps the eight-aligned (240, 256] envelope and the
+decode tile at smaller head dims, which run the same key-group body. Kernels,
+contracts and hosts live in `sm120/d256_f16_all_compute/` and
+`sm120/decode_f16_key_group/`; `sm120/d256_f16_contract.py` holds the shared
+identity and the TILE_M selection. Capabilities, masks, sinks, PackGQA,
+split-KV, paging (decode tile only) and THD (all-compute only) are the legacy
+row's at D256. Central selection preserves the old candidate order, budget and
+placement; explicit records pin the body. Old exact-D256 20505 recipes must be
+replanned. No additional numerical, determinism or batch-invariance claim is
+introduced.
+
 **SM120-family exact wide FP8 and MXFP8 implementation engines:**
 `sdpa_fwd_sm120_d512_fp8_paired` (20533) owns exact per-tensor FP8 D512/V512
 and `sdpa_fwd_sm120_d512_mxfp8_paired` (20534) owns exact MXFP8 D512/V512,
@@ -3025,7 +3040,7 @@ Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 `sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`, `sdpa_bwd_sm120_fp8`,
 `sdpa_bwd_sm120_mxfp8`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
-tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
+tile at 256 on both sides run a dedicated template, `sm120/d256_f16_all_compute/kernel.py`
 with the same support).
 
 D512 FP16/BF16 FPROP (`sm120/d512_f16_paired/kernel.py`) supports **both D_QK and D_V

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SM120 half DECODE tile (``sm120/decode_f16.py``, ``tile_m`` 16 / 32).
+"""The SM120 half DECODE tile (``sm120/decode_f16_key_group/kernel.py``, ``tile_m`` 16 / 32).
 
 KNOB ROUTE: the adapter runs the decode tile when the plan's ``tile_m`` names
 it, exactly as ``lower_dsl_prefill`` forwards a plan's knobs; the kernel tests
@@ -203,8 +203,11 @@ def _facts(**over):
 
 
 def _spec(name: str = _SM120_ROW):
-    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd import engines, heuristics
 
+    if name == _SM120_ROW:
+        # The row's policy domain: exact D256 records are delegated to their TILE_M-named owners.
+        return heuristics.sm100_legacy_policy_spec(name)
     return next(s for s in engines.ENGINE_SPECS if s.name == name)
 
 
@@ -397,7 +400,7 @@ def test_decode_tile_plans_carry_the_split_choice(monkeypatch, over, chosen):
     monkeypatch.setattr(heuristics, "choose_sm120_decode_split_kv", recording)
     spec = _spec()
     facts = _facts(**over)
-    plans = heuristics.recommend("A", facts, {spec.name: 20504})
+    plans = heuristics.recommend("A", facts, {spec.name: 20504, "sdpa_fwd_sm120_d256_all_compute": 20537, "sdpa_fwd_sm120_decode_key_group": 20538})
     decode = [p.knobs for p in plans if sm120_decode_tile(spec.capabilities, p.knobs.tile_m)]
     assert decode and seen
     stage = decode_kv_stage(*head_tiles(facts.d_qk, facts.d_v, HEAD_TILE_GRANULE))

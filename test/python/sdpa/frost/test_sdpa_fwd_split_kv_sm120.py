@@ -327,7 +327,8 @@ def test_sm120_split_sink_is_eligible_on_half_and_exact_fp8_d128(d):
     knobs = SdpaFwdKnobs(sched_policy=0, split_kv=4)
     from frost_test_utils import sm120_half_owner
 
-    assert mismatch(rows[sm120_half_owner(d, d)], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None
+    owners = sm120_half_owner(d, d)
+    assert any(mismatch(rows[o], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None for o in (owners if isinstance(owners, tuple) else (owners,)))
     if d <= 256:
         fp8 = _sink_decode_facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
         reason = mismatch(rows["sdpa_fwd_prefill_sm120_fp8"], fp8, knobs)
@@ -347,7 +348,8 @@ def test_sm120_sink_sets_carry_the_split_choice(monkeypatch, over):
 
     monkeypatch.setattr(heuristics, "choose_split_kv", lambda **_: 4)
     rows = {s.name: s for s in ENGINE_SPECS}
-    half, facts = rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(**over)
+    # The half row's policy domain: exact D256 records are delegated to their TILE_M-named owners.
+    half, facts = heuristics.sm100_legacy_policy_spec("sdpa_fwd_prefill_sm120"), _sink_decode_facts(**over)
     sets = heuristics._knob_sets(half, facts)
     assert 4 in {knobs.split_kv for knobs in sets}, sets
     for knobs in sets:
