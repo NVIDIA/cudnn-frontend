@@ -21,7 +21,7 @@ New implementation rows identify one main body and its local variants. Their
 the shared parser/binder/launch framework. A fixed helper chain (for example
 THD descriptor setup, attention, and split combine) remains one engine.
 Performance selection lives in heuristics. Unmigrated legacy rows still select
-among multiple bodies internally; the explicit D256, wide-half and FP8 D512
+among multiple bodies internally; the explicit half D256, wide-half and FP8 D256/D512
 rows are the migration boundary, not a claim that every row already follows it.
 """
 
@@ -3370,7 +3370,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     One broad legacy row per ARCH LINE (``arch``: "sm100" = pre-Rubin Blackwell 100-106,
     "sm107" = Rubin line 107-119): the two lowerings genuinely diverge and a
     shared row could only describe their union with knob x arch notches.
-    Exact SM100/SM103 D512 has its own explicit implementation owner. On the
+    Exact SM100/SM103 D256/D512 have explicit implementation owners. On the
     remaining legacy domain, the adapter picks the kernel flavor covering the graph. Each row declares
     exactly what its own kernels carry:
 
@@ -4703,7 +4703,7 @@ def engine_name(
     """The registered engine name for a coverage cell (test/user convenience).
 
     This names the broad legacy row. Exact SM100/SM103 half D256/D512/D576
-    and per-tensor FP8 D512 have explicit implementation entries; callers
+    and per-tensor FP8 D256/D512 have explicit implementation entries; callers
     select them by name or use the ordinary heuristics candidates."""
 
     suffix = "_mxfp8" if mxfp8 else "_fp8" if fp8 else ""

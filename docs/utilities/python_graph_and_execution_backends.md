@@ -1030,7 +1030,7 @@ report physical cluster width through `TILE_CGA_M`: 4 for D512, 2 for D576.
 Their MMA group is fixed at two CTAs; the old 20511 pair encoding is not a
 valid D512 cluster assignment for the new engines. Regenerate the complete
 engine/knob recipe through heuristics instead of rewriting its engine id.
-Exact SM100/SM103 per-tensor FP8 D512/V512 recipes similarly move from 20513
+Exact SM100/SM103 per-tensor FP8 D256/D512/V512 recipes similarly move from 20513
 to the explicit role-split engine 20523, with physical `TILE_CGA_M=4` and
 a fixed two-CTA MMA group. Dense head envelopes keep their legacy owner.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
