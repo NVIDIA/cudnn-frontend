@@ -6,7 +6,7 @@ FP16/BF16 SDPA forward DECODE tile for the NVIDIA Blackwell SM120 family
 (SM120 and SM121): ``mma.sync.aligned.m16n8k16`` tensor cores fed by a
 multi-stage TMA K/V ring.
 
-The prefill templates (``sm120/prefill_f16.py`` and its D=256 sibling) give
+The prefill templates (``sm120/f16_general/kernel.py`` and its D=256 sibling) give
 every compute warp 16 query rows of its own and stream one K and one V tile
 through a single shared-memory buffer. On a decode-shaped launch -- the
 ``S_q x G`` packed rows of one KV head are a handful -- most of those warps

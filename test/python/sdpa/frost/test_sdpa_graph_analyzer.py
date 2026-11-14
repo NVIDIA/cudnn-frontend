@@ -255,8 +255,8 @@ def test_sm120_override_admits_prepared_and_declines_legacy_routes(monkeypatch, 
     from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
 
     owner = "sdpa_fwd_sm120_d512_paired" if d == 512 else engines.engine_name(arch="sm120")
-    # Exact D256 spans two TILE_M-named owners; the row's policy domain states the combined contract.
-    spec = sm100_legacy_policy_spec(owner) if d == 256 else next(s for s in engines.ENGINE_SPECS if s.name == owner)
+    # Exact half tiles span two TILE_M-named owners; the row's policy domain states the combined contract.
+    spec = sm100_legacy_policy_spec(owner) if d in (128, 256) else next(s for s in engines.ENGINE_SPECS if s.name == owner)
     lower = Mock(side_effect=AssertionError("capability checking must not compile"))
     engine = FrostSdpaFwdEngine(replace(spec, lower=lower), 20511)
     graph = _mk_graph(is_override_shape_enabled=True)
@@ -1157,6 +1157,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
             "sdpa_fwd_sm120_d256_all_compute",
             "sdpa_fwd_sm120_decode_key_group",
             *d192_owners,
+            "sdpa_fwd_sm120_f16_general",
         )
     }
     assert all(v is None for v in others.values()), others
@@ -1827,6 +1828,8 @@ def test_knob_request_pack_gqa_outside_domain_rejects_row():
 
 _SM120 = engines.engine_name(arch="sm120")
 _SM120_PAIRED = "sdpa_fwd_sm120_d512_paired"
+# The SM120 half row and its implementation engines: eligibility probes accept any of them.
+_SM120_HALF_FAMILY = frozenset(s.name for s in engines.ENGINE_SPECS if s.capabilities.sm_lo == 120 and cudnn.data_type.HALF in s.capabilities.dtypes)
 
 
 def _sm120_half(d_qk, d_v):
@@ -1863,7 +1866,7 @@ def test_sm120_probe_accepts_causal_swa_on_both_minors(monkeypatch):
     for cc in ((12, 0), (12, 1)):
         monkeypatch.setattr(ga, "_device_cc", lambda cc=cc: cc)
         elig = _eligible(_mk_sm120_graph(use_causal_mask=True, sliding_window_length=64))
-        assert _SM120 in elig
+        assert _SM120_HALF_FAMILY & elig
         assert not any("sm100" in name for name in elig)
 
 
@@ -1939,12 +1942,12 @@ def test_sm120_probe_accepts_bottom_right_with_swa(monkeypatch):
     # BR + SWA is served on both families now; this pins the SM120 row's claim.
     kwargs = dict(use_causal_mask_bottom_right=True, sliding_window_length=64)
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _SM120 in _eligible(_mk_sm120_graph(**kwargs))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(**kwargs))
 
 
 def test_sm120_probe_rejects_on_sm100_family():
     # The autouse fixture fakes (10, 0); the SM120 row must stay ineligible.
-    assert _SM120 not in _eligible(_mk_sm120_graph())
+    assert not _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph())
 
 
 def test_sm120_probe_head_dim_envelope(monkeypatch):
@@ -1952,13 +1955,13 @@ def test_sm120_probe_head_dim_envelope(monkeypatch):
     # zero-padding; only sub-8 alignment (TMA 16-byte global-stride rule)
     # stays ineligible. Both dimensions in (256, 512] use the d512 envelope.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _SM120 in _eligible(_mk_sm120_graph(d=192))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=192))
     assert _SM120 in _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
     assert not _eligible(_mk_sm120_graph(d=132))  # multiple of 4, not of 8
     assert _SM120_PAIRED in _eligible(_mk_sm120_graph(d=512))
-    assert _SM120 in _eligible(_mk_sm120_graph(d=504))
-    assert _SM120 in _eligible(_mk_sm120_graph(d=264))
-    assert _SM120 in _eligible(_mk_sm120_graph(d=496))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=504))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=264))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=496))
 
 
 def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
@@ -1968,7 +1971,7 @@ def test_sm120_probe_full_d512_envelope_pairs(monkeypatch):
         for d_v in range(264, 513, 8):
             assert _sm120_half(d_qk, d_v) in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
     for d_qk, d_v in ((256, 512), (512, 256), (248, 264), (264, 248), (260, 264), (264, 260), (584, 512), (512, 520)):
-        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+        assert not _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
 
 
 def test_sm120_probe_d576_envelope_pairs(monkeypatch):
@@ -1988,10 +1991,10 @@ def test_sm120_probe_d576_envelope_pairs(monkeypatch):
             assert pick_flavor(d_qk, d_v, True) is None
             assert smem_bytes(d_qk, d_v, 64, 32) == 98328
     for d_qk, d_v in ((576, 256), (584, 512), (576, 520), (516, 512)):
-        assert _SM120 not in _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
+        assert not _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=d_qk, d_v=d_v)), (d_qk, d_v)
     flags.pop("supports_d576_envelope")
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaDenseBinder", SimpleNamespace(**flags))
-    assert _SM120 not in _eligible(_mk_sm120_graph(d=520, d_v=504))
+    assert not _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=520, d_v=504))
     assert _SM120_PAIRED in _eligible(_mk_sm120_graph(d=576, d_v=512))
 
 
@@ -2013,7 +2016,7 @@ def test_sm120_probe_accepts_right_band_widening(monkeypatch):
             diagonal_alignment=align,
         )
         _finish_output(o, dims, strides)
-        assert _SM120 in _eligible(g), align
+        assert _SM120_HALF_FAMILY & _eligible(g), align
 
 
 def test_sm120_probe_accepts_ragged_skv_without_padding_or_causal(monkeypatch):
@@ -2029,7 +2032,7 @@ def test_sm120_probe_accepts_ragged_skv_without_padding_or_causal(monkeypatch):
     v = g.tensor(dim=(B, H, s_kv, d), stride=(s_kv * H * d, d, H * d, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, d), (S * H * d, d, H * d, 1))
-    assert _SM120 in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def test_sm120_probe_accepts_mixed_head_dims(monkeypatch):
@@ -2041,20 +2044,20 @@ def test_sm120_probe_accepts_mixed_head_dims(monkeypatch):
     v = g.tensor(dim=(B, H, S, d_v), stride=(S * H * d_v, d_v, H * d_v, 1), data_type=DTYPE, name="v")
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True, use_causal_mask=True)
     _finish_output(o, (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1))
-    assert _SM120 in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def test_sm120_probe_accepts_stats_output(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert engines.engine_name(arch="sm120") in _eligible(_mk_dense_stats_graph((H * S, S, 1, 1)))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_dense_stats_graph((H * S, S, 1, 1)))
 
 
 @pytest.mark.parametrize(
     ("cc", "engine"),
     [
-        ((8, 0), engines.engine_name(arch="sm80")),
-        ((10, 0), engines.engine_name(arch="sm100")),
-        ((12, 0), engines.engine_name(arch="sm120")),
+        ((8, 0), frozenset({engines.engine_name(arch="sm80")})),
+        ((10, 0), frozenset({engines.engine_name(arch="sm100")})),
+        ((12, 0), _SM120_HALF_FAMILY),
     ],
     ids=["sm80", "sm100", "sm120"],
 )
@@ -2063,22 +2066,22 @@ def test_fwd_probe_accepts_strided_stats(monkeypatch, cc, engine):
     # B is innermost, then H, then S; the extra two head rows leave a gap
     # between adjacent S positions.
     stats_stride = (1, B, (H + 2) * B, 1)
-    assert engine in _eligible(_mk_dense_stats_graph(stats_stride))
+    assert engine & _eligible(_mk_dense_stats_graph(stats_stride))
 
 
 @pytest.mark.parametrize(
     ("cc", "engine"),
     [
-        ((8, 0), engines.engine_name(arch="sm80")),
-        ((10, 0), engines.engine_name(arch="sm100")),
-        ((12, 0), engines.engine_name(arch="sm120")),
+        ((8, 0), frozenset({engines.engine_name(arch="sm80")})),
+        ((10, 0), frozenset({engines.engine_name(arch="sm100")})),
+        ((12, 0), _SM120_HALF_FAMILY),
     ],
     ids=["sm80", "sm100", "sm120"],
 )
 @pytest.mark.parametrize("stats_stride", [(0, S, 1, 1), (1, 1, 1, 1)], ids=["broadcast", "overlapping"])
 def test_fwd_probe_rejects_aliasing_stats(monkeypatch, cc, engine, stats_stride):
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
-    assert engine not in _eligible(_mk_dense_stats_graph(stats_stride))
+    assert not engine & _eligible(_mk_dense_stats_graph(stats_stride))
 
 
 @pytest.mark.parametrize(
@@ -2118,7 +2121,7 @@ def test_sm120_probe_accepts_padded_stats(monkeypatch):
     assert stats is not None
     stats.set_output(True).set_dim((B, H, S, 1)).set_stride((H * S, S, 1, 1))
     stats.set_data_type(cudnn.data_type.FLOAT)
-    assert engines.engine_name(arch="sm120") in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def test_sm120_probe_accepts_sink(monkeypatch):
@@ -2131,21 +2134,21 @@ def test_sm120_probe_accepts_sink(monkeypatch):
     except TypeError:
         pytest.skip("this cuDNN wheel's sdpa() binding predates sink_token")
     _finish_output(o, dims, strides)
-    assert engines.engine_name(arch="sm120") in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def test_sm120_probe_accepts_thd(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask=True), d=128)
-    assert engines.engine_name(arch="sm120") in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def test_sm120_probe_accepts_thd_bottom_right(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     g = _mk_graph()
     _mk_thd_qkvo(g, mask_kwargs=dict(use_causal_mask_bottom_right=True), d=128)
-    assert engines.engine_name(arch="sm120") in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def test_sm120_probe_accepts_thd_stats(monkeypatch):
@@ -2183,7 +2186,7 @@ def test_sm120_probe_accepts_thd_stats(monkeypatch):
     stats.set_data_type(cudnn.data_type.FLOAT)
     stats_ro = g.tensor(dim=(B + 1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=cudnn.data_type.INT64, name="stats_ro")
     stats.set_ragged_offset(stats_ro)
-    assert engines.engine_name(arch="sm120") in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def _mk_thd_cu_graph(*, extra_seq_len=False):
@@ -2274,7 +2277,7 @@ def test_sm120_probe_accepts_padding_mask_with_seq_lens(monkeypatch):
         seq_len_q=seq_q,
     )
     _finish_output(o, dims, strides)
-    assert _SM120 in _eligible(g)
+    assert _SM120_HALF_FAMILY & _eligible(g)
 
 
 def _mk_sm120_layout_graph(strides, d=128):
@@ -2295,7 +2298,7 @@ def test_sm120_probe_accepts_dense_flex_layouts(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     d = 128
     bhsd_contig = (H * S * d, S * d, d, 1)
-    assert _SM120 in _eligible(_mk_sm120_layout_graph(bhsd_contig))
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_layout_graph(bhsd_contig))
     # Head dim NOT innermost (S innermost instead) is outside dense_flex.
     s_innermost = (H * S * d, S * d, 1, S)
     assert not _eligible(_mk_sm120_layout_graph(s_innermost))
@@ -2304,20 +2307,20 @@ def test_sm120_probe_accepts_dense_flex_layouts(monkeypatch):
 def test_sm120_knob_domains(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     g = _mk_sm120_graph(use_causal_mask=True)
-    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1))
+    assert _SM120_HALF_FAMILY & _eligible(g, engines.SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1))
     assert not _eligible(g, engines.SdpaFwdKnobs(cga=2))
     # All three scheduler policies are in the SM120 domain (static-grid
     # remap); a value outside the vocabulary still declines.
-    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
+    assert _SM120_HALF_FAMILY & _eligible(g, engines.SdpaFwdKnobs(sched_policy=1))
     assert not _eligible(g, engines.SdpaFwdKnobs(sched_policy=99))
     # split_kv: the SM120 row WIRES the split path (inline chunking + the
     # shared combine), which is a boolean gate — the kernel has no upper bound
     # on the split count, so 8 is admissible too. WHICH splits get proposed is
     # split_kv_candidates' device-derived ladder, not a per-row domain. A
     # non-count still declines.
-    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=1))
-    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=4))
-    assert _SM120 in _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
+    assert _SM120_HALF_FAMILY & _eligible(g, engines.SdpaFwdKnobs(split_kv=1))
+    assert _SM120_HALF_FAMILY & _eligible(g, engines.SdpaFwdKnobs(split_kv=4))
+    assert _SM120_HALF_FAMILY & _eligible(g, engines.SdpaFwdKnobs(split_kv=8))
     assert not _eligible(g, engines.SdpaFwdKnobs(split_kv=0))
 
 

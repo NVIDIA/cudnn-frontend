@@ -25,6 +25,7 @@ from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as sm120_half
 from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as sm120_quant_general
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
@@ -440,7 +441,12 @@ def _sm120_spec(name="sdpa_fwd_prefill_sm120"):
 
 # Each legacy SM120 row and the exact-shape owners it delegates to: (owner, id, shapes).
 _SM120_OWNERS = {
-    "sdpa_fwd_prefill_sm120": (("sdpa_fwd_sm120_d512_paired", 20526, ((512, 512), (576, 512))),),
+    "sdpa_fwd_prefill_sm120": (
+        ("sdpa_fwd_sm120_d512_paired", 20526, ((512, 512), (576, 512))),
+        ("sdpa_fwd_sm120_d256_all_compute", 20537, (sm120_half.D256,)),
+        ("sdpa_fwd_sm120_f16_general", 20544, sm120_half.SHAPES - {sm120_half.D256}),
+        ("sdpa_fwd_sm120_decode_key_group", 20538, sm120_half.SHAPES),
+    ),
     "sdpa_fwd_prefill_sm120_fp8": (
         ("sdpa_fwd_sm120_d512_fp8_paired", 20533, ((512, 512),)),
         ("sdpa_fwd_sm120_fp8_general", 20542, sm120_quant_general.SHAPES),
@@ -460,9 +466,10 @@ _SM120_HALF_OFFERED = _sm120_offered("sdpa_fwd_prefill_sm120", 20505)
 
 
 def _sm120_owner_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120", tile_m=None):
-    """Capabilities of the SM120 row that owns these head dims (exact half D256: the TILE_M-named owner)."""
-    if row == "sdpa_fwd_prefill_sm120" and (d_qk, d_v) == (256, 256):
-        return _sm120_spec("sdpa_fwd_sm120_decode_key_group" if tile_m in (16, 32) else "sdpa_fwd_sm120_d256_all_compute").capabilities
+    """Capabilities of the SM120 row that owns these head dims (exact half tiles: the TILE_M-named owner)."""
+    if row == sm120_half.LEGACY_ROW and (d_qk, d_v) in sm120_half.SHAPES:
+        f = SdpaGraphFacts(d_qk=d_qk, d_v=d_v)
+        return _sm120_spec(sm120_half.select_geometry(f, engines.SdpaFwdKnobs(tile_m=tile_m)).implementation).capabilities
     return _sm120_spec(next((owner for owner, _, shapes in _SM120_OWNERS.get(row, ()) if (d_qk, d_v) in shapes), row)).capabilities
 
 
@@ -2492,7 +2499,7 @@ def test_sm121_causal_scheduler_walks_naturally_past_one_stream_per_sm():
     """GB10 (cc 12.1, 48 SMs): a bf16 / f16 d64 / d128 causal dense prefill with more (batch, head) streams than SMs
     leads with the NATURAL walk, the LPT variants behind it as runners; up to one stream per SM, a sliding window, an FP8
     row and the cc 12.0 parts keep the L2-budget rule's LPT_L2."""
-    offered = {"sdpa_fwd_prefill_sm120": 20504}
+    offered = _sm120_offered("sdpa_fwd_prefill_sm120", 20504)
 
     def plans(**over):
         facts = _facts(**{**dict(b=8, h_q=16, h_kv=16, s_q=2048, s_kv=2048, causal=True, bottom_right=True, device_cc=(12, 1), device_sm_count=48), **over})

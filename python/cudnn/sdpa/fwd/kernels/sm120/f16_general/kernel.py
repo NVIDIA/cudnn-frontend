@@ -99,6 +99,9 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 from cudnn.sdpa.fwd.kernels.sm120 import prepared_host as _prepared_host
+from cudnn.sdpa.fwd.kernels.sm120.f16_general import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 # Module exports inspected dynamically by prepared._positional_order.
 _dense_host = _prepared_host.host
@@ -1948,6 +1951,10 @@ class SM120FusedMultiHeadAttentionForward:
             stream=stream,
             min_blocks_per_mp=1,
         )
+
+
+# Profilers and nsys report the owning engine's name; a symbol change, not a program change.
+SM120FusedMultiHeadAttentionForward.kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 @lru_cache(maxsize=None)

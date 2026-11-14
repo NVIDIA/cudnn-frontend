@@ -89,10 +89,10 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8_wide
     from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
 
-    from cudnn.sdpa.fwd.kernels.sm120 import d256_f16_contract as sm120_d256
+    from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as sm120_half
     from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as sm120_quant_general
 
-    sm120_wide = ((SM120_LEGACY_ROW, in_sm120_paired_domain), (sm120_d256.LEGACY_ROW, sm120_d256.in_domain)) + tuple(
+    sm120_wide = ((SM120_LEGACY_ROW, in_sm120_paired_domain), (sm120_half.LEGACY_ROW, sm120_half.in_domain)) + tuple(
         (m.LEGACY_ROW, m.in_domain) for m in (fp8_wide, mxfp8_wide)
     )
     sm120_wide += tuple((row, sm120_quant_general.in_domain) for row in sm120_quant_general.LEGACY_ROWS)

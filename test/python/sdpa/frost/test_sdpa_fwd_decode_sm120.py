@@ -206,7 +206,7 @@ def _spec(name: str = _SM120_ROW):
     from cudnn.sdpa.fwd import engines, heuristics
 
     if name == _SM120_ROW:
-        # The row's policy domain: exact D256 records are delegated to their TILE_M-named owners.
+        # The row's policy domain: exact head-tile records are delegated to their TILE_M-named owners.
         return heuristics.sm100_legacy_policy_spec(name)
     return next(s for s in engines.ENGINE_SPECS if s.name == name)
 
@@ -287,7 +287,7 @@ def test_sm120_tile_requests_the_kernels_cannot_serve_are_ineligible(facts_over,
     # The kernel table's reason is the legacy policy domain's; the exact wide-head owner declines the same request.
     got = mismatch(sm100_legacy_policy_spec(_SM120_ROW).capabilities, facts, knobs)
     assert got is not None and reason in got, got
-    assert mismatch(_spec(sm120_half_owner(facts.d_qk, facts.d_v)).capabilities, facts, knobs) is not None
+    assert mismatch(_spec(sm120_half_owner(facts.d_qk, facts.d_v, knobs.tile_m)).capabilities, facts, knobs) is not None
 
 
 @pytest.mark.L0
@@ -706,7 +706,7 @@ def test_decode_tile_graph_capture_reads_current_inputs_and_storage(split, sink,
     import cudnn
     import cutlass.cute as cute
 
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, engine_name
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from frost_test_utils import select_engine
 
     b, h_q, h_kv, s_kv, d = 2, 32, 8, 4133, 128
@@ -733,7 +733,9 @@ def test_decode_tile_graph_capture_reads_current_inputs_and_storage(split, sink,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    row = select_engine(g, engine_name(arch="sm120"))
+    from frost_test_utils import sm120_half_owner
+
+    row = select_engine(g, sm120_half_owner(d, d, 16))
     g.create_execution_plan(row.engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=16, cga=1, pack_gqa=True, split_kv=split))
     g.select_plan(len(g.plans) - 1)
     g.check_support()

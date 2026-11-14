@@ -130,12 +130,15 @@ from .kernels.sm120.quantized_general_contract import (
     SHAPES as _SM120_QUANT_GENERAL_SHAPES,
     mismatch as _sm120_quant_general_mismatch,
 )
-from .kernels.sm120.d256_f16_contract import (
+from .kernels.sm120.half_exact_contract import (
     ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
-    IMPLEMENTATIONS as _SM120_D256_IMPLEMENTATIONS,
+    D256 as _SM120_D256,
+    GENERAL as _SM120_F16_GENERAL,
+    IMPLEMENTATIONS as _SM120_HALF_EXACT_IMPLEMENTATIONS,
     KEY_GROUP as _SM120_DECODE_KEY_GROUP,
-    explicit_geometry as _sm120_d256_explicit_geometry,
-    mismatch as _sm120_d256_implementation_mismatch,
+    SHAPES as _SM120_HALF_EXACT_SHAPES,
+    explicit_geometry as _sm120_half_exact_explicit_geometry,
+    mismatch as _sm120_half_exact_mismatch,
 )
 
 from cudnn.sdpa.fwd.config_sm107 import (
@@ -1893,13 +1896,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
-    if capabilities.implementation in _SM120_D256_IMPLEMENTATIONS:
-        reason = _sm120_d256_implementation_mismatch(capabilities.implementation, facts, knobs)
+    if capabilities.implementation in _SM120_HALF_EXACT_IMPLEMENTATIONS:
+        reason = _sm120_half_exact_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
         if isinstance(knobs, SdpaFwdKnobs) and knobs.tile_m is None:
             # A partial record runs the owner's fixed Q tile, not the legacy row's default.
-            knobs = replace(knobs, tile_m=_sm120_d256_explicit_geometry(capabilities.implementation, knobs).query_tile)
+            knobs = replace(knobs, tile_m=_sm120_half_exact_explicit_geometry(capabilities.implementation, knobs).query_tile)
     if capabilities.implementation in _SM120_QUANT_GENERAL_IMPLEMENTATIONS:
         reason = _sm120_quant_general_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
@@ -4220,7 +4223,7 @@ def _sm120_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
-            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | {(256, 256)}),
+            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | _SM120_HALF_EXACT_SHAPES),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -4283,14 +4286,21 @@ def _sm120_d256_all_compute_spec() -> EngineSpec:
     from .kernels.sm120.d256_f16_all_compute.contract import QUERY_TILES
     from .kernels.sm120.d256_f16_all_compute.host import lower
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {(256, 256)}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {_SM120_D256}, QUERY_TILES, lower)
+
+
+def _sm120_f16_general_spec() -> EngineSpec:
+    from .kernels.sm120.f16_general.contract import QUERY_TILES
+    from .kernels.sm120.f16_general.host import lower
+
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_F16_GENERAL, _SM120_HALF_EXACT_SHAPES - {_SM120_D256}, QUERY_TILES, lower)
 
 
 def _sm120_decode_key_group_spec() -> EngineSpec:
     from .kernels.sm120.decode_f16_key_group.contract import QUERY_TILES
     from .kernels.sm120.decode_f16_key_group.host import lower
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_DECODE_KEY_GROUP, {(256, 256)}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_DECODE_KEY_GROUP, _SM120_HALF_EXACT_SHAPES, QUERY_TILES, lower)
 
 
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -5318,6 +5328,7 @@ ENGINE_SPECS = (
     _sm120_d512_paired_spec(),
     _sm120_d256_all_compute_spec(),
     _sm120_decode_key_group_spec(),
+    _sm120_f16_general_spec(),
     _sm120_fp8_spec(),
     _sm120_d512_fp8_paired_spec(),
     _sm120_fp8_general_spec(),

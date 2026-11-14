@@ -165,18 +165,19 @@ placement; explicit records pin the body. Old exact general-tile 20507/20518
 recipes must be replanned. No additional numerical, determinism or
 batch-invariance claim is introduced.
 
-**SM120-family exact D256 half implementation engines:**
-`sdpa_fwd_sm120_d256_all_compute` (20537) and `sdpa_fwd_sm120_decode_key_group`
-(20538) own exact FP16/BF16 D256/V256 on cc 12.x; TILE_M names the body
-(64 / 128 all-compute, 16 / 32 key-group decode). The legacy 20505 row
-delegates exact D256 and keeps the eight-aligned (240, 256] envelope and the
-decode tile at smaller head dims, which run the same key-group body. Kernels,
-contracts and hosts live in `sm120/d256_f16_all_compute/` and
-`sm120/decode_f16_key_group/`; `sm120/d256_f16_contract.py` holds the shared
+**SM120-family exact half implementation engines:**
+`sdpa_fwd_sm120_d256_all_compute` (20537), `sdpa_fwd_sm120_f16_general` (20544)
+and `sdpa_fwd_sm120_decode_key_group` (20538) own exact FP16/BF16 cells on
+16-wide head tiles (D/V in 16..256) on cc 12.x. TILE_M names the body: 16 / 32
+run the key-group decode body on every tile; 64 / 128 run the all-compute body
+at D256/V256 and the general body elsewhere. The legacy 20505 row delegates
+those cells and keeps the eight-aligned envelopes. Kernels, contracts and hosts
+live in `sm120/d256_f16_all_compute/`, `sm120/f16_general/` and
+`sm120/decode_f16_key_group/`; `sm120/half_exact_contract.py` holds the shared
 identity and the TILE_M selection. Capabilities, masks, sinks, PackGQA,
-split-KV, paging (decode tile only) and THD (all-compute only) are the legacy
-row's at D256. Central selection preserves the old candidate order, budget and
-placement; explicit records pin the body. Old exact-D256 20505 recipes must be
+split-KV, paging, THD and the exact-D128 additive bias are the legacy row's at
+these shapes. Central selection preserves the old candidate order, budget and
+placement; explicit records pin the body. Old exact-tile 20505 recipes must be
 replanned. No additional numerical, determinism or batch-invariance claim is
 introduced.
 

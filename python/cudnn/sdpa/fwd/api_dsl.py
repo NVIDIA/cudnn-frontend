@@ -483,7 +483,7 @@ _SM120_KERNEL_FILES = {
     _SM120_D256_FLAVOR: "sm120/d256_f16_all_compute/kernel.py",
     _SM120_D512_FLAVOR: "sm120/d512_f16_paired/kernel.py",
     _SM120_D576_FLAVOR: "sm120/d512_f16_paired/kernel.py",
-    None: "sm120/prefill_f16.py",
+    None: "sm120/f16_general/kernel.py",
 }
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16_key_group/kernel.py"
 _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_fp8_paired/kernel.py", None: "sm120/fp8_general/kernel.py"}

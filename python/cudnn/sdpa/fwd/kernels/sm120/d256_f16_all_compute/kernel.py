@@ -5,7 +5,7 @@
 A fused multi-head attention (FMHA) FP16/BF16 kernel for D=256 heads on the
 NVIDIA Blackwell SM120 family (SM120 and SM121) using TMA K/V loads.
 
-This is the D=256 variant of ``sm120/prefill_f16.py``: the same fused Q*K^T,
+This is the D=256 variant of ``sm120/f16_general/kernel.py``: the same fused Q*K^T,
 softmax, and softmax(Q*K^T)*V pipeline on SM80-era ``mma.sync.aligned.m16n8k16``
 tensor cores, with (256, 256) head tiles. To fit the larger Q, S, and O working
 set in registers, it keeps half of the Q tile in shared memory and gives every
@@ -1813,7 +1813,7 @@ def compile(  # noqa: A001
 ) -> Callable:
     """Compile the dense/packed pointer host; geometry binds at execution."""
 
-    # Head dims that do not tile to (256, 256) belong to sm120/prefill_f16.py.
+    # Head dims that do not tile to (256, 256) belong to sm120/f16_general/kernel.py.
     _cache_key = _template_key(globals(), locals(), "compile")
     if not prepared or any(st is not None for st in (q_stride, k_stride, v_stride, o_stride)):
         raise ValueError("SM120 tensor compilation was retired; bind runtime strides through the prepared pointer entry")
