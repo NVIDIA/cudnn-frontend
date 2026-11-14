@@ -2266,6 +2266,10 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
 
+# Profilers and nsys report the owning engine's name; a symbol change, not a program change.
+SM120FusedMultiHeadAttentionForward.kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
+
+
 @lru_cache(maxsize=None)
 def compile(  # noqa: A001
     compute_capability: tuple[int, int],

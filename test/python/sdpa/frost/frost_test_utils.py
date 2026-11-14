@@ -169,11 +169,19 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
     return (f"sdpa_fwd_prefill_{arch}",)
 
 
-def sm120_half_owner(d_qk, d_v) -> str:
-    """The SM120 half engine that may serve these head dims (legality only, no ranking)."""
-    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired.contract import NAME, SHAPES
+def sm120_owner(row, d_qk, d_v) -> str:
+    """The SM120 forward engine that may serve these head dims for ``row``'s input type (legality only, no ranking)."""
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as half
+    from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8
+    from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8
 
-    return NAME if (d_qk, d_v) in SHAPES else "sdpa_fwd_prefill_sm120"
+    wide = {half.LEGACY_ROW: (half.NAME, half.SHAPES), fp8.LEGACY_ROW: (fp8.NAME, (fp8.SHAPE,)), mxfp8.LEGACY_ROW: (mxfp8.NAME, (mxfp8.SHAPE,))}
+    owner, shapes = wide.get(row, (row, ()))
+    return owner if (d_qk, d_v) in shapes else row
+
+
+def sm120_half_owner(d_qk, d_v) -> str:
+    return sm120_owner("sdpa_fwd_prefill_sm120", d_qk, d_v)
 
 
 def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
@@ -188,6 +196,8 @@ def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
             "sdpa_fwd_sm100_d128_fp8_dual_kv",
             "sdpa_fwd_sm100_d128_fp8_swap_ab",
         )
+    if arch == "sm120":
+        return ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_sm120_d512_fp8_paired")
     return (f"sdpa_fwd_prefill_{arch}_fp8",)
 
 

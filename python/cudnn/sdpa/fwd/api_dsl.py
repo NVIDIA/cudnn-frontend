@@ -486,8 +486,8 @@ _SM120_KERNEL_FILES = {
     None: "sm120/prefill_f16.py",
 }
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
-_SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_fp8.py", None: "sm120/prefill_fp8.py"}
-_SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_mxfp8.py", None: "sm120/prefill_mxfp8.py"}
+_SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_fp8_paired/kernel.py", None: "sm120/prefill_fp8.py"}
+_SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_mxfp8_paired/kernel.py", None: "sm120/prefill_mxfp8.py"}
 # Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
 # selectable only once it has an entry here: SdpaFwdDslSm90.check_support builds the
 # config_sm90.pick_flavor pool from these keys.
@@ -989,15 +989,18 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     return _load_kernel_template(filename, params, tag, part=None if rubin else part)
 
 
-def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = False):
-    if not fp8 and _sm120_is_decode_tile(params.q_tile):
+def _load_sm120_kernel_module(
+    flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = False, kernel_file: Optional[str] = None
+):
+    """``kernel_file`` (an explicit engine's selected body) replaces the flavor walk."""
+    if kernel_file is None and not fp8 and _sm120_is_decode_tile(params.q_tile):
         # The decode tile serves every half head tile up to 256 in one body.
         return _load_kernel_template(_SM120_DECODE_KERNEL_FILE, params, tag="sdpa_fwd_sm120_decode")
     files = (_SM120_FP8_KERNEL_FILES if pertensor else _SM120_MXFP8_KERNEL_FILES) if fp8 else _SM120_KERNEL_FILES
     tag = f"sdpa_fwd_sm120_{'fp8' if pertensor else 'mxfp8'}" if fp8 else "sdpa_fwd_sm120"
     if flavor is not None:
         tag = f"{tag}_{_flavor_tag(flavor)}"
-    return _load_kernel_template(files[flavor], params, tag=tag)
+    return _load_kernel_template(kernel_file or files[flavor], params, tag=tag)
 
 
 def _load_sm90_kernel_module(flavor: tuple[int, int], params: Sm90TemplateParams, *, native_d64: bool = False):
@@ -6343,7 +6346,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     (the ``sdpa_mxfp8`` op): ``execute()`` takes ``sf_q`` / ``sf_k`` / ``sf_v``
     E8M0 scale factors in the F8_128x4 order instead of per-tensor descales,
     on the MXFP8 template ``sm120/prefill_mxfp8.py`` (both head dims up to
-    256, multiples of 16) or its d512 flavor ``sm120/prefill_d512_mxfp8.py``
+    256, multiples of 16) or its d512 flavor ``sm120/d512_mxfp8_paired/kernel.py``
     (both head dims in (256, 512], multiples of 16).
     Supported layouts bind their declared strides through the prepared MXFP8
     entry; scale tensors bind unchanged and unsupported layouts decline. A
@@ -6855,12 +6858,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             dtype_kv=_SM120_DTYPE_QKV_CODE[self.k_desc.dtype] if self._mixed_fp8_kv else -1,
         )
         selected_kernel = getattr(self, "_selected_kernel", None)
+        # An explicit engine fixes the body; the legacy row walks the flavors.
+        self._k_mod = _load_sm120_kernel_module(
+            self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, kernel_file=getattr(selected_kernel, "kernel_file", None)
+        )
         if selected_kernel is not None:
-            # Fixed implementation entry: the selected body, never a flavor walk.
-            self._k_mod = _load_kernel_template(selected_kernel.kernel_file, params, tag=f"sdpa_fwd_sm120_{_flavor_tag(self.flavor)}")
             self.kernel_template = self._k_mod.TEMPLATE_NAME
-        else:
-            self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
         direct_layout = self._can_prepare_layout()
         self._prepared_fp8 = self._can_prepare_fp8()

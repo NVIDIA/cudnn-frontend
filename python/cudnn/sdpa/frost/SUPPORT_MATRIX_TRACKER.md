@@ -114,6 +114,19 @@ candidate order, budget and placement; explicit records pin this body. Old
 exact-wide 20505 recipes must be invalidated and replanned. No additional
 numerical, determinism or batch-invariance claim is introduced.
 
+**SM120-family exact wide FP8 and MXFP8 implementation engines:**
+`sdpa_fwd_sm120_d512_fp8_paired` (20533) owns exact per-tensor FP8 D512/V512
+and `sdpa_fwd_sm120_d512_mxfp8_paired` (20534) owns exact MXFP8 D512/V512,
+both E4M3/E5M2 on cc 12.x. The legacy 20507 and 20518 rows delegate these
+exact cells and retain their general tiles and the sixteen-aligned (256, 512]
+envelopes. Each explicit row reports TILE_M=64, TILE_N=64 and TILE_CGA_M=1;
+kernels, contracts and host entries live in `sm120/d512_fp8_paired/` and
+`sm120/d512_mxfp8_paired/`. Capabilities, output dtypes, block-scaled O,
+masks, sinks, split-KV and THD are the legacy rows' at D512. Central selection
+preserves the old candidate order, budget and placement; explicit records pin
+the body. Old exact-D512 20507/20518 recipes must be replanned. No additional
+numerical, determinism or batch-invariance claim is introduced.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;
@@ -3044,13 +3057,13 @@ and THD retain their existing layout/mask contracts; dense-Q paging includes
 half or FP8 K/V, packing and split. Q loads directly and O stages through the
 drained K/V slab; no global staging allocation or kernel is introduced.
 
-FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
+FP8 FPROP (`sm120/d512_fp8_paired/kernel.py`) adds the same independent band with
 **multiples of 16** and a **64 x 64 CTA**. Half, per-tensor E4M3 and MXFP8
 BPROP extend through D512 under their respective contracts described below.
 
 MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
-16**; both head dims in (256, 512] run `sm120/prefill_d512_mxfp8.py`, the d512
+16**; both head dims in (256, 512] run `sm120/d512_mxfp8_paired/kernel.py`, the d512
 FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.
 
 On **SM120 / SM121 (cc 12.0 / 12.1)**, FP16/BF16 backward also serves native

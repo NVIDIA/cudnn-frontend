@@ -109,6 +109,14 @@ from .kernels.sm120.d512_f16_paired.contract import (
     NAME as _SM120_D512_PAIRED,
     mismatch as _sm120_d512_paired_mismatch,
 )
+from .kernels.sm120.d512_fp8_paired.contract import (
+    NAME as _SM120_D512_FP8_PAIRED,
+    mismatch as _sm120_d512_fp8_paired_mismatch,
+)
+from .kernels.sm120.d512_mxfp8_paired.contract import (
+    NAME as _SM120_D512_MXFP8_PAIRED,
+    mismatch as _sm120_d512_mxfp8_paired_mismatch,
+)
 
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
@@ -1836,6 +1844,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return reason
     if capabilities.implementation == _SM120_D512_PAIRED:
         reason = _sm120_d512_paired_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation == _SM120_D512_FP8_PAIRED:
+        reason = _sm120_d512_fp8_paired_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation == _SM120_D512_MXFP8_PAIRED:
+        reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
     if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
@@ -4062,23 +4078,43 @@ def _sm120_spec() -> EngineSpec:
     )
 
 
+def _sm120_wide_paired_spec(legacy: EngineSpec, implementation: str, shapes, tile, host_lower) -> EngineSpec:
+    """An SM120 wide-head paired-warp body on exact native head tiles; shared graph binding and launch."""
+    capabilities = replace(
+        legacy.capabilities,
+        implementation=implementation,
+        delegated_exact=frozenset(),
+        d_shapes=frozenset(shapes),
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        tile_ms=frozenset({tile[0]}),
+        tile_ns=frozenset({tile[1]}),
+    )
+    return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs))
+
+
 def _sm120_d512_paired_spec() -> EngineSpec:
-    """The SM120 wide-head half body on exact native head tiles; shared graph binding and launch."""
     from cudnn.sdpa.fwd.config_sm120 import D512_TILE
 
     from .kernels.sm120.d512_f16_paired.host import lower
 
-    capabilities = replace(
-        _sm120_spec().capabilities,
-        implementation=_SM120_D512_PAIRED,
-        delegated_exact=frozenset(),
-        d_shapes=WIDE_F16_FLAVORS,
-        d_pad_multiple=0,
-        d_envelope_floors=(),
-        tile_ms=frozenset({D512_TILE[0]}),
-        tile_ns=frozenset({D512_TILE[1]}),
-    )
-    return EngineSpec(_SM120_D512_PAIRED, capabilities, partial(lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs))
+    return _sm120_wide_paired_spec(_sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, D512_TILE, lower)
+
+
+def _sm120_d512_fp8_paired_spec() -> EngineSpec:
+    from cudnn.sdpa.fwd.config_sm120 import FP8_D512_TILE
+
+    from .kernels.sm120.d512_fp8_paired.host import lower
+
+    return _sm120_wide_paired_spec(_sm120_fp8_spec(), _SM120_D512_FP8_PAIRED, {D512_FLAVOR}, FP8_D512_TILE, lower)
+
+
+def _sm120_d512_mxfp8_paired_spec() -> EngineSpec:
+    from cudnn.sdpa.fwd.config_sm120 import FP8_D512_TILE
+
+    from .kernels.sm120.d512_mxfp8_paired.host import lower
+
+    return _sm120_wide_paired_spec(_sm120_mxfp8_spec(), _SM120_D512_MXFP8_PAIRED, {D512_FLAVOR}, FP8_D512_TILE, lower)
 
 
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -4479,7 +4515,7 @@ def lower_dsl_prefill(
             and api.split_kv == 1
         )
         or (facts.thd and lowering_row_name == "sdpa_fwd_prefill_sm120" and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16))
-        or (facts.thd and spec.name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
+        or (facts.thd and lowering_row_name in ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"))
         or (
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
@@ -4925,6 +4961,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
+            delegated_exact=frozenset((cc, D512_FLAVOR) for cc in _SM120_DEVICE_CCS),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -4973,6 +5010,7 @@ def _sm120_mxfp8_spec() -> EngineSpec:
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
+            delegated_exact=frozenset((cc, D512_FLAVOR) for cc in _SM120_DEVICE_CCS),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -5052,7 +5090,9 @@ ENGINE_SPECS = (
     _sm120_spec(),
     _sm120_d512_paired_spec(),
     _sm120_fp8_spec(),
+    _sm120_d512_fp8_paired_spec(),
     _sm120_mxfp8_spec(),
+    _sm120_d512_mxfp8_paired_spec(),
     _sm80_spec(),
     _sm90_spec(),
 )

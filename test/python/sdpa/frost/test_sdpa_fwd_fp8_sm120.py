@@ -34,7 +34,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine
+from frost_test_utils import make_dense_stats, requires_blackwell_geforce, requires_dsl, select_engine as _select_engine, offers_engine, sm120_owner
 
 pytestmark = [requires_blackwell_geforce, requires_dsl]
 
@@ -285,13 +285,13 @@ def _run(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if quantized_qkv is None:
-        chosen = _select_engine(g, engine_name(arch="sm120", fp8=True), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+        chosen = _select_engine(g, sm120_owner(engine_name(arch="sm120", fp8=True), D, D_v), tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
     else:
         # Kernel qualification holds the plan fixed independently of ranked offerings.
         from cudnn.engines.manifest import family_for
 
         g.create_execution_plan(
-            family_for(g).offered_ids()[engine_name(arch="sm120", fp8=True)],
+            family_for(g).offered_ids()[sm120_owner(engine_name(arch="sm120", fp8=True), D, D_v)],
             {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
         )
         g.select_plan(len(g.plans) - 1)
@@ -951,7 +951,7 @@ def _fp8_graph_offers_sm120(io_dtype, o_dtype, D=128, D_v=None, sink=False, layo
         # The op itself may refuse the shape before any engine is consulted;
         # for "this cell must not claim it" that is the same answer.
         return False
-    return offers_engine(g, engine_name(arch="sm120", fp8=True))
+    return offers_engine(g, sm120_owner(engine_name(arch="sm120", fp8=True), D, D_v))
 
 
 @pytest.mark.L0
@@ -1464,7 +1464,7 @@ def _run_thd_fp8(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm120", fp8=True))
+    _select_engine(g, sm120_owner(engine_name(arch="sm120", fp8=True), D, D))
     g.check_support()
     g.build_plans()
     g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8))

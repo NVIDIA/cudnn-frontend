@@ -19,7 +19,7 @@ dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
 ``sm120/prefill_d256_f16.py`` is the d256 flavor (head dims that tile at 256 on
 both sides). ``sm120/d512_f16_paired/kernel.py`` serves both head dims in (256, 512]
 at multiples of eight, with two warps per Q slab splitting the head dimension;
-``sm120/prefill_d512_fp8.py`` and ``sm120/prefill_d512_mxfp8.py`` are its FP8
+``sm120/d512_fp8_paired/kernel.py`` and ``sm120/d512_mxfp8_paired/kernel.py`` are its FP8
 and MXFP8 siblings (multiples of 16).
 ``sm90/prefill_d512_f16.py`` is that line's D512 body: one 64-row tile over
 three warpgroups, for every head dim up to 512 at multiples of eight, on native

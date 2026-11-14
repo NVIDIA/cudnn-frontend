@@ -297,7 +297,6 @@ def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
     """The SM120 MXFP8 row rides the SM120 tile rule, and no rule measured on another row (the SM100
     MXFP8 d128 cga1 / cga2 choice) hands it a set outside its own domain."""
     name = "sdpa_fwd_prefill_sm120_mxfp8"
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     facts = _facts(
         s_q=2048,
         s_kv=2048,
@@ -309,11 +308,11 @@ def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
         device_cc=(12, 0),
         device_sm_count=84,
     )
-    plans = recommend("A", facts, {name: 20518})
+    plans = recommend("A", facts, _sm120_offered(name, 20518))
     assert plans
     for plan in plans:
         assert plan.knobs.cga == 1
-        assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
+        assert engines.mismatch(_sm120_owner_caps(d_qk, d_v, name), facts, plan.knobs) is None
 
 
 @pytest.mark.L0
@@ -394,7 +393,7 @@ def test_sm120_d512_flavor_pins_its_one_cta_tile():
             plans = recommend("A", facts, offered)
             assert plans
             assert {(p.knobs.tile_m, p.knobs.tile_n) for p in plans} == {(64, 32)}
-            assert all(engines.mismatch(_sm120_half_caps(d_qk, d_v), facts, p.knobs) is None for p in plans)
+            assert all(engines.mismatch(_sm120_owner_caps(d_qk, d_v), facts, p.knobs) is None for p in plans)
     facts = _facts(d_qk=128, d_v=128, device_cc=(12, 0), device_sm_count=188)
     plans = recommend("A", facts, offered)
     assert plans and all(p.knobs.tile_n != 32 for p in plans)
@@ -414,7 +413,7 @@ def test_sm120_d512_sliding_window_packs_gqa():
     def primary(**over):
         facts = _facts(**{**dict(s_q=16384, s_kv=16384, h_q=64, h_kv=1, d_qk=512, d_v=512, device_cc=(12, 0), device_sm_count=188), **over})
         plans = recommend("A", facts, offered)
-        assert plans and engines.mismatch(_sm120_half_caps(facts.d_qk, facts.d_v), facts, plans[0].knobs) is None
+        assert plans and engines.mismatch(_sm120_owner_caps(facts.d_qk, facts.d_v), facts, plans[0].knobs) is None
         return plans[0].knobs
 
     packed = primary(window_left=128)
@@ -438,15 +437,26 @@ def _sm120_spec(name="sdpa_fwd_prefill_sm120"):
     return next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
 
 
-_SM120_PAIRED = "sdpa_fwd_sm120_d512_paired"
-# The legacy half row and the exact wide-head owner it delegates to.
-_SM120_HALF_OFFERED = {"sdpa_fwd_prefill_sm120": 20505, _SM120_PAIRED: 20526}
+# Each legacy SM120 row and the exact wide-head owner it delegates to.
+_SM120_WIDE_OWNERS = {
+    "sdpa_fwd_prefill_sm120": ("sdpa_fwd_sm120_d512_paired", 20526, ((512, 512), (576, 512))),
+    "sdpa_fwd_prefill_sm120_fp8": ("sdpa_fwd_sm120_d512_fp8_paired", 20533, ((512, 512),)),
+    "sdpa_fwd_prefill_sm120_mxfp8": ("sdpa_fwd_sm120_d512_mxfp8_paired", 20534, ((512, 512),)),
+}
 
 
-def _sm120_half_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120"):
+def _sm120_offered(row, row_id):
+    owner, owner_id, _ = _SM120_WIDE_OWNERS[row]
+    return {row: row_id, owner: owner_id}
+
+
+_SM120_HALF_OFFERED = _sm120_offered("sdpa_fwd_prefill_sm120", 20505)
+
+
+def _sm120_owner_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120"):
     """Capabilities of the SM120 row that owns these head dims."""
-    owned = row == "sdpa_fwd_prefill_sm120" and (d_qk, d_v) in ((512, 512), (576, 512))
-    return _sm120_spec(_SM120_PAIRED if owned else row).capabilities
+    owner, _, shapes = _SM120_WIDE_OWNERS.get(row, (row, None, ()))
+    return _sm120_spec(owner if (d_qk, d_v) in shapes else row).capabilities
 
 
 # Graph facts of each SM120 row's input type.
@@ -478,7 +488,7 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     def reason(tile, **over):
         knobs = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=tile[0], tile_n=tile[1], cga=1, pack_gqa=True, split_kv=1)
         facts = _sm120_gqa6_facts(**_SM120_ROW_FACTS[row], **over)
-        return engines.mismatch(_sm120_half_caps(facts.d_qk, facts.d_v, row), facts, knobs)
+        return engines.mismatch(_sm120_owner_caps(facts.d_qk, facts.d_v, row), facts, knobs)
 
     for d in (128, 256, 512):
         for tile in sorted(tile_domain(d, d, quantized)):
@@ -492,7 +502,7 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
 
     def unset(h_q, d):
         facts = _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=h_q, h_kv=1, d_qk=d, d_v=d)})
-        return engines.mismatch(_sm120_half_caps(d, d, row), facts, engines.SdpaFwdKnobs(pack_gqa=True))
+        return engines.mismatch(_sm120_owner_caps(d, d, row), facts, engines.SdpaFwdKnobs(pack_gqa=True))
 
     refused = unset(96, 512)
     if engines.pack_gqa_partial(caps, _sm120_gqa6_facts(**{**_SM120_ROW_FACTS[row], **dict(h_q=96, h_kv=1, d_qk=512, d_v=512)})):
@@ -627,10 +637,10 @@ def test_sm120_fp8_d512_flavor_and_tile_contract():
         facts = _facts(
             d_qk=d_qk, d_v=d_v, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True, device_cc=(12, 0), device_sm_count=188
         )
-        plans = recommend("A", facts, {name: 20504})
+        plans = recommend("A", facts, _sm120_offered(name, 20504))
         assert plans, (d_qk, d_v)
         assert {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in plans} == {(64, 64)}
-        assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+        assert all(engines.mismatch(_sm120_owner_caps(d_qk, d_v, name), facts, plan.knobs) is None for plan in plans)
     for d_qk, d_v in ((256, 512), (512, 256), (264, 512), (512, 528)):
         facts = _facts(
             d_qk=d_qk, d_v=d_v, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.FP8_E4M3, is_fp8=True, device_cc=(12, 0), device_sm_count=188
@@ -664,16 +674,16 @@ def test_sm120_mxfp8_d512_flavor_and_tile_contract():
 
     for d_qk, d_v in ((272, 272), (496, 512), (512, 496), (512, 512), (384, 320)):
         f = facts(d_qk=d_qk, d_v=d_v)
-        plans = recommend("A", f, {name: 20518})
+        plans = recommend("A", f, _sm120_offered(name, 20518))
         assert plans, (d_qk, d_v)
         assert {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in plans} == {(64, 64)}
-        assert all(engines.mismatch(spec.capabilities, f, plan.knobs) is None for plan in plans)
+        assert all(engines.mismatch(_sm120_owner_caps(d_qk, d_v, name), f, plan.knobs) is None for plan in plans)
     for d_qk, d_v in ((256, 512), (512, 256), (264, 512), (512, 528)):
         assert engines.mismatch(spec.capabilities, facts(d_qk=d_qk, d_v=d_v)) is not None, (d_qk, d_v)
     f = facts(s_q=16384, s_kv=16384, h_q=64, h_kv=1, d_qk=512, d_v=512, window_left=128)
-    windowed = recommend("A", f, {name: 20518})
+    windowed = recommend("A", f, _sm120_offered(name, 20518))
     assert windowed and {(plan.knobs.tile_m, plan.knobs.tile_n) for plan in windowed} == {(64, 64)}
-    assert all(engines.mismatch(spec.capabilities, f, plan.knobs) is None for plan in windowed)
+    assert all(engines.mismatch(_sm120_owner_caps(512, 512, name), f, plan.knobs) is None for plan in windowed)
 
 
 @pytest.mark.L0
@@ -703,10 +713,9 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
         device_sm_count=188,
     )
     name = "sdpa_fwd_prefill_sm120_fp8"
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=64, tile_n=64, cga=1, pack_gqa=False, split_kv=2)
-    assert engines.mismatch(spec.capabilities, facts, knobs) is None
-    plans = recommend("A", facts, {name: 20504})
+    assert engines.mismatch(_sm120_owner_caps(dim, dim, name), facts, knobs) is None
+    plans = recommend("A", facts, _sm120_offered(name, 20504))
     assert plans and any((plan.knobs.split_kv or 1) > 1 for plan in plans)
 
 

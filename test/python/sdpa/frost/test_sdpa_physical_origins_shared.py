@@ -5,7 +5,7 @@
 import pytest
 
 from sdpa.graph.test_mhas_v2 import _PHYSICAL_ORIGIN_CASES, _exec_physical_origin_case, _physical_origin_cfg
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, sm120_half_owner
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, sm120_owner
 import frost_routing
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
@@ -24,7 +24,8 @@ def test_shared_physical_origins_mxfp8(dtype_name, width, request, cudnn_handle)
 def _check_native_origins(dtype_name, width, request, cudnn_handle, *, mxfp8=False, engine=None):
     cfg = _physical_origin_cfg(dtype_name, width)
     if engine is None:
-        engine = "sdpa_fwd_prefill_sm120_mxfp8" if mxfp8 else "sdpa_fwd_prefill_sm120_fp8" if cfg.data_type.itemsize == 1 else sm120_half_owner(width, width)
+        row = "sdpa_fwd_prefill_sm120_mxfp8" if mxfp8 else "sdpa_fwd_prefill_sm120_fp8" if cfg.data_type.itemsize == 1 else "sdpa_fwd_prefill_sm120"
+        engine = sm120_owner(row, width, width)
     cfg.plan_pin = {"engine": engine, "knobs": {"PACK_GQA": 0, "SPLIT_KV": 1}}
     if engine == "sdpa_fwd_sm100_d512_2x2":
         cfg.plan_pin["knobs"]["TILE_M"] = 64
