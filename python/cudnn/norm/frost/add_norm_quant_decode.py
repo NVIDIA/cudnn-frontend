@@ -7,7 +7,8 @@ the plan-time compile and the one launch.  No DSL and no torch import at module 
 can still construct the entry and run its declines.  The binding checks (:func:`check_binding`: presence, type, device, dtype, shape,
 contiguity, alignment and overlap of every operand) run before EVERY launch, compile-cache hits included -- the compile key is the
 config alone, and a compiled DSL entry accepts a tensor of another dtype, footprint or device silently, so the host is a launch's
-only guard.
+only guard.  The overlap check covers the outputs the call does NOT pass too: the entry's own buffers of the row count are operands
+of the launch like the passed ones.
 
 The op, per row of an ``[rows, hidden]`` slab (fp32 arithmetic on bf16 operands)::
 
@@ -54,9 +55,12 @@ Output ownership is PER OUTPUT.  An output the caller passes is the caller's and
 ``compile(rows)`` for every row count before a stream capture.  Entry-owned outputs are valid until the entry's next call at that row
 count from ANY host thread (stream order does not serialize host calls): two host threads that share one entry pass their own
 outputs or build one entry each; a caller that sweeps many row counts passes its own outputs (the per-row-count sets are never
-freed).  THE KERNEL WRITES THE LIVE ROWS' SCALE BYTES ONLY: a caller-owned ``scales`` buffer serves one row count, or its owner
-clears it when the row count shrinks (after a call with more rows, a call with fewer leaves the earlier bytes in the rows between
-``rows`` and ``scale_rows(rows)``).  Workspace: none.  The warm path allocates nothing and reads no device memory to the host.
+freed).  A returned entry-owned output cannot come back as an operand of a call that would write it: a call at that row count
+whose ``x``, ``residual``, ``weight``, ``scale`` or passed output overlaps an entry-owned output it does not pass is declined
+(``ValueError``) before the launch -- pass a caller-owned output to feed a result back in.  THE KERNEL WRITES THE LIVE ROWS' SCALE
+BYTES ONLY: a caller-owned ``scales`` buffer serves one row count, or its owner clears it when the row count shrinks (after a call
+with more rows, a call with fewer leaves the earlier bytes in the rows between ``rows`` and ``scale_rows(rows)``).  Workspace: none.
+The warm path allocates nothing and reads no device memory to the host.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -211,13 +215,24 @@ def _byte_range(t, elements: int) -> Tuple[int, int]:
     return start, start + elements * t.element_size()
 
 
+def _touched_ranges(cfg: Cfg, rows: int, tensors: Dict[str, Any]) -> Dict[str, Tuple[int, int]]:
+    """The byte range a launch of ``rows`` rows touches of each operand in ``tensors`` (by operand name): the live rows of a slab
+    (the whole padded scale tiles), the weight row, the one scale."""
+    hidden = cfg.HIDDEN
+    codes_width = hidden // 2 if cfg.QUANT == "nvfp4" else hidden
+    touched = dict(x=rows * hidden, residual=rows * hidden, weight=hidden, scale=1, out=rows * hidden, codes=rows * codes_width)
+    touched["scales"] = scale_rows(rows) * (hidden // SF_BLOCK)
+    return {name: _byte_range(t, touched[name]) for name, t in tensors.items()}
+
+
 def check_binding(cfg: Cfg, x, residual, weight, scale, out=None, codes=None, scales=None, device=None) -> int:
     """The binding checks of a call, run before every launch (compile-cache hits included).  ``ValueError`` for an operand the form
     requires and did not get, or got and does not use (both directions), an inconsistent device, shape or alignment, or a written
     operand that overlaps another operand; ``TypeError`` for a non-tensor or a dtype; ``NotImplementedError`` for a row count above the
     served ceiling or a non-contiguous operand.  Returns ``rows = x.shape[0]``.  ``device`` (an entry's: a concrete CUDA ordinal)
     requires every operand on exactly that device; without it the operands must share ``x``'s.  Host-only metadata arithmetic, no
-    device work: ``scale``'s VALUE is never read."""
+    device work: ``scale``'s VALUE is never read.  The checks see the operands they are given: an output that is not passed is
+    resolved by the entry, whose call checks its own buffers against these operands (:meth:`AddNormQuantDecode.__call__`)."""
     import torch
 
     hidden = cfg.HIDDEN
@@ -289,10 +304,7 @@ def check_binding(cfg: Cfg, x, residual, weight, scale, out=None, codes=None, sc
             else:
                 why = "for its 128-bit loads / stores"
             raise ValueError(f"{NAME}: {name} must start at a {align}-byte aligned address {why}, got data_ptr % {align} = {t.data_ptr() % align}")
-    # the bytes a launch touches of each operand: the live rows of a slab (the whole padded scale tiles), the weight row, the one scale
-    touched = dict(x=rows * hidden, residual=rows * hidden, weight=hidden, scale=1, out=rows * hidden, codes=rows * codes_width)
-    touched["scales"] = scale_rows(rows) * (hidden // SF_BLOCK)
-    ranges = {name: _byte_range(t, touched[name]) for name, t in tensors.items()}
+    ranges = _touched_ranges(cfg, rows, tensors)
     for name in ("residual", "out", "codes", "scales"):
         if name not in ranges:
             continue
@@ -447,6 +459,29 @@ class AddNormQuantDecode:
             views.get("scales"),
         ]
 
+    def _check_entry_owned(self, rows: int, operands: Dict[str, Any]) -> None:
+        """The overlap check of :func:`check_binding` for the outputs a call does not pass: the launch writes the entry's own
+        buffers of ``rows`` in their place, and a tensor an earlier call returned can come back as an operand.  ``ValueError``
+        when such a buffer overlaps another operand of the call (``operands``: every operand by name, ``None`` where not passed).
+        Before the row count's buffers exist there is nothing to check -- what the call then allocates is fresh memory, disjoint
+        from every live tensor.  Host-only pointer arithmetic; allocates nothing."""
+        owned = self.buffers.get(rows)
+        if owned is None:
+            return
+        entry_owned = {name: t for name, t in owned.items() if operands[name] is None}
+        if not entry_owned:
+            return
+        passed = {name: t for name, t in operands.items() if t is not None}
+        ranges = _touched_ranges(self.cfg, rows, {**passed, **entry_owned})
+        for name in entry_owned:
+            a0, a1 = ranges[name]
+            for other, (b0, b1) in ranges.items():
+                if other != name and a0 < b1 and b0 < a1:
+                    raise ValueError(
+                        f"{NAME}: the entry-owned {name} must not overlap {other} ({name} was not passed, so the launch writes the "
+                        f"entry's own {name} of {rows} row(s), the tensor earlier calls of that row count returned; pass a caller-owned {name})"
+                    )
+
     # ---- compile ----
     def compile(self, rows: Optional[int] = None) -> None:
         """Plan time: the typed declines of the device, the part and the DSL, then ONE trace-compile of the entry's form (a no-op
@@ -488,13 +523,16 @@ class AddNormQuantDecode:
     def __call__(self, x, residual, weight, scale, out=None, codes=None, scales=None):
         """Launch on torch's current stream of the entry's device; returns ``(out, codes, scales)`` -- per slot the caller's tensor
         as given, else the entry-owned buffer of this row count, else ``None`` for a slot the form does not produce.  Compiles on
-        first use.  Every launch re-runs the binding checks before the compiled kernel is looked up.  The launch is scoped to the
-        entry's device and the caller's current device is restored behind it."""
+        first use.  Every launch re-runs the binding checks before the compiled kernel is looked up, the overlap check on the
+        RESOLVED operands: an entry-owned output the launch would write must not overlap ``x``, ``residual``, ``weight``,
+        ``scale`` or a passed output (``ValueError``; a returned output fed back in needs a caller-owned output).  The launch is
+        scoped to the entry's device and the caller's current device is restored behind it."""
         import torch
 
         cfg = self.cfg
         rows = check_binding(cfg, x, residual, weight, scale, out, codes, scales, device=self.device)
         given = dict(out=out, codes=codes, scales=scales)
+        self._check_entry_owned(rows, dict(x=x, residual=residual, weight=weight, scale=scale, **given))
         key = self.key()
         if key not in self.compiled:
             self.compile()

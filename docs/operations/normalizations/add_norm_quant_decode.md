@@ -140,7 +140,10 @@ form's outputs, `scales` zero-filled, allocated by `compile(rows)` / `outputs(ro
 count. Call `compile(rows)` for every row count before a CUDA-graph capture. Entry-owned outputs are valid until the
 entry's next call at that row count from ANY host thread: stream order does not serialize host calls, so two host
 threads that share one entry pass their own outputs or build one entry each. The per-row-count sets are never freed, so
-a caller that sweeps many row counts passes its own outputs.
+a caller that sweeps many row counts passes its own outputs. An entry-owned output is an operand of the launch like a
+passed one, so the overlap rule covers it: a call whose `x`, `residual`, `weight`, `scale` or passed output overlaps an
+entry-owned output that the call does not pass (a tensor an earlier call of that row count returned, fed back in) is
+declined with `ValueError` before the launch. To feed a returned output back in, pass a caller-owned output.
 
 **The kernel writes the live rows' scale bytes only.** A caller-owned `scales` buffer serves one row count, or its
 owner clears it when the row count shrinks: after a call with more rows, a call with fewer leaves the earlier call's

@@ -483,6 +483,97 @@ def test_binding_check_requires_every_operand_on_the_given_device():
     assert entry.check_binding(cfg, ops["x"], ops["residual"], ops["weight"], ops["scale"], device="cpu") == 3
 
 
+def _intercepted_entry(monkeypatch, form):
+    """A CPU entry whose launch is INTERCEPTED on the host: a recording stand-in sits in the entry's compile cache (nothing is
+    compiled, no kernel runs), an operand's view is the tensor itself and the launch stream is a stand-in.  Returns the entry and the
+    list of intercepted launches, each the seven operands as the launch binds them (``None`` where the form has none)."""
+    from types import SimpleNamespace
+
+    k = make_entry("cpu", form)
+    launches = []
+    k.compiled[k.key()] = lambda *args: launches.append(args[:7])
+    monkeypatch.setattr(entry, "_flat", lambda t: t)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: SimpleNamespace(cuda_stream=0))
+    return k, launches
+
+
+def _returned_output_cases():
+    """``name -> (form, rows, mutate(ops, k), overlap)``: a served call that passes no output -- so its launch writes the entry's own
+    buffers of the row count -- with ONE thing changed.  ``k.outputs(rows)`` is what an earlier call of that row count returned.
+    ``overlap`` is ``(the entry-owned output, the operand that overlaps it)``; ``None`` marks a control that stays served."""
+    half = HIDDEN // 2
+    return {
+        "residual-is-the-returned-out": ("add-bf16", 1, lambda ops, k: ops.update(residual=k.outputs(1)["out"]), ("out", "residual")),
+        "residual-is-the-returned-out-beside-caller-owned-codes": (
+            "add-bf16-e4m3",
+            3,
+            lambda ops, k: ops.update(residual=k.outputs(3)["out"], codes=torch.zeros(3, HIDDEN, dtype=E4M3)),
+            ("out", "residual"),
+        ),
+        "x-is-the-returned-out": ("none-bf16", 3, lambda ops, k: ops.update(x=k.outputs(3)["out"]), ("out", "x")),
+        "weight-is-a-row-of-the-returned-out": ("none-bf16", 3, lambda ops, k: ops.update(weight=k.outputs(3)["out"][1]), ("out", "weight")),
+        "scale-is-inside-the-returned-codes": (
+            "none-e4m3",
+            3,
+            lambda ops, k: ops.update(scale=k.outputs(3)["codes"].view(U8).reshape(-1)[16:20].view(torch.float32)),
+            ("codes", "scale"),
+        ),
+        "caller-owned-codes-are-inside-the-returned-scales": (
+            "none-nvfp4",
+            3,
+            lambda ops, k: ops.update(codes=k.outputs(3)["scales"].view(U8).reshape(-1)[: 3 * half].view(3, half)),
+            ("scales", "codes"),
+        ),
+        # controls: the check is on the bytes a launch touches, not on whose tensor an operand is
+        "control-a-returned-out-of-another-row-count-as-the-residual": ("add-bf16", 2, lambda ops, k: ops.update(residual=k.outputs(4)["out"]), None),
+        "control-the-returned-out-as-the-residual-with-a-caller-owned-out": (
+            "add-bf16",
+            1,
+            lambda ops, k: ops.update(residual=k.outputs(1)["out"], out=torch.zeros(1, HIDDEN, dtype=BF16)),
+            None,
+        ),
+        "control-the-returned-out-passed-as-the-out": ("add-bf16", 3, lambda ops, k: ops.update(out=k.outputs(3)["out"]), None),
+        "control-the-first-call-of-a-row-count": ("add-bf16-nvfp4", 3, lambda ops, k: None, None),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_returned_output_cases()))
+def test_declines_an_operand_that_overlaps_an_entry_owned_output(name, monkeypatch):
+    """An output the caller does not pass is the entry's buffer of the row count, and it is an operand of the launch like a passed
+    one: a call whose input -- or whose passed output -- overlaps it is declined by name (``ValueError``) BEFORE the launch.  The
+    tensor an earlier call returned, passed back as the residual, as ``x``, as the weight or holding the scale, would otherwise be
+    read and written by one launch.  The launch is intercepted (a stand-in in the compile cache), so an alias never reaches a
+    kernel: a declined call launches nothing and allocates nothing.  The controls stay served and reach the launch with the entry's
+    buffers bound: an output of ANOTHER row count as the residual (the entry's tensor, other bytes), the returned output beside a
+    caller-owned ``out``, the entry's buffer passed as ``out``, and a row count's first call (its buffers do not exist yet: what the
+    call allocates is fresh memory)."""
+    form, rows, mutate, overlap = _returned_output_cases()[name]
+    k, launches = _intercepted_entry(monkeypatch, form)
+    ops = _host_operands(form, rows, own=False)
+    mutate(ops, k)
+    call = lambda: k(ops["x"], ops["residual"], ops["weight"], ops["scale"], ops.get("out"), ops.get("codes"), ops.get("scales"))  # noqa: E731
+    buffers = lambda: {r: {slot: id(t) for slot, t in bufs.items()} for r, bufs in k.buffers.items()}  # noqa: E731
+    before = buffers()
+    if overlap is not None:
+        slot, other = overlap
+        assert rows in before, "the case takes its operand from the entry's buffers of the call's row count"
+        with pytest.raises(ValueError, match=f"the entry-owned {slot} must not overlap {other} ") as declined:
+            call()
+        assert f"pass a caller-owned {slot}" in str(declined.value), "the decline names the way out"
+        assert launches == [], "a declined call launches nothing"
+        assert buffers() == before and not k._buffer_views, "a declined call allocates nothing"
+        return
+    pytest.importorskip("cutlass")  # behind the checks a served call builds the launch's row count and stream with the DSL's types
+    result = dict(zip(entry.OUTPUT_SLOTS, call()))
+    assert len(launches) == 1, "a served call launches once"
+    owned = k.outputs(rows)
+    bound = dict(zip(("x", "residual", "weight", "scale", *entry.OUTPUT_SLOTS), launches[0]))
+    for slot in entry.produced_slots(k.cfg):
+        want = ops.get(slot) if ops.get(slot) is not None else owned[slot]
+        assert result[slot] is want and bound[slot].data_ptr() == want.data_ptr(), f"{slot}: the launch writes the caller's tensor, else the entry's"
+    assert bound["x"] is ops["x"] and bound["residual"] is ops["residual"]
+
+
 def test_compile_and_outputs_decline_a_bad_row_count():
     """``compile(rows)`` and ``outputs(rows)``: a row count that is not an ``int`` (``TypeError``), below one (``ValueError``), above
     the ceiling (``NotImplementedError``) -- before any device work; ``compile()`` on an entry whose device is not CUDA is the typed
@@ -1896,6 +1987,35 @@ def test_warm_entry_rejects_a_bad_binding_before_the_compiled_kernel_is_looked_u
     assert _same(residual, res0), "a declined warm call launches nothing: the residual is untouched"
     owned = k.outputs(2)
     assert _same(owned["out"], want["out"]) and _same(owned["codes"], want["codes"])
+
+
+def test_returned_output_as_the_residual_is_declined_before_the_launch():
+    """A tensor an earlier call returned comes back as the residual while ``out`` is not passed: the launch would update the residual
+    in place and write the normalized value into the SAME tensor (the entry-owned ``out`` of the row count).  With ``x = 1``, a zero
+    weight and the returned tensor filled with 2, the call is declined by name before the launch -- the tensor still holds 2, neither
+    the residual's 3 nor the normalized value.  With a caller-owned ``out`` the same residual is served: it holds ``x + residual =
+    3`` and ``out`` holds the bytes of a call on separate tensors."""
+    dev = _device_or_skip()
+    k = make_entry(dev, "add-bf16")
+    x = torch.ones(1, HIDDEN, dtype=BF16, device=dev)
+    weight = torch.zeros(HIDDEN, dtype=BF16, device=dev)
+    returned, _, _ = k(x, torch.ones_like(x), weight, None)
+    torch.cuda.synchronize()
+    assert returned is k.outputs(1)["out"]
+    returned.fill_(2)
+    with pytest.raises(ValueError, match="the entry-owned out must not overlap residual .*pass a caller-owned out"):
+        k(x, returned, weight, None)
+    torch.cuda.synchronize()
+    assert bool((returned == 2).all()), "a declined call launches nothing: the returned tensor holds its bytes"
+    want = torch.full_like(x, float("nan"))
+    separate = torch.full_like(x, 2)
+    k(x, separate, weight, None, out=want)
+    mine = torch.full_like(x, float("nan"))
+    out, _, _ = k(x, returned, weight, None, out=mine)
+    torch.cuda.synchronize()
+    assert out is mine and _same(mine, want), "with a caller-owned out the call writes the bytes of a call on separate tensors"
+    assert bool((returned == 3).all()) and _same(returned, separate), "the residual holds x + residual"
+    assert bool(torch.isfinite(want.float()).all()), "the comparison is on written values, not on the sentinel"
 
 
 def test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current():
