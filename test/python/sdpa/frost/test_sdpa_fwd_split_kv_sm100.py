@@ -23,6 +23,7 @@ import torch
 from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import launch_f16, requires_pre_rubin_blackwell, requires_dsl
+from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
 # Pre-Rubin Blackwell only. Most of this module drives the SM100 kernel modules
 # directly (_kernel_module loads prefill_*_sm100.py), which cc10.7 never runs --
@@ -66,37 +67,6 @@ def _ref_sdpa(q, k, v, scale, is_causal, kh, sinks=None):
     if sinks is not None:
         p = p[..., :-1]
     return torch.matmul(p, vb).permute(0, 2, 1, 3)
-
-
-def _partial_o_dtype(splits, o_dtype):
-    """The dtype the compiled kernel WRITES its O argument in.
-
-    Under a split the epilogue stores its fp32 accumulator registers straight to
-    the partial workspace; unsplit it TMA-stores the staged SMEM tile in O's own
-    dtype.  These tests drive the compiled kernel directly, so they have to hand
-    it the buffer the template's ABI expects rather than the caller-facing one.
-    """
-    return torch.float32 if splits > 1 else o_dtype
-
-
-def _partial_kwargs(splits, o_p):
-    """The extra ``o_partial_f32`` argument a split-compiled kernel carries.
-
-    Keyword, not positional: the slot is LAST in the kernel signature precisely
-    so the THD tensors ahead of it do not shift when it is absent.
-    """
-    return {"o_partial_f32": o_p} if splits > 1 else {}
-
-
-def _partial_tag(splits, o_dtype):
-    """The matching ``dtype_partial`` for ``sm100/split_combine.compile_ptr``.
-
-    Compiling the combine for the wrong width reinterprets the workspace and
-    yields garbage rather than an error, so it has to track _partial_o_dtype.
-    """
-    if splits > 1:
-        return "f32"
-    return "f16" if o_dtype == torch.float16 else "bf16"
 
 
 def _kernel_module(splits, dtype_qkv, causal, cta_mma=2, pack_gqa=False, qh_per_kh=1, stats_log2=False, has_sink=False):
@@ -421,7 +391,8 @@ def test_split_kv_and_cta_mma_flavor_gating():
     # record keeps the role-split CfgD512; mma_2x2=True builds the CfgD512X2 and still honours split_kv (the fp32-partials
     # arm is in the kernel body; the ADAPTER twin keeps split plans on the role split in phase 1 -- see
     # test_sdpa_fwd_d512_2x2_sm100.test_twin_declines_split_and_g128).
-    from cudnn.sdpa.fwd.config_sm100 import CfgD512, CfgD512X2
+    from cudnn.sdpa.fwd.config_sm100 import CfgD512X2
+    from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.config import CfgD512
 
     assert isinstance(make_cfg_d512(TemplateParams())[0], CfgD512) and not isinstance(make_cfg_d512(TemplateParams())[0], CfgD512X2)
     cfg_2x2 = make_cfg_d512(TemplateParams(mma_2x2=True))[0]
@@ -444,8 +415,8 @@ def test_split_kv_and_cta_mma_flavor_gating():
 _F16_FLAVORS = {
     "d128": ("sm100/prefill_d128_f16.py", 128, 128),
     "d192": ("sm100/prefill_d192_d128_f16.py", 192, 128),
-    "d256": ("sm100/prefill_d256_f16.py", 256, 256),
-    "d512": ("sm100/prefill_d512_f16.py", 512, 512),
+    "d256": ("sm100/d256_f16_lookahead/kernel.py", 256, 256),
+    "d512": ("sm100/d512_f16_role_split/kernel.py", 512, 512),
 }
 
 

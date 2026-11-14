@@ -19,18 +19,38 @@ from cudnn.sdpa.bwd.kernels.bprop_chain_common import dot_do_o_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_fp8_helpers import delta_d192_fp8_host as delta_host
 
 EXP2_FMA_SPLIT_SMS = frozenset((100,))
+K64_SMS = frozenset((107,))
+SM107_LINE_PARAMS = (64, 8, 1)  # MMA K step, scheduler L2 budget (MiB), dependent launch of the dQ kernel
 SPEC = globals().get("FROST_TEMPLATE_PARAMS")
 HEAD_DIMS = (192, 128) if SPEC is None else (int(SPEC[0]), int(SPEC[1]))
 
 
+def _sm107_line(spec):
+    return len(spec) > 5 and spec[5] == SM107_LINE_PARAMS[0]
+
+
+WIDE_DELTA = SPEC is not None and _sm107_line(SPEC)
+
+
 def _spec(dqk, dv, sm, mx, window):
     """(D_QK, D_V, exp2 FMA split, block-scale mode, window): the kernel pair a prepared host is bound to."""
-    return (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
+    base = (int(dqk), int(dv), int(sm) in EXP2_FMA_SPLIT_SMS, bool(mx), int(window))
+    if int(sm) in (120, 121):
+        return base + ("sm120",)
+    return base + (SM107_LINE_PARAMS if int(sm) in K64_SMS and (int(dqk), int(dv)) == (192, 128) else ())
 
 
 def _kernel_hosts(spec):
     here = pathlib.Path(__file__).resolve()
-    tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}"
+    if len(spec) == 6 and spec[5] == "sm120":
+        fmt = "mxfp8" if spec[3] else "fp8"
+        module = load_template(str(here.parent.parent / "sm120" / f"bprop_{fmt}.py"), spec, tag=f"sdpa_bwd_sm120_{fmt}")
+        return module.dkdv_host, module.dq_host
+    if tuple(spec[:2]) == (512, 512):
+        fmt = "mxfp8" if spec[3] else "fp8"
+        module = load_template(str(here.with_name(f"bprop_d512_{fmt}.py")), spec, tag=f"sdpa_bwd_d512_{fmt}_w{spec[4]}")
+        return module.dkdv_host, module.dq_host
+    tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}{'_k64_l2' + str(spec[6]) + ('_pdl' if spec[7] else '') if _sm107_line(spec) else ''}"
     dkdv = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), spec, tag=f"{tag}_dkdv").host
     dq = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), spec, tag=f"{tag}_dq").host
     return dkdv, dq
@@ -38,7 +58,11 @@ def _kernel_hosts(spec):
 
 def _specialized(spec):
     """The prepared-host module bound to ``spec``; its kernel bindings never change after import."""
-    return load_template(__file__, spec, tag=f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}_host")
+    return load_template(
+        __file__,
+        spec,
+        tag=f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_k64_l2' + str(spec[6]) + ('_pdl' if spec[7] else '') if _sm107_line(spec) else ''}_host",
+    )
 
 
 if SPEC is None:
@@ -51,10 +75,14 @@ _BIND_LOCK = threading.Lock()
 
 def _bind():
     """Bind this module's kernel pair on the first compile; the pair is fixed by ``SPEC`` and never changes."""
-    global dkdv_host, dq_host
+    global dkdv_host, dq_host, delta_host
     with _BIND_LOCK:
         if dkdv_host is None:
             dkdv_host, dq_host = _kernel_hosts(tuple(SPEC))
+            if len(SPEC) == 6 and SPEC[5] == "sm120":
+                from cudnn.sdpa.bwd.kernels.sm120.bprop_fp8 import delta_host as native_delta
+
+                delta_host = native_delta
 
 
 FP8_SCALARS = (
@@ -174,7 +202,10 @@ def host(
     amax_dq, amax_dk, amax_dv, amax_dp = _optional_view(amax_dq_ptr), _optional_view(amax_dk_ptr), _optional_view(amax_dv_ptr), _optional_view(amax_dp_ptr)
     payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
     delta = _scratch(payload, regions[0])
-    delta_host(o, do, delta, descale_o, descale_do, amax_dq, amax_dk, amax_dv, amax_dp, stream)
+    if cutlass.const_expr(WIDE_DELTA):
+        delta_host(o, do, delta, descale_o, descale_do, amax_dq, amax_dk, amax_dv, amax_dp, stream, True)
+    else:
+        delta_host(o, do, delta, descale_o, descale_do, amax_dq, amax_dk, amax_dv, amax_dp, stream)
     dkdv_host(
         q,
         k,
@@ -228,11 +259,11 @@ def host(
     )
 
 
-def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=192, dv=128, ratio=1):
+def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=192, dv=128, ratio=1, window=0):
     """Compile from declarations only; addresses and scale remain runtime slots."""
-    spec = _spec(dqk, dv, sm, False, 0)
+    spec = _spec(dqk, dv, sm, False, window)
     if spec != SPEC:
-        return _specialized(spec).compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk, dv, ratio)
+        return _specialized(spec).compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk, dv, ratio, window)
     _bind()
     head_dims = spec[:2]
     types = [cutlass.Float8E4M3FN] * 5 + [cutlass.Float32] + [grad_dtype] * 3
@@ -251,7 +282,19 @@ def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, dqk=
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=repr(
-            ("sdpa_bwd_sm100_d192_fp8", ABI_VERSION, geometry, regions, str(grad_dtype), bool(causal), sm, tuple(amax_requested), head_dims, int(ratio))
+            (
+                "sdpa_bwd_sm100_d192_fp8",
+                ABI_VERSION,
+                geometry,
+                regions,
+                str(grad_dtype),
+                bool(causal),
+                sm,
+                tuple(amax_requested),
+                head_dims,
+                int(ratio),
+                int(window),
+            )
         ),
         symbol="frost_sdpa_bwd_sm100_d192_fp8_prepared",
     )
@@ -279,6 +322,9 @@ def host_mx(
     sfv_ptr: cute.Pointer,
     sfdo_ptr: cute.Pointer,
     sfdot_ptr: cute.Pointer,
+    amax_dq_ptr: Optional[cute.Pointer],
+    amax_dk_ptr: Optional[cute.Pointer],
+    amax_dv_ptr: Optional[cute.Pointer],
     workspace: cutlass.Int64,
     scale: cutlass.Float32,
     geometry: cutlass.Constexpr,
@@ -298,9 +344,13 @@ def host_mx(
     sf_q, sf_qt = _view(sfq_ptr, sf_geoms[0]), _view(sfqt_ptr, sf_geoms[1])
     sf_k, sf_kt = _view(sfk_ptr, sf_geoms[2]), _view(sfkt_ptr, sf_geoms[3])
     sf_v, sf_do, sf_dot = _view(sfv_ptr, sf_geoms[4]), _view(sfdo_ptr, sf_geoms[5]), _view(sfdot_ptr, sf_geoms[6])
+    amax_dq, amax_dk, amax_dv = _optional_view(amax_dq_ptr), _optional_view(amax_dk_ptr), _optional_view(amax_dv_ptr)
     payload = (workspace + cutlass.Int64(255)) & cutlass.Int64(-256)
     delta = _scratch(payload, regions[0])
-    dot_do_o_host(o16, do16, delta, None, None, 128, HEAD_DIMS[0], HEAD_DIMS[1], 64, False, False, stream)
+    if cutlass.const_expr(len(SPEC) == 6 and SPEC[5] == "sm120"):
+        delta_host(o16, do16, delta, None, None, amax_dq, amax_dk, amax_dv, None, stream)
+    else:
+        dot_do_o_host(o16, do16, delta, None, None, 128, HEAD_DIMS[0], HEAD_DIMS[1], 64, False, False, stream)
     dkdv_host(
         q,
         k,
@@ -320,8 +370,8 @@ def host_mx(
         None,
         None,
         None,
-        None,
-        None,
+        amax_dk,
+        amax_dv,
         None,
         scale,
         causal,
@@ -353,7 +403,7 @@ def host_mx(
         None,
         None,
         None,
-        None,
+        amax_dq,
         None,
         scale,
         causal,
@@ -368,16 +418,19 @@ def host_mx(
     )
 
 
-def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1, dqk=128, dv=128, window=0):
+def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1, dqk=128, dv=128, window=0, amax_requested=(False, False, False)):
     """Compile the block-scale chain from declarations only; the kernel templates run in block-scale mode with a left sliding window of ``window`` keys (0 = none)."""
+    if any(amax_requested) and sm not in (120, 121):
+        raise NotImplementedError("MXFP8 gradient amax outputs require the native SM120/SM121 path")
     spec = _spec(dqk, dv, sm, True, window)
     if spec != SPEC:
-        return _specialized(spec).compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio, dqk, dv, window)
+        return _specialized(spec).compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio, dqk, dv, window, amax_requested)
     _bind()
     head_dims = spec[:2]
     fp8 = cutlass.Float8E4M3FN
     types = (fp8, fp8, fp8, out_dtype, fp8, cutlass.Float32, out_dtype, out_dtype, out_dtype, fp8, fp8, fp8, out_dtype) + (cutlass.Int8,) * 7
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
+    args += [cute.runtime.make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4) if requested else None for requested in amax_requested]
     return compile_cached(
         host_mx,
         *args,
@@ -391,7 +444,20 @@ def compile_host_mx(geometry, sf_geoms, regions, out_dtype, causal, sm, ratio=1,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
         cache_key=repr(
-            ("sdpa_bwd_sm100_d192_mxfp8", ABI_VERSION, geometry, sf_geoms, regions, str(out_dtype), bool(causal), sm, head_dims, int(ratio), int(window))
+            (
+                "sdpa_bwd_sm100_d192_mxfp8_amax_v1",
+                ABI_VERSION,
+                tuple(amax_requested),
+                geometry,
+                sf_geoms,
+                regions,
+                str(out_dtype),
+                bool(causal),
+                sm,
+                head_dims,
+                int(ratio),
+                int(window),
+            )
         ),
         symbol="frost_sdpa_bwd_sm100_d192_mxfp8_prepared",
     )

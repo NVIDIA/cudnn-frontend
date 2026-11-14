@@ -228,15 +228,18 @@ for name in ("qsa_indexed_forward", "qsa_indexed_backward",
 for module in ("cudnn.deepseek_sparse_attention.qsa_training",
                "cudnn.deepseek_sparse_attention.gqa_sparse_attention_backward",
                "cudnn.gated_attention_block.qsa_select",
-               "cudnn.gated_attention_block.qsa_select_paged"):
+               "cudnn.gated_attention_block.qsa_select_paged",
+               "cudnn.QSA.two_pass"):
     assert importlib.util.find_spec(module) is None, module
 """)
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("module", ["cudnn.ops.norm", "cudnn.experimental.ops"])
+@pytest.mark.parametrize("module", ["cudnn.ops", "cudnn.ops.norm", "cudnn.experimental.ops"])
 def test_importing_norm_op_packages_pulls_no_framework(module):
-    _assert_absent(_imported_by(f"import cudnn\nimport {module}"), f"import {module}")
+    imported = _imported_by(f"import cudnn\nimport {module}")
+    _assert_absent(imported, f"import {module}")
+    assert "jax" not in imported, f"import {module} imported jax"
 
 
 @pytest.mark.L0

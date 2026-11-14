@@ -88,6 +88,26 @@ def wait(mb, phase, spin: cutlass.Constexpr[bool] = False):
             pass
 
 
+@cute.jit
+def wait_cluster_acquire(mb, phase):
+    """:func:`wait` (the hint-less spin form) with a CLUSTER-scope acquire: ``mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64``.
+
+    For a barrier whose phase is completed by a PEER CTA's ``st.async ... mbarrier::complete_tx::bytes`` (or any cross-CTA DSMEM write
+    that completes tx bytes): PTX gives the complete-tx operation release semantics at CLUSTER scope, and a ``.acquire.cta`` wait does
+    not include the remote CTA's thread in its synchronizes-with relation, so this CTA's generic ``ld.shared`` of the shipped bytes is
+    formally ordered only by the cluster-scope acquire.  The GDN decode pair (``gdn_decode_fused_f16.py``, ``mb_norm``) runs the
+    ``.acquire.cta`` form bitwise in production, so this closes a formal gap, not an observed one; the shared-expert decode pair's
+    ``mb_kred`` (``moe/frost/kernel/shared_expert_decode_f16.py``) is the first caller.  One-time end-of-kernel waits only: a
+    cluster-scope acquire on a per-iteration path is a per-wait drain (``frost-tile-dsl.md`` section 3).  Same spin shape and labels as
+    :func:`wait` (``spin=True``); no ``predicate=`` (branch around it instead, see :func:`arrive_expect_tx`)."""
+    nvvm.inline_ptx(
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [{$r0}], {$r1};\n\t"
+        "@P1 bra.uni DONE;\n\tbra.uni LAB_WAIT;\n\tDONE:\n\t}",
+        read_only_args=[mb, cutlass.Int32(phase)],
+    )
+
+
 # wait_poll shape: POLL_TIGHT_ITERS back-to-back test_wait's (~1 us), then a plain TIMER ``nanosleep.u32 POLL_SLEEP_NS``
 # between tests.  The sleep is the timer form (SASS NANOSLEEP), NOT the event-sleep of a parked try_wait (NANOSLEEP.SYNCS) --
 # the warp still never hands itself to the barrier unit.  MEASURED (d512 2x2 backward, B200 2026-10-01): a TIGHT test_wait
@@ -463,3 +483,19 @@ class MBarrier:
     def arrive_on_peer(self, peer_cta_id, pred=None, release_cta: bool = False):
         # release_cta=True = the .release.cta cluster arrive of a READ-then-credit across CTAs (see mbar_arrive_on_peer); appended, default off.
         mbar_arrive_on_peer(self.smem_ptr, peer_cta_id, pred=pred, release_cta=release_cta)
+
+
+@cute.jit
+def named_barrier_sync_unaligned(barrier_id: cutlass.Constexpr[int], thread_count: cutlass.Constexpr[int]):
+    """``barrier.sync id, n`` WITHOUT the aligned-CTA promise: the named barrier of a warp-role SUBSET.
+
+    ``bar.sync`` -- what :func:`named_barrier_fence` emits and what the DSL's named-barrier helpers lower to by default -- is
+    ``barrier.sync.aligned``: it promises that EVERY thread of the CTA executes the same barrier instruction, even with an
+    explicit participant count.  A barrier reached only from a warp-role branch (the producer, MMA, epilogue or reduction
+    warps of a warp-specialized kernel) breaks that promise and is undefined; this is its form (the DSL's own unaligned
+    barrier op).  ``thread_count`` is the number of participating threads -- a positive multiple of 32, the same at every use
+    of ``barrier_id`` -- and ``barrier_id`` one of the CTA's sixteen slots, kept disjoint from the kernel's other named
+    barriers.  Like any barrier it synchronizes the participants and orders their memory accesses; it is not a scheduling
+    fence (:func:`named_barrier_fence`) and it elects nobody.  Numerics tests pass with either form: pin ``barrier.sync`` in
+    the kernel's rendering test and run the kernel under the sanitizer's synchronization check."""
+    nvvm.barrier_cta_sync(barrier_id, thread_count=thread_count)

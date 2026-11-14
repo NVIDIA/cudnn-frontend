@@ -21,6 +21,7 @@ the class (add a key field) rather than fitting around it.
 from __future__ import annotations
 
 import argparse
+import ast
 import collections
 import json
 import math
@@ -91,15 +92,32 @@ def _facts_training(c, s):
     )
 
 
-ADAPTERS = {"inference": _facts_inference, "training": _facts_training}
+def _facts_recorded(c, s):
+    """The graph facts the study driver read from the FE graph itself (``case["facts"]``, e.g. FlashInfer's own
+    declaration): nothing is reconstructed from case fields. dtype names and tuples were stored as their repr."""
+    kw = {}
+    for name, v in c["facts"].items():
+        if isinstance(v, str) and v.startswith("data_type."):
+            v = getattr(cudnn.data_type, v.split(".", 1)[1])
+        elif isinstance(v, str) and v.startswith("("):
+            v = ast.literal_eval(v)
+        kw[name] = v
+    return SdpaGraphFacts(**kw)
 
 
-def load(path):
+ADAPTERS = {"inference": _facts_inference, "training": _facts_training, "recorded": _facts_recorded}
+
+
+def load(paths):
+    """Cases with both the backend and the FROST leg timed. ``paths`` is one JSONL or a list; records join on (file, idx), so
+    splits from separate driver runs (each counting idx from 0) never overwrite each other."""
     rows = collections.defaultdict(dict)
-    for line in open(path):
-        r = json.loads(line)
-        if r.get("ms") is not None:
-            rows[r["idx"]][r["leg"]] = r
+    for path in [paths] if isinstance(paths, str) else paths:
+        with open(path) as fh:
+            for line in fh:
+                r = json.loads(line)
+                if r.get("ms") is not None:
+                    rows[(path, r["idx"])][r["leg"]] = r
     return [d for d in rows.values() if "cudnn" in d and "cudnn_oss" in d]
 
 

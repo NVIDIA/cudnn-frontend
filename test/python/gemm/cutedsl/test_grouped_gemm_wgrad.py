@@ -3,7 +3,9 @@
 
 """Tests for grouped GEMM wgrad FE API."""
 
+import ast
 import inspect
+from pathlib import Path
 
 import pytest
 import torch
@@ -108,7 +110,9 @@ def test_grouped_gemm_wgrad_preserves_legacy_positional_prefix(callable_obj, leg
 @pytest.mark.L0
 @pytest.mark.parametrize("discrete", [False, True], ids=["bf16-dense", "bf16-discrete"])
 def test_grouped_gemm_wgrad_wrapper_bf16(discrete):
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
 
     problem = make_grouped_gemm_wgrad_bf16_problem(discrete=discrete)
@@ -786,10 +790,14 @@ def _make_wgrad_wrapper_cache_inputs(group_k_list, sf_vec_size=16):
     }
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("output_mode", ["dense", "discrete"])
 def test_grouped_gemm_wgrad_wrapper_dynamic_tokens_cache_behavior(monkeypatch, output_mode):
     from cudnn.gemm.cutedsl.grouped.wgrad import api as grouped_gemm_wgrad_api
 
+    # The wrapper memo is consulted before the backend cache, so a prior test's
+    # entry could bypass compile(); give this test an empty one.
+    monkeypatch.setattr(grouped_gemm_wgrad_api, "_wgrad_wrapper_memo", {})
     grouped_gemm_wgrad_api._cache_of_GroupedGemmWgradSm100Objects.clear()
 
     compile_count = {"value": 0}
@@ -1223,7 +1231,9 @@ def test_grouped_gemm_wgrad_bf16_rejects_sf_fp8_dtype_override():
     so merely adding the parameter once broke every BF16 call with a TypeError,
     which a rejection-only test would not have caught.
     """
-    if torch.cuda.get_device_capability()[0] < 10:
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM WGrad BF16 kernel.")
     problem = make_grouped_gemm_wgrad_bf16_problem(discrete=False)
     kwargs = dict(
@@ -1245,3 +1255,31 @@ def test_grouped_gemm_wgrad_bf16_rejects_sf_fp8_dtype_override():
     cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs, sf_fp8_dtype_override=None)
     with pytest.raises(ValueError, match="BF16 forbids scale control sf_fp8_dtype_override"):
         cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs, sf_fp8_dtype_override="e5m3")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kernel", ["moe_grouped_gemm_wgrad.py", "moe_blockscaled_grouped_gemm_wgrad.py"])
+def test_wgrad_scheduler_advances_before_producer_tail(kernel):
+    """Without the advance, producer_tail's first wait reuses the END sentinel's parity and can hang the CTA forever."""
+
+    def calls(statement, receiver, method):
+        call = statement.value if isinstance(statement, ast.Expr) else None
+        return (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == method
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == receiver
+        )
+
+    source = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "gemm" / "cutedsl" / "grouped" / "wgrad" / kernel
+    tails = 0
+    for node in ast.walk(ast.parse(source.read_text())):
+        for block in (getattr(node, "body", None), getattr(node, "orelse", None)):
+            if not isinstance(block, list):
+                continue
+            for previous, statement in zip([None] + block, block):
+                if calls(statement, "sched_pipeline", "producer_tail"):
+                    tails += 1
+                    assert previous is not None and calls(previous, "sched_producer_state", "advance"), f"{source}:{statement.lineno}"
+    assert tails == 1

@@ -53,7 +53,7 @@ one), so a captured call's constants are warmed up on the capture stream first -
 ``(B, n_blocks_max)``, head count and cache dtype -- the rule every capture of the gated attention block already follows.
 
 The DECODE form is :func:`qsa_select_decode_forward` (one to a few query rows per sequence, the verify rows sharing the
-step-0 list): the dense DSA scorer at the smallest MMA tile plus the radix top-k kernel with one length per row.
+step-0 list): the dense DSA scorer at its fixed 128-row tile plus the radix top-k kernel with one length per row.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ _E4M3 = torch.float8_e4m3fn  # the fp8 indexer cache's element type (plain e4m3,
 _E8M0 = torch.float8_e8m0fnu  # the MXFP8 scorer's scale type; 1.0 (= 2^0, byte 127) everywhere for the plain-e4m3 scorer
 _SF_VEC_SIZE = 32  # elements per E8M0 scale of the MXFP8 scorer (head_dim 128 -> 4 scale groups per row)
 _SF_ATOM_ROWS = 128  # packed (token, head) rows per scale atom: every scale span is a multiple of it
-_MXFP8_TILE_ROWS = 128  # the MXFP8 scorer's packed-row tile (fixed; the bf16 scorer's m_block_size knob does not apply)
+_SCORER_TILE_ROWS = 128  # the SM100 indexer scorer's packed (token, head) row tile, fixed for the bf16 and MXFP8 kernels alike
 
 _ones_cache: dict = {}  # (device index, capacity) -> (the bf16 ones buffer, the handle of the stream that filled it, its fill event or None)
 _ones_cache_lock = Lock()
@@ -495,8 +495,7 @@ def qsa_select_decode_forward(
     query rows.  A decode step has ``rows_per_seq`` (1, or ``1 + drafts``) rows per sequence, so the dense
     ``[rows, n_blocks_max]`` score matrix is small (``B x 4 x n_blocks_max x 4 B``: 2 MiB at 128K tokens, ``B = 4``)
     and the two-launch form -- the DSA unified scorer writing dense ratio-causal scores, then the radix top-k
-    kernel with one length per row -- serves it with the smallest MMA tile (``m_block_size = max(16, n_heads)``: a
-    16-wide N tile packs the four indexer heads of up to four tokens).
+    kernel with one length per row -- serves it (the scorer packs ``128 // n_heads`` tokens per 128-row tile).
 
     Contract:
 
@@ -521,8 +520,8 @@ def qsa_select_decode_forward(
       smaller block id at an equal k-th score (the selected SET is reproducible; its order is not); ``0`` leaves the
       cutoff tie to the kernel, ``2`` prefers the larger id.
     * ``top_k`` in ``[1, 2048]`` (the radix kernel's bound; a block declaration caps it at 512); ``block_size`` is the
-      compression ratio (4); ``scale`` defaults to ``1 / sqrt(head_dim)``; ``m_block_size`` is the bf16 scorer's tile
-      knob (the e4m3 scorer's tile is fixed at 128 rows and refuses another value).
+      compression ratio (4); ``scale`` defaults to ``1 / sqrt(head_dim)``; ``m_block_size`` is the scorer's tile,
+      fixed at 128 rows for both cache dtypes (another value is refused).
 
     Launches: the position / count prologue (two small elementwise ops), the scorer, the top-k.  Nothing is read
     back to the host unless ``n_blocks_per_seq`` is given (a host consistency check that reads ``kv_lens``).
@@ -571,11 +570,9 @@ def qsa_select_decode_forward(
         raise ValueError(f"top_k must be in [1, {TOP_K_KERNEL_MAX}] (the radix top-k kernel's bound), got {top_k}")
     if tie_break not in (0, 1, 2):
         raise ValueError(f"tie_break must be 0 (kernel order), 1 (smaller block id) or 2 (larger block id), got {tie_break}")
-    if m_block_size is not None and (int(m_block_size) < 16 or int(m_block_size) % 16 != 0):
-        raise ValueError(f"m_block_size must be a multiple of 16 (the scorer's N tile), got {m_block_size}")
-    if fp8 and m_block_size is not None and int(m_block_size) != _MXFP8_TILE_ROWS:
+    if m_block_size is not None and int(m_block_size) != _SCORER_TILE_ROWS:
         raise ValueError(
-            f"the e4m3 scorer runs the MXFP8 kernel's fixed {_MXFP8_TILE_ROWS}-row tile; m_block_size = {m_block_size} is a knob of the bf16 scorer only"
+            f"the SM100 indexer scorer packs a fixed {_SCORER_TILE_ROWS}-row tile for every head group; m_block_size must be {_SCORER_TILE_ROWS}, got {m_block_size}"
         )
 
     if n_blocks_per_seq is not None:
@@ -609,12 +606,6 @@ def qsa_select_decode_forward(
 
     if n_heads not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16:
         raise NotImplementedError(f"qsa_select_decode_forward packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
-    if fp8:
-        m_eff = _MXFP8_TILE_ROWS
-    else:
-        m_eff = max(16, n_heads) if m_block_size is None else int(m_block_size)
-    if m_eff % n_heads != 0:
-        raise ValueError(f"m_block_size must be a multiple of n_heads = {n_heads} (whole tokens per tile), got {m_block_size}")
 
     from cudnn.deepseek_sparse_attention.indexer_forward import indexer_forward_wrapper
     from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_wrapper
@@ -646,7 +637,7 @@ def qsa_select_decode_forward(
             weights,
             ratio=block_size,
             qhead_per_kv_head=n_heads,
-            m_block_size=m_eff,
+            m_block_size=_SCORER_TILE_ROWS,
             sm_scale=float(scale),
             stream=stream,
             q_causal_offsets=pos0,

@@ -61,6 +61,14 @@ def _reference(q, k, v, dt_raw, A, dt_bias, cu, s0):
 
 
 def main(spans=(192, 320), H: int = 2, N_state: int = 128, P: int = 64) -> None:
+    if not torch.cuda.is_available():
+        print("[20] SKIP  needs a CUDA GPU")
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if not 100 <= major * 10 + minor < 120:
+        print("[20] SKIP  needs a data-center Blackwell-family GPU (100 <= SM < 120)")
+        return
+
     torch.manual_seed(0)
     device = "cuda"
     total, num_spans = sum(spans), len(spans)

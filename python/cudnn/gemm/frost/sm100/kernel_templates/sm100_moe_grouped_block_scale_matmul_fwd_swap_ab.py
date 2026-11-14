@@ -46,6 +46,17 @@ from cuda.bindings import driver as _cuda
 
 moe_desc_slots = num_b_operands + num_sfb_operands + n_tma_outputs
 _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
+# The scheduler warp of cluster rank 0 publishes each claimed tile into every
+# cluster CTA's broadcast slot through mapa and arrives on that CTA's barrier,
+# a cluster-scope release by a thread of another CTA. The waits on the
+# broadcast ring poll that barrier at cluster scope with relaxed ordering and
+# then acquire through a fence restricted to shared::cluster memory. That
+# orders the slot read (and the producer's reuse of the slot) after the peer's
+# access just like an acquire-ordered cluster-scope wait, without the L1
+# invalidation such a wait costs on every poll.
+_SCHED_BCAST_CLUSTER = cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1
+_SCHED_BCAST_SCOPE = nvvm.MBarrierScope.CLUSTER if _SCHED_BCAST_CLUSTER else None
+_SCHED_BCAST_ORDER = nvvm.MemOrder.RELAXED if _SCHED_BCAST_CLUSTER else None
 _sf_words_resident = sf_word_stride_cols > 0
 _sf_word_slots = num_sf_atoms if _sf_words_resident else 1
 _sfa_word_stride = 0 if fake_dequant_a else sf_word_stride_cols
@@ -479,8 +490,12 @@ def _kernel(
                     sched_bcast_empty_mbar_ptr.subview(bcast_stage),
                     bcast_empty_phase,
                     time_limit=10_000_000,
+                    scope=_SCHED_BCAST_SCOPE,
+                    order=_SCHED_BCAST_ORDER,
                 ):
                     pass
+                if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                    nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
                 claimed = cutlass.Int32(0)
                 if lane == 0:
                     claimed = nvvm.atomicrmw(
@@ -498,8 +513,12 @@ def _kernel(
                 sched_bcast_full_mbar_ptr.subview(bcast_stage),
                 bcast_full_phase,
                 time_limit=10_000_000,
+                scope=_SCHED_BCAST_SCOPE,
+                order=_SCHED_BCAST_ORDER,
             ):
                 pass
+            if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
             linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
             # Finish every lane's slot reads before the elected release.
             nvvm.bar_warp_sync(0xFFFFFFFF)
@@ -707,8 +726,12 @@ def _kernel(
                     sched_bcast_empty_mbar_ptr.subview(last_bcast_stage),
                     last_bcast_empty_done_phase,
                     time_limit=10_000_000,
+                    scope=_SCHED_BCAST_SCOPE,
+                    order=_SCHED_BCAST_ORDER,
                 ):
                     pass
+                if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                    nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
 
     if warp_idx == tma_warp_id:
         if cutlass.const_expr(not moe_combine_swap_bulk_enabled):

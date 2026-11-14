@@ -348,11 +348,19 @@ def test_split_domains_match_the_wired_lowerings():
 
     advertising = {sp.name for sp in ENGINE_SPECS if sp.capabilities.split_kv_supported}
     assert advertising == {
+        "sdpa_fwd_prefill_sm80",
+        "sdpa_fwd_prefill_sm90",
         "sdpa_fwd_prefill_sm100",
+        "sdpa_fwd_sm100_d256_lookahead",
+        "sdpa_fwd_sm100_d256_swap_ab",
+        "sdpa_fwd_sm100_d512_role_split",
+        "sdpa_fwd_sm100_d512_2x2",
+        "sdpa_fwd_sm100_d512_fp8_role_split",
         "sdpa_fwd_prefill_sm100_mxfp8",
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107",
         "sdpa_fwd_prefill_sm107_fp8",
+        "sdpa_fwd_prefill_sm107_mxfp8",
         "sdpa_fwd_prefill_sm120",
         "sdpa_fwd_prefill_sm120_fp8",
         "sdpa_fwd_prefill_sm120_mxfp8",
@@ -603,7 +611,7 @@ def test_serial_combine_threshold_matches_the_kernel_routing():
 
 # --- the d256 decode tile's own model ----------------------------------------
 #
-# sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,
+# sm100/d256_f16_swap_ab/kernel.py runs one cta_group::1 CTA per (KV-head group, batch,
 # split) unit and is HBM-bound, so its split trades the device's idle SMs
 # against the split path's second launch.  The model has TWO LINES, two fits of
 # two sibling kernels: the Blackwell line (``device_cc=(10, 0)``: the B200 / B300

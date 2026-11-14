@@ -12,11 +12,7 @@ jax = pytest.importorskip("jax")
 ml_dtypes = pytest.importorskip("ml_dtypes")
 torch = pytest.importorskip("torch")
 import jax.numpy as jnp
-from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
-
-requirement_error = cutedsl_requirement_error("JAX grouped GEMM tests")
-if requirement_error:
-    pytest.skip(requirement_error, allow_module_level=True)
+from cudnn.frost.buffers import cutedsl_arch_requirement_error
 
 from cudnn.gemm.cutedsl.grouped.dswiglu.jax_api import grouped_gemm_dswiglu
 from cudnn.gemm.cutedsl.grouped.swiglu.jax_api import grouped_gemm_swiglu
@@ -26,6 +22,14 @@ from gemm.jax.test_gemm_amax_jax import skip_unless_sm100
 pytestmark = pytest.mark.L0
 
 JAX_ENTRY = {"swiglu": grouped_gemm_swiglu, "dswiglu": grouped_gemm_dswiglu}
+
+
+def skip_unless_situ_supported():
+    skip_unless_sm100()
+    from cudnn.tensor_adapter import get_compute_capability
+
+    if get_compute_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("JAX SiTU-GLU requires SM100/SM103")
 
 
 def problem(backward, experts, flat_sf, bf16_prob, n=256):
@@ -142,16 +146,24 @@ def test_canonical_jax_parity(backward, experts, flat_sf, bf16_prob, discrete_co
     assert_outputs(compiled(**inputs), reference)
 
 
-@pytest.mark.parametrize("act_func", ["swiglu", "geglu"])
+@pytest.mark.parametrize(
+    "act_func,situ_betas",
+    [("swiglu", None), ("geglu", None), ("situglu", (4.0, 25.0)), ("situglu", (2.0, 8.0))],
+    ids=["swiglu", "geglu", "situ-k3", "situ-custom"],
+)
 @pytest.mark.parametrize("experts", [1, 4])
 @pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
-def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
+def test_canonical_jax_glu_parity(act_func, situ_betas, experts, shared_wrapper):
     skip_unless_sm100()
+    if situ_betas is not None:
+        skip_unless_situ_supported()
     import cudnn
 
     arrays = problem(False, experts, True, True, n=512)
     eager = cudnn.grouped_gemm_glu_wrapper_sm100
     options = dict(act_func=act_func, discrete_col_sfd=True, generate_c=True, d_dtype=ml_dtypes.float8_e4m3fn)
+    if situ_betas is not None:
+        options.update(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
     reference = eager(**torch_inputs(arrays), sf_vec_size=32, **{**options, "d_dtype": torch.float8_e4m3fn})
     bridge = partial(eager, sf_vec_size=32) if shared_wrapper else cudnn.grouped_gemm_glu_jax_sm100
     bridge = partial(bridge, **options)
@@ -193,16 +205,24 @@ def dglu_reference(arrays, **options):
     return cudnn.grouped_gemm_dglu_wrapper_sm100(**torch_inputs(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
 
 
-@pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
+@pytest.mark.parametrize(
+    "act_func,situ_betas",
+    [("dswiglu", None), ("dgeglu", None), ("dsituglu", (4.0, 25.0)), ("dsituglu", (2.0, 8.0))],
+    ids=["dswiglu", "dgeglu", "dsitu-k3", "dsitu-custom"],
+)
 @pytest.mark.parametrize("experts", [1, 4])
 @pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
-def test_canonical_jax_dglu_parity(act_func, experts, shared_wrapper):
+def test_canonical_jax_dglu_parity(act_func, situ_betas, experts, shared_wrapper):
     skip_unless_sm100()
+    if situ_betas is not None:
+        skip_unless_situ_supported()
     import cudnn
 
     arrays = problem(True, experts, False, False, n=512)
     arrays["beta_tensor"] = np.linspace(0.5, 1.5, experts, dtype=np.float32)
     options = dict(act_func=act_func, discrete_col_sfd=True)
+    if situ_betas is not None:
+        options.update(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
     bridge = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, sf_vec_size=32, dprob_tensor=None) if shared_wrapper else cudnn.grouped_gemm_dglu_jax_sm100
     bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn, **options)
     inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
@@ -796,11 +816,11 @@ def test_canonical_jax_dglu_fp4(data_format, act_func, shared_wrapper):
         (True, "b_major", "n"),
         (True, "sf_fp8_dtype_override", "e5m3"),
         (True, "use_dynamic_sched", True),
-        (True, "act_func", "situglu"),
+        (True, "act_func", "invalid"),
         (False, "n", 512),
         (False, "vector_f32", True),
         (False, "use_dynamic_sched", True),
-        (False, "act_func", "situglu"),
+        (False, "act_func", "invalid"),
     ],
 )
 def test_jax_glu_rejects_unsupported_options(shared_wrapper, option, value):
@@ -1063,3 +1083,168 @@ def test_shared_wrapper_keeps_existing_defaults(backward):
         wrapper(**inputs)
     with pytest.raises(ValueError, match="FP8 output dtype"):
         wrapper(**inputs, sf_vec_size=32)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_situ_empty_expert_and_capacity_tail(backward, shared_wrapper):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 4, False, False, n=512)
+    arrays["padded_offsets"] = np.array([256, 256, 512, 768], np.int32)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    options = dict(
+        act_func="dsituglu" if backward else "situglu",
+        discrete_col_sfd=True,
+        situ_beta1=2.0,
+        situ_beta2=8.0,
+    )
+    if backward:
+        reference = dglu_reference(arrays, **options)
+        bridge = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, dprob_tensor=None) if shared_wrapper else cudnn.grouped_gemm_dglu_jax_sm100
+    else:
+        options["generate_c"] = True
+        reference = cudnn.grouped_gemm_glu_wrapper_sm100(**torch_inputs(arrays), sf_vec_size=32, d_dtype=torch.float8_e4m3fn, **options)
+        bridge = cudnn.grouped_gemm_glu_wrapper_sm100 if shared_wrapper else cudnn.grouped_gemm_glu_jax_sm100
+    compiled = jax.jit(partial(bridge, sf_vec_size=32, d_dtype=ml_dtypes.float8_e4m3fn, **options))
+    result = jax.block_until_ready(compiled(**inputs))
+    for name, expected in reference.items():
+        if expected is None:
+            assert result[name] is None
+            continue
+        actual = np.asarray(result[name])
+        expected = expected.contiguous().view(torch.uint8).cpu().numpy().view(actual.dtype).reshape(actual.shape)
+        if name == "sfd_row_tensor":
+            actual, expected = actual[:, :6], expected[:, :6]
+        elif name == "sfd_col_tensor":
+            # Discrete column scales are packed per expert, not a global scale matrix.
+            width = result["d_row_tensor" if backward else "d_tensor"].shape[1]
+            count = 768 * width // 32
+            actual, expected = actual.reshape(-1)[:count], expected.reshape(-1)[:count]
+        else:
+            actual, expected = actual[:768], expected[:768]
+        if name == "dprob_tensor":
+            np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+        else:
+            np.testing.assert_array_equal(actual.view(np.uint8), expected.view(np.uint8), err_msg=name)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("field", ["situ_beta1", "situ_beta2"])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_canonical_jax_situ_rejects_invalid_caps(backward, field, value):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 1, True, False, n=512)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
+    with pytest.raises(ValueError, match=field):
+        entry(**inputs, act_func="dsituglu" if backward else "situglu", d_dtype=ml_dtypes.float8_e4m3fn, **{field: value})
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("capability", [(9, 0), (10, 7), (12, 0)], ids=["sm90", "sm107", "sm120"])
+def test_canonical_jax_situ_rejects_unsupported_gpu(backward, capability, monkeypatch):
+    skip_unless_situ_supported()
+    import cudnn
+    from importlib import import_module
+
+    module = import_module("cudnn.gemm.cutedsl.grouped.dglu.jax_api" if backward else "cudnn.gemm.cutedsl.grouped.glu.jax_api")
+    monkeypatch.setattr(module, "get_compute_capability", lambda: capability)
+    inputs = {name: jnp.asarray(array) for name, array in problem(backward, 1, True, False, n=512).items()}
+    entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
+    with pytest.raises(ValueError, match="SM100/SM103"):
+        entry(**inputs, act_func="dsituglu" if backward else "situglu", d_dtype=ml_dtypes.float8_e4m3fn)
+
+
+def assert_situ_math_reference(arrays, result, backward, situ_betas):
+    from gemm.cutedsl.test_discrete_grouped_gemm_swiglu_utils import run_discrete_grouped_gemm_ref
+    from gemm.cutedsl.test_discrete_grouped_gemm_dswiglu_utils import run_discrete_dswiglu_ref
+    from gemm.cutedsl.test_grouped_gemm_dswiglu_utils import compute_reference_row_quant
+
+    assert np.all(arrays["sfa_tensor"] == 127) and np.all(arrays["sfb_tensor"] == 127)
+    rows = int(arrays["padded_offsets"][-1])
+    tensors = torch_inputs(arrays)
+    a = tensors["a_tensor"][:rows].float().unsqueeze(-1)
+    weights = [b.float().unsqueeze(-1) for b in tensors["b_tensor"]]
+    act_func = "dsituglu" if backward else "situglu"
+    caps = dict(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
+    ref_options = dict(
+        a_ref=a,
+        b_ref_list=weights,
+        sfa_ref=torch.ones_like(a),
+        sfb_ref_list=[torch.ones_like(b) for b in weights],
+        alpha_tensor=tensors["alpha_tensor"],
+        prob_tensor=tensors["prob_tensor"][:rows].view(-1, 1, 1),
+        aligned_group_m_list=np.diff(np.r_[0, arrays["padded_offsets"]]).tolist(),
+        valid_m=rows,
+        act_func=act_func,
+        **caps,
+    )
+    precision = torch.get_float32_matmul_precision()
+    try:
+        # Reference GEMMs must not inherit TF32 from the test image.
+        torch.set_float32_matmul_precision("highest")
+        if backward:
+            reference = run_discrete_dswiglu_ref(**ref_options, c_ref=tensors["c_tensor"][:rows].float().unsqueeze(-1), beta_tensor=tensors["beta_tensor"])
+        else:
+            reference = run_discrete_grouped_gemm_ref(**ref_options)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+    _, quantized = compute_reference_row_quant(reference["d_ref"], torch.float8_e4m3fn, torch.float8_e8m0fnu, 32, float(arrays["norm_const_tensor"][0]))
+    name = "d_row_tensor" if backward else "d_tensor"
+    actual = torch.from_numpy(np.asarray(result[name])[:rows].astype(np.float32))
+    torch.testing.assert_close(actual, quantized.squeeze(-1).cpu(), atol=0.125, rtol=0.125)
+    name = "dprob_tensor" if backward else "c_tensor"
+    expected = reference["dprob_ref" if backward else "c_ref"].cpu()
+    expected = expected.reshape(-1) if backward else expected.squeeze(-1)
+    torch.testing.assert_close(torch.from_numpy(np.asarray(result[name])[:rows].astype(np.float32)), expected, atol=0.1, rtol=0.01)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("situ_betas", [(4.0, 25.0), (2.0, 8.0)], ids=["default-caps", "custom-caps"])
+def test_canonical_jax_situ_matches_math_reference(backward, situ_betas):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 2, False, False, n=512)
+    arrays["sfa_tensor"].fill(127)
+    arrays["sfb_tensor"].fill(127)
+    arrays["alpha_tensor"] = np.array([0.5, 1.0], np.float32)
+    if backward:
+        arrays["beta_tensor"] = np.array([0.5, 1.5], np.float32)
+    act_func = "dsituglu" if backward else "situglu"
+    caps = dict(situ_beta1=situ_betas[0], situ_beta2=situ_betas[1])
+    options = dict(act_func=act_func, discrete_col_sfd=False, d_dtype=ml_dtypes.float8_e4m3fn, **caps)
+    if not backward:
+        options["generate_c"] = True
+    entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
+    result = jax.block_until_ready(jax.jit(partial(entry, **options))(**{name: jnp.asarray(array) for name, array in arrays.items()}))
+    assert_situ_math_reference(arrays, result, backward, situ_betas)
+
+
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+@pytest.mark.parametrize("discrete_col_sfd", [False, True], ids=["global-scales", "expert-scales"])
+def test_canonical_jax_situ_changed_data_and_routing(backward, shared_wrapper, discrete_col_sfd):
+    skip_unless_situ_supported()
+    import cudnn
+
+    arrays = problem(backward, 2, False, False, n=512)
+    eager = cudnn.grouped_gemm_dglu_wrapper_sm100 if backward else cudnn.grouped_gemm_glu_wrapper_sm100
+    entry = cudnn.grouped_gemm_dglu_jax_sm100 if backward else cudnn.grouped_gemm_glu_jax_sm100
+    bridge = partial(eager, sf_vec_size=32, **({"dprob_tensor": None} if backward else {})) if shared_wrapper else entry
+    options = dict(act_func="dsituglu" if backward else "situglu", discrete_col_sfd=discrete_col_sfd, situ_beta1=2.0, situ_beta2=8.0)
+    if not backward:
+        options["generate_c"] = True
+    compiled = jax.jit(partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn, **options))
+    for offsets in ([256, 512], [0, 512], [512, 512], [256, 512]):
+        arrays["padded_offsets"] = np.array(offsets, np.int32)
+        arrays["a_tensor"] = (-arrays["a_tensor"].astype(np.float32)).astype(ml_dtypes.float8_e4m3fn)
+        arrays["alpha_tensor"] *= 0.5
+        if backward:
+            arrays["beta_tensor"] *= 0.5
+        reference = dglu_reference(arrays, **options) if backward else eager(**torch_inputs(arrays), sf_vec_size=32, d_dtype=torch.float8_e4m3fn, **options)
+        assert_outputs(compiled(**{name: jnp.asarray(array) for name, array in arrays.items()}), reference)

@@ -114,12 +114,19 @@ class BlockSparseAttnBackwardSm90Blk128:
         scale_nonpositive: bool = False,
         direct_kv: bool = False,
         has_kv_tail: bool = False,
+        paired: bool = False,
     ):
         assert head_dim == 128, "SM90 blk128 BSA bwd is currently specialized for D=128"
         assert head_dim_v in [None, 128], "SM90 blk128 BSA bwd is currently specialized for Dv=128"
         self.scale_nonpositive = scale_nonpositive
         self.direct_kv = direct_kv
         self.has_kv_tail = has_kv_tail
+        # Paired mode runs the blk64 paired-KV backward: each CTA owns two matched KV64 blocks (one per compute WG)
+        # and walks the whole Q64 list of both, ordered [first-only | common | second-only]. Each WG computes only its
+        # own range, Q/dO, LSE/dPsum and the dQ reduction are shared, and both WGs reduce-add into the blk64 FP32
+        # dK/dV/dQ workspace, so one sweep of Q/dO covers every edge.
+        assert not (paired and direct_kv)
+        self.paired = paired
         self.dtype = dtype
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.preprocess_num_threads = 256
@@ -623,7 +630,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             mBlockSizes,
             bucketed_k2q_offsets,
             bucketed_k2q_indices,
-            stream,
+            stream=stream,
         )
 
         self.convert_q(mdQaccum, mdQ_bshd, softmax_scale, stream)
@@ -647,6 +654,8 @@ class BlockSparseAttnBackwardSm90Blk128:
         mBlockSizes: Optional[cute.Tensor] = None,
         bucketed_k2q_offsets: Optional[cute.Tensor] = None,
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
+        pair_sync: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -689,6 +698,10 @@ class BlockSparseAttnBackwardSm90Blk128:
             ),
         )
 
+        if const_expr(pair_tasks is not None):
+            pair_tasks = cute.make_tensor(pair_tasks.iterator, pair_tasks.layout)
+        if const_expr(pair_sync is not None):
+            pair_sync = cute.make_tensor(pair_sync.iterator, pair_sync.layout)
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
 
         self.num_mma_threads = self.num_threads - 128
@@ -724,18 +737,24 @@ class BlockSparseAttnBackwardSm90Blk128:
             cute.select(self.sQ_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdim),
         )
-        tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            mK,
-            cute.select(self.sK_layout, mode=[0, 1]),
-            (self.tile_n, self.tile_hdim),
-        )
-        tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(),
-            mV,
-            cute.select(self.sV_layout, mode=[0, 1]),
-            (self.tile_n, self.tile_hdimv),
-        )
+        if const_expr(self.paired):
+            # Paired K/V tiles gather two KV64 blocks; each lands as 64x64 boxes in one row half of the tile.
+            pair_layout = cute.make_composed_layout(self.sK_layout.inner, 0, cute.make_layout((64, 64), stride=(64, 1)))
+            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), mK, pair_layout, (64, 64))
+            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), mV, pair_layout, (64, 64))
+        else:
+            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mK,
+                cute.select(self.sK_layout, mode=[0, 1]),
+                (self.tile_n, self.tile_hdim),
+            )
+            tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mV,
+                cute.select(self.sV_layout, mode=[0, 1]),
+                (self.tile_n, self.tile_hdimv),
+            )
         tma_atom_dO, tma_tensor_dO = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             mdO,
@@ -805,6 +824,8 @@ class BlockSparseAttnBackwardSm90Blk128:
             SharedStorage,
             bucketed_k2q_offsets,
             bucketed_k2q_indices,
+            pair_tasks,
+            pair_sync,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -851,144 +872,214 @@ class BlockSparseAttnBackwardSm90Blk128:
         SharedStorage: cutlass.Constexpr[Callable],
         bucketed_k2q_offsets: Optional[cute.Tensor] = None,
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
+        pair_sync: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # prefetch TMA descriptors
-        if warp_idx == 0:
-            for atom in [tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV]:
-                if const_expr(atom is not None):
-                    cpasync.prefetch_descriptor(atom)
-
-        smem = SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-
-        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
-        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE)
-        pipeline_Q = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_Q.data_ptr(),
-            num_stages=self.Q_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["Q"],
-            defer_sync=True,
-        )
-        pipeline_dO = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_dO.data_ptr(),
-            num_stages=self.dO_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["dO"],
-            defer_sync=True,
-        )
-        # Statistics have their own producer and ring ownership; Q/dO release
-        # cannot authorize overwriting vectors still being read by a compute WG.
-        pipeline_stats = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.mbar_ptr_stats.data_ptr(),
-            num_stages=self.Q_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=2 * self.tile_m * Float32.width // 8,
-            defer_sync=False,
-        )
-
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sP = None
-        sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
-        sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
-        sLSE = storage.sLSE.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
-        sdPsum = storage.sdPsum.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
-
-        SeqlenInfoCls = partial(
-            SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
-            tile_m=self.tile_m,
-            tile_n=self.tile_n,
-        )
-        AttentionMaskCls = partial(
-            AttentionMask,
-            self.tile_m,
-            self.tile_n,
-            swap_AB=True,
-        )
-        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
-
-        if warp_idx < 4:
-            cute.arch.setmaxregister_decrease(self.num_producer_regs)
+        # Paired mode: on the production shape 69% of the (KV pair, head, Q group) tasks have no edges, yet every CTA
+        # paid the whole prologue (descriptor prefetch, mbarrier init + fence + CTA barrier, setmaxnreg, accumulator
+        # zeroing) while it held its SM alone. Read the task record once and let the whole CTA leave before any of it.
+        # The test depends only on the block index and on metadata the partition kernel completed before sum_OdO
+        # (which waited on it) released this grid, so it is CTA-uniform and needs no griddepcontrol wait. The direct_kv
+        # path keeps writing zeros for empty tiles and is not gated.
+        has_work = True
+        if const_expr(self.paired):
+            n_block, head_idx, batch_idx, q_group = TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
+            _, _, _, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            has_work = steps > 0
+        if has_work:
+            # prefetch TMA descriptors
             if warp_idx == 0:
-                self.load(
-                    mQ,
-                    mK,
-                    mV,
-                    mdO,
+                for atom in [tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV]:
+                    if const_expr(atom is not None):
+                        cpasync.prefetch_descriptor(atom)
+
+            smem = SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+
+            pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
+            pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE)
+            pipeline_Q = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_Q.data_ptr(),
+                num_stages=self.Q_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=self.tma_copy_bytes["Q"],
+                defer_sync=True,
+            )
+            pipeline_dO = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_dO.data_ptr(),
+                num_stages=self.dO_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=self.tma_copy_bytes["dO"],
+                defer_sync=True,
+            )
+            # Statistics have their own producer and ring ownership; Q/dO release
+            # cannot authorize overwriting vectors still being read by a compute WG.
+            pipeline_stats = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_stats.data_ptr(),
+                num_stages=self.Q_stage,
+                producer_group=pipeline_producer_group,
+                consumer_group=pipeline_consumer_group,
+                tx_count=2 * self.tile_m * Float32.width // 8,
+                defer_sync=False,
+            )
+
+            sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+            sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+            sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            sP = None
+            sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+            sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
+            sLSE = storage.sLSE.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
+            sdPsum = storage.sdPsum.get_tensor(cute.make_layout((self.tile_m, self.Q_stage)))
+
+            SeqlenInfoCls = partial(
+                SeqlenInfoQK.create,
+                seqlen_q_static=mQ.shape[0],
+                seqlen_k_static=mK.shape[0],
+                tile_m=self.tile_m,
+                tile_n=self.tile_n,
+            )
+            AttentionMaskCls = partial(
+                AttentionMask,
+                self.tile_m,
+                self.tile_n,
+                swap_AB=True,
+            )
+            TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
+
+            if warp_idx < 4:
+                cute.arch.setmaxregister_decrease(self.num_producer_regs)
+                if warp_idx == 0:
+                    self.load(
+                        mQ,
+                        mK,
+                        mV,
+                        mdO,
+                        sQ,
+                        sK,
+                        sV,
+                        sdO,
+                        tma_atom_Q,
+                        tma_atom_K,
+                        tma_atom_V,
+                        tma_atom_dO,
+                        pipeline_Q,
+                        pipeline_dO,
+                        SeqlenInfoCls,
+                        TileSchedulerCls,
+                        bucketed_k2q_offsets,
+                        bucketed_k2q_indices,
+                        pair_tasks,
+                    )
+                if warp_idx == 1:
+                    self.dQaccum_store(
+                        mdQaccum,
+                        sdQaccum,
+                        TileSchedulerCls,
+                        SeqlenInfoCls,
+                        bucketed_k2q_offsets,
+                        bucketed_k2q_indices,
+                        pair_tasks,
+                    )
+                if warp_idx == 2:
+                    self.load_stats(
+                        mLSE,
+                        mdPsum,
+                        sLSE,
+                        sdPsum,
+                        pipeline_stats,
+                        SeqlenInfoCls,
+                        TileSchedulerCls,
+                        bucketed_k2q_offsets,
+                        bucketed_k2q_indices,
+                        pair_tasks,
+                    )
+            else:
+                tidx, _, _ = cute.arch.thread_idx()
+                tidx = tidx - 128
+                mma_args = (
+                    tiled_mma_SdP,
+                    tiled_mma_dK,
+                    tiled_mma_dV,
+                    tiled_mma_dQ,
+                    mdK,
+                    mdV,
+                    mdQaccum,
                     sQ,
                     sK,
                     sV,
                     sdO,
-                    tma_atom_Q,
-                    tma_atom_K,
-                    tma_atom_V,
-                    tma_atom_dO,
+                    sP,
+                    sdS,
+                    sLSE,
+                    sdPsum,
+                    sdQaccum,
                     pipeline_Q,
                     pipeline_dO,
+                    pipeline_stats,
+                    tidx,
+                    tma_atom_dK,
+                    tma_atom_dV,
+                    r2s_tiled_copy_dQaccum,
+                    softmax_scale_log2,
+                    softmax_scale,
                     SeqlenInfoCls,
+                    AttentionMaskCls,
                     TileSchedulerCls,
                     bucketed_k2q_offsets,
                     bucketed_k2q_indices,
+                    mBlockSizes,
+                    pair_tasks,
+                    pair_sync,
                 )
-            if warp_idx == 1:
-                self.dQaccum_store(
-                    mdQaccum,
-                    sdQaccum,
-                    TileSchedulerCls,
-                    SeqlenInfoCls,
-                    bucketed_k2q_offsets,
-                    bucketed_k2q_indices,
-                )
-            if warp_idx == 2:
-                self.load_stats(mLSE, mdPsum, sLSE, sdPsum, pipeline_stats, SeqlenInfoCls, TileSchedulerCls, bucketed_k2q_offsets, bucketed_k2q_indices)
-        else:
-            tidx, _, _ = cute.arch.thread_idx()
-            tidx = tidx - 128
-            mma_args = (
-                tiled_mma_SdP,
-                tiled_mma_dK,
-                tiled_mma_dV,
-                tiled_mma_dQ,
-                mdK,
-                mdV,
-                mdQaccum,
-                sQ,
-                sK,
-                sV,
-                sdO,
-                sP,
-                sdS,
-                sLSE,
-                sdPsum,
-                sdQaccum,
-                pipeline_Q,
-                pipeline_dO,
-                pipeline_stats,
-                tidx,
-                tma_atom_dK,
-                tma_atom_dV,
-                r2s_tiled_copy_dQaccum,
-                softmax_scale_log2,
-                softmax_scale,
-                SeqlenInfoCls,
-                AttentionMaskCls,
-                TileSchedulerCls,
-                bucketed_k2q_offsets,
-                bucketed_k2q_indices,
-                mBlockSizes,
-            )
-            cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
-            self.mma(*mma_args)
+                cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
+                self.mma(*mma_args)
+
+    @cute.jit
+    def _task(self, offsets, tasks, n_block, q_group, head_idx, batch_idx):
+        """Return the KV64 blocks of the two compute WGs, the CSR position of their Q walk and its number of Q64 steps."""
+        if const_expr(self.paired):
+            # The partition kernel resolved this (pair, Q group) task into one record [kv0, kv1, begin0, len0, begin1,
+            # res0, b_ok, steps] (LocalPairPartition8.partition): the owner's CSR list is [first-only | common] and the
+            # partner's starts with its second-only edges. Eight independent loads of one 32-byte record replace three
+            # dependent rounds through the pair flags, the CSR offsets and the residuals (~1,100 cycles on every CTA's
+            # critical path); those tensors now feed the metadata kernels only and are not kernel arguments here.
+            kv0 = tasks[batch_idx, head_idx, q_group, n_block, 0]
+            kv1 = tasks[batch_idx, head_idx, q_group, n_block, 1]
+            begin0 = tasks[batch_idx, head_idx, q_group, n_block, 2]
+            len0 = tasks[batch_idx, head_idx, q_group, n_block, 3]
+            begin1 = tasks[batch_idx, head_idx, q_group, n_block, 4]
+            res0 = tasks[batch_idx, head_idx, q_group, n_block, 5]
+            b_ok = tasks[batch_idx, head_idx, q_group, n_block, 6] != 0
+            steps = tasks[batch_idx, head_idx, q_group, n_block, 7]
+            return kv0, kv1, (begin0, len0, begin1, res0, b_ok), steps
+        begin = offsets[n_block, q_group, (head_idx, batch_idx)]
+        steps = (offsets[n_block + 1, q_group, (head_idx, batch_idx)] - begin) * 2
+        return n_block * 2, n_block * 2 + 1, begin, steps
+
+    @cute.jit
+    def _m_block(self, indices, begin, step, head_idx, batch_idx):
+        if const_expr(self.paired):
+            begin0, len0, begin1, _, _ = begin
+            slot = begin0 + step if step < len0 else begin1 + step - len0
+            return indices[slot, (head_idx, batch_idx)]
+        # CSR remains Q128/KV128. Each edge streams two Q64 subtiles.
+        return indices[begin + step // 2, (head_idx, batch_idx)] * 2 + step % 2
+
+    @cute.jit
+    def load_pair(self, atom, source, shared, kv0, kv1, barrier):
+        layout = cute.make_layout((64, 64), stride=(64, 1))
+        for plane in cutlass.range_constexpr(2):
+            for half in cutlass.range_constexpr(2):
+                dest = cute.make_tensor(shared.iterator + plane * 8192 + half * 4096, layout)
+                tile = cute.local_tile(cute.domain_offset(((kv1 if const_expr(half == 1) else kv0) * 64, plane * 64), source), (64, 64), (0, 0))
+                dst, src = cpasync.tma_partition(atom, 0, cute.make_layout(1), cute.group_modes(dest, 0, 2), cute.group_modes(tile, 0, 2))
+                cute.copy(atom, src, dst, tma_bar_ptr=barrier)
 
     @cute.jit
     def load(
@@ -1011,6 +1102,7 @@ class BlockSparseAttnBackwardSm90Blk128:
         TileSchedulerCls: Callable,
         bucketed_k2q_offsets: Optional[cute.Tensor] = None,
         bucketed_k2q_indices: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
@@ -1025,41 +1117,46 @@ class BlockSparseAttnBackwardSm90Blk128:
                 head_idx_kv = head_idx
                 mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
                 mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
+                load_K = load_V = None
+                if const_expr(not self.paired):
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
+                    load_K, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK, single_stage=True)
+                    load_V, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV, single_stage=True)
 
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx]
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (None, 0))
                 gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (None, 0))
 
-                load_K, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK, single_stage=True)
-                load_V, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV, single_stage=True)
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ)
                 load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
                 load_dO, _, _ = copy_utils.tma_get_copy_fn(tma_atom_dO, 0, cute.make_layout(1), gdO, sdO)
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
 
-                k2q_begin = bucketed_k2q_offsets[n_block, q_group, (head_idx, batch_idx)]
-                k2q_end = bucketed_k2q_offsets[n_block + 1, q_group, (head_idx, batch_idx)]
-                total_m_block_cnt = k2q_end - k2q_begin
-                process_tile = total_m_block_cnt > Int32(0)
+                kv0, kv1, k2q_begin, total_steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
+                process_tile = total_steps > Int32(0)
 
                 if process_tile:
-                    first_m_block = bucketed_k2q_indices[k2q_begin, (head_idx, batch_idx)] * 2
+                    first_m_block = self._m_block(bucketed_k2q_indices, k2q_begin, Int32(0), head_idx, batch_idx)
                     pipeline_Q.producer_acquire(producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"])
-                    load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
+                    if const_expr(self.paired):
+                        self.load_pair(tma_atom_K, mK_cur, sK, kv0, kv1, pipeline_Q.producer_get_barrier(producer_state_Q))
+                    else:
+                        load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                     load_Q(first_m_block, producer_state=producer_state_Q)
                     producer_state_dO_cur = producer_state_Q
                     pipeline_dO.producer_acquire(producer_state_dO_cur, extra_tx_count=self.tma_copy_bytes["V"])
-                    load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
+                    if const_expr(self.paired):
+                        self.load_pair(tma_atom_V, mV_cur, sV, kv0, kv1, pipeline_dO.producer_get_barrier(producer_state_dO_cur))
+                    else:
+                        load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
                     load_dO(first_m_block, producer_state=producer_state_dO_cur)
                     producer_state_Q.advance()
                     producer_state_dO.advance()
 
-                    # CSR remains Q128/KV128. Each edge streams two Q64 subtiles.
-                    for iter_idx in cutlass.range(1, total_m_block_cnt * 2, unroll=1):
-                        m_block = bucketed_k2q_indices[k2q_begin + iter_idx // 2, (head_idx, batch_idx)] * 2 + iter_idx % 2
+                    for iter_idx in cutlass.range(1, total_steps, unroll=1):
+                        m_block = self._m_block(bucketed_k2q_indices, k2q_begin, iter_idx, head_idx, batch_idx)
                         if m_block * self.tile_m < seqlen.seqlen_q:
                             pipeline_Q.producer_acquire(producer_state_Q)
                             load_Q(m_block, producer_state=producer_state_Q)
@@ -1073,7 +1170,19 @@ class BlockSparseAttnBackwardSm90Blk128:
                 work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
-    def load_stats(self, mLSE, mdPsum, sLSE, sdPsum, pipeline_stats, SeqlenInfoCls, TileSchedulerCls, offsets, indices):
+    def load_stats(
+        self,
+        mLSE,
+        mdPsum,
+        sLSE,
+        sdPsum,
+        pipeline_stats,
+        SeqlenInfoCls,
+        TileSchedulerCls,
+        offsets,
+        indices,
+        pair_tasks=None,
+    ):
         # Preprocess writes the padded statistics and clears dQaccum. This wait
         # precedes every statistics transaction published to the compute WGs.
         cute.arch.griddepcontrol_wait()
@@ -1087,10 +1196,9 @@ class BlockSparseAttnBackwardSm90Blk128:
             gdPsum = cute.local_tile(mdPsum[None, head_idx, batch_idx], (self.tile_m,), (None,))
             load_LSE = copy_utils.tma_producer_copy_fn(copy_utils.cpasync_bulk_get_copy_fn(gLSE, sLSE), pipeline_stats)
             load_delta = copy_utils.tma_producer_copy_fn(copy_utils.cpasync_bulk_get_copy_fn(gdPsum, sdPsum), pipeline_stats)
-            begin = offsets[n_block, q_group, (head_idx, batch_idx)]
-            end = offsets[n_block + 1, q_group, (head_idx, batch_idx)]
-            for step in cutlass.range((end - begin) * 2, unroll=1):
-                m_block = indices[begin + step // 2, (head_idx, batch_idx)] * 2 + step % 2
+            _, _, begin, steps = self._task(offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            for step in cutlass.range(steps, unroll=1):
+                m_block = self._m_block(indices, begin, step, head_idx, batch_idx)
                 if m_block * self.tile_m < seqlen.seqlen_q:
                     pipeline_stats.producer_acquire(state)
                     load_LSE(m_block, producer_state=state)
@@ -1140,6 +1248,8 @@ class BlockSparseAttnBackwardSm90Blk128:
         bucketed_k2q_offsets: cute.Tensor,
         bucketed_k2q_indices: cute.Tensor,
         mBlockSizes: Optional[cute.Tensor] = None,
+        pair_tasks: Optional[cute.Tensor] = None,
+        pair_sync: Optional[cute.Tensor] = None,
     ):
         # Both WGs execute all five GEMMs. S/dP/dKV split the KV rows;
         # dQ splits the head dimension and reduces the entire KV128 tile.
@@ -1177,17 +1287,42 @@ class BlockSparseAttnBackwardSm90Blk128:
             tLSEsLSE = layout_utils.mma_partition_C_vec(sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=False)
             tdPsums = layout_utils.mma_partition_C_vec(sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=False)
             mask = AttentionMaskCls(seqlen)
+            kv0, kv1, begin, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
+            # In paired mode WG w owns KV64 block kv_w: its S rows are mask columns [64 w, 64 w + 64) of the tile.
+            mask_n_block = n_block
+            if const_expr(self.paired):
+                mask_n_block = kv1 if wg == 1 else kv0
             block_size_k = None
             if const_expr(mBlockSizes is not None):
-                block_size_k = mBlockSizes[batch_idx, n_block]
-            begin = bucketed_k2q_offsets[n_block, q_group, (head_idx, batch_idx)]
-            end = bucketed_k2q_offsets[n_block + 1, q_group, (head_idx, batch_idx)]
+                block_size_k = mBlockSizes[batch_idx, mask_n_block]
             accumulate = False
             acc_dK.fill(0.0)
             acc_dV.fill(0.0)
-            for step in cutlass.range((end - begin) * 2, unroll=1):
-                m_block = bucketed_k2q_indices[begin + step // 2, (head_idx, batch_idx)] * 2 + step % 2
-                if m_block * self.tile_m < seqlen.seqlen_q:
+            if const_expr(self.paired):
+                _, len0, _, res0, b_ok = begin
+                # The walk is [first-only | common | second-only] = [0, lo1) | [lo1, len0) | [len0, steps): WG0 owns
+                # [0, len0), WG1 owns [lo1, steps) (nothing when the second block is unpaired: then lo1 == len0 ==
+                # steps). Five loops keep the MMAs out of per-step branches; the two owner loops ([0, lo1) for WG0,
+                # [len0, steps) for WG1) and the common loop implement the same per-step protocol with static bodies,
+                # as do the two passive loops, so a change to one body must be mirrored in its twins. In a single-owner step only the owner
+                # computes S/dP/dV/dK and writes its half of dS; BOTH WGs then run their head-dim half of the shared
+                # dQ GEMM over the owner's 64 KV rows only (the two dS halves and the two K halves are independent
+                # 8 KB swizzled blocks, so the K slice is a static descriptor offset), and the non-owner no longer
+                # writes an 8 KB zero dS tile. Every WG keeps one PdS barrier, one dQEmpty/dQFull handshake and one
+                # Q/dO/stats release per step, so the producer and store warps see the same protocol as before.
+                lo1 = res0 if b_ok else steps
+                k_half = cute.size(tdQrdS.shape[2]) // 2  # k-blocks of one KV64 half
+                own_lo_end = lo1  # WG0: owner of [0, lo1), passive in [len0, steps)
+                pas_lo_end = Int32(0)
+                pas_hi_end = steps
+                own_hi_end = len0
+                if wg == 1:  # WG1: passive in [0, lo1), owner of [len0, steps)
+                    own_lo_end = Int32(0)
+                    pas_lo_end = lo1
+                    pas_hi_end = len0
+                    own_hi_end = steps
+                for step in cutlass.range(0, own_lo_end, unroll=1):
+                    m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
                     stage = read_Q.index
                     pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
                     acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
@@ -1199,7 +1334,83 @@ class BlockSparseAttnBackwardSm90Blk128:
                     if const_expr(self.scale_nonpositive):
                         acc_S.store(acc_S.load() * softmax_scale_log2)
                     if const_expr(mBlockSizes is not None or self.has_kv_tail):
-                        mask.apply_mask(acc_S, batch_idx, head_idx, m_block, n_block, thr_mma_SdP, block_size_k=block_size_k)
+                        mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
+                    scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                        lse = rLSE[r]
+                        for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
+                            scores[r, c] = (
+                                cute.math.exp2(
+                                    scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
+                                    fastmath=True,
+                                )
+                                if lse != Float32.inf
+                                else Float32(0.0)
+                            )
+                    rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+                    rDelta = copy_utils.load_s2r(tdPsums[None, stage])
+                    warpgroup.wait_group(0)
+                    dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
+                        for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
+                            # Keep FP32 P for dS, independent of the BF16 dV operand.
+                            dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
+                    rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+                    copy_dS_r2s(rdS, dst_idx=stage)
+                    gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    # The memory-clobbering cross-WG barrier orders both normal
+                    # shared reads before either WG returns the statistics slot.
+                    pipeline_stats.consumer_release(read_Q)
+                    # dQ over this WG's own KV64 half only (WG0 = k-blocks [0, k_half)). Wait only for the
+                    # preceding dV before releasing dO; dK then overlaps dQ store.
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=1, k_begin=0, k_end=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    warpgroup.wait_group(0)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                    accumulate = True
+                for step in cutlass.range(0, pas_lo_end, unroll=1):
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    # The other WG owns this Q block: wait for its dS half, then reduce only that half (K=64) into
+                    # this WG's head-dim half of dQ. No zero dS is written; the handshakes stay one-for-one.
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    pipeline_stats.consumer_release(read_Q)
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=0, k_begin=0, k_end=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                for step in cutlass.range(lo1, len0, unroll=1):
+                    m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
+                    # QK is complete; dP can overlap exp2 and the statistics load.
+                    if const_expr(self.scale_nonpositive):
+                        acc_S.store(acc_S.load() * softmax_scale_log2)
+                    if const_expr(mBlockSizes is not None or self.has_kv_tail):
+                        mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
                     scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
                     for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
                         lse = rLSE[r]
@@ -1243,6 +1454,160 @@ class BlockSparseAttnBackwardSm90Blk128:
                     read_Q.advance()
                     read_dO.advance()
                     accumulate = True
+                for step in cutlass.range(len0, pas_hi_end, unroll=1):
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    # The other WG owns this Q block: wait for its dS half, then reduce only that half (K=64) into
+                    # this WG's head-dim half of dQ. No zero dS is written; the handshakes stay one-for-one.
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    pipeline_stats.consumer_release(read_Q)
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=0, k_begin=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                for step in cutlass.range(len0, own_hi_end, unroll=1):
+                    m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
+                    stage = read_Q.index
+                    pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                    acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
+                    pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                    rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
+                    pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                    acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
+                    # QK is complete; dP can overlap exp2 and the statistics load.
+                    if const_expr(self.scale_nonpositive):
+                        acc_S.store(acc_S.load() * softmax_scale_log2)
+                    if const_expr(mBlockSizes is not None or self.has_kv_tail):
+                        mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
+                    scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                        lse = rLSE[r]
+                        for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
+                            scores[r, c] = (
+                                cute.math.exp2(
+                                    scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
+                                    fastmath=True,
+                                )
+                                if lse != Float32.inf
+                                else Float32(0.0)
+                            )
+                    rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+                    rDelta = copy_utils.load_s2r(tdPsums[None, stage])
+                    warpgroup.wait_group(0)
+                    dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+                    for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
+                        for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
+                            # Keep FP32 P for dS, independent of the BF16 dV operand.
+                            dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
+                    rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+                    copy_dS_r2s(rdS, dst_idx=stage)
+                    gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                    # The memory-clobbering cross-WG barrier orders both normal
+                    # shared reads before either WG returns the statistics slot.
+                    pipeline_stats.consumer_release(read_Q)
+                    # dQ over this WG's own KV64 half only (WG1 = k-blocks [k_half, 2 k_half)). Wait only for the
+                    # preceding dV before releasing dO; dK then overlaps dQ store.
+                    acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=1, k_begin=k_half)
+                    pipeline_dO.consumer_release(read_dO)
+                    gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
+                    named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                    rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                    cute.autovec_copy(rflat, tdQsdQ)
+                    cute.arch.fence_view_async_shared()
+                    named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                    warpgroup.wait_group(0)
+                    pipeline_Q.consumer_release(read_Q)
+                    read_Q.advance()
+                    read_dO.advance()
+                    accumulate = True
+            else:
+                for step in cutlass.range(steps, unroll=1):
+                    m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
+                    if m_block * self.tile_m < seqlen.seqlen_q:
+                        stage = read_Q.index
+                        pipeline_Q.consumer_wait(read_Q, pipeline_Q.consumer_try_wait(read_Q))
+                        acc_S = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tSrQ, tSrK, A_idx=stage, swap_AB=True, wg_wait=-1)
+                        pipeline_stats.consumer_wait(read_Q, pipeline_stats.consumer_try_wait(read_Q))
+                        rLSE = copy_utils.load_s2r(tLSEsLSE[None, stage])
+                        pipeline_dO.consumer_wait(read_dO, pipeline_dO.consumer_try_wait(read_dO))
+                        acc_dP = gemm_zero_init(tiled_mma_SdP, shape_S[:2], tdPrdO, tdPrV, A_idx=stage, swap_AB=True, wg_wait=1)
+                        # QK is complete; dP can overlap exp2 and the statistics load.
+                        if const_expr(self.scale_nonpositive):
+                            acc_S.store(acc_S.load() * softmax_scale_log2)
+                        if const_expr(mBlockSizes is not None or self.has_kv_tail):
+                            if const_expr(self.paired):
+                                mask.apply_mask_kv64(acc_S, mask_n_block, wg, thr_mma_SdP, block_size_k=block_size_k)
+                            else:
+                                mask.apply_mask(acc_S, batch_idx, head_idx, m_block, n_block, thr_mma_SdP, block_size_k=block_size_k)
+                        scores = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+                        for r in cutlass.range_constexpr(cute.size(scores, mode=[0])):
+                            lse = rLSE[r]
+                            for c in cutlass.range_constexpr(cute.size(scores, mode=[1])):
+                                scores[r, c] = (
+                                    cute.math.exp2(
+                                        scores[r, c] * (Float32(1.0) if const_expr(self.scale_nonpositive) else softmax_scale_log2) - lse,
+                                        fastmath=True,
+                                    )
+                                    if lse != Float32.inf
+                                    else Float32(0.0)
+                                )
+                        rP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
+                        rDelta = copy_utils.load_s2r(tdPsums[None, stage])
+                        warpgroup.wait_group(0)
+                        dS = layout_utils.reshape_acc_to_mn(acc_dP, transpose=True)
+                        for r in cutlass.range_constexpr(cute.size(dS, mode=[0])):
+                            for c in cutlass.range_constexpr(cute.size(dS, mode=[1])):
+                                # Keep FP32 P for dS, independent of the BF16 dV operand.
+                                dS[r, c] = scores[r, c] * (dS[r, c] - rDelta[r])
+                        rdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
+                        copy_dS_r2s(rdS, dst_idx=stage)
+                        gemm_w_idx(tiled_mma_dV, acc_dV, rP, tdVrdO, zero_init=not accumulate, B_idx=stage, wg_wait=-1)
+                        cute.arch.fence_view_async_shared()
+                        named_barrier_sync(barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=256)
+                        # The memory-clobbering cross-WG barrier orders both normal
+                        # shared reads before either WG returns the statistics slot.
+                        pipeline_stats.consumer_release(read_Q)
+                        # dQ consumes both WG-produced KV halves. Wait only for the
+                        # preceding dV before releasing dO; dK then overlaps dQ store.
+                        acc_dQ = gemm_zero_init(tiled_mma_dQ, shape_dQ[:2], tdQrdS, tdQrK, A_idx=stage, wg_wait=1)
+                        pipeline_dO.consumer_release(read_dO)
+                        gemm_w_idx(tiled_mma_dK, acc_dK, rdS, tdKrQ, zero_init=not accumulate, B_idx=stage, wg_wait=1)
+                        named_barrier_sync(barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + wg, number_of_threads=160)
+                        rflat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQ.shape))
+                        cute.autovec_copy(rflat, tdQsdQ)
+                        cute.arch.fence_view_async_shared()
+                        named_barrier_arrive(barrier_id=int(NamedBarrierBwd.dQFullWG0) + wg, number_of_threads=160)
+                        warpgroup.wait_group(0)
+                        pipeline_Q.consumer_release(read_Q)
+                        read_Q.advance()
+                        read_dO.advance()
+                        accumulate = True
+            if const_expr(self.paired and pair_sync is not None):
+                # First-arriver protocol (see epilogue_paired_kv): thread 0 of each WG draws its KV64 block's ticket
+                # before the barrier so the L2 round trip overlaps the fragment staging. WG1 owns no block when the
+                # pair is unpaired (kv1 == kv0, b_ok False): it stages zeros but neither counts nor writes.
+                own_kv = kv1 if wg == 1 else kv0
+                participate = steps > 0 and (wg == 0 or begin[4])
+                ticket = Int32(1)
+                stored_early = Int32(0)
+                if participate and tidx % 128 == 0:
+                    arrive_ptr = pair_sync.iterator + cute.crd2idx((batch_idx, head_idx, 0, own_kv), pair_sync.layout)
+                    stored_ptr = pair_sync.iterator + cute.crd2idx((batch_idx, head_idx, 1, own_kv), pair_sync.layout)
+                    ticket = Int32(cute.arch.atomic_add(arrive_ptr.llvm_ptr, Int32(1), sem="relaxed", scope="gpu"))
+                    # The first arriver's flag is normally set long before (same-pair tasks are ~2,000 CTAs apart), so
+                    # read it here too: an acquire that already observed 1 orders the reduce and the poll after the
+                    # barrier does not have to wait for another L2 round trip (ncu: that wait cost ~0.9% of the kernel).
+                    stored_early = copy_utils.ld_acquire_gpu_s32(stored_ptr)
             # Both WGs must finish all input reads before K/V (direct) or Q/dO
             # (multi-bucket) become epilogue scratch. Empty tiles write zeros.
             named_barrier_sync(barrier_id=int(NamedBarrierBwd.Epilogue), number_of_threads=256)
@@ -1251,14 +1616,32 @@ class BlockSparseAttnBackwardSm90Blk128:
                 self.epilogue_direct_kv(acc_dV, mdV, sV, tma_atom_dV, tiled_mma_dV, tidx, n_block, head_idx, batch_idx, Float32(1.0))
                 if tidx < 32:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
+            elif const_expr(self.paired and pair_sync is not None):
+                # Both WGs stage their fragments whenever the pair has work (the barriers inside span both WGs);
+                # the K/V tiles are dead too, so dK and dV are staged at once and drained together.
+                if steps > 0:
+                    if wg == 0:
+                        self.epilogue_paired_kv(acc_dK, acc_dV, mdK, mdV, sQ, sK, tidx, kv0, participate, ticket, stored_early, pair_sync, head_idx, batch_idx)
+                    else:
+                        self.epilogue_paired_kv(acc_dK, acc_dV, mdK, mdV, sdO, sV, tidx, kv1, participate, ticket, stored_early, pair_sync, head_idx, batch_idx)
+            elif const_expr(self.paired):
+                # The epilogue barrier spans both WGs, so both add their fragment whenever the pair has work: a WG
+                # whose block attended nothing adds zeros (to the first block when the second is unpaired).
+                if steps > 0:
+                    if wg == 0:
+                        self.epilogue_accum_kv(acc_dK, mdK, sQ, tidx, kv0, head_idx, batch_idx)
+                        self.epilogue_accum_kv(acc_dV, mdV, sQ, tidx, kv0, head_idx, batch_idx)
+                    else:
+                        self.epilogue_accum_kv(acc_dK, mdK, sdO, tidx, kv1, head_idx, batch_idx)
+                        self.epilogue_accum_kv(acc_dV, mdV, sdO, tidx, kv1, head_idx, batch_idx)
             else:
                 # Each drained Q/dO allocation holds one WG's FP32 KV64 fragment.
                 if wg == 0:
-                    self.epilogue_accum_kv(acc_dK, mdK, sQ, tidx, n_block, head_idx, batch_idx)
-                    self.epilogue_accum_kv(acc_dV, mdV, sQ, tidx, n_block, head_idx, batch_idx)
+                    self.epilogue_accum_kv(acc_dK, mdK, sQ, tidx, n_block * 2, head_idx, batch_idx)
+                    self.epilogue_accum_kv(acc_dV, mdV, sQ, tidx, n_block * 2, head_idx, batch_idx)
                 else:
-                    self.epilogue_accum_kv(acc_dK, mdK, sdO, tidx, n_block, head_idx, batch_idx)
-                    self.epilogue_accum_kv(acc_dV, mdV, sdO, tidx, n_block, head_idx, batch_idx)
+                    self.epilogue_accum_kv(acc_dK, mdK, sdO, tidx, n_block * 2 + 1, head_idx, batch_idx)
+                    self.epilogue_accum_kv(acc_dV, mdV, sdO, tidx, n_block * 2 + 1, head_idx, batch_idx)
 
     @cute.jit
     def epilogue_direct_kv(self, acc, output, scratch, tma_atom, tiled_mma, tidx, n_block, head_idx, batch_idx, scale):
@@ -1277,8 +1660,7 @@ class BlockSparseAttnBackwardSm90Blk128:
             cute.arch.cp_async_bulk_commit_group()
 
     @cute.jit
-    def epilogue_accum_kv(self, acc, output, scratch, tidx, n_block, head_idx, batch_idx):
-        wg = cute.arch.make_warp_uniform(tidx // 128)
+    def epilogue_accum_kv(self, acc, output, scratch, tidx, kv64_block, head_idx, batch_idx):
         count = self.tile_n * self.tile_hdim // self.num_wg_mma
         shared = cute.make_tensor(cute.recast_ptr(scratch.iterator, dtype=Float32), cute.make_layout(count))
         tiled = cute.make_tiled_copy_tv(
@@ -1292,9 +1674,63 @@ class BlockSparseAttnBackwardSm90Blk128:
         named_barrier_sync(barrier_id=int(NamedBarrierBwd.Epilogue), number_of_threads=256)
         if tidx % 128 < 32:
             with cute.arch.elect_one():
-                ptr = output.iterator + output.layout((n_block * count * 2 + wg * count, head_idx, batch_idx))
+                ptr = output.iterator + output.layout((kv64_block * count, head_idx, batch_idx))
                 copy_utils.cpasync_reduce_bulk_add_f32(shared.iterator, ptr, count * 4)
             cute.arch.cp_async_bulk_commit_group()
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    @cute.jit
+    def epilogue_paired_kv(
+        self, acc_dK, acc_dV, mdK, mdV, scratch_k, scratch_v, tidx, kv64_block, participate, ticket, stored_early, pair_sync, head_idx, batch_idx
+    ):
+        """Paired-mode dK/dV epilogue without a zeroed workspace: the first (pair, Q group) task to reach a KV64 block
+        stores its FP32 fragments, every later one reduce-adds.
+
+        Each WG stages dK into ``scratch_k`` and dV into ``scratch_v`` at once (sQ/sK for WG0, sdO/sV for WG1; all
+        four are dead once both WGs passed the Epilogue barrier) and thread 0 of the WG runs the protocol on the
+        block's two words of ``pair_sync`` (row 0 ``arrive``: the ticket counter the caller already incremented; row 1
+        ``stored``, which the caller also read once with acquire semantics while the fragments were being staged).
+        Ticket 0: plain bulk stores, ``cp.async.bulk.wait_group 0`` (full completion, not ``.read``),
+        ``fence.proxy.async.global`` (async-proxy writes ordered before the generic-proxy flag), ``st.release.gpu``
+        stored = 1. Tickets >= 1: ``ld.acquire.gpu`` spin on stored unless the early read already saw 1,
+        ``fence.proxy.async.global`` (acquire ordered before the async-proxy reduce), then ``cp.reduce.async.bulk``
+        add as before. The spin sits after the last
+        CTA-wide barrier and a first arriver never waits, so every spin waits on a resident thread that cannot be
+        blocked; the two WGs never share a block (``participate`` is False for WG1 of an unpaired task). Blocks no
+        task arrives at keep arrive == 0 and are zeroed by the convert kernel instead of a 1 GB memset.
+        """
+        count = self.tile_n * self.tile_hdim // self.num_wg_mma
+        shared_k = cute.make_tensor(cute.recast_ptr(scratch_k.iterator, dtype=Float32), cute.make_layout(count))
+        shared_v = cute.make_tensor(cute.recast_ptr(scratch_v.iterator, dtype=Float32), cute.make_layout(count))
+        tiled = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128), cute.make_layout(128), cute.make_layout(4)
+        )
+        thr_copy = tiled.get_slice(tidx % 128)
+        dst_k = thr_copy.partition_D(shared_k)
+        dst_v = thr_copy.partition_D(shared_v)
+        cute.autovec_copy(cute.make_tensor(acc_dK.iterator, cute.make_layout(dst_k.shape)), dst_k)
+        cute.autovec_copy(cute.make_tensor(acc_dV.iterator, cute.make_layout(dst_v.shape)), dst_v)
+        cute.arch.fence_view_async_shared()
+        named_barrier_sync(barrier_id=int(NamedBarrierBwd.Epilogue), number_of_threads=256)
+        if participate and tidx % 128 == 0:
+            dk_ptr = mdK.iterator + mdK.layout((kv64_block * count, head_idx, batch_idx))
+            dv_ptr = mdV.iterator + mdV.layout((kv64_block * count, head_idx, batch_idx))
+            stored_ptr = pair_sync.iterator + cute.crd2idx((batch_idx, head_idx, 1, kv64_block), pair_sync.layout)
+            if ticket == 0:
+                copy_utils.cpasync_bulk_store_s2g(shared_k.iterator, dk_ptr, count * 4)
+                copy_utils.cpasync_bulk_store_s2g(shared_v.iterator, dv_ptr, count * 4)
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
+                copy_utils.fence_proxy_async_global()
+                copy_utils.st_release_gpu_s32(stored_ptr, Int32(1))
+            else:
+                stored = stored_early
+                while stored == 0:
+                    stored = copy_utils.ld_acquire_gpu_s32(stored_ptr)
+                copy_utils.fence_proxy_async_global()
+                copy_utils.cpasync_reduce_bulk_add_f32(shared_k.iterator, dk_ptr, count * 4)
+                copy_utils.cpasync_reduce_bulk_add_f32(shared_v.iterator, dv_ptr, count * 4)
+                cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
@@ -1306,17 +1742,17 @@ class BlockSparseAttnBackwardSm90Blk128:
         SeqlenInfoCls: Callable,
         bucketed_k2q_offsets: cute.Tensor,
         bucketed_k2q_indices: cute.Tensor,
+        pair_tasks: Optional[cute.Tensor] = None,
     ):
         scheduler = TileSchedulerCls()
         work = scheduler.initial_work_tile_info()
         if work.is_valid_tile:
             n_block, head_idx, batch_idx, q_group = work.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            begin = bucketed_k2q_offsets[n_block, q_group, (head_idx, batch_idx)]
-            end = bucketed_k2q_offsets[n_block + 1, q_group, (head_idx, batch_idx)]
+            _, _, begin, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
             gdQ = cute.local_tile(mdQaccum[None, head_idx, batch_idx], (self.tile_m * self.tile_hdim,), (None,))
-            for step in cutlass.range((end - begin) * 2, unroll=1):
-                m_block = bucketed_k2q_indices[begin + step // 2, (head_idx, batch_idx)] * 2 + step % 2
+            for step in cutlass.range(steps, unroll=1):
+                m_block = self._m_block(bucketed_k2q_indices, begin, step, head_idx, batch_idx)
                 if m_block * self.tile_m < seqlen.seqlen_q:
                     for wg in cutlass.range_constexpr(2):
                         cute.arch.cp_async_bulk_wait_group(1 - wg, read=True)
@@ -1458,6 +1894,22 @@ class AttentionMask:
                     acc_S_mn,
                     lambda s: predicate_bitmask_below(seqlenk_col_limit_predicate, s),
                 )
+
+    @cute.jit
+    def apply_mask_kv64(self, acc_S, kv64_block, wg, thr_mma, block_size_k=None):
+        """Mask the KV rows past the end of KV64 block ``kv64_block``, which occupies tile columns [64 wg, 64 wg + 64)."""
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
+        cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+        tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=True)
+        t0ScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cS), transpose=True)
+        limit = self.seqlen_k - kv64_block * 64
+        if const_expr(block_size_k is not None):
+            limit = cutlass.min(limit, block_size_k)
+        limit = limit + wg * 64 - tScS_mn[0][0]
+        for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+            oob = t0ScS_mn[0, c][0] >= limit
+            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
 
 
 class _GradientConverter:

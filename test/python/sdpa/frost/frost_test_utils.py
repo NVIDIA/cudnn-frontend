@@ -60,6 +60,23 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+
+
+def requires_bwd_engine_row(name):
+    """``skipif`` off the sm range the named FROST backward engine row DECLARES (``Capabilities.sm_lo`` / ``sm_hi`` in
+    sdpa/bwd/engines.py), read from the row at import -- never a per-file copy of the range.  For the rows whose bodies are
+    compiled per device (the ``sdpa_bwd_sm100_d128`` family: ``--gpu-arch sm_{cc}a`` from the device cc, cc 10.0 / 10.3 and,
+    since the Rubin admission, cc 10.7) a suite gated on ``requires_pre_rubin_blackwell`` would skip exactly the lane that
+    needs to run; this marker follows the row instead."""
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS
+
+    caps = next(s for s in ENGINE_SPECS if s.name == name).capabilities
+    return pytest.mark.skipif(
+        _SM is None or not (caps.sm_lo <= _SM <= caps.sm_hi),
+        reason=f"needs a GPU in the {name} row's range (SM{caps.sm_lo}-{caps.sm_hi}), have " + ("none" if _SM is None else f"sm_{_SM}"),
+    )
+
+
 # Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
 # sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
 # marker mirrors that range rather than pinning (10, 7)).
@@ -128,11 +145,37 @@ def _dsl_installed() -> bool:
 def _is_plan_for(plan_name, engine) -> bool:
     """A plan reads ``<engine>[<knobs>]``: the heuristics name a concrete config
     for every entry, so match on the engine, not on the whole plan name."""
+    if isinstance(engine, tuple):
+        return any(_is_plan_for(plan_name, name) for name in engine)
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
+def half_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Allowed half engines for feature tests that exercise default selection.
+
+    Implementation/routing tests pin a single concrete name instead. This
+    list only follows ownership; it contains no shape or performance policy.
+    """
+    if arch == "sm100":
+        return (
+            "sdpa_fwd_prefill_sm100",
+            "sdpa_fwd_sm100_d256_lookahead",
+            "sdpa_fwd_sm100_d256_swap_ab",
+            "sdpa_fwd_sm100_d512_role_split",
+            "sdpa_fwd_sm100_d512_2x2",
+        )
+    return (f"sdpa_fwd_prefill_{arch}",)
+
+
+def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Per-tensor FP8 owners for feature tests; routing tests pin one name."""
+    if arch == "sm100":
+        return ("sdpa_fwd_prefill_sm100_fp8", "sdpa_fwd_sm100_d512_fp8_role_split")
+    return (f"sdpa_fwd_prefill_{arch}_fp8",)
+
+
 def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
-    """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
+    """Pin the ranked entry for engine ``name`` (or an explicit tuple of names; graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 

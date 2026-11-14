@@ -41,9 +41,10 @@ out[b, j] = sum_k kv[w(b,k), c(k,j)] * softmax_k(score[w(b,k), c(k,j)] + ape[k %
 
 computed in fp32 with a single final bf16 rounding. Per-segment tail tokens
 (`seqlen % ratio`) are dropped, as in the eager code. Output rows beyond
-`cu_seqlens_comp[-1]` (a static CUDA-graph capacity) are computed with first-in-segment
-semantics from token 0, exactly like the eager gather; the backward ignores incoming
-gradients on such padding rows.
+`cu_seqlens_comp[-1]` (a static CUDA-graph capacity) are exact zeros on SM90 and
+SM100+; the forward skips their APE/KV/score loads and softmax, and the backward
+ignores incoming gradients on those rows. Consequently a positive static capacity is
+valid even when every segment is shorter than `ratio`.
 
 ### Numerics
 
@@ -154,6 +155,18 @@ policies:
   Both launches use the caller stream and are CUDA-graph capture/replay safe after
   `compile()`.
 
+On SM90, production `coff=2`, ratio-2 backward adds one measured 16-row producer
+bucket while keeping 8 rows for smaller capacities. Atomic plans switch at 8,192
+compressed rows for `head_dim=128`. For `head_dim=512`, the atomic 16-row bucket
+is limited to the measured `[4,096, 5,121)` safe interval; larger capacities
+retain 8 rows because additional grid-wave occupancy steps showed regressions.
+Deterministic plans switch at 4,096 and 2,048
+rows for `head_dim=128` and `512`, respectively, and keep 16 rows thereafter.
+Other `coff`/head dimensions and architecture families retain the 8-row schedule.
+The deterministic 16-row bucket halves the partial workspace. The selected row
+count is bound by the prepared plan, so `execute()` does not query device
+capability or specialize on device-side sequence metadata.
+
 #### Deterministic dAPE performance
 
 CUDA-event medians over 100 iterations after 30 warmups on one GB200
@@ -200,8 +213,21 @@ against an unchanged-source checkout for the independent control.
 
 ### Support surface (`check_support`)
 
-- Compute-capability major **>= 10** (SM100 and newer; the kernels use no
-  architecture-specific features beyond the SM100 baseline)
+| architecture | ratio | coff | head dimension | forward | backward | deterministic backward |
+|---|---:|---:|---:|---|---|---|
+| SM90 | 2 or 4 | 1 or 2 | generic launch bound below | yes | yes | yes |
+| SM100+ | 2 or 4 | 1 or 2 | generic launch bound below | yes | yes | yes |
+| SM100+ | 128 | 1 or 2 | 128 or 512 | yes | yes | yes |
+| SM90 | 128 | any | any | no | no | no |
+
+The primary SM90 training configuration is packed THD, `ratio=4`, `coff=1`,
+`head_dim=128`, BF16 KV/score/output, FP32 APE and int32 prefix metadata. Both dAPE
+policies use the same forward/backward math; `deterministic=True` selects the
+caller-workspace fixed-order reduction.
+
+- SM90 and compute-capability major **>= 10** for the generic ratio `{2, 4}`
+  kernels. Ratio 128 remains SM100-or-newer only; its schedule and tolerance
+  contract have not yet been validated on SM90.
 - `ratio in {2, 4}`, `coff in {1, 2}` (`coff == 2` is the production CSA/HCA configuration,
   `coff == 1` the own-block window form; `ratio == 2` is the configuration used in
   production training) — served by the generic kernels, which are
@@ -214,8 +240,9 @@ against an unchanged-source checkout for the independent control.
 - BF16 `kv` / `score` / `out`, FP32 `ape`, int32 `cu_seqlens` / `cu_seqlens_comp`
 - int32 flat offsets: `total_tokens * coff * head_dim < 2**31` and
   `total_comp * head_dim < 2**31`
-- `total_comp > 0` requires `total_tokens >= ratio` (each compressed row gathers a
-  window of `ratio` tokens)
+- Capacity-only rows do not require a token window. Device prefix metadata still owns
+  the logical contract: every valid compressed row must describe a complete `ratio`
+  token block.
 - `head_dim <= 8388480` (forward launch `gridDim.y` bound)
 - contiguous tensors on one CUDA device, with 16-byte-aligned base pointers (4-byte
   for the int32 cu_seqlens) — contiguity does not imply base alignment for
@@ -227,7 +254,41 @@ against an unchanged-source checkout for the independent control.
 pip install nvidia-cudnn-frontend
 ```
 
+For a source checkout in a CUDA 13 environment, keep the CUDA extra when installing or
+pinning CuTe DSL:
+
+```bash
+python -m pip install 'nvidia-cutlass-dsl[cu13]>=4.8.0'
+python -m pip install -e .
+```
+
 ## API Usage
+
+### JAX ops (SM100 ratio-4 CSA / ratio-128 HCA)
+
+```python
+from cudnn.ops import dsa
+
+out = dsa.compressor_forward_jax(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp=static_output_rows
+)
+# DSv4 HCA: non-overlapping ratio-128 pooling, kv/score width == head_dim.
+out = dsa.compressor_forward_jax(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, total_comp=static_output_rows, ratio=128, coff=1
+)
+grad_kv, grad_score, grad_ape = dsa.compressor_backward_jax(
+    kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, ratio=128, coff=1
+)
+```
+
+`cudnn.ops.dsa.compressor_forward_jax` and `cudnn.ops.dsa.compressor_backward_jax`
+accept JAX arrays, eagerly or under `jax.jit`, and require no PyTorch. They support
+`ratio=4, coff=2` (CSA) and `ratio=128, coff in {1, 2}` with `head_dim in {128, 512}`
+(HCA), BF16 KV/scores, FP32 APE and int32 packed-sequence metadata, on SM100-family
+GPUs. Forward and backward are separate calls; the caller owns the VJP. The
+PyTorch counterparts are `cudnn.ops.dsa.compressor_forward` and
+`cudnn.ops.dsa.compressor_backward`, the same functions as
+`cudnn.csa.csa_compressor_forward_wrapper` and `csa_compressor_backward_wrapper`.
 
 ### High-level wrappers
 
@@ -256,8 +317,15 @@ Set `coff=1` for the `ratio`-token own-block window (and use `kv` / `score` tens
 packed width is `head_dim`); `coff=2` selects the `2 * ratio` overlapping window shown
 above.
 
-The wrappers cache compiled API instances; the underlying JIT is shared per
-`(ratio, head_dim, coff, device)`, so runtime shape changes never recompile.
+The wrappers keep a bounded LRU of prepared API instances. The generic forward
+artifact is shared per `(ratio, head_dim, coff, device)`; generic backward adds
+`deterministic` and the bounded `rows_per_cta` schedule bucket. In particular,
+the generic row-count domain is the finite set `{8, 16, 24}`: SM90 ratio-2 uses
+the documented capacity bucket, and ratio-4 deterministic backward has only its
+documented short/long capacity buckets. The SM90 and SM100-family artifacts
+remain device-scoped and are lowered for the active device; packed token totals
+and per-sequence length distributions within a schedule bucket are runtime
+data, not compile specializations.
 
 ### Class API
 
@@ -300,6 +368,13 @@ configuration are compiled: run one warmup call (or `compile()`) per configurati
 before capturing, and pass `total_comp` explicitly. A call that would JIT under capture
 raises a `RuntimeError` instead of corrupting the capture.
 
+For deterministic backward capture, construct and compile
+`CSACompressorBackward(..., deterministic=True)`, query
+`scratch_workspace_bytes()`, and allocate the returned workspace before capture. The
+captured `execute()` performs no JIT, allocation, host synchronization or device-prefix
+readback. Prefix contents may change at the captured device addresses on replay;
+tensor addresses, prepared capacities and launch topology remain fixed.
+
 ### Environment variables
 
 - `CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH=0` — disable the cached-launch host optimization
@@ -310,6 +385,31 @@ raises a `RuntimeError` instead of corrupting the capture.
   `nvidia-cutlass-dsl` upgrade) it falls back to the regular launch path automatically.
 
 ## Performance
+
+Reproduce the primary SM90 configuration with:
+
+```bash
+python benchmark/csa/bench_csa_compressor.py --ratio 4 --coff 1 --head-dim 128
+python benchmark/csa/bench_csa_dape_deterministic.py --sm90-primary
+python benchmark/csa/bench_csa_dape_deterministic.py --sm90-primary --construct-order deterministic-first
+```
+
+The first command reports eager/fused forward, backward and CUDA Graph replay timing;
+the latter two compare atomic and deterministic dAPE with JIT and allocation excluded.
+
+Measured on one SM90 GPU (CC 9.0, driver 570.148.08, CUDA 13.0, cuDNN 9.20, PyTorch
+2.12.1, CUTLASS DSL 4.8.1); BF16 `kv`/`score`, FP32 `ape`; `ratio = 4`,
+`coff = 1`, `head_dim = 128`; median of 50 iterations after 20 warmup:
+
+| THD pack | eager fwd | fused fwd | fwd | eager bwd | fused bwd | bwd | eager graph total | fused graph total | graph total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 x 8192 | 205.7 us | 40.9 us | **5.0x** | 270.0 us | 54.4 us | **5.0x** | 202.2 us | 17.9 us | **11.3x** |
+| 3 x 8192 | 222.9 us | 39.8 us | **5.6x** | 261.6 us | 57.2 us | **4.6x** | 306.4 us | 28.4 us | **10.8x** |
+
+The opt-in deterministic backward used 0.52 MiB and 1.55 MiB of caller workspace for
+the two packs. Its operation time was 35.87 us and 35.49 us, respectively, versus
+29.84 us and 35.04 us for atomic dAPE (1.20x and 1.01x). The deterministic dAPE maximum
+absolute error versus the fp64 oracle was `3.41e-6` and `5.46e-6`.
 
 Measured on 1x B200 (CC 10.0, driver 590.48.01); BF16 `kv`/`score`, FP32 `ape`; `ratio = 4`, `coff = 2`;
 THD packs of 8192-token sequences; eager baseline = the exact replaced region of

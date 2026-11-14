@@ -30,6 +30,11 @@ jobs:
   fern-check:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    # docs/fern/fern.config.json pins Fern CLI 5.56.3. The launcher installed
+    # below (unpinned) refuses a pinned CLI older than 5.215.0 unless this is
+    # set. Remove it when the pinned version is raised (`fern upgrade`).
+    env:
+      FERN_ALLOW_OLD_CLI_VERSION: "true"
     steps:
       - uses: actions/checkout@v4
 

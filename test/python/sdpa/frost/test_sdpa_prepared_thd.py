@@ -15,6 +15,8 @@ import sdpa_binding_reference as binding_reference
 import math
 from itertools import accumulate
 
+from frost_test_utils import half_engine_names, _is_plan_for
+
 import pytest
 import torch
 
@@ -104,6 +106,7 @@ def _thd_graph(
     bottom_right=False,
     window_left=None,
     independent_o_offsets=False,
+    explicit_engine=None,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -159,9 +162,15 @@ def _thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name(arch=arch)
-    g.select_plan(next(i for i, n in enumerate(names) if n == want or n.startswith(want + "[")))
+    if explicit_engine is not None:
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(family_for(g).offered_ids()[explicit_engine], {cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 0})
+        g.select_plan(g.get_execution_plan_count() - 1)
+    else:
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        want = half_engine_names(arch)
+        g.select_plan(next(i for i, n in enumerate(names) if _is_plan_for(n, want)))
     g.check_support()
     g.build_plans()
     tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
@@ -987,11 +996,11 @@ def _dense_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name(arch=arch)
+    want = half_engine_names(arch)
     # the FROST row's unsplit plan (the heuristics may rank a split first on long KV)
-    idx = next((i for i, n in enumerate(names) if (n == want or n.startswith(want + "[")) and g.plans[i].knobs.split_kv == 1), None)
+    idx = next((i for i, n in enumerate(names) if (_is_plan_for(n, want)) and g.plans[i].knobs.split_kv == 1), None)
     if idx is None:
-        idx = next(i for i, n in enumerate(names) if n == want or n.startswith(want + "["))
+        idx = next(i for i, n in enumerate(names) if _is_plan_for(n, want))
     if split_kv > 1:
         from dataclasses import replace
 
@@ -1739,7 +1748,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     g.select_plan(index)
     if cga is not None:
         engine, knobs = g.get_engine_and_knobs_at_index(index)
@@ -2530,7 +2539,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if d == 128:
         knobs = {**knobs, cudnn.knob_type.PACK_GQA: True, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1}
@@ -2756,7 +2765,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
     policies = (0,) if arch == "sm107" and d == 128 else ((0, 1, 2) if "_boundary" in geometry else (0, 1))
@@ -2941,15 +2950,32 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("python_binding", [False, True], ids=["native", "python"])
-def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
+@pytest.mark.parametrize(
+    "d,explicit_engine",
+    [
+        (128, None),
+        (256, None),
+        (512, "sdpa_fwd_sm100_d512_role_split"),
+        (512, "sdpa_fwd_sm100_d512_2x2"),
+    ],
+    ids=["legacy", "explicit-lookahead", "d512-role", "d512-2x2"],
+)
+def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding, d, explicit_engine):
     """Vary compact HN stride, then replay older independent captures with no compile or adaptation."""
-    b, qmax, kl, hq, hk, d = 2, 16, 64, 8, 2, 128
+    b, qmax, kl, hq, hk = 2, 16, 64, 8, 2
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
     arch = "sm100"
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    g, t = _thd_graph(b, qmax, kl, hq, hk, d, override_enabled=True, dtype=dt, arch=arch, stats_head_stride=b * qmax)
+    g, t = _thd_graph(b, qmax, kl, hq, hk, d, override_enabled=True, dtype=dt, arch=arch, stats_head_stride=b * qmax, explicit_engine=explicit_engine)
+    note = cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
+    assert note in g.get_behavior_notes()
+    assert cudnn.behavior_note.RUNTIME_COMPILATION in g.get_behavior_notes()
+    assert g.get_behavior_notes() == g.get_behavior_notes_for_plan_at_index(g._plan_index)
+    if d == 256:
+        assert g.selected_engine.name == "sdpa_fwd_sm100_d256_lookahead"
     prepared = _plan(g)._prepared
+    assert prepared.supports_stats_stride_override
     assert prepared.spec.native is not None
     if python_binding:
         binding_reference.use_reference(prepared.spec)
@@ -2957,7 +2983,9 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
     retained = []
     for i, ql in enumerate((16, 9, 13, 16)):
         bufs = _buffers(b, ql, kl, hq, hk, d, seed=17 + i, dtype=dtype)
-        bufs["lse"] = torch.full((hq, b * ql), float("nan"), device=DEV)
+        bufs["lse_storage"] = torch.full((hq * b * ql + 8,), -12345.0, device=DEV)
+        bufs["lse"] = bufs["lse_storage"][4:-4].view(hq, b * ql)
+        bufs["lse"].fill_(float("nan"))
         bufs["off_lse"] = bufs["cu_q"]
         kwargs = dict(
             override_uids=[t["stats"].get_uid()],
@@ -2974,7 +3002,15 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
         torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
         assert _plan(g)._prepared is prepared
+        torch.testing.assert_close(bufs["lse_storage"][:4], torch.full_like(bufs["lse_storage"][:4], -12345.0))
+        torch.testing.assert_close(bufs["lse_storage"][-4:], torch.full_like(bufs["lse_storage"][-4:], -12345.0))
         retained.append((cg, bufs, ql))
+    # Another graph/config from the same engine cannot change retained plans'
+    # note or binder state. This graph deliberately disables runtime overrides.
+    other, _ = _thd_graph(b, 8, kl, hq, hk, d, override_enabled=False, dtype=dt, arch=arch, stats_head_stride=b * 8, explicit_engine=explicit_engine)
+    assert note not in other.get_behavior_notes()
+    assert not _plan(other)._prepared.supports_stats_stride_override
+    assert note in g.get_behavior_notes()
     try:
         for cg, bufs, ql in reversed(retained):
             bufs["q"].mul_(0.75)
@@ -2986,6 +3022,8 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding):
             expected_o, expected_lse = _reference(bufs, b, ql, kl, hq, hk, d)
             torch.testing.assert_close(bufs["o"].float(), expected_o, atol=2e-2, rtol=2e-2)
             torch.testing.assert_close(bufs["lse"].T, expected_lse, atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(bufs["lse_storage"][:4], torch.full_like(bufs["lse_storage"][:4], -12345.0))
+            torch.testing.assert_close(bufs["lse_storage"][-4:], torch.full_like(bufs["lse_storage"][-4:], -12345.0))
     finally:
         for cg, _, _ in retained:
             cg.reset()
@@ -3072,7 +3110,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if splits is None:
         # Exercise the public default without pinning a particular split count.

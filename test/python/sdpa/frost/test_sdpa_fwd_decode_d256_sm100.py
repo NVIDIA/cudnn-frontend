@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The d256 DECODE tile of the FROST SM100 f16/bf16 engine (sm100/decode_d256_f16.py).
+"""The d256 DECODE tile of the FROST SM100 f16/bf16 engine (sm100/d256_f16_swap_ab/kernel.py).
 
 Decode-shaped d256 graphs (S_q x packed heads <= 16 rows,
 ``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``) lower onto the swap-AB tile --
 KV tokens on the MMA M axis, the packed Q rows on N -- instead of the 256-row
-prefill tile.  Same graph contract, same engine row (``sdpa_fwd_prefill_sm100``):
+prefill tile.  Same graph contract, explicit D256 implementation engines:
 every test here pins the engine with ``select_engine`` and additionally asserts
 WHICH template served the plan through the executor's ``kernel_template`` (a
 decline or a fallback to the prefill tile fails instead of passing on the wrong
@@ -20,10 +20,10 @@ trim), sliding window, right band, sink, Stats natural and base-2, fp16 and
 bf16, the decode split policy (the serving shape leads unsplit with the split
 as the runner-up plan; a small batch splits) plus forced splits with empty
 ranges, CUDA-graph replay under ``set_sync_debug_mode("error")`` (Rule 3), the
-32-column tile (N_Q = 32: compiled and driven at the template level, NOT routed
--- see the routing-boundary tests, which pin S_q x G in (16, 32] on the prefill
-tile), and the routing boundary: larger S_q x G, THD queries and d128 stay on
-the prefill tiles.
+32-column tile (N_Q = 32: explicitly selectable, and automatically routed
+for the existing wide-launch domain), and routing boundaries including THD
+queries, which stay on the prefill implementation. D128 paged units with at most eight live query rows use
+this body's physical D128 envelope and half-width softmax group.
 """
 
 import math
@@ -148,6 +148,7 @@ def _run_graph(
     seed=0,
     split_kv=None,
     graph_kwargs=None,
+    explicit_q_tile=None,
 ):
     """Build cuDNN's paged (``page`` > 0) or dense padded SDPA graph, pin the
     FROST engine (its first entry: the heuristics' own choice, split included --
@@ -209,11 +210,32 @@ def _run_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name())
-    if split_kv is not None:
+    from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
+
+    selected_name = (SWAP_AB if expect == DECODE else LOOKAHEAD) if d == 256 else engine_name()
+    if explicit_q_tile is not None:
+        from cudnn.engines.manifest import MANIFEST
+
+        engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[selected_name]
+        g.create_execution_plan(
+            engine_id,
+            {
+                cudnn.knob_type.TILE_M: explicit_q_tile,
+                cudnn.knob_type.TILE_N: 128,
+                cudnn.knob_type.TILE_CGA_M: 1 if expect == DECODE else 2,
+                cudnn.knob_type.SCHED_POLICY: 0,
+                cudnn.knob_type.PACK_GQA: 0,
+                cudnn.knob_type.SPLIT_KV: split_kv or 1,
+            },
+        )
+        g.select_plan(g.get_execution_plan_count() - 1)
+        plan = g.plans[g._plan_index]
+    else:
+        plan = select_engine(g, selected_name)
+    if split_kv is not None and explicit_q_tile is None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if _is_plan_for(n, engine_name()) and g.plans[i].knobs.split_kv == split_kv), None)
-        assert idx is not None, f"no {engine_name()} entry with split_kv={split_kv}; plans={names}"
+        idx = next((i for i, n in enumerate(names) if _is_plan_for(n, selected_name) and g.plans[i].knobs.split_kv == split_kv), None)
+        assert idx is not None, f"no {selected_name} entry with split_kv={split_kv}; plans={names}"
         g.select_plan(idx)
         plan = g.plans[idx]
     idx = g._plan_index
@@ -252,6 +274,68 @@ def _run_graph(
         torch.testing.assert_close(got_lse[~dead], exp_lse[~dead], atol=5e-3, rtol=0)
         if dead.any():
             assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "dead rows must write LSE := -inf"
+    if explicit_q_tile is not None:
+        # Rebuild the declaration in a fresh graph using only the public
+        # engine/knob record. No selected-plan or adapter state is inherited.
+        engine_id, public = g.get_engine_and_knobs_at_index(idx)
+        g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, **(graph_kwargs or {}))
+        replay_kw = dict(kw)
+        replay_vp = {}
+        for port in ("q", "k", "v", "seq_len_q", "seq_len_kv", "paged_attention_k_table", "paged_attention_v_table", "sink_token"):
+            if port in kw:
+                buffer = vp[kw[port]]
+                tensor = g.tensor_like(buffer)
+                replay_kw[port] = tensor
+                replay_vp[tensor] = buffer
+        replay_o, replay_stats = g.sdpa(**replay_kw)
+        replay_o.set_output(True).set_dim(o_gpu.shape).set_stride(o_gpu.stride())
+        replay_vp[replay_o] = o_gpu
+        if stats:
+            replay_stats.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
+            replay_vp[replay_stats] = stats_gpu
+        vp = replay_vp
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plan(engine_id, public)
+        g.select_plan(0)
+        g.check_support()
+        g.build_plans()
+        ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+        assert _served_by(g, g._plan_index) == expect
+        metadata = g._compiled_plans[g._plan_index]._compiled.implementation_config
+        assert metadata["query_tile"] == explicit_q_tile
+        assert metadata["cga"] == (1 if expect == DECODE else 2)
+        expected_o = o_gpu.clone()
+        expected_stats = stats_gpu.clone() if stats else None
+        handle = cudnn.create_handle()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        cudnn.set_stream(handle, capture_stream.cuda_stream)
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(capture_stream):
+                for _ in range(2):
+                    g.execute(vp, ws, handle=handle)
+            capture_stream.synchronize()
+            with torch.cuda.graph(captured, stream=capture_stream):
+                previous_sync_mode = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    g.execute(vp, ws, handle=handle)
+                finally:
+                    torch.cuda.set_sync_debug_mode(previous_sync_mode)
+            v_c.mul_(0.5)
+            o_gpu.fill_(float("nan"))
+            if stats:
+                stats_gpu.fill_(float("nan"))
+            captured.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(o_gpu, expected_o * 0.5, atol=2e-3, rtol=5e-3)
+            if stats:
+                torch.testing.assert_close(stats_gpu, expected_stats, atol=0, rtol=0)
+        finally:
+            torch.cuda.synchronize()
+            cudnn.destroy_handle(handle)
     return plan
 
 
@@ -515,29 +599,20 @@ def test_decode_graph_wide_tile_routed_launch(page, sink):
     reference: mixed lengths including a one-key row and a tile-unaligned tail, and
     per-batch query lengths down to a row with no live query (with a sink too: the
     padded rows stay O := 0 / LSE := -inf, the live ones fold the sink logit)."""
-    import cudnn.sdpa.fwd.api_dsl as api_dsl
-
-    seen = []
-    real = api_dsl.decode_d256_q_tile
-
-    def spy(*args, **kwargs):
-        seen.append(real(*args, **kwargs))
-        return seen[-1]
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(api_dsl, "decode_d256_q_tile", spy)
-        _run_graph(
-            B=8,
-            H=8,
-            KH=1,
-            s_q=4,
-            lens=[65536, 40000, 1, 129, 65000, 777, 33333, 20000],
-            q_lens=[4, 3, 4, 2, 4, 1, 4, 0],
-            page=page,
-            causal_br=True,
-            sink=sink,
-        )
-    assert 32 in seen, seen
+    plan = _run_graph(
+        B=8,
+        H=8,
+        KH=1,
+        s_q=4,
+        lens=[65536, 40000, 1, 129, 65000, 777, 33333, 20000],
+        q_lens=[4, 3, 4, 2, 4, 1, 4, 0],
+        page=page,
+        causal_br=True,
+        sink=sink,
+    )
+    # The public record and the build-time geometry assertion now carry N_Q;
+    # the adapter no longer calls a policy helper for this selected engine.
+    assert (plan.knobs.tile_m, plan.knobs.cga) == (32, 1)
 
 
 @pytest.mark.L0
@@ -547,7 +622,7 @@ def test_decode_graph_wide_tile_routed_launch(page, sink):
         dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 0, 2048, 4096, 300, 77], q_lens=[1, 0, 1, 1, 1, 1, 1, 1], page=16, sink=0.7),
         dict(B=4, H=16, KH=2, s_q=2, lens=[4096, 600, 0, 129], q_lens=[2, 1, 0, 2], page=16, causal_br=True, sink=True),
         dict(B=2, H=32, KH=2, s_q=3, lens=[16384, 9000], q_lens=[3, 1], page=16, causal_br=True, sink=0.7, expect=PREFILL),
-        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect="decode_d128_f16", split_kv=2),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect=DECODE, split_kv=2),
         dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=64, expect="decode_d128_f16", split_kv=2),
     ],
     ids=["d256_decode_empty_batch", "d256_decode_mtp2_trim", "d256_prefill_tile_trim", "d128_decode_split2", "d64_decode_split2"],
@@ -574,9 +649,9 @@ def test_decode_routing_boundary():
     _run_graph(B=2, H=16, KH=2, s_q=4, lens=[700, 130], page=16, causal_br=True, expect=PREFILL)  # 32 packed rows at 8:1
     _run_graph(B=2, H=4, KH=4, s_q=17, lens=[700, 130], page=16, expect=PREFILL)  # 17 MHA rows
     _run_graph(B=2, H=32, KH=2, s_q=3, lens=[700, 130], page=16, expect=PREFILL)  # 48 packed rows
-    # d128 is another flavor: its decode-shaped graphs ride the d128 flavor's own
-    # decode tile (sm100/decode_d128_f16.py, TILE_CGA_M=1, PR #1094), never this one.
-    _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect="decode_d128_f16")
+    # D128 paged units with at most eight live rows share the swap-AB body,
+    # with native D128 geometry and half-width softmax work.
+    _run_graph(B=2, H=8, KH=2, s_q=1, lens=[700, 130], d=128, page=16, expect=DECODE)
     _run_graph(B=2, H=64, KH=1, s_q=1, lens=[300, 130], page=16, expect=PREFILL)  # 64 packed rows
 
 
@@ -596,7 +671,7 @@ def test_decode_kernel_two_column_groups(splits):
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
-    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+    from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     B, H, KH, P, s_q = 3, 32, 2, 16, 2
     lens = [700, 130, 5]
@@ -709,7 +784,9 @@ def test_decode_routing_boundary_thd_queries():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD
+
+    select_engine(g, LOOKAHEAD)
     idx = g._plan_index
     g.check_support()
     g.build_plans()
@@ -810,3 +887,13 @@ def test_decode_adapter_cuda_graph_replay_no_host_sync():
             torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-3, rtol=0)
     finally:
         g.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("q_tile,expect", [(16, DECODE), (32, DECODE), (128, PREFILL)])
+@pytest.mark.parametrize("page", [0, 16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_explicit_d256_body_does_not_reselect_for_query_extent(q_tile, expect, page, dtype):
+    # N16/N32 remain explicit even where default policy chooses lookahead.
+    # The helper checks O/Stats, changed-input CUDA Graph replay and no D2H.
+    _run_graph(B=2, H=4, KH=4, s_q=33, lens=[257, 130], page=page, dtype=dtype, expect=expect, explicit_q_tile=q_tile)

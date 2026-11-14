@@ -113,7 +113,11 @@ def test_mismatch_accepts_and_rejects(row):
     assert reason(has_sink=True) is None
     assert "dense graphs only" in reason(thd=True, packed_layout=True)
     assert "paged-KV" in reason(has_paged_kv=True, padded=True, page_size=128)
-    assert "wired on the d128" in reason(d_qk=256, d_v=256)
+    d256_reason = reason(d_qk=256, d_v=256)
+    assert ("owned by" if row == "sdpa_fwd_prefill_sm100" else "wired on the d128") in d256_reason
+    if row == "sdpa_fwd_prefill_sm100":
+        d256_caps = _caps("sdpa_fwd_sm100_d256_lookahead")
+        assert "score_max output, which this engine does not support" in engines.mismatch(d256_caps, _facts(device_cc=cc, d_qk=256, d_v=256))
     if row == "sdpa_fwd_prefill_sm100":
         # The native d64 flavor is the same file at d_flavor=64 but is not validated with the outputs: not claimed.
         assert "wired on the d128" in reason(d_qk=64, d_v=64)
@@ -170,7 +174,7 @@ def test_capabilities_field_is_appended():
 
 
 def test_adapter_signatures_append_the_score_kwargs():
-    """Public-API signatures evolve append-only: the constructor's samples and execute's tensors are the last parameters."""
+    """Public-API signatures evolve append-only: existing parameter segments retain their order."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     ctor = inspect.signature(SdpaFwdDsl.__init__).parameters
@@ -188,10 +192,12 @@ def test_adapter_signatures_append_the_score_kwargs():
         "dead_subtile_quiet",
         "bias_max_form",
         "softmax_wgs",
+        "swap_ab",
     ], list(ctor)[j:]
     assert ctor["sample_score_max"].default is None and ctor["sample_score_sum_exp"].default is None
     ex = inspect.signature(SdpaFwdDslSm100.execute).parameters
-    assert list(ex)[-4:] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
+    j = list(ex).index("score_max_tensor")
+    assert list(ex)[j : j + 4] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
     assert ex["score_max_tensor"].default is None and ex["score_sum_exp_tensor"].default is None
     assert ex["bias_tensor"].default is None and ex["kv_mask_tensor"].default is None
 

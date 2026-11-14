@@ -189,7 +189,11 @@ The runner produces (in `benchmark/results/`):
 
 ## Single Benchmark Script
 
-For running individual benchmarks:
+For running individual benchmarks. Unless `--skip_ref` is passed, the script
+imports FlashAttention 4 (`flash_attn.cute`) as its reference and checks
+non-FP8 results against it, so FlashAttention 4 must be installed and must
+support the GPU (the Docker image above provides it). FlashAttention 4 does
+not run on SM8x; add `--skip_ref` there.
 
 ```bash
 # cuDNN Frontend (BF16)

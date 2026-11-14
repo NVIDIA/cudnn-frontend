@@ -415,7 +415,7 @@ def test_the_decode_step_is_bitwise_with_and_without_pdl_on_cc_10_0(decl, group,
     off = _case(group, s_q, pdl=False, **kw)
     on = _case(group, s_q, pdl=True, **kw)
     assert on.route_readback() == off.route_readback() and _stage_names(on) == _stage_names(off)
-    assert on.route_readback()["template"] == DECODE_TILE and on.route_readback()["file"].endswith("/sm100/decode_d256_f16.py")
+    assert on.route_readback()["template"] == DECODE_TILE and on.route_readback()["file"].endswith("/sm100/d256_f16_swap_ab/kernel.py")
     assert on.blk.use_pdl is True and on.blk._sdpa.use_pdl is True and "sdpa" in on.blk.pdl_stages and off.blk.use_pdl is False
     a = off.run().clone()
     b = on.run().clone()

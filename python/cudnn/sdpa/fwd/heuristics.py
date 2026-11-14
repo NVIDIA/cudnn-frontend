@@ -42,6 +42,7 @@ the honest answer while nobody has timed it.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from math import gcd
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
@@ -50,6 +51,7 @@ import cudnn
 
 from cudnn.engines.base import PlanConfig
 from cudnn.frost.tile_dsl.constants import (
+    DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
     DTYPE_E4M3,
     DTYPE_E5M2,
@@ -58,6 +60,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd.config_sm90 import d128_causal_route as _sm90_d128_causal_route
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     FP8_DUAL_KV_STREAM_MAX_ROWS,
@@ -105,6 +108,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,
     EngineSpec,
@@ -120,6 +124,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    effective_tile_ms,
     launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
@@ -144,6 +149,8 @@ _SM100_L2_BUDGET_BYTES = 50 * 1024 * 1024
 # causal walks take plain LPT (see _sched_points): 8 MiB sits between the measured
 # S=8K bf16 (4 MiB, LPT ahead) and S=32K bf16 (16 MiB, LPT_L2 ahead) points.
 _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
+# Per-KV-head K+V footprint below which the quantized d128 GQA causal arm of the 107 line proposes plain LPT first.
+_SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES = 2 * 1024 * 1024
 # Rubin, causal, NO GQA (h_q == h_kv): the LPT-vs-NATURAL crossover in grid WAVES
 # (work items per persistent 2-CTA cluster).  Perf node, kernel-level, d192x128
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
@@ -152,10 +159,29 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # 256 = the 2-CTA flavors' q rows per cluster; measured on the 212-SM part (106 clusters).
 _SM107_CGA_Q_ROWS = 256
 _SM107_MEASURED_SMS = 212
-_SM107_NO_GQA_LPT_MAX_WAVES = 24
+_SM107_NO_GQA_LPT_MAX_WAVES = 8
 # Rubin half THD causal prefill on the d128 flavor without packing: LPT ahead of NATURAL up to ~10 waves (9.48 and 11.85
 # measured; 311 FI-path cells, ragged and paged, 2026-11-01). d256 measured mixed from 5 waves on and keeps NATURAL.
 _SM107_THD_LPT_MAX_WAVES = 10
+# SM100 d192x128 f16/bf16 causal without GQA (h_q == h_kv): plain LPT up to this many grid waves of 512-row 2-CTA
+# pair units (one unit per persistent cluster); above it the L2-grouped LPT walk, except
+# on cc 10.3 with more (batch, head) K/V streams than SMs, where the natural walk stays.
+_SM100_D192_PAIR_ROWS = 512
+_SM100_MEASURED_SMS = 148
+_SM100_D192_LPT_MAX_WAVES = 12
+# GB10 (cc 12.1): its SM count, the fallback where the graph facts carry none (the causal NATURAL rule in _sched_points).
+_SM121_MEASURED_SMS = 48
+# The SM90 D128 causal route's CTA count where the facts carry no device (a host without CUDA): an H100 SXM's SM count,
+# the board the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+_SM90_MEASURED_SMS = 132
+# api_dsl's call-time switches that decide whether a causal D128 plan runs the walk's record, at the values api_dsl
+# ships them with: _sm90_d128_causal_walks reads the module's own once it is loaded.
+_SM90_D128_SHIPPED_SWITCHES = (
+    ("D128_INTRA_WG_OVERLAP", True),
+    ("D128_PERSISTENT", True),
+    ("D128_PERSISTENT_CAUSAL_WALK", 2),
+    ("D128_CAUSAL_WALK_ROUTE", True),
+)
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -450,7 +476,7 @@ def choose_split_kv(
 
 
 # --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
-# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# sm100/d256_f16_swap_ab/kernel.py is not the machine choose_split_kv was fitted on: one
 # cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
 # tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
 # kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
@@ -651,7 +677,8 @@ DECODE_COMBINE_LEAN_ROWS_PER_BLOCK = 4
 # is the rule's host reading, the one the split model prices a launch's combine
 # by; it answers False off cc 10.7, where the module's own forms (measured on
 # B200 / B300 by their author) serve every launch.
-DECODE_COMBINE_MAX_LEAN_BLOCKS = 128
+# DECODE_COMBINE_MAX_LEAN_BLOCKS is re-exported from the shared tile constants
+# so the reduction kernel can read the same bound without an adapter cycle.
 # The split-aware FORM rule the adapter pins a split launch's combine entry to
 # (decode_combine_grid_selected; the kernel module's own entry takes the
 # decode-grid kernel on every launch inside its bound, so the adapter forces the
@@ -735,8 +762,8 @@ def decode_combine_grid_selected(b: int, h_q: int, s_q: int, split: int, device_
     Blackwell line (cc 10.0 / 10.3), whose launches keep the module's own forms, and any line the rule was
     never measured on (``_DECODE_COMBINE_RULE_CC`` is the one line it holds for); ``None`` reads the cc 10.7
     rule (the model's direct callers; a plan always names its device).  The sparse adapter's LEAN plans on the Blackwell parts of
-    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0) evaluate this rule at the measured line's cc on purpose
-    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 class; the table sits there)."""
+    ``sparse_tile_rules.SPARSE_LEAN_COMBINE_RULE_CCS`` (cc 10.0 / 10.3) evaluate this rule at the measured line's cc on purpose
+    (``sparse_lean_combine_rule_cc``: the rule's shape was measured for the lean grids on the GB200 and GB300 classes; the tables sit there)."""
     if device_cc is not None and tuple(device_cc)[:2] != _DECODE_COMBINE_RULE_CC:
         return False
     if decode_combine_lean_blocks(b, h_q, s_q) > DECODE_COMBINE_MAX_LEAN_BLOCKS or int(split) < DECODE_COMBINE_MIN_SPLIT:
@@ -1318,7 +1345,7 @@ def _prefer_paged_d256_lpt(facts) -> bool:
         and facts.causal
         and facts.window_left is None
         and (facts.right_bound or 0) == 0
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.dtype == cudnn.data_type.BFLOAT16 or (facts.device_cc == (10, 0) and facts.dtype == cudnn.data_type.HALF))
         and (facts.d_qk, facts.d_v) == (256, 256)
         and facts.b == 1
         and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
@@ -1334,13 +1361,35 @@ def _sm107_cluster_waves(facts) -> float:
     return (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
 
 
-def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
+def _sm90_d128_causal_walks(facts) -> bool:
+    """Whether check_support gives a causal SM90 D128 graph of ``facts`` the walk's record (persistent, causal_walk 1,
+    the NATURAL order unless pinned) rather than the one-tile record (the causal order): the choice a check_support
+    without a pinned order makes, mirrored here because a graph-route plan carries its proposal as a pin. A record
+    check_support then hands to the claim counter (api_dsl.D128_CAUSAL_CLAIM, past its gate) is persistent and NATURAL
+    too, so the counter's switches do not move this answer. The walk's
+    record needs api_dsl's switches at the walk (D128_INTRA_WG_OVERLAP, D128_PERSISTENT, D128_PERSISTENT_CAUSAL_WALK 2,
+    as api_dsl._sm90_d128_persistence reads them) and a plan the route keeps (config_sm90.d128_causal_route, while
+    D128_CAUSAL_WALK_ROUTE is on) at the device's SM count, the CTA count compile() gives the record. The switches are
+    api_dsl's call-time module constants, read from the module once it is loaded; it imports torch, so this module does
+    not load it, and until something does they hold the values it ships with (_SM90_D128_SHIPPED_SWITCHES; getattr on
+    the absent module's None returns them)."""
+    api = sys.modules.get("cudnn.sdpa.fwd.api_dsl")
+    overlap, persistent, walk, route = (getattr(api, name, shipped) for name, shipped in _SM90_D128_SHIPPED_SWITCHES)
+    if not (overlap and persistent and walk == 2):
+        return False
+    shape = (int(facts.b), int(facts.h_q), int(facts.h_kv), int(facts.s_q), int(facts.s_kv))
+    return not (route and _sm90_d128_causal_route(shape, bool(facts.bottom_right), int(facts.device_sm_count or _SM90_MEASURED_SMS)))
+
+
+def _sched_points(caps: Capabilities, facts, *, d128: bool = False) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
     The PRIMARY follows the measured preference for the graph's shape; the
     remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
-    standalone wrapper users who bypass ranking.
+    standalone wrapper users who bypass ranking. ``d128`` asks for the SM90 row's
+    128 x 128 sets (the dedicated D128 template, :func:`_sm90_d128_knob_sets`),
+    whose causal walk record takes its own order; every other set leaves it False.
     """
     # The FLAVOR's domain, not the row-wide floor: a `sched_policies_by_d_shape`
     # claim (the Rubin f16 / FP8 (256, 256) LPT entries) must reach the ranking,
@@ -1511,6 +1560,28 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # proposes LPT on cc 10.3, where LPT vs LPT_L2 is unmeasured; it follows the
         # existing B200-measured precedent of the decode-tile arm above, keyed the same way.
         primary = SCHED_LPT
+    elif (
+        causal_ish
+        and 107 <= caps.sm_lo < 120
+        and (facts.is_fp8 or facts.is_mxfp8)
+        and _selected_d_shape(caps, facts) == (128, 128)
+        and int(facts.h_q) != int(facts.h_kv)
+        and int(facts.s_kv) * (int(facts.d_qk) + int(facts.d_v)) < _SM107_QUANT_D128_GQA_LPT_MAX_HEAD_BYTES
+    ):
+        # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
+        primary = SCHED_LPT
+    elif causal_ish and d128 and not facts.thd and _sm90_d128_causal_walks(facts):
+        # The SM90 row's 128 x 128 tile (the D128 template; ``d128``, _sm90_d128_knob_sets), on a causal plan
+        # check_support gives the walk's record (_sm90_d128_causal_walks): its
+        # persistent loop walks the work in NATURAL order, a head's Q tiles side by side, so they run at once on
+        # neighbouring CTAs and share the head's K and V in L2 (the stride deals its rounds straight or snaked by the
+        # planner's busiest-CTA cost). MEASURED on an H100 SXM (2026-11-06, Nsight, 8 causal shapes): the LPT_L2 walk
+        # read K and V from HBM 1.26 to 2.16 times the read-once floor where cuDNN 9.27 read it once; the NATURAL stride
+        # read it 1.00 to 1.03 times. A graph-route plan carries this knob, and the adapter honours a carried knob as a
+        # pin, so the proposal here is what a causal D128 graph runs. LPT and LPT_L2 stay behind for autotune. A plan
+        # the route sends one tile per CTA takes the causal rule below instead, the order the one-tile record keeps and
+        # the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+        primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -1524,16 +1595,18 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             and int(facts.h_q) == int(facts.h_kv)
             and facts.window_left is None
         ):
-            # SM100 d192x128 f16/bf16 without GQA (DeepSeek-V3 / Kimi layers):
-            # every KV head is read by one Q head, so LPT_L2 has nothing to
-            # group, and at these head counts the causal triangle spans dozens
-            # of waves, so LPT has little to balance -- the natural walk keeps
-            # a head's K/V hot in L2.  MEASURED (cuDNN 9.30 yardstick, profiler
-            # kernel sums, 2026-09-28) NATURAL / LPT_L2 / LPT of cuDNN: B300
-            # 128 heads S=2K 1.06 / 1.09 / 1.09x, S=8K 1.08 / 1.12 / 1.25x;
-            # B200 S=2K 1.03 / 1.05 / 1.06x, S=8K 1.02 / 1.02 / 1.12x, 64 heads
-            # S=4K 1.02 / 1.03 / 1.05x.  GQA d192 graphs keep the L2 rule.
-            primary = SCHED_NATURAL
+            # SM100 d192x128 f16/bf16 without GQA: the plain LPT walk while the causal grid is at most
+            # _SM100_D192_LPT_MAX_WAVES waves of 512-row pair units; above that the L2-grouped walk, except on cc 10.3
+            # with more (batch, head) K/V streams than SMs, which keeps the natural walk.
+            sm_count = int(facts.device_sm_count or _SM100_MEASURED_SMS)
+            streams = int(facts.b) * int(facts.h_q)
+            waves = (streams * -(-int(facts.s_q) // _SM100_D192_PAIR_ROWS)) / (sm_count // 2)
+            if waves <= _SM100_D192_LPT_MAX_WAVES:
+                primary = SCHED_LPT
+            elif tuple(facts.device_cc or ()) == (10, 3) and streams > sm_count:
+                primary = SCHED_NATURAL
+            else:
+                primary = SCHED_LPT_L2
         elif caps.sm_lo == 100 and _selected_d_shape(caps, facts) in ((128, 128), (64, 64)) and one_head_bytes < _SM100_D128_LPT_L2_MIN_BYTES:
             # The SM100 d128 / d64 f16 and per-tensor FP8 kernels: below a few
             # MiB per head the K/V of a head stays L2-resident under ANY walk, so
@@ -1543,6 +1616,24 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
             # 1.04x vs 1.07x, S=32K packed 1.11x vs 1.07x (16 MiB/head: L2 wins);
             # e4m3 64/64 S=2K cga1 1.19x vs 1.33x, 64/8 S=2K/8K packed equal.
             primary = SCHED_LPT
+        if (
+            tuple(facts.device_cc or ()) == (12, 1)
+            and caps.sm_lo == 120
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and _selected_d_shape(caps, facts) in ((64, 64), (128, 128))
+            and facts.window_left is None
+            and int(facts.b) * int(facts.h_q) > int(facts.device_sm_count or _SM121_MEASURED_SMS)
+        ):
+            # GB10 (cc 12.1: 48 SMs, 24 MiB L2, LPDDR5X): with more (batch, head) streams than SMs the natural walk
+            # keeps each resident wave on a few heads' K/V, while both LPT walks spread it over as many heads as there
+            # are SMs -- the cc 10.3 d192 rule above, measured here on the d64 / d128 half kernels.  MEASURED on GB10
+            # (cuDNN 9.27.0.42, bf16, bottom-right causal dense prefill, every policy of the 128x128 tile timed
+            # round-robin): a 145-cell MHA grid (b 1-16, h 8-32, S 512-8192) and a 320-cell holdout off it (b 3-12,
+            # h 12-40, GQA 1 / 4 / 8, S 768-6144); against LPT_L2 first, NATURAL/LPT_L2 ran 0.49x at b*h = 512 and 1.08-1.11x
+            # at b*h <= 16, and the rule took the holdout's geomean regret from 1.384 to 1.005, two of 320 cells over 3 % slower
+            # (max 1.083x, within run-to-run spread).
+            # RTX 5060 Ti / PRO 6000 (cc 12.0) keep the L2-budget rule: LPT_L2 measured even or ahead there.
+            primary = SCHED_NATURAL
     else:
         primary = SCHED_NATURAL
     order = {SCHED_LPT_L2: (SCHED_LPT, SCHED_NATURAL), SCHED_LPT: (SCHED_LPT_L2, SCHED_NATURAL), SCHED_NATURAL: (SCHED_LPT, SCHED_LPT_L2)}
@@ -2054,7 +2145,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         prefer = (
             pack_gqa is not False
             and _prefer_thd_pack_gqa(caps, facts)
-            and facts.dtype == cudnn.data_type.BFLOAT16
+            and (facts.dtype == cudnn.data_type.BFLOAT16 or (not rubin_paged and facts.has_paged_kv and facts.dtype == cudnn.data_type.HALF))
             and facts.bottom_right
             and facts.window_left is None
             and not facts.right_band_widening
@@ -2072,6 +2163,8 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     if selected_shape == (128, 128) and (split_kv or 1) == 1 and sm100_nonpaged_d128_thd_single_cta_leg(caps, facts, cga=1, split_kv=1):
         # The SM100 nonpaged D128 half THD graphs with one query head per KV head run the single-CTA two-slab prefill body
         # (engines.sm100_nonpaged_d128_thd_single_cta_leg); the pair tile stays a runner.
+        return sched_policy, 1
+    if selected_shape == (128, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
         return sched_policy, 1
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row
@@ -2091,6 +2184,8 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         if selected_cga not in domain:
             raise ValueError(f"D512 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
+    if selected_shape == (192, 128) and caps.sm_lo == 107 and (caps.is_fp8 or caps.is_mxfp8) and domain == frozenset({1, 2}):
+        return SCHED_LPT, 1
     if selected_shape != (192, 128) or not any(shape == (192, 128) for shape, _ in caps.cgas_by_d_shape):
         return sched_policy, _sole(domain)
     params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
@@ -2230,7 +2325,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/decode_d256_f16.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
@@ -2244,7 +2339,7 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv:
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
     """The heads the DECODE tile packs per token for a set whose prefill-tile
     group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
-    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    ratio.  sm100/d256_f16_swap_ab/kernel.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
     one unit per (KV head, batch) with every head of the group in its 16-column
     tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
     the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not
@@ -2402,9 +2497,10 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
             # When tile_q % G != 0 a packed tile holds tile_q // G tokens, its tail rows dead: packing wins only while it launches no
             # more Q tiles than the unpacked set (G per KV head here, since S_q < tile_q).  48/1 at S_q = 120 would
             # launch 60 two-token tiles against 48, 71/1 at S_q = 100 one-token tiles 100 against 71.  A group that
-            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.
-            g = facts.h_q // facts.h_kv
-            wins = _ceil_div(facts.s_q, tile_q // g) <= g
+            # divides the tile always passes: ceil(S_q * G / tile_q) <= G.  Under partial PackGQA the tile holds the
+            # packed subgroup p, not G (96/1 at a 64-row tile packs 32): the same test per subgroup, G / p of them.
+            g = _pack_gqa_group(caps, facts, tile_m, True, split_kv)
+            wins = 1 < g <= tile_q and _ceil_div(facts.s_q, tile_q // g) <= g
         if (
             wins
             and rubin_dense_d128_shared_leg(caps, facts)
@@ -2641,9 +2737,16 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(
-            caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
-        )
+        from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+        if caps.sm_lo == 100 and in_pilot_domain(facts):
+            # Cost the same immutable geometry that becomes the public plan;
+            # there is no adapter route to predict for these candidates.
+            decode_q_tile = select_sm100_d256_geometry(facts, decode_pack_g > 1).query_tile
+        else:
+            decode_q_tile = decode_d256_q_tile_for_row(
+                caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
+            )
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,
@@ -2782,6 +2885,157 @@ def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaun
     return launch if units <= resident else None
 
 
+SM100_PAGED_PACKED_SPLIT_CGA = {(64, 64): 1, (256, 256): 2}  # SM100/103 paged half packed split: D64 decode tile, D256 pair
+SM100_PAGED_PACKED_SPLIT_GROUPS = (2, 4, 8, 16)
+SM100_PAGED_PACKED_SPLIT_Q = (8, 1024)  # declared S_q range measured (B200 study sm100_paged_d64_d256_prefill_20261111)
+SM100_PAGED_PACKED_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_PACKED_SPLIT_KV_PER_Q = 2  # declared S_kv >= this x S_q
+# Past the first wave (study sm100_paged_packed_split_waves_20261112; B200, B300 transfer): the parts timed, the declared S_q up to which the
+# packed split still leads, D64 also to 128 rows over at least this many KV tiles, and at most this many partitions.
+SM100_PAGED_PACKED_SPLIT_WAVE_CCS = frozenset({(10, 0), (10, 3)})
+SM100_PAGED_PACKED_SPLIT_WAVE_Q = {(64, 64): 64, (256, 256): 128}
+SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES = 128
+SM100_PAGED_PACKED_SPLIT_WAVE_MAX = 4
+
+
+def sm100_paged_packed_split_choice(caps: Capabilities, facts) -> int:
+    """SM100/103 paged bf16 D64 / D256 GQA prefix: the packed split count (:func:`_sm100_paged_packed_wave_split`, else the packed
+    :func:`sm100_paged_tail_split_choice`), 1 when neither splits."""
+    splits = _sm100_paged_packed_wave_split(caps, facts)
+    if splits > 1 or (facts.d_qk, facts.d_v) not in SM100_PAGED_PACKED_SPLIT_CGA:
+        return splits
+    tail, packed = sm100_paged_tail_split_choice(caps, facts)
+    return tail if packed else 1
+
+
+def _sm100_paged_packed_wave_split(caps: Capabilities, facts) -> int:
+    """SM100/103 paged bf16 D64 / D256 GQA prefix: the packed split count, 1 outside the domain.
+
+    The packed launch (b x KV heads x packed Q tiles) underfills the part on these short-Q / long-KV graphs; split the KV
+    loop over the idle clusters (four KV tiles per partition at least, 16 partials at most). With no idle cluster, short
+    queries still split two to four ways (``SM100_PAGED_PACKED_SPLIT_WAVE_*``). The declaration bounds the launch: live
+    lengths are never read."""
+    d_shape = (facts.d_qk, facts.d_v)
+    cga = SM100_PAGED_PACKED_SPLIT_CGA.get(d_shape)
+    if not (
+        cga is not None
+        and caps.sm_lo == 100
+        and facts.device_cc in ((10, 0), (10, 3))
+        and paged_thd_split_domain(caps, facts)
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)  # the measured dtype, as the D128 split rule
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in SM100_PAGED_PACKED_SPLIT_GROUPS
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and SM100_PAGED_PACKED_SPLIT_Q[0] <= facts.s_q <= SM100_PAGED_PACKED_SPLIT_Q[1]
+        and SM100_PAGED_PACKED_SPLIT_KV[0] <= facts.s_kv <= SM100_PAGED_PACKED_SPLIT_KV[1]
+        and facts.s_kv >= SM100_PAGED_PACKED_SPLIT_KV_PER_Q * facts.s_q
+        and facts.device_sm_count
+    ):
+        return 1
+    pack_g = _pack_gqa_group(caps, facts, 128, True, split_kv=2)
+    if pack_g <= 1:
+        return 1
+    launch = _split_launch(caps, facts, 128, 128, cga, pack_g, split_kv=2)
+    units = facts.b * launch.heads_q * launch.q_tiles
+    slots = facts.device_sm_count // launch.ctas_per_tile
+    budget = min(16, slots // max(1, units), launch.kv_tiles // 4)
+    if budget >= 2:
+        splits = _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+    else:
+        # No first-wave room: on short queries the packed split still beats the unpacked unsplit default (a THD graph has no
+        # packed unsplit plan) -- two to four partitions, the fewest waves x loop tiles.
+        if facts.device_cc not in SM100_PAGED_PACKED_SPLIT_WAVE_CCS:
+            return 1
+        short_q = facts.s_q <= SM100_PAGED_PACKED_SPLIT_WAVE_Q[d_shape] or (
+            d_shape == (64, 64) and facts.s_q <= 128 and launch.kv_tiles >= SM100_PAGED_PACKED_SPLIT_D64_Q128_KV_TILES
+        )
+        if not short_q:
+            return 1
+        loop = lambda s: (_ceil_div(units * s, slots) * _ceil_div(launch.kv_tiles, s), s)
+        splits = min(range(2, min(SM100_PAGED_PACKED_SPLIT_WAVE_MAX, launch.kv_tiles // 4) + 1), key=loop, default=1)
+        if splits < 2:
+            return 1
+    knobs = SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=splits)
+    return splits if mismatch(caps, facts, knobs) is None else 1
+
+
+# Past the choosers above (study sm100_paged_split_v2_20261112; B200 train / holdout, B300 transfer): an SM100/103 paged bf16
+# prefix they leave unsplit still splits when its KV loop is long next to the wave load. The equal-length check
+# (sm100_paged_tail_split_equal_check_20261112, B200 and B300) kept one Q tile per unit at D64 / D128 (always split) and more Q tiles
+# at D256 (KV tiles past 2 x BREAK_EVEN x waves); the other branches lost up to 1.33x on equal-length batches and revert.
+# Count = argmin PARTIAL_COST x waves x s + KV tiles / s (a partial's setup and combine vs the loop's tail).
+SM100_PAGED_TAIL_SPLIT_CGA = {(64, 64): 1, (128, 128): 1, (256, 256): 2}
+SM100_PAGED_TAIL_SPLIT_CCS = frozenset({(10, 0), (10, 3)})
+SM100_PAGED_TAIL_SPLIT_MAX_B = 16
+SM100_PAGED_TAIL_SPLIT_Q = (16, 1024)  # declared S_q range measured
+SM100_PAGED_TAIL_SPLIT_KV = (2048, 65536)  # declared S_kv range measured
+SM100_PAGED_TAIL_SPLIT_ONE_TILE_DIMS = frozenset({64, 128})
+SM100_PAGED_TAIL_SPLIT_MULTI_TILE_BREAK_EVEN = {256: 74}
+SM100_PAGED_TAIL_SPLIT_PARTIAL_COST = 16
+SM100_PAGED_TAIL_SPLIT_COUNTS = (2, 3, 4, 6, 8, 12, 16)
+
+
+def sm100_paged_tail_split_domain(caps: Capabilities, facts) -> bool:
+    """FlashInfer's exact paged bf16 prefix on cc 10.0 / 10.3 as study sm100_paged_split_v2_20261112 declared it."""
+    return (
+        caps.sm_lo == 100
+        and facts.d_qk == facts.d_v
+        and (facts.d_qk, facts.d_v) in SM100_PAGED_TAIL_SPLIT_CGA
+        and facts.device_cc in SM100_PAGED_TAIL_SPLIT_CCS
+        and paged_thd_split_domain(caps, facts)
+        and not facts.shape_overrides
+        and facts.max_total_seq_len_q is None
+        and facts.dtype in (cudnn.data_type.BFLOAT16, cudnn.data_type.HALF)
+        and 1 <= facts.b <= SM100_PAGED_TAIL_SPLIT_MAX_B
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and SM100_PAGED_TAIL_SPLIT_Q[0] <= facts.s_q <= SM100_PAGED_TAIL_SPLIT_Q[1]
+        and SM100_PAGED_TAIL_SPLIT_KV[0] <= facts.s_kv <= SM100_PAGED_TAIL_SPLIT_KV[1]
+        and facts.s_kv >= 2 * facts.s_q
+        and bool(facts.device_sm_count)
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
+def sm100_paged_tail_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """(split count, packing) past the measured choosers (``SM100_PAGED_TAIL_SPLIT_*``); (1, False) declines. GQA packs. The
+    declaration bounds the launch: live lengths are never read."""
+    if not sm100_paged_tail_split_domain(caps, facts):
+        return 1, False
+    d_shape = (facts.d_qk, facts.d_v)
+    group = facts.h_q // facts.h_kv
+    pack = group > 1
+    cga = SM100_PAGED_TAIL_SPLIT_CGA[d_shape]
+    q_tiles = _ceil_div(facts.s_q * (group if pack else 1), 128)
+    units = facts.b * (facts.h_kv if pack else facts.h_q) * q_tiles
+    slots = facts.device_sm_count // cga
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    if q_tiles == 1:
+        if facts.d_qk not in SM100_PAGED_TAIL_SPLIT_ONE_TILE_DIMS:
+            return 1, False
+    else:
+        break_even = SM100_PAGED_TAIL_SPLIT_MULTI_TILE_BREAK_EVEN.get(facts.d_qk)
+        if break_even is None or kv_tiles * slots <= 2 * break_even * units:
+            return 1, False
+    counts = [s for s in SM100_PAGED_TAIL_SPLIT_COUNTS if kv_tiles // s >= 4]
+    if not counts:
+        return 1, False
+    splits = min(counts, key=lambda s: (SM100_PAGED_TAIL_SPLIT_PARTIAL_COST * units * s / slots + kv_tiles / s, s))
+    sched = SCHED_NATURAL if d_shape in SM100_PAGED_PACKED_SPLIT_CGA else SCHED_LPT
+    knobs = SdpaFwdKnobs(sched_policy=sched, tile_m=128, tile_n=128, cga=cga, pack_gqa=pack, split_kv=splits)
+    return (splits, pack) if mismatch(caps, facts, knobs) is None else (1, False)
+
+
 def _paged_d256_thd_split_choice(caps: Capabilities, facts) -> int:
     launch = paged_d256_prefix_launch(caps, facts)
     if launch is None:
@@ -2830,10 +3084,54 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1, prefer_pack: boo
     return 1, False
 
 
+# Paged D128 GQA prefix envelope on the parts its study timed, sm103_paged_d128_envelope_20261112: pages 32 / 64, b <= 16, s_q 16-63
+# and S_kv to 131072 split too (holdout new / old 0.113 geomean on B300, 0.126 on B200).
+SM100_PAGED_D128_WIDE_CCS = frozenset({(10, 0), (10, 3)})
+SM100_PAGED_D128_WIDE_PAGES = (16, 32, 64, 128)
+SM100_PAGED_D128_WIDE_MAX_B = 16
+SM100_PAGED_D128_WIDE_MIN_Q = 16
+SM100_PAGED_D128_WIDE_MAX_KV = 131072
 SM107_PAGED_PREFILL_SPLIT_WAVES = 2  # Rubin paged d128 GQA (group >= 4) split budget past one Q tile, in waves of SMs
 
 
+# Rubin paged bf16 D64 GQA prefixes split on the D128 Rubin budget (the native split is #2502's); study
+# sm107_paged_d64_split_20261112 measured these bounds.
+SM107_PAGED_D64_SPLIT_MAX_B = 16
+SM107_PAGED_D64_SPLIT_Q = (16, 1024)
+SM107_PAGED_D64_SPLIT_KV = (2048, 131072)
+SM107_PAGED_D64_SPLIT_PAGES = (16, 64)
+
+
+def _sm107_paged_d64_split_domain(caps: Capabilities, facts) -> bool:
+    return (
+        caps.sm_lo == 107
+        and paged_thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (64, 64)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 1 <= facts.b <= SM107_PAGED_D64_SPLIT_MAX_B
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in (4, 8, 16)
+        and facts.page_size in SM107_PAGED_D64_SPLIT_PAGES
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and SM107_PAGED_D64_SPLIT_Q[0] <= facts.s_q <= SM107_PAGED_D64_SPLIT_Q[1]
+        and SM107_PAGED_D64_SPLIT_KV[0] <= facts.s_kv <= SM107_PAGED_D64_SPLIT_KV[1]
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    )
+
+
 def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = False) -> Tuple[int, bool]:
+    """:func:`_measured_paged_thd_split_choice`, else :func:`sm100_paged_tail_split_choice`; (1, False) keeps the existing plan."""
+    splits, pack = _measured_paged_thd_split_choice(caps, facts, first_wave=first_wave)
+    return (splits, pack) if splits > 1 else sm100_paged_tail_split_choice(caps, facts)
+
+
+def _measured_paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = False) -> Tuple[int, bool]:
     """Measured bounded-graph (split count, packing); one keeps the existing plan.
 
     Include batch in the grid estimate so multi-request chunks do not receive
@@ -2844,28 +3142,36 @@ def paged_thd_split_choice(caps: Capabilities, facts, *, first_wave: bool = Fals
     listed after the default; a mixed-length KV batch can lose with fewer partials). Blackwell also admits
     GQA16 and KV lengths through 32K with the same physical-grid score and
     bounded partial workspace, excluding splits with more waves than partitions.
+    SM100/103 D64 / D256 GQA prefixes take :func:`sm100_paged_packed_split_choice` (packed); Rubin D64 GQA prefixes take the Rubin
+    budget below inside ``SM107_PAGED_D64_SPLIT_*``. On cc 10.3 the D128 envelope also
+    admits pages 32 / 64, s_q from 16, S_kv to 131072 and b to 16 (``SM100_PAGED_D128_WIDE_*``).
     """
+    sm100_splits = sm100_paged_packed_split_choice(caps, facts)
+    if sm100_splits > 1:
+        return sm100_splits, True
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
-    if not (
+    wide = caps.sm_lo == 100 and facts.device_cc in SM100_PAGED_D128_WIDE_CCS
+    d128 = (
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
-        and facts.dtype == cudnn.data_type.BFLOAT16
-        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
+        and (facts.dtype == cudnn.data_type.BFLOAT16 or (caps.sm_lo == 100 and facts.dtype == cudnn.data_type.HALF))
+        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else SM100_PAGED_D128_WIDE_MAX_B if wide else 4)
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
-        and facts.page_size in ((16, 128) if caps.sm_lo == 100 else (16,))
+        and facts.page_size in (SM100_PAGED_D128_WIDE_PAGES if wide else (16, 128) if caps.sm_lo == 100 else (16,))
         and facts.causal
         and facts.bottom_right
         and facts.window_left is None
-        and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= 32768
+        and (SM100_PAGED_D128_WIDE_MIN_Q if wide else 64) <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= (SM100_PAGED_D128_WIDE_MAX_KV if wide else 32768)
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
-    ):
+    )
+    if not (d128 or _sm107_paged_d64_split_domain(caps, facts)):
         return 1, False
     if caps.sm_lo == 100:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave
@@ -2984,6 +3290,27 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         return 1, False
     _, splits, _, pack = min(choices)
     return splits, pack
+
+
+def _sm90_d128_knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
+    """The SM90 row's 128 x 128 set: the dedicated D128 template (#378). Its tile names the template, and mismatch()
+    admits it only on an exact (128, 128) graph the template serves (engines._sm90_d128_tile_mismatch), so the set
+    exists there alone and leads the D512 body's 64 x 64 sets (:func:`_knob_sets`). One CTA, unsplit, unpacked, in the
+    order the template's route proposes (_sched_points with ``d128``): its other orders measured slower on causal
+    graphs on H100 SXM, so the remaining slots go to the D512 body's sets, split and packed runners among them. Empty on
+    every other row and graph, and below config_sm90.D128_LEAD_MIN_SQ query rows, where the D512 body's 64-row and
+    packed decode tiles keep the row's order (the template stays reachable by pinning its tile)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
+
+    caps = spec.capabilities
+    lead = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    if caps.sm_lo != 90 or 128 not in effective_tile_ms(caps, facts, lead) or mismatch(caps, facts, lead) is not None:
+        return []
+    if facts.s_q < D128_LEAD_MIN_SQ:
+        return []
+    scheds = _sched_points(caps, facts, d128=True)
+    first, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)
+    return [replace(lead, sched_policy=first)]
 
 
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
@@ -3152,7 +3479,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
                 cga=_sole(effective_cgas(caps, facts, splits)),
                 pack_gqa=packed,
                 split_kv=splits,
-                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
+                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 or (facts.d_qk, facts.d_v) in SM100_PAGED_PACKED_SPLIT_CGA else SCHED_LPT,
             ),
         )
         first_splits, first_packed = paged_thd_split_choice(caps, facts, first_wave=True) if caps.sm_lo == 107 else (1, False)
@@ -3166,7 +3493,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         unique.insert(
             0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
         )
-    return unique[:_MAX_SETS_PER_ENGINE]
+    # SM90 at exact (128, 128): the dedicated D128 template's 128 x 128 set first, where it serves the graph, then the
+    # D512 body's 64 x 64 sets above.
+    lead = _sm90_d128_knob_sets(spec, facts)
+    return (lead + [knobs for knobs in unique if knobs not in lead])[:_MAX_SETS_PER_ENGINE]
 
 
 def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
@@ -3198,6 +3528,92 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     )
 
 
+def select_sm100_d256_geometry_for_shape(s_q, pack_g, *, batch=None, h_q=None, s_kv=None, windowed=False, thd=False, prefolded=False, gated=False):
+    """The sole SM100 half D256 implementation/Q-tile performance choice.
+
+    Both the graph candidate generator and standalone auto use this result.
+    A selected engine instead receives a fixed geometry and never calls this
+    selector during build or execution.
+    """
+    from .config_sm100 import decode_d256_q_tile, d256_wide_decode_launch
+    from .kernels.sm100.d256_f16_contract import D256Geometry, LOOKAHEAD, SWAP_AB
+
+    if not (thd or prefolded or gated):
+        wide = batch is not None and h_q is not None and s_kv is not None and d256_wide_decode_launch(batch, h_q // pack_g, s_kv, windowed)
+        q_tile = decode_d256_q_tile(s_q, pack_g, wide_launch=wide)
+        if q_tile:
+            return D256Geometry(SWAP_AB, q_tile)
+    return D256Geometry(LOOKAHEAD, 128)
+
+
+def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
+    return select_sm100_d256_geometry_for_shape(
+        facts.s_q,
+        (facts.h_q // facts.h_kv if pack_gqa else 1) if pack_g is None else pack_g,
+        batch=facts.b,
+        h_q=facts.h_q,
+        s_kv=facts.s_kv,
+        windowed=facts.window_left is not None,
+        thd=facts.thd,
+        prefolded=facts.attn_scale_prefolded,
+        gated=facts.has_epilogue_gate,
+    )
+
+
+def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
+    """Central wide-half body choice; explicit implementation replay never calls it."""
+    from .kernels.sm100.d512_f16_contract import D512Geometry, ROLE_SPLIT, TWO_BY_TWO
+
+    two_by_two = d_qk == 576 or (prefer_two_by_two and split_kv == 1 and not paged and 64 % max(1, pack_g) == 0)
+    return D512Geometry(TWO_BY_TWO if two_by_two else ROLE_SPLIT, d_qk)
+
+
+def select_sm100_d512_geometry(facts, knobs):
+    return select_sm100_d512_geometry_for_shape(
+        facts.d_qk,
+        paged=facts.has_paged_kv,
+        split_kv=knobs.split_kv or 1,
+        pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
+    )
+
+
+def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
+    """Retain the existing candidate budget/order, naming each actual body.
+
+    The old row's policy domain generates pack/split and scheduler combinations.
+    It is not an offered engine: each combination resolves to one explicit
+    implementation before being returned, and its split model consumes the
+    same selected geometry.
+    """
+    policy = sm100_legacy_policy_spec() if policy is None else policy
+    if mismatch(policy.capabilities, facts) is not None:
+        return []
+    sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
+    by_name = {s.name: s for s in ENGINE_SPECS}
+    out = []
+    for knobs in sets:
+        if mismatch(policy.capabilities, facts, knobs) is not None:
+            if knobs.split_kv != 1 or launch_grid_mismatch(policy.capabilities, facts, knobs) is None:
+                continue
+            knobs = next(
+                (lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(policy.capabilities, facts, lpt) is None),
+                None,
+            )
+            if knobs is None:
+                continue
+        geometry = select_geometry(facts, knobs)
+        engine_id = offered.get(geometry.implementation)
+        if engine_id is None:
+            continue
+        resolved = geometry.canonical_knobs(knobs)
+        if mismatch(by_name[geometry.implementation].capabilities, facts, resolved) is not None:
+            continue
+        plan = PlanConfig(engine_id, resolved)
+        if plan not in out:
+            out.append(plan)
+    return out
+
+
 def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]]:
     """(engine_id, spec) for each offered cell whose capability row admits ``facts``."""
     for spec in ENGINE_SPECS:
@@ -3221,6 +3637,20 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
     """
+    from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+    if in_pilot_domain(facts):
+        # Only the explicit D256 implementations admit this domain. Keep the
+        # eligible-row contract test in sync before adding another owner here.
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: select_sm100_d256_geometry(f, k.pack_gqa))
+    from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+
+    if in_wide_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
+    from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
+
+    if in_d512_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
@@ -3260,7 +3690,8 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if not rest:
         return [BACKEND, LAST_RESORT] + last
     spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
-    placed = rest + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + rest
+    position = place(spec, facts, rest[0].knobs) if spec.capabilities.implementation else place(spec, facts)
+    placed = rest + [BACKEND] if position == LEAD else [BACKEND] + rest
     return placed + [LAST_RESORT] + last if last else placed
 
 

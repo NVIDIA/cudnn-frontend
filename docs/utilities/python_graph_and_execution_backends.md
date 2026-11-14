@@ -769,7 +769,7 @@ instead of silently degrading FlashInfer to its fallback path.
 | does the native SDPA binder honor a packed-split / stride contract? | `cudnn._pybind_module._SdpaThdBinder.supports_stats_stride_override`, `.supports_nonpaged_packed_split`, `.supports_paged_split_sink`, ... (static read-only properties, `True`) | `"<cap>" in cudnn.sdpa_capabilities()` -- the frozenset of every `supports_<cap>` flag the build provides; append-only, never renamed |
 | which engine serves the selected plan? | `graph.selected_engine` (`None` = the cuDNN backend; else `.name`) | the same property, documented: `.name` is the engine's manifest name, a stable identifier (`sdpa_fwd_prefill_sm100` / `sdpa_fwd_prefill_sm107` / `sdpa_fwd_prefill_sm120`, ...; manifest names and slots are append-only) |
 | can the cuDNN backend still serve this graph? | `graph.backend_plan_entries()` after `create_execution_plans` (`[]` = declined, guarded or not installed) | the same method, documented above |
-| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
+| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`), and a part below cc 8.0 has no target in any DSL (its `Arch` starts at `sm_80`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
 | the cuDNN dtype of a torch dtype | `cudnn.datatypes._torch_to_cudnn_data_type(dtype)` | `cudnn.datatypes.torch_to_cudnn_data_type(dtype)` (the private name is an alias of it) |
 | the unified attention implementation, the graph helpers, the caller hints | `cudnn.attention_implementation.UNIFIED`, `cudnn.graph_cache(key_fn=)`, `cudnn.jit(heur_modes=)`, `cudnn.graph(handle, **graph_kwargs)`, `cudnn.pygraph(is_override_shape_enabled=, is_cuda_graph_replay_expected=)` | already public; listed so the pin covers them |
 
@@ -1000,9 +1000,9 @@ engine's plan is not a blob: it is a deterministic function of the graph and its
   format cannot represent exactly (a `score_mod` callback, a framework object)
   refuses serialization; nothing is dropped. Buffers bound at build time
   (`_data_bindings`) are not carried; pass them to `execute()`.
-- **the plan**: engine id, engine name (checked on load) and public knobs. Ids
-  and knob values are append-only, so the recipe stays valid on any frontend
-  that still ships the engine.
+- **the plan**: engine id, engine name (checked on load) and public knobs. The
+  current frontend must still admit the saved graph/configuration; retaining
+  an engine id does not promise unchanged eligibility across releases.
 - **the kernels** (`include_kernels=True`, the default): the compiled-cache
   entries the plan's build used (`compiled_cache.record_entries()` around
   `build_plan`), each with the environment manifest it was compiled under.
@@ -1017,6 +1017,24 @@ record's key. A refused or missing kernel compiles as usual;
 b2 h8 s1024 d128): build 3.1 s; deserialize into another process with an
 empty cache 33 ms, with imports already done (a backend plan takes 23-30 ms).
 3 kernels seeded, zero compiles, O bitwise equal.
+
+A retired graph/configuration is a recipe cache miss, not a request to substitute
+another implementation silently. Deserialization raises and restores the empty
+destination graph; discard the saved recipe and reconstruct the graph with
+heuristics. Namespace persisted recipes by the frontend build/version as well
+as the target environment. For example, exact SM100/SM103 half D256 recipes
+using engine 20511 must be regenerated for the explicit 20519/20520 engines.
+Exact D512/V512 and D576/V512 half recipes likewise move from 20511 to the
+explicit role-split (20521) or 2x2 (20522) implementation. These new wide engines
+report physical cluster width through `TILE_CGA_M`: 4 for D512, 2 for D576.
+Their MMA group is fixed at two CTAs; the old 20511 pair encoding is not a
+valid D512 cluster assignment for the new engines. Regenerate the complete
+engine/knob recipe through heuristics instead of rewriting its engine id.
+Exact SM100/SM103 per-tensor FP8 D512/V512 recipes similarly move from 20513
+to the explicit role-split engine 20523, with physical `TILE_CGA_M=4` and
+a fixed two-CTA MMA group. Dense head envelopes keep their legacy owner.
+The blob's `frontend_version` is provenance, not an automatic fallback switch;
+the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 
 The kernels are native code: deserialize only blobs from a trusted source. The
 C++ `Graph::deserialize` does not read this format. Running a python-engine
@@ -1121,3 +1139,33 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   kernel's persistent schedule to save the launch on that path. The dense
   padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks
   CUDA-graph capture; decide it at `check_support` or drop it.
+
+### Plan-specific Stats stride override note
+
+After selecting the final plan, query
+`graph.get_behavior_notes()` (or `get_behavior_notes_for_plan_at_index(i)`).
+`cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` declares that the plan
+accepts legal execution-time Stats stride overrides, including changes to the
+head stride of packed HN Stats. It does not permit changing the packing, dtype,
+or storage capacity, or bypass the plan's ragged-offset and override bounds.
+
+The initial declaration covers admitted override-enabled FP16/BF16 THD plans
+with packed HN Stats through the prepared THD binder on qualified SM100/SM103
+devices. SM107/SM120 do not advertise this note pending hardware qualification.
+This includes the explicit D256 lookahead engine and eligible legacy
+half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
+quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
+not serve THD. Backend plans retain their existing notes and do not inherit this
+frontend declaration. `RUNTIME_COMPILATION` remains present on FROST plans.
+
+Callers should use the selected plan's note to choose direct HN execution or
+retain their existing NH fallback. Do not infer support from the engine name or
+from FROST membership. Selecting/deselecting behavior notes uses the same
+per-plan declaration, but integrations should not filter the candidate pool just
+to choose a Stats layout. Consumers of this new enum must require an FE release
+that supplies it.
+
+The note has frontend-only integer value **1000**, in the band starting at
+`FRONTEND_BEHAVIOR_NOTE_BASE`; existing values 0–5 are unchanged. It serializes
+as `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE`. Backend enum conversion rejects it;
+it is never passed as a `cudnnBackendBehaviorNote_t`.

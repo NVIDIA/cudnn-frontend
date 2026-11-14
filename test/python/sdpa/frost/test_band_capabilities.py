@@ -73,7 +73,10 @@ def _pick_dtype(dtypes):
 def _dims(kind: str, caps):
     if kind == "fwd":
         shapes = sorted(tuple(s) for s in caps.d_shapes)
-        return (128, 128) if (128, 128) in shapes else shapes[0]
+        # A smaller native flavor can support fewer features than the row's
+        # full envelope (SM90 D64 versus D512). Sample the full envelope for
+        # the row-wide band claims; dedicated flavor tests pin its restrictions.
+        return (128, 128) if (128, 128) in shapes else shapes[-1]
     # A backward row lists head dims, not pairs, and may serve only some pairs of
     # them (the SM100 d256 row: exact (256, 256) and dense (192, 128)). Take the
     # first pair the row accepts unmasked, so a head-dim rule never stands in
@@ -109,6 +112,22 @@ def probe_matches(kind: str, caps, facts, expected) -> bool:
     return actual in ({decl} if expected is None else {expected, decl})
 
 
+@dataclasses.dataclass(frozen=True)
+class _DeclaredTensor:
+    dim: tuple
+    dtype: object
+
+    def get_dim(self):
+        return self.dim
+
+    def get_stride(self):
+        _, h, seq, d = self.dim
+        return (seq * h * d, d, h * d, 1)
+
+    def get_data_type(self):
+        return self.dtype
+
+
 def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     """Facts that satisfy every NON-mask constraint of this row.
 
@@ -117,6 +136,17 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     """
     values = _values(kind, caps, *_dims(kind, caps))
     values.update(overrides)
+    # Wide native rows validate the actual binding declarations even without
+    # shape overrides. Keep the non-mask baseline legal after geometry changes.
+    b, hq, hk = values["b"], values["h_q"], values["h_kv"]
+    sq, sk, dq, dv = (values[k] for k in ("s_q", "s_kv", "d_qk", "d_v"))
+    for role, dim, dtype in (
+        ("q_t", (b, hq, sq, dq), values["dtype"]),
+        ("k_t", (b, hk, sk, dq), values["dtype"]),
+        ("v_t", (b, hk, sk, dv), values["dtype"]),
+        ("o_t", (b, hq, sq, dv), values["dtype_o"]),
+    ):
+        values.setdefault(role, _DeclaredTensor(dim, dtype))
     return ga.SdpaGraphFacts(**values)
 
 

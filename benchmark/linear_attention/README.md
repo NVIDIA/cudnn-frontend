@@ -58,7 +58,7 @@ python benchmark_single_linear_attention.py \
 # group count, x at the head count; state dim N = 128, head dim P = 64)
 python benchmark_single_linear_attention.py \
     --batch_size 4 --seqlen 8192 \
-    --num_q_heads 64 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
+    --num_q_heads 8 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
     --la_backend cudnn --variant mamba2 --data_type bfloat16 \
     --skip_ref --fwd_bwd
 
@@ -90,6 +90,13 @@ python benchmark_single_linear_attention.py \
     --la_backend flash_kda --variant kda --data_type bfloat16 \
     --skip_ref
 
+# mamba_ssm comparison point (mamba2 variant only; B / C at the group count)
+python benchmark_single_linear_attention.py \
+    --batch_size 4 --seqlen 8192 \
+    --num_q_heads 8 --num_kv_heads 64 --head_dim_qk 128 --head_dim_vo 64 \
+    --la_backend mamba_ssm --variant mamba2 --data_type bfloat16 \
+    --skip_ref --fwd_bwd
+
 # Input initial state and dump state for every chunk
 python benchmark_single_linear_attention.py \
     --batch_size 1 --seqlen 8192 \
@@ -104,6 +111,34 @@ Every variant, except Mamba-2, applies the q/k L2 normalization; pass `--no_qk_l
 
 The decay gates are all ones (alpha = 1, log gate 0) for every variant and backend, so the measured schedule does not depend on the input draw; kda and gdn2 feed the raw safe-gate logit of that gate, whose in-kernel `lower_bound * sigmoid` transform reproduces alpha = 1 exactly in fp32. The write strengths (beta, and w for GDN-2) stay random.  Mamba-2 feeds a raw dt of -30 (A = -1, zero dt_bias): softplus makes dt vanish, so its decay exp(A dt) is 1 in fp32 as well.
 
+### SM100 packed-ragged KDA schedule
+
+`benchmark_kda_e2e.py --ragged-suite` exercises packed batches whose declared
+`B * H` tile count can hide a long-sequence tail. On compute capability 10.0,
+the automatic KDA selector may reuse the existing device-side length-rule
+piece table when the ordinary selector would otherwise leave the batch uncut.
+Sequences of at most 8192 tokens remain one piece; longer sequences use at
+most four pieces. Other architectures preserve the previous selector.
+
+The schedule changes plan selection only. It does not change the public KDA
+API, arithmetic, checkpoint format, or the `batch_invariant=True` contract.
+The piece table reads the actual `cu_seqlens` on the device, so runtime lengths
+do not enter the compile key and no device-to-host read is required.
+
+```bash
+python benchmark_kda_e2e.py \
+  --ragged-suite --heads 32 --checkpoint 0 \
+  --json /tmp/kda_ragged.json
+
+# Diagnostic controls: keep the same inputs and force uncut or four pieces.
+python benchmark_kda_e2e.py \
+  --ragged-suite --heads 32 --checkpoint 0 --force-pieces 0 \
+  --json /tmp/kda_ragged_uncut.json
+python benchmark_kda_e2e.py \
+  --ragged-suite --heads 32 --checkpoint 0 --force-pieces 4 \
+  --json /tmp/kda_ragged_four_pieces.json
+```
+
 ## Supported Backends
 
 | Backend | Description |
@@ -112,10 +147,11 @@ The decay gates are all ones (alpha = 1, log gate 0) for every variant and backe
 | `fla`   | FLA (flash-linear-attention, Triton; `gdn`, `kda`, `gdn2`, `gdp`, and `mamba2` through `chunk_simple_gla` with the Mamba-2 pre-scaling of k by dt and g = A dt) |
 | `flash_qla` | FlashQLA (TileLang fused GDN kernels, `gdn` variant only) |
 | `flash_kda` | FlashKDA (`kda` forward variant only) |
+| `mamba_ssm` | mamba_ssm (the reference Mamba-2 SSD Triton kernel `mamba_chunk_scan_combined`, `mamba2` variant only; takes B / C at the group count natively, chunk size 128) |
 
 The cuDNN backend routes through the pygraph engines: FROST (Cutlass DSL) on SM100-SM103 and SM107, the cuTile engines elsewhere. `gdn2`, `gdp` and `mamba2` are FROST-only.
 
-Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, `mamba2`), the counts the tracked sweeps run at; the low-occupancy sweep passes 16 explicitly.  `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`): the cudnn op fuses it and produces `dD`, the fla path adds it in torch inside the timed region.  Mamba-2 only.
+Default head counts are per variant: `kda` 96, `gdp` 40, 64 otherwise (`gdn`, `gdn2`, and the `mamba2` x heads; Mamba-2's B / C default to 8 groups, `--num_q_heads` being the group count).  For Mamba-2 only, `--d_skip` adds the Mamba-2 D skip (`y += D x`, a per-head `D`; `--d_per_channel` makes it `[heads, P]`). 
 
 ## Results
 

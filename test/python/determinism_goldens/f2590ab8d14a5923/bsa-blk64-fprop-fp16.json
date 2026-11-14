@@ -1,0 +1,113 @@
+{
+  "inputs": {
+    "counts": {
+      "dtype": "torch.int32",
+      "sha256": "fc2cc002c9a92235eedd6fab6f21dab3e40cf3da5ce889b202f852766b2f7097",
+      "shape": [
+        1,
+        2,
+        3
+      ]
+    },
+    "do": {
+      "dtype": "torch.float16",
+      "sha256": "65e003b5cdb6311b5d402de9f05f76f27b790ce71f5fe02794a8d5e81761c056",
+      "shape": [
+        1,
+        2,
+        192,
+        128
+      ]
+    },
+    "idx": {
+      "dtype": "torch.int32",
+      "sha256": "95870cf74f4b914b86efe652f3bd253963f379b8fed9388aaae8f067dc663c92",
+      "shape": [
+        1,
+        2,
+        3,
+        2
+      ]
+    },
+    "k": {
+      "dtype": "torch.float16",
+      "sha256": "1e262419e81b158b1b4539e363d989dfbbfe220a9a93fc03ae038f0f692997e4",
+      "shape": [
+        1,
+        2,
+        256,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.float16",
+      "sha256": "25d83fd85bb6fc4c369a727234177768c44b84d2a221d0921c87e11ab72b20f9",
+      "shape": [
+        1,
+        2,
+        192,
+        128
+      ]
+    },
+    "sizes": {
+      "dtype": "torch.int32",
+      "sha256": "76b2120ae8e72989fe0c9bd4671a6a6d1f23df76abd5e126ca6c45c4ef647a8c",
+      "shape": [
+        4
+      ]
+    },
+    "v": {
+      "dtype": "torch.float16",
+      "sha256": "3d7c958ce85ee9e14ee2ca379417be3c0d18c991018bde27ca69b2f7873fc1bf",
+      "shape": [
+        1,
+        2,
+        256,
+        128
+      ]
+    },
+    "width": {
+      "dtype": "torch.int32",
+      "sha256": "26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece",
+      "shape": [
+        1
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "473798a0c253b974529cdf267c11fb7e38a8ec9948838c6ae32e358d2b87ede3",
+      "shape": [
+        1,
+        2,
+        192
+      ]
+    },
+    "o": {
+      "dtype": "torch.float16",
+      "sha256": "e4dba36eb111a1171a17dd4ec1ffaadcd7596f47e010f760c9856694ec6875ad",
+      "shape": [
+        1,
+        2,
+        192,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.2",
+    "cuda_driver": 13040,
+    "cudnn": 92600,
+    "cutlass": "4.8.1",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.15.0+cu132",
+    "tvm_ffi": "0.1.15.post1"
+  },
+  "schema": 1
+}

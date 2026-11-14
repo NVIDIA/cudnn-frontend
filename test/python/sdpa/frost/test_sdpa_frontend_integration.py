@@ -17,7 +17,7 @@ from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, requires_sm80, _dsl_installed, _is_plan_for
 
-_FROST = engine_name()  # matches the D=512 graphs below
+_FROST = "sdpa_fwd_sm100_d512_2x2"  # exact D512 half owner for the graphs below
 
 
 _SM100 = requires_pre_rubin_blackwell
@@ -210,17 +210,6 @@ def test_envelope_serves_small_dims_through_one_family_engine():
     torch.testing.assert_close(o_gpu, ref, atol=5e-2, rtol=3e-2)
 
 
-@pytest.mark.skip(
-    reason="graph.set_engine_knobs() was removed with the monkey-patch dispatch layer and has no replacement in this MR. "
-    "Knobs now ride on the plan (engines.base.PlanConfig.knobs) — an engine proposes one entry per knob set and the "
-    "caller picks with select_plan(); re-enable once the SDPA fwd family proposes its SdpaFwdKnobs domain as plans."
-)
-@_SM100
-def test_knob_request_gates_selection():
-    """An unsupported knob request must not silently degrade: the plan carrying
-    it should simply not be in the list (or decline when pinned)."""
-
-
 @_SM100
 def test_no_magic_import_required():
     """Discovery is the library's job: a fresh process that only imports cudnn
@@ -243,7 +232,7 @@ def test_no_magic_import_required():
         "o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())\n"
         "g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])\n"
         "names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]\n"
-        "i = next((i for i, n in enumerate(names) if n.split('[')[0] == 'sdpa_fwd_prefill_sm100'), None)\n"
+        f"i = next((i for i, n in enumerate(names) if n.split('[')[0] == {_FROST!r}), None)\n"
         "assert i is not None, names\n"
         "g.select_plan(i)\n"
         "g.check_support()\n"

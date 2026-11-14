@@ -34,7 +34,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import cudnn
 
-from .common import execute_graph, make_execution_resources, select_plan, torch_dtype_to_cudnn
+from .common import check_composed_state, check_composed_summaries, execute_graph, make_execution_resources, select_plan, torch_dtype_to_cudnn
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -86,6 +86,7 @@ def make_fprop_cache_key(
     overwrite_initial_state,
     state_pool_rows=None,
     checkpoint_dtype=None,
+    composed_rows=None,
 ):
     return (
         "fprop",
@@ -116,6 +117,7 @@ def make_fprop_cache_key(
         bool(overwrite_initial_state),
         state_pool_rows,
         checkpoint_dtype,
+        composed_rows,
     )
 
 
@@ -151,6 +153,7 @@ def build_fprop_graph(
     state_indices_dtype=None,
     state_pool_rows=None,
     checkpoint_dtype=None,
+    composed_rows=None,
 ):
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, G, K], data_type=io_dtype, name="q")
@@ -167,6 +170,12 @@ def build_fprop_graph(
     if state_indices_dtype is not None:
         state_indices_t = graph.tensor([N], data_type=state_indices_dtype, name="state_indices")
     pool_ports = {"state_indices": state_indices_t} if state_indices_t is not None else {}
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            preceding_state_update=graph.tensor([composed_rows, H, V, K], data_type=cudnn.data_type.FLOAT, name="preceding_state_update"),
+            preceding_transition=graph.tensor([composed_rows, H], data_type=cudnn.data_type.FLOAT, name="preceding_transition"),
+        )
     dt_bias_t = None
     if dt_bias_dtype is not None:
         dt_bias_t = graph.tensor([H], data_type=dt_bias_dtype, name="dt_bias")
@@ -176,7 +185,7 @@ def build_fprop_graph(
     z_t = None
     if z_dtype is not None:
         z_t = graph.tensor([total, H, V], data_type=z_dtype, name="z")
-    O_t, fs_t, state_checkpoints_t, o_pre_t = graph.mamba2(
+    O_t, fs_t, state_checkpoints_t, o_pre_t, composed_t = graph.mamba2(
         q=q_t,
         k=k_t,
         v=v_t,
@@ -185,6 +194,7 @@ def build_fprop_graph(
         cu_seqlens=cu_t,
         initial_state=state0_t,
         **pool_ports,
+        **composed_ports,
         dt_bias=dt_bias_t,
         d=d_t,
         z=z_t,
@@ -200,6 +210,8 @@ def build_fprop_graph(
     )
     if state_checkpoints_t is not None:
         state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT if checkpoint_dtype == torch.float32 else io_dtype)
+    if composed_t is not None:
+        composed_t.set_data_type(cudnn.data_type.FLOAT)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -216,6 +228,8 @@ def build_fprop_graph(
         fs=fs_t,
         state_checkpoints=state_checkpoints_t,
         O_pre=o_pre_t,
+        composed_initial_state=composed_t,
+        **composed_ports,
     )
 
 
@@ -246,15 +260,22 @@ def run_mamba2_fwd(
     final_state_out: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
     checkpoint_dtype: Optional[torch.dtype] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal Mamba-2 forward over a cached single-node MAMBA2 pygraph in THD layout.
 
-    Returns ``(y, final_state, state_checkpoints, y_pre)``; ``final_state`` / ``state_checkpoints`` / ``y_pre`` are
-    zero-size tensors when ``output_final_state`` is ``False`` / ``checkpoint_every_n_tokens`` is ``0`` /
-    ``output_pre_gate`` is ``False`` or ``z`` is absent.  ``final_state_out`` binds the final_state output to a caller
-    buffer (the in-place op passes ``initial_state``); ``state_indices`` (int32 ``[N]``) makes ``initial_state`` a
-    pool whose row ``state_indices[i]`` seeds sequence ``i`` and receives its final state.  ``checkpoint_dtype`` is the
-    checkpoint row dtype: ``None`` (the io dtype) or ``torch.float32``.
+    Returns ``(y, final_state, state_checkpoints, y_pre, composed_initial_state)``; ``final_state`` /
+    ``state_checkpoints`` / ``y_pre`` are zero-size tensors when ``output_final_state`` is ``False`` /
+    ``checkpoint_every_n_tokens`` is ``0`` / ``output_pre_gate`` is ``False`` or ``z`` is absent.  ``final_state_out``
+    binds the final_state output to a caller buffer (the in-place op passes ``initial_state``); ``state_indices`` (int32
+    ``[N]``) makes ``initial_state`` a pool whose row ``state_indices[i]`` seeds sequence ``i`` and receives its final
+    state.  ``checkpoint_dtype`` is the checkpoint row dtype: ``None`` (the io dtype) or ``torch.float32``.
+    ``preceding_state_update`` / ``preceding_transition`` (fp32 ``[P, H, P_dim, N_dim]`` / ``[P, H]``, the forward
+    summaries of the ``P`` preceding context-parallel ranks in rank order) are folded on the device into the one-row
+    ``composed_initial_state`` (fp32 ``[1, H, P_dim, N_dim]``) that the first local sequence starts from; the caller's
+    ``initial_state`` row 0, when given, is the state beyond the farthest rank and the other rows stay the other
+    sequences' starts (zero without one).  Zero-size without summaries, as with an empty ``P = 0`` pair.
     """
     total, H, V = x.shape
     G, K = C.shape[1], C.shape[2]
@@ -325,6 +346,14 @@ def run_mamba2_fwd(
         if tensor is not None and tensor.device != device:
             raise ValueError(f"mamba2: {tensor_name} must be on x's device ({device}); got {tensor.device}")
     state0 = initial_state if initial_state is not None else None
+    composed_rows = check_composed_summaries(
+        "mamba2", "preceding_state_update", "preceding_transition", preceding_state_update, preceding_transition, (H, V, K), (H,), device
+    )
+    composed = torch.empty(0, dtype=torch.float32, device=device)
+    if composed_rows:
+        if state_indices is not None or final_state_out is not None:
+            raise ValueError("mamba2: preceding summaries cannot combine with state_indices or overwrite_initial_state")
+        composed = torch.empty(1, H, V, K, dtype=torch.float32, device=device)
     state_out_dtype = state0.dtype if state0 is not None else torch.float32
     checkpoint = int(checkpoint_every_n_tokens)
     if checkpoint_dtype not in (None, torch.float32, x.dtype):
@@ -360,6 +389,7 @@ def run_mamba2_fwd(
         final_state_out is not None,
         state_pool_rows,
         checkpoint_dtype,
+        composed_rows or None,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
@@ -389,6 +419,7 @@ def run_mamba2_fwd(
             state_indices_dtype=torch_dtype_to_cudnn(state_indices.dtype) if state_indices is not None else None,
             state_pool_rows=state_pool_rows,
             checkpoint_dtype=checkpoint_dtype,
+            composed_rows=composed_rows or None,
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -408,6 +439,10 @@ def run_mamba2_fwd(
         variant_pack[t["state0"]] = state0
     if state_indices is not None:
         variant_pack[t["state_indices"]] = state_indices
+    if composed_rows:
+        variant_pack[t["preceding_state_update"]] = preceding_state_update
+        variant_pack[t["preceding_transition"]] = preceding_transition
+        variant_pack[t["composed_initial_state"]] = composed
     if dt_bias is not None:
         variant_pack[t["dt_bias"]] = dt_bias
     if D is not None:
@@ -432,7 +467,7 @@ def run_mamba2_fwd(
         variant_pack[t["O_pre"]] = y_pre
     workspace, handle = make_execution_resources(graph, device)
     execute_graph(graph, variant_pack, workspace, handle)
-    return y, final_state, state_checkpoints, y_pre
+    return y, final_state, state_checkpoints, y_pre, composed
 
 
 @torch.library.custom_op("cudnn::mamba2_fwd", mutates_args=())
@@ -456,7 +491,9 @@ def mamba2_fwd_op(
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
     checkpoint_dtype: Optional[torch.dtype] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional Mamba-2 forward: :func:`run_mamba2_fwd` with fresh outputs; the autograd formula registers below."""
     return run_mamba2_fwd(
         x=x,
@@ -478,6 +515,8 @@ def mamba2_fwd_op(
         batch_invariant=batch_invariant,
         plan_name=plan_name,
         checkpoint_dtype=checkpoint_dtype,
+        preceding_state_update=preceding_state_update,
+        preceding_transition=preceding_transition,
     )
 
 
@@ -505,7 +544,7 @@ def mamba2_fwd_overwrite_state_op(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """In-place Mamba-2 forward: the final state overwrites ``initial_state`` (or the ``state_indices`` rows of the
     pool it addresses).  Inference only: no autograd formula."""
-    y, _, state_checkpoints, _ = run_mamba2_fwd(
+    y, _, state_checkpoints, _, _ = run_mamba2_fwd(
         x=x,
         dt=dt,
         A=A,
@@ -551,6 +590,8 @@ def mamba2_fwd_fake(
     batch_invariant=False,
     plan_name: Optional[str] = None,
     checkpoint_dtype=None,
+    preceding_state_update=None,
+    preceding_transition=None,
 ):
     total, H, V = x.shape
     K = C.shape[2]
@@ -561,6 +602,10 @@ def mamba2_fwd_fake(
         raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     y = x.new_empty(total, H, V)
     state_dtype = initial_state.dtype if initial_state is not None else torch.float32
+    composed_rows = check_composed_summaries(
+        "mamba2", "preceding_state_update", "preceding_transition", preceding_state_update, preceding_transition, (H, V, K), (H,), x.device
+    )
+    composed = x.new_empty((1, H, V, K) if composed_rows else (0,), dtype=torch.float32)
     final = x.new_empty((N, H, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total // int(checkpoint_every_n_tokens) + N, 1)
@@ -568,7 +613,7 @@ def mamba2_fwd_fake(
     else:
         state_checkpoints = x.new_empty(0)
     y_pre = x.new_empty((total, H, V) if (output_pre_gate and z is not None) else (0,))
-    return y, final, state_checkpoints, y_pre
+    return y, final, state_checkpoints, y_pre, composed
 
 
 @mamba2_fwd_overwrite_state_op.register_fake
@@ -593,7 +638,7 @@ def mamba2_fwd_overwrite_state_fake(
     output_final_state=True,
     checkpoint_dtype=None,
 ):
-    y, _, state_checkpoints, _ = mamba2_fwd_fake(
+    y, _, state_checkpoints, _, _ = mamba2_fwd_fake(
         x=x,
         dt=dt,
         A=A,
@@ -649,6 +694,8 @@ def build_bprop_graph(
     dt_min,
     dt_max,
     checkpoint_dtype=None,
+    composed_rows=None,
+    has_composed_state=False,
 ):
     graph = cudnn.pygraph()
     q_t = graph.tensor([total, G, K], data_type=io_dtype, name="q")
@@ -658,9 +705,16 @@ def build_bprop_graph(
     a_t = graph.tensor([H], data_type=a_dtype, name="a")
     cu_t = graph.tensor([N + 1], data_type=cu_dtype, name="cu_seqlens")
     dO_t = graph.tensor([total, H, V], data_type=io_dtype, name="dO")
+    composed_state_t = graph.tensor([1, H, V, K], data_type=cudnn.data_type.FLOAT, name="composed_initial_state") if has_composed_state else None
     checkpoints_t = None
     if checkpoint_rows is not None:
         checkpoints_t = graph.tensor([checkpoint_rows, H, V, K], data_type=checkpoint_dtype, name="state_checkpoints")
+    composed_ports = {}
+    if composed_rows is not None:
+        composed_ports = dict(
+            following_state_grad=graph.tensor([composed_rows, H, V, K], data_type=cudnn.data_type.FLOAT, name="following_state_grad"),
+            following_transition=graph.tensor([composed_rows, H], data_type=cudnn.data_type.FLOAT, name="following_transition"),
+        )
     state0_t = None
     if state_dtype is not None:
         state0_t = graph.tensor([N, H, V, K], data_type=state_dtype, name="initial_state")
@@ -689,6 +743,8 @@ def build_bprop_graph(
         state_checkpoints=checkpoints_t,
         initial_state=state0_t,
         d_final_state=dfs_t,
+        composed_initial_state=composed_state_t,
+        **composed_ports,
         dt_bias=dt_bias_t,
         d=d_t,
         z=z_t,
@@ -715,6 +771,7 @@ def build_bprop_graph(
         d=d_t,
         z=z_t,
         O_pre=o_pre_t,
+        composed_initial_state=composed_state_t,
         dQ=dQ_t,
         dK=dK_t,
         dV=dV_t,
@@ -724,6 +781,7 @@ def build_bprop_graph(
         d_dt_bias=dDt_t,
         dD=dD_t,
         dZ=dZ_t,
+        **composed_ports,
     )
 
 
@@ -749,13 +807,21 @@ def mamba2_bwd_op(
     dt_max: Optional[float] = None,
     batch_invariant: bool = False,
     plan_name: Optional[str] = None,
+    following_state_grad: Optional[torch.Tensor] = None,
+    following_transition: Optional[torch.Tensor] = None,
+    composed_initial_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal Mamba-2 backward over a cached single-node MAMBA2_BWD pygraph in THD layout.
 
     ``state_checkpoints`` is the forward's state series (io or fp32 rows); io rows at the kernel chunk cadence are
     consumed in place of the regenerated series, any other rows leave the engine regenerating it.  ``y_pre`` is the forward's pre-gate output,
-    required with ``z``.  Returns ``(dx, ddt, dA, dB, dC, dD, ddt_bias, dz, d_initial_state)``; the gradients of
-    absent inputs come back as zero-size tensors.
+    required with ``z``.  ``following_state_grad`` / ``following_transition`` (fp32 ``[P, H, P_dim, N_dim]`` / ``[P, H]``,
+    the backward summaries of the ``P`` following context-parallel ranks in rank order) are folded on the device into a
+    one-row gradient state that the last local sequence starts from (the caller's ``d_final_state`` row, when given, is
+    the gradient beyond the farthest rank; every other sequence starts from its ``d_final_state`` row, or zero).
+    ``composed_initial_state`` (fp32 ``[1, H, P_dim, N_dim]``, the forward's fifth output) is the first local sequence's
+    initial state under context parallelism, beside the caller's optional ``initial_state``.  Returns ``(dx, ddt, dA,
+    dB, dC, dD, ddt_bias, dz, d_initial_state)``; the gradients of absent inputs come back as zero-size tensors.
     """
     total, H, V = x.shape
     G, K = C.shape[1], C.shape[2]
@@ -780,6 +846,10 @@ def mamba2_bwd_op(
         check_dtype("d_final_state", d_final_state, (torch.float32, torch.bfloat16, torch.float16))
         if d_final_state.dtype != dstate_dtype:
             raise TypeError(f"mamba2: d_final_state must be {dstate_dtype} (one state dtype per kernel)")
+    composed_rows = check_composed_summaries(
+        "mamba2", "following_state_grad", "following_transition", following_state_grad, following_transition, (H, V, K), (H,), device
+    )
+    composed_state = check_composed_state("mamba2", composed_initial_state, (H, V, K), device)
     dt_max_value = float("inf") if dt_max is None else float(dt_max)
     checkpoint = int(checkpoint_every_n_tokens) if state_checkpoints is not None else 0
     cache_key = make_bprop_cache_key(
@@ -808,6 +878,8 @@ def mamba2_bwd_op(
         dt_max_value,
         device,
         plan_name,
+        composed_rows or None,
+        composed_state is not None,
     )
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
@@ -834,6 +906,8 @@ def mamba2_bwd_op(
             float(dt_min),
             dt_max_value,
             checkpoint_dtype=torch_dtype_to_cudnn(state_checkpoints.dtype) if state_checkpoints is not None else None,
+            composed_rows=composed_rows or None,
+            has_composed_state=composed_state is not None,
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -867,6 +941,11 @@ def mamba2_bwd_op(
         variant_pack[t["dstate0"]] = dstate0
     if d_final_state is not None:
         variant_pack[t["dfs"]] = d_final_state
+    if composed_rows:
+        variant_pack[t["following_state_grad"]] = following_state_grad
+        variant_pack[t["following_transition"]] = following_transition
+    if composed_state is not None:
+        variant_pack[t["composed_initial_state"]] = composed_state
     ddt_bias = torch.empty(0, dtype=torch.float32, device=device)
     if dt_bias is not None:
         variant_pack[t["dt_bias"]] = dt_bias
@@ -910,6 +989,9 @@ def mamba2_bwd_fake(
     dt_max=None,
     batch_invariant=False,
     plan_name: Optional[str] = None,
+    following_state_grad=None,
+    following_transition=None,
+    composed_initial_state=None,
 ):
     total, H, V = x.shape
     G, K = C.shape[1], C.shape[2]
@@ -947,6 +1029,8 @@ def mamba2_setup_context(ctx, inputs, output):
         batch_invariant,
         plan_name,
         checkpoint_dtype,
+        preceding_state_update,
+        preceding_transition,
     ) = inputs
     saved = [x, dt, A, B, C, cu_seqlens]
     ctx.checkpoint_reuse = checkpoint_every_n_tokens > 0 and checkpoint_every_n_tokens % 128 == 0 and output[2].numel() > 0
@@ -956,12 +1040,17 @@ def mamba2_setup_context(ctx, inputs, output):
     ctx.has_d = D is not None
     ctx.has_dt_bias = dt_bias is not None
     ctx.has_z = z is not None
+    # under context parallelism the backward starts from the composed state, and the caller's initial_state (the
+    # state beyond the farthest preceding rank) gets no gradient
+    ctx.composed = output[4].numel() > 0
     ctx.has_initial_state = initial_state is not None
     for tensor in (D, dt_bias, z, initial_state):
         if tensor is not None:
             saved.append(tensor)
     if ctx.has_z:
         saved.append(output[3])
+    if ctx.composed:
+        saved.append(output[4])
     ctx.save_for_backward(*saved)
     ctx.dt_softplus = bool(dt_softplus)
     ctx.dt_min = float(dt_min)
@@ -969,10 +1058,10 @@ def mamba2_setup_context(ctx, inputs, output):
     ctx.batch_invariant = bool(batch_invariant)
     ctx.plan_name = plan_name
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(output[2], output[3])
+    ctx.mark_non_differentiable(output[2], output[3], output[4])
 
 
-def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre):
+def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre, d_composed_initial_state):
     # read ctx.saved_tensors once
     saved_tensors = list(ctx.saved_tensors)
     x, dt, A, B, C, cu_seqlens = saved_tensors[:6]
@@ -983,6 +1072,7 @@ def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre):
     z = rest.pop(0) if ctx.has_z else None
     initial_state = rest.pop(0) if ctx.has_initial_state else None
     y_pre = rest.pop(0) if ctx.has_z else None
+    composed_state = rest.pop(0) if ctx.composed else None
 
     if dy is None:
         dy = torch.zeros_like(x)
@@ -1000,6 +1090,7 @@ def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre):
         z=z,
         initial_state=initial_state,
         d_final_state=dstate_in,
+        composed_initial_state=composed_state,
         state_checkpoints=state_checkpoints,
         y_pre=y_pre,
         checkpoint_every_n_tokens=ctx.checkpoint_every_n_tokens,
@@ -1019,7 +1110,9 @@ def mamba2_backward(ctx, dy, dFinal, dstate_checkpoints, dy_pre):
         dD if ctx.has_d else None,
         ddt_bias if ctx.has_dt_bias else None,
         dz if ctx.has_z else None,
-        dstate0 if ctx.has_initial_state else None,
+        dstate0 if ctx.has_initial_state and not ctx.composed else None,
+        None,
+        None,
         None,
         None,
         None,
@@ -1065,6 +1158,8 @@ def mamba2(
     overwrite_initial_state: bool = False,
     plan_name: Optional[str] = None,
     checkpoint_dtype: Optional[torch.dtype] = None,
+    preceding_state_update: Optional[torch.Tensor] = None,
+    preceding_transition: Optional[torch.Tensor] = None,
 ):
     """Mamba-2 state space duality (SSD) layer, the chunked scan of ``mamba_chunk_scan_combined``.
 
@@ -1119,12 +1214,21 @@ def mamba2(
             buffer, which is required and returned as the final state.  Inference only.
         plan_name: optionally pin one execution plan by name (``mamba2_frost``); a graph offering no
             such plan raises ``cudnnGraphNotSupportedError``.
+        preceding_state_update: context parallelism: the ``final_state`` outputs of :func:`mamba2_summary`
+            over the preceding ranks, stacked in rank order as fp32 ``[P, H, P_dim, N_dim]`` (``P = 0`` for the
+            first rank).  The op folds them, with ``preceding_transition``, into row 0 of a copy of
+            ``initial_state`` (zeros without one): sequence 0 of this rank continues the sequence that
+            crosses the rank boundary.  The backward starts from that composed state, which the op returns;
+            ``initial_state`` itself then gets no gradient.
+        preceding_transition: the matching ``transition`` outputs, fp32 ``[P, H]`` (log2 decay products).
 
     Returns:
         ``(y, final_state)`` with ``y`` shaped like ``x``, or ``(y, final_state, state_checkpoints)``
-        when ``checkpoint_every_n_tokens > 0``.  ``final_state`` is empty unless
-        ``output_final_state=True``; under ``overwrite_initial_state`` or ``state_indices`` it is
-        the caller's buffer.
+        when ``checkpoint_every_n_tokens > 0``, or ``(y, final_state, state_checkpoints, composed_initial_state)``
+        when ``preceding_state_update`` is given (the composed state is fp32 ``[N_seq, H, P, N]``, the
+        forward's starting state; pass it as ``initial_state`` to ``torch.ops.cudnn.mamba2_bwd``).
+        ``final_state`` is empty unless ``output_final_state=True``; under ``overwrite_initial_state``
+        or ``state_indices`` it is the caller's buffer.
     """
     if x.dim() != 3 or B.dim() != 3 or C.dim() != 3 or dt.dim() != 2:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -1134,6 +1238,8 @@ def mamba2(
     if overwrite_initial_state or state_indices is not None:
         if initial_state is None:
             raise ValueError("mamba2: overwrite_initial_state requires initial_state")
+        if preceding_state_update is not None or preceding_transition is not None:
+            raise ValueError("mamba2: preceding summaries cannot combine with overwrite_initial_state or state_indices")
         y, state_checkpoints = torch.ops.cudnn.mamba2_fwd_overwrite_state(
             x,
             dt,
@@ -1157,7 +1263,7 @@ def mamba2(
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        y, final_state, state_checkpoints, _ = torch.ops.cudnn.mamba2_fwd(
+        y, final_state, state_checkpoints, _, composed_initial_state = torch.ops.cudnn.mamba2_fwd(
             x,
             dt,
             A,
@@ -1177,7 +1283,11 @@ def mamba2(
             batch_invariant=bool(batch_invariant),
             plan_name=plan_name,
             checkpoint_dtype=checkpoint_dtype,
+            preceding_state_update=preceding_state_update,
+            preceding_transition=preceding_transition,
         )
+        if preceding_state_update is not None:
+            return y, final_state, state_checkpoints, composed_initial_state
     if checkpoint_every_n_tokens > 0:
         return y, final_state, state_checkpoints
     return y, final_state

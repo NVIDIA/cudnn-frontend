@@ -43,6 +43,7 @@ symbols_to_import = [
     "moe_grouped_matmul_mode",
     "scalar_type",
     "reshape_mode",
+    "custom_reduction_identity",
 ]
 
 for symbol_name in symbols_to_import:
@@ -170,6 +171,9 @@ def destroy_handle(handle):
 from .datatypes import _library_type, _is_torch_tensor
 
 __version__ = "1.33.0"
+# Keep in sync with the JAX dependency minimum in pyproject.toml.
+CUTEDSL_MIN_JAX_VERSION = (0, 9, 1)
+CUTEDSL_MIN_JAX_VERSION_STR = ".".join(map(str, CUTEDSL_MIN_JAX_VERSION))
 
 
 def _tensor(
@@ -294,6 +298,7 @@ from ._pygraph import pygraph, GraphContext
 from .nodes import Node
 
 from .graph import graph, jit, graph_cache
+from . import reduction_modifiers
 
 from typing import Any
 
@@ -326,6 +331,8 @@ _EAGER_PUBLIC_NAMES = (
     "Handle",
     "DeviceInfo",
     "__version__",
+    "CUTEDSL_MIN_JAX_VERSION",
+    "CUTEDSL_MIN_JAX_VERSION_STR",
     "NodeType",
     "Tensor",
     "pygraph",
@@ -334,6 +341,7 @@ _EAGER_PUBLIC_NAMES = (
     "graph",
     "jit",
     "graph_cache",
+    "reduction_modifiers",
     "sdpa_capabilities",
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
@@ -386,24 +394,45 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "Nvfp4AttentionQatBackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "nvfp4_attention_qat_backward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "gated_attention_block": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "GdnDecodeFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "GdnVerifyFused": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AttentionGateQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
-    # the triangle multiplicative update (cuEquivariance's signature); the function shares its package's name, so the package module
-    # is itself callable -- `cudnn.triangle_multiplicative_update(...)` works whichever the attribute resolved to
-    "triangle_multiplicative_update": (".triangle_multiplicative_update", "triangle_multiplicative_update"),
-    "TriangleMultiplicativeUpdateFwd": (".triangle_multiplicative_update", "TriangleMultiplicativeUpdateFwd"),
-    # triangle attention (cuEquivariance's signature; the same callable-package arrangement as the triangle multiplicative update)
-    "triangle_attention": (".triangle_attention", "triangle_attention"),
-    "mask_to_kv_lengths": (".triangle_attention", "mask_to_kv_lengths"),
-    "prefix_mask_to_kv_lengths": (".triangle_attention", "prefix_mask_to_kv_lengths"),
-    "TriangleAttentionFwd": (".triangle_attention", "TriangleAttentionFwd"),
     # the gated attention block (its package had no entry here, so `from cudnn import gated_attention_block_forward` failed)
     "gated_attention_block_forward": (".gated_attention_block", "gated_attention_block_forward"),
     "gated_attention_block_backward": (".gated_attention_block", "gated_attention_block_backward"),
     "GatedAttentionBlockFwd": (".gated_attention_block", "GatedAttentionBlockFwd"),
     "GatedAttentionBlockBwd": (".gated_attention_block", "GatedAttentionBlockBwd"),
+    # the fused GDN decode / MTP verify step entries for SM100- and SM120-class parts: direct-call kernels with the FlashInfer Qwen 3.5 GDN block's
+    # argument contract (also `cudnn.linear_attention.frost.GdnDecodeFused` / `GdnVerifyFused`); their FlashInfer backend registration is
+    # the explicit import of `cudnn.linear_attention.frost.flashinfer_gdn_backend`, never reached from here
+    "GdnDecodeFused": (".linear_attention.frost.gdn_decode_fused", "GdnDecodeFused"),
+    "GdnVerifyFused": (".linear_attention.frost.gdn_verify_fused", "GdnVerifyFused"),
+    # the shared-expert decode kernel pair (bf16 shared expert next to a routed MoE, SM100-class parts): a direct-call entry like the GDN
+    # steps (also `cudnn.moe.frost.SharedExpertDecode`)
+    "SharedExpertDecode": (".moe.frost.shared_expert_decode", "SharedExpertDecode"),
+    # the attention gate + quantize decode step (the sigmoid output gate of an attention block fused with the static E4M3 quantization of
+    # the following projection's input, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.attention_gate.frost.AttentionGateQuantDecode`)
+    "AttentionGateQuantDecode": (".attention_gate.frost.gate_quant_decode", "AttentionGateQuantDecode"),
+    # the FP8 split-K projection for decode rows (E4M3 x E4M3 -> bf16, 1 .. 32 rows, SM100-class parts): a direct-call entry like the
+    # GDN steps (also `cudnn.gemm.Fp8ProjectionDecode`, with its `ProjectionGeometry` / `ProjectionForm`)
+    "Fp8ProjectionDecode": (".gemm.frost.projection_decode.fp8_projection_decode", "Fp8ProjectionDecode"),
+    # the add + RMSNorm + quantize decode step (the residual add, the RMSNorm and the quantization of the following projection's input --
+    # bf16, FP8 E4M3 or NVFP4 -- in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.norm.frost.AddNormQuantDecode`)
+    "AddNormQuantDecode": (".norm.frost.add_norm_quant_decode", "AddNormQuantDecode"),
+    # the gate / up product of an FP4 MLP for decode rows with SiLU(gate) x up and the FP4 re-quantisation in one launch (block-scaled FP4
+    # in and out, 1 .. 64 rows, SM100-class parts): a direct-call entry like the steps above (also `cudnn.gemm.SwigluFp4Decode`, with
+    # its `SwigluGeometry`)
+    "SwigluFp4Decode": (".gemm.frost.swiglu_decode.swiglu_fp4_decode", "SwigluFp4Decode"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
@@ -474,8 +503,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     "block_sparse_attention_forward": (".block_sparse_attention", "block_sparse_attention_forward"),
     "block_sparse_attention_fp8_forward": (".block_sparse_attention", "block_sparse_attention_fp8_forward"),
     "block_sparse_attention_backward": (".block_sparse_attention", "block_sparse_attention_backward"),
+    "block_sparse_attention_prepare_backward": (".block_sparse_attention", "block_sparse_attention_prepare_backward"),
     "kpage_prepare_layout": (".block_sparse_attention", "kpage_prepare_layout"),
     "KPageLayout": (".block_sparse_attention", "KPageLayout"),
+    "BsaBackwardMetadata": (".block_sparse_attention", "BsaBackwardMetadata"),
     "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
@@ -796,7 +827,7 @@ def __getattr__(name: str) -> Any:
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.
         # Deferred so torch-only users never pay the jax import (the submodule
-        # itself raises a descriptive ImportError when jax >= 0.5 is missing).
+        # itself raises a descriptive ImportError when JAX is below CUTEDSL_MIN_JAX_VERSION).
         _jax = importlib.import_module(".jax", __name__)
         globals()["jax"] = _jax
         return _jax

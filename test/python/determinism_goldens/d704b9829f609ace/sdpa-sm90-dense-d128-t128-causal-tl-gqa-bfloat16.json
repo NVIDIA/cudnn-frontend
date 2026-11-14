@@ -1,0 +1,65 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "213e3fc85ae24d1bebe1b07b472d5527877c16fef58496db863feb9ec20e612c",
+      "shape": [
+        1500,
+        2,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "c008fbb1df3de9f1571d74989373a4396369e264d30ba7de42faf7240286f0a9",
+      "shape": [
+        1280,
+        8,
+        128
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "06499be907382e4c5aa92a0fa5582b93e0f7e496dbe7ad7a4cd4febc0b07fb92",
+      "shape": [
+        1500,
+        2,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "186e2158b2c0366569e3e1c91b721db6ea024357aebeee3afdcebad0f8d117c2",
+      "shape": [
+        8,
+        1280
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "072eca98cd694cb5c2ec9c6dc083647998fd91fe84a4de6a515bcd6e247b1035",
+      "shape": [
+        8,
+        1280,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13000,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "sm": [
+      9,
+      0
+    ],
+    "sm_count": 132,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

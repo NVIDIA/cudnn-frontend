@@ -1,0 +1,138 @@
+{
+  "inputs": {
+    "blk_base": {
+      "dtype": "torch.int32",
+      "sha256": "1f315783ce7429c05ea255134641b3ca905ce7d3598fad0b1b828d60be495565",
+      "shape": [
+        20
+      ]
+    },
+    "block_first": {
+      "dtype": "torch.int32",
+      "sha256": "29420d81a3244f4785ad65c1dbb1d9c64288f57695c0d2ade61b15877b05652f",
+      "shape": [
+        6
+      ]
+    },
+    "block_last": {
+      "dtype": "torch.int32",
+      "sha256": "7974a8dc9a018af787e8f6fe7fd1bf005555bd70abbd648eac62cb8224df7ea6",
+      "shape": [
+        6
+      ]
+    },
+    "do": {
+      "dtype": "torch.bfloat16",
+      "sha256": "267993d3fc27e380bd6047a2f0d94bf75cfee53f8f6c7474bad27ed822957945",
+      "shape": [
+        20,
+        12,
+        256
+      ]
+    },
+    "hi": {
+      "dtype": "torch.int32",
+      "sha256": "a9551fcf2864b95f8f2422220d046cb5d775ebbfdcacbedf132e3b06de46f3c5",
+      "shape": [
+        20
+      ]
+    },
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "450aed681d5fd2ba07236466fdf24d0d579d9416dba3f83f5bc5feddb068c3ac",
+      "shape": [
+        20,
+        1,
+        256
+      ]
+    },
+    "lo": {
+      "dtype": "torch.int32",
+      "sha256": "8005270cb5f1b6fe1e6d6cec79b0a216ac312bab99d9051bf0466e6ab829b854",
+      "shape": [
+        20
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "32a2a918b931630b303d348a6fca3e0d00f486b33917c081362dd589b5432679",
+      "shape": [
+        20,
+        12,
+        256
+      ]
+    },
+    "scale": {
+      "dtype": "torch.float64",
+      "sha256": "e452a95f61b21a03ce78eee95f15d2e611d4ee3926f614a6e9c6f70a79bdfa7d",
+      "shape": []
+    },
+    "sel_blocks": {
+      "dtype": "torch.uint8",
+      "sha256": "17a04a7895ebc4f9e1c88c2ce73f3439918388a0a093987b7429a72a79ce9072",
+      "shape": [
+        20,
+        6
+      ]
+    },
+    "tok_base": {
+      "dtype": "torch.int32",
+      "sha256": "8005270cb5f1b6fe1e6d6cec79b0a216ac312bab99d9051bf0466e6ab829b854",
+      "shape": [
+        20
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "af827e85ac03e107bfad57365708b8b9a6b3bd0d88a362ff76c4b2a5eb0eee19",
+      "shape": [
+        20,
+        1,
+        256
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "36a14528d054280c8e10c195270a7f5bcf1c7758821757f49f11d8a32306ecac",
+      "shape": [
+        12,
+        20
+      ]
+    },
+    "out": {
+      "dtype": "torch.bfloat16",
+      "sha256": "a81231669722e4ab4dc25407415da70ae16316d77d82b4771d2fff6e38c462da",
+      "shape": [
+        20,
+        12,
+        256
+      ]
+    },
+    "out_fp32": {
+      "dtype": "torch.float32",
+      "sha256": "b5960b935efd1c0b2df5fcef6b27cbbfe488caefc1442e278298646c1e79ced8",
+      "shape": [
+        20,
+        12,
+        256
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.4",
+    "cuda_driver": 13050,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA VR NVL72",
+    "sm": [
+      10,
+      7
+    ],
+    "sm_count": 212,
+    "torch": "2.14.0a0+b2c75dd062.nv26.09",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

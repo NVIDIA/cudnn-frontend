@@ -6,10 +6,11 @@
 
 1. **Freeze a study.** Write the training grid and a seeded random holdout, record their sha256, and only then time anything. A study JSON names:
    - `id`, `row` (the FROST engine spec name), `device_cc`, `dtype` (`bf16` / `f16`);
-   - `adapter`: `inference` for the generation phase of `benchmark/attention_inference`, or `training` for `benchmark/attention_training`;
+   - `adapter`: `inference` for the generation phase of `benchmark/attention_inference`, `training` for `benchmark/attention_training`, or `recorded` when the driver stored the FE graph's own facts in each case (`case["facts"]`; e.g. a graph built by FlashInfer's cudnn path, whose declaration the case fields cannot reproduce);
    - head pair defaults (`d_qk`, `d_v`), an optional `layout` default;
-   - the `train` / `holdout` JSONL paths.
-2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end.
+   - the `train` / `holdout` JSONL paths (each one path or a list; records join on file and `idx`, so separately run supplements can be listed as they are).
+   Count the holdout's on- and off-tile cells from its final lengths before timing: a transform applied after aligning S_kv (e.g. unequal per-request lengths) moves the cell off the tile.
+2. **Sweep on the target part.** Run the `cudnn` (backend only), `cudnn_oss` (FROST first) and `cudnn_auto` (default dispatch) legs. Write one JSON line per (case, leg) with `ms`, `plan` and the `case` dict. Use a full-power board, and record co-tenant GPU processes at start and end. Where the backend's first plan fails to finalize, the backend-only reference is the first backend plan that builds (the default leg, when it ran a backend plan); otherwise `load` drops those cells from the fit.
 3. **Fit:** `python benchmark/placement_gen/gen.py study.json`. Every case becomes graph facts, classified with `placement_table.class_key`, the same code the runtime uses. Per class, every scalar in `placement_table.FEATURES` is fit (today: `cost`, the roofline proxy; `tiles`, the parallel tiles before a KV split; `rows`, the query rows b * h_q * s_q; `kv`, the KV tokens per request; `q`, the query tokens per request). Each fit is:
    - `always`;
    - `never`;
@@ -21,6 +22,7 @@
    The feature with the lowest training regret is kept and recorded in the entry. Cells within `--margin` of parity (default 3%) never move a threshold. A class that no feature can split monotonically is **NON-MONOTONE** and gets no entry; refine the class key instead.
 4. **Qualify on the frozen holdout, once, at the frozen head.** The holdout must exercise every class the entries cover (on- and off-tile S_kv, every layout), was never used to fit or to choose a feature or constant, and is consumed by the run.
 5. **Score.** The tool prints generated vs measured-default vs backend-only regret on train and holdout. The holdout must show no case where the generated choice is slower than the measured default beyond noise.
+   A bounded declaration (`shape_overrides`, e.g. FlashInfer's ragged envelope) is classified on what it declares (layout `*_bounded`), so one entry answers every live shape under the declaration and some cells will trail the default by construction. Write its per-class bar (geomean vs the measured default, worst-cell cap) into the study record before the holdout is read, and score it on the realized shapes.
 6. **Emit:** `gen.py study.json --emit` prints the entries. Paste them as one block under a comment naming the study, part, cuDNN version and case counts.
 
 Entries carry the study id. Re-run the study when a kernel change touches the row's capabilities.

@@ -26,6 +26,8 @@ empty ranges, cga1, page sizes across the 128-row tile.
 import math
 import os
 
+from frost_test_utils import fp8_engine_names, half_engine_names
+
 import pytest
 
 import torch
@@ -217,13 +219,20 @@ def _run_graph(
     else:
         from cudnn.engines.manifest import family_for
 
-        g.create_execution_plan(family_for(g).offered_ids()[engine_name(arch=arch)], explicit_knobs)
-    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
+        explicit_name = engine_name(arch=arch)
+        if arch == "sm100":
+            explicit_name = {
+                (256, 256): "sdpa_fwd_sm100_d256_lookahead",
+                (512, 512): "sdpa_fwd_sm100_d512_role_split",
+                (576, 512): "sdpa_fwd_sm100_d512_2x2",
+            }.get((d, d_v), explicit_name)
+        g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
+    plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:
         assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(arch=arch)) and g.plans[i].knobs.split_kv == want_split), None)
+        idx = next((i for i, n in enumerate(names) if n.startswith(half_engine_names(arch)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(arch=arch)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
         plan = g.plans[idx]
@@ -618,8 +627,7 @@ def test_paged_graph_declines_off_contract():
     """Plan-time declines stay plan-time: no engine plan is offered, nothing compiles."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
-    from frost_test_utils import offers_engine
+    from frost_test_utils import half_engine_names, offers_engine
 
     def _build(P, d=D, H=8, KH=2, hnd=False, padding=True, sink=False, d_v=None):
         B, max_pages = 2, 8
@@ -663,7 +671,7 @@ def test_paged_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name())
+        return g is not None and any(offers_engine(g, name) for name in half_engine_names("sm100"))
 
     assert _offers(_build(16))
     # Lifted: paged KV + attention sink at s_q == 1 is offered (the decline
@@ -795,7 +803,7 @@ def _device_lead_split(B, H, KH, s_kv, *, s_q=1, causal_br=False, dtype=torch.fl
         device_cc=torch.cuda.get_device_capability(),
         device_sm_count=_sm_count(),
     )
-    plans = recommend("A", facts, {engine_name(): 0})
+    plans = recommend("A", facts, {name: i for i, name in enumerate(half_engine_names())})
     assert plans, "the f16 row must serve this graph"
     return plans[0].knobs.split_kv
 
@@ -849,7 +857,7 @@ def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "prefill_d256_f16.py", 512: "prefill_d512_f16.py"}
+_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "d256_f16_lookahead/kernel.py", 512: "d512_f16_role_split/kernel.py"}
 
 
 def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, d_v=None, expect_pack_g=None):
@@ -893,7 +901,7 @@ def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=t
     # The pools' strides in the kernel's [num_pages, page_size, H_kv, d] order carry the layout (HND vs NHD).
     fn = mod.compile(d_qk=d, d_v=d_v, has_lse=True, lse_kind="dense", paged_hnd=k_view.stride(1) < k_view.stride(2))
     # Split partials are fp32 on SM100 (#891); the combine must be compiled for that width.
-    from test_sdpa_fwd_split_kv_sm100 import _partial_kwargs, _partial_o_dtype, _partial_tag
+    from sdpa_split_partial_test_utils import _partial_kwargs, _partial_o_dtype, _partial_tag
 
     o_p = torch.zeros(splits * B, 1, H, d_v, device=dev, dtype=_partial_o_dtype(splits, dtype))
     lse_p = torch.zeros(splits * B, H, 1, device=dev, dtype=torch.float32)
@@ -1190,7 +1198,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
+    plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -1531,6 +1539,10 @@ def _run_graph_fp8(
     explicit_cga=None,
     d_v=None,
     head_padding=False,
+    softmax_precision=None,
+    amax=True,
+    stats_log2=False,
+    explicit_swap_ab=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1542,11 +1554,12 @@ def _run_graph_fp8(
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
+    target_engine = fp8_engine_names(arch="sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100")
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
     d_v = d if d_v is None else d_v
     k_pool, v_pool, k_c, v_c, bt, dk, dv = _pools_fp8(B, KH, d, P, max_pages, hnd, in_key, lens, v_hnd=v_hnd, d_v=d_v, head_padding=head_padding)
-    mask_kw = {}
+    mask_kw = {} if softmax_precision is None else dict(softmax_precision=softmax_precision)
     right_bound = 0 if causal is not None else None
     diag_align = cudnn.diagonal_alignment.BOTTOM_RIGHT if causal == "bottom_right" else cudnn.diagonal_alignment.TOP_LEFT
     if causal is not None:
@@ -1604,6 +1617,7 @@ def _run_graph_fp8(
         scale_o=son,
         attn_scale=scale,
         generate_stats=stats,
+        stats_use_log2=stats_log2,
         use_padding_mask=True,
         seq_len_q=sq_t,
         seq_len_kv=sk_t,
@@ -1618,18 +1632,22 @@ def _run_graph_fp8(
         lse = torch.empty(B, H, s_q, 1, device=dev, dtype=torch.float32)
         st.set_output(True).set_dim([B, H, s_q, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     amax_o = torch.full((1, 1, 1, 1), float("nan"), device=dev, dtype=torch.float32)
-    amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if amax:
+        amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     if pin:
-        select_engine(g, engine_name(fp8=True))
+        select_engine(g, target_engine)
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(fp8=True)) and g.plans[i].knobs.split_kv == want_split), None)
-        assert idx is not None, f"no {engine_name(fp8=True)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
+        idx = next(
+            (i for i, n in enumerate(names) if n.startswith(target_engine) and g.plans[i].knobs.split_kv == want_split),
+            None,
+        )
+        assert idx is not None, f"no {target_engine} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
-    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None:
+    if explicit_split is not None or explicit_pack is not None or explicit_cga is not None or explicit_swap_ab is not None:
         from dataclasses import replace
 
         selected = g.plans[g._plan_index]
@@ -1640,7 +1658,9 @@ def _run_graph_fp8(
             knobs = replace(knobs, pack_gqa=explicit_pack)
         if explicit_cga is not None:
             knobs = replace(knobs, cga=explicit_cga)
-        g.create_execution_plan(selected.engine_id, knobs)
+        if explicit_swap_ab is not None:
+            knobs = replace(knobs, swap_ab=explicit_swap_ab)
+        g.create_execution_plan(selected.engine_id, knobs.to_public() if explicit_swap_ab is not None else knobs)
         g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -1663,6 +1683,8 @@ def _run_graph_fp8(
         ssn: _sc(1.0),
         son: _sc(1.0),
     }
+    if not amax:
+        vp.pop(amx_o)
     if sink_t is not None:
         vp[sink_t] = sinks
     if stats:
@@ -1719,9 +1741,12 @@ def _run_graph_fp8(
         assert torch.count_nonzero(out[dead]).item() == 0, "trimmed and sink-only rows must write exact zero O"
     # Amax_O is produced in-kernel (atomicMax over the pre-cast fp32 values; the
     # recombined O's under a split), so it matches the fp32 reference for every O dtype.
-    assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
+    if amax:
+        assert abs(amax_o.item() - ref_o.abs().max().item()) <= 0.03, f"amax_o {amax_o.item():.4f} vs ref {ref_o.abs().max().item():.4f}"
     if stats:
         got_lse = lse.view(B, H, s_q)
+        if stats_log2:
+            ref_lse = ref_lse * math.log2(math.e)
         lse_atol = _fp8_lse_atol(256 if max(d, d_v) > 128 else d)
         torch.testing.assert_close(got_lse[live], ref_lse[live], atol=lse_atol, rtol=0)
         if (~live).any():
@@ -1734,14 +1759,16 @@ def _run_graph_fp8(
             tensors["sinks"] = sink_t
         if stats:
             tensors["lse"] = st
-        return g, vp, ws, {name: vp[tensor] for name, tensor in tensors.items()}, tensors
+        buffers = {name: vp[tensor] for name, tensor in tensors.items() if tensor in vp}
+        buffers["amax_o"] = amax_o
+        return g, vp, ws, buffers, tensors
     return (plan, g) if return_graph else plan
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", ["e4m3", "e5m2"])
 @pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 128])
+@pytest.mark.parametrize("page_size", [8, 16, 128])
 def test_paged_graph_fp8_matches_reference(in_key, hnd, page_size):
     """FP8 twin of test_paged_graph_matches_reference: mixed lengths incl. 0 and 1
     (partial last pages, dead pages NaN-filled), GQA 8:2 (PackGQA), a tile-unaligned
@@ -1830,7 +1857,7 @@ def _is_frost_fp8(g, index) -> bool:
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import _is_plan_for
 
-    return _is_plan_for(g.get_plan_name_at_index(index), engine_name(fp8=True))
+    return _is_plan_for(g.get_plan_name_at_index(index), fp8_engine_names())
 
 
 def _assert_frost_fp8_led_and_served(g):
@@ -1838,7 +1865,7 @@ def _assert_frost_fp8_led_and_served(g):
 
     names = _plan_names(g)
     assert _is_frost_fp8(g, 0), names
-    assert g.selected_engine is not None and g.selected_engine.name == engine_name(fp8=True), names
+    assert g.selected_engine is not None and g.selected_engine.name in fp8_engine_names(), names
 
 
 @pytest.mark.L0
@@ -1930,7 +1957,7 @@ def _build_fp8_paged_graph(P, *, d=D, H=8, KH=2, hnd=False, thd=False, mask_kw=N
 
 @pytest.mark.L0
 def test_paged_graph_fp8_declines_off_contract():
-    """D128/D256 serve dense or THD queries over FP8 pools. D512, THD D64
+    """D128/D256 serve dense or THD queries over FP8 pools. THD D64/D512
     and off-contract page sizes remain plan-time declines."""
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
@@ -1942,7 +1969,8 @@ def test_paged_graph_fp8_declines_off_contract():
     assert _offers(_build_fp8_paged_graph(128, hnd=True))
     assert not _offers(_build_fp8_paged_graph(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
     assert _offers(_build_fp8_paged_graph(16, d=256))
-    assert not _offers(_build_fp8_paged_graph(16, d=512)), "paged KV for per-tensor FP8 d512 is not wired"
+    assert _offers(_build_fp8_paged_graph(16, d=512))
+    assert not _offers(_build_fp8_paged_graph(16, d=512, thd=True)), "paged D512 FP8 requires dense Q"
     for d in (128, 256):
         assert _offers(_build_fp8_paged_graph(16, d=d, thd=True))
     assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True)), "THD requires an exact native FP8 width"
@@ -1972,8 +2000,7 @@ def test_paged_graph_fp8_declines_off_contract():
 # names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d192_d128_fp8.py", 0, 1),
-    ("sm100/prefill_d512_fp8.py", 0, 2),
-    ("sm100/prefill_d512_f16_2x2.py", 2, 2),
+    ("sm100/d512_f16_2x2/kernel.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
     ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
@@ -2006,12 +2033,8 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("fp8", [False, True], ids=["f16", "fp8"])
-def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
-    """Dense paged queries stay unsupported on SM107, including quantized inputs.
-
-    The half THD extension does not admit these dense declarations. The same
-    adapter accepts them on SM100, then raises before compile on a mocked SM107.
-    """
+def test_paged_adapter_sm107_device_contract(monkeypatch, fp8):
+    """Native half D128 accepts dense Q; per-tensor FP8 D128 retains its decline."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     B, H, KH, P, max_pages = 2, 8, 2, 16, 8
@@ -2049,8 +2072,11 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
-        _api().check_support()
+    if fp8:
+        with pytest.raises(NotImplementedError, match="Rubin paged KV"):
+            _api().check_support()
+    else:
+        assert _api().check_support()
 
 
 @pytest.mark.L0
@@ -2839,7 +2865,7 @@ def test_paged_mxfp8_adapter_sm107_device_contract(monkeypatch, dims):
             assert "Rubin paged KV" not in str(e), e
             raise
     else:
-        with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
+        with pytest.raises(NotImplementedError, match=r"Rubin paged KV.*MXFP8 D128/D256"):
             _api().check_support()
 
 
@@ -2937,7 +2963,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         (192, 128, 2, 3, 1),
         (256, 256, 2, 33, 1),
         (256, 256, 2, 3, 2),
-        (512, 512, 2, 3, 1),
+        (512, 512, 4, 3, 1),
     ],
 )
 def test_paged_independent_pool_layouts(k_hnd, v_hnd, kh, dtype, d, d_v, cga, s_q, split):
@@ -3236,4 +3262,61 @@ def test_paged_graph_fp8_d256_persistent_batch_lengths(page_size, pack, split, h
         explicit_pack=pack,
         q_lens=[257, 1, 0, 17, 257] * 2,
         sinks=sinks,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "page_size,s_q,split,pack,in_key,out_dt,causal,window",
+    [
+        (8, 1, 1, True, "e4m3", torch.bfloat16, None, None),
+        (16, 2, 4, True, "e4m3", torch.float8_e4m3fn, "bottom_right", None),
+        (32, 16, 1, False, "e5m2", torch.float16, "top_left", 64),
+        (64, 16, 4, False, "e5m2", torch.float8_e5m2, "bottom_right", 128),
+        (128, 257, 1, True, "e4m3", torch.bfloat16, "bottom_right", 256),
+        (256, 2, 4, True, "e4m3", torch.bfloat16, None, None),
+    ],
+)
+def test_paged_graph_fp8_d512_boundaries(page_size, s_q, split, pack, in_key, out_dt, causal, window):
+    """Empty batches, partial pages and later persistent tiles use live page counts."""
+    _run_graph_fp8(
+        5,
+        8,
+        2,
+        512,
+        page_size,
+        -(-513 // page_size),
+        [513, 0, 1, 129, 256],
+        pack,
+        in_key=in_key,
+        out_dt=out_dt,
+        s_q=s_q,
+        explicit_split=split,
+        explicit_pack=pack,
+        causal=causal,
+        window_left=window,
+        v_hnd=not pack,
+        q_lens=[s_q, 1, 0, min(2, s_q), s_q],
+        sinks=torch.linspace(-3, 3, 8, device="cuda").view(1, 8, 1, 1) if page_size in (16, 128) else None,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd,split", [(False, 1), (True, 4)])
+def test_paged_graph_fp8_d512_head_envelope(hnd, split):
+    _run_graph_fp8(
+        3,
+        4,
+        2,
+        384,
+        16,
+        17,
+        [257, 0, 129],
+        hnd,
+        d_v=320,
+        out_dt=torch.bfloat16,
+        s_q=2,
+        explicit_split=split,
+        explicit_pack=True,
+        head_padding=True,
     )

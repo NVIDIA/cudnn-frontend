@@ -47,7 +47,7 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
 from ._support import (
     check_paged_args as _check_paged_args,
     check_q_covered_by_k as _check_q_covered_by_k,
-    resolve_m_block_size as _resolve_m_block_size,
+    validate_bf16_tile as _validate_bf16_tile,
     resolve_paged_k as _resolve_paged_k,
     validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
 )
@@ -144,6 +144,7 @@ def compress_topk_cand_buffer_size(
     return_lse: bool = False,
     q_causal_offsets: torch.Tensor | None = None,
     precision: str = "bf16",
+    paged: bool = False,
 ) -> int:
     """Number of float32 elements a caller-provided ``cand_buffer`` must hold for
     ``indexer_fwd_compress_topk`` at this BSHD shape.  It is ``bs * per_batch_floats``; for a
@@ -162,7 +163,11 @@ def compress_topk_cand_buffer_size(
 
     Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``)
     always run a single launch, so this returns the full buffer and an explicit
-    ``microbatch_rows > 0`` raises, as at launch."""
+    ``microbatch_rows > 0`` raises, as at launch.
+
+    Pass ``paged=True`` when the launch reads K through ``block_table`` / ``kv_lens``
+    (``seqlen_k`` is then the launch's ``max_seqlen_k``): paged K also runs a single
+    launch, with the same full-buffer sizing and the same ``microbatch_rows > 0`` error."""
     from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
 
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
@@ -170,6 +175,10 @@ def compress_topk_cand_buffer_size(
     if precision in BLOCK_SCALED_FORMATS:
         if microbatch_rows > 0:
             raise NotImplementedError(f"microbatch_rows is not supported with precision={precision!r} " "(per-window scale repacking is not implemented)")
+        microbatch_rows = 0
+    if paged:
+        if microbatch_rows > 0:
+            raise NotImplementedError("microbatch_rows > 0 is not supported with paged K; pass microbatch_rows=0")
         microbatch_rows = 0
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:
@@ -418,7 +427,7 @@ def indexer_fwd_compress_topk(
     if n_heads_kv != 1:
         raise ValueError("compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}. The stage-1 GEMM reads only KV head 0.")
     if precision == "bf16":
-        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
+        _validate_bf16_tile(m_block_size, head_dim, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
@@ -612,7 +621,6 @@ def indexer_fwd_compress_topk(
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
-    unified_kv_stage = 4
     # Without LSE the denom slot is compiled out: None at compile and launch (R3).
     lse_buf = (lse_out if lse_out is not None else torch.empty((bs, seqlen_q), dtype=torch.float32, device=device)) if want_lse else None
     denom_tmp = lse_buf
@@ -659,7 +667,6 @@ def indexer_fwd_compress_topk(
         m_block_size,
         n_block_size,
         unified_k_block_size,
-        unified_kv_stage,
         sf_vec_size,
         float(sm_scale),
         seqlen_q,
@@ -692,8 +699,6 @@ def indexer_fwd_compress_topk(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=64,
-                kv_stage=24,
                 ratio=ratio,
                 is_varlen=False,
                 sf_vec_size=sf_vec_size,
@@ -728,7 +733,6 @@ def indexer_fwd_compress_topk(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 k_block_size=unified_k_block_size,
-                kv_stage=unified_kv_stage,
                 ratio=ratio,
                 is_varlen=False,
                 compute_lse=want_lse,
@@ -986,7 +990,6 @@ def _run_compress_gemm_varlen(
 
     head_dim_padded = (head_dim + 15) // 16 * 16
     unified_k_block_size = 64 if head_dim_padded % 64 == 0 else head_dim_padded
-    unified_kv_stage = 4
 
     if precision in BLOCK_SCALED_FORMATS:
         # Data uses compact cu_seqlens offsets. Scale regions are independently padded
@@ -1037,8 +1040,6 @@ def _run_compress_gemm_varlen(
                 qhead_per_kvhead=qhead_per_kv_head,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
-                k_block_size=64,
-                kv_stage=24,
                 ratio=ratio,
                 is_varlen=True,
                 sf_vec_size=sf_vec_size,
@@ -1101,7 +1102,6 @@ def _run_compress_gemm_varlen(
         m_block_size,
         n_block_size,
         unified_k_block_size,
-        unified_kv_stage,
         float(sm_scale),
         int(max_seqlen_q),
         None if page_size else int(max_seqlen_k),  # paged: a runtime bound, not a layout parameter
@@ -1128,7 +1128,6 @@ def _run_compress_gemm_varlen(
             m_block_size=m_block_size,
             n_block_size=n_block_size,
             k_block_size=unified_k_block_size,
-            kv_stage=unified_kv_stage,
             ratio=ratio,
             is_varlen=True,
             compute_lse=want_lse,
@@ -1348,7 +1347,7 @@ def _indexer_fwd_compress_topk_thd(
             device=device,
         )
     if precision == "bf16":
-        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
+        _validate_bf16_tile(m_block_size, head_dim, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     cu_q32 = cu_seqlens_q.to(torch.int32)

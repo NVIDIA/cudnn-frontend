@@ -51,29 +51,56 @@ def test_independent_thd_origins_rebind_and_capture(
     cga=None,
     compact=False,
     heads_override=None,
+    batch_override=None,
+    extra_checks=None,
+    origin_element_unit=None,
 ):
     import cudnn
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (((10, 7),) if engine_name.endswith("sm107") else ((10, 0), (10, 3))):
-        pytest.skip("SM100/SM103 physical THD origin path")
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == engine_name)
+    sm120 = caps.sm_lo == 120
+    fp8, mxfp8 = caps.is_fp8, caps.is_mxfp8
+    quantized = fp8 or mxfp8
+    arches = ((12, 0), (12, 1)) if sm120 else (((10, 7),) if "sm107" in engine_name else ((10, 0), (10, 3)))
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in arches:
+        pytest.skip(f"{engine_name} physical THD origin path")
     torch.manual_seed(117)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (256, 256):
+        engine_name = "sdpa_fwd_sm100_d256_lookahead"
     batch, heads, kv_heads, maximum = 4, (heads_override or (24 if d_qk == 576 else 8)), 2, 256
+    if batch_override is not None:
+        assert batch_override == 1
+        batch, maximum = 1, 512
     capacity = batch * maximum
     dtype = getattr(torch, dtype_name)
     ports = ("q", "k", "v", "o", "stats")
     widths = (torch.int64, torch.int32, torch.int64, torch.int32, torch.int64)
     # +16 head padding must represent integral compact and gapped token origins.
-    qk_multiplier = 16 if d_qk in (64, 192, 576) else d_qk
-    multipliers = (heads * qk_multiplier, qk_multiplier, 1, d_v, 1)
+    qk_multiplier = 16 if d_qk in (64, 192, 512, 576) or sm120 else d_qk
+    o_multiplier = 16 if sm120 else d_v
+    if origin_element_unit is not None:
+        qk_multiplier = o_multiplier = origin_element_unit
+    multipliers = (heads * qk_multiplier, qk_multiplier, 1, o_multiplier, 1)
     q_lengths, kv_lengths = [129, 0, 65, 33], [147, 0, 92, 50]
+    q_lengths, kv_lengths = q_lengths[:batch], kv_lengths[:batch]
     log2_stats = stats_layout == "head"
+
+    scale_values = dict(descale_q=0.8, descale_k=0.9, descale_v=0.7, scale_s=1.0, descale_s=1.0, scale_o=1.3) if fp8 else {}
+    mx_refs = {}
 
     def tensors(head_padding=0):
         result = {
             name: torch.empty(
-                batch, maximum, h, width + head_padding, device="cuda", dtype=getattr(torch, kv_dtype_name) if kv_dtype_name and name in ("k", "v") else dtype
+                batch,
+                maximum,
+                h,
+                width + head_padding,
+                device="cuda",
+                dtype=(torch.bfloat16 if quantized and name == "o" else getattr(torch, kv_dtype_name) if kv_dtype_name and name in ("k", "v") else dtype),
             )[..., :width].transpose(1, 2)
             for name, h, width in (("q", heads, d_qk), ("k", kv_heads, d_qk), ("v", kv_heads, d_v), ("o", heads, d_v))
         }
@@ -86,18 +113,23 @@ def test_independent_thd_origins_rebind_and_capture(
         result["kl"] = torch.empty_like(result["ql"])
         for name, width in zip(ports, widths):
             result["ro_" + name] = torch.empty(batch + 1, 1, 1, 1, device="cuda", dtype=width)
+        for name, value in scale_values.items():
+            result[name] = torch.full((1, 1, 1, 1), value, device="cuda", dtype=torch.float32)
+        if mxfp8:
+            for name, h, width in (("q", heads, d_qk), ("k", kv_heads, d_qk), ("v", kv_heads, d_v)):
+                result["sf_" + name] = torch.empty(h, batch * ((maximum + 127) // 128), ((width + 127) // 128) * 512, device="cuda", dtype=torch.uint8)
         return result
 
     def flat(t):
         return t.as_strided((capacity, t.shape[1], t.shape[-1]), (t.stride(2), t.stride(1), t.stride(3)))
 
     def fill(values, shift, short=False, empty=False):
-        ql = [97, 0, 49, 17] if short else q_lengths
+        ql = [97, 0, 49, 17][:batch] if short else q_lengths
         if empty:
             ql = [0] * batch
         # Replay also turns a live query sequence into a keyless row.
-        kl = [101, 0, 76, 0] if short else kv_lengths
-        origins = {name: [shift + port * 16 + x for x in (0, 176, 224, 384)] for port, name in enumerate(ports)}
+        kl = ([0] if batch_override == 1 else [101, 0, 76, 0]) if short else kv_lengths
+        origins = {name: [shift + port * 16 + x for x in (0, 176, 224, 384)[:batch]] for port, name in enumerate(ports)}
         if compact:
             from itertools import accumulate
 
@@ -111,29 +143,67 @@ def test_independent_thd_origins_rebind_and_capture(
             values["ro_" + name].copy_(
                 torch.tensor([x * stride // multiplier for x in rows], device="cuda", dtype=values["ro_" + name].dtype).view(batch + 1, 1, 1, 1)
             )
+        mx_payloads = {}
         for name in ("q", "k", "v"):
             view = flat(values[name])
             view.fill_(float("nan"))
+            if mxfp8:
+                from mxfp8_test_reference import _quantize_seq
+
+                values["sf_" + name].zero_()
+                sf_start = 0
+                mx_payloads[name] = []
             for start, length in zip(origins[name], ql if name == "q" else kl):
-                view[start : start + length].copy_(torch.randn(length, view.shape[1], view.shape[-1], device="cuda", dtype=dtype))
+                data = torch.randn(length, view.shape[1], view.shape[-1], device="cuda", dtype=torch.float32 if quantized else dtype)
+                if mxfp8:
+                    raw, descale, sf = _quantize_seq(
+                        (data * 0.4).permute(1, 0, 2).unsqueeze(0), view.shape[1], length, view.shape[-1], dtype, columnwise=name == "v"
+                    )
+                    view[start : start + length].copy_(raw.squeeze(0).permute(1, 0, 2))
+                    values["sf_" + name][:, sf_start : sf_start + sf.shape[1]].copy_(sf)
+                    sf_start += sf.shape[1]
+                    mx_payloads[name].append((raw.clone(), descale.clone()))
+                else:
+                    view[start : start + length].copy_(data * 0.4 if fp8 else data)
+        if mxfp8:
+            mx_refs[id(values)] = (mx_payloads, {name: values[name].clone() for name in ("sf_q", "sf_k", "sf_v")})
         return ql, kl, origins
 
     first = tensors()
-    dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
+    dt = {
+        "float16": cudnn.data_type.HALF,
+        "bfloat16": cudnn.data_type.BFLOAT16,
+        "float8_e4m3fn": cudnn.data_type.FP8_E4M3,
+        "float8_e5m2": cudnn.data_type.FP8_E5M2,
+    }[dtype_name]
     graph = cudnn.pygraph(
         io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True
     )
-    nodes = {name: graph.tensor_like(first[name]) for name in ("q", "k", "v", "ql", "kl")}
+    nodes = {name: graph.tensor_like(first[name]) for name in ("q", "k", "v", "ql", "kl", *scale_values)}
+    if mxfp8:
+        for name, h, width in (("q", heads, d_qk), ("k", kv_heads, d_qk), ("v", kv_heads, d_v)):
+            rows, cols = (
+                (((maximum + 127) // 128) * 4, ((width + 127) // 128) * 128) if name == "v" else (((maximum + 127) // 128) * 128, ((width + 127) // 128) * 4)
+            )
+            nodes["sf_" + name] = graph.tensor(
+                dim=(batch, h, rows, cols),
+                stride=(h * rows * cols, rows * cols, cols, 1),
+                data_type=cudnn.data_type.FP8_E8M0,
+                reordering_type=cudnn.tensor_reordering.F8_128x4,
+            )
     for name, multiplier in zip(ports, multipliers):
         nodes["ro_" + name] = graph.tensor_like(first["ro_" + name])
         if name in ("q", "k", "v"):
             nodes[name].set_ragged_offset(nodes["ro_" + name]).set_ragged_offset_multiplier(multiplier)
     extra = dict(max_total_seq_len_q=sum(q_lengths), max_total_seq_len_kv=sum(kv_lengths)) if total_hints else {}
-    nodes["o"], nodes["stats"] = graph.sdpa(
+    extra.update({name: nodes[name] for name in scale_values})
+    if mxfp8:
+        extra.update({"descale_" + name: nodes["sf_" + name] for name in ("q", "k", "v")})
+    extra.update(dict(generate_stats=True) if quantized else dict(is_inference=False))
+    outputs = (graph.sdpa_mxfp8 if mxfp8 else graph.sdpa_fp8 if fp8 else graph.sdpa)(
         q=nodes["q"],
         k=nodes["k"],
         v=nodes["v"],
-        is_inference=False,
         attn_scale=d_qk**-0.5,
         diagonal_band_right_bound=0,
         use_padding_mask=True,
@@ -142,6 +212,9 @@ def test_independent_thd_origins_rebind_and_capture(
         stats_use_log2=log2_stats,
         **extra,
     )
+    nodes["o"], nodes["stats"] = outputs[:2]
+    if quantized:
+        nodes["o"].set_data_type(cudnn.data_type.BFLOAT16)
     nodes["o"].set_output(True).set_dim(first["o"].shape).set_stride(first["o"].stride()).set_ragged_offset(nodes["ro_o"]).set_ragged_offset_multiplier(
         multipliers[3]
     )
@@ -151,15 +224,23 @@ def test_independent_thd_origins_rebind_and_capture(
     )
     graph.validate()
     graph.build_operation_graph()
-    if cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
+    if sm120:
         from cudnn.engines.manifest import family_for
 
+        graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], {cudnn.knob_type.PACK_GQA: int(pack_gqa)} if quantized else {})
+        graph.select_plan(0)
+    elif cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
+        from cudnn.engines.manifest import family_for
+
+        if engine_name == "sdpa_fwd_prefill_sm100" and d_qk == 576 and torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+            engine_name = "sdpa_fwd_sm100_d512_2x2"
         graph.create_execution_plan(
             family_for(graph).offered_ids()[engine_name],
             {
                 cudnn.knob_type.TILE_CGA_M: cga if cga is not None else (1 if d_qk == 128 and splits > 1 else 2),
                 cudnn.knob_type.PACK_GQA: int(pack_gqa),
                 cudnn.knob_type.SPLIT_KV: splits,
+                **({cudnn.knob_type.TILE_M: 64} if engine_name == "sdpa_fwd_sm100_d512_2x2" else {}),
             },
         )
         graph.select_plan(0)
@@ -178,9 +259,12 @@ def test_independent_thd_origins_rebind_and_capture(
         values["stats"].fill_(-29)
         workspace.fill_(255)
 
-    def check(values, state):
+    def check(values, state, *, output_normalization=1):
         ql, kl, origins = state
         inputs = {name: flat(values[name]).double().cpu() for name in ("q", "k", "v")}
+        if mxfp8:
+            for name, expected in mx_refs[id(values)][1].items():
+                assert torch.equal(values[name], expected), f"{name} was modified"
         for name, tensor in inputs.items():
             live = torch.zeros(capacity, dtype=torch.bool)
             for start, length in zip(origins[name], ql if name == "q" else kl):
@@ -197,13 +281,39 @@ def test_independent_thd_origins_rebind_and_capture(
             q = inputs["q"][origins["q"][b] : origins["q"][b] + nq].transpose(0, 1)
             k = inputs["k"][origins["k"][b] : origins["k"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
             v = inputs["v"][origins["v"][b] : origins["v"][b] + nk].repeat_interleave(heads // kv_heads, dim=1).transpose(0, 1)
+            if fp8:
+                q = q * values["descale_q"].item()
+                k = k * values["descale_k"].item()
+                v = v * values["descale_v"].item()
+            if mxfp8:
+                for name, length in (("q", nq), ("k", nk), ("v", nk)):
+                    raw, _ = mx_refs[id(values)][0][name][b]
+                    torch.testing.assert_close(
+                        inputs[name][origins[name][b] : origins[name][b] + length].transpose(0, 1), raw.squeeze(0).double().cpu(), atol=0, rtol=0
+                    )
+                q *= mx_refs[id(values)][0]["q"][b][1].squeeze(0).double().cpu()
+                k *= mx_refs[id(values)][0]["k"][b][1].squeeze(0).double().cpu().repeat_interleave(heads // kv_heads, dim=0)
+                v *= mx_refs[id(values)][0]["v"][b][1].squeeze(0).double().cpu().repeat_interleave(heads // kv_heads, dim=0)
             scores = (q @ k.transpose(-1, -2)) * d_qk**-0.5
             scores.masked_fill_(torch.arange(nk)[None, :] > torch.arange(nq)[:, None], float("-inf"))
             expected = (scores.softmax(-1) @ v).transpose(0, 1)
+            if fp8:
+                expected = expected * values["scale_o"].item()
             expected_stats = scores.logsumexp(-1).T * (math.log2(math.e) if log2_stats else 1)
             o_start, st_start = origins["o"][b], origins["stats"][b]
-            torch.testing.assert_close(output[o_start : o_start + nq].double(), expected, atol=0.025 if dtype_name == "bfloat16" else 0.004, rtol=0.02)
-            torch.testing.assert_close(stats[st_start : st_start + nq].double(), expected_stats, atol=0.003, rtol=0.003)
+            # P is also E5M2, with a two-bit mantissa. Match the existing
+            # test_fp8_sm120_e5m2 absolute budget. Compact parent/candidate and
+            # gapped candidate controls produce identical bytes and errors.
+            e5m2 = quantized and dtype_name == "float8_e5m2"
+            torch.testing.assert_close(
+                output[o_start : o_start + nq].double() / output_normalization,
+                expected / output_normalization,
+                atol=0.1 if e5m2 else 0.03 if quantized else 0.025 if dtype_name == "bfloat16" else 0.004,
+                rtol=0.0 if e5m2 else 0.03 if quantized else 0.02,
+            )
+            torch.testing.assert_close(
+                stats[st_start : st_start + nq].double(), expected_stats, atol=0.01 if quantized else 0.003, rtol=0.01 if quantized else 0.003
+            )
             written_o[o_start : o_start + nq] = True
             written_stats[st_start : st_start + nq] = True
         assert torch.all(output[~written_o] == -17)
@@ -225,6 +335,8 @@ def test_independent_thd_origins_rebind_and_capture(
             graph.execute(pack, workspace, **overrides)
             torch.cuda.synchronize()
             check(values, state)
+            if extra_checks is not None:
+                extra_checks(graph, nodes, values, state, workspace, overrides, flat, stats_layout)
             captured = torch.cuda.CUDAGraph()
             captures.append((captured, values, shift))
             with torch.cuda.graph(captured):
@@ -232,10 +344,35 @@ def test_independent_thd_origins_rebind_and_capture(
         # Both captures survive a later pointer bind; mutate all metadata in place.
         for captured, values, shift in reversed(captures):
             state = fill(values, shift + 32, short=True)
+            if fp8:
+                values["descale_q"].mul_(0.5)
+                values["descale_v"].mul_(1.25)
+            if mxfp8:
+                # First qualify these exact replay inputs at their original
+                # scale. Changing only V's power-of-two scale must then double
+                # every live O byte exactly and leave Stats unchanged.
+                poison(values)
+                captured.replay()
+                torch.cuda.synchronize()
+                check(values, state)
+                expected_output = values["o"].clone()
+                expected_stats = values["stats"].clone()
+                for start, length in zip(state[2]["o"], state[0]):
+                    flat(expected_output)[start : start + length].mul_(2)
+                values["sf_v"].add_(1)
+                mx_refs[id(values)][1]["sf_v"].add_(1)
+                for _, descale in mx_refs[id(values)][0]["v"]:
+                    descale.mul_(2)
             poison(values)
             captured.replay()
             torch.cuda.synchronize()
-            check(values, state)
+            if mxfp8:
+                for actual, expected in ((values["o"], expected_output), (values["stats"], expected_stats)):
+                    assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+            # Preserve the original reference error budget in the original V
+            # units; the exact-byte scaling assertion above separately checks
+            # the scale change, including unchanged physical padding.
+            check(values, state, output_normalization=2 if mxfp8 else 1)
             # The launch envelope stays nonzero after live query work reaches
             # zero. No dead cluster may acquire the unwritten sentinel maps.
             state = fill(values, shift + 32, short=True, empty=True)
@@ -339,7 +476,8 @@ def test_compact_thd_origins_use_single_load_maps(dim):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+    expected_engine = "sdpa_fwd_sm100_d256_lookahead" if dim == 256 else "sdpa_fwd_prefill_sm100"
+    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(expected_engine))
     graph.select_plan(index)
     graph.check_support()
     graph.build_plans()

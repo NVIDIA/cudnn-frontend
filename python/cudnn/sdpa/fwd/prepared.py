@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 from cudnn.datatypes import _DLPACK_FP4_CODE_BITS
 from cudnn.frost import buffers as _buffers
 from cudnn.frost.compiled_cache import positional_entry
+from cudnn.sdpa.fwd.config_sm100 import paged_pool_layout as _paged_pool_layout
 
 _ALIGN_TMA = 16
 _ALIGN_F32 = 4
@@ -408,10 +409,60 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
         raise NotImplementedError("paged physical THD origins require rebuilding the native extension")
     if (
         s.origin_specs is not None
+        and s.quant is not None
+        and not s.paged
+        and not s.quant.sf_sizes
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_fp8_physical_origins", False)
+    ):
+        raise NotImplementedError("nonpaged FP8 physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.quant is not None
+        and not s.paged
+        and not s.quant.sf_sizes
+        and "thd_origin_caps" not in s.index
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_fp8_origin_maps", False)
+    ):
+        raise NotImplementedError("nonpaged FP8 physical THD tensor maps require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.quant is not None
+        and not s.paged
+        and s.quant.sf_sizes
+        and "thd_origin_caps" not in s.index
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_mxfp8_origin_maps", False)
+    ):
+        raise NotImplementedError("nonpaged MXFP8 physical THD tensor maps require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.quant is not None
+        and not s.paged
+        and s.quant.sf_sizes
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_nonpaged_mxfp8_physical_origins", False)
+    ):
+        raise NotImplementedError("nonpaged MXFP8 physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
         and s.split_workspace is not None
         and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_physical_origins", False)
     ):
         raise NotImplementedError("paged split physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and s.paged
+        and (s.d_qk, s.d_v) == (64, 64)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_d64_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged D64 split physical THD origins require rebuilding the native extension")
+    if (
+        s.origin_specs is not None
+        and s.split_workspace is not None
+        and s.paged
+        and (s.d_qk, s.d_v) == (256, 256)
+        and not getattr(_pybind_module._SdpaThdBinder, "supports_paged_d256_split_physical_origins", False)
+    ):
+        raise NotImplementedError("paged D256 split physical THD origins require rebuilding the native extension")
     if (
         s.origin_specs is not None
         and s.split_workspace is not None
@@ -507,28 +558,6 @@ def execute_native_thd_tensors(spec, buffers, workspace_ptr, stream, scale, *, l
 
 
 @lru_cache(maxsize=256)
-def _paged_pool_layout(shape, strides, elem_bytes, hnd, kh, page_size, d):
-    """Cache pure geometry only; addresses and observed storage are checked per call."""
-    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
-
-    if len(shape) != 4 or any(n <= 0 for n in shape) or shape[1] != kh or shape[2] != page_size or shape[3] != d:
-        raise ValueError(f"a page pool is (n_pages, {kh}, {page_size}, {d}); got {shape}")
-    if strides[3] != 1:
-        raise ValueError("the page pool's head dim must be contiguous")
-    if (strides[1] > strides[2]) != hnd:
-        raise ValueError(f"this artifact was compiled for {'HND' if hnd else 'NHD'} page pools; got strides {strides}")
-    # Match dense TMA admission in storage order, including singleton axes.
-    ordered_shape = (shape[0], shape[2], shape[1], shape[3]) if hnd else shape
-    ordered_strides = (strides[0], strides[2], strides[1], strides[3]) if hnd else strides
-    bound = dense_bind_strides(ordered_shape, ordered_strides, elem_bytes)
-    if bound is None:
-        raise ValueError(f"page-pool strides must be covering and 16-byte aligned; got {shape} / {strides}")
-    bs, ss, hs = (bound[0], bound[2], bound[1]) if hnd else bound
-    need = (shape[0] - 1) * bs + (page_size - 1) * ss + (kh - 1) * hs + d
-    return (bs, ss, hs), need
-
-
-@lru_cache(maxsize=256)
 def _paged_table_layout(shape, strides):
     """Normalize immutable table geometry; pointer/span checks stay per call."""
     if len(shape) == 4:
@@ -555,6 +584,8 @@ class PreparedThdLaunch:
 
             spec.native = _pybind_module._SdpaThdBinder(spec)
         self.spec = spec
+        # Frozen per-plan lowering fact, checked against the public declaration.
+        self.supports_stats_stride_override = bool(spec.lse_stride_override and spec.native.supports_stats_stride_override)
         uids = {
             "q": binding.q.get_uid(),
             "k": binding.k.get_uid(),
@@ -760,6 +791,9 @@ class DenseLaunchSpec:
         "lpt_grid_fixed",
         "dense_flex",
         "device_index",
+        # A persistent SM90 D128 causal record's work-item claim counter (TemplateParams.causal_claim): word 0 of the
+        # caller's workspace, bound as meta_ptr and zeroed on the launch stream before every launch by the native binder.
+        "claim_counter",
         # The decode tile's ragged-Q leg: Q / O / Stats are the caller's PACKED
         # buffers, their rows placed by the bound (B+1,) int32 ragged offsets
         # (elements) divided by ``ragged_divs`` (Q, O, Stats elements per token);
@@ -901,6 +935,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # K/V SF pools page with K/V, so S_kv follows the block table. Batch and S_q stay pinned.
             s.shape_fixed = False
     s.device_index = int(api.q_desc.device.index or 0)
+    # A persistent SM90 D128 causal record's work-item claim counter, read off the keyed module's own record so the
+    # binder's flag cannot disagree with the compiled kernel (every other template's record has no such field).
+    s.claim_counter = bool(getattr(getattr(km, "PARAMS", None), "causal_claim", 0))
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
     # Standalone THD always requires Q lengths. Graph lowering may explicitly
@@ -921,7 +958,7 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.combine = None
     s.combine_q_lens = False
     if s.split > 1:
-        from cudnn.sdpa.fwd.api_dsl import ws_align
+        from cudnn.api_base import ws_align
         from cudnn.sdpa.fwd.kernels.sm100 import split_combine
         from cudnn import _pybind_module
 
@@ -1041,10 +1078,14 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     # None / zero slots untouched), so a plan that requests them keeps ``native`` None and ``bind_dense`` fills the
     # pointer / stride slots per call.
     if s.has_score_max or s.has_score_sum_exp or s.has_bias or s.has_kv_mask:
+        if s.claim_counter:
+            raise NotImplementedError(f"{km.__name__}: a work-item claim counter binds through the native dense binder only")
         s.native = None
         return s
     from cudnn import _pybind_module
 
+    if s.claim_counter and not getattr(_pybind_module._SdpaDenseBinder, "supports_claim_counter", False):
+        raise NotImplementedError(f"{km.__name__}: this extension's native dense binder has no work-item claim counter role")
     s.native = _pybind_module._SdpaDenseBinder(s)
     return s
 
@@ -1427,6 +1468,8 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     as compiled, ``lse sinks seq_kv seq_q gate`` and the paged ``block_table block_table_v``). Under a
     split the ``o`` / ``lse`` roles are the split-major partial slabs (batch extent split * B)."""
     ix = spec.index
+    if getattr(spec, "claim_counter", False):
+        raise ValueError("cudnn.sdpa: a work-item claim-counter plan binds the caller workspace through the native dense binder")
     frame = spec.frame()
     q_tokens = 0
     if getattr(spec, "ragged", False):

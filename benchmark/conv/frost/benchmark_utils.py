@@ -73,6 +73,15 @@ class BenchmarkResult:
     error: str = ""
 
 
+def frost_conv_unsupported_reason() -> Optional[str]:
+    """Why the FROST conv engines cannot serve the current GPU, or ``None``: they
+    compile for SM100 and SM103 only."""
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) not in ((10, 0), (10, 3)):
+        return f"FROST conv needs an SM100 or SM103 GPU; found SM{major}{minor}, skipping."
+    return None
+
+
 def select_tile_configs(spec: Optional[str], heuristic_config: str, configs: Sequence[ConvTileConfig]) -> list[str]:
     """Resolve ``--configs`` into compatible catalog names in catalog order."""
     config_by_name = {config.name: config for config in configs}
@@ -363,7 +372,7 @@ def make_parser(description: str, default_shape: str, configs_help: str) -> argp
     parser.add_argument("--_nsys-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_implementation", choices=("frost", "cudnn"), help=argparse.SUPPRESS)
     parser.add_argument("--_tile-config", help=argparse.SUPPRESS)
-    parser.add_argument("-v", "--verbose", action="store_true", help="If enabled, print more debug messages")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print worker output, kernel timings, and full failure diagnostics")
     return parser
 
 
@@ -401,6 +410,8 @@ def run_sweep(
     except RuntimeError as exc:
         if not allow_missing_cudnn:
             raise
+        if args.verbose:
+            print(str(exc), file=sys.stderr, flush=True)
         lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
         message = lines[-1] if lines else type(exc).__name__
         print(f"  [native cuDNN baseline unavailable: {message[:160]}]", flush=True)
@@ -415,6 +426,8 @@ def run_sweep(
             if args.verbose:
                 print_kernel_breakdown(config_name, stats, args.iters)
         except RuntimeError as exc:
+            if args.verbose:
+                print(str(exc), file=sys.stderr, flush=True)
             lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
             message = lines[-1] if lines else type(exc).__name__
             result = BenchmarkResult(config_name, float("inf"), error=message[:160])

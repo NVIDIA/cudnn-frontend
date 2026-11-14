@@ -17,7 +17,8 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM not in (90, 1
 def test_build_all_preserves_selection_and_executes_both_providers(selected_provider, monkeypatch):
     import cudnn
 
-    # Hopper exposes the d512 FROST template; Blackwell also serves d128.
+    # Hopper runs its d512 FROST template here (at exact d128 its row also proposes the dedicated D128 template, #378);
+    # Blackwell serves d128.
     head_dim = 512 if _SM == 90 else 128
     q = torch.zeros(1, 128, 2, head_dim, device="cuda", dtype=torch.float16).transpose(1, 2)
     k = torch.zeros_like(q)

@@ -34,6 +34,10 @@ def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
         facts[role] = f._replace(shape=shape, strides=strides, span=span)
     stem = "prefill_d192_d128_f16" if dq == 192 else f"prefill_d{max(128, dq)}_f16"
     path = Path(prep.__file__).parent / "kernels" / arch / (stem + ".py")
+    if arch == "sm100" and dq == 256:
+        path = path.parent / "d256_f16_lookahead/kernel.py"
+    if arch == "sm100" and dq == 512:
+        path = path.parent / "d512_f16_role_split/kernel.py"
     if arch == "sm120":
         path = path.with_name("prepared_host.py")
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("host" if arch == "sm120" else "_host"))

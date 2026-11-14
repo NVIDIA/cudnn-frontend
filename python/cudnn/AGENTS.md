@@ -121,6 +121,9 @@ unsupported input runnable.
   bind aligned covering B/H/S permutations directly. Graph and standalone
   admission share `config_sm100.dense_bind_strides`; each port uses its own
   storage element width. Unaligned outer strides decline before compilation.
+  The SM90 row does the same through `config_sm90.dense_bind_strides`
+  (`dense_flex` strides, a unit axis pinned to D), the layouts its adapter's
+  `check_support()` accepts.
   The prior compact-BSHD normalization exception has been removed; split
   partials and quantization scalars remain legitimate algorithmic scratch.
 - The flip side of declining: whatever `check_support()` ACCEPTS, the kernel
@@ -239,6 +242,12 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Cache-key decorators preserve `None`.** `template_key()` returns `None`
+  when a specialization cannot be identified safely. Appending a suffix must
+  leave it uncacheable; formatting it as a string lets unrelated kernels share
+  the first compiled object even with the disk cache disabled. Detector:
+  `test_uncacheable_fp8_hosts_do_not_reuse_another_kernel` in the SDPA API
+  contract suite runs through the real in-process memo with compilation mocked.
 - **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
   when compiling storage-free declarations; compile and execute under that device,
   and reject differently placed bindings before lowering pointers. An outer
@@ -297,6 +306,17 @@ the kernel that reads it).
   fallback allocations, cached-dummy first use) inside
   `_torch_stream_context(current_stream, device)` — see the fp8/mxfp8 amax
   resets and both `_execute_thd` paths in `sdpa/fwd/api_dsl.py`.
+- **TVM-FFI can override an explicit stream from the producer's DLPack exchange API.**
+  `OperandBuffer.current_work_stream` reports the default stream. For Cake
+  launches, pass DLPack-only `DeviceView` wrappers over validated buffers and
+  enter `tvm_ffi.use_raw_stream` with the execution stream. Test capture and
+  replay with changed inputs on an explicit nondefault stream; an empty graph
+  exposes this failure even when eager output tests pass.
+- **Native Cake bindings need explicit DLTensor strides, including contiguous buffers.**
+  Their TMA setup reads stride metadata directly. XLA bridges must supply it and
+  use XLA-owned scratch on the XLA stream. Exercise complete forward/backward
+  chains: a simple head reduction can pass while a TMA stage crashes. The LM-head
+  and mHC JAX suites cover these chains with changed-input replay.
 - **Consumers too, not just producers**: anything reading what the kernel
   wrote (`amax_o.div_()`, an O scratch copy-back) belongs on the launch
   stream for the same reason.
@@ -304,6 +324,12 @@ the kernel that reads it).
   context is a no-op — the race only bites direct graph-API users with an
   explicit handle stream, which is exactly why tests miss it. Order the work
   by construction rather than relying on the common case.
+- **Stream order does not serialize host calls.** Two host threads can enqueue
+  A's producer, B's producer, then A's consumer on one stream. Cached scratch
+  needs a lock through the final queued read, including reserve/growth, or
+  storage owned by each call. Keep separate streams independent. Detector:
+  `simplified_sparse_attention/cutedsl/test_simplified_sparse_attention.py::test_host_threads_share_stream`
+  pauses between scratch writes and reads in the dense and filtered paths.
 - **The device is implicit state exactly like the stream.** A `torch.empty`
   (or any allocator call) without a device context silently allocates on the
   *current* GPU, not the input tensor's — wrap execute-path allocations in
@@ -335,6 +361,13 @@ the kernel that reads it).
   wrapper. Detector:
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
+
+- **Restore caller device state after native context binding, including errors.**
+  Scope `ensure_current_context` and the native call with the shared
+  `device_context(x.device)`, and select `current_stream(x.device)` explicitly.
+  A two-GPU regression test should put operands on one GPU and make the other
+  current, check the binding stream before launch, and verify device/stream
+  restoration after both successful calls and injected native exceptions.
 
 SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
@@ -368,8 +401,10 @@ DSL satisfies your kernel.**
   floor. Keep the existing version gates and actionable errors.
 - Before a path imports a DSL-version-specific API, check the installed version
   with `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old()` (floor:
-  `CUTEDSL_MIN_VERSION`) and **decline, or raise an error that names the
-  version** — `cutedsl_requirement_error(what)` builds it. Never let the failure
+  `CUTEDSL_MIN_VERSION`; a kernel whose own floor is higher passes it as
+  `floor=`, never a second copy of the version parse) and **decline, or raise an
+  error that names the version** — `cutedsl_requirement_error(what, floor=...)`
+  builds it. Never let the failure
   surface as an `AttributeError` / `TypeError` / `ModuleNotFoundError` from
   inside the DSL, and never let it read as a missing-dependency install hint:
   the package is installed, and that `pip install` changes nothing.
@@ -379,6 +414,13 @@ DSL satisfies your kernel.**
   `ops/_causal_conv1d_update.py`), an engine's `check_support`, or the family
   `__init__`'s lazy import. Module-scope code in kernel files may assume the
   floor only because that gate ran first.
+- Pass an explicit kernel floor when qualification starts above the shared
+  helper floor. The package dependency floor and `CUTEDSL_MIN_VERSION` can
+  differ. `test_old_dsl_fails_before_kernel_import` in the simplified sparse
+  attention suite pins its 4.8 floor; a real 4.7.1 run exposed the missing
+  argument. Check PyTorch conditional-graph capability before allocating
+  filtered repair state; `test_filtered_runtime_declines_before_allocation`
+  covers a missing runtime entry.
 - A version floor does not guarantee target-architecture support. For example,
   public 4.7.0 lacks `sm_107a`; check the actual target capability before
   admitting SM107 plans. Test graph and standalone declines with the real
@@ -386,14 +428,37 @@ DSL satisfies your kernel.**
 - Check the DSL compiler's CUDA version separately when a kernel depends on
   its toolkit flavor: `from cutlass.base_dsl.version_info import CUDA_VERSION`.
   `torch.version.cuda` and `CUDA_HOME` do not identify the compiler selected by
-  the DSL wheel. QSA's 12Q/1KV two-pass key kernel, for example, compiles with
-  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8; its
-  `check_support` rejects that compiler before JIT compilation, and its tests
-  exercise the rejection rather than crashing or silently skipping the gate.
+  the DSL wheel. QSA's 12Q/1KV key-major kernel, for example, compiles with
+  the CUDA 13 flavor but crashes the CUDA 12 compiler in DSL 4.7/4.8. Both
+  QSA backward entries decline that compiler for every one-KV-head geometry
+  (12Q/1KV and 6Q/1KV) before JIT compilation, and the tests exercise the
+  decline rather than crashing or silently skipping the gate.
+- **Validate both CUDA compiler flavors for new or changed CuTe DSL kernels
+  and DSL upgrades.** Run cold compilation and numerical GPU tests with cu12
+  and cu13 in separate environments/processes and empty, separate caches.
+  Cover the declared dependency floor and the newer supported DSL version
+  being qualified, when different, on every claimed architecture. Exercise
+  forward/backward paths, supported dtypes, and boundary/tail cases; check
+  finite outputs and the existing accuracy contract. Import-only or
+  compile-only success does not establish numerical correctness. Unsupported
+  compiler/architecture combinations must decline before JIT and have a test
+  for that rejection. Report unavailable lanes explicitly; do not loosen
+  tolerances or skip failing supported lanes to make this matrix pass.
+- Record the source revision, installed DSL distributions, loaded native
+  compiler path and `CUDA_VERSION.major` / `.minor`, GPU/driver, framework,
+  backend/NVRTC, and pass/fail/skip counts. With DSL 4.8, the default wheel
+  installs cu12; `[cu13]` adds another flavor and the loader can select it.
+  Verify the loaded flavor rather than assuming the install command selected
+  it. A cu12 DSL run with a CUDA 13 framework/backend isolates DSL compatibility;
+  it is not qualification of a deployment using CUDA 12 throughout. The
+  [integration skill](../../skills/cutedsl-kernel-integration/SKILL.md)
+  carries the test workflow.
 - Known floors — extend this list when you take a dependency on a newer API,
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
+  the JAX dependency group and runtime guard enforce this higher floor.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
   `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
@@ -408,6 +473,60 @@ DSL satisfies your kernel.**
   `l2_hint=True` by name -- the decline states the defect as observed (never as a property of
   the compiler it found) and prescribes the cu13 flavour under a CUDA 13 driver, not a wheel
   number.
+  The `cutlass.cute.experimental` layer (`@cute.experimental.kernel` / `.jit` / `.compile`, the
+  IR-level `allocate` / `tma_load` / `dot` / `partition_and_copy` ops; the FP8 projection for
+  decode rows, `gemm/frost/projection_decode`) → 4.8.0. The DSL marks this layer deprecated in
+  favour of the unified decorators, so a version floor cannot promise it: the entry probes the
+  layer's names before it imports the kernel module and declines by name
+  (`fp8_projection_decode.DSL_LAYER`, `dsl_layer_error`). No version ceiling is set.
+- **Bind a DSL name that moved between releases through `cudnn._cutlass_compat`, never through
+  its old home.** DSL 4.8 keeps `cutlass.utils.LayoutEnum` (and the other moved names) as a
+  package-level alias that warns on every read and is announced for removal; a kernel body that
+  still reads it compiles today and raises `AttributeError` from inside the trace on the release
+  that drops it -- past the version gate, on every shape. The shim binds each name from its
+  owning module and falls back to the older home. Detectors:
+  `test_kernel_module_reads_no_deprecated_name_off_a_dsl_module` (host: every name the kernel
+  module imports from or reads off a DSL module resolves without a `DeprecationWarning` unless
+  the entry's probe names it) and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` (device: a real trace) in
+  `test/python/gemm/frost/projection_decode/test_fp8_projection_decode.py`; the pytest warnings
+  summary of a kernel suite shows the same reads by file and line. The first detector sees a
+  name that warns when it is READ. An object the DSL deprecates in place warns only when it is
+  USED: on 4.8.0 `cutlass.utils.StaticPersistentTileScheduler` and
+  `PersistentTileSchedulerParams` resolve silently, and a trace that deals its tiles with them
+  raises 63 `DeprecationWarning`s per compiled form (one attributed to the kernel's line, the
+  rest inside the wheel) -- an exception from inside the trace under
+  `-W error::DeprecationWarning`. Only a trace shows it: take the tree's vendored copy
+  (`cudnn._cutlass_helpers.static_persistent_tile_scheduler`) and pin the trace on a host as
+  well as on a device (`test_rendering_pins_the_convention` and
+  `test_trace_raises_no_deprecation_warning_from_the_kernel_package` in
+  `test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py`).
+- **A kernel on the `cutlass.cute.experimental` layer reads TWO environment namespaces.** The
+  target check of `cutlass.utils.blackwell_helpers` reads `CUTE_DSL_ARCH`; the layer's own
+  lowering, dump and cache settings read `CUTE_EXPERIMENTAL_DSL_*`. A cross-target render
+  needs BOTH `CUTE_DSL_ARCH` and `CUTE_EXPERIMENTAL_DSL_ARCH`; `CUTE_DSL_KEEP` dumps nothing
+  for such a kernel -- use `CUTE_EXPERIMENTAL_DSL_KEEP=cubin,ptx` with
+  `CUTE_EXPERIMENTAL_DSL_DUMP_DIR` (and `CUTE_EXPERIMENTAL_DSL_NO_CACHE=1` for a real
+  compile). With only one of the two set the kernel traces for the host's part or is refused
+  by the helper. On 4.8.0 the unified spelling (`@cute.kernel(is_experimental=True)` on a
+  method, `@cute.jit(is_experimental=True)` on a module function) does not preprocess such a
+  kernel (a staged `if` is rejected as plain Python control flow; the jit function's code
+  object is rejected for its free variables), so the layer's own decorators stay and
+  `test_frost_kernel_name_prefix.py` recognises both spellings.
+- **A DSL that knows a target can be bound to a compiler that does not have it.**
+  `cutedsl_arch_requirement_error` checks that the DSL's `Arch` has `sm_107a`; it does not read
+  the compiler flavor. DSL 4.8.0 refuses a Rubin target on a compiler up to CUDA 13.3 from
+  inside the trace (`Unsupported GPU architecture 'sm_107a' with CUDA toolkit version ...`, an
+  internal DSL error), and a default install binds the CUDA 12.9 flavor even under a CUDA 13
+  driver. A kernel that admits cc 10.7 therefore also gates on `CUDA_VERSION` before JIT and
+  tests the decline (`fp8_projection_decode.DSL_COMPILER_FLOORS`, `dsl_compiler_error`; found by
+  running that entry's suites under the CUDA 12.9 flavor on a cc 10.7 part: 394 cells failed
+  inside the DSL before the gate existed).
+- **The PTX compiler's output depends on the kernel's symbol name.** Two renderings with
+  byte-identical PTX apart from the entry symbol can differ in SASS (other move idioms, another
+  block layout, a few instructions more or fewer): the cuDNN prefix of Rule 6 changes the
+  symbol, so "the same kernel" is established on the PTX, and a SASS-level comparison or a
+  static audit of the instruction order belongs to one rendering with its final symbol.
 - Tests that import a kernel module directly `pytest.skip` on a too-old DSL —
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/python_tests/cutedsl.yml` in internal CI); a lane below your floor
@@ -714,8 +833,9 @@ treatment at the caller boundary.**
   -> False cell of the arch-aware probe. Renaming one means updating
   FlashInfer's fallbacks first; that test failing is the reminder. The runtime
   probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
-  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
-  cc 10.7 graph to the backend engine.
+  cc 10.7, and no DSL has a target below cc 8.0 (Rule 7): a device-blind
+  "available" is the blind spot that routes a cc 10.7 graph to the backend
+  engine.
 
 **Rule 10 — a kwarg that makes a graph ineligible for the python engines is
 read by the family's analyzer under the spelling of EVERY op that takes it.**
@@ -741,6 +861,99 @@ read by the family's analyzer under the spelling of EVERY op that takes it.**
   the control graph declines by name) and
   `test/python/sdpa/graph/test_flexible_sdpa_te_shape.py` (the TE shape is
   served by the backend and O carries the modifier).
+
+**Rule 11 — consume what a thread loaded from a shared-memory stage before
+anything releases that stage, and prove the order in the compiled kernel.**
+
+- **The hazard.** A consumer that reads a pipeline stage with ordinary
+  shared-memory loads (`ld.shared`, `ldmatrix`) and then lets the producer
+  refill it can receive the bytes of the NEXT fill in any load whose
+  destination registers have not been read when the release executes. Nothing
+  faults and nothing hangs; the kernel returns a wrong value. Measured with
+  test kernels on SM100-line parts of compute capability 10.0, 10.3 and 10.7:
+  from a few launches in a hundred thousand to every launch, depending on how
+  many loads are still unread and on what sits between the load and the
+  release. The rate also depends on the launch geometry: on the two parts
+  where this was measured (10.0 and 10.7), the same unsafe kernel, with every
+  lane of a load in the same shared-memory banks, failed in every launch at
+  three thread blocks per SM, in all or all but one of 20,000 launches at
+  two, and in none at one; released through the helper below it read zero at
+  two and at three. A kernel with this order can pass every functional test
+  and fail in another shape or on another part.
+- **A release is anything after which the stage may be rewritten:** every
+  `mbarrier` arrive form (plain, counted, `expect_tx`, the remote and cluster
+  forms), `tcgen05.commit` to a barrier, a named-barrier or cluster-barrier
+  arrive, a peer send that completes the peer's barrier (`st.async`), and a
+  CTA barrier behind which the stage is refilled (by `cp.async`, a bulk copy,
+  a TMA load or another warp's stores). The loading lanes and the releasing
+  lane need not be the same.
+- **Source order is not consumption.** The compiler moves pure arithmetic,
+  comparisons, warp votes and shuffles, and `mma` on register operands behind
+  a release that does not depend on them. Writing the use in front of the
+  arrive proves nothing; the generated code does.
+- **Not an ordering:** `bar.warp.sync`, a CTA barrier, `fence.acq_rel` /
+  `fence.sc`, the release semantics of the arrive itself, the cross-proxy
+  fence placed in front of the loads, a warp-collective operation by itself,
+  a delay, a polling wait.
+- **Do this:** release through `cudnn.frost.tile_dsl.consume` —
+  `consume_then_arrive` (local; elected with `pred=`; counted with `count=`),
+  `consume_then_arrive_on_peer` (a peer CTA's barrier) and
+  `consume_then_read_tile_id_arrive` (the scheduler slot credit). Each form
+  adds every loaded word into a wrapping 32-bit sum, masks the sum with the
+  kernel's release-zero argument (0 at run time, unknown to the compiler and
+  to the assembler) and adds the result to the barrier address. The address
+  of the arrive is then computed from every loaded register, so each of them
+  is read in front of the release in the generated code, and no data value
+  can change where the arrive lands. Pass EVERY value the calling lanes
+  loaded from the stage since they acquired it, each once, and never a value
+  derived from another one (a difference or a checksum can cancel the term it
+  was computed from). Every warp that loads releases through the helper
+  itself. Contract and cost: [frost/README.md](frost/README.md).
+- **Where the helper does not fit** (the release has no address operand — a
+  CTA barrier in front of a refill, a peer send — or another warp or thread
+  block releases): put the release behind a store of a result computed from
+  the values, and show that store in front of the release in the
+  disassembly; or, when the refill is an async-proxy write (a TMA load, a
+  bulk copy, the cluster launch-control response), put
+  `fence.proxy.async.shared::cta` between the LAST load and the release. Both
+  read zero in every measurement — the fence against TMA and bulk-copy
+  refills; the launch-control response is a write of the same kind and was
+  not measured separately — and neither is ordered by data flow: name the
+  choice in the kernel's shared-memory buffer table and keep the site under
+  the warm stress.
+- **Never let the kernel know the mask.** The release-zero argument has
+  exactly one use in the kernel, `release_zero(arg)`. A compare, a branch, an
+  assert or an assume on it — an entry guard `if arg == 0:` is enough — lets
+  the optimizer replace the mask by a constant. A zero from an inline-asm
+  `mov` (`opaque_i32_zero`) is opaque to the optimizer only; the assembler
+  folds it. In both cases the sum disappears from the kernel and the loads
+  are unread at the release again, without any error. A non-zero argument is
+  undefined behaviour (the arrive lands on another word of shared memory):
+  the host passes the literal 0 and nothing in the kernel tests for it.
+- **Tensor memory.** A value read from tensor memory (`tcgen05.ld`) whose
+  slot the release frees follows the same order, as a precaution: keep the
+  load's `tcgen05.wait::ld` and the first read of its registers in front of
+  the release. Test kernels that left such a load unread across the release
+  of its accumulator returned no wrong value on compute capability 10.0, 10.3
+  and 10.7 (more than 12 million launches per class), for one load form and
+  for a slot overwritten by the same thread block's next MMA chain. A slot
+  rewritten by another thread block, by `tcgen05.st` or after a deallocation
+  was not measured. Do not read this rule as an exemption for tensor memory.
+- **Scope.** The rule applies to new and changed release sites. Existing
+  sites move onto the helper in follow-up changes; until a site has moved,
+  its release arrive, fence or named barrier stays.
+- **Detectors.** Rendering (the proof): in the disassembly of every rendering
+  that ships, each load of a released stage has a read of every destination
+  register in front of the release on every path.
+  `warm_stress.assert_release_dependence` pins the helper's chain in a
+  kernel's PTX (the address of the arrive reaches an `and` with the
+  release-zero parameter, and that `and` reaches the loaded registers);
+  `sdpa/frost/test_tile_dsl_consume_then_arrive.py` applies it to every form
+  on a ring whose unsafe twin fails. Run time (a rate bound, not a proof):
+  `warm_stress.assert_warm_stress` ([test/AGENTS.md](../../test/AGENTS.md))
+  on a shape that refills the stage inside one launch, with at least two
+  thread blocks per SM where the kernel allows it. A cold functional test and
+  a first-launch-equals-second-launch check do not test this class.
 
 ## Frontend-only kernel package layout
 
@@ -785,7 +998,9 @@ python/cudnn/gemm/
 │   ├── compiler.py                 # facade for the active family's compiler
 │   ├── epilogue_codegen.py          # facade for the active family's codegen
 │   ├── kernel_templates/           # template code shared by architecture families
-│   └── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+│   ├── ln_prologue/                # LayerNorm-prologue dual GEMM host and rendered per-arch kernels
+│   ├── projection_decode/          # direct-call FP8 projection for decode rows: host entry + kernel/ (beside the engine, not part of it)
+│   └── swiglu_decode/              # direct-call FP4 gate / up product with SwiGLU for decode rows: host entry + kernel/ (same)
 └── ops/                            # backend-independent torch custom-op contracts
 ```
 
@@ -795,6 +1010,23 @@ Keep helpers in the narrowest package shared by their users. For example,
 Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
+
+Widen operands before triangular workspace products, in both producer and
+consumer. Widening an already-overflowed offset cannot recover it. Derive tile
+decoder bounds from the input extent. `test_triangular_offsets.py` compiles the
+actual address expressions and checks large offsets without dereferencing them.
+
+An unused name can still hold a required shared-memory allocation. Preserve
+the allocation when a later operand aliases that storage; remove only the
+binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
+for its P operand. Its public forward/backward reference and byte-golden
+tests in `simplified_sparse_attention/cutedsl/` cover this layout.
+
+When sharing a kernel with JAX, match scratch flag storage to its native ABI.
+A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
+CuTe tensor can reject that store during lowering. The long-key cases in
+`simplified_sparse_attention/cutedsl/test_filtered_jax.py` compile and execute
+the selector and its repair loop to cover this boundary.
 
 Loaded integer vectors can infer `Int8` while retaining no signedness metadata.
 Set the declared integer dtype on the vector wrapper before widening to INT32.
@@ -855,6 +1087,50 @@ The same rule applies to inline PTX: `bar.sync` is an alias for
 replay and synccheck runs do not establish that the aligned-CTA promise is
 valid. D192 dense and THD backward share this Stats-publication barrier.
 
+A kernel taken over from another source carries this defect silently. With the
+aligned form at its five warp-role sites the SwiGLU FP4 decode kernel
+(`gemm/frost/swiglu_decode`) wrote the bytes the unaligned form writes in every
+byte comparison run on cc 10.0, while `synccheck` reported `Barrier error
+detected. Divergent thread(s) in block` in its first launch and aborted it.
+Spell a subset barrier through `tile_dsl.barrier.named_barrier_sync_unaligned`
+and pin the statement counts in the rendering:
+`test_rendering_pins_the_convention` in
+`test/python/gemm/frost/swiglu_decode/test_swiglu_fp4_decode.py` requires five
+`barrier.sync` and three `bar.sync`.
+
+**The assembler folds an approximate reciprocal of a constant.**
+`rcp.approx.ftz.f32` of an immediate -- 6.0 in an NVFP4 block scale -- never
+reaches the kernel: the compiled code multiplies by the fp32 value the
+assembler computed. State such a factor as its bits
+(`tile_dsl.pointwise.opaque_fp4_max_rcp()` is fp32(1/6), `0x3E2AAAAB`), so the
+value is the source's and not one assembler's. Detector: the rendering pins
+count the bits once and exactly two `rcp.approx.ftz.f32` per block-scale chain
+(`test_rendering_of_every_helper` in
+`test/python/sdpa/frost/test_tile_dsl_quant_helpers.py`;
+`test_rendering_pins_the_convention` of the SwiGLU FP4 decode suite).
+
+**An approximate reciprocal spelled as a DSL intrinsic can be speculated across
+a branch.** `cute.arch.rcp_approx` is the same PTX instruction as
+`tile_dsl.pointwise.rcp_approx_ftz`, but as an intrinsic call the optimizer may
+hoist it above a zero test and turn the branch into a select: the bytes are
+equal, the instruction stream is not (both reciprocals then run for every
+block). Where a kernel must keep a reference instruction stream, use the opaque
+inline form. Detector: with a disassembler, the SwiGLU FP4 decode rendering pin
+requires the two reciprocals of each block-scale chain to be predicated.
+
+**`griddepcontrol.launch_dependents` behind warp-role branches fires at the
+FIRST role that reaches it.** One statement behind the role dispatch of a
+warp-specialised kernel is executed by each role as it finishes, and a thread
+block has signalled once its first role has -- in a persistent GEMM the loader
+warp, when its operand ring has drained and BEFORE the block's last output tile
+is written. "Released at the end" must name the role, and the entry's
+documentation must state the consumer's obligation: a kernel launched behind it
+with the programmatic-stream-serialization attribute issues its own wait before
+it reads the outputs. Detector: `test_dependent_that_waits_reads_the_eager_bytes`
+(SwiGLU FP4 decode suite: a waiting dependent behind the entry copies the
+outputs, eager and captured); the rendering pin counts one
+`launch_dependents`.
+
 **Detector.** These break at `compile()`, not at import — `python -c "import ..."`
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
@@ -894,6 +1170,15 @@ unless padding is included in both the layout and resource accounting. Detector:
 `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py::test_moe_block_scale_narrow_n_routing`
 (`scatter-False-24`, including capture/replay), verified RED before the store gate.
 
+**`cute.arch.shuffle_sync_up` defaults to a clamp of 31 before CuTe DSL 4.7.0.**
+`shfl.sync.up` keeps a lane's own value when its source lane falls below the
+clamp operand, so with that default every lane reads back its own value and a
+warp prefix sum silently returns its input. Pass `mask_and_clamp=0` for a
+full-warp up-shuffle; 4.7.0 and later default to 0, so the explicit argument
+emits the same PTX there. Detector: the H128 D512 conflict-rank cases of
+`deepseek_sparse_attention/cutedsl/test_DSA_sparse_attention_backward.py` on the
+4.6.2 wheel, which give wrong dKV without the argument.
+
 For fractional-microsecond performance changes, repeat A/B with shared addresses,
 reversed construction order, and an independently compiled unchanged-source
 control. An A/A that shares one compiled kernel does not bound the variation
@@ -917,6 +1202,24 @@ that warp. Keep the MoE scheduler's release arrives unless a separate ordering
 proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
+Rule 11 is the general form of this requirement and names the helper that
+satisfies it. Until a site has moved onto that helper, its release arrive,
+fence or named barrier is kept; none of them is the ordering Rule 11 asks for.
+
+A TMA-store epilogue must not reuse an smem output buffer while a bulk store may
+still be reading it. Every `PipelineTmaStore.producer_commit()` needs a
+`producer_acquire()` (`cp.async.bulk.wait_group.read num_stages - 1`) in the
+issuing thread before the epilogue warps write that buffer again: right after the
+commit and before the barrier (the GLU and quant epilogues), or before the next
+write into the buffer (the dGLU epilogues, the GLU-Hadamard delayed acquire).
+`producer_tail()` waits only at kernel exit. Another pipeline's acquire, such as
+the C store's, can mask a missing one, so check every compile-time configuration
+that drops that other store. Without the acquire, the block-scaled GLU kernels' D
+store silently corrupted D codes on SM107 with `generate_c=False` (#2350); the race
+is intermittent on hardware. Detectors: `gemm/cutedsl/test_tma_store_buffer_reuse.py`
+(host-only: no committed TMA store under `gemm/cutedsl` lacks an acquire) and
+`gemm/cutedsl/test_grouped_gemm_glu.py::test_rubin_mxfp8_glu_without_c_matches_with_c`
+(SM107: `generate_c=False` writes the same D bytes as `generate_c=True`).
 
 Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
 graphs from override-enabled graphs. Only fixed shapes select token widths
@@ -928,6 +1231,17 @@ coefficients unchanged. Automatic candidates still use workspace reduction.
 The B200-targeted rule leads on SM100; other GPUs retain the existing first
 choice and include the new geometry as an autotuning candidate. A four-shape
 SM107 comparison found both wins and regressions from unconditional preference.
+On a CC 12.x part no cost profile names (`planning._calibrated`: a profile
+keyed on the part's SM version and reported name), two further profile-free
+rules lead with the auto pick second: a block-scaled fp4 x fp4 GEMM of up to
+32 tokens plans the family's 32-row tile with the tokens left on M, and a
+dense fp8 x fp8 GEMM of up to 16 tokens with K >= 2048 plans a synthesized
+16-row 1x8-warp tile; both take the one-wave split-K, and the fp8 rule
+declines where the weight tiles alone fill more than half the SMs. A cost
+profile for such a part retires both rules for it; the calibrated RTX PRO
+6000 and every SM 10.x part keep their picks. Both rules stay host-testable:
+`gemm/frost/test_tile_select_analytic.py` pins the picks, the K-floor and
+weight-grid boundaries, and the plan list through the sm120 compiler's gates.
 
 The dense SM100, mainloop-fusion, block-scale and SM103 hosts resolve the L2
 swizzle width once per call from the current logical M/N/K, then pass an Int32
@@ -979,6 +1293,18 @@ reject without changing the selected reduction mode.
 ## The public function contract
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/operations/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
+
+JAX tracers do not reveal eventual buffer placement. A default device can supply
+tuning properties only when the resulting launch and scratch sizes remain valid
+on every supported execution device. Pin the compiler architecture explicitly and
+query shared-memory limits for the build device; unrelated visible GPUs must not
+affect eligibility. Process count likewise does not constrain independent local
+kernel calls; global-array partitioning is a separate contract. Cache launchers
+by the full configuration, including device.
+Select an appropriate `jax.default_device` in architecture-specific tests without
+hiding other GPUs. Cover tracing with unrelated hardware properties and reuse
+jitted functions on non-default devices with changed inputs and gradients (see
+`test/python/norm/jax/test_norm_jax.py`).
 
 ## Adding a new frontend-only API — required checklist
 
@@ -1086,6 +1412,7 @@ key is nonfinite: a key valid for one query can be masked for its neighbor,
 and zero dS multiplied by that key still produces NaN. A union mask alone is
 insufficient, including across an unaligned packed sequence boundary. Keep any
 nonfinite fallback entirely on device and re-evaluate it on each graph replay.
-The detector is `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`,
-which changes finite/nonfinite inputs under one captured graph for both shared
-and separate packed sequences.
+The detectors are `QSA/cutedsl/test_qsa_backward_sm100.py::test_sparse_pair_isolates_a_nonfinite_key_row`
+for the sparse query pairs and `QSA/cutedsl/test_qsa.py::test_paired_backward_nonfinite_isolation`
+for the dense kernel's query groups, which changes finite/nonfinite inputs under
+one captured graph for both shared and separate packed sequences.

@@ -15,6 +15,10 @@
 #include <sstream>
 #include <cmath>
 #include <cstdint>
+#include <charconv>
+#include <limits>
+#include <stdexcept>
+#include <cstring>
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -26,6 +30,59 @@
 #endif
 
 using json = nlohmann::json;
+
+namespace cudnn_frontend::serialization_detail {
+
+inline int64_t
+signed_integer(json const& j) {
+    if (!j.is_number_integer() ||
+        (j.is_number_unsigned() && j.get<uint64_t>() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))) {
+        throw std::invalid_argument("Serialized integer must be an in-range signed 64-bit integer");
+    }
+    return j.get<int64_t>();
+}
+
+inline int64_t
+uid_key(std::string const& text) {
+    int64_t value     = 0;
+    auto const parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || std::to_string(value) != text) {
+        throw std::invalid_argument("Serialized UID must be a canonical signed 64-bit decimal string");
+    }
+    return value;
+}
+
+inline uint64_t
+unsigned_integer(json const& value) {
+    if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<int64_t>() < 0)) {
+        throw std::invalid_argument("Serialized integer must be an in-range unsigned 64-bit integer");
+    }
+    return value.get<uint64_t>();
+}
+
+inline int32_t
+integer32(json const& value) {
+    auto const number = signed_integer(value);
+    if (number < std::numeric_limits<int32_t>::min() || number > std::numeric_limits<int32_t>::max()) {
+        throw std::invalid_argument("Serialized integer is out of signed 32-bit range");
+    }
+    return static_cast<int32_t>(number);
+}
+
+inline std::vector<int64_t>
+integer_array(json const& value) {
+    if (!value.is_array()) {
+        throw std::invalid_argument("Serialized integer sequence must be an array");
+    }
+    std::vector<int64_t> result;
+    result.reserve(value.size());
+    for (auto const& element : value) {
+        result.push_back(signed_integer(element));
+    }
+    return result;
+}
+
+}  // namespace cudnn_frontend::serialization_detail
 
 template <>
 struct nlohmann::adl_serializer<float> {
@@ -42,13 +99,16 @@ struct nlohmann::adl_serializer<float> {
 
     static void
     from_json(const nlohmann::json& j, float& f) {
-        // Read hexadecimal string and convert back to float
-        std::string hexValueStr = j.get<std::string>();
-        unsigned int hexValue;
-        std::stringstream stream(hexValueStr);
-        stream >> std::hex >> hexValue;
-
-        std::memcpy(&f, &hexValue, sizeof(float));
+        if (!j.is_string()) {
+            throw std::invalid_argument("Serialized FLOAT must contain exactly eight hexadecimal digits");
+        }
+        auto const& text  = j.get_ref<std::string const&>();
+        uint32_t bits     = 0;
+        auto const parsed = std::from_chars(text.data(), text.data() + text.size(), bits, 16);
+        if (text.size() != 8 || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+            throw std::invalid_argument("Serialized FLOAT must contain exactly eight hexadecimal digits");
+        }
+        std::memcpy(&f, &bits, sizeof(f));
     }
 };
 
@@ -90,24 +150,31 @@ struct nlohmann::adl_serializer<std::variant<int64_t, int32_t, half, float, doub
     static void
     from_json(const nlohmann::json& j, std::variant<int64_t, int32_t, half, float, double, nv_bfloat16>& data) {
         if (!j.is_object() || !j.contains("index") || !j.contains("value")) {
-            return;
+            throw std::invalid_argument("Serialized pass-by-value scalar requires index and value");
         }
 
-        size_t type_index = j.at("index").get<size_t>();
+        auto const type_index = cudnn_frontend::serialization_detail::signed_integer(j.at("index"));
         if (type_index == 0) {
-            data = j.at("value").get<int64_t>();
+            data = cudnn_frontend::serialization_detail::signed_integer(j.at("value"));
         } else if (type_index == 1) {
-            data = j.at("value").get<int32_t>();
+            auto const value = cudnn_frontend::serialization_detail::signed_integer(j.at("value"));
+            if (value < std::numeric_limits<int32_t>::min() || value > std::numeric_limits<int32_t>::max()) {
+                throw std::invalid_argument("Serialized INT32 scalar is out of range");
+            }
+            data = static_cast<int32_t>(value);
         } else if (type_index == 2) {
             data = j.at("value").get<half>();
         } else if (type_index == 3) {
             data = j.at("value").get<float>();
         } else if (type_index == 4) {
+            if (!j.at("value").is_number()) {
+                throw std::invalid_argument("Serialized DOUBLE scalar must be a number");
+            }
             data = j.at("value").get<double>();
         } else if (type_index == 5) {
             data = j.at("value").get<nv_bfloat16>();
         } else {
-            return;
+            throw std::invalid_argument("Serialized pass-by-value scalar has an unknown index");
         }
     }
 };
@@ -288,6 +355,10 @@ to_string(cudnnBackendNumericalNote_t note) {
 #if (CUDNN_VERSION >= 90100)
         case CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP:
             return std::string("CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP");
+#endif
+#if defined(CUDNN_HAS_FULL_PRECISION_MATH_NUMERICAL_NOTE)
+        case CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH:
+            return std::string("CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH");
 #endif
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -634,6 +705,10 @@ NLOHMANN_JSON_SERIALIZE_ENUM(HeurMode_t,
                                  {HeurMode_t::OPENSOURCE, "OPENSOURCE"},
                              })
 
+// Frontend-only behavior notes use a separate append-only band. These values
+// may be serialized and filtered by FE, but have no backend enum equivalent.
+constexpr int64_t FRONTEND_BEHAVIOR_NOTE_BASE = 1000;
+
 enum class BehaviorNote_t {
     NOT_SET,
 
@@ -642,7 +717,14 @@ enum class BehaviorNote_t {
     REQUIRES_BIAS_INT8x32_REORDER,
     SUPPORTS_CUDA_GRAPH_NATIVE_API,
     CUBLASLT_DEPENDENCY,
+
+    SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE = FRONTEND_BEHAVIOR_NOTE_BASE,
 };
+
+static_assert(static_cast<int64_t>(BehaviorNote_t::CUBLASLT_DEPENDENCY) == 5,
+              "existing behavior-note integers are append-only");
+static_assert(static_cast<int64_t>(BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE) == FRONTEND_BEHAVIOR_NOTE_BASE,
+              "frontend-only behavior notes start at FRONTEND_BEHAVIOR_NOTE_BASE");
 
 NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                              {
@@ -652,6 +734,8 @@ NLOHMANN_JSON_SERIALIZE_ENUM(BehaviorNote_t,
                                  {BehaviorNote_t::REQUIRES_BIAS_INT8x32_REORDER, "REQUIRES_BIAS_INT8x32_REORDER"},
                                  {BehaviorNote_t::SUPPORTS_CUDA_GRAPH_NATIVE_API, "SUPPORTS_CUDA_GRAPH_NATIVE_API"},
                                  {BehaviorNote_t::CUBLASLT_DEPENDENCY, "CUBLASLT_DEPENDENCY"},
+                                 {BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE,
+                                  "SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE"},
                              })
 
 enum class NumericalNote_t {
@@ -667,6 +751,7 @@ enum class NumericalNote_t {
     WINOGRAD_TILE_6x6,
     WINOGRAD_TILE_13x13,
     STRICT_NAN_PROP,
+    FULL_PRECISION_MATH,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
@@ -682,6 +767,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(NumericalNote_t,
                                  {NumericalNote_t::WINOGRAD_TILE_6x6, "WINOGRAD_TILE_6x6"},
                                  {NumericalNote_t::WINOGRAD_TILE_13x13, "WINOGRAD_TILE_13x13"},
                                  {NumericalNote_t::STRICT_NAN_PROP, "STRICT_NAN_PROP"},
+                                 {NumericalNote_t::FULL_PRECISION_MATH, "FULL_PRECISION_MATH"},
                              })
 
 enum class DataType_t {
@@ -709,6 +795,7 @@ enum class DataType_t {
     INT4,
     COMPLEX_FP32,
     COMPLEX_FP64,
+    UINT32,
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
@@ -736,6 +823,7 @@ NLOHMANN_JSON_SERIALIZE_ENUM(DataType_t,
                                  {DataType_t::INT4, "INT4"},
                                  {DataType_t::COMPLEX_FP32, "COMPLEX_FP32"},
                                  {DataType_t::COMPLEX_FP64, "COMPLEX_FP64"},
+                                 {DataType_t::UINT32, "UINT32"},
 
                              })
 
@@ -1015,6 +1103,8 @@ get_data_type_size(DataType_t const data_type) {
             return 1;
         case DataType_t::INT32:
             return sizeof(int32_t);
+        case DataType_t::UINT32:
+            return sizeof(uint32_t);
         case DataType_t::INT8x4:
         case DataType_t::UINT8x4:
             return 4;
@@ -1082,6 +1172,14 @@ convert_to_cudnn_type(cudnn_frontend::DataType_t const mode, cudnnDataType_t& cu
         case DataType_t::INT32:
             cudnn_mode = CUDNN_DATA_INT32;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+        case DataType_t::UINT32:
+#if (CUDNN_VERSION >= 91100)
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(91100, cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE);
+            cudnn_mode = CUDNN_DATA_UINT32;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
         case DataType_t::INT8x4:
             cudnn_mode = CUDNN_DATA_INT8x4;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1435,6 +1533,13 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
 #else
             return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
 #endif
+        case NumericalNote_t::FULL_PRECISION_MATH:
+#if defined(CUDNN_HAS_FULL_PRECISION_MATH_NUMERICAL_NOTE)
+            cudnn_mode = CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH;
+            return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
+#else
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
+#endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
         default:
@@ -1447,6 +1552,9 @@ convert_to_cudnn_type(cudnn_frontend::NumericalNote_t const mode, cudnnBackendNu
 static inline cudnnStatus_t
 convert_to_cudnn_type(cudnn_frontend::BehaviorNote_t const mode, cudnnBackendBehaviorNote_t& cudnn_mode) {
     switch (mode) {
+        case BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE:
+            // FE-only capability: never manufacture a backend enum value.
+            return cudnnStatus_t::CUDNN_STATUS_INVALID_VALUE;
         case BehaviorNote_t::RUNTIME_COMPILATION:
             cudnn_mode = CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION;
             return cudnnStatus_t::CUDNN_STATUS_SUCCESS;
@@ -1532,6 +1640,10 @@ convert_from_cudnn_type(cudnnBackendNumericalNote_t const cudnn_mode) {
 #if (CUDNN_VERSION >= 90100)
         case CUDNN_NUMERICAL_NOTE_STRICT_NAN_PROP:
             return NumericalNote_t::STRICT_NAN_PROP;
+#endif
+#if defined(CUDNN_HAS_FULL_PRECISION_MATH_NUMERICAL_NOTE)
+        case CUDNN_NUMERICAL_NOTE_FULL_PRECISION_MATH:
+            return NumericalNote_t::FULL_PRECISION_MATH;
 #endif
 
 #ifndef NO_DEFAULT_IN_SWITCH
@@ -2329,6 +2441,10 @@ convert_from_cudnn_type(cudnnDataType_t const cudnn_mode) {
             return DataType_t::INT8;
         case CUDNN_DATA_INT32:
             return DataType_t::INT32;
+#if (CUDNN_VERSION >= 91100)
+        case CUDNN_DATA_UINT32:
+            return DataType_t::UINT32;
+#endif
         case CUDNN_DATA_INT8x4:
             return DataType_t::INT8x4;
         case CUDNN_DATA_UINT8:
@@ -2407,6 +2523,7 @@ get_element_size_in_bits(cudnn_frontend::DataType_t datatype) {
             break;
         case DataType_t::FLOAT:
         case DataType_t::INT32:
+        case DataType_t::UINT32:
         case DataType_t::INT8x4:
         case DataType_t::UINT8x4:
             return 32;
@@ -2570,6 +2687,9 @@ std::string static get_engine_tag(ManagedOpaqueDescriptor const config) {
     std::stringstream tag{""};
     ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
     auto status                             = extractedEngine->get_status();
+    if (status != CUDNN_STATUS_SUCCESS) {
+        return "INVALID_ENGINE_NAME_CFG";
+    }
 
     cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
     int64_t elemCount                         = 0;

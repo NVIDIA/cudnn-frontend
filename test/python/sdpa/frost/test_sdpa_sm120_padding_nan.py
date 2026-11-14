@@ -104,3 +104,43 @@ def test_runtime_kv_padding_nan_rebind_replay(d, dv, dtype, sq, sk, causal, cudn
                         launch()
         finally:
             capture.reset()
+
+
+@pytest.mark.parametrize("sink_value", [-float("inf"), float("inf")])
+def test_d512_dense_sink_limits(sink_value):
+    from sdpa.frost.native_forward_sm120_cases import _case, _execute
+
+    api, tensors, storage = _case(d=512, features=True)
+    tensors["sinks"].fill_(sink_value)
+    tensors["seq_kv_lens"][1] = 0
+    api.compile()
+    assert api._k_mod.__file__.endswith("sm120/prefill_d512_f16.py")
+    assert api._k_mod.PARAMS.page_size == 0
+    workspace = torch.empty(max(1, api.scratch_workspace_bytes()), dtype=torch.uint8, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    try:
+        _execute(api, tensors, workspace)
+        with torch.cuda.graph(graph):
+            _execute(api, tensors, workspace)
+        for _ in range(2):
+            tensors["o"].fill_(float("nan"))
+            graph.replay()
+            for batch, nq in enumerate((17, 14)):
+                out, lse = tensors["o"][batch, :, :nq], tensors["lse"][batch, :, :nq]
+                if sink_value > 0 or batch == 1:
+                    assert torch.count_nonzero(out) == 0
+                    assert torch.all(lse == sink_value)
+                else:
+                    q = tensors["q"][batch, :, :nq].double()
+                    k = tensors["k"][batch].double().repeat_interleave(2, 0)
+                    v = tensors["v"][batch].double().repeat_interleave(2, 0)
+                    scores = q @ k.transpose(-1, -2) / math.sqrt(512)
+                    qi = torch.arange(nq, device="cuda")[:, None]
+                    ki = torch.arange(k.shape[1], device="cuda")[None, :]
+                    scores.masked_fill_(ki > qi, -torch.inf)
+                    torch.testing.assert_close(out.double(), scores.softmax(-1) @ v, atol=0.003, rtol=0.02)
+                    torch.testing.assert_close(lse.double(), scores.logsumexp(-1), atol=0.0006, rtol=0)
+            assert (storage["o"][..., -1] == 11).all()
+            assert torch.isnan(storage["lse"][..., 1::2]).all()
+    finally:
+        graph.reset()

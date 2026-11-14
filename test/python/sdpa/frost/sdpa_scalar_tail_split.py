@@ -15,12 +15,17 @@ def test_half_scalar_tail_explicit_candidate_admission(device_cc, d_shape):
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
 
     name = "sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"
+    if device_cc in ((10, 0), (10, 3)) and d_shape == (256, 256):
+        name = "sdpa_fwd_sm100_d256_lookahead"
+    cga = 2
+    if device_cc in ((10, 0), (10, 3)) and d_shape == (512, 512):
+        name, cga = "sdpa_fwd_sm100_d512_role_split", 4
     caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == name)
     # Rubin D256 dense split is the existing decode tile; scalar-tail
     # admission does not add a split implementation to its prefill body.
     sq = 1 if device_cc == (10, 7) and d_shape in ((256, 256), (248, 224)) else 64
     facts = ga.SdpaGraphFacts(b=2, h_q=4, h_kv=2, s_q=sq, s_kv=257, d_qk=d_shape[0], d_v=d_shape[1], dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
-    assert mismatch(caps, facts, SdpaFwdKnobs(split_kv=4, tile_m=128, tile_n=128, cga=2, pack_gqa=False)) is None
+    assert mismatch(caps, facts, SdpaFwdKnobs(split_kv=4, tile_m=128, tile_n=128, cga=cga, pack_gqa=False)) is None
 
 
 @pytest.mark.parametrize("d_shape", _SHAPES)

@@ -6,6 +6,8 @@
 import math
 import os
 
+from frost_test_utils import half_engine_names, _is_plan_for
+
 import pytest
 import torch
 
@@ -15,12 +17,42 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, _dsl_installed, run_sass_probe, sass_probe_source
 
 
-from frost_test_utils import select_engine as _select_engine  # noqa: F401
+from frost_test_utils import select_engine as _select_ranked_engine
+
+_D512_GRAPH_ARM = None
+
+
+def _select_engine(graph, *args, **kwargs):
+    """Keep default selection, with an explicit record for the role-split test arm."""
+    plan = _select_ranked_engine(graph, *args, **kwargs)
+    if _D512_GRAPH_ARM != "role_split" or not _is_plan_for(graph.get_plan_name_at_index(graph._plan_index), "sdpa_fwd_sm100_d512_2x2"):
+        return plan
+    import cudnn
+    from cudnn.engines.manifest import family_for
+    from cudnn.sdpa import graph_analyzer
+
+    facts = graph._facts_for(graph_analyzer.analyze)
+    if (facts.d_qk, facts.d_v) != (512, 512):
+        return plan
+    _, knobs = graph.get_engine_and_knobs_at_index(graph._plan_index)
+    graph.create_execution_plan(family_for(graph).offered_ids()["sdpa_fwd_sm100_d512_role_split"], {**knobs, cudnn.knob_type.TILE_M: 128})
+    graph.select_plan(graph.get_execution_plan_count() - 1)
+    return graph.plans[graph._plan_index]
+
 
 pytestmark = requires_blackwell
 
-# ONE engine per arch line: pin the row that serves the device under test.
-# ``engine_name(arch=_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
+
+@pytest.mark.L0
+@requires_dsl
+class TestServiceRegisterRelease:
+    from service_register_release_checks import test_sm100_service_register_release as _release
+
+    test_service_register_release = staticmethod(_release)
+
+
+# Feature tests admit the half implementations for their architecture; routing tests pin a concrete body.
+# ``half_engine_names(_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
 # unqualified pin fails on Rubin with "no plan for engine" for routing reasons
 # that have nothing to do with the kernel.  Same shape as
 # test_sdpa_fwd_fp8_sm100.py / test_sdpa_fwd_mxfp8_sm100.py.
@@ -100,7 +132,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch=_ARCH))
+    _select_engine(graph, half_engine_names(_ARCH))
     graph.check_support()
     graph.build_plans()
     # Honest workspace: no Stats output, so the kernel compiles the LSE store
@@ -161,10 +193,10 @@ def test_sdpa_fwd_gate_tail_graph_api(dtype, is_causal):
     assert graph._lowered_graph is None, "the tail must validate python-natively"
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch=_ARCH))
+    _select_engine(graph, half_engine_names(_ARCH))
     graph.check_support()
     graph.build_plans()
-    assert graph.selected_engine is not None and graph.selected_engine.name == engine_name(arch=_ARCH)
+    assert graph.selected_engine is not None and graph.selected_engine.name in half_engine_names(_ARCH)
     note_frost_routing(graph, label="sdpa-gate-tail")
     assert graph.get_workspace_size() == 0
 
@@ -190,7 +222,7 @@ _DTYPE_IDS = ["fp16", "bf16"]
 
 # --- the d512 2x2 twin arm --------------------------------------------------------------------------------------
 # Every case of this file that can name the d512 flavor runs under BOTH values of api_dsl.D512_2X2 (default True since
-# 2026-10-06): two_by_two lowers its d512 half plans onto sm100/prefill_d512_f16_2x2.py, role_split onto the 4x1 kernel
+# 2026-10-06): two_by_two lowers its d512 half plans onto sm100/d512_f16_2x2/kernel.py, role_split onto the 4x1 kernel
 # (the same ids `-k "d512 or dsv4"` lists, suffixed -role_split / -two_by_two;
 # conftest deselects the twin arm of the other flavors' cells).  Plans the twin declines (split_kv > 1 from the
 # heuristics, PackGQA G=128) keep the role-split kernel under both arms; test_sdpa_fwd_d512_2x2_sm100.py asserts the
@@ -224,13 +256,16 @@ def pytest_generate_tests(metafunc):
 @pytest.fixture(autouse=True)
 def d512_arm(request, monkeypatch):
     """Both arms set api_dsl.D512_2X2 EXPLICITLY (the switch defaults to True since 2026-10-06): ``two_by_two`` -> mma_2x2=True
-    on every eligible d512 half record (cc 10.0 lowers it onto sm100/prefill_d512_f16_2x2.py, cc 10.7 onto
+    on every eligible d512 half record (cc 10.0 lowers it onto sm100/d512_f16_2x2/kernel.py, cc 10.7 onto
     sm107/prefill_d512_f16_2x2.py); ``role_split`` -> the 4x1 kernel.  Unparametrized cases (no d512 in their name) keep the
     module default.  Added only to the d512-naming cases by pytest_generate_tests above."""
     from cudnn.sdpa.fwd import api_dsl
 
     arm = getattr(request, "param", None)
     if arm is not None:
+        # Standalone and unmigrated architectures retain their switch. Exact
+        # SM100 graph rows use the test-local explicit record above.
+        monkeypatch.setitem(globals(), "_D512_GRAPH_ARM", arm)
         monkeypatch.setattr(api_dsl, "D512_2X2", arm == "two_by_two")
     yield
 
@@ -359,7 +394,7 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    plan = _select_engine(g, half_engine_names(_ARCH), pack_gqa=pack_gqa)
     if want_cga is not None:
         assert plan.knobs.cga == want_cga, f"expected the heuristics to lead with cga={want_cga}; got {plan.knobs}"
     g.check_support()
@@ -781,8 +816,21 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8))
-    engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+    name = engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8)
+    if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
+        # This fixture explicitly requests the two-CTA scalar-tail split body.
+        name = "sdpa_fwd_sm100_d256_lookahead"
+    if not fp8 and _SM in (100, 103) and d_shape == (512, 512):
+        from cudnn.engines.manifest import family_for
+
+        # This test explicitly requests split-KV, whose wide owner is the
+        # role-split body even when automatic unsplit selection prefers 2x2.
+        engine = family_for(g).offered_ids()["sdpa_fwd_sm100_d512_role_split"]
+        knobs = {cudnn.knob_type.TILE_M: 128, cudnn.knob_type.TILE_N: 128}
+        cga = 4
+    else:
+        _select_engine(g, name)
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})})
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
@@ -1831,11 +1879,11 @@ def test_dsl_sm100_pack_gqa_knob_contract():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        name = engine_name(arch=_ARCH)
+        name = half_engine_names(_ARCH)
         out = []
         for i in range(len(g.plans)):
             pn = g.get_plan_name_at_index(i)
-            if pn == name or pn.startswith(name + "["):
+            if _is_plan_for(pn, name):
                 out.append(getattr(g.plans[i].knobs, "pack_gqa", None))
         return out
 
@@ -1937,7 +1985,7 @@ def test_dsl_sm100_thd(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -2038,7 +2086,7 @@ def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_qk, kro: ro_qk, vro: ro_v, oro: ro_v}
@@ -2129,7 +2177,7 @@ def test_dsl_sm100_thd_cross(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
@@ -2309,11 +2357,11 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     if pack_gqa is not None:
         # Exercise the requested support directly, independently of automatic candidate proposals.
         engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-        knobs.update({cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        knobs.update({cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: 1})
         g.create_execution_plan(engine, knobs)
         g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
@@ -3058,7 +3106,7 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name(arch=_ARCH))
+        _select_engine(g, half_engine_names(_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -3147,7 +3195,7 @@ def test_dsl_sm100_thd_interleaved_kv_views():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name(arch=_ARCH))
+        _select_engine(g, half_engine_names(_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -3255,10 +3303,9 @@ def test_dsl_sm100_combo(flavor, dtype, heads, sink, layout, mask):
 # test (O to the bf16 rounding, the fp32 row-sum moves by ~1e-5) and worth +1.9 % at S=8K dense / +1.75 % causal on the
 # DSv3 chart layer on B200, so its only tripwire is the SASS.  Two arms per specialization, one per cc the sm100 rows
 # serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True) and sm_103a with the cc 10.3 record
-# (exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate, so the split is folded OUT and the kernel is
-# develop's -- INCLUDING develop's pre-existing causal-only tail emulation, `_exp2_mixed_late`, which the split replaces
-# only where it is on; the gate-off cubin is md5-identical to develop's on both archs).  Compiled here for the target
-# arch (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
+# (exp2_fma_split=False: the split is folded OUT and every softmax column takes the plain MUFU exp2 -- the dense top-left
+# causal arm too, whose exp2-split spelling (CfgD192.EXP2_TAIL_MIX) follows the claim).  Compiled here for the target arch
+# (`CUTE_DSL_ARCH` needs no matching device); skips when no nvdisasm on $CUDA_PATH/bin or $PATH decodes the cubin.
 _SM100_D192_F16_SASS_PROBE = sass_probe_source("""
     # The PRODUCTION geometry of the DSv3 chart layer the split was measured on (B200, B=1 H=128/128 d_qk=192 d_v=128
     # bf16 S=8K, Stats, cga2 = the adapter's default for an f16 build); the per-arch field (exp2_fma_split) and the causal
@@ -3266,14 +3313,11 @@ _SM100_D192_F16_SASS_PROBE = sass_probe_source("""
     params = TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=1, **params_kw)
     mod = _load_sm100_kernel_module((192, 128), params, fp8=False, pertensor=False, rubin=False)
     # MUFU.EX2 the kernel must carry: per traced softmax body one alpha exp2 plus the non-emulated columns; the body is
-    # traced once per softmax warpgroup and, on a masked specialization, once more for the masked arm.  With the split
-    # OFF the dense top-left causal arm still emulates its last 34 columns of chunk 1 (`_exp2_mixed_late`: pairs from
-    # index 30 of the 64-wide chunk, PR #841) -- develop's spelling, which the gate-off build must reproduce.
+    # traced once per softmax warpgroup and, on a masked specialization, once more for the masked arm.
     n_bodies = (2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1) * (2 if mod.CFG.MASK_FLAGS else 1)
-    tail_cols = 0 if mod._E2E_ENABLED or not mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX else mod._SOFTMAX_CHUNK - 30  # `_exp2_mixed_late`: `if i >= 30`
-    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS - tail_cols + 1))
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
-    print("TAIL_EMULATED_COLS", tail_cols)
+    print("CAUSAL_SPLIT_SPELLING", int(mod._DENSE_CAUSAL_PUBLIC_EXP2_MIX))
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
     mod.compile(d_qk=192, d_v=128, has_lse=True)
     """)
@@ -3284,8 +3328,9 @@ _D192_F16_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 2}
 # +2.64 % S=2K, +3.07 % S=32K, +1.75 % S=8K causal).  Gate ON (sm_100a): dense MUFU.EX2 258 -> 194 (2 x 97), FFMA2
 # 130 -> 226, FADD2 126 -> 222 (+3 each per emulated pair), STL / LDL 14 / 14 unchanged; causal (masked + unmasked arm x 2
 # warpgroups) MUFU.EX2 380 -> 388 (4 x 97: the split emulates 32 columns per row where develop's tail emulation did 34),
-# FFMA2 396 -> 452, FADD2 456 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a, cubin md5-identical to develop's): develop's
-# counts exactly -- dense 2 x 129 = 258, causal 4 x (129 - 34) = 380 with STL / LDL 12 / 12.  The MUFU count is pinned
+# FFMA2 396 -> 452, FADD2 456 -> 444, STL / LDL 0 / 0.  Gate OFF (sm_103a): every column on MUFU -- dense 2 x 129 = 258,
+# causal 4 x 129 = 516 (the causal arm's exp2-split spelling goes with the claim; its FFMA2 / FADD2 / STL / LDL are the
+# counts of that build on this toolchain).  The MUFU count is pinned
 # EXACTLY (derived from the module); slack 16 on the packed-FMA counts tolerates unrelated ptxas drift and still catches
 # one emulated pair falling back to MUFU (+2 MUFU.EX2, -3 FFMA2) or leaking into the gate-off build.  The STL / LDL entries
 # are the counts of THIS toolchain (cutlass-dsl 4.8.0.dev0 + CUDA 13.5 ptxas) and are bounds, not literals: the causal cubins
@@ -3297,7 +3342,7 @@ _D192_F16_ON_PINS = {
 }
 _D192_F16_OFF_PINS = {
     "dense": {"MUFU_EX2": 258, "FFMA2": 130, "FADD2": 126, "STL": 14, "LDL": 14},
-    "causal": {"MUFU_EX2": 380, "FFMA2": 396, "FADD2": 456, "STL": 12, "LDL": 12},
+    "causal": {"MUFU_EX2": 516, "FFMA2": 260, "FADD2": 252, "STL": 0, "LDL": 0},
 }
 
 
@@ -3318,7 +3363,7 @@ def test_sm100_d192_f16_exp2_split_sass_pins(tmp_path, spec):
     pins = _D192_F16_ON_PINS[spec]
     assert probe.expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
     assert probe.expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {probe.expect['EMULATED_COLS']}"
-    assert probe.expect["TAIL_EMULATED_COLS"] == 0, "with the split on, the module-wide pattern replaces the causal tail emulation"
+    assert probe.expect["CAUSAL_SPLIT_SPELLING"] == (1 if spec == "causal" else 0), "the dense top-left causal arm takes the split's spelling with the claim"
     assert (
         probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
     ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
@@ -3331,11 +3376,10 @@ def test_sm100_d192_f16_exp2_split_sass_pins(tmp_path, spec):
 @requires_dsl
 @pytest.mark.parametrize("spec", sorted(_D192_F16_SPECS))
 def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
-    """cc 10.3 record (exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300, where MUFU.EX2 runs at
-    Rubin's 32/clk/SM and the same split MEASURED -9..-10 %): the kernel issues develop's MUFU.EX2 count exactly (dense
-    2 x 129 = 258; causal 4 x (129 - 34) = 380, develop's tail emulation intact), with no `exp2_emul_pair` left behind
-    (FFMA2 / FADD2 at or below develop's plus slack) and no spill beyond develop's.  Compiled for sm_103a; skips where
-    this cutlass-dsl has no sm_103a."""
+    """cc 10.3 record (exp2_fma_split=False, what api_dsl.template_params() builds for cc 10.3): every softmax column
+    takes the plain MUFU exp2 -- MUFU.EX2 == 2 x 129 = 258 (dense) / 4 x 129 = 516 (causal) exactly, the causal arm's
+    exp2-split spelling folded out with the claim -- with no `exp2_emul_pair` left behind (FFMA2 / FADD2 at or below the
+    recorded counts plus slack) and no new spill.  Compiled for sm_103a; skips where this cutlass-dsl has no sm_103a."""
     from cudnn.sdpa.fwd.api_dsl import _exp2_fma_split_for
 
     assert _exp2_fma_split_for((10, 3), kind="f16", flavor=(192, 128)) is False, "the cc 10.3 record must fold the split OUT"
@@ -3345,7 +3389,7 @@ def test_sm103_d192_f16_exp2_split_is_folded_out_sass_pins(tmp_path, spec):
     pins = _D192_F16_OFF_PINS[spec]
     assert probe.expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
     assert probe.expect["EMULATED_COLS"] == 0, f"no column may be emulated by the split with the gate off, the module says {probe.expect['EMULATED_COLS']}"
-    assert probe.expect["TAIL_EMULATED_COLS"] == (34 if spec == "causal" else 0), "develop's causal tail emulation must survive the gate-off build untouched"
+    assert probe.expect["CAUSAL_SPLIT_SPELLING"] == 0, "the causal arm's exp2-split spelling must fold out with the claim"
     assert (
         probe.stats["MUFU_EX2"] == probe.expect["EXPECT_MUFU_EX2"] == pins["MUFU_EX2"]
     ), f"MUFU.EX2 {probe.stats['MUFU_EX2']} != {probe.expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
@@ -3432,3 +3476,112 @@ class TestNativeScalarTailSplit:
 
     test_half_scalar_tail_explicit_candidate_admission = staticmethod(_checks.test_half_scalar_tail_explicit_candidate_admission)
     test_half_scalar_tail_graph_overrides_and_replay = staticmethod(_checks.test_half_scalar_tail_graph_overrides_and_replay)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D256 paged packed split on SM100/SM103")
+class TestPagedD256PackedSplit:
+    """Combined packing/splitting, physical origins and standalone replay."""
+
+    import sdpa_d256_paged_split_checks as _checks
+
+    test_origins_and_replay = staticmethod(_checks.test_origins_and_replay)
+    test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64 paged origins on SM100/SM103")
+class TestPagedD64PhysicalOrigins:
+    """Paged queries keep physical row origins distinct from valid lengths."""
+
+    @pytest.mark.parametrize(
+        "dtype,layout,stats,splits,packed,page,q_bound",
+        [
+            ("bfloat16", "hnd", "token", 1, False, 16, None),
+            ("bfloat16", "hnd", "token", 1, False, 16, 64),
+            ("float16", "nhd", "head", 1, False, 64, 64),
+            ("bfloat16", "hnd", "head", 2, True, 16, None),
+            ("float16", "nhd", "token", 3, False, 128, None),
+            ("float16", "mixed", "head", 9, True, 256, None),
+        ],
+        ids=["bf16-unsplit", "bf16-short-unsplit", "fp16-short-unsplit", "bf16-packed-split2", "fp16-unpacked-split3", "fp16-packed-split9"],
+    )
+    def test_origins_and_replay(self, dtype, layout, stats, splits, packed, page, q_bound):
+        from sdpa.frost.test_sdpa_fwd_paged_thd_origins import test_paged_thd_origins_rebind_and_capture as check
+
+        check(64, dtype, layout, stats, 1, splits, packed, page_size=page, kv_bound=1024, cpu_reference=True, q_bound=q_bound)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64/D128 single-sequence setup on SM100/SM103")
+class TestSingleSequenceSetup:
+    """The one-sequence setup and generic batch path compute identical bytes."""
+
+    import sdpa_single_sequence_setup_sm100 as _checks
+
+    test_physical_origins = staticmethod(_checks.test_single_sequence_physical_origins)
+    test_batch_bytes = staticmethod(_checks.test_single_sequence_batch_bytes)
+    test_paged_origins = staticmethod(_checks.test_single_sequence_paged_origins)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D64/D128 split setup on SM100/SM103")
+class TestUnifiedSplitSetup:
+    """Split partials and final physical origins survive runtime batch changes."""
+
+    import sdpa_split_setup_sm100 as _checks
+
+    test_paged_origins = staticmethod(_checks.test_single_sequence_paged_origins)
+    test_dense_origins = staticmethod(_checks.test_single_sequence_dense_origins)
+    test_mixed_origins = staticmethod(_checks.test_single_sequence_mixed_origins)
+    test_batch_bytes = staticmethod(_checks.test_runtime_batch_bytes)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="D128 live-column decode on SM100/SM103")
+class TestDecodeLiveColumns:
+    """Numerical routes, retained replay, batch invariance and refill coverage."""
+
+    import test_sdpa_fwd_decode_live_columns_sm100 as _graph
+    import test_sdpa_fwd_decode_live_columns_determinism as _determinism
+
+    live_column_route = staticmethod(_graph.live_column_route)
+    test_graph = staticmethod(_graph.test_live_columns_graph)
+    test_features = staticmethod(_graph.test_live_columns_graph_features)
+    test_existing_routes = staticmethod(_graph.test_live_columns_keep_existing_routes)
+    test_replay_batch = staticmethod(_determinism.test_live_columns_replay_batch)
+    test_golden = staticmethod(_determinism.test_live_columns_golden)
+    test_warm_refill = staticmethod(_determinism.test_live_columns_warm_refill)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(_SM not in (100, 103), reason="SM100/SM103 native D64 packed THD prefill")
+class TestD64ThdPackedUnsplit:
+    """Direct final stores, independent origins and retained batch/replay bytes."""
+
+    import sdpa_d64_thd_packed_unsplit as _checks
+
+    test_contract = staticmethod(_checks.test_contract)
+    test_paged_origins = staticmethod(_checks.test_paged_origins)
+    test_nonpaged_origins = staticmethod(_checks.test_nonpaged_origins)
+    test_standalone = staticmethod(_checks.test_standalone)
+    test_batch_and_golden = staticmethod(_checks.test_batch_and_golden)
+    test_warm_refill = staticmethod(_checks.test_warm_refill)
+
+
+@pytest.mark.L0
+@requires_dsl
+@pytest.mark.skipif(not 100 <= _SM <= 106, reason="SM100-family entry; native SM107 entry owns Rubin")
+class TestSplitCombineZeroWeight:
+    """The fixed-order combine excludes zero-weight payloads before multiplication."""
+
+    import split_combine_zero_weight_checks as _checks
+
+    test_partial_and_chain = staticmethod(_checks.test_zero_weight_partial_and_chain_are_excluded)
+    test_replay_and_batch_invariance = staticmethod(_checks.test_zero_weight_replay_and_batch_invariance)

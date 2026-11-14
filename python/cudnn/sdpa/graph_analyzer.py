@@ -413,9 +413,11 @@ class SdpaGraphFacts:
     descale_k_t: Any = None
     descale_v_t: Any = None
     scale_o_t: Any = None
-    # cuDNN's Scale_S/Descale_S: they quantize P, the softmax OUTPUT. SM120
-    # applies them; SM100 converts P unscaled (exact for a reciprocal pair) and
-    # declines a non-reciprocal one (api_dsl._require_reciprocal_s_scales).
+    # cuDNN's Scale_S/Descale_S: they quantize P, the softmax OUTPUT. The FROST
+    # per-tensor FP8 and MXFP8 rows never read them: each kernel casts P with its
+    # own fixed power-of-two bias (P_CAST_LOG2_SCALE) and cancels it exactly, which
+    # equals the graph for the reciprocal pair the docs prescribe. A non-reciprocal
+    # pair is device data, so it is not detected at plan time.
     descale_s_t: Any = None
     scale_s_t: Any = None
     amax_s_t: Any = None

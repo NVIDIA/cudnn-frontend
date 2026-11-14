@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""The SM100 d512 f16/bf16 forward on the 2x2 DATAPATH (sm100/prefill_d512_f16_2x2.py, TemplateParams.mma_2x2).
+"""The SM100 d512 f16/bf16 forward on the 2x2 DATAPATH (sm100/d512_f16_2x2/kernel.py, TemplateParams.mma_2x2).
 
 Host-only: the Cfg / mbarrier-ledger pins, the byte-identity of the 4x1 role-split renderings (cubin md5 with and
 without the appended field, against the pin recorded before the field existed), the arrive-site counts of the kernel
@@ -28,14 +28,13 @@ import torch
 
 from test_utils import torch_fork_set_rng
 
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, assert_no_new_spills, launch_f16, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
+from frost_test_utils import _SM, assert_no_new_spills, half_engine_names, launch_f16, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
 import test_sdpa_fwd_dsl_sm100 as _dsl
 
 pytestmark = requires_dsl
 
-_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
+_KERNEL_FILE = "sm100/d512_f16_2x2/kernel.py"
 _TEMPLATE = "prefill_d512_f16_2x2"
 _ROLE_SPLIT_TEMPLATE = "prefill_d512_f16"
 _D = 512
@@ -54,7 +53,8 @@ def _kernels_dir():
 @pytest.mark.L0
 def test_config_default_arm_is_unchanged():
     """A record without the field (or with it False) builds the role-split CfgD512, dataclass-equal."""
-    from cudnn.sdpa.fwd.config_sm100 import CfgD512, TemplateParams, make_cfg_d512
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
+    from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.config import CfgD512
 
     c0, t0 = make_cfg_d512(TemplateParams())
     c1, t1 = make_cfg_d512(TemplateParams(mma_2x2=False))
@@ -77,11 +77,15 @@ def test_two_by_two_host_slots_match_role_split():
         host = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_host")
         return [a.arg for a in host.args.args if not (a.annotation is not None and "Constexpr" in ast.unparse(a.annotation))]
 
-    parent = runtime_slots("sm100/prefill_d512_f16.py")
-    # The SM100 twin adds independent V-table strides and physical THD origins
-    # for native D576. The prepared positional entry always keeps stream last.
-    assert runtime_slots(_KERNEL_FILE) == parent[:-1] + ["table_v_strides", "thd_origin_ptrs", parent[-1]]
-    assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == parent
+    parent = runtime_slots("sm100/d512_f16_role_split/kernel.py")
+    # Both SM100 bodies bind physical origins; the 2x2 twin additionally
+    # carries independent V-table strides. The prepared entry keeps stream last.
+    assert parent[-2:] == ["thd_origin_ptrs", "stream"]
+    assert runtime_slots(_KERNEL_FILE) == parent[:-2] + ["table_v_strides", *parent[-2:]]
+    # Native SM107 D512 paging adds the independent V-table pitch as well.
+    rubin_parent = runtime_slots("sm107/prefill_d512_f16.py")
+    assert rubin_parent[-2:] == ["thd_origin_ptrs", "stream"]
+    assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == rubin_parent[:-2] + ["table_v_strides", *rubin_parent[-2:]]
 
 
 @pytest.mark.L0
@@ -256,7 +260,7 @@ def test_two_by_two_cross_pair_waits_poll():
 
 # ------------------------------------------------------------------------------------------- host-only: byte identity
 
-# Cubin md5 of sm100/prefill_d512_f16.py (bf16 dense, has_lse, sm_100a) RECORDED BEFORE TemplateParams.mma_2x2 existed
+# Cubin md5 of sm100/d512_f16_role_split/kernel.py (bf16 dense, has_lse, sm_100a) RECORDED BEFORE TemplateParams.mma_2x2 existed
 # (job c9d07061, lane_d512_fprop/md5_pins_before.log, nvidia-cutlass-dsl 4.7.0 + CUDA 13.3 ptxas).  Toolchain-specific:
 # a different ptxas renders a different cubin; the WITH-vs-WITHOUT-field equality below is the toolchain-independent half.
 _ROLE_SPLIT_PRE_FIELD_MD5 = {"dense": "0a5e0d71bc3714475394cd70cdc9a58d", "causal": "0138a912f5390f06c5ff031df9739c46"}
@@ -265,7 +269,7 @@ _ROLE_SPLIT_SPECS = {"dense": {}, "causal": {"window_right": 0, "sched_policy": 
 _ROLE_SPLIT_PROBE = sass_probe_source("""
     params = TemplateParams(dtype_qkv=2, dtype_o=2, **params_kw)
     mod = _load_sm100_kernel_module((512, 512), params, fp8=False, pertensor=False, rubin=False)
-    print("IS_2X2", int(mod.__file__.endswith("_2x2.py")))
+    print("IS_2X2", int(mod.__file__.endswith("d512_f16_2x2/kernel.py")))
     mod.compile(d_qk=512, d_v=512, has_lse=True, lse_kind="dense")
     """)
 
@@ -302,7 +306,7 @@ _2X2_PROBE = sass_probe_source(
     """
     params = TemplateParams(dtype_qkv=2, dtype_o=2, mma_2x2=True, **params_kw)
     mod = _load_sm100_kernel_module((512, 512), params, fp8=False, pertensor=False, rubin=False)
-    print("IS_2X2", int(mod.__file__.endswith("_2x2.py")))
+    print("IS_2X2", int(mod.__file__.endswith("d512_f16_2x2/kernel.py")))
     print("CGA_M", int(mod.CFG.CGA_M))
     print("SMEM_TOTAL", int(mod._SMEM["total"]))
     mod.compile(d_qk=512, d_v=512, has_lse=True, lse_kind="dense")
@@ -393,7 +397,18 @@ def _run_graph(q, k, v, *, scale, dtype, sdpa_kwargs, seq_len_kv=None, seq_len_q
     g.create_execution_plans([cudnn.heur_mode.A])
     # split_kv pinned to 1: the heuristics split small B*H causal graphs over KV, and the twin (correctly) keeps
     # split plans on the role-split kernel in phase 1 -- this file tests the 2x2 kernel, not the split heuristic.
-    _dsl._select_engine(g, engine_name(arch=_dsl._ARCH), pack_gqa=pack_gqa, split_kv=1)
+    _dsl._select_engine(g, half_engine_names(_dsl._ARCH), pack_gqa=pack_gqa, split_kv=1)
+    if _SM in (100, 103) and (q.shape[-1], d_v) == (512, 512):
+        # These are body-specific tests, including the nondefault role-split
+        # control. Rebuild an explicit record; a standalone A/B switch must
+        # never alter the implementation named by a graph plan.
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import ROLE_SPLIT, TWO_BY_TWO
+
+        name, tile = (TWO_BY_TWO, 64) if expect_template == _TEMPLATE else (ROLE_SPLIT, 128)
+        _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        g.create_execution_plan(family_for(g).offered_ids()[name], {**knobs, cudnn.knob_type.TILE_M: tile})
+        g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
     assert _served_template(g) == expect_template
@@ -952,7 +967,7 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
     from frost_test_utils import launch_f16
     B, H, S, D = 1, 128, 8192, 512
     if role == "twin":
-        path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/prefill_d512_f16_2x2.py")
+        path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100/d512_f16_2x2/kernel.py")
         spec = importlib.util.spec_from_file_location("cudnn.frost._templates.contention_twin", path)
         mod = importlib.util.module_from_spec(spec)
         setattr(mod, "FROST_TEMPLATE_PARAMS", TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2))

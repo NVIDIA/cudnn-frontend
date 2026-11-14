@@ -5,6 +5,7 @@
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
 #include "sdpa_mxfp8_binding.h"
+#include "cudnn_frontend.h"
 #include <memory>
 
 #include <algorithm>
@@ -20,6 +21,20 @@ namespace py = nanobind;
 namespace cudnn_frontend {
 namespace python_bindings {
 namespace {
+// A persistent SM90 D128 causal plan's work-item claim counter (prefill_d128_f16.py, TemplateParams.causal_claim): one
+// Int32 at the caller's workspace base, zeroed on the launch stream before every launch. The bytes the plan reserves
+// for it (api_dsl scratch_workspace_bytes, config_sm90.D128_CLAIM_WORKSPACE_BYTES).
+constexpr int64_t kClaimWorkspaceBytes = 128;
+// cuMemsetD32Async, resolved once through the runtime as cudnn_frontend_shim.h resolves its driver entry points, so
+// the binder never links libcuda and never calls back into Python for the reset (an earlier counter did: cuda-python's
+// memset through cudnn.frost.buffers cost most of its 12.4 us per call). Null when the entry point is unavailable.
+using PfnMemsetD32Async = CUresult (*)(CUdeviceptr, unsigned int, size_t, CUstream);
+PfnMemsetD32Async
+memset_d32_async() {
+    static const auto fn =
+        reinterpret_cast<PfnMemsetD32Async>(cudnn_frontend::detail::get_driver_entry_point("cuMemsetD32Async"));
+    return fn;
+}
 [[noreturn]] void
 invalid(const std::string &message) {
     throw py::value_error(("cudnn.sdpa: " + message).c_str());
@@ -166,7 +181,8 @@ class SdpaDenseBinder {
         if (integer("split") < 1) invalid("native dense binding requires split >= 1");
         // Admitted split plans produce sink-free partials; combine folds it once.
         const auto dq = integer("d_qk"), dv = integer("d_v");
-        const bool native_d576 = !quantized_ && dq == 576 && dv == 512;
+        const bool native_d576 =
+            !quantized_ && dq > 512 && dq <= 576 && dv > 256 && dv <= 512 && dq % 8 == 0 && dv % 8 == 0;
         if (!native_d576 && (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8))
             invalid("native dense binding requires a supported half attention head dimension pair");
         fp32_partial_  = flag("fp32_partial");
@@ -289,6 +305,11 @@ class SdpaDenseBinder {
                     "operands)");
             gate_code_ = dtype == "float16" ? kDLFloat : kDLBfloat;
         }
+        // A persistent SM90 D128 causal plan claims its work items from an Int32 counter: word 0 of the caller's
+        // workspace, bound as the meta pointer and zeroed on the launch stream before every launch.
+        claim_counter_ = py::hasattr(spec, "claim_counter") && flag("claim_counter");
+        if (claim_counter_ && (split_ != 1 || quantized_ || paged_ || ragged_ || seq_kv_ || has_gate_ || block_output_))
+            invalid("a work-item claim counter needs a dense unsplit half plan without KV lengths, paging or a gate");
         auto order = py::cast<std::vector<std::string>>(spec.attr("order"));
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
         for (size_t slot = 0; slot < NumSlots; ++slot) {
@@ -329,6 +350,7 @@ class SdpaDenseBinder {
     }
     py::tuple
     bind(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream) {
+        if (claim_counter_) invalid("a work-item claim-counter plan binds the caller workspace; use execute");
         if (quantized_) invalid("FP8 binding needs a workspace and bind_quantized");
         if (split_ != 1) invalid("split decode needs a workspace and bind_split");
         return bind_launch(pack, indices, std::move(stream), 0).first;
@@ -492,7 +514,25 @@ class SdpaDenseBinder {
             invalid("this specialization was compiled without an epilogue gate");
         }
         put(frame, ODescPtr, py::int_(0));
-        put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : 0));
+        if (claim_counter_) {
+            if (workspace <= 0 || workspace % 16)
+                invalid(
+                    "this plan's work-item claim counter lives in the caller workspace; pass a non-null 16-byte "
+                    "aligned "
+                    "workspace of " +
+                    std::to_string(kClaimWorkspaceBytes) + " bytes");
+            // The counter word is zeroed before the launch and incremented during it: an operand sharing those bytes
+            // would be overwritten, and its stores would corrupt the claims.
+            const auto counter_end = add(workspace, 4);
+            for (size_t role = Q; role < facts.size(); ++role) {
+                const auto &f = facts[role];
+                if (!f.filled) continue;
+                const auto bytes = storage_span(f);
+                if (bytes && workspace < add(f.pointer, bytes) && f.pointer < counter_end)
+                    invalid("the work-item claim counter's workspace overlaps " + std::string(names[role]));
+            }
+        }
+        put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : claim_counter_ ? workspace : 0));
         const int64_t q_lens_address = seq_q_ ? lengths(facts[QLens], QLens, b + (ragged_q_lens_ == 2 ? 1 : 0)) : 0;
         if (seq_q_) put(frame, QLensPtr, py::int_(q_lens_address));
         put(frame, Stream, stream);
@@ -568,6 +608,7 @@ class SdpaDenseBinder {
             frame = py::tuple(args);
         }
         if (bound.identity) fill_word_(bound.identity, 1, 0x3f800000, py::int_(stream));
+        if (claim_counter_) reset_claim_counter(workspace, stream);
         auto result = py::steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
         if (!result) throw py::python_error();
         if (split_ > 1 && !fused_split_) {
@@ -587,17 +628,61 @@ class SdpaDenseBinder {
                     py::handle override_strides,
                     const std::vector<int64_t> &indices,
                     py::object stream) {
-        auto read = read_ordered_binding(
-            schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+        DLDevice workspace_device{};
+        auto read = read_ordered_binding(schema,
+                                         buffers,
+                                         tensor_uids,
+                                         auto_bindings,
+                                         workspace,
+                                         override_uids,
+                                         override_shapes,
+                                         override_strides,
+                                         &workspace_device);
         // Supplied workspace is observed even when this bounded plan needs no
         // scratch. Python completes unsupported producer protocols before the
         // same binder runs; malformed buffers never trigger another executor.
         if (quantized_ || split_ > 1 || !py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
-        execute(read[0], indices, std::move(stream));
+        int64_t claim_workspace = 0;
+        if (claim_counter_) {
+            // The claim counter's workspace, checked as the THD binder checks its scratch: the shared reader's extent
+            // and the device it observed with it, so the counter plan keeps the ordered native path.
+            const auto extent = py::cast<py::tuple>(read[2]);
+            claim_workspace   = py::cast<int64_t>(extent[0]);
+            if (!claim_workspace)
+                invalid("requires a " + std::to_string(kClaimWorkspaceBytes) +
+                        "-byte workspace but execute() received none; allocate graph.get_workspace_size() bytes");
+            const int64_t bytes = py::cast<int64_t>(extent[1]);
+            if (bytes < kClaimWorkspaceBytes)
+                invalid("needs a " + std::to_string(kClaimWorkspaceBytes) + "-byte workspace, got " +
+                        std::to_string(bytes) + " bytes (size it with graph.get_workspace_size())");
+            if (workspace_device.device_type != kDLCUDA || workspace_device.device_id != device_)
+                invalid("workspace must be on CUDA device " + std::to_string(device_));
+        }
+        execute(read[0], indices, std::move(stream), py::none(), claim_workspace);
         return py::none();
+    }
+    int64_t
+    ordered_workspace_bytes() const {
+        // The workspace the ordered native path checks and binds: the claim counter's bytes, 0 for every other plan
+        // (split and quantized plans keep the Python path, which binds their workspace).
+        return claim_counter_ ? kClaimWorkspaceBytes : 0;
     }
 
    private:
+    void
+    reset_claim_counter(int64_t workspace, const py::object &stream) const {
+        // The claim counter starts at zero for this launch, on its stream; under capture this is a memset node, so
+        // every replay zeroes it again. Never left to the kernel: the caller's workspace is uninitialized at first use
+        // and other plans write it between launches.
+        const auto fn = memset_d32_async();
+        if (!fn) invalid("the work-item claim counter's reset needs the CUDA driver entry point cuMemsetD32Async");
+        const int64_t handle = stream.is_none() ? 0 : py::cast<int64_t>(py::int_(stream));
+        const auto status =
+            fn(static_cast<CUdeviceptr>(workspace), 0u, 1, reinterpret_cast<CUstream>(static_cast<intptr_t>(handle)));
+        if (status != CUDA_SUCCESS)
+            invalid("cuMemsetD32Async failed resetting the work-item claim counter (CUresult " +
+                    std::to_string(static_cast<int>(status)) + ")");
+    }
     size_t
     first_scalar_role() const {
         return !mx_scales_ ? DescaleQ : block_output_ && block_has_scale_ ? ScaleO : AmaxO;
@@ -888,7 +973,7 @@ class SdpaDenseBinder {
     }
     py::object fn_, owner_, dense_layout_, pool_layout_, table_layout_, lse_layout_;
     py::object combine_fn_, combine_owner_, fill_word_;
-    bool quantized_ = false, has_amax_ = false, pv_bf16_ = false;
+    bool quantized_ = false, has_amax_ = false, pv_bf16_ = false, claim_counter_ = false;
     int64_t quant_offset_ = 0;
     bool block_output_ = false, block_has_scale_ = false;
     bool has_gate_       = false;
@@ -931,8 +1016,14 @@ init_sdpa_dense_binding(py::module_ &m) {
         .def_prop_ro_static("supports_ragged_q_lens", [](py::object) { return true; })
         .def_prop_ro_static("supports_quantized_split_sink", [](py::object) { return true; })
         .def_prop_ro_static("supports_native_d576", [](py::object) { return true; })
+        .def_prop_ro_static("supports_d576_envelope", [](py::object) { return true; })
         .def_prop_ro_static("supports_fused_split", [](py::object) { return true; })
         .def_prop_ro_static("supports_mixed_fp8_kv", [](py::object) { return true; })
+        // The SM90 D128 causal claim counter's binder role (claim_counter spec flag): the adapter keeps a causal plan
+        // on its static schedules on an older extension instead of launching a counter kernel whose counter pointer is
+        // 0.
+        .def_prop_ro_static("supports_claim_counter", [](py::object) { return true; })
+        .def_prop_ro("ordered_workspace_bytes", &SdpaDenseBinder::ordered_workspace_bytes)
         .def("bind", &SdpaDenseBinder::bind, py::arg("pack"), py::arg("indices"), py::arg("stream"))
         .def("bind_split",
              &SdpaDenseBinder::bind_split,

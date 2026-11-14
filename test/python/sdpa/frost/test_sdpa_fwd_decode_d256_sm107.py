@@ -143,7 +143,7 @@ def test_sm107_decode_routes_to_the_rubin_sibling():
         mod = _load(rubin=True, decode_q_tile=16, seq_kv_lens_present=True, **extra)
         assert mod.__file__.endswith("/sm107/decode_d256_f16.py") and "sm107_decode" in mod.__name__, mod.__name__
     sm100 = _load(rubin=False, decode_q_tile=16, seq_kv_lens_present=True)
-    assert sm100.__file__.endswith("/sm100/decode_d256_f16.py") and "sm100_decode" in sm100.__name__, sm100.__name__
+    assert sm100.__file__.endswith("/sm100/d256_f16_swap_ab/kernel.py") and "sm100_decode" in sm100.__name__, sm100.__name__
 
 
 @pytest.mark.parametrize(
@@ -184,13 +184,14 @@ def test_sm107_decode_body_matches_the_sm100_body():
     """The partial producer remains the SM100 body line for line, modulo the
     declared deltas -- the config import, the DSL gate + the two module constants, the
     ``desc_version=DESC_VERSION`` keyword on every SmemTile, the ``spin=SPIN_RING_WAITS``
-    keyword on the ring waits and the header prose. The optional cluster reducer and
+    keyword on the ring waits, the SM100-only live-column specialization, and the
+    header prose. The optional cluster reducer and
     its host/compiler bindings are separate implementations, exercised by the cluster
     binding/GPU suites. A change to the shared partial producer still fails here."""
     from cudnn.sdpa.fwd import api_dsl
 
     kdir = Path(api_dsl.__file__).parent / "kernels"
-    sm100 = (kdir / "sm100" / "decode_d256_f16.py").read_text(encoding="utf-8")
+    sm100 = (kdir / "sm100" / "d256_f16_swap_ab" / "kernel.py").read_text(encoding="utf-8")
     sm107 = (kdir / "sm107" / "decode_d256_f16.py").read_text(encoding="utf-8")
 
     def _body(src):
@@ -213,6 +214,30 @@ def test_sm107_decode_body_matches_the_sm100_body():
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
 
     a, b = _body(sm100), _body(sm107)
+    a = [ln for ln in a if ln != "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME"]
+    # Pin the exact SM100-only specialization before comparing the shared body.
+    # Removing an arbitrary AST branch would hide edits to its zero-fill/fence.
+    sm100_only = {
+        'COLS = getattr(PARAMS, "decode_live_columns", 0) or 16': "COLS = 16",
+        "COL_GROUPS = N_Q // 16": "COL_GROUPS = N_Q // COLS",
+        'if COLS not in (8, 16) or (COLS == 8 and N_Q != 16):\n    raise ValueError("swap-AB decode: a reduced softmax width needs a single 16-column MMA group")': "",
+        "{4 * COL_GROUPS} softmax warps": "{4 * (N_Q // COLS)} softmax warps",
+        "\n".join(
+            (
+                "        if cutlass.const_expr(COLS < 16):",
+                "            zero4 = cutlass.Vector.from_elements(tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32)",
+                "            for slot in cutlass.range_constexpr(2):",
+                "                offset = cutlass.Int32(slot * pBufferWords + COLS // 2) + tidx * cutlass.Int32(P_ROW_WORDS)",
+                "                Pointer(sP_raw.subview(offset).data_ptr(), dtype=cutlass.Int32).store_swizzled(zero4, _P_SMEM_SWIZZLE, alignment=16)",
+                '            nvvm.fence_proxy("async.shared", space="cta")',
+            )
+        ): "",
+    }
+    a_src = "\n".join(a)
+    for specialized, shared in sm100_only.items():
+        assert a_src.count(specialized) == 1, f"the declared SM100-only live-column delta changed:\n{specialized}"
+        a_src = a_src.replace(specialized, shared)
+    a = [ln for ln in a_src.splitlines() if ln.strip()]
     b = [ln for ln in b if ln.strip() not in ("desc_version=DESC_VERSION,",)]
     b = [ln.replace(", spin=SPIN_RING_WAITS)", ")") for ln in b]
     b = [
@@ -232,10 +257,11 @@ def test_sm107_decode_body_matches_the_sm100_body():
     b = [
         ln.replace(
             "from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d256_decode_desc_version, make_cfg_d256_decode",
-            "from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256_decode",
+            "from cudnn.sdpa.fwd.config_common import TemplateParams\nfrom cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode",
         )
         for ln in b
     ]
+    b = "\n".join(b).splitlines()
     assert a == b, "the Rubin decode module diverged from the SM100 body beyond the declared deltas:\n" + "\n".join(
         f"{'-' if x else '+'} {x or y}" for x, y in zip(a, b) if x != y
     )
@@ -469,7 +495,7 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     """The facts-level twin (engines.d256_decode_tile_selected) of the adapter's _decode_q_tile on the
     Rubin row: a decode-shaped half d256 graph is selected (paged or dense, sink or not); a gated,
     pre-folded, THD, quantized or wider graph is not -- and the row's paged rule admits exactly the
-    selected form while the paged PREFILL pipeline keeps its THD-only scope."""
+    selected D256 form; native D128 also serves dense-Q paging."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
@@ -492,10 +518,10 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     gated = SdpaGraphFacts(**{**base, "has_epilogue_gate": True, "epilogue_gate_dtype": cudnn.data_type.BFLOAT16})
     assert engines.d256_decode_tile_selected(caps, gated, 12) and engines.d256_decode_tile_selected(caps, gated, 12, split_kv=2)
     assert not engines.d256_decode_tile_selected(caps, gated, 12, split_kv=1)
-    for change in (dict(s_q=64), dict(d_qk=128, d_v=128)):
-        g = SdpaGraphFacts(**{**base, **change})
-        reason = engines.mismatch(caps, g, None)
-        assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
+    reason = engines.mismatch(caps, SdpaGraphFacts(**{**base, "s_q": 64}), None)
+    assert reason and "Rubin paged KV requires THD" in reason
+    # D128 has a native dense-Q page loader independently of the D256 decode tile.
+    assert engines.mismatch(caps, SdpaGraphFacts(**{**base, "d_qk": 128, "d_v": 128}), None) is None
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the 32-column tile, one unit
     # base is a PADDED, mask-free paged graph: the 64-column width's predicate declines it, so the (16, 32) table rules here
     assert engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 4}), 12)  # 48 packed rows: two token units of the 32-column tile

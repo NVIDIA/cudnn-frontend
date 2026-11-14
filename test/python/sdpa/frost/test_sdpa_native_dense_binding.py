@@ -40,7 +40,9 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_name = "prefill_d512_f16_2x2.py" if d == 576 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    host_name = "d512_f16_2x2/kernel.py" if d > 512 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    if d == 256:
+        host_name = "d256_f16_swap_ab/kernel.py"
     host_path = Path(prep.__file__).parent / "kernels/sm100" / host_name
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
@@ -437,6 +439,13 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
         tile_m, tile_n, cga = 64, 32 if d > 256 else 64, 1
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
+    if cc in ((10, 0), (10, 3)) and (d, d_v) == (256, 256):
+        # Pin the same body this fixture exercised before the row split.
+        # Its short packed Q rows used swap-AB even with the old CGA2 knob.
+        engine_id, tile_m, cga = (20519, 128, 2) if prefill else (20520, 16, 1)
+    if cc in ((10, 0), (10, 3)) and (d, d_v) == (512, 512):
+        # Preserve this native-binder fixture's original role-split ABI.
+        engine_id, tile_m, cga = 20521, 128, 4
     graph.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, tile_n=tile_n, cga=cga, pack_gqa=cc != (10, 7), split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared
@@ -779,13 +788,16 @@ def test_native_decode_new_flavors_keep_int64_table_stride(d, monkeypatch, reque
 
 
 @pytest.mark.parametrize("paged,hnd,v_hnd", [(False, False, False), (True, False, True), (True, True, False)])
-def test_native_d576_dense_binding(paged, hnd, v_hnd):
-    spec, facts, frames = _fixture(d=576, d_v=512, paged=paged, hnd=hnd, v_hnd=v_hnd)
+@pytest.mark.parametrize("d,d_v", [(576, 512), (576, 504), (568, 512), (520, 264)])
+def test_native_d576_dense_binding(paged, hnd, v_hnd, d, d_v):
+    # The binder preserves accepted native widths; architecture-specific
+    # kernel eligibility is validated by the graph and adapter suites.
+    spec, facts, frames = _fixture(d=d, d_v=d_v, paged=paged, hnd=hnd, v_hnd=v_hnd)
     _equal(spec, facts)
     assert not frames
 
 
-@pytest.mark.parametrize("d,d_v", [(576, 504), (568, 512), (576, 576), (584, 512)])
-def test_native_d576_binding_keeps_exact_geometry(d, d_v):
+@pytest.mark.parametrize("d,d_v", [(576, 576), (584, 512), (576, 256), (575, 512), (576, 510)])
+def test_native_d576_binding_rejects_outside_envelope(d, d_v):
     with pytest.raises(ValueError, match="supported half attention head dimension pair"):
         _fixture(d=d, d_v=d_v)

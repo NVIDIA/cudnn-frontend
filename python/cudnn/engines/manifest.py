@@ -119,6 +119,12 @@ class EngineFamily:
     # reason instead of a dead process. None: the backend is always queried. Rare by contract: a
     # documented backend defect on a measured domain, never placement policy.
     backend_guard: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_engine_guard(graph, facts) -> Dict[int, str]``: backend engines
+    # (global ids) that must not run this graph, each with the reason (an engine that returns a wrong result on
+    # a measured domain). Planning drops their configs from the backend's list and an explicit pin of one is a
+    # typed decline; the backend's other engines stay. None: no engine is excluded. Same contract as
+    # backend_guard: a documented backend defect on a measured domain, never placement policy.
+    backend_engine_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -195,7 +201,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "gdn",
         "cudnn.linear_attention",
         "GdnEngines",
-        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2)},
+        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2), "gdn_cake_det": EngineSlot(3, opt_in=True)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
@@ -213,6 +219,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_cake": EngineSlot(3),
             "kda_hopper": EngineSlot(4),
             "kda_hopper_cuda": EngineSlot(5),
+            "kda_cake_det": EngineSlot(6, opt_in=True),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
         # Ordering only, and only on Hopper: slot order is identity, not
@@ -270,7 +277,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         #   10 sm100_d192_d128_mxfp8
         slots={
             "sdpa_fwd_prefill_sm120": EngineSlot(5),
-            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
+            "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7),
             "sdpa_fwd_prefill_sm80": EngineSlot(8),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
@@ -279,12 +286,18 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
-            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18, opt_in=True),
+            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18),
+            "sdpa_fwd_sm100_d256_lookahead": EngineSlot(19),
+            "sdpa_fwd_sm100_d256_swap_ab": EngineSlot(20),
+            "sdpa_fwd_sm100_d512_role_split": EngineSlot(21),
+            "sdpa_fwd_sm100_d512_2x2": EngineSlot(22),
+            "sdpa_fwd_sm100_d512_fp8_role_split": EngineSlot(23),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
         backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
+        backend_engine_guard=("cudnn.sdpa.fwd.backend_guard", "backend_engine_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -306,6 +319,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm100_d128_fp8": EngineSlot(11, opt_in=True),
             "sdpa_bwd_sm100_d192": EngineSlot(12, opt_in=True),
             "sdpa_bwd_sm100_d192_fp8": EngineSlot(13, opt_in=True),
+            "sdpa_bwd_d512_fp8": EngineSlot(14, opt_in=True),
+            "sdpa_bwd_d512_mxfp8": EngineSlot(15, opt_in=True),
+            "sdpa_bwd_sm120_fp8": EngineSlot(16, opt_in=True),
+            "sdpa_bwd_sm120_mxfp8": EngineSlot(17, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -319,6 +336,8 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.conv.frost.engine",
         "FrostConvEngines",
         slots={"frost_conv": EngineSlot(0, opt_in=True)},
+        analyzer=("cudnn.conv.frost.heuristics", "analyze_facts"),
+        heuristics=("cudnn.conv.frost.heuristics", "propose"),
     ),
     EngineFamily(
         FROST_NORM_FWD_ID_BASE,
@@ -420,6 +439,12 @@ def resolve_backend_guard(family: EngineFamily):
     """The family's backend-query guard, or None (see EngineFamily.backend_guard)."""
 
     return _resolve(family, family.backend_guard, "backend_guard")
+
+
+def resolve_backend_engine_guard(family: EngineFamily):
+    """The family's backend-engine guard, or None (see EngineFamily.backend_engine_guard)."""
+
+    return _resolve(family, family.backend_engine_guard, "backend_engine_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

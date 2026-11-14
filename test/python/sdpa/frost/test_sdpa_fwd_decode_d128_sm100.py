@@ -340,7 +340,11 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     assert {p.knobs.cga for p in _plans(_facts(s_q=2048, causal=True, padded=False))} == {1, 2}
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9, has_paged_kv=True, page_size=16)) if p.knobs.pack_gqa)
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
+    # Exact D256 now belongs to the explicit implementation rows, so the
+    # broad D128 row must offer no candidate for that former control case.
+    from cudnn.sdpa.fwd.heuristics import recommend
+
+    assert recommend("A", _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), {ENGINE: _SM100_ID}) == []
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
     # LPT_L2: one head's K+V here is 4096 * 256 * 2 B = 2 MiB, under the SM100 d128 row's 8 MiB floor for the L2 grouping,
     # heuristics._SM100_D128_LPT_L2_MIN_BYTES.)
@@ -404,7 +408,7 @@ def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     assert thd is not None and "decode tile" in thd and "THD" in thd
     assert engines.mismatch(caps, _facts(thd=True), engines.SdpaFwdKnobs(cga=2)) is None
     d256 = engines.mismatch(caps, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), engines.SdpaFwdKnobs(cga=1))
-    assert d256 is not None and "outside this engine's domain" in d256
+    assert d256 is not None and "owned by the explicit implementation engines" in d256
     # Partial PackGQA rides the decode tile: a pinned cga=1 + PACK_GQA=1 on 96/8
     # (G=12 packs 4) is honored; on 24/8 (G=3, no common factor) it is declined.
     assert engines.mismatch(caps, _facts(h_q=96, h_kv=8), engines.SdpaFwdKnobs(cga=1, pack_gqa=True)) is None
@@ -980,6 +984,7 @@ def _paged_graph(
     table_batch_stride=None,
     require_prepared=False,
     sink=None,
+    expected_template="decode_d128_f16",
 ):
     """Build + run cuDNN's paged-cache graph; return (plan, o [B,H,s_q,d], stats or None, inputs)."""
     import cudnn
@@ -1054,7 +1059,7 @@ def _paged_graph(
         from cudnn.sdpa.fwd.prepared import PreparedDenseLaunch
 
         compiled = g._compiled_plans[g._plan_index]
-        assert compiled._compiled.kernel_template == "decode_d128_f16"
+        assert compiled._compiled.kernel_template == expected_template
         assert isinstance(compiled._prepared, PreparedDenseLaunch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
     vp = {q: q_gpu, k: k_c, v: v_c, tk: bt4, tv: bt4, sq_t: slq, sk_t: slk, o: o_gpu}
@@ -1094,7 +1099,7 @@ def _paged_graph(
 def test_graph_decode_prepared_keeps_int64_page_table_batch_stride():
     """A singleton table's unused batch stride must not narrow at the pointer ABI.
     B=1 keeps the valid allocation small while a stride over 2**31 catches int32 fakes."""
-    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True)
+    _paged_graph(1, 8, 2, D, 16, 8, [128], False, stats=True, table_batch_stride=2**31 + 32, require_prepared=True, expected_template="decode_d256_f16")
 
 
 @pytest.mark.L0
@@ -1696,7 +1701,9 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.CGA_TILE_M == 128 and api._k_mod.CFG.TILES_Q == 1, "cga=1 must have loaded the decode tile"
+    mod = api._k_mod
+    assert mod.__file__.endswith("sm100/d256_f16_swap_ab/kernel.py"), "the short paged D128 graph must load the swap-AB decode tile"
+    assert mod.CFG.TILE_K == mod.CFG.TILE_O == 128 and mod.N_Q == 16 and mod.COLS == 8
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):

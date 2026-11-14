@@ -12,7 +12,7 @@ right-to-left masked KV walk and P kept in registers, with every MMA lowered to
 
 - Q/K/V arrive PRE-QUANTIZED e4m3/e5m2 with one E8M0 scale per 32 elements
   (Q/K along D, V along S) in the F8_128x4 atom order (``sdpa/kernels/_mxfp8_sf.py``).
-  There are no per-tensor descales; ``scale_softmax``, the 2**-4 P-cast
+  There are no per-tensor descales; ``scale_softmax``, the 2**-8 P-cast
   inverse and a block-scaled O's optional global ``scale_o`` are the only
   scalar factors.
 - Q scales load GMEM-direct into one 32-bit register per 128-column plane
@@ -25,7 +25,7 @@ right-to-left masked KV walk and P kept in registers, with every MMA lowered to
   word per column held across the k32 steps.
 - K B-fragments: byte-preserving ``ldmatrix.m8n8.x4.b16``; V B-fragments: the
   8-bit transposed ``ldmatrix.m16n16.x2.trans.b8``, register map (0, 2, 1, 3).
-- P: fp32 softmax output packed to the INPUT fp8 dtype with a baked 2**4 cast
+- P: fp32 softmax output packed to the INPUT fp8 dtype with a baked 2**8 cast
   bias and the unit block scale (E8M0 127); the k32 C->A fragment-column
   mismatch is an exchange inside each thread quad (two ``shfl.sync`` and one
   ``prmt`` in ``mma_pv``).
@@ -92,6 +92,7 @@ from cudnn.sdpa.fwd.kernels.thd_helpers import (
     THD_SETUP_THREADS,
 )
 from cudnn.sdpa.fwd.kernels.sm120._common import (
+    thd_row_origin,
     SCHED_L2_BUDGET_BYTES,
     ceil_div,
     nvvm_threadquad_reduction_max,
@@ -118,13 +119,15 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(d
 
 # P -> fp8 cast bias (BAKED constant). P is quantized as P * 2**P_CAST_LOG2_SCALE
 # via the exp2 bias under the unit block scale: the online softmax adopts every
-# new row max, so P <= 1 and the cast peaks at 2^4 = 16, far below the e4m3
-# maximum of 448, while flat-row entries (P ~ 1/S) sit four binades above
-# e4m3's subnormal cliff (quantization stays normal out to S ~ 2^13). row_sum
-# accumulates in the same 2^4-scaled units and is de-scaled by the EXACT 2^-4
-# before the finalize paths (sink mix, rcp, LSE, zero-row guards run on
-# bit-identical true sums); the O leg's 2^4 is cancelled by O_SCALE.
-P_CAST_LOG2_SCALE = 4.0
+# new row max, so P <= 1 and the cast peaks at 2^8 = 256, below the e4m3
+# maximum of 448. P is relative to the row max, not normalized, so in a peaked
+# long row the other keys sit far below 1/S; the cast keeps them while P * 2^8
+# reaches half of e4m3's smallest subnormal (2^-10), i.e. down to P = 2^-18,
+# about 12.5 nats below the max. row_sum accumulates in the same 2^8-scaled
+# units and is de-scaled by the EXACT 2^-8 before the finalize paths (sink mix,
+# rcp, LSE, zero-row guards run on bit-identical true sums); the O leg's 2^8 is
+# cancelled by O_SCALE.
+P_CAST_LOG2_SCALE = 8.0
 # The O factor: block scales replace the per-tensor descales, and a
 # block-scaled O multiplies in its optional global scale_o at launch. The kernel
 # takes it as a runtime ``o_scale`` argument rather than a folded constant: the
@@ -830,7 +833,7 @@ class SM120FusedMultiHeadAttentionForward:
             if cutlass.const_expr(in_mask_steps):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^4 * P (EX2 is
+            # P-cast bias: exp2(x + P_CAST_LOG2_SCALE) = 2^8 * P (EX2 is
             # binade-shift-exact); see P_CAST_LOG2_SCALE.
             neg_exp_max_scaled = cutlass.Float32(P_CAST_LOG2_SCALE) - exp_max * softmax_scale_log2
             tile_sum = cutlass.Float32(0.0)
@@ -1074,16 +1077,20 @@ class SM120FusedMultiHeadAttentionForward:
         )
 
         if cutlass.const_expr((self.thd_varlen or self.seq_kv_lens_present) and in_mask_steps and is_first_kv_tile):
-            sanitize_v_tail(
-                mma_params.sV,
-                basic_params.lane,
-                basic_params.seqlen_k,
-                kv_tile_idx * self.kv_tile,
-                self.in_dtype,
-                self.head_tile_v,
-                self.kv_tile,
-                self.v_swizzle_chunk_elems,
-            )
+            # Shared V-tail zero stores have one owner and complete before
+            # any compute warp starts its PV ldmatrix reads.
+            if basic_params.q_warp_row0 == 0:
+                sanitize_v_tail(
+                    mma_params.sV,
+                    basic_params.lane,
+                    basic_params.seqlen_k,
+                    kv_tile_idx * self.kv_tile,
+                    self.in_dtype,
+                    self.head_tile_v,
+                    self.kv_tile,
+                    self.v_swizzle_chunk_elems,
+                )
+            prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
         self.mma_pv(basic_params, mma_params, p_regs, kv_sf_row0, v_sf_valid_blocks)
         prims.barrier_cta_arrive(self.bar_v_consumed, self.threads_kv_pipeline)
 
@@ -1129,6 +1136,8 @@ class SM120FusedMultiHeadAttentionForward:
         sfo_row_off_b,
         sfo_col_off_h,
         sfo_cols,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> cutlass.Int32:
         """One unit of work: the (Q tile, sequence, head) triple named by the
         ``q_tile_idx`` / ``batch_idx`` / ``head_idx`` arguments.
@@ -1176,6 +1185,18 @@ class SM120FusedMultiHeadAttentionForward:
 
         num_heads_q = q.shape[2]
         num_heads_kv = k.shape[2]
+        o_row_base = q_row_base
+        stats_row_base = q_row_base
+        v_row_base = kv_row_base
+        if cutlass.const_expr(thd_origin_specs is not None):
+            # Length prefixes locate logical work and scale tiles; data ports own their physical origins.
+            q_row_base = thd_row_origin(thd_origins, thd_origin_specs, 0, batch_idx, q.stride[1], q_row_base)
+            kv_row_base = cutlass.Int32(thd_row_origin(thd_origins, thd_origin_specs, 1, batch_idx, k.stride[1], kv_row_base))
+            v_row_base = cutlass.Int32(thd_row_origin(thd_origins, thd_origin_specs, 2, batch_idx, v.stride[1], v_row_base))
+            o_row_base = thd_row_origin(thd_origins, thd_origin_specs, 3, batch_idx, o.stride[1], o_row_base)
+            if cutlass.const_expr(lse is not None and not self.thd_lse_padded):
+                stats_stride = lse.stride[1] if cutlass.const_expr(self.thd_lse_head_major) else lse.stride[0]
+                stats_row_base = thd_row_origin(thd_origins, thd_origin_specs, 4, batch_idx, stats_stride, stats_row_base)
         head_dim_qk = q.shape[3]
         head_dim_v = v.shape[3]
         # Envelope: actual head dims narrower than the compile-time tiles —
@@ -1193,7 +1214,7 @@ class SM120FusedMultiHeadAttentionForward:
             # batch stride term, and every Q/O row index below stays
             # sequence-local.
             q_head_off = q_row_base * q_seq_stride + q_head_base * q_head_stride
-            o_head_off = q_row_base * o_seq_stride + q_head_base * o_head_stride
+            o_head_off = o_row_base * o_seq_stride + q_head_base * o_head_stride
         else:
             q_head_off = batch_idx * q_batch_stride + q_head_base * q_head_stride
             # O rides the COMPOSITE batch (B*split_kv) so each split lands in its
@@ -1322,7 +1343,7 @@ class SM120FusedMultiHeadAttentionForward:
                     v_tma_mbar,
                     tma_batch_idx,
                     kv_head_idx,
-                    kv_row_base + kv_seq_idx,
+                    v_row_base + kv_seq_idx,
                     is_v=True,
                     envelope=v_envelope,
                     **self._kv_sf_load(sf_coords, sVSF, kv_seq_idx, is_v=True),
@@ -1356,7 +1377,7 @@ class SM120FusedMultiHeadAttentionForward:
                         v_tma_mbar,
                         tma_batch_idx,
                         kv_head_idx,
-                        kv_row_base + kv_seq_idx,
+                        v_row_base + kv_seq_idx,
                         is_v=True,
                         envelope=v_envelope,
                         **self._kv_sf_load(sf_coords, sVSF, kv_seq_idx, is_v=True),
@@ -1547,8 +1568,8 @@ class SM120FusedMultiHeadAttentionForward:
             row_sum_inv = cutlass.Array(cutlass.Float32, 2, alignment=8)
             row_lse = cutlass.Array(cutlass.Float32, 2, alignment=8)
             for row_half in cutlass.range_constexpr(2):
-                # row_sum carries the P-cast 2^4 — take it out with the EXACT
-                # 2^-4 so every finalize path below sees the true sum.
+                # row_sum carries the P-cast 2^8 — take it out with the EXACT
+                # 2^-8 so every finalize path below sees the true sum.
                 row_sum[row_half] = row_sum[row_half] * cutlass.Float32(2.0**-P_CAST_LOG2_SCALE)
                 row_max_nat = row_max[row_half] * softmax_scale_log2 * LN2
                 if cutlass.const_expr(self.has_sink):
@@ -1605,9 +1626,9 @@ class SM120FusedMultiHeadAttentionForward:
                                     # per-batch padded Stats (B, H, s_max), no ragged offsets
                                     lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
                                 elif cutlass.const_expr(self.thd_lse_head_major):
-                                    lse_arr[_lse_head, q_row_base + lse_q_idx] = lse_out
+                                    lse_arr[_lse_head, stats_row_base + lse_q_idx] = lse_out
                                 else:
-                                    lse_arr[q_row_base + lse_q_idx, _lse_head] = lse_out
+                                    lse_arr[stats_row_base + lse_q_idx, _lse_head] = lse_out
                         else:
                             # Rows at/past this batch's Q length trim to -inf.
                             if lse_q_idx >= seqlen_q:
@@ -1871,6 +1892,8 @@ class SM120FusedMultiHeadAttentionForward:
         sfo_row_off_b: cutlass.Int64 = 0,
         sfo_col_off_h: cutlass.Int64 = 0,
         sfo_cols: cutlass.Int64 = 0,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> None:
         """SM120 block-scaled MXFP8 FMHA prefill kernel.
 
@@ -2027,6 +2050,8 @@ class SM120FusedMultiHeadAttentionForward:
                     sfo_row_off_b,
                     sfo_col_off_h,
                     sfo_cols,
+                    thd_origins=thd_origins,
+                    thd_origin_specs=thd_origin_specs,
                 )
                 _uid = thd_claim_next(seq_kv_lens, cutlass.Int32(4 * _nb + 3), _slot, cutlass.Int32(tidx))
         else:
@@ -2114,6 +2139,8 @@ class SM120FusedMultiHeadAttentionForward:
                 sfo_row_off_b,
                 sfo_col_off_h,
                 sfo_cols,
+                thd_origins=thd_origins,
+                thd_origin_specs=thd_origin_specs,
             )
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -2147,6 +2174,8 @@ class SM120FusedMultiHeadAttentionForward:
         sfo_col_off_h: cutlass.Int64 = 0,
         sfo_cols: cutlass.Int64 = 0,
         prepared: cutlass.Constexpr[bool] = False,
+        thd_origins=None,
+        thd_origin_specs: cutlass.Constexpr = None,
     ) -> None:
         """Launch the SM120 block-scaled MXFP8 FMHA kernel.
 
@@ -2294,6 +2323,8 @@ class SM120FusedMultiHeadAttentionForward:
             sfo_row_off_b,
             sfo_col_off_h,
             sfo_cols,
+            thd_origins=thd_origins,
+            thd_origin_specs=thd_origin_specs,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -2327,6 +2358,7 @@ def compile(  # noqa: A001
     scale_o_in_combine: bool = False,
     sfo_geometry: Optional[tuple[int, int, int, int]] = None,
     has_scale_o: bool = False,
+    thd_origin_specs=None,
 ) -> Callable:
     """Compile the dense/packed pointer host; geometry binds at execution.
 
@@ -2380,6 +2412,7 @@ def compile(  # noqa: A001
         persistent_ctas,
         _cache_key,
         thd_max_sq=sq if PARAMS.thd_varlen else 0,
+        thd_origin_specs=thd_origin_specs,
         output_dtype=OUT_DTYPE,
         has_amax=has_amax,
         sfo_geometry=sfo_geometry,

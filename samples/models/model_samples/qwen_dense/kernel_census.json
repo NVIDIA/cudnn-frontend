@@ -1,0 +1,88 @@
+{
+  "schema": 2,
+  "about": [
+    "The target kernel set of a plain decode step of the dense Qwen 3.5-architecture model: per block call of a step the kernel a stack that reproduces the set launches, in step order.",
+    "kernels: per kernel id what it is, where it comes from and how it stands to the target -- 'target' of kind 'code' (the target's own compiled kernel: an entry, a library call or a framework operator called as the target calls it) or of kind 'port' (a kernel whose home is cuDNN Frontend: an entry that reproduces the target kernel's results byte for byte), or 'stand-in' (a declared replacement for an operation that lives inside a serving engine). 'entry' is null until a stack of this repository calls an entry for the kernel; with an entry comes 'form', what the target passes to it.",
+    "A port's byte equality is the entry's own record, not a measurement of the sample that reads this file: 'tie_out' says where that comparison stands and on which GPU class it was made, 'differences' what differs from the target's kernel besides its results. A port without an entry here has neither yet.",
+    "configurations: per GPU class and SM count one section. 'geometry' is the layer widths of the model the section holds for; a model with other widths has no section. 'launch' is [grid, block, shared memory in bytes] of one launch at the section's row count; 'at' names further fields of the geometry that one launch shape was recorded with. A section is 'recorded' (launch records of the target on that class) or 'planned' (derived, never claimed); 'claimed' is false until a stack launches every kernel of the section.",
+    "The numbers of a section are three, never one: of its launches per step, how many are the target's own compiled kernels (code), how many cuDNN Frontend entries with byte-equal results (port), how many declared stand-ins. They count what a complete stack launches: a port is counted whether or not its entry is called by a stack yet.",
+    "A change of a form this file names changes this file in the same commit."
+  ],
+  "validated": {
+    "recorded": {
+      "torch": "2.14.0",
+      "triton": "3.8.0",
+      "flashinfer-python": "0.7.2.post1",
+      "nvidia-cutlass-dsl": "4.8.0",
+      "apache-tvm-ffi": "0.1.11"
+    }
+  },
+  "kernels": {
+    "embedding_gather": {"what": "token embedding lookup", "origin": "PyTorch", "relation": "target", "kind": "code", "entry": "torch.index_select"},
+    "add_norm_quant": {"what": "residual add + RMSNorm + quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
+    "fp8_projection": {"what": "8-bit in-projection of a layer", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
+    "gdn_decode_fused": {"what": "fused linear-attention decode step", "origin": "cuDNN Frontend", "relation": "target", "kind": "code", "entry": "cudnn.GdnDecodeFused", "form": {"PDL": true, "PDL_RELEASE": true}},
+    "cublaslt_fp8_gemm": {"what": "8-bit out-projection of a layer", "origin": "cuBLASLt through FlashInfer", "relation": "target", "kind": "code", "entry": null, "selection": "the library's tuner chooses the kernel: a pick is recorded and never gated, so no launch shape is held here"},
+    "attention_prepare": {"what": "attention preparation: norm, rotary embedding, cache insert", "origin": "Triton", "relation": "target", "kind": "code", "entry": null},
+    "fi_decode_attention": {"what": "attention core over a paged cache", "origin": "FlashInfer", "relation": "target", "kind": "code", "entry": null},
+    "gate_quant": {"what": "attention output gate + 8-bit quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": "cudnn.AttentionGateQuantDecode", "form": {"THREADS": 256, "PDL_RELEASE": true},
+      "tie_out": "Compared when the entry was written: its output bytes against the target kernel's for every pair of bf16 operand values, at 14 scales, on compute capability 10.3 -- no differing byte. No such comparison is recorded for compute capability 10.0. It needs the target's kernel and is not a test of this repository. In the repository: the entry's numerics contract (docs/operations/attention/gate_quant_decode.md) and its suites (test/python/attention_gate/frost/).",
+      "differences": ["a kernel of its own: the same arithmetic at the same rounding points in another instruction stream than the target kernel's"]},
+    "swiglu_fp4": {"what": "MLP gate / up multiply with SiLU x up and the 4-bit quantise", "origin": "cuDNN Frontend", "relation": "target", "kind": "port", "entry": null},
+    "fi_mm_fp4": {"what": "4-bit multiply: MLP down, output head", "origin": "FlashInfer", "relation": "target", "kind": "code", "entry": null},
+    "fi_fp4_quantize": {"what": "4-bit quantise of the final hidden rows in front of the output head", "origin": "FlashInfer", "relation": "stand-in", "entry": null}
+  },
+  "layers": {"linear_attention": "linear_attention_layer", "full_attention": "attention_layer"},
+  "configurations": {
+    "plain": {
+      "cc10.0/sm148": {
+        "claimed": false,
+        "basis": "recorded",
+        "recorded": {
+          "date": "2026-11-12",
+          "gpu": "compute capability 10.0, 148 SMs",
+          "sequences": 1,
+          "steps": 15,
+          "layers": [48, 16],
+          "max_model_len": 2051
+        },
+        "geometry": {"hidden": 5120, "mlp": 17408, "la_key_heads": 16, "la_value_heads": 48, "la_head_dim": 128, "attn_heads": 24, "attn_kv_heads": 4, "attn_head_dim": 256},
+        "numbers": {"launches": 484, "code": 210, "port": 273, "stand_in": 1},
+        "rows": {
+          "1": {
+            "prologue": [
+              ["embedding", "embedding_gather", {"launch": [[40, 1, 1], [128, 1, 1], 0]}]
+            ],
+            "linear_attention_layer": [
+              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["projection.fp8.in", "fp8_projection", {"launch": [[128, 1, 1], [256, 1, 1], 139520]}],
+              ["linear_attention.step", "gdn_decode_fused", {"launch": [[96, 1, 1], [256, 1, 1], 42112]}],
+              ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
+              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["mlp.gate_up", "swiglu_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424]}],
+              ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
+            ],
+            "attention_layer": [
+              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["projection.fp8.in", "fp8_projection", {"launch": [[112, 1, 1], [256, 1, 1], 139520]}],
+              ["attention.prepare", "attention_prepare", {"launch": [[1, 28, 1], [128, 1, 1], 16]}],
+              ["attention.core", "fi_decode_attention", {"launch": [[5, 4, 1], [512, 1, 1], 178456]}],
+              ["attention.gate_quantize", "gate_quant", {"launch": [[3, 1, 1], [256, 1, 1], 0]}],
+              ["projection.fp8.out", "cublaslt_fp8_gemm", {}],
+              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}],
+              ["mlp.gate_up", "swiglu_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424]}],
+              ["mlp.down", "fi_mm_fp4", {"launch": [[40, 1, 2], [192, 1, 1], 231424]}]
+            ],
+            "epilogue": [
+              ["add_norm_quantize", "add_norm_quant", {"launch": [[1, 1, 1], [640, 1, 1], 80]}]
+            ],
+            "after_step": [
+              ["output_head.quantize", "fi_fp4_quantize", {}],
+              ["output_head", "fi_mm_fp4", {"launch": [[1, 1, 148], [192, 1, 1], 231424], "at": {"vocab": 248320}}]
+            ]
+          }
+        }
+      }
+    }
+  }
+}

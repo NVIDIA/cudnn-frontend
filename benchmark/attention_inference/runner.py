@@ -32,8 +32,11 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 # The backends whose generation phase reads a paged KV cache, and so sweep ``config.page_sizes``; the cudnn graph paths and fa4
 # attend over dense K / V and take one case per shape at ``config.page_size``.
-PAGED_BACKENDS = ("flashinfer", "flash_mla", "b12x")
+PAGED_BACKENDS = ("flashinfer", "flashinfer_fa2", "flashinfer_cudnn", "flash_mla", "b12x")
 CUDNN_LEGS = ("cudnn", "cudnn_oss", "cudnn_auto")
+# FlashInfer with a pinned attention backend: like the cudnn legs they sweep config.kv_layouts in both phases (a paged prefill
+# reads the paged wrapper).
+FI_PINNED_LEGS = ("flashinfer_fa2", "flashinfer_cudnn")
 
 
 def kv_layouts_for(config, backend, phase, model=None) -> List[str]:
@@ -41,6 +44,9 @@ def kv_layouts_for(config, backend, phase, model=None) -> List[str]:
     page their generation cache, except b12x's dense sliding-window GQA fallback; their prefill reads contiguous K/V)."""
     if backend in CUDNN_LEGS:
         return list(config.kv_layouts)
+    if backend in FI_PINNED_LEGS:
+        # Context sweeps FlashInfer's ragged and paged prefill; its generation always reads a paged cache.
+        return list(config.kv_layouts) if phase == "context" else ["paged"]
     if backend == "b12x" and model is not None and model.kind == "gqa" and model.sliding_window_size:
         return ["dense"]
     return ["paged" if backend in PAGED_BACKENDS and phase == "generation" else "dense"]
@@ -48,7 +54,7 @@ def kv_layouts_for(config, backend, phase, model=None) -> List[str]:
 
 def kv_min_fills_for(config, backend, kv_layout) -> List[float]:
     """Per-request KV lengths are wired for the paged cudnn legs and flashinfer; the rest run equal lengths."""
-    if (backend in CUDNN_LEGS and kv_layout == "paged") or backend == "flashinfer":
+    if (backend in CUDNN_LEGS and kv_layout == "paged") or backend.startswith("flashinfer"):
         return list(config.kv_min_fills)
     return [1.0]
 
@@ -60,6 +66,12 @@ def _device_cc() -> tuple:
         return torch.cuda.get_device_capability()
     except Exception:
         return (0, 0)
+
+
+def _cudnn_total_q(config, case) -> Optional[str]:
+    """The total-Q declaration a cudnn leg's graph carries; only a paged prefill declares one."""
+    paged_prefill = case["phase"] == "context" and case.get("kv_layout") == "paged"
+    return config.cudnn_context_total_q if case["backend"] in CUDNN_LEGS and paged_prefill else None
 
 
 def backend_supported(backend: str, model: ModelPreset, phase: str, cc: tuple) -> Optional[str]:
@@ -134,6 +146,22 @@ class InferenceBenchmarkRunner:
                                 "kv_layout": kv_layout,
                                 "kv_min_fill": 1.0,
                             }
+                        for cc_case in config.context_cases:
+                            yield {
+                                "config": config,
+                                "model": model,
+                                "backend": backend,
+                                "data_type": data_type,
+                                "kv_cache_dtype": data_type,
+                                "phase": "context",
+                                "batch_size": cc_case["batch_size"],
+                                "q_tokens": cc_case["q_tokens"],
+                                "kv_len": cc_case["kv_len"],
+                                "page_size": cc_case.get("page_size", config.page_size),
+                                "kv_layout": kv_layout,
+                                "kv_min_fill": cc_case.get("kv_min_fill", 1.0),
+                                "q_min_fill": cc_case.get("q_min_fill", 1.0),
+                            }
                     for kv_layout in kv_layouts_for(config, backend, "generation", model):
                         for q_tokens, kv_len in config.generation_shapes:
                             for batch in config.generation_batch_sizes:
@@ -180,6 +208,8 @@ class InferenceBenchmarkRunner:
             kv_min_fill=case.get("kv_min_fill", 1.0),
             attn_mask=attn_mask(case["phase"], config.context_causal, case["q_tokens"], case["kv_len"], model.sliding_window_size),
             has_sink=model.has_sink,
+            q_min_fill=case.get("q_min_fill", 1.0),
+            cudnn_total_q=_cudnn_total_q(config, case),
         )
 
         skip = backend_supported(case["backend"], model, case["phase"], cc)
@@ -224,6 +254,10 @@ class InferenceBenchmarkRunner:
             case.get("kv_layout", "dense"),
             "--kv_min_fill",
             str(case.get("kv_min_fill", 1.0)),
+            "--q_min_fill",
+            str(case.get("q_min_fill", 1.0)),
+            "--cudnn_total_q",
+            config.cudnn_context_total_q,
         ]
         if case["phase"] == "context" and config.context_causal:
             cmd.append("--causal")
@@ -274,6 +308,8 @@ class InferenceBenchmarkRunner:
                 pg += " | paged"
             if case.get("kv_min_fill", 1.0) < 1.0:
                 pg += f" | kv_fill={case['kv_min_fill']:g}"
+            if case.get("q_min_fill", 1.0) < 1.0:
+                pg += f" | q_fill={case['q_min_fill']:g}"
             logger.info(
                 f"[{i}/{len(cases)}] {m.name} | {case['phase']} | b={case['batch_size']} "
                 f"q={case['q_tokens']} kv={case['kv_len']} | {case['backend']} | {case['data_type']}{kvd}{pg}"
@@ -285,7 +321,7 @@ class InferenceBenchmarkRunner:
                 metric = f"{r.tflops:.0f} TFLOPS" if r.phase == "context" else f"{r.gbps:.0f} GB/s{sol}"
                 logger.info(f"  -> {r.time_ms:.3f} ms ({metric}) [{r.backend_detail}]")
             else:
-                logger.warning(f"  -> FAILED: {(r.error_message or '').splitlines()[-1][:140]}")
+                logger.warning(f"  -> FAILED: {((r.error_message or '').strip().splitlines() or ['(no error message)'])[-1][:140]}")
         return results
 
     def results_to_dataframe(self, results):

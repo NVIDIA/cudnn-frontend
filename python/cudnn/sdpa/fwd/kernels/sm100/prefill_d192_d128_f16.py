@@ -37,8 +37,8 @@ SM100 resource layout:
      +1.9 % at S=8K dense, +2.6 % at S=2K, +3.1 % at S=32K, +1.75 % causal.
      ``PARAMS.exp2_fma_split`` (auto-set from the build device) folds it out on
      every other cc, where MUFU.EX2 runs at twice B200's rate and the same
-     split loses (``_E2E_ENABLED``); there the dense top-left causal arm keeps
-     its pre-existing tail emulation (``_exp2_mixed_late``).
+     split loses (``_E2E_ENABLED``); there every column takes the plain MUFU
+     exp2, the dense top-left causal arm included (``CFG.EXP2_TAIL_MIX`` = 0).
 
 Supported: FP16 / BF16 (``DTYPE_QKV in {2, 3}``); masks none / causal / SWA /
 padded and all pairwise combos (causal+swa, causal+padded, swa+padded);
@@ -139,17 +139,12 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_SWA,
 )
 
-from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
-
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
-# Dense top-left causal MHA: BMM1/BMM2 issue tweaks (an opaque K descriptor, one BMM2 issue election per
-# sub-tile, chunk 1's row-sum after its publish) plus -- with the cc 10.0 exp2 split OFF -- the pre-existing
-# causal-only tail emulation ``_exp2_mixed_late`` (the last 34 columns of chunk 1 on ex2_emulation_2's
-# degree-2 polynomial, PR #841).  With the split ON (``_E2E_ENABLED`` below) the module-wide ``_E2E_*``
-# pattern replaces that tail emulation on EVERY mask arm -- the exact form MEASURED on B200.  The tail
-# emulation itself is untouched and still traces wherever the split is off; it runs ungated on cc 10.3
-# today and its own arch gate is a separate follow-up.
-# The dense-causal tail emulation; CFG.EXP2_TAIL_MIX = 0 (the L2-prefetching cga1 loader) keeps the plain MUFU exp2 on that arm.
+# Dense top-left causal MHA with the exp2 split's spelling (``CFG.EXP2_TAIL_MIX``, set by make_cfg_d192 on a
+# build that claims ``PARAMS.exp2_fma_split`` and runs the develop loader): BMM1/BMM2 issue tweaks (an opaque
+# K descriptor, one BMM2 issue election per sub-tile) and chunk 1's row-sum after its publish, next to the
+# module-wide ``_E2E_*`` pattern on every mask arm.  Off (no split claim, or the L2-prefetching cga1 loader)
+# the arm keeps the default issue order and the plain MUFU exp2 on every column.
 _DENSE_CAUSAL_PUBLIC_EXP2_MIX = (
     bool(CFG.EXP2_TAIL_MIX) and not CFG.THD_VARLEN and CFG.MASK_FLAGS == MASK_CAUSAL and CFG.WINDOW_RIGHT == 0 and not CFG.BOTTOM_RIGHT and not CFG.HAS_SINK
 )
@@ -202,18 +197,6 @@ def _e2e_pairs(chunk: int, chunk_elems: int = _SOFTMAX_CHUNK) -> frozenset:
 _E2E_PAIRS = tuple(_e2e_pairs(c) if _E2E_ENABLED else frozenset() for c in range(CFG.N_BMM2_CHUNKS))
 if 2 * sum(len(p) for p in _E2E_PAIRS) != _E2E_EMULATED_COLS:
     raise ValueError(f"{__name__}: exp2 emulation pairs cover {2 * sum(len(p) for p in _E2E_PAIRS)} columns, expected {_E2E_EMULATED_COLS}")
-
-
-def _exp2_mixed_late(vec):
-    values = []
-    for i in range(0, int(vec.shape[0]), 2):
-        if i >= 30:
-            x, y = ex2_emulation_2(vec[i], vec[i + 1], poly_degree=2)
-        else:
-            x = cute.math.exp2(vec[i], fastmath=True)
-            y = cute.math.exp2(vec[i + 1], fastmath=True)
-        values.extend((x, y))
-    return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
 # Only the common dense CLC path has a single scheduler publisher.
@@ -912,6 +895,11 @@ def _kernel(
     is_leader = cta_in_pair == cutlass.Int32(0)
 
     # === Per-warp role dispatch ===
+    # Service roles form one warpgroup and must release at one common
+    # instruction before branching into MMA, load, store and scheduler.
+    if warp_idx >= CFG.MMA_WARP_ID:
+        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
+
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
         nvvm.setmaxregister(CFG.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
         _softmax_warp_group(
@@ -984,7 +972,6 @@ def _kernel(
 
     elif warp_idx == CFG.MMA_WARP_ID:
         # Under cga2 the non-leader CTA runs the quiet body (alloc + dealloc only).
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(CFG.CTA_MMA == 2):
             if is_leader:
                 _mma_warp_group(
@@ -1028,7 +1015,6 @@ def _kernel(
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_k_desc.get_ptr())
         nvvm.prefetch_tensormap(tma_v_desc.get_ptr())
@@ -1060,7 +1046,6 @@ def _kernel(
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         _tmastg_warp_group(
             tma_o_desc=tma_o_desc,
             sO=sO,
@@ -1077,7 +1062,6 @@ def _kernel(
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
-        nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
@@ -2472,15 +2456,11 @@ def _softmax_kv_body(
     p1_sum_pair = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        # Split ON: the module-wide pattern on every mask arm.  Split OFF: develop's spelling -- the dense
-        # top-left causal arm's tail emulation (_exp2_mixed_late), the plain MUFU exp2 everywhere else.
+        # Split ON: the module-wide pattern on every mask arm.  Split OFF: the plain MUFU exp2.
         if cutlass.const_expr(_E2E_ENABLED):
             deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK)
         else:
-            if cutlass.const_expr(_DENSE_CAUSAL_PUBLIC_EXP2_MIX):
-                deferred_P_1 = _exp2_mixed_late(chunk_S_1)
-            else:
-                deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+            deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
         if cutlass.const_expr(not _DENSE_CAUSAL_PUBLIC_EXP2_MIX):
             p1_sum_pair = row_reduction_pair(deferred_P_1)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)

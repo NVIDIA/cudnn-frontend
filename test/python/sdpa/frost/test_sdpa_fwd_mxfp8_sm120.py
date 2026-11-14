@@ -258,10 +258,14 @@ def _run(
     sf_o_layout=None,
     scale_o=None,
     sched_policy=None,
+    qkv=None,
+    capture=None,
+    quantized_qkv=None,
 ):
     """Quantize, build the sdpa_mxfp8 graph, pin the SM120 MXFP8 engine (and ``split_kv``), execute.
     ``layout`` names the storage order (``_LAYOUTS``) of Q/K/V/O. ``sf_o_layout`` ("planes" / "token_major")
-    requests the block-scaled MXFP8 O (E4M3 + UE8M0 per 32 d in ``sf_o``), with the optional global ``scale_o``."""
+    requests the block-scaled MXFP8 O (E4M3 + UE8M0 per 32 d in ``sf_o``), with the optional global ``scale_o``.
+    ``qkv`` (fp32 Q, K, V in [b, h, s, d]) replaces the random draw."""
     import cudnn
 
     dev = "cuda"
@@ -269,7 +273,12 @@ def _run(
     scale = d_qk**-0.5 if scale is None else scale
     sdpa_kwargs = sdpa_kwargs or {}
     fp8 = _FP8[in_key]
-    q_op, k_op, v_op = _draw(B, H_q, H_kv, S_q, S_kv, d_qk, d_v, fp8)
+    if quantized_qkv is not None:
+        q_op, k_op, v_op = quantized_qkv
+    elif qkv is None:
+        q_op, k_op, v_op = _draw(B, H_q, H_kv, S_q, S_kv, d_qk, d_v, fp8)
+    else:
+        q_op, k_op, v_op = (_quantize(t, fp8, columnwise=i == 2) for i, t in enumerate(qkv))
     Qb, Kb, Vb = _bshd(q_op.data), _bshd(k_op.data), _bshd(v_op.data)
     sfq, sfk, sfv = q_op.sf, k_op.sf, v_op.sf
     if poison_pad:
@@ -368,7 +377,18 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    if quantized_qkv is None:
+        chosen = _select_engine(g, _ENGINE, tiles=tiles, pack_gqa=pack_gqa, sched_policy=sched_policy)
+    else:
+        # Kernel qualification holds the plan fixed independently of ranked offerings.
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(
+            family_for(g).offered_ids()[_ENGINE],
+            {cudnn.knob_type.TILE_M: tiles[0], cudnn.knob_type.TILE_N: tiles[1], cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: split_kv},
+        )
+        g.select_plan(len(g.plans) - 1)
+        chosen = g.plans[g._plan_index]
     if split_kv is not None and (chosen.knobs.split_kv or 1) != split_kv:
         # The ranked plans need not carry this split count: re-plan the engine's own knob set with it.
         g.create_execution_plan(chosen.engine_id, replace(chosen.knobs, split_kv=split_kv, sched_policy=0))
@@ -389,6 +409,14 @@ def _run(
         if sync_debug:
             torch.cuda.set_sync_debug_mode(prev)
     torch.cuda.synchronize()
+
+    if capture is not None:
+        assert with_stats and sf_o_layout is None
+        capture.update(
+            run=lambda: g.execute(vp, ws),
+            inputs=dict(q=Qb, k=Kb, v=Vb, sfq=sfq, sfk=sfk, sfv=sfv),
+            outputs=dict(o=Ob, stats=lse, amax=amax_buf),
+        )
 
     o_ref, lse_ref = _ref(
         q_op.dequant, k_op.dequant, v_op.dequant, scale=scale, sinks=sinks, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **_ref_kwargs(sdpa_kwargs)
@@ -452,6 +480,34 @@ def test_mxfp8_sm120_negative_scale(mask):
 @torch_fork_set_rng(seed=13)
 def test_mxfp8_sm120_o_dtype(out_dt):
     _check(_run(1, 4, 4, 192, 320, out_dt=out_dt, sdpa_kwargs=_MASKS["causal"]))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 512], ids=["d128", "d512"])
+def test_mxfp8_sm120_peaked_row_keeps_its_tail(d):
+    """A peaked long row keeps the probability mass of keys far below its max.
+
+    Anchor keys at both ends of the cache, 10 nats (attn_scale = 10, unit Q / K) above 32766 keys at logit 0,
+    V_anchor = e0 and V_tail = e1, all exact in e4m3: an anchor sits in the first KV tile visited in either
+    order, each tail P is e^-10 = 4.5e-5 of the row max, and the tail carries 0.427 of the mass. P is cast to
+    e4m3 under the unit block scale with the kernel's P_CAST_LOG2_SCALE bias; a bias that flushes 4.5e-5 to
+    zero (2^4 does) loses O[..., 1], while 2^8 keeps it within 1%. Unsplit: a split without an anchor would
+    cast its tail against its own max of 0 and hide the flush.
+    """
+    S_q, S_kv = 16, 32768
+    q = torch.zeros(1, 1, S_q, d, device="cuda")
+    q[..., 0] = 1.0
+    k = torch.zeros(1, 1, S_kv, d, device="cuda")
+    v = torch.zeros(1, 1, S_kv, d, device="cuda")
+    v[..., 1] = 1.0
+    for anchor in (0, S_kv - 1):
+        k[:, :, anchor, 0] = 1.0
+        v[:, :, anchor] = 0.0
+        v[:, :, anchor, 0] = 1.0
+    res = _run(1, 1, 1, S_q, S_kv, d_qk=d, scale=10.0, split_kv=1, qkv=(q, k, v))
+    tail = 1.0 / (1.0 + 2.0 * math.exp(10.0) / (S_kv - 2))
+    assert abs(res.reference[..., 1].mean().item() - tail) < 1e-4, "the reference is the analytic tail mass"
+    _check(res, d_qk=d)
 
 
 @pytest.mark.L0
