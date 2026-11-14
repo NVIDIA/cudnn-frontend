@@ -51,9 +51,14 @@ CLASSES = tuple(ShapeClass(d, causal, None, False) for d in (64, 128, 256) for c
     ShapeClass(64, True, 127, True, pack_gqa=(8,)),
 )
 
+# Q tiles of the decode tile (sm120/decode_f16.py, config_sm120.DECODE_Q_TILES); every other tile_m is a prefill
+# template's. The decode tile's KV tile is its stage width (config_sm120.decode_kv_stage).
+DECODE_TILE_MS = (16, 32)
+PREFILL_TILE_MS = (64, 128)
+
 # Unsplit knob sets compiled for every class regardless of the heuristic, so a caller can tune over them:
-# (pack_gqa, sched_policy, split_kv, tile_m, tile_n); tile_n = 0 means "the class's preferred KV tile".
-EXTRA_KNOBS = ((0, 0, 1, 64, 0), (0, 0, 1, 128, 0), (0, 2, 1, 64, 0), (0, 2, 1, 128, 0))
+# (pack_gqa, sched_policy, split_kv, tile_m, tile_n); tile_n = 0 means "the template's KV tile at this class".
+EXTRA_KNOBS = ((0, 0, 1, 16, 0), (0, 0, 1, 32, 0), (0, 0, 1, 64, 0), (0, 0, 1, 128, 0), (0, 2, 1, 64, 0), (0, 2, 1, 128, 0))
 
 # The selection grid. Each axis is bucketed by ceil(log2(x)); a bucket's representative is its upper end 2^i. The C++
 # lookup clamps past the last bucket. "units" is b * h_kv (the heuristic sees work through that product).
@@ -63,8 +68,9 @@ GRID_SKV = tuple(2**i for i in range(18))  # 1 .. 131072
 # G = h_q / h_kv: one table per G in 1..8; G > 8 uses the table computed at GRID_G_LARGE (never packed).
 GRID_G = tuple(range(1, 9))
 GRID_G_LARGE = 16
-# SM counts the tables are computed for (RTX 5090 = 170, RTX PRO 6000 Blackwell = 188); a device uses the nearest.
-SM_COUNTS = (170, 188)
+# SM counts the tables are computed for (RTX 5070 / DGX Spark = 48, RTX 5080 = 84, RTX 5090 = 170, RTX PRO 6000
+# Blackwell = 188); a device uses the nearest.
+SM_COUNTS = (48, 84, 170, 188)
 
 SCHED_NAMES = {0: "nat", 1: "lpt", 2: "lptl2"}
 PREFIX = "cudnn_fe_aot_sm120_sdpa_fwd"
@@ -92,6 +98,18 @@ def kv_tile(d: int) -> int:
     raise ValueError(f"no KV tile fits both Q tiles at d={d}")
 
 
+@functools.lru_cache(maxsize=None)
+def decode_kv_tile(d: int) -> int:
+    """The decode tile's KV tile (its K/V stage width) at head dim d."""
+    from cudnn.sdpa.fwd.config_sm120 import decode_kv_stage
+
+    return decode_kv_stage(d, d)
+
+
+def template_kv_tile(d: int, tile_m: int) -> int:
+    return decode_kv_tile(d) if tile_m in DECODE_TILE_MS else kv_tile(d)
+
+
 def variant_name(dtype: str, c: ShapeClass, k: Knobs) -> str:
     sink = "_sink" if c.sink else ""
     gqa = f"_pgqa{k.pack_gqa}" if k.pack_gqa else ""
@@ -103,11 +121,13 @@ def combine_name(dtype: str, sink: bool) -> str:
 
 
 def in_domain(c: ShapeClass, g: int, k: Knobs) -> bool:
-    """Whether knob set ``k`` (proposed at GQA ratio ``g``) is compiled for class ``c``: the class's KV tile; PackGQA only
-    for the class's ratios and at tile_m 128; splits from ``SPLITS``, unpacked at tile_m 64; an unsplit causal set on
-    LPT_L2 (LPT folds into it)."""
-    if k.tile_m not in (64, 128) or k.tile_n != kv_tile(c.d) or k.split not in SPLITS:
+    """Whether knob set ``k`` (proposed at GQA ratio ``g``) is compiled for class ``c``: the template's KV tile; splits
+    from ``SPLITS`` on NATURAL. Decode tile: PackGQA for the class's ratios that fit the Q tile, NATURAL only. Prefill:
+    PackGQA only at tile_m 128, splits unpacked at tile_m 64, an unsplit causal set on LPT_L2 (LPT folds into it)."""
+    if k.tile_m not in DECODE_TILE_MS + PREFILL_TILE_MS or k.tile_n != template_kv_tile(c.d, k.tile_m) or k.split not in SPLITS:
         return False
+    if k.tile_m in DECODE_TILE_MS:
+        return k.sched == 0 and (not k.pack_gqa or (g in c.pack_gqa and g <= k.tile_m))
     if k.pack_gqa and (g not in c.pack_gqa or k.tile_m != 128):
         return False
     if k.split > 1:
@@ -119,17 +139,18 @@ def snap(c: ShapeClass, g: int, pick: Knobs) -> Knobs:
     """``pick`` moved into the compiled domain of class ``c`` (see :func:`in_domain`)."""
     pack = pick.pack_gqa if (pick.pack_gqa and g in c.pack_gqa) else 0
     split = max(s for s in SPLITS if s <= pick.split)
+    if pick.tile_m in DECODE_TILE_MS:
+        return Knobs(pack if pack <= pick.tile_m else 0, 0, split, pick.tile_m, decode_kv_tile(c.d))
     tile_m = 128 if pack else (64 if split > 1 else (64 if pick.tile_m < 128 else 128))
     sched = 0 if split > 1 else (2 if c.causal else 0)
     return Knobs(pack, sched, split, tile_m, kv_tile(c.d))
 
 
 def extra_knobs(c: ShapeClass):
-    n = kv_tile(c.d)
     for pack, sched, split, tm, tn in EXTRA_KNOBS:
         if sched != 0 and not c.causal:
             continue
-        yield Knobs(pack, sched, split, tm, tn or n)
+        yield Knobs(pack, sched, split, tm, tn or template_kv_tile(c.d, tm))
 
 
 def grid_points():

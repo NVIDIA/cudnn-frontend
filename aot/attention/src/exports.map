@@ -1,0 +1,18 @@
+/* SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
+/* SPDX-License-Identifier: Apache-2.0 */
+{
+  global:
+    cudnn_fe_aot_abi_version;
+    cudnn_fe_aot_build_info;
+    cudnn_fe_aot_sdpa_plan_create;
+    cudnn_fe_aot_sdpa_plan_destroy;
+    cudnn_fe_aot_sdpa_workspace_size;
+    cudnn_fe_aot_sdpa_execute;
+    cudnn_fe_aot_sdpa_query;
+    cudnn_fe_aot_sdpa_num_knob_sets;
+    cudnn_fe_aot_sdpa_get_knob_set;
+    cudnn_fe_aot_status_string;
+    cudnn_fe_aot_last_error;
+  local:
+    *;
+};

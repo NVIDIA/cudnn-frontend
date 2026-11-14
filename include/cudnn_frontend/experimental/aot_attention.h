@@ -4,11 +4,11 @@
  */
 
 /*
- * Header-only C++ API over libcudnn_frontend_aot_sm120.so (ahead-of-time compiled sm_120a attention forward).
+ * Header-only C++ API over libcudnn_frontend_aot_attention.so (ahead-of-time compiled attention forward).
  * The library is dlopened; nothing here needs cuDNN, Python or a runtime compiler. See
- * docs/operations/attention/aot_sm120_attention.md.
+ * docs/operations/attention/aot_attention.md.
  *
- *   namespace aot = cudnn_frontend::experimental::sm120_aot;
+ *   namespace aot = cudnn_frontend::experimental::aot;
  *   aot::SdpaDesc desc = aot::make_desc();            // head_dim, dtypes, mask, sinks, gqa_ratio
  *   aot::SdpaPlan plan;
  *   if (plan.build(desc) != CUDNN_FE_AOT_STATUS_SUCCESS) { ... plan.last_error() ... }   // once per shape class
@@ -16,12 +16,12 @@
  *   plan.execute(args, workspace, workspace_size, stream);                               // launches only
  *
  * Library lookup: a trusted path explicitly given to Library::load(), else
- * "libcudnn_frontend_aot_sm120.so" on the dynamic loader's search path.
+ * "libcudnn_frontend_aot_attention.so" on the dynamic loader's search path.
  */
 
 #pragma once
 
-#include "sm120_aot_attention_abi.h"
+#include "aot_attention_abi.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -38,7 +38,7 @@
 
 namespace cudnn_frontend {
 namespace experimental {
-namespace sm120_aot {
+namespace aot {
 
 using Status    = cudnn_fe_aot_status_t;
 using SdpaDesc  = cudnn_fe_aot_sdpa_desc_t;
@@ -142,7 +142,7 @@ class Library {
     dl_error() {
         return "Windows error " + std::to_string(GetLastError());
     }
-    static constexpr const char* kDefaultName = "cudnn_frontend_aot_sm120.dll";
+    static constexpr const char* kDefaultName = "cudnn_frontend_aot_attention.dll";
 #else
     using Handle = void*;
     static Handle
@@ -158,7 +158,7 @@ class Library {
         const char* e = dlerror();
         return e ? e : "unknown error";
     }
-    static constexpr const char* kDefaultName = "libcudnn_frontend_aot_sm120.so";
+    static constexpr const char* kDefaultName = "libcudnn_frontend_aot_attention.so";
 #endif
 
     template <class Fn>
@@ -179,23 +179,21 @@ class Library {
             return CUDNN_FE_AOT_STATUS_LIBRARY_NOT_LOADED;
         }
         AbiVersionFn abi_version = nullptr;
-        if (!resolve(&abi_version, "cudnn_fe_aot_sm120_abi_version") ||
-            !resolve(&build_info_, "cudnn_fe_aot_sm120_build_info") ||
-            !resolve(&plan_create, "cudnn_fe_aot_sm120_sdpa_plan_create") ||
-            !resolve(&plan_destroy, "cudnn_fe_aot_sm120_sdpa_plan_destroy") ||
-            !resolve(&workspace_size, "cudnn_fe_aot_sm120_sdpa_workspace_size") ||
-            !resolve(&execute, "cudnn_fe_aot_sm120_sdpa_execute") ||
-            !resolve(&query, "cudnn_fe_aot_sm120_sdpa_query") ||
-            !resolve(&num_knob_sets, "cudnn_fe_aot_sm120_sdpa_num_knob_sets") ||
-            !resolve(&get_knob_set, "cudnn_fe_aot_sm120_sdpa_get_knob_set") ||
-            !resolve(&status_string, "cudnn_fe_aot_sm120_status_string") ||
-            !resolve(&last_error, "cudnn_fe_aot_sm120_last_error")) {
+        if (!resolve(&abi_version, "cudnn_fe_aot_abi_version") || !resolve(&build_info_, "cudnn_fe_aot_build_info") ||
+            !resolve(&plan_create, "cudnn_fe_aot_sdpa_plan_create") ||
+            !resolve(&plan_destroy, "cudnn_fe_aot_sdpa_plan_destroy") ||
+            !resolve(&workspace_size, "cudnn_fe_aot_sdpa_workspace_size") ||
+            !resolve(&execute, "cudnn_fe_aot_sdpa_execute") || !resolve(&query, "cudnn_fe_aot_sdpa_query") ||
+            !resolve(&num_knob_sets, "cudnn_fe_aot_sdpa_num_knob_sets") ||
+            !resolve(&get_knob_set, "cudnn_fe_aot_sdpa_get_knob_set") ||
+            !resolve(&status_string, "cudnn_fe_aot_status_string") ||
+            !resolve(&last_error, "cudnn_fe_aot_last_error")) {
             handle_ = nullptr;
             return CUDNN_FE_AOT_STATUS_LIBRARY_NOT_LOADED;
         }
-        if (abi_version() < CUDNN_FE_AOT_SM120_ABI_VERSION) {
+        if (abi_version() < CUDNN_FE_AOT_ABI_VERSION) {
             error_ = std::string(path) + " has ABI version " + std::to_string(abi_version()) + "; this header needs " +
-                     std::to_string(CUDNN_FE_AOT_SM120_ABI_VERSION);
+                     std::to_string(CUDNN_FE_AOT_ABI_VERSION);
             handle_ = nullptr;
             return CUDNN_FE_AOT_STATUS_ABI_MISMATCH;
         }
@@ -309,6 +307,6 @@ knob_sets(const SdpaDesc& desc, int32_t* count, SdpaKnobs* out, int32_t capacity
     return CUDNN_FE_AOT_STATUS_SUCCESS;
 }
 
-}  // namespace sm120_aot
+}  // namespace aot
 }  // namespace experimental
 }  // namespace cudnn_frontend

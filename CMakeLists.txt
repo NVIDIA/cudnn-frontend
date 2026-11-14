@@ -10,7 +10,7 @@ option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_TESTS "Defines if unittests are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." OFF)
 option(CUDNN_FRONTEND_ENABLE_RTTI "Build in-tree targets with RTTI. Off by default so the headers stay compilable for consumers that disable it." OFF)
-option(CUDNN_FRONTEND_BUILD_AOT_SM120 "Build libcudnn_frontend_aot_sm120.so (ahead-of-time sm_120a attention kernels; needs the CuTeDSL wheel)." OFF)
+option(CUDNN_FRONTEND_BUILD_AOT_ATTENTION "Build libcudnn_frontend_aot_attention.so (ahead-of-time sm_120a attention kernels; needs the CuTeDSL wheel)." OFF)
 
 if(MSVC OR MSYS OR MINGW)
     add_compile_options(/W4 /WX)
@@ -76,7 +76,7 @@ if (CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS)
     add_subdirectory(python)
 endif()
 
-if (CUDNN_FRONTEND_BUILD_AOT_SM120)
+if (CUDNN_FRONTEND_BUILD_AOT_ATTENTION)
     add_subdirectory(aot)
 endif()
 

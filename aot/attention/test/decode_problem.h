@@ -48,11 +48,11 @@ struct Case {
 
 inline const char*
 type_name(int t) {
-    return t == CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0 ? "q8_0" : "q4_0";
+    return t == CUDNN_FE_AOT_DECODE_KV_Q8_0 ? "q8_0" : "q4_0";
 }
 inline int
 block_bytes(int t) {
-    return t == CUDNN_FE_AOT_SM120_DECODE_KV_Q8_0 ? 34 : 18;
+    return t == CUDNN_FE_AOT_DECODE_KV_Q8_0 ? 34 : 18;
 }
 
 struct Problem {
@@ -64,7 +64,7 @@ struct Problem {
     std::vector<float> maskf;         // [s][t][pos], empty if no mask
     // device
     void *dq = nullptr, *dk = nullptr, *dv = nullptr, *dm = nullptr, *dout = nullptr;
-    cudnn_fe_aot_sm120_decode_params_t p{};
+    cudnn_fe_aot_decode_params_t p{};
 
     size_t
     qi(int s, int t, int h, int j) const {

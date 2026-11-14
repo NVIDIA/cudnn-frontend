@@ -4,13 +4,14 @@
  */
 
 /*
- * The flat C ABI of libcudnn_frontend_aot_sm120.so: ahead-of-time compiled attention forward kernels for sm_120a
- * (RTX 50xx, RTX PRO Blackwell). Nothing is compiled at run time. A plan fixes a shape class (head dim, dtypes, mask,
+ * The flat C ABI of libcudnn_frontend_aot_attention.so: ahead-of-time compiled attention forward kernels. f16/bf16 KV
+ * runs on compute capability 12.x (RTX 50xx, RTX PRO Blackwell, DGX Spark); q8_0/q4_0 KV also on 8.x (Ampere, Ada).
+ * Nothing is compiled at run time. A plan fixes a shape class (head dim, dtypes, mask,
  * sink, GQA ratio); execute() takes the run-time extents, strides and pointers and only launches.
  *
  * Every struct starts with `struct_size` (set it to sizeof the struct); structs only ever grow at the end, and the
- * library reads only the fields the caller's struct_size covers. See docs/fe-oss-apis/aot_sm120_attention.md.
- * C++ callers use sm120_aot_attention.h, which dlopens the library.
+ * library reads only the fields the caller's struct_size covers. See docs/operations/attention/aot_attention.md.
+ * C++ callers use aot_attention.h, which dlopens the library.
  */
 
 #pragma once
@@ -23,14 +24,14 @@
 extern "C" {
 #endif
 
-#define CUDNN_FE_AOT_SM120_ABI_VERSION 1
+#define CUDNN_FE_AOT_ABI_VERSION 1
 
 typedef enum {
     CUDNN_FE_AOT_STATUS_SUCCESS             = 0,
     CUDNN_FE_AOT_STATUS_INVALID_ARGUMENT    = 1, /* null pointer, misalignment, bad stride or shape */
     CUDNN_FE_AOT_STATUS_NOT_SUPPORTED       = 2, /* no prebuilt kernel serves this shape class / knob set / extent */
     CUDNN_FE_AOT_STATUS_WORKSPACE_TOO_SMALL = 3,
-    CUDNN_FE_AOT_STATUS_ARCH_MISMATCH       = 4, /* the device is not compute capability 12.0 */
+    CUDNN_FE_AOT_STATUS_ARCH_MISMATCH       = 4, /* the library has no kernel for this device (f16/bf16 KV: 12.x) */
     CUDNN_FE_AOT_STATUS_CUDA_ERROR          = 5, /* a module load or launch returned a CUDA error */
     CUDNN_FE_AOT_STATUS_LIBRARY_NOT_LOADED  = 6, /* C++ loader only: dlopen / dlsym failed */
     CUDNN_FE_AOT_STATUS_ABI_MISMATCH = 7, /* C++ loader only: the library's ABI version is older than this header's */
@@ -98,61 +99,59 @@ typedef struct {
 typedef struct cudnn_fe_aot_sdpa_plan_s cudnn_fe_aot_sdpa_plan_t;
 
 uint32_t
-cudnn_fe_aot_sm120_abi_version(void);
+cudnn_fe_aot_abi_version(void);
 /* "<FE commit> cutlass-dsl <version> <n> prefill kernels ..." */
 const char*
-cudnn_fe_aot_sm120_build_info(void);
+cudnn_fe_aot_build_info(void);
 
 /*
  * Builds a plan on `device` (-1: the current device). Loads every kernel module the plan can launch, so execute()
  * never loads code. `knobs` (may be NULL) pins one FROST knob set instead of the built-in selection table.
  */
 cudnn_fe_aot_status_t
-cudnn_fe_aot_sm120_sdpa_plan_create(const cudnn_fe_aot_sdpa_desc_t* desc,
-                                    const cudnn_fe_aot_sdpa_knobs_t* knobs,
-                                    int device,
-                                    cudnn_fe_aot_sdpa_plan_t** plan);
+cudnn_fe_aot_sdpa_plan_create(const cudnn_fe_aot_sdpa_desc_t* desc,
+                              const cudnn_fe_aot_sdpa_knobs_t* knobs,
+                              int device,
+                              cudnn_fe_aot_sdpa_plan_t** plan);
 void
-cudnn_fe_aot_sm120_sdpa_plan_destroy(cudnn_fe_aot_sdpa_plan_t* plan);
+cudnn_fe_aot_sdpa_plan_destroy(cudnn_fe_aot_sdpa_plan_t* plan);
 
 /* Device workspace execute() needs for these extents (pointers are not read). 256-byte alignment. */
 cudnn_fe_aot_status_t
-cudnn_fe_aot_sm120_sdpa_workspace_size(const cudnn_fe_aot_sdpa_plan_t* plan,
-                                       const cudnn_fe_aot_sdpa_args_t* args,
-                                       size_t* bytes);
+cudnn_fe_aot_sdpa_workspace_size(const cudnn_fe_aot_sdpa_plan_t* plan,
+                                 const cudnn_fe_aot_sdpa_args_t* args,
+                                 size_t* bytes);
 
 /*
  * Launches on `stream`: no allocation, no synchronization, no code loading; capturable in a CUDA graph and safe to call
  * concurrently from several threads / streams (each call with its own workspace).
  */
 cudnn_fe_aot_status_t
-cudnn_fe_aot_sm120_sdpa_execute(const cudnn_fe_aot_sdpa_plan_t* plan,
-                                const cudnn_fe_aot_sdpa_args_t* args,
-                                void* workspace,
-                                size_t workspace_size,
-                                cudaStream_t stream);
+cudnn_fe_aot_sdpa_execute(const cudnn_fe_aot_sdpa_plan_t* plan,
+                          const cudnn_fe_aot_sdpa_args_t* args,
+                          void* workspace,
+                          size_t workspace_size,
+                          cudaStream_t stream);
 
 /* What execute() would launch: the knob set (FROST plans) and main kernel name. Quantized plans require
  * bound pointer values to report the alignment-specific copy mode; device memory is never read. */
 cudnn_fe_aot_status_t
-cudnn_fe_aot_sm120_sdpa_query(const cudnn_fe_aot_sdpa_plan_t* plan,
-                              const cudnn_fe_aot_sdpa_args_t* args,
-                              cudnn_fe_aot_sdpa_knobs_t* knobs,
-                              const char** kernel_name);
+cudnn_fe_aot_sdpa_query(const cudnn_fe_aot_sdpa_plan_t* plan,
+                        const cudnn_fe_aot_sdpa_args_t* args,
+                        cudnn_fe_aot_sdpa_knobs_t* knobs,
+                        const char** kernel_name);
 
 /* The compiled knob sets that serve a shape class (to tune over: build one plan per set). */
 int32_t
-cudnn_fe_aot_sm120_sdpa_num_knob_sets(const cudnn_fe_aot_sdpa_desc_t* desc);
+cudnn_fe_aot_sdpa_num_knob_sets(const cudnn_fe_aot_sdpa_desc_t* desc);
 cudnn_fe_aot_status_t
-cudnn_fe_aot_sm120_sdpa_get_knob_set(const cudnn_fe_aot_sdpa_desc_t* desc,
-                                     int32_t index,
-                                     cudnn_fe_aot_sdpa_knobs_t* knobs);
+cudnn_fe_aot_sdpa_get_knob_set(const cudnn_fe_aot_sdpa_desc_t* desc, int32_t index, cudnn_fe_aot_sdpa_knobs_t* knobs);
 
 const char*
-cudnn_fe_aot_sm120_status_string(cudnn_fe_aot_status_t status);
+cudnn_fe_aot_status_string(cudnn_fe_aot_status_t status);
 /* The reason for this thread's last non-success status ("" if none). */
 const char*
-cudnn_fe_aot_sm120_last_error(void);
+cudnn_fe_aot_last_error(void);
 
 #ifdef __cplusplus
 }
