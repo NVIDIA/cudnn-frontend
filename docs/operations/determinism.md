@@ -244,9 +244,13 @@ a row alone and inside a batch under the entry's own picks.
   additional SM103 byte-parity coverage. Runtime-head reuse of compiled code
   and independent CUDA Graph replays on two streams with separate workspaces
   are also checked against the unsplit backward path on SM103, including H96
-  with BF16/log gates and FP32 states. This additional workspace regression
-  has not been rerun on SM100 or SM107; their earlier determinism coverage
-  remains recorded in the test report.
+  with BF16/log gates and FP32 states (two/four-wave backward). Forward state
+  waves and eight-wave backward have additional SM103 byte-parity coverage
+  for grouped heads, rectangular forward states, public checkpoints and
+  changed-prefix graph replay. Their automatic policy may retain more storage
+  to protect parallelism; it is not a hard workspace cap. These additional
+  workspace regressions have not been rerun on SM100 or SM107; their earlier
+  determinism coverage remains recorded in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

@@ -28,19 +28,33 @@ _KDA_CHECKPOINT_WAVE_BYTES = 5 * 1024**3
 
 
 def _checkpoint_head_divisor(heads: int, checkpoint_bytes: int, num_pieces: int, num_sm: int) -> int:
-    """Limit checkpoint storage with three bounded codegen variants.
+    """Limit private state/checkpoint storage with four bounded codegen variants.
 
     Each wave retains a complete recurrence per head. Avoid further splitting
     a wave below half the SM count: a few long sequences need their head-level
-    parallelism. The storage budget is a preference, not an allocation limit.
+    parallelism. Eight waves additionally require at least four tasks per SM
+    per wave to amortize repeated scheduling and ragged tails. The storage
+    budget is a preference, not an allocation limit.
     """
     selected = 1
-    for divisor in (2, 4):
+    for divisor in (2, 4, 8):
         if checkpoint_bytes <= selected * _KDA_CHECKPOINT_WAVE_BYTES:
             break
-        if heads % divisor == 0 and num_pieces * heads // divisor >= max(1, num_sm // 2):
+        minimum_tasks = 4 * num_sm if divisor == 8 else max(1, num_sm // 2)
+        if heads % divisor == 0 and num_pieces * heads // divisor >= minimum_tasks:
             selected = divisor
     return selected
+
+
+def _forward_head_divisor(heads: int, state_bytes: int, num_pieces: int, num_sm: int) -> int:
+    """Use at most two forward waves to reuse H/M/X without repeated short queues.
+
+    Forward states precede allocation of the input gradients in training.
+    Halving a large arena can remove that phase's peak without paying the
+    scheduling cost of the deeper checkpoint partition used by backward.
+    This remains a shape-only preference, not a whole-layer memory cap.
+    """
+    return min(2, _checkpoint_head_divisor(heads, state_bytes, num_pieces, num_sm))
 
 
 def build_kda(graph):
@@ -241,6 +255,11 @@ class CompiledKda:
         regions = []
         if self.chain:
             self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
+            state_bytes = self.num_pieces * HO * (2 * V * K + K * K) * 4
+            self.state_head_divisor = _forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm)
+            state_heads = HO // self.state_head_divisor
+            if self.state_head_divisor > 1:
+                regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
             off_scheduler = layout.add(24)
@@ -260,9 +279,9 @@ class CompiledKda:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
-                ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
+                ("state_h", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", (self.num_pieces, state_heads, V, K)),
+                ("state_m", layout.add(self.num_pieces * state_heads * K * K * 4), "float32", (self.num_pieces, state_heads, K, K)),
+                ("state_x", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", (self.num_pieces, state_heads, V, K)),
             ]
             from .kernel import kda_summary_f16 as summary_module
 
@@ -449,8 +468,9 @@ class CompiledKda:
 
     def run_chain(self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
         """Chain prologue, fused H and M summaries, fp32 state chain seeded with initial_state, prefill over the pieces seeded
-        with X, all four launched from one compiled host (kernel/kda_chain_forward_f16.py); the checkpoint series keeps its
-        unsplit layout."""
+        with X, launched from one compiled host (kernel/kda_chain_forward_f16.py). Independent-head waves reuse
+        private H/M/X storage after each prefill completes; caller seeds, final states and checkpoint series keep their
+        unsplit layouts and arithmetic. The immutable piece geometry is shared by all waves."""
         state_h = region["state_h"]
         buffers = dict(
             q=q,
@@ -483,6 +503,7 @@ class CompiledKda:
             final_state=final_state,
             final_indices=state_indices,
             checkpoints=state_checkpoints if self.has_state_checkpoints and self.checkpoint else None,
+            state_wave_counts=region.get("state_wave_counts"),
         )
         checkpoint = self.checkpoint if self.has_state_checkpoints else 0
         if self.chain_launch is None:
@@ -503,6 +524,7 @@ class CompiledKda:
                 checkpoint_every_n_tokens=checkpoint,
                 scale=self.scale,
                 chain_rows=self.chain_rows_per_cta(state_h.shape[2], state_h.shape[3], self.num_seqs, self.n_heads_out, self.num_sm),
+                state_head_divisor=self.state_head_divisor,
                 device=self.device,
                 num_sm=self.num_sm,
                 stream=stream,

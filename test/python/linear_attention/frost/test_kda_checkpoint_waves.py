@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
     [(torch.bfloat16, False, 64), (torch.bfloat16, True, 128), (torch.float16, False, 128), (torch.float16, True, 64)],
     ids=["bf16-log-d64", "bf16-safe-d128", "fp16-log-d128", "fp16-safe-d64"],
 )
-@pytest.mark.parametrize("divisor", [2, 4])
+@pytest.mark.parametrize("divisor", [2, 4, 8])
 @pytest.mark.parametrize("head_pattern", ["equal", "gqa", "gva"])
 @pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
 def test_checkpoint_waves_bitwise_and_capture(monkeypatch, dtype, safe, dim, divisor, head_pattern, state_waves):
@@ -32,19 +32,20 @@ def test_checkpoint_waves_bitwise_and_capture(monkeypatch, dtype, safe, dim, div
     if reason:
         pytest.skip(reason)
     monkeypatch.setattr(kda_engine, "_KDA_STATE_WAVE_BYTES", 0 if state_waves else 1024**3)
-    inputs = pack(sequences("kda", [0, 1, 15, 16, 17, 8193] + [33] * 31, dtype=dtype, heads=4, key_dim=dim, value_dim=dim))
+    heads = max(4, divisor)
+    inputs = pack(sequences("kda", [0, 1, 15, 16, 17, 8193] + [33] * 31, dtype=dtype, heads=heads, key_dim=dim, value_dim=dim))
     if head_pattern == "gqa":
-        inputs["q"] = inputs["q"][:, :2].contiguous()
-        inputs["k"] = inputs["k"][:, :2].contiguous()
+        inputs["q"] = inputs["q"][:, : heads // 2].contiguous()
+        inputs["k"] = inputs["k"][:, : heads // 2].contiguous()
     elif head_pattern == "gva":
-        inputs["v"] = inputs["v"][:, :2].contiguous()
+        inputs["v"] = inputs["v"][:, : heads // 2].contiguous()
     inputs["cu_seqlens"] = inputs.pop("cu")
     inputs["dO"] = inputs.pop("do")
     inputs["d_final_state"] = inputs.pop("dfs")
     inputs["g"].fill_(-4 if safe else -0.001)
     if safe:
-        inputs["a_log"] = torch.zeros(4, device="cuda")
-        inputs["dt_bias"] = torch.zeros(4, dim, device="cuda")
+        inputs["a_log"] = torch.zeros(heads, device="cuda")
+        inputs["dt_bias"] = torch.zeros(heads, dim, device="cuda")
     handle = cudnn.create_handle()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -94,11 +95,15 @@ def test_checkpoint_waves_bitwise_and_capture(monkeypatch, dtype, safe, dim, div
 def test_checkpoint_wave_capacity_policy():
     gib = 1024**3
     budget = kda_engine._KDA_CHECKPOINT_WAVE_BYTES
-    for heads in (1, 2, 3, 4, 8, 12, 16, 32, 64):
+    for heads in (1, 2, 3, 4, 8, 12, 16, 32, 64, 96, 128):
         for size in (0, budget, budget + 1, 2 * budget, 2 * budget + 1, 32 * gib):
             divisor = kda_engine._checkpoint_head_divisor(heads, size, 1024, 148)
-            assert divisor in (1, 2, 4)
+            assert divisor in (1, 2, 4, 8)
             assert heads % divisor == 0
+            if divisor == 8:
+                assert 1024 * heads // divisor >= 4 * 148
+            forward = kda_engine._forward_head_divisor(heads, size, 1024, 148)
+            assert forward in (1, 2) and heads % forward == 0
             assert divisor == 1 or size > (divisor // 2) * budget
     assert kda_engine._checkpoint_head_divisor(32, 2 * budget + 1, 16, 148) == 4
     assert kda_engine._checkpoint_head_divisor(4, 2 * budget + 1, 16, 148) == 1
@@ -143,7 +148,7 @@ def test_checkpoint_wave_compile_count(monkeypatch):
         cudnn.destroy_handle(handle)
 
 
-@pytest.mark.parametrize("divisor", [2, 4])
+@pytest.mark.parametrize("divisor", [2, 4, 8])
 @pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
 def test_checkpoint_wave_runtime_heads(monkeypatch, divisor, state_waves):
     """A compiled wave must use the current head count, including non-power-of-two counts."""
