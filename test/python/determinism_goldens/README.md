@@ -1679,13 +1679,13 @@ cases share their operands and their updated residual; the store and no-residual
 and 1.0).
 
 Strict check and the functional module, from a clean tree with the package, test and golden files of the branch's last commit that
-changes any of them (2026-11-13 UTC, the runtime above; the six golden files are unchanged since they were recorded).
+changes any of them (2026-11-14 UTC, the runtime above; the six golden files are unchanged since they were recorded).
 `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 61 passed, 0 skipped: `test_replay` 24,
 `test_replay_on_a_fresh_entry_and_fresh_operands` 6, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 6,
 `test_insertion_removal_and_reordering` 6, `test_duplicated_row_and_neighbour_isolation` 6, `test_inputs_are_unmodified` 1,
 `test_crosses_a_scheduling_wave` 2, `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 6.  `pytest <module>
-core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 179 passed, 1 skipped: the
-module 175 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 190 passed, 1 skipped: the
+module 186 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
 are required" -- one device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the
 symbol-prefix test 4 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 12 of
 12 cells (one kernel per call; grid `(rows, 1, 1)`, block `(640, 1, 1)`, 80 B of shared memory).  The module's case behind a
@@ -1694,11 +1694,18 @@ step equal to the plain step, behind its positive control: a dependent without a
 eager launches and 4 of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.
 The module's overflow case (`test_rows_whose_sum_of_squares_overflows_normalize_to_zeros`: a finite row whose sum of squares exceeds
 the largest fp32 value writes signed zeros, the signed zero's codes and zero block scales, and its neighbours keep their bytes) is one
-of the 175.
+of the 186.  So are the eleven cases of an operand that overlaps an entry-owned output (an output the call does not pass): ten on the
+host with the launch intercepted (`test_declines_an_operand_that_overlaps_an_entry_owned_output`: six declines -- among them a tensor
+an earlier call returned, passed back as the residual -- and four controls that stay served) and one on the device
+(`test_returned_output_as_the_residual_is_declined_before_the_launch`: the declined call leaves the tensor's bytes as they were, and
+with a caller-owned `out` the same residual is served and `out` holds the bytes of a call on separate tensors).  The same command with
+`<suite>` added, on an x86 host with a cc 8.0 device (every device case skips): 112 passed, 140 skipped.
 
 The records of the next three paragraphs (the CUDA 12.9 flavour, CuTe DSL 4.8.1, the cold compile) are from an earlier tree: the
-functional module had one case fewer there (the overflow case did not exist), it did not reset its captured CUDA graphs, and the
-package differed from this tree's in docstrings and in the text of two decline messages only.
+functional module had twelve cases fewer there (the overflow case and the eleven overlap cases did not exist), it did not reset its
+captured CUDA graphs, and the package differed from this tree's in docstrings, in the text of two decline messages, in the entry's
+overlap check of the outputs a call does not pass, and in one line of the kernel module that binds a name (the kernel's renderings
+are byte-identical) only.
 
 CUDA 12.9 compiler flavour on the same part and runtime (2026-11-13 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
 libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL
