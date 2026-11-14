@@ -239,6 +239,12 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Cache-key decorators preserve `None`.** `template_key()` returns `None`
+  when a specialization cannot be identified safely. Appending a suffix must
+  leave it uncacheable; formatting it as a string lets unrelated kernels share
+  the first compiled object even with the disk cache disabled. Detector:
+  `test_uncacheable_fp8_hosts_do_not_reuse_another_kernel` in the SDPA API
+  contract suite runs through the real in-process memo with compilation mocked.
 - **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
   when compiling storage-free declarations; compile and execute under that device,
   and reject differently placed bindings before lowering pointers. An outer
@@ -353,6 +359,13 @@ the kernel that reads it).
   monkeypatch `torch.cuda.ExternalStream` to raise and drive the execute path
   with handle 0 (`test_hopper_marshal_stream.py`).
 
+- **Restore caller device state after native context binding, including errors.**
+  Scope `ensure_current_context` and the native call with the shared
+  `device_context(x.device)`, and select `current_stream(x.device)` explicitly.
+  A two-GPU regression test should put operands on one GPU and make the other
+  current, check the binding stream before launch, and verify device/stream
+  restoration after both successful calls and injected native exceptions.
+
 SDPA-specific hard rules (cited as Rule S1, S2, ...) live in
 [sdpa/AGENTS.md](sdpa/AGENTS.md) — read it before touching anything under
 `python/cudnn/sdpa/`.
@@ -441,6 +454,8 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
+  `cudnn._jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
+  the JAX dependency group and runtime guard enforce this higher floor.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
   `cp.async.cg.shared.global.L2::cache_hint` with a `createpolicy` register (the paged decode
@@ -1220,6 +1235,18 @@ reject without changing the selected reduction mode.
 ## The public function contract
 
 Public functions (`cudnn.ops.<op>_<direction>(...)` / `cudnn.ops.<op>_<direction>_jax(...)`, see `docs/operations/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
+
+JAX tracers do not reveal eventual buffer placement. A default device can supply
+tuning properties only when the resulting launch and scratch sizes remain valid
+on every supported execution device. Pin the compiler architecture explicitly and
+query shared-memory limits for the build device; unrelated visible GPUs must not
+affect eligibility. Process count likewise does not constrain independent local
+kernel calls; global-array partitioning is a separate contract. Cache launchers
+by the full configuration, including device.
+Select an appropriate `jax.default_device` in architecture-specific tests without
+hiding other GPUs. Cover tracing with unrelated hardware properties and reuse
+jitted functions on non-default devices with changed inputs and gradients (see
+`test/python/norm/jax/test_norm_jax.py`).
 
 ## Adding a new frontend-only API — required checklist
 

@@ -1713,7 +1713,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "dead_subtile_quiet",
         "bias_max_form",
         "softmax_wgs",
+        "swap_ab",
     ], params[extension_start:]
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["swap_ab"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["decode_q_tile_max"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["use_pdl"].default is False
@@ -8915,3 +8917,15 @@ class TestNativeD64Paged:
     from native_d64_paged_thd_determinism import test_thd_split_batch_and_golden as _thd_split_determinism
 
     test_thd_split_determinism = staticmethod(_thd_split_determinism)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_rubin
+class TestSplitCombineZeroWeight:
+    """The fixed-order combine excludes zero-weight payloads before multiplication."""
+
+    import split_combine_zero_weight_checks as _checks
+
+    test_partial_and_chain = staticmethod(_checks.test_zero_weight_partial_and_chain_are_excluded)
+    test_replay_and_batch_invariance = staticmethod(_checks.test_zero_weight_replay_and_batch_invariance)

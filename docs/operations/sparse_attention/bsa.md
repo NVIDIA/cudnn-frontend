@@ -402,6 +402,50 @@ comparison; it records the imported source, input hashes and individual CUDA
 Event samples. Numerical tests, sanitizer checks and measurements on each
 target GPU are required before drawing performance conclusions.
 
+### Prepared backward metadata (SM90 blk64)
+
+On SM90 with `sparse_block_size=64` the backward's metadata kernels (the
+bucketed K-to-Q CSR build and, on the paired-KV path, the pair bitsets,
+matching, refinement and partitioned CSR; about 0.33 ms and ten launches on
+a 255K-token production mask) depend on the sparse metadata and the sequence
+lengths only, never on `q`, `k`, `v` or `dout`. `block_sparse_attention_prepare_backward`
+runs them once and returns a `BsaBackwardMetadata`; a backward that takes it
+through `metadata=` launches only the preprocess, the main kernel and the
+dK/dV/dQ conversions (plus, on the paired-KV path, a copy of the object's small
+per-call dK/dV arrival bookkeeping), so a mask that serves several backward passes (every
+layer of a training step, or the backward of the forward that has just been
+launched) pays for its metadata once, off the backward's critical path.
+
+```python
+from cudnn.ops import block_sparse_attention_backward, block_sparse_attention_prepare_backward
+
+# Metadata as for the backward; the sequence lengths size the CSR. Runs on the current stream, never synchronizes.
+prepared = block_sparse_attention_prepare_backward(
+    q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, seqlen_q=q.shape[2], seqlen_k=k.shape[2], sparse_block_size=64
+)
+for layer in layers:  # every backward over this mask skips the metadata kernels
+    dq, dk, dv = block_sparse_attention_backward(do, q, k, v, o, lse, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, sparse_block_size=64, metadata=prepared)
+```
+
+The positional arguments of `block_sparse_attention_prepare_backward` have the
+backward's meaning; `bucket_size_blocks` is fixed when the object is built
+(`None` selects the SM90 default) and a backward may pass the same value or
+`None`. The object keeps the metadata tensors alive and remembers their
+storage address, shape, strides, dtype, device and in-place version counter:
+a backward that passes it with other metadata tensors, with the same tensors
+after an in-place change, with another batch, head count or sequence length,
+or with another `bucket_size_blocks` raises `ValueError` instead of walking a
+stale pattern. Rebuild the object after changing the metadata. The prepare
+call issues kernels on the current stream of the metadata's device and does
+not synchronize the host, so it can run on a side stream (for example right
+after the forward launch) with the usual event ordering before the backward;
+the backward records the object's tensors on its own stream when it consumes
+them, so the object may be released as soon as the backward call returns,
+even when it was built on another stream. Both the default backward and the
+prepared one can be captured into a CUDA graph. `metadata=` is exclusive with
+`kpage=` (a `KPageLayout` already holds its metadata) and is not accepted by
+the SM100/SM110 backward or by `sparse_block_size=128`.
+
 Backward defaults to blk64 on SM90 and blk128 on SM100/SM103. Pass the same
 explicit `sparse_block_size` used by forward when selecting the Blackwell blk64
 path. SM100/SM103 blk128 backward accepts one-dimensional `block_sizes`
@@ -624,6 +668,10 @@ blk128 supports empty rows and explicit split-KV; its default remains unsplit.
 | SM100/SM103 | 128 | BF16 | 64 or 128 | MHA |
 | SM100/SM103 | 128, `kpage=True` | BF16 | 128 | MHA, GQA, MQA; `block_sizes` supported |
 | SM90 | 128, `kpage=True` | BF16 | 128 | MHA; `block_sizes` supported |
+
+On SM90 with `sparse_block_size=64` the backward also accepts a prepared `BsaBackwardMetadata`
+through `metadata=` (see [Prepared backward metadata](#prepared-backward-metadata-sm90-blk64));
+every other path rejects the argument.
 
 Backward is not implemented for SM120. It requires equal QK/V dimensions and,
 except on the SM100/SM103 KPage path, does not currently support GQA/MQA.

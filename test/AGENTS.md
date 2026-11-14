@@ -35,6 +35,18 @@ Remap global Top-K IDs when batches move and preserve negative padding.
 Keep API-by-dtype/GPU support in [the status page](../docs/operations/determinism.md).
 Put test counts, commands, runtimes, and failure diagnostics in
 [the test report](python/determinism_goldens/README.md), not the status page.
+When widening SDPA eligibility, also run the host contract
+`sdpa/frost/test_heuristic_geometry.py` and
+`sdpa/frost/test_sdpa_graph_analyzer.py` suites. Older negative assertions in
+these files can contradict the new contract even when the feature's GPU tests
+pass. Preserve negative coverage at a still-unsupported boundary; D64 packed
+THD now accepts unsplit N128, while N64 still declines.
+Use the normal test environment: some analyzer cases also validate the C++
+graph and require a CUDA device and backend handle.
+When appending an SDPA adapter constructor argument, update every signature-tail
+pin, including the API-contract, score-stats, SM107 and bias-max suites. Search
+for the previous trailing parameter in `test/python/sdpa/frost`; a new feature's
+GPU tests do not exercise all of these host-only append-order assertions.
 When a CUDA-graph check can select a backend plan, supply an explicit cuDNN handle and bind it to the same
 capture stream used by Torch. A Python-engine path may follow Torch's current stream while a backend handle
 stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
@@ -187,6 +199,12 @@ root (`test/python`); pytest's own `sys.path` changes are not inherited. Check
 the child from a temporary working directory without that root on `PYTHONPATH`.
 The delayed-MMA FP8 dual-KV probe needs both this root and `sdpa/frost`.
 
+Compiler subprocesses must import the same `cudnn` package as their parent.
+Derive its package root from `cudnn.__file__`, then check the child import path.
+CI may run source tests against an installed wheel while the source checkout
+contains no native extension; prepending `<checkout>/python` then fails before
+compilation. The native FP8 decode score-release probe exercises this contract.
+
 
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its
@@ -241,6 +259,11 @@ new flavor tests. Keep the routing assertion, numerical comparisons and shape
 unchanged. The SM107 GPT-OSS D64 case in
 `test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
 prefill; a short query alone does not imply the D128 decode template.
+
+When a kernel gains an architecture-specific branch, update cross-architecture
+source-parity tests with exact, counted replacements for the declared delta.
+Do not omit an arbitrary AST branch: pin its initialization and fences, and
+check that changing either the delta or a shared barrier still fails the test.
 
 ### Layout
 
@@ -358,6 +381,12 @@ prefill; a short query alone does not imply the D128 decode template.
 - **A harness mirror of an engine's admission rule includes the engine's DSL target gate.** `sdpa/mxfp8.py::block_scaled_o_draw` admits a block-scaled O draw where the FROST MXFP8 row would serve it, and an admitted draw the row then declines FAILS the test (the `sf_o` output has no backend lowering), so the mirror must agree with the row on every gate. When the cc 10.7 row became a default candidate (PR #1478) the mirror asked the manifest but not `cutedsl_arch_requirement_error`: on a cc 10.7 host with the public CuTe DSL 4.7.0 (no `sm_107a`) the row declines through that gate while the mirror admitted the draw, so every flag-less d128 block-scaled draw of `test_sdpa_mxfp8_fwd_L0` would have failed where develop ran the backend on the folded draw (verified host-side with the target modelled absent). Model the target on both sides: `sdpa/test_mxfp8_block_scaled_fold.py::test_cc107_default_admission_needs_the_sm_107a_dsl_target` pins the fold with `buffers._cutedsl_has_sm107` patched absent and present.
 - **A version-bounded backend workaround ships with the detector that re-measures it.** A constant such as `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN` is a measurement, and nothing in an ordinary test run would ever notice the backend getting fixed (the guard keeps it from being asked). `sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0` runs the trigger matrix one interpreter per contract with the guard disabled in the child (the constant set to 0 there; a crash is the child's rc 139, never the runner's) plus a control contract the backend is known to plan, and fails with the version to record once the installed backend plans the matrix cleanly -- or, above a recorded version, once it crashes again. Spawn the children with the test module's own directory and `test/python` on their `sys.path`; they inherit neither pytest's path setup nor its fixtures.
 - Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
+When an attention oracle is FP64 with tolerances, it is not an exact-byte
+`StressCase.reference`. Validate both cold launches used by the helper against
+that oracle, then retain exact byte comparisons for all warm/poisoned launches.
+A check on an earlier launch alone does not validate the actual cold baseline.
+`TestD64ThdPackedUnsplit.test_warm_refill` keeps these two checks distinct.
+
 - **Poison unused attention storage.** Use independent indices; poison unused KV with NaN, infinities, and large finite values. Require unchanged valid gradients and zero unused gradients in eager execution and graph replay. Check `+inf` sinks against a finite dominant-sink control.
 - **Pair very negative LSE with large finite dO.** Exponent clamps can still overflow in dS. Use an analytic reference and confirm the test rejects masking after the product.
 - **FP8 attention references must mirror intermediate probability rounding.** Full-precision softmax times V is a different function from the kernel's FP8 P product and can exceed a fixed bound, especially with an amplified V tail. Use the shared `sdpa.fp8_ref.compute_ref` with the selected kernel's P scale and rescale threshold; keep output tolerances unchanged. `test_paged_adapter_fp8_compile_key_canonicalizes_the_logical_kv_maximum` exercises this while checking 96/128/96 artifact reuse.
@@ -542,6 +571,13 @@ FP8 D128 cases and checks both prepared and standalone graph execution.
 Default-provider passes alone cannot qualify an advertised native path.
 
 ### CUDA Graph test lifetimes
+
+Apply `torch.cuda.set_sync_debug_mode("error")` around the execute body,
+inside an already entered CUDA Graph context. PyTorch capture setup itself can
+synchronize on newer versions; auditing `capture_begin()` can raise after
+capture starts and poison subsequent tests. Restore the prior mode before the
+context exits. Native FP8 decode graph tests cover eager and captured execution
+with this boundary.
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a
 `finally` block or context manager. Python reference cycles can defer its CUDA

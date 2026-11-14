@@ -33,7 +33,7 @@ PROVIDERS = {
             "fe.gdn_decode_fused",
             "fe-cublas",
             serves="rows 1-65,535",
-            measured=("cc10.0: 1 row",),
+            measured=("cc 10.0, 1 row",),
             band="gdn_step",
             batch_invariant=("cc10.0", "cc10.3", "cc12.0"),
         ),
@@ -100,6 +100,21 @@ FIRST_LAUNCH_RESERVE = {"cc12.x": 3 * GIB}
 #: logit.  It is declared for the reduced seeded model (measured by this sample: 1.0 unit with two layers, 1.2 with four, 1.4
 #: with eight); a real checkpoint declares its own
 LOGITS_BAND_UNITS = 4.0
+#: the logits band for a checkpoint read from local disk (the published depth, trained weights): none.  The token line of
+#: such a run is REPORTED and gated on finite logits only (``tie_out.token_check`` with ``band_units=None``).
+#: The model quantises its MLP inputs to 4 bits per element and its projection inputs to 8, so a difference of one bf16
+#: rounding in a multiply becomes a different code in the next quantiser, 64 layers deep.  Measured by this sample on the
+#: published 27B-class checkpoint: two REFERENCE stacks that differ only in their accumulation precision (fp64 against IEEE
+#: fp32) were up to 52 units (13.0 logits) apart over 80 steps and chose another greedy token at 13 of them; the provider
+#: stack was up to 54 units (13.5 logits) from the fp64 reference over the same steps.  In three 16-step windows of the
+#: kind a run checks, the provider stack was 8.7 to 10.3 logits from the reference and a second reference 7.5 to 11.4.
+#: No band separates a correct stack from a failed one here.  In bf16 units of the largest logit a band is 8, 16 or 32
+#: logits wide by that logit's binade, and the distance of two correct stacks does not follow the binade: 128 units --
+#: beyond which a stack that returns zeros passes -- are 8 logits where a window's largest logit is below 16, less than
+#: two correct stacks were apart.  And a greedy token is decidable only where its margin exceeds twice the band, which no
+#: step of those runs reached.  What verifies a provider on a checkpoint is the per-block check, teacher-forced; the run
+#: prints the distance, the count of equal greedy tokens and the same for a second reference, to be read side by side
+CHECKPOINT_LOGITS_BAND_UNITS = None
 
 
 def readme_table(calls: dict) -> str:

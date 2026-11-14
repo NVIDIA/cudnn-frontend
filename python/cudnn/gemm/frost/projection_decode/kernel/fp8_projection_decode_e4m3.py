@@ -101,10 +101,11 @@ SMEM BUFFER TABLE (allocation order = ``smem_bytes`` of the config, which the la
 
 TENSOR MEMORY.  Warp 2 allocates ``TMEM_COLS`` columns at entry (the accumulator is one column per token row; 32 is the allocation
 granule and the default at every token tile) and deallocates the same constant after the rendezvous.  An SM has 512 columns; the config
-declines a form whose shared-memory co-residency times ``TMEM_COLS`` exceeds them.  By default the epilogue releases the columns right
-after ``tcgen05.ld`` + ``tcgen05.wait``, so the deallocation overlaps rank 0's wait for its peers while the loaded registers are
-still unread; ``HOLD_TMEM`` releases them only after the last use of those registers, at the price of a deallocation that starts
-after the output store.
+declines a form whose shared-memory co-residency times ``TMEM_COLS`` exceeds them.  With ``HOLD_TMEM`` off (a form's default and the
+pick of the one-wave classes) the epilogue releases the columns right after ``tcgen05.ld`` + ``tcgen05.wait``, so the deallocation
+overlaps rank 0's wait for its peers while the loaded registers are still unread; ``HOLD_TMEM`` (the pick of every other class, whose
+grids can take more than one wave, so that the freed columns can go to another CTA of the same launch) releases them only after the
+last use of those registers, at the price of a deallocation that starts after the output store.
 
 PDL SITES.  ``PDL``: the launch carries the programmatic-stream-serialization attribute; warp 1 issues ``griddepcontrol.wait`` as its
 first instruction, i.e. BEFORE every read of ``activation``.  Above that wait run the barrier inits, the cluster sync, warp 2's
@@ -118,6 +119,12 @@ reads ``out``; a consumer launched without the attribute is unaffected.  When a 
 precede this CTA's own ``tcgen05.alloc``: a consumer that allocates tensor memory above its wait must fit beside this kernel's columns
 (at most ``SMEM_RESIDENT x TMEM_COLS`` per SM, 96 at the default forms) -- with the default 32 columns two instances of this kernel
 chain by construction.
+
+THE SYMBOL.  ``cudnn_kernel_frost_fp8_projection_decode_<text>_...``: the DSL appends the text of the kernel object and of the operand
+types to the kernel's name and cuts the result.  ``<text>`` is the rendering's ``Cfg.SYMBOL_TEXT`` (geometry, split, rows, weight
+tile, stages, token tile, tensor-memory columns and the four switches) for every class but those of ``SHAPE_SYMBOL_CLASSES``, whose
+symbol names the weight's shape only -- there every rendering of one geometry shares a symbol, and the form is what the host entry's
+``form_for`` states.
 """
 
 from __future__ import annotations
@@ -229,6 +236,13 @@ class Fp8ProjectionDecodeKernel:
             )
         self.mailbox_elements = cfg.MAILBOX_ELEMENTS
         self.expected_transaction_bytes = cfg.REDUCE_TX_BYTES
+
+    def __str__(self) -> str:
+        """The text the DSL writes into the kernel symbol for this object.  A kernel symbol is the kernel's name followed by the text of
+        its arguments -- this object first -- cut at a fixed length; with the rendering's ``SYMBOL_TEXT`` here the symbol names the
+        rendering in its first 100 characters.  A class whose ``SYMBOL_TEXT`` is empty keeps the default text of an object, i.e. the
+        symbol its renderings were validated with."""
+        return self.cfg.SYMBOL_TEXT or object.__repr__(self)
 
     def _check_mmas_per_k_tile(self, mma_inst_tile_k: int) -> int:
         """Trace-time: one K tile is ``MMAS_PER_K_TILE`` MMA instructions (the accumulation order the bytes are a function of)."""

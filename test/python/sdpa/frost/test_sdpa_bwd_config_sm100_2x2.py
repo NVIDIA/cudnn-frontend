@@ -403,7 +403,7 @@ def test_kernel_source_pins():
     assert len(tiles) == 6, len(tiles)
     assert all("desc_version=DESC_VERSION" in t for t in tiles)
     assert src.count("DESC_VERSION: int = desc_version_2x2(CFG)") == 1
-    assert src.count("@cute.kernel") == 2 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
+    assert src.count("@cute.kernel") == 3 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
     assert "Q_SLOT, DO_SLOT, K_SLOT, V_SLOT = 0, 1, 2, 3" in src and "_THD_SEQ_ORD = 2" in src
     for gone in ("cp_async_bulk_shared_cluster_shared_cta", "tcgen05_cp", "mb_op_utccp_done", "mb_s_xfer", "barrier_id=8", "cross_sg_peer", "mma_ts("):
         assert gone not in src, gone

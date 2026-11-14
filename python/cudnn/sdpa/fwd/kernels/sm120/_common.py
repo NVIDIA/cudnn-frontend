@@ -195,6 +195,7 @@ def load_paged_half_tile(
     head_tile: cutlass.Constexpr[int],
     chunk_elems: cutlass.Constexpr[int],
     producer_warps: cutlass.Constexpr[int] = 1,
+    async_publication: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Fill one paged half tile, then publish every producer arrival."""
     copy_paged_half_tile(
@@ -205,7 +206,8 @@ def load_paged_half_tile(
         prims.mbarrier_arrive(mbar)
     else:
         prims.cp_async_commit_group()
-        prims.cp_async_wait_group(0)
+        if cutlass.const_expr(not async_publication):
+            prims.cp_async_wait_group(0)
         # Async-tracked arrivals publish cp.async writes; .noinc accounts
         # for all producer lanes counted by barrier initialization/rearm.
         prims.cp_async_mbarrier_arrive(mbar, noinc=True)

@@ -36,7 +36,7 @@ class ProviderRow:
     key: str  # "fe.gdn_decode_fused" | "cublas.bf16_dequantized" | ...: one of the closed list in providers.KEYS
     stack: Union[str, Tuple[str, ...]]  # "fe-cublas" | "native" | "reference" | "selectable" (only through --provider), or several
     serves: str  # what the entry admits, in rows
-    measured: Tuple[str, ...] = ()  # rows with a published record; elsewhere the table prints "served, not measured here"
+    measured: Tuple[str, ...] = ()  # where a published record of the entry exists (GPU class, rows); the table prints "none" otherwise
     fallback: str = ""  # non-empty for a reference chain or a dequantised copy: the reason printed in the table
     band: str = "same"  # the tie-out band against the reference block (tie_out.BANDS); never widened in place
     batch_invariant: Tuple[str, ...] = ()  # GPU classes on which "a sequence alone = the sequence in a batch" is a gate
@@ -177,41 +177,46 @@ class Plan(dict):
 
     def table(self) -> str:
         """The served-by table: decided before the load, printed before every run."""
-        head = ("block", "calls", "provider", "entry", "serves", "measured here")
+        head = ("block", "calls", "provider", "entry", "serves", "published record")  # of the entry: not a measurement of this run or GPU
         lines = [head]
         for name, block in self.items():
             row = self.rows[name]
             if row.fallback:
                 measured = f"fallback: {row.fallback}"
             else:
-                measured = "; ".join(row.measured) if row.measured else "served, not measured here"
+                measured = "; ".join(row.measured) if row.measured else "none"
             if not row.ci:
                 measured += "; unverified in CI"
             lines.append((name, self.calls.get(name, ""), block.provider, block.entry, row.serves, measured))
         widths = [max(len(line[i]) for line in lines) for i in range(len(head))]
-        text = [
-            f"served by (decided before the load from {self.source}; stack {self.stack}, {self.sequences} sequence{'s' if self.sequences > 1 else ''}, {self.facts.class_text})"
-        ]
+        run = f"stack {self.stack}, {self.sequences} sequence{'s' if self.sequences > 1 else ''}, {self.facts.class_text}"
+        text = [f"served by (decided before the load from {self.source}; {run})"]
         text += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in lines]
         text.append("  " + self.by_provider())
         if self.regime is not None:
-            text.append(f"  regime: {self.regime.name} ({self.regime.note})")
+            text.append(f"  declared regime: {self.regime.name} ({self.regime.note})")
         return "\n".join(text)
 
     def reserve_bytes(self) -> int:
         return sum(block.reserve_bytes() for block in self.values())
 
     def memory(self, need_bytes: int, what: str = "") -> str:
-        """The memory sentence; ``what`` names what the need covers when that is more than this plan's run.  Raises
-        ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free."""
+        """The memory sentence, in GiB (2^30 bytes); ``what`` names what the need covers when that is more than this plan's
+        run.  Raises ``NotImplementedError`` (a SKIP that names what to do) when the GPU has too little free, and says so when
+        the need exceeds what the GPU has in total: freeing memory cannot help there."""
         need = need_bytes + self.reserve_bytes()
-        free = self.facts.free_bytes
+        free, total = self.facts.free_bytes, self.facts.total_bytes
+        if total and need > total:
+            raise NotImplementedError(
+                f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; this GPU has {total / GIB:.1f} GiB in total: "
+                "the run does not fit on it (CUDA_VISIBLE_DEVICES selects another GPU)"
+            )
         if need > free:
             raise NotImplementedError(
-                f"stack {self.stack} needs about {need / GIB:.1f} GB on this GPU{what}; {free / GIB:.1f} GB are free: "
+                f"stack {self.stack} needs about {need / GIB:.1f} GiB on this GPU{what}; {free / GIB:.1f} GiB are free: "
                 "free memory on this GPU, or select another one with CUDA_VISIBLE_DEVICES"
             )
-        return f"this stack needs about {need / GIB:.1f} GB on this GPU{what}; {free / GIB:.1f} GB are free"
+        return f"this stack needs about {need / GIB:.1f} GiB on this GPU{what}; {free / GIB:.1f} GiB are free"
 
 
 def parse_overrides(pairs: Sequence[str]) -> Dict[str, str]:

@@ -2060,6 +2060,20 @@ def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
 
 
 @requires_rubin
+class TestDenseFp8SwapAB:
+    from sdpa.frost import native_fp8_dense_swap_ab as _dense
+
+    test_rebind_capture = staticmethod(_dense.test_rebind_capture)
+    test_public_choice = staticmethod(_dense.test_public_choice)
+    test_standalone_current_lengths_and_logbase = staticmethod(_dense.test_standalone_current_lengths_and_logbase)
+    test_domain = staticmethod(_dense.test_domain)
+    test_invalid_plan_then_recovery = staticmethod(_dense.test_invalid_plan_then_recovery)
+    test_replay_batch = staticmethod(_dense.test_replay_batch)
+    test_golden = staticmethod(_dense.test_golden)
+    test_warm_refill = staticmethod(_dense.test_warm_refill)
+
+
+@requires_rubin
 class TestNativeD128Fp8Cga1Split:
     """Single-CTA dense split coverage through the selected Rubin CI entry."""
 

@@ -22,6 +22,7 @@ DISTRIBUTION = "nvidia-cudnn-frontend"
 _LAZY = {
     "TextIO": (".text_io", "TextIO"),
     "TextStream": (".text_io", "TextStream"),
+    "load_messages": (".text_io", "load_messages"),
     "Checkpoint": (".weights", "Checkpoint"),
     "ScaledTensor": (".weights", "ScaledTensor"),
     "BlockScaledTensor": (".weights", "BlockScaledTensor"),
@@ -34,6 +35,7 @@ _LAZY = {
     "Session": (".loop", "Session"),
     "StopRule": (".loop", "StopRule"),
     "Report": (".timing", "Report"),
+    "Trace": (".timing", "Trace"),
     "GREEDY": (".sampling", "GREEDY"),
     "run_checks": (".tie_out", "run_checks"),
 }

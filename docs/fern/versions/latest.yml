@@ -9,6 +9,9 @@ navigation:
   - page: Samples
     path: ../../samples.mdx
     slug: samples
+  - page: Model Samples
+    path: ../../model-samples.mdx
+    slug: model-samples
   - link: Release Notes
     href: https://github.com/NVIDIA/cudnn-frontend/releases
   - section: API Reference
@@ -225,6 +228,9 @@ navigation:
         path: ../../operations/Normalizations.md
         slug: operations/Normalizations
         contents:
+          - page: LayerNorm and RMSNorm in JAX
+            path: ../../operations/normalizations/norm_jax.md
+            slug: norm_jax
           - page: RMSNorm + RHT + Amax (SM100)
             path: ../../operations/normalizations/rmsnorm_rht_amax.md
             slug: rmsnorm_rht_amax
