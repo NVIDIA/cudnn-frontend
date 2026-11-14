@@ -792,7 +792,11 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8))
+    name = engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8)
+    if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
+        # This fixture explicitly requests the two-CTA scalar-tail split body.
+        name = "sdpa_fwd_sm100_d256_lookahead"
+    _select_engine(g, name)
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})})
     g.select_plan(g.get_execution_plan_count() - 1)
