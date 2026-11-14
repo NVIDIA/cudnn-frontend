@@ -752,7 +752,7 @@ def test_split_kv_fp8_d192(splits, causal):
     from cudnn.frost.tile_dsl.constants import DTYPE_E4M3
 
     got, ref, amax_o = _fp8_family_split(
-        "sm100/prefill_d192_d128_fp8.py",
+        "sm100/d192_fp8_multi_q/kernel.py",
         DTYPE_E4M3,
         splits,
         2,

@@ -40,6 +40,7 @@ _OFFERED = {
     TWO_BY_TWO: 20522,
     "sdpa_fwd_sm100_d512_fp8_role_split": 20523,
     "sdpa_fwd_sm100_d256_fp8_single_q": 20524,
+    "sdpa_fwd_sm100_d192_fp8_multi_q": 20525,
 }
 _HALF_IDS = (20500, 20519, 20520, 20521, 20522)
 

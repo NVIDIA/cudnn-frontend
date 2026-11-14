@@ -1034,6 +1034,8 @@ Exact SM100/SM103 per-tensor FP8 D512/V512 recipes similarly move from 20513
 to the explicit role-split engine 20523, with physical `TILE_CGA_M=4` and
 a fixed two-CTA MMA group. Exact D256/V256 per-tensor FP8 recipes move to
 the single-Q engine 20524, with `TILE_CGA_M=1` and a one-CTA MMA group.
+Exact D192/V128 per-tensor FP8 recipes move to the multi-Q engine 20525,
+with matching physical-cluster/MMA widths of one or two CTAs.
 Dense head envelopes keep their legacy owner.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
 the compiled-kernel manifest protects binary reuse, not recipe eligibility.

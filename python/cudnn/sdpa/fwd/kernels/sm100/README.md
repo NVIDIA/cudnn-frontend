@@ -1,7 +1,7 @@
 # SM100 forward implementations
 
 Each migrated main implementation has a local owner directory. Half D256,
-exact half D512/D576 and per-tensor FP8 D256/D512 graph plans use explicit engines;
+exact half D512/D576 and per-tensor FP8 D192/D256/D512 graph plans use explicit engines;
 other SM100 implementations remain at their existing paths.
 
 ```text
@@ -32,6 +32,12 @@ sm100/
     host.py
     __init__.py
   d512_f16_contract.py  # immutable selection; full cluster vs fixed MMA pair
+  d192_fp8_multi_q/    # per-tensor FP8 D192/V128, one/two CTA variants
+    contract.py
+    config.py
+    kernel.py
+    host.py
+    __init__.py
   d256_fp8_single_q/    # per-tensor FP8 D256, one/two softmax WG variants
     contract.py
     config.py
@@ -66,11 +72,15 @@ The explicit D512 rows expose `TILE_CGA_M=4`, while D576 exposes `2`. Both
 lower to a fixed two-CTA MMA group. This translation is checked at compile time
 and does not change the legacy split-cost model's input geometry.
 
+The per-tensor D192 owner has a standalone configuration record; the shared
+root D192 factory remains for half/MXFP8 consumers. Neither implementation
+record inherits mutable defaults from the other.
+
 The per-tensor D256 owner keeps its own configuration record and factory.
 The legacy D256 record remains with its MXFP8 consumers, including wide MXFP8;
 neither path imports the other implementation's factory or validator.
 
 Kernel diagnostic identities retain their `prefill_d256_f16`, `decode_d256_f16`,
-`prefill_d256_fp8`, `prefill_d512_f16`, `prefill_d512_f16_2x2` and `prefill_d512_fp8` spellings; file basenames are not a
+`prefill_d192_d128_fp8`, `prefill_d256_fp8`, `prefill_d512_f16`, `prefill_d512_f16_2x2` and `prefill_d512_fp8` spellings; file basenames are not a
 capability API. Runtime capabilities are queried from
 the final selected plan's behavior notes.
