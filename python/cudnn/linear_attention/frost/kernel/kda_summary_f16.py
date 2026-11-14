@@ -1969,7 +1969,7 @@ def compute1_warp_group(
             if owns_final:
                 # ---- final state store: TMEM -> GMEM ---------------------------------
                 state_vw = 16 // (mState_out.element_type.width // 8)
-                state_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+                state_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o // cfg.state_head_divisor, value_dim, 0))).raw_ptr()
                 for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                     loaded = nvvm.tcgen05_ld(
                         "32x32b",
@@ -1988,7 +1988,7 @@ def compute1_warp_group(
 
                 # ---- final state store: TMEM -> GMEM ---------------------------------
                 state_vw = 16 // (mTransition.element_type.width // 8)
-                state_dst = (mTransition.iterator + mTransition.layout((batch_idx, head_o, key_dim, 0))).raw_ptr()
+                state_dst = (mTransition.iterator + mTransition.layout((batch_idx, head_o // cfg.state_head_divisor, key_dim, 0))).raw_ptr()
                 for key_block_start in cutlass.range_constexpr(0, cfg.d_k, 32):
                     loaded = nvvm.tcgen05_ld(
                         "32x32b",
@@ -2006,7 +2006,7 @@ def compute1_warp_group(
                             )
         else:
             h_vw = 16 // (mState_out.element_type.width // 8)
-            h_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o, value_dim, 0))).raw_ptr()
+            h_dst = (mState_out.iterator + mState_out.layout((batch_idx, head_o // cfg.state_head_divisor, value_dim, 0))).raw_ptr()
             if cutlass.const_expr(cfg.has_composed):
                 is_boundary = batch_idx == cutlass.Int32(0)
                 composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, value_dim, 0))).raw_ptr()
@@ -2038,13 +2038,13 @@ def compute1_warp_group(
                     if row_valid_h:
                         (h_dst + g * h_vw).store(h_zero, alignment=16)
             m_vw = 16 // (mTransition.element_type.width // 8)
-            m_dst = (mTransition.iterator + mTransition.layout((batch_idx, head_o, key_dim, 0))).raw_ptr()
+            m_dst = (mTransition.iterator + mTransition.layout((batch_idx, head_o // cfg.state_head_divisor, key_dim, 0))).raw_ptr()
             m_zero = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0).to(mTransition.element_type) for _ in range(m_vw)), mTransition.element_type)
             for g in cutlass.range_constexpr(cfg.d_k // m_vw):
                 if row_valid_m:
                     (m_dst + g * m_vw).store(m_zero, alignment=16)
             if row_valid_m:
-                mTransition[batch_idx, head_o, key_dim, key_dim] = cutlass.Float32(1.0).to(mTransition.element_type)
+                mTransition[batch_idx, head_o // cfg.state_head_divisor, key_dim, key_dim] = cutlass.Float32(1.0).to(mTransition.element_type)
         cum_chunk_base += num_chunks_tile
         tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
@@ -2555,6 +2555,7 @@ class KdaSummaryCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
     state_table: bool = True
     has_composed: bool = False
     scheduler_stages: int = CFG.SMEM_SCHEDULER_STAGES

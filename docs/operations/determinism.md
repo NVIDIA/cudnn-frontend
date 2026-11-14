@@ -237,7 +237,11 @@ a row alone and inside a batch under the entry's own picks.
   KDA's packed workspace uses a shape-only bound on the number of piece slots;
   it preserves the per-sequence split rule and arithmetic. Compact-workspace
   output, gradient and CP-summary byte parity is additionally checked on SM103
-  for BF16/FP16, including changed-length CUDA Graph replay. This additional
+  for BF16/FP16, including changed-length CUDA Graph replay. Large KDA backward
+  plans can also reuse checkpoint and owned-state storage across independent
+  head waves. This preserves each head's recurrence, FP32 state and reduction
+  order; BF16/FP16 grouped heads, rectangular states and external contexts have
+  additional SM103 byte-parity coverage. This additional
   workspace regression has not been rerun on SM100 or SM107; their earlier
   determinism coverage remains recorded in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism

@@ -339,6 +339,162 @@ Compatibility, docstring, compile-cache, CUDA Graph and fence audits pass.
 Changed-file pre-commit and syntax checks pass; Fern validation has zero
 errors (the unauthenticated redirect check is skipped).
 
+### KDA independent-head workspace reuse — B300, 2026-11-14
+
+This follow-up starts from `03ed4530337c3e9bd01565b493d99d66a1c6924d`,
+the compact-piece change described above. It targets the KDA layer's complete
+input/output/gradient/transport/workspace peak. The earlier complete KDA+CSA
+table is a different measurement and is not used for the below-20-GB claim.
+The published change is rebased onto develop
+`3fa2cfb38f6b278e1ab2de2eb26c40f2bfa3f560`, whose linear-attention sources
+are byte-identical to that measured baseline.
+
+A large backward plan partitions independent heads into two or four waves.
+Each wave keeps the original sequence pieces, BT16 recurrence and checkpoint
+cadence. Internal state/checkpoint head coordinates are compact; caller states,
+CP summaries, gradients and saved contexts retain their original layouts.
+Grouped-head and gate-parameter reductions keep their order after all waves.
+No dtype, precision default, numerical threshold or golden is changed.
+
+The H/G region is shared across their non-overlapping lifetimes. Once both
+state chains finish, the combined H/G+M arena holds the checkpoint series.
+X/dX remain disjoint and live until backward consumes them. Document-dense
+ranks can partition all owned states as well as checkpoints. This second mode
+is disabled with an external context. Caller/coarse checkpoints retain their
+full-head ABI. The original row tables remain immutable: wave counts use a
+separate two-element buffer because the original counts alias terminal row
+entries. Every regenerated queue row has exactly one writer. The main queues place
+pieces with at least 512 tokens (BT16) before shorter pieces, reducing the tail
+of the persistent schedule. A CTA prefix scan assigns disjoint destinations
+from the two ends of the queue. Partial rounds participate with zero counts;
+two blocking CTA barriers publish and retire the eight warp counts. Queue
+ordering changes no task identity, chunk bounds or floating-point operation.
+
+The shape-only policy has a 5 GiB checkpoint/state capacity preference and
+an occupancy guard. It is not a universal memory limit for every head size,
+external state or unbounded document count. The added compile-key combinations
+are (checkpoint divisor, state divisor) = (1,1), (2,1), (4,1), (2,2), (4,4).
+The compile-count detector requires exactly four new artifacts across three
+ragged capacities for the four nontrivial combinations. Warm prepared execution
+retains the existing stream/capture contract and adds no allocation or length
+readback.
+
+Qualification on B300, driver 580.173.02, Torch 2.12.1+cu130 and cuDNN 9.20.0:
+
+- **60 new non-stress tests pass**: 48 BF16/FP16 log/safe-gate cases across
+  equal/GQA/GVA heads, both divisors and both storage modes; two policy/cache
+  tests; two rectangular K/V cases, two external-context geometries, two
+  non-invariant chain cases, two queue identity/partition cases and two
+  standalone default state-chain ABI cases with CPU FP64 references.
+  They compare all input/state/parameter gradients, canaries, poisoned native
+  graph replay and changed input/length data at stable addresses.
+- **71 existing tests pass**, including 28 determinism/golden/reference cases,
+  the compact-piece regressions, and four GDN/GDN2 long-sequence checks
+  of the shared chain default. The standalone default tests also pass on the
+  unchanged parent. Existing numerical tolerances and goldens are unchanged.
+- **16 equal-head cases pass in each additional compiler lane**:
+  CuTeDSL 4.8.0 with CUDA compiler 12.9/13.4, and 4.8.1 with compiler 12.9.
+  The main 60-case lane uses 4.8.1/compiler 13.4. CUDA 13 dependencies use
+  `nvidia-cutlass-dsl[cu13]`. All four lanes use the final v7 kernel sources,
+  including long-first queue scheduling; the extra lanes explicitly force both
+  divisors. CUDA 12 compiler testing does not qualify a fully CUDA 12 framework
+  deployment.
+- **6,000 warm/poisoned native graph executions pass** (3,000 of each), with
+  the unsafe control failing 200/200. The deliberately two-CTA grid forces
+  scheduler wrapping; it is not full-occupancy stress evidence.
+- **Memcheck, Synccheck and Racecheck each pass three cases** (one full-state
+  wave and both direct queue-partition divisors),
+  including changed-metadata capture replay, with zero errors/hazards. No
+  kernel or API-error filtering is used. This sanitizer lane sets
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`: the ordinary expandable
+  allocator reports a recoverable `cuMemCreate` permission failure under
+  instrumentation. An independent Torch-only program reproduces the two API
+  errors with expandable allocation and reports zero with regular allocation.
+  Numerical/performance runs retain their original allocator settings.
+- Actual generated code covers 13 queue/chain prerequisite waits and retains
+  100 scheduler release dependencies in 20 summary/recompute bodies across
+  five rendered hosts. PTX data-flow checks and SASS mask/address/arrival
+  checks pass. Backward's existing SMEM handoffs are unchanged; this review's
+  new ownership edges are the inter-kernel queues, phase-arena reuse and
+  generic shared-memory prefix counts. The three emitted queue kernels retain
+  shared stores → `barrier.sync` → shared loads → `barrier.sync` before reuse.
+
+Reproduce the new checks from `test/python`:
+
+```bash
+export CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -rs -k 'not warm_stress'
+python -m pytest linear_attention/frost/test_kda_wave_boundaries.py -q -rs
+python -m pytest linear_attention/frost/test_kda_wave_queues.py -q -rs
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -s -k warm_stress
+for tool in memcheck synccheck racecheck; do
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+    compute-sanitizer --tool "$tool" --error-exitcode 99 \
+    python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py \
+    linear_attention/frost/test_kda_wave_queues.py -q -rs \
+    -k 'test_wave_queue_identity or (all-states and equal and bf16-log-d64 and 2)'
+done
+```
+
+The first non-invariant fixture failed its routing assertion because its
+oversubscribed SM103 shape selected the uncut path. Reducing its nominal
+sequence/head grid selects the ordinary chain and both cases pass; no production
+routing or numerical threshold was changed. Earlier failed/interrupted runs
+are retained separately and are not counted as passes.
+
+The additional memory/replay measurements are B300-only. No new H20, B200 or
+SM107 result is claimed, and Hopper code is unchanged.
+
+Final real CP8 measurements use eight B300 devices, 1,048,576 total tokens,
+131,072 tokens per rank, H32/K128/V128, BF16 Q/K/V/dO and FP32 gates, beta,
+their gradients and CP merge. `batch_invariant=True` in both arms. Each case
+runs the parent and candidate in separate fresh processes, three warmups and
+31 measured iterations per arm. Time is the median of the per-iteration
+maximum-rank forward+backward time; memory is the maximum over ranks and
+measured iterations. The region includes KDA and boundary communication;
+one-time CPU planning/JIT, validation and hashing are excluded. This is eager
+execution, not a CUDA Graph performance measurement.
+
+All inputs, outputs, gradients, CP transport tensors and workspace contribute
+to the allocated peak. Peak counters are reset before releasing the preceding
+iteration's gradients, so the iteration transition is included. The reference
+already includes #2574's compact-piece optimization. Both arms use the same
+existing cuLA integration snapshot, including its pre-existing worktree changes;
+no pristine cuLA commit or new cuLA change is claimed. The CP harness is separate
+from this repository; the native regression commands above are self-contained.
+
+| Global THD token lengths | Allocated GiB, before → after | Reserved GiB, before → after | F+B ms, before → after | Change |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 × 512 | 22.998 → 17.271 | 23.596 → 17.869 | 13.520 → 13.562 | +0.31% |
+| 1,024 × (480, 544) | 22.998 → 17.271 | 23.596 → 17.869 | 13.610 → 13.550 | -0.44% |
+| 2,047 × 256 + 524,544 | 25.754 → 17.372 | 26.850 → 18.467 | 29.551 → 29.639 | +0.30% |
+| 1,536 × 64, then 512 × 1,856 | 36.953 → 17.256 | 42.158 → 17.270 | 22.071 → 22.813 | +3.36% |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 28.990 → 18.108 | 29.850 → 18.969 | 18.002 → 18.381 | +2.11% |
+| 4,096 × 256 | 25.749 → 17.366 | 26.848 → 18.465 | 14.851 → 15.109 | +1.74% |
+| 8,192 × 128 | 31.252 → 18.619 | 33.352 → 20.719 | 17.500 → 17.902 | +2.29% |
+| one 1M, weak gate | 20.285 → 16.215 | 21.219 → 17.148 | 29.511 → 29.766 | +0.86% |
+
+The maximum allocated footprint is **19.992 decimal GB**
+(18.619 GiB), below 20,000,000,000 bytes for all eight measured cases.
+The maximum allocator reservation is **22.247 decimal GB**
+(20.719 GiB), which is **not below 20 GB**. These Torch counters do
+not include driver/context allocations or every NCCL allocation. The claim is
+about the live KDA tensor/workspace footprint, not a process-wide reservation
+ceiling, a whole-model footprint or a universal limit for arbitrary THD layouts.
+
+The sensitive middle-skew case also passes a second round with candidate-first
+order: 17.955 → 18.352 ms
+(+2.21%). The largest measured latency regression across
+the table and this repeat is **3.36%**. Full-tensor SHA256 records match
+for all six inputs and O/dQ/dK/dV/dG/dBeta on all eight ranks, in every paired
+case and the reversed-order repeat. Hashing is outside the timed region.
+The weak-gate control uses one 1M document with gates scaled by 0.01.
+
+Compatibility, docstring, compile-cache, CUDA Graph and fence audits pass.
+Changed-file pre-commit and syntax checks pass; Fern reports zero errors and
+one warning because unauthenticated redirect checking is unavailable.
+
+
 ## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
 
