@@ -148,12 +148,13 @@ def test_current_name_study_precedes_inherited_placement(monkeypatch, verdict):
 
 
 def test_cold_host_import_does_not_import_registry():
-    source_root = str(Path(__file__).resolve().parents[4] / "python")
+    # CI can run source tests against a wheel without an in-tree native extension.
+    package_root = str(Path(cudnn.__file__).resolve().parent.parent)
     code = "\n".join(
         (
             "import sys",
             "sys.meta_path[:] = [f for f in sys.meta_path if 'editable' not in str(f).lower()]",
-            f"sys.path.insert(0, {source_root!r})",
+            f"sys.path.insert(0, {package_root!r})",
             "import cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q.host",
             "assert 'cudnn.sdpa.fwd.engines' not in sys.modules",
         )
