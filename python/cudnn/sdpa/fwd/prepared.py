@@ -582,6 +582,8 @@ class PreparedThdLaunch:
 
             spec.native = _pybind_module._SdpaThdBinder(spec)
         self.spec = spec
+        # Frozen per-plan lowering fact, checked against the public declaration.
+        self.supports_stats_stride_override = bool(spec.lse_stride_override and spec.native.supports_stats_stride_override)
         uids = {
             "q": binding.q.get_uid(),
             "k": binding.k.get_uid(),

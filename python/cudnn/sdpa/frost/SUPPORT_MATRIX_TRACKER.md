@@ -1,5 +1,28 @@
 # FROST SDPA — support matrix
 
+**Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
+graph/config for admitted override-enabled half THD plans with packed HN Stats
+and the matching prepared binder on qualified SM100/SM103 devices. SM107 and
+SM120 do not advertise this note pending hardware qualification. This includes the
+explicit D256 lookahead entry and eligible legacy entries, not swap-AB or all
+FROST plans. See [the graph contract](../../../../docs/utilities/python_graph_and_execution_backends.md#plan-specific-stats-stride-override-note).
+
+**SM100/SM103 exact half D256 implementation engines (refactor pilot):**
+`sdpa_fwd_sm100_d256_lookahead` (20519) and
+`sdpa_fwd_sm100_d256_swap_ab` (20520) own exact D_qk=D_v=256 FP16/BF16
+on cc 10.0/10.3. The old `sdpa_fwd_prefill_sm100` row declines these exact
+cells; its other widths, envelopes and targets retain their existing owner.
+Lookahead uses TILE_M=128/CGA2 and preserves the existing dense/paged/THD
+and split/packing contracts, including the existing nonpaged THD PackGQA
+decline. Swap-AB uses TILE_M=N_Q=16/32, TILE_N=128,
+CGA1 and SCHED_POLICY=0, with dense queries over dense/paged KV; it does
+not admit THD. PACK_GQA on swap-AB packs the whole group, which must fit
+N_Q; lookahead retains partial packing. Both reuse the common graph and
+prepared-execution contract. Central heuristics retains the old default
+routes and candidate budget; explicit engine selection fixes the body.
+The main kernel bodies and arithmetic are unchanged; only implementation
+selection, configuration ownership and public replay identities move.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;
@@ -1237,7 +1260,7 @@ masks over the default walk and asserts the row served every draw). Not yet: pac
 half / per-tensor FP8 siblings (the SM107 MXFP8 d128 / d256 siblings serve pools -- SM107 table), sink + KV split on the FP8 / MXFP8 pool rows (their epilogues fold the sink per tile, so a quantized sink graph runs unsplit; the half rows split with a sink -- see ˢ), block-scaled O
 (`sf_o`) over FP8 and MXFP8 pools.
 Served by the `PAGED_KV` specialization of
-`sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py`, `sm100/prefill_d256_f16.py`
+`sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py`, `sm100/d256_f16_lookahead/kernel.py`
 and `sm100/prefill_d128_fp8.py`, and of the four `sm100/prefill_d*_mxfp8.py` kernels
 (**MXFP8 pools**, below) (block-table indirection on the K/V TMA loads; boxes past
 a sequence's live pages are TMA-OOB zero-filled; under paged KV the d192×d128 kernel
@@ -1368,7 +1391,7 @@ D128/D192 partials exclude the sink, as do the shared D128 and native D256 decod
 empty splits, natural/base-2 Stats, fresh bindings and retained capture replay. The packed
 THD sink domain remains the D128 half paged Q>1 exception ᵖˢ.
 
-ᵈ **d256 decode tile (`sm100/decode_d256_f16.py`, 2026-09-16).** Same engine row,
+ᵈ **d256 decode tile (`sm100/d256_f16_swap_ab/kernel.py`, 2026-09-16).** Same engine row,
 same graph contract, a second template: f16/bf16 d256 graphs (d_qk = d_v in
 (128, 256], the d256 envelope) whose packed Q rows fit 16 -- `S_q * G <= 16` with
 `G` the PackGQA group (16:1 at S_q = 1, 8:1 at S_q <= 2, 4:1 at S_q <= 4, MHA at
@@ -2559,7 +2582,7 @@ d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
 `Capabilities.epilogue_gate_d_shapes = config_sm107.SM107_EPILOGUE_GATE_SHAPES`, the
 same constant the standalone adapter's `check_support` twin reads) — and, over PAGED
 pools, of the SHARED SM100 d256 f16/bf16 body compiled for sm_107a
-(`sm100/prefill_d256_f16.py`: the paged / THD / PackGQA prefill a Rubin paged half
+(`sm100/d256_f16_lookahead/kernel.py`: the paged / THD / PackGQA prefill a Rubin paged half
 (256, 256) plan loads; `config_sm100._EPILOGUE_GATE_FLAVORS = {"d256"}` for half
 inputs; its gate seams are the sm107 body's through the shared hook, the gate tile's
 TMA box the Q / O box's packed-row convention, the staging tile declared after the V
@@ -3536,7 +3559,7 @@ remain outside this extension. No default selection is changed.
 The cc 10.7 half row serves paged KV for packed (THD / ragged-Q) queries on the exact D128 and D256 flavors with
 or without `sink_token` (2026-10-08). The two Rubin-specific sink gates (`engines.mismatch`'s paged rule and
 `SdpaFwdDslSm100.check_support`'s Rubin paged clause) were lifted; no kernel changed: the legs run the shared
-`sm100/prefill_d128_f16.py` / `sm100/prefill_d256_f16.py` bodies compiled for sm_107a, whose per-row sink fold
+`sm100/prefill_d128_f16.py` / `sm100/d256_f16_lookahead/kernel.py` bodies compiled for sm_107a, whose per-row sink fold
 indexes sinks by packed query head (PackGQA composes) and selects a keyless row to O := 0 / LSE := sink. Validated
 on cc 10.7 (216-SM board, cuDNN 9.26.0.51 and 9.27.0.28) by test_mhas_v2.py's P2 block: per-request Q 1 / 4 / 8
 (and 0) mixed in one packed batch, chunked prefill (128 / 77 / 1 / 128), KV lengths 0 / 1 / page-1 / page / tile
@@ -4039,7 +4062,7 @@ two steps the same day; the table above is the route of record).  The route (`de
 `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` -- the decode tile's single-unit widths, `D256_DECODE_ROUTED_MAX_Q_ROWS = 64`
 --, under ONE rule per policy.  `"single_unit"` (the default): packed rows `S_q x group` within a width ride the narrowest such width in ONE
 token unit (the KV streamed once per sequence and KV head); past the table the step rides the paged d256 PREFILL tile with the whole group
-packed (the EXTEND form's binding at the dense step's `(B, S_q)` envelope: the shared `sm100/prefill_d256_f16.py` body, paged THD, PackGQA,
+packed (the EXTEND form's binding at the dense step's `(B, S_q)` envelope: the shared `sm100/d256_f16_lookahead/kernel.py` body, paged THD, PackGQA,
 unsplit, `fuse_gate` in its epilogue -- one Q tile per sequence and KV head, the KV streamed once) wherever that body packs the group within
 its 128 rows (`DECODE_PREFILL_TILE_ROWS`: a group dividing 128 -- 16, 8, 4, 32, ...; the cc 10.7 paged THD leg takes whole-group PackGQA
 only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4 and 6 / 1), or a step past its 128 rows, keeps the decode tile's token-unit arm (up to
@@ -4159,9 +4182,9 @@ own K / V, an e4m3 KV cache under the mode, `use_pdl=True`, `num_tokens_live`.
 FUNCTIONAL ONLY, UNMEASURED; the cc 10.0 cells RAN 2026-10-29 (the run record in the cells table below).**  The block's part gate reads ONE tuple (`_Sdpa.check_support`, the envelope's part
 row, the block-level `_check_part_support`, the suite's `requires_blackwell` / `requires_dense_part` markers): the dense prefill form
 (`kv_source="self"`, a dense `[B, S]` inference block), the EXTEND form and the DECODE form of the bf16 / f16 block are served on cc 10.0
-through the shared SM100 d256 kernels -- the paged prefill tile with PackGQA (`sm100/prefill_d256_f16.py`: the sm100 f16 row's paged THD
+through the shared SM100 d256 kernels -- the paged prefill tile with PackGQA (`sm100/d256_f16_lookahead/kernel.py`: the sm100 f16 row's paged THD
 leg, CGA2, unsplit, unpacked on EXTEND, the whole group packed on the DECODE form's prefill route, NATURAL, no gate, no LSE), the SM100
-d256 decode tile (`sm100/decode_d256_f16.py` at 16 columns; its 32-column arm -- the width the adapter's rule takes on a wide launch -- is
+d256 decode tile (`sm100/d256_f16_swap_ab/kernel.py` at 16 columns; its 32-column arm -- the width the adapter's rule takes on a wide launch -- is
 declined by name until its cells run, `DECODE_WIDE_TILE_CCS`, the route paragraph below) and its split combine in the combine module's OWN
 forms, UNMEASURED on this line (`split_combine.DECODE_GRID_OFF` through `prepared._split_combine_decode_grid`: the decode-grid pin is the cc
 10.7 rule's, `heuristics._DECODE_COMBINE_RULE_CC`, and the lean route's cc 10.0 pin of 2026-10-29 is the standalone sparse adapter's -- the

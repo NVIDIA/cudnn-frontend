@@ -67,6 +67,8 @@ def test_independent_thd_origins_rebind_and_capture(
         pytest.skip(f"{engine_name} physical THD origin path")
     torch.manual_seed(117)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (256, 256):
+        engine_name = "sdpa_fwd_sm100_d256_lookahead"
     batch, heads, kv_heads, maximum = 4, (heads_override or (24 if d_qk == 576 else 8)), 2, 256
     if batch_override is not None:
         assert batch_override == 1
@@ -469,7 +471,8 @@ def test_compact_thd_origins_use_single_load_maps(dim):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+    expected_engine = "sdpa_fwd_sm100_d256_lookahead" if dim == 256 else "sdpa_fwd_prefill_sm100"
+    index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(expected_engine))
     graph.select_plan(index)
     graph.check_support()
     graph.build_plans()

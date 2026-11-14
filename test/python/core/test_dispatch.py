@@ -1815,3 +1815,38 @@ def test_build_all_skips_a_deselected_other_plan(monkeypatch, pin_python):
     g.deselect_engines([g.get_plan_name_at_index(other)])
     g.build_plans(cudnn.build_plan_policy.ALL)
     assert g._is_built and g._plan_index == selected
+
+
+def test_behavior_notes_follow_plan_configuration_and_selection(monkeypatch):
+    """One engine can offer capable and incapable plans; notes and filters must agree."""
+    import cudnn
+    from cudnn.engines.base import PlanConfig
+
+    note = cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
+
+    class PerPlan(StubEngine):
+        name = "unfamiliar_name"
+        engine_id = _FAKE + 83
+        behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
+
+        def get_behavior_notes(self, graph, plan):
+            return self.behavior_notes + ((note,) if plan.knobs else ())
+
+    engine = PerPlan()
+    _offer(monkeypatch, engine)
+    _ranking(
+        monkeypatch,
+        lambda graph, engines, backend_plans, modes=None: [PlanConfig(engine.engine_id, None), PlanConfig(engine.engine_id, {cudnn.knob_type.TILE_M: 128})],
+    )
+    g = pygraph()
+    g.matmul(torch.randn(2, 3), torch.randn(3, 2))
+    g.create_execution_plans()
+    for index, expected in ((0, False), (1, True), (0, False)):
+        g.select_plan(index)
+        assert (note in g.get_behavior_notes()) == expected
+        assert g.get_behavior_notes() == g.get_behavior_notes_for_plan_at_index(index)
+    assert engine.behavior_notes == (cudnn.behavior_note.RUNTIME_COMPILATION,)
+    g.select_behavior_notes([note])
+    assert 0 in g._barred_indices() and 1 not in g._barred_indices()
+    g.deselect_behavior_notes([note])
+    assert {0, 1}.issubset(g._barred_indices())

@@ -71,7 +71,9 @@ def _unpacked_decode(row: str, facts) -> bool:
     spec = next((s for s in ENGINE_SPECS if s.name == row), None)
     if spec is None:
         return False
-    caps = spec.capabilities
+    from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
+
+    caps = heuristics.sm100_d256_policy_spec().capabilities if row == "sdpa_fwd_prefill_sm100" and in_pilot_domain(facts) else spec.capabilities
     return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
 
 
@@ -85,7 +87,12 @@ def _packed_split(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next((s for s in ENGINE_SPECS if s.name == row), None)
-    return spec is not None and heuristics.sm100_paged_packed_split_choice(spec.capabilities, facts) > 1
+    if spec is None:
+        return False
+    from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
+
+    caps = heuristics.sm100_d256_policy_spec().capabilities if in_pilot_domain(facts) else spec.capabilities
+    return heuristics.sm100_paged_packed_split_choice(caps, facts) > 1
 
 
 _VERIFY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90"})

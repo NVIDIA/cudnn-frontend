@@ -9,7 +9,7 @@ has N_Q = 16, but softmax, accumulator rescaling and stores cover eight
 columns; the unused half of each P slot is zeroed once before MMA can read it.
 Other records retain the original 16-column work per softmax warpgroup.
 
-Why a second template.  The prefill tile (sm100/prefill_d256_f16.py) issues
+Why a second template.  The prefill tile (sm100/d256_f16_lookahead/kernel.py) issues
 BMM1 / BMM2 over a 256-row collective Q tile per 128-key KV tile whatever the
 number of LIVE Q rows, and its softmax warpgroup exponentiates the full
 128 x 128 score tile.  A decode step of a 32/2-head d256 model has 16 live
@@ -98,7 +98,9 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256_decode
+from cudnn.sdpa.fwd.config_common import TemplateParams
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes; a plain import gets a

@@ -32,7 +32,8 @@ def live_column_route(monkeypatch):
     yield
     assert observed, "the test did not compile a FROST kernel"
     assert any(
-        mod.__file__.endswith("sm100/decode_d256_f16.py") and mod.CFG.TILE_K == mod.CFG.TILE_O == 128 and mod.N_Q == 16 and mod.COLS == 8 for mod in observed
+        mod.__file__.endswith("sm100/d256_f16_swap_ab/kernel.py") and mod.CFG.TILE_K == mod.CFG.TILE_O == 128 and mod.N_Q == 16 and mod.COLS == 8
+        for mod in observed
     ), "the graph did not execute the D128 live-column route"
 
 

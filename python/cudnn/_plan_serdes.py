@@ -13,8 +13,10 @@ compiled kernels the plan was built from:
 - ``graph``: every node and tensor of the python IR, tensors referenced by uid. A value the
   encoder cannot represent exactly (a score_mod callback, a framework object) refuses
   serialization; nothing is dropped silently.
-- ``plan``: the selected plan's ``(engine_id, public knobs)``. Engine ids and knob values are
-  append-only, so the recipe stays valid on any frontend that still ships the engine.
+- ``plan``: the selected plan's ``(engine_id, public knobs)``. The current frontend
+  must still admit that graph/configuration. Stable ids alone do not preserve
+  eligibility across releases. A declined recipe raises and leaves the graph
+  empty; callers must invalidate the cached recipe and rebuild with heuristics.
 - ``kernels``: the ``compiled_cache`` entries the plan's build used, each with the environment
   manifest it was compiled under. Deserialize installs one only when that manifest equals the
   current process's exactly; otherwise the kernel is compiled again. A stale object is never

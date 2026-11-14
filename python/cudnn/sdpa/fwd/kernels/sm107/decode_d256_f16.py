@@ -3,7 +3,7 @@
 
 """Decode-shaped SDPA forward for the SM107 (Rubin) d256 f16/bf16 flavor: the swap-AB tile.
 
-Why a second template.  The prefill tile (sm100/prefill_d256_f16.py) issues
+Why a second template.  The prefill tile (sm100/d256_f16_lookahead/kernel.py) issues
 BMM1 / BMM2 over a 256-row collective Q tile per 128-key KV tile whatever the
 number of LIVE Q rows, and its softmax warpgroup exponentiates the full
 128 x 128 score tile.  A decode step of a 32/2-head d256 model has 16 live
@@ -73,7 +73,7 @@ tables and the split chunking are all resolved on device. The host uses the
 explicit pointer ABI: extents and Int64 strides are runtime arguments, while
 head dimensions, Stats presence and the paged in-page layout specialize compile().
 
-Rubin (SM107) sibling of sm100/decode_d256_f16.py: the SAME body (cta_group::1,
+Rubin (SM107) sibling of sm100/d256_f16_swap_ab/kernel.py: the SAME body (cta_group::1,
 6 / 10 / 18 warps, f16 TILE_K_HW = 16 on both arch lines, 4 x N_Q TMEM columns)
 under config_sm107.make_cfg_d256_decode, which builds the shared CfgD256Decode
 record over the Rubin width set (config_sm107._D256_DECODE_Q_TILES_SM107: the SM100

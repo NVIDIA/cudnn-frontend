@@ -361,7 +361,12 @@ def _built_plan_name(graph) -> str:
     """Name of the plan build_plans() settled on ('backend_heuristics' = the
     backend's own OSS candidate space)."""
     try:
-        return graph.get_plan_name_at_index(graph._plan_index)
+        name = graph.get_plan_name_at_index(graph._plan_index)
+        compiled = getattr(graph._compiled_plans.get(graph._plan_index), "_compiled", None)
+        resolved = getattr(compiled, "implementation_config", None)
+        if resolved:
+            name += " resolved=" + ";".join(f"{key}:{value}" for key, value in resolved.items())
+        return name
     except Exception:
         return "unknown"
 

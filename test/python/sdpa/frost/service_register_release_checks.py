@@ -131,7 +131,8 @@ def release_cases(arch):
         if name.startswith("decode_") or (arch == "sm100" and name in ("prefill_d256_fp8.py", "prefill_d256_mxfp8.py", "prefill_d512_mxfp8.py")):
             cga = 1
         kwargs = dict(cta_mma=cga, dtype_qkv=2 if "f16" in name else 0, dtype_o=2, mma_2x2="2x2" in name)
-        cases.append(pytest.param(f"{arch}/{name}", kwargs, id=name.removesuffix(".py")))
+        path = "d256_f16_lookahead/kernel.py" if arch == "sm100" and name == "prefill_d256_f16.py" else name
+        cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))
     return cases
 
 

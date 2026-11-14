@@ -38,7 +38,7 @@ from cudnn.frost.tile_dsl.tma import ld_shared_v4, st_global_v4, st_shared_v4, t
 # module off the Rubin package (engine-contract S8: a shared module never leans
 # on one arch's package) and is cycle-free -- config_sm100 imports only
 # tile_dsl.constants, never this package.
-from cudnn.sdpa.fwd.config_sm100 import o_swz_bytes as _o_swz_bytes
+from cudnn.sdpa.fwd.config_common import o_swz_bytes as _o_swz_bytes
 
 
 @cute.jit

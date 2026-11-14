@@ -658,7 +658,7 @@ TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80"})
 the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph."""
 
 
-def place(spec, facts) -> str:
+def place(spec, facts, knobs=None) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
@@ -674,6 +674,27 @@ def place(spec, facts) -> str:
     A measured entry in ``cudnn.sdpa.placement_table`` (generated from a frozen sweep) answers first; the hand-written
     rules below decide every graph the table has no entry for."""
     from cudnn.sdpa import placement_table
+    from .kernels.sm100.d256_f16_contract import IMPLEMENTATIONS
+
+    # Studies for an explicit implementation take precedence over inherited
+    # placement, including a measured TRAIL and non-default legal variants.
+    measured = placement_table.lookup(spec.name, facts)
+    if measured is not None:
+        return LEAD if measured else TRAIL
+
+    if spec.capabilities.implementation in IMPLEMENTATIONS:
+        # Preserve the frozen parent's placement only for the implementation
+        # and geometry its central policy selects. This is a behavior mapping,
+        # not new performance evidence for every legal variant of either row.
+        # An explicitly requested alternative has no inherited LEAD claim.
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm100_d256_geometry, sm100_d256_policy_spec
+
+        selected = select_sm100_d256_geometry(facts, knobs.pack_gqa)
+        if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
+            return TRAIL
+        spec = sm100_d256_policy_spec()
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
         # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);
@@ -688,6 +709,13 @@ def place(spec, facts) -> str:
     if spec.name == "sdpa_fwd_prefill_sm107_mxfp8":
         return _place_sm107_mxfp8(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100":
+        from .kernels.sm100.d256_f16_contract import in_pilot_domain
+        from .heuristics import sm100_d256_policy_spec
+
+        if in_pilot_domain(facts):
+            # Historical study queries can still use the old row name. Its
+            # class and hand-rule fallback must use the same policy domain.
+            spec = sm100_d256_policy_spec()
         return _place_sm100_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120":
         return _place_sm120_f16(spec.capabilities, facts)

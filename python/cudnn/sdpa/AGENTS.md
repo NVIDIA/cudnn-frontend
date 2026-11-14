@@ -628,6 +628,11 @@ production kernels gain no debug knob or timing-dependent assertion.
 - A new FROST capability that changes a class's plan (e.g. the SM100 packed split) makes that class's entries stale where
   the plan changed. Key the new regime from the row's own decision (`gqa_split`) and fit it; keep an older study's
   entries for the unchanged regime instead of refitting it over a narrower grid than that study measured.
+- When ownership moves to explicit implementation rows, look up their measured
+  entries before a legacy-name fallback. An inherited study must retain its
+  original pack/split classification even when the old engine no longer admits
+  that shape. `test_sdpa_fwd_d256_implementation_contract.py` checks both actual-name
+  verdicts and the paged packed-split classification with real pool strides.
 
 
 **Rule S13 — Register redistribution must converge at warpgroup scope.**
@@ -1826,3 +1831,13 @@ Prepared split-KV slab offsets must use the same 128-byte carve alignment as
 advertised workspace. Guard the exact allocation on widths/row counts whose
 partial-O extent rounds differently, including packed and unpacked paging.
 `test_split_workspace_128_byte_alignment` is the detector.
+
+
+When splitting a broad engine into explicit implementations, preserve each
+capability subdomain rather than filling every shape list with the new exact
+width. In particular, paged packed-split support does not imply nonpaged THD
+PackGQA support; `test_d256_thd_split_explicit_contract` detects that expansion.
+Compare canonical compiled geometry when old public knobs were ignored.
+`test_explicit_d256_body_does_not_reselect_for_query_extent` exports the public
+engine/knob record into a fresh graph, checks the actual body/tile/CGA and
+replays changed inputs under CUDA Graph capture.

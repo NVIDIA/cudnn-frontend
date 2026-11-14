@@ -5805,3 +5805,38 @@ python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -m L0 -q -x -k situ
 
 This corrects the test reference; it does not establish broader kernel
 coverage. SM103, E5M2 and atomic dprob determinism remain unverified.
+
+
+### SM100/SM103 D256 engine isolation pilot — 2026-11-14
+
+The exact half D256 graph domain now has explicit lookahead and swap-AB
+entries. Kernel bodies/arithmetic are unchanged; no golden is added or changed
+and no general determinism/batch-invariance status is upgraded.
+
+On both B200 (SM100) and B300 (SM103), CuTeDSL 4.8 compiling with CUDA 13.4,
+cuDNN 9.30.0 and Torch 2.14.1+cu130, the selection below passed **59 cases**
+with **4 skips** (nvdisasm unavailable) per GPU. It includes twelve explicit
+FP16/BF16 dense/paged cases selecting N16, N32 or lookahead128, exporting the
+public record into a fresh graph, and checking changed-V CUDA Graph replay
+and exact unchanged Stats. These checks do not establish general batch
+invariance. Backward was not changed or requalified.
+
+```bash
+cd test/python
+pytest -q -x -rs -m 'L0 or L1' \
+  sdpa/frost/test_sdpa_fwd_d256_implementation_contract.py \
+  sdpa/frost/test_sdpa_fwd_decode_d256_sm100.py \
+  sdpa/frost/test_sdpa_fwd_d256_fused_correction.py \
+  sdpa/frost/test_sdpa_prepared_thd.py \
+  sdpa/frost/test_sdpa_fwd_thd_origins.py \
+  -k 'explicit_d256 or d256_nonpaged or fused or implementation_contract or routing_boundary or wide_tile or compact_thd_origins'
+```
+
+A separate B200 migration run passed 148 checks, with 3 skips: the existing
+D256 paged packed-split float16/bfloat16 goldens were absent for this exact
+runtime, and one case required SM107. Those golden comparisons remain
+**unverified**, not passes. Five B200 BF16 forced-FROST parent/candidate
+comparisons preserved input/output hashes, actual body/config and workspace
+against parent `ae3d4e4425c563a159af2acb5f873a5a0dcc6022`; independent FP64
+references and changed-input replay also passed. This bounded comparison is
+not a replacement for the full batch-invariance or golden contract.

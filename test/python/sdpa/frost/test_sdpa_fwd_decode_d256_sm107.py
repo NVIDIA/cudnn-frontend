@@ -143,7 +143,7 @@ def test_sm107_decode_routes_to_the_rubin_sibling():
         mod = _load(rubin=True, decode_q_tile=16, seq_kv_lens_present=True, **extra)
         assert mod.__file__.endswith("/sm107/decode_d256_f16.py") and "sm107_decode" in mod.__name__, mod.__name__
     sm100 = _load(rubin=False, decode_q_tile=16, seq_kv_lens_present=True)
-    assert sm100.__file__.endswith("/sm100/decode_d256_f16.py") and "sm100_decode" in sm100.__name__, sm100.__name__
+    assert sm100.__file__.endswith("/sm100/d256_f16_swap_ab/kernel.py") and "sm100_decode" in sm100.__name__, sm100.__name__
 
 
 @pytest.mark.parametrize(
@@ -191,7 +191,7 @@ def test_sm107_decode_body_matches_the_sm100_body():
     from cudnn.sdpa.fwd import api_dsl
 
     kdir = Path(api_dsl.__file__).parent / "kernels"
-    sm100 = (kdir / "sm100" / "decode_d256_f16.py").read_text(encoding="utf-8")
+    sm100 = (kdir / "sm100" / "d256_f16_swap_ab" / "kernel.py").read_text(encoding="utf-8")
     sm107 = (kdir / "sm107" / "decode_d256_f16.py").read_text(encoding="utf-8")
 
     def _body(src):
@@ -214,6 +214,7 @@ def test_sm107_decode_body_matches_the_sm100_body():
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
 
     a, b = _body(sm100), _body(sm107)
+    a = [ln for ln in a if ln != "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME"]
     # Pin the exact SM100-only specialization before comparing the shared body.
     # Removing an arbitrary AST branch would hide edits to its zero-fill/fence.
     sm100_only = {
@@ -256,10 +257,11 @@ def test_sm107_decode_body_matches_the_sm100_body():
     b = [
         ln.replace(
             "from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d256_decode_desc_version, make_cfg_d256_decode",
-            "from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256_decode",
+            "from cudnn.sdpa.fwd.config_common import TemplateParams\nfrom cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode",
         )
         for ln in b
     ]
+    b = "\n".join(b).splitlines()
     assert a == b, "the Rubin decode module diverged from the SM100 body beyond the declared deltas:\n" + "\n".join(
         f"{'-' if x else '+'} {x or y}" for x, y in zip(a, b) if x != y
     )

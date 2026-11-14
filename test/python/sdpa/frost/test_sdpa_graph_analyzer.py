@@ -278,7 +278,7 @@ def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
     output_strides = (H * S * (d + 1), S * (d + 1), d + 1, 1)
     _finish_output(o, dims, output_strides)
     facts = _facts(graph)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == ("sdpa_fwd_sm100_d256_lookahead" if d == 256 else engines.engine_name()))
     unsplit = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
     from dataclasses import replace
 
@@ -1072,7 +1072,7 @@ def test_knob_request_pack_gqa_partial_group_on_wired_flavors_only():
     # the d128 and d256 f16 flavors (G=12 -> 4 heads per row group, G=6 -> 2) ...
     for h_q, h_kv in ((24, 2), (12, 2)):
         assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv), engines.SdpaFwdKnobs(pack_gqa=True))
-        assert engines.engine_name() in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
+        assert "sdpa_fwd_sm100_d256_lookahead" in _eligible(_mk_gqa_graph(h_q, h_kv, d=256), engines.SdpaFwdKnobs(pack_gqa=True))
     # ... while the d512 flavor keeps the full-ratio contract (its kernel packs
     # HEADS_PER_TILE = G), so the same request is declined there.
     assert not _eligible(_mk_gqa_graph(24, 2, d=512), engines.SdpaFwdKnobs(pack_gqa=True))
@@ -1103,8 +1103,11 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
     native_sm120 = engines.engine_name(arch="sm120")
     assert by_name[native_sm120].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})
+    assert by_name["sdpa_fwd_sm100_d256_lookahead"].pack_gqa_partial_d_shapes == frozenset({(256, 256)})
     others = {
-        name: caps.pack_gqa_partial_d_shapes for name, caps in by_name.items() if name not in (engines.engine_name(), native_sm107, native_sm90, native_sm120)
+        name: caps.pack_gqa_partial_d_shapes
+        for name, caps in by_name.items()
+        if name not in (engines.engine_name(), "sdpa_fwd_sm100_d256_lookahead", native_sm107, native_sm90, native_sm120)
     }
     assert all(v is None for v in others.values()), others
 

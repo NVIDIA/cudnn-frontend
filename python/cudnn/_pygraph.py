@@ -421,8 +421,9 @@ class pygraph:
         cuDNN backend serves the selected entry; otherwise ``.name`` is the
         engine's manifest name (``sdpa_fwd_prefill_sm100`` /
         ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
-        identifier -- manifest names and slots are append-only, never renamed
-        or reused -- so a caller may compare against one.
+        identifier for diagnostics and explicit selection. Execution capabilities
+        belong to the selected plan's ``get_behavior_notes()``; names do not
+        establish which runtime layouts or overrides a plan accepts.
         ``get_plan_name_at_index`` reports the same name with the plan's
         public knobs appended in brackets.
 
@@ -1600,7 +1601,11 @@ class pygraph:
         """The declared notes of a python plan; () for a backend entry, whose
         notes the backend owns and filters itself."""
         eng = self._engine_for(cfg)
-        return tuple(getattr(eng, f"{kind}_notes", ()) or ()) if eng is not None else ()
+        if eng is None:
+            return ()
+        if kind == "behavior":
+            return tuple(eng.get_behavior_notes(self, cfg) or ())
+        return tuple(getattr(eng, f"{kind}_notes", ()) or ())
 
     def _resolve_stream(self, handle: Any) -> Any:
         """Stream for a supplied handle (classic set_stream semantics). A failed
@@ -2047,11 +2052,11 @@ class pygraph:
         return (cfg.engine_id, dict(cfg.knobs) if cfg.knobs else {})
 
     def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
-        """Classic backend behaviour notes for the plan at ``index``.
+        """Declared behavior notes for this backend or Python plan.
 
-        Backend-only by construction: a python plan has no ``BehaviorNote_t``.
-        Saying so is better than forwarding the index and returning some other
-        plan's notes."""
+        Python engines answer for the graph and the indexed configuration;
+        capabilities are not inferred from an engine's name or provider.
+        """
         if not self._planning_done:
             return self._lowered_graph.get_behavior_notes_for_plan_at_index(index, *args, **kwargs)
         cfg = self._plans[self._check_plan_index(index)]
@@ -2063,8 +2068,11 @@ class pygraph:
         return self._lowered_graph.get_behavior_notes_for_plan_at_index(cfg.cpp_index, *args, **kwargs)
 
     def get_behavior_notes(self, *args, **kwargs):
-        """Classic behaviour notes for the SELECTED plan — backend-only, for the
-        same reason as the at-index query."""
+        """Declared behavior notes for the selected backend or Python plan.
+
+        Query after final plan selection when choosing an execution layout.
+        Absence of a capability note means the plan makes no such guarantee.
+        """
         eng = self.selected_engine
         if eng is not None:
             return list(self._notes_of(self._selected_plan_config, "behavior"))

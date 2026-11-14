@@ -335,8 +335,8 @@ python/cudnn/
         sm90/prefill_d128_f16.py      dedicated exact D128: 128-row tile, two
                                       64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
-        sm100/prefill_d256_f16.py
-        sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
+        sm100/d256_f16_lookahead/kernel.py
+        sm100/d256_f16_swap_ab/kernel.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass

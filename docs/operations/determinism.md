@@ -116,6 +116,14 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 
+Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
+engine entries. The public engine/knob record fixes the main body and Q tile;
+this alone does not guarantee batch invariance across all legal configurations.
+The refactor retains the existing arithmetic and support conclusions above.
+Its fresh-graph replay and parent-output comparisons are bounded correctness
+checks, not a new general determinism qualification. Backward is unchanged.
+See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
+
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
 are batch invariant for the tested fixed plans; Amax is a whole-batch reduction,

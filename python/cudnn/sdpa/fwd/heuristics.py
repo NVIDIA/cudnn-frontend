@@ -475,7 +475,7 @@ def choose_split_kv(
 
 
 # --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
-# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# sm100/d256_f16_swap_ab/kernel.py is not the machine choose_split_kv was fitted on: one
 # cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
 # tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
 # kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
@@ -2324,7 +2324,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/decode_d256_f16.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
@@ -2338,7 +2338,7 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv:
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
     """The heads the DECODE tile packs per token for a set whose prefill-tile
     group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
-    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    ratio.  sm100/d256_f16_swap_ab/kernel.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
     one unit per (KV head, batch) with every head of the group in its 16-column
     tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
     the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not
@@ -2736,9 +2736,16 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(
-            caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
-        )
+        from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+        if caps.sm_lo == 100 and in_pilot_domain(facts):
+            # Cost the same immutable geometry that becomes the public plan;
+            # there is no adapter route to predict for these candidates.
+            decode_q_tile = select_sm100_d256_geometry(facts, decode_pack_g > 1).query_tile
+        else:
+            decode_q_tile = decode_d256_q_tile_for_row(
+                caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
+            )
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,
@@ -3520,6 +3527,85 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     )
 
 
+def select_sm100_d256_geometry_for_shape(s_q, pack_g, *, batch=None, h_q=None, s_kv=None, windowed=False, thd=False, prefolded=False, gated=False):
+    """The sole SM100 half D256 implementation/Q-tile performance choice.
+
+    Both the graph candidate generator and standalone auto use this result.
+    A selected engine instead receives a fixed geometry and never calls this
+    selector during build or execution.
+    """
+    from .config_sm100 import decode_d256_q_tile, d256_wide_decode_launch
+    from .kernels.sm100.d256_f16_contract import D256Geometry, LOOKAHEAD, SWAP_AB
+
+    if not (thd or prefolded or gated):
+        wide = batch is not None and h_q is not None and s_kv is not None and d256_wide_decode_launch(batch, h_q // pack_g, s_kv, windowed)
+        q_tile = decode_d256_q_tile(s_q, pack_g, wide_launch=wide)
+        if q_tile:
+            return D256Geometry(SWAP_AB, q_tile)
+    return D256Geometry(LOOKAHEAD, 128)
+
+
+def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
+    return select_sm100_d256_geometry_for_shape(
+        facts.s_q,
+        (facts.h_q // facts.h_kv if pack_gqa else 1) if pack_g is None else pack_g,
+        batch=facts.b,
+        h_q=facts.h_q,
+        s_kv=facts.s_kv,
+        windowed=facts.window_left is not None,
+        thd=facts.thd,
+        prefolded=facts.attn_scale_prefolded,
+        gated=facts.has_epilogue_gate,
+    )
+
+
+def sm100_d256_policy_spec():
+    """Historical policy domain for D256 candidate generation and study keys.
+
+    This is never an offered engine. Delegation changes ownership, not the
+    pack/split decisions on which the existing placement studies were fitted.
+    """
+    legacy = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
+def _recommend_sm100_d256(kind, facts, offered):
+    """Retain the existing candidate budget/order, naming each actual body.
+
+    The old row's policy domain generates pack/split and scheduler combinations.
+    It is not an offered engine: each combination resolves to one explicit
+    implementation before being returned, and its split model consumes the
+    same selected geometry.
+    """
+    policy = sm100_d256_policy_spec()
+    if mismatch(policy.capabilities, facts) is not None:
+        return []
+    sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
+    by_name = {s.name: s for s in ENGINE_SPECS}
+    out = []
+    for knobs in sets:
+        if mismatch(policy.capabilities, facts, knobs) is not None:
+            if knobs.split_kv != 1 or launch_grid_mismatch(policy.capabilities, facts, knobs) is None:
+                continue
+            knobs = next(
+                (lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(policy.capabilities, facts, lpt) is None),
+                None,
+            )
+            if knobs is None:
+                continue
+        geometry = select_sm100_d256_geometry(facts, knobs.pack_gqa)
+        engine_id = offered.get(geometry.implementation)
+        if engine_id is None:
+            continue
+        resolved = geometry.canonical_knobs(knobs)
+        if mismatch(by_name[geometry.implementation].capabilities, facts, resolved) is not None:
+            continue
+        plan = PlanConfig(engine_id, resolved)
+        if plan not in out:
+            out.append(plan)
+    return out
+
+
 def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]]:
     """(engine_id, spec) for each offered cell whose capability row admits ``facts``."""
     for spec in ENGINE_SPECS:
@@ -3543,6 +3629,12 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
     """
+    from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+    if in_pilot_domain(facts):
+        # Only the explicit D256 implementations admit this domain. Keep the
+        # eligible-row contract test in sync before adding another owner here.
+        return _recommend_sm100_d256(kind, facts, offered)
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
@@ -3582,7 +3674,8 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if not rest:
         return [BACKEND, LAST_RESORT] + last
     spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
-    placed = rest + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + rest
+    position = place(spec, facts, rest[0].knobs) if spec.capabilities.implementation else place(spec, facts)
+    placed = rest + [BACKEND] if position == LEAD else [BACKEND] + rest
     return placed + [LAST_RESORT] + last if last else placed
 
 

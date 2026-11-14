@@ -227,7 +227,7 @@ _SM100_PARTIAL_PACK_GQA_FLAVORS = ((128, 128), (256, 256), SM100_NATIVE_D576_SHA
 _SM100_KERNEL_FILES = {
     SM100_NATIVE_D576_SHAPE: "sm100/prefill_d512_f16_2x2.py",
     (512, 512): "sm100/prefill_d512_f16.py",
-    (256, 256): "sm100/prefill_d256_f16.py",
+    (256, 256): "sm100/d256_f16_lookahead/kernel.py",
     (192, 128): "sm100/prefill_d192_d128_f16.py",
     (128, 128): "sm100/prefill_d128_f16.py",
     # Same file as (128, 128): one pipeline, two head-dim geometries, selected
@@ -358,7 +358,7 @@ _EARLY_Q_CC: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
 # The two decode tiles are disjoint by flavor -- (128, 128) rides the cga1 knob
 # above, (256, 256) this record -- so _load_sm100_kernel_module tests both.
 _SM100_DECODE_KERNEL_FILES = {
-    (256, 256): "sm100/decode_d256_f16.py",
+    (256, 256): "sm100/d256_f16_swap_ab/kernel.py",
 }
 # The Rubin (cc 10.7) sibling of the d256 decode tile: the same swap-AB body under
 # config_sm107.make_cfg_d256_decode (the Rubin SMEM-carveout and descriptor-window
@@ -3077,7 +3077,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
         )
-        self._value_error_if(self.tile_m is not None and self.tile_m != 128, "SM100 DSL SDPA only supports tile_m=128")
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        expected_tile_m = selected_kernel.query_tile if selected_kernel is not None else 128
+        self._value_error_if(
+            self.tile_m is not None and self.tile_m != expected_tile_m,
+            "SM100 DSL SDPA only supports tile_m=128" if selected_kernel is None else f"selected implementation requires tile_m={expected_tile_m}",
+        )
         # The KV tile width: 128 on every flavor; the Rubin f16/bf16 small tiles also render 64 (the TILE_N knob --
         # config_sm107.SM107_TILE_NS_BY_D_SHAPE, the engine row's per-shape domain, rule 8b').
         # the KV tile widths this plan may request: the Rubin small tiles' domain on cc 10.7, the SM100 small tiles' on cc 10.0 / 10.3 (both from the
@@ -3119,6 +3124,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # this check is not cosmetic -- it is precisely the rule-8b' failure the
         # helper exists to prevent, since an explicit cga=1 on the Rubin quantized
         # d192 path would then clear check_support() and die inside compile().
+        if selected_kernel is not None:
+            supported_cgas = (selected_kernel.cga,)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
@@ -3782,7 +3789,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # d256_decode_tile_selected(..., split_kv) -- keep them in lockstep.
             _gate_in_combine = self._gate_in_combine_for(int(s_qo), int(h_qo), int(h_kv))
             # The gate on the PAGED d256 half PREFILL body: a Rubin paged half (256, 256) plan that is not a decode-shaped one
-            # loads the SHARED SM100 body (_load_sm100_kernel_module's paged arm: sm100/prefill_d256_f16.py compiled for sm_107a),
+            # loads the SHARED SM100 body (_load_sm100_kernel_module's paged arm: sm100/d256_f16_lookahead/kernel.py compiled for sm_107a),
             # whose paged / THD / PackGQA arms carry the gate seams -- the serving EXTEND form's SDPA (packed queries over the
             # pools, PackGQA on or off) and dense paged queries past the decode tile alike; unsplit only (the split's partials
             # bypass the gated epilogue).  The GRAPH rows keep their narrower claim (the graph's THD lowering binds no gate):
@@ -3960,6 +3967,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``b`` / ``s_kv`` are the launch size the Blackwell line's wide-tile route reads
         (config_sm100.d256_wide_decode_launch); without them only the 16-column tile is
         routed there."""
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        if selected_kernel is not None:
+            return selected_kernel.decode_q_tile
         if self._fp8 or self._mixed_fp8_kv or self.thd or self.flavor != (256, 256):
             return 0
         if self.softmax_scale_prefolded:
@@ -3989,8 +3999,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 max_q_tile=self.decode_q_tile_max,
             )
         # (a cap off cc 10.7 was refused once, in check_support, before this dispatch is reached)
-        wide_launch = b is not None and s_kv is not None and d256_wide_decode_launch(int(b), int(h_q) // pack_g, int(s_kv), self.window_left is not None)
-        return decode_d256_q_tile(int(s_q), pack_g, wide_launch=wide_launch)
+        from cudnn.sdpa.fwd.heuristics import select_sm100_d256_geometry_for_shape
+
+        return select_sm100_d256_geometry_for_shape(int(s_q), pack_g, batch=b, h_q=int(h_q), s_kv=s_kv, windowed=self.window_left is not None).decode_q_tile
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
         """:meth:`_gate_in_combine` on explicit shapes (for ``check_support``, like
@@ -4011,7 +4022,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _decode_q_tile(self) -> int:
         """N extent of the decode tile (config_sm100.decode_d256_q_tile) when this
-        plan lowers onto the d256 decode tile -- sm100/decode_d256_f16.py on the
+        plan lowers onto the d256 decode tile -- sm100/d256_f16_swap_ab/kernel.py on the
         Blackwell line, sm107/decode_d256_f16.py on cc 10.7 -- else 0 (the prefill tile).
 
         A LOWERING choice, like the flavor pick: the decode tile serves the same
@@ -4348,21 +4359,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if self._rubin_native_d192_paged_leg():
                 params = replace(params, cta_mma=2)
         elif self.flavor == (256, 256):
-            from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
+            if getattr(self, "_selected_kernel", None) is None:
+                from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
 
-            auto_sched, auto_cga = select_d256_auto_knobs(
-                params,
-                pertensor=self._pertensor,
-                s_q=self.s_q_max,
-                s_kv=self.s_k_max,
-                device_cc=self._device_cc,
-                paged=self.paged,
-            )
-            params = replace(
-                params,
-                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
-                cta_mma=auto_cga if self.cga is None else params.cta_mma,
-            )
+                auto_sched, auto_cga = select_d256_auto_knobs(
+                    params,
+                    pertensor=self._pertensor,
+                    s_q=self.s_q_max,
+                    s_kv=self.s_k_max,
+                    device_cc=self._device_cc,
+                    paged=self.paged,
+                )
+                params = replace(
+                    params,
+                    sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                    cta_mma=auto_cga if self.cga is None else params.cta_mma,
+                )
             params = canonicalize_d256_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
             params = derive_d256_internal_params(
                 params,
@@ -4483,13 +4495,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         params = self.template_params()
-        self._k_mod = _load_sm100_kernel_module(
-            self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
-        )
-        # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        if selected_kernel is not None:
+            # Fixed implementation entry: no ordered body dispatch, and no
+            # unrelated architecture's mutable sweep state in its module key.
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", selected_kernel.kernel_file)
+            self._k_mod = load_template(path, params, tag=selected_kernel.template, extra_key=("part", self._device_cc))
+        else:
+            self._k_mod = _load_sm100_kernel_module(
+                self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
+            )
+        # Which template serves this plan (logical identity, e.g. "prefill_d256_f16" /
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.
-        self.kernel_template = os.path.splitext(os.path.basename(self._k_mod.__file__))[0]
+        self.kernel_template = getattr(self._k_mod, "TEMPLATE_NAME", os.path.splitext(os.path.basename(self._k_mod.__file__))[0])
         # ... and the softmax arms it traced (softmax_arms_of): the executor exposes both.
         self.softmax_arms = softmax_arms_of(self._k_mod, has_lse=self.lse_desc is not None)
         # The kernel compile() keyword surface, read ONCE per plan (like

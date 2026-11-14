@@ -414,7 +414,7 @@ def test_split_kv_and_cta_mma_flavor_gating():
 _F16_FLAVORS = {
     "d128": ("sm100/prefill_d128_f16.py", 128, 128),
     "d192": ("sm100/prefill_d192_d128_f16.py", 192, 128),
-    "d256": ("sm100/prefill_d256_f16.py", 256, 256),
+    "d256": ("sm100/d256_f16_lookahead/kernel.py", 256, 256),
     "d512": ("sm100/prefill_d512_f16.py", 512, 512),
 }
 

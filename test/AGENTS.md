@@ -52,6 +52,19 @@ capture stream used by Torch. A Python-engine path may follow Torch's current st
 stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
 evidence of a backend replay defect. Check the captured graph and changed-input replay before attributing it.
 
+Scope sync-debug mode to the execute call inside the CUDA-graph context.
+Torch's capture entry may synchronize before capture begins; guarding that
+entry tests Torch's setup rather than the executor. Restore the previous mode
+before leaving capture, including on exceptions.
+
+Moving a kernel requires checking dynamic fixture paths as well as full-path
+imports. The D256 implementation contract's `test_dynamic_kernel_fixture_paths_exist`
+checks the actual paged-kernel and service-register-release case providers;
+their deeper numerical/PTX tests may not run in a bounded smoke selection.
+Splitting an engine also updates the shared `test_mhas_v2` routing assertions
+and explicit plan pins, not only the architecture-local FROST suites. Keep
+concrete owner/body assertions so native fallback cannot count as a pass.
+
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale

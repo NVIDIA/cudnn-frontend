@@ -113,7 +113,11 @@ def test_mismatch_accepts_and_rejects(row):
     assert reason(has_sink=True) is None
     assert "dense graphs only" in reason(thd=True, packed_layout=True)
     assert "paged-KV" in reason(has_paged_kv=True, padded=True, page_size=128)
-    assert "wired on the d128" in reason(d_qk=256, d_v=256)
+    d256_reason = reason(d_qk=256, d_v=256)
+    assert ("owned by" if row == "sdpa_fwd_prefill_sm100" else "wired on the d128") in d256_reason
+    if row == "sdpa_fwd_prefill_sm100":
+        d256_caps = _caps("sdpa_fwd_sm100_d256_lookahead")
+        assert "score_max output, which this engine does not support" in engines.mismatch(d256_caps, _facts(device_cc=cc, d_qk=256, d_v=256))
     if row == "sdpa_fwd_prefill_sm100":
         # The native d64 flavor is the same file at d_flavor=64 but is not validated with the outputs: not claimed.
         assert "wired on the d128" in reason(d_qk=64, d_v=64)
