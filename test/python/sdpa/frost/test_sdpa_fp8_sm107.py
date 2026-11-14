@@ -167,23 +167,26 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     from cudnn.sdpa.fwd import engines
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
+    sm100_envelopes = caps[engines.engine_name(arch="sm100", fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    assert sm100.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
+    assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
     assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
     assert (64, 64) not in sm107.thd_d_shapes
     # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
-    assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
-    # Both rows keep the D512 role-split floor; smaller flavors serve their
-    # qualified aligned dense envelopes through bounded TMA descriptors.
-    assert sm100.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    assert dict(sm107.d_envelope_floors) == dict(sm100_envelopes.d_envelope_floors)
+    # The legacy SM100 envelope row and Rubin retain the D512 floor. The
+    # explicit small-head owner only accepts its exact D64/D128 shapes.
+    assert sm100_envelopes.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    assert sm100.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
@@ -251,7 +254,7 @@ def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, under the SM100 d128 /
@@ -295,7 +298,7 @@ def test_softmax_half_declines_by_row_domain():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     half = _c.data_type.HALF
 
@@ -305,7 +308,7 @@ def test_softmax_half_declines_by_row_domain():
     assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
     # And the rows keep their arch lanes regardless of the attribute.
     assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
-    assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
+    assert "SM100-106" in engines.mismatch(caps[engines.engine_name(fp8=True)], facts((10, 7)), None)
 
 
 @pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
@@ -790,6 +793,7 @@ def test_fp8_envelope_mismatch_rules():
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps[engines.engine_name(fp8=True)]
     d192 = caps["sdpa_fwd_sm100_d192_fp8_multi_q"]
+    small = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     d256 = caps["sdpa_fwd_sm100_d256_fp8_single_q"]
     d512 = caps["sdpa_fwd_sm100_d512_fp8_role_split"]
     assert engines.mismatch(sm100, _fp8_facts()) is None
@@ -811,7 +815,9 @@ def test_fp8_envelope_mismatch_rules():
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
     assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
     assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
+    assert engines.mismatch(small, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
+    for d in (64, 128):
+        assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=d, d_v=d))
     # SM100 carries THD at each native per-tensor FP8 shape.
     assert engines.mismatch(d192, _fp8_facts(d_qk=192, d_v=128, thd=True, padded=True)) is None
     assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None

@@ -39,6 +39,19 @@ def _sm100_half_owner(graph):
     return engines.engine_name()
 
 
+def _sm100_fp8_owner(facts):
+    """Capability owner, independent of performance ranking among valid bodies."""
+    if facts.device_cc in ((10, 0), (10, 3)):
+        return {
+            (64, 64): "sdpa_fwd_sm100_d128_fp8_multi_q",
+            (128, 128): "sdpa_fwd_sm100_d128_fp8_multi_q",
+            (192, 128): "sdpa_fwd_sm100_d192_fp8_multi_q",
+            (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
+            (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
+        }.get((facts.d_qk, facts.d_v), engines.engine_name(fp8=True))
+    return engines.engine_name(fp8=True)
+
+
 # The default pytest.ini addopts is `-m L0`; mark the whole module so it runs.
 pytestmark = pytest.mark.L0
 
@@ -384,7 +397,7 @@ def test_prepared_fp8_dense_envelopes_do_not_expand_thd(d, dv):
     o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
     facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, d_qk=d, d_v=dv, thd=True)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _sm100_fp8_owner(facts))
     assert "packed native-tile leg" in engines.mismatch(caps, facts)
 
 
@@ -405,7 +418,7 @@ def test_prepared_fp8_output_stride_uses_output_element_width(dtype_o, padding):
     pitch = 128 + padding
     _finish_output(o, dims, (S * H * pitch, pitch, H * pitch, 1), dtype=dtype_o)
     facts = _facts(graph)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _sm100_fp8_owner(facts))
     knobs = engines.SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)
     supported = padding == 16 or dtype_o in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
     reason = engines._prepared_decline_reason(spec.capabilities, facts, 1)
@@ -1895,7 +1908,7 @@ def test_probe_rejects_requested_amax_s():
             amx_s.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
         return gg
 
-    fp8_name = engines.engine_name(fp8=True)
+    fp8_name = _sm100_fp8_owner(_facts(build(request_amax_s=False)))
     assert fp8_name in _eligible(build(request_amax_s=False))
     assert fp8_name not in _eligible(build(request_amax_s=True))
 
@@ -2732,36 +2745,30 @@ def test_paged_fp8_probe_accepts_and_declines():
     """Paged per-tensor FP8 admits native D128/D256 with dense or THD Q.
     D64 and aligned D256 envelope heads serve dense Q only. Off-contract pages remain declined, and the
     f16/bf16 row never serves an sdpa_fp8 graph."""
-    fp8_name = engines.engine_name(fp8=True)
-    for hnd in (True, False):
-        facts = _facts(_mk_paged_graph_fp8(hnd=hnd))
-        assert facts.has_paged_kv and facts.is_fp8 and facts.padded and facts.page_size == 16
-        elig = _eligible(_mk_paged_graph_fp8(hnd=hnd))
-        assert fp8_name in elig and engines.engine_name() not in elig
-    assert fp8_name in _eligible(_mk_paged_graph_fp8(d=64)), "d=64 FP8 rides the d128 FP8 envelope"
-    assert fp8_name in _eligible(_mk_paged_graph_fp8(page_size=128))
-    d256_name = "sdpa_fwd_sm100_d256_fp8_single_q"
+    legacy = engines.engine_name(fp8=True)
     rows = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
-    for d in (192, 224, 256):
+    for d in (64, 128, 192, 224, 256):
         for hnd in (True, False):
             graph = _mk_paged_graph_fp8(d=d, hnd=hnd)
-            owner = d256_name if d == 256 else fp8_name
+            facts = _facts(graph)
+            assert facts.has_paged_kv and facts.is_fp8 and facts.padded and facts.page_size == 16
+            owner = _sm100_fp8_owner(facts)
             eligible = _eligible(graph)
-            assert owner in eligible
-            if d == 256:
-                assert fp8_name not in eligible
-            assert engines._selected_d_shape(rows[owner], _facts(graph)) == (256, 256)
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=225)), "FP8 head widths must be 16-aligned"
-    assert fp8_name not in _eligible(_mk_paged_graph_fp8(page_size=48)), "page_size must divide 128 or be a multiple of it"
+            assert owner in eligible and engines.engine_name() not in eligible
+            if owner != legacy:
+                assert legacy not in eligible
+            assert engines._selected_d_shape(rows[owner], facts) == ((d, d) if d <= 128 else (256, 256))
+    graph = _mk_paged_graph_fp8(page_size=128)
+    assert _sm100_fp8_owner(_facts(graph)) in _eligible(graph)
+    for graph in (_mk_paged_graph_fp8(d=225), _mk_paged_graph_fp8(page_size=48)):
+        assert not _eligible(graph), "retain head-alignment and page-size declines"
     for d in (128, 256):
         for hnd in (True, False):
-            owner = d256_name if d == 256 else fp8_name
-            eligible = _eligible(_mk_paged_graph_fp8(d=d, hnd=hnd, thd=True))
-            assert owner in eligible
-            if d == 256:
-                assert fp8_name not in eligible
+            graph = _mk_paged_graph_fp8(d=d, hnd=hnd, thd=True)
+            eligible = _eligible(graph)
+            assert _sm100_fp8_owner(_facts(graph)) in eligible and legacy not in eligible
     for d in (64, 192, 224):
-        assert fp8_name not in _eligible(_mk_paged_graph_fp8(d=d, thd=True))
+        assert not _eligible(_mk_paged_graph_fp8(d=d, thd=True))
 
 
 def test_paged_quantized_rows_mismatch_reasons():
@@ -2790,7 +2797,8 @@ def test_paged_quantized_rows_mismatch_reasons():
         return ga.SdpaGraphFacts(**base)
 
     spec = {s.name: s for s in engines.ENGINE_SPECS}
-    fp8 = spec[engines.engine_name(fp8=True)].capabilities
+    legacy_fp8 = spec[engines.engine_name(fp8=True)].capabilities
+    fp8 = spec["sdpa_fwd_sm100_d128_fp8_multi_q"].capabilities
     mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
     fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
     assert fp8.paged_kv and mxfp8.paged_kv and fp8_rubin.paged_kv
@@ -2807,18 +2815,18 @@ def test_paged_quantized_rows_mismatch_reasons():
             facts = paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)
             assert engines.mismatch(fp8_d256 if d == 256 else fp8, facts) is None
             if d == 256:
-                assert "owned by the explicit implementation engines" in engines.mismatch(fp8, facts)
+                assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, facts)
     assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
     fp8_d512 = spec["sdpa_fwd_sm100_d512_fp8_role_split"].capabilities
     assert "native per-tensor D128/D256" in engines.mismatch(fp8_d512, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
     # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
     d256_facts = paged_facts(is_fp8=True, d_qk=256, d_v=256)
     assert engines.mismatch(fp8_d256, d256_facts) is None
-    assert "owned by the explicit implementation engines" in engines.mismatch(fp8, d256_facts)
-    assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
+    assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, d256_facts)
+    assert engines.mismatch(legacy_fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
     fp8_d192 = spec["sdpa_fwd_sm100_d192_fp8_multi_q"].capabilities
     d192_facts = paged_facts(is_fp8=True, d_qk=192, d_v=128)
-    assert "owned by the explicit implementation engines" in engines.mismatch(fp8, d192_facts)
+    assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, d192_facts)
     assert "paged attention" in engines.mismatch(fp8_d192, d192_facts)
     for d in (64, 128):
         sink_facts = paged_facts(is_fp8=True, has_sink=True, d_qk=d, d_v=d)
@@ -3145,10 +3153,10 @@ def test_virtual_amax_o_is_not_a_fact():
     assert amx_o.is_virtual
     facts = _facts(g)
     assert facts.amax_o_t is None, "a virtual Amax_O is not a requested output"
-    assert engines.engine_name(fp8=True) in _eligible(g), "and its absence declines nothing"
+    assert _sm100_fp8_owner(_facts(g)) in _eligible(g), "and its absence declines nothing"
     g, amx_o = build(request_amax_o=True)
     assert _facts(g).amax_o_t is amx_o
-    assert engines.engine_name(fp8=True) in _eligible(g)
+    assert _sm100_fp8_owner(_facts(g)) in _eligible(g)
 
 
 def test_mxfp8_virtual_amax_o_is_inferred_and_not_a_fact():
@@ -3271,7 +3279,7 @@ def test_fp8_paged_prepared_table_stride_admission(v_stride, split, entry):
     facts = _facts(graph)
     facts.paged_v_table_t.set_stride((v_stride[0], 1, v_stride[1], 1))
     facts = replace(_facts(graph), is_fp8=True, dtype=cudnn.data_type.FP8_E4M3, shape_overrides=True)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(fp8=True))
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _sm100_fp8_owner(facts))
     if entry == "graph":
         reason = engines._prepared_decline_reason(caps, facts, split)
         assert reason is None

@@ -1036,6 +1036,11 @@ a fixed two-CTA MMA group. Exact D256/V256 per-tensor FP8 recipes move to
 the single-Q engine 20524, with `TILE_CGA_M=1` and a one-CTA MMA group.
 Exact D192/V128 per-tensor FP8 recipes move to the multi-Q engine 20525,
 with matching physical-cluster/MMA widths of one or two CTAs.
+Exact D64/D128 per-tensor FP8 recipes move to multi-Q (20527), dual-KV
+(20528) or swap-AB (20529). The new swap-AB record exposes its physical
+`TILE_M=16` and NATURAL scheduler; `SWAP_AB` is no longer a knob on these
+three engines because the engine id already fixes the implementation.
+Regenerate the full recipe instead of changing an old id in place.
 Dense head envelopes keep their legacy owner.
 Exact SM120-family half D512/V512 and D576/V512 recipes move from 20505 to
 the explicit paired-warp engine 20526 with unchanged knobs; the padded head

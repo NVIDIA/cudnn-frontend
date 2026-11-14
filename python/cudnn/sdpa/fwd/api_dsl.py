@@ -4363,23 +4363,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self.batch_size == 1,
         )
         if self.flavor == (192, 128):
-            from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
+            if getattr(self, "_selected_kernel", None) is None:
+                from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
 
-            auto_sched, auto_cga = select_d192_auto_knobs(
-                params,
-                pertensor=self._pertensor,
-                s_q=self.s_q_max,
-                s_kv=self.s_k_max,
-                paged=bool(self.paged),
-                has_sink=bool(self.has_sink),
-                gqa_ratio=int(params.qh_per_kh),
-                device_cc=self._device_cc,
-            )
-            params = replace(
-                params,
-                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
-                cta_mma=auto_cga if self.cga is None else params.cta_mma,
-            )
+                auto_sched, auto_cga = select_d192_auto_knobs(
+                    params,
+                    pertensor=self._pertensor,
+                    s_q=self.s_q_max,
+                    s_kv=self.s_k_max,
+                    paged=bool(self.paged),
+                    has_sink=bool(self.has_sink),
+                    gqa_ratio=int(params.qh_per_kh),
+                    device_cc=self._device_cc,
+                )
+                params = replace(
+                    params,
+                    sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                    cta_mma=auto_cga if self.cga is None else params.cta_mma,
+                )
             params = canonicalize_d192_lowering(
                 params,
                 pertensor=self._pertensor,
@@ -4450,6 +4451,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     thd_decode_leg=self.thd_decode_leg,
                 ),
             )
+        selected = getattr(self, "_selected_kernel", None)
+        if selected is not None:
+            # A replayed engine record already names its pipeline. Keep the
+            # shared parameter derivation above, but never apply the legacy
+            # standalone body's dual-KV or late swap-AB selection below.
+            return selected.configure_params(params) if hasattr(selected, "configure_params") else params
         if self._d64_decode_tile():
             params = replace(params, decode_tile=True)
         if self._decode_early_q(params):
@@ -4468,10 +4475,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
-        selected = getattr(self, "_selected_kernel", None)
-        if selected is not None and hasattr(selected, "configure_params"):
-            params = selected.configure_params(params)
-        elif self.flavor == SM100_NATIVE_D576_SHAPE and not self._fp8:
+        if self.flavor == SM100_NATIVE_D576_SHAPE and not self._fp8:
             params = replace(params, mma_2x2=True)
         elif self.flavor == (512, 512) and not self._fp8:
             # The legacy D512_2X2 switch selects unsplit, unpaged half plans

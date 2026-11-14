@@ -22,7 +22,7 @@ def digest(t):
 def _observe_loader(monkeypatch):
     from cudnn.sdpa.fwd import api_dsl
 
-    original = api_dsl._load_sm100_kernel_module
+    original = api_dsl.load_template
     loaded = []
 
     def observe(*args, **kwargs):
@@ -30,12 +30,13 @@ def _observe_loader(monkeypatch):
         loaded.append(module)
         return module
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", observe)
+    monkeypatch.setattr(api_dsl, "load_template", observe)
     return loaded
 
 
-def _assert_decode(mod):
-    assert mod.__file__.endswith("sm100/decode_d128_fp8.py")
+def _assert_decode(mod, *, envelope=False):
+    expected = "sm100/decode_d128_fp8.py" if envelope else "sm100/d128_fp8_swap_ab/kernel.py"
+    assert mod.__file__.endswith(expected)
     assert mod.FROST_SOURCE_DIGEST
     assert (mod.TILE_K, mod.TILE_O, mod.N_Q, mod.COLS, mod.STAGES) == (128, 128, 16, 8, 5)
 
@@ -242,14 +243,14 @@ def test_native_fp8_decode_features(feature, monkeypatch):
         explicit_swap_ab=1 if d <= 64 else None,
         **kwargs,
     )
-    _assert_decode(loaded[-1])
+    _assert_decode(loaded[-1], envelope=d != dv or d not in (64, 128))
 
 
 @pytest.mark.parametrize("sq,group,cga,d", [(1, 16, 1, 128), (9, 1, 1, 128), (1, 8, 2, 128), (5, 8, 1, 64), (33, 1, 1, 64), (1, 16, 1, 64)])
 def test_native_fp8_decode_route_boundaries(sq, group, cga, d, monkeypatch):
     loaded = _observe_loader(monkeypatch)
     paged._run_graph_fp8(2, 2 * group, 2, d, 16, 9, [129, 77], True, s_q=sq, explicit_pack=True, explicit_split=1, explicit_cga=cga)
-    assert loaded[-1].__file__.endswith("sm100/prefill_d128_fp8.py")
+    assert loaded[-1].__file__.endswith(("sm100/d128_fp8_multi_q/kernel.py", "sm100/d128_fp8_dual_kv/kernel.py"))
 
 
 @pytest.mark.parametrize("swap_ab", [None, 0, 1])
@@ -275,16 +276,18 @@ def test_d64_swap_ab_public_choice(swap_ab, monkeypatch):
         return_case=True,
         override=True,
     )
-    expected = "decode_d128_fp8.py" if swap_ab == 1 else "prefill_d128_fp8.py"
+    expected = "d128_fp8_swap_ab/kernel.py" if swap_ab == 1 else "d128_fp8_multi_q/kernel.py"
     assert loaded[-1].__file__.endswith("sm100/" + expected)
-    _, public = graph.get_engine_and_knobs_at_index(graph._plan_index)
-    assert public.get(cudnn.knob_type.SWAP_AB) == swap_ab
+    engine_id, public = graph.get_engine_and_knobs_at_index(graph._plan_index)
+    assert engine_id == (20529 if swap_ab == 1 else 20527)
+    assert cudnn.knob_type.SWAP_AB not in public
+    assert public[cudnn.knob_type.TILE_M] == (16 if swap_ab == 1 else 128)
     assert SdpaFwdKnobs.from_public(public).to_public() == public
 
 
-@pytest.mark.parametrize("sq,group,d", [(5, 8, 64), (33, 1, 64), (1, 16, 64), (1, 8, 128)])
+@pytest.mark.parametrize("sq,group,d", [(5, 8, 64), (33, 1, 64), (1, 16, 64), (2, 8, 128)])
 def test_d64_swap_ab_declines_unsupported(sq, group, d):
-    with pytest.raises(NotImplementedError, match="swap_ab"):
+    with pytest.raises(NotImplementedError, match="swap-AB"):
         paged._run_graph_fp8(
             2,
             2 * group,
@@ -399,19 +402,19 @@ def test_native_fp8_decode_optional_outputs(in_key, stats, amax, log2, split, mo
 def test_native_fp8_decode_direct_partial_log_base(in_key, monkeypatch):
     from cudnn.sdpa.fwd import api_dsl
 
-    original = api_dsl._load_sm100_kernel_module
+    original = api_dsl.load_template
     observed = []
 
-    def direct_params(flavor, params, **kwargs):
+    def direct_params(path, params, **kwargs):
         # The normal adapter clears this flag for partials. Exercise a direct
         # template declaration that still requests log2, as allowed by its ABI.
         assert params.split_kv == 4
-        mod = original(flavor, replace(params, stats_log2=True), **kwargs)
+        mod = original(path, replace(params, stats_log2=True), **kwargs)
         assert mod.CFG.STATS_LOG2 and mod.SPLIT_KV == 4
         observed.append(mod)
         return mod
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", direct_params)
+    monkeypatch.setattr(api_dsl, "load_template", direct_params)
     paged._run_graph_fp8(
         3, 8, 1, 128, 16, 33, [513, 77, 0], True, in_key=in_key, out_dt=torch.bfloat16, stats_log2=True, explicit_pack=True, explicit_split=4, explicit_cga=1
     )
@@ -419,38 +422,34 @@ def test_native_fp8_decode_direct_partial_log_base(in_key, monkeypatch):
 
 
 def check_architecture_route(monkeypatch):
-    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa import graph_analyzer
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry
     from frost_test_utils import _SM
 
-    original = api_dsl.SdpaFwdDslSm100.template_params
-    checked = []
-
-    def inspect(api):
-        actual = api._device_cc
-        actual_batch = api.batch_size
-        try:
-            api._device_cc = (10, 0)
-            sm100 = original(api)
-            api.batch_size = 65535
-            assert original(api).decode_live_columns == 8
-            api.batch_size = 65536
-            assert original(api).decode_q_tile == 0
-            api.batch_size = actual_batch
-            api._device_cc = (10, 3)
-            sm103 = original(api)
-        finally:
-            api._device_cc = actual
-            api.batch_size = actual_batch
-        assert sm100.decode_q_tile == 16 and sm100.decode_live_columns == 8
-        assert sm103.decode_q_tile == 0
-        checked.append(True)
-        return original(api)
-
-    monkeypatch.setattr(api_dsl.SdpaFwdDslSm100, "template_params", inspect)
     loaded = _observe_loader(monkeypatch)
-    paged._run_graph_fp8(2, 16, 2, 128, 16, 9, [129, 77], True, s_q=1, explicit_pack=True, explicit_split=2, explicit_cga=1)
-    assert checked
-    expected = "decode_d128_fp8.py" if _SM == 100 else "prefill_d128_fp8.py"
+    graph, _, _, _, _ = paged._run_graph_fp8(
+        2,
+        16,
+        2,
+        128,
+        16,
+        9,
+        [129, 77],
+        True,
+        s_q=1,
+        explicit_pack=True,
+        explicit_split=2,
+        explicit_cga=1,
+        return_case=True,
+    )
+    facts = graph_analyzer.analyze(graph)
+    knobs = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=2)
+    select = lambda **changes: select_sm100_small_fp8_geometry(replace(facts, **changes), knobs)
+    assert select(device_cc=(10, 0), b=65535).decode_q_tile == 16
+    assert select(device_cc=(10, 0), b=65536).decode_q_tile == 0
+    assert select(device_cc=(10, 3)).decode_q_tile == 0
+    expected = "d128_fp8_swap_ab/kernel.py" if _SM == 100 else "d128_fp8_dual_kv/kernel.py"
     assert loaded[-1].__file__.endswith("sm100/" + expected)
 
 

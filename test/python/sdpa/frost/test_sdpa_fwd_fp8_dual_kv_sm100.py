@@ -3,12 +3,11 @@
 
 """Per-tensor FP8 d128 decode with two KV streams per CTA (TemplateParams.dual_kv_stream).
 
-sm100/prefill_d128_fp8.py runs its second Q sub-tile as a second KV stream over
+sm100/d128_fp8_dual_kv/kernel.py runs its second Q sub-tile as a second KV stream over
 the first sub-tile's 128 rows: stream 0 takes the even KV tiles, stream 1 the
 odd ones, each with its own running max / sum and O accumulator, merged once in
-the correction epilogue.  The routing is the adapter's (``_fp8_dual_kv_stream``),
-on by default behind ``config_sm100.FP8_DUAL_KV_STREAM_ROUTED``; these tests pin
-it on and check every shape family the merge has to get right: an even and an odd tile
+the correction epilogue.  Graph tests pin the explicit dual-KV engine; standalone adapter tests retain
+the legacy ``_fp8_dual_kv_stream`` routing check. They cover every shape family the merge has to get right: an even and an odd tile
 count (stream 1's phantom step), one and two tiles, a KV split whose chunks are
 odd, bottom-right causal multi-query, an unpacked 64-row Q tile, fp8 and bf16 O,
 and paged K/V with unaligned lengths.
@@ -29,12 +28,12 @@ from cudnn.sdpa.fwd import config_sm100
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 from determinism_utils import assert_bitwise, snapshot
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import fp8_engine_names, requires_dsl, requires_pre_rubin_blackwell, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
-ENGINE = "sdpa_fwd_prefill_sm100_fp8"
-ENGINE_ID = 20513  # FROST_SDPA_FWD_ID_BASE + manifest slot 13 (sdpa_fwd_prefill_sm100_fp8)
+ENGINE = "sdpa_fwd_sm100_d128_fp8_dual_kv"
+ENGINE_ID = 20528  # Explicit dual-KV implementation, independent of heuristic ranking.
 D = 128
 F8 = torch.float8_e4m3fn
 
@@ -272,11 +271,14 @@ def _run_paged(b, h, kh, s_q, page, max_pages, lens, *, causal_br, split=None, s
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.OPENSOURCE])
-    plan = select_engine(g, ENGINE)
-    if split is not None:
-        g.create_execution_plan(ENGINE_ID, SdpaFwdKnobs(sched_policy=sched_policy, tile_m=128, tile_n=128, cga=1, pack_gqa=pack_gqa, split_kv=split))
-        g.select_plan(len(g.plans) - 1)
-        plan = g.plans[g._plan_index]
+    # This producer is a legal explicit alternative even when heuristics prefer swap-AB.
+    # Preserve the parent's split/packing choice for the unpinned legacy cases.
+    lead = select_engine(g, fp8_engine_names())
+    chosen_split = lead.knobs.split_kv if split is None else split
+    chosen_pack = lead.knobs.pack_gqa if split is None else pack_gqa
+    g.create_execution_plan(ENGINE_ID, SdpaFwdKnobs(sched_policy=sched_policy, tile_m=128, tile_n=128, cga=1, pack_gqa=chosen_pack, split_kv=chosen_split))
+    g.select_plan(len(g.plans) - 1)
+    plan = g.plans[g._plan_index]
     assert plan.knobs.cga in (None, 1), plan.knobs
     g.check_support()
     g.build_plans()
@@ -357,7 +359,7 @@ def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh,
     from cudnn.sdpa.fwd import api_dsl
 
     modules = []
-    original_load = api_dsl._load_kernel_template
+    original_load = api_dsl.load_template
 
     def load(*args, **kwargs):
         module = original_load(*args, **kwargs)
@@ -365,7 +367,7 @@ def test_paged_split_producer_lengths_replay(routed, monkeypatch, hnd, b, h, kh,
             modules.append(module)
         return module
 
-    monkeypatch.setattr(api_dsl, "_load_kernel_template", load)
+    monkeypatch.setattr(api_dsl, "load_template", load)
     generator = torch.Generator(device="cuda").manual_seed(7)
     o, ref = _run_paged(
         b, h, kh, s_q, page, max_pages, lens, causal_br=causal, split=split, sched_policy=sched, pack_gqa=packed, hnd=hnd, replay=True, generator=generator
@@ -387,7 +389,8 @@ _PHANTOM_CHILD = textwrap.dedent(r"""
 
     config_sm100.FP8_DUAL_KV_STREAM_ROUTED = True
     kernels = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels")
-    src = open(os.path.join(kernels, api_dsl._SM100_FP8_KERNEL_FILES[(128, 128)])).read()
+    source_path = os.path.join(kernels, "sm100/d128_fp8_dual_kv/kernel.py")
+    src = open(source_path).read()
     # The MMA warp sleeps before it consumes stream 1's P-ready credits: the adverse ordering in which
     # stream 0 and the ping-pong run ahead while stream 1's previous credits sit unconsumed.
     anchor = "    bars.mb_bmm2_ready[stream * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)\n"
@@ -399,7 +402,12 @@ _PHANTOM_CHILD = textwrap.dedent(r"""
     assert src.count(anchor) == 1, "the stream-indexed ready wait of _mma_dual_pv moved: update this test's anchor"
     path = os.path.join(os.getcwd(), "prefill_d128_fp8_delayed_mma.py")
     open(path, "w").write(src.replace(anchor, delay + anchor))
-    api_dsl._SM100_FP8_KERNEL_FILES[(128, 128)] = path
+    original_load = api_dsl.load_template
+    def delayed_load(filename, *args, **kwargs):
+        if filename == source_path:
+            filename = path
+        return original_load(filename, *args, **kwargs)
+    api_dsl.load_template = delayed_load
     # 4 sequences, 48 packed rows (12 q heads over one KV head x 4 tokens), page 128: 3 / 5 / 7 / 9 KV tiles.
     # Every count is odd, so stream 1 ends on a phantom step with at least one real step before it.
     torch.manual_seed(1234)  # the block table is a random permutation: pin it so the bound below is a number, not a draw

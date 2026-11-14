@@ -6,7 +6,7 @@
 import math
 import os
 
-from frost_test_utils import half_engine_names, _is_plan_for
+from frost_test_utils import fp8_engine_names, half_engine_names, _is_plan_for
 
 import pytest
 import torch
@@ -817,10 +817,27 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     name = engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8)
+    if fp8 and _SM in (100, 103):
+        name = {
+            (64, 64): "sdpa_fwd_sm100_d128_fp8_multi_q",
+            (128, 128): "sdpa_fwd_sm100_d128_fp8_multi_q",
+            (192, 128): "sdpa_fwd_sm100_d192_fp8_multi_q",
+            (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
+            (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
+        }.get(d_shape, name)
     if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"
-    if not fp8 and _SM in (100, 103) and d_shape == (512, 512):
+    if fp8 and _SM in (100, 103):
+        from cudnn.engines.manifest import family_for
+
+        # Keep the ranked packing/scheduler knobs, but bind this fixture's
+        # explicit CTA width to its owner. The automatic list may contain
+        # only dual-KV/CGA1 while this fixture requests multi-Q/CGA2.
+        _select_engine(g, fp8_engine_names(_ARCH))
+        _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        engine = family_for(g).offered_ids()[name]
+    elif not fp8 and _SM in (100, 103) and d_shape == (512, 512):
         from cudnn.engines.manifest import family_for
 
         # This test explicitly requests split-KV, whose wide owner is the

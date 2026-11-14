@@ -1543,6 +1543,7 @@ def _run_graph_fp8(
     amax=True,
     stats_log2=False,
     explicit_swap_ab=None,
+    record=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1636,7 +1637,10 @@ def _run_graph_fp8(
         amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        g.create_execution_plan(*record)
     if pin:
         select_engine(g, target_engine)
     if want_split is not None:
@@ -1660,7 +1664,23 @@ def _run_graph_fp8(
             knobs = replace(knobs, cga=explicit_cga)
         if explicit_swap_ab is not None:
             knobs = replace(knobs, swap_ab=explicit_swap_ab)
-        g.create_execution_plan(selected.engine_id, knobs.to_public() if explicit_swap_ab is not None else knobs)
+        engine_id = selected.engine_id
+        if record is None:
+            from cudnn.engines.manifest import family_for
+            from cudnn.sdpa import graph_analyzer
+            from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry
+            from cudnn.sdpa.fwd.kernels.sm100.small_fp8_contract import in_domain
+            from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+
+            facts = graph_analyzer.analyze(g)
+            if in_domain(facts):
+                # Fixture arguments describe a legacy body choice. Resolve them once,
+                # then create/replay the canonical fixed implementation record.
+                knobs = replace(knobs, tile_m=128)
+                geometry = SwapAB(d_flavor=d) if explicit_swap_ab == 1 else select_sm100_small_fp8_geometry(facts, knobs)
+                knobs = geometry.canonical_knobs(knobs)
+                engine_id = family_for(g).offered_ids()[geometry.implementation]
+        g.create_execution_plan(engine_id, knobs.to_public())
         g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -1966,7 +1986,7 @@ def test_paged_graph_fp8_declines_off_contract():
         owner = {
             256: "sdpa_fwd_sm100_d256_fp8_single_q",
             512: "sdpa_fwd_sm100_d512_fp8_role_split",
-        }.get(d, engine_name(fp8=True))
+        }.get(d, fp8_engine_names())
         return g is not None and offers_engine(g, owner)
 
     assert _offers(_build_fp8_paged_graph(16))
@@ -1991,7 +2011,7 @@ def test_paged_graph_fp8_declines_off_contract():
     assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(right_bound=0, left_bound=64)))
     assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(diagonal_alignment=br)))
     g_br_window_only = _build_fp8_paged_graph(16, mask_kw=dict(left_bound=64, diagonal_alignment=br))
-    assert g_br_window_only is not None and not offers_engine(g_br_window_only, engine_name(fp8=True)), "bottom-right alignment requires a causal upper bound"
+    assert g_br_window_only is not None and not offers_engine(g_br_window_only, fp8_engine_names()), "bottom-right alignment requires a causal upper bound"
     # The f16/bf16 engine never sees an sdpa_fp8 graph: its row is a different quantization family.
     assert not offers_engine(_build_fp8_paged_graph(16), engine_name())
 
