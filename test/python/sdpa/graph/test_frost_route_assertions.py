@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A migrated D256 route assertion still detects fallback and the wrong body."""
+"""A migrated route assertion still detects fallback and the wrong body."""
 
 from types import SimpleNamespace
 
@@ -39,6 +39,40 @@ def test_d256_route_assertion_keeps_owner_and_body_strict(monkeypatch, served, b
     cfg = SimpleNamespace(d_qk=256, d_v=256)
     if valid:
         mhas._exec_sdpa_on_frost(cfg, None, None, template=requested, cga=2, knobs={"split_kv": 1})
+    else:
+        with pytest.raises(AssertionError, match="expected .*serve this graph"):
+            mhas._exec_sdpa_on_frost(cfg, None, None, template=requested)
+
+
+@pytest.mark.parametrize(
+    "dq,served,body,requested,valid",
+    [
+        (512, "sdpa_fwd_sm100_d512_role_split", "prefill_d512_f16", None, True),
+        (512, "sdpa_fwd_sm100_d512_2x2", "prefill_d512_f16_2x2", None, True),
+        (576, "sdpa_fwd_sm100_d512_2x2", "prefill_d512_f16_2x2", None, True),
+        (512, "sdpa_fwd_sm100_d512_role_split", "prefill_d512_f16", "prefill_d512_f16", True),
+        (512, "sdpa_fwd_sm100_d512_2x2", "prefill_d512_f16_2x2", "prefill_d512_f16", False),
+        (512, "sdpa_fwd_sm100_d512_role_split", "prefill_d512_f16_2x2", "prefill_d512_f16_2x2", False),
+        (576, "sdpa_fwd_sm100_d512_role_split", "prefill_d512_f16", None, False),
+        (512, "sdpa_fwd_prefill_sm100", "prefill_d512_f16", None, False),
+        (576, "sdpa_fwd_prefill_sm100", "prefill_d512_f16_2x2", None, False),
+        (512, None, None, None, False),
+    ],
+)
+def test_wide_route_assertion_keeps_owner_and_body_strict(monkeypatch, dq, served, body, requested, valid):
+    counts = {}
+    monkeypatch.setattr(mhas.frost_routing, "snapshot", lambda: dict(counts))
+    monkeypatch.setattr(mhas.frost_routing, "LAST_PLAN", (served, SimpleNamespace(cga=4 if dq == 512 else 2)))
+
+    def execute(*args, **kwargs):
+        counts[f"frost:{served}" if served else "native:fp16-fwd"] = 1
+        if served:
+            counts[f"frost:{served}:{body}"] = 1
+
+    monkeypatch.setattr(mhas, "exec_sdpa", execute)
+    cfg = SimpleNamespace(d_qk=dq, d_v=512)
+    if valid:
+        mhas._exec_sdpa_on_frost(cfg, None, None, template=requested, cga=4 if dq == 512 else 2)
     else:
         with pytest.raises(AssertionError, match="expected .*serve this graph"):
             mhas._exec_sdpa_on_frost(cfg, None, None, template=requested)

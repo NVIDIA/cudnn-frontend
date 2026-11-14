@@ -106,6 +106,7 @@ def _thd_graph(
     bottom_right=False,
     window_left=None,
     independent_o_offsets=False,
+    explicit_engine=None,
 ):
     """A THD bf16 graph the way FlashInfer declares it: BHSD dims with ragged offsets, cu_seq_len
     lengths, token-major Stats. ``ragged_batch_stride`` mimics FlashInfer's small declared batch
@@ -161,9 +162,15 @@ def _thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = half_engine_names(arch)
-    g.select_plan(next(i for i, n in enumerate(names) if _is_plan_for(n, want)))
+    if explicit_engine is not None:
+        from cudnn.engines.manifest import family_for
+
+        g.create_execution_plan(family_for(g).offered_ids()[explicit_engine], {cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 0})
+        g.select_plan(g.get_execution_plan_count() - 1)
+    else:
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        want = half_engine_names(arch)
+        g.select_plan(next(i for i, n in enumerate(names) if _is_plan_for(n, want)))
     g.check_support()
     g.build_plans()
     tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
@@ -2943,15 +2950,24 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 @requires_dsl
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("python_binding", [False, True], ids=["native", "python"])
-@pytest.mark.parametrize("d", [128, 256], ids=["legacy", "explicit-lookahead"])
-def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding, d):
+@pytest.mark.parametrize(
+    "d,explicit_engine",
+    [
+        (128, None),
+        (256, None),
+        (512, "sdpa_fwd_sm100_d512_role_split"),
+        (512, "sdpa_fwd_sm100_d512_2x2"),
+    ],
+    ids=["legacy", "explicit-lookahead", "d512-role", "d512-2x2"],
+)
+def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding, d, explicit_engine):
     """Vary compact HN stride, then replay older independent captures with no compile or adaptation."""
     b, qmax, kl, hq, hk = 2, 16, 64, 8, 2
     if torch.cuda.get_device_capability() == (10, 7):
         pytest.skip("SM107 overlaunch admission is qualified separately")
     arch = "sm100"
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    g, t = _thd_graph(b, qmax, kl, hq, hk, d, override_enabled=True, dtype=dt, arch=arch, stats_head_stride=b * qmax)
+    g, t = _thd_graph(b, qmax, kl, hq, hk, d, override_enabled=True, dtype=dt, arch=arch, stats_head_stride=b * qmax, explicit_engine=explicit_engine)
     note = cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
     assert note in g.get_behavior_notes()
     assert cudnn.behavior_note.RUNTIME_COMPILATION in g.get_behavior_notes()
@@ -2991,7 +3007,7 @@ def test_hn_stride_override_reuses_plan_and_old_capture(dtype, python_binding, d
         retained.append((cg, bufs, ql))
     # Another graph/config from the same engine cannot change retained plans'
     # note or binder state. This graph deliberately disables runtime overrides.
-    other, _ = _thd_graph(b, 8, kl, hq, hk, d, override_enabled=False, dtype=dt, arch=arch, stats_head_stride=b * 8)
+    other, _ = _thd_graph(b, 8, kl, hq, hk, d, override_enabled=False, dtype=dt, arch=arch, stats_head_stride=b * 8, explicit_engine=explicit_engine)
     assert note not in other.get_behavior_notes()
     assert not _plan(other)._prepared.supports_stats_stride_override
     assert note in g.get_behavior_notes()

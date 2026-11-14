@@ -225,8 +225,8 @@ _SM100_FLAVORS = (
 # whole group only.  Mirror of Capabilities.pack_gqa_partial_d_shapes.
 _SM100_PARTIAL_PACK_GQA_FLAVORS = ((128, 128), (256, 256), SM100_NATIVE_D576_SHAPE)
 _SM100_KERNEL_FILES = {
-    SM100_NATIVE_D576_SHAPE: "sm100/prefill_d512_f16_2x2.py",
-    (512, 512): "sm100/prefill_d512_f16.py",
+    SM100_NATIVE_D576_SHAPE: "sm100/d512_f16_2x2/kernel.py",
+    (512, 512): "sm100/d512_f16_role_split/kernel.py",
     (256, 256): "sm100/d256_f16_lookahead/kernel.py",
     (192, 128): "sm100/prefill_d192_d128_f16.py",
     (128, 128): "sm100/prefill_d128_f16.py",
@@ -248,7 +248,7 @@ _SM100_KERNEL_FILES = {
 # role-split A/B arm (the `d512_arm` / `two_by_two` test fixtures set both explicitly): the record keeps
 # mma_2x2=False for the original plans. Native Rubin dense packed/split plans require 2x2 under either
 # value. Other plans the twin does not serve (paged, quantized, SM100 split / G128) retain the role split.
-_SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
+_SM100_D512_2X2_KERNEL_FILE = "sm100/d512_f16_2x2/kernel.py"
 _SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
 D512_2X2: bool = True
 # The SM90 D128 template's overlap switch (config_sm90.TemplateParams.intra_wg_overlap). A CALL-TIME module
@@ -3125,7 +3125,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # helper exists to prevent, since an explicit cga=1 on the Rubin quantized
         # d192 path would then clear check_support() and die inside compile().
         if selected_kernel is not None:
-            supported_cgas = (selected_kernel.cga,)
+            # This adapter parameter names the MMA group. Wide explicit
+            # engines expose the physical cluster and lower its fixed pair.
+            supported_cgas = (getattr(selected_kernel, "cta_group", selected_kernel.cga),)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
@@ -4430,13 +4432,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 cta_mma=auto_cga if self.cga is None else params.cta_mma,
             )
             params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
-        if self.flavor == SM100_NATIVE_D576_SHAPE and not self._fp8:
+        selected = getattr(self, "_selected_kernel", None)
+        if selected is not None and hasattr(selected, "configure_params"):
+            params = selected.configure_params(params)
+        elif self.flavor == SM100_NATIVE_D576_SHAPE and not self._fp8:
             params = replace(params, mma_2x2=True)
-        if self.flavor == (512, 512) and not self._fp8:
+        elif self.flavor == (512, 512) and not self._fp8:
             # The legacy D512_2X2 switch selects unsplit, unpaged half plans
             # whose entire packed group divides the 64-row tile. Native SM107
             # dense packed/split plans below always use their qualified 2x2 body.
-            two_by_two = D512_2X2 and self.split_kv == 1 and not self.paged and (not self.pack_gqa or 64 % max(1, int(params.qh_per_kh)) == 0)
+            from .heuristics import select_sm100_d512_geometry_for_shape
+            from .kernels.sm100.d512_f16_contract import TWO_BY_TWO
+
+            two_by_two = (
+                select_sm100_d512_geometry_for_shape(
+                    512,
+                    paged=self.paged,
+                    split_kv=self.split_kv,
+                    pack_g=int(params.qh_per_kh) if self.pack_gqa else 1,
+                    prefer_two_by_two=D512_2X2,
+                ).implementation
+                == TWO_BY_TWO
+            )
             # New native packed/split plans require this body even if the
             # legacy unpacked A/B seam selects the role-split implementation.
             two_by_two = two_by_two or self._mixed_fp8_kv or (self._rubin_native_d512_leg() and (self.paged or self.pack_gqa or self.split_kv > 1))

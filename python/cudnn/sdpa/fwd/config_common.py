@@ -240,7 +240,7 @@ class TemplateParams:
     thd_batch_one: bool = False
     # d512 f16/bf16 forward on the "2x2 datapath": ONE pipeline per CTA on the
     # cta_group::2 M=128 atom (64 Q rows per CTA, 12 warps), a (4,1,1) cluster of
-    # two pairs sharing K/V by TMA multicast -- sm100/prefill_d512_f16_2x2.py
+    # two pairs sharing K/V by TMA multicast -- sm100/d512_f16_2x2/kernel.py
     # (make_cfg_d512_2x2 / CfgD512X2) instead of the cga4x1 role-split kernel.
     # APPEND-ONLY and default False: every existing record renders byte-identically
     # (make_cfg_d512 and the loader read it through getattr).  Plan-time only;
@@ -579,7 +579,7 @@ def _validate_params(
             # tile's split applies the gate in ITS combine; this prefill body has no such arm).
             raise ValueError(f"{flavor}: epilogue_gate with split_kv > 1 is not served on this body (the split partials bypass the gated epilogue)")
     if getattr(k, "mma_2x2", False):
-        # The 2x2-datapath kernel exists for the half d512 flavor only (sm100/prefill_d512_f16_2x2.py).
+        # The 2x2-datapath kernel exists for the half d512 flavor only (sm100/d512_f16_2x2/kernel.py).
         if flavor != "d512":
             raise ValueError(f"{flavor}: mma_2x2 selects the d512 2x2-datapath kernel; the other flavors do not consume it")
         if fp8:

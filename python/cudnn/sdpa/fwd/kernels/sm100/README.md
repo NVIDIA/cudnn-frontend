@@ -1,7 +1,8 @@
 # SM100 forward implementations
 
-The first explicit-engine pilot gives each D256 half main implementation a local
-owner directory. Other SM100 implementations remain at their existing paths.
+Each migrated half main implementation has a local owner directory. D256 and
+exact D512/D576 graph plans use explicit engines; other SM100 implementations
+remain at their existing paths.
 
 ```text
 sm100/
@@ -18,11 +19,24 @@ sm100/
     host.py
     __init__.py
   d256_f16_contract.py  # immutable selection record / common exact-D256 domain
+  d512_f16_role_split/  # D512, 128 query rows / four-CTA cluster
+    contract.py
+    config.py
+    kernel.py
+    host.py
+    __init__.py
+  d512_f16_2x2/         # D512/D576, 64 query rows / four- or two-CTA cluster
+    contract.py
+    config.py
+    kernel.py
+    host.py
+    __init__.py
+  d512_f16_contract.py  # immutable selection; full cluster vs fixed MMA pair
 ```
 
 The graph parser, variant-pack binder, compilation cache and launch lifecycle
 remain shared. Performance selection belongs to `fwd/heuristics.py`; a selected
-engine cannot silently switch to the other main pipeline. Importing either
+engine cannot silently switch to another main pipeline. Importing an owner's
 contract/config does not load a kernel body or the tensor/DSL runtimes.
 
 This is implementation isolation, not duplication of shared utilities.
@@ -33,6 +47,14 @@ wrapper and restricted D128 swap-AB route explicitly import/load these owners.
 Their tests remain part of the change surface. No old-path forwarding modules
 or cross-import of sibling kernel bodies are needed.
 
-Kernel diagnostic identities remain `prefill_d256_f16` and `decode_d256_f16`;
-file basenames are not a capability API. Runtime capabilities are queried from
+Wide half configuration is independent of the per-tensor FP8 record.
+`fwd/config_d512_2x2_common.py` owns only the immutable 2x2 record and geometry
+helpers shared with SM107; the two architectures retain their own factories.
+The explicit D512 rows expose `TILE_CGA_M=4`, while D576 exposes `2`. Both
+lower to a fixed two-CTA MMA group. This translation is checked at compile time
+and does not change the legacy split-cost model's input geometry.
+
+Kernel diagnostic identities retain their `prefill_d256_f16`, `decode_d256_f16`,
+`prefill_d512_f16` and `prefill_d512_f16_2x2` spellings; file basenames are not a
+capability API. Runtime capabilities are queried from
 the final selected plan's behavior notes.

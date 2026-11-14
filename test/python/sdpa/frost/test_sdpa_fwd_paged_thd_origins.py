@@ -85,6 +85,8 @@ def test_paged_thd_origins_rebind_and_capture(
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
     if not rubin and (d_qk, d_v) == (256, 256):
         engine = "sdpa_fwd_sm100_d256_lookahead"
+    elif not rubin and (d_qk, d_v) == (576, 512):
+        engine = "sdpa_fwd_sm100_d512_2x2"
     batch, heads, kv_heads, maximum, page, kv_max = (
         2,
         (24 if d_qk in (192, 576) else 16),

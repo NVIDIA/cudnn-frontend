@@ -230,12 +230,15 @@ def test_independent_thd_origins_rebind_and_capture(
     elif cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
         from cudnn.engines.manifest import family_for
 
+        if engine_name == "sdpa_fwd_prefill_sm100" and d_qk == 576 and torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+            engine_name = "sdpa_fwd_sm100_d512_2x2"
         graph.create_execution_plan(
             family_for(graph).offered_ids()[engine_name],
             {
                 cudnn.knob_type.TILE_CGA_M: cga if cga is not None else (1 if d_qk == 128 and splits > 1 else 2),
                 cudnn.knob_type.PACK_GQA: int(pack_gqa),
                 cudnn.knob_type.SPLIT_KV: splits,
+                **({cudnn.knob_type.TILE_M: 64} if engine_name == "sdpa_fwd_sm100_d512_2x2" else {}),
             },
         )
         graph.select_plan(0)

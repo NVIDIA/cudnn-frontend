@@ -391,7 +391,8 @@ def test_split_kv_and_cta_mma_flavor_gating():
     # record keeps the role-split CfgD512; mma_2x2=True builds the CfgD512X2 and still honours split_kv (the fp32-partials
     # arm is in the kernel body; the ADAPTER twin keeps split plans on the role split in phase 1 -- see
     # test_sdpa_fwd_d512_2x2_sm100.test_twin_declines_split_and_g128).
-    from cudnn.sdpa.fwd.config_sm100 import CfgD512, CfgD512X2
+    from cudnn.sdpa.fwd.config_sm100 import CfgD512X2
+    from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.config import CfgD512
 
     assert isinstance(make_cfg_d512(TemplateParams())[0], CfgD512) and not isinstance(make_cfg_d512(TemplateParams())[0], CfgD512X2)
     cfg_2x2 = make_cfg_d512(TemplateParams(mma_2x2=True))[0]
@@ -415,7 +416,7 @@ _F16_FLAVORS = {
     "d128": ("sm100/prefill_d128_f16.py", 128, 128),
     "d192": ("sm100/prefill_d192_d128_f16.py", 192, 128),
     "d256": ("sm100/d256_f16_lookahead/kernel.py", 256, 256),
-    "d512": ("sm100/prefill_d512_f16.py", 512, 512),
+    "d512": ("sm100/d512_f16_role_split/kernel.py", 512, 512),
 }
 
 

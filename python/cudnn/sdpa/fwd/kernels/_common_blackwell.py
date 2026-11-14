@@ -259,7 +259,7 @@ def make_d256_bars(CFG, *, N_O_CHUNKS: int, epilogue_gate: bool = False) -> D256
 
 
 class D512X2Bars(NamedTuple):
-    """Barrier bundle of the d512 2x2-datapath forward (sm100/prefill_d512_f16_2x2.py)."""
+    """Barrier bundle of the d512 2x2-datapath forward (sm100/d512_f16_2x2/kernel.py)."""
 
     mb_q_full: object
     mb_q_empty: object

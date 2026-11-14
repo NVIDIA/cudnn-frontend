@@ -157,7 +157,13 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
     list only follows ownership; it contains no shape or performance policy.
     """
     if arch == "sm100":
-        return ("sdpa_fwd_prefill_sm100", "sdpa_fwd_sm100_d256_lookahead", "sdpa_fwd_sm100_d256_swap_ab")
+        return (
+            "sdpa_fwd_prefill_sm100",
+            "sdpa_fwd_sm100_d256_lookahead",
+            "sdpa_fwd_sm100_d256_swap_ab",
+            "sdpa_fwd_sm100_d512_role_split",
+            "sdpa_fwd_sm100_d512_2x2",
+        )
     return (f"sdpa_fwd_prefill_{arch}",)
 
 

@@ -103,7 +103,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D128 dense single-CTA splits (fixed split count and packing) | fprop | E4M3 to BF16; E5M2 to FP16; FP32 tensor scales | Unsupported | Unverified by this suite | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D128 dense `SWAP_AB=1` (at most eight live query rows per packed unit; fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | Supported (tested configurations) | Supported (tested configurations) |
-| `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
+| `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); full SM103 suite unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D192/V128 and D256 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
@@ -816,8 +816,19 @@ byte comparisons: readable bytes after deallocation do not establish safe
 ownership. This check is measured on SM100 and does not extend the GPU
 qualification below.
 
-All six dtype/implementation lowerings compile for SM103, whose execution
-remains unverified. These results do not qualify MXFP8, SM107 or backward.
+All six dtype/implementation lowerings compile for SM103. The explicit-engine
+migration additionally checks FP16/BF16 role-split and 2x2 plans on SM103 with
+token/head-major Stats, raw-byte replay, batch reordering/duplication, an
+isolated sequence and changed neighbors. The full SM103 suite, including FP8
+execution and runtime goldens, remains unverified. These results do not
+qualify MXFP8, SM107 or backward.
+
+Exact SM100/SM103 half D512 graph plans now name the role-split or 2x2 main
+implementation explicitly. Their public cluster width is four; D576/V512 uses
+the 2x2 implementation with width two. Replaying an engine/knob record fixes
+that implementation. This identity contract does not make results invariant
+across different engines, packing choices or split counts, and does not add a
+general determinism or batch-invariance note to these engines.
 See the coverage report for the exact cases and validation receipts.
 
 ## SM100 MXFP8 THD physical origins

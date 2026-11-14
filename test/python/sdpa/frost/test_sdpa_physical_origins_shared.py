@@ -26,6 +26,8 @@ def _check_native_origins(dtype_name, width, request, cudnn_handle, *, mxfp8=Fal
     if engine is None:
         engine = "sdpa_fwd_prefill_sm120_mxfp8" if mxfp8 else "sdpa_fwd_prefill_sm120_fp8" if cfg.data_type.itemsize == 1 else "sdpa_fwd_prefill_sm120"
     cfg.plan_pin = {"engine": engine, "knobs": {"PACK_GQA": 0, "SPLIT_KV": 1}}
+    if engine == "sdpa_fwd_sm100_d512_2x2":
+        cfg.plan_pin["knobs"]["TILE_M"] = 64
     key = "frost:" + engine
     before = frost_routing.snapshot().get(key, 0)
     try:

@@ -168,18 +168,19 @@ def test_delegated_paged_split_retains_parent_study_and_placement():
     assert placement.place(spec, f, first.knobs) == placement.LEAD
 
 
-def test_retired_recipe_is_an_explicit_cache_miss_and_can_be_rebuilt():
+@pytest.mark.parametrize("dq,dv,owners", [(256, 256, {20519, 20520}), (512, 512, {20521, 20522}), (576, 512, {20522})])
+def test_retired_recipe_is_an_explicit_cache_miss_and_can_be_rebuilt(dq, dv, owners):
     import torch
     import cudnn._plan_serdes as ps
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("exact D256 ownership transition is qualified on SM100/SM103")
+        pytest.skip("exact half implementation ownership transition is qualified on SM100/SM103")
 
     def make_graph():
         g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-        q, k, v = (g.tensor(dim=[1, 8, 16, 256], stride=[32768, 256, 2048, 1], name=n) for n in ("q", "k", "v"))
-        o, _ = g.sdpa(q=q, k=k, v=v, generate_stats=False, attn_scale=0.0625)
-        o.set_output(True).set_stride([32768, 256, 2048, 1])
+        q, k, v = (g.tensor(dim=[1, 8, 16, d], stride=[128 * d, d, 8 * d, 1], name=n) for n, d in (("q", dq), ("k", dq), ("v", dv)))
+        o, _ = g.sdpa(q=q, k=k, v=v, generate_stats=False, attn_scale=dq**-0.5)
+        o.set_output(True).set_stride([128 * dv, dv, 8 * dv, 1])
         return g
 
     header = dict(
@@ -198,11 +199,23 @@ def test_retired_recipe_is_an_explicit_cache_miss_and_can_be_rebuilt():
     rebuilt.validate()
     rebuilt.create_execution_plans([cudnn.heur_mode.A])
     ids = {rebuilt.get_engine_and_knobs_at_index(i)[0] for i in range(rebuilt.get_execution_plan_count())}
-    assert 20511 not in ids and ids.intersection({20519, 20520})
+    assert 20511 not in ids and ids.intersection(owners)
 
 
 @pytest.mark.parametrize(
-    "module", ["d256_f16_contract", "d256_f16_lookahead.contract", "d256_f16_lookahead.config", "d256_f16_swap_ab.contract", "d256_f16_swap_ab.config"]
+    "module",
+    [
+        "d256_f16_contract",
+        "d256_f16_lookahead.contract",
+        "d256_f16_lookahead.config",
+        "d256_f16_swap_ab.contract",
+        "d256_f16_swap_ab.config",
+        "d512_f16_contract",
+        "d512_f16_role_split.contract",
+        "d512_f16_role_split.config",
+        "d512_f16_2x2.contract",
+        "d512_f16_2x2.config",
+    ],
 )
 def test_implementation_contracts_import_without_other_bodies_or_heavy_runtimes(module):
     code = f"""import importlib, json, sys
@@ -219,5 +232,7 @@ print(json.dumps(sorted(sys.modules)))
         "cudnn.sdpa.fwd.config_sm100",
         "cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.kernel",
         "cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.kernel",
+        "cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.kernel",
+        "cudnn.sdpa.fwd.kernels.sm100.d512_f16_2x2.kernel",
     )
     assert not set(forbidden).intersection(loaded)

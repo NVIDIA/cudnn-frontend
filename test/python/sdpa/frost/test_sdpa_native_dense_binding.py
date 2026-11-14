@@ -40,7 +40,7 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_name = "prefill_d512_f16_2x2.py" if d > 512 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    host_name = "d512_f16_2x2/kernel.py" if d > 512 else f"decode_d{256 if d == 256 else 128}_f16.py"
     if d == 256:
         host_name = "d256_f16_swap_ab/kernel.py"
     host_path = Path(prep.__file__).parent / "kernels/sm100" / host_name

@@ -40,7 +40,7 @@ _KERNELS = {
     ("f16", (128, 128)): ("prefill_d128_f16.py", 3),  # + the resident-block bias / kv_mask arms' two sites (pre-masked tail, masked body)
     ("f16", (192, 128)): ("prefill_d192_d128_f16.py", 5),
     ("f16", (256, 256)): ("d256_f16_lookahead/kernel.py", 3),  # fused correction masks its P1 slice independently
-    ("f16", (512, 512)): ("prefill_d512_f16.py", 1),
+    ("f16", (512, 512)): ("d512_f16_role_split/kernel.py", 1),
     ("fp8", (128, 128)): ("prefill_d128_fp8.py", 1),
     ("fp8", (192, 128)): ("prefill_d192_d128_fp8.py", 2),
     ("fp8", (256, 256)): ("prefill_d256_fp8.py", 4),

@@ -1024,6 +1024,12 @@ destination graph; discard the saved recipe and reconstruct the graph with
 heuristics. Namespace persisted recipes by the frontend build/version as well
 as the target environment. For example, exact SM100/SM103 half D256 recipes
 using engine 20511 must be regenerated for the explicit 20519/20520 engines.
+Exact D512/V512 and D576/V512 half recipes likewise move from 20511 to the
+explicit role-split (20521) or 2x2 (20522) implementation. These new wide engines
+report physical cluster width through `TILE_CGA_M`: 4 for D512, 2 for D576.
+Their MMA group is fixed at two CTAs; the old 20511 pair encoding is not a
+valid D512 cluster assignment for the new engines. Regenerate the complete
+engine/knob recipe through heuristics instead of rewriting its engine id.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
 the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 

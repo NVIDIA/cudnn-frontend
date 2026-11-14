@@ -18,7 +18,9 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
+from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.contract import TEMPLATE_NAME as TEMPLATE_NAME
+from cudnn.sdpa.fwd.config_common import TemplateParams
+from cudnn.sdpa.fwd.kernels.sm100.d512_f16_role_split.config import make_cfg_d512
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes; a plain import gets
