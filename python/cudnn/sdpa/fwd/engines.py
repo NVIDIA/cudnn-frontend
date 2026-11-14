@@ -3645,7 +3645,7 @@ def _sm100_d256_fp8_spec() -> EngineSpec:
         split_cgas_by_d_shape=(),
         swap_abs=frozenset(),
     )
-    return EngineSpec(_D256_FP8_SINGLE_Q, capabilities, lower)
+    return EngineSpec(_D256_FP8_SINGLE_Q, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
 
 
 def _sm100_d512_fp8_spec() -> EngineSpec:
