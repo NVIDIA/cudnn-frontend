@@ -507,6 +507,136 @@ def test_sm90_blk128_partial_prologue(scale, variable):
     torch.testing.assert_close(result["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
 
 
+def _sm90_blk128_forward_with_flags(monkeypatch, call, *variants):
+    """Run ``call()`` once per dict of kernel-constructor flags in ``variants``, each on a freshly built SM90 blk128
+    forward kernel (empty compile cache), and return the cloned ``(O, LSE)`` of every run."""
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    fwd = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm90_blk128.bsa_fwd_sm90")
+    base = fwd.BlockSparseAttnForwardSm90Blk128
+    results = []
+    for flags in variants:
+        builds = []
+
+        class Kernel(base):
+            def __init__(self, *args, **kwargs):
+                builds.append(flags)
+                super().__init__(*args, **{**kwargs, **flags})
+
+        monkeypatch.setattr(fwd, "BlockSparseAttnForwardSm90Blk128", Kernel)
+        monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+        result = call()
+        assert builds, "the forward did not build the SM90 blk128 kernel"
+        results.append((result["o_tensor"].clone(), result["lse_tensor"].clone()))
+    return results
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "variable, count, splits, sizes_rank, kv_tail, scale",
+    [
+        pytest.param(True, 5, 1, 2, True, 0.137, id="variable-sizes_rank2-tail"),
+        pytest.param(True, 5, 1, 1, False, -0.125, id="variable-sizes_rank1-negative_scale"),
+        pytest.param(True, 5, 1, 0, True, 0.0, id="variable-tail_only-zero_scale"),
+        pytest.param(True, 5, 1, 0, False, 0.137, id="variable-full_blocks"),
+        pytest.param(True, 5, 3, 3, True, 0.137, id="variable-split3-sizes_rank3-tail"),
+        pytest.param(False, 5, 1, 2, True, 0.137, id="fixed-sizes_rank2-tail"),
+        pytest.param(False, 1, 1, 1, False, 0.137, id="fixed-single_block-one_stage"),
+        pytest.param(False, 4, 2, 0, False, -0.125, id="fixed-split2-full_blocks-negative_scale"),
+    ],
+)
+@torch_fork_set_rng(seed=128)
+def test_sm90_blk128_lean_consumer_loop_matches_plain_loop(monkeypatch, variable, count, splits, sizes_rank, kv_tail, scale):
+    """The lean consumer loop (full KV blocks skip the mask, partial ones compare one limit per thread; the O rescale
+    runs one step later, behind a warp vote) returns the O and LSE bits of the plain loop.  GQA problems with a
+    one-row last Q tile; variable counts walk lists of 0..5 blocks in every head; block sizes mix full, 127-, 96-,
+    64-, 3- and 1-token blocks, per batch and per head where the rank allows, and the physical KV tail."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    batch, heads, kv_heads, q_blocks, kv_blocks = 2, 4, 2, 6, 8
+    seqlen_q = (q_blocks - 1) * 128 + 1
+    tail = 37 if kv_tail else 128
+    seqlen_k = (kv_blocks - 1) * 128 + tail
+    q = torch.randn((batch, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, seqlen_k, 96), device="cuda", dtype=torch.bfloat16)
+    # Distinct block ids per row (the prefix of a random permutation); the slots past a variable count hold a poison index.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :count].to(torch.int32).contiguous()
+    counts = None
+    if variable:
+        lengths = torch.arange(q_blocks, device="cuda", dtype=torch.int32)
+        counts = torch.stack([lengths.roll(i) for i in range(batch * heads)]).view(batch, heads, q_blocks).contiguous()
+        assert counts.min() == 0 and counts.max() == count
+        indices.masked_fill_(torch.arange(count, device="cuda") >= counts[..., None], 999999)
+    sizes = None
+    if sizes_rank:
+        pattern = torch.tensor([128, 1, 127, 128, 3, 96, 64, tail], device="cuda", dtype=torch.int32)
+        shape = {1: (kv_blocks,), 2: (batch, kv_blocks), 3: (batch, heads, kv_blocks)}[sizes_rank]
+        rows = pattern.expand(shape).reshape(-1, kv_blocks)
+        # Every row of the rank keeps the tail size last and rotates the other blocks.
+        sizes = torch.stack([torch.cat((row[:-1].roll(i), row[-1:])) for i, row in enumerate(rows)]).view(shape).contiguous()
+
+    def call():
+        return ops.block_sparse_attention_forward(
+            q,
+            k,
+            v,
+            indices,
+            count,
+            sizes,
+            q2k_block_nums=counts,
+            allow_empty_block_nums=variable,
+            sparse_block_size=128,
+            softmax_scale=scale,
+            kv_splits=splits,
+        )
+
+    (o_plain, lse_plain), (o_lean, lse_lean) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(lean_consumer_loop=False), {})
+    assert torch.isfinite(o_lean).all()
+    assert torch.equal(o_lean, o_plain) and torch.equal(lse_lean, lse_plain)
+    o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, counts, sizes, count, scale, "bhsd")
+    torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
+@torch_fork_set_rng(seed=129)
+def test_sm90_blk128_lean_consumer_loop_rescale_vote(monkeypatch, with_block_sizes):
+    """Both outcomes of the warp vote that guards the deferred O rescale, bitwise against the plain loop.  Every key of
+    KV block j has the logit 4 * j for a query row with q = 8 and -4 * j for one with q = -8, and the lists are
+    ascending, so a positive row raises its running max at every step (ratio < 1) and a zero or negative row never
+    does (ratio exactly 1.0).  Tile 0 never rescales, tile 1 rescales in every warp, tile 2 alternates warps of the two
+    kinds and tile 3 mixes both kinds of row inside every warp."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    q_blocks, kv_blocks = 4, 8
+    seqlen_q, seqlen_k = q_blocks * 128, kv_blocks * 128
+    row = torch.arange(128, device="cuda")
+    q = torch.zeros((1, 1, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    q[0, 0, 128:256, 0] = 8
+    q[0, 0, 256:384, 0] = torch.where(row % 32 < 16, -8, 8).to(q.dtype)
+    q[0, 0, 384:512, 0] = torch.where(row % 2 == 0, 8, -8).to(q.dtype)
+    k = torch.zeros((1, 1, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    k[0, 0, :, 0] = (torch.arange(seqlen_k, device="cuda") // 128).to(k.dtype) * 0.5
+    v = torch.randn((1, 1, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, q_blocks, kv_blocks).contiguous()
+    sizes = torch.tensor([128, 1, 128, 77, 128, 3, 128, 111], device="cuda", dtype=torch.int32) if with_block_sizes else None
+
+    # The rows of one compute warp are 16 consecutive query rows. A warp must rescale at a step when the block's logit
+    # exceeds the running max of one of its rows, and must skip the rescale when it does so for none of them.
+    block_logit = q[0, 0, :, 0].double()[:, None] * k[0, 0, ::128, 0].double()[None, :]
+    raised = (block_logit[:, 1:] > block_logit.cummax(dim=1).values[:, :-1]).view(q_blocks * 8, 16, kv_blocks - 1)
+    assert raised.any(1).any() and (~raised.any(1)).any(), "the problem must hold a rescaling warp-step and a skipping one"
+    assert (raised.any(1) & ~raised.all(1)).any(), "some warp must mix rescaled and unchanged rows"
+
+    def call():
+        return ops.block_sparse_attention_forward(q, k, v, indices, kv_blocks, sizes, sparse_block_size=128)
+
+    (o_plain, lse_plain), (o_lean, lse_lean) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(lean_consumer_loop=False), {})
+    assert torch.equal(o_lean, o_plain) and torch.equal(lse_lean, lse_plain)
+    o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, None, sizes, kv_blocks, None, "bhsd")
+    torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
 # ---- SM100/SM110 blk64
 
 
