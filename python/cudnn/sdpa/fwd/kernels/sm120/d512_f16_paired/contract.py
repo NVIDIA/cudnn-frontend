@@ -73,7 +73,7 @@ class Geometry:
 
 def mismatch(facts, knobs):
     if facts.device_cc not in DEVICE_CCS:
-        return f"requires the SM120 family; current device is {facts.device_cc}"
+        return f"requires SM12x (the SM120 family); current device is {facts.device_cc}"
     if not in_domain(facts):
         return "requires exact D512/V512 or D576/V512 FP16/BF16 on the SM120 family"
     if knobs is not None:
