@@ -19,7 +19,8 @@ here is what that fixture does not reach:
   packed launches, with and without a partial last chunk;
 * inputs the gate alone does not bound: raw (un-normalised) keys and a very
   large carried state, where a forward that truncated history by the gate
-  would drop state that matters;
+  would drop state that matters, or one that rounded beta into a bf16 operand
+  would compound the rounding; and random raw keys in both directions;
 * that the scalar-gate build computes the same function as the per-channel
   one wherever the latter is valid, with ``dG`` equal to its sum over channels;
 * that the GDN heuristics hook makes this engine the default on Hopper without
@@ -160,14 +161,14 @@ def launches(monkeypatch):
 
 
 # ----------------------------------------------------------------------------- numerics
-# What each shape reaches. Forward: P = min(264 // (N * H), chunks) pieces per sequence. Backward scan:
+# What each shape reaches. The forward runs one chain per (sequence, head), unsplit. Backward scan:
 # 64 value columns from 32 (sequence, head) pairs up, 16 for one sequence of exactly 8 heads, 32 otherwise.
 SHAPES = [
-    pytest.param([257], 2, id="one_seq"),  # many forward pieces; scan<32>, single sequence with a tail
+    pytest.param([257], 2, id="one_seq"),  # few pairs (a split forward would cut it up); scan<32>, single sequence with a tail
     pytest.param([130, 1, 63, 64, 65], 3, id="ragged"),  # around both chunk sizes (16 forward, 64 backward); scan<32>, packed
     pytest.param([512], 1, id="full_chunks"),  # a multiple of both chunk sizes: the tail-free kernel variants
     pytest.param([200, 300], 16, id="two_seq"),  # exactly 32 pairs: scan<64>, packed
-    pytest.param([64] * 40, 8, id="many_seq"),  # more pairs than the forward has CTAs to split with: P == 1
+    pytest.param([64] * 40, 8, id="many_seq"),  # more (sequence, head) pairs than CTAs
     pytest.param([320], 32, id="one_seq_wide_scan"),  # scan<64>, single sequence, tail-free
     pytest.param([300], 40, id="one_seq_wide_scan_tail"),  # the same with a partial last chunk
     pytest.param([320], 8, id="one_seq_eight_heads"),  # scan<16>, tail-free
@@ -541,7 +542,7 @@ def _pack(ports, tensors, cu, d_out, state=None, d_final=None):
 def test_warm_execute_allocates_nothing_and_never_synchronizes(backward):
     """Recipe R9 on the zero-copy path (packed bf16 q/k/v, fp32 gate, beta and state, int32 cu_seqlens).
 
-    The shape splits the forward and runs the 64-column backward scan. Strided inputs, int64
+    The shape runs the 64-column backward scan. Strided inputs, int64
     cu_seqlens and bf16 state go through hopper/marshal.py, which allocates and copies; they are
     a declared exception and not covered here.
     """
@@ -891,9 +892,9 @@ def _unit(i):
 @pytest.mark.parametrize(
     "case",
     [
-        # Raw keys: beta * |k|^2 = 3.6, so I - beta k k^T expands (factor -2.6) the state the gate is decaying.
-        # Badly conditioned for this kernel (see the docstring), so only the probe value is checked, loosely.
-        dict(k_row=2 * _unit(0), q_rows=lambda t: _unit(0), g=-1.0, beta=0.9, seed_value=1.0, scale=1.0, probe=(48, 0), probe_tol=0.2, full=False),
+        # Raw keys: beta * |k|^2 = 3.6, so I - beta k k^T expands (factor -2.6) the state the gate is decaying,
+        # and every token's factor e^-1 (1 - beta |k|^2) = -0.956 keeps the seed alive to the end.
+        dict(k_row=2 * _unit(0), q_rows=lambda t: _unit(0), g=-1.0, beta=0.9, seed_value=1.0, scale=1.0, probe=(48, 0), probe_tol=2e-2, full=True),
         # Normalised keys orthogonal to the seed and a seed of 1e30: the gate alone says it is gone by token 48.
         dict(
             k_row=_unit(1),
@@ -913,9 +914,11 @@ def test_state_the_gate_alone_does_not_bound_is_kept(case):
     """The two cases from the review of NVIDIA/cudnn-frontend#2539: a forward that cut history by the gate alone
     returned zero at the probe; the fp64 recurrence does not.
 
-    The raw-key case expands the state, and there this kernel is less accurate than FLA or gdn_cutile: on H100,
-    12% off at the probe and 0.15 rms on the final state, against 0.2% / 0.003 for FLA and 1.5% / 4e-5 for
-    gdn_cutile. A truncating forward is 100% off (it returns zero), which is what this case guards against.
+    The raw-key case also pins where beta is rounded. Every token repeats the same key, so a beta rounded into
+    a bf16 operand repeats the same error at every step: rounded into the Gram product it compounded through
+    the in-chunk inverse to 12% at the probe and 15% on the final state; rounded into the state update's keys
+    it still left 3%. With beta applied in fp32 this engine is 0.7% / 0.2% on H100, against 0.2% / 0.3% for FLA
+    and 1.5% / 0.004% for gdn_cutile.
     """
     tensors, cu, state = _single_head_case(case["k_row"], case["q_rows"], case["g"], case["beta"], case["seed_value"], case["scale"])
     out, final = gated_delta_net(*tensors, cu, scale=case["scale"], initial_state=state, output_final_state=True, plan_name=ENGINE)[:2]
@@ -929,6 +932,52 @@ def test_state_the_gate_alone_does_not_bound_is_kept(case):
     if case["full"]:
         assert rms_ratio(out, ref_out.squeeze(0)) <= FWD_TOL
         assert rms_ratio(final, ref_final) <= STATE_TOL
+
+
+@pytest.mark.L0
+@requires_hopper
+@pytest.mark.parametrize(
+    "knorm, gate",
+    [
+        # beta |k|^2 <= 2: the delta-rule factor is non-expansive on its own, whatever the gate.
+        pytest.param((0.5, 1.4), "slow", id="norm_0.5_to_1.4-slow"),
+        # |k| up to 2 (beta |k|^2 up to 4): bounded only because a Megatron-init gate decays at least 1.3 per token.
+        pytest.param((1.4, 2.0), "init", id="norm_1.4_to_2-init"),
+    ],
+)
+def test_raw_keys_match_the_fp64_recurrence(knorm, gate):
+    """Un-normalised keys at random, with a carried state: output, final state and every gradient against fp64.
+
+    On H100 this engine, gdn_cutile and FLA land within a few times 1e-3 of fp64 here (rms ratio), except the
+    initial-state gradient, where this engine's 2.4e-3 is about five times theirs on any keys."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    lengths, heads = [1000, 300, 64], 4
+    total = sum(lengths)
+    norms = knorm[0] + (knorm[1] - knorm[0]) * torch.rand(total, heads, 1, generator=gen, device="cuda")
+    q = F.normalize(torch.randn(total, heads, DIM, generator=gen, device="cuda"), dim=-1).to(torch.bfloat16)
+    k = (F.normalize(torch.randn(total, heads, DIM, generator=gen, device="cuda"), dim=-1) * norms).to(torch.bfloat16)
+    v = (torch.randn(total, heads, DIM, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
+    g = make_gate(gate, total, heads, gen)
+    beta = torch.sigmoid(torch.randn(total, heads, generator=gen, device="cuda"))
+    if gate != "init":
+        beta = torch.minimum(beta, 2.0 / norms[..., 0] ** 2)
+    state = torch.randn(len(lengths), heads, DIM, DIM, generator=gen, device="cuda") * 0.05
+    d_out = torch.randn(total, heads, DIM, generator=gen, device="cuda").to(torch.bfloat16)
+    d_state = torch.randn(len(lengths), heads, DIM, DIM, generator=gen, device="cuda") * 0.1
+    cu = torch.tensor([0, *lengths], device="cuda").cumsum(0).to(torch.int32)
+    leaves = [t.contiguous().requires_grad_(True) for t in (q, k, v, g, beta.contiguous(), state)]
+    out, final = gated_delta_net(*leaves[:5], cu, initial_state=leaves[5], output_final_state=True, plan_name=ENGINE)[:2]
+    grads = torch.autograd.grad((out, final), leaves, (d_out, d_state))
+    ref_leaves = [t.detach().double().requires_grad_(True) for t in leaves]
+    ref_out, ref_final = gdn_reference(*(t.unsqueeze(0) for t in ref_leaves[:5]), initial_state=ref_leaves[5], cu_seqlens=cu)
+    ref_grads = torch.autograd.grad((ref_out, ref_final), ref_leaves, (d_out.double().unsqueeze(0), d_state.double()))
+    checks = [("o", out, ref_out[0], FWD_TOL), ("final_state", final, ref_final, STATE_TOL)]
+    checks += [(name, mine, theirs, BWD_TOL) for name, mine, theirs in zip(GRAD_NAMES, grads, ref_grads)]
+    checks += [("dinitial_state", grads[5], ref_grads[5], STATE_GRAD_TOL)]
+    for name, mine, theirs, tol in checks:
+        assert torch.isfinite(mine.float()).all(), f"non-finite {name}"
+        err = rms_ratio(mine, theirs)
+        assert err <= tol, f"{name}: rms ratio {err:.3e} against fp64 exceeds {tol}"
 
 
 @pytest.mark.L0

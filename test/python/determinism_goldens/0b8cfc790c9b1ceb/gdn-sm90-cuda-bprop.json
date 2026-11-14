@@ -136,7 +136,7 @@
     },
     "final_state": {
       "dtype": "torch.float32",
-      "sha256": "f2417d925933a8bf5d0eb503b4dcc0acdbb279bf2d718856914fed40e21fd1cd",
+      "sha256": "47c4822d712ec3c7f2818f0fbbd165110d316d26224b50cacafedf0cda762b46",
       "shape": [
         2,
         2,
@@ -146,7 +146,7 @@
     },
     "out": {
       "dtype": "torch.bfloat16",
-      "sha256": "0e99cbc6f4e3190ccd5eacba587542ee53058d2db5d6b52663150d5d439ab959",
+      "sha256": "568e6c3e6569825f0f997fd86b1c99f7480398bb4de7d46fbfacbcc885645ee6",
       "shape": [
         20,
         2,

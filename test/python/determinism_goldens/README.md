@@ -36,6 +36,22 @@ pytest linear_attention/hopper/test_gdn_sm90_cuda_determinism.py -m L0  # SM90 o
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 
+### SM90 GDN engine (`gdn_hopper_cuda`) — beta in fp32, 2026-11-13 (UTC)
+
+The scalar-gate forward no longer rounds beta into a bf16 operand. The Gram
+products take raw q/k and multiply beta_j into their fp32 results, and the
+state update multiplies beta_t exp(c_15 - c_t) into the fp32 residual before
+it is rounded, with raw k as the key operand. On raw keys with
+beta |k|^2 = 3.6 (review of NVIDIA/cudnn-frontend#2539), the rounded beta had
+compounded to 12% at token 48 and 15% on the final state; it is now 0.7% and
+0.2%. The backward is unchanged.
+
+Same runtime and commands as the records below: 2 recorded, then
+**34 passed, 0 failed, 0 skipped** against them. Both golden records changed
+in two fields each, the forward's `out` and `final_state` hashes. Their inputs,
+runtime and gradient hashes are unchanged. The per-channel (KDA) cubins are
+byte-identical to `develop`'s.
+
 ### SM90 GDN engine (`gdn_hopper_cuda`) — unsplit forward, 2026-11-13 (UTC)
 
 The engine's forward no longer cuts a sequence into pieces: a piece after the

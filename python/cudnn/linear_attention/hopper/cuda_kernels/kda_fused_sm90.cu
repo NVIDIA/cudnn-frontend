@@ -279,7 +279,7 @@ mbar_wait(uint64_t* b, int phase) {
 struct __align__(128) Record {
     bf16 mw[2048];           // -(Tinv W)^T, GMMA B layout, [k=128 channels, n=16 tokens]
     bf16 qg[kChunk * kQgG];  //  (A*q/sqrt(D))^T, padded group stride kQgG
-    bf16 kg[2048];           //  beta*k/A * A_total, GMMA B layout [k=16 tokens, n=128 ch]
+    bf16 kg[2048];           //  beta*k/A * A_total (raw k with a scalar gate), GMMA B layout [k=16 tokens, n=128 ch]
     bf16 z[256];             //  tril(Q' (beta*U)^T), GMMA B layout [k=16, n=16]
     bf16 ut[kChunk * kLdU];  //  Tinv V, row major [16 tokens][128 v], ld=kLdU
     float av[128];           //  A_total = exp(sum of g over the chunk)
@@ -413,8 +413,14 @@ cp_wait() {
 // case is an underflow to an exactly-negligible term:
 //     M[r][j]  = beta_j (k_r . k_j) exp(c_r - c_j)            (j <  r)
 //     Z[t][j]  = s beta_j (q_t . k_j) exp(c_t - c_j)          (j <= t)
-//     kg_t     = beta_t k_t exp(c_15 - c_t)
+//     dS       = sum_t (beta_t exp(c_15 - c_t) r_t) k_t^T          (r_t the token's residual)
 //     Tinv W   = (Tinv diag(A)) K                              (A folded into Tinv's columns)
+// Every bf16 key operand is the raw k, exact: the Gram products take raw q/k and
+// beta_j multiplies their fp32 results, and the state update's factor multiplies
+// the fp32 residual before it is rounded, so Record::kg is raw k. A bf16 beta*k
+// would round beta inside M, and the inverse carries that into every token's
+// residual, compounding along the sequence; a factor rounded into kg repeats the
+// same rounding in every chunk whose keys repeat.
 // q' = s A q is kept as is: it only meets the carried state, where an underflow
 // of A_t is the right answer. Raw::g holds the working set: [0,16) the gates,
 // [16,32) the prefix sums c_t in log2 units, [64,256) the bf16 tile Tinv diag(A).
@@ -435,6 +441,10 @@ cp_wait() {
 // error the serial prefix adds accumulate). A NaN gate stays NaN. Scalar build only.
 #if KDA_FUSED_SCALAR_GATE
 constexpr float kGateFloor = -128.0f;
+// Record::av holds one value per channel, and with a scalar gate the 128 are all
+// A_total: the scan reads av[0], and av[kScalarKf + t] carries the state-update
+// factor beta_t exp(c_15 - c_t) of token t of the chunk.
+constexpr int kScalarKf = 128 - kChunk;
 __device__ __forceinline__ float
 gate_in(float g) {
     return g < kGateFloor ? kGateFloor : g;
@@ -790,7 +800,10 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             *reinterpret_cast<uint32_t*>(&rec.qg[(dd0 >> 3) * kQgG + t * 8 + (dd0 & 7)]) =
                 pack2(__bfloat162float(qc.x) * d0 * q_scale, __bfloat162float(qc.y) * d1 * q_scale);
 #if KDA_FUSED_SCALAR_GATE
-            *reinterpret_cast<uint32_t*>(&sm.u[t * kLdA + dd0]) = pack2(b * kx0, b * kx1);
+            // Raw k, not beta*k (see the scalar-gate notes above): beta_j is applied
+            // in fp32 to the M, Z and kg results below.
+            (void)b;
+            *reinterpret_cast<uint32_t*>(&sm.u[t * kLdA + dd0]) = *reinterpret_cast<const uint32_t*>(&kc);
 #else
             *reinterpret_cast<uint32_t*>(&sm.u[t * kLdA + dd0]) = pack2(b * kx0 / d0, b * kx1 / d1);
 #endif
@@ -864,9 +877,13 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                     // Loaded only where m0 (m1 implies m0) reads it, and volatile so the load is
                     // neither hoisted nor shared with warp 1's: a lane whose entries are all masked
                     // must not reach the barrier below with a load of this stage unread (Rule 11).
-                    const float cr               = m0 ? *reinterpret_cast<const volatile float*>(&cs_[row]) : 0.0f;
-                    sm.prod[row * kPS + col]     = m0 ? acc[2 * e] * exp2f(m0 ? cr - cs_[col] : 0.0f) : 0.0f;
-                    sm.prod[row * kPS + col + 1] = m1 ? acc[2 * e + 1] * exp2f(m1 ? cr - cs_[col + 1] : 0.0f) : 0.0f;
+                    const float cr = m0 ? *reinterpret_cast<const volatile float*>(&cs_[row]) : 0.0f;
+                    // beta_j in fp32 on the raw Gram product (column j = col), loaded the same way.
+                    const float b0           = m0 ? *reinterpret_cast<const volatile float*>(&R.beta[col]) : 0.0f;
+                    const float b1           = m1 ? *reinterpret_cast<const volatile float*>(&R.beta[col + 1]) : 0.0f;
+                    sm.prod[row * kPS + col] = m0 ? acc[2 * e] * b0 * exp2f(m0 ? cr - cs_[col] : 0.0f) : 0.0f;
+                    sm.prod[row * kPS + col + 1] =
+                        m1 ? acc[2 * e + 1] * b1 * exp2f(m1 ? cr - cs_[col + 1] : 0.0f) : 0.0f;
 #else
                     sm.prod[row * kPS + col]     = acc[2 * e];
                     sm.prod[row * kPS + col + 1] = acc[2 * e + 1];
@@ -886,8 +903,11 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                     const bool m0 = tr <= tq, m1 = tr + 1 <= tq;  // masked in the exponent too, as for M
                     // As for cr above: loaded only where m0 (m1 implies m0) reads it.
                     const float cq = m0 ? *reinterpret_cast<const volatile float*>(&cs_[tq]) : 0.0f;
-                    const float v0 = m0 ? acc[2 * e] * q_scale * exp2f(m0 ? cq - cs_[tr] : 0.0f) : 0.0f;
-                    const float v1 = m1 ? acc[2 * e + 1] * q_scale * exp2f(m1 ? cq - cs_[tr + 1] : 0.0f) : 0.0f;
+                    // beta_j of the key token (j = tr), as for M.
+                    const float b0 = m0 ? *reinterpret_cast<const volatile float*>(&R.beta[tr]) : 0.0f;
+                    const float b1 = m1 ? *reinterpret_cast<const volatile float*>(&R.beta[tr + 1]) : 0.0f;
+                    const float v0 = m0 ? acc[2 * e] * b0 * q_scale * exp2f(m0 ? cq - cs_[tr] : 0.0f) : 0.0f;
+                    const float v1 = m1 ? acc[2 * e + 1] * b1 * q_scale * exp2f(m1 ? cq - cs_[tr + 1] : 0.0f) : 0.0f;
 #else
                     const float v0 = (tr <= tq) ? acc[2 * e] : 0.0f;
                     const float v1 = (tr + 1 <= tq) ? acc[2 * e + 1] : 0.0f;
@@ -907,15 +927,17 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
             float nu0          = __bfloat162float(sm.u[i0 * kLdA + dd_first]);
             float nu1          = __bfloat162float(sm.u[(i0 + 1) * kLdA + dd_first]);
 #if KDA_FUSED_SCALAR_GATE
-            // exp(c_15 - c_t) for the four tokens this lane republishes.
-            float kf[4];
-            {
-                const float* cs_ = &R.g[kChunk];
-                const float ce   = cs_[kChunk - 1];
-                kf[0]            = exp2f(ce - cs_[i0]);
-                kf[1]            = exp2f(ce - cs_[i0 + 1]);
-                kf[2]            = exp2f(ce - cs_[i0 + 8]);
-                kf[3]            = exp2f(ce - cs_[i0 + 9]);
+            // kg is the raw k (exact in bf16). The state update's per-token factor
+            // beta_t exp(c_15 - c_t) goes onto the fp32 residuals in the scan instead
+            // (see kScalarKf), so the one key operand every chunk reuses is never rounded
+            // with a factor in it. Lanes 0-3 of warp 2 cover the sixteen tokens.
+            if (warp == 2 && dl == 0) {
+                const float* cs_           = &R.g[kChunk];
+                const float ce             = cs_[kChunk - 1];
+                rec.av[kScalarKf + i0]     = R.beta[i0] * exp2f(ce - cs_[i0]);
+                rec.av[kScalarKf + i0 + 1] = R.beta[i0 + 1] * exp2f(ce - cs_[i0 + 1]);
+                rec.av[kScalarKf + i0 + 8] = R.beta[i0 + 8] * exp2f(ce - cs_[i0 + 8]);
+                rec.av[kScalarKf + i0 + 9] = R.beta[i0 + 9] * exp2f(ce - cs_[i0 + 9]);
             }
 #endif
 #pragma unroll
@@ -935,7 +957,7 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
 #if KDA_FUSED_SCALAR_GATE
                 (void)a;
                 *reinterpret_cast<uint32_t*>(&rec.kg[(dd >> 6) * 1024 + (i >> 3) * 512 + (dd & 63) * 8 + (i & 7)]) =
-                    pack2(u0 * kf[(idx & 1) * 2], u1 * kf[(idx & 1) * 2 + 1]);
+                    pack2(u0, u1);
 #else
                 *reinterpret_cast<uint32_t*>(&rec.kg[(dd >> 6) * 1024 + (i >> 3) * 512 + (dd & 63) * 8 + (i & 7)]) =
                     pack2(u0 * a, u1 * a);
@@ -1073,6 +1095,15 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
         const uint64_t dmw = gdesc16(R.mw), dqg = gdesc16<kQgLbo>(R.qg);
         float r[2][8], out[2][8];
         uint32_t ra[2][4];
+#if KDA_FUSED_SCALAR_GATE
+        // ra feeds the output (Z); rk = r * beta_t exp(c_15 - c_t) feeds the state update
+        // against the raw keys in kg. This thread's tokens are 2tg, 2tg+1, 8+2tg and 9+2tg.
+        uint32_t rk[2][4];
+        const float fk[4] = {R.av[kScalarKf + 2 * tg],
+                             R.av[kScalarKf + 2 * tg + 1],
+                             R.av[kScalarKf + 8 + 2 * tg],
+                             R.av[kScalarKf + 9 + 2 * tg]};
+#endif
         // Seed the state contraction's accumulator with Tinv V and let the eight
         // wgmma accumulate straight onto it.  The shared loads move ahead of the
         // fence, where their latency overlaps the repack, and the sixteen adds that
@@ -1090,7 +1121,12 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
 #pragma unroll
             for (int rh = 0; rh < 2; ++rh)
 #pragma unroll
-                for (int i = 0; i < 4; ++i) ra[rh][i] = pack2(r[rh][2 * i], r[rh][2 * i + 1]);
+                for (int i = 0; i < 4; ++i) {
+                    ra[rh][i] = pack2(r[rh][2 * i], r[rh][2 * i + 1]);
+#if KDA_FUSED_SCALAR_GATE
+                    rk[rh][i] = pack2(r[rh][2 * i] * fk[2 * (i >> 1)], r[rh][2 * i + 1] * fk[2 * (i >> 1) + 1]);
+#endif
+                }
         } else {
             uint32_t a[8][4];
 #pragma unroll
@@ -1116,8 +1152,12 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                     for (int j = 0; j < 2; ++j)
 #pragma unroll
                         for (int i = 0; i < 32; i += 2) {
-                            const int col  = j * 64 + 8 * (i >> 2) + 2 * tg;
+                            const int col = j * 64 + 8 * (i >> 2) + 2 * tg;
+#if KDA_FUSED_SCALAR_GATE
+                            const float a0 = R.av[0], a1 = a0;
+#else
                             const float a0 = R.av[col], a1 = R.av[col + 1];
+#endif
                             st[j][i] *= a0;
                             st[j][i + 1] *= a1;
                             st[2 + j][i] *= a0;
@@ -1126,7 +1166,12 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
                 }
                 wg_wait<0>();
 #pragma unroll
-                for (int i = 0; i < 4; ++i) ra[rh][i] = pack2(r[rh][2 * i], r[rh][2 * i + 1]);
+                for (int i = 0; i < 4; ++i) {
+                    ra[rh][i] = pack2(r[rh][2 * i], r[rh][2 * i + 1]);
+#if KDA_FUSED_SCALAR_GATE
+                    rk[rh][i] = pack2(r[rh][2 * i] * fk[2 * (i >> 1)], r[rh][2 * i + 1] * fk[2 * (i >> 1) + 1]);
+#endif
+                }
             }
         }
         const uint64_t dz = gdesc16(R.z), d_kg = gdesc64(R.kg);
@@ -1134,15 +1179,25 @@ __launch_bounds__(128, 2) void kda_fused(const bf16* __restrict__ gq,
         if (zero_start) {
 #pragma unroll
             for (int rh = 0; rh < 2; ++rh) {
+#if KDA_FUSED_SCALAR_GATE
+                wg64_zero(st[2 * rh + 0], rk[rh], d_kg);
+                wg64_zero(st[2 * rh + 1], rk[rh], d_kg + 128);
+#else
                 wg64_zero(st[2 * rh + 0], ra[rh], d_kg);
                 wg64_zero(st[2 * rh + 1], ra[rh], d_kg + 128);
+#endif
             }
         } else {
 #pragma unroll
             for (int rh = 0; rh < 2; ++rh) {
                 wg16_add(out[rh], ra[rh], dz);
+#if KDA_FUSED_SCALAR_GATE
+                wg64_add(st[2 * rh + 0], rk[rh], d_kg);
+                wg64_add(st[2 * rh + 1], rk[rh], d_kg + 128);
+#else
                 wg64_add(st[2 * rh + 0], ra[rh], d_kg);
                 wg64_add(st[2 * rh + 1], ra[rh], d_kg + 128);
+#endif
             }
         }
         wg_commit();
