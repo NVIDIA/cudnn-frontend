@@ -1664,7 +1664,23 @@ def _run_graph_fp8(
             knobs = replace(knobs, cga=explicit_cga)
         if explicit_swap_ab is not None:
             knobs = replace(knobs, swap_ab=explicit_swap_ab)
-        g.create_execution_plan(selected.engine_id, knobs.to_public() if explicit_swap_ab is not None else knobs)
+        engine_id = selected.engine_id
+        if record is None:
+            from cudnn.engines.manifest import family_for
+            from cudnn.sdpa import graph_analyzer
+            from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry
+            from cudnn.sdpa.fwd.kernels.sm100.small_fp8_contract import in_domain
+            from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+
+            facts = graph_analyzer.analyze(g)
+            if in_domain(facts):
+                # Fixture arguments describe a legacy body choice. Resolve them once,
+                # then create/replay the canonical fixed implementation record.
+                knobs = replace(knobs, tile_m=128)
+                geometry = SwapAB(d_flavor=d) if explicit_swap_ab == 1 else select_sm100_small_fp8_geometry(facts, knobs)
+                knobs = geometry.canonical_knobs(knobs)
+                engine_id = family_for(g).offered_ids()[geometry.implementation]
+        g.create_execution_plan(engine_id, knobs.to_public())
         g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()

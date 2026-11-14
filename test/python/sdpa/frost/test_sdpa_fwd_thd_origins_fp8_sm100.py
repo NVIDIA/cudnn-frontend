@@ -11,7 +11,7 @@ from sdpa.frost.test_sdpa_physical_origins_shared import _check_native_origins
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
-_ENGINE = "sdpa_fwd_prefill_sm100_fp8"
+_ENGINE = "sdpa_fwd_sm100_d128_fp8_multi_q"
 _DTYPES = ("float8_e4m3fn", "float8_e5m2")
 
 

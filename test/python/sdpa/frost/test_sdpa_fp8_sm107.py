@@ -167,7 +167,7 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     from cudnn.sdpa.fwd import engines
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
@@ -251,7 +251,7 @@ def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, under the SM100 d128 /
@@ -295,7 +295,7 @@ def test_softmax_half_declines_by_row_domain():
         )
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(fp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     half = _c.data_type.HALF
 
@@ -305,7 +305,7 @@ def test_softmax_half_declines_by_row_domain():
     assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
     # And the rows keep their arch lanes regardless of the attribute.
     assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
-    assert "SM100-106" in engines.mismatch(sm100, facts((10, 7)), None)
+    assert "SM100-106" in engines.mismatch(caps[engines.engine_name(fp8=True)], facts((10, 7)), None)
 
 
 @pytest.mark.parametrize("rubin", [True, False], ids=["sm107", "sm100"])
