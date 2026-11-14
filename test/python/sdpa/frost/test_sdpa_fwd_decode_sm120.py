@@ -277,8 +277,14 @@ def test_sm120_tile_requests_the_kernels_cannot_serve_are_ineligible(facts_over,
     if knobs_over.get("sched_policy") == "lpt":
         knobs_over = dict(knobs_over, sched_policy=SCHED_LPT)
     knobs = replace(SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=False), **knobs_over)
-    got = mismatch(_spec().capabilities, _facts(**facts_over), knobs)
+    from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
+    from frost_test_utils import sm120_half_owner
+
+    facts = _facts(**facts_over)
+    # The kernel table's reason is the legacy policy domain's; the exact wide-head owner declines the same request.
+    got = mismatch(sm100_legacy_policy_spec(_SM120_ROW).capabilities, facts, knobs)
     assert got is not None and reason in got, got
+    assert mismatch(_spec(sm120_half_owner(facts.d_qk, facts.d_v)).capabilities, facts, knobs) is not None
 
 
 @pytest.mark.L0

@@ -325,7 +325,9 @@ def test_sm120_split_sink_is_eligible_on_half_and_exact_fp8_d128(d):
 
     rows = {s.name: s.capabilities for s in ENGINE_SPECS}
     knobs = SdpaFwdKnobs(sched_policy=0, split_kv=4)
-    assert mismatch(rows["sdpa_fwd_prefill_sm120"], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None
+    from frost_test_utils import sm120_half_owner
+
+    assert mismatch(rows[sm120_half_owner(d, d)], _sink_decode_facts(d_qk=d, d_v=d), knobs) is None
     if d <= 256:
         fp8 = _sink_decode_facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
         reason = mismatch(rows["sdpa_fwd_prefill_sm120_fp8"], fp8, knobs)

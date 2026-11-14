@@ -37,7 +37,7 @@ def _require_dsl() -> None:
         pytest.skip("cutlass/dsl not installed")
 
 
-from frost_test_utils import select_engine as _select_engine  # noqa: F401
+from frost_test_utils import select_engine as _select_engine, sm120_half_owner  # noqa: F401
 
 # Exact in fp16/bf16/fp32: pre-fills O/Stats storages in the THD harness so
 # no-op paths (t_q == 0) can assert the buffers came back untouched.
@@ -265,7 +265,6 @@ def _run_dsl_graph(
     import cudnn
 
     from cudnn.sdpa.fwd.api_dsl import ws_align
-    from cudnn.sdpa.fwd.engines import engine_name
 
     dtype = q_gpu.dtype
     io_dtype = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -337,14 +336,14 @@ def _run_dsl_graph(
         from cudnn.engines.manifest import engines_for
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-        selected = next(engine for engine in engines_for(graph) if engine.name == engine_name(arch="sm120"))
+        selected = next(engine for engine in engines_for(graph) if engine.name == sm120_half_owner(q_gpu.shape[3], v_gpu.shape[3]))
         knobs = SdpaFwdKnobs(cga=1, tile_m=q_tile, tile_n=kv_tile, sched_policy=0, split_kv=1, pack_gqa=pack_gqa)
         graph.create_execution_plan(selected.engine_id, knobs)
         graph.select_plan(0)
         plan = graph.plans[0]
     else:
         graph.create_execution_plans([cudnn.heur_mode.A])
-        plan = _select_engine(graph, engine_name(arch="sm120"), tiles=tiles, pack_gqa=pack_gqa)
+        plan = _select_engine(graph, sm120_half_owner(q_gpu.shape[3], v_gpu.shape[3]), tiles=tiles, pack_gqa=pack_gqa)
     graph.check_support()
     graph.build_plans()
     # Native dense plans have no dummy LSE scratch. Split plans add the
@@ -423,8 +422,6 @@ def _run_thd_case(
 
     _require_dsl()
     import cudnn
-
-    from cudnn.sdpa.fwd.engines import engine_name
 
     batch = len(seq_q_lens)
     s_q_max = max(max(seq_q_lens), 1)
@@ -543,7 +540,7 @@ def _run_thd_case(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch="sm120"))
+    _select_engine(graph, sm120_half_owner(head_dim, d_v))
     graph.check_support()
     graph.build_plans()
     workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")
