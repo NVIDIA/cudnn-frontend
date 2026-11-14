@@ -156,11 +156,16 @@ def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
     to_v, to_other = (t - va).abs(), (t - oa).abs()
     # ``v`` unless the other end is strictly nearer.  A quotient ON the midpoint is exact in fp32, so the cast above has
     # already rounded it to the even end: at equal distances ``v`` is the nearest-even value
-    nearest = torch.where(exact | (to_v <= to_other), v, other)
+    at_v = exact | (to_v <= to_other)
+    nearest = torch.where(at_v, v, other)
+    # ... and where the other end is the nearer one, ``v`` stays in the bracket as its second value.  That happens where the
+    # quotient rounds to the midpoint itself in fp32 and the even end is the farther one: ``v`` is then what an fp32 chain
+    # rounds to, and a bracket without it would hold the nearest value twice
+    second = torch.where(at_v, other, v)
     exponent = torch.frexp(t.abs()).exponent.clamp(min=-125)
     unit = torch.pow(torch.tensor(2.0, dtype=acc, device=t.device), (exponent - 24).to(acc))  # one fp32 unit of the quotient
     margin = torch.where(exact, torch.full_like(t, float("inf")), (t - (va + oa) * 0.5).abs() / unit)
-    return nearest, other, margin
+    return nearest, second, margin
 
 
 def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> ScaledTensor:

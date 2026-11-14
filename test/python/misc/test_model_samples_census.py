@@ -2188,6 +2188,42 @@ def test_the_gates_twin_and_its_band_on_stated_tensors():
     assert int((nearest != twice).sum()) > 0, "the pairs hold a quotient whose two-step rounding leaves the nearest bf16 value"
     assert bool(((quotient - nearest.double()).abs() <= (quotient - other.double()).abs()).all()), "the nearest value is never the farther one"
     assert float(margin[nearest != twice].max()) < tie_out.GATE_MARGIN_ULP32, "and such a quotient sits inside the band's margin"
+    assert torch.equal(other[nearest != twice], twice[nearest != twice]), "there the bracket keeps the value the two-step rounding gives as its other end"
+    # one such quotient on stated operands: 1.8984375 / (1 + exp(-0.02880859375)) = 0.96289063..., 0.14 fp32 units above the
+    # midpoint of the bf16 values 0.9609375 and 0.96484375.  In fp32 it is the midpoint itself, which rounds to the even
+    # value, 0.9609375: the farther one, and the one a kernel that forms the quotient in fp32 writes there (code 56 at the
+    # scale 0.90625; the nearest value's code is 57).  The bracket holds both values, so a row of either code is inside the
+    # band; a byte of a third code is not
+    near_attn = torch.full((1, 6144), 1.8984375).to(torch.bfloat16)
+    near_gate = torch.full((1, 6144), 0.02880859375).to(torch.bfloat16)
+    near_quant = Quant("fp8", 0.90625)
+    assert near_attn[0, 0].item() == 1.8984375 and near_gate[0, 0].item() == 0.02880859375, "bf16 values, as stated"
+    quotient = float(near_attn[0, 0].double() / (1.0 + torch.exp(-near_gate[0, 0].double())))
+    assert abs(quotient - 0.9628906331227847) < 1e-15 and 0.13 < (quotient - (0.9609375 + 0.96484375) / 2) / 2.0**-24 < 0.14
+    assert float(torch.tensor(quotient, dtype=torch.float64).float()) == 0.962890625, "in fp32 the quotient is the midpoint of the two bf16 values"
+    nearest, other, margin = torch_ref.gate_quotient_bracket(near_attn, near_gate, torch.float64)
+    assert bool((nearest == 0.96484375).all()) and bool((other == 0.9609375).all()), "the nearest value, and the one the two-step rounding gives"
+    assert 0.13 < float(margin.min()) and float(margin.max()) < 0.14
+    assert quantize_fp8(nearest, near_quant.scale).codes.unique().tolist() == [57] and quantize_fp8(other, near_quant.scale).codes.unique().tolist() == [56]
+
+    def judged_near(codes):
+        twin = torch_ref.GateQuantizeQuotient(row, model, DeviceFacts((0, 0), "cpu"), {})
+        stats = tie_out.BlockStats("gate_fp8")
+        tie_out.BlockTap._judge(stats, (codes,), tie_out._tensors(twin(near_attn, near_gate, near_quant)), [], [], 0, twin)
+        return stats
+
+    farther = torch.full((1, 6144), 56, dtype=torch.uint8)
+    stats = judged_near(farther)
+    assert stats.ok and stats.outside == 0 and stats.off_nearest == 0 and stats.equal_bytes == 0 and stats.total_bytes == 6144, stats.line()
+    assert "; 6,144 of 6,144 the code of the other one around the gated value, 0 of them more than 2.5 fp32 units" in stats.line()
+    stats = judged_near(torch.full((1, 6144), 57, dtype=torch.uint8))
+    assert stats.ok and stats.equal_bytes == 6144, "the nearest value's code"
+    stats = judged_near(quantize_fp8((near_attn.float() / (1.0 + torch.exp(-near_gate.float()))).to(torch.bfloat16), near_quant.scale).codes)
+    assert stats.ok and stats.outside == 0, "the fp32 chain of this host, whichever of the two values it rounds to"
+    third = farther.clone()
+    third[0, 0] = 55
+    stats = judged_near(third)
+    assert not stats.ok and stats.outside == 1 and stats.line().endswith("; 1 the code of neither")
     # (4) state a call updates is compared byte for byte by a band that has no rule for it
     stats = tie_out.BlockStats("bf16_rounding")
     out = torch.ones((1, 8), dtype=torch.bfloat16)
@@ -2199,6 +2235,65 @@ def test_the_gates_twin_and_its_band_on_stated_tensors():
     chain = torch_ref.GateQuantize(row, model, DeviceFacts((0, 0), "cpu"), {})  # the reference chain: it rounds elsewhere and keeps no bracket
     with pytest.raises(ValueError, match="the band gate_fp8 is judged against the gate at the kernel's rounding points"):
         tie_out.BlockTap._judge(tie_out.BlockStats("gate_fp8"), (codes,), tie_out._tensors(chain(attn, gate, quant)), [], [], 0, chain)
+
+
+def test_the_gates_bracket_holds_both_bf16_values_around_the_quotient():
+    """The bracket of the gate's twin is the two bf16 values around the quotient ``attn / (1 + exp(-gate))`` in every branch of
+    its rounding: the nearest one first, the one on the other side of the quotient second -- also where the quotient is the
+    midpoint of the two in fp32 and the two-step rounding (fp64 to fp32 to bf16) lands on the farther value, below the
+    quotient or above it, for either sign.  A quotient that is a bf16 value has that value twice.  A bracket that names the
+    nearest value twice elsewhere would refuse a kernel that rounds such a quotient to the other one, which its band allows."""
+    from model_samples import tie_out
+    from model_samples.providers import torch_ref
+
+    def bracket(attn, gate):
+        operands = (torch.tensor([attn]).to(torch.bfloat16), torch.tensor([gate]).to(torch.bfloat16))
+        assert operands[0].item() == attn and operands[1].item() == gate, "the stated operands are bf16 values"
+        nearest, other, margin = torch_ref.gate_quotient_bracket(*operands, torch.float64)
+        quotient = float(operands[0].double() / (1.0 + torch.exp(-operands[1].double())))
+        return nearest.item(), other.item(), margin.item(), quotient, float(torch.tensor(quotient, dtype=torch.float64).float().to(torch.bfloat16))
+
+    # (attn, gate) -> (the nearest bf16 value, the other one); the quotient is the midpoint of the two in fp32, which rounds
+    # to the even value: the FARTHER one, below the quotient in the first case and above it in the others
+    on_a_midpoint = {
+        (1.8984375, 0.02880859375): (0.96484375, 0.9609375),
+        (1.8984375, -0.02880859375): (0.93359375, 0.9375),
+        (1.3828125, -0.9921875): (0.373046875, 0.375),
+        (1.21875, 0.3828125): (0.72265625, 0.7265625),
+    }
+    for (attn, gate), (near, far) in on_a_midpoint.items():
+        for sign in (1.0, -1.0):
+            nearest, other, margin, quotient, twice = bracket(sign * attn, gate)
+            assert (nearest, other) == (sign * near, sign * far), (attn, gate, sign)
+            assert twice == sign * far and abs(quotient - nearest) < abs(quotient - other), "the two-step rounding gives the farther value"
+            assert min(nearest, other) < quotient < max(nearest, other) and 0.0 < margin < 0.5, "less than half an fp32 unit from the midpoint"
+    # away from a midpoint the two-step rounding is the nearest value, and the other one is its neighbour across the quotient
+    for (attn, gate), (near, far) in {(1.0, 1.0): (0.73046875, 0.734375), (1.0, 3.0): (0.953125, 0.94921875)}.items():
+        for sign in (1.0, -1.0):
+            nearest, other, margin, quotient, twice = bracket(sign * attn, gate)
+            assert (nearest, other) == (sign * near, sign * far) and twice == nearest and margin > tie_out.GATE_MARGIN_ULP32, (attn, gate, sign)
+            assert min(nearest, other) < quotient < max(nearest, other)
+    # a quotient that is a bf16 value: that value twice, at no distance from a midpoint that matters
+    for (attn, gate), value in {(3.0, 0.0): 1.5, (-1.0, 0.0): -0.5, (0.0, 2.0): 0.0, (448.0, 40.0): 448.0}.items():
+        assert bracket(attn, gate)[:3] == (value, value, float("inf")), (attn, gate)
+    # over two million seeded pairs: the two values are one bf16 step apart (or equal, where the quotient is one), the
+    # quotient lies between them, the first is never the farther one -- and an fp32 chain rounds to one of the two everywhere
+    many = torch.Generator().manual_seed(11)
+    a = torch.randn((1 << 21,), generator=many).to(torch.bfloat16)
+    g = (3 * torch.randn((1 << 21,), generator=many)).to(torch.bfloat16)
+    nearest, other, margin = torch_ref.gate_quotient_bracket(a, g, torch.float64)
+    quotient = a.double() / (1.0 + torch.exp(-g.double()))
+    bits = lambda values: values.view(torch.int16).to(torch.int32) & 0x7FFF  # noqa: E731  the magnitude's bit pattern
+    step = (bits(nearest) - bits(other)).abs()
+    assert bool(((step == 1) | ((step == 0) & (margin == float("inf")))).all()), "neighbours, or one value where the quotient is a bf16 value"
+    assert bool((torch.signbit(nearest) == torch.signbit(other)).all()), "on one side of zero"
+    low, high = torch.minimum(nearest.double(), other.double()), torch.maximum(nearest.double(), other.double())
+    assert bool(((low <= quotient) & (quotient <= high)).all()), "the quotient lies between the two"
+    assert bool(((quotient - nearest.double()).abs() <= (quotient - other.double()).abs()).all()), "the first is the nearest"
+    chain = (a.float() / (1.0 + torch.exp(-g.float()))).to(torch.bfloat16)
+    assert bool(((chain == nearest) | (chain == other)).all()), "the kernel's chain in fp32 rounds to one of the two"
+    twice = quotient.float().to(torch.bfloat16)
+    assert int((nearest != twice).sum()) > 0 and torch.equal(other[nearest != twice], twice[nearest != twice]), "the farther value stays in the bracket"
 
 
 def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tmp_path):
