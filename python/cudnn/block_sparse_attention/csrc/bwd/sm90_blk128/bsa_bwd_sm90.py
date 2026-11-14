@@ -883,8 +883,14 @@ class BlockSparseAttnBackwardSm90Blk128:
         # The test depends only on the block index and on metadata the partition kernel completed before sum_OdO
         # (which waited on it) released this grid, so it is CTA-uniform and needs no griddepcontrol wait. The direct_kv
         # path keeps writing zeros for empty tiles and is not gated.
+        # The regular FP32-workspace route (neither paired nor direct_kv) leaves the same way on its two CSR offsets:
+        # 43-68% of the (KV128 block, head, Q group) CTAs of the measured blk128 masks have no edges, and each one ran
+        # the prologue and then reduce-added 131,072 bytes of zeros into the DRAM-resident dK/dV workspace (the
+        # memset already zeroed it, and +0.0 is the identity of the reduction). The exit path has no griddepcontrol
+        # wait on purpose: convert_q and convert_kv are plain launches, which the stream orders behind sum_OdO and this
+        # grid even when every CTA leaves here (test_sm90_blk128_empty_grid_stream_order guards that contract).
         has_work = True
-        if const_expr(self.paired):
+        if const_expr(self.paired or not self.direct_kv):
             n_block, head_idx, batch_idx, q_group = TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
             _, _, _, steps = self._task(bucketed_k2q_offsets, pair_tasks, n_block, q_group, head_idx, batch_idx)
             has_work = steps > 0
@@ -1609,7 +1615,8 @@ class BlockSparseAttnBackwardSm90Blk128:
                     # barrier does not have to wait for another L2 round trip (ncu: that wait cost ~0.9% of the kernel).
                     stored_early = copy_utils.ld_acquire_gpu_s32(stored_ptr)
             # Both WGs must finish all input reads before K/V (direct) or Q/dO
-            # (multi-bucket) become epilogue scratch. Empty tiles write zeros.
+            # (multi-bucket) become epilogue scratch. Empty direct tiles write
+            # zeros; empty multi-bucket tiles left at the top of bwd().
             named_barrier_sync(barrier_id=int(NamedBarrierBwd.Epilogue), number_of_threads=256)
             if const_expr(self.direct_kv):
                 self.epilogue_direct_kv(acc_dK, mdK, sK, tma_atom_dK, tiled_mma_dK, tidx, n_block, head_idx, batch_idx, softmax_scale)

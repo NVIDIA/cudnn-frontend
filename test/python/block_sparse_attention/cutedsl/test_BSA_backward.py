@@ -640,6 +640,191 @@ def test_sm90_blk128_dynamic_shape_compile_reuse(monkeypatch, variable, bucket, 
         assert len(native._bsa_attn_bwd_sm90_blk128.compile_cache) == 1
 
 
+def _assert_blk128_gradients(gradients, reference, mask):
+    """Gradients against the FP64 reference, and exactly zero wherever ``mask`` lets nothing attend."""
+    for got, expected in zip(gradients, reference):
+        torch.testing.assert_close(got.double(), expected, atol=3e-2, rtol=3e-2)
+        assert torch.linalg.vector_norm(got.double() - expected) <= 0.01 * torch.linalg.vector_norm(expected) + 1e-5
+    visible = torch.isfinite(mask)
+    dq, dk, dv = gradients
+    assert torch.count_nonzero(dq[~visible.any(3)]) == 0
+    assert torch.count_nonzero(dk[~visible.any(2)]) == 0 and torch.count_nonzero(dv[~visible.any(2)]) == 0
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("sq,sk", [(1536, 1152), (1466, 1090)], ids=["full_blocks", "q_and_kv_tails"])
+@pytest.mark.parametrize("bucket", [1, 3])
+def test_sm90_blk128_empty_groups_and_unattended_blocks(sq, sk, bucket):
+    """Multi-group FP32-workspace route where most (KV block, Q group) CTAs have no edges and leave before the
+    prologue: KV blocks nothing attends (dK/dV exactly zero from the workspace memset alone), Q groups without any
+    edge, a (batch, head) without any edge and blocks several groups reduce into, twice into poisoned gradient
+    buffers, against the FP64 reference."""
+    ops = import_bsa(families=(9,), reason=SM90_BLK128)
+    torch.manual_seed(128001)
+    b, h, width, scale = 2, 2, 3, 0.11
+    nq, nk = (sq + 127) // 128, (sk + 127) // 128
+    q = torch.randn((b, h, sq, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((b, h, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    # Head 0 attends four of the nine KV blocks (one of them the last, partial for a KV tail), head 1 three; the other
+    # blocks of each head are attended by no query block.
+    attended = ([0, 2, 3, nk - 1], [1, 2, nk - 2])
+    rows = [[[blocks[(row + slot) % len(blocks)] for slot in range(width)] for row in range(nq)] for blocks in attended]
+    ids = torch.tensor(rows, device="cuda", dtype=torch.int32).expand(b, h, nq, width).contiguous()
+    counts = torch.full((b, h, nq), width, device="cuda", dtype=torch.int32)
+    counts[:, :, 3:6] = 0  # the second Q group of bucket 3 has no edge
+    counts[:, :, 9:] = 1  # the last one keeps a single KV block per Q block
+    counts[1, 1] = 0  # and one (batch, head) attends nothing at all
+    mask = block_sparse_mask(ids, width, None, sq, sk, 128, counts)
+    _, _, *reference = attention_reference(q, k, v, mask, scale, do=do, dtype=torch.float64)
+    opts = dict(block_sparse_num=width, q2k_block_nums=counts, sparse_block_size=128, softmax_scale=scale)
+    forward = ops.block_sparse_attention_forward(q, k, v, ids, allow_empty_block_nums=True, **opts)
+    dest = tuple(torch.empty_like(t) for t in (q, k, v))
+    for _ in range(2):
+        for t in dest:
+            t.fill_(17.0)
+        gradients = ops.block_sparse_attention_backward(
+            do,
+            q,
+            k,
+            v,
+            forward["o_tensor"],
+            forward["lse_tensor"],
+            ids,
+            dq_tensor=dest[0],
+            dk_tensor=dest[1],
+            dv_tensor=dest[2],
+            bucket_size_blocks=bucket,
+            **opts,
+        )
+        assert all(got.data_ptr() == buffer.data_ptr() for got, buffer in zip(gradients, dest))
+        _assert_blk128_gradients(gradients, reference, mask)
+
+
+@pytest.mark.L1
+def test_sm90_blk128_multigroup_graph_empty_replay():
+    """Graph replay of the multi-group route with the counts changed at the same addresses: all zero (every CTA of the
+    main grid leaves through the early exit and every poisoned gradient is reset to exactly zero), the captured counts
+    again, then whole empty Q groups and unattended KV blocks, and zero once more; no recompile, no host sync."""
+    ops = import_bsa(families=(9,), reason=SM90_BLK128)
+    from cudnn.block_sparse_attention import _interface as native
+
+    torch.manual_seed(128002)
+    b, h, nq, nk, width = 1, 2, 8, 6, 3
+    q = torch.randn((b, h, nq * 128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((b, h, nk * 128, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    ids = torch.rand(b, h, nq, nk, device="cuda").argsort(-1)[..., :width].int().contiguous()
+    counts = torch.full((b, h, nq), width, device="cuda", dtype=torch.int32)
+    captured = counts.clone()
+    sparse = torch.zeros_like(counts)
+    sparse[:, :, 2] = 1  # bucket 2: only the second Q group keeps edges, in one head a third one too
+    sparse[:, 0, 5] = width
+    dest = tuple(torch.empty_like(t) for t in (q, k, v))
+    opts = dict(block_sparse_num=width, q2k_block_nums=counts, sparse_block_size=128)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def run():
+        f = ops.block_sparse_attention_forward(q, k, v, ids, allow_empty_block_nums=True, **opts)
+        g = ops.block_sparse_attention_backward(
+            do, q, k, v, f["o_tensor"], f["lse_tensor"], ids, dq_tensor=dest[0], dk_tensor=dest[1], dv_tensor=dest[2], bucket_size_blocks=2, **opts
+        )
+        return f, g
+
+    def caches():
+        return len(native._bsa_attn_fwd_sm90_blk128.compile_cache), len(native._bsa_attn_bwd_sm90_blk128.compile_cache)
+
+    with torch.cuda.stream(stream), cuda_graph() as graph:
+        run()
+        run()
+        sizes_before = caches()
+        with torch.cuda.graph(graph, stream=stream):
+            f, g = run()
+        for new_counts in (torch.zeros_like(counts), captured, sparse, torch.zeros_like(counts)):
+            with no_host_sync():
+                counts.copy_(new_counts)
+                run()  # the eager path takes the new counts without a host sync or a recompile (checked below)
+                for t in dest:
+                    t.fill_(17.0)
+                graph.replay()
+            mask = block_sparse_mask(ids, width, None, nq * 128, nk * 128, 128, counts)
+            if not new_counts.any():
+                assert torch.count_nonzero(f["o_tensor"]) == 0 and torch.isneginf(f["lse_tensor"]).all()
+                assert all(torch.count_nonzero(t) == 0 for t in g)
+            else:
+                ro, rl, *reference = attention_reference(q, k, v, mask, do=do, dtype=torch.float64)
+                torch.testing.assert_close(f["o_tensor"].double(), ro, atol=8e-3, rtol=8e-3)
+                _assert_blk128_gradients(g, reference, mask)
+        assert sizes_before == caches()
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.L1
+def test_sm90_blk128_empty_grid_stream_order(monkeypatch):
+    """An all-empty multi-group backward issued right behind a non-empty one, with no host sync in between: every CTA
+    of its main grid leaves through the early exit without a griddepcontrol wait, so that grid can complete while
+    sum_OdO still clears dQaccum.  The converters are plain launches, which the stream orders behind both; with the
+    workspace prefix [dPsum | LSElog2 | dQaccum] and the outputs poisoned, a converter that ran early would return
+    non-zero gradients."""
+    ops = import_bsa(families=(9,), reason=SM90_BLK128)
+    from cudnn.block_sparse_attention import _interface as native
+
+    allocate = native._empty_bwd_workspace_with_zeroed_accum
+    poisoned, calls = [], []
+
+    def poisoned_workspace(**kwargs):
+        workspace = allocate(**kwargs)
+        q_rounded = -(-kwargs["seqlen_q"] // kwargs["round_q_to"]) * kwargs["round_q_to"]
+        d_rounded = -(-kwargs["head_dim"] // kwargs["round_d_to"]) * kwargs["round_d_to"]
+        prefix = kwargs["batch_size"] * kwargs["num_heads"] * (2 * q_rounded + q_rounded * d_rounded)
+        workspace.reshape(-1)[:prefix].fill_(17.0)
+        poisoned.append(prefix)
+        return workspace
+
+    monkeypatch.setattr(native, "_empty_bwd_workspace_with_zeroed_accum", poisoned_workspace)
+    torch.manual_seed(128003)
+    # (batch, heads, Q128 blocks, KV128 blocks, bucket): main grids of 2 to 64 CTAs behind sum_OdO grids of 4 to 8,192.
+    for b, h, nq, nk, bucket in [(1, 1, 2, 1, 1), (1, 1, 40, 1, 20), (1, 2, 64, 2, 32), (2, 4, 512, 4, 256)]:
+        q = torch.randn((b, h, nq * 128, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn((b, h, nk * 128, 128), device="cuda", dtype=torch.bfloat16)
+        v, do, o = torch.randn_like(k), torch.randn_like(q), torch.randn_like(q)
+        lse = torch.randn((b, h, nq * 128), device="cuda", dtype=torch.float32)
+        ids = torch.randint(0, nk, (b, h, nq, 1), device="cuda", dtype=torch.int32)
+        full = torch.ones((b, h, nq), device="cuda", dtype=torch.int32)
+        empty = torch.zeros_like(full)
+        dest = tuple(torch.empty_like(t) for t in (q, k, v))
+
+        def backward(counts):
+            calls.append(bucket)
+            for t in dest:
+                t.fill_(17.0)
+            return ops.block_sparse_attention_backward(
+                do,
+                q,
+                k,
+                v,
+                o,
+                lse,
+                ids,
+                1,
+                q2k_block_nums=counts,
+                dq_tensor=dest[0],
+                dk_tensor=dest[1],
+                dv_tensor=dest[2],
+                sparse_block_size=128,
+                bucket_size_blocks=bucket,
+            )
+
+        for _ in range(100):
+            backward(full)  # leaves real gradients in the buffers and a busy stream behind
+            gradients = backward(empty)
+            assert [int(torch.count_nonzero(t)) for t in gradients] == [0, 0, 0]
+        assert all(torch.count_nonzero(t) > 0 for t in backward(full))
+    # Every backward of this test went through the poisoned workspace helper exactly once.
+    assert len(poisoned) == len(calls) == 4 * 201
+
+
 # ---- SM100/SM110 blk64
 
 
