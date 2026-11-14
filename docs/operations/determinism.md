@@ -243,9 +243,10 @@ a row alone and inside a batch under the entry's own picks.
   order; BF16/FP16 grouped heads, rectangular states and external contexts have
   additional SM103 byte-parity coverage. Runtime-head reuse of compiled code
   and independent CUDA Graph replays on two streams with separate workspaces
-  are also checked against the unsplit backward path on SM103. This additional
-  workspace regression has not been rerun on SM100 or SM107; their earlier
-  determinism coverage remains recorded in the test report.
+  are also checked against the unsplit backward path on SM103, including H96
+  with BF16/log gates and FP32 states. This additional workspace regression
+  has not been rerun on SM100 or SM107; their earlier determinism coverage
+  remains recorded in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

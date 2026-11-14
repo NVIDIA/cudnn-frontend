@@ -158,7 +158,7 @@ def test_checkpoint_wave_runtime_heads(monkeypatch, divisor, state_waves):
     cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
     try:
         compiled = None
-        for heads in (divisor, 3 * divisor, 2 * divisor, 4 * divisor):
+        for heads in (divisor, 3 * divisor, 2 * divisor, 4 * divisor, 96):
             inputs = pack(sequences("kda", [0, 8193, 17, 513], heads=heads))
             inputs["cu_seqlens"] = inputs.pop("cu")
             inputs["dO"] = inputs.pop("do")
@@ -188,7 +188,8 @@ def test_checkpoint_wave_runtime_heads(monkeypatch, divisor, state_waves):
 
 
 @pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
-def test_checkpoint_wave_independent_streams(monkeypatch, state_waves):
+@pytest.mark.parametrize("heads", [8, 96], ids=["h8", "h96"])
+def test_checkpoint_wave_independent_streams(monkeypatch, state_waves, heads):
     """Shared compiled code must not share queues or state across independent graph replays."""
     reason = frost_la_unavailable()
     if reason:
@@ -206,7 +207,7 @@ def test_checkpoint_wave_independent_streams(monkeypatch, state_waves):
             stream.wait_stream(torch.cuda.current_stream())
             cudnn.set_stream(handle=handle, stream=stream.cuda_stream)
             with torch.cuda.stream(stream):
-                inputs = pack(sequences("kda", [0, 1, 15, 16, 17, 8193] + [33] * (31 + index), heads=8))
+                inputs = pack(sequences("kda", [0, 1, 15, 16, 17, 8193] + [33] * (31 + index), heads=heads))
                 inputs["cu_seqlens"] = inputs.pop("cu")
                 inputs["dO"] = inputs.pop("do")
                 inputs["d_final_state"] = inputs.pop("dfs")

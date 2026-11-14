@@ -537,6 +537,90 @@ Changed-file pre-commit and syntax checks pass; Fern reports zero errors and
 one warning because unauthenticated redirect checking is unavailable.
 
 
+### H96 KDA workspace qualification — B300 CP8, 2026-11-14
+
+This follow-up retains the preceding baseline/candidate production sources and
+measurement method, increasing equal Q/K/V heads from 32 to **96 per rank**.
+Global THD length is 1,048,576, local length 131,072, K=V=128, BF16 Q/K/V/dO,
+FP32 gates/beta/CP merge, and batch invariance enabled. Every arm is a fresh
+process with three warmups and 31 measured forward+backward iterations, including
+CP boundary communication. Arm order alternates across the ten cases. This is
+KDA only; input construction, planning/JIT and full-tensor hashing are outside
+the timed region.
+
+| Global THD lengths | F+B ms, before → after | Change | Allocated GiB, before → after | Candidate reserved GiB |
+| --- | ---: | ---: | ---: | ---: |
+| 256 × 4,096 | 37.116 → 39.419 | +6.21% | 61.746 → 42.797 | 42.801 |
+| one 1M | 81.786 → 84.159 | +2.90% | 60.832 → 42.609 | 45.406 |
+| 20 × 1,024 + 2 × 514,048 | 90.681 → 94.813 | +4.56% | 61.409 → 42.678 | 45.406 |
+| 2,048 × 512 | 39.621 → 40.103 | +1.22% | 68.967 → 43.198 | 44.986 |
+| 1,024 × (480, 544) | 39.803 → 40.006 | +0.51% | 68.967 → 43.198 | 44.986 |
+| 2,047 × 256 + 524,544 | 80.328 → 83.474 | +3.92% | 77.238 → 44.155 | 47.434 |
+| 1,536 × 64; 512 × 1,856 | 63.007 → 64.648 | +2.60% | 110.828 → 51.764 | 51.801 |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 51.539 → 52.565 | +1.99% | 86.941 → 45.261 | 56.895 |
+| 4,096 × 256 | 43.442 → 43.956 | +1.18% | 77.221 → 44.138 | 47.428 |
+| 8,192 × 128 | 50.920 → 51.918 | +1.96% | 93.725 → 46.018 | 52.312 |
+
+All ten pairs have identical full-tensor hashes for the six inputs and
+O/dQ/dK/dV/dG/dBeta on every rank, with finite outputs/gradients. All seven
+loaded production-module hashes match the qualified source manifests.
+Allocated memory decreases **29.96–53.29%**. Nine cases stay within 5% latency
+regression in this round; **256 × 4K regresses 6.21%**. This exception retains
+the PR's Draft status rather than widening the acceptance threshold.
+
+Both cases with at least 4.5% first-round regression were repeated in reverse
+arm order (candidate first), again with three warmups and 31 samples:
+
+| Global THD lengths | F+B ms, baseline → candidate | Change | Byte equality |
+| --- | ---: | ---: | --- |
+| 256 × 4,096 | 37.122 → 39.374 | +6.07% | all ranks, outputs and input gradients |
+| 20 × 1,024 + 2 × 514,048 | 90.712 → 94.801 | +4.51% | all ranks, outputs and input gradients |
+
+The memory peaks are unchanged. The first case remains above the 5% target;
+this H96 follow-up also leaves the earlier H32 7.06% / 7.16% exception unresolved.
+
+The candidate uses four checkpoint waves throughout. Document-dense ranks also
+use four state waves; long-document ranks retain full-head states. Mixed
+layouts can therefore select (4,4) and (4,1) on different ranks. The table
+reports the median of per-iteration maximum-rank F+B and the memory maximum
+across ranks/iterations, not an average that hides imbalance.
+
+H96 inputs, outputs and gradients alone occupy approximately **36.094 GiB /
+38.755 decimal GB per rank**, before transport or workspace. The H32 below-20-GB
+result does not extend to this H96 configuration. Candidate allocated peaks
+range from 42.609 to 51.764 GiB; the largest reservation is 56.895 GiB.
+These are Torch counters, not process-wide VRAM caps. No new H20/SM90, SM100
+or SM107 result is implied.
+
+The native test follow-up uses BF16/log-gate **D64**, with FP32 gates and
+initial/final states; the CP8 performance matrix above uses **K=V=128**.
+The same runtime as the preceding qualification is retained: Torch 2.12.1+cu130,
+cuDNN 9.20.0, CuTeDSL 4.8.1/compiler 13.4 and driver 580.173.02. Run from
+`test/python` with an explicit handle bound to each capture stream:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -x -rs -k 'runtime_heads or (independent_streams and h96)'
+```
+
+**6 passed, 53 deselected, 2 warnings in 315.64 s**, with no failures or skips.
+The warnings are Torch's `torch.jit.script` deprecation. Four runtime-head
+cases now cover 20 shape/configuration pairs, including H96 for both divisors
+and both storage modes, while reusing the same two compiled launch objects
+per case. Two H96 independent-stream cases run 64 poisoned CUDA Graph replays
+per stream and storage mode: **256 total**, comparing every eight replays.
+All backward outputs match the unsplit D=1 path byte for byte; input immutability
+and workspace canaries pass. Concurrent submission does not measure hardware
+overlap or permit sharing a workspace across streams.
+
+All seven loaded production-module hashes and the executed test-source hash
+were checked against the local source. This follow-up changes tests and
+documentation only; production kernels remain byte-identical to `a19c476d`.
+No numerical tolerance or golden changed. Earlier sanitizer and warm-stress
+results remain retained evidence, not H96 reruns. Compatibility audit: passed
+for the added head-count/storage-mode checks. Docstring audit: passed for the
+unchanged production surface.
+
 ## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
 
