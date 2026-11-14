@@ -292,6 +292,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_sm100_d512_role_split": EngineSlot(21),
             "sdpa_fwd_sm100_d512_2x2": EngineSlot(22),
             "sdpa_fwd_sm100_d512_fp8_role_split": EngineSlot(23),
+            "sdpa_fwd_sm100_d256_fp8_single_q": EngineSlot(24),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),

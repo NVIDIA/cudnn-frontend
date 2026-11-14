@@ -133,6 +133,7 @@ def release_cases(arch):
         kwargs = dict(cta_mma=cga, dtype_qkv=2 if "f16" in name else 0, dtype_o=2, mma_2x2="2x2" in name)
         moved = {
             "prefill_d256_f16.py": "d256_f16_lookahead/kernel.py",
+            "prefill_d256_fp8.py": "d256_fp8_single_q/kernel.py",
             "prefill_d512_f16.py": "d512_f16_role_split/kernel.py",
             "prefill_d512_f16_2x2.py": "d512_f16_2x2/kernel.py",
             "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",

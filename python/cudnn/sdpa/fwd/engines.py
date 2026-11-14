@@ -21,7 +21,7 @@ New implementation rows identify one main body and its local variants. Their
 the shared parser/binder/launch framework. A fixed helper chain (for example
 THD descriptor setup, attention, and split combine) remains one engine.
 Performance selection lives in heuristics. Unmigrated legacy rows still select
-among multiple bodies internally; the explicit D256, wide-half and FP8 D512
+among multiple bodies internally; the explicit half D256, wide-half and FP8 D256/D512
 rows are the migration boundary, not a claim that every row already follows it.
 """
 
@@ -85,6 +85,10 @@ from .kernels.sm100.d512_f16_contract import (
     TWO_BY_TWO as _D512_TWO_BY_TWO,
     IMPLEMENTATIONS as _D512_IMPLEMENTATIONS,
     mismatch as _d512_implementation_mismatch,
+)
+from .kernels.sm100.d256_fp8_single_q.contract import (
+    NAME as _D256_FP8_SINGLE_Q,
+    mismatch as _d256_fp8_implementation_mismatch,
 )
 from .kernels.sm100.d512_fp8_role_split.contract import (
     NAME as _D512_FP8_ROLE_SPLIT,
@@ -1798,6 +1802,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _d512_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
+    if capabilities.implementation == _D256_FP8_SINGLE_Q:
+        reason = _d256_fp8_implementation_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation == _D512_FP8_ROLE_SPLIT:
         reason = _d512_fp8_implementation_mismatch(facts, knobs)
         if reason is not None:
@@ -3362,7 +3370,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     One broad legacy row per ARCH LINE (``arch``: "sm100" = pre-Rubin Blackwell 100-106,
     "sm107" = Rubin line 107-119): the two lowerings genuinely diverge and a
     shared row could only describe their union with knob x arch notches.
-    Exact SM100/SM103 D512 has its own explicit implementation owner. On the
+    Exact SM100/SM103 D256/D512 have explicit implementation owners. On the
     remaining legacy domain, the adapter picks the kernel flavor covering the graph. Each row declares
     exactly what its own kernels carry:
 
@@ -3406,7 +3414,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
     return EngineSpec(
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
-            delegated_exact=frozenset() if rubin_row else frozenset({((10, 0), (512, 512)), ((10, 3), (512, 512))}),
+            delegated_exact=(frozenset() if rubin_row else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((256, 256), (512, 512)))),
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
@@ -3612,6 +3620,32 @@ def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
     """
     legacy = next(s for s in ENGINE_SPECS if s.name == name)
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
+def _sm100_d256_fp8_spec() -> EngineSpec:
+    """One per-tensor FP8 body; shared graph binding and launch construction."""
+    from .kernels.sm100.d256_fp8_single_q.host import lower
+
+    shape = frozenset({(256, 256)})
+    capabilities = replace(
+        _sm100_fp8_spec().capabilities,
+        implementation=_D256_FP8_SINGLE_Q,
+        delegated_exact=frozenset(),
+        d_shapes=shape,
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        thd_d_shapes=shape,
+        paged_d_shapes=shape,
+        split_d_shapes=shape,
+        pack_gqa_d_shapes=shape,
+        out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        o_block_scales=frozenset({0}),
+        cgas=frozenset({1}),
+        cgas_by_d_shape=(),
+        split_cgas_by_d_shape=(),
+        swap_abs=frozenset(),
+    )
+    return EngineSpec(_D256_FP8_SINGLE_Q, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
 
 
 def _sm100_d512_fp8_spec() -> EngineSpec:
@@ -4669,7 +4703,7 @@ def engine_name(
     """The registered engine name for a coverage cell (test/user convenience).
 
     This names the broad legacy row. Exact SM100/SM103 half D256/D512/D576
-    and per-tensor FP8 D512 have explicit implementation entries; callers
+    and per-tensor FP8 D256/D512 have explicit implementation entries; callers
     select them by name or use the ordinary heuristics candidates."""
 
     suffix = "_mxfp8" if mxfp8 else "_fp8" if fp8 else ""
@@ -4872,6 +4906,7 @@ ENGINE_SPECS = (
     _sm100_mxfp8_spec(),
     _sm100_fp8_spec(),
     _sm100_d512_fp8_spec(),
+    _sm100_d256_fp8_spec(),
     _sm100_fp8_spec(arch="sm107"),
     _sm107_spec(),
     _sm107_mxfp8_spec(),

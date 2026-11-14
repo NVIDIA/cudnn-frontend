@@ -677,6 +677,7 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d256_f16_contract import IMPLEMENTATIONS
     from .kernels.sm100.d512_f16_contract import IMPLEMENTATIONS as WIDE_IMPLEMENTATIONS
     from .kernels.sm100.d512_fp8_role_split.contract import NAME as D512_FP8_ROLE_SPLIT, LEGACY_ROW as FP8_LEGACY_ROW
+    from .kernels.sm100.d256_fp8_single_q.contract import NAME as D256_FP8_SINGLE_Q
 
     # Studies for an explicit implementation take precedence over inherited
     # placement, including a measured TRAIL and non-default legal variants.
@@ -708,7 +709,7 @@ def place(spec, facts, knobs=None) -> str:
             return TRAIL
         spec = sm100_legacy_policy_spec()
 
-    if spec.capabilities.implementation == D512_FP8_ROLE_SPLIT:
+    if spec.capabilities.implementation in (D512_FP8_ROLE_SPLIT, D256_FP8_SINGLE_Q):
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:

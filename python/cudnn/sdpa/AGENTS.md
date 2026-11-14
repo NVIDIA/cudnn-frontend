@@ -231,7 +231,7 @@ ordered after that read.**
 
 - Some kernels have no spare TMEM and pack P into the tail of the S slot it
   was computed from (`P_EVEN_OFF`/`P_ODD_OFF` inside the `S_ACC_*` column
-  range — e.g. `sm100/prefill_d256_fp8.py`, `P_EVEN_OFF = 96` in a 128-col
+  range — e.g. `sm100/d256_fp8_single_q/kernel.py`, `P_EVEN_OFF = 96` in a 128-col
   slot). With a single softmax owner that is safe: all of S is in registers
   before any P store. It is a race the moment a row's keys are split across
   two softmax warpgroups: the half storing into the aliased columns
@@ -243,7 +243,7 @@ ordered after that read.**
   after its `tcgen05.ld` has landed (`tcgen05.wait::ld` first — the
   softmax paths otherwise never wait on loads explicitly), and the storing
   half waits on it right before the aliased store (`mb_softmax_hi_loaded`
-  in `sm100/prefill_d256_fp8.py`, mirroring `mb_softmax_max`). Do NOT try
+  in `sm100/d256_fp8_single_q/kernel.py`, mirroring `mb_softmax_max`). Do NOT try
   to fix it by swapping which half owns which keys: the alpha/stats value
   is aliased too (`STATS_*_OFF == S_ACC_*_OFF`, i.e. S column 0), so the
   half that stores alpha must also be the one that owns key 0 — the
