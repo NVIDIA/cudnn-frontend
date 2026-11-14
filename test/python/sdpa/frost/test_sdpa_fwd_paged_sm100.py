@@ -852,7 +852,7 @@ def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "d256_f16_lookahead/kernel.py", 512: "prefill_d512_f16.py"}
+_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "d256_f16_lookahead/kernel.py", 512: "d512_f16_role_split/kernel.py"}
 
 
 def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, d_v=None, expect_pack_g=None):
@@ -1995,7 +1995,7 @@ def test_paged_graph_fp8_declines_off_contract():
 # names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d192_d128_fp8.py", 0, 1),
-    ("sm100/prefill_d512_f16_2x2.py", 2, 2),
+    ("sm100/d512_f16_2x2/kernel.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
     ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),

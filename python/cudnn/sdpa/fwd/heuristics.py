@@ -3559,8 +3559,8 @@ def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
     )
 
 
-def sm100_d256_policy_spec():
-    """Historical policy domain for D256 candidate generation and study keys.
+def sm100_legacy_policy_spec():
+    """Historical policy domain for migrated candidate generation and study keys.
 
     This is never an offered engine. Delegation changes ownership, not the
     pack/split decisions on which the existing placement studies were fitted.
@@ -3569,7 +3569,24 @@ def sm100_d256_policy_spec():
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
 
 
-def _recommend_sm100_d256(kind, facts, offered):
+def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
+    """Central wide-half body choice; explicit implementation replay never calls it."""
+    from .kernels.sm100.d512_f16_contract import D512Geometry, ROLE_SPLIT, TWO_BY_TWO
+
+    two_by_two = d_qk == 576 or (prefer_two_by_two and split_kv == 1 and not paged and 64 % max(1, pack_g) == 0)
+    return D512Geometry(TWO_BY_TWO if two_by_two else ROLE_SPLIT, d_qk)
+
+
+def select_sm100_d512_geometry(facts, knobs):
+    return select_sm100_d512_geometry_for_shape(
+        facts.d_qk,
+        paged=facts.has_paged_kv,
+        split_kv=knobs.split_kv or 1,
+        pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
+    )
+
+
+def _recommend_sm100_implementation(kind, facts, offered, select_geometry):
     """Retain the existing candidate budget/order, naming each actual body.
 
     The old row's policy domain generates pack/split and scheduler combinations.
@@ -3577,7 +3594,7 @@ def _recommend_sm100_d256(kind, facts, offered):
     implementation before being returned, and its split model consumes the
     same selected geometry.
     """
-    policy = sm100_d256_policy_spec()
+    policy = sm100_legacy_policy_spec()
     if mismatch(policy.capabilities, facts) is not None:
         return []
     sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
@@ -3593,7 +3610,7 @@ def _recommend_sm100_d256(kind, facts, offered):
             )
             if knobs is None:
                 continue
-        geometry = select_sm100_d256_geometry(facts, knobs.pack_gqa)
+        geometry = select_geometry(facts, knobs)
         engine_id = offered.get(geometry.implementation)
         if engine_id is None:
             continue
@@ -3634,7 +3651,11 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if in_pilot_domain(facts):
         # Only the explicit D256 implementations admit this domain. Keep the
         # eligible-row contract test in sync before adding another owner here.
-        return _recommend_sm100_d256(kind, facts, offered)
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: select_sm100_d256_geometry(f, k.pack_gqa))
+    from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+
+    if in_wide_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

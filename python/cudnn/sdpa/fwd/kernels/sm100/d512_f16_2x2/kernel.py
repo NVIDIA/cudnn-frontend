@@ -79,7 +79,10 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, CfgD512X2, make_cfg_d512_2x2, d512_2x2_smem_bytes
+from cudnn.sdpa.fwd.kernels.sm100.d512_f16_2x2.contract import TEMPLATE_NAME as TEMPLATE_NAME
+from cudnn.sdpa.fwd.config_common import TemplateParams
+from cudnn.sdpa.fwd.config_d512_2x2_common import CfgD512X2, d512_2x2_smem_bytes
+from cudnn.sdpa.fwd.kernels.sm100.d512_f16_2x2.config import make_cfg_d512_2x2
 
 # The per-graph params are injected as a module global by the loader before this body executes
 # (api_dsl._load_sm100_kernel_module routes mma_2x2=True records here); a plain import gets the
@@ -2313,7 +2316,7 @@ def compile(  # noqa: A001
     paged_v_hnd: Optional[bool] = None,
     thd_origin_specs=None,
 ) -> Callable:
-    """Compile the host entry for one layout kind (same key surface as sm100/prefill_d512_f16.py: the
+    """Compile the host entry for one layout kind (same key surface as sm100/d512_f16_role_split/kernel.py: the
     head-dim ENVELOPE, whether the Stats store exists, the Stats layout kind)."""
     if thd_origin_specs is not None:
         if not CFG.THD_VARLEN or SPLIT_KV != 1:

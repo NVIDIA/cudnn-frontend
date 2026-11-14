@@ -64,6 +64,8 @@ def _load(arch, template, d_qk, d_v, **overrides):
     path = Path(api_dsl.__file__).parent / "kernels" / arch / f"{template}.py"
     if arch == "sm100" and template in ("decode_d256_f16", "prefill_d256_f16"):
         path = path.parent / ("d256_f16_swap_ab" if template.startswith("decode") else "d256_f16_lookahead") / "kernel.py"
+    if arch == "sm100" and template == "prefill_d512_f16":
+        path = path.parent / "d512_f16_role_split/kernel.py"
     return load_template(str(path), TemplateParams(**values), tag=f"pointer_abi_{arch}_{template}_{d_qk}_{d_v}")
 
 

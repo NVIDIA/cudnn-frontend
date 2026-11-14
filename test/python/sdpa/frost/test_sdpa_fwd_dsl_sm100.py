@@ -17,7 +17,28 @@ from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, _dsl_installed, run_sass_probe, sass_probe_source
 
 
-from frost_test_utils import select_engine as _select_engine  # noqa: F401
+from frost_test_utils import select_engine as _select_ranked_engine
+
+_D512_GRAPH_ARM = None
+
+
+def _select_engine(graph, *args, **kwargs):
+    """Keep default selection, with an explicit record for the role-split test arm."""
+    plan = _select_ranked_engine(graph, *args, **kwargs)
+    if _D512_GRAPH_ARM != "role_split" or not _is_plan_for(graph.get_plan_name_at_index(graph._plan_index), "sdpa_fwd_sm100_d512_2x2"):
+        return plan
+    import cudnn
+    from cudnn.engines.manifest import family_for
+    from cudnn.sdpa import graph_analyzer
+
+    facts = graph._facts_for(graph_analyzer.analyze)
+    if (facts.d_qk, facts.d_v) != (512, 512):
+        return plan
+    _, knobs = graph.get_engine_and_knobs_at_index(graph._plan_index)
+    graph.create_execution_plan(family_for(graph).offered_ids()["sdpa_fwd_sm100_d512_role_split"], {**knobs, cudnn.knob_type.TILE_M: 128})
+    graph.select_plan(graph.get_execution_plan_count() - 1)
+    return graph.plans[graph._plan_index]
+
 
 pytestmark = requires_blackwell
 
@@ -201,7 +222,7 @@ _DTYPE_IDS = ["fp16", "bf16"]
 
 # --- the d512 2x2 twin arm --------------------------------------------------------------------------------------
 # Every case of this file that can name the d512 flavor runs under BOTH values of api_dsl.D512_2X2 (default True since
-# 2026-10-06): two_by_two lowers its d512 half plans onto sm100/prefill_d512_f16_2x2.py, role_split onto the 4x1 kernel
+# 2026-10-06): two_by_two lowers its d512 half plans onto sm100/d512_f16_2x2/kernel.py, role_split onto the 4x1 kernel
 # (the same ids `-k "d512 or dsv4"` lists, suffixed -role_split / -two_by_two;
 # conftest deselects the twin arm of the other flavors' cells).  Plans the twin declines (split_kv > 1 from the
 # heuristics, PackGQA G=128) keep the role-split kernel under both arms; test_sdpa_fwd_d512_2x2_sm100.py asserts the
@@ -235,13 +256,16 @@ def pytest_generate_tests(metafunc):
 @pytest.fixture(autouse=True)
 def d512_arm(request, monkeypatch):
     """Both arms set api_dsl.D512_2X2 EXPLICITLY (the switch defaults to True since 2026-10-06): ``two_by_two`` -> mma_2x2=True
-    on every eligible d512 half record (cc 10.0 lowers it onto sm100/prefill_d512_f16_2x2.py, cc 10.7 onto
+    on every eligible d512 half record (cc 10.0 lowers it onto sm100/d512_f16_2x2/kernel.py, cc 10.7 onto
     sm107/prefill_d512_f16_2x2.py); ``role_split`` -> the 4x1 kernel.  Unparametrized cases (no d512 in their name) keep the
     module default.  Added only to the d512-naming cases by pytest_generate_tests above."""
     from cudnn.sdpa.fwd import api_dsl
 
     arm = getattr(request, "param", None)
     if arm is not None:
+        # Standalone and unmigrated architectures retain their switch. Exact
+        # SM100 graph rows use the test-local explicit record above.
+        monkeypatch.setitem(globals(), "_D512_GRAPH_ARM", arm)
         monkeypatch.setattr(api_dsl, "D512_2X2", arm == "two_by_two")
     yield
 

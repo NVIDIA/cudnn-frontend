@@ -3,7 +3,7 @@
 
 """SM100 (Blackwell) SDPA prefill — d_qk = d_v = 512, per-tensor FP8 (E4M3/E5M2).
 
-FP8 fork of ``sm100/prefill_d512_f16.py``: same cga4x1 role-split pipeline, same
+FP8 fork of ``sm100/d512_f16_role_split/kernel.py``: same cga4x1 role-split pipeline, same
 Q u K_ring SMEM alias, same UTCCP(Q SMEM -> TMEM) + ``mma_ts`` BMM1, same THD /
 split-KV / pack-GQA legs.  Only the dtype-driven deltas differ, and every one of
 them is derived from ``CFG`` rather than spelled as a literal:
@@ -181,7 +181,7 @@ elif CFG.DTYPE_QKV == 1:
     MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4
 else:
     raise ValueError(
-        f"prefill_sdpa_d512_fp8 (SM100): DTYPE_QKV={CFG.DTYPE_QKV} not supported (expected 0=E4M3 or 1=E5M2; BF16/FP16 ship in sm100/prefill_d512_f16.py)"
+        f"prefill_sdpa_d512_fp8 (SM100): DTYPE_QKV={CFG.DTYPE_QKV} not supported (expected 0=E4M3 or 1=E5M2; BF16/FP16 ship in sm100/d512_f16_role_split/kernel.py)"
     )
 
 # DTYPE_O is independent of DTYPE_QKV: an FP8 graph may ask for a half-precision

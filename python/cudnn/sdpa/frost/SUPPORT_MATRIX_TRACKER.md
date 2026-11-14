@@ -23,6 +23,21 @@ routes and candidate budget; explicit engine selection fixes the body.
 The main kernel bodies and arithmetic are unchanged; only implementation
 selection, configuration ownership and public replay identities move.
 
+**SM100/SM103 exact wide half implementation engines:**
+`sdpa_fwd_sm100_d512_role_split` (20521) owns exact D512/V512;
+`sdpa_fwd_sm100_d512_2x2` (20522) owns exact D512/V512 and D576/V512.
+The old 20511 row delegates these exact cells and retains their envelopes.
+Role-split uses TILE_M=128 and a four-CTA launch cluster; 2x2 uses TILE_M=64,
+a four-CTA cluster for D512, and one two-CTA pair for D576.
+Both retain the existing TILE_CGA_M=2 MMA-group vocabulary; plan metadata
+records the complete cluster separately. D512 2x2 declines paging/split-KV and packs
+whole groups dividing 64; role-split preserves D512 paging and whole-group
+packing into 128. D576 retains its existing paged/THD/partial-packing
+contract. Common dtype, mask, split, Stats and binding checks remain shared.
+Default policy retains the prior body choices, order and candidate budget;
+explicit replay fixes the implementation without a second body crossover.
+No additional determinism or batch-invariance guarantee is introduced.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;

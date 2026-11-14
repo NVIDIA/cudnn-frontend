@@ -427,7 +427,7 @@ def test_sm107_d512_2x2_routes_to_the_rubin_sibling():
     # The loader's tag is "sdpa_fwd_sm107_f16_d512_2x2" (the role-split tag + "_2x2"); the template cache appends a per-record suffix.
     assert mod.__file__.endswith(_D512_2X2_FILE) and "sdpa_fwd_sm107_f16_d512_2x2" in mod.__name__, mod.__name__
     assert _load(_D512, rubin=True).__file__.endswith("sm107/prefill_d512_f16.py")
-    assert _load(_D512, rubin=False, **_D512_2X2_KW).__file__.endswith("sm100/prefill_d512_f16_2x2.py")
+    assert _load(_D512, rubin=False, **_D512_2X2_KW).__file__.endswith("sm100/d512_f16_2x2/kernel.py")
     assert mod.CFG.CGA_M == 4 and mod.KV_SHARE == 2 and mod.CFG.TILE_M == 64
 
 

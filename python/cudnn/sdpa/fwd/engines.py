@@ -16,11 +16,13 @@ candidate match against its :class:`Capabilities` row below. Architecture
 resource feasibility remains a lowering responsibility. Adding an engine is
 one ``Capabilities``/spec row plus (usually) one kernel template.
 
-An engine is a *lowering strategy*, not a kernel: its ``lower`` hook receives
-the parsed facts and returns an executor, and is free to compile one kernel,
-pick among several, or chain multiple launches (the THD path already launches
-an O-descriptor builder kernel before the main one). Conversely several
-engines may share one template. Neither direction is 1:1.
+New implementation rows identify one main body and its local variants. Their
+``lower`` hook consumes an immutable selection and returns an executor through
+the shared parser/binder/launch framework. A fixed helper chain (for example
+THD descriptor setup, attention, and split combine) remains one engine.
+Performance selection lives in heuristics. Unmigrated legacy rows still select
+among multiple bodies internally; the explicit D256 and wide-half rows are the
+migration boundary, not a claim that every row already follows it.
 """
 
 from __future__ import annotations
@@ -78,6 +80,13 @@ from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import (
     in_pilot_domain as _in_d256_pilot_domain,
     mismatch as _d256_implementation_mismatch,
 )
+from .kernels.sm100.d512_f16_contract import (
+    ROLE_SPLIT as _D512_ROLE_SPLIT,
+    TWO_BY_TWO as _D512_TWO_BY_TWO,
+    IMPLEMENTATIONS as _D512_IMPLEMENTATIONS,
+    mismatch as _d512_implementation_mismatch,
+)
+
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
     SM107_BIAS_D_SHAPES,
@@ -1771,9 +1780,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if knobs is not None and not isinstance(knobs, SdpaFwdKnobs):
         return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
     if (facts.device_cc, (facts.d_qk, facts.d_v)) in capabilities.delegated_exact:
-        return "exact SM100/SM103 half D256 is owned by the lookahead and swap-AB implementation engines"
+        return f"exact SM100/SM103 half D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
     if capabilities.implementation in _D256_IMPLEMENTATIONS:
         reason = _d256_implementation_mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation in _D512_IMPLEMENTATIONS:
+        reason = _d512_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
     if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
@@ -2777,15 +2790,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
 class EngineSpec:
     name: str
     capabilities: Capabilities
-    # Lowering strategy: facts -> executor. A future engine may select between
-    # kernels (e.g. decode vs prefill by S_q) or chain several launches under
-    # one name.
+    # Facts and a selected configuration -> executor. New implementation rows
+    # fix the main body; a predetermined helper chain stays in the same row.
+    # Unmigrated legacy rows retain their internal body dispatch.
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Optional[SdpaFwdKnobs]], Any]"
 
 
 def _sm100_spec() -> EngineSpec:
-    """f16/bf16 SM100-family engine: ONE row; the adapter picks the smallest
-    kernel flavor (d128 / d192xd128 / d256 / d512) covering the graph's head
+    """Legacy f16/bf16 SM100 row for widths/envelopes not yet delegated.
+
+    Exact D256/D512/D576 on SM100/SM103 have explicit implementation owners.
+    For retained graphs the adapter picks the smallest kernel flavor (d128 / d192xd128 / d256 / d512) covering the graph's head
     dims (api_dsl._pick_flavor), and every flavor serves its envelope via TMA
     zero-padding. The d128 flavor has two tiles behind one knob: TILE_CGA_M=2
     is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
@@ -2800,7 +2815,7 @@ def _sm100_spec() -> EngineSpec:
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
             phase="prefill",
-            delegated_exact=frozenset({((10, 0), (256, 256)), ((10, 3), (256, 256))}),
+            delegated_exact=frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((256, 256), (512, 512), SM100_NATIVE_D576_SHAPE)),
             # (64, 64) is a NATIVE flavor, not an envelope: it compiles the d128
             # file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of
             # zero-filling a 128-wide tile for gpt-oss-class head dims.  (32, 32)
@@ -2913,6 +2928,39 @@ def _sm100_spec() -> EngineSpec:
             score_stats_d_shapes=SM100_SCORE_STATS_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
+    )
+
+
+def _sm100_d512_specs():
+    """Two wide half main implementations with the existing common graph contract."""
+    from .kernels.sm100.d512_f16_role_split.host import lower as lower_role_split
+    from .kernels.sm100.d512_f16_2x2.host import lower as lower_two_by_two
+
+    base = replace(
+        _sm100_spec().capabilities,
+        delegated_exact=frozenset(),
+        d_shapes=frozenset({(512, 512), SM100_NATIVE_D576_SHAPE}),
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        paged_d_shapes=frozenset({(512, 512), SM100_NATIVE_D576_SHAPE}),
+        pack_gqa_partial_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
+        thd_pack_gqa_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
+        dense_only_d_shapes=frozenset(),
+        mixed_fp8_kv_d_shapes=frozenset(),
+        bias=False,
+        kv_mask=False,
+        score_max=False,
+        score_sum_exp=False,
+        cgas_by_d_shape=(),
+        split_cgas_by_d_shape=(),
+        tile_ns_by_d_shape=(),
+        sched_policies_by_d_shape=(),
+    )
+    role_split = replace(base, implementation=_D512_ROLE_SPLIT, d_shapes=frozenset({(512, 512)}), tile_ms=frozenset({128}))
+    two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}))
+    return (
+        EngineSpec(_D512_ROLE_SPLIT, role_split, lower_role_split),
+        EngineSpec(_D512_TWO_BY_TWO, two_by_two, lower_two_by_two),
     )
 
 
@@ -4238,6 +4286,7 @@ def lower_dsl_prefill(
             target="sm" + "".join(map(str, facts.device_cc)),
             query_tile=getattr(cfg, "N_Q", getattr(cfg, "TILE_M", None)),
             cga=getattr(cfg, "CTA_MMA", 1),
+            cluster_m=getattr(cfg, "CGA_M", 1),
             scheduler=getattr(cfg, "SCHEDULER_POLICY", SCHED_NATURAL),
             pack_group=getattr(cfg, "PACK_G", cfg.QH_PER_KH if cfg.PACK_GQA else 1),
             split_kv=cfg.SPLIT_KV,
@@ -4246,6 +4295,7 @@ def lower_dsl_prefill(
             kernel_template != selected_kernel.template
             or implementation_config["query_tile"] != selected_kernel.query_tile
             or implementation_config["cga"] != knobs.cga
+            or (hasattr(selected_kernel, "cluster_m") and implementation_config["cluster_m"] != selected_kernel.cluster_m)
             or implementation_config["scheduler"] != knobs.sched_policy
             or params.split_kv != knobs.split_kv
             or bool(params.pack_gqa) != bool(knobs.pack_gqa)
@@ -4755,6 +4805,7 @@ def _sm90_spec() -> EngineSpec:
 ENGINE_SPECS = (
     _sm100_spec(),
     *_sm100_d256_specs(),
+    *_sm100_d512_specs(),
     _sm100_mxfp8_spec(),
     _sm100_fp8_spec(),
     _sm100_fp8_spec(arch="sm107"),

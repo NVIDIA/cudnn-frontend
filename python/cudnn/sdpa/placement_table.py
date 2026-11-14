@@ -72,8 +72,13 @@ def _unpacked_decode(row: str, facts) -> bool:
     if spec is None:
         return False
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
+    from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
 
-    caps = heuristics.sm100_d256_policy_spec().capabilities if row == "sdpa_fwd_prefill_sm100" and in_pilot_domain(facts) else spec.capabilities
+    caps = (
+        heuristics.sm100_legacy_policy_spec().capabilities
+        if row == "sdpa_fwd_prefill_sm100" and (in_pilot_domain(facts) or in_wide_half_domain(facts))
+        else spec.capabilities
+    )
     return heuristics._pack_gqa_group(caps, facts, 128, heuristics._pack_gqa_eligible(caps, facts, 128)) == 1
 
 
@@ -90,8 +95,9 @@ def _packed_split(row: str, facts) -> bool:
     if spec is None:
         return False
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
+    from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
 
-    caps = heuristics.sm100_d256_policy_spec().capabilities if in_pilot_domain(facts) else spec.capabilities
+    caps = heuristics.sm100_legacy_policy_spec().capabilities if in_pilot_domain(facts) or in_wide_half_domain(facts) else spec.capabilities
     return heuristics.sm100_paged_packed_split_choice(caps, facts) > 1
 
 
