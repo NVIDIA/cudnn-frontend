@@ -303,8 +303,11 @@ class BlockSparseAttnForwardSm90Blk128:
                 cute.nvgpu.warpgroup.commit_group()
             # Final statistics do not read O and can overlap the last PV.
             ratio, logsum = get_final_ratio_and_lse_empty_safe(mx, den, softmax_scale)
+            # Keep this wait outside `if has_blocks:`. The rescale below reads the PV accumulators, and a read that some
+            # path reaches without a wgmma wait makes ptxas serialize every wgmma of the kernel (remarks C7514/C7517:
+            # a wait injected after each of the 16 issues of a step). With nothing pending the wait is a no-op.
+            cute.nvgpu.warpgroup.wait_group(0)
             if has_blocks:
-                cute.nvgpu.warpgroup.wait_group(0)
                 vpipe.consumer_release(vstate)
             rescale_o_for_next_acc(pv, out, ratio)
             cmn = cute.make_tensor(coords.iterator, layout_acc_mn(qk, coords.layout))
