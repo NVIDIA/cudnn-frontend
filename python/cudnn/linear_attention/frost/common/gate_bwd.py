@@ -50,6 +50,7 @@ from cudnn.frost.tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, s
 
 from .host import get_dtype
 from cudnn.frost.device import current_device
+from cudnn import launch_plan
 
 USE_PDL = True
 
@@ -514,7 +515,7 @@ def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, p
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    cache["compiled"](*tensors, n_tokens, h_o, slice_len, n_blocks, head_tiles, cu_stream)
+    launch_plan.launch(cache["compiled"], *tensors, n_tokens, h_o, slice_len, n_blocks, head_tiles, cu_stream)
 
 
 def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, gate_lower_bound, *, stream):
@@ -555,7 +556,7 @@ def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, 
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    cache["compiled"](*tensors, *args, float(gate_lower_bound), cu_stream)
+    launch_plan.launch(cache["compiled"], *tensors, *args, float(gate_lower_bound), cu_stream)
 
 
 @cute.jit

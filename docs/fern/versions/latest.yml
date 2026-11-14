@@ -320,6 +320,9 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
+          - page: 'Launch plans: repeated calls launched from C++'
+            path: ../../utilities/launch_plans.md
+            slug: launch_plans
   - section: Developer Guide
     slug: developer
     contents:

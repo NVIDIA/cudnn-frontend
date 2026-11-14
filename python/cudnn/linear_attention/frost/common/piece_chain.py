@@ -38,6 +38,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn import _pybind_module
+from cudnn import launch_plan
 from cudnn.frost.buffers import DTYPES, DeviceView
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fp32_to_fp16
@@ -1180,7 +1181,8 @@ def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail,
     ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
     ``has_composed`` (the context-parallel boundary sequence's entry state)."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
-    compiled.compiled(
+    launch_plan.launch(
+        compiled.compiled,
         int(compiled.heads_out),
         int(compiled.pieces),
         int(num_seqs),

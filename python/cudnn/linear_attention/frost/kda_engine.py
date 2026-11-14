@@ -12,6 +12,7 @@ from operator import itemgetter
 
 
 from cudnn import behavior_note
+from cudnn import launch_plan
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
@@ -357,7 +358,7 @@ class CompiledKda:
             self.run_boundary_fold(self.composed_fold, table, composed, summaries, views[self.index_preceding_transition], int(stream or 0))
         if self.chain and self.chain_launch is not None:
             buffers = self.chain_buffers((*views, *workspace.carve(self.carve), None))
-            self.chain_launch(*self.chain_scalars, *buffers, self.stream_type(int(stream or 0)))
+            launch_plan.launch(self.chain_launch, *self.chain_scalars, *buffers, self.stream_type(int(stream or 0)))
             return
         q = views[self.index_q]
         k = views[self.index_k]

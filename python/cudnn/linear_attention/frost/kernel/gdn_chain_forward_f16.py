@@ -30,6 +30,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
+from cudnn import launch_plan
 
 from ..common.host import get_dtype, family_slots
 from ..common.piece_chain import dtype_name, launch_state_chain
@@ -536,7 +537,8 @@ def run_chain_forward(
     """Replay the chain forward: one crossing into the DSL for the five launches.  The plan validated the contract at build,
     so nothing here raises."""
     buffers = locals()
-    compiled(
+    launch_plan.launch(
+        compiled,
         int(pieces),
         int(heads_out),
         int(num_seqs),

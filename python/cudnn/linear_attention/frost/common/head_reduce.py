@@ -27,6 +27,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from .host import get_dtype
 from cudnn.frost.device import current_device
+from cudnn import launch_plan
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
@@ -156,7 +157,7 @@ def head_group_reduce(src, dst, *, stream) -> None:
             cu_stream,
             options="--enable-tvm-ffi",
         )
-    compiled_cache[key](src, dst, total_words, out_row_words, out_head_words, grid_x, H, r, cu_stream)
+    launch_plan.launch(compiled_cache[key], src, dst, total_words, out_row_words, out_head_words, grid_x, H, r, cu_stream)
 
 
 frost_head_reduce.set_name_prefix("cudnn", remove_cutlass_symbol=False)
