@@ -171,7 +171,7 @@ def test_paged_thd_fp8_origins_rebind_and_capture(
         nodes["amax_o"] = amax_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
-    engine = "sdpa_fwd_sm100_d256_fp8_single_q" if dim == 256 else "sdpa_fwd_prefill_sm100_fp8"
+    engine = "sdpa_fwd_sm100_d256_fp8_single_q" if dim == 256 else "sdpa_fwd_sm100_d128_fp8_multi_q"
     graph.create_execution_plan(
         family_for(graph).offered_ids()[engine],
         {cudnn.knob_type.TILE_CGA_M: 2 if dim == 128 else 1, cudnn.knob_type.SPLIT_KV: 1, cudnn.knob_type.PACK_GQA: 0},
