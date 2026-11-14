@@ -4,7 +4,7 @@
 """SM100 wide half 2x2 configuration; native SM107 uses its own factory."""
 
 from typing import Tuple
-from cudnn.frost.tile_dsl.constants import DTYPE_FP16, DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, MASK_NONE, SCHED_NATURAL
+from cudnn.frost.tile_dsl.constants import DTYPE_FP16, DTYPE_BF16
 from cudnn.sdpa.fwd.config_common import (
     TemplateParams,
     TmaIters,
@@ -13,13 +13,9 @@ from cudnn.sdpa.fwd.config_common import (
     _pack_g,
     _tma_iters,
     bpe,
-    q_swz_bytes,
-    v_swz_bytes,
-    o_swz_bytes,
     rescale_threshold,
-    tile_k_hw,
 )
-from cudnn.sdpa.fwd.config_d512_2x2_common import CfgD512X2, d512_2x2_smem_bytes, d512_2x2_p_ring_start_bytes, d512_2x2_geometry_checks
+from cudnn.sdpa.fwd.config_d512_2x2_common import CfgD512X2, d512_2x2_p_ring_start_bytes, d512_2x2_geometry_checks
 
 
 def _validate_cfg_d512_2x2(cfg: CfgD512X2) -> None:
