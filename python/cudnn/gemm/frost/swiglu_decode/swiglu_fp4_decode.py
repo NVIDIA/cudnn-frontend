@@ -55,7 +55,6 @@ from .kernel.swiglu_fp4_decode_config import (
     NAME,
     PACKED_ALIGN_BYTES,
     QUALIFIED_MIN_COMPILER,
-    READING_FIELDS,
     SCALAR_ALIGN_BYTES,
     SF_ATOM_ROWS,
     SF_VEC,
