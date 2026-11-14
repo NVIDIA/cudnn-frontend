@@ -189,7 +189,7 @@ class SdpaFwdKnobs:
     sched_policy: Optional[int] = None  # tile-scheduler policy (SCHED_NATURAL, ...)
     tile_m: Optional[int] = None  # Q sequence tile width
     tile_n: Optional[int] = None  # KV sequence tile width
-    cga: Optional[int] = None  # CTA group width used by one cooperative MMA tile
+    cga: Optional[int] = None  # physical cluster M width; legacy wide rows retain their historical pair encoding
     pack_gqa: Optional[bool] = None  # Head packing for GQA/MQA
     # KV-split count: each Q tile's KV range cut into this many chunks, each
     # run by its own CTA, recombined by the split_combine pass. 1 = off.
@@ -1415,6 +1415,10 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     cga1-only 32-wide one), so the domain returned is that flavor's.  Without
     it (the heuristics' auto pick) the domain is the dense selection's."""
 
+    if capabilities.implementation in _D512_IMPLEMENTATIONS:
+        from .kernels.sm100.d512_f16_contract import explicit_geometry
+
+        return frozenset({explicit_geometry(capabilities.implementation, facts).cluster_m})
     if capabilities.sm_lo == 80 and cga is not None:
         return frozenset({1})
     _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
@@ -2956,8 +2960,8 @@ def _sm100_d512_specs():
         tile_ns_by_d_shape=(),
         sched_policies_by_d_shape=(),
     )
-    role_split = replace(base, implementation=_D512_ROLE_SPLIT, d_shapes=frozenset({(512, 512)}), tile_ms=frozenset({128}))
-    two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}))
+    role_split = replace(base, implementation=_D512_ROLE_SPLIT, d_shapes=frozenset({(512, 512)}), tile_ms=frozenset({128}), cgas=frozenset({4}))
+    two_by_two = replace(base, implementation=_D512_TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
     return (
         EngineSpec(_D512_ROLE_SPLIT, role_split, lower_role_split),
         EngineSpec(_D512_TWO_BY_TWO, two_by_two, lower_two_by_two),
@@ -4045,7 +4049,10 @@ def lower_dsl_prefill(
         sched_policy=knobs.sched_policy if knobs is not None else None,
         tile_m=knobs.tile_m if knobs is not None else None,
         tile_n=knobs.tile_n if knobs is not None else None,
-        cga=knobs.cga if knobs is not None else None,
+        # The legacy adapter's wide-half cga parameter means MMA group. The
+        # explicit engine exposes the physical cluster and lowers its fixed
+        # pair here; the selected config remains the source of launch geometry.
+        cga=getattr(selected_kernel, "cta_group", knobs.cga if knobs is not None else None),
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         **({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {}),
@@ -4285,7 +4292,8 @@ def lower_dsl_prefill(
             template=kernel_template,
             target="sm" + "".join(map(str, facts.device_cc)),
             query_tile=getattr(cfg, "N_Q", getattr(cfg, "TILE_M", None)),
-            cga=getattr(cfg, "CTA_MMA", 1),
+            cga=getattr(cfg, "CGA_M", 1),
+            cta_group=getattr(cfg, "CTA_MMA", 1),
             cluster_m=getattr(cfg, "CGA_M", 1),
             scheduler=getattr(cfg, "SCHEDULER_POLICY", SCHED_NATURAL),
             pack_group=getattr(cfg, "PACK_G", cfg.QH_PER_KH if cfg.PACK_GQA else 1),
@@ -4295,6 +4303,7 @@ def lower_dsl_prefill(
             kernel_template != selected_kernel.template
             or implementation_config["query_tile"] != selected_kernel.query_tile
             or implementation_config["cga"] != knobs.cga
+            or (hasattr(selected_kernel, "cta_group") and implementation_config["cta_group"] != selected_kernel.cta_group)
             or (hasattr(selected_kernel, "cluster_m") and implementation_config["cluster_m"] != selected_kernel.cluster_m)
             or implementation_config["scheduler"] != knobs.sched_policy
             or params.split_kv != knobs.split_kv

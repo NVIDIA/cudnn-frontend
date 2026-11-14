@@ -77,7 +77,7 @@ def _check_case(monkeypatch, dtype, two_by_two, stats, *, total_hints, collect=N
         False,
         1,
         engine_name=engine,
-        cga=2,
+        cga=4 if engine in ("sdpa_fwd_sm100_d512_role_split", "sdpa_fwd_sm100_d512_2x2") else 2,
         extra_checks=extra,
         origin_element_unit=8 if isinstance(dims, tuple) else None,
     )

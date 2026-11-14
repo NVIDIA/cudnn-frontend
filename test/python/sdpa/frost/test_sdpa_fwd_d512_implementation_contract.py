@@ -52,7 +52,8 @@ def test_ownership_and_complete_cluster_geometry(cc, dq):
         knobs = geometry.canonical_knobs(engines.SdpaFwdKnobs())
         assert engines.mismatch(SPECS[name].capabilities, f, knobs) is None
         assert engines.SdpaFwdKnobs.from_public(knobs.to_public()) == knobs
-        assert geometry.cga == 2  # MMA-group knob, not the complete launch cluster.
+        assert geometry.cga == geometry.cluster_m
+        assert geometry.cta_group == 2
         assert geometry.cluster_m == (2 if dq == 576 else 4)
         assert geometry.query_tile == (128 if name == ROLE_SPLIT else 64)
     if dq == 576:
@@ -101,7 +102,7 @@ def test_paging_and_packing_use_the_selected_bodys_limits():
     assert engines.mismatch(SPECS[ROLE_SPLIT].capabilities, f, role) is None
     assert "whole GQA groups" in engines.mismatch(SPECS[TWO_BY_TWO].capabilities, f, pair)
     assert "split-KV is unqualified" in engines.mismatch(SPECS[TWO_BY_TWO].capabilities, f, replace(pair, split_kv=2))
-    assert "MMA group" in engines.mismatch(SPECS[ROLE_SPLIT].capabilities, f, replace(role, cga=4))
+    assert "physical launch cluster" in engines.mismatch(SPECS[ROLE_SPLIT].capabilities, f, replace(role, cga=2))
 
 
 @pytest.mark.parametrize("name", [ROLE_SPLIT, TWO_BY_TWO])
@@ -140,3 +141,13 @@ def test_half_configuration_is_isolated_from_the_quantized_record():
     assert type(half) is HalfRecord
     assert type(fp8) is QuantizedRecord
     assert HalfRecord is not QuantizedRecord
+
+
+@pytest.mark.parametrize("name,dq,cluster", [(ROLE_SPLIT, 512, 4), (TWO_BY_TWO, 512, 4), (TWO_BY_TWO, 576, 2)])
+@pytest.mark.parametrize("requested", [1, 2, 4, 8])
+def test_public_cluster_width_is_honored_or_rejected(name, dq, cluster, requested):
+    f = facts(d_qk=dq)
+    knobs = engines.SdpaFwdKnobs(cga=requested)
+    why = engines.mismatch(SPECS[name].capabilities, f, engines.SdpaFwdKnobs.from_public(knobs.to_public()))
+    assert (why is None) == (requested == cluster)
+    assert engines.effective_cgas(SPECS[name].capabilities, f) == frozenset({cluster})

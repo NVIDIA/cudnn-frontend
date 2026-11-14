@@ -39,7 +39,7 @@ def test_public_record_rebuild_and_retained_capture(monkeypatch, dtype, engine_i
     o = torch.empty(b, sq, h, 512, device="cuda", dtype=dtype).transpose(1, 2)
     stats = torch.empty(b, h, sq, 1, device="cuda", dtype=torch.float32)
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
-    public = SdpaFwdKnobs(tile_m=tile, tile_n=128, cga=2, sched_policy=0, pack_gqa=False, split_kv=split).to_public()
+    public = SdpaFwdKnobs(tile_m=tile, tile_n=128, cga=cluster, sched_policy=0, pack_gqa=False, split_kv=split).to_public()
 
     def build(record):
         g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
@@ -56,7 +56,8 @@ def test_public_record_rebuild_and_retained_capture(monkeypatch, dtype, engine_i
         compiled = g._compiled_plans[0]._compiled
         assert compiled.kernel_template == template
         metadata = compiled.implementation_config
-        assert (metadata["query_tile"], metadata["cga"], metadata["cluster_m"], metadata["split_kv"]) == (tile, 2, cluster, split)
+        assert (metadata["query_tile"], metadata["cga"], metadata["cluster_m"], metadata["split_kv"]) == (tile, cluster, cluster, split)
+        assert metadata["cta_group"] == 2
         return g, {tq: q, tk: k, tv: v, to: o, ts: stats}, torch.empty(max(1, g.get_workspace_size()), device="cuda", dtype=torch.uint8)
 
     g, vp, workspace = build((engine_id, public))

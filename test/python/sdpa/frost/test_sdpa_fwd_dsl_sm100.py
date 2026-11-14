@@ -820,8 +820,17 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"
-    _select_engine(g, name)
-    engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+    if not fp8 and _SM in (100, 103) and d_shape == (512, 512):
+        from cudnn.engines.manifest import family_for
+
+        # This test explicitly requests split-KV, whose wide owner is the
+        # role-split body even when automatic unsplit selection prefers 2x2.
+        engine = family_for(g).offered_ids()["sdpa_fwd_sm100_d512_role_split"]
+        knobs = {cudnn.knob_type.TILE_M: 128, cudnn.knob_type.TILE_N: 128}
+        cga = 4
+    else:
+        _select_engine(g, name)
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})})
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
@@ -2352,7 +2361,7 @@ def _run_dsl_thd_graph(
     if pack_gqa is not None:
         # Exercise the requested support directly, independently of automatic candidate proposals.
         engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-        knobs.update({cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.TILE_CGA_M: 2, cudnn.knob_type.SPLIT_KV: 1})
+        knobs.update({cudnn.knob_type.PACK_GQA: int(pack_gqa), cudnn.knob_type.SPLIT_KV: 1})
         g.create_execution_plan(engine, knobs)
         g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()

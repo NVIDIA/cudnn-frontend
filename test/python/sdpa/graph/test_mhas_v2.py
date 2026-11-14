@@ -563,11 +563,15 @@ def _exec_sdpa_on_frost(
     ``tensor_checker`` too (an exact check on the outputs before the tolerance
     compare)."""
     engines = (engine,)
-    if engine == "sdpa_fwd_prefill_sm100" and (cfg.d_qk, cfg.d_v) == (256, 256):
-        # Exact D256 has two explicit owners. Preserve the requested main-body
-        # assertion; when no body is pinned, either concrete owner may serve.
-        owners = {"prefill_d256_f16": "sdpa_fwd_sm100_d256_lookahead",
-                  "decode_d256_f16": "sdpa_fwd_sm100_d256_swap_ab"}
+    owners = {
+        (256, 256): {"prefill_d256_f16": "sdpa_fwd_sm100_d256_lookahead",
+                     "decode_d256_f16": "sdpa_fwd_sm100_d256_swap_ab"},
+        (512, 512): {"prefill_d512_f16": "sdpa_fwd_sm100_d512_role_split",
+                     "prefill_d512_f16_2x2": "sdpa_fwd_sm100_d512_2x2"},
+        (576, 512): {"prefill_d512_f16_2x2": "sdpa_fwd_sm100_d512_2x2"},
+    }.get((cfg.d_qk, cfg.d_v))
+    if engine == "sdpa_fwd_prefill_sm100" and owners is not None:
+        # Preserve the concrete owner/body assertion after splitting a row.
         engines = (owners[template],) if template in owners else tuple(owners.values())
     keys = [[f"frost:{name}" for name in engines]]
     if template:
@@ -3215,6 +3219,8 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     want = engine_name(arch="sm107" if sm >= 107 else "sm100")
     if sm in (100, 103) and (d_qk, d_v) == (256, 256):
         want = "sdpa_fwd_sm100_d256_lookahead"
+    elif sm in (100, 103) and (d_qk, d_v) == (512, 512):
+        want = "sdpa_fwd_sm100_d512_2x2"
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
     graph.check_support()

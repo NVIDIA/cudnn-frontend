@@ -7,6 +7,15 @@ never renumber.
 
 ## Hard rules
 
+For explicit implementation records, distinguish the physical CTA cluster
+(`TILE_CGA_M/N`) from the MMA group (`CTA_GROUP`). D512 uses a four-CTA
+cluster containing two-CTA MMA groups; D576 uses a single pair. Translate
+only at an adapter boundary that still uses the historical MMA-group
+encoding, including its second support check. Compare the built config
+with both quantities. Detectors: `test_sdpa_fwd_d512_explicit_engines.py`
+(public recipe, metadata and retained capture) and
+`test_public_cluster_width_is_honored_or_rejected` (wrong-width declines).
+
 When selecting a specialized launch body, check its grid bounds independently
 of the generic scheduler. The SM100 FP8 D128 decode body puts batch in
 `gridDim.y` for every scheduler policy, so it only replaces the existing body

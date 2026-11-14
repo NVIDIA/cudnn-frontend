@@ -37,8 +37,11 @@ class D512Geometry:
 
     @property
     def cga(self):
-        # Preserve the existing public knob's MMA-group interpretation. The
-        # full launch cluster is separate and checked against the compiled CFG.
+        # TILE_CGA_M names the physical launch cluster, not the MMA pair.
+        return self.cluster_m
+
+    @property
+    def cta_group(self):
         return _CONTRACTS[self.implementation].CTA_MMA
 
     @property
@@ -86,6 +89,7 @@ def mismatch(implementation, facts, knobs):
     reason = _CONTRACTS[implementation].mismatch(facts, knobs)
     if reason is not None:
         return reason
-    if knobs is not None and knobs.cga not in (None, 2):
-        return "wide half implementations require a two-CTA MMA group (TILE_CGA_M=2)"
+    cluster = explicit_geometry(implementation, facts).cluster_m
+    if knobs is not None and knobs.cga not in (None, cluster):
+        return f"wide half implementation requires TILE_CGA_M={cluster} (physical launch cluster)"
     return None

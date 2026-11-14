@@ -3125,7 +3125,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # helper exists to prevent, since an explicit cga=1 on the Rubin quantized
         # d192 path would then clear check_support() and die inside compile().
         if selected_kernel is not None:
-            supported_cgas = (selected_kernel.cga,)
+            # This adapter parameter names the MMA group. Wide explicit
+            # engines expose the physical cluster and lower its fixed pair.
+            supported_cgas = (getattr(selected_kernel, "cta_group", selected_kernel.cga),)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",

@@ -103,3 +103,23 @@ def test_ineligible_knobs_and_sibling_plans_do_not_leak_notes():
 def test_note_requires_the_native_binder_feature(monkeypatch):
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(supports_stats_stride_override=False))
     assert NOTE not in _notes("sdpa_fwd_prefill_sm100", _facts())
+
+
+@pytest.mark.parametrize(
+    "name,dq,tile,cluster",
+    [
+        ("sdpa_fwd_sm100_d512_role_split", 512, 128, 4),
+        ("sdpa_fwd_sm100_d512_2x2", 512, 64, 4),
+        ("sdpa_fwd_sm100_d512_2x2", 576, 64, 2),
+    ],
+)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_wide_half_notes_follow_selected_plan(name, dq, tile, cluster, cc):
+    from dataclasses import replace
+
+    f = _facts(d_qk=dq, d_v=512, device_cc=cc)
+    good = engines.SdpaFwdKnobs(tile_m=tile, cga=cluster, split_kv=1, pack_gqa=False)
+    assert NOTE in _notes(name, f, good.to_public())
+    assert NOTE not in _notes(name, f, replace(good, cga=1))
+    assert NOTE not in _notes(name, _facts(packing="NH", d_qk=dq, d_v=512, device_cc=cc), good)
+    assert NOTE not in _notes(name, _facts(d_qk=dq, d_v=512, device_cc=cc, shape_overrides=False), good)

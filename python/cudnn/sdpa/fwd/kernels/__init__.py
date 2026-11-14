@@ -7,10 +7,12 @@ Layout
 ------
 One package per arch line — ``sm80/``, ``sm90/`` (Hopper), ``sm100/``
 (SM100/SM103), ``sm107/`` (Rubin), ``sm120/`` (SM120/SM121) — holding the
-flavor templates that arch owns.  Within a package the filename encodes the
-rest of the coverage matrix: ``<phase>_d<dim>_<dtype-family>.py``, e.g.
-``sm100/d512_f16_role_split/kernel.py`` (``f16`` covers fp16 and bf16, picked by
-``TemplateParams``).
+main implementations that arch owns. Isolated implementations use a directory
+such as ``sm100/d512_f16_role_split/`` with ``kernel.py``, ``config.py``,
+``contract.py`` and a small ``host.py`` entry into the shared launch framework.
+``f16`` covers FP16 and BF16 variants selected by ``TemplateParams``. Legacy
+files retain ``<phase>_d<dim>_<dtype-family>.py`` until their engine boundary
+is made explicit.
 
 A file omits the dimension when one implementation covers a range of head
 dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while

@@ -29,8 +29,9 @@ selection, configuration ownership and public replay identities move.
 The old 20511 row delegates these exact cells and retains their envelopes.
 Role-split uses TILE_M=128 and a four-CTA launch cluster; 2x2 uses TILE_M=64,
 a four-CTA cluster for D512, and one two-CTA pair for D576.
-Both retain the existing TILE_CGA_M=2 MMA-group vocabulary; plan metadata
-records the complete cluster separately. D512 2x2 declines paging/split-KV and packs
+TILE_CGA_M reports that physical cluster (4 for D512, 2 for D576); the
+MMA group is fixed at two CTAs and recorded separately in plan metadata.
+The retired 20511 D512 pair encoding is not a recipe for these new rows. D512 2x2 declines paging/split-KV and packs
 whole groups dividing 64; role-split preserves D512 paging and whole-group
 packing into 128. D576 retains its existing paged/THD/partial-packing
 contract. Common dtype, mask, split, Stats and binding checks remain shared.
