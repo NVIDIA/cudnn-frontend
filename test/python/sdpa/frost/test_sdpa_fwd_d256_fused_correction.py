@@ -120,7 +120,9 @@ def test_half_fused_correction_rebind_and_capture(b, sq, sk, hq, hkv, pack, sink
         sd.set_output(True).set_dim(initial[4].shape).set_stride(initial[4].stride()).set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
-        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm100"]
+        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[
+            "sdpa_fwd_sm100_d256_lookahead" if d == 256 else "sdpa_fwd_prefill_sm100"
+        ]
         knobs = {
             getattr(cudnn.knob_type, k): v for k, v in dict(TILE_M=128, TILE_N=128, TILE_CGA_M=2, PACK_GQA=int(pack), SCHED_POLICY=sched, SPLIT_KV=1).items()
         }

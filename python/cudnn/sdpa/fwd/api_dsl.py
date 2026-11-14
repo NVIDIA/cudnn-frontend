@@ -2937,7 +2937,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
             f"SM100 DSL SDPA sched_policy must be NATURAL/LPT/LPT_L2 (or None to derive); got {self.sched_policy}",
         )
-        self._value_error_if(self.tile_m is not None and self.tile_m != 128, "SM100 DSL SDPA only supports tile_m=128")
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        expected_tile_m = selected_kernel.query_tile if selected_kernel is not None else 128
+        self._value_error_if(
+            self.tile_m is not None and self.tile_m != expected_tile_m,
+            "SM100 DSL SDPA only supports tile_m=128" if selected_kernel is None else f"selected implementation requires tile_m={expected_tile_m}",
+        )
         # The KV tile width: 128 on every flavor; the Rubin f16/bf16 small tiles also render 64 (the TILE_N knob --
         # config_sm107.SM107_TILE_NS_BY_D_SHAPE, the engine row's per-shape domain, rule 8b').
         # the KV tile widths this plan may request: the Rubin small tiles' domain on cc 10.7, the SM100 small tiles' on cc 10.0 / 10.3 (both from the
@@ -2979,6 +2984,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # this check is not cosmetic -- it is precisely the rule-8b' failure the
         # helper exists to prevent, since an explicit cga=1 on the Rubin quantized
         # d192 path would then clear check_support() and die inside compile().
+        if selected_kernel is not None:
+            supported_cgas = (selected_kernel.cga,)
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
@@ -3820,6 +3827,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ``b`` / ``s_kv`` are the launch size the Blackwell line's wide-tile route reads
         (config_sm100.d256_wide_decode_launch); without them only the 16-column tile is
         routed there."""
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        if selected_kernel is not None:
+            return selected_kernel.decode_q_tile
         if self._fp8 or self._mixed_fp8_kv or self.thd or self.flavor != (256, 256):
             return 0
         if self.softmax_scale_prefolded:
@@ -3849,8 +3859,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 max_q_tile=self.decode_q_tile_max,
             )
         # (a cap off cc 10.7 was refused once, in check_support, before this dispatch is reached)
-        wide_launch = b is not None and s_kv is not None and d256_wide_decode_launch(int(b), int(h_q) // pack_g, int(s_kv), self.window_left is not None)
-        return decode_d256_q_tile(int(s_q), pack_g, wide_launch=wide_launch)
+        from cudnn.sdpa.fwd.heuristics import select_sm100_d256_geometry_for_shape
+
+        return select_sm100_d256_geometry_for_shape(int(s_q), pack_g, batch=b, h_q=int(h_q), s_kv=s_kv, windowed=self.window_left is not None).decode_q_tile
 
     def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
         """:meth:`_gate_in_combine` on explicit shapes (for ``check_support``, like
@@ -4208,21 +4219,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if self._rubin_native_d192_paged_leg():
                 params = replace(params, cta_mma=2)
         elif self.flavor == (256, 256):
-            from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
+            if getattr(self, "_selected_kernel", None) is None:
+                from cudnn.sdpa.fwd.heuristics import select_d256_auto_knobs
 
-            auto_sched, auto_cga = select_d256_auto_knobs(
-                params,
-                pertensor=self._pertensor,
-                s_q=self.s_q_max,
-                s_kv=self.s_k_max,
-                device_cc=self._device_cc,
-                paged=self.paged,
-            )
-            params = replace(
-                params,
-                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
-                cta_mma=auto_cga if self.cga is None else params.cta_mma,
-            )
+                auto_sched, auto_cga = select_d256_auto_knobs(
+                    params,
+                    pertensor=self._pertensor,
+                    s_q=self.s_q_max,
+                    s_kv=self.s_k_max,
+                    device_cc=self._device_cc,
+                    paged=self.paged,
+                )
+                params = replace(
+                    params,
+                    sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                    cta_mma=auto_cga if self.cga is None else params.cta_mma,
+                )
             params = canonicalize_d256_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
             params = derive_d256_internal_params(
                 params,
@@ -4343,9 +4355,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("Entering compile")
         self._ensure_support_checked()
         params = self.template_params()
-        self._k_mod = _load_sm100_kernel_module(
-            self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
-        )
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        if selected_kernel is not None:
+            # Fixed implementation entry: no ordered body dispatch, and no
+            # unrelated architecture's mutable sweep state in its module key.
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "sm100", selected_kernel.template + ".py")
+            self._k_mod = load_template(path, params, tag=selected_kernel.template, extra_key=("part", self._device_cc))
+        else:
+            self._k_mod = _load_sm100_kernel_module(
+                self.flavor, params, fp8=self._fp8, pertensor=self._pertensor, rubin=(self._device_cc == (10, 7)), part=self._device_cc
+            )
         # Which template serves this plan (its file stem, e.g. "prefill_d256_f16" /
         # "decode_d256_f16"): a lowering choice the engine's executor exposes so
         # a test can assert the route without inferring it from the source.

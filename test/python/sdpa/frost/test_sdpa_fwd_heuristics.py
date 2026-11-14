@@ -27,8 +27,11 @@ from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
+
 _F16 = "sdpa_fwd_prefill_sm100"
-_OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501}
+_OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501, LOOKAHEAD: 20519, SWAP_AB: 20520}
+_HALF_IDS = (20500, 20519, 20520)
 
 
 @pytest.fixture
@@ -1098,10 +1101,10 @@ def _decode_facts(**over):
 
 
 def _f16_plans(facts):
-    plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+    plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id in _HALF_IDS]
     assert plans, "the f16 row must serve this graph"
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
-    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    by_id = {_OFFERED[s.name]: s for s in engines.ENGINE_SPECS if s.name in _OFFERED}
+    assert all(engines.mismatch(by_id[p.engine_id].capabilities, facts, p.knobs) is None for p in plans)
     return plans
 
 
@@ -1333,9 +1336,10 @@ def test_d128_cga_request_domain():
             assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga)) is None
             assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=2)) is None
         assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=4))
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == LOOKAHEAD)
     d256 = _decode_facts(d_qk=256, d_v=256)
     assert engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=2)) is None
-    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=1))
+    assert "requires TILE_CGA_M=2" in engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=1))
 
 
 @pytest.mark.L0
@@ -1873,7 +1877,7 @@ def test_decode_tile_split_points_lead_with_the_eager_safe_choice():
     either shape at b=32."""
 
     def sets(**over):
-        return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id == 20500]
+        return [p.knobs for p in recommend("A", _decode_d256_facts(**over), _OFFERED) if p.engine_id in _HALF_IDS]
 
     serving = sets()
     assert serving[0].split_kv == 1 and serving[0].pack_gqa is True, serving[0]
@@ -2128,10 +2132,10 @@ def test_rubin_paged_thd_d256_keeps_its_packed_candidate(sm107_metadata_target, 
 def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
     """Policy support and candidate validity are independent of heuristic ranking."""
     facts = _facts(d_qk=d, d_v=d, s_q=2048, h_q=16, h_kv=2, thd=True, padded=True, has_paged_kv=paged, page_size=128)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == (LOOKAHEAD if d == 256 else _F16))
     for policy in (0, SCHED_LPT, SCHED_LPT_L2):
         assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(sched_policy=policy)) is None
-    plans = recommend("A", facts, {_F16: 20500})
+    plans = recommend("A", facts, _OFFERED)
     assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
 
 
@@ -2664,7 +2668,7 @@ def test_sm100_paged_packed_split_past_the_first_wave(d, b, h_q, h_kv, s_q, s_kv
     """Study sm100_paged_packed_split_waves_20261112: with no first-wave room the packed split still leads short queries."""
     from cudnn.sdpa.fwd import heuristics
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == (LOOKAHEAD if d == 256 else _F16))
     facts = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None)
     assert heuristics.sm100_paged_packed_split_choice(spec.capabilities, facts) == splits
     b300 = _sm100_paged_prefix(d, h_q, h_kv, b=b, s_q=s_q, s_kv=s_kv, max_total_seq_len_q=None, device_cc=(10, 3))
@@ -2720,11 +2724,11 @@ def test_sm100_paged_d64_d256_prefix_defaults_to_the_packed_split(d, h_q, h_kv, 
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     facts = _sm100_paged_prefix(d, h_q, h_kv, s_q=s_q)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
-    first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id == _OFFERED[_F16])
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == (LOOKAHEAD if d == 256 else _F16))
+    first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id in _HALF_IDS)
     assert first.knobs == SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=cga, pack_gqa=True, split_kv=9)
     assert engines.mismatch(spec.capabilities, facts, first.knobs) is None
-    assert placement.place(spec, facts) == placement.LEAD
+    assert placement.place(spec, facts, _f16_plans(facts)[0].knobs) == placement.LEAD
 
 
 @pytest.mark.L0
@@ -2770,12 +2774,12 @@ def test_sm100_paged_tail_split(d, h_q, h_kv, over, choice, cc):
     next to the wave load (MHA, group 2, several waves of units); the split leads and is the first FROST plan."""
     from cudnn.sdpa.fwd import heuristics, placement
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == (LOOKAHEAD if d == 256 else _F16))
     facts = _sm100_paged_prefix(d, h_q, h_kv, max_total_seq_len_q=None, device_cc=cc, **over)
     assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == choice
     if choice[0] > 1:
-        assert placement.place(spec, facts) == placement.LEAD
-        first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id == _OFFERED[_F16])
+        assert placement.place(spec, facts, _f16_plans(facts)[0].knobs) == placement.LEAD
+        first = next(p for p in recommend("A", facts, _OFFERED) if p.engine_id in _HALF_IDS)
         assert (first.knobs.split_kv, bool(first.knobs.pack_gqa)) == choice
 
 
@@ -2784,10 +2788,10 @@ def test_sm100_paged_d256_mha_prefix_leads_unsplit():
     """Study sm100_paged_split_v2_20261112: the D256 pair tile ran 0.45-0.51 of the backend on every MHA prefix, split or not."""
     from cudnn.sdpa.fwd import heuristics, placement
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == LOOKAHEAD)
     facts = _sm100_paged_prefix(256, 16, 16, b=2, s_q=1024, s_kv=4096, max_total_seq_len_q=None)
     assert heuristics.paged_thd_split_choice(spec.capabilities, facts) == (1, False)
-    assert placement.place(spec, facts) == placement.LEAD
+    assert placement.place(spec, facts, _f16_plans(facts)[0].knobs) == placement.LEAD
 
 
 @pytest.mark.L0

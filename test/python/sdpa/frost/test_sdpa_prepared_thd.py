@@ -15,6 +15,8 @@ import sdpa_binding_reference as binding_reference
 import math
 from itertools import accumulate
 
+from frost_test_utils import half_engine_names, _is_plan_for
+
 import pytest
 import torch
 
@@ -160,8 +162,8 @@ def _thd_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name(arch=arch)
-    g.select_plan(next(i for i, n in enumerate(names) if n == want or n.startswith(want + "[")))
+    want = half_engine_names(arch)
+    g.select_plan(next(i for i, n in enumerate(names) if _is_plan_for(n, want)))
     g.check_support()
     g.build_plans()
     tensors = dict(q=tq, k=tk, v=tv, o=to, stats=ts, cu_q=t_cu_q, cu_kv=t_cu_kv, off_q=off_q, off_kv=off_kv, off_lse=off_lse)
@@ -987,11 +989,11 @@ def _dense_graph(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    want = engine_name(arch=arch)
+    want = half_engine_names(arch)
     # the FROST row's unsplit plan (the heuristics may rank a split first on long KV)
-    idx = next((i for i, n in enumerate(names) if (n == want or n.startswith(want + "[")) and g.plans[i].knobs.split_kv == 1), None)
+    idx = next((i for i, n in enumerate(names) if (_is_plan_for(n, want)) and g.plans[i].knobs.split_kv == 1), None)
     if idx is None:
-        idx = next(i for i, n in enumerate(names) if n == want or n.startswith(want + "["))
+        idx = next(i for i, n in enumerate(names) if _is_plan_for(n, want))
     if split_kv > 1:
         from dataclasses import replace
 
@@ -1739,7 +1741,7 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     g.select_plan(index)
     if cga is not None:
         engine, knobs = g.get_engine_and_knobs_at_index(index)
@@ -2530,7 +2532,7 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if d == 128:
         knobs = {**knobs, cudnn.knob_type.PACK_GQA: True, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: 1}
@@ -2756,7 +2758,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
     policies = (0,) if arch == "sm107" and d == 128 else ((0, 1, 2) if "_boundary" in geometry else (0, 1))
@@ -3072,7 +3074,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name(arch=arch) or name.startswith(engine_name(arch=arch) + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names(arch)))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     if splits is None:
         # Exercise the public default without pinning a particular split count.

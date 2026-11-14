@@ -1,5 +1,21 @@
 # FROST SDPA — support matrix
 
+**SM100/SM103 exact half D256 implementation engines (refactor pilot):**
+`sdpa_fwd_sm100_d256_lookahead` (20519) and
+`sdpa_fwd_sm100_d256_swap_ab` (20520) own exact D_qk=D_v=256 FP16/BF16
+on cc 10.0/10.3. The old `sdpa_fwd_prefill_sm100` row declines these exact
+cells; its other widths, envelopes and targets retain their existing owner.
+Lookahead uses TILE_M=128/CGA2 and preserves the existing dense/paged/THD
+and split/packing contracts, including the existing nonpaged THD PackGQA
+decline. Swap-AB uses TILE_M=N_Q=16/32, TILE_N=128,
+CGA1 and SCHED_POLICY=0, with dense queries over dense/paged KV; it does
+not admit THD. PACK_GQA on swap-AB packs the whole group, which must fit
+N_Q; lookahead retains partial packing. Both reuse the common graph and
+prepared-execution contract. Central heuristics retains the old default
+routes and candidate budget; explicit engine selection fixes the body.
+The main kernel bodies and arithmetic are unchanged; only implementation
+selection, configuration ownership and public replay identities move.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;

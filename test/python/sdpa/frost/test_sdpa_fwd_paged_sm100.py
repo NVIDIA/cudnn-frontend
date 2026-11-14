@@ -26,6 +26,8 @@ empty ranges, cga1, page sizes across the 128-row tile.
 import math
 import os
 
+from frost_test_utils import half_engine_names
+
 import pytest
 
 import torch
@@ -217,13 +219,14 @@ def _run_graph(
     else:
         from cudnn.engines.manifest import family_for
 
-        g.create_execution_plan(family_for(g).offered_ids()[engine_name(arch=arch)], explicit_knobs)
-    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
+        explicit_name = "sdpa_fwd_sm100_d256_lookahead" if arch == "sm100" and (d, d_v) == (256, 256) else engine_name(arch=arch)
+        g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
+    plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:
         assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(arch=arch)) and g.plans[i].knobs.split_kv == want_split), None)
+        idx = next((i for i, n in enumerate(names) if n.startswith(half_engine_names(arch)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(arch=arch)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
         plan = g.plans[idx]
@@ -795,7 +798,7 @@ def _device_lead_split(B, H, KH, s_kv, *, s_q=1, causal_br=False, dtype=torch.fl
         device_cc=torch.cuda.get_device_capability(),
         device_sm_count=_sm_count(),
     )
-    plans = recommend("A", facts, {engine_name(): 0})
+    plans = recommend("A", facts, {name: i for i, name in enumerate(half_engine_names())})
     assert plans, "the f16 row must serve this graph"
     return plans[0].knobs.split_kv
 
@@ -1190,7 +1193,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
+    plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

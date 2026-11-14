@@ -19,7 +19,8 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256
+from cudnn.sdpa.fwd.config_common import TemplateParams
+from cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16_config import make_cfg_d256
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes; a plain import gets

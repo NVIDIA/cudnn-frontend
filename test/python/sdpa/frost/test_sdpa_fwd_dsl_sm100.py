@@ -6,6 +6,8 @@
 import math
 import os
 
+from frost_test_utils import half_engine_names, _is_plan_for
+
 import pytest
 import torch
 
@@ -28,8 +30,8 @@ class TestServiceRegisterRelease:
     test_service_register_release = staticmethod(_release)
 
 
-# ONE engine per arch line: pin the row that serves the device under test.
-# ``engine_name(arch=_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
+# Feature tests admit the half implementations for their architecture; routing tests pin a concrete body.
+# ``half_engine_names(_ARCH)`` defaults to arch="sm100", whose row stops at cc 10.6, so an
 # unqualified pin fails on Rubin with "no plan for engine" for routing reasons
 # that have nothing to do with the kernel.  Same shape as
 # test_sdpa_fwd_fp8_sm100.py / test_sdpa_fwd_mxfp8_sm100.py.
@@ -109,7 +111,7 @@ def test_sdpa_fwd_dsl_sm100_graph_api(dtype, is_causal, d):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch=_ARCH))
+    _select_engine(graph, half_engine_names(_ARCH))
     graph.check_support()
     graph.build_plans()
     # Honest workspace: no Stats output, so the kernel compiles the LSE store
@@ -170,10 +172,10 @@ def test_sdpa_fwd_gate_tail_graph_api(dtype, is_causal):
     assert graph._lowered_graph is None, "the tail must validate python-natively"
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(graph, engine_name(arch=_ARCH))
+    _select_engine(graph, half_engine_names(_ARCH))
     graph.check_support()
     graph.build_plans()
-    assert graph.selected_engine is not None and graph.selected_engine.name == engine_name(arch=_ARCH)
+    assert graph.selected_engine is not None and graph.selected_engine.name in half_engine_names(_ARCH)
     note_frost_routing(graph, label="sdpa-gate-tail")
     assert graph.get_workspace_size() == 0
 
@@ -368,7 +370,7 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    plan = _select_engine(g, half_engine_names(_ARCH), pack_gqa=pack_gqa)
     if want_cga is not None:
         assert plan.knobs.cga == want_cga, f"expected the heuristics to lead with cga={want_cga}; got {plan.knobs}"
     g.check_support()
@@ -1840,11 +1842,11 @@ def test_dsl_sm100_pack_gqa_knob_contract():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        name = engine_name(arch=_ARCH)
+        name = half_engine_names(_ARCH)
         out = []
         for i in range(len(g.plans)):
             pn = g.get_plan_name_at_index(i)
-            if pn == name or pn.startswith(name + "["):
+            if _is_plan_for(pn, name):
                 out.append(getattr(g.plans[i].knobs, "pack_gqa", None))
         return out
 
@@ -1946,7 +1948,7 @@ def test_dsl_sm100_thd(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro, kro: ro, vro: ro, oro: ro}
@@ -2047,7 +2049,7 @@ def test_dsl_sm100_thd_nan_capacity_tail(dtype, d_qk, d_v):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_qk, kro: ro_qk, vro: ro_v, oro: ro_v}
@@ -2138,7 +2140,7 @@ def test_dsl_sm100_thd_cross(dtype, d):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, o: o_gpu, sq: slq, skv: slk, qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
@@ -2318,7 +2320,7 @@ def _run_dsl_thd_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH))
+    _select_engine(g, half_engine_names(_ARCH))
     if pack_gqa is not None:
         # Exercise the requested support directly, independently of automatic candidate proposals.
         engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
@@ -3067,7 +3069,7 @@ def test_dsl_sm100_thd_declared_total_bounds_capacity_tail():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name(arch=_ARCH))
+        _select_engine(g, half_engine_names(_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)
@@ -3156,7 +3158,7 @@ def test_dsl_sm100_thd_interleaved_kv_views():
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-        _select_engine(g, engine_name(arch=_ARCH))
+        _select_engine(g, half_engine_names(_ARCH))
         g.check_support()
         g.build_plans()
         o_buf = torch.zeros(T, H, d, device=dev, dtype=dtype)

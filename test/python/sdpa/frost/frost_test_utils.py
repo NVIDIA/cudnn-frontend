@@ -145,11 +145,24 @@ def _dsl_installed() -> bool:
 def _is_plan_for(plan_name, engine) -> bool:
     """A plan reads ``<engine>[<knobs>]``: the heuristics name a concrete config
     for every entry, so match on the engine, not on the whole plan name."""
+    if isinstance(engine, tuple):
+        return any(_is_plan_for(plan_name, name) for name in engine)
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
+def half_engine_names(arch="sm100"):
+    """Allowed half engines for feature tests that exercise default selection.
+
+    Implementation/routing tests pin a single concrete name instead. This
+    list only follows ownership; it contains no shape or performance policy.
+    """
+    if arch == "sm100":
+        return ("sdpa_fwd_prefill_sm100", "sdpa_fwd_sm100_d256_lookahead", "sdpa_fwd_sm100_d256_swap_ab")
+    return (f"sdpa_fwd_prefill_{arch}",)
+
+
 def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
-    """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
+    """Pin the ranked entry for engine ``name`` (or an explicit tuple of names; graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 

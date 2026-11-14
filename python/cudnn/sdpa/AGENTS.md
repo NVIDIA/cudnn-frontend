@@ -1826,3 +1826,13 @@ Prepared split-KV slab offsets must use the same 128-byte carve alignment as
 advertised workspace. Guard the exact allocation on widths/row counts whose
 partial-O extent rounds differently, including packed and unpacked paging.
 `test_split_workspace_128_byte_alignment` is the detector.
+
+
+When splitting a broad engine into explicit implementations, preserve each
+capability subdomain rather than filling every shape list with the new exact
+width. In particular, paged packed-split support does not imply nonpaged THD
+PackGQA support; `test_d256_thd_split_explicit_contract` detects that expansion.
+Compare canonical compiled geometry when old public knobs were ignored.
+`test_explicit_d256_body_does_not_reselect_for_query_extent` exports the public
+engine/knob record into a fresh graph, checks the actual body/tile/CGA and
+replays changed inputs under CUDA Graph capture.
