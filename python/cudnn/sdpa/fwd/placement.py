@@ -1097,11 +1097,9 @@ def _place_sm90_d128(facts) -> str:
     ``SM90_D128_HAND_RULE_CLASSES`` names, worst case per class: prefill by 4 to 18%, mtp by 6 to 11%, verify by
     2.1 to 3.6x; and the table's features (cost, tiles, rows, kv, q) do not carry what it reads (the mean KV
     tiles per Q tile of a causal plan, MHA S_q 128)."""
-    from cudnn.sdpa.fwd.config_sm90 import d128_causal_kv_tiles
+    from cudnn.sdpa.fwd.config_sm90 import d128_causal_kv_tiles, d128_graph_decline
 
-    from .engines import SdpaFwdKnobs, _sm90_d128_tile_mismatch
-
-    if _sm90_d128_tile_mismatch(facts, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)) is not None:
+    if d128_graph_decline(facts) is not None:
         return TRAIL
     if facts.h_q == facts.h_kv:
         if facts.s_q <= SM90_D128_MHA_TRAIL_MAX_SQ:

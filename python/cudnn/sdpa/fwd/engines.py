@@ -639,42 +639,16 @@ class Capabilities:
 def _sm90_d128_tile_mismatch(facts: "ga.SdpaGraphFacts", knobs: "SdpaFwdKnobs") -> Optional[str]:
     """Why the SM90 row's 128 x 128 tile, the dedicated D128 template (#378), cannot run this graph and knob set, or None.
 
-    A tile of 128 on either axis names that template, so the other axis must be 128 or unset; then the adapter's own
-    refusal (config_sm90.d128_decline: exact (128, 128) head dims and nothing in config_sm90.D128_NOT_SERVED, with the
-    knobs' split and packing among the declared features). Two declines are the row's alone: S_q == 1 (decode is
-    outside the scope #378 accepted; the D512 body keeps it, while the direct adapter serves it on D128), and the
-    adapter's pending unpadded bottom-right S_q > S_kv, declined here as native_d64_mismatch declines it for D64 so the
-    row ranks no D128 plan that cannot build."""
-    from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, FLAVOR_TILES, d128_decline, declared_features
+    A tile of 128 on either axis names that template, so the other axis must be 128 or unset; then the graph's own
+    refusal with the knobs' split and packing (config_sm90.d128_graph_decline: config_sm90.d128_decline's exact
+    (128, 128) head dims and nothing in config_sm90.D128_NOT_SERVED, then the row's S_q == 1 and unpadded bottom-right
+    S_q > S_kv declines)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, FLAVOR_TILES, d128_graph_decline
 
     tile_m, tile_n = FLAVOR_TILES[D128_FLAVOR]
     if knobs.tile_m not in (None, tile_m) or knobs.tile_n not in (None, tile_n):
         return f"SM90's D128 template runs a {tile_m} x {tile_n} tile; requested tile_m={knobs.tile_m}/tile_n={knobs.tile_n}"
-    declared = declared_features(
-        thd=facts.thd,
-        sink=facts.has_sink,
-        window_left=facts.window_left,
-        window_right=(facts.right_bound or 1) if facts.right_band_widening else None,
-        lengths=bool(
-            facts.seq_q_trim
-            or facts.padded
-            or facts.seq_q_t is not None
-            or facts.cu_seq_q_t is not None
-            or facts.seq_kv_t is not None
-            or facts.cu_seq_kv_t is not None
-        ),
-        pack_gqa=knobs.pack_gqa is True,
-        paged=facts.has_paged_kv,
-        split_kv=knobs.split_kv or 1,
-    )
-    why = d128_decline(facts.d_qk, facts.d_v, declared)
-    if why is not None:
-        return why
-    if facts.s_q == 1:
-        return "s_q == 1 (decode) is outside the SM90 D128 template's scope; the 64 x 64 tile serves it"
-    if facts.causal and facts.bottom_right and facts.s_q > facts.s_kv:
-        return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
-    return None
+    return d128_graph_decline(facts, pack_gqa=knobs.pack_gqa is True, split_kv=knobs.split_kv or 1)
 
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:

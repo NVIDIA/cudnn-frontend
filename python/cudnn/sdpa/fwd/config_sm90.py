@@ -461,6 +461,41 @@ def d128_decline(d_qk: int, d_v: int, declared: frozenset[str] = frozenset()) ->
     return None
 
 
+def d128_graph_decline(facts, *, pack_gqa: bool = False, split_kv: int = 1) -> str | None:
+    """Why the SM90 row's 128 x 128 tile, the dedicated D128 template (#378), cannot run this graph with this packing
+    and split, or None: :func:`d128_decline` on the graph's declared features, then the two declines that are the
+    row's alone: S_q == 1 (decode is outside the scope #378 accepted; the D512 body keeps it, while the direct adapter
+    serves it on D128), and the adapter's pending unpadded bottom-right S_q > S_kv, declined as native_d64_mismatch
+    declines it for D64 so the row ranks no D128 plan that cannot build. ``facts`` is the graph's
+    ``graph_analyzer.SdpaGraphFacts``. It lives here, beside the decline it extends, so the row's placement can ask it
+    without importing the engines module."""
+    declared = declared_features(
+        thd=facts.thd,
+        sink=facts.has_sink,
+        window_left=facts.window_left,
+        window_right=(facts.right_bound or 1) if facts.right_band_widening else None,
+        lengths=bool(
+            facts.seq_q_trim
+            or facts.padded
+            or facts.seq_q_t is not None
+            or facts.cu_seq_q_t is not None
+            or facts.seq_kv_t is not None
+            or facts.cu_seq_kv_t is not None
+        ),
+        pack_gqa=pack_gqa,
+        paged=facts.has_paged_kv,
+        split_kv=split_kv,
+    )
+    why = d128_decline(facts.d_qk, facts.d_v, declared)
+    if why is not None:
+        return why
+    if facts.s_q == 1:
+        return "s_q == 1 (decode) is outside the SM90 D128 template's scope; the 64 x 64 tile serves it"
+    if facts.causal and facts.bottom_right and facts.s_q > facts.s_kv:
+        return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    return None
+
+
 def dense_bind_strides(shape: tuple, strides: tuple, elem_bytes: int) -> tuple | None:
     """SM90 binds every covering dense permutation with TMA-aligned live strides."""
     from cudnn.sdpa.graph_analyzer import dense_layout_ok

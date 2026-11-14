@@ -148,9 +148,9 @@ def class_key(row: str, facts, verify: bool = True) -> Optional[Tuple]:
         # The row's own decision (Rule S12: a key follows the kernel): the D128 template's entries answer the graphs it serves;
         # a graph it declines (per-batch lengths, unpadded bottom-right S_q > S_kv, ...) runs the 64 x 64 tile, which no
         # study of these classes timed, so it keeps the hand-written rules.
-        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm90_d128_tile_mismatch
+        from cudnn.sdpa.fwd.config_sm90 import d128_graph_decline
 
-        if _sm90_d128_tile_mismatch(facts, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)) is not None:
+        if d128_graph_decline(facts) is not None:
             return None
     return (row, tuple(facts.device_cc or ()), dtype, (facts.d_qk, facts.d_v), phase, layout, mask, bool(facts.has_sink), group, kv_off_tile)
 
