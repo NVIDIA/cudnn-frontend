@@ -434,6 +434,18 @@ def collapse_layout(shape, strides) -> list:
     return out
 
 
+def is_nonoverlapping(shape, strides):
+    """Conservatively prove disjoint elements in a nonnegative strided layout."""
+    if any(int(d) == 0 for d in shape):
+        return True
+    occupied = 1
+    for step, extent in sorted((int(s), int(d)) for d, s in zip(shape, strides) if int(d) > 1):
+        if step < occupied:
+            return False
+        occupied += (extent - 1) * step
+    return True
+
+
 def strided_fill_plan(shape, strides) -> "list | None":
     """The 2D memsets that cover a strided region exactly once, or None.
 

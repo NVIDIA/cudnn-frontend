@@ -446,6 +446,10 @@ evaluating them (`api_index/test_api_index.py` covers Enum, IntEnum and aliases)
 Signature tests should accept both `object` and `object | None` for an argument
 defaulting to `None`, while retaining argument order and default checks.
 
+### Append-only enum stability
+
+Pin established public enum values in stability tests. Do not assert that an existing member remains the last or largest member: a valid append-only addition must not break that test. Keep the established values unchanged when updating the test.
+
 ### Confirm you are testing the code you edited
 
 Bind tensor views in the graph's declared axis order. A BSHD allocation and

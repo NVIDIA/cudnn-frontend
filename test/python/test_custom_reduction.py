@@ -35,10 +35,9 @@ def test_custom_reduction_surface_is_public():
 
 
 def test_custom_reduction_node_type_preserves_existing_values():
-    # CUSTOM_REDUCTION is appended; it must never renumber an existing member.
+    # Pin established values; future append-only members may follow CUSTOM_REDUCTION.
     assert cudnn.NodeType.BLOCK_SCALE_DEQUANTIZE.value == 42
-    public_values = [member.value for member in cudnn.NodeType if member is not cudnn.NodeType.CUSTOM_REDUCTION]
-    assert cudnn.NodeType.CUSTOM_REDUCTION.value == max(public_values) + 1
+    assert cudnn.NodeType.CUSTOM_REDUCTION.value == 57
 
 
 def test_custom_reduction_refuses_a_cudnn_backend_older_than_9_29(cudnn_handle):

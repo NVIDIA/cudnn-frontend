@@ -181,3 +181,17 @@ def _row_major_stride(dim: List[int]) -> List[int]:
     for i in range(len(dim) - 2, -1, -1):
         stride[i] = stride[i + 1] * dim[i + 1]
     return stride
+
+
+def gather_shape(shape, indices_shape, axis=0):
+    """Logical gather shape, independent of GEMM/backend storage restrictions."""
+    from operator import index
+
+    shape, indices_shape = list(shape), list(indices_shape)
+    if not shape or not indices_shape or any(d <= 0 for d in (*shape, *indices_shape)):
+        raise ValueError("gather requires positive input and index extents")
+    axis = index(axis)
+    if not -len(shape) <= axis < len(shape):
+        raise ValueError("gather axis is outside the input rank")
+    axis %= len(shape)
+    return shape[:axis] + indices_shape + shape[axis + 1 :]

@@ -253,22 +253,9 @@ class GemmRecipe:
         views = operands
         for index, view in self.operand_reshapes:
             value = views[index]
-            source_shape, source_stride = tuple(value.shape), tuple(value.stride())
-            shape, stride = view.layout(source_shape, source_stride)
-            if source_shape == shape and source_stride == stride:
+            value = view.apply(value)
+            if value is views[index]:
                 continue
-            if hasattr(value, "metadata_view"):
-                value = value.metadata_view(shape, stride)
-            elif isinstance(value, DeviceView):
-                if not is_contiguous(shape, stride):
-                    raise ValueError("strided reshape/transpose execution requires a tensor or native variant pack")
-                value = value.reshape(shape)
-            elif hasattr(value, "as_strided"):
-                # Every intermediate index map was proved; inherit storage_offset
-                # and ownership, with one final view and no materializing reshape.
-                value = value.as_strided(shape, stride)
-            else:
-                raise ValueError("operand views require a tensor, DeviceView or native variant pack")
             if views is operands:
                 views = list(operands)
             views[index] = value

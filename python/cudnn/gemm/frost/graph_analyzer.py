@@ -29,6 +29,9 @@ from .fusion_ir import (
     Axis,
     IndexExpr,
     IndexMap,
+    IndexLookup,
+    GroupPartition,
+    GatherSpec,
     OperandAccess,
     MatmulSpec,
     ReductionSpec,
@@ -145,6 +148,8 @@ class _RecordedOp:
     index_expr: IndexExpr | None = None
     aux_input: int | None = None
     aux_mapping: IndexMap | None = None
+    group_partition: GroupPartition | None = None
+    source_access: IndexMap | None = None
 
 
 @dataclass
@@ -191,6 +196,7 @@ class GemmBinding:
     aux_transposed: tuple[bool, ...] = ()
     matrix_batches: tuple[tuple[Any, tuple[int, ...]], ...] = ()
     operand_views: tuple = ()
+    gather_inputs: tuple = ()  # logical (source, indices, output) edges; not kernel slots
 
     def bound_tensors(self) -> list[Any]:
         """List tensors bound by this GEMM plan."""
@@ -210,6 +216,7 @@ class GemmBinding:
             ts.append(self.token_ks)
         if self.top_k_scores is not None:
             ts.append(self.top_k_scores)
+        ts.extend(t for source, indices, _output in self.gather_inputs for t in (source, indices))
         # A shared input can occupy different roles/views but has one caller binding.
         return list({id(t): t for t in ts if t is not None}.values())
 
@@ -234,6 +241,7 @@ def swap_ab_binding(binding: "GemmBinding | None") -> "GemmBinding | None":
         aux_transposed=binding.aux_transposed,
         matrix_batches=binding.matrix_batches,
         operand_views=binding.operand_views,
+        gather_inputs=binding.gather_inputs,
     )
 
 
@@ -391,6 +399,9 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
     node_type = node.node_type.name
     name = node.name
     compute = _map_dtype(node.compute_data_type)
+    if node_type == "GATHER":
+        inp, indices, out = node.inputs["input"], node.inputs["indices"], node.outputs["OUT_0"]
+        return _RecordedOp("gather", name, [id(inp), id(indices)], id(out), out, op_attrs=(("axis", node.params.get("axis", 0)),))
     if node_type == "MATMUL":
         A, B = node.inputs["A"], node.inputs["B"]
         out = node.outputs["C"]
@@ -613,6 +624,10 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
 
 def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
     """Analyze + JIT the graph into a compiled GEMM plan."""
+    if any(node.node_type.name == "GATHER" for node in graph.nodes):
+        from .gather_execution import build_execution_plan
+
+        return build_execution_plan(graph, knobs=knobs)
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
     from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed, jit_from_cudnn_graph, plan_config, probe_chain
@@ -1203,7 +1218,7 @@ def _output_layouts(dense_entries, quant_recs, meta):
     for _di in range(len(dense_entries)):
         _spec_i, _obj_i = dense_entries[_di]
         _m_i = meta.get(id(_obj_i))
-        if _m_i is not None and _m_i.matrix_batch is not None:
+        if _m_i is not None and (_m_i.matrix_batch is not None or _m_i.operand_view is not None):
             _d_i, _s_i = _m_i.dim, _m_i.stride
         else:
             _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
@@ -1301,6 +1316,13 @@ def _build_multi_moe_chain(
             if ks_meta.dtype != "int32" or ks_meta.stride[1] != 1:
                 raise NotImplementedError(f"MoE {mode} token_ks must be INT32 with contiguous routed rows")
 
+    if moe_ops[0].moe_mode == "gather" and moe_ops[0].source_access is None:
+        routed_shape = (1, index_meta.dim[1], meta[moe_ops[0].inputs[0]].dim[-1])
+        index_map = IndexMap.broadcast(index_meta.dim, routed_shape)
+        source_shape = meta[moe_ops[0].inputs[0]].dim
+        indirect = IndexMap(routed_shape, source_shape, (IndexExpr.constant(0), IndexLookup(index_meta.name, index_map), IndexExpr.coordinate(2)))
+        moe_ops = [replace(op, source_access=indirect) for op in moe_ops]
+
     # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
     fto_id = moe_ops[0].inputs[2]
     for moe in moe_ops[1:]:
@@ -1308,8 +1330,17 @@ def _build_multi_moe_chain(
             raise ValueError("parallel MoE grouped matmuls must share the same " "first_token_offset tensor")
     fto_meta = meta.get(fto_id)
     offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
-    num_groups = int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0
-    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
+    partition = moe_ops[0].group_partition
+    if any(op.group_partition != partition for op in moe_ops[1:]):
+        raise ValueError("parallel grouped GEMMs must share the same row partition")
+    if partition is None:
+        if fto_meta is None or not fto_meta.dim:
+            raise ValueError("variable grouped GEMMs require first_token_offset")
+        partition = GroupPartition.offsets(int(fto_meta.dim[0]) - 1, offset_dtype, fto_meta.alignment_value)
+    elif fto_meta is not None:
+        raise ValueError("uniform grouped GEMMs must not declare an offsets tensor")
+    num_groups = partition.num_groups
+    offset_multiple = partition.boundary_alignment
 
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
 
@@ -1411,6 +1442,13 @@ def _build_multi_moe_chain(
         block_scale_spec = _block_scale_spec(a0, b0, meta)
     mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
     gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in moe_ops)
+    if partition.is_uniform:
+        declared = [
+            *gemm_out_dtypes,
+            *(_resolve_out_dtype(tid, meta[tid].tensor, io_dtype, intermediate_dtype, meta) for tid in _materialized_output_ids(meta)),
+        ]
+        if any(dt not in ("bf16", "fp16", "fp32") for dt in declared):
+            raise NotImplementedError("indirect row plans support BF16, FP16 and FP32 outputs only")
     if combine:
         gemm_out_dtypes = ("fp32",) * len(moe_ops)
 
@@ -1530,11 +1568,13 @@ def _build_multi_moe_chain(
             offset_dtype=offset_dtype,
             num_groups=num_groups,
             offset_multiple=offset_multiple,
+            partition=partition,
             top_k=moe_ops[0].top_k,
         ),
         block_scale=block_scale_spec,
         reductions=reductions,
         quants=quants,
+        source_access=moe_ops[0].source_access,
     )
     output_objs.extend(reduction_objs)
     output_objs.extend(quant_scale_objs)
@@ -1547,7 +1587,7 @@ def _build_multi_moe_chain(
         output_objs,
         aux_objs,
         block_scale_spec is not None,
-        first_token_offset=meta[fto_id].tensor,
+        first_token_offset=meta[fto_id].tensor if fto_meta is not None else None,
         token_index=index_meta.tensor if index_meta is not None else None,
         token_ks=ks_meta.tensor if ks_meta is not None else None,
         top_k_scores=scores_meta.tensor if scores_meta is not None else None,
@@ -2438,6 +2478,57 @@ def _build_multi_gemm_chain(
     return chain, binding
 
 
+def _operand_view_path(tid, producers, meta):
+    """Trace virtual dtype-preserving views back to their storage producer."""
+    steps, outputs = [], []
+    while (op := producers.get(tid)) is not None and op.cudnn_name in ("reshape", "transpose"):
+        if _is_output(meta, tid):
+            raise NotImplementedError("operand views must be virtual")
+        if meta[tid].dtype != meta[op.inputs[0]].dtype:
+            raise ValueError("operand views must preserve dtype")
+        if op.cudnn_name == "reshape":
+            if op.reshape_mode not in ("VIEW_ONLY", "LOGICAL"):
+                raise NotImplementedError("operand reshape requires VIEW_ONLY or LOGICAL")
+            steps.append(ViewStep("reshape", meta[tid].dim, meta[tid].stride))
+        else:
+            steps.append(ViewStep("transpose", op.permutation))
+        outputs.append(tid)
+        tid = op.inputs[0]
+    return tid, tuple(reversed(steps)), tuple(outputs)
+
+
+def _reachable_recorded_ops(ops, meta):
+    """Keep the ordinary DAG below materialized input boundaries."""
+    producers, used = {op.output: op for op in ops}, set()
+
+    def visit(tid):
+        if tid in used or meta[tid].is_input:
+            return
+        used.add(tid)
+        producer = producers.get(tid)
+        if producer is not None:
+            for inp in producer.inputs:
+                visit(inp)
+
+    for op in ops:
+        if op.cudnn_name == "matmul" or _is_output(meta, op.output):
+            visit(op.output)
+    return [op for op in ops if op.output in used]
+
+
+def _prepare_operand_view(meta, tid, steps, *, writable=False):
+    """Append a checked storage projection without introducing a data producer."""
+    m = meta[tid]
+    if m.operand_view is None:
+        shape, stride, previous = m.dim, m.stride, ()
+    else:
+        shape, stride, previous = m.operand_view.source_shape, m.operand_view.source_stride, m.operand_view.steps
+    view = OperandView.prepare(shape, stride, (*previous, *steps))
+    if writable:
+        fold_batch_layout(view.target_shape, view.target_stride, writable=True)
+    meta[tid] = replace(m, dim=view.target_shape, stride=view.target_stride, operand_view=view)
+
+
 def _build_chain(
     ops: list[_RecordedOp],
     meta: dict[int, _TensorMeta],
@@ -2464,11 +2555,44 @@ def analyze_with_binding(
     return _analyze_state(_state_from_graph(graph))
 
 
+def _analyze_gather_state(state):
+    """Retain gather edges while analyzing the ordinary GEMM/pointwise DAG.
+
+    A gather result is a logical operand boundary, not an allocated buffer or
+    a promise that any loader supports its layout. Backend grouping is absent.
+    """
+    meta = {tid: replace(m) for tid, m in state["tensor_meta"].items()}
+    gathers = []
+    edges = []
+    for op in state["ops"]:
+        if op.cudnn_name != "gather":
+            continue
+        source, indices, output = (meta[tid] for tid in (*op.inputs, op.output))
+        access = IndexMap.take(indices.name, source.dim, indices.dim, dict(op.op_attrs)["axis"])
+        if output.dim != access.consumer_shape or output.dtype != source.dtype:
+            raise ValueError("gather must preserve source dtype and match the logical index domain")
+        if indices.dtype not in ("int32", "int64"):
+            raise ValueError("gather indices must be INT32 or INT64")
+        gathers.append(GatherSpec(source.name, indices.name, output.name, access, output.output_index is not None))
+        edges.append((source.tensor, indices.tensor, output.tensor))
+        meta[op.output] = replace(output, is_input=True, output_index=None)
+    # Source/index producers belong to the retained gather edges, not to the
+    # GEMM epilogue. Walk only the ordinary DAG downstream of those boundaries.
+    remaining = [op for op in state["ops"] if op.cudnn_name != "gather"]
+    remaining = _reachable_recorded_ops(remaining, meta)
+    referenced = {tid for op in remaining for tid in (*op.inputs, op.output)}
+    gemm_meta = {tid: m for tid, m in meta.items() if tid in referenced}
+    chain, binding = _analyze_state({**state, "ops": remaining, "tensor_meta": gemm_meta})
+    return replace(chain, gathers=tuple(gathers)), replace(binding, gather_inputs=tuple(edges))
+
+
 def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
-    """Lower one graph metadata snapshot."""
+    """Analyze logical graph semantics; execution routes lower independently."""
+    if any(op.cudnn_name == "gather" for op in state["ops"]):
+        return _analyze_gather_state(state)
     if not state["ops"]:
         raise ValueError("graph has no ops; nothing to compile")
-    meta = dict(state["tensor_meta"])
+    meta = {tid: replace(m) for tid, m in state["tensor_meta"].items()}
     ops = _normalize_operand_views(state["ops"], meta, state["io_dtype"], state["intermediate_dtype"], state["compute_dtype"])
     return _build_chain(
         ops,

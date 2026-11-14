@@ -58,7 +58,7 @@ class _FrostGemmPlan(CompiledPlan):
         if launch is not None:
             launch(operands, graph_order, stream=ctx.stream, workspace=workspace)
         elif workspace is not None:
-            self._compiled(dict(zip(self._tensors, operands)), workspace, stream=ctx.stream)
+            self._compiled(dict(zip(self._tensors, operands)), workspace=workspace, stream=ctx.stream)
         else:
             self._compiled(dict(zip(self._tensors, operands)), stream=ctx.stream)
 
@@ -73,8 +73,8 @@ class FrostGemmEngine(BaseEngine):
         from .compiler import probe_supported
         from .graph_analyzer import _graph_has_gemm
 
-        if not _graph_has_gemm(graph):
-            raise NotImplementedError("frost_gemm: the graph has no matmul / moe_grouped_matmul node")
+        if not _graph_has_gemm(graph) and not any(node.node_type.name == "GATHER" for node in graph.nodes):
+            raise NotImplementedError("frost_gemm: the graph has no matmul / moe_grouped_matmul / gather node")
         try:
             probe_supported(graph)
         except (NotImplementedError, ValueError) as exc:

@@ -159,6 +159,7 @@ _ANCHOR_NODE_TO_FAMILY = {
     "INSTANCENORM_BWD": "frost_norm_bwd",
     "BATCHNORM_BWD": "frost_norm_bwd",
     "MATMUL": "frost_gemm",
+    "GATHER": "frost_gemm",
     "MATMUL_FP8": "frost_gemm",
     "MOE_GROUPED_MATMUL": "frost_gemm",
     "CONV_FPROP": "frost_conv",
