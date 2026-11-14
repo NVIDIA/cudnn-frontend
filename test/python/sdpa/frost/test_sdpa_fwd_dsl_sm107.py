@@ -1686,7 +1686,7 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     # Append-only: the ragged-Q decode leg's two plan-time facts follow the block-scale tail; then (2026-10-15) the Rubin decode
     # route's width cap and the programmatic-dependent-launch switch, in landing order; then this branch's tail (the score side
     # outputs, the resident-block operands of the small tiles and their knobs), appended after the public tree's.
-    assert params[extension_start:] == [
+    assert params[extension_start : params.index("swap_ab") + 1] == [
         "sample_amax_o",
         "pv_bf16",
         "stats_log2",
@@ -1716,6 +1716,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "swap_ab",
     ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["swap_ab"].default is None
+    # The sdpa_mxfp8 op attribute causal_exclude_own_block is appended after swap_ab and defaults off.
+    assert params[params.index("swap_ab") + 1] == "causal_exclude_own_block"
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["causal_exclude_own_block"].default == 0
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["decode_q_tile_max"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["use_pdl"].default is False

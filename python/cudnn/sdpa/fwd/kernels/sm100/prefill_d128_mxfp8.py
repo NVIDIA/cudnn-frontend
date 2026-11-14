@@ -101,6 +101,27 @@ Cfg = type(CFG)
 # row_max_reduction_64 (default 0). api_dsl sets this from the device capability at
 # compile time; a distinct value yields a distinct kernel specialization (cache key).
 FUSED_LDTM_STAT = int(PARAMS.fused_ldtm_stat)
+# sdpa_mxfp8(causal_exclude_own_block=B) (TemplateParams.causal_exclude_own_block; 0 = plain causal): the causal bound
+# tightened to keys j < B * floor(q / B), i.e. the band's last key for row q is B * floor(q / B) - 1.  With B = 32 every
+# V scale block the row reads covers fully visible tokens only (NVIDIA/TransformerEngine#3248).  Two sites read it: the
+# score mask (_softmax_kv_body) and the empty-row geometry (rows 0 .. B-1 read no key: O = 0, Stats = -inf); both take
+# the row's TOKEN index, so PackGQA rows are anchored correctly.  Nothing else changes: the LEFT / unmasked / RIGHT kv
+# split and the phantom-step tests stay on the causal diagonal.  That stays exact for any q tile start q0: the unmasked
+# segment ends at kv tile floor(q0 / TILE_N), whose first key TILE_N * floor(q0 / TILE_N) <= B * floor(q0 / B) since
+# TILE_N is a multiple of B, so every unmasked tile is fully visible under the tighter bound too; a phantom tile (no key
+# under the causal bound) has none under it either; and a tile that only the tighter bound empties rides the masked
+# segment.  Split-KV narrows those same bounds per split (_bounds_for_tile_split).
+OWN_BLOCK = int(PARAMS.causal_exclude_own_block)
+
+
+def _causal_row_bound(q_abs):
+    """The row index the causal band is anchored on: ``q_abs`` itself, or ``B * floor(q_abs / B) - 1`` under
+    causal_exclude_own_block=B (a trace-time branch; the plain-causal rendering is unchanged)."""
+    if cutlass.const_expr(OWN_BLOCK != 0):
+        return (q_abs // cutlass.Int32(OWN_BLOCK)) * cutlass.Int32(OWN_BLOCK) - cutlass.Int32(1)
+    return q_abs
+
+
 # THD / varlen (CFG.THD_VARLEN=1) follows the device-built-metadata +
 # plan-time-envelope design (write_thd_meta, issue #552 / PRs #606, #608) used
 # by the f16 kernels: packed [1,T,H,D] Q/K/V/O with DYNAMIC token extents, the
@@ -2447,9 +2468,11 @@ def _softmax_kv_body(
         # Bottom-right causal: runtime SKV-SQ diagonal offset (folds out when
         # CFG.BOTTOM_RIGHT is 0 — top-left masking is unchanged).
         causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
+        # The causal band's anchor row (q_abs, or the own-block-excluded bound -- see OWN_BLOCK).
+        causal_row = _causal_row_bound(q_abs)
         reg_S_a = apply_mask_chunk(
             reg_S_a,
-            q_abs,
+            causal_row,
             kv_col_base_a,
             eff_seqlen_kv,
             CFG.WINDOW_LEFT,
@@ -2461,7 +2484,7 @@ def _softmax_kv_body(
         )
         reg_S_b = apply_mask_chunk(
             reg_S_b,
-            q_abs,
+            causal_row,
             kv_col_base_b,
             eff_seqlen_kv,
             CFG.WINDOW_LEFT,
@@ -3128,7 +3151,7 @@ def _correction_warp_group(
                 _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
                 _last_k = eff_seqlen_kv - cutlass.Int32(1)
                 if cutlass.const_expr(CFG.MASK_FLAGS & MASK_CAUSAL):
-                    _last_k = cute.math.min(_last_k, q_row_global + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
+                    _last_k = cute.math.min(_last_k, _causal_row_bound(q_row_global) + _diag + cutlass.Int32(CFG.WINDOW_RIGHT))
                 _first_k = cutlass.Int32(0)
                 if cutlass.const_expr(CFG.MASK_FLAGS & MASK_SWA):
                     _first_k = cute.math.max(_first_k, q_row_global + _diag - cutlass.Int32(CFG.WINDOW_LEFT))

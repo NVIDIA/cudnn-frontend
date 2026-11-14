@@ -12,6 +12,14 @@ from typing import Optional
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
 from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_ROWS
 
+
+def bias_decline(d_qk, d_v, *, thd=False, paged=False, split_kv=1, pack_gqa=False, tile_m=None, bottom_right=False):
+    """The bounded register-bias arm, shared by graph admission and standalone."""
+    if (d_qk, d_v) != (128, 128) or thd or paged or split_kv > 1 or pack_gqa or tile_m in DECODE_Q_TILES or bottom_right:
+        return "SM120 additive bias requires dense exact D128, unsplit, unpacked prefill"
+    return None
+
+
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64, 32)
 # Q tiles of the DECODE tile (sm120/decode_f16.py): 16 or 32 packed rows per CTA,

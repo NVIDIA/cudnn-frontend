@@ -121,6 +121,7 @@ pytest core/test_determinism_utils.py
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 | `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
 | `sdpa/frost/test_sdpa_fwd_d128_sm90_determinism.py` | the SM90 D128 template (`SdpaFwdDslSm90`, the 128 x 128 tile pinned) | O, Stats | none (forward-only template; no backward) |
+| `sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` | `pygraph.sdpa_mxfp8(causal_exclude_own_block=32)` (SM100/SM103 MXFP8 D128 FROST kernel) | BF16 O, FP32 Stats | — (the option is forward-only) |
 
 ### SM90 D128 template forward (issue #378): validation, 2026-11-13 (UTC)
 
@@ -2268,6 +2269,29 @@ route's dK/dV (one CSR build, one owner CTA per KV block, direct stores) and
 the golden patterns (one query block per KV block, at most two reduce-adds
 onto zero per dQ tile). The measured counts are in the dated record above; a
 small golden establishes bytes for its pattern and nothing more.
+
+### SDPA MXFP8 completed-block causal: 15 cases
+
+`sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py` covers `sdpa_mxfp8` with `use_causal_mask=True, causal_exclude_own_block=32`: each query reads only the keys of completed 32-token blocks before its own (NVIDIA/TransformerEngine#3248). The plan is pinned to the SM100 MXFP8 engine. PackGQA keeps each row's key order, so packed and unpacked plans write the same bytes. Split-KV adds per-split partials in a fixed order: it replays bit for bit, but its bytes follow the split count, which the heuristics pick from the launch grid (on B200, only a single sequence at one or two KV heads splits); the batch-invariance cases run unsplit plans. Run it with `requires_pre_rubin_blackwell`; other architectures skip, and SM90/SM107 decline the option by contract.
+
+| Method | Parameters | Cases |
+| --- | --- | ---: |
+| `test_replay` | E4M3/E5M2 × MHA 8:8 / GQA 8:2; B4 S2048 (512 work tiles); eight executions with side-stream contention, fresh NaN-poisoned outputs, input-byte mutation check | 4 |
+| `test_batch_invariance` | Same combinations, S512; four sequences alone, packed, reordered, each duplicated, and repeated into a 16-sequence batch that crosses one wave | 4 |
+| `test_neighbor_isolation` | E4M3/E5M2; fixed target payload and scales beside a requantized neighbour, then a scale-only neighbour change (every V E8M0 scale one exponent up); the neighbour's bytes must change | 2 |
+| `test_pack_gqa_keeps_bytes` | E4M3/E5M2, B2 GQA 8:2 S1024; pinned PackGQA and unpacked plans on the same packed bytes | 2 |
+| `test_split_kv_replay` | E4M3, B1 H1 S2048, pinned split-KV plan (4 splits on B200); eight executions with side-stream contention | 1 |
+| `test_pack_reuses_quantized_bytes` | Harness control: per-sequence quantized payloads and swizzled scales, packed, equal the joint quantization's bytes and strides | 1 |
+| `test_golden` | E4M3, B2 H4:2 S256; FP32 reference, three executions, payload/scale/output hashes | 1 |
+
+Each sequence is quantized once, alone, from CPU-seeded FP32 inputs; batches reuse those payload and E8M0 scale bytes and never requantize. Comparisons cover O and Stats by raw bytes. Rows 0-31 keep no key: their O is zero and their Stats is the declared `-inf` sentinel, checked by location in `test_replay`. The numerical reference for the full shape grid is `test_sdpa_mxfp8_causal_exclude_own_block.py::test_numerics_against_reference`; `test_golden` re-checks its own inputs against the same reference before hashing.
+
+Validation, 2026-11-14 (UTC): `NVIDIA B200`, SM100, 148 SMs, driver 580.178.04 (API `13040`); Torch `2.14.0a0+4fdf77b940.nv26.08`, CUDA `13.4`, cuDNN `92500`, CuTe DSL `4.8.1`, TVM FFI `0.1.13.post3`. Source: `develop` at `f0a0a1b1c43f2338193c10201a5dc467e917ec93` plus this change; imports resolved to that checkout (editable install). The golden was recorded on 2026-11-10 (`CUDNN_DETERMINISM_RECORD`, `-k golden`, into a new directory, after replay and the reference passed) and is unchanged. Steps: a normal run of both own-block suites at L0-L4 (**76 passed, 0 skipped**); a strict run of the 15 cases against the committed [golden](3851e622ca8e3564/sdpa-mxfp8-own-block32-fprop.json) with `CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens"`: **15 passed, 0 failed, 0 skipped**. SM103 is unverified: the kernel compiles for `sm_103a` with the option on and off, but no SM103 GPU ran it.
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  python -m pytest -q -m L0 sdpa/frost/test_sdpa_mxfp8_own_block_determinism.py
+```
 
 ## Golden checks
 
@@ -5866,3 +5890,68 @@ the follow-up fixture changes only migrate other test owners and the split
 capability inventory. FP8 on SM103, strict runtime-golden comparisons, other
 architectures and backward are not qualified by this migration. No support
 status is upgraded from these bounded identity/replay checks.
+
+
+## 2026-11-14 — SM120 dense D128 additive-bias integration (#2193)
+
+The integration retains the paged prepared host and append-only API argument
+order. It qualifies `SdpaFwdDslSm120` forward only: FP16/BF16 D128, FP32 or
+matching-input bias, unpaged/unpacked/unsplit, without physical origins.
+Bias backward and SM121 hardware were not qualified.
+
+`test_frost_sdpa_bias_sm120_determinism.py` adds eight L0 cases: both input
+dtypes, both bias dtypes, M64 dense and M128 causal. CPU-seeded B3/H64/Hkv16
+inputs use Q129/K257 tails, padded bias storage, and an all-minus-infinity
+row. Tests compare O and FP32 LSE bytes over fresh-buffer/concurrent replays,
+isolated/reordered/duplicated batches, changed neighbors and captured replay,
+separately check an FP64 numerical reference, and retain runtime-keyed goldens.
+The golden case name also includes the DSL compiler version; the common
+runtime key alone does not distinguish CUDA 12 and CUDA 13 DSL wheels.
+
+`test_frost_sdpa_bias_sm120_stress.py` adds two L0 cases, one per input dtype,
+with FP32 bias, B3/H64/Hkv16/Q257/K513/D128, M128/N128, 576 thread blocks and
+four K/V refills per launch. Each case independently checks its FP64 reference,
+then 3,000 warm and 3,000 poisoned launches against a cold byte reference.
+The unsafe control failed 200/200 launches on this device. Cold agreement is
+only a stability check, separate from the FP64 reference.
+
+On the initial f0a0a1b1c43f integration, ordinary bias/contract/analyzer/geometry
+checks passed 1,575 cases; paged/prepared/origin controls passed 271 with 12
+missing-runtime-golden skips and eight deselections. Those skips supply no
+strict golden qualification. The eight new replay/batch checks passed, but
+the new stress failed on warm launch 13 (FP16) and 55 (BF16). The true develop
+f0a0a1b1c43f no-bias control with the same Q/K/V passed both stress cases.
+Enabling the existing result-dependent consumption stores for dense bias
+retains K/V use before the named reuse barriers, just as for paged half-storage.
+
+After that bounded fix, native RTX 6000D (cc 12.0, 156 SMs), driver API 13040,
+Torch 2.14.1+cu130, cuDNN 9.27.0 and CuTe DSL 4.8.0 produced:
+
+| DSL compiler | Scope | Result |
+|---|---|---|
+| CUDA 13.4 | bias + eight strict replay/batch goldens + API contract + paged native rebind | 88 passed, zero skips |
+| CUDA 13.4 | two warm/poisoned stress cases | 2 passed; zero byte mismatches |
+| CUDA 12.9 | bias + API contract | 72 passed, zero skips |
+| CUDA 12.9 | eight new golden candidates, then a separate strict replay/batch run | 8 passed + 8 passed, zero skips |
+| CUDA 12.9 | two warm/poisoned stress cases | 2 passed; zero byte mismatches |
+
+The eight CUDA 13.4 candidates recorded before the fix also passed strict
+checks after it; no existing golden was replaced. All sixteen reviewed new
+JSON files are committed under runtime key `0c261da063500aab`. Fixed-runtime
+identity is asserted, not cross-runtime identity. Source/native-extension and
+loaded-template hashes were checked for each run. The CUDA 13.4 cache objects
+for all 32 bias renderings exercised by the regression contain the consumption
+store before each of 204 K/V `BAR.ARV` sites, without an intervening branch.
+
+Reproduce from `test/python` with the desired installed DSL compiler flavor:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+pytest -o addopts= -m L0 sdpa/frost/test_frost_sdpa_bias_sm120_determinism.py \
+  sdpa/frost/test_frost_sdpa_bias_sm120_stress.py
+```
+
+The ordinary numerical and integration controls are
+`test_frost_sdpa_bias_sm120.py`, `test_sdpa_fwd_api_contract.py`,
+`test_sdpa_graph_analyzer.py`, `test_heuristic_geometry.py` and
+`test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_native_rebind_replay`.

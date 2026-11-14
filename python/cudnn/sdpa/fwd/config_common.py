@@ -377,6 +377,12 @@ class TemplateParams:
     # Optional native FP8 K/V storage for the half-input d128 pipeline.
     # Appended: -1 keeps the existing uniform Q/K/V behavior.
     dtype_kv: int = -1
+    # The op attribute sdpa_mxfp8(causal_exclude_own_block=B) (APPENDED): the causal bound tightened to keys
+    # j < B * floor(i / B) -- query i never reads its own B-token block, so with B = 32 every V scale block it reads
+    # covers fully visible tokens only.  0 = plain causal (every record so far renders byte-identically).  A
+    # template-key field: the mask band and the empty-row geometry are traced from it.  Read by the SM100 MXFP8 d128
+    # body only (kernels/sm100/prefill_d128_mxfp8.py); _validate_params refuses it everywhere else.
+    causal_exclude_own_block: int = 0
 
 
 _PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512", "d576"})
@@ -421,6 +427,18 @@ def _validate_params(
         raise ValueError(f"{flavor}: softmax_scale_prefolded is served by the cc 10.7 kernels only (this line applies the scale in-kernel)")
     if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
         raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
+    if k.causal_exclude_own_block:
+        # The one body that reads the field is the MXFP8 d128 prefill (dense, unpadded, unpaged).
+        if k.causal_exclude_own_block != 32:
+            raise ValueError(f"{flavor}: causal_exclude_own_block must be 32 (the MXFP8 V scale block); got {k.causal_exclude_own_block}")
+        # (The per-tensor FP8 d128 body shares this factory; it refuses the field at load, see prefill_d128_fp8.py.)
+        if not fp8 or flavor != "d128" or k.d_flavor != 128 or k.pv_bf16:
+            raise ValueError(f"{flavor}: causal_exclude_own_block is served by the MXFP8 d128 prefill body only")
+        # bottom_right is admitted for the square case only (S_q == S_kv: a zero diagonal offset); the adapter checks the shapes.
+        if k.window_right != 0 or k.window_left is not None or k.has_sink:
+            raise ValueError(f"{flavor}: causal_exclude_own_block requires the plain causal band (no window, widened band or sink)")
+        if k.thd_varlen or k.seq_kv_lens_present or k.seq_q_lens_present or k.kv_tail_mask or k.paged_kv:
+            raise ValueError(f"{flavor}: causal_exclude_own_block is wired on the dense unpadded body only")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
     if dtype_o not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16, DTYPE_O_NVFP4, DTYPE_O_MXFP8):
         raise ValueError(f"{flavor}: DTYPE_O must be 0..5; got {dtype_o}")

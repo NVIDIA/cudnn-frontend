@@ -193,6 +193,7 @@ def test_adapter_signatures_append_the_score_kwargs():
         "bias_max_form",
         "softmax_wgs",
         "swap_ab",
+        "causal_exclude_own_block",
     ], list(ctor)[j:]
     assert ctor["sample_score_max"].default is None and ctor["sample_score_sum_exp"].default is None
     ex = inspect.signature(SdpaFwdDslSm100.execute).parameters
