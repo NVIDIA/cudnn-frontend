@@ -2,7 +2,8 @@
 
 **Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
 graph/config for admitted override-enabled half THD plans with packed HN Stats
-and the matching prepared binder (SM100/103, SM107, SM120). This includes the
+and the matching prepared binder on qualified SM100/SM103 devices. SM107 and
+SM120 do not advertise this note pending hardware qualification. This includes the
 explicit D256 lookahead entry and eligible legacy entries, not swap-AB or all
 FROST plans. See [the graph contract](../../../../docs/utilities/python_graph_and_execution_backends.md#plan-specific-stats-stride-override-note).
 

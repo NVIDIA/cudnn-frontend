@@ -3785,7 +3785,8 @@ def supports_stats_stride_override(spec: EngineSpec, facts: "ga.SdpaGraphFacts",
         return False
     if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
         return False
-    if spec.capabilities.sm_lo not in (100, 107, 120):
+    # Public notes require hardware qualification, not only a shared binder.
+    if spec.capabilities.sm_lo != 100 or facts.device_cc not in ((10, 0), (10, 3)):
         return False
     stats = facts.stats_t
     if stats is None or stats.ragged_offset is None:

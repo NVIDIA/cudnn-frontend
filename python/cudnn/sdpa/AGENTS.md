@@ -628,6 +628,11 @@ production kernels gain no debug knob or timing-dependent assertion.
 - A new FROST capability that changes a class's plan (e.g. the SM100 packed split) makes that class's entries stale where
   the plan changed. Key the new regime from the row's own decision (`gqa_split`) and fit it; keep an older study's
   entries for the unchanged regime instead of refitting it over a narrower grid than that study measured.
+- When ownership moves to explicit implementation rows, look up their measured
+  entries before a legacy-name fallback. An inherited study must retain its
+  original pack/split classification even when the old engine no longer admits
+  that shape. `test_sdpa_fwd_d256_implementation_contract.py` checks both actual-name
+  verdicts and the paged packed-split classification with real pool strides.
 
 
 **Rule S13 — Register redistribution must converge at warpgroup scope.**

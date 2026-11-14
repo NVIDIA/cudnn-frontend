@@ -3487,6 +3487,16 @@ def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
     )
 
 
+def sm100_d256_policy_spec():
+    """Historical policy domain for D256 candidate generation and study keys.
+
+    This is never an offered engine. Delegation changes ownership, not the
+    pack/split decisions on which the existing placement studies were fitted.
+    """
+    legacy = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
 def _recommend_sm100_d256(kind, facts, offered):
     """Retain the existing candidate budget/order, naming each actual body.
 
@@ -3495,8 +3505,7 @@ def _recommend_sm100_d256(kind, facts, offered):
     implementation before being returned, and its split model consumes the
     same selected geometry.
     """
-    legacy = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
-    policy = replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+    policy = sm100_d256_policy_spec()
     if mismatch(policy.capabilities, facts) is not None:
         return []
     sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
@@ -3551,6 +3560,8 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     from .kernels.sm100.d256_f16_contract import in_pilot_domain
 
     if in_pilot_domain(facts):
+        # Only the explicit D256 implementations admit this domain. Keep the
+        # eligible-row contract test in sync before adding another owner here.
         return _recommend_sm100_d256(kind, facts, offered)
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):

@@ -45,29 +45,33 @@ from cudnn.frost.tile_dsl.constants import (
 # Compatibility re-exports: definitions have one owner in the lightweight modules.
 from cudnn.sdpa.fwd.config_common import (
     TemplateParams,
-    _PAGED_KV_FLAVORS,
-    _EPILOGUE_GATE_FLAVORS,
-    _SPLIT_KV_FLAVORS,
-    _CTA_MMA_FLAVORS,
-    _D512_2X2_TILE_M,
+    _PAGED_KV_FLAVORS as _PAGED_KV_FLAVORS,
+    _EPILOGUE_GATE_FLAVORS as _EPILOGUE_GATE_FLAVORS,
+    _SPLIT_KV_FLAVORS as _SPLIT_KV_FLAVORS,
+    _CTA_MMA_FLAVORS as _CTA_MMA_FLAVORS,
+    _D512_2X2_TILE_M as _D512_2X2_TILE_M,
     _validate_params,
     _mask_flags_from,
     bpe,
     o_pack_div,
-    o_row_bytes,
+    o_row_bytes as o_row_bytes,
     tile_k_hw,
     q_swz_bytes,
     v_swz_bytes,
     o_swz_bytes,
     rescale_threshold,
-    pack_gqa_group_size,
-    pack_gqa_supported,
+    pack_gqa_group_size as pack_gqa_group_size,
+    pack_gqa_supported as pack_gqa_supported,
     _pack_g,
-    _tma_iters_for,
+    _tma_iters_for as _tma_iters_for,
     TmaIters,
     _tma_iters,
 )
-from cudnn.sdpa.fwd.config_swap_ab import CfgD256Decode, _validate_cfg_d256_decode, make_cfg_d256_decode
+from cudnn.sdpa.fwd.config_swap_ab import (
+    CfgD256Decode,
+    _validate_cfg_d256_decode as _validate_cfg_d256_decode,
+    make_cfg_d256_decode as make_cfg_d256_decode,
+)
 
 # The arch-NEUTRAL half of the d128-file small-tile configuration (the field block, the TMEM map formula, the budgets and the
 # validators, each taking the arch BUDGET as a parameter) -- shared with config_sm107; this module adds the SM100 budget

@@ -107,6 +107,88 @@ def test_new_names_and_explicit_alternatives_do_not_inherit_generic_lead():
     assert placement.place(SPECS[LOOKAHEAD], f, lookahead) == placement.TRAIL
 
 
+@pytest.mark.parametrize("name,tile,cga", [(LOOKAHEAD, 128, 2), (SWAP_AB, 16, 1), (SWAP_AB, 32, 1)])
+@pytest.mark.parametrize("direction,expected", [("always", placement.LEAD), ("never", placement.TRAIL)])
+def test_explicit_implementation_study_precedes_legacy_mapping(monkeypatch, name, tile, cga, direction, expected):
+    from cudnn.sdpa import placement_table as pt
+
+    f = facts()
+    knobs = engines.SdpaFwdKnobs(tile_m=tile, cga=cga, pack_gqa=False)
+    monkeypatch.setitem(pt.TABLE, pt.class_key(name, f), pt.Entry(direction, None, "implementation-regression-control"))
+    # Opposite legacy verdict: both True and False on the actual name must win,
+    # even for a legal variant that the default policy would not choose.
+    monkeypatch.setitem(pt.TABLE, pt.class_key("sdpa_fwd_prefill_sm100", f), pt.Entry("never" if direction == "always" else "always", None, "legacy-control"))
+    assert placement.place(SPECS[name], f, knobs) == expected
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("sq", [1, 16, 128, 129, 512])
+def test_pilot_shortcut_covers_every_eligible_row(cc, sq):
+    offered = {s.name: i for i, s in enumerate(engines.ENGINE_SPECS)}
+    eligible = {s.name for _, s in heuristics._eligible(facts(device_cc=cc, s_q=sq), offered)}
+    assert eligible and eligible <= {LOOKAHEAD, SWAP_AB}
+
+
+def test_delegated_paged_split_retains_parent_study_and_placement():
+    from types import SimpleNamespace
+    from cudnn.sdpa import placement_table as pt
+
+    pool = SimpleNamespace(get_stride=lambda: (8192, 4096, 256, 1))
+    f = facts(
+        h_q=16,
+        h_kv=2,
+        s_q=128,
+        s_kv=2049,
+        bottom_right=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        max_total_seq_len_q=128,
+        k_t=pool,
+        v_t=pool,
+    )
+    assert pt.class_key("sdpa_fwd_prefill_sm100", f)[8] == "gqa_split"
+    assert pt.matched_entry("sdpa_fwd_prefill_sm100", f).study == "sm100_paged_d64_d256_prefill_20261111"
+    first = heuristics.recommend("A", f, OFFERED)[0]
+    spec = next(s for s in engines.ENGINE_SPECS if OFFERED.get(s.name) == first.engine_id)
+    assert first.knobs.pack_gqa and first.knobs.split_kv > 1
+    assert placement.place(spec, f, first.knobs) == placement.LEAD
+
+
+def test_retired_recipe_is_an_explicit_cache_miss_and_can_be_rebuilt():
+    import torch
+    import cudnn._plan_serdes as ps
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("exact D256 ownership transition is qualified on SM100/SM103")
+
+    def make_graph():
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        q, k, v = (g.tensor(dim=[1, 8, 16, 256], stride=[32768, 256, 2048, 1], name=n) for n in ("q", "k", "v"))
+        o, _ = g.sdpa(q=q, k=k, v=v, generate_stats=False, attn_scale=0.0625)
+        o.set_output(True).set_stride([32768, 256, 2048, 1])
+        return g
+
+    header = dict(
+        format=ps.FORMAT,
+        frontend_version="historical",
+        graph=ps._encode_graph(make_graph()),
+        plan=dict(engine_id=20511, engine_name="sdpa_fwd_prefill_sm100", knobs=[]),
+        kernels=[],
+    )
+    encoded = json.dumps(header).encode()
+    target = cudnn.pygraph()
+    with pytest.raises((ValueError, RuntimeError), match="20511|owned by|not supported|No execution plans"):
+        target.deserialize(ps.MAGIC + ps._LEN.pack(len(encoded)) + encoded)
+    assert not target._nodes and not target._planning_done
+    rebuilt = make_graph()
+    rebuilt.validate()
+    rebuilt.create_execution_plans([cudnn.heur_mode.A])
+    ids = {rebuilt.get_engine_and_knobs_at_index(i)[0] for i in range(rebuilt.get_execution_plan_count())}
+    assert 20511 not in ids and ids.intersection({20519, 20520})
+
+
 @pytest.mark.parametrize(
     "module", ["d256_f16_contract", "d256_f16_lookahead.contract", "d256_f16_lookahead.config", "d256_f16_swap_ab.contract", "d256_f16_swap_ab.config"]
 )

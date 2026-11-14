@@ -10,7 +10,7 @@ implementation's config. The legacy config_sm100 imports remain re-exports.
 
 from dataclasses import dataclass
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 from cudnn.frost.tile_dsl.constants import (
     DTYPE_BF16,
@@ -19,7 +19,6 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_FP16,
     DTYPE_O_MXFP8,
     DTYPE_O_NVFP4,
-    O_BLOCK_SCALE_BY_DTYPE,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,

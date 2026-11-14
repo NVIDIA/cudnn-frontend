@@ -150,7 +150,7 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
-def half_engine_names(arch="sm100"):
+def half_engine_names(arch="sm100") -> tuple[str, ...]:
     """Allowed half engines for feature tests that exercise default selection.
 
     Implementation/routing tests pin a single concrete name instead. This

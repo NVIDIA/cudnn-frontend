@@ -73,6 +73,8 @@ def explicit_geometry(implementation, knobs):
 
 def mismatch(implementation, facts, knobs):
     """The implementation-specific part of support, after common graph checks."""
+    if facts.device_cc not in ((10, 0), (10, 3)):
+        return f"requires SM100/SM103; current device is {facts.device_cc}"
     if not in_pilot_domain(facts):
         return "this implementation serves exact D_qk=D_v=256 half graphs on SM100/SM103"
     if facts.has_epilogue_gate or facts.attn_scale_prefolded:

@@ -317,12 +317,13 @@ def _run_graph(
                 for _ in range(2):
                     g.execute(vp, ws, handle=handle)
             capture_stream.synchronize()
-            torch.cuda.set_sync_debug_mode("error")
-            try:
-                with torch.cuda.graph(captured, stream=capture_stream):
+            with torch.cuda.graph(captured, stream=capture_stream):
+                previous_sync_mode = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
                     g.execute(vp, ws, handle=handle)
-            finally:
-                torch.cuda.set_sync_debug_mode("default")
+                finally:
+                    torch.cuda.set_sync_debug_mode(previous_sync_mode)
             v_c.mul_(0.5)
             o_gpu.fill_(float("nan"))
             if stats:

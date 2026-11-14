@@ -1000,9 +1000,9 @@ engine's plan is not a blob: it is a deterministic function of the graph and its
   format cannot represent exactly (a `score_mod` callback, a framework object)
   refuses serialization; nothing is dropped. Buffers bound at build time
   (`_data_bindings`) are not carried; pass them to `execute()`.
-- **the plan**: engine id, engine name (checked on load) and public knobs. Ids
-  and knob values are append-only, so the recipe stays valid on any frontend
-  that still ships the engine.
+- **the plan**: engine id, engine name (checked on load) and public knobs. The
+  current frontend must still admit the saved graph/configuration; retaining
+  an engine id does not promise unchanged eligibility across releases.
 - **the kernels** (`include_kernels=True`, the default): the compiled-cache
   entries the plan's build used (`compiled_cache.record_entries()` around
   `build_plan`), each with the environment manifest it was compiled under.
@@ -1017,6 +1017,15 @@ record's key. A refused or missing kernel compiles as usual;
 b2 h8 s1024 d128): build 3.1 s; deserialize into another process with an
 empty cache 33 ms, with imports already done (a backend plan takes 23-30 ms).
 3 kernels seeded, zero compiles, O bitwise equal.
+
+A retired graph/configuration is a recipe cache miss, not a request to substitute
+another implementation silently. Deserialization raises and restores the empty
+destination graph; discard the saved recipe and reconstruct the graph with
+heuristics. Namespace persisted recipes by the frontend build/version as well
+as the target environment. For example, exact SM100/SM103 half D256 recipes
+using engine 20511 must be regenerated for the explicit 20519/20520 engines.
+The blob's `frontend_version` is provenance, not an automatic fallback switch;
+the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 
 The kernels are native code: deserialize only blobs from a trusted source. The
 C++ `Graph::deserialize` does not read this format. Running a python-engine
@@ -1132,8 +1141,9 @@ head stride of packed HN Stats. It does not permit changing the packing, dtype,
 or storage capacity, or bypass the plan's ragged-offset and override bounds.
 
 The initial declaration covers admitted override-enabled FP16/BF16 THD plans
-with packed HN Stats through the prepared THD binder on SM100/103, SM107 and
-SM120. This includes the explicit D256 lookahead engine and eligible legacy
+with packed HN Stats through the prepared THD binder on qualified SM100/SM103
+devices. SM107/SM120 do not advertise this note pending hardware qualification.
+This includes the explicit D256 lookahead engine and eligible legacy
 half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
 quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
 not serve THD. Backend plans retain their existing notes and do not inherit this

@@ -1034,7 +1034,7 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None, changed
     for changed in (dict(cga=1), dict(split_kv=2)):
         assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
-    blackwell_caps = _caps("sdpa_fwd_prefill_sm100")
+    blackwell_caps = _caps("sdpa_fwd_sm100_d256_lookahead")
     for cc in ((10, 0), (10, 3)):
         blackwell = dataclasses.replace(facts, device_cc=cc)
         assert engines.mismatch(blackwell_caps, blackwell, knobs) is None

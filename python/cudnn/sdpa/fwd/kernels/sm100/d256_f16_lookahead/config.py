@@ -15,15 +15,10 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
-    DTYPE_O_MXFP8,
-    DTYPE_O_NVFP4,
-    O_BLOCK_SCALE_BY_DTYPE,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
     MASK_SWA,
-    SCHED_LPT,
-    SCHED_LPT_L2,
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_common import (

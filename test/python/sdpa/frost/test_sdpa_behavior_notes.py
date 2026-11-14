@@ -59,8 +59,7 @@ def _notes(name, facts, knobs=None):
         ("sdpa_fwd_sm100_d256_lookahead", 256, (10, 0)),
         ("sdpa_fwd_sm100_d256_lookahead", 256, (10, 3)),
         ("sdpa_fwd_prefill_sm100", 128, (10, 0)),
-        ("sdpa_fwd_prefill_sm107", 128, (10, 7)),
-        ("sdpa_fwd_prefill_sm120", 128, (12, 0)),
+        ("sdpa_fwd_prefill_sm100", 128, (10, 3)),
     ],
 )
 def test_eligible_new_and_legacy_half_plans_declare_note(name, d, cc, monkeypatch):
@@ -77,6 +76,14 @@ def test_eligible_new_and_legacy_half_plans_declare_note(name, d, cc, monkeypatc
 )
 def test_familiar_legacy_name_is_not_a_capability(changes):
     assert NOTE not in _notes("sdpa_fwd_prefill_sm100", _facts(**changes))
+
+
+@pytest.mark.parametrize("name,cc", [("sdpa_fwd_prefill_sm107", (10, 7)), ("sdpa_fwd_prefill_sm120", (12, 0))])
+def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    assert NOTE not in _notes(name, _facts(device_cc=cc))
 
 
 def test_new_swap_ab_does_not_inherit_lookahead_notes():

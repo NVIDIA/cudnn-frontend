@@ -99,7 +99,7 @@ import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
 from cudnn.sdpa.fwd.config_common import TemplateParams
-from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode
 
 # The per-graph params are injected as a module global by the loader

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 from cudnn.sdpa.fwd.config_common import TemplateParams
-from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.contract import TEMPLATE_NAME
+from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.contract import TEMPLATE_NAME as TEMPLATE_NAME
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.config import make_cfg_d256
 
 # The per-graph params are injected as a module global by the loader
