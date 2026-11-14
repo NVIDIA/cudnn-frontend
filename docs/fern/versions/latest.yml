@@ -237,6 +237,9 @@ navigation:
           - page: Fused RMSNorm + SiLU
             path: ../../operations/normalizations/rmsnorm_silu.md
             slug: rmsnorm_silu
+          - page: Add + RMSNorm + Quantize Decode Step (SM100-class)
+            path: ../../operations/normalizations/add_norm_quant_decode.md
+            slug: add_norm_quant_decode
       - section: Pointwise and Reduction
         path: ../../operations/Pointwise.md
         slug: operations/Pointwise
