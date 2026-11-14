@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,13 +21,16 @@ def _record_route(monkeypatch):
     from cudnn.sdpa.fwd import api_dsl
 
     seen = []
-    load = api_dsl._load_kernel_template
+    load = api_dsl.load_template
+    kernels = Path(api_dsl.__file__).parent / "kernels"
 
-    def record(filename, params, tag, part=None):
-        seen.append(filename)
-        return load(filename, params, tag, part=part)
+    def record(filename, *args, **kwargs):
+        # Explicit owners enter this common loader directly; the legacy
+        # flavor dispatcher is no longer on every graph's compile path.
+        seen.append(Path(filename).relative_to(kernels).as_posix())
+        return load(filename, *args, **kwargs)
 
-    monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
+    monkeypatch.setattr(api_dsl, "load_template", record)
     return seen
 
 
