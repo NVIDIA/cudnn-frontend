@@ -1144,6 +1144,8 @@ def _run_template_tail(D, D_v, *, mask, S=256):
         one.data_ptr(),
         amax_o.data_ptr(),
         None,
+        None,
+        None,
         cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     torch.cuda.synchronize()
