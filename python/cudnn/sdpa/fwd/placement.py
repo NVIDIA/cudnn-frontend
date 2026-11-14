@@ -483,6 +483,7 @@ longer cache (equal Q and KV extents and, with packed totals declared, equal tot
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import cudnn
 
@@ -679,6 +680,9 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d512_fp8_role_split.contract import NAME as D512_FP8_ROLE_SPLIT, LEGACY_ROW as FP8_LEGACY_ROW
     from .kernels.sm100.d256_fp8_single_q.contract import NAME as D256_FP8_SINGLE_Q
     from .kernels.sm100.d192_fp8_multi_q.contract import NAME as D192_FP8_MULTI_Q
+    from .kernels.sm100.d128_fp8_multi_q.contract import NAME as SMALL_FP8_MULTI_Q
+    from .kernels.sm100.d128_fp8_dual_kv.contract import NAME as SMALL_FP8_DUAL_KV
+    from .kernels.sm100.d128_fp8_swap_ab.contract import NAME as SMALL_FP8_SWAP_AB
 
     # Studies for an explicit implementation take precedence over inherited
     # placement, including a measured TRAIL and non-default legal variants.
@@ -712,6 +716,21 @@ def place(spec, facts, knobs=None) -> str:
 
     if spec.capabilities.implementation in (D512_FP8_ROLE_SPLIT, D256_FP8_SINGLE_Q, D192_FP8_MULTI_Q):
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
+
+    if spec.capabilities.implementation in (SMALL_FP8_MULTI_Q, SMALL_FP8_DUAL_KV, SMALL_FP8_SWAP_AB):
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm100_small_fp8_geometry
+        from .engines import effective_swap_abs
+
+        policy = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
+        legacy_knobs = replace(knobs, tile_m=128, swap_ab=None)
+        if spec.capabilities.implementation == SMALL_FP8_SWAP_AB and effective_swap_abs(policy.capabilities, facts, legacy_knobs):
+            legacy_knobs = replace(legacy_knobs, swap_ab=1)
+        selected = select_sm100_small_fp8_geometry(facts, legacy_knobs)
+        if selected.implementation != spec.capabilities.implementation:
+            return TRAIL
+        spec = policy
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
         # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);

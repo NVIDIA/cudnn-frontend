@@ -3588,18 +3588,10 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     from .kernels.sm100.d128_fp8_multi_q.contract import Geometry as MultiQ
     from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
     from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .kernels.sm100.small_fp8_contract import in_domain
 
     shape = (facts.d_qk, facts.d_v)
-    if (
-        facts.device_cc not in ((10, 0), (10, 3))
-        or shape not in ((64, 64), (128, 128))
-        or not facts.is_fp8
-        or facts.is_mxfp8
-        or not facts.uniform_dtype
-        or facts.invalid
-        or facts.is_backward
-        or facts.dtype not in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
-    ):
+    if not in_domain(facts):
         raise ValueError("small-head FP8 selection requires exact SM100/SM103 D64 or D128 per-tensor inputs")
     cga = knobs.cga if knobs.cga is not None else 1 if facts.d_qk == 64 else 2
     group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
@@ -3715,6 +3707,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_d192_fp8_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D192Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.small_fp8_contract import in_domain as in_small_fp8_domain
+
+    if in_small_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_fp8_geometry, policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

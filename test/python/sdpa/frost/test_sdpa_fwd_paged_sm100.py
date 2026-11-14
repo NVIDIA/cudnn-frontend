@@ -1543,6 +1543,7 @@ def _run_graph_fp8(
     amax=True,
     stats_log2=False,
     explicit_swap_ab=None,
+    record=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1636,7 +1637,10 @@ def _run_graph_fp8(
         amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        g.create_execution_plan(*record)
     if pin:
         select_engine(g, target_engine)
     if want_split is not None:

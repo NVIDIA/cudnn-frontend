@@ -3,7 +3,7 @@
 
 """Host contracts for the independent small-head per-tensor FP8 records."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import importlib
 from pathlib import Path
 import subprocess
@@ -13,7 +13,7 @@ import pytest
 
 import cudnn
 from cudnn.sdpa.fwd import config_sm100 as legacy
-from cudnn.sdpa.fwd import engines, heuristics
+from cudnn.sdpa.fwd import engines, heuristics, placement
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
@@ -159,3 +159,75 @@ def test_cold_host_import_does_not_import_registry(variant):
         )
     )
     subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
+
+
+SPECS = {spec.name: spec for spec in engines.ENGINE_SPECS}
+PREFIX = "sdpa_fwd_sm100_d128_fp8_"
+OFFERED = {PREFIX + variant: engine for variant, engine in (("multi_q", 20527), ("dual_kv", 20528), ("swap_ab", 20529))}
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("d", [64, 128])
+def test_exact_domain_moves_to_explicit_owners(cc, d):
+    facts = _facts(device_cc=cc, d_qk=d, d_v=d)
+    assert "owned by" in engines.mismatch(SPECS["sdpa_fwd_prefill_sm100_fp8"].capabilities, facts)
+    for kind in ("A", "FALLBACK"):
+        plans = heuristics.recommend(kind, facts, OFFERED)
+        assert plans
+        for plan in plans:
+            assert engines.SdpaFwdKnobs.from_public(plan.knobs.to_public()) == plan.knobs
+            assert plan.knobs.swap_ab is None
+
+
+@pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
+@pytest.mark.parametrize("changes", [{"device_cc": (10, 7)}, {"d_qk": 112, "d_v": 112}, {"is_mxfp8": True}, {"is_fp8": False}])
+def test_other_implementations_remain_outside_owner(variant, changes):
+    assert engines.mismatch(SPECS[PREFIX + variant].capabilities, _facts(**changes)) is not None
+
+
+@pytest.mark.parametrize("variant", ["multi_q", "dual_kv"])
+@pytest.mark.parametrize("sq", [1, 129, 257])
+def test_prefill_body_eligibility_is_not_a_query_length_policy(variant, sq):
+    facts = _facts(s_q=sq)
+    knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1, sched_policy=0)
+    assert engines.mismatch(SPECS[PREFIX + variant].capabilities, facts, knobs) is None
+    assert engines.mismatch(SPECS[PREFIX + variant].capabilities, facts, replace(knobs, swap_ab=1)) is not None
+
+
+@pytest.mark.parametrize(
+    "changes,pack",
+    [
+        ({"s_q": 9}, False),
+        ({"s_q": 3}, True),
+        ({"b": 65536}, False),
+        ({"thd": True}, False),
+        ({"device_cc": (10, 3), "has_paged_kv": True}, False),
+        ({"d_qk": 64, "d_v": 64}, False),
+        ({"d_qk": 64, "d_v": 64, "has_paged_kv": True, "s_q": 9}, True),
+        ({"attn_scale_prefolded": True}, False),
+        ({"o_block_scale": 32}, False),
+    ],
+)
+def test_swap_ab_declines_outside_qualified_geometry(changes, pack):
+    knobs = engines.SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, pack_gqa=pack, split_kv=1, sched_policy=0)
+    assert engines.mismatch(SPECS[PREFIX + "swap_ab"].capabilities, _facts(**changes), knobs) is not None
+
+
+@pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
+@pytest.mark.parametrize("verdict", [False, True])
+def test_own_study_precedes_inherited_placement(monkeypatch, variant, verdict):
+    from cudnn.sdpa import placement_table
+
+    name = PREFIX + variant
+    monkeypatch.setattr(placement_table, "lookup", lambda row, facts: verdict if row == name else not verdict)
+    assert placement.place(SPECS[name], _facts()) == (placement.LEAD if verdict else placement.TRAIL)
+
+
+def test_manual_alternate_has_no_inherited_lead_claim(monkeypatch):
+    from cudnn.sdpa import placement_table
+
+    monkeypatch.setattr(placement_table, "lookup", lambda row, facts: None if row in OFFERED else True)
+    monkeypatch.setattr(legacy, "FP8_DUAL_KV_STREAM_ROUTED", True)
+    knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=True, split_kv=1, sched_policy=0)
+    assert placement.place(SPECS[PREFIX + "multi_q"], _facts(), knobs) == placement.TRAIL
+    assert placement.place(SPECS[PREFIX + "dual_kv"], _facts(), knobs) == placement.LEAD

@@ -5,6 +5,8 @@
 
 from dataclasses import dataclass, replace
 
+from ..small_fp8_contract import in_domain
+
 NAME = "sdpa_fwd_sm100_d128_fp8_multi_q"
 TEMPLATE_NAME = "prefill_d128_fp8"
 KERNEL_FILE = "sm100/d128_fp8_multi_q/kernel.py"
@@ -44,3 +46,15 @@ class Geometry:
 
     def configure_params(self, params):
         return replace(params, d_flavor=self.d_flavor, cta_mma=self.cga, dual_kv_stream=False, decode_q_tile=0)
+
+
+def mismatch(facts, knobs):
+    if not in_domain(facts):
+        return "requires exact D64/D128 per-tensor FP8 on SM100/SM103"
+    if knobs is not None:
+        widths = (None, 1) if facts.d_qk == 64 else (None, 1, 2)
+        if knobs.cga not in widths:
+            return "multi-Q requires one CTA for D64, or one/two CTAs for D128"
+        if knobs.tile_m not in (None, 128):
+            return "multi-Q requires TILE_M=128"
+    return None

@@ -5,6 +5,8 @@
 
 from dataclasses import dataclass, replace
 
+from ..small_fp8_contract import in_domain
+
 NAME = "sdpa_fwd_sm100_d128_fp8_dual_kv"
 TEMPLATE_NAME = "prefill_d128_fp8"
 KERNEL_FILE = "sm100/d128_fp8_dual_kv/kernel.py"
@@ -37,3 +39,16 @@ class Geometry:
 
     def configure_params(self, params):
         return replace(params, d_flavor=128, cta_mma=1, dual_kv_stream=True, decode_q_tile=0)
+
+
+def mismatch(facts, knobs):
+    if not in_domain(facts) or facts.d_qk != 128:
+        return "dual-KV requires exact D128 per-tensor FP8 on SM100/SM103"
+    if facts.thd:
+        return "dual-KV requires dense queries"
+    if knobs is not None:
+        if knobs.cga not in (None, 1):
+            return "dual-KV requires TILE_CGA_M=1"
+        if knobs.tile_m not in (None, 128):
+            return "dual-KV requires TILE_M=128"
+    return None

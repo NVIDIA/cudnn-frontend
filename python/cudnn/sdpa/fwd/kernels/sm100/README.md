@@ -1,7 +1,7 @@
 # SM100 forward implementations
 
 Each migrated main implementation has a local owner directory. Half D256,
-exact half D512/D576 and per-tensor FP8 D192/D256/D512 graph plans use explicit engines;
+exact half D512/D576 and per-tensor FP8 D64/D128/D192/D256/D512 graph plans use explicit engines;
 other SM100 implementations remain at their existing paths.
 
 ```text
@@ -32,6 +32,25 @@ sm100/
     host.py
     __init__.py
   d512_f16_contract.py  # immutable selection; full cluster vs fixed MMA pair
+  d128_fp8_multi_q/     # D64/D128 per-tensor FP8, one/two CTA variants
+    contract.py
+    config.py
+    kernel.py
+    host.py
+    __init__.py
+  d128_fp8_dual_kv/     # D128 per-tensor FP8, one CTA with dual K/V streams
+    contract.py
+    config.py
+    kernel.py
+    host.py
+    __init__.py
+  d128_fp8_swap_ab/     # D64/D128 per-tensor FP8, 16 physical / 8 live columns
+    contract.py
+    config.py
+    kernel.py
+    host.py
+    __init__.py
+  small_fp8_contract.py # shared exact-D64/D128 graph domain only
   d192_fp8_multi_q/    # per-tensor FP8 D192/V128, one/two CTA variants
     contract.py
     config.py
@@ -56,6 +75,16 @@ The graph parser, variant-pack binder, compilation cache and launch lifecycle
 remain shared. Performance selection belongs to `fwd/heuristics.py`; a selected
 engine cannot silently switch to another main pipeline. Importing an owner's
 contract/config does not load a kernel body or the tensor/DSL runtimes.
+
+The small-head FP8 owners have independent configuration records. Multi-Q
+and dual-KV keep separate copies of their main pipeline while sharing pure
+layout helpers. The legacy small-head files remain for dense envelopes and
+the existing SM107 shared swap-AB consumer. The common immutable decode
+parameter record lives in `fwd/config_fp8_decode_common.py`; it does not
+select an implementation. Only central heuristics applies the old short-Q
+crossover. Explicit records can name either admitted prefill body directly.
+Swap-AB exposes its real query tile and NATURAL scheduler; the old ignored
+scheduler variants collapse to the same public recipe.
 
 This is implementation isolation, not duplication of shared utilities.
 `fwd/config_common.py` owns common value types and layout arithmetic;
