@@ -12,6 +12,7 @@ import argparse
 import cProfile
 import hashlib
 import json
+import math
 import pstats
 import statistics
 import time
@@ -19,7 +20,18 @@ from pathlib import Path
 
 import torch
 import cudnn
-from cudnn.linear_attention.ops.kda import bprop_cache, kda_bwd, kimi_delta_attention
+from cudnn.linear_attention.ops.kda import bprop_cache, fprop_cache, kda_bwd, kimi_delta_attention
+
+RAGGED_SUITE = (
+    ("balanced_8x4k", [4096] * 8),
+    ("two_tier_32k", [8192, 8192, 4096, 4096, 2048, 2048, 2048, 2048]),
+    ("skewed_4x_32k", [16384, 4096, 4096, 2048, 2048, 1024, 1024, 2048]),
+    ("skewed_7x_32k", [28672, 2048, 1024, 512, 256, 128, 64, 64]),
+    ("empty_padded_32k", [32768, 0, 0, 0, 0, 0, 0, 0]),
+    ("skewed_7x_8k", [7168, 512, 256, 64, 32, 16, 16, 128]),
+    ("skewed_7x_64k", [57344, 4096, 2048, 1024, 512, 256, 128, 128]),
+    ("many_short_32k", [24576, *([1024] * 4), *([512] * 4), *([256] * 8)]),
+)
 
 
 def measure(call, repeats, rounds):
@@ -36,7 +48,11 @@ def measure(call, repeats, rounds):
         end.record()
         end.synchronize()
         samples.append({"host_us": host_us, "event_us": begin.elapsed_time(end) * 1000 / repeats})
-    return {key: statistics.median(x[key] for x in samples) for key in samples[0]} | {"samples": samples}
+    measured = {key: statistics.median(x[key] for x in samples) for key in samples[0]} | {"samples": samples}
+    for key in ("host_us", "event_us"):
+        if not math.isfinite(measured[key]) or measured[key] <= 0:
+            raise ValueError(f"invalid {key} median: {measured[key]}")
+    return measured
 
 
 def graph_measure(call, repeats, rounds):
@@ -64,11 +80,18 @@ def graph_measure(call, repeats, rounds):
         graph.reset()
 
 
-def run_case(args, batch, tokens, heads, checkpoint):
-    """Construct one stable pretraining shape and measure both public paths."""
+def run_case(args, case_name, seq_lengths, heads, checkpoint):
+    """Construct one stable packed pretraining shape and measure both public paths."""
+    # Different cu_seqlens with the same declared tensors share a production
+    # graph-cache key.  Isolate benchmark cases so plan introspection below
+    # cannot accidentally report the previously inserted shape-equivalent plan.
+    fprop_cache.clear()
+    bprop_cache.clear()
     generator = torch.Generator().manual_seed(1234)
     dtype = getattr(torch, args.dtype)
-    shape = (batch * tokens, heads, args.dim)
+    batch = len(seq_lengths)
+    total_tokens = sum(seq_lengths)
+    shape = (total_tokens, heads, args.dim)
 
     def rand(shape, dtype):
         """Draw reproducible CPU inputs, then upload outside the timed region."""
@@ -78,9 +101,15 @@ def run_case(args, batch, tokens, heads, checkpoint):
     inputs += [rand(shape, torch.float32) - 4, rand(shape[:2], torch.float32)]
     inputs = tuple(t.detach().requires_grad_(True) for t in inputs)
     q, k, v, g, beta = inputs
-    cu = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * tokens
+    cu = torch.tensor([0, *torch.tensor(seq_lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
     do = rand(shape, dtype)
-    opts = dict(use_qk_l2norm_in_kernel=True, use_beta_sigmoid_in_kernel=True, safe_gate=True, plan_name="kda_frost")
+    opts = dict(
+        use_qk_l2norm_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        batch_invariant=args.batch_invariant,
+        plan_name="kda_frost",
+    )
 
     def forward():
         """Run public KDA forward, retaining the requested state checkpoints."""
@@ -104,12 +133,27 @@ def run_case(args, batch, tokens, heads, checkpoint):
         backward()
     torch.cuda.synchronize()
     assert all(torch.isfinite(t).all() for t in before)
-    row = {"batch": batch, "tokens": tokens, "heads": heads, "dim": args.dim, "checkpoint": checkpoint}
+    row = {
+        "case": case_name,
+        "batch": batch,
+        "seq_lengths": seq_lengths,
+        "total_tokens": total_tokens,
+        "max_over_mean": max(seq_lengths, default=0) / max(total_tokens / batch, 1),
+        "heads": heads,
+        "dim": args.dim,
+        "checkpoint": checkpoint,
+    }
     row["fingerprints"] = [hashlib.sha256(t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest() for t in before]
-    graph, _ = next(reversed(bprop_cache.values()))
-    plan = graph._compiled_plans[graph._plan_index].compiled
-    row["schedule"] = "chain" if plan.chain else "uncut"
-    row["workspace_bytes"] = graph.get_workspace_size()
+    fwd_graph, _ = next(reversed(fprop_cache.values()))
+    bwd_graph, _ = next(reversed(bprop_cache.values()))
+    fwd_plan = fwd_graph._compiled_plans[fwd_graph._plan_index].compiled
+    bwd_plan = bwd_graph._compiled_plans[bwd_graph._plan_index].compiled
+    row["forward_schedule"] = "chain" if fwd_plan.chain else "uncut"
+    row["backward_schedule"] = "chain" if bwd_plan.chain else "uncut"
+    row["forward_pieces"] = int(fwd_plan.pieces)
+    row["backward_pieces"] = int(bwd_plan.pieces)
+    row["forward_workspace_bytes"] = fwd_graph.get_workspace_size()
+    row["backward_workspace_bytes"] = bwd_graph.get_workspace_size()
     row["eager_e2e"] = measure(e2e, args.repeats, args.rounds)
     row["graph_e2e"] = graph_measure(e2e, args.repeats, args.rounds)
     row["graph_bwd"] = graph_measure(backward, args.repeats, args.rounds)
@@ -132,7 +176,7 @@ def run_case(args, batch, tokens, heads, checkpoint):
         row["bwd_kernels"] = [
             {"name": event.name, "us": event.device_time_total} for event in profiler.events() if event.device_type == torch.autograd.DeviceType.CUDA
         ]
-    print(json.dumps(row), flush=True)
+    print(json.dumps(row, allow_nan=False), flush=True)
     return row
 
 
@@ -141,6 +185,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", nargs="+", type=int, default=[1])
     parser.add_argument("--tokens", nargs="+", type=int, default=[2048])
+    parser.add_argument(
+        "--seq-lengths",
+        action="append",
+        default=[],
+        metavar="L0,L1,...",
+        help="Packed sequence lengths for one case. Repeat for a case matrix; zero-length sequences are allowed.",
+    )
+    parser.add_argument("--ragged-suite", action="store_true", help="Run the built-in balanced, skewed, empty-padded, and many-short controls.")
     parser.add_argument("--heads", nargs="+", type=int, default=[32])
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--checkpoint", nargs="+", type=int, default=[16])
@@ -149,8 +201,40 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--cpu-profile", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--batch-invariant", action="store_true", help="Use the fixed per-sequence length rule for piece scheduling.")
+    parser.add_argument(
+        "--force-pieces",
+        type=int,
+        choices=range(17),
+        help="Benchmark-only scheduler override: 0 is uncut, 1..16 force that piece capacity, omitted keeps auto.",
+    )
     parser.add_argument("--json", type=Path, required=True)
     args = parser.parse_args()
+    seq_length_cases = list(RAGGED_SUITE) if args.ragged_suite else []
+    for index, spec in enumerate(args.seq_lengths):
+        lengths = [int(value) for value in spec.split(",")]
+        if not lengths or any(length < 0 for length in lengths) or sum(lengths) == 0:
+            raise ValueError("--seq-lengths needs non-negative lengths with at least one token")
+        seq_length_cases.append((f"cli_{index}", lengths))
+    if not seq_length_cases:
+        seq_length_cases = [(f"uniform_b{batch}_t{tokens}", [tokens] * batch) for batch in args.batch for tokens in args.tokens]
+
+    if args.force_pieces is not None:
+        from cudnn.linear_attention.frost.common import piece_chain
+
+        auto_choose_pieces = piece_chain.choose_pieces
+
+        def choose_pieces_override(**kwargs):
+            _, unit_chunks = auto_choose_pieces(**kwargs)
+            return args.force_pieces, unit_chunks
+
+        def choose_kda_pieces_override(**kwargs):
+            kwargs.pop("enable_ragged_fallback")
+            _, unit_chunks = auto_choose_pieces(**kwargs)
+            return args.force_pieces, unit_chunks, bool(args.force_pieces and args.batch_invariant)
+
+        piece_chain.choose_pieces = choose_pieces_override
+        piece_chain.choose_kda_pieces = choose_kda_pieces_override
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_stream(stream)
@@ -173,12 +257,11 @@ def main():
         "args": vars(args) | {"json": str(args.json)},
         "cases": [],
     }
-    for batch in args.batch:
-        for tokens in args.tokens:
-            for heads in args.heads:
-                for checkpoint in args.checkpoint:
-                    report["cases"].append(run_case(args, batch, tokens, heads, checkpoint))
-    args.json.write_text(json.dumps(report, indent=2))
+    for case_name, seq_lengths in seq_length_cases:
+        for heads in args.heads:
+            for checkpoint in args.checkpoint:
+                report["cases"].append(run_case(args, case_name, seq_lengths, heads, checkpoint))
+    args.json.write_text(json.dumps(report, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

@@ -111,6 +111,34 @@ Every variant, except Mamba-2, applies the q/k L2 normalization; pass `--no_qk_l
 
 The decay gates are all ones (alpha = 1, log gate 0) for every variant and backend, so the measured schedule does not depend on the input draw; kda and gdn2 feed the raw safe-gate logit of that gate, whose in-kernel `lower_bound * sigmoid` transform reproduces alpha = 1 exactly in fp32. The write strengths (beta, and w for GDN-2) stay random.  Mamba-2 feeds a raw dt of -30 (A = -1, zero dt_bias): softplus makes dt vanish, so its decay exp(A dt) is 1 in fp32 as well.
 
+### SM100 packed-ragged KDA schedule
+
+`benchmark_kda_e2e.py --ragged-suite` exercises packed batches whose declared
+`B * H` tile count can hide a long-sequence tail. On compute capability 10.0,
+the automatic KDA selector may reuse the existing device-side length-rule
+piece table when the ordinary selector would otherwise leave the batch uncut.
+Sequences of at most 8192 tokens remain one piece; longer sequences use at
+most four pieces. Other architectures preserve the previous selector.
+
+The schedule changes plan selection only. It does not change the public KDA
+API, arithmetic, checkpoint format, or the `batch_invariant=True` contract.
+The piece table reads the actual `cu_seqlens` on the device, so runtime lengths
+do not enter the compile key and no device-to-host read is required.
+
+```bash
+python benchmark_kda_e2e.py \
+  --ragged-suite --heads 32 --checkpoint 0 \
+  --json /tmp/kda_ragged.json
+
+# Diagnostic controls: keep the same inputs and force uncut or four pieces.
+python benchmark_kda_e2e.py \
+  --ragged-suite --heads 32 --checkpoint 0 --force-pieces 0 \
+  --json /tmp/kda_ragged_uncut.json
+python benchmark_kda_e2e.py \
+  --ragged-suite --heads 32 --checkpoint 0 --force-pieces 4 \
+  --json /tmp/kda_ragged_four_pieces.json
+```
+
 ## Supported Backends
 
 | Backend | Description |
