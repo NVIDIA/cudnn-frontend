@@ -168,22 +168,25 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
+    sm100_envelopes = caps[engines.engine_name(arch="sm100", fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
     # Arch ranges tile the SM100 family at the Rubin boundary, no overlap.
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
-    assert sm100.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
+    assert sm100.d_shapes == frozenset({(64, 64), (128, 128)})
+    assert sm100_envelopes.d_shapes == sm107.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert dict(sm107.cgas_by_d_shape)[(64, 64)] == frozenset({1, 2})
     assert (64, 64) in sm107.split_d_shapes and (64, 64) in sm107.pack_gqa_d_shapes
     assert (64, 64) not in sm107.thd_d_shapes
     # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
-    assert dict(sm107.d_envelope_floors) == dict(sm100.d_envelope_floors)
-    # Both rows keep the D512 role-split floor; smaller flavors serve their
-    # qualified aligned dense envelopes through bounded TMA descriptors.
-    assert sm100.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    assert dict(sm107.d_envelope_floors) == dict(sm100_envelopes.d_envelope_floors)
+    # The legacy SM100 envelope row and Rubin retain the D512 floor. The
+    # explicit small-head owner only accepts its exact D64/D128 shapes.
+    assert sm100_envelopes.d_envelope_floors == sm107.d_envelope_floors == (((512, 512), 256),)
+    assert sm100.d_envelope_floors == ()
 
     # The f16x2 exponent arm is Rubin-row data, not a notch.
     assert sm100.softmax_precisions == frozenset({_c.data_type.FLOAT})
