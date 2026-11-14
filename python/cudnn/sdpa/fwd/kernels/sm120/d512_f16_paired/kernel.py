@@ -1983,8 +1983,7 @@ class SM120FusedMultiHeadAttentionForward:
                 )
                 _uid = self._next_dense_unit(_uid)
 
-    # nsys / profiler name: the owning engine (a symbol, not a program change).
-    kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
     @cute.jit
     def __call__(
@@ -2265,6 +2264,10 @@ class SM120FusedMultiHeadAttentionForward:
             stream=stream,
             min_blocks_per_mp=1,
         )
+
+
+# Profilers and nsys report the owning engine's name; a symbol change, not a program change.
+SM120FusedMultiHeadAttentionForward.kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 @lru_cache(maxsize=None)
