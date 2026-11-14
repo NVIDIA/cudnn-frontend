@@ -32,7 +32,9 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401
 from dataclasses import dataclass
 
 from cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q.config import TemplateParams, make_cfg_d256
-from cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q.contract import TEMPLATE_NAME
+from cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 # The template loader injects the graph's FP8 parameters before executing this
 # module. The default record only keeps import-time tooling well-defined; it is
