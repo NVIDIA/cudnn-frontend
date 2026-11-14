@@ -6,7 +6,6 @@
 import pytest
 import torch
 
-import cudnn
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 import test_sdpa_prepared_fp8 as shared
 
