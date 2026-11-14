@@ -1513,3 +1513,9 @@ An origin operand can land independently on SM100 and SM107; borrowing the
 other architecture's parameter list hides missing slots or rejects a valid
 new slot. `test_two_by_two_host_slots_match_role_split` pins each pair and
 checks the native SM107 origin operand explicitly.
+
+When a graph-ranking test helper catches an unsupported-graph exception, its
+fallback must match each caller's verdict shape. A three-field caller cannot
+unpack the helper's two-field rejection: it masks the actual graph diagnostic.
+Let that caller propagate the original exception, and exercise the rejection
+path as well as the normal callback (the SM90 D128 packed-plan test is an example).

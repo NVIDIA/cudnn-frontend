@@ -40,13 +40,25 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm90 import (
     BAND_COORDINATE_LIMIT as _SM90_BAND_COORDINATE_LIMIT,
+    D128_FLAVOR as _SM90_D128_FLAVOR,
+    D128_CLAIM_NATURAL as _SM90_D128_CLAIM_NATURAL,
+    D128_CLAIM_OFF as _SM90_D128_CLAIM_OFF,
+    D128_CLAIM_WORKSPACE_BYTES as _SM90_D128_CLAIM_WORKSPACE_BYTES,
+    D128_ROUTE_MAX_L as _D128_ROUTE_MAX_L,
+    D512_FLAVOR as _SM90_D512_FLAVOR,
+    FLAVORS as _SM90_FLAVORS,
+    FLAVOR_TILES as _SM90_FLAVOR_TILES,
     SCALE_NEGATIVE as _SM90_SCALE_NEGATIVE,
     SCALE_POSITIVE as _SM90_SCALE_POSITIVE,
     SCALE_ZERO as _SM90_SCALE_ZERO,
     TILE_M as _SM90_TILE_M,
-    TILE_N as _SM90_TILE_N,
     TemplateParams as Sm90TemplateParams,
+    d128_causal_kv_tiles as _sm90_d128_causal_kv_tiles,
+    d128_causal_route as _sm90_d128_causal_route,
+    declared_features as _sm90_declared_features,
+    d128_decline as _sm90_d128_decline,
     head_dims_mismatch as _sm90_head_dims_mismatch,
+    pick_flavor as _sm90_pick_flavor,
     validate_params as _sm90_validate_params,
 )
 from cudnn.sdpa.fwd.config_sm107 import supports_native_small_half_dense_paged
@@ -239,6 +251,93 @@ _SM100_KERNEL_FILES = {
 _SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
 _SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
 D512_2X2: bool = True
+# The SM90 D128 template's overlap switch (config_sm90.TemplateParams.intra_wg_overlap). A CALL-TIME module
+# constant that SdpaFwdDslSm90.check_support writes into a D128 plan's record (the D512_2X2 precedent above: a module
+# constant, not configuration, never per plan); a D512 plan never carries it. Either value computes the same function
+# bit for bit, up to the sign of a zero O element (test_sdpa_fwd_d128_sm90.py::test_d128_variant_is_bitwise_v1), so
+# this is a speed choice. Measured on an H200 SXM (bf16, b2 32/8 and 32/32 heads at s 2k-16k, b8 16/4 at s 1k, dense
+# and causal; 7 interleaved rounds, after the per-row FP64 check left the narrow path): overlap ran 1.07-1.28x the v1
+# loop (geometric mean 1.20x over 12 shapes) and 0.91-1.12x cuDNN 9.27 in the same rounds; Nsight Compute at s16384
+# dense, base clock: 14.6 ms against 18.6 ms (v1) and 15.6 ms (cuDNN), tensor pipe 82.9% against 65.0% and 77.6%.
+# A ping-pong turn between the two compute warpgroups measured 1.11x alone and no further gain on top of overlap, so the
+# kernel has none: each warpgroup issues its own WGMMA groups and the hardware interleaves them.
+D128_INTRA_WG_OVERLAP: bool = True
+# The SM90 D128 template's persistent-loop switch (config_sm90.TemplateParams.persistent). A CALL-TIME module constant
+# like D128_INTRA_WG_OVERLAP above, written into a D128 plan's record by check_support; a D512 plan never carries it.
+# Persistence rides the overlap loop (validate_params), so a plan is persistent only while D128_INTRA_WG_OVERLAP is on
+# as well. A non-causal plan's items all walk the same KV tiles, so a stride by the grid balances them; a causal plan's
+# items differ in length, and the end of this comment says when a causal plan is persistent. The loop keeps a zero
+# workspace. Either value computes the same O and Stats bit for bit
+# (test_sdpa_fwd_d128_sm90.py::test_d128_persistent_is_bitwise_ov), so this is a speed choice. Measured on one H100 SXM
+# (132 SMs) on 2026-10-20 against the one-tile-per-CTA overlap kernel and cuDNN 9.27 (bf16, 22 non-causal shapes, 9
+# interleaved rounds, 15 on the six s512 and s1024 shapes the default was chosen on, the decision shapes; CuTe DSL 4.8.0
+# and its ptxas 13.4, torch 2.14 on CUDA 13.0; every ratio a median of per-round ratios): persistence ran 1.006-1.305x
+# the one-tile kernel (geometric mean 1.112x; 1.225x over the decision shapes) and 1.021-1.144x cuDNN in the same rounds
+# (geometric mean 1.085x), where the one-tile kernel ran 0.821-1.140x cuDNN. Per shape set, over every measured shape
+# in it, against the one-tile kernel and cuDNN: b1-16 at 16 or 32 query heads, s512-8k, 1.006-1.231x and 1.021-1.144x;
+# b33 and b66, s512-8k, 1.010-1.305x and 1.064-1.111x; s1024 at b1-33, 1.006-1.204x and 1.072-1.111x; b2 at 32 query
+# heads, s4k-16k, 1.007-1.042x and 1.081-1.144x. The A/A band (the worst per-round gap between a timed kernel and its
+# twin: an independently compiled copy of it, or for cuDNN the same call timed twice per round) has a median of 0.13
+# over these shapes (0.02-0.24) against the one-tile kernel and 0.14 (0.02-0.31) against cuDNN. No shape ran below 1x
+# against either; 10 shapes, the six decision shapes among them, ran above 1 plus their band against the one-tile
+# kernel, and 3 against cuDNN. The weakest against the one-tile kernel, b1 h16/4 s1024 at 1.006x (host-bound, 0.025 ms
+# a call), has a band of 0.10. A causal plan is persistent only as D128_PERSISTENT_CAUSAL_WALK below says, because of an
+# earlier measurement (this one timed non-causal shapes only): the same day, on another H100 SXM, a development copy of
+# this loop, which this loop matched within the copy's band on the six decision shapes, ran three long causal shapes at
+# 0.889-0.922x the one-tile kernel with a stride by the grid (b4 h8/8 s8192, b1 h16/4 s8192, b2 h32/32 s4096; only the
+# first by more than its band). At that constant's default, 2, a causal plan runs the paired walk or the stride in
+# NATURAL order that the plan-time rule picks, unless D128_CAUSAL_WALK_ROUTE sends it one tile per CTA.
+D128_PERSISTENT: bool = True
+# Causal D128 plans on the persistent loop (config_sm90.TemplateParams.causal_walk). A CALL-TIME module constant like
+# D128_PERSISTENT above, read by check_support (_sm90_d128_persistence) for causal D128 plans only, and only while
+# D128_INTRA_WG_OVERLAP and D128_PERSISTENT are on: 0 keeps a causal plan one tile per CTA, 1 runs it on the persistent
+# loop with the stride by the grid (causal_walk 0), 2 on the paired walk (causal_walk 1). An int, not a bool, so that
+# either walk can be selected. Every value computes the one-tile kernel's O and Stats bit for bit
+# (test_sdpa_fwd_d128_sm90.py: test_d128_persistent_is_bitwise_ov runs the stride on causal cases,
+# test_d128_paired_walk_is_bitwise_ov the paired walk at each of its branches), so this is a speed choice. 2: a causal
+# record's plan-time rule (the template's causal_walk_plan) runs the paired walk, or the stride by the grid below
+# CAUSAL_WALK_MIN_TILES Q tiles per group on a plan of at most CAUSAL_WALK_CUT_MAX_QH Q heads per KV head and wherever
+# the stride balances better, and check_support gives such a record the NATURAL order unless the caller pins one, so the
+# stride runs a group's Q tiles in one round on neighbouring CTAs, with the deal causal_stride_snake picks. On H100 SXM
+# GPUs (#1159's harness, bf16, O and Stats, CUPTI kernel time, ratios medians of per-round ratios against cuDNN 9.27):
+# Nsight Compute (2026-11-06) found the LPT_L2 stride the previous rule ran reading K and V from HBM 1.26 to 2.16 times
+# the read-once floor on causal MHA plans with short S_q, where cuDNN read them once and the NATURAL stride 1.00 to 1.03
+# times. Timed on 88 causal shapes (the walk, the NATURAL stride under each deal and the one-tile kernel; 69 of them
+# fresh shapes of named head layouts frozen before the run), this rule's choices ran at least 0.99 of cuDNN on 85, the
+# previous rule's on 71; the rule was chosen on those shapes. A second run on 56 fresh shapes frozen before it: at
+# least 0.99 of cuDNN on 53, and slower than the previous rule beyond the band on six, which the cut's head limit
+# (CAUSAL_WALK_CUT_MAX_QH) and the route's L cutoff (_D128_ROUTE_MAX_L) now send back to the record that ran faster
+# there. Those two limits were chosen on the second run's timings.
+D128_PERSISTENT_CAUSAL_WALK: int = 2
+# A causal D128 plan of the walk's rule goes one tile per CTA (_sm90_d128_causal_route), in the causal order
+# check_support gives the one-tile record, where it has at most one item per CTA (both kernels run one item per CTA
+# there) or where L, its mean KV tiles per Q tile, is at least _D128_ROUTE_MAX_L, whatever the rule would run. A
+# CALL-TIME module constant read by check_support only while D128_PERSISTENT_CAUSAL_WALK is 2; False keeps every such
+# plan on the walk's record. A speed choice (every record computes the one-tile kernel's O and Stats bit for bit). An
+# earlier version of the route also sent strides one tile per CTA (L above 15 with more than one Q head per KV head, 10
+# or more on MHA); those cutoffs are retired: on the strides they routed, all below L 48, the NATURAL stride ran 0.985
+# to 1.077 of cuDNN and the one-tile kernel 0.830 to 0.978.
+D128_CAUSAL_WALK_ROUTE: bool = True
+# The claim counter of a causal D128 record (TemplateParams.causal_claim, config_sm90.D128_CLAIM_*): 0 keeps the static
+# schedules above on every record; 1 (the counter, a group's Q tiles in NATURAL order) hands out the items of a causal
+# persistent record of the walk's rule that the route keeps, whose order is NATURAL (the graph route's proposal, or no
+# pin), and which has more than D128_CLAIM_MIN_ROUNDS items per CTA. The record then needs
+# config_sm90.D128_CLAIM_WORKSPACE_BYTES of caller workspace (scratch_workspace_bytes), which the native dense binder
+# zeroes on the launch stream before every launch; an extension whose binder lacks that role
+# (_SdpaDenseBinder.supports_claim_counter) keeps the static record. A CALL-TIME module constant read by check_support. A
+# speed choice: every value computes the one-tile kernel's O and Stats bit for bit. Why a counter (Nsight Compute,
+# H100 SXM): the static NATURAL stride read K/V 1.24 to 1.46 times the read-once floor on large causal plans (b203
+# h32/32 S 768, b82 h32/16 S 1024, b203 h32/8 S 768), the CTAs drifting apart over hundreds of rounds, while the same
+# order handed out dynamically (the one-tile grid) read 1.000 times.
+D128_CAUSAL_CLAIM: int = 1
+# The counter's gate in rounds of items per CTA (items > D128_CLAIM_MIN_ROUNDS x CTAs), set by a timing study (H100
+# SXM, cuDNN 9.27, 45 causal shapes on ten batch ladders, under a rule frozen before the run): the smallest ladder
+# point from which every larger one has the counter at least the static schedules within the band (the larger of 1%
+# and the twin runs' gap) and faster in the median, 93.1 rounds (MHA h32/32 S 1024 b48). Below it the static schedules
+# stay ahead on square prefill (h24/2 S 3584 b16, 81.5 rounds: the counter 2.2% behind) and on short items (MHA h32/32
+# S 768 b16, 23 rounds: 1.7%); above it the counter is 1 to 14% faster on MHA and GQA (MHA h32/32 S 768 b203: the
+# static schedules 0.872 of cuDNN, the counter 1.000) and within 1% on square prefill, chunked prefill and MQA.
+D128_CLAIM_MIN_ROUNDS: int = 93
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -389,6 +488,10 @@ _SM120_KERNEL_FILES = {
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
 _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_fp8.py", None: "sm120/prefill_fp8.py"}
 _SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_mxfp8.py", None: "sm120/prefill_mxfp8.py"}
+# Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
+# selectable only once it has an entry here: SdpaFwdDslSm90.check_support builds the
+# config_sm90.pick_flavor pool from these keys.
+_SM90_KERNEL_FILES = {_SM90_D512_FLAVOR: "sm90/prefill_d512_f16.py", _SM90_D128_FLAVOR: "sm90/prefill_d128_f16.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -458,6 +561,34 @@ def _causal_sched_policy(s_kv: int, d_qk: int, d_v: int, elem_bytes: int) -> int
     """SCHED_LPT_L2 vs SCHED_LPT for a causal graph (see _SCHED_L2_BUDGET_BYTES)."""
     one_head_bytes = int(s_kv) * (int(d_qk) + int(d_v)) * int(elem_bytes)
     return SCHED_LPT_L2 if _SCHED_L2_BUDGET_BYTES >= one_head_bytes else SCHED_LPT
+
+
+def _sm90_d128_persistence(flavor: tuple[int, int], causal: bool) -> tuple[bool, int]:
+    """``(TemplateParams.persistent, TemplateParams.causal_walk)`` of an SM90 plan of ``flavor``, from the D128 switch
+    constants above, read at call time: persistent on D128 under overlap for every non-causal plan, and for a causal
+    plan only when D128_PERSISTENT_CAUSAL_WALK picks a persistent walk; causal_walk 1 exactly when it picks the paired
+    walk. A D512 plan carries neither."""
+    walk = D128_PERSISTENT_CAUSAL_WALK
+    if type(walk) is not int or walk not in (0, 1, 2):
+        raise ValueError(f"api_dsl.D128_PERSISTENT_CAUSAL_WALK must be 0, 1 or 2; got {walk!r}")
+    persistent = flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP and D128_PERSISTENT and (not causal or walk > 0)
+    return persistent, int(persistent and causal and walk == 2)
+
+
+def _sm90_claim_binder_ready() -> bool:
+    """Whether this extension's native dense binder has the claim counter's role (_SdpaDenseBinder.supports_claim_counter):
+    it binds the caller's workspace as the counter and zeroes it before every launch. Without it a counter record's meta
+    pointer would stay 0, so check_support keeps the static record (D128_CAUSAL_CLAIM)."""
+    try:
+        from cudnn import _pybind_module
+    except ImportError:
+        return False
+    return bool(getattr(getattr(_pybind_module, "_SdpaDenseBinder", None), "supports_claim_counter", False))
+
+
+# The route (D128_CAUSAL_WALK_ROUTE: _sm90_d128_causal_route, its L cutoff _D128_ROUTE_MAX_L and the KV tile count it
+# reads) lives in config_sm90 (d128_causal_route), torch-free, so the graph route's proposal
+# (heuristics._sched_points) reads the same decision.
 
 
 class WorkspaceCarver:
@@ -867,6 +998,15 @@ def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120Te
     if flavor is not None:
         tag = f"{tag}_{_flavor_tag(flavor)}"
     return _load_kernel_template(files[flavor], params, tag=tag)
+
+
+def _load_sm90_kernel_module(flavor: tuple[int, int], params: Sm90TemplateParams, *, native_d64: bool = False):
+    """One SM90 template module per (flavor, params); the tag names the template (``sdpa_fwd_sm90_d512``). The D512
+    flavor's exact dense D64 subset (``native_d64``: SdpaFwdDslSm90._native_d64, config_sm90.native_d64_mismatch) loads
+    the D64 body."""
+    if native_d64:
+        return _load_kernel_template("sm90/prefill_d64_f16.py", params, tag="sdpa_fwd_sm90_d64")
+    return _load_kernel_template(_SM90_KERNEL_FILES[flavor], params, tag=f"sdpa_fwd_sm90_{_flavor_tag(flavor)}")
 
 
 # SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
@@ -5550,12 +5690,19 @@ def sdpa_fwd_wrapper_dsl_sm100(
 
 
 # ---------------------------------------------------------------------------
-# SM90: adapter over the Hopper D512 prefill kernel template
+# SM90: adapter over the Hopper D512 body and dedicated D128 prefill kernel templates
 # ---------------------------------------------------------------------------
 
 
 class SdpaFwdDslSm90(SdpaFwdDsl):
     """Compile native-width SM90 forward attention over dense, packed or paged KV.
+
+    The tile knob names the template: a 128 x 128 tile the dedicated D128 template, which
+    serves exact (128, 128) dense declarations outside ``config_sm90.NOT_SERVED`` and refuses
+    the rest; a 64 x 64 tile the D512 body, which serves every head dim up to 512 and every
+    declared feature. With no tile pinned, an exact (128, 128) declaration D128 serves runs on
+    it and every other declaration on the D512 body. The choice is made once, in
+    ``check_support``.
 
     Q, K, V and O keep their declared strides: the kernel binds native TMA
     views over caller storage, with no BSHD gather. Dtype, shape, band,
@@ -5573,6 +5720,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._native_d64 = False
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
+        # Kernel flavor (config_sm90.FLAVORS), chosen by check_support.
+        self.flavor: Optional[tuple[int, int]] = None
 
     def check_support(self) -> bool:
         """Validate the Hopper tile geometry and native operand layouts."""
@@ -5643,6 +5792,39 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._value_error_if(self.window_size_right is not None and not self.is_causal, "SM90 SDPA: window_size_right requires is_causal=True")
         self._value_error_if(self.causal_bottom_right and not self.is_causal, "SM90 SDPA: causal_bottom_right requires is_causal=True")
 
+        # The base's canonical band; a bound at or beyond S_q + S_kv masks nothing.
+        unpadded = not (self.thd or self.seq_q_lens_present or self.seq_kv_lens_present)
+        envelope = s_q + s_kv
+        left = None if self.window_left is None or self.window_left >= envelope else int(self.window_left)
+        right = None if self.window_right is None or self.window_right >= envelope else int(self.window_right)
+
+        # The template this declaration lowers onto, decided once. A candidate has a template
+        # (_SM90_KERNEL_FILES) and owns any pinned tile; pick_flavor takes the smallest candidate
+        # that covers the head dims and serves every declared feature, else the D512 body. A pinned
+        # tile of D128's that D128 does not serve is refused, with the reason. The tile, band,
+        # PackGQA and split checks below read the chosen flavor's tile.
+        declared = _sm90_declared_features(
+            thd=self.thd,
+            sink=self.has_sink,
+            window_left=left,
+            window_right=right,
+            lengths=self.seq_q_lens_present or self.seq_kv_lens_present,
+            pack_gqa=self.pack_gqa,
+            paged=self.paged,
+            split_kv=self.split_kv,
+        )
+        pool = tuple(
+            flavor
+            for flavor in _SM90_FLAVORS
+            if flavor in _SM90_KERNEL_FILES and self.tile_m in (None, _SM90_FLAVOR_TILES[flavor][0]) and self.tile_n in (None, _SM90_FLAVOR_TILES[flavor][1])
+        )
+        self.flavor = _sm90_pick_flavor(d_qk, d_v, pool, declared)
+        if pool and _SM90_D512_FLAVOR not in pool and self.flavor == _SM90_D512_FLAVOR and _sm90_d128_decline(d_qk, d_v) is None:
+            # At (128, 128) the pinned tile names the D128 template, refused with the feature it does not serve. Other
+            # head dims keep the D512 body and meet its tile refusal below ("tiles other than 64/64").
+            self._not_implemented_error_if(True, f"SM90 SDPA: {_sm90_d128_decline(d_qk, d_v, declared)}")
+        tile_m, tile_n = _SM90_FLAVOR_TILES[self.flavor]
+
         # Well-formed declarations this engine does not serve.
         refusals = (
             (self.gate_desc is not None, "epilogue gate fusion (served by the SM107 d256 SDPA engines only)"),
@@ -5656,7 +5838,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             ),
             (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 kernels only)"),
             (self.thd and self.split_kv > 1, "THD split-KV"),
-            (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
+            (self.tile_m not in (None, tile_m) or self.tile_n not in (None, tile_n), f"tiles other than {tile_m}/{tile_n}"),
             (self.cga not in (None, 1), "CGA other than 1"),
             (self.q_desc.dtype not in (torch.float16, torch.bfloat16), "Q/K/V/O other than FP16/BF16"),
             (self.lse_desc is not None and self.lse_desc.dtype != torch.float32, "Stats other than FP32"),
@@ -5707,16 +5889,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                     f"Stats: dense Stats strides {self.lse_desc.stride} are outside dense_flex (non-broadcast, non-overlapping, each covering the full pitch below it)",
                 )
 
-        # The base's canonical band; a bound at or beyond S_q + S_kv masks nothing.
-        unpadded = not (self.thd or self.seq_q_lens_present or self.seq_kv_lens_present)
-        envelope = s_q + s_kv
-        left = None if self.window_left is None or self.window_left >= envelope else int(self.window_left)
-        right = None if self.window_right is None or self.window_right >= envelope else int(self.window_right)
+        # The band, from the canonical bounds computed before the flavor choice.
         if left is None and right is None:
             band = dict(causal=False)
         else:
             self._not_implemented_error_if(
-                envelope + 2 * _SM90_TILE_M >= _SM90_BAND_COORDINATE_LIMIT,
+                envelope + 2 * tile_m >= _SM90_BAND_COORDINATE_LIMIT,
                 "SM90 SDPA: a diagonal band needs S_q + S_kv below 2**30 (Int32 band coordinates)",
             )
             causal = right == 0
@@ -5748,18 +5926,26 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             "SM90 SDPA: THD walks its live units with the natural single-tile work decoder; SCHED_LPT and SCHED_LPT_L2 are dense-only",
         )
         self._not_implemented_error_if(
-            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M, partial=True),
-            "SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64",
+            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, tile_m, partial=True),
+            f"SM90 {_flavor_tag(self.flavor).upper()} PackGQA requires a head ratio sharing a factor with tile_m={tile_m}",
         )
 
         self._value_error_if(type(self.split_kv) is not int or not 1 <= self.split_kv <= 65535, "SM90 split_kv must be an integer in [1, 65535]")
         self._not_implemented_error_if(self.split_kv > 1 and max(b, h_q) > 65535, "SM90 split combine requires batch and heads at most 65535")
         if self.split_kv > 1:
-            pack_g = pack_gqa_group_size(h_q // h_kv, _SM90_TILE_M, partial=True) if self.pack_gqa else 1
+            pack_g = pack_gqa_group_size(h_q // h_kv, tile_m, partial=True) if self.pack_gqa else 1
             packed_heads = h_q // pack_g
-            tokens_per_tile = _SM90_TILE_M // pack_g
+            tokens_per_tile = tile_m // pack_g
             units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
+        # D128 only, read at call time (the module constants above); causal plans as D128_PERSISTENT_CAUSAL_WALK says.
+        persistent, causal_walk = _sm90_d128_persistence(self.flavor, band["causal"])
+        # A causal record of the walk's rule walks NATURAL unless the caller pinned an order: the stride it may keep
+        # then runs a group's Q tiles in one round (D128_PERSISTENT_CAUSAL_WALK's comment). The one-tile record keeps
+        # the order above (causal_sched), which a routed plan takes back.
+        causal_sched = sched
+        if causal_walk and self.sched_policy is None:
+            sched = SCHED_NATURAL
         self.params = Sm90TemplateParams(
             dtype_qkv=DTYPE_BF16 if self.q_desc.dtype == torch.bfloat16 else DTYPE_FP16,
             head_tile=next(width for width in (128, 256, 512) if max(d_qk, d_v) <= width),
@@ -5776,6 +5962,11 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
             page_size=self.paged_page_size,
+            # D128 only: the overlap switch, read at call time (module constant above).
+            intra_wg_overlap=self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP,
+            # D128 only: the persistent-loop switch and, on a causal plan, its walk.
+            persistent=persistent,
+            causal_walk=causal_walk,
         )
         self._native_d64 = False
         if (d_qk, d_v) == (64, 64) and not self.paged:
@@ -5797,6 +5988,27 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # The standalone adapter already serves these richer declarations
             # on the D512 envelope; only select D64 inside its native subset.
             self._native_d64 = why is None
+        if causal_walk and D128_CAUSAL_WALK_ROUTE:
+            # A plan of at most one item per CTA, or of L at least _D128_ROUTE_MAX_L, takes the one-tile record
+            # (D128_CAUSAL_WALK_ROUTE) under the alignment the template reads and the CTA count compile() gives the
+            # walk's record.
+            if _sm90_d128_causal_route(
+                (b, h_q, h_kv, s_q, s_kv),
+                self.params.causal if self.params.bottom_right is None else self.params.bottom_right,
+                self._persistent_ctas(self.q_desc.device),
+            ):
+                self.params = replace(self.params, persistent=False, causal_walk=0, sched_policy=causal_sched)
+        claim = D128_CAUSAL_CLAIM
+        if type(claim) is not int or claim not in (_SM90_D128_CLAIM_OFF, _SM90_D128_CLAIM_NATURAL):
+            raise ValueError(f"api_dsl.D128_CAUSAL_CLAIM must be 0 or 1; got {claim!r}")
+        if claim and self.params.causal_walk and self.params.sched_policy == SCHED_NATURAL and _sm90_claim_binder_ready():
+            # A causal persistent record of the walk's rule the route kept, in NATURAL order: past the gate its items go
+            # out from the workspace counter instead (D128_CAUSAL_CLAIM); the counter numbers them itself, so the walk's
+            # plan is not built.
+            ctas = self._persistent_ctas(self.q_desc.device)
+            items = -(-s_q // tile_m) * h_q * b
+            if items > D128_CLAIM_MIN_ROUNDS * ctas:
+                self.params = replace(self.params, causal_walk=0, causal_claim=claim)
         self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max = b, h_q, h_kv, s_q, s_kv
         self.head_dim_qk, self.head_dim_v = d_qk, d_v
         self.dtype = self.q_desc.dtype
@@ -5816,9 +6028,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # The graph lowering bound per-port physical offsets (thd_origins.graph_origin_specs): every
             # (row, multiplier, token stride, bits) entry becomes the template's (bits, multiplier).
             self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
-            _sm90_validate_params(self.params)
-        flavor = "d64" if self._native_d64 else "d512"
-        self._k_mod = template = _load_kernel_template(f"sm90/prefill_{flavor}_f16.py", self.params, tag=f"sdpa_fwd_sm90_{flavor}")
+            _sm90_validate_params(self.params, self.flavor)
+        self._k_mod = template = _load_sm90_kernel_module(self.flavor, self.params, native_d64=self._native_d64)
+        # Which template serves this plan ("prefill_d128_f16", "prefill_d512_f16" or "prefill_d64_f16"), as the SM100
+        # adapter records it: the engine's executor exposes it, so a test or the routing tally names the template without
+        # inferring it from the source.
+        self.kernel_template = os.path.splitext(os.path.basename(template.__file__))[0]
         strides, lse_stride = self._strides, self._lse_stride
         if self.split_kv > 1:
             # The producer TMA maps describe split-major partials; final layouts
@@ -5837,6 +6052,9 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             target="sm_90a",
             d_qk=self.head_dim_qk,
             d_v=self.head_dim_v,
+            # A persistent D128 record's grid cap, the SM count (_persistent_ctas below); every other plan passes nothing,
+            # so its compile key names no device.
+            **({"persistent_ctas": self._persistent_ctas(self.q_desc.device)} if self.params.persistent else {}),
         )
         from .prepared import build_dense_spec, build_thd_spec
 
@@ -5848,13 +6066,24 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
 
     def scratch_workspace_bytes(self) -> int:
         """THD: the metadata, then the tensor maps (and, with physical offsets, the per-port origins),
-        bound as ``seq_kv_lens``; a dense split plan holds O/Stats partials."""
+        bound as ``seq_kv_lens``; a dense split plan holds O/Stats partials, and a dense claim-counter record
+        (causal_claim) its work-item counter (config_sm90.D128_CLAIM_WORKSPACE_BYTES, word 0)."""
         self._ensure_support_checked()
         if not self.thd:
-            return self._split_workspace_bytes() if self.split_kv > 1 else 0
+            if self.split_kv > 1:
+                return self._split_workspace_bytes()
+            return _SM90_D128_CLAIM_WORKSPACE_BYTES if self.params.causal_claim else 0
         from cudnn.sdpa.fwd.config_sm90 import thd_meta_words
 
         return thd_meta_words(self.batch_size, getattr(self, "_thd_origin_specs", None) is not None) * 4
+
+    def _persistent_ctas(self, device) -> int:
+        """The persistent D128 grid cap: the device's SM count. One CTA per SM fits (min_blocks_per_mp=1, 196,704 B of
+        SMEM), and a CTA with no item left just retires, so more would only queue behind the first wave. A device
+        property, cached per device by _device_sm_count: plan-time (python/cudnn/AGENTS.md Rule 4). Deliberately not
+        SdpaFwdDslSm120._persistent_ctas: FROST_THD_CTAS and FROST_THD_CTAS_PER_SM tune THD grids and must not resize
+        this one. Tests force a count by patching this method or by calling the template's compile() directly."""
+        return _device_sm_count(device)
 
     def execute(
         self,
@@ -5924,6 +6153,14 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
                 if workspace.device != q_tensor.device or not workspace.is_contiguous():
                     raise ValueError("cudnn.sdpa: split workspace must be contiguous and on the Q tensor's CUDA device")
                 ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90 (split)")
+            elif self.params.causal_claim:
+                # The claim counter's word: an int-only address (no tensor views on the hot path); the native binder
+                # checks it against the operands and zeroes it on the launch stream before the launch.
+                if workspace is None:
+                    raise ValueError(f"SdpaFwdDslSm90 requires a {_SM90_D128_CLAIM_WORKSPACE_BYTES}-byte workspace; pass scratch_workspace_bytes() bytes")
+                if workspace.device != q_tensor.device or not workspace.is_contiguous():
+                    raise ValueError("cudnn.sdpa: the claim counter's workspace must be contiguous and on the Q tensor's CUDA device")
+                ws_ptr = self._scratch_base(workspace, "SdpaFwdDslSm90", _SM90_D128_CLAIM_WORKSPACE_BYTES)
             execute_native_dense_tensors(spec, buffers, stream, scale, ws_ptr)
         self._logger.debug("execute completed")
 

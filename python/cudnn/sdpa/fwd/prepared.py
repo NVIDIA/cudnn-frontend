@@ -787,6 +787,9 @@ class DenseLaunchSpec:
         "lpt_grid_fixed",
         "dense_flex",
         "device_index",
+        # A persistent SM90 D128 causal record's work-item claim counter (TemplateParams.causal_claim): word 0 of the
+        # caller's workspace, bound as meta_ptr and zeroed on the launch stream before every launch by the native binder.
+        "claim_counter",
         # The decode tile's ragged-Q leg: Q / O / Stats are the caller's PACKED
         # buffers, their rows placed by the bound (B+1,) int32 ragged offsets
         # (elements) divided by ``ragged_divs`` (Q, O, Stats elements per token);
@@ -928,6 +931,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             # K/V SF pools page with K/V, so S_kv follows the block table. Batch and S_q stay pinned.
             s.shape_fixed = False
     s.device_index = int(api.q_desc.device.index or 0)
+    # A persistent SM90 D128 causal record's work-item claim counter, read off the keyed module's own record so the
+    # binder's flag cannot disagree with the compiled kernel (every other template's record has no such field).
+    s.claim_counter = bool(getattr(getattr(km, "PARAMS", None), "causal_claim", 0))
     # The decode tile's ragged-Q leg (api.thd_decode_leg): a split launch by construction.
     s.ragged = bool(getattr(api, "thd_decode_leg", False))
     # Standalone THD always requires Q lengths. Graph lowering may explicitly
@@ -1068,10 +1074,14 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     # None / zero slots untouched), so a plan that requests them keeps ``native`` None and ``bind_dense`` fills the
     # pointer / stride slots per call.
     if s.has_score_max or s.has_score_sum_exp or s.has_bias or s.has_kv_mask:
+        if s.claim_counter:
+            raise NotImplementedError(f"{km.__name__}: a work-item claim counter binds through the native dense binder only")
         s.native = None
         return s
     from cudnn import _pybind_module
 
+    if s.claim_counter and not getattr(_pybind_module._SdpaDenseBinder, "supports_claim_counter", False):
+        raise NotImplementedError(f"{km.__name__}: this extension's native dense binder has no work-item claim counter role")
     s.native = _pybind_module._SdpaDenseBinder(s)
     return s
 
@@ -1454,6 +1464,8 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     as compiled, ``lse sinks seq_kv seq_q gate`` and the paged ``block_table block_table_v``). Under a
     split the ``o`` / ``lse`` roles are the split-major partial slabs (batch extent split * B)."""
     ix = spec.index
+    if getattr(spec, "claim_counter", False):
+        raise ValueError("cudnn.sdpa: a work-item claim-counter plan binds the caller workspace through the native dense binder")
     frame = spec.frame()
     q_tokens = 0
     if getattr(spec, "ragged", False):

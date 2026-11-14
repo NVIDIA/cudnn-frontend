@@ -42,6 +42,7 @@ the honest answer while nobody has timed it.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from math import gcd
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
@@ -59,6 +60,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd.config_sm90 import d128_causal_route as _sm90_d128_causal_route
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     FP8_DUAL_KV_STREAM_MAX_ROWS,
@@ -121,6 +123,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    effective_tile_ms,
     launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
@@ -167,6 +170,17 @@ _SM100_MEASURED_SMS = 148
 _SM100_D192_LPT_MAX_WAVES = 12
 # GB10 (cc 12.1): its SM count, the fallback where the graph facts carry none (the causal NATURAL rule in _sched_points).
 _SM121_MEASURED_SMS = 48
+# The SM90 D128 causal route's CTA count where the facts carry no device (a host without CUDA): an H100 SXM's SM count,
+# the board the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+_SM90_MEASURED_SMS = 132
+# api_dsl's call-time switches that decide whether a causal D128 plan runs the walk's record, at the values api_dsl
+# ships them with: _sm90_d128_causal_walks reads the module's own once it is loaded.
+_SM90_D128_SHIPPED_SWITCHES = (
+    ("D128_INTRA_WG_OVERLAP", True),
+    ("D128_PERSISTENT", True),
+    ("D128_PERSISTENT_CAUSAL_WALK", 2),
+    ("D128_CAUSAL_WALK_ROUTE", True),
+)
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -1346,13 +1360,35 @@ def _sm107_cluster_waves(facts) -> float:
     return (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
 
 
-def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
+def _sm90_d128_causal_walks(facts) -> bool:
+    """Whether check_support gives a causal SM90 D128 graph of ``facts`` the walk's record (persistent, causal_walk 1,
+    the NATURAL order unless pinned) rather than the one-tile record (the causal order): the choice a check_support
+    without a pinned order makes, mirrored here because a graph-route plan carries its proposal as a pin. A record
+    check_support then hands to the claim counter (api_dsl.D128_CAUSAL_CLAIM, past its gate) is persistent and NATURAL
+    too, so the counter's switches do not move this answer. The walk's
+    record needs api_dsl's switches at the walk (D128_INTRA_WG_OVERLAP, D128_PERSISTENT, D128_PERSISTENT_CAUSAL_WALK 2,
+    as api_dsl._sm90_d128_persistence reads them) and a plan the route keeps (config_sm90.d128_causal_route, while
+    D128_CAUSAL_WALK_ROUTE is on) at the device's SM count, the CTA count compile() gives the record. The switches are
+    api_dsl's call-time module constants, read from the module once it is loaded; it imports torch, so this module does
+    not load it, and until something does they hold the values it ships with (_SM90_D128_SHIPPED_SWITCHES; getattr on
+    the absent module's None returns them)."""
+    api = sys.modules.get("cudnn.sdpa.fwd.api_dsl")
+    overlap, persistent, walk, route = (getattr(api, name, shipped) for name, shipped in _SM90_D128_SHIPPED_SWITCHES)
+    if not (overlap and persistent and walk == 2):
+        return False
+    shape = (int(facts.b), int(facts.h_q), int(facts.h_kv), int(facts.s_q), int(facts.s_kv))
+    return not (route and _sm90_d128_causal_route(shape, bool(facts.bottom_right), int(facts.device_sm_count or _SM90_MEASURED_SMS)))
+
+
+def _sched_points(caps: Capabilities, facts, *, d128: bool = False) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
     The PRIMARY follows the measured preference for the graph's shape; the
     remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
-    standalone wrapper users who bypass ranking.
+    standalone wrapper users who bypass ranking. ``d128`` asks for the SM90 row's
+    128 x 128 sets (the dedicated D128 template, :func:`_sm90_d128_knob_sets`),
+    whose causal walk record takes its own order; every other set leaves it False.
     """
     # The FLAVOR's domain, not the row-wide floor: a `sched_policies_by_d_shape`
     # claim (the Rubin f16 / FP8 (256, 256) LPT entries) must reach the ranking,
@@ -1533,6 +1569,18 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     ):
         # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
         primary = SCHED_LPT
+    elif causal_ish and d128 and not facts.thd and _sm90_d128_causal_walks(facts):
+        # The SM90 row's 128 x 128 tile (the D128 template; ``d128``, _sm90_d128_knob_sets), on a causal plan
+        # check_support gives the walk's record (_sm90_d128_causal_walks): its
+        # persistent loop walks the work in NATURAL order, a head's Q tiles side by side, so they run at once on
+        # neighbouring CTAs and share the head's K and V in L2 (the stride deals its rounds straight or snaked by the
+        # planner's busiest-CTA cost). MEASURED on an H100 SXM (2026-11-06, Nsight, 8 causal shapes): the LPT_L2 walk
+        # read K and V from HBM 1.26 to 2.16 times the read-once floor where cuDNN 9.27 read it once; the NATURAL stride
+        # read it 1.00 to 1.03 times. A graph-route plan carries this knob, and the adapter honours a carried knob as a
+        # pin, so the proposal here is what a causal D128 graph runs. LPT and LPT_L2 stay behind for autotune. A plan
+        # the route sends one tile per CTA takes the causal rule below instead, the order the one-tile record keeps and
+        # the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+        primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -3236,6 +3284,27 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return splits, pack
 
 
+def _sm90_d128_knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
+    """The SM90 row's 128 x 128 set: the dedicated D128 template (#378). Its tile names the template, and mismatch()
+    admits it only on an exact (128, 128) graph the template serves (engines._sm90_d128_tile_mismatch), so the set
+    exists there alone and leads the D512 body's 64 x 64 sets (:func:`_knob_sets`). One CTA, unsplit, unpacked, in the
+    order the template's route proposes (_sched_points with ``d128``): its other orders measured slower on causal
+    graphs on H100 SXM, so the remaining slots go to the D512 body's sets, split and packed runners among them. Empty on
+    every other row and graph, and below config_sm90.D128_LEAD_MIN_SQ query rows, where the D512 body's 64-row and
+    packed decode tiles keep the row's order (the template stays reachable by pinning its tile)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
+
+    caps = spec.capabilities
+    lead = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    if caps.sm_lo != 90 or 128 not in effective_tile_ms(caps, facts, lead) or mismatch(caps, facts, lead) is not None:
+        return []
+    if facts.s_q < D128_LEAD_MIN_SQ:
+        return []
+    scheds = _sched_points(caps, facts, d128=True)
+    first, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)
+    return [replace(lead, sched_policy=first)]
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -3416,7 +3485,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         unique.insert(
             0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
         )
-    return unique[:_MAX_SETS_PER_ENGINE]
+    # SM90 at exact (128, 128): the dedicated D128 template's 128 x 128 set first, where it serves the graph, then the
+    # D512 body's 64 x 64 sets above.
+    lead = _sm90_d128_knob_sets(spec, facts)
+    return (lead + [knobs for knobs in unique if knobs not in lead])[:_MAX_SETS_PER_ENGINE]
 
 
 def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:

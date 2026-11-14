@@ -625,6 +625,31 @@ class Capabilities:
     warp_spec_cfgs: frozenset[int] = frozenset({0})
     swap_abs: frozenset[int] = frozenset()
 
+    # Per-d-shape Q tile-height domain, the tile_m twin of tile_ns_by_d_shape above, for a
+    # row whose Q tile differs by head dims (the SM90 row, whose exact (128, 128) graphs also
+    # take a 128 x 128 tile, the dedicated D128 template, beside the 64 x 64 tile of the
+    # D512 body).  The sched_policies_by_d_shape idiom: an entry OVERRIDES tile_ms for the
+    # d-shape the lowering SELECTS (effective_tile_ms, as effective_tile_ns reads
+    # tile_ns_by_d_shape).  () = the row-wide tile_ms holds for every d-shape (every row but
+    # SM90).  APPENDED after warp_spec_cfgs (append-only contract above; the same test pins
+    # it).
+    tile_ms_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+
+
+def _sm90_d128_tile_mismatch(facts: "ga.SdpaGraphFacts", knobs: "SdpaFwdKnobs") -> Optional[str]:
+    """Why the SM90 row's 128 x 128 tile, the dedicated D128 template (#378), cannot run this graph and knob set, or None.
+
+    A tile of 128 on either axis names that template, so the other axis must be 128 or unset; then the graph's own
+    refusal with the knobs' split and packing (config_sm90.d128_graph_decline: config_sm90.d128_decline's exact
+    (128, 128) head dims and nothing in config_sm90.D128_NOT_SERVED, then the row's S_q == 1 and unpadded bottom-right
+    S_q > S_kv declines)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, FLAVOR_TILES, d128_graph_decline
+
+    tile_m, tile_n = FLAVOR_TILES[D128_FLAVOR]
+    if knobs.tile_m not in (None, tile_m) or knobs.tile_n not in (None, tile_n):
+        return f"SM90's D128 template runs a {tile_m} x {tile_n} tile; requested tile_m={knobs.tile_m}/tile_n={knobs.tile_n}"
+    return d128_graph_decline(facts, pack_gqa=knobs.pack_gqa is True, split_kv=knobs.split_kv or 1)
+
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     return (
@@ -1174,9 +1199,20 @@ def effective_swap_abs(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", k
 
 
 def effective_tile_ms(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
-    """Explicit native query tiles; keep the default proposal domain unchanged."""
+    """Q tile-height domain of the d-shape the lowering will pick.  Explicit SM80 tile knobs read the native query
+    tiles of the graph's head dims (``_sm80_explicit_tile_domains``), which keeps the default proposal domain
+    unchanged.  Otherwise row-wide ``tile_ms`` is the floor, and a ``tile_ms_by_d_shape`` entry for the selected
+    d-shape replaces it, as ``effective_sched_policies`` does for the scheduler and ``effective_tile_ns`` for the KV
+    tile."""
     sm80_domains = _sm80_explicit_tile_domains(capabilities, facts, knobs)
-    return sm80_domains[0] if sm80_domains is not None else capabilities.tile_ms
+    if sm80_domains is not None:
+        return sm80_domains[0]
+    selected = _selected_d_shape(capabilities, facts, knobs)
+    if selected is not None:
+        for shape, shape_domain in capabilities.tile_ms_by_d_shape:
+            if shape == selected:
+                return shape_domain
+    return capabilities.tile_ms
 
 
 def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
@@ -1731,6 +1767,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if capabilities.sm_lo == 90 and facts.has_paged_kv:
         if facts.thd:
             return "SM90 paged KV currently requires dense Q"
+    if (
+        capabilities.sm_lo == 90
+        and isinstance(knobs, SdpaFwdKnobs)
+        and 128 in (knobs.tile_m, knobs.tile_n)
+        and 128 in effective_tile_ms(capabilities, facts, knobs)
+    ):
+        why = _sm90_d128_tile_mismatch(facts, knobs)
+        if why is not None:
+            return why
     if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
@@ -2368,9 +2413,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     elif "bshd" in capabilities.layouts and not facts.bshd_layout:
         return "Q/K/V/O must be BSHD-physical (stride order 3,1,2,0)"
 
-    if not facts.thd and capabilities.sm_lo in (100, 107, 120):
+    if not facts.thd and capabilities.sm_lo in (90, 100, 107, 120):
         from cudnn.graph_types import storage_geometry, storage_slot_bytes
-        from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+        if capabilities.sm_lo == 90:
+            # The SM90 adapter binds the same TMA maps and refuses the same pitches in check_support.
+            from cudnn.sdpa.fwd.config_sm90 import dense_bind_strides
+        else:
+            from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
 
         for role in ("q", "k", "v", "o"):
             if facts.has_paged_kv and role in ("k", "v"):
@@ -4516,9 +4566,13 @@ def _sm120_mxfp8_spec() -> EngineSpec:
 
 
 def _sm90_spec() -> EngineSpec:
-    """Native D64/D128/D256/D512 with bounded TMA padding."""
-    from cudnn.sdpa.fwd.config_sm90 import D_ALIGN, D_TILE, TILE_M, TILE_N
+    """Native D64/D128/D256/D512 with bounded TMA padding. At (128, 128) the tile knob also offers 128 x 128, the dedicated
+    D128 template (#378), beside the D512 body's 64 x 64: mismatch() declines that tile for what the template does not
+    serve (_sm90_d128_tile_mismatch, config_sm90.d128_decline), so those graphs keep the D512 body. The D128 tile comes
+    from the config_sm90 constants the adapter reads (rule 8b')."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, D_ALIGN, D_TILE, FLAVOR_TILES, TILE_M, TILE_N
 
+    d128_tile_m, d128_tile_n = FLAVOR_TILES[D128_FLAVOR]
     return EngineSpec(
         name="sdpa_fwd_prefill_sm90",
         capabilities=Capabilities(
@@ -4553,8 +4607,12 @@ def _sm90_spec() -> EngineSpec:
             skv_tile=0,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The row-wide tile is the D512 body's 64 x 64. At (128, 128) the 128 x 128 tile names the D128 template
+            # instead; a knob of 128 on either axis is judged by _sm90_d128_tile_mismatch.
             tile_ms=frozenset({TILE_M}),
             tile_ns=frozenset({TILE_N}),
+            tile_ms_by_d_shape=((D128_FLAVOR, frozenset({TILE_M, d128_tile_m})),),
+            tile_ns_by_d_shape=((D128_FLAVOR, frozenset({TILE_N, d128_tile_n})),),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256), (D_TILE, D_TILE)}),
