@@ -442,7 +442,10 @@ validated on compute capability 10.0 and 12.0 (`docs/operations/linear_attention
 
 A class the current checks have not run on is uncovered, not passing. That holds for the stacks `native` and
 `fe-entries` on every class but 10.0: the gate entry inside this sample, the fused step in its wait + release form, and
-the kernel patterns of the check have run on 10.0 only.
+the kernel patterns of the check have run on 10.0 only. So has the build of the entries' kernels while a run is
+planned: what a plan prints on a GPU for which the installed CuTe DSL cannot build (a `SKIP` in the entry's own words) is
+held by a host test over a stand-in entry and was seen on a real GPU only with the entry's own toolchain question made to
+decline, not on such an installation.
 
 Memory of the default run (2 layers, 1 and 4 sequences): 1.7 GiB of bf16 copies; PyTorch held 2.5 GiB at its peak and
 reserved 3.7 GiB on a compute capability 10.0 GPU, so the sample asks for about 3.7 GiB free there. On compute capability 12.x
@@ -453,7 +456,7 @@ prints what it took. Measured by this sample on a compute
 capability 12.0 GPU of 32 GB: 3,124 MiB at the first launch of the 1-sequence form, nothing at the 4-sequence form, and
 6.9 GiB of growth on the device over the whole run.
 The four-layer run (`--layers 4`) holds 3.1 GiB of copies. The whole default run takes well under a minute on a data-center
-Blackwell GPU: a few seconds to plan, which includes building the entries' kernels for both sequence counts (3.6 s in
-the one run of `native` since that build became part of the plan; built after the load, the fused step's kernel took
-0.5 to 2.4 s for the first sequence count and 0.3 to 0.4 s for the next), about 5 s to draw the weights, the rest for
-the decode and its checks. These are orientation values of single runs, not measurements of record.
+Blackwell GPU: a second or two to plan, which includes building the entries' kernels for both sequence counts (1.1 to
+1.7 s in the runs since that build became part of the plan, 3.6 s in the first of them; built after the load, the fused
+step's kernel took 0.5 to 2.4 s for the first sequence count and 0.3 to 0.4 s for the next), about 5 s to draw the
+weights, the rest for the decode and its checks. These are orientation values of single runs, not measurements of record.
