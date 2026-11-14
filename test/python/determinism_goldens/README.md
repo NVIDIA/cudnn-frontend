@@ -116,6 +116,7 @@ pytest core/test_determinism_utils.py
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
 | `attention_gate/frost/test_gate_quant_decode_determinism.py` | `AttentionGateQuantDecode` (the attention gate + quantize decode step, rows 1 .. 160) | FP8 E4M3 output `out` | — (inference-only step kernel; no backward) |
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
+| `norm/frost/test_add_norm_quant_decode_determinism.py` | `AddNormQuantDecode` (the add + RMSNorm + quantize decode step, hidden 5120, rows 1 .. 1024) | the updated BF16 residual, BF16 output `out`, FP8 E4M3 or packed E2M1 `codes`, the NVFP4 E4M3 block `scales` | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
 | `block_sparse_attention/cutedsl/test_BSA_determinism.py` (`TestBlk64Forward`, `TestBlk64Backward`) | `block_sparse_attention_forward`, `block_sparse_attention_backward`, `block_sparse_attention_prepare_backward` with `sparse_block_size=64` (SM90 blk64 kernels; the SM100/SM103 blk64 path through the same API) | O, LSE (BF16, FP16; SM100/SM103: BF16) | dQ, dK, dV (BF16; bytes measured on every route, asserted only for the prepared regular route's dK/dV; order-free golden patterns) |
@@ -1607,6 +1608,127 @@ instead of comparing); the 21 records hold the input and output hashes of the co
 committed; `pytest <module> -m L0 -q -rs -n 0 -k "not performance_arms"` -> 417 passed, 1 skipped, and `-k performance_arms` -> 105
 passed.  With its CUDA 12.9 compiler flavor: the same determinism command -> 531 passed, and its 21 records hold the committed
 hashes too; the functional module was not run in that combination.
+
+### Add + RMSNorm + quantize decode step: replay, batch invariance and goldens per numerical path and residual mode
+
+`norm/frost/test_add_norm_quant_decode_determinism.py` pins `cudnn.AddNormQuantDecode` (the residual add, the RMSNorm and the quantization
+of the next projection's input in one launch: bf16 `x` / `residual` `[rows, 5120]`, a bf16 weight, one fp32 scale; bf16 `out`, FP8 E4M3
+or packed E2M1 `codes`, E4M3 block `scales`; rows 1 .. 1024).  Forward only: the entry is an inference step with no backward entry point,
+no gradient and no state, so there is no backward case.  Every comparison is raw bytes over every buffer a launch writes: the residual
+(in / out under the add, out under the store), `out`, `codes` and the NVFP4 `scales`.  The suite runs six of the entry's fifteen forms,
+one per numerical path and per residual mode: the add with bf16 and E4M3 codes, with bf16 and NVFP4 codes, and with bf16 alone; the
+residual store with E4M3 codes; no residual with E4M3 codes and with bf16 and NVFP4 codes.  The other nine forms select which buffers
+are written, not what is computed: `test_add_norm_quant_decode.py` runs all fifteen against the references and compares each form that
+does not write the bf16 value with the form that does, byte for byte.
+
+What is held fixed: the row's sum of squares is one tree whose shape depends on the width alone, so no split, pick or knob selects
+another association and there is nothing to pin across batch layouts besides the operands.  Operands come from a CPU generator (an
+operand set has the same bytes on every device) and are built once per case; the cases slice and permute them.  The residual is
+in / out: every execution runs on a fresh copy.  Every output is a fresh caller-owned buffer filled with a sentinel (the NaN pattern of
+bf16 and of E4M3, `0xA5` for the packed codes; the scale buffer zero-filled, as its owner must).  A block scale's position in the 128 x 4
+scale layout follows its row index while its value does not, so batch layouts are compared on the scale bytes per row, read through the
+layout rule; the replay and golden cases compare the whole scale buffer.  The independent references are a separate check
+(`add_norm_quant_utils.assert_reference`: every `out` element one of the two bf16 neighbours of an fp64 evaluation; the residual, the
+E4M3 codes and the NVFP4 block scales bitwise the host model on the kernel's own bf16 value; every NVFP4 code inside the bracket of the
+two approximate reciprocals) and gate the goldens.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | form x rows 1 / 17 / 160 / 1024; eight executions into fresh buffers under side-stream contention; then the references.  1024 rows are 1,024 thread blocks of 640 threads, three per SM: more than one scheduling wave | 24 |
+| `test_replay_on_a_fresh_entry_and_fresh_operands` | L0 | form; two entries, two identical 24-row operand sets drawn afresh | 6 |
+| `test_launch_on_a_side_stream_writes_the_same_bytes` | L0 | launch arm (plain, wait, wait + release); the add with bf16 and NVFP4 codes at 17 rows under a side stream (ordered after the operands' producer stream) vs the current stream | 3 |
+| `test_batch_invariance` | L0 | form; one 1024-row operand set: the 1024-row call replayed three times and checked against the references; every row alone (a one-row call) vs inside that call, vs the first 2 / 3 / 8 / 16 / 17 / 24 / 32 / 64 / 127 / 128 / 129 / 160 rows as one call (both sides of the 128-row scale-tile edge), vs the reversed batch | 6 |
+| `test_insertion_removal_and_reordering` | L0 | form; a 130-row call (two scale tiles), then a row inserted at position 5 (row 127 moves into the second tile), rows 3 / 11 / 129 removed (rows 128 / 129 move into the first tile), a permutation: every row keeps its bytes, the inserted row writes its alone bytes | 6 |
+| `test_duplicated_row_and_neighbour_isolation` | L0 | form; a row twice in one call (both copies = alone); the row at position 5 among 63 and at position 128 among 159 redrawn neighbours | 6 |
+| `test_inputs_are_unmodified` | L0 | every form x launch arm x rows 1 / 17 / 1024, caller-owned and entry-owned outputs (108 launches): `x`, `weight` and both scales hold their bytes; the residual is bitwise `bf16(x + residual)` under the add and `x` under the store | 1 |
+| `test_crosses_a_scheduling_wave` | L0 | the add with bf16 and E4M3 / NVFP4 codes; the premise (1024 rows exceed three thread blocks per SM on this part) is asserted first; eight executions at 1024 rows; the rows on both sides of every wave edge alone vs inside | 2 |
+| `test_row_ceiling_is_the_typed_decline` | L0 | 1025 rows is a `NotImplementedError`, zero rows a `ValueError`; never a launch (the residual is untouched), never another provider | 1 |
+| `test_golden` | L0 | six cases: three executions, the references, the wait and the wait + release arms on the same operands, the saved hashes of the residual and of every output | 6 |
+
+Collected: 61 cases, all on a device.  Replay executions: `test_replay` 24 x 8 = 192; `test_batch_invariance` 6 x 3 of the 1024-row call
+and 6 x 1,024 of a row alone; `test_crosses_a_scheduling_wave` 2 x 8; `test_golden` 6 x 3.
+
+Golden sets: `add-norm-quant-decode-h5120-<case>`, six files in `c84dd9abaee769b4/`, the first goldens of this API -- `add-bf16-e4m3-rows3`,
+`store-e4m3-rows3` and `none-e4m3-rows3` (the three residual modes with static E4M3 codes), `add-nvfp4-rows3` and `add-nvfp4-rows130`
+(NVFP4 codes in one and in two scale tiles) and `add-bf16-nvfp4-ties-rows2` (rows of `x = +-1` whose weight places the normalized value
+on chosen bf16 values: two blocks get the block scales 1.5 and 1.75 and fourteen elements each on an exact E2M1 rounding tie).  The
+launch arms write the default's bytes inside `test_golden` and, on more shapes, in `test_add_norm_quant_decode.py`
+(`test_bit_neutral_arms_write_the_default_bytes`; behind a predecessor that released its dependents before it wrote the operands,
+`test_wait_holds_every_read_behind_a_predecessor_that_released_early`), so the one set holds for every arm.  The tie case's
+codes follow the part's approximate reciprocal: its hashes are a record of this runtime, not a claim across GPU architectures.  A new
+set is owed with a stated reason when the sum tree, the rounding chain or the scale layout changes.
+
+GPU coverage: cc 10.0 (replay, batch invariance and goldens).  cc 10.3 and cc 10.7 have not been run on a device: the entry admits
+compute capability 10.x and the status page reads "SM103: Unverified" and, for SM107, "Unverified"; a run there skips the six golden
+cases (no set for its runtime) -- a coverage gap, not a pass.  cc 9.0 and cc 12.x are declined by type.  Every run below is one
+pytest run per command on one visible device, from `test/python`; `<suite>` = `norm/frost/test_add_norm_quant_decode_determinism.py`,
+`<module>` = `norm/frost/test_add_norm_quant_decode.py`.  A command on `<suite>` alone is an in-process run
+(`CUDNN_TEST_NO_ISOLATION=1`); a command that names `<module>` runs under the suite's default per-test isolation.  The device is a
+shared development part: these are correctness runs, and no timing was taken.
+
+cc 10.0 record (2026-11-13 UTC): a cc 10.0 part with 148 SMs (the device reports the name `NVIDIA Graphics Device`; x86 host, Python
+3.10) with torch 2.13.0+cu130, CUDA 13.0, driver API 13010, cuDNN 92700, nvidia-cutlass-dsl 4.8.0 (compiling with CUDA 13.4), tvm-ffi
+0.1.13.post3 (the `runtime` block of the goldens in `c84dd9abaee769b4/`).  Before the set existed: `pytest <suite> -m L0 -q -ra` -> 55
+passed, 6 skipped (the six `test_golden` cases, "no golden for ...").  The set was then recorded from a clean tree at the commit that
+adds the suite, into a new directory: `CUDNN_DETERMINISM_RECORD=<new directory> pytest <suite> -m L0 -q -ra -k golden` -> 6 passed, 55
+deselected.  The six records were inspected before the copy: one runtime block whose key is the directory's name; shapes and dtypes;
+the operand hashes equal those of the operands rebuilt on an x86 host from the suite's CPU generator in 6 of 6 files; the updated
+residual's hash equals that of the host's `bf16(x + residual)` in the four add cases and that of `x` in the store case; the tie case's
+`out` hash equals the host construction's and its scale-buffer hash the host model's laid out by the layout rule; the two 3-row add
+cases share their operands and their updated residual; the store and no-residual cases share `x` and differ in their codes (scales 0.02
+and 1.0).
+
+Strict check and the functional module, from a clean tree with the package, test and golden files of the branch's last commit that
+changes any of them (2026-11-14 UTC, the runtime above; the six golden files are unchanged since they were recorded).
+`CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest <suite> -m L0 -q -ra` -> 61 passed, 0 skipped: `test_replay` 24,
+`test_replay_on_a_fresh_entry_and_fresh_operands` 6, `test_launch_on_a_side_stream_writes_the_same_bytes` 3, `test_batch_invariance` 6,
+`test_insertion_removal_and_reordering` 6, `test_duplicated_row_and_neighbour_isolation` 6, `test_inputs_are_unmodified` 1,
+`test_crosses_a_scheduling_wave` 2, `test_row_ceiling_is_the_typed_decline` 1, `test_golden` 6.  `pytest <module>
+core/frost/test_frost_kernel_name_prefix.py -m L0 -q -ra` -> 190 passed, 1 skipped: the
+module 186 passed and 1 skipped (`test_entry_on_another_device_launches_there_and_keeps_the_callers_device_current`: "two CUDA devices
+are required" -- one device is visible, so an entry on a device that is not the caller's current one is not covered on cc 10.0), the
+symbol-prefix test 4 passed.  The module's launch-facts case compared the profiler's record of a launch with the entry's facts in 12 of
+12 cells (one kernel per call; grid `(rows, 1, 1)`, block `(640, 1, 1)`, 80 B of shared memory).  The module's case behind a
+predecessor that released early (`test_wait_holds_every_read_behind_a_predecessor_that_released_early`) compared 16 of 16 launches of the
+step equal to the plain step, behind its positive control: a dependent without a wait read other bytes than the written ones in 4 of 4
+eager launches and 4 of 4 replays.  On a part where that control does not reproduce the case skips -- a coverage gap, not a pass.
+The module's overflow case (`test_rows_whose_sum_of_squares_overflows_normalize_to_zeros`: a finite row whose sum of squares exceeds
+the largest fp32 value writes signed zeros, the signed zero's codes and zero block scales, and its neighbours keep their bytes) is one
+of the 186.  So are the eleven cases of an operand that overlaps an entry-owned output (an output the call does not pass): ten on the
+host with the launch intercepted (`test_declines_an_operand_that_overlaps_an_entry_owned_output`: six declines -- among them a tensor
+an earlier call returned, passed back as the residual -- and four controls that stay served) and one on the device
+(`test_returned_output_as_the_residual_is_declined_before_the_launch`: the declined call leaves the tensor's bytes as they were, and
+with a caller-owned `out` the same residual is served and `out` holds the bytes of a call on separate tensors).  The same command with
+`<suite>` added, on an x86 host with a cc 8.0 device (every device case skips): 112 passed, 140 skipped.
+
+The records of the next three paragraphs (the CUDA 12.9 flavour, CuTe DSL 4.8.1, the cold compile) are from an earlier tree: the
+functional module had twelve cases fewer there (the overflow case and the eleven overlap cases did not exist), it did not reset its
+captured CUDA graphs, and the package differed from this tree's in docstrings, in the text of two decline messages, in the entry's
+overlap check of the outputs a call does not pass, and in one line of the kernel module that binds a name (the kernel's renderings
+are byte-identical) only.
+
+CUDA 12.9 compiler flavour on the same part and runtime (2026-11-13 UTC; the CuTe DSL 4.8.0 install without its CUDA 13 toolchain
+libraries, so the DSL binds its CUDA 12 flavour: `CUDA_VERSION` 12.9; torch and the driver stay CUDA 13 -- this isolates DSL
+compatibility and is not a deployment that uses CUDA 12 throughout): the strict determinism command -> 61 passed, 0 skipped -- the six
+golden cases pass against the SAME set, whose runtime key does not name the compiler flavour, so the two flavours write the same bytes
+for those cases; the functional command -> 177 passed, 2 skipped (`test_rendering_pins_the_convention` for `sm_107a`: that compiler
+rejects the target, and the case skips with the entry's own decline; the two-device case).
+
+CuTe DSL 4.8.1 on the same part (2026-11-13 UTC; the 4.8.1 wheels put first on the path of the same runtime; the same tree as the
+CUDA 12.9 runs above).  Compiling with CUDA 13.4: the functional command -> 178
+passed, 1 skipped (the two-device case); the determinism command WITHOUT the goldens variable -> 55 passed, 6 skipped (the six
+`test_golden` cases: the DSL version is part of the runtime key and no set is committed for that key, so the golden comparison is a
+coverage gap there, not a pass).  With only the CUDA 12 toolchain libraries of 4.8.1 (`CUDA_VERSION` 12.9): 177 passed, 2 skipped (the
+`sm_107a` rendering case and the two-device case); 55 passed, 6 skipped (the golden cases, same reason).  A record into a new directory
+under each flavour (`-k golden`: 6 passed, 55 deselected) holds the input and output hashes of the committed 4.8.0 set in 6 of 6 files;
+it is not committed.
+
+Cold compile on an x86 host (2026-11-13 UTC; a cc 8.0 device: every device case skips; fake tensors).  The kernel's 45 renderings per
+target (fifteen forms x three launch arms) under 4.8.1 are byte-identical cubins to 4.8.0's for `sm_100a`, `sm_103a` and `sm_107a` with
+the CUDA 13.4 compiler (135 of 135) and for `sm_100a` / `sm_103a` with the CUDA 12.9 compiler (90 of 90); `sm_107a` does not compile
+under CUDA 12.9 in either version (the entry's typed decline).  `pytest <module> <suite> core/frost/test_frost_kernel_name_prefix.py -m
+L0 -q -ra` on that host: 102 passed, 138 skipped under 4.8.0 and under 4.8.1 with CUDA 13.4; 101 passed, 139 skipped under either
+version with CUDA 12.9 (the `sm_107a` rendering case skips with the entry's decline).
 
 ### SwiGLU FP4 gate / up product for decode rows: replay and batch invariance at every row count, goldens per token tile
 

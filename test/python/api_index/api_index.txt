@@ -1,4 +1,5 @@
 cudnn
+cudnn.AddNormQuantDecode
 cudnn.AlignedHCABackward
 cudnn.AttentionGateQuantDecode
 cudnn.BSA

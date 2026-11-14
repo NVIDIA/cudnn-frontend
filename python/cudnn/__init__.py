@@ -399,6 +399,7 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
     "SharedExpertDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "AttentionGateQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "Fp8ProjectionDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
+    "AddNormQuantDecode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
     "SwigluFp4Decode": "Install with 'pip install nvidia-cudnn-frontend[cutedsl]' and install a CUDA-enabled torch build",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
@@ -424,6 +425,10 @@ _LAZY_OPTIONAL_IMPORTS = {
     # the FP8 split-K projection for decode rows (E4M3 x E4M3 -> bf16, 1 .. 32 rows, SM100-class parts): a direct-call entry like the
     # GDN steps (also `cudnn.gemm.Fp8ProjectionDecode`, with its `ProjectionGeometry` / `ProjectionForm`)
     "Fp8ProjectionDecode": (".gemm.frost.projection_decode.fp8_projection_decode", "Fp8ProjectionDecode"),
+    # the add + RMSNorm + quantize decode step (the residual add, the RMSNorm and the quantization of the following projection's input --
+    # bf16, FP8 E4M3 or NVFP4 -- in one launch, SM100-class parts): a direct-call entry like the steps above (also
+    # `cudnn.norm.frost.AddNormQuantDecode`)
+    "AddNormQuantDecode": (".norm.frost.add_norm_quant_decode", "AddNormQuantDecode"),
     # the gate / up product of an FP4 MLP for decode rows with SiLU(gate) x up and the FP4 re-quantisation in one launch (block-scaled FP4
     # in and out, 1 .. 64 rows, SM100-class parts): a direct-call entry like the steps above (also `cudnn.gemm.SwigluFp4Decode`, with
     # its `SwigluGeometry`)
