@@ -112,6 +112,22 @@ def probe_matches(kind: str, caps, facts, expected) -> bool:
     return actual in ({decl} if expected is None else {expected, decl})
 
 
+@dataclasses.dataclass(frozen=True)
+class _DeclaredTensor:
+    dim: tuple
+    dtype: object
+
+    def get_dim(self):
+        return self.dim
+
+    def get_stride(self):
+        _, h, seq, d = self.dim
+        return (seq * h * d, d, h * d, 1)
+
+    def get_data_type(self):
+        return self.dtype
+
+
 def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     """Facts that satisfy every NON-mask constraint of this row.
 
@@ -120,6 +136,17 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     """
     values = _values(kind, caps, *_dims(kind, caps))
     values.update(overrides)
+    # Wide native rows validate the actual binding declarations even without
+    # shape overrides. Keep the non-mask baseline legal after geometry changes.
+    b, hq, hk = values["b"], values["h_q"], values["h_kv"]
+    sq, sk, dq, dv = (values[k] for k in ("s_q", "s_kv", "d_qk", "d_v"))
+    for role, dim, dtype in (
+        ("q_t", (b, hq, sq, dq), values["dtype"]),
+        ("k_t", (b, hk, sk, dq), values["dtype"]),
+        ("v_t", (b, hk, sk, dv), values["dtype"]),
+        ("o_t", (b, hq, sq, dv), values["dtype_o"]),
+    ):
+        values.setdefault(role, _DeclaredTensor(dim, dtype))
     return ga.SdpaGraphFacts(**values)
 
 

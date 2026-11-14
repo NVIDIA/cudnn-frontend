@@ -443,6 +443,9 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
         # Pin the same body this fixture exercised before the row split.
         # Its short packed Q rows used swap-AB even with the old CGA2 knob.
         engine_id, tile_m, cga = (20519, 128, 2) if prefill else (20520, 16, 1)
+    if cc in ((10, 0), (10, 3)) and (d, d_v) == (512, 512):
+        # Preserve this native-binder fixture's original role-split ABI.
+        engine_id, tile_m, cga = 20521, 128, 4
     graph.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, tile_n=tile_n, cga=cga, pack_gqa=cc != (10, 7), split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared

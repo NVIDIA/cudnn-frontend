@@ -17,7 +17,7 @@ from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, requires_sm80, _dsl_installed, _is_plan_for
 
-_FROST = engine_name()  # matches the D=512 graphs below
+_FROST = "sdpa_fwd_sm100_d512_2x2"  # exact D512 half owner for the graphs below
 
 
 _SM100 = requires_pre_rubin_blackwell
@@ -232,7 +232,7 @@ def test_no_magic_import_required():
         "o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())\n"
         "g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])\n"
         "names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]\n"
-        "i = next((i for i, n in enumerate(names) if n.split('[')[0] == 'sdpa_fwd_prefill_sm100'), None)\n"
+        f"i = next((i for i, n in enumerate(names) if n.split('[')[0] == {_FROST!r}), None)\n"
         "assert i is not None, names\n"
         "g.select_plan(i)\n"
         "g.check_support()\n"
