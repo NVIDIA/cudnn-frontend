@@ -705,6 +705,101 @@ def test_sm90_blk128_tile_order_matches_identity_order(monkeypatch, q_blocks, la
         torch.testing.assert_close(lse_graph.double(), lse_ref, atol=1e-4, rtol=1e-5)
 
 
+def _longest_list_first(counts):
+    """Per (batch, head), the Q tiles by descending list length with equal lengths in their natural order, computed
+    on the host.  Every tile has its own sort key, so the reference does not rest on the stability of a sort."""
+    lengths = counts.long().cpu()
+    tiles = torch.arange(lengths.shape[-1])
+    return torch.argsort((lengths.max() - lengths) * lengths.shape[-1] + tiles, dim=-1)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_blocks", [pytest.param(11, id="small_sort"), pytest.param(4100, id="large_sort")])
+@torch_fork_set_rng(seed=131)
+def test_sm90_blk128_tile_order_is_longest_list_first(monkeypatch, q_blocks):
+    """The tile order that the wrapper hands to the kernel is, per (batch, head), the permutation of the Q tiles by
+    descending list length with equal lengths in their natural order.  O and LSE cannot show it (every permutation
+    of the CTAs gives the same bits), so the launch arguments are recorded.  Checked on an eager call, on a second
+    one after the counts changed at the same address, and on a CUDA graph replayed after another change: the order
+    tensor of the captured launch then holds the order of the counts the replay ran on.  11 and 4100 Q tiles take
+    torch's two sort paths (up to and beyond 4096 elements)."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    batch, heads, kv_heads, dim = (2, 4, 2, 128) if q_blocks <= 4096 else (1, 2, 1, 64)
+    kv_blocks, width = 8, 5
+    q = torch.randn((batch, heads, (q_blocks - 1) * 128 + 1, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, kv_blocks * 128, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, kv_blocks * 128, 64), device="cuda", dtype=torch.bfloat16)
+    # Every slot of a list holds a valid block id, so that any count up to the width is legal after the counts change.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    counts = torch.randint(0, width + 1, (batch, heads, q_blocks), device="cuda", dtype=torch.int32)
+
+    def call():
+        return ops.block_sparse_attention_forward(q, k, v, indices, width, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
+
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    call()
+    cache = interface._bsa_attn_fwd_sm90_blk128.compile_cache
+    ((key, compiled),) = cache.items()
+    launches = []
+
+    def recorder(*args):
+        launches.append(args)
+        return compiled(*args)
+
+    cache[key] = recorder
+
+    def launched_order():
+        # Launch arguments: q, k, v, o, lse, lists, counts, sizes, order, then the scalars and the stream.
+        order = launches[-1][8]
+        assert tuple(order.shape) == (q_blocks, heads, batch) and not order.dtype.is_floating_point, (order.shape, order.dtype)
+        return order.permute(2, 1, 0).long().cpu()
+
+    call()
+    first = _longest_list_first(counts)
+    assert (first != torch.arange(q_blocks)).any(), "the natural order must not already be the longest-list-first order"
+    assert torch.equal(launched_order(), first)
+
+    counts.copy_(counts.flip(-1))
+    call()
+    second = _longest_list_first(counts)
+    assert not torch.equal(second, first)
+    assert torch.equal(launched_order(), second), "an eager call must order the counts it is given"
+
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            call()
+        counts.copy_(counts.roll(1, -1))
+        third = _longest_list_first(counts)
+        assert not torch.equal(third, second)
+        with no_host_sync():
+            graph.replay()
+        assert torch.equal(launched_order(), third), "a replay must order the counts it runs on"
+    assert len(launches) == 3 and list(cache) == [key], "three launches of the one compiled kernel"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("surplus", [pytest.param(2, id="more_lengths_than_q_tiles"), pytest.param(-1, id="fewer_lengths_than_q_tiles")])
+@torch_fork_set_rng(seed=132)
+def test_sm90_blk128_tile_order_rejects_lengths_off_the_q_grid(monkeypatch, surplus):
+    """The host entry ranks every list length it is given and the grid has one CTA per Q tile of q.  Lengths for more
+    Q tiles than q has would hand CTAs to tiles that do not exist and leave real tiles unwritten; lengths for fewer
+    would leave CTAs without a tile.  The public API rejects such metadata by its shape (test_BSA_api.py); the
+    private entry behind it raises before a kernel is built or launched."""
+    import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    q_blocks, kv_blocks, width = 4, 8, 5
+    q = torch.randn((1, 2, q_blocks * 128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, kv_blocks * 128, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indices = torch.arange(width, device="cuda", dtype=torch.int32).expand(1, 2, q_blocks + surplus, width).contiguous()
+    counts = torch.full((1, 2, q_blocks + surplus), width, device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    with pytest.raises(ValueError, match=f"one list length per Q tile: expected {q_blocks}, got {q_blocks + surplus}"):
+        interface.bsa_attn_fwd(q, k, v, indices, width, q2k_block_nums=counts, sparse_block_size=128)
+    assert not interface._bsa_attn_fwd_sm90_blk128.compile_cache, "the rejection must come before a kernel is built"
+
+
 # ---- SM100/SM110 blk64
 
 

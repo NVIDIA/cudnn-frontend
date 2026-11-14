@@ -1181,6 +1181,10 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
     # descending argsort per (b, h) keeps equal lengths in their natural order; it stays on the device (no host
     # synchronization, CUDA-graph safe) and is issued here so its small kernels run while the host prepares the launch.
     has_tile_order = variable and splits == 1
+    if has_tile_order and counts.shape[-1] != (sq + 127) // 128:
+        # The order ranks every length it is given and the grid has one CTA per Q tile of q: a length for a tile
+        # that q does not have would take the CTA of a real tile, whose output rows would then stay unwritten.
+        raise ValueError(f"q2k_block_nums must hold one list length per Q tile: expected {(sq + 127) // 128}, got {counts.shape[-1]}")
     order = torch.argsort(counts, dim=-1, descending=True, stable=True) if has_tile_order else None
     if splits == 1:
         out = torch.empty((b, h, sq, dv) if layout == "bhsd" else (b, sq, h, dv), device=q.device, dtype=q.dtype)
