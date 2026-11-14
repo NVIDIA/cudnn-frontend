@@ -76,6 +76,12 @@ def _load(kind, flavor):
     # the d128 f16 flavor would select the decode kernel above), cga1 where that is the only width (fp8 d256, mxfp8 d512).
     cta_mma = max(supported_cgas_for(flavor, fp8=fp8, device_cc=(10, 0), pertensor=pertensor))
     params = TemplateParams(dtype_qkv=_E4M3 if fp8 else _BF16, dtype_o=_BF16, cta_mma=cta_mma)
+    if kind == "f16" and flavor == (192, 128):
+        from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+        from cudnn.sdpa.fwd.kernels.sm100.d192_f16_multi_q.contract import Geometry, KERNEL_FILE, NAME
+
+        geometry = Geometry(cga=cta_mma)
+        return _load_kernel_template(KERNEL_FILE, geometry.configure_params(params), NAME)
     return _load_sm100_kernel_module(flavor, params, fp8=fp8, pertensor=pertensor, rubin=False)
 
 
