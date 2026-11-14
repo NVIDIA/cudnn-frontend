@@ -64,6 +64,12 @@ their deeper numerical/PTX tests may not run in a bounded smoke selection.
 Splitting an engine also updates the shared `test_mhas_v2` routing assertions
 and explicit plan pins, not only the architecture-local FROST suites. Keep
 concrete owner/body assertions so native fallback cannot count as a pass.
+For an engine ownership split, also run `test_band_capabilities.py`,
+`test_sdpa_frontend_integration.py`, and affected paged/native-binding cases.
+The band matrix synthesizes facts: include current Q/K/V/O declarations so
+mandatory native-binding validation cannot hide the band decision. Explicit
+pins in shared helpers must migrate both the engine ID and physical cluster
+knob; updating architecture-local body tests alone misses these consumers.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.

@@ -408,7 +408,7 @@ def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     assert thd is not None and "decode tile" in thd and "THD" in thd
     assert engines.mismatch(caps, _facts(thd=True), engines.SdpaFwdKnobs(cga=2)) is None
     d256 = engines.mismatch(caps, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), engines.SdpaFwdKnobs(cga=1))
-    assert d256 is not None and "owned by the lookahead and swap-AB" in d256
+    assert d256 is not None and "owned by the explicit implementation engines" in d256
     # Partial PackGQA rides the decode tile: a pinned cga=1 + PACK_GQA=1 on 96/8
     # (G=12 packs 4) is honored; on 24/8 (G=3, no common factor) it is declined.
     assert engines.mismatch(caps, _facts(h_q=96, h_kv=8), engines.SdpaFwdKnobs(cga=1, pack_gqa=True)) is None

@@ -627,8 +627,7 @@ def test_paged_graph_declines_off_contract():
     """Plan-time declines stay plan-time: no engine plan is offered, nothing compiles."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
-    from frost_test_utils import offers_engine
+    from frost_test_utils import half_engine_names, offers_engine
 
     def _build(P, d=D, H=8, KH=2, hnd=False, padding=True, sink=False, d_v=None):
         B, max_pages = 2, 8
@@ -672,7 +671,7 @@ def test_paged_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name())
+        return g is not None and any(offers_engine(g, name) for name in half_engine_names("sm100"))
 
     assert _offers(_build(16))
     # Lifted: paged KV + attention sink at s_q == 1 is offered (the decline
@@ -2964,7 +2963,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         (192, 128, 2, 3, 1),
         (256, 256, 2, 33, 1),
         (256, 256, 2, 3, 2),
-        (512, 512, 2, 3, 1),
+        (512, 512, 4, 3, 1),
     ],
 )
 def test_paged_independent_pool_layouts(k_hnd, v_hnd, kh, dtype, d, d_v, cga, s_q, split):
