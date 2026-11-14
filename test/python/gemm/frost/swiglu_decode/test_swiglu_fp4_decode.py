@@ -1221,7 +1221,9 @@ def test_plan_time_compile_covers_every_served_row_count(monkeypatch):
 def test_a_failed_form_leaves_the_compiled_forms_launchable(monkeypatch):
     """On the device: ``compile()`` of a fresh entry compiles the 8-token form, then the 16-token form's trace raises.  A caller
     that catches the error can serve rows 1 .. 8: the launch finds the form compiled and writes the default entry's bytes.  Once
-    the trace works again, ``compile()`` builds the three missing forms and a row count of the failed form launches."""
+    the trace works again, ``compile()`` builds the three missing forms and a row count of the failed form launches.  The reference
+    bytes are taken before the patch is installed: the default entry compiles its own form there, so every call the patch records
+    is a call of the entry under test, whichever test ran first in the process."""
     dev = U.device_or_skip()
     kernel = importlib.import_module("cudnn.gemm.frost.swiglu_decode.kernel.swiglu_fp4_decode_nvfp4")  # behind the gate of device_or_skip
     real, seen = kernel.compile_kernel, []
@@ -1233,13 +1235,14 @@ def test_a_failed_form_leaves_the_compiled_forms_launchable(monkeypatch):
         return real(cfg)
 
     k = entry.SwigluFp4Decode(dev, G_SMALL)
+    ops, _ = _ops(dev, G_SMALL, 5)
+    want = U.run(_entry(dev, G_SMALL), ops)  # outside the patch: in a fresh process this call compiles the default entry's 8-token form
+    torch.cuda.synchronize()
     with monkeypatch.context() as patched:
         patched.setattr(kernel, "compile_kernel", second_form_raises)
         with pytest.raises(RuntimeError, match="the second form does not compile"):
             k.compile()
         assert seen == [8, 16] and [form.TOKEN_TILE for form in k.compiled] == [8]
-        ops, _ = _ops(dev, G_SMALL, 5)
-        want = U.run(_entry(dev, G_SMALL), ops)
         got = U.run(k, ops)  # compiles nothing: the 8-token form is in the cache
         torch.cuda.synchronize()
         assert seen == [8, 16], "a launch of the compiled form reached the compiler"
