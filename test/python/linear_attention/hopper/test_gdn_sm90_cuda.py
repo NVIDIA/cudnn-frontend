@@ -733,12 +733,12 @@ def test_a_failed_kernel_build_declines(monkeypatch):
     from cudnn.linear_attention.hopper import cuda_bwd_host, cuda_host, gdn_cuda_engine
     from linear_attention.test_la import clear_caches
 
-    def broken(*args, **kwargs):
+    def raise_build_error(*args, **kwargs):
         raise OSError("read-only cubin cache")
 
     monkeypatch.setattr(gdn_cuda_engine, "_LOAD_FAILURES", {})
-    monkeypatch.setattr(cuda_host, "_library", broken)
-    monkeypatch.setattr(cuda_bwd_host, "library", broken)
+    monkeypatch.setattr(cuda_host, "_library", raise_build_error)
+    monkeypatch.setattr(cuda_bwd_host, "library", raise_build_error)
     clear_caches()
     try:
         tensors, cu, d_out = make_case([256], 4, "init", seed=23)
