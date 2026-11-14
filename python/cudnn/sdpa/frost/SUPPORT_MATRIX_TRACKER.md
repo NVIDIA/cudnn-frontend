@@ -101,6 +101,21 @@ swap-AB records that differed only in an unused scheduler are canonicalized.
 Old exact-width recipes must be replanned. No new numerical or behavior-note
 guarantee accompanies this ownership migration.
 
+**SM100/SM103 exact half D192/V128 implementation engines:**
+`sdpa_fwd_sm100_d192_multi_q` (20531) owns the multi-Q pipeline with
+TILE_M=128 and one/two-CTA internal variants. K-subtile release granularity
+and the coupled K/V ring depths remain internal configuration of this body.
+`sdpa_fwd_sm100_d128_single_q` (20532) initially owns only its exact D192/V128
+unpacked nonpaged THD leg, including supported splits, with TILE_M=128 and one CTA. Its shared
+single-Q body is kept separate from multi-Q and quadrant cooperation; this
+batch does not transfer D64/D128 or SM107 consumers of the old shared file.
+The legacy 20511 row declines exact half D192/V128 on SM100/SM103, while
+dense head envelopes retain their previous owner. Central selection preserves
+the existing candidate order, budget and placement. Fixed public records
+select the body directly; old exact-D192 20511 records require replanning.
+Mask, sink, Stats, packing/split and physical-origin checks remain shared.
+This ownership migration adds no numerical or behavior-note guarantee.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;

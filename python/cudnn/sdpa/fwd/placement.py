@@ -683,6 +683,8 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d128_fp8_multi_q.contract import NAME as SMALL_FP8_MULTI_Q
     from .kernels.sm100.d128_fp8_dual_kv.contract import NAME as SMALL_FP8_DUAL_KV
     from .kernels.sm100.d128_fp8_swap_ab.contract import NAME as SMALL_FP8_SWAP_AB
+    from .kernels.sm100.d192_f16_multi_q.contract import NAME as D192_HALF_MULTI_Q
+    from .kernels.sm100.d128_f16_single_q.contract import NAME as HALF_SINGLE_Q
 
     # Studies for an explicit implementation take precedence over inherited
     # placement, including a measured TRAIL and non-default legal variants.
@@ -717,6 +719,16 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in (D512_FP8_ROLE_SPLIT, D256_FP8_SINGLE_Q, D192_FP8_MULTI_Q):
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
 
+    if spec.capabilities.implementation in (D192_HALF_MULTI_Q, HALF_SINGLE_Q):
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm100_d192_half_geometry
+
+        selected = select_sm100_d192_half_geometry(facts, knobs)
+        if selected.implementation != spec.capabilities.implementation:
+            return TRAIL
+        spec = sm100_legacy_policy_spec()
+
     if spec.capabilities.implementation in (SMALL_FP8_MULTI_Q, SMALL_FP8_DUAL_KV, SMALL_FP8_SWAP_AB):
         if knobs is None:
             return TRAIL
@@ -747,8 +759,9 @@ def place(spec, facts, knobs=None) -> str:
     if spec.name == "sdpa_fwd_prefill_sm100":
         from .kernels.sm100.d256_f16_contract import in_pilot_domain
         from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+        from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
 
-        if in_pilot_domain(facts) or in_wide_half_domain(facts):
+        if in_pilot_domain(facts) or in_wide_half_domain(facts) or in_d192_half_domain(facts):
             # Historical study queries can still use the old row name. Its
             # class and hand-rule fallback must use the same policy domain.
             spec = sm100_legacy_policy_spec()
