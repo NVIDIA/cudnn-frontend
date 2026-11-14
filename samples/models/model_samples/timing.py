@@ -220,6 +220,7 @@ def trace_steps(step: Callable[[int], None], count: int, device=None, records: O
         except RuntimeError:
             pass  # the step's error is the one to raise; a profiler that cannot stop adds nothing to it
         raise
+    activity = []  # set on either path below: from the profiler's own events, or from the exported launch records
     try:
         profiler.__exit__(None, None, None)
         if records is None:

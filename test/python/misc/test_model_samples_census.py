@@ -634,7 +634,7 @@ def test_the_adapter_builds_its_entry_from_the_rows_form_and_states_the_entrys_f
             return torch.zeros((rows, 4), dtype=torch.uint8)
 
         def kernel_symbols_for(self, rows):
-            return (SYMBOL,) if rows == 1 else ()
+            return tuple([SYMBOL] if rows == 1 else [])
 
         def form_for(self, rows):
             return {"PDL": bool(self.knobs.get("pdl")), "PDL_RELEASE": bool(self.knobs.get("pdl_release")), "ROWS": rows}
@@ -1041,9 +1041,10 @@ def test_the_traced_pass_hands_over_its_launch_records(monkeypatch, tmp_path):
             if self.fail == "names the file":
                 raise RuntimeError(f"cannot save the trace to {path}\nsecond line")
             if self.fail == "cut short":
-                return Path(path).write_text(_trace_text(events(self.steps))[:900])
+                Path(path).write_text(_trace_text(events(self.steps))[:900])
+                return
             if self.fail == "writes nothing":
-                return None  # an exporter that logs what it cannot write and raises nothing
+                return  # an exporter that logs what it cannot write and raises nothing
             if self.fail:
                 raise RuntimeError(self.fail)
             Path(path).write_text(_trace_text(events(self.steps)))
