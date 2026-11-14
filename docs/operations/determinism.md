@@ -44,7 +44,7 @@ arbitrary user callbacks.
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
 | `kimi_delta_attention` (KDA) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `gated_delta_product` (GDP) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
-| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
+| `gated_delta_net` (GDN) | fprop, bprop | FP16, BF16 | BF16 (`gdn_hopper_cuda`): Supported; FP16: Unverified | Supported | Supported |
 | `gated_delta_net_v2` (GDN-2) | fprop, bprop | FP16, BF16 | Unverified | Supported | Supported |
 | `GdnDecodeFused` (fused GDN decode step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Supported | Supported |
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
@@ -226,6 +226,12 @@ a row alone and inside a batch under the entry's own picks.
   other unmeasured GPU paths remain unverified.
 - Linear attention: select the FROST plan with `batch_invariant=True`.
   Initial/final state and state gradients use FP32.
+- `gated_delta_net` on SM90: `gdn_hopper_cuda` is the default engine, for BF16
+  Q/K/V with K=V=128 and an FP32 gate, beta and state. It accepts
+  `batch_invariant=True`, and its bytes are the same with or without it: the
+  forward runs one unsplit chain per (sequence, head), and the backward's
+  per-(sequence, head) arithmetic does not depend on the batch. Other SM90 GDN
+  configurations run on `gdn_cutile` and are unverified.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
@@ -374,7 +380,7 @@ a row alone and inside a batch under the entry's own picks.
   FP8 are outside these rows.
 - Use a compatible CuTe DSL runtime, including `sm_107a` support for SM107.
 
-Other linear-attention backends, FP16 indexer inputs, MXFP4, paged indexer,
+Linear-attention backends other than FROST and SM90 `gdn_hopper_cuda`, FP16 indexer inputs, MXFP4, paged indexer,
 separate Top-K generation, THD dense indexer backward, score recompute,
 pooled DSA, distributed execution, and the block-sparse attention blk128,
 KPage and FP8 paths are outside this status page's scope.

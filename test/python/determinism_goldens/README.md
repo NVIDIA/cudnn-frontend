@@ -97,6 +97,7 @@ pytest compressed_sparse_attention/cutedsl/test_CSA_compressor.py -m L0 \
   -k 'batch_invariance or replay_determinism or determinism_golden'
 pytest block_sparse_attention/cutedsl/test_BSA_determinism.py -m L0
 pytest core/test_determinism_utils.py
+pytest linear_attention/hopper/test_gdn_sm90_cuda_determinism.py -m L0  # SM90 only
 ```
 
 | Suite | API | Forward results | Backward results |
@@ -105,6 +106,7 @@ pytest core/test_determinism_utils.py
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN` | `gated_delta_net` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestGDN2` | `gated_delta_net_v2` | output, final state | dQ, dK, dV, dG, dBeta, dW, dInitialState |
+| `linear_attention/hopper/test_gdn_sm90_cuda_determinism.py` | `gated_delta_net` on SM90, `plan_name="gdn_hopper_cuda"` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `TestQSA` | `qsa_forward`, `qsa_backward` | BF16 output, FP32 output, LSE | dQ, dK, dV |
 | `TestQSABackwardEngine` | `qsa_backward`, `qsa_indexed_backward` | — | dQ, dK, dV |
 | CSA compressor focused cases | `CSA.csa_compressor_forward_wrapper`, `CSA.csa_compressor_backward_wrapper` | BF16 pooled output, including exact-zero capacity rows | BF16 dKV/dScore, FP32 dAPE |
@@ -335,6 +337,83 @@ selects the preceding record phase. The environment sets
 `CUBLAS_WORKSPACE_CONFIG=:4096:8`, `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`,
 `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`, preloads CUDA 13.4 NVRTC, and uses
 the cuDNN 9.30.0.4 library directory with isolated source/cache paths.
+
+### SM90 GDN engine (`gdn_hopper_cuda`) — beta in fp32, 2026-11-13 (UTC)
+
+The scalar-gate forward no longer rounds beta into a bf16 operand. The Gram
+products take raw q/k and multiply beta_j into their fp32 results, and the
+state update multiplies beta_t exp(c_15 - c_t) into the fp32 residual before
+it is rounded, with raw k as the key operand. On raw keys with
+beta |k|^2 = 3.6 (review of NVIDIA/cudnn-frontend#2539), the rounded beta had
+compounded to 12% at token 48 and 15% on the final state; it is now 0.7% and
+0.2%. The backward is unchanged.
+
+Same runtime and commands as the records below: 2 recorded, then
+**34 passed, 0 failed, 0 skipped** against them. Both golden records changed
+in two fields each, the forward's `out` and `final_state` hashes. Their inputs,
+runtime and gradient hashes are unchanged. The per-channel (KDA) cubins are
+byte-identical to `develop`'s.
+
+### SM90 GDN engine (`gdn_hopper_cuda`) — unsplit forward, 2026-11-13 (UTC)
+
+The engine's forward no longer cuts a sequence into pieces: a piece after the
+first warmed up from a history cut by a gate-only bound, which raw keys or a
+large state could break (review of NVIDIA/cudnn-frontend#2539). With one chain
+per (sequence, head) the forward's bytes no longer depend on the rest of the
+batch, and the suite now asserts batch invariance in both directions and runs
+with `batch_invariant=True`, which the engine now accepts. It has 34 L0 cases.
+
+Same runtime and commands as the record below, on the branch with this change:
+`CUDNN_DETERMINISM_RECORD` then `CUDNN_DETERMINISM_GOLDENS` give 2 recorded and
+**34 passed, 0 failed, 0 skipped**. The two new golden records have the same
+input and output hashes as the committed ones, field for field, so the files are
+unchanged. A probe comparing one sequence alone with the same sequence packed
+among three others (2 and 16 heads) found every output, final-state and gradient
+byte equal. Not covered: other SM90 parts, FP16 (served by `gdn_cutile`), warm
+stress.
+
+### SM90 GDN engine (`gdn_hopper_cuda`) — validation, 2026-11-12 (UTC)
+
+`linear_attention/hopper/test_gdn_sm90_cuda_determinism.py` covers
+`gated_delta_net` pinned to `gdn_hopper_cuda`: BF16 Q/K/V with K=V=128,
+L2-normalised Q/K, FP32 gate, beta, initial state and state gradient, packed
+THD with int32 offsets. It had 28 L0 cases; the current method table is under
+[How to read the test cases](#sm90-gdn-engine-gdn_hopper_cuda-34-cases).
+
+H100 80GB HBM3 (SXM, 132 SMs); Torch `2.14.0a0+b2c75dd062.nv26.09`, CUDA
+`13.4`, driver API `13040`, cuDNN `92600`, CuTe DSL `4.8.1`, TVM FFI `0.1.11`.
+Source: branch `gdn-sm90-engine` on `develop` `5c99b2c8`. The Python package
+from the branch ran over the Megatron-LM CI container's cudnn-frontend install,
+with `_compiled_module` built from `develop` `a736a06c`; no compiled-module
+source changed between the two commits. `cudnn.__file__` resolved to that tree.
+
+```bash
+cd test/python
+suite=linear_attention/hopper/test_gdn_sm90_cuda_determinism.py
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=/fresh/dir \
+  python -m pytest "$suite" -m L0 -q -rs -k test_golden        # 2 passed: replay, FP64 reference, then record
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS=/fresh/dir \
+  python -m pytest "$suite" -m L0 -q -rA                        # 28 passed, 0 failed, 0 skipped
+```
+
+The two golden records, [fprop](0b8cfc790c9b1ceb/gdn-sm90-cuda-fprop.json) and
+[bprop](0b8cfc790c9b1ceb/gdn-sm90-cuda-bprop.json), were recorded only after
+three replays and the FP64 reference passed, then checked again in a separate
+strict run. They are a new baseline; no existing golden changed.
+
+Forward batch invariance is not provided, and the suite asserts no forward batch
+case. A probe compared one sequence alone with the same sequence packed among
+three others (2 and 16 heads; Megatron-init, softplus, bounded (-5, 0), slow,
+zero and constant -8 gates). Output and final-state bytes matched in every cell
+but one: at 16 heads on the softplus gate, one of 614,400 output elements and one
+of 262,144 final-state elements differed (relative 1.5e-5 and 2.9e-9). Backward
+gradients matched in every probe cell, as in the suite's batch-invariance cases.
+
+Not covered: other SM90 parts (H200, H20), FP16 (this engine declines it and
+`gdn_cutile` serves it), and a warm stress of the shared-memory stages the
+kernels refill. The control ring is a CuTe DSL kernel and was not run on SM90.
+Rule 11 ordering for the stages the scalar-gate build adds was checked in the
+disassembly instead; see the pull request.
 
 ### D128 paged live-column decode — qualification, 2026-11-12 (UTC)
 
@@ -1229,6 +1308,23 @@ executions, then compare every sequence alone, the reversed batch, and a
 duplicated first sequence. GDP slices K/V/Beta gradients on the expanded
 Householder axis. State tensors use `[sequence, output heads, V, K]`.
 
+### SM90 GDN engine (`gdn_hopper_cuda`): 34 cases
+
+`linear_attention/hopper/test_gdn_sm90_cuda_determinism.py` pins
+`gdn_hopper_cuda` with `batch_invariant=True`. Inputs are drawn on the CPU per
+sequence: BF16 Q/K/V with K=V=128, L2-normalised Q/K, FP32 gate (Megatron
+initialisation unless listed), beta, initial state and state gradient.
+
+| Test method | Level | Parameters and purpose | Cases |
+| --- | --- | --- | ---: |
+| `test_replay` | L0 | fprop/bprop × Megatron-init/slow gate; lengths 65, 0, 17, 1; eight executions; input mutation check | 4 |
+| `test_replay_across_launch_geometries` | L0 | fprop/bprop × 48 and 160 pairs on the 64-column scan, 2 pairs on the 32-column scan, one 17001-token sequence, more work items than SMs, lengths 1 to 65; four executions | 12 |
+| `test_empty_sequence_passes_its_state_through` | L0 | fprop/bprop; a zero-length sequence returns its initial state and its state gradient | 2 |
+| `test_neighbor_isolation` | L0 | fprop/bprop × 2/16 heads; changed neighbors, fixed lengths, target and upstream gradients | 4 |
+| `test_batch_invariance` | L0 | fprop/bprop × 2/16 heads × Megatron-init/slow gate; removal, reorder, duplication; every output and gradient | 8 |
+| `test_gradient_source` | L0 | bprop with output loss only or final-state loss only; FP64 reference | 2 |
+| `test_golden` | L0 | fprop/bprop; lengths 17, 3; three executions, FP64 reference, saved hashes | 2 |
+
 ### Fused GDN step kernels: per-geometry replay and batch invariance, no goldens
 
 The fused decode / MTP-verify step entries (`cudnn.linear_attention.frost.gdn_decode_fused` / `gdn_verify_fused`) carry their determinism
@@ -1916,7 +2012,7 @@ must name the defect, retain the recorded failures, and be removed with its fix.
 
 The earlier suites cover FROST and public QSA/DSA APIs on SM100/SM103/SM107.
 The quantized indexer suite adds SM90 FP8 and SM100/SM103/SM107 MXFP8.
-The set excludes cuTile/CAKE, other Hopper paths, QSA indexed/two-pass APIs,
+The set excludes cuTile/CAKE, Hopper paths other than `gdn_hopper_cuda`, QSA indexed/two-pass APIs,
 checkpoint/summary/decode paths, shared gate parameters, fused/separate Top-K,
 paged/MXFP4 indexer forward, THD dense indexer backward, score recompute,
 pooled DSA, and distributed recipes. Existing tests cover some paths separately.

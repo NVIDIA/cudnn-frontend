@@ -201,8 +201,17 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "gdn",
         "cudnn.linear_attention",
         "GdnEngines",
-        slots={"gdn_frost": EngineSlot(0), "gdn_cutile": EngineSlot(1), "gdn_summary_frost": EngineSlot(2), "gdn_cake_det": EngineSlot(3, opt_in=True)},
+        slots={
+            "gdn_frost": EngineSlot(0),
+            "gdn_cutile": EngineSlot(1),
+            "gdn_summary_frost": EngineSlot(2),
+            "gdn_cake_det": EngineSlot(3, opt_in=True),
+            "gdn_hopper_cuda": EngineSlot(4),
+        },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+        # Ordering only, and only on Hopper: without it the slot-1 cuTile engine
+        # wins every sm90 graph ahead of the dedicated sm90 engine at slot 4.
+        heuristics=("cudnn.linear_attention.gdn_heuristics", "recommend"),
     ),
     EngineFamily(
         KDA_ID_BASE,
