@@ -5866,3 +5866,68 @@ the follow-up fixture changes only migrate other test owners and the split
 capability inventory. FP8 on SM103, strict runtime-golden comparisons, other
 architectures and backward are not qualified by this migration. No support
 status is upgraded from these bounded identity/replay checks.
+
+
+## 2026-11-14 — SM120 dense D128 additive-bias integration (#2193)
+
+The integration retains the paged prepared host and append-only API argument
+order. It qualifies `SdpaFwdDslSm120` forward only: FP16/BF16 D128, FP32 or
+matching-input bias, unpaged/unpacked/unsplit, without physical origins.
+Bias backward and SM121 hardware were not qualified.
+
+`test_frost_sdpa_bias_sm120_determinism.py` adds eight L0 cases: both input
+dtypes, both bias dtypes, M64 dense and M128 causal. CPU-seeded B3/H64/Hkv16
+inputs use Q129/K257 tails, padded bias storage, and an all-minus-infinity
+row. Tests compare O and FP32 LSE bytes over fresh-buffer/concurrent replays,
+isolated/reordered/duplicated batches, changed neighbors and captured replay,
+separately check an FP64 numerical reference, and retain runtime-keyed goldens.
+The golden case name also includes the DSL compiler version; the common
+runtime key alone does not distinguish CUDA 12 and CUDA 13 DSL wheels.
+
+`test_frost_sdpa_bias_sm120_stress.py` adds two L0 cases, one per input dtype,
+with FP32 bias, B3/H64/Hkv16/Q257/K513/D128, M128/N128, 576 thread blocks and
+four K/V refills per launch. Each case independently checks its FP64 reference,
+then 3,000 warm and 3,000 poisoned launches against a cold byte reference.
+The unsafe control failed 200/200 launches on this device. Cold agreement is
+only a stability check, separate from the FP64 reference.
+
+On the initial f0a0a1b1c43f integration, ordinary bias/contract/analyzer/geometry
+checks passed 1,575 cases; paged/prepared/origin controls passed 271 with 12
+missing-runtime-golden skips and eight deselections. Those skips supply no
+strict golden qualification. The eight new replay/batch checks passed, but
+the new stress failed on warm launch 13 (FP16) and 55 (BF16). The true develop
+f0a0a1b1c43f no-bias control with the same Q/K/V passed both stress cases.
+Enabling the existing result-dependent consumption stores for dense bias
+retains K/V use before the named reuse barriers, just as for paged half-storage.
+
+After that bounded fix, native RTX 6000D (cc 12.0, 156 SMs), driver API 13040,
+Torch 2.14.1+cu130, cuDNN 9.27.0 and CuTe DSL 4.8.0 produced:
+
+| DSL compiler | Scope | Result |
+|---|---|---|
+| CUDA 13.4 | bias + eight strict replay/batch goldens + API contract + paged native rebind | 88 passed, zero skips |
+| CUDA 13.4 | two warm/poisoned stress cases | 2 passed; zero byte mismatches |
+| CUDA 12.9 | bias + API contract | 72 passed, zero skips |
+| CUDA 12.9 | eight new golden candidates, then a separate strict replay/batch run | 8 passed + 8 passed, zero skips |
+| CUDA 12.9 | two warm/poisoned stress cases | 2 passed; zero byte mismatches |
+
+The eight CUDA 13.4 candidates recorded before the fix also passed strict
+checks after it; no existing golden was replaced. All sixteen reviewed new
+JSON files are committed under runtime key `0c261da063500aab`. Fixed-runtime
+identity is asserted, not cross-runtime identity. Source/native-extension and
+loaded-template hashes were checked for each run. The CUDA 13.4 cache objects
+for all 32 bias renderings exercised by the regression contain the consumption
+store before each of 204 K/V `BAR.ARV` sites, without an intervening branch.
+
+Reproduce from `test/python` with the desired installed DSL compiler flavor:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+pytest -o addopts= -m L0 sdpa/frost/test_frost_sdpa_bias_sm120_determinism.py \
+  sdpa/frost/test_frost_sdpa_bias_sm120_stress.py
+```
+
+The ordinary numerical and integration controls are
+`test_frost_sdpa_bias_sm120.py`, `test_sdpa_fwd_api_contract.py`,
+`test_sdpa_graph_analyzer.py`, `test_heuristic_geometry.py` and
+`test_sdpa_fwd_paged_sm120.py::test_sm120_frost_paged_native_rebind_replay`.

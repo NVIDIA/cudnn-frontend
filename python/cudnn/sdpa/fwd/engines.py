@@ -1061,7 +1061,9 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
         if facts.thd or facts.is_fp8 or facts.is_mxfp8 or not _sm120_paged_head_dims_supported(facts.d_qk, facts.d_v, decode=True, d512=True, d576=True):
             return "SM120 paged KV requires FP16/BF16 dense Q with head dims through 256 or D512/D576-V512 wide envelopes, divisible by 8"
-    if facts.has_bias and capabilities.bias_d_shapes is None:
+    if facts.has_bias and capabilities.sm_lo == 120 and facts.shape_overrides:
+        return "SM120 additive bias does not support execute-time shape/stride overrides"
+    if facts.has_bias and capabilities.bias_d_shapes is None and capabilities.sm_lo != 120:
         # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
         # the SM80 row's bias travels through its own adapter and stays off the prepared path.
         return "prepared overrides cannot use bias"
@@ -2748,6 +2750,29 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if facts.has_sink and capabilities.sink_dtypes is not None and facts.dtype not in capabilities.sink_dtypes:
         return f"sink token with dtype {facts.dtype} not in {sorted(str(d) for d in capabilities.sink_dtypes)}"
 
+    if facts.has_bias and capabilities.sm_lo == 120 and not (capabilities.is_fp8 or capabilities.is_mxfp8):
+        from cudnn.sdpa.fwd.config_sm120 import bias_decline
+
+        why = bias_decline(
+            facts.d_qk,
+            facts.d_v,
+            thd=facts.thd,
+            paged=facts.has_paged_kv,
+            split_kv=(knobs.split_kv or 1) if knobs else 1,
+            pack_gqa=bool(knobs.pack_gqa) if knobs else False,
+            tile_m=knobs.tile_m if knobs else None,
+            bottom_right=facts.bottom_right,
+        )
+        if why is not None:
+            return why
+        why = _resident_arm_layout_decline(facts)
+        if why is not None:
+            return why
+        dims, strides = facts.bias_dim, facts.bias_stride
+        elem = 4 if facts.bias_t.get_data_type() == cudnn.data_type.FLOAT else 2
+        if len(strides) != 4 or strides[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(dims[:3], strides[:3])):
+            return "SM120 bias requires contiguous keys and 16-byte aligned outer pitches"
+
     if facts.has_bias and capabilities.bias and facts.bias_t is not None:
         # uniform_dtype covers K/V/O only; the serving adapters compile the
         # bias load as fp32 or the io dtype, so anything else must decline
@@ -3966,6 +3991,7 @@ def _sm120_spec() -> EngineSpec:
             d_shapes=frozenset((tq, tv) for tq in GENERAL_HEAD_TILES for tv in GENERAL_HEAD_TILES) | WIDE_F16_FLAVORS,
             d_envelope_floors=tuple((shape, GENERAL_HEAD_TILE_MAX) for shape in sorted(WIDE_F16_FLAVORS)),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            bias=True,
             causal=True,
             bottom_right=True,
             swa=True,

@@ -768,6 +768,33 @@ the even CTA and only the odd CTA as well as both: symmetric delays can hide
 a missing local completion credit. Check both CTAs' final loads against each
 deallocation; the 2x2 body's local-plus-peer protocol is the existing control.
 
+
+**Rule S17 — Keep additive logits in range before softmax.**
+
+A representable attention scale and finite bias must not overflow merely from
+an algebraic rewrite. Folding `bias / scale` into unscaled QK overflows at
+`scale = 1e-38` with ordinary finite bias; pre-converting a large scale or row
+max to base 2 can also overflow while the natural-unit logits are finite.
+Form `scale * QK + bias` in natural units, subtract the row max before base-2
+conversion, and retain that natural-unit max for LSE (or explicitly bound and
+decline an unsafe numerical domain). Preserve the bias-free specialization.
+An all-`-inf` attention row with an `-inf` sink has zero mass (O = 0,
+LSE = -inf); a `+inf` sink dominates finite attention logits (O = 0,
+LSE = +inf). Handle these endpoints before an `inf - inf` exponent.
+Detector: `test_frost_sdpa_bias_sm120.py` checks negative/tiny/large scales,
+finite `±3e38` bias, all-`-inf` rows and sink endpoints through graph and
+standalone execution and changed-input replay.
+
+Bias arithmetic also changes when the compiler consumes the K/V MMA results.
+Keep the result-dependent shared stores ahead of both named stage credits
+(`store_consumed_result`, package Rule 11), including dense bias, not only
+paged half-storage. Short replay and batch-isolation checks missed a byte
+drift reproduced by `test_frost_sdpa_bias_sm120_stress.py` within 13/55 warm
+launches on SM120. The same-input develop no-bias control passed; enabling
+the existing consumption stores fixed the bias stress. Inspect the compiled
+load/MMA/result-store/release order and retain the refilling warm stress.
+
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`

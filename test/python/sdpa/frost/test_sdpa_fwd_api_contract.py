@@ -193,6 +193,8 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
         assert tail[:8] == ["sf_o", "block_table", "block_table_v", "ragged_q", "ragged_k", "ragged_v", "ragged_o", "ragged_lse"], tail
         for name in tail[1:8]:
             assert params[name].default is None
+        assert tail[8:9] == ["bias_tensor"], tail
+        assert params["bias_tensor"].default is None
     else:
         # SM100 appends ragged-Q offsets, score side outputs and resident-block operands.
         assert tail[:8] == ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"], tail

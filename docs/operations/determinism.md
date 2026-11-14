@@ -509,6 +509,20 @@ retain bytewise identity under replay, reordered/duplicated batches and changed
 neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
 this forward result does not establish a backward or cross-runtime guarantee.
 
+## SM120 D128 additive-bias forward
+
+FP16/BF16 dense D128 forward with FP32 or matching-input bias is repeatable
+and batch invariant for the tested fixed M64 dense and M128 causal plans.
+O and FP32 Stats preserve their bytes across fresh allocations, concurrent
+work, isolated/reordered/duplicated batches, changed neighbors and CUDA Graph
+replay on SM120 (cc 12.0). The M128 path also passes sustained K/V stage-refill
+stress with its result-dependent stores before stage reuse.
+
+This covers unpaged, unpacked, unsplit forward with no physical origins;
+bias backward is unsupported. SM121 execution and cross-GPU, cross-plan or
+cross-runtime bitwise identity remain unverified. The coverage report records
+both tested DSL compiler flavors and the original stress failure.
+
 ## SM120 paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch
