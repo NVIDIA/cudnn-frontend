@@ -31,6 +31,7 @@ from test_utils import torch_fork_set_rng
 from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import (
     _SM,
+    fp8_engine_names,
     assert_no_new_spills,
     make_dense_stats,
     requires_blackwell,
@@ -302,7 +303,7 @@ def _run(
     g.create_execution_plans([cudnn.heur_mode.A])
     # ONE fp8 engine per arch line — kernel-flavor choice (d128 vs d192xd128,
     # and the head-dim envelope) happens inside the lowering.
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True), pack_gqa=pack_gqa)
+    _select_engine(g, fp8_engine_names(_D128_ARCH), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     if not stats:
@@ -1438,7 +1439,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_D128_ARCH, fp8=True))
+    _select_engine(g, fp8_engine_names(_D128_ARCH))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amx_o: amax_o})

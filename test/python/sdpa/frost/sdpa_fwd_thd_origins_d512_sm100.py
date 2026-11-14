@@ -27,8 +27,8 @@ def _configure(monkeypatch, dtype, two_by_two, dims=512):
     monkeypatch.setattr(api_dsl, "D512_2X2", two_by_two)
     fp8 = dtype.startswith("float8_")
     engine = "sdpa_fwd_prefill_sm100_fp8" if fp8 else "sdpa_fwd_prefill_sm100"
-    if not fp8 and dims == 512:
-        engine = "sdpa_fwd_sm100_d512_2x2" if two_by_two else "sdpa_fwd_sm100_d512_role_split"
+    if dims == 512:
+        engine = "sdpa_fwd_sm100_d512_fp8_role_split" if fp8 else "sdpa_fwd_sm100_d512_2x2" if two_by_two else "sdpa_fwd_sm100_d512_role_split"
     template = "prefill_d512_fp8" if fp8 else "prefill_d512_f16_2x2" if two_by_two else "prefill_d512_f16"
     return engine, template
 
@@ -77,7 +77,7 @@ def _check_case(monkeypatch, dtype, two_by_two, stats, *, total_hints, collect=N
         False,
         1,
         engine_name=engine,
-        cga=4 if engine in ("sdpa_fwd_sm100_d512_role_split", "sdpa_fwd_sm100_d512_2x2") else 2,
+        cga=4 if engine in ("sdpa_fwd_sm100_d512_role_split", "sdpa_fwd_sm100_d512_2x2", "sdpa_fwd_sm100_d512_fp8_role_split") else 2,
         extra_checks=extra,
         origin_element_unit=8 if isinstance(dims, tuple) else None,
     )
@@ -124,7 +124,7 @@ def test_stats_slot_waits_for_all_warps(monkeypatch, tmp_path, dtype):
 
     def delayed(path, params, tag="template", **kwargs):
         source_path = Path(path)
-        if source_path.as_posix().endswith(("sm100/d512_f16_role_split/kernel.py", "sm100/prefill_d512_fp8.py")):
+        if source_path.as_posix().endswith(("sm100/d512_f16_role_split/kernel.py", "sm100/d512_fp8_role_split/kernel.py")):
             source = source_path.read_text()
             anchor = "            ell_addr = sStats_xfer_raw.subview(tid_in_wg)\n"
             assert source.count(anchor) == 1
@@ -174,7 +174,7 @@ def test_tmem_release_waits_for_all_readers(monkeypatch, tmp_path, dtype, delaye
 
     def traced(path, params, tag="template", **kwargs):
         source_path = Path(path)
-        if not source_path.as_posix().endswith(("sm100/d512_f16_role_split/kernel.py", "sm100/prefill_d512_fp8.py")):
+        if not source_path.as_posix().endswith(("sm100/d512_f16_role_split/kernel.py", "sm100/d512_fp8_role_split/kernel.py")):
             return original_load(path, params, tag, **kwargs)
         source = source_path.read_text()
         helper = f"""

@@ -39,6 +39,20 @@ Default policy retains the prior body choices, order and candidate budget;
 explicit replay fixes the implementation without a second body crossover.
 No additional determinism or batch-invariance guarantee is introduced.
 
+**SM100/SM103 exact per-tensor FP8 D512 implementation engine:**
+`sdpa_fwd_sm100_d512_fp8_role_split` (20523) owns exact D512/V512
+E4M3/E5M2 inputs with FP16/BF16/E4M3/E5M2 output. The legacy 20513 row
+delegates these exact cells and retains smaller flavors and head envelopes.
+The explicit row reports TILE_M=128 and physical TILE_CGA_M=4, with a fixed
+two-CTA MMA group. Its kernel, configuration, contract and host entry live in
+`sm100/d512_fp8_role_split/`; half and block-scaled kernels keep separate owners.
+Dense Q over dense/paged KV retains masks, sinks, whole-group packing and split-KV;
+nonpaged THD retains its existing unsplit contract. Paged THD and block-scaled
+output remain declined. Central selection preserves the old candidate order,
+budget and placement; explicit records pin this body. Old exact-D512 20513
+recipes must be invalidated and replanned. No additional numerical, Stats
+stride-override, determinism or batch-invariance claim is introduced.
+
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
 Larger groups use their greatest common divisor with 64 as a subgroup width;

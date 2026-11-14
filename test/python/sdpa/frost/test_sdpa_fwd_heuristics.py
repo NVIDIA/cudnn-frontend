@@ -31,7 +31,15 @@ from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
 from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import ROLE_SPLIT, TWO_BY_TWO
 
 _F16 = "sdpa_fwd_prefill_sm100"
-_OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501, LOOKAHEAD: 20519, SWAP_AB: 20520, ROLE_SPLIT: 20521, TWO_BY_TWO: 20522}
+_OFFERED = {
+    _F16: 20500,
+    "sdpa_fwd_prefill_sm100_fp8": 20501,
+    LOOKAHEAD: 20519,
+    SWAP_AB: 20520,
+    ROLE_SPLIT: 20521,
+    TWO_BY_TWO: 20522,
+    "sdpa_fwd_sm100_d512_fp8_role_split": 20523,
+}
 _HALF_IDS = (20500, 20519, 20520, 20521, 20522)
 
 

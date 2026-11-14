@@ -2779,7 +2779,8 @@ def test_paged_quantized_rows_mismatch_reasons():
         for d in (128, 256):
             assert engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=d, d_v=d, device_cc=cc)) is None
     assert "dense-only" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=64, d_v=64))
-    assert "native per-tensor D128/D256" in engines.mismatch(fp8, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
+    fp8_d512 = spec["sdpa_fwd_sm100_d512_fp8_role_split"].capabilities
+    assert "native per-tensor D128/D256" in engines.mismatch(fp8_d512, paged_facts(is_fp8=True, thd=True, d_qk=512, d_v=512))
     # D192/V192 selects the D256 envelope; D192/V128 selects the unpaged D192 flavor.
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=256, d_v=256)) is None
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None

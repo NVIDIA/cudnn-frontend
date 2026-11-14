@@ -38,7 +38,7 @@ them is derived from ``CFG`` rather than spelled as a literal:
     fp32 pre-cast output and divided by ``scale_o`` on device in the adapter.
     ``descale_s`` / ``scale_s`` are accepted and ignored (P is cast unscaled).
 
-MXFP8 (block-scale) is NOT served by this file — d512 has no MXFP8 kernel.
+MXFP8 (block-scale) uses its separate D512 implementation.
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key
@@ -60,7 +60,8 @@ from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initializ
 from cutlass.base_dsl.typing import Pointer
 import cuda.bindings.driver as _cuda_driver
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
+from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.config import TemplateParams, make_cfg_d512
+from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.contract import TEMPLATE_NAME as TEMPLATE_NAME
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes.  A plain import would get

@@ -215,6 +215,8 @@ def test_retired_recipe_is_an_explicit_cache_miss_and_can_be_rebuilt(dq, dv, own
         "d512_f16_role_split.config",
         "d512_f16_2x2.contract",
         "d512_f16_2x2.config",
+        "d512_fp8_role_split.contract",
+        "d512_fp8_role_split.config",
     ],
 )
 def test_implementation_contracts_import_without_other_bodies_or_heavy_runtimes(module):
