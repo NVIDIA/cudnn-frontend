@@ -16,7 +16,15 @@ import pytest
 import torch
 
 from cudnn.api_base import TupleDict
-from block_sparse_attention.cutedsl.bsa_utils import blk128_case, import_bsa, make_fixed_metadata, require_sm90_fp8, require_sm120_fp8, supported_block_size
+from block_sparse_attention.cutedsl.bsa_utils import (
+    blk128_case,
+    blk128_reference,
+    import_bsa,
+    make_fixed_metadata,
+    require_sm90_fp8,
+    require_sm120_fp8,
+    supported_block_size,
+)
 
 pytestmark = [pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 
@@ -391,6 +399,45 @@ def test_backward_sm90_blk128_host_entry_rejects_q_block_count(monkeypatch, q_bl
     ids = torch.zeros((1, 1, q_blocks, 1), device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="must list 2 query blocks for seqlen_q=256"):
         _interface._bsa_attn_bwd_sm90_blk128(q, q, q, q, q, lse, ids, 1)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("bucket,groups", [(1, 2), (256, 1)], ids=["groups", "direct_kv"])
+def test_backward_sm90_blk128_zeroes_workspace_before_csr_build(monkeypatch, bucket, groups):
+    """The zeroing of the FP32 dK/dV accumulators needs no metadata: the SM90 blk128 backward issues it before the
+    CSR build, so that the host side of the build runs under the memset.  One Q group stores dK/dV directly and
+    carries no such accumulators.  Both routes still match the FP64 reference."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    from cudnn.block_sparse_attention import _interface
+
+    calls = []
+    build, allocate = _interface.build_bucketed_k2q_csr_cutedsl, _interface._empty_bwd_workspace_with_zeroed_accum
+
+    def recording_build(*args, **kwargs):
+        calls.append(("csr", None))
+        return build(*args, **kwargs)
+
+    def recording_allocate(**kwargs):
+        workspace = allocate(**kwargs)
+        calls.append(("workspace", (kwargs, workspace.numel())))
+        return workspace
+
+    monkeypatch.setattr(_interface, "build_bucketed_k2q_csr_cutedsl", recording_build)
+    monkeypatch.setattr(_interface, "_empty_bwd_workspace_with_zeroed_accum", recording_allocate)
+    q, k, v, ids, _, _, count = blk128_case()
+    batch, heads, seqlen_q, dim = q.shape
+    forward = ops.block_sparse_attention_forward(q, k, v, ids, count, sparse_block_size=128)
+    do = torch.randn_like(q)
+    gradients = ops.block_sparse_attention_backward(
+        do, q, k, v, forward["o_tensor"], forward["lse_tensor"], ids, count, sparse_block_size=128, bucket_size_blocks=bucket
+    )
+    assert [name for name, _ in calls] == ["workspace", "csr"]
+    kwargs, numel = calls[0][1]
+    assert kwargs["zero_kv_accum"] is (groups > 1) and kwargs["include_dkv_accum"] is (groups > 1)
+    assert numel == batch * heads * (2 * seqlen_q + seqlen_q * dim + (2 * k.shape[2] * dim if groups > 1 else 0))
+    _, _, reference = blk128_reference(q, k, v, ids, None, None, count, dim**-0.5, "bhsd", do)
+    for got, expected in zip(gradients, reference):
+        torch.testing.assert_close(got.double(), expected, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.L0

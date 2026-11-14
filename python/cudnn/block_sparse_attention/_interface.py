@@ -114,9 +114,15 @@ def _sm100_blk128_bwd_auto_bucket_size_blocks(*, num_q_blocks: int, num_kv_block
     return 2048 if large_bucket_tasks >= min(num_sms, default_tasks) else default_bucket
 
 
+_CUTLASS_DSL_VERSIONS: dict[str, tuple[int, int, int]] = {}
+
+
 def _cutlass_dsl_version() -> tuple[int, int, int]:
     """Return the installed CUTLASS DSL version without adding a dependency."""
     version = getattr(cutlass, "__version__", None)
+    # The entry points gate on the version before every launch: parse a given version string once.
+    if isinstance(version, str) and version in _CUTLASS_DSL_VERSIONS:
+        return _CUTLASS_DSL_VERSIONS[version]
     try:
         parts = str(version).split(".")
         parsed = []
@@ -129,9 +135,11 @@ def _cutlass_dsl_version() -> tuple[int, int, int]:
             if not digits:
                 raise ValueError
             parsed.append(int(digits))
-        return tuple(parsed)
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Cannot parse CUTLASS DSL version {version!r}") from exc
+    if isinstance(version, str):
+        _CUTLASS_DSL_VERSIONS[version] = tuple(parsed)
+    return tuple(parsed)
 
 
 def _require_sage_fp8_cutedsl() -> None:
@@ -1271,15 +1279,12 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
         # half only when ceil(sq / 64) is odd, so a row past the last Q128 block would leave them waiting for a Q stage
         # that the loader warps skip (a hang); a missing row would silently drop its edges.
         raise ValueError(f"q2k_block_index must list {(sq + 127) // 128} query blocks for seqlen_q={sq} and sparse_block_size=128, got {tuple(indices.shape)}")
-    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
-        indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
-    )
-    dq = torch.empty_like(q) if dq is None else dq
-    dk = torch.empty_like(k) if dk is None else dk
-    dv = torch.empty_like(v) if dv is None else dv
-    _validate_sm90_blk128_tma(dq=dq, dk=dk, dv=dv)
-    if sizes is not None and sizes.ndim == 1:
-        sizes = sizes[None, :].expand(b, -1)
+    # One Q group stores dK/dV directly and needs no FP32 dK/dV accumulators. Several groups reduce into them, so they
+    # must start at zero: that memset (1 GB, 0.3 ms on a 255k-token, 4-head problem) depends on nothing the CSR build
+    # produces and is the first device work of the call. The host side of the CSR build then runs under it instead of
+    # ahead of it with an idle GPU. The group count is the CSR builder's own formula (asserted below).
+    num_q_groups = (indices.shape[2] + bucket - 1) // bucket
+    direct_kv = num_q_groups == 1
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=b,
         num_heads=h,
@@ -1291,11 +1296,21 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
         round_d_to=32,
         zero_dq_accum=False,
         device=q.device,
-        zero_kv_accum=offsets.shape[2] != 1,
+        zero_kv_accum=not direct_kv,
+        include_dkv_accum=not direct_kv,
     )
+    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
+        indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
+    )
+    assert offsets.shape[2] == num_q_groups
+    dq = torch.empty_like(q) if dq is None else dq
+    dk = torch.empty_like(k) if dk is None else dk
+    dv = torch.empty_like(v) if dv is None else dv
+    _validate_sm90_blk128_tma(dq=dq, dk=dk, dv=dv)
+    if sizes is not None and sizes.ndim == 1:
+        sizes = sizes[None, :].expand(b, -1)
     args = (do, o, q, k, v, lse, dq, dk, dv, offsets, edges, sizes, workspace)
     scale_nonpositive = scale is not None and scale <= 0
-    direct_kv = offsets.shape[2] == 1
     has_kv_tail = sk % 128 != 0
     key = (q.device.index, d, scale_nonpositive, direct_kv, has_kv_tail, *map(_sm90_blk128_tensor_key, args))
     shape = (sq, sk, d, (h, b))
