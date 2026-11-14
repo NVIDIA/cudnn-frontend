@@ -57,6 +57,11 @@ Torch's capture entry may synchronize before capture begins; guarding that
 entry tests Torch's setup rather than the executor. Restore the previous mode
 before leaving capture, including on exceptions.
 
+Moving a kernel requires checking dynamic fixture paths as well as full-path
+imports. The D256 implementation contract's `test_dynamic_kernel_fixture_paths_exist`
+checks the actual paged-kernel and service-register-release case providers;
+their deeper numerical/PTX tests may not run in a bounded smoke selection.
+
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale

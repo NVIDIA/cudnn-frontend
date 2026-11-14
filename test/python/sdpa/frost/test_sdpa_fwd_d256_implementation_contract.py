@@ -129,6 +129,18 @@ def test_pilot_shortcut_covers_every_eligible_row(cc, sq):
     assert eligible and eligible <= {LOOKAHEAD, SWAP_AB}
 
 
+def test_dynamic_kernel_fixture_paths_exist():
+    from cudnn.sdpa.fwd import api_dsl
+    from service_register_release_checks import release_cases
+    from test_sdpa_fwd_paged_sm100 import _KERNEL_FILES
+
+    kernels = Path(api_dsl.__file__).parent / "kernels"
+    paths = [f"sm100/{name}" for name in _KERNEL_FILES.values()]
+    paths += [case.values[0] for arch in ("sm100", "sm107") for case in release_cases(arch)]
+    for path in paths:
+        assert (kernels / path).is_file(), path
+
+
 def test_delegated_paged_split_retains_parent_study_and_placement():
     from types import SimpleNamespace
     from cudnn.sdpa import placement_table as pt
