@@ -28,7 +28,7 @@ def _case(q=(129, 0, 65), kv=(3, 257, 0), **options):
 
 
 def _adapter(case):
-    from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
+    from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.host import SdpaBwdDslSm100D192
 
     return make_adapter(case, SdpaBwdDslSm100D192)
 

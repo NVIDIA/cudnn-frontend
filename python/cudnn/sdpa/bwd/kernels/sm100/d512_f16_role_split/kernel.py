@@ -85,7 +85,7 @@ from cudnn.sdpa.bwd.config_sm100 import (
 )
 
 # Injected by the loader before this body executes; a plain import gets the
-# all-defaults config (dense bf16), which keeps `python sm100/bprop_d512_f16.py`
+# all-defaults config (dense bf16), which keeps `python sm100/d512_f16_role_split/kernel.py`
 # usable as a standalone benchmark.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG = make_cfg_d512(PARAMS)

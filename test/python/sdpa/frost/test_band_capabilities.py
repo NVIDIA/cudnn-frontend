@@ -135,7 +135,12 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
         return check(facts)
     from cudnn.frost.buffers import cutedsl_state
 
-    return check(facts, cutedsl_state()[1])
+    reason = check(facts, cutedsl_state()[1])
+    if reason is None and caps.delegated and bwd_engines._declared_mismatch(caps, facts, None) is None:
+        # A partially migrated row can transfer only some masks to another
+        # owner. Keep testing its bands, while recognizing that transfer.
+        return bwd_engines.mismatch(caps, facts)
+    return reason
 
 
 def probe_matches(kind: str, caps, facts, expected) -> bool:

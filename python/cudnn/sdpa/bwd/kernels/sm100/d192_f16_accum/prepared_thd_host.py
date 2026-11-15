@@ -9,8 +9,8 @@ import cutlass.cute as cute
 from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
-from cudnn.sdpa.bwd.d192_thd_contract import ABI_VERSION, MAPS_PER_SEQUENCE, ORIGIN_PORTS, workspace_offsets
-from .bprop_d192_accum_thd_helpers import host_thd
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.thd_contract import ABI_VERSION, MAPS_PER_SEQUENCE, ORIGIN_PORTS, workspace_offsets
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.helpers_thd import host_thd
 
 
 @cute.jit

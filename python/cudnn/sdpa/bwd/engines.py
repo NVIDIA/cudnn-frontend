@@ -3,11 +3,11 @@
 
 """FROST SDPA-backward engine registry: capability declarations + spec table.
 
-One registered engine per architecture x quantization family, named
-``sdpa_bwd_sm<arch>`` for the half rows (dtype is NOT part of the identity: a
-cell's engine serves every dtype its kernel handles — fp16 and bf16 — via
-``Capabilities.dtypes``) with a ``_mxfp8`` / ``_fp8`` suffix for the quantized
-graphs (``engine_name``), mirroring ``fwd/engines.py``.
+Explicit engines identify one main implementation or fixed algorithm chain.
+Legacy architecture/precision rows remain registered for unmigrated domains
+and decline graphs delegated to explicit owners. FP16/BF16 can share one
+implementation through ``Capabilities.dtypes``; dtype need not be part of
+the engine identity.
 
 The backward opset keeps its own :class:`Capabilities` record rather than
 reusing the forward one: the feature model differs (gradient side outputs,
@@ -36,6 +36,8 @@ from cudnn.sdpa import graph_analyzer as ga
 _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
 _SM100 = "SdpaBwdDslSm100"
+_SM100_D512_ROLE_SPLIT = "SdpaBwdDslSm100D512RoleSplit"
+_SM100_D512_TWO_BY_TWO = "SdpaBwdDslSm100D512TwoByTwo"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
@@ -43,6 +45,7 @@ _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
 _SM100_D128 = "SdpaBwdDslSm100D128"
+_SM100_D128_RECOMPUTE = "SdpaBwdDslSm100D128Recompute"
 _SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
 _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
@@ -53,6 +56,18 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM100_D512_ROLE_SPLIT:
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+        return SdpaBwdDslSm100D512RoleSplit
+    if name == _SM100_D512_TWO_BY_TWO:
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+
+        return SdpaBwdDslSm100D512TwoByTwo
+    if name == _SM100_D128_RECOMPUTE:
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_recompute.host import SdpaBwdDslSm100D128Recompute
+
+        return SdpaBwdDslSm100D128Recompute
     if name == _SM100_D128:
         from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 
@@ -62,7 +77,7 @@ def _adapter(name: str):
 
         return SdpaBwdDslSm100D128Fp8
     if name == _SM100_D192:
-        from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
+        from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.host import SdpaBwdDslSm100D192
 
         return SdpaBwdDslSm100D192
     if name == _SM100_D192_FP8:
@@ -146,6 +161,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_HEAD_DIMS,
 )
+from cudnn.sdpa.bwd.kernels.sm100 import d512_half_contract as _sm100_d512_half
 from cudnn.sdpa.bwd.kernels.sm120 import half_contract as _sm120_half
 from cudnn.sdpa.bwd.kernels.sm80 import half_contract as _sm80_half
 from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract as _sm100_q
@@ -1269,7 +1285,7 @@ def _sm100_spec() -> EngineSpec:
     another 512, plus the S/dS accumulators -- against 512 per CTA.
 
         stage 1  do_dot = rowsum(dO * O)          (shared with the sm120 chain)
-        stage 2  S and dS workspaces              sm100/bprop_d512_f16.py
+        stage 2  S and dS workspaces              sm100/d512_f16_role_split/kernel.py
         stage 3  dV = S^T.dO, dK = dS^T.Q, dQ = dS.K   bprop_matmul_blackwell.py
 
     ``d`` is an ENVELOPE: the kernel's tiles are fixed at 512 and a smaller head
@@ -1332,17 +1348,26 @@ def _sm100_spec() -> EngineSpec:
             # Independent native B/H/S nesting and aligned padding; no layout copies.
             declaration_check=_sm100_dense_layout_mismatch,
             layouts=frozenset({"bshd", "dense_flex"}),
+            select_implementation=_sm100_d512_half.select_implementation,
+            delegated=frozenset({_sm100_d512_half.ROLE_SPLIT, _sm100_d512_half.TWO_BY_TWO}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100),
     )
 
 
-def engine_name(arch: str = "sm120", fp8: bool = False, mxfp8: bool = False) -> str:
-    """The shipped engine name for a coverage cell (test/user convenience).
+def _sm100_d512_role_split_spec() -> EngineSpec:
+    return explicit_engine(_sm100_spec(), _sm100_d512_half.ROLE_SPLIT, partial(lower_dsl_bwd, api_type=_SM100_D512_ROLE_SPLIT))
 
-    One engine per arch x quantization family, like ``fwd.engines.engine_name``:
-    the half row is ``sdpa_bwd_<arch>``, the block-scale MXFP8 row
-    ``sdpa_bwd_<arch>_mxfp8`` and the per-tensor FP8 row ``sdpa_bwd_<arch>_fp8``."""
+
+def _sm100_d512_two_by_two_spec() -> EngineSpec:
+    return explicit_engine(_sm100_spec(), _sm100_d512_half.TWO_BY_TWO, partial(lower_dsl_bwd, api_type=_SM100_D512_TWO_BY_TWO))
+
+
+def engine_name(arch: str = "sm120", fp8: bool = False, mxfp8: bool = False) -> str:
+    """The legacy architecture/precision row name, retained for compatibility.
+
+    A row may delegate its graph domain to explicit implementation engines.
+    Use the recommended public records to select an executable owner."""
 
     suffix = "_mxfp8" if mxfp8 else "_fp8" if fp8 else ""
     return f"sdpa_bwd_{arch}" + suffix
@@ -2212,6 +2237,12 @@ def _sm100_d128_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Opt
     return None
 
 
+def _sm100_d128_implementations(facts):
+    from .d128_selection import legal_implementations
+
+    return legal_implementations(facts, cutedsl_state()[1])
+
+
 def _sm100_d128_spec() -> EngineSpec:
     """Dense and packed d128 with plan-time prepared implementation selection.
 
@@ -2242,8 +2273,24 @@ def _sm100_d128_spec() -> EngineSpec:
             thd_ragged_offsets=True,
             gqa=True,
             declaration_check=_sm100_d128_declaration_mismatch,
+            select_implementation=_sm100_d128_implementations,
+            delegated=frozenset({"sdpa_bwd_sm100_d128_recompute"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100_D128),
+    )
+
+
+def _sm100_d128_recompute_spec() -> EngineSpec:
+    from .d128_selection import RECOMPUTE_OWNER
+
+    return explicit_engine(
+        _sm100_d128_spec(),
+        RECOMPUTE_OWNER,
+        partial(lower_dsl_bwd, api_type=_SM100_D128_RECOMPUTE),
+        gqa=False,
+        thd=False,
+        thd_declared_totals=False,
+        thd_ragged_offsets=False,
     )
 
 
@@ -2302,7 +2349,7 @@ def _sm100_d192_half_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
     import re
 
     from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
-    from .d192_thd_contract import validate_bounds, validate_stats_span
+    from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.thd_contract import validate_bounds, validate_stats_span
 
     if (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
         return "d192 THD requires MHA with exact (192, 128) head dimensions"
@@ -2538,6 +2585,8 @@ ENGINE_SPECS = (
     _sm80_f16_d64_spec(),
     _sm80_f16_two_subgroup_spec(),
     _sm100_spec(),
+    _sm100_d512_role_split_spec(),
+    _sm100_d512_two_by_two_spec(),
     _sm100_mxfp8_spec(),
     _sm100_mxfp8_pair_spec(),
     _sm100_d256_mxfp8_spec(),
@@ -2549,6 +2598,7 @@ ENGINE_SPECS = (
     _sm100_d256_spec(),
     _sm107_d512_spec(),
     _sm100_d128_spec(),
+    _sm100_d128_recompute_spec(),
     _sm107_d192_spec(),
     _sm100_d128_fp8_spec(),
     _sm100_d128_fp8_pair_spec(),

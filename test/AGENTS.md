@@ -301,6 +301,12 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+A partially migrated backward row can remain legal for one mask and delegate
+another. Band-model tests must distinguish declaration rejection from ownership
+transfer while sampling both the retained row and its explicit owners; do not
+drop the whole row merely because `delegated` is nonempty. The detector is
+`test_band_capabilities.py::test_model_and_probe_agree_on_every_band_sample`.
+
 Audit dotted module names as well as file paths when retiring a kernel.
 Check direct imports, `from package import old_module`, and strings passed
 to `find_spec` or `import_module`;
@@ -1236,6 +1242,13 @@ binder uses that name to enable gradient-overlap checks. Pin the public engine
 identity separately, verify the emitted target, and keep a real overlapping-gradient
 negative control with unchanged output/workspace sentinels. The SM120 THD cases
 in `test_sdpa_bwd_thd_sm120.py` exercise this boundary.
+
+An implementation-specific artifact symbol need not rename the shared native
+binding contract. The SM100 D512 fixed hosts keep their own symbol and template
+cache tag while retaining the chain's binding name. The actual prepared-spec
+probe in `test_sdpa_bwd_config_sm100_2x2.py` checks that all three overlapping
+gradient pairs still raise before the entry, for both fixed owners and the
+legacy/adjacent controls.
 
 Exercise the actual standalone adapter as well as the prepared binder. A lower-level
 frame test can miss an incompatible metadata container built by the adapter.

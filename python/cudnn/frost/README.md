@@ -363,7 +363,7 @@ python/cudnn/
                                 config_sm*.py
       kernels/                  one package per ARCH LINE, like fwd/
         sm80/f16_two_subgroup/kernel.py  one directory per explicit engine body
-        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
+        sm100/d512_f16_role_split/kernel.py       stage 2 of the large-head-dim chain
         sm100/d256_mxfp8/dq.py        ported MXFP8 kernel classes (+ dkdv,
                                       _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
         sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
