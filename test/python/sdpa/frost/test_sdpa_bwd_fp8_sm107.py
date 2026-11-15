@@ -260,7 +260,8 @@ def test_engine_name_grammar():
 
     if "fp8" in inspect.signature(engine_name).parameters:
         assert engine_name("sm107", fp8=True) == _ENGINE
-        assert engine_name("sm107") == _HALF_ENGINE
+        assert engine_name("sm107") == "sdpa_bwd_sm107"  # legacy delegated row
+        assert _HALF_ENGINE == "sdpa_bwd_sm107_d256_f16_4x1"
     assert _spec().name == _ENGINE
 
 
