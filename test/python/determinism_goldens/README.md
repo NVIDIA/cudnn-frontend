@@ -4,6 +4,58 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM107 small-head FP8 implementation identity (2026-11-15)
+
+Exact D64/D128 per-tensor FP8 uses engine 20563,
+`sdpa_fwd_sm107_d128_fp8_multi_q`. Explicit dense D128 swap-AB uses 20564,
+`sdpa_fwd_sm107_d128_fp8_swap_ab`, reusing the existing SM100 device body
+and configuration. Native device definitions are AST-identical to the
+parent, and no new copy of the swap-AB body is introduced.
+
+`TestSmallFp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py` checks
+public record rebuild without candidate selection, fresh tensors/workspace,
+changed scales and retained capture for both native widths, both CGAs,
+E4M3/E5M2 inputs, BF16/FP8 outputs and fixed splits. The same entry collects
+independent D128 THD origins, existing block-output artifact/rebind/capture,
+swap-AB and CGA1-split replay/batch checks, sink splits, D64 narrow tiles and
+the native service-register PTX detector. Run those selected groups and
+`sdpa/frost/test_sdpa_fwd_sm107_small_fp8_contract.py` from `test/python`
+with `-m "L0 or L1"`.
+
+Frozen snapshots corresponding to source `903faab1d` ran on native cc 10.7,
+with cuDNN 9.30.0, CuTe DSL 4.8.0, compiler/NVRTC 13.4 and
+Torch 2.14.1+cu130; the stress worker had 208 SMs. Import and architecture
+were asserted. Taking the latest result for each selected case gives
+**249 passes, 10 missing-golden skips and no unresolved failures**.
+This includes CPU contract cases on the GPU worker and existing MXFP8
+block-output controls. The final sink/narrow/PTX/contract batch passed
+98 cases without skips or failures.
+
+The intermediate runs preserve two fixture failures in their raw results:
+block-output tests pinned retired engine 20514, and sink tests listened to
+the old router hook instead of inspecting the selected compiled artifact.
+Both were migrated and their complete affected groups passed. No numerical
+tolerance or device arithmetic changed. Strict historical THD, swap-AB and
+CGA1-split comparisons remain unavailable for fingerprint `aa97de087283f297`
+(driver API 13050); no replacement goldens were recorded.
+
+Native D64 and D128 refill stress each use 1,024 CTAs and seven ring refills
+per work item. Independent numerical checks precede the stress loop. Each
+passed 256 warm and 256 shared-memory-poisoned launches with zero byte
+mismatches; the unsafe-ring control failed 200/200 launches. Existing shared
+swap-AB and CGA1-split refill tests also passed. This is finite evidence,
+not a proof of race freedom or a comparison between different plans.
+
+Fifteen frozen parent/head/head/parent cases cover native D64/D128 with CGA1
+and CGA2, dense, split and HALF-softmax, D128 THD, and two shared swap-AB
+plans. Full configuration, parameters, TMA metadata, normalized public
+knobs, workspace, inputs, outputs and changed-scale capture digests match
+across all four processes. The integrated `f643ba345` host check passed
+1,165 cases with eight skips; 15,360 graph/mode declarations preserve all
+5,760 ordered candidates and placements against the frozen parent. The
+legacy D64 unspecified CGA is normalized to its actual one-CTA default.
+No other architecture or backward path is newly qualified here.
+
 ### SM107 D192/D256 FP8 implementation identity (2026-11-15)
 
 Exact D192/V128 and D256 per-tensor FP8 now use engines 20561 and 20562,
