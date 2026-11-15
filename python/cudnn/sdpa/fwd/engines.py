@@ -4619,7 +4619,15 @@ def lower_dsl_prefill(
         cga=getattr(selected_kernel, "cta_group", knobs.cga if knobs is not None else None),
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
-        **({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {}),
+        # Fix the work-item form before the adapter computes bias budgets.
+        # Deferring this to configure_params would validate the default body
+        # and only later substitute the explicitly selected one.
+        **({"n_chunk": selected_kernel.n_chunk} if hasattr(selected_kernel, "n_chunk") else {}),
+        **(
+            {"softmax_wgs": selected_kernel.softmax_wgs}
+            if hasattr(selected_kernel, "softmax_wgs")
+            else ({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {})
+        ),
         **({"swap_ab": knobs.swap_ab} if knobs is not None and knobs.swap_ab is not None else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
