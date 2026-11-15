@@ -173,9 +173,9 @@ def test_row_serves_the_streamed_ring_and_declines_where_no_form_fits(name, fkw,
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-    caps = _s13._caps()
     f = _s13._facts(**_s13._resolve_dtypes(fkw))
     knobs = SdpaFwdKnobs(**kkw) if kkw else None
+    caps = _s13._caps(f, knobs)
     why = engines.mismatch(caps, f, knobs)
     assert (why is None) == accept, (name, why)
     if not accept and "no ring" in name:
@@ -196,7 +196,7 @@ def test_heuristics_take_the_streamed_width():
         (dict(s_q=2048, s_kv=2048, **_s13._bias_kw(s_q=2048, s_kv=2048)), {1}),
     ):
         plans = heuristics.recommend("A", _s13._facts(device_sm_count=204, **_s13._resolve_dtypes(fkw)), offered)
-        assert {p.knobs.cga for p in plans if offered[_ROW] == p.engine_id} == want, (fkw, [p.knobs for p in plans])
+        assert {p.knobs.cga for p in plans if p.engine_id in {offered[row] for row in _s13._ROWS}} == want, (fkw, [p.knobs for p in plans])
 
 
 def test_config_factory_derives_the_ring_and_raises_on_each_coupling():

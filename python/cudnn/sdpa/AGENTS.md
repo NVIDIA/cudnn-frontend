@@ -20,6 +20,13 @@ the registry. Keep performance policy out of fixed kernel contracts. The
 wide-placement import-guard test detects a reverse dependency on the candidate
 generator; preserving the selector's logic and candidate/placement comparison
 checks that moving it does not change ranking.
+Capability-aware SM107 half selection lives in `fwd/sm107_half_selection.py`:
+the registry resolves capability-derived geometry and passes scalar inputs
+to that policy, without a reverse registry import. A direct import of registry
+helpers can close a cycle through its legacy adapter even when placement no
+longer imports heuristics. The selection-module and placement import guards
+detect both edges; fixed hosts never call the policy. Keep selection shared
+rather than copying its decisions into placement.
 
 For explicit implementation records, distinguish the physical CTA cluster
 (`TILE_CGA_M/N`) from the MMA group (`CTA_GROUP`). D512 uses a four-CTA

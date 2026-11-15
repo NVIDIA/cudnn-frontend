@@ -85,7 +85,7 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
-    owner = "sdpa_fwd_prefill_sm107" if arch == "sm107" else "sdpa_fwd_sm100_d128_multi_q"
+    owner = "sdpa_fwd_sm107_d128_multi_q" if arch == "sm107" else "sdpa_fwd_sm100_d128_multi_q"
     index = next((i for i, name in enumerate(names) if name.split("[")[0] == owner), None)
     assert index is not None, names  # A missing FROST route must not silently skip this test.
     engine, knobs = g.get_engine_and_knobs_at_index(index)
@@ -112,7 +112,13 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
     with monkeypatch.context() as patch:
         patch.setattr(api_dsl, "load_template", record_module)
         g.build_plans()
-    assert loaded and all(m._BOUNDED_THD_DECODE == (q.dtype == torch.bfloat16) for m in loaded)
+    assert loaded
+    if arch == "sm107":
+        # The native Rubin body uses its own scheduler; the bounded lookup
+        # switch belongs to the shared SM100 implementation.
+        assert all(m.__file__.endswith("sm107/d128_f16_multi_q/kernel.py") and m.CFG.THD_VARLEN for m in loaded)
+    else:
+        assert all(m._BOUNDED_THD_DECODE == (q.dtype == torch.bfloat16) for m in loaded)
     assert all(int(m.CFG.PACK_GQA) == pack for m in loaded), "The executed kernel must honor the requested packing mode"
     expected_group = math.gcd(hq // hkv, 128) if pack else 1
     assert all(m.CFG.PACK_G == expected_group for m in loaded), "The kernel must use the expected partial head group"

@@ -177,6 +177,12 @@ tests and samples use this separation.
 
 ## Python tests (`test/python`)
 
+Architecture-specific test adjustments use device capability, not an engine-name
+suffix. Explicit implementation names can change during a migration while the
+scheduler domain stays the same. The D64 origins-helper host control exercises
+the actual helper and engine admission across SM100/SM103/SM107, including all
+eight dtype/Stats-layout/compact combinations of the SM107 scheduler clamp.
+
 Shared SDPA test helpers accept both public knob mappings and native knob
 dataclasses. Normalize mappings with `SdpaFwdKnobs.from_public` before attribute
 access or `dataclasses.replace`, preserving native callers and caller-owned

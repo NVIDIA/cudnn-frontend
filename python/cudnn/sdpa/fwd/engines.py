@@ -77,6 +77,11 @@ from cudnn.sdpa.fwd.config_sm100 import (
 from cudnn.sdpa.fwd.config_d128_family import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.kernels.sm107 import d512_half_contract as _sm107_wide_half
+from cudnn.sdpa.fwd.kernels.sm107 import small_half_contract as _sm107_small_half
+from cudnn.sdpa.fwd.kernels.sm107 import mid_half_contract as _sm107_mid_half
+from cudnn.sdpa.fwd.kernels.sm107 import shared_half_contract as _sm107_shared_half
+
+_SM107_HALF_IMPLEMENTATIONS = _sm107_small_half.IMPLEMENTATIONS | _sm107_mid_half.IMPLEMENTATIONS | _sm107_shared_half.IMPLEMENTATIONS
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import (
     LOOKAHEAD as _D256_LOOKAHEAD,
     SWAP_AB as _D256_SWAP_AB,
@@ -949,6 +954,8 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
     binds G to the plan's declared (B, H_q, S_q, D_v) (``prepared.CombineGate``), so
     such a graph keeps the unsplit fused-gate kernel (``mismatch`` names the
     overrides).  Keep the three in lockstep."""
+    if capabilities.implementation in _SM107_HALF_IMPLEMENTATIONS:
+        return capabilities.implementation == _sm107_mid_half.SWAP_AB
     if capabilities.implementation in _D256_IMPLEMENTATIONS:
         return capabilities.implementation == _D256_SWAP_AB
     if capabilities.sm_lo == 100 and _in_d256_pilot_domain(facts):
@@ -1511,7 +1518,11 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     if capabilities.implementation in _sm107_wide_half.IMPLEMENTATIONS:
         return frozenset({_sm107_wide_half.explicit_geometry(capabilities.implementation, facts).cluster_m})
-    if capabilities.implementation == _sm107_swap_fp8_owner.NAME:
+    if capabilities.implementation in _sm107_mid_half.IMPLEMENTATIONS:
+        return frozenset({_sm107_mid_half.explicit_geometry(capabilities.implementation, facts, SdpaFwdKnobs()).cga})
+    if capabilities.implementation in _sm107_shared_half.IMPLEMENTATIONS:
+        return frozenset({_sm107_shared_half.explicit_geometry(capabilities.implementation, facts, SdpaFwdKnobs()).cga})
+    if capabilities.implementation in (_sm107_small_half.BATCH_PAIR, _sm107_swap_fp8_owner.NAME):
         return frozenset({1})
     if capabilities.implementation in _D512_IMPLEMENTATIONS:
         from .kernels.sm100.d512_f16_contract import explicit_geometry
@@ -1808,25 +1819,34 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             domain=effective_tile_ns(capabilities, facts, knobs),
         )
     )
-    _pair = {
-        cga: sm107_pair_item_active(
-            _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0], tile_n=int(_tile_n)
-        )
-        for cga in widths
-    }
+    if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS:
+        # A named record fixes its work item independently of the default
+        # crossover. Validate the same budget the constructor will receive.
+        _pair = {cga: capabilities.implementation == _sm107_small_half.BATCH_PAIR and cga == 1 for cga in widths}
+    else:
+        _pair = {
+            cga: sm107_pair_item_active(
+                _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0], tile_n=int(_tile_n)
+            )
+            for cga in widths
+        }
     # the softmax warp-group count the plan would run at each width (3 on the bias + kv_mask pair form at TILE_N 64 above the measured S_kv;
     # config_sm107.sm107_softmax_wgs_pick -- the adapter's pick, rule 8b'): its third Q / O slab shrinks the resident bias budget
     _wgs = {
-        cga: sm107_softmax_wgs_pick(
-            d_flavor=selected[0],
-            s_kv=facts.s_kv,
-            tile_n=int(_tile_n),
-            pair=_pair[cga],
-            has_bias=facts.has_bias,
-            has_kv_mask=facts.has_kv_mask,
-            padded=facts.padded,
-            cga=cga,
-            b_flat=facts.b,
+        cga: (
+            2
+            if capabilities.implementation == _sm107_small_half.MULTI_Q
+            else sm107_softmax_wgs_pick(
+                d_flavor=selected[0],
+                s_kv=facts.s_kv,
+                tile_n=int(_tile_n),
+                pair=_pair[cga],
+                has_bias=facts.has_bias,
+                has_kv_mask=facts.has_kv_mask,
+                padded=_sm107_small_half.kv_padded(facts) if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS else facts.padded,
+                cga=cga,
+                b_flat=facts.b,
+            )
         )
         for cga in widths
     }
@@ -1885,6 +1905,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         precision = "MXFP8" if capabilities.is_mxfp8 else "FP8" if capabilities.is_fp8 else "half"
         major, minor = facts.device_cc
         return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
+    if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS:
+        if not _sm107_small_half.in_domain(facts):
+            return "requires SM107 and supported half small-head graph declarations"
+        shape = _selected_d_shape(capabilities, facts, knobs)
+        if shape is None:
+            return "no native small-half width envelope serves this declaration"
+        reason = _sm107_small_half.mismatch(capabilities.implementation, replace(facts, d_qk=shape[0], d_v=shape[1]), knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation in _sm107_mid_half.IMPLEMENTATIONS:
+        reason = _sm107_mid_half.mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation in _sm107_shared_half.IMPLEMENTATIONS:
+        reason = _sm107_shared_half.mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation in _SMALL_FP8_CONTRACTS:
         reason = _SMALL_FP8_CONTRACTS[capabilities.implementation].mismatch(facts, knobs)
         if reason is not None:
@@ -3448,7 +3485,7 @@ def _sm107_spec() -> EngineSpec:
             layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
-            delegated_exact=frozenset({((10, 7), (512, 512)), ((10, 7), (576, 512))}),
+            delegated_exact=frozenset(((10, 7), shape) for shape in _sm107_shared_half.SHAPES | {(512, 512), (576, 512)}),
             phase="prefill",
             # Every f16 flavor has a Rubin module -- api_dsl._SM107_KERNEL_FILES
             # is the other half of this claim, and _pick_flavor lands a d=192
@@ -3602,6 +3639,63 @@ def _sm107_spec() -> EngineSpec:
             tile_ns_by_d_shape=SM107_TILE_NS_BY_D_SHAPE,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
+    )
+
+
+def _sm107_half_specs():
+    """Five native bodies plus two architecture contracts for shared bodies."""
+    from .kernels.sm107.d128_f16_multi_q.host import lower as lower_multi_q
+    from .kernels.sm107.small_f16_batch_pair.host import lower as lower_pair
+    from .kernels.sm107.d192_f16_multi_q.host import lower as lower_d192
+    from .kernels.sm107.d256_f16_lookahead.host import lower as lower_lookahead
+    from .kernels.sm107.d256_f16_swap_ab.host import lower as lower_swap_ab
+    from .kernels.sm107.shared_f16_single_q.host import lower as lower_shared_single_q
+    from .kernels.sm107.shared_d256_f16_lookahead.host import lower as lower_shared_lookahead
+
+    # The legacy policy owns the legal width envelopes and common features.
+    # Each local contract narrows that declaration to one fixed body. Keep
+    # the original flavor pool so exact D32 can retain its D64/D128 envelope.
+    base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), sm_hi=107, tile_ms_by_d_shape=())
+    rows = (
+        (_sm107_small_half.MULTI_Q, lower_multi_q, frozenset({128})),
+        (_sm107_small_half.BATCH_PAIR, lower_pair, frozenset({128})),
+        (_sm107_mid_half.D192, lower_d192, frozenset({128})),
+        (_sm107_mid_half.LOOKAHEAD, lower_lookahead, frozenset({128})),
+        (_sm107_mid_half.SWAP_AB, lower_swap_ab, frozenset({16, 32, 64})),
+        (_sm107_shared_half.SINGLE_Q, lower_shared_single_q, frozenset({128})),
+        (_sm107_shared_half.LOOKAHEAD, lower_shared_lookahead, frozenset({128})),
+    )
+    exact_shapes = {
+        _sm107_small_half.BATCH_PAIR: frozenset({(32, 32), (64, 64)}),
+        _sm107_mid_half.D192: frozenset({(192, 128)}),
+        _sm107_mid_half.LOOKAHEAD: frozenset({(128, 128), (256, 256)}),
+        _sm107_mid_half.SWAP_AB: frozenset({(256, 256)}),
+        _sm107_shared_half.LOOKAHEAD: frozenset({(256, 256)}),
+    }
+    return tuple(
+        EngineSpec(
+            name,
+            replace(
+                base,
+                implementation=name,
+                tile_ms=tiles,
+                d_shapes=exact_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
+                epilogue_gate=name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB),
+                epilogue_gate_d_shapes=(base.epilogue_gate_d_shapes if name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB) else None),
+                score_max=name == _sm107_small_half.MULTI_Q,
+                score_sum_exp=name == _sm107_small_half.MULTI_Q,
+                score_stats_d_shapes=base.score_stats_d_shapes if name == _sm107_small_half.MULTI_Q else None,
+                split_kv_supported=name != _sm107_small_half.BATCH_PAIR,
+                **({"d_pad_multiple": 0, "d_envelope_floors": ()} if name in exact_shapes else {}),
+            ),
+            partial(
+                lower,
+                lower_impl=lower_dsl_prefill,
+                knob_type=SdpaFwdKnobs,
+                **({"shape_of": _selected_d_shape} if name in _sm107_small_half.IMPLEMENTATIONS else {}),
+            ),
+        )
+        for name, lower, tiles in rows
     )
 
 
@@ -4001,6 +4095,30 @@ def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
     """
     legacy = _sm90_spec() if name == "sdpa_fwd_prefill_sm90" else next(s for s in ENGINE_SPECS if s.name == name)
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
+
+
+def select_sm107_half_geometry(facts, knobs):
+    """Resolve capability geometry for the shared policy, never for fixed hosts."""
+    from .sm107_half_selection import select_sm107_half_geometry as select
+
+    if not _sm107_shared_half.in_domain(facts):
+        raise ValueError("SM107 half selection requires exact supported small/mid-width forward declarations")
+    caps = sm100_legacy_policy_spec(_sm107_shared_half.LEGACY_ROW).capabilities
+    flavor = _selected_d_shape(caps, facts, knobs)
+    if flavor not in _sm107_shared_half.SHAPES:
+        raise ValueError("SM107 half selection has no supported width envelope")
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    decode_tile = 0
+    if flavor[0] == 256 and d256_decode_tile_selected(caps, facts, group, knobs.split_kv or 1):
+        decode_tile = decode_d256_q_tile_for_row(caps, facts.s_q, group, **_facts_decode_form_kw(facts))
+    return select(
+        facts,
+        knobs,
+        flavor=flavor,
+        packed_split=flavor[0] == 64 and knobs.tile_n is None and packed_thd_split(caps, facts, knobs),
+        thd_decode=flavor[0] == 128 and knobs.warp_spec_cfg != 1 and _thd_decode_leg(caps, facts),
+        decode_tile=decode_tile,
+    )
 
 
 def _sm100_small_fp8_specs():
@@ -4977,7 +5095,15 @@ def lower_dsl_prefill(
         cga=getattr(selected_kernel, "cta_group", knobs.cga if knobs is not None else None),
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
-        **({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {}),
+        # Fix the work-item form before the adapter computes bias budgets.
+        # Deferring this to configure_params would validate the default body
+        # and only later substitute the explicitly selected one.
+        **({"n_chunk": selected_kernel.n_chunk} if hasattr(selected_kernel, "n_chunk") else {}),
+        **(
+            {"softmax_wgs": selected_kernel.softmax_wgs}
+            if hasattr(selected_kernel, "softmax_wgs")
+            else ({"softmax_wgs": 1} if knobs is not None and knobs.warp_spec_cfg == 1 else {})
+        ),
         **({"swap_ab": knobs.swap_ab} if knobs is not None and knobs.swap_ab is not None else {}),
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
         # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
@@ -5810,6 +5936,7 @@ ENGINE_SPECS = (
     *_sm100_small_fp8_specs(),
     _sm100_fp8_spec(arch="sm107"),
     _sm107_spec(),
+    *_sm107_half_specs(),
     *_sm107_wide_half_specs(),
     _sm107_mxfp8_spec(),
     *_sm107_mxfp8_owner_specs(),

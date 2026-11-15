@@ -386,7 +386,7 @@ def _sm107_half_plan_record(graph, overrides):
     """
     from cudnn.engines.manifest import MANIFEST
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
-    from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry
+    from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry, select_sm107_half_geometry
     from cudnn.sdpa.graph_analyzer import analyze
     from sdpa.frost.frost_test_utils import half_engine_names
 
@@ -398,7 +398,8 @@ def _sm107_half_plan_record(graph, overrides):
             break
     facts = analyze(graph)
     requested = SdpaFwdKnobs.from_public({**base, **overrides})
-    geometry = select_sm107_d512_geometry(facts, requested)
+    selector = select_sm107_d512_geometry if facts.d_qk in (512, 576) else select_sm107_half_geometry
+    geometry = selector(facts, requested)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     return family.offered_ids()[geometry.implementation], geometry.canonical_knobs(requested).to_public()
 
@@ -434,7 +435,7 @@ def _apply_plan_pin(graph, cfg):
         raise ValueError(f"FROST engine {pin['engine']!r} is not offered here (an opt-in row needs CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1)")
     base = next((knobs for _, eid, knobs in pairs if eid == engine_id), {})
     knobs = {**base, **{getattr(cudnn.knob_type, name): int(value) for name, value in (pin.get("knobs") or {}).items()}}
-    if pin["engine"] == "sdpa_fwd_prefill_sm107" and (cfg.d_qk, cfg.d_v) in ((512, 512), (576, 512)):
+    if pin["engine"] == "sdpa_fwd_prefill_sm107" and (cfg.d_qk, cfg.d_v) in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), (576, 512)):
         engine_id, knobs = _sm107_half_plan_record(graph, knobs)
     graph.create_execution_plan(engine_id, knobs)
     graph.select_plan(graph.get_execution_plan_count() - 1)

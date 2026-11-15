@@ -22,7 +22,11 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     o, stats = graph.sdpa(q=q, k=k, v=v, generate_stats=True, attn_scale=128**-0.5, use_causal_mask=True)
     o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(io)
     stats.set_output(True).set_dim((2, 8, 256, 1)).set_stride((2048, 256, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
-    default_name = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+    default_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+    if cc == (10, 7):
+        from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+
+        default_name = select_sm107_half_geometry(ga.analyze(graph), engines.SdpaFwdKnobs(cga=cga)).implementation
     spec = next(s for s in engines.ENGINE_SPECS if s.name == (engine_name or default_name))
     facts, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
     assert reason is None, reason
@@ -32,7 +36,7 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
         original = changed.get_data_type()
         changed.set_data_type(expected)
         _, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
-        assert reason and "dtypes" in reason
+        assert reason and ("dtypes" in reason or reason == "requires SM107 and supported half small-head graph declarations"), reason
         changed.set_data_type(original)
     # Eight half elements align Q, but only sixteen FP8 elements align K.
     k.set_stride((256 * 8 * (d + 8), d + 8, 8 * (d + 8), 1))
@@ -142,10 +146,16 @@ def check_dense_paged_rebind_capture(
                 )
             graph.validate()
             graph.build_operation_graph()
-            graph.create_execution_plan(
-                family_for(graph).offered_ids()[engine_name],
-                {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: splits},
-            )
+            record = {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: splits}
+            if engine_name == "sdpa_fwd_prefill_sm107":
+                from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+                from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+                from cudnn.sdpa.graph_analyzer import analyze
+
+                requested = SdpaFwdKnobs.from_public(record)
+                geometry = select_sm107_half_geometry(analyze(graph), requested)
+                engine_name, record = geometry.implementation, geometry.canonical_knobs(requested).to_public()
+            graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], record)
             graph.select_plan(0)
             graph.check_support()
             graph.build_plans()
@@ -189,8 +199,13 @@ def check_dense_paged_rebind_capture(
             expected_file = "sm100/d128_f16_single_q/kernel.py" if cga == 1 else "sm100/d128_f16_multi_q/kernel.py"
         if native_sm107 and head_dim in (256, 512):
             expected_file = "sm107/prefill_d256_f16.py" if head_dim == 256 else "sm107/prefill_d512_f16_2x2.py"
-        if entry == "graph" and engine_name == "sdpa_fwd_sm107_d512_2x2":
-            expected_file = "sm107/d512_f16_2x2/kernel.py"
+        if entry == "graph" and native_sm107:
+            expected_file = {
+                "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",
+                "sdpa_fwd_sm107_shared_single_q": "sm100/d128_f16_single_q/kernel.py",
+                "sdpa_fwd_sm107_d256_lookahead": "sm107/d256_f16_lookahead/kernel.py",
+                "sdpa_fwd_sm107_d512_2x2": "sm107/d512_f16_2x2/kernel.py",
+            }[engine_name]
         assert loaded[-1].__file__.endswith(expected_file)
         assert loaded[-1].CFG.CTA_MMA == cga and loaded[-1].KV_STORAGE_DTYPE.width == 8
 
@@ -342,14 +357,16 @@ def check_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle,
             )
             graph.validate()
             graph.build_operation_graph()
-            graph.create_execution_plan(
-                family_for(graph).offered_ids()[engine_name],
-                {
-                    cudnn.knob_type.TILE_CGA_M: cga,
-                    cudnn.knob_type.PACK_GQA: 1,
-                    cudnn.knob_type.SPLIT_KV: splits,
-                },
-            )
+            record = {cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.PACK_GQA: 1, cudnn.knob_type.SPLIT_KV: splits}
+            if engine_name == "sdpa_fwd_prefill_sm107":
+                from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+                from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+                from cudnn.sdpa.graph_analyzer import analyze
+
+                requested = SdpaFwdKnobs.from_public(record)
+                geometry = select_sm107_half_geometry(analyze(graph), requested)
+                engine_name, record = geometry.implementation, geometry.canonical_knobs(requested).to_public()
+            graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], record)
             graph.select_plan(0)
             graph.check_support()
             graph.build_plans()
@@ -364,7 +381,7 @@ def check_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle,
                 from cudnn.sdpa.fwd.prepared import PreparedThdLaunch
 
                 api = inspect.getclosurevars(compiled._compiled.default_stream).nonlocals["api"]
-                assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+                assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
                 assert not api.thd_decode_leg and api._thd_origin_specs is not None
                 assert isinstance(compiled._prepared, PreparedThdLaunch)
             workspace = torch.empty(max(1, graph.get_workspace_size()), dtype=torch.uint8, device="cuda")

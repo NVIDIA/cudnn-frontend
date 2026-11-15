@@ -230,9 +230,9 @@ def test_row_serves_the_multicast_ring_on_the_seam_and_declines_typed(name, fkw,
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     _pins(mode=_MCAST)
-    caps = _s13._caps()
     f = _s13._facts(**_s13._resolve_dtypes(fkw))
     knobs = SdpaFwdKnobs(**kkw) if kkw else None
+    caps = _s13._caps(f, knobs)
     why = engines.mismatch(caps, f, knobs)
     assert (why is None) == accept, (name, why)
     if not accept:
@@ -368,11 +368,11 @@ def test_the_row_passes_the_lowerings_length_fact_to_the_pick(monkeypatch, s, pa
     from cudnn.sdpa.fwd import engines
 
     seen = _spy_row_picks(monkeypatch)
-    caps = _s13._caps()
     kw = dict(s_q=s, s_kv=s, **_s13._bias_kw(s_q=s, s_kv=s))
     if padded:
         kw["padded"] = True
     f = _s13._facts(**_s13._resolve_dtypes(kw))
+    caps = _s13._caps(f)
     assert engines._synth_kv_padding(caps, f) == (not padded and s % 128 != 0), "the lowering's predicate for this cell"
     assert engines.mismatch(caps, f, None) is None, "the row serves every cell of this table (the cga1 ring or the multicast ring)"
     # the ROW's calls pass the fact by keyword; the heuristics' width pick (sm107_bias_auto_cga) calls the same function WITHOUT it
@@ -717,7 +717,7 @@ def test_multicast_declines_the_padded_dense_tail_the_cga1_ring_serves(case, _pi
             dict(b=c["b"], h_q=c["h"], h_kv=c["h_kv"], s_q=c["s_q"], s_kv=c["s_kv"], **_s13._bias_kw(h=c["h"], s_q=c["s_q"], s_kv=c["s_kv"]))
         )
     )
-    why = engines.mismatch(_s13._caps(), f, None)
+    why = engines.mismatch(_s13._caps(f), f, None)
     assert why and "multicast bias ring" in why and "synthesized" in why, why
     ring = _run(q, k, v, kw, c, _pins, mode=2)
     _s13._check(ring, ref)

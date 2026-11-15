@@ -27,7 +27,15 @@ def test_half_scalar_tail_explicit_candidate_admission(device_cc, d_shape):
     # admission does not add a split implementation to its prefill body.
     sq = 1 if device_cc == (10, 7) and d_shape in ((256, 256), (248, 224)) else 64
     facts = ga.SdpaGraphFacts(b=2, h_q=4, h_kv=2, s_q=sq, s_kv=257, d_qk=d_shape[0], d_v=d_shape[1], dtype=cudnn.data_type.BFLOAT16, device_cc=device_cc)
-    assert mismatch(caps, facts, SdpaFwdKnobs(split_kv=4, tile_m=128, tile_n=128, cga=cga, pack_gqa=False)) is None
+    knobs = SdpaFwdKnobs(split_kv=4, tile_m=128, tile_n=128, cga=cga, pack_gqa=False)
+    if device_cc == (10, 7) and d_shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)):
+        from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry, select_sm107_half_geometry
+
+        selector = select_sm107_d512_geometry if d_shape == (512, 512) else select_sm107_half_geometry
+        geometry = selector(facts, knobs)
+        caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == geometry.implementation)
+        knobs = geometry.canonical_knobs(knobs)
+    assert mismatch(caps, facts, knobs) is None
 
 
 @pytest.mark.parametrize("d_shape", _SHAPES)

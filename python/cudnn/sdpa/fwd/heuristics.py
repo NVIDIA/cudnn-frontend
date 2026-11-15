@@ -109,6 +109,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    select_sm107_half_geometry,
     sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,
@@ -3826,6 +3827,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     """
     from .kernels.sm107 import d512_half_contract as sm107_wide_half
 
+    from .kernels.sm107 import shared_half_contract as sm107_half
+
+    if sm107_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm107_half_geometry, policy=sm100_legacy_policy_spec(sm107_half.LEGACY_ROW))
     if sm107_wide_half.in_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm107_d512_geometry, policy=sm100_legacy_policy_spec(sm107_wide_half.LEGACY_ROW))
     from .kernels.sm100.d256_f16_contract import in_pilot_domain

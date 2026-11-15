@@ -590,11 +590,22 @@ def _exec_sdpa_on_frost(
             # The legacy module held both single-Q and quadrant cooperation.
             # Their new owners retain separate, concrete body identities.
             engines = (owners[template], owners["decode_d64_f16_quadrant"])
-    if engine == "sdpa_fwd_prefill_sm107" and (cfg.d_qk, cfg.d_v) in ((512, 512), (576, 512)):
-        rubin_owners = {"prefill_d512_f16_2x2": "sdpa_fwd_sm107_d512_2x2"}
-        if cfg.d_qk == 512:
-            rubin_owners["prefill_d512_f16"] = "sdpa_fwd_sm107_d512_role_split"
-        engines = (rubin_owners[template],) if template in rubin_owners else tuple(rubin_owners.values())
+    if engine == "sdpa_fwd_prefill_sm107":
+        ordinary = ("sdpa_fwd_sm107_d128_multi_q",)
+        shared_single = ("sdpa_fwd_sm107_shared_single_q",)
+        lookahead = ("sdpa_fwd_sm107_d256_lookahead",)
+        small = {"prefill_d128_f16": ordinary + ("sdpa_fwd_sm107_small_batch_pair",), "decode_d128_f16": shared_single}
+        rubin_owners = {
+            (32, 32): small,
+            (64, 64): small,
+            (128, 128): {"prefill_d128_f16": ordinary, "decode_d128_f16": shared_single, "prefill_d256_f16": lookahead},
+            (192, 128): {"prefill_d192_d128_f16": ("sdpa_fwd_sm107_d192_multi_q",), "decode_d128_f16": shared_single},
+            (256, 256): {"prefill_d256_f16": lookahead + ("sdpa_fwd_sm107_shared_d256_lookahead",), "decode_d256_f16": ("sdpa_fwd_sm107_d256_swap_ab",)},
+            (512, 512): {"prefill_d512_f16": ("sdpa_fwd_sm107_d512_role_split",), "prefill_d512_f16_2x2": ("sdpa_fwd_sm107_d512_2x2",)},
+            (576, 512): {"prefill_d512_f16_2x2": ("sdpa_fwd_sm107_d512_2x2",)},
+        }.get((cfg.d_qk, cfg.d_v))
+        if rubin_owners is not None:
+            engines = rubin_owners[template] if template in rubin_owners else tuple(name for group in rubin_owners.values() for name in group)
     keys = [[f"frost:{name}" for name in engines]]
     if template:
         keys.append([f"frost:{name}:" + ("decode_d64_f16_quadrant" if name == "sdpa_fwd_sm100_d64_quadrant" else template) for name in engines])
@@ -3273,8 +3284,9 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
         want = "sdpa_fwd_sm100_d256_lookahead"
     elif sm in (100, 103) and (d_qk, d_v) == (512, 512):
         want = "sdpa_fwd_sm100_d512_2x2"
-    elif sm == 107 and (d_qk, d_v) == (512, 512):
-        want = "sdpa_fwd_sm107_d512_2x2"
+    elif sm == 107:
+        want = {(128, 128): "sdpa_fwd_sm107_d128_multi_q", (192, 128): "sdpa_fwd_sm107_d192_multi_q",
+                (256, 256): "sdpa_fwd_sm107_d256_lookahead", (512, 512): "sdpa_fwd_sm107_d512_2x2"}[(d_qk, d_v)]
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
     graph.check_support()
@@ -3853,7 +3865,8 @@ def _p2_frost(cfg, request, cudnn_handle, *, cga=None, pin=None):
     if request.config.option.dryrun:
         return None
     served, knobs = frost_routing.LAST_PLAN
-    assert served == engine and knobs is not None, frost_routing.LAST_PLAN
+    owner = "sdpa_fwd_sm107_d128_multi_q" if cfg.d_qk == 128 else "sdpa_fwd_sm107_shared_d256_lookahead"
+    assert served == owner and knobs is not None, frost_routing.LAST_PLAN
     assert knobs.split_kv in (None, 1), f"this route pins an unsplit plan, yet the served plan was {knobs}"
     print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy}")
     return knobs
@@ -4050,7 +4063,7 @@ def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn
     cfg.softmax_precision = cudnn.data_type.FLOAT   # python engines only: the plan list is the row's proposals
     graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
-    want = _cc107_engine("half")
+    want = "sdpa_fwd_sm107_shared_d256_lookahead"
     names = [graph.get_plan_name_at_index(i) for i in range(graph.get_execution_plan_count())]
     ours = [i for i, name in enumerate(names) if name == want or name.startswith(want + "[")]
     assert ours, f"the row must propose a plan for paged THD + sink on cc 10.7; plans: {names}"
@@ -4617,23 +4630,17 @@ _P3_PINS = {
 }
 
 
-def _cc107_half_engine_id():
-    """The cc 10.7 half row's engine id from the manifest (what create_execution_plan replays a pin on)."""
-    from cudnn.engines import manifest
-    family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
-    return family.engine_id + family.slots[_cc107_engine("half")].slot
-
-
 def _cc107_half_plan_sets(graph):
     """{(PACK_GQA, TILE_CGA_M, SPLIT_KV)} of the cc 10.7 half row's entries in the ranked plan list -- ADMISSION, read
     through get_engine_and_knobs_at_index, never rank."""
     from cudnn.engines.engine_ids import is_python_engine
-    kt, engine, out = cudnn.knob_type, _cc107_engine("half"), set()
+    from sdpa.frost.frost_test_utils import half_engine_names
+    kt, engines, out = cudnn.knob_type, half_engine_names("sm107"), set()
     for i in range(graph.get_execution_plan_count()):
         if not is_python_engine(graph.plans[i].engine_id):
             continue
         name = graph.get_plan_name_at_index(i)
-        if name != engine and not name.startswith(engine + "["):
+        if name.split("[", 1)[0] not in engines:
             continue
         _, knobs = graph.get_engine_and_knobs_at_index(i)
         public = {int(k): int(v) for k, v in knobs.items()}
@@ -5051,7 +5058,9 @@ def test_sdpa_fwd_cc107_sink_split_pins_L0(request, cudnn_handle, shape):
     offered = _cc107_half_plan_sets(build()[0])
     assert {(1, 1, 1), (0, 1, 1)} <= offered, offered
     g, bindings = build()
-    g.create_execution_plan(_cc107_half_engine_id(), {kt.PACK_GQA: 1, kt.TILE_CGA_M: 1, kt.SPLIT_KV: 2, kt.SCHED_POLICY: 0, kt.TILE_M: 128, kt.TILE_N: 128})
+    from sdpa.fp16 import _sm107_half_plan_record
+    engine_id, public = _sm107_half_plan_record(g, {kt.PACK_GQA: 1, kt.TILE_CGA_M: 1, kt.SPLIT_KV: 2, kt.SCHED_POLICY: 0, kt.TILE_M: 128, kt.TILE_N: 128})
+    g.create_execution_plan(engine_id, public)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()

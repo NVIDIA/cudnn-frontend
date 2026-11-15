@@ -862,13 +862,29 @@ def _caps(name):
     return engines.sm100_legacy_policy_spec(name).capabilities
 
 
+def _half_mismatch(facts, knobs=None):
+    """Check the concrete owner, retaining requested knobs for negative controls."""
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    shape = (facts.d_qk, facts.d_v)
+    requested = knobs or engines.SdpaFwdKnobs()
+    if shape in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256)):
+        geometry = heuristics.select_sm107_half_geometry(dataclasses.replace(facts, device_cc=(10, 7)), requested)
+        name = geometry.implementation
+    elif shape in ((512, 512), (576, 512)):
+        name = heuristics.select_sm107_d512_geometry(facts, requested).implementation
+    else:
+        name = "sdpa_fwd_prefill_sm107"  # Retained non-native width envelopes.
+    return engines.mismatch(_caps(name), facts, knobs)
+
+
 def test_sm107_f16_row_owns_the_rubin_lane():
-    """One row per ARCH LINE: sm100 stops at cc 10.6, sm107 starts at 10.7."""
+    """Each explicit owner retains its architecture boundary."""
     from cudnn.sdpa.fwd import engines
 
-    sm107, sm100 = _caps("sdpa_fwd_prefill_sm107"), _caps("sdpa_fwd_prefill_sm100")
+    sm107, sm100 = _caps("sdpa_fwd_sm107_d128_multi_q"), _caps("sdpa_fwd_prefill_sm100")
     assert engines.mismatch(sm107, _f16_facts()) is None
-    assert "SM107-119" in engines.mismatch(sm107, _f16_facts(device_cc=(10, 0)))
+    assert "SM107" in engines.mismatch(sm107, _f16_facts(device_cc=(10, 0)))
     assert "SM100-106" in engines.mismatch(sm100, _f16_facts(device_cc=(10, 7)))
 
 
@@ -876,7 +892,7 @@ def test_sm107_f16_row_owns_the_rubin_lane():
 def test_sm107_f16_accepts_every_native_shape(d):
     from cudnn.sdpa.fwd import engines
 
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(d_qk=d[0], d_v=d[1])) is None
+    assert _half_mismatch(_f16_facts(d_qk=d[0], d_v=d[1])) is None
 
 
 def test_sm107_f16_accepts_both_dtypes():
@@ -887,7 +903,7 @@ def test_sm107_f16_accepts_both_dtypes():
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     for dt in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
-        assert engines.mismatch(caps, _f16_facts(dtype=dt, dtype_o=dt)) is None
+        assert _half_mismatch(_f16_facts(dtype=dt, dtype_o=dt)) is None
 
 
 @pytest.mark.parametrize(
@@ -906,7 +922,7 @@ def test_sm107_f16_accepts_the_measured_feature_set(feature):
     """Each of these was validated on Rubin (cos = 1.000000)."""
     from cudnn.sdpa.fwd import engines
 
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(**feature)) is None
+    assert _half_mismatch(_f16_facts(**feature)) is None
 
 
 def test_sm107_f16_serves_d192_on_its_native_kernel():
@@ -924,7 +940,7 @@ def test_sm107_f16_serves_d192_on_its_native_kernel():
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert (192, 128) in caps.d_shapes
-    assert engines.mismatch(caps, _f16_facts(d_qk=192, d_v=128)) is None
+    assert _half_mismatch(_f16_facts(d_qk=192, d_v=128)) is None
 
 
 def test_sm107_f16_thd_is_served_on_every_flavor():
@@ -942,9 +958,9 @@ def test_sm107_f16_thd_is_served_on_every_flavor():
     assert SM107_F16_THD_SHAPES < caps.d_shapes
     assert caps.d_shapes - SM107_F16_THD_SHAPES == {(32, 32), (576, 512)}
     for d_qk, d_v in sorted(SM107_F16_THD_SHAPES):
-        assert engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
+        assert _half_mismatch(_f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
     for d_qk, d_v in sorted(caps.d_shapes - SM107_F16_THD_SHAPES):
-        why = engines.mismatch(caps, _f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
+        why = _half_mismatch(_f16_facts(thd=True, padded=True, d_qk=d_qk, d_v=d_v))
         assert why is not None and "THD" in why, (d_qk, d_v, why)
 
 
@@ -955,45 +971,45 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
     caps = _caps("sdpa_fwd_prefill_sm107")
     assert caps.split_kv_supported is True
     for d_qk, d_v in _FLAVORS:
-        why = engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
+        why = _half_mismatch(_f16_facts(d_qk=d_qk, d_v=d_v), engines.SdpaFwdKnobs(split_kv=2))
         assert (why is None) == (d_v == 128 or (d_qk, d_v) in ((256, 256), (512, 512))), (d_qk, d_v, why)
     # Dense split graphs at D <= 64 select the native D64 tile, including its envelope.
     for d in (24, 32, 64):
         knobs = engines.SdpaFwdKnobs(split_kv=2)
-        assert engines.mismatch(caps, _f16_facts(d_qk=d, d_v=d), knobs) is None, d
+        assert _half_mismatch(_f16_facts(d_qk=d, d_v=d), knobs) is None, d
         assert engines._selected_d_shape(caps, _f16_facts(d_qk=d, d_v=d), knobs) == (64, 64), d
     for feature in (dict(thd=True, padded=True), dict(padded=True)):
-        assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    assert engines.mismatch(caps, _f16_facts(has_sink=True), engines.SdpaFwdKnobs(split_kv=2)) is None
+        assert _half_mismatch(_f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
+    assert _half_mismatch(_f16_facts(has_sink=True), engines.SdpaFwdKnobs(split_kv=2)) is None
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_epilogue_gate=True)):
-        assert engines.mismatch(caps, _f16_facts(has_sink=True, **feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
+        assert _half_mismatch(_f16_facts(has_sink=True, **feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
     # D128 unsplit THD and dense packing share the native two-CTA SM107 body.
-    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    assert _half_mismatch(_f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
         knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=False)
-        assert engines.mismatch(caps, facts, knobs) is None
-        assert (engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None) == paged
+        assert _half_mismatch(facts, knobs) is None
+        assert (_half_mismatch(dataclasses.replace(facts, has_sink=True), knobs) is None) == paged
         bounded = dataclasses.replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
-        assert engines.mismatch(caps, bounded, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
+        assert _half_mismatch(bounded, knobs) is None
+        assert _half_mismatch(dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
     for d in (128, 256):
         facts = _f16_facts(d_qk=d, d_v=d, thd=True, padded=True, has_paged_kv=True, page_size=16)
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
-        assert engines.mismatch(caps, facts, knobs) is None
-        assert (engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is None) == (d == 128)
+        assert _half_mismatch(facts, knobs) is None
+        assert (_half_mismatch(dataclasses.replace(facts, thd=False), knobs) is None) == (d == 128)
         # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
         # at every cluster width the leg admits; dense D128 uses its native page loader too.
         sink = dataclasses.replace(facts, has_sink=True)
         gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
-        assert engines.mismatch(caps, sink, knobs) is None, d
-        assert engines.mismatch(caps, gqa_sink, dataclasses.replace(knobs, pack_gqa=True)) is None, d
+        assert _half_mismatch(sink, knobs) is None, d
+        assert _half_mismatch(gqa_sink, dataclasses.replace(knobs, pack_gqa=True)) is None, d
         if d == 128:
             for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
-                assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
-        assert (engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs) is None) == (d == 128)
-        assert engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2)) is not None
+                assert _half_mismatch(gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
+        assert (_half_mismatch(dataclasses.replace(sink, thd=False), knobs) is None) == (d == 128)
+        assert _half_mismatch(sink, dataclasses.replace(knobs, split_kv=2)) is not None
 
 
 def test_sm107_dense_d128_shared_legs_admission():
@@ -1007,15 +1023,15 @@ def test_sm107_dense_d128_shared_legs_admission():
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     pack, cga1 = engines.SdpaFwdKnobs(pack_gqa=True), engines.SdpaFwdKnobs(cga=1)
-    assert engines.mismatch(caps, _f16_facts(h_kv=2), pack) is None
-    assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=64, d_v=64), pack) is None, "the d64 envelope rides the same bodies"
-    assert engines.mismatch(caps, _f16_facts(), pack) is None, "MHA: PACK_G = 1, the bit-exact unpacked fold (SM100 parity)"
-    assert "pre-folded" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), pack)
-    assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=256, d_v=256), pack) is not None
-    assert engines.mismatch(caps, _f16_facts(h_kv=2, s_q=4), cga1) is None
-    assert engines.mismatch(caps, _f16_facts(s_q=4), cga1) is None, "MHA rides the decode tile unpacked"
-    assert engines.mismatch(caps, _f16_facts(h_kv=2, thd=True, padded=True), cga1) is None
-    assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), cga1)
+    assert _half_mismatch(_f16_facts(h_kv=2), pack) is None
+    assert _half_mismatch(_f16_facts(h_kv=2, d_qk=64, d_v=64), pack) is None, "the d64 envelope rides the same bodies"
+    assert _half_mismatch(_f16_facts(), pack) is None, "MHA: PACK_G = 1, the bit-exact unpacked fold (SM100 parity)"
+    assert "pre-folded" in _half_mismatch(_f16_facts(h_kv=2, attn_scale_prefolded=True), pack)
+    assert _half_mismatch(_f16_facts(h_kv=2, d_qk=256, d_v=256), pack) is not None
+    assert _half_mismatch(_f16_facts(h_kv=2, s_q=4), cga1) is None
+    assert _half_mismatch(_f16_facts(s_q=4), cga1) is None, "MHA rides the decode tile unpacked"
+    assert _half_mismatch(_f16_facts(h_kv=2, thd=True, padded=True), cga1) is None
+    assert "pre-folded" in _half_mismatch(_f16_facts(h_kv=2, attn_scale_prefolded=True), cga1)
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
 
 
@@ -1041,12 +1057,12 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         page_size=16,
     )
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
-    assert engines.mismatch(caps, facts, knobs) is None
+    assert _half_mismatch(facts, knobs) is None
     bounded = dataclasses.replace(facts, wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
-    assert engines.mismatch(caps, bounded, knobs) is None
+    assert _half_mismatch(bounded, knobs) is None
     # cc 10.7 paged THD + sink: the sink composes with paged D256 PackGQA (unsplit); sink x split stays declined.
-    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None
-    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), dataclasses.replace(knobs, split_kv=2)) is not None
+    assert _half_mismatch(dataclasses.replace(facts, has_sink=True), knobs) is None
+    assert _half_mismatch(dataclasses.replace(facts, has_sink=True), dataclasses.replace(knobs, split_kv=2)) is not None
     for changed in (
         dict(thd=False),
         dict(has_paged_kv=False),
@@ -1054,9 +1070,9 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         dict(device_cc=(10, 8)),
         dict(h_q=6),
     ):
-        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None, changed
+        assert _half_mismatch(dataclasses.replace(facts, **changed), knobs) is not None, changed
     for changed in (dict(cga=1), dict(split_kv=2)):
-        assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
+        assert _half_mismatch(facts, dataclasses.replace(knobs, **changed)) is not None, changed
     blackwell_caps = _caps("sdpa_fwd_sm100_d256_lookahead")
     for cc in ((10, 0), (10, 3)):
         blackwell = dataclasses.replace(facts, device_cc=cc)
@@ -1082,14 +1098,14 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
     caps = _caps("sdpa_fwd_prefill_sm107")
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=1, pack_gqa=True)
     for extra in ({}, dict(has_sink=True), dict(wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)):
-        assert engines.mismatch(caps, dataclasses.replace(facts, **extra), knobs) is None
+        assert _half_mismatch(dataclasses.replace(facts, **extra), knobs) is None
     # Native packing retains the existing public pre-folded-scale admission boundary.
-    why = engines.mismatch(caps, dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
+    why = _half_mismatch(dataclasses.replace(facts, attn_scale_prefolded=True), knobs)
     assert why is not None
     assert ("attn_scale_prefolded" if cga == 2 else "outside this engine's domain") in why
     for shape in ((192, 128), (256, 256), (512, 512)):
-        assert engines.mismatch(caps, dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
-    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=4)) is not None
+        assert _half_mismatch(dataclasses.replace(facts, d_qk=shape[0], d_v=shape[1]), knobs) is not None
+    assert _half_mismatch(facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
 def _fp8_owner(shape):
@@ -1383,7 +1399,7 @@ def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
         assert reason is not None and needle in reason, (kw, reason)
     assert engines.mismatch(caps, paged(has_sink=True), SdpaFwdKnobs(split_kv=2)) is not None
     # The half D128 row now admits dense queries through the native page loader.
-    half = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
+    half = engines.mismatch(_caps("sdpa_fwd_sm107_d128_multi_q"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
     assert half is None, half
     fp8 = _caps("sdpa_fwd_prefill_sm107_fp8")
     assert fp8.paged_kv
@@ -1625,9 +1641,9 @@ def test_sm107_lpt_knob_is_honored_or_ineligible_per_d_shape():
 
     caps = _caps("sdpa_fwd_prefill_sm107")
     for dq, dv in ((128, 128), (192, 128), (256, 256)):
-        assert engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
+        assert _half_mismatch(_f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None
     for dq, dv in ((512, 512),):
-        why = engines.mismatch(caps, _f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT))
+        why = _half_mismatch(_f16_facts(d_qk=dq, d_v=dv), SdpaFwdKnobs(sched_policy=SCHED_LPT))
         assert why is not None and "sched_policy" in why
 
 
@@ -2051,9 +2067,17 @@ def test_sm107_stats_log2_specializes_every_dtype_and_flavor(flavor, kind, load_
 # Three rows, one per dtype family of the d256 flavor: f16/bf16, per-tensor FP8
 # (PR-A) and block-scale MXFP8 (PR-B slice S7).  Order is load-bearing for the
 # `f16, fp8 = ...` destructurings below; the MXFP8 row is indexed explicitly.
-_GATE_ROWS = ("sdpa_fwd_prefill_sm107", "sdpa_fwd_sm107_d256_fp8_single_q", "sdpa_fwd_prefill_sm107_mxfp8")
-# Include the legacy FP8 policy row and the explicit MXFP8 D256 owner.
-_GATE_SPECS = _GATE_ROWS + ("sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_sm107_d256_mxfp8_single_q")
+_GATE_ROWS = ("sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_sm107_d256_fp8_single_q", "sdpa_fwd_prefill_sm107_mxfp8")
+# The retained half row still supplies the legacy policy's feature constants,
+# but its delegated exact D256 graph must decline. Split-gated decode belongs
+# to its own fixed implementation, not the unsplit lookahead engine.
+_GATE_DECLARED_ROWS = (
+    *_GATE_ROWS,
+    "sdpa_fwd_prefill_sm107",
+    "sdpa_fwd_prefill_sm107_fp8",
+    "sdpa_fwd_sm107_d256_swap_ab",
+    "sdpa_fwd_sm107_d256_mxfp8_single_q",
+)
 _D256 = (256, 256)
 _GATE_SEAMS = (
     "cfg",
@@ -2154,13 +2178,13 @@ def test_sm107_gate_rows_claim_exactly_d256():
     from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES
 
     assert SM107_EPILOGUE_GATE_SHAPES == frozenset({_D256})
-    for row in _GATE_SPECS:
+    for row in _GATE_DECLARED_ROWS:
         caps = _caps(row)
         assert caps.epilogue_gate is True, row
         assert caps.epilogue_gate_d_shapes == frozenset({_D256}), row
         assert caps.epilogue_gate_d_shapes is SM107_EPILOGUE_GATE_SHAPES, f"{row}: the row must consume the shared constant, not a copy"
     for spec in engines.ENGINE_SPECS:
-        if spec.name not in _GATE_SPECS:
+        if spec.name not in _GATE_DECLARED_ROWS:
             assert spec.capabilities.epilogue_gate is False, spec.name
             assert spec.capabilities.epilogue_gate_d_shapes is None, spec.name
     # The envelope row retains historical policy metadata; its exact gated
@@ -2171,7 +2195,8 @@ def test_sm107_gate_rows_claim_exactly_d256():
     assert engines.mismatch(specs["sdpa_fwd_sm107_d256_mxfp8_single_q"].capabilities, _mxfp8_gate_facts()) is None
     # The gate is a FEATURE of the Rubin rows, never a row of its own -- a claim
     # unrelated rows landing cannot falsify (a bare spec count could not say it).
-    assert {s.name for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate} == set(_GATE_SPECS)
+    assert {s.name for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate} == set(_GATE_DECLARED_ROWS)
+    assert "owned by" in engines.mismatch(specs["sdpa_fwd_prefill_sm107"].capabilities, _gate_facts())
 
     f16, fp8, mxfp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1]), _caps(_GATE_ROWS[2])
     assert engines.mismatch(f16, _gate_facts()) is None
@@ -2179,10 +2204,9 @@ def test_sm107_gate_rows_claim_exactly_d256():
     assert engines.mismatch(mxfp8, _mxfp8_gate_facts()) is None, "PR-B: the MXFP8 row serves the tail at (256, 256) with a bf16 G"
     # Every other flavor -- and the d=200 envelope ride -- declines by the gate's reason.
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512), (200, 200)):
-        caps = _caps("sdpa_fwd_sm107_d512_2x2") if (d_qk, d_v) == (512, 512) else f16
-        assert engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v)) is None
-        why = engines.mismatch(caps, _gate_facts(d_qk=d_qk, d_v=d_v))
+        why = _half_mismatch(_gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue" in why, (d_qk, d_v, why)
+        assert _half_mismatch(_f16_facts(d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
         fp8_owner = _caps(_fp8_owner((d_qk, d_v)))
         why = engines.mismatch(fp8_owner, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
@@ -2194,7 +2218,7 @@ def test_sm107_gate_rows_claim_exactly_d256():
     assert engines.mismatch(mxfp8, _mxfp8_facts(d_qk=256, d_v=256)) is None
     # An UNGATED graph is untouched by the new fields on every row.
     assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256)) is None
-    assert engines.mismatch(f16, _f16_facts(d_qk=128, d_v=128)) is None
+    assert _half_mismatch(_f16_facts(d_qk=128, d_v=128)) is None
 
 
 def test_sm107_gate_accepts_every_dtype_member():
@@ -2281,9 +2305,10 @@ def test_sm107_gate_declines_the_interactions():
     d512_fp8 = _caps("sdpa_fwd_sm107_d512_fp8_role_split")
     assert d512_fp8.paged_d_shapes == frozenset({(512, 512)})
     assert engines.mismatch(fp8, _fp8_gate_facts(**paged)) is not None
-    assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
-    why = engines.mismatch(f16, _gate_facts(**paged))
-    assert why is not None and "paged" in why and "gate" in why, why
+    shared = _caps("sdpa_fwd_sm107_shared_d256_lookahead")
+    assert engines.mismatch(shared, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
+    why = engines.mismatch(shared, _gate_facts(thd=True, **paged))
+    assert why is not None and "epilogue" in why, why
     # Knob interactions: a split or packed plan can never carry the gate.
     why = engines.mismatch(fp8, _fp8_gate_facts(), SdpaFwdKnobs(split_kv=2))
     assert why is not None and "gate" in why, why
@@ -2307,15 +2332,17 @@ def test_sm107_gate_declines_the_interactions():
     decode = _gate_facts(
         h_kv=2, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, epilogue_gate_dtype=cudnn.data_type.BFLOAT16
     )  # dense UNPADDED: the one dense form a split rides
-    assert engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=2, pack_gqa=True)) is None
-    assert engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=2)) is None
+    swap = _caps("sdpa_fwd_sm107_d256_swap_ab")
+    assert engines.mismatch(swap, decode, SdpaFwdKnobs(tile_m=16, cga=1, split_kv=2, pack_gqa=True)) is None
+    assert engines.mismatch(swap, decode, SdpaFwdKnobs(tile_m=16, cga=1, split_kv=2)) is None
     assert engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=1)) is None  # the prefill kernel's fused epilogue
     why = engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=1, pack_gqa=True))
     assert why is not None and "decode tile" in why, why
     decode_paged = _gate_facts(h_kv=2, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, epilogue_gate_dtype=cudnn.data_type.BFLOAT16, **paged)
-    assert engines.mismatch(f16, decode_paged) is None and engines.mismatch(f16, decode_paged, SdpaFwdKnobs(split_kv=2, pack_gqa=True)) is None
-    why = engines.mismatch(f16, decode_paged, SdpaFwdKnobs(split_kv=1))
-    assert why is not None and "paged" in why and "gate" in why, why
+    assert engines.mismatch(swap, decode_paged) is None
+    assert engines.mismatch(swap, decode_paged, SdpaFwdKnobs(tile_m=16, cga=1, split_kv=2, pack_gqa=True)) is None
+    why = engines.mismatch(swap, decode_paged, SdpaFwdKnobs(tile_m=16, cga=1, split_kv=1))
+    assert why is not None and "gate" in why and "split combine" in why, why
     assert engines.mismatch(fp8, _fp8_gate_facts(h_kv=2, s_q=1, s_kv=4096), SdpaFwdKnobs(split_kv=2)) is not None, "the quantized rows keep the gate unsplit"
     # A broadcast G / an undeclared O_v are DECLINES (legal graphs for the backend), never facts.invalid.
     why = engines.mismatch(f16, _gate_facts(epilogue_gate_shape_ok=False))
@@ -2387,7 +2414,7 @@ def test_sm107_gate_row_matches_the_adapter_twin():
     from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES
 
     gate_rows = [s for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate]
-    assert {s.name for s in gate_rows} == set(_GATE_SPECS)
+    assert {s.name for s in gate_rows} == set(_GATE_DECLARED_ROWS)
     for spec in gate_rows:
         assert spec.capabilities.epilogue_gate_d_shapes is SM107_EPILOGUE_GATE_SHAPES, spec.name
         assert spec.capabilities.epilogue_gate_d_shapes <= spec.capabilities.d_shapes, spec.name
@@ -8849,11 +8876,11 @@ def test_native_d192_paged_admission_boundaries(thd, packed, dims):
         has_sink=True,
     )
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=packed)
-    reason = engines.mismatch(caps, facts, knobs)
+    reason = _half_mismatch(facts, knobs)
     # Ragged inputs retain their existing exact-native-width contract.
     assert (reason is None) == (not thd or dims == (192, 128)), reason
     for bad in (dataclasses.replace(knobs, cga=1), dataclasses.replace(knobs, split_kv=2)):
-        assert engines.mismatch(caps, facts, bad) is not None
+        assert _half_mismatch(facts, bad) is not None
 
 
 @pytest.mark.parametrize("thd,cga,splits", [(False, 2, 1), (True, 1, 2), (True, 2, 1)])
@@ -8863,8 +8890,8 @@ def test_native_d192_paged_pack_keeps_nonpaged_decline(thd, cga, splits):
     facts = _f16_facts(d_qk=192, d_v=128, thd=thd, padded=thd, h_q=16, h_kv=4)
     caps = _caps("sdpa_fwd_prefill_sm107")
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
-    assert engines.mismatch(caps, facts, knobs) is None
-    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, pack_gqa=True)) is not None
+    assert _half_mismatch(facts, knobs) is None
+    assert _half_mismatch(facts, dataclasses.replace(knobs, pack_gqa=True)) is not None
 
 
 @pytest.mark.parametrize(

@@ -15,7 +15,11 @@ def test_independent_origins(dtype_name, stats_layout, cga, policy, total_hints,
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("native SM100/SM103/SM107 D192 physical origins")
-    engine = "sdpa_fwd_prefill_sm107" if torch.cuda.get_device_capability() == (10, 7) else "sdpa_fwd_prefill_sm100"
+    engine = (
+        ("sdpa_fwd_sm107_shared_single_q" if cga == 1 else "sdpa_fwd_sm107_d192_multi_q")
+        if torch.cuda.get_device_capability() == (10, 7)
+        else "sdpa_fwd_prefill_sm100"
+    )
     original = cudnn.pygraph.create_execution_plan
 
     def select_schedule(graph, engine_id, knobs=None):
@@ -34,7 +38,7 @@ def test_split_independent_origins(dtype_name, stats_layout, splits):
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("native SM100/SM103/SM107 D192 split physical origins")
-    engine = "sdpa_fwd_prefill_sm107" if torch.cuda.get_device_capability() == (10, 7) else "sdpa_fwd_prefill_sm100"
+    engine = "sdpa_fwd_sm107_shared_single_q" if torch.cuda.get_device_capability() == (10, 7) else "sdpa_fwd_prefill_sm100"
     run((192, 128), dtype_name, stats_layout, True, False, splits, engine_name=engine, cga=1)
 
 
@@ -59,7 +63,7 @@ def test_split_origins_require_matching_extension(monkeypatch, cc):
         device_cc=cc,
         device_sm_count=148,
     )
-    name = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
+    name = "sdpa_fwd_sm107_shared_single_q" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
     caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
     split = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=0, sched_policy=0)
     assert engines.mismatch(caps, facts, split) is None

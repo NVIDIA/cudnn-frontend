@@ -18,7 +18,7 @@ def test_explicit_contract_and_template(monkeypatch, cc, packed):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     facts = SdpaGraphFacts(b=2, h_q=8, h_kv=2, s_q=129, s_kv=2048, d_qk=64, d_v=64, dtype=cudnn.data_type.BFLOAT16, thd=True, device_cc=cc, device_sm_count=148)
-    name = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
+    name = "sdpa_fwd_sm107_shared_single_q" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
     knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=packed, tile_n=128, sched_policy=0)
     assert engines.mismatch(caps, facts, knobs) is None
@@ -55,9 +55,10 @@ def test_origins_and_replay(dtype_name, stats_layout, packed, splits, policy, co
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("SM100/SM103/SM107 nonpaged D64 split")
-    name = "sdpa_fwd_prefill_sm107" if torch.cuda.get_device_capability() == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
+    is_sm107 = torch.cuda.get_device_capability() == (10, 7)
+    name = "sdpa_fwd_sm107_shared_single_q" if is_sm107 else "sdpa_fwd_sm100_d128_single_q"
     original = cudnn.pygraph.create_execution_plan
-    effective_policy = min(policy, 1) if name.endswith("sm107") else policy
+    effective_policy = min(policy, 1) if is_sm107 else policy
 
     def select_schedule(graph, engine_id, knobs=None):
         return original(graph, engine_id, {**(knobs or {}), cudnn.knob_type.SCHED_POLICY: effective_policy})
@@ -72,7 +73,7 @@ def test_proper_divisor_pack_replay():
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("native SM107 proper-divisor PackGQA")
-    run(64, "bfloat16", "head", True, True, 9, engine_name="sdpa_fwd_prefill_sm107", cga=1, heads_override=12)
+    run(64, "bfloat16", "head", True, True, 9, engine_name="sdpa_fwd_sm107_shared_single_q", cga=1, heads_override=12)
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])

@@ -37,6 +37,7 @@ class D256Geometry:
     head_dim: int = 256
     live_columns: int = 0
     early_q: bool = False
+    lowering_row_name: str = "sdpa_fwd_prefill_sm100"
 
     @property
     def cga(self):

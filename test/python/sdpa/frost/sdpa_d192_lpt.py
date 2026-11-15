@@ -65,7 +65,7 @@ def test_native_admission(dtype, shape, leg):
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
 
-    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d192_multi_q")
     f = SdpaGraphFacts(
         b=3,
         h_q=8,

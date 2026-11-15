@@ -6369,6 +6369,33 @@ command remains unavailable. This test-only follow-up preserves production
 source from that qualified head.
 
 
+### SM107 small/mid half explicit records — registration checkpoint, 2026-11-15
+
+The new fixed native and shared-body contracts are exercised by
+`sdpa/frost/test_sdpa_fwd_sm107_half_selection.py`: 37 host tests pass,
+including nine registered-host public-knob round trips, preserved physical
+width envelopes, and N64 split ownership. These are metadata/host checks;
+they do not launch a GPU or compare output bytes. The configuration audit
+compares the real registered admission and host adapters with the legacy
+loader, including complete configuration/TMA records.
+
+At that registration checkpoint the new owners' native output/replay and
+batch-invariance checks were pending. Existing body tests and cross-compiled
+PTX equality alone do not qualify new graph records.
+
+The integrated implementation revision subsequently passed 53 focused checks
+on SM107, CUDA 13.4, CuTe DSL 4.8 and cuDNN 9.30. These cover public-record
+reconstruction, fresh bindings, retained capture, both output-stride binders,
+and score/gate admission. Two strict expected failures retain the existing
+shared D256 nonpaged split independent-origin gap reproduced on the parent;
+compact split is covered positively. A preceding focused revision passed 38
+paged lookup, physical-origin, stride and dead-row checks, with 15 architecture
+scope skips. The runs are partly overlapping and are not a full-pool claim.
+
+No numerical tolerance or historical golden changed. These tests establish
+only their explicit output and lifecycle checks; they do not add a general
+batch-invariance or Stats-stride-override declaration.
+
 ### SM100 explicit MXFP8 implementation records — 2026-11-15
 
 The existing D64/D128 multi-Q, D192/V128 multi-Q and D256 single-Q bodies

@@ -140,8 +140,9 @@ def test_boundaries(dims, page, sq, cga, split, packed, policy, empty, monkeypat
 
 def check_admission(_caps, _f16_facts):
     from cudnn.sdpa.fwd import engines
+    from test_sdpa_fwd_dsl_sm107 import _half_mismatch
 
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d128_multi_q")
     assert (64, 64) in caps.paged_d_shapes
     for thd in (False, True):
         facts = _f16_facts(d_qk=64, d_v=64, thd=thd, padded=True, has_paged_kv=True, page_size=16)
@@ -151,7 +152,7 @@ def check_admission(_caps, _f16_facts):
                     for split in (1, 4):
                         knobs = engines.SdpaFwdKnobs(cga=cga, pack_gqa=packed, tile_n=n, split_kv=split)
                         assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
-                        reason = engines.mismatch(caps, facts, knobs)
+                        reason = _half_mismatch(facts, knobs)
                         if thd and split > 1 and (cga != 1 or n != 128):
                             assert reason is not None, (thd, knobs)
                         else:
