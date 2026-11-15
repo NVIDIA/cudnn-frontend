@@ -1731,21 +1731,6 @@ def _store_words(slab, byte_offset, row, words):
 
 
 @cute.jit
-def _store_words_quarter(slab, row_base, words, first: cutlass.Constexpr[int], xor_lane):
-    """16w_fa4 (the alternate role shape, the resource plan): ONE 32-q quarter of the lane's dS^T row -- the CFG.PACK_QUARTER_COLS = 16 packed Int32 words
-    ``words[first, first + 16)`` -- into the SW128 slab row at ``row_base`` (= the own-half or XCHG base + row * SWIZZLE_BYTES) as
-    CFG.DS_STS_VECS_PER_QUARTER = 4 16-B vectors at vec ``vec0 + v`` of the row, ``xor_lane = (row % 8) ^ vec0`` (``vec0`` = 4 x the softmax group:
-    group g owns vec 4g .. 4g+3 of the 64-q half; ``vec0 + v == vec0 | v == vec0 ^ v`` for v < 4): the same ``(row % 8) ^ vec`` XOR of
-    :func:`_store_words`, so the softmax writes today's epilogue LDTM image word for word (dK / dV bitwise, dQ's A descriptor unchanged);
-    conflict-free: 4 wavefronts per STS.128 = the floor (the resource plan, the audit record).  The caller passes
-    ``xor_lane`` through ``opaque_i32(.., anchor=qtile)`` so the 8 address adds live inside the tile (the d256 2x2 lesson: hoisted, they spilled)."""
-    for v in cutlass.range_constexpr(CFG.DS_STS_VECS_PER_QUARTER):
-        off = row_base + (xor_lane ^ v) * 16
-        values = cutlass.Vector.from_elements(tuple(words[first + v * 4 + k] for k in range(4)), cutlass.Int32)
-        Pointer(slab.data_ptr() + off, dtype=cutlass.Int32).store(values, alignment=16)
-
-
-@cute.jit
 def _store_dq_slice(slab, byte_base, row, values):
     """fp32 slice row: the lane's DQ_BOX values of q row ``row`` into the SW128 [Q_HALF x DQ_BOX] slot at ``byte_base`` (one ROUND's half of
     the 64-column dQ readout; the same 16-B vector / XOR-swizzle form as _store_words)."""
@@ -2147,8 +2132,6 @@ def _dq_issue(
         for _us in cutlass.range(DEBUG_SOFTMAX_DQ_WAR_DELAY_US, unroll=1):
             nvvm.inline_ptx("nanosleep.u32 1000;", read_only_args=[])
     mma_ss(dqdesc, dsd_s, k2d, dq_acc)
-    if cutlass.const_expr(fa4_roles):
-        _commit_pair(bars.dq_war_done, elect_p)  # section 15: the softmax's WAR signal (the two dQ sites only), BEFORE dq_done
     _commit_pair(bars.dq_done, elect_p)
     return advance(xchg_state, geo.DS_STAGES), dq_read_state
 
@@ -2310,23 +2293,9 @@ def _softmax_loop(
     if cutlass.const_expr(tma_ring):
         # RESOURCE-NOTE: stage base = STATS_RING + idx*1024; LSE @+0, delta @+512: today's LDS.128 immediates
         stats_state = PipelineState.start()  # st(0): wait k <-> the loader's copy k; ONE state for the barrier index AND the stage byte base (P2); carried
-    if cutlass.const_expr(fa4_roles):
-        # lo_base=rank?XCHG:DS, hi_base=rank?DS+16K:XCHG; vec 4g..4g+3; (row%8)^vec: floor
-        own_base = cutlass.Int32(geo.DS) + rank * cutlass.Int32(CFG.DS_HALF_BYTES)  # geo.ds_own(rank): our 128 kv rows of sDS
-        xchg_base = cutlass.Int32(geo.XCHG)  # the peer's 64 q of our rows: the ship's source
-        is_leader_cta = rank == cutlass.Int32(LEADER_RANK)
-        lo_base = cutlass.Int32(arith.select(is_leader_cta.ir_value(), own_base.ir_value(), xchg_base.ir_value()))  # quarter g = q half 0 (rank 0's own)
-        hi_base = cutlass.Int32(arith.select(is_leader_cta.ir_value(), xchg_base.ir_value(), own_base.ir_value()))  # quarter g+2 = q half 1 (rank 1's own)
-        lo_row = lo_base + row * cutlass.Int32(CFG.SWIZZLE_BYTES)  # the lane's 128-B row of the quarter-g slab (item-invariant: 1 register)
-        hi_row = hi_base + row * cutlass.Int32(CFG.SWIZZLE_BYTES)  # the lane's row of the quarter-(g+2) slab (1 register)
-        xor_lane = (row % 8) ^ (group * cutlass.Int32(CFG.DS_STS_VECS_PER_QUARTER))  # (row % 8) ^ vec0: group g writes vec 4g .. 4g+3 of BOTH halves
-        is_lead_warp = warp == cutlass.Int32(SOFTMAX_LEAD_WARP)
-        dq_war = PipelineState.start(phase=1)  # pre-armed (P5): the kernel's first dS STS has no predecessor; +1 per live-tile wait (no zero-trip site)
     valid = cutlass.Int32(1)
     while valid != 0:
         _credit(bars.sched_empty[sched_state.idx])
-        if cutlass.const_expr(fa4_roles):
-            ship_pred = is_lead_warp & nvvm.elect_sync()  # ONE lane of warp SOFTMAX_LEAD_WARP per item (P16): the arm + the ship
         lo, hi, seq_q, seq_k, q_start = _item_bounds(pair, meta, batch, n_batch, causal)
         key = pair * CFG.PAIR_KV_ROWS + rank * CFG.M + row
         if cutlass.const_expr(not tma_ring):  # stats_form ldg: the item prologue's stats fetch (tile lo) under the SOFTMAX_BARRIER pair
@@ -2368,33 +2337,7 @@ def _softmax_loop(
             nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             _arrive_leader(bars.ds_ready)
-            if cutlass.const_expr(not fa4_roles):
-                bars.ds_tmem.arrive()
-            else:
-                # STTM + ds_ready BEFORE the dq_done WAR wait: dK(t) never waits dQ(t-1)
-                # WAR: wait dq_war_done (dQ issues only, never the zero-trip commit); st(1); drain after the loop
-                # section 15: dQ(t-1)'s read of sDS own + recv (and, via the leader's gates, both ships' XCHG reads) done.  STAMPS declines under
-                # 16w_fa4 (no record word for this row): dbg=None = the shipped statements, untimed.
-                _wait(bars.dq_war_done, dq_war.phase, None, 0)
-                dq_war = advance(dq_war, 1)
-                _skew_follower_own_half(rank)  # skew lever 1 (16w_fa4 site): the FOLLOWER holds its 8 STS (its ds_smem AND its ship)
-                # dS STS from the 32 packed words = today's LDTM image; 4 own + 4 XCHG STS.128/lane
-                xor_t = opaque_i32(xor_lane, anchor=qtile)  # pins the 8 address adds inside the tile (hoisted per item they spilled 4 words at 144 regs)
-                _store_words_quarter(slab, lo_row, words, 0, xor_t)
-                _store_words_quarter(slab, hi_row, words, CFG.PACK_QUARTER_COLS, xor_t)
-                nvvm.fence_proxy("async.shared", space="cta")
-                # ds_smem 256 THREAD bare after own STS + fence.proxy; no tcgen05 fence (registers)
-                bars.ds_smem.arrive()
-                # XCHG_BARRIER 256 (8 softmax warps) -> warp 0 elect: arm ds_recv_full, ship XCHG
-                named_barrier_fence(CFG.XCHG_BARRIER, XCHG_BARRIER_LANES_16W_FA4)
-                _skew_leader_ship(rank)  # skew lever 2 (16w_fa4 site): the LEADER holds its arm + ship (the half is written, the barrier passed)
-                # BARRIER (the arm's back-edge on EVERY path, section 15.2 row 3): arm(t) follows this warp's dq_war_done wait above = dQ(t-1) issued
-                # after the leader's ds_recv_full(t-1) / ds_pair_ready(t-1) waits (both copies of the previous phase landed); across items the first
-                # tile's wait consumes the previous LIVE item's tail flip (a real dQ behind the leader's gates); a zero-trip item adds no phase
-                # (no tile, no arm, no ship) and no flip -- the edge is a DATA edge through a real dQ, never through the zero-trip empty commit.
-                bars.ds_recv_full.arrive(n_bytes=xchg_tx, pred=ship_pred)  # XCHG_TX; the probe arms CFG.DIAG_EXCHANGE_OFF_TX = 0 (completes at the arm)
-                if cutlass.const_expr(not exchange_off):  # DIAGNOSTIC exchange_off (re-sited): the ship only; the arm above expects 0 bytes, every wait stays
-                    _ship_xchg(slab, bars, rank, ship_pred, None, geo, False)  # 16w_fa4 x rubin_b2 declines by name: the single-stage ship
+            bars.ds_tmem.arrive()
             if cutlass.const_expr(not tma_ring):  # stats_form ldg: the per-tile lookahead fetch of tile t+1 under the SOFTMAX_BARRIER pair
                 if qtile + 1 < hi:
                     _stats(slab, lse, delta, row, group, (qtile + 1) * CFG.N, batch, head, scale, q_start, seq_q, origins, stats_origin, geo)
@@ -2403,10 +2346,6 @@ def _softmax_loop(
             tile_state = advance(tile_state, 1)
         # section 15: NO zero-trip wait and NO zero-trip advance on dq_war -- dq_war_done flips at dQ issues only (0 / 0 on every zero-trip path)
         pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, dbg, _W["wait:softmax:sched_full"])
-    if cutlass.const_expr(fa4_roles):
-        # P15 / section 15.3: the ONE unconditional drain of dq_war_done (the kernel's last tail flip, or the pre-arm when this CTA ran no live item);
-        # the leader's last commit is issued before it leaves its loop and depends on nothing of this warp: the drain cannot hang.
-        _wait(bars.dq_war_done, dq_war.phase, None, 0)  # STAMPS declines under 16w_fa4: no record word for this row (passed dbg=None, untimed)
 
 
 @cute.jit
@@ -2762,8 +2701,7 @@ def _mma_loop_leader(
         dq_read_state = PipelineState.start(phase=1)  # rubin_b2: dq_read_done, pre-armed (the kernel's first dQ issue has no previous tenant); +1 per wait
     else:
         dq_read_state = None  # sm100: no row, no wait; `_dq_slot` / `_dq_issue` thread the None through unchanged
-    if cutlass.const_expr(not fa4_roles):
-        dp_empty_state = PipelineState.start(phase=1)
+    dp_empty_state = PipelineState.start(phase=1)
     out_empty = PipelineState.start(phase=1)
     sched_state = PipelineState.start()
     valid = cutlass.Int32(1)
@@ -2803,8 +2741,7 @@ def _mma_loop_leader(
                 _clk_add(dbg, _W["tiles_leader"], cutlass.Int32(1))  # STAMPS: this warp's tile count (the handshake's tag base)
             # slot 1: dP^T(t) -- 16w: gated by the dS^T(t-1) READOUT (dp_empty's moved arrive), never by a dQ readout; 16w_fa4: dp_empty OUT
             _skew_leader_slot1()  # skew lever 9: the LEADER holds slot 1 of tile t (relay(t) + the staging of t land before flip t-1 is consumed)
-            if cutlass.const_expr(not fa4_roles):
-                _wait_tcgen(bars.dp_empty, dp_empty_state.phase, dbg, _W["wait:leader:dp_empty"])
+            _wait_tcgen(bars.dp_empty, dp_empty_state.phase, dbg, _W["wait:leader:dp_empty"])
             # dp_empty OUT: packed dS^T(t) read by dK(t) in-order; dP^T(t) fp32 by ds_ready(t)
             if cutlass.const_expr(not b2):
                 do1d_t = do1d  # the pinned single stage
@@ -2840,8 +2777,7 @@ def _mma_loop_leader(
             do2_state = advance(do2_state, 1)
             q2_state = advance(q2_state, 1)
             ready_state = advance(ready_state, 1)
-            if cutlass.const_expr(not fa4_roles):
-                dp_empty_state = advance(dp_empty_state, 1)
+            dp_empty_state = advance(dp_empty_state, 1)
         if lo < hi:
             if cutlass.const_expr(not dq576):
                 # tail: dQ(hi-1) -- the S tail holds the UNREAD dQ(hi-2) image iff a dQ was issued in the loop (N >= 2): wait its readout (D1 iii);
@@ -2864,8 +2800,7 @@ def _mma_loop_leader(
         pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, dbg, _W["wait:leader:sched_full"])
     # P15: the follower's last relaxed arrives (dp_empty of the last dS^T readout, dvk_empty of the last item, s_tail_empty of the last tail
     # readout) land on a resident leader.
-    if cutlass.const_expr(not fa4_roles):
-        _wait_tcgen(bars.dp_empty, dp_empty_state.phase, dbg, _W["wait:leader:dp_empty"])
+    _wait_tcgen(bars.dp_empty, dp_empty_state.phase, dbg, _W["wait:leader:dp_empty"])
     _wait_tcgen(bars.dvk_empty, out_empty.phase, dbg, _W["wait:leader:dvk_empty"])
     if cutlass.const_expr(b2):
         # P15 (rubin_b2): the last readout's dq_read_done (both epilogues' relaxed arrives of the last live item's dQ(hi-1); the pre-arm on a leader
@@ -2917,83 +2852,6 @@ def _mma_loop_follower(
             _slot(bars.ds_pair_ready, relay_state, geo.DS_STAGES).arrive_on_peer(cutlass.Int32(LEADER_RANK), pred=elect_p, release_cta=True)
             relay_state = advance(relay_state, geo.DS_STAGES)
         pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, dbg, _W["wait:follower:sched_full"])
-
-
-@cute.jit
-def _reduce_loop(
-    slab,
-    bars,
-    sched,
-    tmem_base,
-    pair,
-    head,
-    batch,
-    meta,
-    n_batch,
-    rank,
-    causal: cutlass.Constexpr[bool],
-    dtype: cutlass.Constexpr,
-    diag_2cta_code: cutlass.Constexpr[int],
-    regs: cutlass.Constexpr[int],
-    geo: cutlass.Constexpr,
-):
-    """Warps 8-11 under warp_roles 16w_fa4 (the alternate role shape): the REDUCE group = FAv4's dQ readout warps on the S-tail body (lane = q row of d half
-    (warp // 2) % 2 for dQ; lane = own kv row for the item-end dV / dK staging).  No dS work: the softmax writes sDS own + XCHG and ships.
-    ``diag_2cta_code`` (DIAGNOSTIC): DIAG_SDQ_STS_OFF (sdq_sts_off) = the two `_dq_round` sites skip the sDQ slice STS + its proxy fence .  STAMPS (`debug_clk`) declines under 16w_fa4: every wait here is passed dbg=None (untimed).
-    `dkv_accum = "fp32_reduce"` declines under 16w_fa4 too: this group stages bf16 halves only (`_native_out`); dvk_stage_empty has no field here.
-
-    # BARRIER (per item, first): _credit(bars.sched_empty[sched_state.idx])
-    # BARRIER (per tile t; dq_state st(0), empty_state st(1); the barrier audit x-fa4 table section 9, the reduce stub order):
-    #   1. _wait_tcgen(bars.dq_done, dq_state.phase)   [the AUDIT's K:1144 / an earlier tree K:1277 site STAYS on warps 8-11]
-    #      -> [test-only EPILOGUE_DQ_READOUT sleep, FOLLOWER only] -> dq = tcgen05.ld x64 @ CFG.DQ_COL -> tcgen05_wait(LOAD)
-    #      -> tcgen05_fence(BEFORE_THREAD_SYNC) -> _arrive_leader(bars.s_tail_empty)   [LEADER, bare, 128 x 2 = 256; BEFORE round A (X8)]
-    #   2. round A: _dq_round(dq[0, 32)) = _wait(dq_empty[0]) + _wait(dq_empty[1]) at empty_state.phase -> STS slot dhalf -> fence_proxy
-    #      -> bars.dq_full[dhalf].arrive()   [THREAD local, 2 warps = 64 == DQ_SLICE_LANES] -> empty_state += 1
-    #   3. round B: _dq_round(dq[32, 64)) -- back-to-back inside the tile: no `carried` half, no item-end round (the resource plan)
-    #   4. dq_state = advance(dq_state, 1)
-    # BARRIER (item end): if lo >= hi: _wait_tcgen(bars.dq_done, dq_state.phase) + advance   [the zero-trip empty commit; both CTAs' groups observe it]
-    #   -> [test-only FOLLOWER_EPILOGUE_ITEM_END sleep, FOLLOWER only] -> native dV over K2 -> bars.dv_full.arrive() [128 of 160: + the loader's 32, fix A]
-    #   -> native dK over ds_own(rank) + XCHG -> bars.dk_full.arrive() [128]   (X9: the reduce group keeps the staging; the store warp keeps the TMA stores)
-    # Flips: dq_done N (+1 zero-trip) observed; dq_empty / dq_full 2N / 2N per slot (A then B per tile); s_tail_empty N; dv_full / dk_full 1 per item.
-    # No drain: every arrive of this role is local or waited by the leader in-loop (s_tail_empty's last phase is the leader's P15 drain).
-    """
-    # reduce group: dq_done -> ld x64 -> s_tail_empty -> rounds A, B; no carried half
-    nvvm.setmaxregister(regs, nvvm.SetMaxRegisterAction.INCREASE)  # CFG.EPILOGUE_REGS (the same 144)
-    lane = cute.arch.thread_idx()[0] % CFG.M  # own kv row for the dV / dK staging; TMEM lane of the dQ half-row image
-    qrow = lane % CFG.Q_HALF  # dQ row of the half-row image
-    dhalf = lane // CFG.Q_HALF  # d half this warp pair holds (warp-uniform) = its sDQ slot
-    own_base = cutlass.Int32(geo.DS) + rank * cutlass.Int32(CFG.DS_HALF_BYTES)  # geo.ds_own(rank): the dK staging's first alias half
-    slot_base = cutlass.Int32(geo.DQ) + dhalf * cutlass.Int32(CFG.DQ_SLICE_BYTES)  # geo.dq_slot(dhalf): the warp pair's slot of the ring
-    dq_state = PipelineState.start()
-    empty_state = PipelineState.start(phase=1)  # pre-armed (P5 b): both slots of the ring are free before the first round; NO bootstrap (D3)
-    sched_state = PipelineState.start()
-    sts_off = cutlass.const_expr(diag_2cta_code == DIAG_SDQ_STS_OFF)  # DIAGNOSTIC sdq_sts_off: the sDQ slice STS + its proxy fence skipped in every round
-    valid = cutlass.Int32(1)
-    while valid != 0:
-        _credit(bars.sched_empty[sched_state.idx])
-        lo, hi, seq_q, seq_k, q_start = _item_bounds(pair, meta, batch, n_batch, causal)
-        for _ in cutlass.range(lo, hi, 1, unroll=1):
-            _wait_tcgen(bars.dq_done, dq_state.phase, None, 0)
-            _skew_follower_dq_readout(rank)  # skew lever 6 (16w_fa4 site): the FOLLOWER holds its dQ readout (s_tail_empty alone holds S^T(t+1))
-            dq = _tmem_load(tmem_base + geo.DQ_COL, CFG.DQ_COLS)  # 16w_fa4 serves the s_tail map only (tmem_map dq_576 declines by name): geo.DQ_COL = 64
-            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            # s_tail_empty right after wait(LOAD): S^T(t+1) waits the readout, never the STS
-            _arrive_leader(bars.s_tail_empty)
-            # round A of dQ(t): slice 2 dhalf; round B: slice 2 dhalf + 1 (the tma route only; the sdq_sts_off probe's flag; no stamps under 16w_fa4)
-            empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, 0), empty_state, sts_off, None)
-            empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, CFG.DQ_BOX), empty_state, sts_off, None)
-            dq_state = advance(dq_state, 1)
-        if lo >= hi:
-            _wait_tcgen(bars.dq_done, dq_state.phase, None, 0)  # the zero-trip empty commit (both reduce groups observe it: dq_state +1 per item)
-            dq_state = advance(dq_state, 1)
-        live = lo < hi
-        _skew_follower_item_end(rank)  # skew lever 3 (16w_fa4 site): the FOLLOWER holds its dV / dK TMEM readout at the item end
-        _native_out(slab, tmem_base, lane, live, CFG.DV_COL, (geo.dv_store(0), geo.dv_store(1)), dtype)
-        bars.dv_full.arrive()
-        _native_out(slab, tmem_base, lane, live, CFG.DK_COL, (own_base, geo.XCHG), dtype)
-        bars.dk_full.arrive()
-        pair, head, batch, valid, sched_state = _next_tile(sched, bars, sched_state, None, 0)
 
 
 @cute.jit
@@ -3415,8 +3273,10 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     stats_empty fed from ``stats2`` (the chain's padded pre-scaled stats region) at ``rowoff[batch]`` (the sequence's padded token base), ``lse`` /
     ``delta`` None = dropped, the CFG_RING geometry: SMEM_BYTES == the cap, the bar block / TMEM handle / CLC payload re-based +1024), from the
     typed ``stats_form`` field; read by the softmax and the loader; declines by name under 16w_fa4."""
+    if cutlass.const_expr(warp_roles_code != WARP_ROLES_16W):
+        raise ValueError("this fixed main implementation requires warp_roles 16w")
     softmax_regs, epilogue_regs, service_regs = CFG.SOFTMAX_REGS, CFG.EPILOGUE_REGS, CFG.SERVICE_REGS  # config = truth: the 144 / 144 / 80 split
-    fa4_roles = warp_roles_code == WARP_ROLES_16W_FA4  # the role shape (trace-time)
+    fa4_roles = False  # fixed main protocol; callers cannot switch the role ownership
     tma_ring = stats_form_code == STATS_FORM_TMA_RING  # the stats form (trace-time)
     # Trace-time invariants (const_expr: a Python raise, never a staged early exit); the config's validate_fields_for_roles declines first by name.
     if cutlass.const_expr(warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)):
@@ -3549,31 +3409,28 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
             dbg_softmax,
         )
     elif warp < EPILOGUE_WARP_END:
-        if cutlass.const_expr(fa4_roles):
-            _reduce_loop(slab, bars, sched, tmem_base, pair, head, batch, meta, n_batch, rank, causal, dtype, diag_2cta_code, epilogue_regs, geo)
-        else:
-            _epilogue_loop(
-                slab,
-                bars,
-                sched,
-                tmem_base,
-                pair,
-                head,
-                batch,
-                meta,
-                n_batch,
-                rank,
-                warp,
-                causal,
-                dtype,
-                diag_2cta_code,
-                tmem_map_code,
-                smem_map_code,
-                geo,
-                epilogue_regs,
-                dkv_fp32,
-                dbg_epilogue,
-            )
+        _epilogue_loop(
+            slab,
+            bars,
+            sched,
+            tmem_base,
+            pair,
+            head,
+            batch,
+            meta,
+            n_batch,
+            rank,
+            warp,
+            causal,
+            dtype,
+            diag_2cta_code,
+            tmem_map_code,
+            smem_map_code,
+            geo,
+            epilogue_regs,
+            dkv_fp32,
+            dbg_epilogue,
+        )
     elif warp == MMA_WARP:
         if is_leader:
             _mma_loop_leader(

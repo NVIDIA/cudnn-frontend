@@ -282,12 +282,12 @@ def _body_module():
     return importlib.import_module(_BODY_MODULE)
 
 
-def _function_code(source, name, next_name):
-    """The CODE lines of ``def <name>`` up to ``def <next_name>`` with the docstring and the comment lines stripped (the punch lists repeat the
-    site names in prose; a source assertion reads the statements only)."""
-    start = source.index(f"def {name}(")
-    end = source.index(f"def {next_name}(", start)
-    body = source[start:end]
+def _function_code(source, name, next_name=None):
+    """Read one function's executable lines without depending on its former neighbor."""
+    import ast
+
+    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == name)
+    body = "\n".join(source.splitlines()[node.lineno - 1 : node.end_lineno])
     doc = re.search(r'"""[\s\S]*?"""', body)
     if doc:
         body = body[: doc.start()] + body[doc.end() :]
@@ -1420,7 +1420,6 @@ def test_2cta_stail_ds_gates_ride_the_xchg_state():
         "if cutlass.const_expr(dbg is not None):",
         "if cutlass.const_expr(b2):",  # the FOURTH gate of smem_map rubin_b2 (dq_read_done) + the per-issue dS stage advance: after the three, never guarding them
         "if cutlass.const_expr(DEBUG_SOFTMAX_DQ_WAR_DELAY_US > 0):",
-        "if cutlass.const_expr(fa4_roles):",
     ], issue
     gate_lines = [ln for ln in issue if "_wait_tcgen(_slot(bars.ds_" in ln]
     assert len(gate_lines) == 3 and len({len(ln) - len(ln.lstrip()) for ln in gate_lines}) == 1 and "DIAG" not in "".join(issue), issue
@@ -1554,7 +1553,8 @@ def test_2cta_stail_geometry_keyed_bodies_take_every_depth_and_offset_from_geo()
     offenders = []
     for name, nxt in zip(bodies, nexts):
         in_doc = False
-        for ln in _function_code(src, name, nxt):
+        body_source = (_TREE / _BODY_REL.parent / "fa4/kernel.py").read_text() if name == "_reduce_loop" else src
+        for ln in _function_code(body_source, name, nxt):
             quotes = ln.count('"""')
             if in_doc:
                 in_doc = quotes % 2 == 0

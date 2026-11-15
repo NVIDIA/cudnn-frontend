@@ -25,6 +25,9 @@ from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host
 from cudnn.sdpa.bwd.kernels.sm100._d128_thd_chain import _origin_row, _zero_group_vector, cast_dq_thd_d128_kernel, delta_zero_thd_d128_kernel
 
 from .kernel import main_thd_2cta_stail_host
+from .fa4.kernel import main_thd_2cta_stail_host as fa4_main_host
+
+_FA4_ROLE = warp_roles_code("16w_fa4")
 
 LOG2E = 1.4426950408889634
 STATS_FORM_LDG = stats_form_code("ldg")
@@ -539,31 +542,58 @@ def host_thd_2cta(
             delta_zero_thd_d128_kernel(o, do, delta, dq_accum, meta, origins, cutlass.Int32(batch), origin_specs).launch(
                 grid=(q_grid, batch, q.shape[2]), block=(THREADS, 1, 1), stream=stream
             )
-    main_thd_2cta_stail_host(
-        maps,
-        rowoff if cutlass.const_expr(tma_ring) else lse,  # the stats slots by form (the body's header section 14): the padded row offsets | the LSE
-        stats2 if cutlass.const_expr(tma_ring) else delta,  # the padded pre-scaled stats region | the compact delta
-        meta,
-        origins,
-        cutlass.Int32(batch),
-        q.shape[2],
-        max_skv,
-        _origin_row(origin_specs, 8),
-        scale,
-        causal,
-        q.element_type,
-        q.shape[2] // k.shape[2],
-        diag_2cta_code,
-        warp_roles_code,
-        mask_form_code,
-        stats_form_code,
-        tmem_map_code,
-        smem_map_code,
-        dkv_fp32,
-        debug_clk,
-        dbg_clk,
-        stream,
-    )
+    if cutlass.const_expr(warp_roles_code == _FA4_ROLE):
+        fa4_main_host(
+            maps,
+            rowoff if cutlass.const_expr(tma_ring) else lse,  # the stats slots by form (the body's header section 14): the padded row offsets | the LSE
+            stats2 if cutlass.const_expr(tma_ring) else delta,  # the padded pre-scaled stats region | the compact delta
+            meta,
+            origins,
+            cutlass.Int32(batch),
+            q.shape[2],
+            max_skv,
+            _origin_row(origin_specs, 8),
+            scale,
+            causal,
+            q.element_type,
+            q.shape[2] // k.shape[2],
+            diag_2cta_code,
+            warp_roles_code,
+            mask_form_code,
+            stats_form_code,
+            tmem_map_code,
+            smem_map_code,
+            dkv_fp32,
+            debug_clk,
+            dbg_clk,
+            stream,
+        )
+    else:
+        main_thd_2cta_stail_host(
+            maps,
+            rowoff if cutlass.const_expr(tma_ring) else lse,  # the stats slots by form (the body's header section 14): the padded row offsets | the LSE
+            stats2 if cutlass.const_expr(tma_ring) else delta,  # the padded pre-scaled stats region | the compact delta
+            meta,
+            origins,
+            cutlass.Int32(batch),
+            q.shape[2],
+            max_skv,
+            _origin_row(origin_specs, 8),
+            scale,
+            causal,
+            q.element_type,
+            q.shape[2] // k.shape[2],
+            diag_2cta_code,
+            warp_roles_code,
+            mask_form_code,
+            stats_form_code,
+            tmem_map_code,
+            smem_map_code,
+            dkv_fp32,
+            debug_clk,
+            dbg_clk,
+            stream,
+        )
     if cutlass.const_expr(dkv_fp32):
         cast_dq_thd_d128_kernel(
             dq_accum,
