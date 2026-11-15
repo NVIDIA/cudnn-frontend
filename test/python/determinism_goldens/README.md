@@ -82,6 +82,18 @@ contract also passed (three cases total, zero skips). Separate host entrypoint
 checks passed 43 cases, with 34 GPU skips and nine runtime cases deselected.
 These are additional selected fixture checks; device/runtime code is unchanged.
 
+The shared-consumer review follow-up on source `34350c64e` passed
+1,550 selected checks on the native SM107 worker, with nine pre-Rubin-only
+frontend integration skips. This covers the complete graph-analyzer,
+heuristic-geometry, band-capability and frontend-integration files, the
+D512 owner contracts, and shared graph `test_sdpa_fp8_fwd_cc107_L0[test693]`.
+The count is primarily host contracts; the shared graph reproducer completed
+its numerical checks and exact tally through engine 20549. The two analyzer
+failures are fixed with current-owner semantic checks and separate retired
+record rejection; 12 host tally controls retain exact counts and reject
+backend/wrong-owner fallback. Runtime code and numerical tolerances did not
+change, and the wider cc107 graph sweep is not claimed as qualified.
+
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
 `sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`
