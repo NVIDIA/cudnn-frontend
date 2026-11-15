@@ -756,6 +756,11 @@ def place(spec, facts, knobs=None) -> str:
         if spec.capabilities.implementation == wide.NAME:
             spec = sm100_legacy_policy_spec(wide.LEGACY_ROW)
 
+    from .kernels.sm120 import d256_f16_contract as sm120_d256
+
+    if spec.capabilities.implementation in sm120_d256.IMPLEMENTATIONS:
+        spec = sm100_legacy_policy_spec(sm120_d256.LEGACY_ROW)
+
     from .kernels.sm90.d64_f16_one_wg import contract as sm90_d64
     from .kernels.sm90.f16_three_wg import contract as sm90_three_wg
     from .kernels.sm90.d128_f16_multi_q import contract as sm90_d128

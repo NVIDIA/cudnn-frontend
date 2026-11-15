@@ -120,12 +120,16 @@ def _case(
 
         # Native qualification may request a legal tile that the ranking does
         # not propose for this Q length. Keep ordinary-candidate tests separate.
-        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(d_qk, d_v))
+        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(d_qk, d_v, tile_m))
         knobs = SdpaFwdKnobs(cga=1, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
     else:
+        from cudnn.engines.manifest import engines_for
+
         g.create_execution_plans([cudnn.heur_mode.A])
-        selected = select_engine(g, sm120_half_owner(d_qk, d_v))
-        knobs = replace(selected.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
+        # The ranked entry of the head dims' owners supplies the unpinned knobs; TILE_M names the owner that runs them.
+        ranked = select_engine(g, sm120_half_owner(d_qk, d_v))
+        knobs = replace(ranked.knobs, tile_m=tile_m, tile_n=tile_n, split_kv=split_kv, sched_policy=scheduler, pack_gqa=packed)
+        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(d_qk, d_v, tile_m))
     g.create_execution_plan(selected.engine_id, knobs)
     g.select_plan(len(g.plans) - 1)
     g.check_support()
@@ -246,7 +250,7 @@ def test_sm120_frost_paged_native_rebind_replay(
     api.check_support()
     api.compile()
     assert api.compute_capability in ((12, 0), (12, 1))
-    kernel_file = "decode_f16.py" if tile_m in (16, 32) else ("d512_f16_paired/kernel.py" if min(dims) > 256 else "prefill_f16.py")
+    kernel_file = "decode_f16_key_group/kernel.py" if tile_m in (16, 32) else ("d512_f16_paired/kernel.py" if min(dims) > 256 else "prefill_f16.py")
     assert api._k_mod.__file__.endswith("/sm120/" + kernel_file)
     assert api._k_mod.PARAMS.split_kv == split_kv
     assert api._k_mod.PARAMS.page_size == page
@@ -364,12 +368,13 @@ def test_sm120_frost_paged_scope_declines_before_compile(monkeypatch):
     import cutlass.cute as cute
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
     from cudnn.sdpa.graph_analyzer import analyze
     from cudnn.sdpa.fwd.config_sm120 import TemplateParams, validate_params
 
     g, _, bufs, _, _, _ = _case(torch.float16, 2, 16, True, False)
     facts = analyze(g)
-    caps = _sm120_spec().capabilities
+    caps = sm100_legacy_policy_spec(_sm120_spec().name).capabilities  # the row's combined contract
     assert mismatch(caps, facts, SdpaFwdKnobs(tile_m=64, tile_n=64, split_kv=1)) is None
     for changes in ({"thd": True}, {"d_qk": 136}, {"d_v": 136}, {"d_qk": 65}, {"is_fp8": True}, {"is_mxfp8": True}):
         assert mismatch(caps, replace(facts, **changes), SdpaFwdKnobs(tile_m=64, tile_n=64, split_kv=1)) is not None
@@ -558,7 +563,7 @@ def test_sm120_frost_paged_width_determinism(
             api.check_support()
             api.compile()
             wide_file = "prefill_d512_f16.py" if arch == "sm90" else "d512_f16_paired/kernel.py"
-            kernel_file = "decode_f16.py" if tile_m in (16, 32) else (wide_file if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
+            kernel_file = "decode_f16_key_group/kernel.py" if tile_m in (16, 32) else (wide_file if min(dims) > 256 or arch == "sm90" else "prefill_f16.py")
             assert api._k_mod.__file__.endswith(arch + "/" + kernel_file)
             assert api._k_mod.PARAMS.split_kv == split_kv
             assert api._k_mod.PARAMS.page_size == page
@@ -764,11 +769,12 @@ def test_sm120_frost_paged_wide_decode_ring_pipeline(tile_m, dims, split_kv, pag
 
 def test_sm120_frost_paged_wide_decode_admission():
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
     from cudnn.sdpa.graph_analyzer import analyze
 
     g, _, _, _, _, _ = _case(torch.float16, 2, 16, True, False, dims=(256, 256), tile_m=16, tile_n=16, sq=1, explicit_plan=True)
     facts = analyze(g)
-    caps = _sm120_spec().capabilities
+    caps = sm100_legacy_policy_spec(_sm120_spec().name).capabilities  # the row's combined contract
     assert mismatch(caps, facts) is None
     for tile_m in (16, 32):
         for split in (1, 3):
@@ -944,10 +950,11 @@ def test_sm120_frost_paged_mixed_fp8_candidate(d, tile_m, tile_n):
     _check(bufs, 16)
     if d == 128:
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+        from cudnn.sdpa.fwd.heuristics import sm100_legacy_policy_spec
         from cudnn.sdpa.graph_analyzer import analyze
         from cudnn.sdpa.fwd.config_sm120 import TemplateParams, validate_params
 
-        facts, caps = analyze(g), _sm120_spec().capabilities
+        facts, caps = analyze(g), sm100_legacy_policy_spec(_sm120_spec().name).capabilities  # the row's combined contract
         knobs = SdpaFwdKnobs(tile_m=16, tile_n=16, split_kv=3)
         assert mismatch(caps, facts, knobs) is None
         for changes in ({"has_paged_kv": False}, {"thd": True}, {"uniform_qo_dtype": False}, {"is_fp8": True}):

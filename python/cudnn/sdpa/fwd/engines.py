@@ -123,6 +123,13 @@ from .kernels.sm120.d512_mxfp8_paired.contract import (
     NAME as _SM120_D512_MXFP8_PAIRED,
     mismatch as _sm120_d512_mxfp8_paired_mismatch,
 )
+from .kernels.sm120.d256_f16_contract import (
+    ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
+    IMPLEMENTATIONS as _SM120_D256_IMPLEMENTATIONS,
+    KEY_GROUP as _SM120_DECODE_KEY_GROUP,
+    explicit_geometry as _sm120_d256_explicit_geometry,
+    mismatch as _sm120_d256_implementation_mismatch,
+)
 
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
@@ -1184,7 +1191,7 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
 
 
 def sm120_decode_tile(capabilities: Capabilities, tile_m: Optional[int]) -> bool:
-    """Whether ``tile_m`` runs the SM120 half DECODE tile (sm120/decode_f16.py):
+    """Whether ``tile_m`` runs the SM120 half DECODE tile (sm120/decode_f16_key_group/kernel.py):
     the f16/bf16 SM120 row with ``tile_m`` 16 or 32."""
     return capabilities.sm_lo == 120 and not (capabilities.is_fp8 or capabilities.is_mxfp8) and tile_m is not None and _sm120_is_decode_tile(tile_m)
 
@@ -1879,6 +1886,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
+    if capabilities.implementation in _SM120_D256_IMPLEMENTATIONS:
+        reason = _sm120_d256_implementation_mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
+        if isinstance(knobs, SdpaFwdKnobs) and knobs.tile_m is None:
+            # A partial record runs the owner's fixed Q tile, not the legacy row's default.
+            knobs = replace(knobs, tile_m=_sm120_d256_explicit_geometry(capabilities.implementation, knobs).query_tile)
     if capabilities.sm_lo == 90 and capabilities.implementation != _sm90_d64_owner.NAME and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
@@ -4184,7 +4198,7 @@ def _sm120_spec() -> EngineSpec:
             # backstop bars a split under the LPT remaps, so the heuristic's
             # split sets ride SCHED_NATURAL.
             split_kv_supported=True,
-            # 16 / 32 are the half DECODE tile (sm120/decode_f16.py, packed rows
+            # 16 / 32 are the half DECODE tile (sm120/decode_f16_key_group/kernel.py, packed rows
             # x the warps on the key axis), whose tile_n is its K/V stage width
             # (config_sm120.decode_kv_stage: 64 keys at head tiles up to 32, 32
             # at 48 and 64, 16 above; config_sm120.tile_domain).
@@ -4195,14 +4209,14 @@ def _sm120_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
-            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS),
+            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | {(256, 256)}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
-def _sm120_wide_paired_spec(legacy: EngineSpec, implementation: str, shapes, tile, host_lower) -> EngineSpec:
-    """An SM120 wide-head paired-warp body on exact native head tiles; shared graph binding and launch."""
+def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_ms, host_lower, tile_ns=None) -> EngineSpec:
+    """An SM120 body on exact native head tiles; shared graph binding and launch. ``tile_ns`` None keeps the legacy domain."""
     capabilities = replace(
         legacy.capabilities,
         implementation=implementation,
@@ -4210,8 +4224,8 @@ def _sm120_wide_paired_spec(legacy: EngineSpec, implementation: str, shapes, til
         d_shapes=frozenset(shapes),
         d_pad_multiple=0,
         d_envelope_floors=(),
-        tile_ms=frozenset({tile[0]}),
-        tile_ns=frozenset({tile[1]}),
+        tile_ms=frozenset(tile_ms),
+        tile_ns=legacy.capabilities.tile_ns if tile_ns is None else frozenset(tile_ns),
     )
     return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM120), knob_type=SdpaFwdKnobs))
 
@@ -4221,7 +4235,7 @@ def _sm120_d512_paired_spec() -> EngineSpec:
 
     from .kernels.sm120.d512_f16_paired.host import lower
 
-    return _sm120_wide_paired_spec(_sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, D512_TILE, lower)
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_D512_PAIRED, WIDE_F16_FLAVORS, {D512_TILE[0]}, lower, {D512_TILE[1]})
 
 
 def _sm120_d512_fp8_paired_spec() -> EngineSpec:
@@ -4229,7 +4243,7 @@ def _sm120_d512_fp8_paired_spec() -> EngineSpec:
 
     from .kernels.sm120.d512_fp8_paired.host import lower
 
-    return _sm120_wide_paired_spec(_sm120_fp8_spec(), _SM120_D512_FP8_PAIRED, {D512_FLAVOR}, FP8_D512_TILE, lower)
+    return _sm120_explicit_spec(_sm120_fp8_spec(), _SM120_D512_FP8_PAIRED, {D512_FLAVOR}, {FP8_D512_TILE[0]}, lower, {FP8_D512_TILE[1]})
 
 
 def _sm120_d512_mxfp8_paired_spec() -> EngineSpec:
@@ -4237,7 +4251,21 @@ def _sm120_d512_mxfp8_paired_spec() -> EngineSpec:
 
     from .kernels.sm120.d512_mxfp8_paired.host import lower
 
-    return _sm120_wide_paired_spec(_sm120_mxfp8_spec(), _SM120_D512_MXFP8_PAIRED, {D512_FLAVOR}, FP8_D512_TILE, lower)
+    return _sm120_explicit_spec(_sm120_mxfp8_spec(), _SM120_D512_MXFP8_PAIRED, {D512_FLAVOR}, {FP8_D512_TILE[0]}, lower, {FP8_D512_TILE[1]})
+
+
+def _sm120_d256_all_compute_spec() -> EngineSpec:
+    from .kernels.sm120.d256_f16_all_compute.contract import QUERY_TILES
+    from .kernels.sm120.d256_f16_all_compute.host import lower
+
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {(256, 256)}, QUERY_TILES, lower)
+
+
+def _sm120_decode_key_group_spec() -> EngineSpec:
+    from .kernels.sm120.decode_f16_key_group.contract import QUERY_TILES
+    from .kernels.sm120.decode_f16_key_group.host import lower
+
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_DECODE_KEY_GROUP, {(256, 256)}, QUERY_TILES, lower)
 
 
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -5263,6 +5291,8 @@ ENGINE_SPECS = (
     _sm107_mxfp8_spec(),
     _sm120_spec(),
     _sm120_d512_paired_spec(),
+    _sm120_d256_all_compute_spec(),
+    _sm120_decode_key_group_spec(),
     _sm120_fp8_spec(),
     _sm120_d512_fp8_paired_spec(),
     _sm120_mxfp8_spec(),

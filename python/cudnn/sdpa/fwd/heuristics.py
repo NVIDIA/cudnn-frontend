@@ -3751,6 +3751,11 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     for wide in (fp8_wide, mxfp8_wide):
         if wide.in_domain(facts):
             return _recommend_sm100_implementation(kind, facts, offered, lambda f, k, g=wide.Geometry: g(), policy=sm100_legacy_policy_spec(wide.LEGACY_ROW))
+    from .kernels.sm120 import d256_f16_contract as sm120_d256
+
+    if sm120_d256.in_domain(facts):
+        # TILE_M names the body: the decode tile (16 / 32) or the all-compute D256 tile (64 / 128).
+        return _recommend_sm100_implementation(kind, facts, offered, sm120_d256.select_geometry, policy=sm100_legacy_policy_spec(sm120_d256.LEGACY_ROW))
     if facts.device_cc == (9, 0) and not (facts.is_fp8 or facts.is_mxfp8 or facts.is_backward):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm90_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm90"))
     out: List[PlanConfig] = []

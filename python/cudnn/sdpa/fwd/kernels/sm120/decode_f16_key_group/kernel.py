@@ -88,6 +88,9 @@ from cudnn.sdpa.fwd.config_sm120 import (
 )
 
 from cudnn.sdpa.fwd.kernels.sm120.prepared_host import host as _dense_host, paged_host as _paged_host, compile_host as _compile_prepared_host
+from cudnn.sdpa.fwd.kernels.sm120.decode_f16_key_group import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 # The FROST loader injects one immutable specialization before executing this
 # module. A direct import uses the dense FP16 defaults on the 16-row tile.
@@ -1022,6 +1025,10 @@ class SM120DecodeForward:
             stream=stream,
             min_blocks_per_mp=1,
         )
+
+
+# Profilers and nsys report the owning engine's name; a symbol change, not a program change.
+SM120DecodeForward.kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 @lru_cache(maxsize=None)
