@@ -55,8 +55,9 @@ def facts(*, packing="TH1", **overrides):
 
 
 def reason(value):
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm100_d128")
-    return engines.mismatch(spec.capabilities, value)
+    specs = [s for s in engines.ENGINE_SPECS if engines.policy_name(s) == "sdpa_bwd_sm100_d128"]
+    reasons = [engines.mismatch(spec.capabilities, value) for spec in specs]
+    return None if None in reasons else reasons[0]
 
 
 @pytest.mark.parametrize(

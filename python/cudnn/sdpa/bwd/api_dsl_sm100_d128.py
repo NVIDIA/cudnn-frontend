@@ -12,8 +12,6 @@ from .d128_contract import (
     ACCUMULATION,
     DENSE_SM_RANGE,
     PAIR,
-    PAIR_CCS,
-    RECOMPUTE,
     pair_split,
     pair_workspace_layout,
     select_implementation,
@@ -276,23 +274,32 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         self.head_dim_qk = self.head_dim_v = d
         self.scale_softmax = d**-0.5 if self.scale_softmax is None else float(self.scale_softmax)
         require(math.isfinite(self.scale_softmax) and self.scale_softmax != 0, "attn_scale must be finite and nonzero")
-        window_bounded = self.window_size_left is None or self.window_size_left + 1 + int(sk) + 2 * 128 <= 2**31 - 1
-        window_in_envelope = self.window_size_left is None or (d == 64 and window_bounded)
-        natural = select_implementation(cc, version, int(b), int(h), int(sq), int(sk), self.scale_softmax, d_qk=int(d), d_v=int(d))
-        if self.deterministic:
-            # Each kernel of the pair owns its output tiles; outside the accumulation envelope and off the pair's measured parts the
-            # recompute body serves dense MHA.
-            pair_part = natural == ACCUMULATION and window_bounded and tuple(cc) in PAIR_CCS
-            require(h == hk or pair_part, "grouped deterministic backward requires the accumulation envelope on a measured part")
-            self._implementation = PAIR if pair_part else RECOMPUTE
-            if self._implementation == PAIR:
-                masked = self.is_causal or self.window_size_left is not None
-                sms = 0 if masked else multiprocessor_count(resolve_device(self.q_desc.device))
-                self._pair_split = pair_split(int(b), int(hk), int(sk), int(sq), int(h) // int(hk), sms, masked)
-        else:
-            self._implementation = natural if window_in_envelope else RECOMPUTE
+        self._implementation = self._choose_dense_implementation(cc, version)
+        require(h == hk or self._implementation == PAIR, "grouped deterministic backward requires the accumulation envelope on a measured part")
+        if self._implementation == PAIR:
+            masked = self.is_causal or self.window_size_left is not None
+            sms = 0 if masked else multiprocessor_count(resolve_device(self.q_desc.device))
+            self._pair_split = pair_split(int(b), int(hk), int(sk), int(sq), int(h) // int(hk), sms, masked)
         self._is_supported = True
         return True
+
+    def _choose_dense_implementation(self, cc, version):
+        from .d128_selection import default_dense_implementation
+
+        natural = select_implementation(
+            cc,
+            version,
+            int(self.batch_size),
+            int(self.h_q),
+            int(self.s_q_max),
+            int(self.s_k_max),
+            self.scale_softmax,
+            d_qk=int(self.head_dim_qk),
+            d_v=int(self.head_dim_v),
+        )
+        # Each kernel of the deterministic pair owns its output tiles. Outside
+        # its admitted parts and accumulation envelope, dense MHA uses recompute.
+        return default_dense_implementation(natural, cc, self.head_dim_qk, int(self.s_k_max), self.window_size_left, self.deterministic)
 
     def compile(self):
         if self._uses_grouped_heads() and not self._pair_grouped():

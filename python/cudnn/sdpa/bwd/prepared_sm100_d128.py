@@ -68,7 +68,7 @@ def compile_plan(api):
         with torch.cuda.device(device):
             entry = compile_host_pair(tuple(geometry), regions, dtype, api.is_causal, sm, window, api.h_q // api.h_kv, split)
     else:
-        from .kernels.sm100.prepared_d128_host import compile_host_recompute
+        from .kernels.sm100.d128_f16_recompute.prepared_host import compile_host_recompute
 
         with torch.cuda.device(device):
             entry = compile_host_recompute(tuple(geometry), dtype, api.is_causal, sm, window)
@@ -86,7 +86,7 @@ def compile_plan(api):
         required,
         device,
         api.scale_softmax,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         roles=ROLES[:9],
         attributes=ATTRIBUTES[:9],
         scale_log2=False,

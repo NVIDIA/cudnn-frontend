@@ -301,6 +301,12 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+A partially migrated backward row can remain legal for one mask and delegate
+another. Band-model tests must distinguish declaration rejection from ownership
+transfer while sampling both the retained row and its explicit owners; do not
+drop the whole row merely because `delegated` is nonempty. The detector is
+`test_band_capabilities.py::test_model_and_probe_agree_on_every_band_sample`.
+
 Audit dotted module names as well as file paths when retiring a kernel.
 Check direct imports, `from package import old_module`, and strings passed
 to `find_spec` or `import_module`;
