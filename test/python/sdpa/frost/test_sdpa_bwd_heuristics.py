@@ -96,7 +96,7 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
             assert default_knobs(spec, _facts()) is None
             continue
         single_point = len(caps.tile_ms) == 1 and len(caps.tile_ns) == 1
-        assert single_point or spec.name in _DEFAULT_TILE_RESOLVERS, spec.name
+        assert single_point or bwd_engines.policy_name(spec) in _DEFAULT_TILE_RESOLVERS, spec.name
 
 
 @pytest.mark.parametrize(

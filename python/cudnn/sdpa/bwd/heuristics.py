@@ -27,7 +27,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from cudnn.engines.base import PlanConfig
 
-from .engines import ENGINE_SPECS, EngineSpec, SdpaBwdKnobs, mismatch
+from .engines import ENGINE_SPECS, EngineSpec, SdpaBwdKnobs, mismatch, policy_name
 
 
 def _sm120_default_tiles(facts) -> Optional[Tuple[int, int]]:
@@ -60,7 +60,7 @@ def default_knobs(spec: EngineSpec, facts) -> Optional[SdpaBwdKnobs]:
     caps = spec.capabilities
     if not caps.tile_ms and not caps.tile_ns:
         return None
-    resolver = _DEFAULT_TILE_RESOLVERS.get(spec.name)
+    resolver = _DEFAULT_TILE_RESOLVERS.get(policy_name(spec))
     if resolver is not None:
         tiles = resolver(facts)
         if tiles is None:
@@ -103,14 +103,15 @@ def _leads(spec: EngineSpec, facts) -> bool:
     A measured entry in ``cudnn.sdpa.placement_table`` answers first; the rules above decide every graph without one."""
     from cudnn.sdpa import placement_table
 
-    measured = placement_table.lookup(spec.name, facts)
+    name = policy_name(spec)
+    measured = placement_table.lookup(name, facts)
     if measured is not None:
         return measured
-    if spec.name == "sdpa_bwd_sm100_d128":
+    if name == "sdpa_bwd_sm100_d128":
         return facts.device_cc in D128_LEAD_CCS and facts.thd and facts.window_left is None and (facts.d_qk, facts.d_v) == (128, 128)
-    if spec.name == "sdpa_bwd_sm100_d256":
+    if name == "sdpa_bwd_sm100_d256":
         return _d256_leads(facts)
-    return spec.name not in TRAIL_ONLY_ROWS
+    return name not in TRAIL_ONLY_ROWS
 
 
 TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
@@ -133,10 +134,11 @@ def _measured_lead(spec: EngineSpec, facts) -> bool:
     same goes for a non-square graph whose entry comes from a study in :data:`SQUARE_ONLY_STUDIES`."""
     from cudnn.sdpa import placement_table
 
-    entry = placement_table.matched_entry(spec.name, facts)
+    name = policy_name(spec)
+    entry = placement_table.matched_entry(name, facts)
     if entry is not None and facts.s_q != facts.s_kv and entry.study.startswith(SQUARE_ONLY_STUDIES):
         return False
-    return not facts.padded and not facts.seq_q_trim and placement_table.lookup(spec.name, facts) is True
+    return not facts.padded and not facts.seq_q_trim and placement_table.lookup(name, facts) is True
 
 
 D128_LEAD_CCS = ((10, 0), (10, 3), (10, 7))
@@ -170,7 +172,7 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     from cudnn.engines.heuristics import BACKEND, LAST_RESORT
 
     spec_of = {offered[s.name]: s for s in ENGINE_SPECS if s.name in offered}
-    last = [p for p in ours if spec_of[p.engine_id].name in TRAIL_ONLY_ROWS and not _measured_lead(spec_of[p.engine_id], facts)]
+    last = [p for p in ours if policy_name(spec_of[p.engine_id]) in TRAIL_ONLY_ROWS and not _measured_lead(spec_of[p.engine_id], facts)]
     lead = [p for p in ours if p not in last and _leads(spec_of[p.engine_id], facts)]
     trail = [p for p in ours if p not in last and p not in lead]
     if last:
@@ -181,7 +183,7 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 def _lists_last(spec: EngineSpec, facts) -> bool:
     """Rows listed after the other eligible rows: the d192 half row on a dense graph, where the d256 row's native
     192/128 geometry serves the same declaration."""
-    return spec.name == "sdpa_bwd_sm100_d192" and not facts.thd
+    return policy_name(spec) == "sdpa_bwd_sm100_d192" and not facts.thd
 
 
 def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:

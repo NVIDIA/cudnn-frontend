@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -362,6 +362,14 @@ class Capabilities:
     # Joint geometry/resource constraints that independent knob domains cannot
     # express. Declaration-only, with the same resolved geometry as lowering.
     knob_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
+    # The fixed main implementation of an engine that names one body. Append-only.
+    implementation: str = ""
+    # The body a multi-body row runs for a graph, from declaration facts alone; the lowering dispatches on
+    # the same function. None = one body.
+    select_implementation: Optional[Callable[["ga.SdpaGraphFacts"], str]] = None
+    # Bodies a row has handed to explicit engines (:func:`explicit_engine`). A graph selecting one is
+    # declined here, so neither an automatic route nor an old record reaches the row for it.
+    delegated: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         """Single normalization layer: legacy mask flags -> canonical band set."""
@@ -402,6 +410,18 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     """First reason this engine is not a candidate for these facts and tuning
     knobs, or ``None`` when lowering should perform the final feasibility check.
     """
+    reason = _declared_mismatch(capabilities, facts, requested)
+    if reason is not None or capabilities.select_implementation is None:
+        return reason
+    selected = capabilities.select_implementation(facts)
+    if capabilities.implementation and selected != capabilities.implementation:
+        return f"{capabilities.implementation} does not run this graph; its declaration selects {selected}"
+    if selected in capabilities.delegated:
+        return f"this graph is owned by the explicit implementation engine {selected}"
+    return None
+
+
+def _declared_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any) -> Optional[str]:
     if facts.invalid:
         return facts.invalid
     if not facts.is_backward:
@@ -683,6 +703,21 @@ class EngineSpec:
     name: str
     capabilities: Capabilities
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Any], Any]"
+    # The row whose candidate position, default tiles and placement decisions this engine inherits
+    # (:func:`policy_name`); empty = its own name.
+    policy: str = ""
+
+
+def policy_name(spec: EngineSpec) -> str:
+    """The row name the heuristics and ``placement_table`` key ``spec``'s decisions by."""
+    return spec.policy or spec.name
+
+
+def explicit_engine(row: EngineSpec, implementation: str, lower, **narrowed) -> EngineSpec:
+    """One of ``row``'s bodies as its own engine: the row's contract, admitted where the row's
+    ``select_implementation`` picks ``implementation``. ``narrowed`` replaces fields the body does not span."""
+    capabilities = replace(row.capabilities, implementation=implementation, delegated=frozenset(), **narrowed)
+    return EngineSpec(implementation, capabilities, lower, policy=row.name)
 
 
 def _sm120_spec() -> EngineSpec:
@@ -2393,5 +2428,7 @@ __all__ = [
     "SdpaBwdKnobs",
     "analyze_for",
     "engine_name",
+    "explicit_engine",
     "mismatch",
+    "policy_name",
 ]
