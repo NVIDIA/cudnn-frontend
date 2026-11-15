@@ -38,6 +38,7 @@ from mxfp8_test_reference import _cdiv, _quantize, _quantize_seq, _ref
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
+from frost_test_utils import mxfp8_engine_name
 from frost_test_utils import (
     _SM,
     assert_no_new_spills,
@@ -321,7 +322,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_name(_ARCH, d_qk, d_v))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -1486,7 +1487,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_name(_ARCH, d_qk, d_v))
     g.check_support()
     g.build_plans()
     g.execute(
@@ -1825,7 +1826,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_name(_ARCH, d_qk, d_v))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amax_o: amax})

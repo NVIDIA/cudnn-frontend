@@ -183,6 +183,20 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
     return (f"sdpa_fwd_prefill_{arch}",)
 
 
+def mxfp8_engine_name(arch, d_qk, d_v) -> str:
+    """Exact implementation owner for a block-scaled forward test declaration."""
+    if arch == "sm100":
+        owner = {
+            (64, 64): "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            (128, 128): "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            (192, 128): "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+            (256, 256): "sdpa_fwd_sm100_d256_mxfp8_single_q",
+        }.get((d_qk, d_v))
+        if owner is not None:
+            return owner
+    return sm120_owner(f"sdpa_fwd_prefill_{arch}_mxfp8", d_qk, d_v) if arch == "sm120" else f"sdpa_fwd_prefill_{arch}_mxfp8"
+
+
 def sm80_owner(d_qk, d_v):
     """The SM80 forward engine that serves these head dims (legality only, no ranking)."""
     from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as half

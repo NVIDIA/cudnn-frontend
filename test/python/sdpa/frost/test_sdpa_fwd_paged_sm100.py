@@ -26,6 +26,7 @@ empty ranges, cga1, page sizes across the 128-row tile.
 import math
 import os
 
+from frost_test_utils import mxfp8_engine_name
 from frost_test_utils import fp8_engine_names, half_engine_names
 
 import pytest
@@ -2643,7 +2644,7 @@ def _run_graph_mxfp8(B, H, KH, P, max_pages, lens, hnd, *, want_split=None, **bu
     from cudnn.sdpa.fwd.engines import engine_name
 
     g, vp, Ob, stats_gpu, amax, ref_in = _build_mxfp8(B, H, KH, P, max_pages, lens, hnd, **build_kw)
-    name = engine_name(mxfp8=True)
+    name = mxfp8_engine_name("sm100", build_kw.get("d_qk", 256), build_kw.get("d_v", 256))
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -2974,7 +2975,9 @@ def test_paged_mxfp8_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name(mxfp8=True))
+        return g is not None and offers_engine(
+            g, (engine_name(mxfp8=True), *(mxfp8_engine_name("sm100", d, v) for d, v in ((128, 128), (192, 128), (256, 256))))
+        )
 
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"

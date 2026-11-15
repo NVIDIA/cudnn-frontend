@@ -75,7 +75,12 @@ def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
         "sdpa_fwd_prefill_sm120_fp8",
         "sdpa_fwd_prefill_sm120_mxfp8",
     }
-    opt_in_rows = {"sdpa_fwd_prefill_sm100_mxfp8"}
+    opt_in_rows = {
+        "sdpa_fwd_prefill_sm100_mxfp8",
+        "sdpa_fwd_sm100_d256_mxfp8_single_q",
+        "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+    }
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)

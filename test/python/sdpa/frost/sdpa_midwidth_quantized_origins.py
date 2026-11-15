@@ -11,6 +11,10 @@ from sdpa.frost.test_sdpa_fwd_thd_origins_fp8_sm120 import _check_routes_and_inv
 
 def origin_checks(family, arch="sm100", shapes=None):
     def engine_for(dims):
+        if arch == "sm100" and family == "mxfp8":
+            from frost_test_utils import mxfp8_engine_name
+
+            return mxfp8_engine_name(arch, *(dims if isinstance(dims, tuple) else (dims, 128 if dims == 192 else dims)))
         if arch == "sm100" and family == "fp8" and dims in (256, (256, 256)):
             return "sdpa_fwd_sm100_d256_fp8_single_q"
         if arch == "sm100" and family == "fp8" and dims in (192, (192, 128)):
@@ -28,6 +32,9 @@ def origin_checks(family, arch="sm100", shapes=None):
         expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" and family == "fp8" and width == 256 else f"{arch}/prefill_{flavor}_{family}.py"
         if arch == "sm100" and family == "fp8" and width == 192:
             expected = "sm100/d192_fp8_multi_q/kernel.py"
+        if arch == "sm100" and family == "mxfp8" and width in (128, 192, 256):
+            implementation = "d256_mxfp8_single_q" if width == 256 else f"d{width}_mxfp8_multi_q"
+            expected = f"sm100/{implementation}/kernel.py"
         assert plan._compiled.kernel_module.__file__.endswith(expected)
         assert graph.selected_engine.name == engine_for(width)
         assert plan._prepared.spec.origin_specs is not None and plan._prepared.spec.native is not None

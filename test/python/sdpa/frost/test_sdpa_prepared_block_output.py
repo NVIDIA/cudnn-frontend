@@ -161,8 +161,8 @@ def _fp8_case(
     g.validate()
     g.build_operation_graph()
     name = engine_name(arch=arch, fp8=not mxfp8, mxfp8=mxfp8)
-    if arch == "sm100" and not mxfp8:
-        name = "sdpa_fwd_sm100_d128_fp8_multi_q"
+    if arch == "sm100":
+        name = "sdpa_fwd_sm100_d128_mxfp8_multi_q" if mxfp8 else "sdpa_fwd_sm100_d128_fp8_multi_q"
     if arch == "sm120":
         from frost_test_utils import sm120_owner
 
