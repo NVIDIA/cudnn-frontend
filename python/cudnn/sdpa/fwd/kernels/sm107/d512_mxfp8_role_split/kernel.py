@@ -465,7 +465,7 @@ SOFTMAX_N_CHUNKS_LOAD = CFG.TILE_N // SOFTMAX_CHUNK  # 2 for TILE_N=128
 # Swizzle for P SMEM stores (Swz128B at d=512 — same as Q/O).
 P_SMEM_SWIZZLE = cutlass.Swizzle(3, 4, 3)
 # Per-work-item hoists in the kv-iteration bodies (all loop-invariant across the kv iterations; the C++ reference computes
-# each of them once per tile), ported from the fp8 sibling (prefill_d512_fp8.py) whose P geometry this kernel shares
+# each of them once per tile), ported from the fp8 sibling (d512_fp8_role_split/kernel.py) whose P geometry this kernel shares
 # (BPE=1, e4m3 / e5m2 P, 128-B lane rows, P_TMA_ITERS=1; the P scale factor is the constant 0x7F, not derived from P).
 # Referenced by tag in the comments below:
 #   K1  P-row swizzle XOR: the Swizzle(3,4,3) term of each lane's eight 16-B P vectors is computed once per work item and

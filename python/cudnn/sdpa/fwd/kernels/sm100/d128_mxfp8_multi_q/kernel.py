@@ -61,7 +61,7 @@ from cudnn.sdpa.fwd.kernels.sm100.d128_mxfp8_multi_q.config import make_cfg_d64,
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 # One pipeline, two head-dim geometries: d128 and the native d64 (gpt-oss class),
-# selected by TemplateParams.d_flavor exactly as in prefill_d128_f16.py.
+# selected by TemplateParams.d_flavor exactly as in d128_f16_multi_q/kernel.py.
 # The d128 flavor runs three K/V stages at cga1 (config_sm100.make_cfg_d128: the scale-factor staging still fits
 # next to the aliased Q/O slab; the per-tensor fp8 sibling keeps the default two).
 _MAKE_CFG = {64: make_cfg_d64, 128: lambda p: make_cfg_d128(p, cga1_kv_stages=3)}

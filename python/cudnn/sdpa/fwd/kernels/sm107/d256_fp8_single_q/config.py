@@ -195,7 +195,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     #   depth 3, desc v0:  1.0000 / 1.0000 / 1.0000 / 1.0000   (stays under)
     # `prefill_d256_f16.DESC_VERSION` is now DERIVED from the layout, so any
     # depth that fits SMEM is correct by construction. Do not re-literal it.
-    # (The per-tensor FP8 sibling `prefill_d256_fp8.py` carried a literal 0
+    # (The per-tensor FP8 sibling `d256_fp8_single_q/kernel.py` carried a literal 0
     # until the epilogue-gate PR ported the same `_needs_desc_v1` derivation;
     # at e4m3-O depth 4 its last V stage starts at exactly 262144, so the
     # literal was one depth away from the same wrap.)

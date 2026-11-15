@@ -1748,7 +1748,7 @@ def _rescale_o_half(tmem_base, alpha, first_block: cutlass.Constexpr[int], n_blo
     """O[lane][cols of blocks first_block .. +n_blocks) *= alpha (16-col ld / wait::ld / packed mul / st), then wait::st.
 
     The ``tcgen05.wait::ld`` after each load is the DSL contract ("pair tcgen05_ld with tcgen05_wait(LOAD) before reading
-    the result"); the shipped d256 (prefill_d256_f16.py _correction rescale) and role-split d512 rescale loops omit it and
+    the result"); the shipped d256 (d256_f16_lookahead/kernel.py _correction rescale) and role-split d512 rescale loops omit it and
     pass by hardware grace -- this kernel keeps the contract on its rare slow arm (one wait per 16-col block, alpha != 1
     only)."""
     for blk in cutlass.range_constexpr(n_blocks):

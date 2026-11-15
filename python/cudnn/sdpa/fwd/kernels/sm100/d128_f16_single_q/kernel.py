@@ -273,7 +273,7 @@ HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 PACKED_HEADS_PER_KV = CFG.QH_PER_KH // HEADS_PER_TILE if CFG.PACK_GQA else 1
 
-# === KV split === (shared mechanics; see prefill_d128_f16.py and _common_blackwell)
+# === KV split === (shared mechanics; see d128_f16_multi_q/kernel.py and _common_blackwell)
 _split_h = make_split_helpers(
     CFG,
     bounds_for_tile=_bounds_for_tile,
@@ -1588,7 +1588,7 @@ def _softmax_kv_body_full(
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2  # -inf when the whole iteration is masked
 
-    # Online softmax with RESCALE_THRESHOLD skip (see prefill_d128_f16.py).
+    # Online softmax with RESCALE_THRESHOLD skip (see d128_f16_multi_q/kernel.py).
     update_cond = (current_max - total_max) > RESCALE_THRESHOLD
     total_max = cutlass.Float32(
         arith.select(

@@ -172,7 +172,7 @@ _REUSE_BMM2_ISSUE_ELECTION = CFG.THD_VARLEN or _DENSE_CAUSAL_PUBLIC_EXP2_MIX
 # auto-set by the adapter from the BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the
 # kernels that measured a win) and folded here at trace time: off, ``_E2E_PAIRS`` are empty and both
 # exp2 sites trace the develop spelling.  Full rationale and the measured rates: the ``_E2E_*`` block
-# of ``prefill_d128_mxfp8.py``.
+# of ``d128_mxfp8_multi_q/kernel.py``.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N

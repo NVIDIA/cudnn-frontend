@@ -95,7 +95,7 @@ if PARAMS.paged_kv:
 # buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
 # sits at the bottom of SMEM.
 #
-# DERIVED from the layout, as the f16 sibling does (prefill_d256_f16.py), not a
+# DERIVED from the layout, as the f16 sibling does (d256_f16_lookahead/kernel.py), not a
 # literal: STAGES_KV moves the last V stage.  Declaration order in _kernel is
 # sQO_raw | sK_raw[STAGES_KV] | sV_raw[STAGES_KV], and the Q∪O alias is
 # byte-sized for max(Q@BPE, O@BPE_O) -- a BF16/FP16 O doubles it.  With an

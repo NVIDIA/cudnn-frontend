@@ -128,7 +128,7 @@ is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
   rotates AND quantizes in its epilogue -- e4m3 Q / K / V into COMPACT
   per-tensor ``q8`` / ``k8`` / ``v8`` (each == compact BSHD ``[B, S, H, d]``,
   exactly what the unfused FP8 SDPA reads), the GATE as bf16 into ``gate16``
-  -- and the production FP8 d256 SDPA (``prefill_d256_fp8.py`` with
+  -- and the production FP8 d256 SDPA (``sm107/d256_fp8_single_q/kernel.py`` with
   ``epilogue_gate`` on and ``has_amax_o=False``: the block runs static scales
   and reads no ``Amax_O``, so the atomic is compiled out) reads those compact
   buffers, multiplies by ``sigmoid(gate16)`` after the dead-row select and
@@ -5503,7 +5503,7 @@ class _Sdpa(_Stage):
         ts = self.token_stride
         # has_amax_o=False: static scales, no Amax_O consumer -> the FP8 kernel
         # compiles the atomicMax out (and execute() refuses an amax_o tensor).
-        # pertensor_fp8 picks the kernel FAMILY: True -> prefill_d256_fp8.py
+        # pertensor_fp8 picks the kernel FAMILY: True -> sm107/d256_fp8_single_q/kernel.py
         # (scalar descales), False -> sm107/d256_mxfp8_single_q/kernel.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
         if self.use_pdl:
