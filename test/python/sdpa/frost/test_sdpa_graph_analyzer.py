@@ -1036,8 +1036,28 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     every = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert specs["sdpa_fwd_prefill_sm107"].capabilities.attn_scale_prefolded_d_shapes == every | {(576, 512)}
     assert specs["sdpa_fwd_prefill_sm107_mxfp8"].capabilities.attn_scale_prefolded_d_shapes == every
-    assert specs["sdpa_fwd_prefill_sm107_fp8"].capabilities.attn_scale_prefolded_d_shapes is None
-    assert "not wired" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, facts)
+    fp8 = specs["sdpa_fwd_sm107_d512_fp8_role_split"].capabilities
+    assert fp8.attn_scale_prefolded_d_shapes is None
+    fp8_facts = ga.SdpaGraphFacts(
+        b=B,
+        h_q=H,
+        h_kv=H,
+        s_q=S,
+        s_kv=S,
+        d_qk=D,
+        d_v=D,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.HALF,
+        is_fp8=True,
+        device_cc=(10, 7),
+        causal=True,
+        scale=None,
+        attn_scale_prefolded=True,
+    )
+    assert "not wired" in engines.mismatch(fp8, fp8_facts)
+    ordinary_fp8 = dataclasses.replace(fp8_facts, attn_scale_prefolded=False, scale=1.0)
+    assert engines.mismatch(fp8, ordinary_fp8) is None
+    assert "owned by" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, ordinary_fp8)
     # Routing declines on a claiming row: the paged-KV bodies and the single-CTA half THD legs apply the
     # scale in-kernel (api_dsl._load_sm100_kernel_module), so the fold must never reach them.
     half = specs["sdpa_fwd_prefill_sm107"].capabilities
@@ -2840,14 +2860,18 @@ def test_paged_quantized_rows_mismatch_reasons():
     legacy_fp8 = spec[engines.engine_name(fp8=True)].capabilities
     fp8 = spec["sdpa_fwd_sm100_d128_fp8_multi_q"].capabilities
     mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
-    fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
+    legacy_fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
+    fp8_rubin = spec["sdpa_fwd_sm107_d512_fp8_role_split"].capabilities
     assert fp8.paged_kv and mxfp8.paged_kv and fp8_rubin.paged_kv
     assert fp8_rubin.paged_d_shapes == frozenset({(512, 512)})
     assert engines.mismatch(fp8, paged_facts(is_fp8=True)) is None
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
-    assert "d512 kernel flavors only" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
-    assert engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert "d512 kernel flavors only" in engines.mismatch(legacy_fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=96, d_v=96))
+    assert "requires exact D512/V512" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
+    rubin_d512 = paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512)
+    assert engines.mismatch(fp8_rubin, rubin_d512) is None
+    assert "owned by" in engines.mismatch(legacy_fp8_rubin, rubin_d512)
     assert "native per-tensor D128/D256 on SM100/SM103" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512, thd=True))
     fp8_d256 = spec["sdpa_fwd_sm100_d256_fp8_single_q"].capabilities
     for cc in ((10, 0), (10, 3)):
