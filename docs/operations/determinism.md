@@ -204,6 +204,14 @@ bindings and retained CUDA Graph execution. Packing and split count remain
 fixed during byte comparisons; the implementation identity does not extend
 the numerical or cross-runtime guarantees of the table.
 
+Exact SM107 D192/V128 and D256 per-tensor FP8 use engines 20561 and 20562.
+Their fixed-record checks cover fresh bindings, retained captures, independent
+THD origins and dense packing/splits, including the bounded D192 single-CTA
+causal case and D256 sigmoid gate. Reference checks and replay/batch-byte
+checks pass on the qualified runtime; strict historical THD goldens are
+unavailable for that runtime. These identities preserve the existing math
+and do not promise equal bytes across split counts or softmax precisions.
+
 The native D128 FP8 single-CTA split checks fix the plan's split count and
 packing, preserve quantized payloads, and compare O/Stats across fresh
 buffers, reordered and duplicated sequences, and changed neighbors. Amax_O
