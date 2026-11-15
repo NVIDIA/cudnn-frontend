@@ -1127,11 +1127,16 @@ Contract:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum**, and ARCH is the only
-    coverage axis allowed to be one of them (`kernels/sm107/d128_fp8_multi_q/kernel.py`).
-    Every other axis -- phase, head dim, dtype family -- goes in the filename and
-    the engine name. A module shared across arch lines stays at `kernels/` level
-    rather than inside one arch package.
+10. **One directory per implementation, under its arch.** ARCH is the only
+    coverage axis that is a directory level of its own; each implementation then
+    gets one directory holding its body (`kernel.py`), its declaration contract
+    (`contract.py`), its fixed host (`host.py`) and, where needed, `config.py`
+    (`kernels/sm107/d128_fp8_multi_q/kernel.py`). Head dim, dtype family and the
+    pipeline shape go in the implementation directory name and the engine name.
+    Contracts and helpers shared by several implementations of one arch stay at
+    the arch level (`kernels/sm100/small_half_contract.py`); a module shared
+    across arch lines stays at `kernels/` level. Backward kernels are migrating
+    to this layout and are still flat files in some arch packages.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.
