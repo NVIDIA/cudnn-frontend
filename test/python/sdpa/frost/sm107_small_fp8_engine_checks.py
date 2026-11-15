@@ -15,11 +15,23 @@ import test_sdpa_prepared_fp8 as shared
 pytestmark = [pytest.mark.L0, requires_dsl, requires_rubin]
 
 
-@pytest.mark.parametrize("d,cga,decode", [(64, 1, False), (64, 2, False), (128, 1, False), (128, 2, False), (128, 1, True)])
+@pytest.mark.parametrize(
+    "d,dv,cga,decode",
+    [
+        (64, 64, 1, False),
+        (64, 64, 2, False),
+        (128, 128, 1, False),
+        (128, 128, 2, False),
+        (128, 128, 1, True),
+        (48, 32, 1, False),
+        (80, 112, 2, False),
+        (80, 112, 1, True),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split", [1, 4])
-def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, cga, decode, dtype, output, split):
+def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dv, cga, decode, dtype, output, split):
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
@@ -35,7 +47,7 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, cga, 
     monkeypatch.setattr(heuristics, "recommend", forbidden)
 
     def build(saved):
-        result = shared._case(arch="sm107", d=d, sq=sq, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
+        result = shared._case(arch="sm107", d=d, dv=dv, sq=sq, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
         graph = result[0]
         assert graph.get_engine_and_knobs_at_index(graph._plan_index) == saved
         compiled = graph._compiled_plans[graph._plan_index]._compiled
@@ -78,12 +90,12 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, cga, 
     shared._check(bufs, thd=False, sq=sq, skv=256)
 
 
-@pytest.mark.parametrize("d", [64, 128])
-def test_retired_fp8_recipe_is_rejected_without_silent_substitution(d):
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (48, 32), (80, 112)])
+def test_retired_fp8_recipe_is_rejected_without_silent_substitution(d, dv):
     sq = 17
     import cudnn._plan_serdes as ps
 
-    graph, _, _, _, _ = shared._case(arch="sm107", d=d, sq=sq, skv=256)
+    graph, _, _, _, _ = shared._case(arch="sm107", d=d, dv=dv, sq=sq, skv=256)
     blob = graph.serialize(as_bytes=True, include_kernels=False)
     start = len(ps.MAGIC) + ps._LEN.size
     (length,) = ps._LEN.unpack_from(blob, len(ps.MAGIC))

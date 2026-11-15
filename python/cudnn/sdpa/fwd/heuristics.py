@@ -3635,10 +3635,12 @@ def select_sm107_small_fp8_geometry(facts, knobs):
     """Resolve the existing Rubin native/swap-AB choice before fixed lowering."""
     from .kernels.sm107.d128_fp8_multi_q.contract import Geometry as MultiQ
     from .kernels.sm107.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .kernels.sm107.fp8_flavor_contract import padded_shape
     from .config_sm100 import supports_dense_fp8_swap_ab
 
+    shape = padded_shape(facts)
     if knobs.swap_ab == 1 and supports_dense_fp8_swap_ab(
-        (facts.d_qk, facts.d_v),
+        shape,
         device_cc=facts.device_cc,
         paged=facts.has_paged_kv,
         thd=facts.thd,
@@ -3651,7 +3653,7 @@ def select_sm107_small_fp8_geometry(facts, knobs):
         tile_n=knobs.tile_n,
     ):
         return SwapAB()
-    return MultiQ(d_flavor=facts.d_qk, cga=(1 if facts.d_qk == 64 else 2) if knobs.cga is None else knobs.cga)
+    return MultiQ(d_flavor=shape[0], cga=(1 if shape[0] == 64 else 2) if knobs.cga is None else knobs.cga)
 
 
 def resolve_sm100_half_multi_q_geometry(facts, knobs, *, d_flavor):

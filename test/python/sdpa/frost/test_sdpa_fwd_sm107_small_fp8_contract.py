@@ -68,7 +68,7 @@ def test_native_candidates_keep_legacy_order_and_resolve_d64_default(width, mode
         assert plans[0].knobs.cga == 1
 
 
-@pytest.mark.parametrize("changes", [{"device_cc": (10, 0)}, {"d_qk": 96, "d_v": 96}, {"is_mxfp8": True}, {"has_paged_kv": True, "page_size": 16}])
+@pytest.mark.parametrize("changes", [{"device_cc": (10, 0)}, {"d_qk": 96, "d_v": 88}, {"is_mxfp8": True}, {"has_paged_kv": True, "page_size": 16}])
 def test_native_owner_declines_other_domains(changes):
     assert engines.mismatch(SPECS[native.NAME].capabilities, facts(**changes)) is not None
 
@@ -111,7 +111,8 @@ def test_swap_rejects_non_decode_domains(changes):
 
 
 @pytest.mark.parametrize("owner", [native, swap])
-def test_fixed_lowering_bypasses_candidate_policy(owner, monkeypatch):
+@pytest.mark.parametrize("widths", [(128, 128), (80, 112)])
+def test_fixed_lowering_bypasses_candidate_policy(owner, widths, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("fixed record entered candidate policy")
 
@@ -119,9 +120,10 @@ def test_fixed_lowering_bypasses_candidate_policy(owner, monkeypatch):
     calls = []
     monkeypatch.setattr(engines, "lower_dsl_prefill", lambda spec, f, k, *, selected_kernel: calls.append((k, selected_kernel)))
     spec = next(s for s in engines._sm107_small_fp8_specs() if s.name == owner.NAME)
-    spec.lower(spec, facts(s_q=1), None)
+    spec.lower(spec, facts(s_q=1, d_qk=widths[0], d_v=widths[1]), None)
     assert len(calls) == 1 and calls[0][1].implementation == owner.NAME
     assert calls[0][1].lowering_row_name == native.LEGACY_ROW
+    assert calls[0][1].d_flavor == 128
 
 
 @pytest.mark.parametrize("width", [64, 128])
@@ -137,3 +139,17 @@ def test_native_config_is_independent_of_legacy_factory_and_records(width, monke
     cfg, _ = getattr(config, f"make_cfg_d{width}")(config.TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=1, d_flavor=width))
     assert type(cfg) is getattr(config, f"CfgD{width}")
     assert (cfg.TILE_K, cfg.TILE_O, cfg.CTA_MMA) == (width, width, 1)
+
+
+@pytest.mark.parametrize("dq,dv,flavor", [(16, 32, 64), (48, 64, 64), (80, 112, 128), (128, 96, 128)])
+def test_envelope_owner_uses_covering_geometry_and_preserves_thd_boundary(dq, dv, flavor, monkeypatch):
+    f = facts(d_qk=dq, d_v=dv)
+    assert "owned by" in engines.mismatch(SPECS[native.LEGACY_ROW].capabilities, f)
+    assert engines.mismatch(SPECS[native.NAME].capabilities, f) is None
+    assert engines.mismatch(SPECS[native.NAME].capabilities, replace(f, thd=True, padded=True)) is not None
+    calls = []
+    monkeypatch.setattr(engines, "lower_dsl_prefill", lambda s, f, k, *, selected_kernel: calls.append((k, selected_kernel)))
+    spec = next(s for s in engines._sm107_small_fp8_specs() if s.name == native.NAME)
+    spec.lower(spec, f, None)
+    assert calls[0][1].d_flavor == flavor
+    assert calls[0][0].cga == (1 if flavor == 64 else 2)

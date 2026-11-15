@@ -58,7 +58,7 @@ def test_exact_owner_and_public_cluster_geometry(cc, dtype):
     [
         {"device_cc": (10, 0)},
         {"device_cc": (12, 0)},
-        {"d_qk": 384, "d_v": 320},
+        {"d_qk": 384, "d_v": 312},
         {"dtype": cudnn.data_type.BFLOAT16, "is_fp8": False},
         {"is_mxfp8": True},
         {"o_block_scale": 32},
@@ -70,13 +70,17 @@ def test_other_implementations_do_not_enter_the_owner(overrides):
     assert engines.mismatch(SPECS[NAME].capabilities, facts(**overrides)) is not None
 
 
-def test_dense_envelope_keeps_legacy_owner():
-    assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, facts(d_qk=384, d_v=320)) is None
+def test_dense_envelope_has_fixed_owner_and_thd_stays_exact():
+    f = facts(d_qk=384, d_v=320)
+    assert "owned by" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, f)
+    assert engines.mismatch(SPECS[NAME].capabilities, f) is None
+    assert engines.mismatch(SPECS[NAME].capabilities, replace(f, thd=True, padded=True)) is not None
 
 
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
-def test_candidate_order_and_budget_preserve_the_legacy_policy(kind):
-    f = facts()
+@pytest.mark.parametrize("partial", [False, True])
+def test_candidate_order_and_budget_preserve_the_legacy_policy(kind, partial):
+    f = facts(d_qk=384, d_v=320) if partial else facts()
     policy = heuristics.sm100_legacy_policy_spec(LEGACY_ROW)
     old = heuristics._knob_sets(policy, f) if kind == "A" else [heuristics._fallback_knobs(policy, f)]
     expected = [Geometry().canonical_knobs(k) for k in old if engines.mismatch(policy.capabilities, f, k) is None]
