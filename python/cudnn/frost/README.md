@@ -343,11 +343,11 @@ python/cudnn/
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
         sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
                                       swap-AB body; config_sm107.make_cfg_d256_decode)
-        sm120/prefill_f16.py          general SM120 template (d <= 256)
+        sm120/f16_general/            general SM120 template (d <= 256; explicit engine)
         sm120/d256_f16_all_compute/   d256 flavor (explicit engine)
         sm120/d512_f16_paired/        d512 / d576 flavors (explicit engine)
-        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
-        sm120/prefill_mxfp8.py        block-scaled MXFP8 template (d <= 256)
+        sm120/fp8_general/            general SM120 FP8 template (d <= 256; explicit engine)
+        sm120/mxfp8_general/          block-scaled MXFP8 template (d <= 256; explicit engine)
         sm120/d512_fp8_paired/        d512 flavor for FP8 (explicit engine)
         sm120/d512_mxfp8_paired/      d512 flavor for MXFP8 (explicit engine)
         sm120/_common.py              SM120-only warp-level primitives

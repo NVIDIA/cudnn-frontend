@@ -27,7 +27,7 @@ def test_sm120_bias_stage_refill_stress(dtype):
     api.check_support()
     api.compile()
     assert api._dense_spec.has_bias
-    assert api._k_mod.__file__.replace("\\", "/").endswith("/sm120/prefill_f16.py")
+    assert api._k_mod.__file__.replace("\\", "/").endswith("/sm120/f16_general/kernel.py")
 
     def launch():
         api.execute(q, k, v, o, lse, bias_tensor=bias)

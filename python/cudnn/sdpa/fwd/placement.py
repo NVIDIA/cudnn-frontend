@@ -756,10 +756,10 @@ def place(spec, facts, knobs=None) -> str:
         if spec.capabilities.implementation == wide.NAME:
             spec = sm100_legacy_policy_spec(wide.LEGACY_ROW)
 
-    from .kernels.sm120 import d256_f16_contract as sm120_d256
+    from .kernels.sm120 import half_exact_contract as sm120_half
 
-    if spec.capabilities.implementation in sm120_d256.IMPLEMENTATIONS:
-        spec = sm100_legacy_policy_spec(sm120_d256.LEGACY_ROW)
+    if spec.capabilities.implementation in sm120_half.IMPLEMENTATIONS:
+        spec = sm100_legacy_policy_spec(sm120_half.LEGACY_ROW)
 
     from .kernels.sm90.d64_f16_one_wg import contract as sm90_d64
     from .kernels.sm90.f16_three_wg import contract as sm90_three_wg
@@ -767,6 +767,11 @@ def place(spec, facts, knobs=None) -> str:
 
     if spec.capabilities.implementation in (sm90_d64.NAME, sm90_three_wg.NAME, sm90_d128.NAME):
         spec = sm100_legacy_policy_spec(sm90_d64.LEGACY_ROW)
+
+    from .kernels.sm120 import quantized_general_contract as sm120_quant_general
+
+    if spec.capabilities.implementation in sm120_quant_general.IMPLEMENTATIONS:
+        spec = sm100_legacy_policy_spec(sm120_quant_general.explicit_geometry(spec.capabilities.implementation, None).lowering_row_name)
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
         # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);

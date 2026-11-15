@@ -5,7 +5,7 @@
 A fused multi-head attention (FMHA) FP16/BF16 kernel for D512 and D576/V512 on the
 NVIDIA Blackwell SM120 family (SM120 and SM121) using dense TMA or paged K/V loads.
 
-This is the D=512 variant of ``sm120/prefill_f16.py``: the same fused Q*K^T,
+This is the D=512 variant of ``sm120/f16_general/kernel.py``: the same fused Q*K^T,
 softmax, and softmax(Q*K^T)*V pipeline on SM80-era ``mma.sync.aligned.m16n8k16``
 tensor cores, with (512, 512) head tiles. A 16-row Q slab's fp32 O accumulator
 is 16 x 512 / 32 lanes = 256 registers per lane, more than the whole register

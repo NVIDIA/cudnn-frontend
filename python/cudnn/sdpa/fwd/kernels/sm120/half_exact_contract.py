@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Identity and geometry shared by the two exact-D256 SM120 half engines.
+"""Identity and geometry shared by the SM120 half engines on exact 16-wide head tiles.
 
-TILE_M names the body: 64 / 128 run the all-compute D256 body, 16 / 32 the
-key-group decode body. No performance policy or DSL imports live here.
+TILE_M names the body: 16 / 32 run the key-group decode body on every tile;
+64 / 128 run the all-compute D256 body at (256, 256) and the general body
+elsewhere. No performance policy or DSL imports live here.
 """
 
 from dataclasses import dataclass, replace
@@ -12,22 +13,28 @@ from dataclasses import dataclass, replace
 from cudnn import data_type
 from .d256_f16_all_compute import contract as all_compute
 from .decode_f16_key_group import contract as key_group
+from .f16_general import contract as general
 
 ALL_COMPUTE = all_compute.NAME
+GENERAL = general.NAME
 KEY_GROUP = key_group.NAME
-_CONTRACTS = {ALL_COMPUTE: all_compute, KEY_GROUP: key_group}
+_CONTRACTS = {ALL_COMPUTE: all_compute, GENERAL: general, KEY_GROUP: key_group}
 IMPLEMENTATIONS = frozenset(_CONTRACTS)
-LEGACY_ROW = all_compute.LEGACY_ROW
-# The legacy row's arch range (120..129); exact D256 only, the eight-aligned
-# (240, 256] envelope keeps the legacy owner.
+LEGACY_ROW = general.LEGACY_ROW
+# The legacy row's arch range (120..129). Eight-aligned envelopes and the
+# wide (512, 512) / (576, 512) tiles keep their current owners.
 DEVICE_CCS = tuple((12, minor) for minor in range(10))
-SHAPE = (256, 256)
+# config_sm120.GENERAL_HEAD_TILES; a test pins the equality.
+HEAD_TILES = tuple(range(16, 257, 16))
+D256 = (256, 256)
+SHAPES = frozenset((q, v) for q in HEAD_TILES for v in HEAD_TILES)
+_SHAPES = {ALL_COMPUTE: frozenset({D256}), GENERAL: SHAPES - {D256}, KEY_GROUP: SHAPES}
 
 
 def in_domain(facts):
     return (
         facts.device_cc in DEVICE_CCS
-        and (facts.d_qk, facts.d_v) == SHAPE
+        and (facts.d_qk, facts.d_v) in SHAPES
         and not (facts.invalid or facts.is_backward)
         and not (facts.is_fp8 or facts.is_mxfp8)
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
@@ -35,7 +42,7 @@ def in_domain(facts):
 
 
 @dataclass(frozen=True)
-class D256Geometry:
+class HalfGeometry:
     implementation: str
     query_tile: int
     lowering_row_name: str = LEGACY_ROW
@@ -87,20 +94,24 @@ def explicit_geometry(implementation, knobs):
     """Fixed defaults within an already-selected implementation; no crossover."""
     contract = _CONTRACTS[implementation]
     tile = contract.DEFAULT_QUERY_TILE if knobs is None or knobs.tile_m is None else knobs.tile_m
-    return D256Geometry(implementation, tile)
+    return HalfGeometry(implementation, tile)
 
 
 def select_geometry(facts, knobs):
-    """The body a legacy-policy candidate names: its TILE_M."""
-    implementation = KEY_GROUP if knobs.tile_m in key_group.QUERY_TILES else ALL_COMPUTE
+    """The body a legacy-policy candidate names: its TILE_M, then the head tile."""
+    if knobs.tile_m in key_group.QUERY_TILES:
+        implementation = KEY_GROUP
+    else:
+        implementation = ALL_COMPUTE if (facts.d_qk, facts.d_v) == D256 else GENERAL
     return explicit_geometry(implementation, knobs)
 
 
 def mismatch(implementation, facts, knobs):
     if facts.device_cc not in DEVICE_CCS:
         return f"requires SM12x (the SM120 family); current device is {facts.device_cc}"
-    if not in_domain(facts):
-        return "requires exact D256/V256 FP16/BF16 on the SM120 family"
+    if not in_domain(facts) or (facts.d_qk, facts.d_v) not in _SHAPES[implementation]:
+        shapes = "exact D256/V256" if implementation == ALL_COMPUTE else "exact 16-wide head tiles up to 256"
+        return f"{implementation} requires {shapes} FP16/BF16 on the SM120 family"
     reason = _CONTRACTS[implementation].mismatch(facts, knobs)
     if reason is not None:
         return reason
