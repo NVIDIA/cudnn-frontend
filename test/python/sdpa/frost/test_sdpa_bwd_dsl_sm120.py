@@ -13,7 +13,8 @@ import torch
 from test_utils import torch_fork_set_rng
 from frost_test_utils import requires_blackwell_geforce, requires_dsl, _dsl_installed
 
-ENGINE = "sdpa_bwd_sm120"
+ENGINE = "sdpa_bwd_sm120_f16_fused"  # the dense body of the sdpa_bwd_sm120 row (slot 0)
+RECORD_SLOT = 18
 
 
 def _is_sm120() -> bool:
@@ -320,7 +321,7 @@ def _run_bwd_graph(
         from cudnn.engines.engine_ids import FROST_SDPA_BWD_ID_BASE
         from cudnn.sdpa.bwd.engines import SdpaBwdKnobs
 
-        graph.create_execution_plan(FROST_SDPA_BWD_ID_BASE + 0, SdpaBwdKnobs(tile_m=q_tile, tile_n=kv_tile))
+        graph.create_execution_plan(FROST_SDPA_BWD_ID_BASE + RECORD_SLOT, SdpaBwdKnobs(tile_m=q_tile, tile_n=kv_tile))
         graph.select_plan(0)
     else:
         graph.create_execution_plans([cudnn.heur_mode.A])
@@ -2109,3 +2110,17 @@ def test_prepared_backward_artifact_reloads_in_fresh_process(route, dtype, tmp_p
     from prepared_bwd_cache_utils import check_backward_artifact_reload
 
     check_backward_artifact_reload("sm120", route, dtype, tmp_path)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=13)
+def test_sdpa_bwd_dsl_sm120_retired_row_record_is_declined(monkeypatch):
+    """A dense D_QK <= 256 record on the row (20600) is declined and names the fused body; the same tiles replay on 20618."""
+    import sys
+
+    import cudnn
+
+    _run_case(head_dim=64, is_causal=True, q_tile=64, kv_tile=128)
+    monkeypatch.setattr(sys.modules[__name__], "RECORD_SLOT", 0)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="owned by the explicit implementation engine sdpa_bwd_sm120_f16_fused"):
+        _run_case(head_dim=64, is_causal=True, q_tile=64, kv_tile=128)

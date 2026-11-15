@@ -74,7 +74,7 @@ if arch == "sm120" and route.startswith("aux_"):
         return original(g, *args, **kwargs)
     with patch.object(cudnn.pygraph, "execute", record):
         grads = helper._run_bwd_graph(q, k, v, o, do, stats, scale=d**-0.5, is_causal=True, bias_gpu=bias, dbias_gpu=dbias, sink_gpu=sink)
-    assert grads[-1] == "sdpa_bwd_sm120"
+    assert grads[-1] == "sdpa_bwd_sm120_f16_fused"
     g, (vp, ws) = calls[-1]
     outputs = [*grads[:4], dbias]
     expected = [dq, dk, dv, aux.dsink, aux.dbias]

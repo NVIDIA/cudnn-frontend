@@ -146,6 +146,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_HEAD_DIMS,
 )
+from cudnn.sdpa.bwd.kernels.sm120.f16_fused import contract as _sm120_f16_fused
 
 _LOG = logging.getLogger(__name__)
 
@@ -757,8 +758,30 @@ def _sm120_spec() -> EngineSpec:
             knob_check=knob_mismatch,
             tile_ms=frozenset((*_SM120_Q_TILES, 16)),
             tile_ns=frozenset((*_SM120_KV_TILES, 16)),
+            select_implementation=_sm120_f16_fused.select_implementation,
+            delegated=frozenset({_sm120_f16_fused.NAME}),
         ),
         lower=lower_dsl_bwd,
+    )
+
+
+def _sm120_f16_fused_spec() -> EngineSpec:
+    """The row's dense body for D_QK <= 256; the row keeps its packed and wide bodies."""
+    from .kernels.sm120.f16_fused.host import lower
+
+    return explicit_engine(
+        _sm120_spec(),
+        _sm120_f16_fused.NAME,
+        partial(lower, lower_impl=partial(lower_dsl_bwd, api_type=_SM120)),
+        d=frozenset(_SM120_HEAD_DIMS),
+        tile_ms=frozenset(_SM120_Q_TILES),
+        tile_ns=frozenset(_SM120_KV_TILES),
+        thd=False,
+        thd_declared_totals=False,
+        thd_ragged_offsets=False,
+        thd_head_stride=False,
+        thd_tile_ms=frozenset(),
+        thd_tile_ns=frozenset(),
     )
 
 
@@ -881,11 +904,13 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    if api_type == _SM120 and facts.d_qk > 256:
+    select = spec.capabilities.select_implementation
+    selected = None if select is None else select(facts)
+    if selected == _sm120_f16_fused.WIDE:
         from .api_dsl_sm120_wide import SdpaBwdDslSm120Wide
 
         adapter_cls = SdpaBwdDslSm120Wide
-    elif api_type == _SM120 and thd:
+    elif selected == _sm120_f16_fused.PACKED:
         from .api_dsl_sm120_thd import SdpaBwdDslSm120Thd
 
         adapter_cls = SdpaBwdDslSm120Thd
@@ -2402,6 +2427,7 @@ def _sm120_mxfp8_spec():
 
 ENGINE_SPECS = (
     _sm120_spec(),
+    _sm120_f16_fused_spec(),
     _sm80_spec(),
     _sm100_spec(),
     _sm100_mxfp8_spec(),

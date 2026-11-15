@@ -41,6 +41,7 @@ _OFFERED = {
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
+    "sdpa_bwd_sm120_f16_fused": 20618,
 }
 
 
@@ -53,7 +54,7 @@ def _facts(**over):
 @pytest.mark.parametrize("d", [32, 40, 64, 128, 192, 256])
 def test_sm120_row_lists_the_kernels_per_head_dim_default(d):
     plans = recommend("A", _facts(d_qk=d, d_v=d), _OFFERED)
-    assert [p.engine_id for p in plans] == [20600]
+    assert [p.engine_id for p in plans] == [20618]  # the fused body; the SM120 row keeps its packed and D > 256 bodies
     q_tile, kv_tile = DEFAULT_TILES[padded_head_dims(d, d)[0]]  # d=40 runs at the padded 64
     assert plans[0].knobs == SdpaBwdKnobs(tile_m=q_tile, tile_n=kv_tile)
     kt = cudnn.knob_type
@@ -101,14 +102,14 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20600])],
+    [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20618])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     """The Rubin d256 bf16 / fp16 backward row (slot 4 -> 20604) is fixed-geometry: on cc 10.7-11.x it lists exactly one
     entry with NO knobs (``{}`` is the complete record), and off the Rubin line it is absent -- on the SM100 line the
     d256 half graph lists exactly the 2x2-datapath row (slot 7 -> 20607, knobless too; the sm100 d512 row's envelope floor
-    is exclusive at 256), on SM120 only that line's own continuum row (20600, with its tiles) lists."""
+    is exclusive at 256), on SM120 only that line's own fused continuum body (20618, with its tiles) lists."""
     assert any(s.name == "sdpa_bwd_sm107" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107 is not registered (plan s7)"
     plans = recommend("A", _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
@@ -430,7 +431,7 @@ def test_sm120_short_square_class_keeps_default_and_long_square_leads(monkeypatc
     for s in (5, 16, 63, 64, 127, 128, 129, 2037):
         facts = _facts(dtype=dtype, d_qk=d, d_v=d, h_q=6, h_kv=h_kv, s_q=s, s_kv=s, causal=mask != "none", window_left=3 if mask == "window" else None)
         key = pt.class_key("sdpa_bwd_sm120", facts)
-        plans = propose("A", facts, {"sdpa_bwd_sm120": 20600})
+        plans = propose("A", facts, {"sdpa_bwd_sm120": 20600, "sdpa_bwd_sm120_f16_fused": 20618})
         if s < 128:
             assert key[4] == "prefill_short_square"
             assert pt.lookup("sdpa_bwd_sm120", facts) is None
@@ -438,7 +439,7 @@ def test_sm120_short_square_class_keeps_default_and_long_square_leads(monkeypatc
         else:
             assert key[4] == "prefill"
             assert pt.lookup("sdpa_bwd_sm120", facts) is True
-            assert plans[0].engine_id == 20600
+            assert plans[0].engine_id == 20618  # the fused body inherits the row's measured entries
 
 
 @pytest.mark.parametrize("row,cc", [("sdpa_bwd_sm120", (12, 1)), ("sdpa_bwd_sm80", (8, 0)), ("sdpa_fwd_prefill_sm120", (12, 0))])

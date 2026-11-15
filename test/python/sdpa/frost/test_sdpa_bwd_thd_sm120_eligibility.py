@@ -64,7 +64,9 @@ def test_frost_thd_sm120_family_admission(device_cc):
 
 
 def test_frost_dense_sm120_eligibility_unchanged():
-    assert reason(thd=False, padded=False, d_qk=64, d_v=64, h_kv=1) is None
+    dense = facts(device_cc=(12, 0), thd=False, padded=False, d_qk=64, d_v=64, h_kv=1)
+    assert engines.mismatch(next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_fused").capabilities, dense) is None
+    assert reason(thd=False, padded=False, d_qk=64, d_v=64, h_kv=1) == "this graph is owned by the explicit implementation engine sdpa_bwd_sm120_f16_fused"
 
 
 @pytest.mark.parametrize("tile_m,tile_n,accepted", [(64, 64, True), (32, 32, True), (64, 32, True), (None, None, True), (32, 64, False), (64, 128, False)])

@@ -35,7 +35,8 @@ from cudnn.sdpa.bwd.config_sm120 import (
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
-_SM120_KERNEL_FILE = "sm120/bprop_f16.py"
+from .kernels.sm120.f16_fused.contract import KERNEL_FILE as _SM120_KERNEL_FILE
+
 _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
