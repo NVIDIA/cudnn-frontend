@@ -289,7 +289,8 @@ into the baseline tree when a new regression must run against old production cod
 ### Native flavor routing assertions
 
 Audit dotted module names as well as file paths when retiring a kernel.
-Check direct imports and strings passed to `find_spec` or `import_module`;
+Check direct imports, `from package import old_module`, and strings passed
+to `find_spec` or `import_module`;
 a search for the old `.py` basename misses them. The SM107 D256 descriptor
 version cases and the gated-block EXTEND PDL source check cover both forms.
 
