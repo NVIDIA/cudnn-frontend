@@ -9,10 +9,10 @@ Geometry is ``make_cfg_d192_mxfp8``; the BODY is the same as
 warps, persistent try_cancel scheduler).  The pre-upstream base kernel was
 flavor-generic — one file served the d128 and d192xd128 geometries by swapping
 the config — and ``CfgD192`` only widens ``TILE_K``, so the config factory is the
-ONLY difference, mirroring ``sm107/prefill_d192_d128_f16.py``.
+ONLY difference, mirroring ``sm107/d192_f16_multi_q/kernel.py``.
 
 The softmax ROW-SUM rides the tensor core, exactly as the per-tensor FP8 sibling
-``sm107/prefill_d192_d128_fp8.py`` does it: an N=16 ones-BMM runs over the same
+``sm107/d192_fp8_multi_q/kernel.py`` does it: an N=16 ones-BMM runs over the same
 quantized P tile that BMM2 consumes, accumulating the softmax denominator into
 16 TMEM columns behind each sub-tile's O.  The softmax warps never build it in
 registers, and the correction warp's alpha-rescale covers O and the running
@@ -2882,7 +2882,7 @@ def _host(
     total_kv_sf_tiles: cutlass.Int32 = 0,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    # sm107/d128_fp8_multi_q/kernel.py sibling does.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.

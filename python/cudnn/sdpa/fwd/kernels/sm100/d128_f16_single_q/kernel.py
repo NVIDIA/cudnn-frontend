@@ -9,7 +9,7 @@ stages: 48 KiB (Q/O alias) + 2 x (48 KiB K + 32 KiB V) = 208 KiB before
 barriers and scheduler state. It can write either final packed outputs or
 FP32 split partials for the shared packed combine, without a separate kernel.
 
-The d128 prefill pipeline (``sm100/prefill_d128_f16.py``) computes 512 Q rows
+The d128 prefill pipeline (``sm100/d128_f16_multi_q/kernel.py``) computes 512 Q rows
 per cga2 cluster (TILES_Q=2 x TILE_M=128 x CTA_MMA=2).  A decode step has one
 token per sequence -- with PackGQA, G rows out of those 512 are live -- so the
 prefill tile spends its time issuing BMM1/BMM2 for dead rows and exponentiating
@@ -268,12 +268,12 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 # and PACKED_HEADS_PER_KV = 3 of them read the same KV head).  CFG.QH_PER_KH
 # stays the graph's GQA ratio (it drives the bottom-right diagonal).  The
 # bounds helpers take HEADS_PER_TILE (the packed group), never QH_PER_KH --
-# the same mapping as sm100/prefill_d128_f16.py.
+# the same mapping as sm100/d128_f16_multi_q/kernel.py.
 HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 PACKED_HEADS_PER_KV = CFG.QH_PER_KH // HEADS_PER_TILE if CFG.PACK_GQA else 1
 
-# === KV split === (shared mechanics; see prefill_d128_f16.py and _common_blackwell)
+# === KV split === (shared mechanics; see d128_f16_multi_q/kernel.py and _common_blackwell)
 _split_h = make_split_helpers(
     CFG,
     bounds_for_tile=_bounds_for_tile,
@@ -306,7 +306,7 @@ if QUAD and not (
     CFG.TILE_K == 64 and CFG.TILE_O == QUAD_O_COLS and CFG.N_BMM2_CHUNKS == 2 and CFG.TILES_Q == 1 and EARLY_Q and QUAD_ROWS % HEADS_PER_TILE == 0
 ):
     raise ValueError("decode_quad: the d64 tile with two P chunks, early Q and a packed group that divides 32 rows")
-# exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/prefill_d128_f16.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
+# exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/d128_f16_multi_q/kernel.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
 # evaluated on the FMA pipe (``exp2_emul_pair``), the rest on MUFU.EX2.  On cc 10.0 the d64 tile's one softmax warpgroup is MUFU-bound at a long KV (16
 # EX2 per clk per SM, and the 128 rows of a tile exponentiate whether live or not), so the FMA pipe takes a quarter of every row's columns.  Gate:
 # ``PARAMS.exp2_fma_split`` supplies the measured cc gate. This tile enables it for d64 decode and the measured d128 THD FP32-partial form;
@@ -1588,7 +1588,7 @@ def _softmax_kv_body_full(
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
     current_max = current_max_unscaled * scale_log2  # -inf when the whole iteration is masked
 
-    # Online softmax with RESCALE_THRESHOLD skip (see prefill_d128_f16.py).
+    # Online softmax with RESCALE_THRESHOLD skip (see d128_f16_multi_q/kernel.py).
     update_cond = (current_max - total_max) > RESCALE_THRESHOLD
     total_max = cutlass.Float32(
         arith.select(

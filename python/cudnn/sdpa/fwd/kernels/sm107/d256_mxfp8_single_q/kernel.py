@@ -115,7 +115,7 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams()
 CFG, _TMA = make_cfg_d256_mxfp8(PARAMS)
 # Paged KV (CFG.PAGED_KV): K/V and their F8_128x4 scale-factor pools are addressed through the block tables -- the page
 # id is the TMA batch coordinate of the K/V AND SF descriptors and the tile inside the page the SF tile coordinate (the
-# SM100 sibling's specialization, sm100/prefill_d256_mxfp8.py; V's columnwise SF keeps its D-plane-major layout ACROSS
+# SM100 sibling's specialization, sm100/d256_mxfp8_single_q/kernel.py; V's columnwise SF keeps its D-plane-major layout ACROSS
 # THE POOL: group (page * KH + head) * tiles_per_page + tile); page -1 past a sequence's live pages is TMA-OOB zero
 # fill.  A page holds whole 128-row SF atom sets, so PAGE_SIZE is a multiple of TILE_N (config_sm107 backstops it).
 # Paging changes the TMA-LDG warp's coordinates and the host's descriptor extents only: no SMEM, so the version-0
@@ -2930,7 +2930,7 @@ def _host(
     block_table_v_tensor: Optional[cute.Tensor] = None,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    # sm107/d128_fp8_multi_q/kernel.py sibling does.
     stream: _cuda_driver.CUstream = None,
     # == EPILOGUE_FUSION_SEAM(host_desc) ==
     # Epilogue gate, APPENDED after `stream` so no existing positional moves
@@ -3069,7 +3069,7 @@ def _host(
     # THD packs both planes of a (head, sequence tile) contiguously.  At d=128 the
     # two layouts coincide (the d128 sibling reads V through the rowwise form);
     # d256 was correct at S=128 (one KV tile => one group) and wrong from S=256 on
-    # until it took the columnwise form.  Mirrors sm100/prefill_d256_mxfp8.py's
+    # until it took the columnwise form.  Mirrors sm100/d256_mxfp8_single_q/kernel.py's
     # dense/THD stride split.  The box walks V_SF_PLANES_PER_PEER planes per load.
     tma_q_sf_desc = build_rowwise_sf_desc(
         sf_q_tensor, num_tiles=_q_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_Q, num_rows_box=SF_NUM_ROWS_Q, num_heads=QH, num_batches=_B_SF

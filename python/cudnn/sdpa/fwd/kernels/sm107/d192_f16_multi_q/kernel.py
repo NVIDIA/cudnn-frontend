@@ -17,7 +17,7 @@ by hand:
      ``..._from_view`` — a signature change, not a rename.
 
 Geometry is FROST's ``make_cfg_d192`` (d_qk=192, d_v=128) as-is.
-Same body as ``sm107/prefill_d128_f16.py`` -- the pre-upstream base kernel is
+Same body as ``sm107/d128_f16_multi_q/kernel.py`` -- the pre-upstream base kernel is
 flavor-generic (it served llama/dsv3/gptoss off one file by swapping
 sdpa_config_<flavor>), and CfgD192/CfgD128 have identical field sets, so
 the ONLY difference is the config factory. the pre-upstream helper would give
@@ -780,7 +780,7 @@ def _tmaldg_warp_group(
         # tail wipes the whole tile through BMM2 (0 * NaN == NaN).  Through the
         # clamped descriptors those rows are TMA-OOB and land as EXACT ZEROS.
         # Same closure shape as GmemTileTma, so every load site stays
-        # branch-free.  Mirrors sm107/prefill_d128_fp8.py.
+        # branch-free.  Mirrors sm107/d128_fp8_multi_q/kernel.py.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         # Setup publishes immutable packed-total maps for this launch.

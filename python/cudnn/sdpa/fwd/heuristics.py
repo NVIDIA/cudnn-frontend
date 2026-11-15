@@ -185,7 +185,7 @@ _SM90_D128_SHIPPED_SWITCHES = (
     ("D128_PERSISTENT_CAUSAL_WALK", 2),
     ("D128_CAUSAL_WALK_ROUTE", True),
 )
-# cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
+# cc 10.7 half, the shared d128 DECODE tile (sm100/d128_f16_single_q/kernel.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
 # verify tables, bottom-right causal, no window): LPT / NATURAL median 0.989 over 224 (cell, policy) pairs at KV 2k-16k
@@ -549,7 +549,7 @@ def decode_tile_split_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # A KV tile's cost to a lone CTA by the tile's N extent (its packed Q rows), in
 # units of the 16-column tile's, PER ARCH LINE -- the two lines' decode tiles are
-# sibling kernels (sm100/ and sm107/decode_d256_f16.py), so each carries its own
+# sibling kernels (sm100/ and sm107/d256_f16_swap_ab/kernel.py), so each carries its own
 # fit and the model reads the caller's ``device_cc``:
 #   * the Blackwell line (B200 fit): the 32-column tile at _DECODE_TILE_WIDE_Q_TILE_COST.
 #   * cc 10.7 (measured on the Rubin performance class, 212 SMs, per-CTA device
@@ -1043,7 +1043,7 @@ def choose_decode_tile_split_kv(
     declared S_kv; ``q_tile`` the tile's N extent (16, 32 or 64 packed Q rows,
     :func:`config_sm107.decode_d256_q_tile`).  ``device_cc`` names the ARCH LINE
     the launch is priced on, and the two lines are two fits of two sibling
-    kernels (sm100/ and sm107/decode_d256_f16.py), each measured on its own
+    kernels (sm100/ and sm107/d256_f16_swap_ab/kernel.py), each measured on its own
     part -- the model answers for one line exactly as that line's fit says:
 
     * the Blackwell line (cc 10.0 / 10.3, measured on B200 / B300):
@@ -1545,7 +1545,7 @@ def _sched_points(caps: Capabilities, facts, *, d128: bool = False) -> List[Opti
         # band above the decode tile is unmeasured and keeps the L2-budget rule.
         primary = SCHED_NATURAL
     elif causal_ish and caps.sm_lo == 100 and facts.is_mxfp8 and _selected_d_shape(caps, facts) == (128, 128):
-        # SM100 d128 MXFP8 (sm100/prefill_d128_mxfp8.py): plain LPT beats the L2-budget
+        # SM100 d128 MXFP8 (sm100/d128_mxfp8_multi_q/kernel.py): plain LPT beats the L2-budget
         # arm's LPT_L2 on EVERY measured causal shape -- MEASURED on B200 (cc 10.0,
         # 148 SMs, 2026-09-22; CUPTI device time, L2 flushed per launch, 3 rounds,
         # one process per slot, controls <= 0.35 %): LPT over LPT_L2 +5.1 / +7.2 /
@@ -1812,7 +1812,7 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
 #
 # The SM100 f16 row's (128, 128) flavor has two tiles behind TILE_CGA_M
 # (_d128_decode_tile_fits below): cga1 IS the decode tile -- one independent
-# 128-row CTA per (batch, packed head) unit, sm100/decode_d128_f16.py -- and
+# 128-row CTA per (batch, packed head) unit, sm100/d128_f16_single_q/kernel.py -- and
 # cga2 the prefill pipeline, 512 rows per cluster.  The rules here measure a
 # unit by its live rows, S_q * PACK_G -- the kernel's packed subgroup (the
 # whole GQA group when it divides the tile, its largest divisor that does
@@ -1925,7 +1925,7 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
 # The d128 decode tile's Q rows per CTA (config_sm100.CfgD128Decode: TILES_Q=1 x
 # TILE_M=128 x CTA_MMA=1).  The SM100 f16 row's (128, 128) flavor has two
 # tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
-# cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
+# cluster), cga1 the decode tile (sm100/d128_f16_single_q/kernel.py).
 _D128_DECODE_TILE_ROWS = 128
 # The d64 f16 decode tile's Q rows (api_dsl._D64_DECODE_TILE_ROWS): the one d64 leg
 # narrower than the flavor's 256-row cga1 prefill, selected by the adapter once
@@ -2328,7 +2328,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/d256_f16_swap_ab/kernel.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
