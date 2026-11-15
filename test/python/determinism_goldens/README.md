@@ -24,7 +24,47 @@ of race freedom. Historical THD golden keys retain their old `cga2` MMA-group
 suffix while public records now state the physical cluster width `cga4`;
 this preserves the original baselines instead of recording replacements.
 
-Native qualification results are recorded below after the frozen-source runs.
+Qualification used isolated frozen snapshots culminating in `c501e487d`,
+on native cc 10.7 with cuDNN 9.30.0, CuTe DSL 4.8.0, compiler/NVRTC 13.4,
+Torch 2.14.1+cu130 and driver API 13050. The source import and target
+architecture were asserted before pytest. Run the selected groups from
+`test/python` with `-m L0`:
+
+```text
+sdpa/frost/test_sdpa_fp8_sm107.py::TestD512Fp8Implementation
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Pack
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Split
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Paged
+sdpa/frost/test_sdpa_fp8_sm107.py::TestWideFp8PhysicalOrigins
+sdpa/frost/test_sdpa_fp8_sm107.py::TestServiceRegisterRelease::test_service_register_release[prefill_d512_fp8]
+sdpa/frost/test_sdpa_fwd_sm107_d512_fp8_contract.py
+```
+
+The first functional run had 218 passes, four missing-golden skips and two
+failures in a stale route observer: selected implementations load directly,
+so the old router hook was not called. The numerical/capture checks completed
+before that observer failed. The test now inspects the actual compiled
+artifact, owner and physical/MMA geometry, including cache hits. The final
+paged group plus larger stress and PTX detector passed 27 cases with six
+missing-golden skips. The separate final-owner/origins/metadata run passed
+52 with eight missing-golden skips; it also included the three affected
+packing/scheduler/gate metadata tests and the running-max source inventory.
+Taking the latest result for each selected case gives **266 passes,
+14 missing-golden skips and no unresolved failures**; this total includes
+host contract checks collected on the GPU worker.
+
+The 1,024-CTA stress had zero byte mismatches in both 256-launch phases;
+the unsafe-ring control failed all 200 launches. A frozen parent/head/head/parent
+comparison covered dense E4M3-to-BF16, packed split E5M2-to-E4M3, HALF softmax
+E4M3-to-BF16 and nonpaged THD E5M2-to-BF16. Complete configurations, template
+parameters, TMA metadata, workspace, normalized public records, inputs,
+outputs and changed-scale capture results matched exactly across all four
+processes. This is bounded equivalence evidence, not a cross-runtime promise.
+
+Historical paging and THD goldens are unavailable for runtime fingerprint
+`aa97de087283f297`. Strict historical-golden qualification therefore remains
+unverified for this runtime; no replacement baselines were recorded. No
+other architecture or backward path is newly qualified by this change.
 
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
