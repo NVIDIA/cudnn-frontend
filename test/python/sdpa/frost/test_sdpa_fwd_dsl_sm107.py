@@ -126,8 +126,8 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
 
     from cudnn.sdpa.fwd.kernels import sm107 as pkg
 
-    root = os.path.dirname(pkg.__file__)
-    files = sorted(glob.glob(os.path.join(root, "prefill_*.py")) + glob.glob(os.path.join(root, "*", "kernel.py")))
+    directory = os.path.dirname(pkg.__file__)
+    files = sorted(glob.glob(os.path.join(directory, "prefill_*.py")) + glob.glob(os.path.join(directory, "*", "kernel.py")))
     assert len(files) >= 13, files
     shared_call = re.compile(
         r"running_max_step_finite_sentinel\(\s*(\w+),\s*current_max,\s*total_max,\s*(NEG_INF(?:_F32)?),\s*RESCALE_THRESHOLD(?:_F32)?,\s*masked=CFG\.MASK_FLAGS != MASK_NONE\s*\)"
@@ -136,7 +136,7 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
     for f in files:
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
-        name = os.path.relpath(f, root)
+        name = os.path.relpath(f, directory)
         if "row_max_for_exp2(" in code and "running_max_step_finite_sentinel(" not in code:
             continue  # the -inf-masked twin alone (the 2x2 bodies)
         # sm107/prefill_d128_f16.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
@@ -1079,11 +1079,13 @@ def test_sm107_fp8_pack_gqa_serves_native_split_flavors():
     shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert caps.pack_gqa_d_shapes == shapes
     for d_qk, d_v in shapes:
+        caps = _caps("sdpa_fwd_sm107_d512_fp8_role_split" if (d_qk, d_v) == (512, 512) else "sdpa_fwd_prefill_sm107_fp8")
         packed = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
         assert engines.mismatch(caps, packed) is None
         assert engines.mismatch(caps, packed, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    caps = _caps("sdpa_fwd_sm107_d512_fp8_role_split")
     d512 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=512, d_v=512))
-    assert engines.mismatch(caps, d512, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2, cga=2)) is None
+    assert engines.mismatch(caps, d512, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2, cga=4)) is None
     assert engines.mismatch(caps, dataclasses.replace(d512, thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
 
@@ -1572,10 +1574,12 @@ def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
     for shape in ((512, 512), (256, 256), (192, 128), (128, 128)):
+        caps = _caps("sdpa_fwd_sm107_d512_fp8_role_split" if shape == (512, 512) else "sdpa_fwd_prefill_sm107_fp8")
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None, shape
     for shape in ((192, 128), (128, 128)):
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2)) is None, shape
     for shape in ((256, 256), (512, 512)):
+        caps = _caps("sdpa_fwd_sm107_d512_fp8_role_split" if shape == (512, 512) else "sdpa_fwd_prefill_sm107_fp8")
         why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2))
         assert why is not None and "sched_policy" in why, shape
 
@@ -2140,8 +2144,10 @@ def test_sm107_gate_rows_claim_exactly_d256():
         why = engines.mismatch(f16, _gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
-        why = engines.mismatch(fp8, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
-        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+        fp8_owner = _caps("sdpa_fwd_sm107_d512_fp8_role_split") if (d_qk, d_v) == (512, 512) else fp8
+        why = engines.mismatch(fp8_owner, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
+        expected = "graph fuses O * sigmoid(G)" if (d_qk, d_v) == (512, 512) else "epilogue gate"
+        assert why is not None and expected in why, (d_qk, d_v, why)
         why = engines.mismatch(mxfp8, _mxfp8_gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
     # The MXFP8 row's UNGATED (256, 256) graph is untouched by the new fields.
@@ -8241,7 +8247,7 @@ def test_d512_half_prefolded_scale_sass_drops_the_per_score_multiply(tmp_path, s
 
 
 # ============================================================================ d512 per-tensor FP8: the HALF softmax arm
-# The role-split d512 per-tensor FP8 kernel (sm107/prefill_d512_fp8.py) honors softmax_precision=HALF: MUFU EX2.F16x2 on
+# The role-split d512 per-tensor FP8 kernel (sm107/d512_fp8_role_split/kernel.py) honors softmax_precision=HALF: MUFU EX2.F16x2 on
 # packed pairs and an f16x2 -> FP8 cast per 16-byte P vector through the SHARED helpers (tile_dsl/softmax_f16.py); the
 # SMEM pack and the DSMEM ship are untouched.  The kernel has no ones-MMA row-sum, so the stats-less build normalizes O
 # by the f16 pair-tree sum of the P words it stores while a build with Stats keeps the exact f32 denominator (honored,
@@ -8250,7 +8256,7 @@ def test_d512_half_prefolded_scale_sass_drops_the_per_score_multiply(tmp_path, s
 # keyless rows under the masked arm.  Oracle: float64 on the DEQUANTIZED inputs the kernel actually saw.
 _D512_FP8_HALF_FMT = {"e4m3": "float8_e4m3fn", "e5m2": "float8_e5m2"}
 _D512_FP8_HALF_D = 512
-_D512_FP8_KERNEL_FILE = os.path.join("sm107", "prefill_d512_fp8.py")
+_D512_FP8_KERNEL_FILE = os.path.join("sm107", "d512_fp8_role_split", "kernel.py")
 
 
 @pytest.mark.L0
@@ -8578,7 +8584,7 @@ _SM107_D512_FP8_HALF_SASS_PROBE = textwrap.dedent("""
     (cta_mma,) = supported_cgas_for((512, 512), fp8=True, device_cc=(10, 7), pertensor=True)
     params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, softmax_f16=True)
     mod = _load_sm100_kernel_module((512, 512), params, fp8=True, pertensor=True, rubin=True)
-    assert mod.SOFTMAX_F16 == 1 and mod.__file__.endswith(os.path.join("sm107", "prefill_d512_fp8.py")), mod.__file__
+    assert mod.SOFTMAX_F16 == 1 and mod.__file__.endswith(os.path.join("sm107", "d512_fp8_role_split", "kernel.py")), mod.__file__
     mod.compile_prepared(d_qk=512, d_v=512, has_lse=bool(has_lse))
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:

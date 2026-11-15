@@ -428,7 +428,7 @@ _SM107_KERNEL_FILES = {
 # the natives on themselves; config_sm107.sm107_f16_tile_width is the same pick as a function).
 _SM107_FLAVORS = ((32, 32),) + _SM100_FLAVORS
 _SM107_FP8_KERNEL_FILES = {
-    (512, 512): "sm107/prefill_d512_fp8.py",
+    (512, 512): "sm107/d512_fp8_role_split/kernel.py",
     (256, 256): "sm107/prefill_d256_fp8.py",
     (192, 128): "sm107/prefill_d192_d128_fp8.py",
     (128, 128): "sm107/prefill_d128_fp8.py",

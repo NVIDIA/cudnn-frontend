@@ -143,6 +143,7 @@ def release_cases(arch):
             "prefill_d512_mxfp8.py": "d512_mxfp8_slice_recompute/kernel.py",
         }
         moved_sm107 = {
+            "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
             "prefill_d128_mxfp8.py": "d128_mxfp8_multi_q/kernel.py",
             "prefill_d192_d128_mxfp8.py": "d192_mxfp8_multi_q/kernel.py",
             "prefill_d256_mxfp8.py": "d256_mxfp8_single_q/kernel.py",

@@ -67,7 +67,7 @@ def test_native_d512_split_nomask_optional(pack, dtype, stats, amax, monkeypatch
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    assert seen and set(seen) == {"sm107/prefill_d512_fp8.py"}, seen
+    assert seen and set(seen) == {"sm107/d512_fp8_role_split/kernel.py"}, seen
     for name in ("q", "k", "v"):
         value = bufs[name]
         value._base[..., value.shape[-1] :].fill_(float("nan"))
