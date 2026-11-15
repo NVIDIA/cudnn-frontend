@@ -70,8 +70,8 @@ def reason(value):
 def test_thd_admission_and_ranking(packing, dtype, causal):
     value = facts(packing=packing, dtype=dtype, causal=causal)
     assert reason(value) is None
-    plans = recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})
-    assert [(plan.engine_id, plan.knobs) for plan in plans] == [(20609, None)]
+    plans = recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})
+    assert [(plan.engine_id, plan.knobs) for plan in plans] == [(20630, None)]
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,7 @@ def test_thd_admission_and_ranking(packing, dtype, causal):
 def test_thd_rejects_before_ranking(overrides, token):
     value = facts(**overrides)
     assert token.lower() in reason(value).lower()
-    assert recommend("A", value, {"sdpa_bwd_sm100_d128": 20609}) == []
+    assert recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630}) == []
 
 
 @pytest.mark.parametrize("version", [("nvidia-cutlass-dsl", "4.7.4"), ("cutlass", "4.8.0"), ("nvidia-cutlass-dsl", "unknown")])
@@ -192,8 +192,8 @@ def test_thd_stats_malformed_descriptor_declines(shape, stride, token):
         assert observed is None
     else:
         assert token in observed
-    plans = recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})
-    assert (len(plans) == 1 and plans[0].engine_id == 20609) == (token is None)
+    plans = recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})
+    assert (len(plans) == 1 and plans[0].engine_id == 20630) == (token is None)
 
 
 @pytest.mark.parametrize(
@@ -229,5 +229,5 @@ def test_real_thd_graph_admission(monkeypatch, cc, scale, missing_totals, token)
         assert observed is None
     else:
         assert token in observed
-    plans = recommend("A", value, {"sdpa_bwd_sm100_d128": 20609})
-    assert (len(plans) == 1 and plans[0].engine_id == 20609) == (token is None)
+    plans = recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630})
+    assert (len(plans) == 1 and plans[0].engine_id == 20630) == (token is None)

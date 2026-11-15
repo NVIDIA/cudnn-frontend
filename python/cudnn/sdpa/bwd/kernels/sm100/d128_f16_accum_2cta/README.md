@@ -4,4 +4,4 @@
 
 Packed delta/cast helpers come from `../_d128_thd_chain.py`; pointer views come from `../_prepared_d128_common.py`. The one-CTA attention body is not imported. The detailed pipeline and diagnostic documentation remains beside the source.
 
-This source extraction preserves the existing standalone selection contract. It does not by itself make the legacy graph row a fixed two-CTA owner, widen graph support, or add a determinism/batch-invariance guarantee.
+`contract.py` names fixed engine 20631; `host.py` forces this body and declines failed cluster admission. Central ranking is outside this directory. Standalone diagnostic and numerical renderings remain available under their existing typed contracts; they are not public engine knobs. The isolation of their different barrier protocols remains a separate source audit. No determinism or batch-invariance guarantee is added.

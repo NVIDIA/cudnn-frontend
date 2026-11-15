@@ -465,7 +465,7 @@ def compile_plan(api):
         required,
         device,
         api.scale_softmax,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         length_form=not dense,
         roles=ROLES[:9] if dense else THD_ROLES,
         attributes=ATTRIBUTES[:9] if dense else THD_ATTRIBUTES,

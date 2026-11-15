@@ -571,7 +571,7 @@ def test_cta_pair_dense_dispatch_selects_the_pair_and_records_the_dense_form(mon
 _ONE_CTA_DENSE = _ONE_CTA_IMPLEMENTATIONS["dense"]
 
 
-def _declaration_api(monkeypatch, geometry, *, dtype=torch.bfloat16, causal=True, cc=(10, 0), mode=None, **fields):
+def _declaration_api(monkeypatch, geometry, *, dtype=torch.bfloat16, causal=True, cc=(10, 0), mode=None, api_type=None, **fields):
     """The shipping adapter on declared geometry alone (``TensorDesc`` on a CUDA device, no tensors: the eligibility suite's recipe) with the device
     facts the dispatch and the grouped checks read modelled host-side -- the device cc (both the pair's reader and the grouped checks'), the
     occupancy admission, the DSL floor, the binder -- so the REAL ``check_support`` runs every grouped dense check and the pair's dense branch on
@@ -600,7 +600,7 @@ def _declaration_api(monkeypatch, geometry, *, dtype=torch.bfloat16, causal=True
         )
         for role, (shape, stride) in geometry.items()
     }
-    api = SdpaBwdDslSm100D128(**samples, is_causal=causal, scale_softmax=SCALE, thd=False)
+    api = (api_type or SdpaBwdDslSm100D128)(**samples, is_causal=causal, scale_softmax=SCALE, thd=False)
     if mode is not None:
         api.cta_pair = mode
     for name, value in fields.items():
@@ -691,7 +691,7 @@ def test_cta_pair_dense_pair_declines_by_name(monkeypatch, over, text):
 def test_cta_pair_dense_graph_declaration_at_the_threshold_selects_the_pair(monkeypatch, compiler_version):
     """The graph API's plan-time hook, host-side (the engine row's declaration check: ``graph_analyzer.analyze`` -> ``engines.mismatch`` ->
     ``heuristics.recommend``, the eligibility suite's recipe) on a dense compact-BSHD BF16 GQA ``sdpa_backward`` graph at the 8K bar shape (B 4,
-    Hq 32, Hkv 4, S = ``CTA_PAIR_MIN_SEQ[(10, 0)]``, causal): the d128 row (engine 20609) is recommended, and the shipping adapter built on the graph's declared
+    Hq 32, Hkv 4, S = ``CTA_PAIR_MIN_SEQ[(10, 0)]``, causal): the explicit two-CTA owner (20631) is recommended first, and the shipping adapter built on the graph's declared
     geometry (what the engine row binds) resolves the pair body under the DEFAULT ``cta_pair`` ("auto") with the dense token -- the dispatch cell
     of the bar shape without the 8K oracle a device run would need.  The same graph at S 4096 resolves the one-CTA dense body."""
     from cudnn.sdpa import graph_analyzer as ga
@@ -705,7 +705,9 @@ def test_cta_pair_dense_graph_declaration_at_the_threshold_selects_the_pair(monk
         graph, _, _ = _half_bwd_graph(b=4, hq=32, hkv=4, d=128, thd=False, sq=s, skv=s, use_causal_mask=True)
         value = ga.analyze(graph)
         assert value is not None and not value.thd and (value.h_q, value.h_kv, value.s_q) == (32, 4, s) and reason(value) is None
-        assert [plan.engine_id for plan in recommend("A", value, {_ENGINE: 20609})] == [20609]
+        assert [
+            plan.engine_id for plan in recommend("A", value, {"sdpa_bwd_sm100_d128_accumulation": 20630, "sdpa_bwd_sm100_d128_accumulation_2cta": 20631})
+        ] == ([20631, 20630] if body == c.PAIR_BODY else [20630, 20631])
         geometry = {name.lower(): (dim, stride) for name, dim, stride in value.port_layouts}
         geometry["stats"] = value.stats_t.get_dim(), value.stats_t.get_stride()
         api = _declaration_api(monkeypatch, geometry, causal=True)  # cta_pair left at the class default: "auto"

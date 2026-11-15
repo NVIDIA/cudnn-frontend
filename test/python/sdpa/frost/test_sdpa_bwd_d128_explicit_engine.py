@@ -9,7 +9,7 @@ import pytest
 
 import cudnn
 from cudnn.sdpa.bwd import engines, heuristics
-from cudnn.sdpa.bwd.d128_selection import LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER
+from cudnn.sdpa.bwd.d128_selection import ACCUMULATION_OWNER, LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER, TWO_CTA_OWNER
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 from frost_test_utils import requires_bwd_engine_row, requires_dsl
 
@@ -22,7 +22,7 @@ pytestmark = pytest.mark.L0
 def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profile):
     from cudnn.frost import buffers
 
-    monkeypatch.setattr(engines, "cutedsl_state", lambda: (None, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     specs = {s.name: s for s in engines.ENGINE_SPECS}
     row, owner = specs[LEGACY_ROW], specs[RECOMPUTE_OWNER]
@@ -35,13 +35,15 @@ def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profil
         "grouped": {"h_kv": 1},
         "thd": {"thd": True, "padded": True, "max_total_seq_len_q": 256, "max_total_seq_len_kv": 512},
     }[profile]
-    facts = SdpaGraphFacts(**(dict(is_backward=True, b=2, h_q=2, h_kv=2, s_q=128, s_kv=256, d_qk=d, d_v=d, device_cc=cc) | changes))
+    facts = SdpaGraphFacts(
+        **(dict(is_backward=True, b=2, h_q=2, h_kv=2, s_q=128, s_kv=256, d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, device_cc=cc) | changes)
+    )
     baseline = engines.mismatch(old, facts)
-    reasons = [engines.mismatch(s.capabilities, facts) for s in (row, owner)]
+    reasons = [engines.mismatch(s.capabilities, facts) for s in (row, owner, specs[PAIR_OWNER], specs[ACCUMULATION_OWNER], specs[TWO_CTA_OWNER])]
     assert (None in reasons) == (baseline is None)
     if baseline is None and profile not in ("grouped", "thd"):
         assert reasons[1] is None
-    offered = {LEGACY_ROW: 20609, RECOMPUTE_OWNER: 20628, PAIR_OWNER: 20629}
+    offered = {LEGACY_ROW: 20609, RECOMPUTE_OWNER: 20628, PAIR_OWNER: 20629, ACCUMULATION_OWNER: 20630, TWO_CTA_OWNER: 20631}
     plans = heuristics.recommend("A", facts, offered)
     if baseline is None:
         expected = [offered[name] for name in engines.legal_implementations(row.capabilities, facts)]

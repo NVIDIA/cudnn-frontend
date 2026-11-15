@@ -201,7 +201,7 @@ def compile_plan(api):
         api._thd_workspace_bytes,
         device,
         api.scale_softmax,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         length_form=True,
         roles=THD_ROLES,
         attributes=THD_ATTRIBUTES,

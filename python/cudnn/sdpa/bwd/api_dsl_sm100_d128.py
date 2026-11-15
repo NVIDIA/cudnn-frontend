@@ -193,9 +193,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
 
     def check_support(self):
         if self._uses_grouped_heads() and not self._pair_grouped():
-            from .prepared_sm100_d128_grouped_2cta import check_support_selected
-
-            return check_support_selected(self)
+            return self._check_grouped_implementation()
         from .d128_grouped_contract import DKV_ACCUM_DEFAULT, resolve_dkv_accum
         from .prepared_sm100_d128_grouped_2cta import cta_pair
 
@@ -301,12 +299,20 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
         # its admitted parts and accumulation envelope, dense MHA uses recompute.
         return default_dense_implementation(natural, cc, self.head_dim_qk, int(self.s_k_max), self.window_size_left, self.deterministic)
 
+    def _check_grouped_implementation(self):
+        from .prepared_sm100_d128_grouped_2cta import check_support_selected
+
+        return check_support_selected(self)
+
+    def _compile_grouped_implementation(self):
+        from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
+
+        return compile_plan_selected(self)
+
     def compile(self):
         if self._uses_grouped_heads() and not self._pair_grouped():
-            from .prepared_sm100_d128_grouped_2cta import compile_plan_selected
-
-            self._ensure_support_checked()  # resolves cta_pair and records the chosen body first
-            self._prepared = compile_plan_selected(self)
+            self._ensure_support_checked()
+            self._prepared = self._compile_grouped_implementation()
             self._compiled_kernel = self._prepared.artifact
             return
         if self.thd:

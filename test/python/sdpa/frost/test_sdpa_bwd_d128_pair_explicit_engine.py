@@ -9,7 +9,7 @@ import cudnn
 import pytest
 
 from cudnn.sdpa.bwd import engines, heuristics
-from cudnn.sdpa.bwd.d128_selection import LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER
+from cudnn.sdpa.bwd.d128_selection import ACCUMULATION_OWNER, LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER, TWO_CTA_OWNER
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 from frost_test_utils import requires_bwd_engine_row, requires_dsl
 
@@ -23,7 +23,7 @@ pytestmark = pytest.mark.L0
 def test_pair_preserves_admission_and_default_order(monkeypatch, cc, d, dtype, profile):
     from cudnn.frost import buffers
 
-    monkeypatch.setattr(engines, "cutedsl_state", lambda: (None, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     specs = {s.name: s for s in engines.ENGINE_SPECS}
     row = specs[LEGACY_ROW]
@@ -37,11 +37,11 @@ def test_pair_preserves_admission_and_default_order(monkeypatch, cc, d, dtype, p
         "thd": {"thd": True, "padded": True, "max_total_seq_len_q": 256, "max_total_seq_len_kv": 512},
     }[profile]
     facts = SdpaGraphFacts(**(dict(is_backward=True, b=2, h_q=2, h_kv=2, s_q=128, s_kv=256, d_qk=d, d_v=d, dtype=dtype, device_cc=cc) | changes))
-    owners = (LEGACY_ROW, RECOMPUTE_OWNER, PAIR_OWNER)
+    owners = (LEGACY_ROW, RECOMPUTE_OWNER, PAIR_OWNER, ACCUMULATION_OWNER, TWO_CTA_OWNER)
     baseline = engines.mismatch(original, facts)
     reasons = {name: engines.mismatch(specs[name].capabilities, facts) for name in owners}
     assert (None in reasons.values()) == (baseline is None)
-    offered = dict(zip(owners, (20609, 20628, 20629)))
+    offered = dict(zip(owners, (20609, 20628, 20629, 20630, 20631)))
     plans = heuristics.recommend("A", facts, offered)
     if baseline is not None:
         assert not plans
@@ -49,7 +49,7 @@ def test_pair_preserves_admission_and_default_order(monkeypatch, cc, d, dtype, p
         assert plans[0].engine_id == 20629
         assert reasons[LEGACY_ROW] is not None
     elif profile == "plain" and cc in ((10, 0), (10, 3)):
-        assert [p.engine_id for p in plans] == [20609, 20628, 20629]
+        assert [p.engine_id for p in plans] == [20630, 20628, 20629]
     elif profile == "negative_scale":
         assert [p.engine_id for p in plans] == [20628]
     else:

@@ -99,6 +99,9 @@ def _dims(kind: str, caps):
     # first pair the row accepts unmasked, so a head-dim rule never stands in
     # for a band decision.
     dims = sorted(caps.d)
+    if caps.implementation == "sdpa_bwd_sm100_d128_accumulation":
+        # D64 serves this owner's sliding-window domain; D128 is unwindowed.
+        return (64, 64)
     pairs = ([(128, 128)] if 128 in dims else []) + [(d, d) for d in reversed(dims)] + [(a, b) for a in reversed(dims) for b in dims if a != b]
     for pair in pairs:
         if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, *pair))) is None:
@@ -236,6 +239,9 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
     if getattr(caps, "implementation", "") == "sdpa_fwd_sm107_shared_d256_lookahead":
         # Its nonpaged domain is THD split, not the native dense lookahead.
         values.update(thd=True, padded=True)
+    if getattr(caps, "implementation", "") == "sdpa_bwd_sm100_d128_accumulation_2cta":
+        # Two-CTA accumulation owns grouped attention; MHA has no such body.
+        values["h_kv"] = 2
     return values
 
 
