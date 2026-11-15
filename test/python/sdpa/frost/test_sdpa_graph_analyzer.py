@@ -47,6 +47,8 @@ def _sm100_half_owner(graph):
 
 def _sm100_fp8_owner(facts):
     """Capability owner, independent of performance ranking among valid bodies."""
+    from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
+
     if facts.device_cc in ((10, 0), (10, 3)):
         return {
             (64, 64): "sdpa_fwd_sm100_d128_fp8_multi_q",
@@ -54,7 +56,7 @@ def _sm100_fp8_owner(facts):
             (192, 128): "sdpa_fwd_sm100_d192_fp8_multi_q",
             (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
             (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
-        }.get((facts.d_qk, facts.d_v), engines.engine_name(fp8=True))
+        }.get(padded_shape(facts), engines.engine_name(fp8=True))
     return engines.engine_name(fp8=True)
 
 
@@ -2907,7 +2909,9 @@ def test_paged_quantized_rows_mismatch_reasons():
     d256_facts = paged_facts(is_fp8=True, d_qk=256, d_v=256)
     assert engines.mismatch(fp8_d256, d256_facts) is None
     assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, d256_facts)
-    assert engines.mismatch(legacy_fp8, paged_facts(is_fp8=True, d_qk=192, d_v=192)) is None
+    envelope = paged_facts(is_fp8=True, d_qk=192, d_v=192)
+    assert engines.mismatch(fp8_d256, envelope) is None
+    assert "owned by" in engines.mismatch(legacy_fp8, envelope)
     fp8_d192 = spec["sdpa_fwd_sm100_d192_fp8_multi_q"].capabilities
     d192_facts = paged_facts(is_fp8=True, d_qk=192, d_v=128)
     assert "owned by the explicit implementation engines" in engines.mismatch(legacy_fp8, d192_facts)

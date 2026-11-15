@@ -17,19 +17,23 @@ OWNERS = {"multi_q": 20527, "dual_kv": 20528, "swap_ab": 20529}
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
-    "variant,d,sq,cga,split,thd",
+    "variant,d,dv,sq,cga,split,thd",
     [
-        ("multi_q", 64, 17, 1, 1, False),
-        ("multi_q", 128, 1, 1, 1, False),
-        ("multi_q", 128, 129, 2, 4, False),
-        ("multi_q", 128, 17, 2, 1, True),
-        ("dual_kv", 128, 1, 1, 4, False),
-        ("dual_kv", 128, 257, 1, 1, False),
-        ("swap_ab", 128, 4, 1, 1, False),
-        ("swap_ab", 128, 4, 1, 4, False),
+        ("multi_q", 64, 64, 17, 1, 1, False),
+        ("multi_q", 48, 32, 17, 1, 1, False),
+        ("multi_q", 80, 112, 129, 2, 4, False),
+        ("dual_kv", 80, 112, 17, 1, 4, False),
+        ("swap_ab", 80, 112, 4, 1, 4, False),
+        ("multi_q", 128, 128, 1, 1, 1, False),
+        ("multi_q", 128, 128, 129, 2, 4, False),
+        ("multi_q", 128, 128, 17, 2, 1, True),
+        ("dual_kv", 128, 128, 1, 1, 4, False),
+        ("dual_kv", 128, 128, 257, 1, 1, False),
+        ("swap_ab", 128, 128, 4, 1, 1, False),
+        ("swap_ab", 128, 128, 4, 1, 4, False),
     ],
 )
-def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, output, variant, d, sq, cga, split, thd):
+def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, output, variant, d, dv, sq, cga, split, thd):
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -45,7 +49,7 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, o
     monkeypatch.setattr(SdpaFwdDslSm100, "_fp8_dual_kv_stream", forbidden)
 
     def build(saved):
-        result = shared._case(d=d, sq=sq, skv=512, dtype=dtype, output_dtype=output, split_kv=split, thd=thd, record=saved)
+        result = shared._case(d=d, dv=dv, sq=sq, skv=512, dtype=dtype, output_dtype=output, split_kv=split, thd=thd, record=saved)
         graph = result[0]
         assert graph.get_engine_and_knobs_at_index(graph._plan_index) == saved
         assert graph.selected_engine.name == "sdpa_fwd_sm100_d128_fp8_" + variant
@@ -82,7 +86,7 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, o
     shared._check(buffers, thd=thd, sq=sq, skv=512)
 
 
-@pytest.mark.parametrize("d,sq,group", [(64, 3, 8), (64, 4, 8), (128, 1, 8)])
+@pytest.mark.parametrize("d,sq,group", [(48, 3, 8), (64, 3, 8), (64, 4, 8), (112, 1, 8), (128, 1, 8)])
 @pytest.mark.parametrize("split", [1, 4])
 def test_paged_swap_ab_fixed_record_and_live_columns(monkeypatch, d, sq, group, split):
     from cudnn.sdpa.fwd import heuristics

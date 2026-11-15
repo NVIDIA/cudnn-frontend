@@ -6,6 +6,7 @@
 from dataclasses import dataclass, replace
 
 from ..small_fp8_contract import in_domain
+from ..fp8_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm100_d128_fp8_dual_kv"
 TEMPLATE_NAME = "prefill_d128_fp8"
@@ -42,8 +43,8 @@ class Geometry:
 
 
 def mismatch(facts, knobs):
-    if not in_domain(facts) or facts.d_qk != 128:
-        return "dual-KV requires exact D128 per-tensor FP8 on SM100/SM103"
+    if not in_domain(facts) or padded_shape(facts) != (128, 128):
+        return "dual-KV requires per-tensor FP8 covered by D128 on SM100/SM103"
     if facts.thd:
         return "dual-KV requires dense queries"
     if knobs is not None:

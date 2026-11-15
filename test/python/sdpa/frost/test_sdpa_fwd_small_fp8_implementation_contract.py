@@ -167,8 +167,8 @@ OFFERED = {PREFIX + variant: engine for variant, engine in (("multi_q", 20527), 
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
-@pytest.mark.parametrize("d", [64, 128])
-def test_exact_domain_moves_to_explicit_owners(cc, d):
+@pytest.mark.parametrize("d", [48, 64, 112, 128])
+def test_native_and_envelope_domains_move_to_explicit_owners(cc, d):
     facts = _facts(device_cc=cc, d_qk=d, d_v=d)
     assert "owned by" in engines.mismatch(SPECS["sdpa_fwd_prefill_sm100_fp8"].capabilities, facts)
     for kind in ("A", "FALLBACK"):
@@ -180,7 +180,7 @@ def test_exact_domain_moves_to_explicit_owners(cc, d):
 
 
 @pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
-@pytest.mark.parametrize("changes", [{"device_cc": (10, 7)}, {"d_qk": 112, "d_v": 112}, {"is_mxfp8": True}, {"is_fp8": False}])
+@pytest.mark.parametrize("changes", [{"device_cc": (10, 7)}, {"d_qk": 112, "d_v": 120}, {"is_mxfp8": True}, {"is_fp8": False}])
 def test_other_implementations_remain_outside_owner(variant, changes):
     assert engines.mismatch(SPECS[PREFIX + variant].capabilities, _facts(**changes)) is not None
 

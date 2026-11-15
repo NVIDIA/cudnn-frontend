@@ -853,17 +853,16 @@ def test_per_tensor_fp8_d128_paged_decode_runs_cga1_on_both_legs(batch):
 @pytest.mark.L0
 def test_per_tensor_fp8_envelope_uses_d256_cga1():
     """Exact and aligned padded heads use the D256 flavor with CGA1."""
-    name = engines.engine_name(fp8=True)
+    owner = "sdpa_fwd_sm100_d256_fp8_single_q"
     for d in (256, 224):
-        owner = "sdpa_fwd_sm100_d256_fp8_single_q" if d == 256 else name
         row = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == owner)
         facts = _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-        plans = recommend("A", facts, {owner: 20524 if d == 256 else 20513})
+        plans = recommend("A", facts, {owner: 20524})
         assert plans
         assert {plan.knobs.cga for plan in plans} == {1}
         assert all(engines._selected_d_shape(row, facts, plan.knobs) == (256, 256) for plan in plans)
     misaligned = _facts(d_qk=225, d_v=224, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_fp8=True)
-    assert not recommend("A", misaligned, {name: 20510})
+    assert not recommend("A", misaligned, {owner: 20524})
 
 
 @pytest.mark.L0
