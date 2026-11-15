@@ -2205,7 +2205,7 @@ def test_decode_graph_gated_qwen_24_2_splits_with_the_gate_in_the_combine():
     _assert_decode_tile_plan(plan, G=12, units=8, kv_tiles=32, gated=True, grid=(4, 24, 1))
     assert plan.knobs.split_kv >= 2, plan.knobs
     mod = cap["module"]
-    assert mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
+    assert mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__name__
     assert (mod.HEADS_PER_TILE, mod.CFG.SPLIT_KV, mod.PARAMS.epilogue_gate) == (12, plan.knobs.split_kv, False), (
         mod.HEADS_PER_TILE,
         mod.CFG.SPLIT_KV,

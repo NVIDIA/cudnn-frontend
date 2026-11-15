@@ -864,7 +864,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, name)
         engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     record = {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})}
-    if not fp8 and _SM == 107:
+    if not fp8 and _SM == 107 and d_shape in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), (576, 512)):
         from cudnn.engines.manifest import family_for
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
         from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry, select_sm107_half_geometry

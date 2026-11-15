@@ -3643,6 +3643,9 @@ def _sm107_half_specs():
                 d_shapes=exact_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
                 epilogue_gate=name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB),
                 epilogue_gate_d_shapes=(base.epilogue_gate_d_shapes if name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB) else None),
+                score_max=name == _sm107_small_half.MULTI_Q,
+                score_sum_exp=name == _sm107_small_half.MULTI_Q,
+                score_stats_d_shapes=base.score_stats_d_shapes if name == _sm107_small_half.MULTI_Q else None,
                 **({"d_pad_multiple": 0, "d_envelope_floors": ()} if name in exact_shapes else {}),
             ),
             partial(

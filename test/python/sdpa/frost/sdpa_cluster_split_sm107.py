@@ -155,7 +155,7 @@ def test_cluster_split_graph_contract(stats, ordered):
             st.set_uid(5).set_output(True).set_dim((*lse.shape, 1)).set_stride((*lse.stride(), 1)).set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
-        graph.create_execution_plan(20515, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=True, split_kv=8))
+        graph.create_execution_plan(20558, SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=128, cga=1, pack_gqa=True, split_kv=8).to_public())
         graph.build_plan_at_index(0)
         spec = graph._compiled_plans[graph._plan_index]._prepared.spec
         assert spec.fused_split and spec.native is not None and spec.combine.fn is None

@@ -28,7 +28,7 @@ def test_paged_rowmax_architecture_replay(dtype, packed):
         pytest.skip("requires SM100, SM103 or SM107")
     if cc == (10, 7) and (reason := cutedsl_arch_requirement_error(cc)) is not None:
         pytest.skip(reason)
-    engine = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_multi_q"
+    engine = "sdpa_fwd_sm107_d128_multi_q" if cc == (10, 7) else "sdpa_fwd_sm100_d128_multi_q"
     io_type = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF
     nq, nk, h, hk, d, page = 137, 1155, 8, 2, 128, 16
     npages = (nk + page - 1) // page

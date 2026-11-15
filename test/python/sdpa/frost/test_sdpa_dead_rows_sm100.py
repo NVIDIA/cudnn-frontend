@@ -166,7 +166,10 @@ def _run_twice(
     )
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    ours = [i for i, n in enumerate(names) if n == row or n.startswith(row + "[")]
+    from frost_test_utils import _is_plan_for, half_engine_names
+
+    owners = half_engine_names("sm107") if row == _ROW_SM107 else row
+    ours = [i for i, n in enumerate(names) if _is_plan_for(n, owners)]
     idx = next((i for i in ours if g.plans[i].knobs.split_kv in (None, 1)), None)
     assert idx is not None, f"no unsplit {row} plan in {names}"
     picked = g.plans[idx].knobs
@@ -180,6 +183,16 @@ def _run_twice(
             record[cudnn.knob_type.TILE_CGA_M] = want_cga
         if want_tile_n != picked_tile_n:
             record[cudnn.knob_type.TILE_N] = want_tile_n
+        if row == _ROW_SM107:
+            from cudnn.engines.manifest import family_for
+            from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+            from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
+            from cudnn.sdpa.graph_analyzer import analyze
+
+            requested = SdpaFwdKnobs.from_public(record)
+            geometry = select_sm107_half_geometry(analyze(g), requested)
+            engine_id = family_for(g).offered_ids()[geometry.implementation]
+            record = geometry.canonical_knobs(requested).to_public()
         g.create_execution_plan(engine_id, record)
         idx = g.get_execution_plan_count() - 1
     g.select_plan(idx)
