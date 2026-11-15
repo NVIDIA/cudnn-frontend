@@ -94,6 +94,12 @@ from .kernels.sm100.d192_fp8_multi_q.contract import (
     NAME as _D192_FP8_MULTI_Q,
     mismatch as _d192_fp8_implementation_mismatch,
 )
+from .kernels.sm100.d128_mxfp8_multi_q import contract as _d128_mxfp8_owner
+from .kernels.sm100.d192_mxfp8_multi_q import contract as _d192_mxfp8_owner
+from .kernels.sm100.d256_mxfp8_single_q.contract import (
+    NAME as _D256_MXFP8_SINGLE_Q,
+    mismatch as _d256_mxfp8_implementation_mismatch,
+)
 from .kernels.sm100.d256_fp8_single_q.contract import (
     NAME as _D256_FP8_SINGLE_Q,
     mismatch as _d256_fp8_implementation_mismatch,
@@ -1907,6 +1913,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _d192_fp8_implementation_mismatch(facts, knobs)
         if reason is not None:
             return reason
+    for owner in (_d128_mxfp8_owner, _d192_mxfp8_owner):
+        if capabilities.implementation == owner.NAME:
+            reason = owner.mismatch(facts, knobs)
+            if reason is not None:
+                return reason
+    if capabilities.implementation == _D256_MXFP8_SINGLE_Q:
+        reason = _d256_mxfp8_implementation_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation == _D256_FP8_SINGLE_Q:
         reason = _d256_fp8_implementation_mismatch(facts, knobs)
         if reason is not None:
@@ -3650,7 +3665,6 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100_mxfp8",
         capabilities=Capabilities(
-            delegated_exact=frozenset((cc, _d512_mxfp8.SHAPE) for cc in _d512_mxfp8.DEVICE_CCS),
             layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=_BLACKWELL[0],
             sm_hi=106,  # no Rubin MXFP8 lowering
@@ -3660,6 +3674,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             # (64, 64): the native d64 leg of the d128 MXFP8 file (TemplateParams.d_flavor);
             # dense / unsplit / unpaged for now.
             d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            delegated_exact=frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512))),
             d_pad_multiple=0,
             thd_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
@@ -4062,6 +4077,72 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         swap_abs=frozenset(),
     )
     return EngineSpec(_D192_FP8_MULTI_Q, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+
+
+def _sm100_small_mxfp8_specs():
+    """Two fixed block-scaled bodies sharing graph binding and launch services."""
+    from .kernels.sm100.d128_mxfp8_multi_q.host import lower as lower_small
+    from .kernels.sm100.d192_mxfp8_multi_q.host import lower as lower_mid
+
+    legacy = _sm100_mxfp8_spec().capabilities
+    small_shapes = frozenset({(64, 64), (128, 128)})
+    mid_shapes = frozenset({(192, 128)})
+    small = replace(
+        legacy,
+        implementation=_d128_mxfp8_owner.NAME,
+        delegated_exact=frozenset(),
+        d_shapes=small_shapes,
+        thd_d_shapes=frozenset({(128, 128)}),
+        paged_d_shapes=frozenset({(128, 128)}),
+        split_d_shapes=frozenset({(128, 128)}),
+        cgas_by_d_shape=tuple((s, v) for s, v in legacy.cgas_by_d_shape if s in small_shapes),
+        split_cgas_by_d_shape=(),
+    )
+    mid = replace(
+        legacy,
+        implementation=_d192_mxfp8_owner.NAME,
+        delegated_exact=frozenset(),
+        d_shapes=mid_shapes,
+        thd_d_shapes=mid_shapes,
+        paged_d_shapes=mid_shapes,
+        split_d_shapes=mid_shapes,
+        pack_gqas=frozenset({False}),
+        pack_gqa_d_shapes=frozenset(),
+        causal_exclude_own_block_d_shapes=frozenset(),
+        out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        o_block_scales=frozenset({0}),
+        cgas=frozenset({1, 2}),
+        cgas_by_d_shape=(),
+    )
+    return tuple(
+        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+        for caps, lower in ((small, lower_small), (mid, lower_mid))
+    )
+
+
+def _sm100_d256_mxfp8_spec() -> EngineSpec:
+    """One block-scaled MXFP8 body; shared graph binding and launch construction."""
+    from .kernels.sm100.d256_mxfp8_single_q.host import lower
+
+    shape = frozenset({(256, 256)})
+    capabilities = replace(
+        _sm100_mxfp8_spec().capabilities,
+        implementation=_D256_MXFP8_SINGLE_Q,
+        delegated_exact=frozenset(),
+        d_shapes=shape,
+        thd_d_shapes=shape,
+        paged_d_shapes=shape,
+        split_d_shapes=shape,
+        pack_gqas=frozenset({False}),
+        pack_gqa_d_shapes=frozenset(),
+        causal_exclude_own_block_d_shapes=frozenset(),
+        out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+        o_block_scales=frozenset({0}),
+        cgas=frozenset({1}),
+        cgas_by_d_shape=(),
+        split_cgas_by_d_shape=(),
+    )
+    return EngineSpec(_D256_MXFP8_SINGLE_Q, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
 
 
 def _sm100_d256_fp8_spec() -> EngineSpec:
@@ -5669,6 +5750,8 @@ ENGINE_SPECS = (
     *_sm100_d256_specs(),
     *_sm100_d512_specs(),
     _sm100_mxfp8_spec(),
+    _sm100_d256_mxfp8_spec(),
+    *_sm100_small_mxfp8_specs(),
     _sm100_d512_mxfp8_slice_recompute_spec(),
     _sm100_d512_mxfp8_retained_p_spec(),
     _sm100_fp8_spec(),

@@ -84,7 +84,7 @@ def _reason(graph, name, knobs=None):
     return engines.analyze_for(spec, graph, knobs)[1]
 
 
-_MXFP8_ROW = engines.engine_name(mxfp8=True)
+_MXFP8_ROW = "sdpa_fwd_sm100_d128_mxfp8_multi_q"
 
 
 @pytest.mark.L0
@@ -181,7 +181,7 @@ def test_wider_block_size_declines_by_name(fake_sm100):
 @pytest.mark.L0
 def test_other_head_dims_decline_by_name(fake_sm100):
     g = _mxfp8_graph(256, use_causal_mask=True, causal_exclude_own_block=OWN)
-    assert "wired only in the [(128, 128)] kernel flavors" in (_reason(g, _MXFP8_ROW) or "")
+    assert "wired only in" in (_reason(g, "sdpa_fwd_sm100_d256_mxfp8_single_q") or "")
     assert not _eligible(g)
 
 

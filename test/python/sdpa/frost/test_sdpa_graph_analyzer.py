@@ -2862,7 +2862,8 @@ def test_paged_quantized_rows_mismatch_reasons():
     spec = {s.name: s for s in engines.ENGINE_SPECS}
     legacy_fp8 = spec[engines.engine_name(fp8=True)].capabilities
     fp8 = spec["sdpa_fwd_sm100_d128_fp8_multi_q"].capabilities
-    mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
+    legacy_mxfp8 = spec[engines.engine_name(mxfp8=True)].capabilities
+    mxfp8 = spec["sdpa_fwd_sm100_d128_mxfp8_multi_q"].capabilities
     legacy_fp8_rubin = spec[engines.engine_name(arch="sm107", fp8=True)].capabilities
     fp8_rubin = spec["sdpa_fwd_sm107_d512_fp8_role_split"].capabilities
     assert fp8.paged_kv and mxfp8.paged_kv and fp8_rubin.paged_kv
@@ -2870,6 +2871,7 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8, paged_facts(is_fp8=True)) is None
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
+    assert "owned by the explicit implementation engines" in engines.mismatch(legacy_mxfp8, paged_facts(is_mxfp8=True, page_size=128))
     assert "d512 kernel flavors only" in engines.mismatch(legacy_fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=96, d_v=96))
     assert "requires exact D512/V512" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
     rubin_d512 = paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512)
@@ -3275,7 +3277,7 @@ def test_mxfp8_virtual_amax_o_is_inferred_and_not_a_fact():
             amx_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
         return gg, o, stats, amx_o
 
-    mxfp8_name = engines.engine_name(mxfp8=True)
+    mxfp8_name = "sdpa_fwd_sm100_d256_mxfp8_single_q"
 
     # (a) every output declared explicitly, Amax_O requested: validate() passes, nothing is overridden.
     g, o, stats, amx_o = build(request_amax_o=True)
@@ -3406,7 +3408,7 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
 
 # --- paged MXFP8 (block-scale pools behind the block tables) ------------------
 
-MXFP8_ENGINE = engines.engine_name(mxfp8=True)
+MXFP8_ENGINE = "sdpa_fwd_sm100_d256_mxfp8_single_q"
 
 
 def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_nhd=False, q_bhsd=False, dtype=cudnn.data_type.FP8_E4M3, q_unaligned=False):
@@ -3465,7 +3467,11 @@ def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_n
     return g
 
 
-def _mxfp8_reason(g, name=MXFP8_ENGINE):
+def _mxfp8_reason(g, name=None):
+    from frost_test_utils import mxfp8_engine_name
+
+    facts = _facts(g)
+    name = name or mxfp8_engine_name("sm100", facts.d_qk, facts.d_v)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     return engines.analyze_for(spec, g)[1]
 
@@ -3481,7 +3487,7 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     for kw in (dict(page=256), dict(d=128)):
         assert _mxfp8_reason(_mk_paged_mxfp8(**kw)) is None, kw
     # Exact D512 has explicit owners; paged KV carries per-batch lengths, so output-slice recompute serves it.
-    assert "owned by" in _mxfp8_reason(_mk_paged_mxfp8(d=512))
+    assert "owned by" in _mxfp8_reason(_mk_paged_mxfp8(d=512), "sdpa_fwd_prefill_sm100_mxfp8")
     assert _mxfp8_reason(_mk_paged_mxfp8(d=512), "sdpa_fwd_sm100_d512_mxfp8_slice_recompute") is None
     # a page holds whole 128-row SF atoms
     reason = _mxfp8_reason(_mk_paged_mxfp8(page=64))

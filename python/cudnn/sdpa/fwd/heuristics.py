@@ -3862,6 +3862,21 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_d512_fp8_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.d256_mxfp8_single_q.contract import Geometry as Mxfp8D256Geometry, LEGACY_ROW as MXFP8_LEGACY_ROW, in_domain as in_d256_mxfp8_domain
+
+    from .kernels.sm100.d128_mxfp8_multi_q import contract as small_mxfp8
+    from .kernels.sm100.d192_mxfp8_multi_q import contract as mid_mxfp8
+
+    if small_mxfp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: small_mxfp8.Geometry(d_flavor=f.d_qk, cga=k.cga), policy=sm100_legacy_policy_spec(MXFP8_LEGACY_ROW)
+        )
+    if mid_mxfp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: mid_mxfp8.Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(MXFP8_LEGACY_ROW)
+        )
+    if in_d256_mxfp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Mxfp8D256Geometry(), policy=sm100_legacy_policy_spec(MXFP8_LEGACY_ROW))
     from .kernels.sm107.small_fp8_contract import in_domain as in_sm107_small_fp8
 
     if in_sm107_small_fp8(facts):

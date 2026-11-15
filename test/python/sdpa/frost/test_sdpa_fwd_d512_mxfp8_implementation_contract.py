@@ -111,10 +111,11 @@ def test_the_graph_rule_matches_the_kernel_rule(params, split, thd, padded):
     assert mx.retains_p(f, split) == d512_mxfp8_retains_p(cfg, split)
 
 
-def test_envelopes_and_other_heads_keep_the_legacy_row():
-    for dims in ((128, 128), (256, 256)):
+def test_other_heads_keep_their_explicit_owners():
+    for dims, owner in (((128, 128), "sdpa_fwd_sm100_d128_mxfp8_multi_q"), ((256, 256), "sdpa_fwd_sm100_d256_mxfp8_single_q")):
         f = facts(d_qk=dims[0], d_v=dims[1])
-        assert engines.mismatch(SPECS[mx.LEGACY_ROW].capabilities, f) is None
+        assert "owned by" in engines.mismatch(SPECS[mx.LEGACY_ROW].capabilities, f)
+        assert engines.mismatch(SPECS[owner].capabilities, f) is None
         assert all(engines.mismatch(SPECS[name].capabilities, f) is not None for name in mx.IMPLEMENTATIONS)
 
 
