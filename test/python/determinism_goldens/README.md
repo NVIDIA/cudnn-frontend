@@ -56,6 +56,25 @@ across all four processes. The integrated `f643ba345` host check passed
 legacy D64 unspecified CGA is normalized to its actual one-CTA default.
 No other architecture or backward path is newly qualified here.
 
+After integrating actual SM100 MXFP8 parent `b24979cd4` and F36
+`a2773e404`, clean source `8b41963a0` retained 1,165 host passes/eight skips,
+15,360 small-head graph/modes with 5,760 ordered records and 9,216 mid-width
+graph/modes with 4,096 ordered records, all unchanged. A generic-consumer
+follow-up passed **58 selected cases with zero skips or failures** on the
+native SM107 worker. It covered scalar KV-length overrides and changed-input
+capture, padded Stats strides/rebind/replay, standalone split domains,
+compiler narrow-V rejection, envelope/HALF attributes and paging controls;
+the count includes host contracts and negative controls.
+
+The first follow-up sweep had 55 passes and three failures: two extra private
+probes requested unsupported mask-free scalar-tail splits at D64 and D192,
+and one paging assertion expected the legacy rejection text. Parent and new
+owners reject the two split combinations identically; the final sweep checks
+those explicit rejections. Paging controls first verify the corresponding
+dense graph is accepted by the current owner. The support page records the
+scalar-tail split limit. Arithmetic, eligibility and tolerances are unchanged;
+these results extend the named selected groups, not whole-tree qualification.
+
 ### SM107 D192/D256 FP8 implementation identity (2026-11-15)
 
 Exact D192/V128 and D256 per-tensor FP8 now use engines 20561 and 20562,
