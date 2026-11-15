@@ -132,7 +132,25 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
     shared_call = re.compile(
         r"running_max_step_finite_sentinel\(\s*(\w+),\s*current_max,\s*total_max,\s*(NEG_INF(?:_F32)?),\s*RESCALE_THRESHOLD(?:_F32)?,\s*masked=CFG\.MASK_FLAGS != MASK_NONE\s*\)"
     )
-    seen_shared = 0
+    # Some original paths have become compatibility shims. Count their logical
+    # bodies once, while checking every old and isolated source independently.
+    isolated_origins = {
+        "d128_f16_multi_q": "prefill_d128_f16.py",
+        "small_f16_batch_pair": "prefill_d128_f16.py",
+        "d192_f16_multi_q": "prefill_d192_d128_f16.py",
+        "d256_f16_lookahead": "prefill_d256_f16.py",
+        "d512_f16_role_split": "prefill_d512_f16.py",
+        "d128_fp8_multi_q": "prefill_d128_fp8.py",
+        "d192_fp8_multi_q": "prefill_d192_d128_fp8.py",
+        "d256_fp8_single_q": "prefill_d256_fp8.py",
+        "d512_fp8_role_split": "prefill_d512_fp8.py",
+        "d128_mxfp8_multi_q": "prefill_d128_mxfp8.py",
+        "d192_mxfp8_multi_q": "prefill_d192_d128_mxfp8.py",
+        "d256_mxfp8_single_q": "prefill_d256_mxfp8.py",
+        "d512_mxfp8_role_split": "prefill_d512_mxfp8.py",
+    }
+    expected = {f"prefill_{shape}_{dtype}.py" for shape in ("d128", "d192_d128", "d256", "d512") for dtype in ("f16", "fp8", "mxfp8")}
+    seen_shared = set()
     for f in files:
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
@@ -151,13 +169,12 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         }, f"{name}: the first operand must be the RAW tile max: {calls}"
         for frag in ("is_first = total_max ==", "update_cond = is_first", "exp_input = ", "new_total_max = total_max"):
             assert frag not in code, f"{name}: the inlined running-max chain {frag!r} remains beside the shared helper"
-        # Keep the original twelve-file inventory check while validating every
-        # isolated implementation above with exactly the same helper assertions.
-        if os.path.dirname(f) == directory:
-            seen_shared += 1
-    assert (
-        seen_shared == 12
-    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; the sm107 d128 f16 file counts through its plain body) take the helper; saw {seen_shared}"
+        seen_shared.add(isolated_origins.get(os.path.basename(os.path.dirname(f)), name))
+    assert expected <= seen_shared, (
+        "the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; "
+        "the sm107 d128 f16 file counts through its plain body) take the helper; "
+        f"missing {sorted(expected - seen_shared)}, saw {sorted(seen_shared)}"
+    )
 
 
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
