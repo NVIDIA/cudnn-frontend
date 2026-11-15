@@ -28,7 +28,7 @@ def test_explicit_contract_and_template(monkeypatch, cc, packed):
         dtype_qkv=2, dtype_o=2, d_flavor=64, cta_mma=1, split_kv=2, thd_varlen=True, decode_tile=True, pack_gqa=packed, qh_per_kh=4, seq_kv_lens_present=True
     )
     module = _load_sm100_kernel_module((64, 64), params, rubin=cc == (10, 7), part=cc)
-    assert module.__file__.endswith("sm100/decode_d128_f16.py")
+    assert module.__file__.endswith("sm100/d128_f16_single_q/kernel.py")
     assert module.CFG.TILE_K == module.CFG.TILE_O == 64
     assert module.CFG.TILES_Q == module.CFG.CTA_MMA == module.CFG.THD_VARLEN == 1
     assert module.SPLIT_KV == 2 and module._FP32_PARTIALS

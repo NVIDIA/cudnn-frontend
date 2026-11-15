@@ -390,7 +390,7 @@ def test_block_output_compiler_rejects_narrow_v(arch, block, d_v, monkeypatch):
     from cudnn.sdpa.fwd.kernels import _fp8_host
 
     params_type = import_module(f"cudnn.sdpa.fwd.config_{arch}").TemplateParams
-    relative = "d128_fp8_multi_q/kernel.py" if arch == "sm107" else "prefill_d128_fp8.py"
+    relative = "d128_fp8_multi_q/kernel.py" if arch == "sm107" else "d128_fp8_multi_q/kernel.py"
     path = Path(api_dsl.__file__).parent / "kernels" / arch / relative
     params = params_type(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_O_NVFP4 if block == 16 else DTYPE_O_MXFP8)
     mod = load_template(str(path), params, tag=f"block_width_{arch}_{block}")

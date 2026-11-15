@@ -727,8 +727,6 @@ class Capabilities:
     # the old native flavor for its other envelopes/targets, without offering
     # a duplicate automatic route or accepting an obsolete explicit replay.
     delegated_exact: frozenset = frozenset()
-    # Delegate by the native shape a padded graph selects, so an owner also serves the row's envelope onto its tile.
-    delegated_envelope: bool = False
 
     # Per-d-shape Q tile-height domain, the tile_m twin of tile_ns_by_d_shape above, for a
     # row whose Q tile differs by head dims (the SM90 row, whose exact (128, 128) graphs also
@@ -746,6 +744,9 @@ class Capabilities:
     # plans only (split-KV and PackGQA included) -- mismatch() holds those conditions.  APPENDED after
     # tile_ms_by_d_shape (append-only contract above).
     causal_exclude_own_block_d_shapes: Optional[frozenset] = None
+
+    # Delegate by the native shape a padded graph selects, so an owner also serves the row's envelope onto its tile.
+    delegated_envelope: bool = False
 
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V

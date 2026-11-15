@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Bytewise repeatability and batch invariance of the SM90 D128 template's forward (issue #378).
 
-The template is ``sm90/prefill_d128_f16.py``, the SM90 row's 128 x 128 tile. Every case builds the direct adapter with
+The template is ``sm90/d128_f16_multi_q/kernel.py``, the SM90 row's 128 x 128 tile. Every case builds the direct adapter with
 ``tile_m = tile_n = 128``, so a declaration the template does not serve fails at ``check_support`` instead of running
 the D512 body, and asserts the template that compiled before it trusts a byte.
 

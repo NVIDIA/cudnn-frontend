@@ -123,7 +123,7 @@ def test_owned_d128_claim_release_rendering(monkeypatch, tmp_path):
     import test_sdpa_fwd_d128_sm90 as dedicated_main
 
     source = dedicated_main._SASS_PROBE
-    original = '"sm90/prefill_d128_f16.py"'
+    original = '"sm90/d128_f16_multi_q/kernel.py"'
     assert original in source
     monkeypatch.setattr(dedicated_main, "_SASS_PROBE", source.replace(original, f'"{d128.KERNEL_FILE}"'))
     # Retain the original PTX dependency and SASS register/serialization guards,

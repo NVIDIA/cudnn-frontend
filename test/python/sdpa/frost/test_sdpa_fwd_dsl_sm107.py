@@ -157,7 +157,7 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         name = os.path.relpath(f, directory)
         if "row_max_for_exp2(" in code and "running_max_step_finite_sentinel(" not in code:
             continue  # the -inf-masked twin alone (the 2x2 bodies)
-        # sm107/prefill_d128_f16.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
+        # sm107/d128_f16_multi_q/kernel.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
         # bias / kv_mask body masks with a true -inf (row_max_for_exp2's family) -- checked below as a shared-helper file.
         calls = shared_call.findall(code)
         assert (
@@ -272,7 +272,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     ("f16", (512, 512)): (True, 23, 14),  # +1 ring wait: the in-loop mb_bmm2_done wait is spelled once per CORR_READY_BEFORE_DONE arm (ONE traced site)
     ("fp8", (512, 512)): (True, 22, 14),
     ("mxfp8", (512, 512)): (False, 22, 14),
-    # The 2x2-datapath sibling (sm107/prefill_d512_f16_2x2.py, TemplateParams.mma_2x2): 16 LEVER ring sites = q_empty (TMA-LDG) +
+    # The 2x2-datapath sibling (sm107/d512_f16_2x2/kernel.py, TemplateParams.mma_2x2): 16 LEVER ring sites = q_empty (TMA-LDG) +
     # bmm2_ready + empty_mainloop + q_full + p_full 2 (MMA) + bmm1_done + stat_empty 2 (softmax) + stat_full 3 + bmm2_done 4 (three
     # in-loop spellings, one per hand-off arm, + the final) (correction); 12 idle = 5 scheduler payload waits + 2 tmem_dealloc +
     # 4 mb_o_full (TMA-STG arms) + the q_empty drain.  The 10 CROSS-PAIR sites (k/v_empty per iteration + their drains, k_full 2 +
@@ -419,7 +419,7 @@ def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
 
 
 # ------------------------------------------------------------------ the d512 2x2-DATAPATH sibling (TemplateParams.mma_2x2)
-# sm107/prefill_d512_f16_2x2.py: the SM100 2x2 body (one pipeline per CTA on the cta_group::2 M=128 atom, 64 Q rows per
+# sm107/d512_f16_2x2/kernel.py: the SM100 2x2 body (one pipeline per CTA on the cta_group::2 M=128 atom, 64 Q rows per
 # CTA, a 4-CTA cluster of twin pairs sharing K/V by multicast) with the Rubin deltas -- 3-deep K/V sub-chunk rings,
 # DESC_VERSION=1 derived from the layout (the P ring starts at exactly 262144 B), the 320 KiB usable budget, the
 # ld.red.max dense softmax arm, SPIN_RING_WAITS, and the PAIR-WIDE O u V alias gate (mb_o_empty init ONE_WARP x KV_SHARE:
@@ -428,7 +428,7 @@ def test_sm107_d512_o_store_levers_are_module_constants(kind, load_kw):
 # SAME structural checks as the role-split rows above to the 2x2 module (same regexes, same classification), keyed by the
 # ("f16_2x2", (512, 512)) rows of the tables; the GPU half lives in test_sdpa_fwd_d512_2x2_sm107.py.
 _D512_2X2_KW = {"mma_2x2": True}
-_D512_2X2_FILE = "sm107/prefill_d512_f16_2x2.py"
+_D512_2X2_FILE = "sm107/d512_f16_2x2/kernel.py"
 _D512_2X2_SMEM_TOTAL = 297880  # sQ 64 KiB | sK 3 x 32 | sV 3 x 32 u sO | sP 2 x 16 | xchg 1.5 KiB | 39 bars + sched | 1008 B pad
 
 
@@ -447,7 +447,7 @@ def test_sm107_d512_2x2_routes_to_the_rubin_sibling():
     mod = _load_2x2()
     # The loader's tag is "sdpa_fwd_sm107_f16_d512_2x2" (the role-split tag + "_2x2"); the template cache appends a per-record suffix.
     assert mod.__file__.endswith(_D512_2X2_FILE) and "sdpa_fwd_sm107_f16_d512_2x2" in mod.__name__, mod.__name__
-    assert _load(_D512, rubin=True).__file__.endswith("sm107/prefill_d512_f16.py")
+    assert _load(_D512, rubin=True).__file__.endswith("sm107/d512_f16_role_split/kernel.py")
     assert _load(_D512, rubin=False, **_D512_2X2_KW).__file__.endswith("sm100/d512_f16_2x2/kernel.py")
     assert mod.CFG.CGA_M == 4 and mod.KV_SHARE == 2 and mod.CFG.TILE_M == 64
 
@@ -549,7 +549,7 @@ def test_sm107_d512_packed_split_graph_and_adapter_contract(monkeypatch, group, 
     assert params.mma_2x2 and params.pack_gqa and params.split_kv == splits
     assert api._fp32_partial_split() == (splits > 1)
     module = _load_sm100_kernel_module((512, 512), params, rubin=True)
-    assert module.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+    assert module.__file__.endswith("sm107/d512_f16_2x2/kernel.py")
     assert module.CFG.PACK_G == math.gcd(group, 64)
     assert module.FOLD_SINK == (splits == 1)
     dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
@@ -775,7 +775,7 @@ def test_rubin_f16_never_picks_a_flavor_it_has_no_kernel_for():
     loading instead of riding the next covering envelope.
 
     PARTIALLY INVERTED 2026-09-04: d192xd128 now HAS a Rubin sibling
-    (``sm107/prefill_d192_d128_f16.py`` -- the same body as d128 with
+    (``sm107/d192_f16_multi_q/kernel.py`` -- the same body as d128 with
     ``make_cfg_d192``), so a d=192 f16 graph lowers onto the NATIVE kernel
     instead of riding the d256 envelope.
 
@@ -926,7 +926,7 @@ def test_sm107_f16_accepts_the_measured_feature_set(feature):
 
 
 def test_sm107_f16_serves_d192_on_its_native_kernel():
-    """d192xd128 is a NATIVE f16 Rubin flavor (``sm107/prefill_d192_d128_f16.py``
+    """d192xd128 is a NATIVE f16 Rubin flavor (``sm107/d192_f16_multi_q/kernel.py``
     -- the d128 body with ``make_cfg_d192``), not an envelope ride.
 
     Both halves of that claim are pinned, because they can drift apart
@@ -3249,7 +3249,7 @@ def _thd_gate_cubin_md5(tmp_path, tag):
 @requires_dsl
 def test_sm107_thd_gate_descriptor_leaves_the_dense_gated_and_ungated_thd_cubins_byte_identical(tmp_path):
     """The kernel BODY is untouched by the THD gate descriptor: the dense gated and the ungated THD renderings of
-    ``sm107/prefill_d256_f16.py`` (bf16, causal, cga2, with Stats) trace-compile for sm_107a to the cubins recorded
+    ``sm107/d256_f16_lookahead/kernel.py`` (bf16, causal, cga2, with Stats) trace-compile for sm_107a to the cubins recorded
     before the change.  Another DSL re-records (skip, naming it); a changed md5 under the recorded DSL is a body change."""
     import importlib.metadata as im
 
@@ -4814,7 +4814,7 @@ def test_sm107_d512_o_store_path_sass_pins(tmp_path, quant, dtype_o, reg_measure
 
 
 # ============================================================================ Rubin SASS pins: the d512 2x2-datapath sibling
-# The same probe on sm107/prefill_d512_f16_2x2.py (quant "f16_2x2" -> TemplateParams.mma_2x2).  Structure pinned exactly: 8 UTMASTG
+# The same probe on sm107/d512_f16_2x2/kernel.py (quant "f16_2x2" -> TemplateParams.mma_2x2).  Structure pinned exactly: 8 UTMASTG
 # (the streamed O store's eight 8 KiB subtiles, one behind each mb_o_full wait -> longest run 1), ONE bulk group per tile, 96 UTCHMMA
 # (prologue BMM1 32 + loop BMM1 32 + loop BMM2 16 + tail BMM2 16 collective MMAs), no GPU-scope drain / CGAERRBAR on any per-tile
 # path, exactly one VOTE.ALL (the correction's alpha == 1 ballot) and NO VOTE.ANY (the 2x2 epilogue has no dead-row vote: its
@@ -4854,7 +4854,7 @@ def test_sm107_d512_2x2_sass_pins(tmp_path, quant, dtype_o, reg_measured, stl_me
     stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].lstrip("-").isdigit()}
     expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if (ln.startswith("EXPECT_") or ln.startswith("IS_2X2")) and len(ln.split()) == 2}
     print(f"\nsm107 {quant} d=512 dtype_o={dtype_o} sm_107a SASS: {stats}; module says {expect}")
-    assert expect["IS_2X2"] == 1, "the f16_2x2 row must load sm107/prefill_d512_f16_2x2.py"
+    assert expect["IS_2X2"] == 1, "the f16_2x2 row must load sm107/d512_f16_2x2/kernel.py"
     assert stats["UTMASTG"] == expect["EXPECT_UTMASTG"] == 8
     assert stats["UTMASTG_MAX_RUN"] == expect["EXPECT_UTMASTG_MAX_RUN"] == 1, "every O subtile store sits behind its own mb_o_full wait"
     assert stats["UTMACMDFLUSH"] == 1 and stats["DEPBAR"] == 1, "ONE bulk group per tile"
@@ -5871,13 +5871,13 @@ def test_rubin_d128_prefill_packing_loads_the_native_body():
         mod = _load_sm100_kernel_module((128, 128), TemplateParams(dtype_qkv=DTYPE_BF16, **params), rubin=True)
         return os.path.basename(os.path.dirname(mod.__file__)), os.path.basename(mod.__file__)
 
-    assert where(cta_mma=1) == ("sm100", "decode_d128_f16.py")
-    assert where(cta_mma=1, pack_gqa=True, qh_per_kh=8) == ("sm100", "decode_d128_f16.py")
-    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm107", "prefill_d128_f16.py")
-    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8, split_kv=2) == ("sm107", "prefill_d128_f16.py")
-    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=6, thd_varlen=True) == ("sm107", "prefill_d128_f16.py")
-    assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
-    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=1) == ("d128_f16_single_q", "kernel.py")
+    assert where(cta_mma=1, pack_gqa=True, qh_per_kh=8) == ("d128_f16_single_q", "kernel.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("d128_f16_multi_q", "kernel.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8, split_kv=2) == ("d128_f16_multi_q", "kernel.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=6, thd_varlen=True) == ("d128_f16_multi_q", "kernel.py")
+    assert where(cta_mma=2) == ("d128_f16_multi_q", "kernel.py")
+    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("d128_f16_multi_q", "kernel.py")
 
 
 def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monkeypatch):
@@ -6723,7 +6723,7 @@ def test_d256_fp8_masked_leading_tile_keeps_rows_with_later_keys_finite(with_sta
 
 # --- the d256 f16/bf16 kernel: pre-folded softmax scale ----------------------------------------------------------------
 #
-# kernels/sm107/prefill_d256_f16.py gains ONE lever: softmax_scale_prefolded (the graph's attn_scale_prefolded).  Under it
+# kernels/sm107/d256_f16_lookahead/kernel.py gains ONE lever: softmax_scale_prefolded (the graph's attn_scale_prefolded).  Under it
 # every one of the four inlined softmax copies (dense / left-masked / unmasked interior / right-masked) takes the RAW row
 # max and shifts with reg_S - m, and the runtime scale_log2 is a dead operand.  The f16x2 exponent (softmax_precision=HALF)
 # stays declined on half inputs by the config backstop, so the kernel has no fused arm.  Numerically the fold is neutral:
@@ -6739,7 +6739,7 @@ _D256_FOLD_SHIFT_BLOCK = re.compile(
 
 
 def test_d256_half_fold_arm_is_wired_in_every_softmax_copy():
-    """Source pin (no GPU) for kernels/sm107/prefill_d256_f16.py: the softmax body is inlined four times, and the pre-folded
+    """Source pin (no GPU) for kernels/sm107/d256_f16_lookahead/kernel.py: the softmax body is inlined four times, and the pre-folded
     scale must reach the max site AND the shift site of every copy -- a copy left on the scaled chain is a silent perf no-op
     on the tiles it serves (interior tiles vs the band edges vs the diagonal), and one that pairs a raw max with a scaled
     shift (or the reverse) is a wrong O that only a mask-specific run would see.  Each copy must hold exactly one
@@ -6855,7 +6855,7 @@ def _d256_fold_launch(q, k, v, *, with_stats, prefolded, attn_scale, lse=None, l
     )
     assert api.check_support()
     api.compile()
-    assert api._k_mod.__file__.replace("\\", "/").endswith("kernels/sm107/prefill_d256_f16.py"), api._k_mod.__file__
+    assert api._k_mod.__file__.replace("\\", "/").endswith("kernels/sm107/d256_f16_lookahead/kernel.py"), api._k_mod.__file__
     lse_bind = lse_exec if lse_exec is not None else lse
     kw = dict(lse_tensor=lse_bind if with_stats else None, **(exec_kw or {}))
     ws_bytes = api.scratch_workspace_bytes()
@@ -7506,7 +7506,7 @@ _HALF_PREFOLD_MASKS = {
 
 
 def _half_prefold_twin_file(d_qk):
-    return "sm107/prefill_d128_f16.py" if d_qk == 128 else "sm107/prefill_d192_d128_f16.py"
+    return "sm107/d128_f16_multi_q/kernel.py" if d_qk == 128 else "sm107/d192_f16_multi_q/kernel.py"
 
 
 def _half_prefold_check(out, lse, ref_o, ref_lse, *, tag):
@@ -7851,7 +7851,7 @@ def test_half_prefolded_scale_drops_the_shift_multiply(tmp_path, d_qk, d_v):
 
 
 # ============================================================================ cc 10.7 d512 half: the pre-folded softmax scale
-# sdpa(attn_scale_prefolded=True) on the ROLE-SPLIT d512 f16 / bf16 kernel (sm107/prefill_d512_f16.py, SCALE_PREFOLDED): the
+# sdpa(attn_scale_prefolded=True) on the ROLE-SPLIT d512 f16 / bf16 kernel (sm107/d512_f16_role_split/kernel.py, SCALE_PREFOLDED): the
 # caller multiplied Q by attn_scale * log2(e); the kernel takes the RAW tile max and shifts with `reg_S - m` (an FADD2 for the
 # scaled chain's FFMA2).  Numerically neutral by construction (the adapter pins scale_softmax_log2 = 1.0), so the cells below
 # pin (a) that the fold build ROUTES onto the role-split body and traces (module constants, the call-time twin pinned off),
@@ -7862,7 +7862,7 @@ def test_half_prefolded_scale_drops_the_shift_multiply(tmp_path, d_qk, d_v):
 # FADD-class instructions than the same build without it, the only tripwire for the arm itself.  The HALF exponent
 # (softmax_f16) stays declined on half inputs: P is already stored in the input half format, so the module raises on the
 # record and its _FUSED_SHIFT_CVT is False.
-_D512_HALF_FOLD_KERNEL = "sm107/prefill_d512_f16.py"
+_D512_HALF_FOLD_KERNEL = "sm107/d512_f16_role_split/kernel.py"
 _D512_HALF_FOLD_DTYPES = [pytest.param("bfloat16", id="bf16"), pytest.param("float16", id="fp16")]
 
 
@@ -8192,7 +8192,7 @@ _D512_HALF_FOLD_SASS_SPECS = {"dense": {}, "causal": {"window_right": 0}}
 _D512_HALF_FOLD_PROBE_BODY = """
     params = TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, **params_kw)
     mod = _load_sm100_kernel_module((512, 512), params, fp8=False, pertensor=False, rubin=True)
-    assert mod.__file__.endswith("sm107/prefill_d512_f16.py"), mod.__file__
+    assert mod.__file__.endswith("sm107/d512_f16_role_split/kernel.py"), mod.__file__
     print("SCALE_PREFOLDED", int(mod.SCALE_PREFOLDED))
     print("FUSED_SHIFT_CVT", int(mod._FUSED_SHIFT_CVT))
     mod.compile(d_qk=512, d_v=512, has_lse=True, lse_kind="dense")
@@ -8946,7 +8946,7 @@ def test_native_d64_unsplit_preserves_score_operands(monkeypatch, operand):
     params = api.template_params()
     assert not params.decode_tile
     mod = _load_sm100_kernel_module(api.flavor, params, rubin=True)
-    assert mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
     assert mod.CFG.BIAS_MODE if operand == "bias" else mod.CFG.KV_MASK_FORM
 
 

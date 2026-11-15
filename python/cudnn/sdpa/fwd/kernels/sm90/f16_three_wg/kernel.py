@@ -93,6 +93,7 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     zero_v_tail_rows,
 )
 
+from cudnn.sdpa.fwd.kernels.sm90.f16_three_wg.contract import TEMPLATE_NAME
 from cudnn.sdpa.fwd.kernels.sm90.f16_three_wg.config import TemplateParams, from_shared, validate_params
 
 # The FROST loader injects one immutable specialization before executing this module. A

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The (n, n+1) PAIR work item of the resident-bias arm on the Rubin (SM107) f16/bf16 small head-dim tiles --
-``TemplateParams.n_chunk >= 1`` on ``sm107/prefill_d128_f16.py``.
+``TemplateParams.n_chunk >= 1`` on ``sm107/d128_f16_multi_q/kernel.py``.
 
 A work item is (a 128-row q tile, a head, a CHUNK of up to ``n_chunk`` consecutive entries of the flattened batch axis); the two
 softmax sub-tiles are rows nb / nb + 1 of the SAME q tile, so the bias row-block shrinks to the q tile's 128 rows (twice the kv

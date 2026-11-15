@@ -119,6 +119,7 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     wgmma_descriptor,
 )
 
+from cudnn.sdpa.fwd.kernels.sm90.d128_f16_multi_q.contract import TEMPLATE_NAME
 from cudnn.sdpa.fwd.kernels.sm90.d128_f16_multi_q.config import TemplateParams, from_shared, validate_params
 
 # The FROST loader injects one immutable specialization before executing this module. A

@@ -15,19 +15,19 @@ pytestmark = [pytest.mark.L1, requires_dsl]
 
 # dims, group, Q, KV, CGA, splits, packed, causal, left window, kernel
 CASES = {
-    "decode64": ((64, 64), 8, 4, 1025, 1, 8, True, True, None, "sm107/prefill_d128_f16.py"),
-    "decode128": ((128, 128), 4, 7, 769, 1, 3, True, True, 127, "sm100/decode_d128_f16.py"),
-    "native128": ((128, 128), 4, 129, 513, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
-    "partial6": ((96, 80), 6, 129, 385, 2, 4, True, True, 31, "sm107/prefill_d128_f16.py"),
-    "plain128": ((128, 128), 1, 129, 257, 2, 4, False, False, None, "sm107/prefill_d128_f16.py"),
-    "native192": ((192, 128), 2, 257, 385, 2, 8, False, True, 47, "sm107/prefill_d192_d128_f16.py"),
-    "keyless": ((128, 128), 4, 257, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
-    "decode256": ((256, 256), 4, 4, 513, 2, 4, True, True, None, "sm107/decode_d256_f16.py"),
-    "native64plain": ((64, 64), 1, 1, 4096, 1, 8, False, False, None, "sm107/prefill_d128_f16.py"),
-    "singleq64partial": ((48, 32), 12, 129, 385, 1, 3, True, True, 47, "sm100/decode_d128_f16.py"),
-    "native64partial": ((48, 32), 12, 129, 385, 2, 3, True, True, 47, "sm107/prefill_d128_f16.py"),
-    "native64keyless": ((64, 64), 4, 257, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
-    "native64empty": ((64, 64), 4, 65, 65, 2, 8, True, True, None, "sm107/prefill_d128_f16.py"),
+    "decode64": ((64, 64), 8, 4, 1025, 1, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "decode128": ((128, 128), 4, 7, 769, 1, 3, True, True, 127, "sm100/d128_f16_single_q/kernel.py"),
+    "native128": ((128, 128), 4, 129, 513, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "partial6": ((96, 80), 6, 129, 385, 2, 4, True, True, 31, "sm107/d128_f16_multi_q/kernel.py"),
+    "plain128": ((128, 128), 1, 129, 257, 2, 4, False, False, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "native192": ((192, 128), 2, 257, 385, 2, 8, False, True, 47, "sm107/d192_f16_multi_q/kernel.py"),
+    "keyless": ((128, 128), 4, 257, 65, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "decode256": ((256, 256), 4, 4, 513, 2, 4, True, True, None, "sm107/d256_f16_swap_ab/kernel.py"),
+    "native64plain": ((64, 64), 1, 1, 4096, 1, 8, False, False, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "singleq64partial": ((48, 32), 12, 129, 385, 1, 3, True, True, 47, "sm100/d128_f16_single_q/kernel.py"),
+    "native64partial": ((48, 32), 12, 129, 385, 2, 3, True, True, 47, "sm107/d128_f16_multi_q/kernel.py"),
+    "native64keyless": ((64, 64), 4, 257, 65, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
+    "native64empty": ((64, 64), 4, 65, 65, 2, 8, True, True, None, "sm107/d128_f16_multi_q/kernel.py"),
 }
 # The public graph rejects bottom-right Q capacity larger than KV capacity.
 GRAPH_CASES = [name for name, case in CASES.items() if case[2] <= case[3]]
@@ -183,7 +183,7 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
         api.compile()
         ws_bytes = api.scratch_workspace_bytes()
     if max(dims) <= 64 and cga == 1 and tile_n == 128 and (splits > 1 or api._d64_decode_tile()):
-        kernel = "sm100/decode_d128_f16.py"
+        kernel = "sm100/d128_f16_single_q/kernel.py"
         assert api._k_mod.CFG.TILES_Q == 1
     if graph_api and owner != "sdpa_fwd_prefill_sm107":
         kernel = {

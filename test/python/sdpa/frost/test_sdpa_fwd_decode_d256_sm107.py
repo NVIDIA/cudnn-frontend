@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The d256 DECODE tile of the FROST Rubin (SM107) f16/bf16 engine (sm107/decode_d256_f16.py).
+"""The d256 DECODE tile of the FROST Rubin (SM107) f16/bf16 engine (sm107/d256_f16_swap_ab/kernel.py).
 
 The Rubin sibling of the SM100 swap-AB tile: the same body (KV tokens on the MMA M
 axis, the packed Q rows on N, one cta_group::1 CTA per unit) under
@@ -152,11 +152,11 @@ def _wait_sites(code):
 
 
 def test_sm107_decode_routes_to_the_rubin_sibling():
-    """The decode record routes to sm107/decode_d256_f16.py on cc 10.7 (ahead of the shared
+    """The decode record routes to sm107/d256_f16_swap_ab/kernel.py on cc 10.7 (ahead of the shared
     paged-prefill arm: the paged record too) and to the SM100 file otherwise."""
     for extra in ({}, dict(paged_kv=True, page_size=16)):
         mod = _load(rubin=True, decode_q_tile=16, seq_kv_lens_present=True, **extra)
-        assert mod.__file__.endswith("/sm107/decode_d256_f16.py") and "sm107_decode" in mod.__name__, mod.__name__
+        assert mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py") and "sm107_decode" in mod.__name__, mod.__name__
     sm100 = _load(rubin=False, decode_q_tile=16, seq_kv_lens_present=True)
     assert sm100.__file__.endswith("/sm100/d256_f16_swap_ab/kernel.py") and "sm100_decode" in sm100.__name__, sm100.__name__
 
@@ -207,7 +207,7 @@ def test_sm107_decode_body_matches_the_sm100_body():
 
     kdir = Path(api_dsl.__file__).parent / "kernels"
     sm100 = (kdir / "sm100" / "d256_f16_swap_ab" / "kernel.py").read_text(encoding="utf-8")
-    sm107 = (kdir / "sm107" / "decode_d256_f16.py").read_text(encoding="utf-8")
+    sm107 = (kdir / "sm107" / "d256_f16_swap_ab/kernel.py").read_text(encoding="utf-8")
 
     def _body(src):
         lines = src.splitlines(keepends=True)
@@ -439,7 +439,7 @@ def test_sm107_decode_module_declines_below_the_dsl_floor(monkeypatch):
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     want = buffers.cutedsl_arch_requirement_error((10, 7))
     assert want is not None and "sm_107a" in want
-    path = str(Path(api_dsl.__file__).parent / "kernels" / "sm107" / "decode_d256_f16.py")
+    path = str(Path(api_dsl.__file__).parent / "kernels" / "sm107" / "d256_f16_swap_ab/kernel.py")
     with pytest.raises(NotImplementedError, match=re.escape(want)):
         load_template(path, TemplateParams(decode_q_tile=16, seq_kv_lens_present=True, stats_log2=True, window_left=77, window_right=5), tag="dsl_floor_probe")
 
@@ -1094,7 +1094,7 @@ def test_decode_graph_mtp_qwen_24_2_s_q_three_to_five_ride_the_64_column_tile_in
     _assert_decode_tile_plan(plan, G=12)
     assert (plan.knobs.split_kv or 1) == 1, plan.knobs
     assert _mtp_module_facts(cap["module"]) == (64, 12, 5, 60, True, 16, 18), _mtp_module_facts(cap["module"])
-    assert cap["module"].__file__.endswith("/sm107/decode_d256_f16.py")
+    assert cap["module"].__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
 
 
 @_gpu
@@ -1456,7 +1456,7 @@ def test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile():
     plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], page=16, dtype=torch.bfloat16, capture=cap)
     _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8, grid=(4, 24, 1))
     mod = cap["module"]
-    assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
+    assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__name__
     assert (mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.N_Q - mod.Q_BOX_ROWS, mod.N_Q, mod.CFG.SPLIT_KV) == (
         12,
         1,
@@ -2729,7 +2729,7 @@ def test_decode_graph_mtp_32_2_s_q_four_rides_the_64_column_tile_in_one_unit(pag
     _assert_decode_tile_plan(plan, G=16)
     assert (plan.knobs.split_kv or 1) == 1, plan.knobs
     assert _mtp_module_facts(cap["module"]) == (64, 16, 4, 64, True, 16, 18), _mtp_module_facts(cap["module"])
-    assert cap["module"].__file__.endswith("/sm107/decode_d256_f16.py")
+    assert cap["module"].__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
 
 
 @_gpu

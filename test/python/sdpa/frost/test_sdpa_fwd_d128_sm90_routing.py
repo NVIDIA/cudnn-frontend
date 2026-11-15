@@ -534,7 +534,7 @@ def test_d128_template_refuses_at_load_what_the_picker_keeps_away():
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
     with pytest.raises(ValueError, match="^SM90 D128 does not serve attention sinks"):
-        _load_kernel_template("sm90/prefill_d128_f16.py", dataclasses.replace(c.TemplateParams(), has_sink=True), tag="refusal_probe_sm90_d128")
+        _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", dataclasses.replace(c.TemplateParams(), has_sink=True), tag="refusal_probe_sm90_d128")
 
 
 def test_d512_template_params_messages_are_unchanged():
@@ -604,7 +604,7 @@ def _sm90_host_sources():
     from cudnn.sdpa.fwd import config_sm90 as c
 
     root = Path(c.__file__).parent / "kernels" / "sm90"
-    return [ast.parse((root / name).read_text(encoding="utf-8")) for name in ("prefill_d128_f16.py", "prefill_d512_f16.py", "prepared_host.py")]
+    return [ast.parse((root / name).read_text(encoding="utf-8")) for name in ("d128_f16_multi_q/kernel.py", "f16_three_wg/kernel.py", "prepared_host.py")]
 
 
 def test_d128_template_fits_the_shared_sm90_prepared_host():
@@ -728,7 +728,7 @@ def test_d128_persistent_refuses_a_record_without_overlap():
     with pytest.raises(ValueError, match=why):
         c.validate_params(_record(persistent=True), flavor=c.D128_FLAVOR)
     with pytest.raises(ValueError, match=why):
-        _load_kernel_template("sm90/prefill_d128_f16.py", _record(persistent=True), tag="persistent_refusal_probe_sm90_d128")
+        _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(persistent=True), tag="persistent_refusal_probe_sm90_d128")
 
 
 _CAUSAL_PERSISTENT = dict(causal=True, intra_wg_overlap=True, persistent=True)
@@ -857,11 +857,12 @@ def test_each_causal_claim_is_its_own_module_and_digest():
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
     mods = [
-        _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT, causal_claim=claim), tag="claim_probe_sm90_d128") for claim in (0, 1)
+        _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(**_CAUSAL_PERSISTENT, causal_claim=claim), tag="claim_probe_sm90_d128")
+        for claim in (0, 1)
     ]
     assert [mod.CAUSAL_CLAIM for mod in mods] == [0, 1]
     assert len({id(m) for m in mods}) == len({m.FROST_SOURCE_DIGEST for m in mods}) == 2
-    assert _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT), tag="claim_probe_sm90_d128") is mods[0]
+    assert _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(**_CAUSAL_PERSISTENT), tag="claim_probe_sm90_d128") is mods[0]
 
 
 def test_each_causal_walk_is_its_own_module_and_digest():
@@ -869,10 +870,12 @@ def test_each_causal_walk_is_its_own_module_and_digest():
     carrying its value as CAUSAL_WALK; the stride is the module the persistent causal record loads by default."""
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
-    mods = [_load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT, causal_walk=walk), tag="walk_probe_sm90_d128") for walk in (0, 1)]
+    mods = [
+        _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(**_CAUSAL_PERSISTENT, causal_walk=walk), tag="walk_probe_sm90_d128") for walk in (0, 1)
+    ]
     assert [mod.CAUSAL_WALK for mod in mods] == [0, 1]
     assert len({id(m) for m in mods}) == len({m.FROST_SOURCE_DIGEST for m in mods}) == 2
-    assert _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_CAUSAL_PERSISTENT), tag="walk_probe_sm90_d128") is mods[0]
+    assert _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(**_CAUSAL_PERSISTENT), tag="walk_probe_sm90_d128") is mods[0]
 
 
 def test_each_switch_combination_is_its_own_module_and_digest():
@@ -887,11 +890,11 @@ def test_each_switch_combination_is_its_own_module_and_digest():
     assert len(admitted) == 3, admitted
     mods = []
     for fields in admitted:
-        mod = _load_kernel_template("sm90/prefill_d128_f16.py", _record(**fields), tag="switch_probe_sm90_d128")
+        mod = _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(**fields), tag="switch_probe_sm90_d128")
         assert {name: getattr(mod, name.upper()) for name in _SWITCHES} == fields
         mods.append(mod)
     assert len({id(m) for m in mods}) == len({m.FROST_SOURCE_DIGEST for m in mods}) == 3
-    assert _load_kernel_template("sm90/prefill_d128_f16.py", c.TemplateParams(), tag="switch_probe_sm90_d128") is mods[0]
+    assert _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", c.TemplateParams(), tag="switch_probe_sm90_d128") is mods[0]
 
 
 def test_d128_compile_takes_a_cta_count_exactly_when_persistent():
@@ -903,7 +906,7 @@ def test_d128_compile_takes_a_cta_count_exactly_when_persistent():
     args = (2, 8, 2, 1024, 1024, q, kv, kv, q)
 
     def load(**over):
-        return _load_kernel_template("sm90/prefill_d128_f16.py", _record(intra_wg_overlap=True, **over), tag="ctas_probe_sm90_d128")
+        return _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(intra_wg_overlap=True, **over), tag="ctas_probe_sm90_d128")
 
     why = "persistent_ctas must be positive exactly when the record is persistent"
     for bad in (dict(persistent_ctas=132), dict(persistent_ctas=True), dict(persistent_ctas=-1)):
@@ -1015,7 +1018,7 @@ def _kernel_ast():
     from cudnn.sdpa.fwd import config_sm90 as c
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
-    mod = _load_kernel_template("sm90/prefill_d128_f16.py", c.TemplateParams(), tag="source_pin_sm90_d128")
+    mod = _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", c.TemplateParams(), tag="source_pin_sm90_d128")
     with open(mod.__file__, encoding="utf-8") as f:
         return ast.parse(f.read())
 
@@ -1118,7 +1121,7 @@ def test_persistent_record_requires_every_item_to_have_kv_work():
 
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
-    mod = _load_kernel_template("sm90/prefill_d128_f16.py", _record(intra_wg_overlap=True, persistent=True), tag="ctor_probe_sm90_d128")
+    mod = _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(intra_wg_overlap=True, persistent=True), tag="ctor_probe_sm90_d128")
 
     def make(shape, **kw):
         return mod.SM90FusedMultiHeadAttentionForward(shape, intra_wg_overlap=True, persistent=True, persistent_ctas=132, **kw)
@@ -1142,7 +1145,7 @@ _PAIRED = dict(_CAUSAL_PERSISTENT, causal_walk=1)
 def _walk_module():
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
 
-    return _load_kernel_template("sm90/prefill_d128_f16.py", _record(**_PAIRED), tag="walk_rule_sm90_d128")
+    return _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", _record(**_PAIRED), tag="walk_rule_sm90_d128")
 
 
 def _walk_units(q_tiles, groups, light):

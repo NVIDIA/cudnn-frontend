@@ -257,7 +257,7 @@ def pytest_generate_tests(metafunc):
 def d512_arm(request, monkeypatch):
     """Both arms set api_dsl.D512_2X2 EXPLICITLY (the switch defaults to True since 2026-10-06): ``two_by_two`` -> mma_2x2=True
     on every eligible d512 half record (cc 10.0 lowers it onto sm100/d512_f16_2x2/kernel.py, cc 10.7 onto
-    sm107/prefill_d512_f16_2x2.py); ``role_split`` -> the 4x1 kernel.  Unparametrized cases (no d512 in their name) keep the
+    sm107/d512_f16_2x2/kernel.py); ``role_split`` -> the 4x1 kernel.  Unparametrized cases (no d512 in their name) keep the
     module default.  Added only to the d512-naming cases by pytest_generate_tests above."""
     from cudnn.sdpa.fwd import api_dsl
 
@@ -3353,7 +3353,7 @@ def test_dsl_sm100_combo(flavor, dtype, heads, sink, layout, mask):
 
 
 # ============================================================================ sm100 d192x128 f16/bf16: the exp2 MUFU / FMA split, pinned on the SASS per arch
-# The split (`sm100/prefill_d192_d128_f16.py`, the `_E2E_*` block, traced on EVERY mask arm) is invisible to every numerics
+# The split (`sm100/d192_f16_multi_q/kernel.py`, the `_E2E_*` block, traced on EVERY mask arm) is invisible to every numerics
 # test (O to the bf16 rounding, the fp32 row-sum moves by ~1e-5) and worth +1.9 % at S=8K dense / +1.75 % causal on the
 # DSv3 chart layer on B200, so its only tripwire is the SASS.  Two arms per specialization, one per cc the sm100 rows
 # serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True) and sm_103a with the cc 10.3 record

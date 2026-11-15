@@ -20,7 +20,7 @@ _KEY_GROUP = (20538, "sdpa_fwd_sm120_decode_key_group", "decode_f16")
 def _owner(d_qk, d_v, tile_m):
     if tile_m in (16, 32):
         return _KEY_GROUP
-    return _ALL_COMPUTE if (d_qk, d_v) == (256, 256) else _GENERAL
+    return _ALL_COMPUTE if (d_qk + 15) // 16 == 16 and (d_v + 15) // 16 == 16 else _GENERAL
 
 
 def _record(engine_id, tile_m, split):
@@ -46,6 +46,9 @@ def _record(engine_id, tile_m, split):
         (64, 64, 16, 1, 3),
         (128, 128, 32, 3, 5),
         (96, 160, 64, 1, 97),
+        (120, 104, 64, 1, 97),
+        (248, 248, 128, 2, 97),
+        (120, 104, 16, 3, 3),
     ],
 )
 def test_public_record_names_and_replays_its_body(monkeypatch, dtype, d_qk, d_v, tile_m, split, sq):
@@ -71,15 +74,15 @@ def test_public_record_names_and_replays_its_body(monkeypatch, dtype, d_qk, d_v,
     _check(rbufs)
 
 
-@pytest.mark.parametrize("d,tile_m,sq", [(256, 128, 97), (256, 16, 3), (128, 64, 97), (64, 32, 5)])
+@pytest.mark.parametrize("d,tile_m,sq", [(256, 128, 97), (256, 16, 3), (128, 64, 97), (64, 32, 5), (120, 64, 97), (248, 16, 3)])
 def test_retired_legacy_record_is_declined(d, tile_m, sq):
     _, knobs = _record(20505, tile_m, 1)
     with pytest.raises((ValueError, RuntimeError, NotImplementedError), match="owned by"):
         _graph(d, d, torch.bfloat16, record=(20505, knobs), sq=sq)
 
 
-def test_envelope_keeps_the_legacy_owner():
-    g, vp, ws, bufs, _ = _graph(120, 120, torch.bfloat16, record=_record(20505, 64, 1), sq=97)
-    assert g.selected_engine.name == "sdpa_fwd_prefill_sm120"
+def test_envelope_uses_the_explicit_owner():
+    g, vp, ws, bufs, _ = _graph(120, 120, torch.bfloat16, record=_record(20544, 64, 1), sq=97)
+    assert g.selected_engine.name == _GENERAL[1]
     g.execute(vp, ws)
     _check(bufs)

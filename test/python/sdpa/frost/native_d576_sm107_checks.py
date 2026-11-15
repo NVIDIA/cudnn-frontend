@@ -91,7 +91,7 @@ def test_nonpaged(dtype, folded, split):
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+    assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py")
     assert api._k_mod.CFG.TILE_K == 576 and api._k_mod.CFG.N_BMM1_CHUNKS == 3
     assert api._k_mod.CFG.CGA_M == 2 and not api._k_mod.CFG.PAGED_KV
     ws = torch.empty(max(1, api.scratch_workspace_bytes()), device="cuda", dtype=torch.uint8)

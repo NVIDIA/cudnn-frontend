@@ -562,7 +562,7 @@ def test_sm120_frost_paged_width_determinism(
             )
             api.check_support()
             api.compile()
-            wide_file = "prefill_d512_f16.py" if arch == "sm90" else "d512_f16_paired/kernel.py"
+            wide_file = "f16_three_wg/kernel.py" if arch == "sm90" else "d512_f16_paired/kernel.py"
             kernel_file = (
                 "decode_f16_key_group/kernel.py" if tile_m in (16, 32) else (wide_file if min(dims) > 256 or arch == "sm90" else "f16_general/kernel.py")
             )

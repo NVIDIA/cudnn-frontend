@@ -188,6 +188,6 @@ def test_native_d64_dense_unsplit_replay(dtype_name, graph_api, dims, group, sq,
     """The short-Q single-slab leg and the taller prefill control share public bindings."""
     from test_sdpa_sink_split_sm107 import CASES, _check_sink_split
 
-    case = (dims, group, sq, sk, 1, 1, packed, causal, window, "sm107/prefill_d128_f16.py")
+    case = (dims, group, sq, sk, 1, 1, packed, causal, window, "sm107/d128_f16_multi_q/kernel.py")
     monkeypatch.setitem(CASES, "unsplit64", case)
     _check_sink_split("unsplit64", dtype_name, stats, graph_api=graph_api, handle=cudnn_handle, tile_n=128, sink=sink)
