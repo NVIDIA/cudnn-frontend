@@ -2089,6 +2089,36 @@ def test_2cta_stail_smem_maps_agree_bitwise(spec):
         assert torch.equal(grads["sm100"][role].view(torch.int16), grads["rubin_b2"][role].view(torch.int16)), f"{role}: sm100 vs rubin_b2 differ bitwise"
 
 
+@pytest.mark.parametrize("persistent", [False, True], ids=["two-pairs-causal", "persistent-single-q-empty"])
+def test_2cta_stail_smem_maps_agree_under_fp32_dkv_accum(persistent):
+    """Exercise the two-stage exchange protocol with its existing FP32 dKV mode.
+
+    Hq/Hkv=2 makes the dK/dV reduction order-free. The persistent case reuses
+    the rings across single-Q and empty work; dQ uses the FP64 gate there.
+    """
+    _require_smem_map("rubin_b2")
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
+    from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import smem_map, tmem_map
+
+    hq, hkv = 4, 2
+    if persistent:
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        skv = CFG.PAIR_KV_ROWS * ((sms // (hq * 2)) + 2) + 128
+        lq, lk, causal = (1, 0), (skv, skv - CFG.PAIR_KV_ROWS), False
+    else:
+        lq, lk, causal = (256, 512), (256, 512), True
+    case = make_case(lq, lk, hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=causal, stats_layout="TH1")
+    grads = {}
+    for name in _RING_TWIN_MAPS:
+        api, _ = _run_case(case, dkv_accum="fp32_reduce", tmem_map="dq_576", smem_map=name)
+        assert api._prepared.artifact.dkv_accum == "fp32_reduce"
+        assert tmem_map(api) == "dq_576" and smem_map(api) == name
+        grads[name] = {role: case.tensors[role][0].detach().clone() for role in ("dq", "dk", "dv")}
+    roles = ("dk", "dv") + (("dq",) if max(lk) <= _DQ_ORDER_FREE_PAIRS * CFG.PAIR_KV_ROWS else ())
+    for role in roles:
+        assert torch.equal(grads["sm100"][role].view(torch.int16), grads["rubin_b2"][role].view(torch.int16)), f"{role}: FP32 dKV SMEM-map twins differ"
+
+
 @pytest.mark.parametrize("tmem", ["dq_576", "s_tail"])
 def test_2cta_stail_sm100_oversized_agrees_bitwise_with_sm100(tmem):
     """The DIAGNOSTIC map ``smem_map = "sm100_oversized"`` (the kernel header section 11; cc 10.7 by name, never a default): the sm100 map ITSELF
