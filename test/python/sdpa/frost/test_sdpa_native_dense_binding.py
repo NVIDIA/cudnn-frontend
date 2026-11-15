@@ -447,7 +447,8 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
             # packed rows use the separate quadrant body.
             engine_id = 20535 if prefill else 20532
             if not prefill and d <= 64 and sq * (h // kh) <= 32:
-                engine_id, tile_m = 20536, 32
+                # The quadrant body admits 32 live rows in a physical M128 tile.
+                engine_id, tile_m = 20536, 128
             elif not prefill and d == 128 and paged and sq * (h // kh) <= 8:
                 engine_id, tile_m = 20520, 16
     if cc in ((10, 0), (10, 3)) and (d, d_v) == (256, 256):

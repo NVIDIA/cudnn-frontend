@@ -342,11 +342,14 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     assert {p.knobs.cga for p in _plans(_facts(s_q=2048, causal=True, padded=False))} == {1, 2}
     assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9, has_paged_kv=True, page_size=16)) if p.knobs.pack_gqa)
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
-    # Exact D256 now belongs to the explicit implementation rows, so the
-    # broad D128 row must offer no candidate for that former control case.
+    # The dedicated small-head owners decline D256. Swap-AB intentionally
+    # serves both paged D128 and D256, so keep it out of this negative control.
     from cudnn.sdpa.fwd.heuristics import recommend
 
-    assert recommend("A", _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), OFFERED) == []
+    d256 = _facts(h_q=32, h_kv=2, d_qk=256, d_v=256)
+    small_only = {name: engine_id for name, engine_id in OFFERED.items() if engine_id != 20520}
+    assert recommend("A", d256, small_only) == []
+    assert {plan.engine_id for plan in recommend("A", d256, OFFERED)} == {20520}
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
     # LPT_L2: one head's K+V here is 4096 * 256 * 2 B = 2 MiB, under the SM100 d128 row's 8 MiB floor for the L2 grouping,
     # heuristics._SM100_D128_LPT_L2_MIN_BYTES.)
@@ -410,7 +413,10 @@ def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     assert thd is not None and "decode tile" in thd and "THD" in thd
     assert engines.mismatch(caps, _facts(thd=True), engines.SdpaFwdKnobs(cga=2)) is None
     d256 = engines.mismatch(caps, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), engines.SdpaFwdKnobs(cga=1))
-    assert d256 is not None and "owned by the explicit implementation engines" in d256
+    assert d256 is not None and "cga=1 is outside this engine's domain [2]" in d256
+    registered = next(s for s in engines.ENGINE_SPECS if s.name == LEGACY_ENGINE)
+    delegated = engines.mismatch(registered.capabilities, _facts(h_q=32, h_kv=2, d_qk=256, d_v=256))
+    assert delegated is not None and "owned by the explicit implementation engines" in delegated
     # Partial PackGQA rides the decode tile: a pinned cga=1 + PACK_GQA=1 on 96/8
     # (G=12 packs 4) is honored; on 24/8 (G=3, no common factor) it is declined.
     assert engines.mismatch(caps, _facts(h_q=96, h_kv=8), engines.SdpaFwdKnobs(cga=1, pack_gqa=True)) is None
