@@ -64,9 +64,9 @@ extensions decline those graph plans. Graph plans compute `delta` internally. Se
 Sequence lengths and THD below for the packed contract.
 
 The kernels live in `python/cudnn/sdpa/bwd/kernels/sm107/`
-(`sm107/d256_f16_4x1/kernel.py`, `sm107/d256_fp8/kernel.py`,
-`sm107/d256_mxfp8/kernel.py`; config
-`bwd/config_sm107.py`), the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
+(`d256_f16_4x1/kernel.py`, `d256_fp8/kernel.py`,
+`d256_mxfp8/kernel.py`). Shared configuration lives in
+`python/cudnn/sdpa/bwd/config_sm107.py`, the adapters in `python/cudnn/sdpa/bwd/api_dsl_sm107.py`,
 and the rest of the launch chain is shared with the other Blackwell-line backward
 engines (`kernels/bprop_matmul_blackwell.py`, `kernels/bprop_chain_common.py`).
 
