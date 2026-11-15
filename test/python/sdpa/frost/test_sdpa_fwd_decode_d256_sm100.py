@@ -212,11 +212,11 @@ def _run_graph(
     g.create_execution_plans([cudnn.heur_mode.A])
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
 
-    if d == 256:
+    if 128 < d <= 256:
         selected_name = SWAP_AB if expect == DECODE else LOOKAHEAD
-    elif d == 128:
+    elif 64 < d <= 128:
         selected_name = SWAP_AB if expect == DECODE else "sdpa_fwd_sm100_d128_single_q" if expect == "decode_d128_f16" else "sdpa_fwd_sm100_d128_multi_q"
-    elif d in (32, 64):
+    elif 0 < d <= 64:
         selected_name = "sdpa_fwd_sm100_d64_quadrant" if expect == "decode_d64_f16_quadrant" else "sdpa_fwd_sm100_d128_single_q"
     else:
         selected_name = engine_name()
@@ -900,7 +900,8 @@ def test_decode_adapter_cuda_graph_replay_no_host_sync():
 @pytest.mark.parametrize("q_tile,expect", [(16, DECODE), (32, DECODE), (128, PREFILL)])
 @pytest.mark.parametrize("page", [0, 16])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_explicit_d256_body_does_not_reselect_for_query_extent(q_tile, expect, page, dtype):
+@pytest.mark.parametrize("d", [256, 224], ids=["native", "envelope"])
+def test_explicit_d256_body_does_not_reselect_for_query_extent(q_tile, expect, page, dtype, d):
     # N16/N32 remain explicit even where default policy chooses lookahead.
     # The helper checks O/Stats, changed-input CUDA Graph replay and no D2H.
-    _run_graph(B=2, H=4, KH=4, s_q=33, lens=[257, 130], page=page, dtype=dtype, expect=expect, explicit_q_tile=q_tile)
+    _run_graph(B=2, H=4, KH=4, s_q=33, lens=[257, 130], d=d, page=page, dtype=dtype, expect=expect, explicit_q_tile=q_tile)

@@ -4,6 +4,7 @@
 """The swap-AB body's public identity and local geometry contract."""
 
 from cudnn.sdpa.fwd.config_common import pack_gqa_supported
+from ..half_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm100_d256_swap_ab"
 TEMPLATE_NAME = "decode_d256_f16"
@@ -21,7 +22,7 @@ def mismatch(facts, knobs):
     if facts.h_kv <= 0 or facts.h_q <= 0 or facts.h_q % facts.h_kv:
         return "D256 swap-AB requires positive heads and an integral Q/KV head ratio"
     group = facts.h_q // facts.h_kv if knobs is not None and knobs.pack_gqa else 1
-    if (facts.d_qk, facts.d_v) == (128, 128):
+    if padded_shape(facts) == (128, 128):
         if not facts.has_paged_kv or tile != 16 or not 0 < facts.s_q * group <= 8:
             return "D128 half swap-AB requires paged KV, TILE_M=16 and at most eight live Q columns"
         if facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp:

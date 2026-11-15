@@ -6,6 +6,7 @@
 from dataclasses import dataclass, replace
 
 from cudnn import data_type
+from .half_flavor_contract import padded_shape
 from .d512_f16_role_split import contract as role_split
 from .d512_f16_2x2 import contract as two_by_two
 
@@ -18,7 +19,7 @@ IMPLEMENTATIONS = frozenset(_CONTRACTS)
 def in_domain(facts):
     return (
         facts.device_cc in ((10, 0), (10, 3))
-        and (facts.d_qk, facts.d_v) in ((512, 512), (576, 512))
+        and padded_shape(facts) in ((512, 512), (576, 512))
         and not (facts.invalid or facts.is_backward)
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
         and not (facts.is_fp8 or facts.is_mxfp8)
@@ -78,14 +79,14 @@ class D512Geometry:
 def explicit_geometry(implementation, facts):
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown wide half implementation: {implementation}")
-    return D512Geometry(implementation, facts.d_qk)
+    return D512Geometry(implementation, padded_shape(facts)[0])
 
 
 def mismatch(implementation, facts, knobs):
     if facts.device_cc not in ((10, 0), (10, 3)):
         return f"requires SM100/SM103; current device is {facts.device_cc}"
     if not in_domain(facts):
-        return "this implementation serves exact D512/V512 or D576/V512 half graphs on SM100/SM103"
+        return "this implementation serves the D512/V512 half envelope or exact D576/V512 graphs on SM100/SM103"
     reason = _CONTRACTS[implementation].mismatch(facts, knobs)
     if reason is not None:
         return reason

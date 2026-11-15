@@ -56,13 +56,15 @@ def _check_retired_record(graph, expected_id):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("dims", [(192, 128), (176, 112)], ids=["native", "envelope"])
 @pytest.mark.parametrize("cga,split,packed,causal", [(1, 1, False, False), (1, 1, True, True), (2, 1, True, False), (2, 4, True, True)])
-def test_multi_q_record_rebuild_rebind_and_capture(monkeypatch, dtype, cga, split, packed, causal):
+def test_multi_q_record_rebuild_rebind_and_capture(monkeypatch, dtype, cga, split, packed, causal, dims):
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     seen = _fixed_loader(monkeypatch, "d192_f16_multi_q")
     torch.manual_seed(19231)
-    b, h, hk, sq, sk, dq, dv = 2, 8, 2, 17, 512, 192, 128
+    b, h, hk, sq, sk = 2, 8, 2, 17, 512
+    dq, dv = dims
     tensors = {
         "q": torch.randn(b, sq, h, dq, device="cuda", dtype=dtype).transpose(1, 2),
         "k": torch.randn(b, sk, hk, dq, device="cuda", dtype=dtype).transpose(1, 2),
@@ -169,5 +171,111 @@ def test_single_q_record_origins_and_retained_capture(monkeypatch, dtype, split)
         _check_retired_record(graph, 20532)
         checked.append(True)
 
+    # Independent physical origins and packed splits retain their exact-width
+    # admission. The padded envelope is covered with compact THD below.
     run((192, 128), dtype, "head", True, False, split, engine_name="sdpa_fwd_sm100_d128_single_q", cga=1, extra_checks=record_check)
     assert checked
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("cga,engine_id,folder", [(1, 20532, "d128_f16_single_q"), (2, 20531, "d192_f16_multi_q")])
+def test_envelope_compact_thd_record_rebind_and_capture(monkeypatch, dtype, cga, engine_id, folder):
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    seen = _fixed_loader(monkeypatch, folder)
+    torch.manual_seed(176112)
+    b, h, hk, sq, sk, dq, dv = 2, 4, 2, 129, 192, 176, 112
+    q_lengths, k_lengths = (129, 17), (159, 35)
+    q_starts, k_starts = (0, 129), (0, 159)
+    values = {
+        "q": torch.randn(b * sq, h, dq, device="cuda", dtype=dtype),
+        "k": torch.randn(b * sk, hk, dq, device="cuda", dtype=dtype),
+        "v": torch.randn(b * sk, hk, dv, device="cuda", dtype=dtype),
+        "o": torch.full((b * sq, h, dv), float("nan"), device="cuda", dtype=dtype),
+        "stats": torch.full((b * sq, h), float("nan"), device="cuda", dtype=torch.float32),
+        "ql": torch.tensor(q_lengths, device="cuda", dtype=torch.int32).view(b, 1, 1, 1),
+        "kl": torch.tensor(k_lengths, device="cuda", dtype=torch.int32).view(b, 1, 1, 1),
+    }
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    nodes = {name: graph.tensor_like(values[name]) for name in ("ql", "kl")}
+    for name, heads, width, maximum, starts, lengths in (
+        ("q", h, dq, sq, q_starts, q_lengths),
+        ("k", hk, dq, sk, k_starts, k_lengths),
+        ("v", hk, dv, sk, k_starts, k_lengths),
+        ("o", h, dv, sq, q_starts, q_lengths),
+        ("stats", h, 1, sq, q_starts, q_lengths),
+    ):
+        values["ro_" + name] = (torch.tensor((*starts, sum(lengths)), device="cuda", dtype=torch.int64) * heads * width).view(b + 1, 1, 1, 1)
+        nodes["ro_" + name] = graph.tensor_like(values["ro_" + name])
+        if name in ("q", "k", "v"):
+            nodes[name] = graph.tensor(dim=(b, heads, maximum, width), stride=(maximum * heads * width, width, heads * width, 1), data_type=io)
+            nodes[name].set_ragged_offset(nodes["ro_" + name])
+    nodes["o"], nodes["stats"] = graph.sdpa(
+        q=nodes["q"],
+        k=nodes["k"],
+        v=nodes["v"],
+        generate_stats=True,
+        attn_scale=dq**-0.5,
+        use_padding_mask=True,
+        seq_len_q=nodes["ql"],
+        seq_len_kv=nodes["kl"],
+        max_total_seq_len_q=sum(q_lengths),
+        max_total_seq_len_kv=sum(k_lengths),
+    )
+    nodes["o"].set_output(True).set_dim((b, h, sq, dv)).set_stride((sq * h * dv, dv, h * dv, 1)).set_ragged_offset(nodes["ro_o"])
+    nodes["stats"].set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim((b, h, sq, 1)).set_stride((sq * h, 1, h, 1)).set_ragged_offset(
+        nodes["ro_stats"]
+    )
+    graph.validate()
+    graph.build_operation_graph()
+    record = engine_id, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=cga, pack_gqa=False, split_kv=1, sched_policy=0).to_public()
+    graph.create_execution_plan(*record)
+    graph.select_plan(0)
+    graph.check_support()
+    graph.build_plans()
+    assert graph.get_engine_and_knobs_at_index(0) == record
+    assert seen and seen[-1].CFG.TILES_Q == cga
+    assert seen[-1].CFG.TILE_K == 192
+    workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
+
+    def execute(bound, **kwargs):
+        graph.execute({nodes[name]: tensor for name, tensor in bound.items()}, workspace, **kwargs)
+
+    def check(bound):
+        for qi, ki, nq, nk in zip(q_starts, k_starts, q_lengths, k_lengths):
+            q = bound["q"][qi : qi + nq].float().transpose(0, 1)
+            k = bound["k"][ki : ki + nk].float().transpose(0, 1).repeat_interleave(h // hk, dim=0)
+            v = bound["v"][ki : ki + nk].float().transpose(0, 1).repeat_interleave(h // hk, dim=0)
+            scores = (q @ k.transpose(-1, -2)) / math.sqrt(dq)
+            torch.testing.assert_close(
+                bound["o"][qi : qi + nq].float(), (scores.softmax(-1) @ v).transpose(0, 1), atol=3e-2 if dtype == torch.bfloat16 else 1e-2, rtol=2e-2
+            )
+            torch.testing.assert_close(bound["stats"][qi : qi + nq], scores.logsumexp(-1).transpose(0, 1), atol=5e-3, rtol=0)
+
+    execute(values)
+    check(values)
+    handle, stream, capture = cudnn.create_handle(), torch.cuda.Stream(), torch.cuda.CUDAGraph()
+    stream.wait_stream(torch.cuda.current_stream())
+    cudnn.set_stream(handle, stream.cuda_stream)
+    try:
+        with torch.cuda.stream(stream):
+            execute(values, handle=handle)
+        stream.synchronize()
+        with torch.cuda.graph(capture, stream=stream):
+            execute(values, handle=handle)
+        fresh = {name: value.clone() for name, value in values.items()}
+        fresh["v"].mul_(0.25)
+        execute(fresh)
+        check(fresh)
+        values["v"].mul_(0.5)
+        values["o"].fill_(float("nan"))
+        values["stats"].fill_(float("nan"))
+        capture.replay()
+        torch.cuda.synchronize()
+        check(values)
+        _check_retired_record(graph, engine_id)
+    finally:
+        torch.cuda.synchronize()
+        capture.reset()
+        cudnn.destroy_handle(handle)

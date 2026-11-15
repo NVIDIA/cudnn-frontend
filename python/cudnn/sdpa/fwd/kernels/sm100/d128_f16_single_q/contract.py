@@ -62,7 +62,7 @@ def small_geometry(facts, knobs, *, d_flavor=None):
 
 def mismatch(facts, knobs):
     if not (in_d192_domain(facts) or in_small_domain(facts)):
-        return "half single-Q requires supported dtypes and exact D32/D64/D128 or D192/V128 on SM100/SM103"
+        return "half single-Q requires supported dtypes and a D32/D64/D128 or D192/V128 covering geometry on SM100/SM103"
     if facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp:
         return "half single-Q has no bias, KV-mask or score-output stores"
     if knobs is not None:
@@ -74,6 +74,6 @@ def mismatch(facts, knobs):
         if knobs is not None and knobs.pack_gqa:
             return "D192 single-Q requires unpacked heads"
     elif facts.thd and knobs is not None and (knobs.split_kv or 1) == 1:
-        if facts.d_qk > 64 or not facts.has_paged_kv or knobs.pack_gqa or facts.s_q > 128:
+        if max(facts.d_qk, facts.d_v) > 64 or not facts.has_paged_kv or knobs.pack_gqa or facts.s_q > 128:
             return "small-head single-Q THD requires split-KV, or unpacked paged D64 with at most 128 query rows"
     return None

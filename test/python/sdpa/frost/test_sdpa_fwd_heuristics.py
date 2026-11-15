@@ -2234,7 +2234,7 @@ def test_rubin_paged_thd_d256_keeps_its_packed_candidate(sm107_metadata_target, 
 def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
     """Policy support and candidate validity are independent of heuristic ranking."""
     facts = _facts(d_qk=d, d_v=d, s_q=2048, h_q=16, h_kv=2, thd=True, padded=True, has_paged_kv=paged, page_size=128)
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == (LOOKAHEAD if d == 256 else _F16 if d == 128 else _LEGACY_F16))
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == (LOOKAHEAD if d > 128 else _F16))
     for policy in (0, SCHED_LPT, SCHED_LPT_L2):
         assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(sched_policy=policy)) is None
     plans = recommend("A", facts, _OFFERED)

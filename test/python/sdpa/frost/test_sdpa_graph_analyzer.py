@@ -29,6 +29,8 @@ def _eligible(graph, knobs=None):
 
 def _sm100_half_owner(graph):
     """Concrete owner used by these capability tests; keep retired rows visible as failures."""
+    from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
+
     f = ga.analyze(graph)
     if f is not None and f.device_cc in ((10, 0), (10, 3)):
         return {
@@ -39,7 +41,7 @@ def _sm100_half_owner(graph):
             (256, 256): "sdpa_fwd_sm100_d256_lookahead",
             (512, 512): "sdpa_fwd_sm100_d512_role_split",
             (576, 512): "sdpa_fwd_sm100_d512_2x2",
-        }.get((f.d_qk, f.d_v), engines.engine_name())
+        }.get(padded_shape(f), engines.engine_name())
     return engines.engine_name()
 
 
@@ -477,16 +479,16 @@ def test_probe_rejects_misaligned_head_dim():
 
 
 def test_probe_envelope_covers_small_head_dim():
-    # Non-exact d=56 still uses the legacy zero-padded envelope. Exact D64
-    # now belongs to fixed implementations and is covered separately.
+    # Non-exact d=56 uses the D64 covering geometry of the explicit bodies.
     g = _mk_graph()
     q, k, v, dims, strides = _mk_qkv(g, d=56)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
     elig = _eligible(g)
-    assert engines.engine_name() in elig
+    assert engines.engine_name() not in elig
+    assert elig == {"sdpa_fwd_sm100_d128_multi_q", "sdpa_fwd_sm100_d128_single_q"}
     ordered = [s.name for s in engines.ENGINE_SPECS if s.name in elig]
-    assert ordered[0] == engines.engine_name()
+    assert ordered[0] == "sdpa_fwd_sm100_d128_single_q"
 
 
 def test_probe_envelope_mixed_dims_pick_covering_flavor():
@@ -3752,15 +3754,9 @@ def test_native_d576_admission_preserves_other_head_envelopes(shape, thd, admitt
     from dataclasses import replace
 
     facts = replace(_facts(_mk_eligible_graph()), d_qk=shape[0], d_v=shape[1], thd=thd)
-    spec = next(
-        s
-        for s in engines.ENGINE_SPECS
-        if s.name
-        == (
-            "sdpa_fwd_sm100_d512_2x2" if facts.d_qk == 576 else "sdpa_fwd_sm100_d512_role_split" if facts.d_qk == facts.d_v == 512 else "sdpa_fwd_prefill_sm100"
-        )
-    )
-    reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2, pack_gqa=False))
+    owner = "sdpa_fwd_sm100_d512_2x2" if facts.d_qk > 512 else "sdpa_fwd_sm100_d512_role_split"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == owner)
+    reason = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=2 if facts.d_qk > 512 else 4, pack_gqa=False))
     assert (reason is None) == admitted, reason
 
 

@@ -3572,8 +3572,10 @@ def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_
 
 
 def select_sm100_d512_geometry(facts, knobs):
+    from .kernels.sm100.half_flavor_contract import padded_shape
+
     return select_sm100_d512_geometry_for_shape(
-        facts.d_qk,
+        padded_shape(facts)[0],
         paged=facts.has_paged_kv,
         split_kv=knobs.split_kv or 1,
         pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
@@ -3695,7 +3697,7 @@ def select_sm100_small_half_geometry(facts, knobs):
     from .kernels.sm100.d256_f16_contract import D256Geometry, SWAP_AB
 
     if not in_domain(facts):
-        raise ValueError("small-head half selection requires exact SM100/SM103 D32/D64/D128 half queries")
+        raise ValueError("small-head half selection requires SM100/SM103 queries covered by the D32/D64/D128 half geometries")
     policy = sm100_legacy_policy_spec()
     flavor = _selected_d_shape(policy.capabilities, facts, knobs)
     if flavor not in ((32, 32), (64, 64), (128, 128)):
@@ -3758,7 +3760,7 @@ def select_sm100_d192_half_geometry(facts, knobs):
     from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
 
     if not in_domain(facts):
-        raise ValueError("D192 half selection requires exact SM100/SM103 D192/V128 half inputs")
+        raise ValueError("D192 half selection requires SM100/SM103 half inputs covered by D192/V128")
     cga = 2 if knobs.cga is None else knobs.cga
     if facts.thd and not facts.has_paged_kv and cga == 1:
         return SingleQ()
