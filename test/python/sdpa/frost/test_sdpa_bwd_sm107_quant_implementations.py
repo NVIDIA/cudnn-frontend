@@ -51,10 +51,11 @@ def test_fixed_record_rebuild_rebind_and_changed_input_capture(monkeypatch, fami
     assert_bitwise(second.outs[0], first.outs[0], "fresh record rebuild")
     if family == "fp8":
         assert_bitwise(second.amax[0], first.amax[0], "fresh record amax")
-    assert {t.data_ptr() for t in first.pack.values()}.isdisjoint({t.data_ptr() for t in second.pack.values()})
 
     # Rebind every port on the same compiled graph, including all scalar/SF ports.
     pack = {port: value.clone(memory_format=torch.preserve_format) for port, value in second.pack.items()}
+    original_ptrs = {value.data_ptr() for run in (first, second) for value in run.pack.values()}
+    assert original_ptrs.isdisjoint({value.data_ptr() for value in pack.values()})
     expected = snapshot({str(port.get_uid()): value for port, value in pack.items()})
     workspace = torch.empty_like(second.workspace).fill_(0xBD)
     second.graph.execute(pack, workspace)
