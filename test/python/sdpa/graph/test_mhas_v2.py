@@ -2500,16 +2500,24 @@ def _exec_sdpa_mxfp8_expect_frost(cfg, request, cudnn_handle, strict=True, engin
     """exec_sdpa_mxfp8, then assert the FROST MXFP8 row ``engine`` (the SM100 row by default;
     the cc 10.7 sweeps pass their own row's name) served the graph; with ``strict`` a harness
     skip (every engine declined) is a failure, so an unserved config cannot pass silently."""
-    key = f"frost:{engine}"
-    before = frost_routing.snapshot().get(key, 0)
+    owners = {
+        (64, 64): ("sdpa_fwd_sm100_d128_mxfp8_multi_q",),
+        (128, 128): ("sdpa_fwd_sm100_d128_mxfp8_multi_q",),
+        (192, 128): ("sdpa_fwd_sm100_d192_mxfp8_multi_q",),
+        (256, 256): ("sdpa_fwd_sm100_d256_mxfp8_single_q",),
+        (512, 512): ("sdpa_fwd_sm100_d512_mxfp8_slice_recompute", "sdpa_fwd_sm100_d512_mxfp8_retained_p"),
+    }
+    names = owners.get((cfg.d_qk, cfg.d_v), (engine,)) if engine == FROST_MXFP8_ENGINE else (engine,)
+    keys = tuple(f"frost:{name}" for name in names)
+    before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:
         exec_sdpa_mxfp8(cfg, request, cudnn_handle)
     except pytest.skip.Exception as e:
         if strict and not request.config.option.dryrun:
             pytest.fail(f"FROST-asserting mxfp8 config must run, not skip: {e}", pytrace=False)
         raise
-    after = frost_routing.snapshot().get(key, 0)
-    assert after == before + 1, f"expected {key} to serve this graph; routing tally: {frost_routing.snapshot()}"
+    after = sum(frost_routing.snapshot().get(key, 0) for key in keys)
+    assert after == before + 1, f"expected {keys} to serve this graph; routing tally: {frost_routing.snapshot()}"
 
 
 def _run_mxfp8_paged(test, test_no, request, cudnn_handle):

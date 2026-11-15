@@ -154,14 +154,21 @@ def mxfp8_engine_names(arch="sm100") -> tuple[str, ...]:
     """Allowed MXFP8 engines for feature tests that exercise default selection: the row and, on SM100, its exact D512 owners."""
     row = f"sdpa_fwd_prefill_{arch}_mxfp8"
     if arch == "sm100":
-        return (row, "sdpa_fwd_sm100_d512_mxfp8_slice_recompute", "sdpa_fwd_sm100_d512_mxfp8_retained_p")
+        return (
+            row,
+            "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+            "sdpa_fwd_sm100_d256_mxfp8_single_q",
+            "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+            "sdpa_fwd_sm100_d512_mxfp8_retained_p",
+        )
     return (row,)
 
 
 def sm100_mxfp8_owner(d_qk, d_v, *, retained_p=False) -> str:
     """The SM100 MXFP8 engine that serves these head dims (legality only); exact top-left SWA of one KV tile, unsplit, is retained P."""
     if (d_qk, d_v) != (512, 512):
-        return "sdpa_fwd_prefill_sm100_mxfp8"
+        return mxfp8_engine_name("sm100", d_qk, d_v)
     return "sdpa_fwd_sm100_d512_mxfp8_retained_p" if retained_p else "sdpa_fwd_sm100_d512_mxfp8_slice_recompute"
 
 
@@ -196,6 +203,21 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
     if arch == "sm80":
         return ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative")
     return (f"sdpa_fwd_prefill_{arch}",)
+
+
+def mxfp8_engine_name(arch, d_qk, d_v) -> str:
+    """Exact implementation owner for a block-scaled forward test declaration."""
+    if arch == "sm100":
+        owner = {
+            (64, 64): "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            (128, 128): "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+            (192, 128): "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+            (256, 256): "sdpa_fwd_sm100_d256_mxfp8_single_q",
+            (512, 512): "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
+        }.get((d_qk, d_v))
+        if owner is not None:
+            return owner
+    return sm120_owner(f"sdpa_fwd_prefill_{arch}_mxfp8", d_qk, d_v) if arch == "sm120" else f"sdpa_fwd_prefill_{arch}_mxfp8"
 
 
 def sm80_owner(d_qk, d_v):

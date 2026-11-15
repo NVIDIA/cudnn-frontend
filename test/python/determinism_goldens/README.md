@@ -6367,3 +6367,44 @@ CUDNN_TEST_NO_ISOLATION=1 pytest -o addopts= -q -rs \
 Public documentation CI subsequently passed on `00a232ea0`; the local `fern`
 command remains unavailable. This test-only follow-up preserves production
 source from that qualified head.
+
+
+### SM100 explicit MXFP8 implementation records — 2026-11-15
+
+The existing D64/D128 multi-Q, D192/V128 multi-Q and D256 single-Q bodies
+now have independent implementation identities. The new L0
+`test_sdpa_fwd_small_mxfp8_explicit_engines.py` and
+`test_sdpa_fwd_d256_mxfp8_explicit_engine.py` check public-record reconstruction,
+the actual compiled body, fresh bindings and retained CUDA Graph replay.
+Existing prepared, independent-origin and paged suites use the current owners.
+No numerical tolerance or golden file changed. This qualification does not
+expand the API's general batch-invariance claim.
+
+Bounded native validation used B200 (SM100) and B300 (SM103), CUDA 13.4,
+CuTeDSL 4.8 and cuDNN 9.30, with the loaded source checkout asserted:
+
+- D64/D128/D192: 65 B200 and 40 B300 cases passed without skips or failures
+  in the final focused run. An additional B300 paged subgroup passed all
+  27 cases. Twelve cases already passed on each GPU in the preceding run
+  were deliberately deselected in the final focused run.
+- D256: the first B200 run passed 47 native cases; a separate stale host
+  analyzer fixture failed and was migrated. B300 passed 14 bounded native
+  cases. After correcting explicit-owner THD-origin binding, B200 passed
+  31 checks (12 historical-golden cases deselected), and B300 passed six
+  independent-origin checks (24 other cases deselected).
+- Eight parent/head comparison scenarios for the small/mid bodies and four
+  for D256 preserve the complete configuration, parameters, TMA descriptors,
+  workspace, input/output bytes and changed-input capture results.
+- On the combined implementation tree and its landed parent, 1,062 host
+  contract/policy tests passed; nine tests needing a CUDA backend handle
+  were deselected in the GPU-free run. The 3,840-graph comparison preserved
+  all 7,320 candidate records and placement decisions.
+
+These are separate, partly overlapping checks, not an aggregate count of
+unique shapes or a full architecture sweep. The initial missing template
+identity, off-contract THD fixture and missing origin binding failures were
+retained and corrected before the reported passing reruns. Device evidence
+comes from the frozen implementation revisions; subsequent parent integration
+preserved those device bodies and repeated the affected host checks. General
+batch invariance, unmeasured layouts and other GPU targets remain unverified
+by this refactor qualification.
