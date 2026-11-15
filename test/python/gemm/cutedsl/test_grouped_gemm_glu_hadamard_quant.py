@@ -1003,3 +1003,69 @@ def test_grouped_gemm_glu_hadamard_quant_wrapper_cache_dynamic_m_smoke(request, 
     assert compile_count["value"] == 1
     assert len(grouped_gemm_glu_hadamard_quant_api._cache_of_GroupedGemmGluHadamardQuantSm100Objects) == 1
     grouped_gemm_glu_hadamard_quant_api._cache_of_GroupedGemmGluHadamardQuantSm100Objects.clear()
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar_f32", "vector_f32"])
+def test_grouped_gemm_glu_hadamard_quant_srelu_saved_c_regeneration(request, vector_f32):
+    """SReLU D is bit-identical to the activation recomputed from the saved C, in FP32 arithmetic.
+
+    The epilogue evaluates relu(C)^2 * prob from C as stored in c_dtype, so the dSReLU backward
+    and activation recomputation, which only have the saved C, reproduce D exactly. A tolerance
+    comparison against an FP32 reference cannot see this: evaluating from the FP32 accumulator
+    instead differs from the regenerated value only in the last bits of D.
+    """
+    from cudnn import grouped_gemm_glu_hadamard_quant_wrapper_sm100
+
+    cfg = _make_cfg(request, ab_dtype=torch.float4_e2m1fn_x2, sf_dtype=torch.float8_e4m3fn, sf_vec_size=16)
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+    # The allocator draws alpha from {-2, ..., 1}, so an expert can land on 0 (C == 0 everywhere).
+    # Pin it so every expert is live; a power-of-two scale still leaves C needing rounding to BF16.
+    alpha = [(0.0625, 0.125, 0.03125)[i % 3] * (-1.0 if i % 2 else 1.0) for i in range(cfg["l"])]
+    inputs["alpha_tensor"].copy_(torch.tensor(alpha, dtype=torch.float32, device=inputs["alpha_tensor"].device))
+
+    outputs = grouped_gemm_glu_hadamard_quant_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=torch.bfloat16,
+        cd_major=cfg["cd_major"],
+        rht_rowwise_dtype=None,
+        rht_colwise_dtype=None,
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=vector_f32,
+        m_aligned=cfg["m_aligned"],
+        act_func="srelu",
+    )
+    torch.cuda.synchronize()
+
+    valid_m = inputs["valid_m"]
+    c = outputs["c_tensor"][:valid_m, :, 0].cpu()
+    d = outputs["d_tensor"][:valid_m, :, 0].cpu()
+    prob = inputs["prob_tensor"][:valid_m, :, 0].float().cpu()
+    assert d.shape == c.shape, "SReLU does not split N into gate/up halves"
+    assert torch.count_nonzero(d).item() > d.numel() // 8, "D is mostly zero; the regeneration check would be vacuous"
+
+    c_relu = torch.relu(c.float())
+    regenerated = ((c_relu * c_relu) * prob).to(torch.bfloat16)
+    mismatched = torch.count_nonzero(d.view(torch.int16) != regenerated.view(torch.int16)).item()
+    assert mismatched == 0, f"D vs activation regenerated from saved C: {mismatched}/{d.numel()} elements differ"
