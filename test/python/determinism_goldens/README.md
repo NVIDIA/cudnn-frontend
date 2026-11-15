@@ -6122,3 +6122,31 @@ too old for this PTX version; its serialization-advisory check remains a gap.
 The earlier missing-PATH skip is retained as history, not counted as a pass.
 Local `fern check` cannot run because the command is not installed; changed-file
 pre-commit passes, and documentation validation awaits normal PR CI.
+
+Fresh-process artifact qualification now explicitly selects the fixed owners.
+The earlier prepared-cache tests instantiated the retained standalone API, so
+those results alone did not qualify the moved modules. Four new cases cover
+F04 D64 dense, F05 D512 dense/THD, and dedicated D128 dense: each verifies the
+owned module and local parameter type, independent O/Stats references, poisoned
+output capture replay, identical O/Stats bytes across interpreters, and cache
+hits with `cute.compile` forbidden in the second interpreter.
+
+The initial run gave **6 passed, 1 failed** (four owned cases and three existing
+standalone controls). The THD failure used an invalid Stats fixture whose head
+stride did not cover the packed token total. The same fixture failed on the
+original and owned bodies with identical parameters and output bytes; a legal
+packed token-major view passed on both. Only that fixture was corrected, and
+the targeted rerun gave **1 passed**. All four owned cases and the three existing
+controls are therefore qualified; this is not a claim that the initial run was
+green. No production source or reference/byte/capture assertion changed.
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 pytest -o addopts= -q -rs \
+  sdpa/frost/test_sdpa_fwd_sm90_wide_implementation.py::test_owned_artifact_reloads_without_jit_in_fresh_process \
+  sdpa/frost/test_sdpa_prepared_sm90.py::test_prepared_artifact_reloads_in_fresh_process \
+  sdpa/frost/test_sdpa_prepared_sm90.py::test_prepared_d128_artifact_reloads_in_fresh_process
+```
+
+Public documentation CI subsequently passed on `00a232ea0`; the local `fern`
+command remains unavailable. This test-only follow-up preserves production
+source from that qualified head.

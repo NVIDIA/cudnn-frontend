@@ -264,7 +264,7 @@ def test_prepared_thd_rejects_smaller_batch_and_misaligned_workspace():
 
 
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
-def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pack_gqa=False, d=512):
+def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pack_gqa=False, d=512, owner=None):
     """Verify exported artifacts launch and replay after a new interpreter forbids JIT."""
     import json
     import os
@@ -274,9 +274,9 @@ def test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, splits=1, pac
     import cudnn
 
     child = r"""
-import hashlib, json, os, sys
+import hashlib, importlib, json, os, sys
 from pathlib import Path
-package, thd, reload, splits, pack_gqa, d = sys.argv[1:]
+package, thd, reload, splits, pack_gqa, d, owner = sys.argv[1:]
 sys.meta_path[:] = [f for f in sys.meta_path if "__editable__" not in getattr(f, "__module__", "")]
 sys.path.insert(0, str(Path(package).resolve().parent.parent))
 if os.environ.get("FE_TEST_CUDA_BINDINGS"):
@@ -292,25 +292,49 @@ if reload == "1":
     cute.compile = forbidden
 torch.manual_seed(0)
 q, k, v, o = (torch.randn(2, 64, 2, int(d), device="cuda", dtype=torch.float16).transpose(1, 2) for _ in range(4))
-api = SdpaFwdDslSm90(q, k, v, o, thd=thd == "1", split_kv=int(splits), pack_gqa=pack_gqa == "1")
+stats = None
+if owner != "legacy":
+    # THD Stats is packed across both sequences; per-batch BHS would give a
+    # head stride below the packed total. Retain logical BHS only as a view.
+    stats = torch.empty((2, 64, 2) if thd == "1" else (2, 2, 64), device="cuda", dtype=torch.float32)
+    if thd == "1":
+        stats = stats.transpose(1, 2)
+api = SdpaFwdDslSm90(q, k, v, o, sample_lse=stats, thd=thd == "1", split_kv=int(splits), pack_gqa=pack_gqa == "1")
+contract = None
+if owner != "legacy":
+    contract = importlib.import_module("cudnn.sdpa.fwd.kernels.sm90." + owner + ".contract")
+    api._selected_kernel = contract.Geometry()
 api.compile()
-assert api.flavor == (int(d), int(d)), api.flavor
+assert api.flavor == (contract.Geometry().flavor if contract is not None else (int(d), int(d))), api.flavor
+if contract is not None:
+    assert api._k_mod.__file__.endswith(contract.KERNEL_FILE), api._k_mod.__file__
+    assert type(api._k_mod.PARAMS).__module__ == contract.__package__ + ".config"
 if reload == "1":
     assert hasattr(api._compiled_kernel, "_compiled_cache_raw")
 lens = torch.full((2,), 64, device="cuda", dtype=torch.int32)
 ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
 kw = dict(seq_q_lens=lens, seq_kv_lens=lens, workspace=ws) if thd == "1" else dict(workspace=ws)
-api.execute(q, k, v, o, **kw)
+api.execute(q, k, v, o, lse_tensor=stats, **kw)
 reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 torch.testing.assert_close(o, reference, atol=5e-2, rtol=3e-2)
+if stats is not None:
+    reference_stats = ((q.float() @ k.float().transpose(-1, -2)) * int(d)**-0.5).logsumexp(-1)
+    torch.testing.assert_close(stats, reference_stats, atol=2e-2, rtol=2e-2)
 graph = torch.cuda.CUDAGraph()
 try:
     with torch.cuda.graph(graph):
-        api.execute(q, k, v, o, **kw)
+        api.execute(q, k, v, o, lse_tensor=stats, **kw)
     o.fill_(float("nan"))
+    if stats is not None:
+        stats.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(o, reference, atol=5e-2, rtol=3e-2)
-    digest = hashlib.sha256(o.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+    if stats is not None:
+        torch.testing.assert_close(stats, reference_stats, atol=2e-2, rtol=2e-2)
+    payload = o.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    if stats is not None:
+        payload += stats.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    digest = hashlib.sha256(payload).hexdigest()
 finally:
     graph.reset()
 print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
@@ -320,7 +344,7 @@ print(json.dumps(dict(digest=digest, stats=compiled_cache.stats())))
     results = []
     for reload in (0, 1):
         result = subprocess.run(
-            [sys.executable, "-c", child, cudnn.__file__, str(int(thd)), str(reload), str(splits), str(int(pack_gqa)), str(d)],
+            [sys.executable, "-c", child, cudnn.__file__, str(int(thd)), str(reload), str(splits), str(int(pack_gqa)), str(d), owner or "legacy"],
             env=env,
             cwd=tmp_path,
             capture_output=True,

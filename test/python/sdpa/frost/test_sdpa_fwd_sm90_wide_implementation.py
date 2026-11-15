@@ -193,3 +193,20 @@ def test_d128_compiled_identity_rejects_shared_and_sibling_records():
         _, reason = g.compiled_mismatch(d128.TEMPLATE_NAME, cls(head_tile=128), knobs)
         assert reason is not None and "parameters belong to" in reason
     assert g.compiled_mismatch(d128.TEMPLATE_NAME, Owned(head_tile=128), knobs)[1] is None
+
+
+@pytest.mark.skipif(_SM != 90, reason="requires native Hopper")
+@pytest.mark.parametrize(
+    "owner,thd,d",
+    [
+        ("d64_f16_one_wg", False, 64),
+        ("f16_three_wg", False, 512),
+        ("f16_three_wg", True, 512),
+        ("d128_f16_multi_q", False, 128),
+    ],
+    ids=["native-d64", "three-wg-dense", "three-wg-thd", "dedicated-d128"],
+)
+def test_owned_artifact_reloads_without_jit_in_fresh_process(tmp_path, owner, thd, d):
+    from test_sdpa_prepared_sm90 import test_prepared_artifact_reloads_in_fresh_process
+
+    test_prepared_artifact_reloads_in_fresh_process(thd, tmp_path, d=d, owner=owner)
