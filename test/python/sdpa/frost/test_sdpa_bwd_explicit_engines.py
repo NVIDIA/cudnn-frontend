@@ -136,14 +136,14 @@ def test_sm120_fused_host_refuses_other_bodies():
         lower(None, _sm120_facts(thd=True), None, lower_impl=_lower)
 
 
-@pytest.mark.parametrize("fmt,slot", [("fp8", 16), ("mxfp8", 17)])
-def test_sm120_quantized_rows_name_their_one_body(fmt, slot):
+@pytest.mark.parametrize("package,slot", [("sm120.fp8", 16), ("sm120.mxfp8", 17), ("sm100.d512_fp8", 14), ("sm100.d512_mxfp8", 15)])
+def test_one_body_quantized_rows_name_their_body(package, slot):
     import importlib
     import pathlib
 
     from cudnn.engines.manifest import MANIFEST
 
-    contract = importlib.import_module(f"cudnn.sdpa.bwd.kernels.sm120.{fmt}.contract")
+    contract = importlib.import_module(f"cudnn.sdpa.bwd.kernels.{package}.contract")
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert family.slots[contract.NAME].slot == slot and family.slots[contract.NAME].opt_in
     caps = _spec(contract.NAME).capabilities

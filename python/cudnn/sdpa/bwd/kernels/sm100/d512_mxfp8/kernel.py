@@ -18,7 +18,7 @@ from cudnn.frost.tile_dsl.handles import GmemTileTma
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, amax_to_ue8m0_rp
 from cudnn.frost.tile_dsl.tma import tma_load_tile
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d512_fp8 import _join, _output
+from cudnn.sdpa.bwd.kernels.sm100.d512_fp8.kernel import _join, _output
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import (
     FP8,
     HALF_DTYPES,

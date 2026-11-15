@@ -2347,9 +2347,13 @@ def _d512_fp8_environment_mismatch(facts, version):
 
 
 def _d512_fp8_spec() -> EngineSpec:
+    from .kernels.sm100.d512_fp8 import contract
+    from .kernels.sm100.d512_fp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_d512_fp8",
+        name=contract.NAME,
         capabilities=Capabilities(
+            implementation=contract.NAME,
             sm_lo=100,
             sm_hi=107,
             d=frozenset({512}),
@@ -2365,7 +2369,7 @@ def _d512_fp8_spec() -> EngineSpec:
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
         ),
-        lower=partial(lower_dsl_bwd_fp8, api_type=_D512_FP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_fp8, api_type=_D512_FP8)),
     )
 
 
@@ -2381,9 +2385,13 @@ def _d512_mxfp8_mismatch(facts, version):
 
 
 def _d512_mxfp8_spec() -> EngineSpec:
+    from .kernels.sm100.d512_mxfp8 import contract
+    from .kernels.sm100.d512_mxfp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_d512_mxfp8",
+        name=contract.NAME,
         capabilities=Capabilities(
+            implementation=contract.NAME,
             sm_lo=100,
             sm_hi=107,
             d=frozenset({512}),
@@ -2405,7 +2413,7 @@ def _d512_mxfp8_spec() -> EngineSpec:
                 window_right=frozenset({band.RIGHT_CAUSAL}),
             ),
         ),
-        lower=partial(lower_dsl_bwd_mxfp8, api_type=_D512_MXFP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_mxfp8, api_type=_D512_MXFP8)),
     )
 
 
