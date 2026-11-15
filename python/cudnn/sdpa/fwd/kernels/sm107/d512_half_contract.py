@@ -65,7 +65,9 @@ class Geometry:
         )
 
     def configure_params(self, params):
-        return replace(params, mma_2x2=self.implementation == TWO_BY_TWO, d_flavor=self.d_qk)
+        # The legacy D512 loader retains the generic flavor value. Only D576
+        # changes the record; keep the same compile parameters for each body.
+        return replace(params, mma_2x2=self.implementation == TWO_BY_TWO, d_flavor=576 if self.d_qk == 576 else params.d_flavor)
 
 
 def explicit_geometry(implementation, facts):
