@@ -2814,7 +2814,7 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
     ``kernels/sm100/``.  Widening the opt-out to a third kernel is a MEASURED, per-specialization decision that adds its file to
     ``_SM100_MXFP8_OPTED_OUT`` (and a row to ``_CREDIT_ARRIVE_SITES``), never a copy-paste."""
     kdir = _sm100_kernel_dir()
-    files = sorted(p.name for p in kdir.glob("*.py") if p.name != "__init__.py")
+    files = sorted(p.relative_to(kdir).as_posix() for p in kdir.rglob("*.py") if p.name != "__init__.py")
     assert set(_SM100_MXFP8_OPTED_OUT) <= set(files), f"opted-out kernels missing from {kdir}: {files}"
     leaked = {}
     for name in files:

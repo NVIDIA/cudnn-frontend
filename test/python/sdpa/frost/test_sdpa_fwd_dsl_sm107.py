@@ -1660,7 +1660,7 @@ def test_sm107_d256_desc_version_follows_the_stages_kv_layout(depth):
     """
     from dataclasses import replace
 
-    import cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16 as kern
+    import cudnn.sdpa.fwd.kernels.sm107.d256_f16_lookahead.kernel as kern
 
     cfg = replace(kern.CFG, STAGES_KV=depth)
     want = 1 if depth >= 4 else 0

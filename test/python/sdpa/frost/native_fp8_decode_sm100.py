@@ -481,7 +481,7 @@ def test_native_fp8_decode_score_release(tmp_path, dtype_qkv, dtype_o, split):
             decode_q_tile=16, decode_live_columns=8,
         )
         mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=True)
-        assert mod.__file__.endswith("decode_d128_fp8.py")
+        assert mod.__file__.endswith("sm100/d128_fp8_swap_ab/kernel.py")
         mod.compile_prepared()
     """)
     test_root = Path(__file__).resolve().parents[2]
