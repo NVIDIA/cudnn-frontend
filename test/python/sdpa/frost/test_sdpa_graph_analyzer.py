@@ -2889,8 +2889,12 @@ def test_paged_quantized_rows_mismatch_reasons():
     assert engines.mismatch(fp8, paged_facts(is_fp8=True, d_qk=64, d_v=64)) is None
     assert "multiple of 128" in engines.mismatch(mxfp8, paged_facts(is_mxfp8=True))
     assert "owned by the explicit implementation engines" in engines.mismatch(legacy_mxfp8, paged_facts(is_mxfp8=True, page_size=128))
-    assert "d512 kernel flavors only" in engines.mismatch(legacy_fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=96, d_v=96))
-    assert "requires exact D512/V512" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
+    rubin_small = spec["sdpa_fwd_sm107_d128_fp8_multi_q"].capabilities
+    small_envelope = paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=96, d_v=96)
+    assert "owned by" in engines.mismatch(legacy_fp8_rubin, small_envelope)
+    assert "paged" in engines.mismatch(rubin_small, small_envelope)
+    assert engines.mismatch(rubin_small, paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=96, d_v=96, has_paged_kv=False)) is None
+    assert "D512/V512 per-tensor FP8 envelope" in engines.mismatch(fp8_rubin, paged_facts(is_fp8=True, device_cc=(10, 7)))
     rubin_d512 = paged_facts(is_fp8=True, device_cc=(10, 7), d_qk=512, d_v=512)
     assert engines.mismatch(fp8_rubin, rubin_d512) is None
     assert "owned by" in engines.mismatch(legacy_fp8_rubin, rubin_d512)
