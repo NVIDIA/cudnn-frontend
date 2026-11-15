@@ -86,6 +86,32 @@ def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, 
     assert NOTE not in _notes(name, _facts(device_cc=cc))
 
 
+@pytest.mark.parametrize(
+    "name,dq,dv,tile,cluster,splits,warp",
+    [
+        ("sdpa_fwd_sm107_d128_multi_q", 128, 128, 128, 2, 1, 0),
+        ("sdpa_fwd_sm107_d192_multi_q", 192, 128, 128, 2, 1, 0),
+        ("sdpa_fwd_sm107_d256_lookahead", 256, 256, 128, 2, 1, 0),
+        ("sdpa_fwd_sm107_d256_lookahead", 128, 128, 128, 1, 1, 1),
+        ("sdpa_fwd_sm107_shared_single_q", 128, 128, 128, 1, 2, 0),
+        ("sdpa_fwd_sm107_shared_single_q", 192, 128, 128, 1, 1, 0),
+        ("sdpa_fwd_sm107_shared_d256_lookahead", 256, 256, 128, 2, 2, 0),
+        ("sdpa_fwd_sm107_d512_role_split", 512, 512, 128, 4, 1, 0),
+        ("sdpa_fwd_sm107_d512_2x2", 512, 512, 64, 4, 1, 0),
+    ],
+)
+def test_admitted_sm107_half_owners_do_not_inherit_sm100_notes(name, dq, dv, tile, cluster, splits, warp, monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    f = _facts(d_qk=dq, d_v=dv, device_cc=(10, 7), device_sm_count=208, max_total_seq_len_q=32)
+    knobs = engines.SdpaFwdKnobs(tile_m=tile, cga=cluster, split_kv=splits, pack_gqa=False, warp_spec_cfg=warp)
+    # A retired/ineligible row would also return RTC alone. Require a legal
+    # selected record so this tests the public note's qualification boundary.
+    assert engines.mismatch(SPECS[name].capabilities, f, knobs) is None
+    assert _notes(name, f, knobs.to_public()) == (cudnn.behavior_note.RUNTIME_COMPILATION,)
+
+
 def test_new_swap_ab_does_not_inherit_lookahead_notes():
     f = _facts(d_qk=256, d_v=256)
     assert NOTE not in _notes("sdpa_fwd_sm100_d256_swap_ab", f)
