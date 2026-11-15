@@ -25,9 +25,8 @@ def _packed_stats(facts) -> bool:
 def select_implementation(facts):
     """The D64 body serves plain dense MHA D64 graphs on whole tiles with packed Stats; the two-subgroup body serves
     every other graph. The adapter's own choice (api_dsl._sm80_d64_fast_path_eligible) is the same rule."""
-    plain = not (facts.causal or facts.window_left is not None or facts.bottom_right or facts.padded)
-    plain = plain and not (facts.has_bias or facts.has_sink or facts.deterministic)
+    masked = facts.causal or facts.window_left is not None or facts.bottom_right or facts.padded
+    extras = facts.has_bias or facts.has_sink or facts.deterministic
     whole_tiles = facts.s_q % D64_TILE[0] == 0 and facts.s_kv % D64_TILE[1] == 0
-    if not facts.thd and (facts.d_qk, facts.d_v) == (64, 64) and facts.h_q == facts.h_kv and whole_tiles and plain and _packed_stats(facts):
-        return D64
-    return TWO_SUBGROUP
+    plain_mha_d64 = not facts.thd and (facts.d_qk, facts.d_v) == (64, 64) and facts.h_q == facts.h_kv
+    return D64 if plain_mha_d64 and whole_tiles and not masked and not extras and _packed_stats(facts) else TWO_SUBGROUP
