@@ -67,8 +67,9 @@ def _declarations(*, b=1, h=1, sq=128, sk=128, causal=False, scale=0.125, d=128,
 
 
 def _reason(facts):
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm100_d128")
-    return engines.mismatch(spec.capabilities, facts)
+    specs = [s for s in engines.ENGINE_SPECS if engines.policy_name(s) == "sdpa_bwd_sm100_d128"]
+    reasons = [engines.mismatch(spec.capabilities, facts) for spec in specs]
+    return None if None in reasons else reasons[0]
 
 
 @pytest.mark.parametrize("causal", [True])
@@ -87,7 +88,7 @@ def test_dense_declaration_rejects_unrepresentable_geometry(geometry, token, cau
     if entry == "graph":
         reason = _reason(facts)
         assert reason is not None and token in reason
-        assert recommend("A", facts, {"sdpa_bwd_sm100_d128": 20609}) == []
+        assert recommend("A", facts, {"sdpa_bwd_sm100_d128": 20609, "sdpa_bwd_sm100_d128_recompute": 20628}) == []
     else:
         with pytest.raises(NotImplementedError, match=token):
             api.check_support()
@@ -110,7 +111,9 @@ def test_dense_declaration_rejects_unrepresentable_geometry(geometry, token, cau
 def test_dense_declaration_accepts_safe_boundaries(geometry, implementation, causal):
     facts, api = _declarations(**geometry, causal=causal)
     assert _reason(facts) is None
-    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, {"sdpa_bwd_sm100_d128": 20609})] == [(20609, None)]
+    offered = {"sdpa_bwd_sm100_d128": 20609, "sdpa_bwd_sm100_d128_recompute": 20628}
+    expected = [(20609, None), (20628, None)] if implementation == "accumulation" else [(20628, None)]
+    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, offered)] == expected
     assert api.check_support()
     assert api._implementation == implementation
 

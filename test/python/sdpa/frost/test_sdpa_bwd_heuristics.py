@@ -43,6 +43,7 @@ _OFFERED = {
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
+    "sdpa_bwd_sm100_d128_recompute": 20628,
     "sdpa_bwd_sm120_f16_fused": 20618,
     "sdpa_bwd_sm80_f16_d64": 20619,
     "sdpa_bwd_sm80_f16_two_subgroup": 20620,
@@ -127,11 +128,12 @@ def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     [((10, 0), True), ((10, 3), True), ((10, 4), True), ((10, 5), True), ((10, 6), True), ((10, 7), False), ((12, 0), False), ((8, 0), False)],
     ids=["cc10.0", "cc10.3", "cc10.4", "cc10.5", "cc10.6", "cc10.7", "cc12.0", "cc8.0"],
 )
-def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
+def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(monkeypatch, cc, listed):
     """The SM100 d256 bf16 / fp16 backward row (slot 7 -> 20607, the 2x2-datapath body) lists one knob-less entry on the
     SM100 line (cc 10.0-10.6: the row's ``sm_hi = 106`` admits every pre-Rubin Blackwell datacenter cc, like the MXFP8
     row) for the causal GQA graph too, and nowhere else (the other lines list their own rows); on the SM100 line it never
     lists for d != 256 or for a decode-shaped graph."""
+    monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     assert any(s.name == "sdpa_bwd_sm100_d256" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm100_d256 is not registered"
     facts = _facts(d_qk=256, d_v=256, h_kv=2, dtype=cudnn.data_type.BFLOAT16, causal=True, device_cc=cc)
     plans = recommend("A", facts, _OFFERED)
@@ -140,7 +142,8 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
     if listed:
         assert [p.engine_id for p in plans] == [20607]
         assert 20607 not in [p.engine_id for p in recommend("A", _facts(d_qk=512, d_v=512, device_cc=cc), _OFFERED)]
-        assert [p.engine_id for p in recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED)] == [20609]
+        expected = [20609, 20628] if cc in ((10, 0), (10, 3)) else [20628]
+        assert [p.engine_id for p in recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED)] == expected
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
 
 
@@ -158,15 +161,14 @@ def test_sm100_d256_row_lists_ahead_of_the_d192_half_row_on_dense_graphs(monkeyp
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7"])
-def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
-    """The d128 row (slot 9 -> 20609) lists one knob-less entry for a dense MHA graph on every cc of its sm range (the recompute body serves
-    the SM100-line envelope, cc 10.0-10.6, and Rubin, cc 10.7); the grouped (and THD) chains list on the accumulation parts ONLY -- the
-    family's cc tuple ``d128_contract.ACCUMULATION_CCS`` (cc 10.0 / 10.3 / 10.7), read from the contract, never a copy."""
+def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
+    """Dense MHA offers recompute explicitly; grouped and THD retain the accumulation row."""
     from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
 
     monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     facts = _facts(device_cc=cc)
-    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == [(20609, None)]
+    expected = [(20609, None), (20628, None)] if cc in ACCUMULATION_CCS else [(20628, None)]
+    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == expected
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
     assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc in ACCUMULATION_CCS else [])
     assert ((10, 7) in ACCUMULATION_CCS) and ((10, 6) not in ACCUMULATION_CCS)  # the admitted parts are named, the envelope's hypothetical ccs are not
@@ -183,18 +185,19 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
         ((10, 0), 512, [20626, 20627]),
         ((10, 3), 512, [20626, 20627]),
         ((10, 7), 256, [20604]),
-        ((10, 7), 128, [20609]),  # d128 on cc 10.7: the admitted d128 family row (slot 9), never the d512 row
+        ((10, 7), 128, [20609, 20628]),  # accumulation default, followed by explicit recompute; never the d512 row
         ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
         ((12, 0), 512, [20621]),  # SM120's two-subgroup body
     ],
     ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
 )
-def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(cc, d, want):
+def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(monkeypatch, cc, d, want):
     """The cc 10.7 d512 bf16 / fp16 backward row (slot 8 -> 20608) is fixed-geometry: on the Rubin line (cc 10.7-11.x) a
     d in (256, 512] graph lists exactly one entry with NO knobs (``{}`` is the complete record); the SM100 line keeps its
     explicit d512 owners (20626 then 20627); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
-    d = 128 on cc 10.7 lists the admitted d128 family row (20609; the Rubin admission of 2026-11-03), past that row's range (cc 11.0)
+    d = 128 on cc 10.7 lists accumulation then explicit recompute; past that range (cc 11.0) neither is listed,
     on SM120 the native wide row lists its 16x16 tile pair."""
+    monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     assert any(s.name == "sdpa_bwd_sm107_d512" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_d512 is not registered"
     plans = recommend("A", _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
