@@ -163,6 +163,10 @@ def _case(
 
         # Exact SM100 MXFP8 D512 has its own owners (20552 / 20553).
         name = sm100_mxfp8_owner(d, dv)
+    if arch == "sm107":
+        from frost_test_utils import sm107_mxfp8_owner
+
+        name = sm107_mxfp8_owner(d, dv)
     if arch == "sm120":
         from frost_test_utils import sm120_owner
 

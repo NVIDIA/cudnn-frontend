@@ -15,6 +15,10 @@ def origin_checks(family, arch="sm100", shapes=None):
             return "sdpa_fwd_sm100_d256_fp8_single_q"
         if arch == "sm100" and family == "fp8" and dims in (192, (192, 128)):
             return "sdpa_fwd_sm100_d192_fp8_multi_q"
+        if arch == "sm107" and family == "mxfp8":
+            from frost_test_utils import sm107_mxfp8_owner
+
+            return sm107_mxfp8_owner(*{192: (192, 128)}.get(dims, dims if isinstance(dims, tuple) else (dims, dims)))
         return f"sdpa_fwd_prefill_{arch}_{family}"
 
     if shapes is None:
@@ -28,6 +32,8 @@ def origin_checks(family, arch="sm100", shapes=None):
         expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" and family == "fp8" and width == 256 else f"{arch}/prefill_{flavor}_{family}.py"
         if arch == "sm100" and family == "fp8" and width == 192:
             expected = "sm100/d192_fp8_multi_q/kernel.py"
+        if arch == "sm107" and family == "mxfp8":
+            expected = f"sm107/{engine_for(width).removeprefix('sdpa_fwd_sm107_')}/kernel.py"
         assert plan._compiled.kernel_module.__file__.endswith(expected)
         assert graph.selected_engine.name == engine_for(width)
         assert plan._prepared.spec.origin_specs is not None and plan._prepared.spec.native is not None

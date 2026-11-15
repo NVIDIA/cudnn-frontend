@@ -173,6 +173,17 @@ def sm100_mxfp8_owner(d_qk, d_v, *, retained_p=False) -> str:
     return "sdpa_fwd_sm100_d512_mxfp8_retained_p" if retained_p else "sdpa_fwd_sm100_d512_mxfp8_slice_recompute"
 
 
+def sm107_mxfp8_owner(d_qk, d_v) -> str:
+    """The SM107 MXFP8 engine that serves exact head dims: one body per native shape; the row keeps anything else."""
+    owners = {
+        (128, 128): "sdpa_fwd_sm107_d128_mxfp8_multi_q",
+        (192, 128): "sdpa_fwd_sm107_d192_mxfp8_multi_q",
+        (256, 256): "sdpa_fwd_sm107_d256_mxfp8_single_q",
+        (512, 512): "sdpa_fwd_sm107_d512_mxfp8_role_split",
+    }
+    return owners.get((d_qk, d_v), "sdpa_fwd_prefill_sm107_mxfp8")
+
+
 def half_engine_names(arch="sm100") -> tuple[str, ...]:
     """Allowed half engines for feature tests that exercise default selection.
 

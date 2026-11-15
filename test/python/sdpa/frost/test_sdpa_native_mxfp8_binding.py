@@ -201,6 +201,10 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     # The cc 10.7 row serves the same pool contract on d128 (cga2) / d256 (cga1): separate V table, batch-innermost
     # tables, e4m3 O, Stats, CUDA-graph replay after mutating the SF bytes, native-binder-only execution.
     name = engine_name(arch="sm107" if rubin else "sm100", mxfp8=True)
+    if rubin:
+        from frost_test_utils import sm107_mxfp8_owner
+
+        name = sm107_mxfp8_owner(d, d)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     cga = max(dict(caps.cgas_by_d_shape).get((d, d), caps.cgas))
