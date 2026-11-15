@@ -81,6 +81,15 @@ split uses single-Q even when the ranked unsplit candidate used multi-Q.
 `test_paged_thd_split_capture_lengths_and_stats` and
 `test_native_paged_thd_capture_and_rebind` cover that transition, including
 default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
+Owner migrations must also update shared fixtures at non-exact head widths.
+An exact-width owner map can pass the new contract suite while scalar-tail,
+THD-interior and D512-origin fixtures still select a delegated row. Resolve the
+fixture's covering physical shape, keep its logical tensor dimensions, and run
+the existing envelope cases; do not discard their address or replay assertions.
+When splitting a template, retain its module-load refusals as well as graph
+eligibility gates. `test_per_tensor_body_refuses_mxfp8_only_mask_at_load` covers
+the MXFP8-only mask that a shared parameter factory accepts but per-tensor FP8
+bodies must reject even when called directly.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
