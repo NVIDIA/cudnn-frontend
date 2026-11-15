@@ -42,7 +42,7 @@ from cudnn.sdpa.bwd.d128_grouped_2cta_contract import (
 from cudnn.sdpa.bwd.d128_grouped_2cta_contract import thd_workspace_offsets as grouped_2cta_thd_workspace_offsets
 from cudnn.sdpa.bwd.d128_grouped_contract import dkv_accum_fp32, resolve_dkv_accum, validate_fp32_accum_fits
 from cudnn.sdpa.bwd.d128_thd_contract import ORIGIN_PORTS
-from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.kernel import host_thd_2cta as grouped_2cta_chain_host
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.chain import host_thd_2cta as grouped_2cta_chain_host
 from cudnn.sdpa.bwd.kernels.sm100._prepared_d128_common import _io, _scratch
 
 # ======================================================================================================================

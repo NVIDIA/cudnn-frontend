@@ -64,7 +64,7 @@ _ROUTE_CENSUS = {
 }
 _BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.kernel"  # the d128 family module; the pair body is its section 8
 _BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/kernel.py")
-_BODY_SECTION = ("# section 8:", "# section 9:")  # the pair body's banners in the family module: the source assertions read that section only
+_BODY_SECTION = "# section 8:"  # this module owns the main body; the setup/fold chain lives separately
 _TREE = pathlib.Path(__file__).resolve().parents[4]  # test/python/sdpa/frost/<file> -> the checkout
 _RECORD = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt"
 _RECORD_DEV = _RECORD.with_name("md5_d128_accum_grouped_2cta_stail_default_sm_100a_dsl_4_9_dev_20261028.txt")
@@ -266,14 +266,12 @@ def _run_case(case, repeats=2, **fields):
 
 
 def _body_source():
-    """The pair body's section of the family module (its banner to the next): the source pins count sites in THIS body only."""
+    """The dedicated pair main body: source pins exclude the separate setup/fold chain."""
     path = _TREE / _BODY_REL
     if not path.exists():
         pytest.skip(f"{path} is not in this checkout")
     text = path.read_text()
-    start, end = text.index(_BODY_SECTION[0]), text.index(_BODY_SECTION[1])
-    assert start < end, _BODY_SECTION
-    return text[start:end]
+    return text[text.index(_BODY_SECTION) :]
 
 
 def _body_module():
