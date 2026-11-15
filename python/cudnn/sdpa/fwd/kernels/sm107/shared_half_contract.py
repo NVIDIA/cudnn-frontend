@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from cudnn import data_type
 from ..sm100.d128_f16_single_q import contract as single_q
 from ..sm100.d256_f16_lookahead import contract as lookahead
+from .half_flavor_contract import padded_shape
 
 LEGACY_ROW = "sdpa_fwd_prefill_sm107"
 SINGLE_Q = "sdpa_fwd_sm107_shared_single_q"
@@ -18,7 +19,7 @@ SHAPES = frozenset({(32, 32), (64, 64), (128, 128), (192, 128), (256, 256)})
 def in_domain(facts):
     return (
         facts.device_cc == (10, 7)
-        and (facts.d_qk, facts.d_v) in SHAPES
+        and padded_shape(facts) in SHAPES
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
         and not (facts.invalid or facts.is_backward or facts.is_fp8 or facts.is_mxfp8)
     )
@@ -73,31 +74,32 @@ class Geometry:
 def explicit_geometry(implementation, facts, knobs):
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown shared SM107 half implementation: {implementation}")
-    return Geometry(implementation, facts.d_qk)
+    return Geometry(implementation, padded_shape(facts)[0])
 
 
 def mismatch(implementation, facts, knobs):
     if not in_domain(facts):
-        return "requires SM107 and exact small/mid-width half forward graphs"
+        return "requires SM107 and a supported small/mid-width half envelope"
+    shape = padded_shape(facts)
     if facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp:
         return "the shared half bodies have no additive-bias, KV-mask or score-output stores"
     if knobs is not None and (knobs.tile_m not in (None, 128) or knobs.tile_n not in (None, 128) or knobs.warp_spec_cfg not in (None, 0)):
         return "the shared half bodies require M128 N128 and their ordinary warp topology"
     if implementation == LOOKAHEAD:
-        if (facts.d_qk, facts.d_v) != (256, 256):
-            return "shared lookahead requires exact D256/V256"
+        if shape != (256, 256):
+            return "shared lookahead requires a D256/V256 envelope"
         if not ((facts.has_paged_kv and facts.uniform_dtype) or (facts.thd and not facts.has_paged_kv)):
             return "shared lookahead serves same-dtype paged KV or nonpaged THD split"
         if not facts.has_paged_kv and knobs is not None and (knobs.split_kv or 1) <= 1:
             return "nonpaged THD shared lookahead requires split-KV"
     else:
-        if facts.d_qk > 192:
+        if shape[0] > 192:
             return "shared single-Q serves D32/D64/D128 and D192/V128"
-        if facts.d_qk == 128 and not facts.thd and not facts.has_paged_kv and facts.attn_scale_prefolded:
+        if shape[0] == 128 and not facts.thd and not facts.has_paged_kv and facts.attn_scale_prefolded:
             return "dense D128 shared single-Q does not support the pre-folded attention scale"
-        if not facts.uniform_dtype and facts.d_qk != 128:
+        if not facts.uniform_dtype and (facts.d_qk, facts.d_v) != (128, 128):
             return "shared single-Q mixed KV is supported at D128 only"
-        if facts.d_qk == 192:
+        if shape[0] == 192:
             if not facts.thd or facts.has_paged_kv or (knobs is not None and knobs.pack_gqa):
                 return "D192 shared single-Q requires nonpaged unpacked THD"
             # The legacy single-CTA admission uses the packed-partial feature

@@ -8,6 +8,7 @@ from cudnn import data_type
 from .d192_f16_multi_q import contract as d192
 from .d256_f16_lookahead import contract as lookahead
 from .d256_f16_swap_ab import contract as swap_ab
+from .half_flavor_contract import padded_shape
 
 LEGACY_ROW = "sdpa_fwd_prefill_sm107"
 D192 = d192.NAME
@@ -74,7 +75,7 @@ def explicit_geometry(implementation, facts, knobs):
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown native SM107 mid-width half implementation: {implementation}")
     tile = (knobs.tile_m or 16) if implementation == SWAP_AB else 128
-    return Geometry(implementation, facts.d_qk, tile)
+    return Geometry(implementation, padded_shape(facts)[0], tile)
 
 
 def mismatch(implementation, facts, knobs):

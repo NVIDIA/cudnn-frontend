@@ -16,7 +16,7 @@ features.** It means this new reference has not yet been checked for that scope.
 | SM80 (cc 8.0) | [SM80 support](sm80.md) | FP16/BF16 forward documented; backward pending migration |
 | SM90 (cc 9.0) | [SM90 support](sm90.md) | Forward documented; no FROST SDPA backward engine |
 | SM100 / SM103 (cc 10.0 / 10.3) | [SM100 / SM103 support](sm100.md) | FP16/BF16, per-tensor FP8 and MXFP8 forward documented, including supported head-width envelopes; backward pending migration |
-| SM107 (cc 10.7) | [SM107 support](sm107.md) | FP16/BF16, per-tensor FP8 and MXFP8 forward documented; non-exact half envelopes and backward pending migration |
+| SM107 (cc 10.7) | [SM107 support](sm107.md) | FP16/BF16, per-tensor FP8 and MXFP8 forward documented, including supported head-width envelopes; backward pending migration |
 | SM120 / SM121 (cc 12.0, 12.1) | [SM120 support](sm120.md) | FP16/BF16, FP8 and MXFP8 forward documented; backward pending migration |
 
 For a pending section, consult the registered [forward](../../fwd/engines.py) and
