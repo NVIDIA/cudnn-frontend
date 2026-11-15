@@ -1948,7 +1948,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return reason
         # The legacy shared checks name the MMA pair and logical 128-row recipe.
         # Physical cluster and actual CTA tile were validated by the owner above.
-        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), cgas=frozenset({2}))
+        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), tile_ms_by_d_shape=(), cgas=frozenset({2}))
         legacy_knobs = replace(knobs, tile_m=128, cga=2) if knobs is not None else None
         return mismatch(legacy_caps, facts, legacy_knobs)
     if capabilities.implementation in _D512_IMPLEMENTATIONS:

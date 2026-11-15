@@ -817,18 +817,23 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     name = engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8)
-    sm100_shape = d_shape
-    if _SM in (100, 103):
+    physical_shape = d_shape
+    if _SM in (100, 103, 107):
         from types import SimpleNamespace
 
-        if fp8:
+        if _SM == 107:
+            if fp8:
+                from cudnn.sdpa.fwd.kernels.sm107.fp8_flavor_contract import padded_shape
+            else:
+                from cudnn.sdpa.fwd.kernels.sm107.half_flavor_contract import padded_shape
+        elif fp8:
             from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
         else:
             from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
 
-        sm100_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=dv))
-        assert sm100_shape is not None
-        if sm100_shape == (512, 512):
+        physical_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=dv))
+        assert physical_shape is not None
+        if physical_shape == (512, 512):
             cga = 4
     if fp8 and _SM in (100, 103):
         name = {
@@ -837,7 +842,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
             (192, 128): "sdpa_fwd_sm100_d192_fp8_multi_q",
             (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
             (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
-        }.get(sm100_shape, name)
+        }.get(physical_shape, name)
     if fp8 and _SM == 107:
         name = {
             (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
@@ -845,12 +850,14 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
             (192, 128): "sdpa_fwd_sm107_d192_fp8_multi_q",
             (256, 256): "sdpa_fwd_sm107_d256_fp8_single_q",
             (512, 512): "sdpa_fwd_sm107_d512_fp8_role_split",
-        }.get(d_shape, name)
-        if d_shape == (512, 512):
+        }.get(physical_shape, name)
+        if physical_shape == (256, 256):
+            cga = 1  # the native D256 single-Q body has one physical CTA
+        if physical_shape == (512, 512):
             cga = 4  # public physical cluster; the MMA group has two CTAs
-    if not fp8 and _SM in (100, 103) and sm100_shape == (192, 128):
+    if not fp8 and _SM in (100, 103) and physical_shape == (192, 128):
         name = "sdpa_fwd_sm100_d192_multi_q"
-    if not fp8 and _SM in (100, 103) and sm100_shape == (256, 256):
+    if not fp8 and _SM in (100, 103) and physical_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"
     if not fp8 and _SM == 107:
@@ -867,7 +874,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, fp8_engine_names(_ARCH))
         _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
         engine = family_for(g).offered_ids()[name]
-    elif not fp8 and _SM in (100, 103) and sm100_shape[0] == sm100_shape[1] and sm100_shape[0] in (32, 64, 128):
+    elif not fp8 and _SM in (100, 103) and physical_shape[0] == physical_shape[1] and physical_shape[0] in (32, 64, 128):
         from cudnn.engines.manifest import family_for
 
         # The scalar-tail fixture requests a prefill body at this CTA width;
@@ -875,7 +882,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, half_engine_names(_ARCH))
         _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
         engine = family_for(g).offered_ids()["sdpa_fwd_sm100_d128_multi_q"]
-    elif not fp8 and _SM in (100, 103) and sm100_shape == (512, 512):
+    elif not fp8 and _SM in (100, 103) and physical_shape == (512, 512):
         from cudnn.engines.manifest import family_for
 
         # This test explicitly requests split-KV, whose wide owner is the
@@ -887,15 +894,19 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, name)
         engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     record = {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})}
-    if not fp8 and _SM == 107 and d_shape in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), (576, 512)):
+    if not fp8 and _SM == 107:
         from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.kernels.sm107.half_flavor_contract import padded_shape
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
         from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry, select_sm107_half_geometry
         from cudnn.sdpa.graph_analyzer import analyze
 
+        facts = analyze(g)
+        shape = padded_shape(facts)
+        assert shape is not None
         requested = SdpaFwdKnobs.from_public(record)
-        selector = select_sm107_d512_geometry if d_shape[0] >= 512 else select_sm107_half_geometry
-        geometry = selector(analyze(g), requested)
+        selector = select_sm107_d512_geometry if shape[0] >= 512 else select_sm107_half_geometry
+        geometry = selector(facts, requested)
         engine = family_for(g).offered_ids()[geometry.implementation]
         record = geometry.canonical_knobs(requested).to_public()
     g.create_execution_plan(engine, record)
