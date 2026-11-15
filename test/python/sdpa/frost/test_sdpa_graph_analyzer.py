@@ -179,7 +179,7 @@ def test_zero_attn_scale_claims():
     (score_sign / SCALE_ZERO) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
-    assert fwd == {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm90", "sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg"}
+    assert fwd == {"sdpa_fwd_prefill_sm80", "sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg", "sdpa_fwd_sm90_d128_multi_q"}
     assert bwd == {
         "sdpa_bwd_sm80",
         "sdpa_bwd_sm100",
@@ -1128,7 +1128,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert frozenset(_SM100_PARTIAL_PACK_GQA_FLAVORS) == frozenset({(128, 128), (256, 256), (576, 512)})
     native_sm107 = engines.engine_name(arch="sm107")
     assert by_name[native_sm107].pack_gqa_partial_d_shapes == frozenset({(64, 64), (192, 128), (512, 512), (576, 512)})
-    native_sm90 = engines.engine_name(arch="sm90")
+    native_sm90 = "sdpa_fwd_sm90_f16_three_wg"
     assert by_name[native_sm90].pack_gqa_partial_d_shapes == frozenset({(128, 128), (256, 256), (512, 512)})
     native_sm120 = engines.engine_name(arch="sm120")
     assert by_name[native_sm120].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})

@@ -13,7 +13,7 @@ LEGACY_ROW = "sdpa_fwd_prefill_sm90"
 
 
 def in_domain(facts):
-    # First migration batch: exact D64. The three-WG body owns its paged leg;
+    # Exact D64: the three-WG body owns its paged leg;
     # the native two-WG body owns only the already-admitted nonpaged subset.
     return (
         facts.device_cc == (9, 0)

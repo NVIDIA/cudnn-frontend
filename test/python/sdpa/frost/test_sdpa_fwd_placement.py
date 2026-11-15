@@ -65,7 +65,9 @@ def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
         _SM100,
         _SM120,
         "sdpa_fwd_prefill_sm107",
-        "sdpa_fwd_prefill_sm90",
+        "sdpa_fwd_sm90_d64_one_wg",
+        "sdpa_fwd_sm90_f16_three_wg",
+        "sdpa_fwd_sm90_d128_multi_q",
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm107_mxfp8",
@@ -1087,7 +1089,7 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
     [
         ("sdpa_fwd_sm100_d512_2x2", (10, 0), 148, {}),
         ("sdpa_fwd_sm100_d512_fp8_role_split", (10, 0), 148, _SM107_FP8_QUANT),
-        ("sdpa_fwd_prefill_sm90", (9, 0), 132, {}),
+        ("sdpa_fwd_sm90_f16_three_wg", (9, 0), 132, {}),
         ("sdpa_fwd_prefill_sm107", (10, 7), 216, {}),
         ("sdpa_fwd_prefill_sm107_fp8", (10, 7), 216, _SM107_FP8_QUANT),
     ],
@@ -1424,7 +1426,7 @@ def test_sm90_d128_follows_its_measurement(over, want):
     the 64 x 64 tile runs it."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
     shape = dict(b=8, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132, causal=True, bottom_right=True)
     assert placement.place(spec, _facts(**{**shape, **over})) == want
 
@@ -1442,7 +1444,7 @@ def test_sm90_d128_declined_graphs_trail(monkeypatch, over, want):
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
     shape = dict(b=8, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132, causal=True, bottom_right=True)
     assert placement.place(spec, _facts(**{**shape, **over})) == want
 
@@ -1456,8 +1458,8 @@ def test_sm90_d128_default_placement_reads_its_study(monkeypatch):
     from cudnn.sdpa import placement_table as pt
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
-    row = spec.name
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
+    row = "sdpa_fwd_prefill_sm90"
     shape = dict(d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132)
     for over in (
         dict(b=8, h_q=32, h_kv=8, s_q=1024, s_kv=1024, causal=True, bottom_right=True),
@@ -1486,7 +1488,7 @@ def test_sm90_paged_d512_follows_its_measurement(s_q, paged):
     rows, prefill)."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
     shape = dict(b=64, h_q=8, h_kv=2, s_q=s_q, s_kv=4096, d_qk=512, d_v=512, dtype=cudnn.data_type.BFLOAT16, device_cc=(9, 0), device_sm_count=132)
     assert placement.place(spec, _facts(**shape)) == placement.LEAD
     assert placement.place(spec, _facts(has_paged_kv=True, page_size=16, padded=True, **shape)) == paged

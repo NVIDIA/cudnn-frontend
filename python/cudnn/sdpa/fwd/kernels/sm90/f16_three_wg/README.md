@@ -1,12 +1,14 @@
-# SM90 implementation ownership
+# SM90 three-WG split-output implementation
 
-The three-warpgroup body retains the existing QK/softmax/PV pipeline. In this
-first migration batch engine 20540 owns only exact D64/V64 paged graphs. The
-other widths and envelope shapes still use the legacy row; they are not
-claimed as migrated by this batch.
+Engine 20540 owns the existing 64 x 64 tile domain: exact D64 paged KV,
+native D128/D256/D512 and the bounded head envelopes. Dense, THD, paged,
+split and packing eligibility remain the historical policy's. The body keeps
+its existing QK/softmax/PV pipeline and cross-WG probability/row-factor handoff.
 
-The immutable parameter ABI, pure layout helpers, prepared binder and launch
+The immutable parameter ABI, layout helpers, prepared binder and launch
 services remain shared. `host.py` fixes the body before lowering; candidate
-ranking stays in the central heuristics. No runtime Stats-stride note is added.
+ranking stays centralized. THD keeps NATURAL when the scheduler is omitted.
+No runtime Stats-stride note is added.
 
-Source baseline: `5913f355354bd35d5be54494b91b1227b01917bb`.
+The standalone entry remains in use and is retained. Device classes remain
+AST-equivalent to source baseline `5913f355354bd35d5be54494b91b1227b01917bb`.

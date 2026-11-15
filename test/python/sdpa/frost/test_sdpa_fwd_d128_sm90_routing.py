@@ -1,17 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-only checks of the SM90 per-flavor plumbing (issue #378): no SM90 device needed.
+"""Host checks of Hopper's historical candidate policy and fixed-owner routing.
 
-The SM90 row lowers two templates for exact (128, 128) graphs, chosen by the tile knob: the D512
-body (#2426) on its 64 x 64 tile, and the dedicated D128 template on a 128 x 128 tile that serves
-a dense subset. The row's, the heuristics' and config_sm90's seams are checked here, on every FROST
-lane: no CI lane runs Hopper. Most tests read the row spelled out field by field
-(``_two_flavor_row``); ``test_the_two_flavor_row_is_the_shipped_row`` pins it equal to the shipped
-row, so each of them is a test of the shipped row, and the tests that name ``_caps()`` read the
-shipped row directly. The adapter's seams (its flavor pick, that flavor's tile, the template it
-loads) ask the real device and are pinned in the cc 9.0 suite, test_sdpa_fwd_dsl_sm90.py; the D128
-kernel's numerics and graph route are test_sdpa_fwd_d128_sm90.py's.
+The retained policy supplies the existing 64 x 64 and dedicated 128 x 128
+candidate order. Public recommendations resolve every candidate to a fixed
+owner. Native execution and fixed-body replay are checked by the SM90 suites.
 """
 
 import dataclasses
@@ -30,13 +24,13 @@ _D512, _D128 = (512, 512), (128, 128)
 def _caps(name=_ROW):
     from cudnn.sdpa.fwd import engines
 
-    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[name]
+    return engines.sm100_legacy_policy_spec(name).capabilities if name == _ROW else {s.name: s.capabilities for s in engines.ENGINE_SPECS}[name]
 
 
 def _two_flavor_row(**over):
     """The SM90 row with the D128 template's 128 x 128 tile spelled out, as #378 spells it: the
     (128, 128) d-shape's Q and KV tile domains hold 64 (the D512 body) and 128 (D128). Equal to the
-    shipped row (test_the_two_flavor_row_is_the_shipped_row); ``over`` varies one field."""
+    shipped row (test_two_flavor_policy_retains_the_historical_geometry); ``over`` varies one field."""
     row = dataclasses.replace(
         _caps(),
         tile_ms_by_d_shape=((_D128, frozenset({64, 128})),),
@@ -66,7 +60,7 @@ def test_sm90_d128_set_leads_only_from_its_query_row_floor():
     from cudnn.sdpa.fwd import engines, heuristics
     from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _ROW)
+    spec = engines.sm100_legacy_policy_spec(_ROW)
     floor = D128_LEAD_MIN_SQ
     for h_q, h_kv in ((16, 16), (32, 8)):
         for mask in (dict(), dict(causal=True, bottom_right=True)):
@@ -177,7 +171,7 @@ def test_sm90_d128_shipped_switches_are_api_dsls():
     ]
 
 
-def test_the_two_flavor_row_is_the_shipped_row():
+def test_two_flavor_policy_retains_the_historical_geometry():
     """The spelled-out row is the shipped one, so every test below that reads ``_two_flavor_row()``
     tests what ``engines._sm90_spec`` ships. A tile entry spelled in ``_two_flavor_row`` that the row
     drops or changes fails here first (the tile overrides are tuples: their order counts). Row-wide
@@ -443,9 +437,9 @@ def test_the_shipped_row_proposes_each_flavors_own_geometry(kind):
     row = _caps()
     for d, tiles in ((128, {(128, 128), (64, 64)}), (512, {(64, 64)}), ((264, 504), {(64, 64)})):
         facts = _facts(d, h_kv=2, s_q=1024, s_kv=8192, causal=True)
-        offered = heuristics.recommend(kind, facts, {_ROW: 20517})
+        offered = heuristics.recommend(kind, facts, {"sdpa_fwd_sm90_f16_three_wg": 20540, "sdpa_fwd_sm90_d128_multi_q": 20541})
         assert offered and len({p.knobs for p in offered}) == len(offered) <= heuristics._MAX_SETS_PER_ENGINE, (d, offered)
-        assert {p.engine_id for p in offered} == {20517}, offered
+        assert all(p.engine_id == (20541 if p.knobs.tile_m == 128 else 20540) for p in offered), offered
         lead = (offered[0].knobs.tile_m, offered[0].knobs.tile_n)
         assert lead == ((128, 128) if kind == "A" and (128, 128) in tiles else (64, 64)), (d, kind, lead)
         for knobs in (p.knobs for p in offered):
