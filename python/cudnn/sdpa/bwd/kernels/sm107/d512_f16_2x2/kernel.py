@@ -198,9 +198,10 @@ from cudnn.sdpa.bwd.config_sm100 import (
 
 # The cc 10.7 ring arm: 8 chunk stages (K 8 KiB + V 8 KiB each per CTA) and 2 cast stages under the 325 KiB usable line.
 # ONE spelling, shared with the engine row's adapter (``api_dsl_sm107_d512``), and ``_require``d on the built config below.
-RUBIN_ARM = dict(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
+from cudnn.sdpa.bwd.kernels.sm107.d512_f16_2x2.config import RUBIN_ARM
+
 # Injected by the loader before this body executes; a plain import gets the all-defaults cc 10.7 record (dense bf16, the
-# 8-stage ring arm), which keeps `python sm107/bprop_d512_f16_2x2.py` usable as a standalone benchmark on the board.
+# 8-stage ring arm), which keeps `python sm107/d512_f16_2x2/kernel.py` usable as a standalone benchmark on the board.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams2x2(**RUBIN_ARM))
 CFG = make_cfg_d512_2x2(PARAMS)
 _decode_initial, _decode_payload = make_bwd_decode(CFG)

@@ -267,7 +267,7 @@ D512 BPROP entry in the FROST support tracker](https://github.com/NVIDIA/cudnn-f
 that writes `S` and `dS` to `[B, H_chunk, S_q, S_kv]` GMEM workspaces (heads
 chunked to a 4 GiB budget) -> `dV = Sᵀ·dO`, `dK = dSᵀ·Q`, `dQ = dS·K` as the
 `bprop_matmul_blackwell` GEMMs at the (512, 512) cluster tile -> the GQA fold --
-with stage 2 ALWAYS the **2x2-datapath** body `kernels/sm107/bprop_d512_f16_2x2.py`
+with stage 2 ALWAYS the **2x2-datapath** body `kernels/sm107/d512_f16_2x2/kernel.py`
 at the cc 10.7 ring arm: two independent `tcgen05.mma.cta_group::2` pairs per
 (4,1,1) cluster, 64 q rows per CTA, both BMMs (`Q·Kᵀ`, `dO·Vᵀ`) as SMEM SS
 operands with d streamed in 64-column chunks, an **8-stage K/V chunk ring** (the

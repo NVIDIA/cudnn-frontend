@@ -999,7 +999,7 @@ Backward (d512 stage 2):
 - **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
   CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
   rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
-  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  (`bwd/kernels/sm107/d512_f16_2x2/kernel.py`, parent `sm100/`) differs from its
   parent in a handful of code lines (the ring-arm default record, the
   hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
   fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
@@ -1938,3 +1938,10 @@ host suites never import template bodies, so import every moved module
 (`importlib.import_module`) before the GPU run. After delegating a row, diff
 failing test ids across every file under `test/python/sdpa` against the parent:
 row-name pins in band, admission and GPU suites do not match a `*bwd*` glob.
+
+After moving a body, search both its retired path and its basename across
+`docs`, `python` and `test` (for example, `git grep -n retired_kernel.py --
+docs python test`). Operation pages may spell the filename differently from
+loader constants, so a loader-only replacement can miss a current reference.
+Update current documentation; preserve frozen historical tracker entries and
+existing diagnostic labels.
