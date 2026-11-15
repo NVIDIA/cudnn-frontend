@@ -608,7 +608,8 @@ expressible, with one discipline separating them:
   only unmasked graphs, or only a causal diagonal, says so instead of leaving an
   axis to default (one coupling is expressible: `window_right`, the right modes
   a left window pairs with), and the matcher asks every axis in both directions so an
-  unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  unset graph flag cannot bypass a restricted claim. See the
+  [SDPA support reference](../sdpa/frost/support/README.md).
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
   per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
@@ -1138,15 +1139,16 @@ Contract:
     `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
-14. **Coverage changes update the support matrix.** A change to any SDPA
+14. **Coverage changes update the architecture support page.** A change to any SDPA
     `Capabilities` field that affects graph eligibility, or adding/retiring
     an `EngineSpec`, updates
-    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
-    That tracker is the only arch x pass x head-dim x dtype view of what
-    FROST serves, it is maintained by hand from these rows, and it silently
-    rots otherwise. Knob-domain-only changes are exempt (it does not track
-    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
-    exact scope and is the number to cite in review.
+    the affected section under [SDPA support](../sdpa/frost/support/README.md)
+    in the same commit. Use its template and SM90 example to migrate a section
+    from current source; label unreviewed scopes pending. The old tracker remains
+    historical reference and receives no new development logs. Knob-domain-only
+    changes are exempt; refactors still update moved links and engine identities.
+    `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the exact scope and
+    is the number to cite in review.
 15. **A stage that was read is released through `tile_dsl.consume`.** A bare
     arrive behind shared-memory loads of the stage it frees is not accepted
     in new or changed kernel code, even when every test passes
