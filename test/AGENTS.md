@@ -345,6 +345,13 @@ unchanged. The SM107 GPT-OSS D64 case in
 `test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
 prefill; a short query alone does not imply the D128 decode template.
 
+When transferring an entire head envelope to an explicit engine, migrate
+non-exact fixture widths too. Use the implementation's domain predicate rather
+than an exact-head list in a shared routing helper. Compiler-target rejection
+tests must select the current owner; otherwise legacy delegation rejects the
+record before the intended compiler check runs. The SM107 D24 bias, D248/V224
+prefill-split and D80 FP8 target tests cover these three boundaries.
+
 When a kernel gains an architecture-specific branch, update cross-architecture
 source-parity tests with exact, counted replacements for the declared delta.
 Do not omit an arbitrary AST branch: pin its initialization and fences, and
