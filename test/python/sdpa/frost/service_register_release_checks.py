@@ -15,8 +15,8 @@ from frost_test_utils import arch_known_to_the_dsl
 
 
 def _service_entries(ptx):
-    """Select the template's named _kernel, excluding reset/unscale helpers."""
-    return [entry for entry in re.split(r"\.visible\s+\.entry\s+", ptx)[1:] if entry.startswith("cudnn_kernel__kernel_")]
+    """Select the template's named _kernel (optionally prefixed by its engine name), excluding reset/unscale helpers."""
+    return [entry for entry in re.split(r"\.visible\s+\.entry\s+", ptx)[1:] if re.match(r"cudnn_(?:sdpa_fwd_\w+_)?kernel__kernel_", entry)]
 
 
 def _assert_service_guard(entry, first_warp, n_warps):
@@ -98,7 +98,8 @@ for path in files:
         instructions = [(action, int(count)) for action, count in re.findall(r"\bsetmaxnreg\.(inc|dec)\.sync\.aligned\.u32\s+(\d+)\s*;", entry)]
         sites.append({"file": path.name, "entry": entry.split("(", 1)[0], "instructions": instructions})
         entry_bodies.append(entry)
-expected_entries = 2 if filename == "sm100/prefill_d512_mxfp8.py" else 1
+# Output-slice recompute emits one entry per 256-column V slice; retained P runs both slices in one entry.
+expected_entries = 2 if filename == "sm100/d512_mxfp8_slice_recompute/kernel.py" else 1
 assert len(sites) == expected_entries, ("missing or unexpected service-kernel entries", sites)
 result = {"template": filename, "arch": arch, "service_budget": cfg.OTHER_REGS, "sites": sites}
 print("RELEASE_RESULT", json.dumps(result), flush=True)
@@ -140,6 +141,7 @@ def release_cases(arch):
             "prefill_d512_f16.py": "d512_f16_role_split/kernel.py",
             "prefill_d512_f16_2x2.py": "d512_f16_2x2/kernel.py",
             "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
+            "prefill_d512_mxfp8.py": "d512_mxfp8_slice_recompute/kernel.py",
         }
         path = (
             moved.get(name, name)
@@ -147,6 +149,10 @@ def release_cases(arch):
             else name
         )
         cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))
+    if arch == "sm100":
+        # The retained-P body compiles only for exact top-left SWA of one KV tile.
+        swa = dict(cta_mma=1, dtype_qkv=0, dtype_o=2, mma_2x2=False, window_left=127, window_right=0)
+        cases.append(pytest.param("sm100/d512_mxfp8_retained_p/kernel.py", swa, id="d512_mxfp8_retained_p"))
     return cases
 
 
@@ -177,7 +183,7 @@ def test_sm100_service_register_release(tmp_path, filename, params):
     if filename == "sm100/prefill_d128_fp8.py":
         # Compile only: never launch the deliberately invalid redistribution.
         check_service_release(tmp_path, filename, params, negative="single_warp")
-    if filename == "sm100/prefill_d512_mxfp8.py":
+    if filename == "sm100/d512_mxfp8_slice_recompute/kernel.py":
         for half in range(2):
             check_service_release(tmp_path, filename, params, negative=f"missing_release_{half}")
 

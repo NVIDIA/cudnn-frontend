@@ -164,6 +164,14 @@ shared CPU suites retained 1,089 passes and eight skips. Repeating the
 1,152 graph/mode comparison against that new parent preserved all 1,760
 ordered candidate records and placement decisions.
 
+A follow-up caller audit migrated the generic envelope assertion and scalar
+KV-tail helper to the D512 owner and physical CGA4. The helper passed native
+E4M3-to-BF16 cases with split counts 1 and 4 at D512, checking six execute-time
+KV lengths, fresh binding and changed-input CUDA Graph replay. The envelope
+contract also passed (three cases total, zero skips). Separate host entrypoint
+checks passed 43 cases, with 34 GPU skips and nine runtime cases deselected.
+These are additional selected fixture checks; device/runtime code is unchanged.
+
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
 `sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`

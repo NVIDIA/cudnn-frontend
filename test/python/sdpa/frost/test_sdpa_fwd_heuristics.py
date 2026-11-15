@@ -1061,8 +1061,10 @@ def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
 
 @pytest.mark.L0
 def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
+    from cudnn.sdpa.fwd.kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
     name = engines.engine_name(mxfp8=True)
-    offered = {name: 20510}
+    offered = {name: 20510, d512_mxfp8.SLICE_RECOMPUTE: 20552, d512_mxfp8.RETAINED_P: 20553}
     base = dict(
         s_q=8192,
         d_qk=512,
@@ -1079,6 +1081,7 @@ def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
     assert (causal[0].knobs.cga, causal[0].knobs.sched_policy) == (1, 1)
     assert (dense[0].knobs.cga, dense[0].knobs.sched_policy) == (1, 0)
     assert (thd[0].knobs.cga, thd[0].knobs.sched_policy) == (1, 0)
+    assert {plan.engine_id for plan in causal + dense + thd} == {20552}
 
     rubin_name = engines.engine_name(mxfp8=True, arch="sm107")
     rubin = recommend("A", _facts(device_cc=(10, 7), **base), {rubin_name: 20511})
