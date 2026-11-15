@@ -220,7 +220,7 @@ each way). Rubin's 576 TMEM columns and 327 KiB SMEM
 carveout are what let dV stay resident at d = 256 — the SM100 d512 backward is
 a different, three-stage shape.
 
-### The 2x2-datapath body (`kernels/bprop_d256_2x2_f16.py`; the SM100 row, and the Rubin twin)
+### The 2x2-datapath body (`kernels/sm100/d256_f16_2x2/kernel.py`; the SM100 row, and the Rubin twin)
 
 The same chain has a second main kernel on the **2x2 tcgen05 datapath**:
 `tcgen05.mma.cta_group::2` with the collective M = 128, i.e. 64 kv rows per CTA

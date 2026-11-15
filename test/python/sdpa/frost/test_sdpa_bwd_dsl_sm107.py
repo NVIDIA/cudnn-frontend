@@ -74,11 +74,11 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
         monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
 
 
-_ENGINE = "sdpa_bwd_sm107"
+_ENGINE = "sdpa_bwd_sm107_d256_f16_4x1"
 _FP8_ENGINE = "sdpa_bwd_sm107_fp8"
 _FAMILY_NAME = "frost_sdpa_bwd"
-_SLOT = 4  # engines/manifest.py: EngineSlot(4, opt_in=True) -> FROST_SDPA_BWD_ID_BASE + 4
-_ENGINE_ID = 20_604
+_SLOT = 32  # fixed native body; retired slot 4 remains reserved
+_ENGINE_ID = 20_632
 _D = 256
 _RUBIN_CC = (10, 7)
 _SM_RANGE = (107, 119)  # the row mirrors the forward Rubin rows (fwd/engines.py)
@@ -98,7 +98,7 @@ _BF16_ULP_REL = 2.0**-7
 # ---------------------------------------------------------------------------- the two kernel bodies (plan s1; the fp8 row shares this module's static pins)
 # The MXFP8 body (its own module is test_sdpa_bwd_mxfp8_sm107.py) shares
 # every family-parametrized static pin and SASS pin below.
-_KERNEL_FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+_KERNEL_FILES = {"f16": "sm107/d256_f16_4x1/kernel.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
 _TEMPLATE_TAGS = {"f16": "sdpa_bwd_sm107_main_f16", "fp8": "sdpa_bwd_sm107_main_fp8", "mxfp8": "sdpa_bwd_sm107_main_mxfp8"}
 _FAMILIES = tuple(_KERNEL_FILES)
 
@@ -224,7 +224,8 @@ def test_engine_name_grammar():
     """bwd names carry no phase segment: ``engine_name(arch) -> sdpa_bwd_<arch>``."""
     from cudnn.sdpa.bwd.engines import engine_name
 
-    assert engine_name("sm107") == _ENGINE
+    assert engine_name("sm107") == "sdpa_bwd_sm107"
+    assert engine_name("sm107_d256_f16_4x1") == _ENGINE
 
 
 def test_capabilities_match_what_is_implemented():
@@ -622,6 +623,7 @@ def _run(
     seq_lens=None,
     ws_poison=None,
     attn_scale=None,
+    standalone=False,
     **sdpa_kwargs,
 ):
     """Build, PIN the engine, execute ``runs`` times and hand back every run's (dQ, dK, dV) plus the fp64 oracle.
@@ -655,17 +657,54 @@ def _run(
         lse = lse.masked_fill(all_masked, 0.0)
     if seq_lens is not None:
         sdpa_kwargs["padded"] = True
-    graph_scale = None if omit_scale else ("default" if attn_scale is None else attn_scale)
-    g, t, (dq_t, dk_t, dv_t) = _build_graph(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dt=dt, scale=graph_scale, **sdpa_kwargs)
-    select_engine(g, _ENGINE)
-    g.check_support()
-    g.build_plans()
-    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
     dq, dk, dv = _bshd_empty(b, sq, hq, _D, dt), _bshd_empty(b, skv, hkv, _D, dt), _bshd_empty(b, skv, hkv, _D, dt)
-    pack = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: lse.unsqueeze(-1).contiguous(), dq_t: dq, dk_t: dk, dv_t: dv}
-    if seq_lens is not None:
-        pack[t["seq_len_q"]] = torch.tensor(seq_lens[0], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
-        pack[t["seq_len_kv"]] = torch.tensor(seq_lens[1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    if standalone:
+        # The two diagnostic profiles remain explicit standalone controls; graph records select fixed bodies.
+        from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+
+        assert seq_lens is None
+        assert set(sdpa_kwargs) <= {"use_causal_mask", "use_causal_mask_bottom_right", "diagonal_band_left_bound"}
+        left = sdpa_kwargs.get("diagonal_band_left_bound")
+        stats = lse.unsqueeze(-1).contiguous()
+        api = SdpaBwdDslSm107(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=o,
+            sample_do=do,
+            sample_stats=stats,
+            sample_dq=dq,
+            sample_dk=dk,
+            sample_dv=dv,
+            is_causal=bool(sdpa_kwargs.get("use_causal_mask") or sdpa_kwargs.get("use_causal_mask_bottom_right")),
+            causal_bottom_right=bool(sdpa_kwargs.get("use_causal_mask_bottom_right")),
+            window_size_left=None if left is None else left - 1,
+            scale_softmax=1.0 if omit_scale else (_D**-0.5 if attn_scale is None else attn_scale),
+        )
+        api.check_support()
+        api.compile()
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+
+        def execute():
+            api.execute(
+                q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, do_tensor=do, stats_tensor=stats, dq_tensor=dq, dk_tensor=dk, dv_tensor=dv, workspace=ws
+            )
+
+    else:
+        graph_scale = None if omit_scale else ("default" if attn_scale is None else attn_scale)
+        g, t, (dq_t, dk_t, dv_t) = _build_graph(b=b, hq=hq, hkv=hkv, sq=sq, skv=skv, dt=dt, scale=graph_scale, **sdpa_kwargs)
+        select_engine(g, _ENGINE)
+        g.check_support()
+        g.build_plans()
+        ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+        pack = {t["q"]: q, t["k"]: k, t["v"]: v, t["o"]: o, t["do"]: do, t["stats"]: lse.unsqueeze(-1).contiguous(), dq_t: dq, dk_t: dk, dv_t: dv}
+        if seq_lens is not None:
+            pack[t["seq_len_q"]] = torch.tensor(seq_lens[0], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+            pack[t["seq_len_kv"]] = torch.tensor(seq_lens[1], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+
+        def execute():
+            g.execute(pack, ws)
+
     outs = []
     for _ in range(runs):
         if poison is not None:
@@ -673,7 +712,7 @@ def _run(
                 x.fill_(poison)
         if ws_poison is not None:
             ws.fill_(ws_poison)
-        g.execute(pack, ws)
+        execute()
         torch.cuda.synchronize()
         outs.append(tuple(x.clone() for x in (dq, dk, dv)))
     return _Run(outs, (dq_r, dk_r, dv_r), dt)
@@ -3204,17 +3243,17 @@ class _LoadSpy:
         real = sm107.load_template
 
         def spy(path, params, tag="template"):
-            self.loads.append((os.path.basename(path), getattr(params, "datapath_2x2_profile", None), tag))
+            self.loads.append((path.rsplit("/kernels/", 1)[-1], getattr(params, "datapath_2x2_profile", None), tag))
             return real(path, params, tag=tag)
 
         monkeypatch.setattr(sm107, "load_template", spy)
 
     def main_kernels(self):
-        return sorted({(f, p) for f, p, _t in self.loads if f.startswith("bprop_d256")})
+        return sorted({(f, p) for f, p, _t in self.loads if f in ("sm107/d256_f16_4x1/kernel.py", "sm100/d256_f16_2x2/kernel.py")})
 
     def assert_body(self, profile):
         """Exactly one main-kernel body was loaded: the 2x2 file at ``profile`` (1 / 2), or the 4x1 file at 0."""
-        want = ("bprop_d256_2x2_f16.py", profile) if profile else ("bprop_d256_f16.py", 0)
+        want = ("sm100/d256_f16_2x2/kernel.py", profile) if profile else ("sm107/d256_f16_4x1/kernel.py", 0)
         assert self.main_kernels() == [want], f"the plan loaded {self.main_kernels()}, expected {[want]} (loads: {self.loads})"
 
 
@@ -3231,11 +3270,11 @@ def test_2x2_twin_is_off_by_default_and_selects_the_2x2_body_when_on(monkeypatch
     assert sm107.BWD_D256_2X2 is False, "the 4x1 body ships; the twin flips on only at <= 1.00x on Rubin"
     assert sm107.BWD_D256_2X2_PROFILE == c2.PROFILE_SM107_INTERLEAVED == 2, "the twin's profile is the design's interleaved one"
     api = _adapter(SdpaBwdDslSm107)
-    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == ("sm107/bprop_d256_f16.py", "sdpa_bwd_sm107_main_f16", 0)
+    assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == ("sm107/d256_f16_4x1/kernel.py", "sdpa_bwd_sm107_main_f16", 0)
     assert api._template_params() == _cfg_records_equal_default(api)
     monkeypatch.setattr(sm107, "BWD_D256_2X2", True)
     assert (api._kernel_file(), api._template_tag(), api._datapath_2x2_profile()) == (
-        "bprop_d256_2x2_f16.py",
+        "sm100/d256_f16_2x2/kernel.py",
         "sdpa_bwd_sm107_main_2x2",
         c2.PROFILE_SM107_INTERLEAVED,
     )
@@ -3243,7 +3282,7 @@ def test_2x2_twin_is_off_by_default_and_selects_the_2x2_body_when_on(monkeypatch
     mod = _load_2x2(2)
     assert api._stage3_gran(mod) == c2.kv_pad_rows_2x2(mod.CFG) == 256 and mod.DESC_VERSION == 1 and mod._KV_BLOCK_ROWS == 256
     monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", c2.PROFILE_SM100)
-    assert (api._kernel_file(), api._datapath_2x2_profile(), api._template_params().datapath_2x2_profile) == ("bprop_d256_2x2_f16.py", 1, 1)
+    assert (api._kernel_file(), api._datapath_2x2_profile(), api._template_params().datapath_2x2_profile) == ("sm100/d256_f16_2x2/kernel.py", 1, 1)
     mod1 = _load_2x2(1)
     assert api._stage3_gran(mod1) == 256 and mod1.DESC_VERSION == 0 and mod1._KV_BLOCK_ROWS == 128, "profile 1: 128-row kv block, 256-row write pair"
     for bad in (0, 3, None):
@@ -3270,7 +3309,7 @@ def _load_2x2(profile):
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
 
     return load_template(
-        _sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile), tag=f"sm107_twin_p{profile}"
+        _sm100_kernel_path("sm100/d256_f16_2x2/kernel.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile), tag=f"sm107_twin_p{profile}"
     )
 
 
@@ -3323,13 +3362,13 @@ def _twin_case_kw(case):
 @pytest.mark.parametrize("profile", _TWIN_PROFILES)
 @pytest.mark.parametrize("case", list(_TWIN_CASES), ids=list(_TWIN_CASES))
 def test_twox2_twin_accepts_on_rubin(monkeypatch, profile, case):
-    """The 2x2 twin on the Rubin board against the fp64 oracle (the engine pinned, the constants flipped), profile 1 (the SM100
+    """The 2x2 twin on the Rubin board against the fp64 oracle (the standalone adapter pinned, the constants flipped), profile 1 (the SM100
     row's body, descriptor version 0) and profile 2 (interleaved, descriptor version 1); the load spy pins that the 2x2 body
     at that profile is the one the plan was built from.  First board run 2026-10-01 (profile 2: all PASS, bitwise the 4x1)."""
     _twin_on(monkeypatch, profile)
     spy = _LoadSpy(monkeypatch)
     shape, kw, keep = _twin_case_kw(_TWIN_CASES[case])
-    _run(keep=keep, poison=float("nan"), **shape, **kw).check()
+    _run(standalone=True, keep=keep, poison=float("nan"), **shape, **kw).check()
     spy.assert_body(profile)
 
 
@@ -3342,7 +3381,7 @@ def test_twox2_twin_masked_stage3_reads_only_what_stage2_wrote(monkeypatch, prof
     reading only written dS tiles -- on a 0xFF-poisoned workspace, without the zero-fill."""
     _twin_on(monkeypatch, profile)
     shape, kw, keep = _mask_case_kw(_MASK_POISON_CASES[case])
-    _run(keep=keep, poison=float("nan"), ws_poison=0xFF, **shape, **kw).check()
+    _run(standalone=True, keep=keep, poison=float("nan"), ws_poison=0xFF, **shape, **kw).check()
 
 
 @requires_rubin
@@ -3352,7 +3391,9 @@ def test_twox2_twin_two_launches_are_bitwise_and_race_free(monkeypatch, profile,
     """The two-launch race + determinism probe over the twin (``Producer.LEADER_RELEASE`` on the lane-written P ring, the
     explicit S / dP / P slot barriers), raw bits, causal GQA with several tiles per CTA."""
     _twin_on(monkeypatch, profile)
-    run = _run(b=2, hq=4, hkv=2, sq=512, skv=768, dt=dt, keep=_causal_keep(512, 768), use_causal_mask=True, runs=3, poison=float("nan")).check()
+    run = _run(
+        standalone=True, b=2, hq=4, hkv=2, sq=512, skv=768, dt=dt, keep=_causal_keep(512, 768), use_causal_mask=True, runs=3, poison=float("nan")
+    ).check()
     for which, (a, b_) in (("launch 2 vs 1 (race)", (run.outs[1], run.outs[0])), ("launch 3 vs 2 (determinism)", (run.outs[2], run.outs[1]))):
         for name, x, y in zip(("dQ", "dK", "dV"), a, b_):
             n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
@@ -3376,11 +3417,11 @@ def test_twox2_twin_is_bitwise_the_4x1_body_on_rubin(monkeypatch, profile, shape
     causal = shape.pop("causal", False)
     kw = dict(keep=_causal_keep(shape["sq"], shape["skv"]), use_causal_mask=True) if causal else {}
     base_spy = _LoadSpy(monkeypatch)
-    base = _run(**shape, **kw).check()
+    base = _run(standalone=True, **shape, **kw).check()
     base_spy.assert_body(0)
     _twin_on(monkeypatch, profile)
     twin_spy = _LoadSpy(monkeypatch)
-    twin = _run(**shape, **kw).check()
+    twin = _run(standalone=True, **shape, **kw).check()
     twin_spy.assert_body(profile)
     for name, x, y in zip(("dQ", "dK", "dV"), twin.outs[0], base.outs[0]):
         n_diff = (x.view(torch.int16) != y.view(torch.int16)).sum().item()
@@ -3678,7 +3719,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP32
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
-    FILES = {"f16": "sm107/bprop_d256_f16.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+    FILES = {"f16": "sm107/d256_f16_4x1/kernel.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
     # *_f32dv: the fp8 body at dtype_o = FP32 -- the GQA fold's unrounded dV partial (the 128 KiB staging, two 32-col stores per chunk).
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640),
              "thd": dict(thd_varlen=True), "thd_causal": dict(thd_varlen=True, window_right=0),

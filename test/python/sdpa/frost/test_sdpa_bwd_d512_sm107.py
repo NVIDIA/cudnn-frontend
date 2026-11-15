@@ -264,7 +264,7 @@ def test_d512_half_graph_is_served_by_exactly_this_row_on_the_rubin_line(monkeyp
 
 def test_d256_half_graph_stays_the_d256_rows(monkeypatch):
     """The envelope floor is exclusive at 256: the Rubin d256 half row keeps that graph, this row declines it."""
-    assert _eligible(monkeypatch, d=256) == {"sdpa_bwd_sm107"}
+    assert _eligible(monkeypatch, d=256) == {"sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_d256_f16_2x2"}
     assert _decline_reason(monkeypatch, d=256) is not None
 
 

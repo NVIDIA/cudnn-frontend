@@ -203,6 +203,8 @@ def test_zero_attn_scale_claims():
         "sdpa_bwd_sm100_d512_role_split",
         "sdpa_bwd_sm100_d512_2x2",
         "sdpa_bwd_sm107",
+        "sdpa_bwd_sm107_d256_f16_4x1",
+        "sdpa_bwd_sm107_d256_f16_2x2",
         "sdpa_bwd_sm107_fp8",
         "sdpa_bwd_sm107_mxfp8",
         "sdpa_bwd_sm100_d256",

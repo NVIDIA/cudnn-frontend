@@ -241,7 +241,7 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 
 # Config comes from the FROST template loader, never an env var: the loader injects
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain import usable.
-from cudnn.sdpa.bwd.config_sm107 import (
+from cudnn.sdpa.bwd.kernels.sm107.d256_f16_4x1.config import (
     FAMILY_F16,
     TemplateParams,
     buffer_elems,

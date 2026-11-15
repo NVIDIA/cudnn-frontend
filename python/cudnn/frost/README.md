@@ -366,7 +366,7 @@ python/cudnn/
         sm100/d512_f16_role_split/kernel.py       stage 2 of the large-head-dim chain
         sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
                                       _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
-        sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
+        sm107/d256_f16_4x1/kernel.py       Rubin d256 bf16/fp16 main kernel (dV in
                                       TMEM, dS to a kv-major GMEM workspace)
         sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
                                       the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
