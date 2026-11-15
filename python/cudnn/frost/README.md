@@ -368,7 +368,7 @@ python/cudnn/
                                       _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
         sm107/d256_f16_4x1/kernel.py       Rubin d256 bf16/fp16 main kernel (dV in
                                       TMEM, dS to a kv-major GMEM workspace)
-        sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
+        sm107/d256_fp8/kernel.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
                                       the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
         sm120/f16_fused/kernel.py     fused SM120 main kernel
         sm120/bprop_chain_f16.py      the SM120-only part of its launch chain

@@ -189,7 +189,7 @@ e4m3 -> bf16 upcast of Q / K walks compact elements.  The graph tier needs the
 ragged fp8 graph is a typed decline at eligibility (``thd_declared_totals``).
 
 MXFP8 (cuDNN ``sdpa_mxfp8_backward``):
-ONE kernel plus scale-factor plumbing (``sm107/bprop_d256_mxfp8.py``, the fp8 body's
+ONE kernel plus scale-factor plumbing (``sm107/d256_mxfp8/kernel.py``, the fp8 body's
 pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every block-scale MMA).
 The kernel consumes the ROWWISE payloads q / k / v / dO with their SF and the COLUMNWISE
 dO_T with its D-plane-major SF; q_T / k_T (and their SF) are stage-3 operands only.  P is
@@ -300,8 +300,8 @@ _SM107_Q_PAD = 128
 _SM107_KV_PAD = 256  # also the stage-3 K-trim granularity (`causal_gran`) and the kernels' q write pair (`config_sm107.q_write_tiles`)
 _SM107_KERNEL_FILES = {
     _cfg.FAMILY_F16: "sm107/d256_f16_4x1/kernel.py",
-    _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py",
-    _cfg.FAMILY_MXFP8: "sm107/bprop_d256_mxfp8.py",
+    _cfg.FAMILY_FP8: "sm107/d256_fp8/kernel.py",
+    _cfg.FAMILY_MXFP8: "sm107/d256_mxfp8/kernel.py",
 }
 _SM107_TEMPLATE_TAGS = {
     _cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16",
@@ -1959,7 +1959,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     def _thd_map_slots(self, b: int) -> int:
         """The MXFP8 THD main kernel writes TEN packed-total-clamped input maps (the five payload descriptors of the other bodies plus
         the five scale-factor maps Q-SF / K-SF / V-SF / dO-SF / dO_T-SF, their tile extent clamped to the live SF tile total) and one
-        clipped dV descriptor per sequence: ``10 + B`` slots (``sm107/bprop_d256_mxfp8.py`` ``THD_MAP_SLOTS``)."""
+        clipped dV descriptor per sequence: ``10 + B`` slots (``sm107/d256_mxfp8/kernel.py`` ``THD_MAP_SLOTS``)."""
         return 10 + b
 
     def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):

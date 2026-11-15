@@ -10,10 +10,10 @@ own pipeline rather than a dtype arm of the other:
   ``Q.K -> dO.V -> P.dO``, P written back INTO the S accumulator (no P ring, no
   ``s_acc_empty``), BMM1 K-split (the K back-half is UTCCP'd into the spare
   TMEM columns and the freed SMEM hosts the second ``dO_dv`` stage).
-* ``kernels/sm107/bprop_d256_fp8.py`` (per-tensor FP8 E4M3): lookahead MMA
+* ``kernels/sm107/d256_fp8/kernel.py`` (per-tensor FP8 E4M3): lookahead MMA
   order ``Q.K[i+1]`` ahead of ``S.dO[i]``, a 2-stage fp8 P ring in TMEM, three
   3-deep Q / dO rings.
-* ``kernels/sm107/bprop_d256_mxfp8.py`` (MXFP8: E4M3 payloads + E8M0 block scale
+* ``kernels/sm107/d256_mxfp8/kernel.py`` (MXFP8: E4M3 payloads + E8M0 block scale
   factors, ``FAMILY_MXFP8``): the fp8 body's pipeline -- the 2-stage e4m3 P ring
   in TMEM [512, 576), BMM2 = ``mma_ts`` -- with every UTCCP'd scale-factor atom
   ALIASED into the P-ring slot that is dead in the current q iteration (no
@@ -315,8 +315,8 @@ class TemplateParams(_BwdTemplateParams):
     body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
     served by all three bodies (packed ``[1, T, H, D]`` operands, a kv-blocked
     dS workspace, per-sequence lengths from the metadata buffer -- the module
-    docs of ``sm107/d256_f16_4x1/kernel.py`` / ``bprop_d256_fp8.py`` /
-    ``bprop_d256_mxfp8.py``; the MXFP8 body over packed per-sequence-tile-padded
+    docs of ``sm107/d256_f16_4x1/kernel.py`` / ``sm107/d256_fp8/kernel.py`` /
+    ``sm107/d256_mxfp8/kernel.py``; the MXFP8 body over packed per-sequence-tile-padded
     scale factors).
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also

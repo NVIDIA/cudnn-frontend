@@ -260,7 +260,8 @@ def test_engine_name_grammar():
 
     if "fp8" in inspect.signature(engine_name).parameters:
         assert engine_name("sm107", fp8=True) == _ENGINE
-        assert engine_name("sm107") == _HALF_ENGINE
+        assert engine_name("sm107") == "sdpa_bwd_sm107"  # legacy delegated row
+        assert _HALF_ENGINE == "sdpa_bwd_sm107_d256_f16_4x1"
     assert _spec().name == _ENGINE
 
 
@@ -705,6 +706,7 @@ def _run_fp8(
     ws_poison=None,
     attn_scale=None,
     d_v=None,
+    record=None,
 ):
     """Quantize unit-normal operands per tensor, run the oracle (forward for O / Stats, then backward with the oracle's
     Stats injected -- the kernel recomputes P from the forward's exact LSE), build the graph with the contract's twelve
@@ -827,8 +829,12 @@ def _run_fp8(
     )
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, _ENGINE)
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(g, _ENGINE)
+    else:
+        g.create_execution_plan(*record)
+        g.select_plan(0)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

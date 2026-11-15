@@ -60,6 +60,14 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM107_FP8:
+        from .kernels.sm107.d256_fp8.host import SdpaBwdDslSm107Fp8
+
+        return SdpaBwdDslSm107Fp8
+    if name == _SM107_MXFP8:
+        from .kernels.sm107.d256_mxfp8.host import SdpaBwdDslSm107Mxfp8
+
+        return SdpaBwdDslSm107Mxfp8
     if name == _SM107_D256_NATIVE:
         from .kernels.sm107.d256_f16_4x1.host import SdpaBwdDslSm107D256FourByOne
 
@@ -106,8 +114,8 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
         return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
-    if name in (_SM107, _SM107_FP8, _SM107_MXFP8):
-        # The Rubin d=256 chains (half + per-tensor FP8 + block-scale MXFP8) share one module.
+    if name == _SM107:
+        # Compatibility for the historical half adapter; fixed graph owners live beside their bodies.
         from cudnn.sdpa.bwd import api_dsl_sm107
 
         return getattr(api_dsl_sm107, name)
@@ -127,6 +135,8 @@ def _adapter(name: str):
 
 
 def _fp8_adapter(name: str):
+    if name == _SM107_FP8:
+        return _adapter(name)
     if name == _SM120_FP8:
         from cudnn.sdpa.bwd.api_dsl_sm120_fp8 import SdpaBwdDslSm120Fp8
 
@@ -149,6 +159,8 @@ def _fp8_adapter(name: str):
 
 
 def _mxfp8_adapter(name: str):
+    if name == _SM107_MXFP8:
+        return _adapter(name)
     if name == _SM120_MXFP8:
         from cudnn.sdpa.bwd.api_dsl_sm120_mxfp8 import SdpaBwdDslSm120Mxfp8
 
@@ -1844,6 +1856,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_fp8",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -1874,7 +1887,7 @@ def _sm107_fp8_spec() -> EngineSpec:
 
 def _sm107_mxfp8_spec() -> EngineSpec:
     """SM107 (Rubin) d=256 block-scale MXFP8 backward row (``sdpa_mxfp8_backward``;
-    ``api_dsl_sm107.SdpaBwdDslSm107Mxfp8``, kernel ``sm107/bprop_d256_mxfp8.py``).
+    ``api_dsl_sm107.SdpaBwdDslSm107Mxfp8``, kernel ``sm107/d256_mxfp8/kernel.py``).
 
     ONE kernel plus scale-factor plumbing (no separate SF-repack or dequant kernels): the per-tensor
     fp8 body's pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every
@@ -1945,6 +1958,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_mxfp8",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_mxfp8",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
