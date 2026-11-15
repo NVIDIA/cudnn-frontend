@@ -82,6 +82,8 @@ pre-commit run                # clang-format 21 (C++/CUDA) + black -l 160 (pytho
 
 First invocation builds the hook environments and can take >5 minutes; later runs are fast. Run on the files you changed (staged files, or `pre-commit run --files <paths>`), not `--all-files` — some pre-existing files are not currently formatter-clean, and reformatting them would pollute your diff. C++ style is Google-based, 4-space indent, 120 columns (`.clang-format`); Python is black with line length 160.
 
+The internal pipeline's `analysis:guardwords_scan` scans the whole tree, docs included and case-insensitively, against a word list that pre-commit does not check. The list covers informal or negative comment words (#2609 tripped its `COMMENT` rule), internal tool and CI names, and unreleased architecture names. The job log names the rule that fired; reword the text rather than quoting the flagged word elsewhere.
+
 ## Conventions
 
 - `include/` is header-only: no `.cpp` files, no new required dependencies. Vendored third-party code lives in `include/cudnn_frontend/thirdparty/`.
