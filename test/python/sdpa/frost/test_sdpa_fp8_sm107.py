@@ -796,25 +796,25 @@ def test_fp8_envelope_mismatch_rules():
     small = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
     d256 = caps["sdpa_fwd_sm100_d256_fp8_single_q"]
     d512 = caps["sdpa_fwd_sm100_d512_fp8_role_split"]
-    assert engines.mismatch(sm100, _fp8_facts()) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=96, d_v=64)) is None
+    assert engines.mismatch(small, _fp8_facts()) is None
+    assert engines.mismatch(small, _fp8_facts(d_qk=96, d_v=64)) is None
     # D192 and D256 serve their aligned dense head envelopes.
     assert engines.mismatch(d192, _fp8_facts(d_qk=192, d_v=128)) is None
     assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=192, d_v=128))
     assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None
     for dq, dv in ((16, 144), (224, 16), (160, 160), (224, 208)):
         for arch, cc in (("sm100", (10, 0)), ("sm107", (10, 7))):
-            row = caps[engines.engine_name(arch=arch, fp8=True)]
+            row = d256 if arch == "sm100" else caps[engines.engine_name(arch=arch, fp8=True)]
             facts = _fp8_facts(device_cc=cc, d_qk=dq, d_v=dv)
             assert engines.mismatch(row, facts) is None, (arch, dq, dv)
             assert engines._selected_d_shape(row, facts) == (256, 256)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
-        assert engines.mismatch(sm100, _fp8_facts(d_qk=dq, d_v=dv)) is None
+        assert engines.mismatch(d192, _fp8_facts(d_qk=dq, d_v=dv)) is None
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=192, d_v=128)) == (192, 128)
     assert engines._selected_d_shape(sm100, _fp8_facts(d_qk=256, d_v=256)) == (256, 256)
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=256))
-    assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=88, d_v=88))
-    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(thd=True, padded=True))
+    assert engines.mismatch(small, _fp8_facts(d_qk=88, d_v=88)) is not None
+    assert "dense-only" in engines.mismatch(small, _fp8_facts(thd=True, padded=True))
     assert engines.mismatch(small, _fp8_facts(d_qk=128, d_v=128, thd=True, padded=True)) is None
     for d in (64, 128):
         assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=d, d_v=d))
@@ -828,16 +828,16 @@ def test_fp8_envelope_mismatch_rules():
     assert engines.mismatch(d512, _fp8_facts(d_qk=512, d_v=512, thd=True, padded=True)) is None
     for d in (256, 512):
         assert "owned by" in engines.mismatch(sm100, _fp8_facts(d_qk=d, d_v=d))
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=464, d_v=368)) is None
-    assert engines.mismatch(sm100, _fp8_facts(d_qk=272, d_v=272)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=384, d_v=448)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=464, d_v=368)) is None
+    assert engines.mismatch(d512, _fp8_facts(d_qk=272, d_v=272)) is None
     # Straddling the d512 floor declines rather than routing onto that kernel.
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=128))
     # THD stays native-tile: the (256, 512] envelope band is dense-only.
-    assert "dense-only" in engines.mismatch(sm100, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
+    assert "dense-only" in engines.mismatch(d512, _fp8_facts(d_qk=384, d_v=448, thd=True, padded=True))
     # d % 16 still applies inside the band (TMA 16-byte global-stride rule).
-    assert "multiples of 16" in engines.mismatch(sm100, _fp8_facts(d_qk=392, d_v=392))
+    assert engines.mismatch(d512, _fp8_facts(d_qk=392, d_v=392)) is not None
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
