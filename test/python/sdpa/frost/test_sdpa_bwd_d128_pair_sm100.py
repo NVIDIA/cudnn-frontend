@@ -8,7 +8,8 @@ import torch
 from types import SimpleNamespace
 
 from frost_test_utils import cuda_launch_names, requires_dsl, requires_pre_rubin_blackwell, select_engine
-from test_sdpa_bwd_d128_sm100 import _ENGINE, _case, _check_case
+from test_sdpa_bwd_d128_sm100 import _PAIR_ENGINE as _ENGINE
+from test_sdpa_bwd_d128_sm100 import _case, _check_case
 from test_sdpa_bwd_dsl_sm107 import _bshd_empty, _build_graph, _causal_keep, _reference64
 
 pytestmark = [pytest.mark.L0, requires_dsl]
@@ -24,7 +25,7 @@ def _require_pair():
 
 
 def test_config_geometry():
-    from cudnn.sdpa.bwd.config_sm100_d128_dq import CFG, HEAD_DIMS, make_bar_layout, make_config, validate_config
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_pair.config_dq import CFG, HEAD_DIMS, make_bar_layout, make_config, validate_config
 
     for d in HEAD_DIMS:
         cfg = make_config(d)
@@ -89,19 +90,22 @@ def test_deterministic_request_selects_the_pair(monkeypatch, d, left):
     assert plain.check_support() and plain._implementation == ("recompute" if (d == 128 and left is not None) else "accumulation")
 
 
-def test_dkdv_rendering_is_a_template_parameter():
+def test_dkdv_body_is_fixed_and_width_ratio_split_remain_local():
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_f16 as shipped
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_pair import kernel_dkv
 
     pytest.importorskip("cutlass")
     assert shipped.DQ_OUT is True and shipped.HEAD_DIM == 128 and (shipped.RATIO, shipped.SPLIT) == (1, 1)
-    dkdv = load_template(shipped.__file__, (128, False), tag="test_dkdv_only")
+    dkdv = load_template(kernel_dkv.__file__, 128, tag="test_dkdv_only")
     assert dkdv.DQ_OUT is False and dkdv.HEAD_DIM == 128 and dkdv.CFG_ACCUM == shipped.CFG_ACCUM
-    split = load_template(shipped.__file__, (64, False, 4, 2), tag="test_dkdv_split")
+    split = load_template(kernel_dkv.__file__, (64, 4, 2), tag="test_dkdv_split")
     assert (split.DQ_OUT, split.HEAD_DIM, split.RATIO, split.SPLIT) == (False, 64, 4, 2)
     assert load_template(shipped.__file__, 64, tag="test_d64_shipped").DQ_OUT is True
     with pytest.raises(ValueError):
         load_template(shipped.__file__, (128, True, 2), tag="test_dq_out_ratio")
+    with pytest.raises(ValueError, match="d128_f16_pair"):
+        load_template(shipped.__file__, (128, False), tag="test_retired_dkdv")
 
 
 def test_deterministic_request_off_the_pair_parts_keeps_recompute(monkeypatch):
@@ -334,7 +338,7 @@ def test_pair_tail_keys_with_negative_lse(dt):
     """A tail KV tile whose zero-filled key rows meet a very negative LSE: the tail columns are masked before the exponent."""
     _require_pair()
     from frost_test_utils import select_engine
-    from test_sdpa_bwd_d128_sm100 import _ENGINE
+    from test_sdpa_bwd_d128_sm100 import _PAIR_ENGINE as _ENGINE
     from test_sdpa_bwd_dsl_sm107 import _bshd_empty, _build_graph, _check
 
     b, h, sq, sk = 1, 1, 65, 129
