@@ -434,8 +434,8 @@ def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b
     The graph adapter normally selects non-persistent scheduling. Force the
     kernel constructor flag here to cover the CLC zero-trip path as well.
     """
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.dq import BlackwellFmhaBackwardDQ256
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.dkdv import BlackwellFmhaBackwardDKDV256
 
     def with_schedule(init):
         def wrapped(self, *args, **kwargs):

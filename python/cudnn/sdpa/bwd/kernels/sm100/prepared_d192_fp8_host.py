@@ -16,7 +16,8 @@ from cudnn.frost.template_loader import load_template
 
 from cudnn.sdpa.bwd.d128_contract import ABI_VERSION, WORKSPACE_SLACK
 from cudnn.sdpa.bwd.kernels.bprop_chain_common import dot_do_o_host
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_fp8_helpers import delta_d192_fp8_host as delta_host
+from cudnn.sdpa.bwd.kernels.sm100.fp8_pair.helpers import delta_d192_fp8_host as delta_host
+from cudnn.sdpa.bwd.kernels.sm100.fp8_pair import contract as pair
 
 EXP2_FMA_SPLIT_SMS = frozenset((100,))
 K64_SMS = frozenset((107,))
@@ -57,8 +58,8 @@ def _kernel_hosts(spec):
         module = load_template(str(here.parent.parent / (d512_mxfp8 if spec[3] else d512_fp8).KERNEL_FILE), spec, tag=f"sdpa_bwd_d512_{fmt}_w{spec[4]}")
         return module.dkdv_host, module.dq_host
     tag = f"sdpa_bwd_d{spec[0]}x{spec[1]}_{'mxfp8' if spec[3] else 'fp8'}{'_fma' if spec[2] else ''}_w{spec[4]}{'_k64_l2' + str(spec[6]) + ('_pdl' if spec[7] else '') if _sm107_line(spec) else ''}"
-    dkdv = load_template(str(here.with_name("bprop_d192_dkdv_fp8.py")), spec, tag=f"{tag}_dkdv").host
-    dq = load_template(str(here.with_name("bprop_d192_dq_fp8.py")), spec, tag=f"{tag}_dq").host
+    dkdv = load_template(str(here.parent.parent / pair.DKDV_FILE), spec, tag=f"{tag}_dkdv").host
+    dq = load_template(str(here.parent.parent / pair.DQ_FILE), spec, tag=f"{tag}_dq").host
     return dkdv, dq
 
 
@@ -72,8 +73,8 @@ def _specialized(spec):
 
 
 if SPEC is None:
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import host as dkdv_host
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dq_fp8 import host as dq_host
+    from cudnn.sdpa.bwd.kernels.sm100.fp8_pair.dkdv import host as dkdv_host
+    from cudnn.sdpa.bwd.kernels.sm100.fp8_pair.dq import host as dq_host
 else:
     dkdv_host = dq_host = None
 _BIND_LOCK = threading.Lock()

@@ -398,6 +398,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm80_f16_d64": EngineSlot(19),
             "sdpa_bwd_sm80_f16_two_subgroup": EngineSlot(20),
             "sdpa_bwd_sm120_f16_two_subgroup": EngineSlot(21),
+            "sdpa_bwd_sm100_d128_fp8_pair": EngineSlot(22, opt_in=True),
+            "sdpa_bwd_sm100_d128_fp8_accumulation": EngineSlot(23, opt_in=True),
+            "sdpa_bwd_sm100_mxfp8_pair": EngineSlot(24, opt_in=True),
+            "sdpa_bwd_sm100_d256_mxfp8": EngineSlot(25, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick

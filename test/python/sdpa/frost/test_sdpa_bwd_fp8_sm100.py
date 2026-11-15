@@ -44,8 +44,10 @@ def _spec():
     return spec
 
 
-def _mismatch(monkeypatch, cc=_SM100_CC, **kw):
+def _mismatch(monkeypatch, cc=_SM100_CC, row=False, **kw):
+    """The row's verdict for the graph's own body: the explicit engine its declaration selects (``row=True``: the row)."""
     from cudnn.sdpa.bwd import engines
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
 
     monkeypatch.setattr(_rubin, "_D", _D)
     monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.1")))
@@ -54,7 +56,10 @@ def _mismatch(monkeypatch, cc=_SM100_CC, **kw):
     g = _rubin._build_graph(**{"d": _D, **kw})
     facts = g._facts_for(engines.ga.analyze)
     facts = facts.__class__(**{**facts.__dict__, "device_cc": cc}) if hasattr(facts, "__dict__") else facts
-    return engines.mismatch(_spec().capabilities, facts)
+    if row:
+        return engines.mismatch(_spec().capabilities, facts)
+    owner = quantized_contract.select_d128_fp8(facts)
+    return engines.mismatch(next(s for s in engines.ENGINE_SPECS if s.name == owner).capabilities, facts)
 
 
 def test_engine_is_registered():
@@ -70,6 +75,8 @@ def test_engine_is_registered():
 @pytest.mark.parametrize("cc", [_SM100_CC, _SM103_CC], ids=["sm100", "sm103"])
 def test_row_admits_dense_d128_e4m3(monkeypatch, cc):
     assert _mismatch(monkeypatch, cc=cc) is None
+    assert _mismatch(monkeypatch, cc=cc, row=True) == "this graph is owned by the explicit implementation engine sdpa_bwd_sm100_d128_fp8_pair"
+    assert _mismatch(monkeypatch, cc=cc, d=64, row=True) == "this graph is owned by the explicit implementation engine sdpa_bwd_sm100_d128_fp8_accumulation"
     assert _mismatch(monkeypatch, cc=cc, d=64) is None
     assert _mismatch(monkeypatch, cc=cc, d=64, left_bound=127) is None
     assert _mismatch(monkeypatch, cc=cc, causal=False) is None

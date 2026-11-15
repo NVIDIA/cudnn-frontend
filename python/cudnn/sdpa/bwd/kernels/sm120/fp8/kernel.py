@@ -17,7 +17,7 @@ from cutlass.experimental import primitives as nvvm
 
 from cudnn.frost.tile_dsl.mma import mma_m16n8k32_f32
 from cudnn.frost.tile_dsl.pointwise import fmax_f32, fp32_to_fp8x2
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import _fold_amax, _scalar
+from cudnn.sdpa.bwd.kernels.sm100._fp8_common import _fold_amax, _scalar
 from cudnn.sdpa.bwd.kernels.sm120._fp8_common import _column_word, _store, _word
 
 FP8 = cutlass.Float8E4M3FN
