@@ -2029,7 +2029,7 @@ _PAGED_UNWIRED_KERNELS = [
     ("sm107/prefill_d128_fp8.py", 0, 2),
     ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
-    ("sm107/prefill_d256_fp8.py", 0, 1),
+    ("sm107/d256_fp8_single_q/kernel.py", 0, 1),
     ("sm107/prefill_d512_mxfp8.py", 0, 2),
 ]
 

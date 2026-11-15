@@ -37,7 +37,7 @@ def test_native_fp8_sink_split_rebind_replay(d, dv, split, dtype, output, monkey
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    expected = "sm107/prefill_d192_d128_fp8.py" if d == 192 else "sm107/prefill_d128_fp8.py"
+    expected = "sm107/d192_fp8_multi_q/kernel.py" if d == 192 else "sm107/prefill_d128_fp8.py"
     assert expected in seen and not any(name.startswith("sm100/") for name in seen)
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared.spec.has_sink and prepared.spec.split == split and prepared.spec.combine is not None

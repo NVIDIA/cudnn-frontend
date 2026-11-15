@@ -103,6 +103,8 @@ from .kernels.sm100.d512_fp8_role_split.contract import (
 )
 from .kernels.sm100.d128_fp8_multi_q import contract as _small_fp8_multi_q
 from .kernels.sm107.d512_fp8_role_split import contract as _sm107_d512_fp8_owner
+from .kernels.sm107.d192_fp8_multi_q import contract as _sm107_d192_fp8_owner
+from .kernels.sm107.d256_fp8_single_q import contract as _sm107_d256_fp8_owner
 from .kernels.sm100.d128_fp8_dual_kv import contract as _small_fp8_dual_kv
 from .kernels.sm100.d128_fp8_swap_ab import contract as _small_fp8_swap_ab
 from .kernels.sm100.d192_f16_multi_q import contract as _d192_half_multi_q
@@ -1894,6 +1896,11 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _d512_fp8_implementation_mismatch(facts, knobs)
         if reason is not None:
             return reason
+    for owner in (_sm107_d192_fp8_owner, _sm107_d256_fp8_owner):
+        if capabilities.implementation == owner.NAME:
+            reason = owner.mismatch(facts, knobs)
+            if reason is not None:
+                return reason
     if capabilities.implementation == _sm107_d512_fp8_owner.NAME:
         reason = _sm107_d512_fp8_owner.mismatch(facts, knobs)
         if reason is not None:
@@ -3633,7 +3640,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
         name=f"sdpa_fwd_prefill_{arch}_fp8",
         capabilities=Capabilities(
             delegated_exact=(
-                frozenset({((10, 7), (512, 512))})
+                frozenset(((10, 7), shape) for shape in ((192, 128), (256, 256), (512, 512)))
                 if rubin_row
                 else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
             ),
@@ -3975,6 +3982,45 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         swap_abs=frozenset(),
     )
     return EngineSpec(_D512_FP8_ROLE_SPLIT, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+
+
+def _sm107_mid_fp8_specs():
+    """Native per-tensor mid-width bodies share graph services, not configs."""
+    from .kernels.sm107.d192_fp8_multi_q.host import lower as lower_d192
+    from .kernels.sm107.d256_fp8_single_q.host import lower as lower_d256
+
+    base = _sm100_fp8_spec(arch="sm107").capabilities
+    specs = []
+    for owner, dims, cga, lower in (
+        (_sm107_d192_fp8_owner, (192, 128), 2, lower_d192),
+        (_sm107_d256_fp8_owner, (256, 256), 1, lower_d256),
+    ):
+        shape = frozenset({dims})
+        capabilities = replace(
+            base,
+            implementation=owner.NAME,
+            delegated_exact=frozenset(),
+            sm_hi=107,
+            d_shapes=shape,
+            d_pad_multiple=0,
+            d_envelope_floors=(),
+            thd_d_shapes=shape,
+            paged_kv=False,
+            paged_d_shapes=frozenset(),
+            split_d_shapes=shape,
+            pack_gqa_d_shapes=shape,
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            o_block_scales=frozenset({0}),
+            cgas=frozenset({cga}),
+            cgas_by_d_shape=(),
+            split_cgas_by_d_shape=(),
+            swap_abs=frozenset(),
+            epilogue_gate=dims == (256, 256),
+            epilogue_gate_d_shapes=base.epilogue_gate_d_shapes if dims == (256, 256) else None,
+            epilogue_gate_dtypes=base.epilogue_gate_dtypes if dims == (256, 256) else None,
+        )
+        specs.append(EngineSpec(owner.NAME, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs)))
+    return tuple(specs)
 
 
 def _sm107_d512_fp8_spec() -> EngineSpec:
@@ -5409,6 +5455,7 @@ ENGINE_SPECS = (
     _sm100_fp8_spec(),
     _sm100_d512_fp8_spec(),
     _sm107_d512_fp8_spec(),
+    *_sm107_mid_fp8_specs(),
     _sm100_d256_fp8_spec(),
     _sm100_d192_fp8_spec(),
     *_sm100_small_fp8_specs(),

@@ -79,6 +79,8 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm100.d192_fp8_multi_q.contract import in_domain as in_d192_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.small_fp8_contract import in_domain as in_small_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm107.d512_fp8_role_split import contract as sm107_d512_fp8
+    from cudnn.sdpa.fwd.kernels.sm107.d192_fp8_multi_q import contract as sm107_d192_fp8
+    from cudnn.sdpa.fwd.kernels.sm107.d256_fp8_single_q import contract as sm107_d256_fp8
 
     from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired.contract import LEGACY_ROW as SM120_LEGACY_ROW, in_domain as in_sm120_paired_domain
 
@@ -100,6 +102,7 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as sm80_half
 
     sm120_wide += ((sm80_half.LEGACY_ROW, sm80_half.in_domain), (sm107_d512_fp8.LEGACY_ROW, sm107_d512_fp8.in_domain))
+    sm120_wide += tuple((owner.LEGACY_ROW, owner.in_domain) for owner in (sm107_d192_fp8, sm107_d256_fp8))
     if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts))) or any(
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):

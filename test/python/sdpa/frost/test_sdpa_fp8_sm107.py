@@ -1222,7 +1222,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
 # Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
 #
-# ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
+# ``sm107/d256_fp8_single_q/kernel.py`` carries O := O * sigmoid(G) behind
 # ``TemplateParams.epilogue_gate`` with a bf16 G (``GATE_STORAGE_DTYPE``), and
 # ``Amax_O`` became a COMPILE-TIME fact (``compile(has_amax=False)`` folds the
 # |o| tree and the atomic out) and, when requested, is the amax of the UNGATED
@@ -2190,6 +2190,23 @@ class TestNativeD256Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestMidFp8Implementation:
+    """Public recipes retain native D192/D256 owners through binding/capture."""
+
+    from sm107_mid_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_mid_fp8_refilled_stage_warm_stress as _warm,
+        test_d192_cga1_causal_public_record as _cga1,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_warm_stress = staticmethod(_warm)
+    test_cga1 = staticmethod(_cga1)
 
 
 @requires_rubin

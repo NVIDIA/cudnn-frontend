@@ -1610,8 +1610,10 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
             assert (p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa, p.knobs
             spec = next(s for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
             assert engines.mismatch(spec.capabilities, facts, p.knobs) is None
-    plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), _RUBIN_OFFERED)
-    assert plans and {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_FP8]}
+    fp8_owner = "sdpa_fwd_sm107_d256_fp8_single_q"
+    offered = dict(_RUBIN_OFFERED, **{fp8_owner: _SDPA_FWD_FAMILY.offered_ids()[fp8_owner]})
+    plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), offered)
+    assert plans and {p.engine_id for p in plans} == {offered[fp8_owner]}
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)

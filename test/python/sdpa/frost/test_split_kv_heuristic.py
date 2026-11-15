@@ -359,6 +359,8 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_sm100_d512_2x2",
         "sdpa_fwd_sm100_d512_fp8_role_split",
         "sdpa_fwd_sm107_d512_fp8_role_split",
+        "sdpa_fwd_sm107_d192_fp8_multi_q",
+        "sdpa_fwd_sm107_d256_fp8_single_q",
         "sdpa_fwd_sm100_d256_fp8_single_q",
         "sdpa_fwd_sm100_d192_fp8_multi_q",
         "sdpa_fwd_sm100_d128_fp8_multi_q",
