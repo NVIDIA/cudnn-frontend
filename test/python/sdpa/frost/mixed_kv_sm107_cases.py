@@ -79,7 +79,14 @@ def thd_origins(qdtype, kvdtype, splits):
     import test_sdpa_fwd_thd_origins as thd_checks
 
     thd_checks.test_independent_thd_origins_rebind_and_capture(
-        128, qdtype, "head" if kvdtype == "float8_e5m2" else "token", True, splits == 1, splits, kv_dtype_name=kvdtype, engine_name=_ENGINE
+        128,
+        qdtype,
+        "head" if kvdtype == "float8_e5m2" else "token",
+        True,
+        splits == 1,
+        splits,
+        kv_dtype_name=kvdtype,
+        engine_name="sdpa_fwd_sm107_d128_multi_q",
     )
 
 
@@ -139,7 +146,9 @@ def uniform_control(dtype_name, geometry):
 def thd_uniform_control(dtype_name, pack_gqa):
     import test_sdpa_fwd_thd_origins as thd_checks
 
-    thd_checks.test_independent_thd_origins_rebind_and_capture(128, dtype_name, "token", True, pack_gqa, 1, kv_dtype_name=dtype_name, engine_name=_ENGINE)
+    thd_checks.test_independent_thd_origins_rebind_and_capture(
+        128, dtype_name, "token", True, pack_gqa, 1, kv_dtype_name=dtype_name, engine_name="sdpa_fwd_sm107_d128_multi_q"
+    )
 
 
 @_native
@@ -153,7 +162,7 @@ def thd_cga1_origins(qdtype, kvdtype, pack_gqa):
     import test_sdpa_fwd_thd_origins as thd_checks
 
     thd_checks.test_independent_thd_origins_rebind_and_capture(
-        128, qdtype, "head" if qdtype == "float16" else "token", True, pack_gqa, 1, kv_dtype_name=kvdtype, engine_name=_ENGINE, cga=1
+        128, qdtype, "head" if qdtype == "float16" else "token", True, pack_gqa, 1, kv_dtype_name=kvdtype, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=1
     )
 
 
@@ -191,7 +200,7 @@ def d64_thd_origins(qdtype, kvdtype, cga, paged):
         )
     else:
         thd_checks.test_independent_thd_origins_rebind_and_capture(
-            64, qdtype, "head" if cga == 1 else "token", True, cga == 2, 1, kv_dtype_name=kvdtype, engine_name=_ENGINE, cga=cga
+            64, qdtype, "head" if cga == 1 else "token", True, cga == 2, 1, kv_dtype_name=kvdtype, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=cga
         )
 
 

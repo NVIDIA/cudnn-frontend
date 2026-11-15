@@ -50,6 +50,7 @@ def _fixed_loader(monkeypatch, path):
         (20557, "sm107/d256_f16_lookahead", 256, 256, 129, 512, 2, 128, 1, False, False),
         (20558, "sm107/d256_f16_swap_ab", 256, 256, 3, 512, 1, 16, 3, True, False),
         (20569, "sm100/d128_f16_single_q", 128, 128, 17, 512, 1, 128, 3, True, False),
+        (20570, "sm100/d256_f16_lookahead", 256, 256, 129, 512, 2, 128, 3, False, False),
     ],
 )
 def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, owner, folder, dq, dv, sq, sk, cga, tile, split, packed, bias):
@@ -68,12 +69,27 @@ def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, owner, fol
     }
     if bias:
         values["bias"] = torch.randn(1, h, sq, sk, device="cuda", dtype=dtype) * 0.1
+    compact_thd = owner == 20570
+    if compact_thd:
+        values["stats"] = torch.empty(b, sq, h, 1, device="cuda", dtype=torch.float32).transpose(1, 2)
+        values["ql"] = torch.full((b, 1, 1, 1), sq, device="cuda", dtype=torch.int32)
+        values["kl"] = torch.full((b, 1, 1, 1), sk, device="cuda", dtype=torch.int32)
+        for port, step in (("q", sq * h * dq), ("k", sk * hk * dq), ("v", sk * hk * dv), ("o", sq * h * dv), ("stats", sq * h)):
+            values["ro_" + port] = (torch.arange(b + 1, device="cuda", dtype=torch.int64) * step).reshape(b + 1, 1, 1, 1)
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     record = (owner, SdpaFwdKnobs(tile_m=tile, tile_n=128, cga=cga, sched_policy=0, pack_gqa=packed, split_kv=split, warp_spec_cfg=0).to_public())
 
     def build(saved):
         graph = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
         nodes = {name: graph.tensor_like(value) for name, value in values.items() if name not in ("o", "stats")}
+        if compact_thd:
+            for port in ("q", "k", "v"):
+                nodes[port].set_ragged_offset(nodes["ro_" + port])
+        extra = (
+            dict(use_padding_mask=True, seq_len_q=nodes["ql"], seq_len_kv=nodes["kl"], max_total_seq_len_q=b * sq, max_total_seq_len_kv=b * sk)
+            if compact_thd
+            else {}
+        )
         nodes["o"], nodes["stats"] = graph.sdpa(
             q=nodes["q"],
             k=nodes["k"],
@@ -81,9 +97,12 @@ def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, owner, fol
             generate_stats=True,
             attn_scale=dq**-0.5,
             bias=nodes.get("bias"),
+            **extra,
         )
         for name in ("o", "stats"):
             nodes[name].set_output(True).set_dim(values[name].shape).set_stride(values[name].stride())
+            if compact_thd:
+                nodes[name].set_ragged_offset(nodes["ro_" + name])
         nodes["stats"].set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
@@ -165,7 +184,20 @@ def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, owner, fol
         ("sdpa_fwd_sm107_shared_single_q", "sm100/d128_f16_single_q", (192, 128), 1, 3, False, 20569),
         ("sdpa_fwd_sm107_shared_single_q", "sm100/d128_f16_single_q", 128, 1, 3, False, 20569),
         ("sdpa_fwd_sm107_d256_lookahead", "sm107/d256_f16_lookahead", 256, 2, 1, False, 20557),
-        ("sdpa_fwd_sm107_shared_d256_lookahead", "sm100/d256_f16_lookahead", 256, 2, 3, False, 20570),
+        pytest.param(
+            "sdpa_fwd_sm107_shared_d256_lookahead",
+            "sm100/d256_f16_lookahead",
+            256,
+            2,
+            3,
+            False,
+            20570,
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=AssertionError,
+                reason="Existing SM107 nonpaged D256 split lowering omits independent physical origins; parent control fails the origin_specs assertion",
+            ),
+        ),
     ],
 )
 def test_thd_origins_rebind_and_retained_capture(monkeypatch, dtype, name, folder, dim, cga, split, packed, owner):

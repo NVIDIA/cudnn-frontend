@@ -830,7 +830,12 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"
-    if fp8 and _SM in (100, 103):
+    if not fp8 and _SM == 107:
+        _select_engine(g, half_engine_names(_ARCH))
+        engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        if d_shape == (512, 512):
+            cga = 4
+    elif fp8 and _SM in (100, 103):
         from cudnn.engines.manifest import family_for
 
         # Keep the ranked packing/scheduler knobs, but bind this fixture's
@@ -858,7 +863,19 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     else:
         _select_engine(g, name)
         engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
-    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})})
+    record = {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga, **(knob_overrides or {})}
+    if not fp8 and _SM == 107:
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+        from cudnn.sdpa.fwd.heuristics import select_sm107_d512_geometry, select_sm107_half_geometry
+        from cudnn.sdpa.graph_analyzer import analyze
+
+        requested = SdpaFwdKnobs.from_public(record)
+        selector = select_sm107_d512_geometry if d_shape[0] >= 512 else select_sm107_half_geometry
+        geometry = selector(analyze(g), requested)
+        engine = family_for(g).offered_ids()[geometry.implementation]
+        record = geometry.canonical_knobs(requested).to_public()
+    g.create_execution_plan(engine, record)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
