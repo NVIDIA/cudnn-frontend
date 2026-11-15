@@ -17,8 +17,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_row_offsets,
 )
 from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG as CFG_PAIR_BASE
-from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import diag_2cta_code
-from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG, mask_form_code, stats_form_code, warp_roles_code
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG, stats_form_code, warp_roles_code
 from cudnn.sdpa.bwd.d128_grouped_2cta_contract import DENSE_STATS_ORIGIN_SPEC, LAYOUT_FORM_CODES, STATS_KINDS
 from cudnn.sdpa.bwd.kernels.sm100._d128_chain import ELEMENTS_PER_LANE, LANES_PER_ROW, RN, ROWS_PER_CTA, THREADS
 from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host

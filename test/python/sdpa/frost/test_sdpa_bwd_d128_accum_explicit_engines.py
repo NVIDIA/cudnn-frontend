@@ -7,7 +7,6 @@ from dataclasses import replace
 
 import pytest
 
-import cudnn
 from cudnn.sdpa.bwd import engines, heuristics
 from cudnn.sdpa.bwd.d128_selection import ACCUMULATION_OWNER, LEGACY_ROW, TWO_CTA_OWNER
 from frost_test_utils import requires_bwd_engine_row, requires_dsl

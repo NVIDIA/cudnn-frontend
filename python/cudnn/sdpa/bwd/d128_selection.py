@@ -31,8 +31,12 @@ def accumulation_available(natural, head_dim, skv, window_left):
     return natural == ACCUMULATION and (window_left is None or (head_dim == 64 and window_bounded))
 
 
-def grouped_implementations(facts):
-    """Offer both feasible bodies; the existing sequence policy only orders them."""
+def grouped_implementations(facts) -> tuple[str, ...]:
+    """Return an ordered collection of one or two legal bodies, default first.
+
+    This is a candidate sequence, not a fixed-field record. Admission removes
+    infeasible bodies; the existing sequence policy only orders the remainder.
+    """
     from .d128_grouped_2cta_contract import CtaPairDecline, PAIR_BODY, dense_capacities, select_cta_pair, validate_thd_bounds
 
     layout = "thd" if facts.thd else "dense"
@@ -59,7 +63,7 @@ def grouped_implementations(facts):
     return (TWO_CTA_OWNER, ACCUMULATION_OWNER) if preferred.body == PAIR_BODY else (ACCUMULATION_OWNER, TWO_CTA_OWNER)
 
 
-def legal_implementations(facts, version):
+def legal_implementations(facts, version) -> tuple[str, ...]:
     """Return the existing default first and all admitted fixed bodies."""
     if facts.thd:
         return grouped_implementations(facts) if facts.h_q != facts.h_kv else (ACCUMULATION_OWNER,)
