@@ -76,6 +76,30 @@ def test_head_dims_name_one_owner(dims, owner):
         assert engines.mismatch(SPECS[other].capabilities, f) is not None, other
 
 
+_H, _SQ, _SKV = 16, 256, 4096
+_PLANE = _SQ * _SKV
+
+
+@pytest.mark.parametrize(
+    "dims,strides,legal",
+    [
+        ((1, _H, _SQ, _SKV), (_H * _PLANE, _PLANE, _SKV, 1), True),
+        ((2, _H, _SQ, _SKV), (_H * _PLANE, _PLANE, _SKV, 1), False),
+        ((1, 1, _SQ, _SKV), (_PLANE, _PLANE, _SKV, 1), False),
+        ((2, 1, _SQ, _SKV), (_PLANE, _PLANE, _SKV, 1), False),
+        ((1, _H, _SQ, _SKV), (_H * _SQ * (_SKV + 8), _SQ * (_SKV + 8), _SKV + 8, 1), False),
+    ],
+)
+@pytest.mark.parametrize("owner", [K_PREFETCH, D256, WIDE])
+def test_bias_must_be_the_compact_plane_the_kernel_reads(dims, strides, legal, owner):
+    # The SM80 kernel reads one compact (1, H_q, S_q, S_kv) plane; other admitted forms ran wrong or failed at execute (#2598).
+    d = {K_PREFETCH: (128, 128), D256: (256, 256), WIDE: (512, 512)}[owner]
+    bias = SimpleNamespace(get_data_type=lambda: cudnn.data_type.FLOAT)
+    f = facts(d_qk=d[0], d_v=d[1], has_bias=True, bias_t=bias, bias_dim=dims, bias_stride=strides)
+    reason = engines.mismatch(SPECS[owner].capabilities, f)
+    assert (reason is None) if legal else ("compact (1, H_q, S_q, S_kv)" in reason), reason
+
+
 @pytest.mark.parametrize("dims", [(100, 100), (584, 512), (576, 520)])
 def test_unaligned_and_oversized_dims_have_no_owner(dims):
     f = facts(d_qk=dims[0], d_v=dims[1])

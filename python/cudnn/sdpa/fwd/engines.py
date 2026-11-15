@@ -2865,6 +2865,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if len(strides) != 4 or strides[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(dims[:3], strides[:3])):
             return "SM120 bias requires contiguous keys and 16-byte aligned outer pitches"
 
+    if facts.has_bias and capabilities.sm_lo == 80:
+        # prepared_sm80.build_spec binds one compact (1, H_q, S_q, S_kv) plane (#2598).
+        dims, strides = facts.bias_dim, facts.bias_stride
+        compact = (facts.h_q * facts.s_q * facts.s_kv, facts.s_q * facts.s_kv, facts.s_kv, 1)
+        if dims != (1, facts.h_q, facts.s_q, facts.s_kv) or any(n > 1 and st != c for n, st, c in zip(dims, strides, compact)):
+            return f"SM80 bias must be one compact (1, H_q, S_q, S_kv) plane; got dims {dims} strides {strides}"
+
     if facts.has_bias and capabilities.bias and facts.bias_t is not None:
         # uniform_dtype covers K/V/O only; the serving adapters compile the
         # bias load as fp32 or the io dtype, so anything else must decline
