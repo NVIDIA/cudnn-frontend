@@ -20,7 +20,7 @@ def test_sm120_fp8_sink_split_exact_dense_domain(dtype):
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
     from test_sdpa_fwd_split_kv_sm120 import _sink_decode_facts
 
-    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm120_fp8")
+    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == sm120_owner("sdpa_fwd_prefill_sm120_fp8", 128, 128))
     knobs = SdpaFwdKnobs(sched_policy=0, split_kv=4, pack_gqa=False)
     facts = _sink_decode_facts(d_qk=128, d_v=128, dtype=dtype, dtype_o=cudnn.data_type.HALF, is_fp8=True)
     assert mismatch(caps, facts, knobs) is None

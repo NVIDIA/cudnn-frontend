@@ -2,14 +2,12 @@
 # SPDX-License-Identifier: MIT
 """Native SM120 D128 bias: declared storage, routing, rebinding and capture."""
 
-from dataclasses import replace
-
 import cudnn
 import pytest
 import torch
 
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_blackwell_geforce, requires_dsl, select_engine
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, sm120_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_blackwell_geforce]
 
@@ -98,9 +96,12 @@ def _case(
         tensors["lse"], vp[stats_tensor] = stats_tensor, bufs["lse"]
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
-    selected = select_engine(g, engine_name(arch="sm120"), pack_gqa=False)
-    g.create_execution_plan(selected.engine_id, replace(selected.knobs, tile_m=tile_m, split_kv=split, pack_gqa=False))
+    # Pin the owner directly: the ranker proposes no bias candidate where every A set splits (188-SM parts).
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[sm120_half_owner(d, d, tile_m)]
+    g.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, cga=1, pack_gqa=False, split_kv=split))
     g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -268,9 +269,10 @@ def test_frost_sm120_bias_bounded_route(change):
 def test_frost_sm120_bias_row_claim():
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == engine_name(arch="sm120"))
-    assert caps.bias
-    assert not caps.bias_io_dtype_only
+    for name in (engine_name(arch="sm120"), sm120_half_owner(128, 128, 64)):
+        caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
+        assert caps.bias, name
+        assert not caps.bias_io_dtype_only, name
 
 
 @pytest.mark.parametrize("change", [{}, {"d_qk": 96}, {"d_v": 96}, {"thd": True}, {"shape_overrides": True}])
@@ -300,7 +302,7 @@ def test_frost_sm120_bias_graph_capability_gate(change):
     )
     base.update(change)
     facts = ga.SdpaGraphFacts(**base)
-    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == engine_name(arch="sm120"))
+    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == sm120_half_owner(facts.d_qk, facts.d_v, 64))
     reason = mismatch(caps, facts, SdpaFwdKnobs(tile_m=64, tile_n=64, cga=1, split_kv=1, pack_gqa=False))
     assert (reason is None) == (not change), reason
 

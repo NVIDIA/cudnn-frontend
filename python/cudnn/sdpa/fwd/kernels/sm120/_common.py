@@ -3,7 +3,7 @@
 
 """PTX helpers shared by the SM120 SDPA-forward kernels.
 
-``sm120/prefill_f16.py``, ``sm120/prefill_fp8.py``, ``sm120/prefill_mxfp8.py``,
+``sm120/f16_general/kernel.py``, ``sm120/fp8_general/kernel.py``, ``sm120/mxfp8_general/kernel.py``,
 and the D=256 specialization ``sm120/d256_f16_all_compute/kernel.py`` are self-contained
 kernels that differ in head-tile geometry, MMA shape, and warp roles; the
 lane-level primitives below are shared between them (``sfo_atom_offset`` by the

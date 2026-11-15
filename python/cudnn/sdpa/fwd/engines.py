@@ -125,12 +125,22 @@ from .kernels.sm120.d512_mxfp8_paired.contract import (
     NAME as _SM120_D512_MXFP8_PAIRED,
     mismatch as _sm120_d512_mxfp8_paired_mismatch,
 )
-from .kernels.sm120.d256_f16_contract import (
+from .kernels.sm120.quantized_general_contract import (
+    FP8 as _SM120_FP8_GENERAL,
+    IMPLEMENTATIONS as _SM120_QUANT_GENERAL_IMPLEMENTATIONS,
+    MXFP8 as _SM120_MXFP8_GENERAL,
+    SHAPES as _SM120_QUANT_GENERAL_SHAPES,
+    mismatch as _sm120_quant_general_mismatch,
+)
+from .kernels.sm120.half_exact_contract import (
     ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
-    IMPLEMENTATIONS as _SM120_D256_IMPLEMENTATIONS,
+    D256 as _SM120_D256,
+    GENERAL as _SM120_F16_GENERAL,
+    IMPLEMENTATIONS as _SM120_HALF_EXACT_IMPLEMENTATIONS,
     KEY_GROUP as _SM120_DECODE_KEY_GROUP,
-    explicit_geometry as _sm120_d256_explicit_geometry,
-    mismatch as _sm120_d256_implementation_mismatch,
+    SHAPES as _SM120_HALF_EXACT_SHAPES,
+    explicit_geometry as _sm120_half_exact_explicit_geometry,
+    mismatch as _sm120_half_exact_mismatch,
 )
 
 from cudnn.sdpa.fwd.config_sm107 import (
@@ -1845,7 +1855,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if knobs is not None and not isinstance(knobs, SdpaFwdKnobs):
         return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
     if (facts.device_cc, (facts.d_qk, facts.d_v)) in capabilities.delegated_exact:
-        precision = "FP8" if capabilities.is_fp8 else "half"
+        precision = "MXFP8" if capabilities.is_mxfp8 else "FP8" if capabilities.is_fp8 else "half"
         major, minor = facts.device_cc
         return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
     if capabilities.implementation in _SMALL_FP8_CONTRACTS:
@@ -1888,13 +1898,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
-    if capabilities.implementation in _SM120_D256_IMPLEMENTATIONS:
-        reason = _sm120_d256_implementation_mismatch(capabilities.implementation, facts, knobs)
+    if capabilities.implementation in _SM120_HALF_EXACT_IMPLEMENTATIONS:
+        reason = _sm120_half_exact_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
         if isinstance(knobs, SdpaFwdKnobs) and knobs.tile_m is None:
             # A partial record runs the owner's fixed Q tile, not the legacy row's default.
-            knobs = replace(knobs, tile_m=_sm120_d256_explicit_geometry(capabilities.implementation, knobs).query_tile)
+            knobs = replace(knobs, tile_m=_sm120_half_exact_explicit_geometry(capabilities.implementation, knobs).query_tile)
+    if capabilities.implementation in _SM120_QUANT_GENERAL_IMPLEMENTATIONS:
+        reason = _sm120_quant_general_mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.sm_lo == 90 and capabilities.implementation != _sm90_d64_owner.NAME and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
@@ -4267,7 +4281,7 @@ def _sm120_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
-            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | {(256, 256)}),
+            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | _SM120_HALF_EXACT_SHAPES),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -4312,18 +4326,39 @@ def _sm120_d512_mxfp8_paired_spec() -> EngineSpec:
     return _sm120_explicit_spec(_sm120_mxfp8_spec(), _SM120_D512_MXFP8_PAIRED, {D512_FLAVOR}, {FP8_D512_TILE[0]}, lower, {FP8_D512_TILE[1]})
 
 
+def _sm120_fp8_general_spec() -> EngineSpec:
+    from .kernels.sm120.fp8_general.contract import QUERY_TILES
+    from .kernels.sm120.fp8_general.host import lower
+
+    return _sm120_explicit_spec(_sm120_fp8_spec(), _SM120_FP8_GENERAL, _SM120_QUANT_GENERAL_SHAPES, QUERY_TILES, lower)
+
+
+def _sm120_mxfp8_general_spec() -> EngineSpec:
+    from .kernels.sm120.mxfp8_general.contract import QUERY_TILES
+    from .kernels.sm120.mxfp8_general.host import lower
+
+    return _sm120_explicit_spec(_sm120_mxfp8_spec(), _SM120_MXFP8_GENERAL, _SM120_QUANT_GENERAL_SHAPES, QUERY_TILES, lower)
+
+
 def _sm120_d256_all_compute_spec() -> EngineSpec:
     from .kernels.sm120.d256_f16_all_compute.contract import QUERY_TILES
     from .kernels.sm120.d256_f16_all_compute.host import lower
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {(256, 256)}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_D256_ALL_COMPUTE, {_SM120_D256}, QUERY_TILES, lower)
+
+
+def _sm120_f16_general_spec() -> EngineSpec:
+    from .kernels.sm120.f16_general.contract import QUERY_TILES
+    from .kernels.sm120.f16_general.host import lower
+
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_F16_GENERAL, _SM120_HALF_EXACT_SHAPES - {_SM120_D256}, QUERY_TILES, lower)
 
 
 def _sm120_decode_key_group_spec() -> EngineSpec:
     from .kernels.sm120.decode_f16_key_group.contract import QUERY_TILES
     from .kernels.sm120.decode_f16_key_group.host import lower
 
-    return _sm120_explicit_spec(_sm120_spec(), _SM120_DECODE_KEY_GROUP, {(256, 256)}, QUERY_TILES, lower)
+    return _sm120_explicit_spec(_sm120_spec(), _SM120_DECODE_KEY_GROUP, _SM120_HALF_EXACT_SHAPES, QUERY_TILES, lower)
 
 
 def analyze_for(spec: EngineSpec, graph, knobs: Optional[SdpaFwdKnobs] = None):
@@ -5174,7 +5209,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
-            delegated_exact=frozenset((cc, D512_FLAVOR) for cc in _SM120_DEVICE_CCS),
+            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in {D512_FLAVOR} | _SM120_QUANT_GENERAL_SHAPES),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -5223,7 +5258,7 @@ def _sm120_mxfp8_spec() -> EngineSpec:
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
-            delegated_exact=frozenset((cc, D512_FLAVOR) for cc in _SM120_DEVICE_CCS),
+            delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in {D512_FLAVOR} | _SM120_QUANT_GENERAL_SHAPES),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -5352,10 +5387,13 @@ ENGINE_SPECS = (
     _sm120_d512_paired_spec(),
     _sm120_d256_all_compute_spec(),
     _sm120_decode_key_group_spec(),
+    _sm120_f16_general_spec(),
     _sm120_fp8_spec(),
     _sm120_d512_fp8_paired_spec(),
+    _sm120_fp8_general_spec(),
     _sm120_mxfp8_spec(),
     _sm120_d512_mxfp8_paired_spec(),
+    _sm120_mxfp8_general_spec(),
     _sm80_spec(),
     *_sm90_specs(),
 )

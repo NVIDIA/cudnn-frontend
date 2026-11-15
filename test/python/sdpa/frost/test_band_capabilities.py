@@ -72,15 +72,11 @@ def _pick_dtype(dtypes):
 
 def _dims(kind: str, caps):
     if kind == "fwd":
-        shapes = sorted(tuple(s) for s in caps.d_shapes)
-        if caps.delegated_exact and all(((caps.sm_lo // 10, caps.sm_lo % 10), shape) in caps.delegated_exact for shape in shapes):
-            # Legacy rows retain dense envelopes after all exact flavors
-            # acquire explicit owners. Sample the retained domain using the
-            # row's alignment: half and per-tensor FP8 need not use the same D.
-            assert 0 < caps.d_pad_multiple < 64 and 128 % caps.d_pad_multiple == 0
-            dim = 128 - caps.d_pad_multiple
-            assert (dim, dim) not in caps.d_shapes
-            return (dim, dim)
+        delegated = {shape for _, shape in caps.delegated_exact}
+        shapes = sorted(tuple(s) for s in caps.d_shapes if tuple(s) not in delegated)
+        if not shapes:
+            # Explicit engines own every exact flavor; the legacy row keeps its padded envelopes. Exercise that domain.
+            return next((d, d) for d in range(120, 0, -8) if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, d, d))) is None)
         # A smaller native flavor can support fewer features than the row's
         # full envelope (SM90 D64 versus D512). Sample the full envelope for
         # the row-wide band claims; dedicated flavor tests pin its restrictions.

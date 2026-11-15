@@ -3,7 +3,7 @@
 
 """Fixed D256 all-compute half body lowered through the common graph binding and launch code."""
 
-from ..d256_f16_contract import explicit_geometry
+from ..half_exact_contract import explicit_geometry
 from .contract import NAME
 
 

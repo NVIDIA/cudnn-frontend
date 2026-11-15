@@ -1712,7 +1712,7 @@ For per-thread `cp.async` production, use an async-tracked mbarrier arrival
 rather than publishing those copies with an ordinary mbarrier arrival. The
 qualified SM120 prefill loader retains producer-local commit/wait-group completion
 by default: removing both K and V drains passed numerics but failed racecheck.
-Paged half prefill has a K-only exception in `prefill_f16.py`: separate,
+Paged half prefill has a K-only exception in `sm120/f16_general/kernel.py`: separate,
 16-byte-aligned static completion barriers retain commit and tracked arrivals,
 while the V producer drain retires both copy groups. Each compute lane stores
 a value dependent on every QK/PV result fragment before its named K/V reuse
