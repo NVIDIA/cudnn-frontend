@@ -102,11 +102,12 @@ def _mask_kw(b=2, s_kv=256, dt=None):
 
 def _owner(facts=None, knobs=None):
     from cudnn.sdpa.fwd import engines, heuristics
+    from cudnn.sdpa.fwd.kernels.sm107.small_half_contract import in_domain
 
     if facts is None:
         return "sdpa_fwd_sm107_d128_multi_q"
-    if (facts.d_qk, facts.d_v) not in ((32, 32), (64, 64), (128, 128)):
-        return _ROW  # Non-native envelopes retain their existing row.
+    if not in_domain(facts):
+        return _ROW
     return heuristics.select_sm107_half_geometry(facts, knobs or engines.SdpaFwdKnobs()).implementation
 
 

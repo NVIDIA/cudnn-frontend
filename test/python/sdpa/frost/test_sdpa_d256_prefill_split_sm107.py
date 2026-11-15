@@ -15,7 +15,7 @@ def test_native_d256_prefill_split_admission(shape, dtype, splits):
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
 
-    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == ("sdpa_fwd_sm107_d256_lookahead" if shape == (256, 256) else "sdpa_fwd_prefill_sm107"))
+    caps = next(s.capabilities for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
     facts = SdpaGraphFacts(b=2, h_q=4, h_kv=2, s_q=385, s_kv=512, d_qk=shape[0], d_v=shape[1], dtype=getattr(cudnn.data_type, dtype), device_cc=(10, 7))
     assert mismatch(caps, facts, SdpaFwdKnobs(split_kv=splits, tile_m=128, tile_n=128, cga=2, pack_gqa=False)) is None
 
@@ -138,7 +138,7 @@ def _run_case(case, dtype, monkeypatch, *, graph_mode=False, stats_log2=False, o
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plan(
-            family_for(graph).offered_ids()["sdpa_fwd_sm107_d256_lookahead" if shape == (256, 256) else "sdpa_fwd_prefill_sm107"],
+            family_for(graph).offered_ids()["sdpa_fwd_sm107_d256_lookahead"],
             SdpaFwdKnobs(tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=splits, sched_policy=sched).to_public(),
         )
         graph.select_plan(0)
