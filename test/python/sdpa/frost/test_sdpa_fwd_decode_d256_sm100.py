@@ -216,6 +216,8 @@ def _run_graph(
         selected_name = SWAP_AB if expect == DECODE else LOOKAHEAD
     elif d == 128:
         selected_name = SWAP_AB if expect == DECODE else "sdpa_fwd_sm100_d128_single_q" if expect == "decode_d128_f16" else "sdpa_fwd_sm100_d128_multi_q"
+    elif d in (32, 64):
+        selected_name = "sdpa_fwd_sm100_d64_quadrant" if expect == "decode_d64_f16_quadrant" else "sdpa_fwd_sm100_d128_single_q"
     else:
         selected_name = engine_name()
     if explicit_q_tile is not None:
@@ -628,7 +630,7 @@ def test_decode_graph_wide_tile_routed_launch(page, sink):
         dict(B=4, H=16, KH=2, s_q=2, lens=[4096, 600, 0, 129], q_lens=[2, 1, 0, 2], page=16, causal_br=True, sink=True),
         dict(B=2, H=32, KH=2, s_q=3, lens=[16384, 9000], q_lens=[3, 1], page=16, causal_br=True, sink=0.7, expect=PREFILL),
         dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=128, expect=DECODE, split_kv=2),
-        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=64, expect="decode_d128_f16", split_kv=2),
+        dict(B=3, H=8, KH=2, s_q=2, lens=[600, 77, 0], q_lens=[2, 1, 0], page=16, sink=0.7, d=64, expect="decode_d64_f16_quadrant", split_kv=2),
     ],
     ids=["d256_decode_empty_batch", "d256_decode_mtp2_trim", "d256_prefill_tile_trim", "d128_decode_split2", "d64_decode_split2"],
 )

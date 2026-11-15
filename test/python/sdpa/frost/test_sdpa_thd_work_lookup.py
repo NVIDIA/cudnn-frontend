@@ -102,7 +102,7 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
     g.create_execution_plan(engine, knobs)
     g.select_plan(len(g.plans) - 1)
     loaded = []
-    load_module = api_dsl._load_sm100_kernel_module
+    load_module = api_dsl.load_template
 
     def record_module(*args, **kwargs):
         module = load_module(*args, **kwargs)
@@ -110,7 +110,7 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
         return module
 
     with monkeypatch.context() as patch:
-        patch.setattr(api_dsl, "_load_sm100_kernel_module", record_module)
+        patch.setattr(api_dsl, "load_template", record_module)
         g.build_plans()
     assert loaded and all(m._BOUNDED_THD_DECODE == (q.dtype == torch.bfloat16) for m in loaded)
     assert all(int(m.CFG.PACK_GQA) == pack for m in loaded), "The executed kernel must honor the requested packing mode"

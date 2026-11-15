@@ -92,7 +92,7 @@ def test_paged_thd_origins_rebind_and_capture(
     elif not rubin and d_qk == d_v and d_qk in (32, 64, 128):
         engine = (
             "sdpa_fwd_sm100_d128_single_q"
-            if cga == 1 and (splits > 1 or single_q or (d_qk <= 64 and q_bound is not None and q_bound <= 128 and not packed))
+            if cga == 1 and (splits > 1 or single_q or (d_qk <= 64 and q_bound is not None and q_bound <= 128 and not pack_gqa))
             else "sdpa_fwd_sm100_d128_multi_q"
         )
     batch, heads, kv_heads, maximum, page, kv_max = (
