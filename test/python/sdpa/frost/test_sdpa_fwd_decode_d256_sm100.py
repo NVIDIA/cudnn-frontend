@@ -212,7 +212,12 @@ def _run_graph(
     g.create_execution_plans([cudnn.heur_mode.A])
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import LOOKAHEAD, SWAP_AB
 
-    selected_name = (SWAP_AB if expect == DECODE else LOOKAHEAD) if d == 256 else engine_name()
+    if d == 256:
+        selected_name = SWAP_AB if expect == DECODE else LOOKAHEAD
+    elif d == 128:
+        selected_name = SWAP_AB if expect == DECODE else "sdpa_fwd_sm100_d128_single_q" if expect == "decode_d128_f16" else "sdpa_fwd_sm100_d128_multi_q"
+    else:
+        selected_name = engine_name()
     if explicit_q_tile is not None:
         from cudnn.engines.manifest import MANIFEST
 

@@ -58,11 +58,11 @@ def _notes(name, facts, knobs=None):
     [
         ("sdpa_fwd_sm100_d256_lookahead", 256, (10, 0)),
         ("sdpa_fwd_sm100_d256_lookahead", 256, (10, 3)),
-        ("sdpa_fwd_prefill_sm100", 128, (10, 0)),
-        ("sdpa_fwd_prefill_sm100", 128, (10, 3)),
+        ("sdpa_fwd_sm100_d128_multi_q", 128, (10, 0)),
+        ("sdpa_fwd_sm100_d128_multi_q", 128, (10, 3)),
     ],
 )
-def test_eligible_new_and_legacy_half_plans_declare_note(name, d, cc, monkeypatch):
+def test_eligible_half_plans_declare_note(name, d, cc, monkeypatch):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
@@ -74,8 +74,8 @@ def test_eligible_new_and_legacy_half_plans_declare_note(name, d, cc, monkeypatc
     "changes",
     [dict(packing="NH"), dict(packing="padded"), dict(shape_overrides=False), dict(wants_stats=False, stats_t=None), dict(thd=False), dict(is_fp8=True)],
 )
-def test_familiar_legacy_name_is_not_a_capability(changes):
-    assert NOTE not in _notes("sdpa_fwd_prefill_sm100", _facts(**changes))
+def test_note_excludes_ineligible_graphs(changes):
+    assert NOTE not in _notes("sdpa_fwd_sm100_d128_multi_q", _facts(**changes))
 
 
 @pytest.mark.parametrize("name,cc", [("sdpa_fwd_prefill_sm107", (10, 7)), ("sdpa_fwd_prefill_sm120", (12, 0))])
@@ -102,7 +102,7 @@ def test_ineligible_knobs_and_sibling_plans_do_not_leak_notes():
 
 def test_note_requires_the_native_binder_feature(monkeypatch):
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", SimpleNamespace(supports_stats_stride_override=False))
-    assert NOTE not in _notes("sdpa_fwd_prefill_sm100", _facts())
+    assert NOTE not in _notes("sdpa_fwd_sm100_d128_multi_q", _facts())
 
 
 @pytest.mark.parametrize(

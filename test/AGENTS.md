@@ -64,6 +64,11 @@ their deeper numerical/PTX tests may not run in a bounded smoke selection.
 Splitting an engine also updates the shared `test_mhas_v2` routing assertions
 and explicit plan pins, not only the architecture-local FROST suites. Keep
 concrete owner/body assertions so native fallback cannot count as a pass.
+Also audit legacy-name prefix filters, shared helper defaults, behavior-note
+controls and compiled-module spies. A retired identity can make negative tests
+pass at ownership rejection before reaching the intended stride or binder check.
+Select an eligible current owner for those controls; retain legacy owners only
+for their still-served envelopes and explicit record-invalidation tests.
 For an engine ownership split, also run `test_band_capabilities.py`,
 `test_sdpa_frontend_integration.py`, and affected paged/native-binding cases.
 The band matrix synthesizes facts: include current Q/K/V/O declarations so

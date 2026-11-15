@@ -135,10 +135,10 @@ def test_forward_score_mod_is_a_fact_every_row_declines(layout, score_mod):
     facts = _facts(_fwd_graph(layout, score_mod))
     assert facts.has_score_mod, "sdpa(score_mod=...) must be recorded as a score_mod graph"
     admitting = _assert_every_row_declines_by_name(engines, control, facts)
-    sm100_row = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm100")
+    sm100_row = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_sm100_d128_multi_q")
     if _row_serves_this_device(sm100_row, facts):
-        # The TE shape (d64, S_kv 16) is served by the SM100 prefill row since 1.31 -- the row that dropped the
-        # modifier -- so where that row can run, the by-name check above must not have been vacuous.
+        # The migrated D64 multi-Q owner serves the TE shape (S_kv 16), so
+        # the score_mod rejection above must not have been vacuous.
         assert sm100_row in admitting, [spec.name for spec in admitting]
 
 

@@ -85,7 +85,8 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
-    index = next((i for i, name in enumerate(names) if name.split("[")[0] == "sdpa_fwd_prefill_" + arch), None)
+    owner = "sdpa_fwd_prefill_sm107" if arch == "sm107" else "sdpa_fwd_sm100_d128_multi_q"
+    index = next((i for i, name in enumerate(names) if name.split("[")[0] == owner), None)
     assert index is not None, names  # A missing FROST route must not silently skip this test.
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     knobs.update(
