@@ -248,7 +248,9 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # spelled per slot) -- 81 / 21 on that body (its pin had stayed at 61 / 21); +1 RING wait (the multicast ring's softmax ghost loop:
     # mb_bias_ring_full per leader fill a padded / shorter chunk receives) and +1 IDLE wait (the TMA-LDG warp's end-of-kernel
     # mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 82 / 22.
-    ("f16", (128, 128)): (True, 82, 22),
+    # After isolating the work items: ordinary multi-Q has 47 / 14 sites;
+    # the batch-pair body's 41 / 14 sites are pinned separately below.
+    ("f16", (128, 128)): (True, 47, 14),
     ("fp8", (128, 128)): (
         False,
         56,
@@ -314,10 +316,20 @@ def test_sm107_ring_waits_take_the_module_spin_constant(flavor, kind, load_kw):
     once, no wait site carries a ``spin=True`` / ``spin=False`` literal, every RING site (and only those: the pinned count) passes
     ``spin=SPIN_RING_WAITS``, and no whole-tile idle target does.  A kernel that gains from the spin but regresses to the sleeping
     form at one site, or a loser that leaks the spin onto one ring, changes the count here before it costs 2-6 % on the node."""
+    mod = _load(flavor, rubin=True, **load_kw)
+    _assert_ring_wait_contract(mod, _SPIN_RING_WAITS[(kind, flavor)])
+
+
+def test_sm107_batch_pair_ring_waits_take_the_module_spin_constant():
+    mod = _load((64, 64), rubin=True, cta_mma=1, bias_mode=1, n_chunk=2, window_right=0)
+    assert mod.__file__.endswith("sm107/small_f16_batch_pair/kernel.py")
+    _assert_ring_wait_contract(mod, (True, 41, 14))
+
+
+def _assert_ring_wait_contract(mod, expected):
     import re
 
-    want, n_ring, n_idle = _SPIN_RING_WAITS[(kind, flavor)]
-    mod = _load(flavor, rubin=True, **load_kw)
+    want, n_ring, n_idle = expected
     assert isinstance(mod.SPIN_RING_WAITS, bool) and mod.SPIN_RING_WAITS is want, f"{mod.__name__}: SPIN_RING_WAITS={mod.SPIN_RING_WAITS}, expected {want}"
     with open(mod.__file__, encoding="utf-8") as fh:
         code = _code_lines(fh.read())
@@ -4711,7 +4723,7 @@ _SM107_O_STORE_PROBE = textwrap.dedent("""
     # 2x2-datapath sibling (TemplateParams.mma_2x2); the role-split rows pass the field's default.
     params = TemplateParams(dtype_qkv=(0 if fp8 else 2), dtype_o=dtype_o, cta_mma=cta_mma, mma_2x2=(quant == "f16_2x2"))
     mod = _load_sm100_kernel_module((d, d), params, fp8=fp8, pertensor=(quant == "fp8"), rubin=True)
-    print("IS_2X2", int(mod.__file__.endswith("_2x2.py")))
+    print("IS_2X2", int(mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py")))
     print("EXPECT_UTMASTG", mod.TMA_O_ITERS_HOST)
     print("EXPECT_UTMASTG_MAX_RUN", mod._O_SUBTILES_PER_CHUNK if mod.O_STORE_STREAM else mod.TMA_O_ITERS_HOST)
     print("EXPECT_VOTE_ANY", 1 if mod.O_EPI_PIPELINE else 0)

@@ -26,7 +26,7 @@ empty ranges, cga1, page sizes across the 128-row tile.
 import math
 import os
 
-from frost_test_utils import mxfp8_engine_name
+from frost_test_utils import mxfp8_engine_name, mxfp8_engine_names
 from frost_test_utils import fp8_engine_names, half_engine_names
 
 import pytest
