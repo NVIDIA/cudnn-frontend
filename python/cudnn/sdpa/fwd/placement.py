@@ -729,7 +729,7 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in sm107_wide_half.IMPLEMENTATIONS:
         if knobs is None:
             return TRAIL
-        from .heuristics import select_sm107_d512_geometry
+        from .implementation_selection import select_sm107_d512_geometry
 
         selected = select_sm107_d512_geometry(facts, knobs)
         if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:

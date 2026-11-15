@@ -124,6 +124,23 @@ def test_current_owner_study_precedes_inherited_placement(monkeypatch, name, ver
     assert placement.place(SPECS[name], f, k) == (placement.LEAD if verdict else placement.TRAIL)
 
 
+def test_wide_placement_shares_selection_without_importing_it_from_recommend(monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.endswith("heuristics") and "select_sm107_d512_geometry" in fromlist:
+            raise AssertionError("placement imports its body selector from the candidate generator")
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    f = facts()
+    for name in (ROLE_SPLIT, TWO_BY_TWO):
+        k = explicit_geometry(name, f).canonical_knobs(engines.SdpaFwdKnobs())
+        assert placement.place(SPECS[name], f, k) in (placement.LEAD, placement.TRAIL)
+
+
 def test_config_factories_do_not_consume_sibling_types_or_factories(monkeypatch):
     from cudnn.sdpa.fwd import config_sm107 as old
     from cudnn.sdpa.fwd.kernels.sm107.d512_f16_role_split import config as role
