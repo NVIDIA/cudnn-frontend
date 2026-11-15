@@ -596,6 +596,8 @@ def _exec_sdpa_on_frost(
             # Their new owners retain separate, concrete body identities.
             engines = (owners[template], owners["decode_d64_f16_quadrant"])
     if engine == "sdpa_fwd_prefill_sm107":
+        from cudnn.sdpa.fwd.kernels.sm107.half_flavor_contract import padded_shape as rubin_padded_shape
+
         ordinary = ("sdpa_fwd_sm107_d128_multi_q",)
         shared_single = ("sdpa_fwd_sm107_shared_single_q",)
         lookahead = ("sdpa_fwd_sm107_d256_lookahead",)
@@ -604,11 +606,11 @@ def _exec_sdpa_on_frost(
             (32, 32): small,
             (64, 64): small,
             (128, 128): {"prefill_d128_f16": ordinary, "decode_d128_f16": shared_single, "prefill_d256_f16": lookahead},
-            (192, 128): {"prefill_d192_d128_f16": ("sdpa_fwd_sm107_d192_multi_q",), "decode_d128_f16": shared_single},
+            (192, 128): {"prefill_d192_d128_f16": ("sdpa_fwd_sm107_d192_multi_q",), "prefill_d128_f16": ordinary, "decode_d128_f16": shared_single},
             (256, 256): {"prefill_d256_f16": lookahead + ("sdpa_fwd_sm107_shared_d256_lookahead",), "decode_d256_f16": ("sdpa_fwd_sm107_d256_swap_ab",)},
             (512, 512): {"prefill_d512_f16": ("sdpa_fwd_sm107_d512_role_split",), "prefill_d512_f16_2x2": ("sdpa_fwd_sm107_d512_2x2",)},
             (576, 512): {"prefill_d512_f16_2x2": ("sdpa_fwd_sm107_d512_2x2",)},
-        }.get((cfg.d_qk, cfg.d_v))
+        }.get(rubin_padded_shape(cfg))
         if rubin_owners is not None:
             engines = rubin_owners[template] if template in rubin_owners else tuple(name for group in rubin_owners.values() for name in group)
     keys = [[f"frost:{name}" for name in engines]]
@@ -2137,13 +2139,15 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=
     owner_shape = padded_shape(cfg) if torch.cuda.get_device_capability() in ((10, 0), (10, 3)) else (cfg.d_qk, cfg.d_v)
     names = owners.get(owner_shape, (engine,)) if engine == FROST_FP8_ENGINE else (engine,)
     if engine == "sdpa_fwd_prefill_sm107_fp8":
+        from cudnn.sdpa.fwd.kernels.sm107.fp8_flavor_contract import padded_shape as rubin_padded_shape
+
         names = {
             (64, 64): ("sdpa_fwd_sm107_d128_fp8_multi_q",),
             (128, 128): ("sdpa_fwd_sm107_d128_fp8_multi_q", "sdpa_fwd_sm107_d128_fp8_swap_ab"),
             (192, 128): ("sdpa_fwd_sm107_d192_fp8_multi_q",),
             (256, 256): ("sdpa_fwd_sm107_d256_fp8_single_q",),
             (512, 512): ("sdpa_fwd_sm107_d512_fp8_role_split",),
-        }.get((cfg.d_qk, cfg.d_v), (engine,))
+        }.get(rubin_padded_shape(cfg), (engine,))
     keys = tuple(f"frost:{name}" for name in names)
     before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:
@@ -4970,6 +4974,11 @@ _P3_ENVELOPE_CASES = {
     # (4 tiles per head) and packed (64 tiles per KV head) -- the heuristics propose cga1 only inside the tile-fit band
     "over_tile_cga1_unpacked_q512": dict(cfg=dict(b=1, h_q=64, h_kv=4, s_q=512, s_kv=512), pin="u1n", cga=None, knobs=None, template=None),
     "over_tile_cga1_packed_q512": dict(cfg=dict(b=1, h_q=64, h_kv=4, s_q=512, s_kv=512), pin="p1n", cga=None, knobs=None, template=None),
+    # Logical head envelopes must also reach a concrete owner after the split.
+    "head_d24": dict(cfg=dict(b=2, h_q=4, h_kv=4, s_q=8, s_kv=256, d=24), pin=None, cga=None, knobs=None, template=None),
+    "head_d80": dict(cfg=dict(b=2, h_q=4, h_kv=4, s_q=8, s_kv=256, d=80), pin=None, cga=None, knobs=None, template=None),
+    "head_d176": dict(cfg=dict(b=2, h_q=4, h_kv=4, s_q=8, s_kv=256, d=176), pin=None, cga=None, knobs=None, template=None),
+    "head_d384": dict(cfg=dict(b=2, h_q=4, h_kv=4, s_q=8, s_kv=256, d=384), pin=None, cga=None, knobs=None, template=None),
 }
 
 

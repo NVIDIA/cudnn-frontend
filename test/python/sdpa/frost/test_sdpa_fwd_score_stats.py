@@ -132,14 +132,14 @@ def test_mismatch_accepts_and_rejects(row):
         # carries the store, exactly as before the small head-dim tiles -- the tiles carry the dense leg only
         # (engines.Capabilities.dense_only_d_shapes), so a graph asking for the ports is selected past them.
         for d in (64, 24):
-            # Exact widths name the fixed implementation; non-native widths
-            # retain the historical envelope row and its score-store contract.
-            owner_caps = caps if d == 64 else _caps("sdpa_fwd_prefill_sm107")
+            # The fixed implementation also owns the existing score-store
+            # envelopes; its physical flavor still promotes these to D128.
+            owner_caps = caps
             facts = _facts(device_cc=cc, d_qk=d, d_v=d)
             assert engines.mismatch(owner_caps, facts) is None, (d, engines.mismatch(owner_caps, facts))
             assert engines._selected_d_shape(owner_caps, facts) == (128, 128), d
             assert engines._selected_d_shape(owner_caps, _facts(device_cc=cc, d_qk=d, d_v=d, has_score_max=False, has_score_sum_exp=False)) != (128, 128), d
-        assert "requires SM107 and supported half small-head graph declarations" in reason(d_qk=24, d_v=24)
+        assert reason(d_qk=24, d_v=24) is None
     assert "split_kv > 1" in reason(SdpaFwdKnobs(split_kv=2))
     assert ("cga" if row == "sdpa_fwd_sm100_d128_multi_q" else "dense D128 CTA1 uses the shared SM100 single-Q body") in reason(SdpaFwdKnobs(cga=1))
     assert reason(SdpaFwdKnobs(cga=2, split_kv=1)) is None
