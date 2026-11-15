@@ -222,6 +222,7 @@ def _run_graph(
         explicit_name = engine_name(arch=arch)
         if arch == "sm100":
             explicit_name = {
+                (192, 128): "sdpa_fwd_sm100_d192_multi_q",
                 (256, 256): "sdpa_fwd_sm100_d256_lookahead",
                 (512, 512): "sdpa_fwd_sm100_d512_role_split",
                 (576, 512): "sdpa_fwd_sm100_d512_2x2",
@@ -857,7 +858,7 @@ def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "d256_f16_lookahead/kernel.py", 512: "d512_f16_role_split/kernel.py"}
+_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "d192_f16_multi_q/kernel.py", 256: "d256_f16_lookahead/kernel.py", 512: "d512_f16_role_split/kernel.py"}
 
 
 def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, d_v=None, expect_pack_g=None):

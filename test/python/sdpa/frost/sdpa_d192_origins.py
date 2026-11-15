@@ -59,7 +59,7 @@ def test_split_origins_require_matching_extension(monkeypatch, cc):
         device_cc=cc,
         device_sm_count=148,
     )
-    name = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_prefill_sm100"
+    name = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
     caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
     split = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=0, sched_policy=0)
     assert engines.mismatch(caps, facts, split) is None

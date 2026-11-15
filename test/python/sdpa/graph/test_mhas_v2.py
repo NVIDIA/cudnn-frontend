@@ -564,6 +564,8 @@ def _exec_sdpa_on_frost(
     compare)."""
     engines = (engine,)
     owners = {
+        (192, 128): {"prefill_d192_d128_f16": "sdpa_fwd_sm100_d192_multi_q",
+                     "decode_d128_f16": "sdpa_fwd_sm100_d128_single_q"},
         (256, 256): {"prefill_d256_f16": "sdpa_fwd_sm100_d256_lookahead",
                      "decode_d256_f16": "sdpa_fwd_sm100_d256_swap_ab"},
         (512, 512): {"prefill_d512_f16": "sdpa_fwd_sm100_d512_role_split",
