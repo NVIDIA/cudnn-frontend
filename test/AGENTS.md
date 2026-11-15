@@ -78,8 +78,9 @@ knob; updating architecture-local body tests alone misses these consumers.
 When a fixture changes an unsplit record into a split record, select its
 implementation after computing the final knobs. Small-head SM100 paged THD
 split uses single-Q even when the ranked unsplit candidate used multi-Q.
-`test_paged_thd_split_capture_lengths_and_stats` covers that transition,
-including default cluster, packed heads, Stats layouts and retained replay.
+`test_paged_thd_split_capture_lengths_and_stats` and
+`test_native_paged_thd_capture_and_rebind` cover that transition, including
+default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.

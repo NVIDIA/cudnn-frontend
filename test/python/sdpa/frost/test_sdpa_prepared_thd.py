@@ -1752,6 +1752,9 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     g.select_plan(index)
     if cga is not None:
         engine, knobs = g.get_engine_and_knobs_at_index(index)
+        if arch == "sm100" and d in (64, 128) and splits > 1:
+            # Choose the body for the final split record, not the unsplit candidate.
+            engine = 20532
         g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: packed})
         g.select_plan(g.get_execution_plan_count() - 1)
         _, selected = g.get_engine_and_knobs_at_index(g._plan_index)
