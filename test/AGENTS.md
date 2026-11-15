@@ -90,6 +90,10 @@ When splitting a template, retain its module-load refusals as well as graph
 eligibility gates. `test_per_tensor_body_refuses_mxfp8_only_mask_at_load` covers
 the MXFP8-only mask that a shared parameter factory accepts but per-tensor FP8
 bodies must reject even when called directly.
+Structural pins must follow the isolated body too: a generic `kernel.py`
+basename no longer identifies a 2x2 pipeline. Check its owner directory and
+retain the compiled SASS assertions. When a combined body splits, pin each
+body's barrier sites separately, including both ordinary and batch-pair work.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.

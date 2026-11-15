@@ -804,7 +804,7 @@ def test_fp8_envelope_mismatch_rules():
     assert engines.mismatch(d256, _fp8_facts(d_qk=256, d_v=256)) is None
     for dq, dv in ((16, 144), (224, 16), (160, 160), (224, 208)):
         for arch, cc in (("sm100", (10, 0)), ("sm107", (10, 7))):
-            row = d256 if arch == "sm100" else caps[engines.engine_name(arch=arch, fp8=True)]
+            row = caps[f"sdpa_fwd_{arch}_d256_fp8_single_q"]
             facts = _fp8_facts(device_cc=cc, d_qk=dq, d_v=dv)
             assert engines.mismatch(row, facts) is None, (arch, dq, dv)
             assert engines._selected_d_shape(row, facts) == (256, 256)
@@ -840,22 +840,23 @@ def test_fp8_envelope_mismatch_rules():
     assert engines.mismatch(d512, _fp8_facts(d_qk=392, d_v=392)) is not None
     # The Rubin row serves the same dense envelope (the ViT d=72-in-80 case).
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
+    native_small = caps["sdpa_fwd_sm107_d128_fp8_multi_q"]
+    assert engines.mismatch(native_small, _fp8_facts(device_cc=(10, 7))) is None
     # Native SM107 serves the same aligned dense D192 envelope.
     native192 = caps["sdpa_fwd_sm107_d192_fp8_multi_q"]
     assert engines.mismatch(native192, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
     assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
-        assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
-    assert "dense-only" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
+        assert engines.mismatch(native192, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
+    assert "dense-only" in engines.mismatch(native_small, _fp8_facts(device_cc=(10, 7), thd=True, padded=True))
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined, and the (256, 512]
     # floor applies here exactly as on the SM100 row.
     native512 = caps["sdpa_fwd_sm107_d512_fp8_role_split"]
     assert engines.mismatch(native512, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
     assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
+    assert engines.mismatch(native512, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
     # ...and straddling the floor declines on BOTH rows, identically.
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
     assert "no kernel-flavor envelope" in engines.mismatch(sm100, _fp8_facts(d_qk=512, d_v=256))
@@ -2220,12 +2221,14 @@ class TestMidFp8Implementation:
         test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
         test_mid_fp8_refilled_stage_warm_stress as _warm,
         test_d192_cga1_causal_public_record as _cga1,
+        test_wide_envelopes_keep_the_adapter_block_output_decline as _block_output,
     )
 
     test_public_record = staticmethod(_record)
     test_retired_record = staticmethod(_retired)
     test_warm_stress = staticmethod(_warm)
     test_cga1 = staticmethod(_cga1)
+    test_block_output_decline = staticmethod(_block_output)
 
 
 @requires_rubin

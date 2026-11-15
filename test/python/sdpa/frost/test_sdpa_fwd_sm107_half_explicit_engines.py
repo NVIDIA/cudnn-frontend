@@ -51,6 +51,14 @@ def _fixed_loader(monkeypatch, path):
         (20558, "sm107/d256_f16_swap_ab", 256, 256, 3, 512, 1, 16, 3, True, False),
         (20569, "sm100/d128_f16_single_q", 128, 128, 17, 512, 1, 128, 3, True, False),
         (20570, "sm100/d256_f16_lookahead", 256, 256, 129, 512, 2, 128, 3, False, False),
+        (20559, "sm107/d128_f16_multi_q", 24, 16, 129, 512, 1, 128, 1, False, False),
+        (20559, "sm107/d128_f16_multi_q", 80, 112, 129, 512, 2, 128, 3, False, False),
+        (20560, "sm107/small_f16_batch_pair", 24, 16, 128, 512, 1, 128, 1, False, True),
+        (20560, "sm107/small_f16_batch_pair", 48, 40, 256, 256, 1, 128, 1, False, True),
+        (20556, "sm107/d192_f16_multi_q", 176, 112, 33, 512, 2, 128, 1, False, False),
+        (20557, "sm107/d256_f16_lookahead", 224, 208, 129, 512, 2, 128, 1, False, False),
+        (20558, "sm107/d256_f16_swap_ab", 224, 208, 3, 512, 1, 16, 3, True, False),
+        (20569, "sm100/d128_f16_single_q", 112, 96, 17, 512, 1, 128, 3, True, False),
     ],
 )
 def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, owner, folder, dq, dv, sq, sk, cga, tile, split, packed, bias):
@@ -213,3 +221,36 @@ def test_thd_origins_rebind_and_retained_capture(monkeypatch, dtype, name, folde
 
     run(dim, dtype, "head", True, packed, split, engine_name=name, cga=cga, extra_checks=check)
     assert checked
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("owner,folder,dq,dv", [(20559, "sm107/d128_f16_multi_q", 80, 112)])
+def test_paged_envelope_public_record_and_replay(monkeypatch, dtype, owner, folder, dq, dv):
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from test_sdpa_fwd_paged_sm100 import _run_graph
+
+    seen = _fixed_loader(monkeypatch, folder + "/kernel.py")
+    k = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=2, sched_policy=0, pack_gqa=False, split_kv=1, warp_spec_cfg=0)
+
+    def check(graph, *args):
+        assert graph.get_engine_and_knobs_at_index(graph._plan_index) == (owner, k.to_public())
+        assert seen and seen[-1].__file__.endswith(folder + "/kernel.py")
+
+    _run_graph(
+        2,
+        8,
+        2,
+        dq,
+        64,
+        8,
+        [511, 129],
+        True,
+        dtype=dtype,
+        d_v=dv,
+        stats=True,
+        s_q=129,
+        replay=True,
+        arch="sm107",
+        record=(owner, k.to_public()),
+        extra_checks=check,
+    )

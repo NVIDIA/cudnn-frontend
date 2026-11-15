@@ -3,13 +3,15 @@
 
 """Local identity and admission for the native SM107 d256_f16_lookahead body."""
 
+from ..half_flavor_contract import padded_shape
+
 NAME = "sdpa_fwd_sm107_d256_lookahead"
 TEMPLATE_NAME = "prefill_d256_f16"
 KERNEL_FILE = "sm107/d256_f16_lookahead/kernel.py"
 
 
 def mismatch(facts, knobs):
-    shape = (facts.d_qk, facts.d_v)
+    shape = padded_shape(facts)
     if shape == (128, 128):
         if not facts.thd or not facts.uniform_dtype or facts.has_bias or facts.has_kv_mask or facts.has_epilogue_gate:
             return "native one-Q D128 requires half THD without bias, KV mask, mixed KV or gate"
@@ -23,7 +25,7 @@ def mismatch(facts, knobs):
         if knobs is not None and (knobs.cga not in (None, 2) or knobs.warp_spec_cfg not in (None, 0)):
             return "native D256 lookahead requires CTA2 and its ordinary warp topology"
     else:
-        return "native lookahead requires exact D128/V128 or D256/V256"
+        return "native lookahead requires a D128/V128 or D256/V256 envelope"
     if knobs is not None and (knobs.tile_m not in (None, 128) or knobs.tile_n not in (None, 128)):
         return "native lookahead requires a 128x128 query/key tile"
     return None

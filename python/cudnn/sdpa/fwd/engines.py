@@ -1948,7 +1948,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return reason
         # The legacy shared checks name the MMA pair and logical 128-row recipe.
         # Physical cluster and actual CTA tile were validated by the owner above.
-        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), cgas=frozenset({2}))
+        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), tile_ms_by_d_shape=(), cgas=frozenset({2}))
         legacy_knobs = replace(knobs, tile_m=128, cga=2) if knobs is not None else None
         return mismatch(legacy_caps, facts, legacy_knobs)
     if capabilities.implementation in _D512_IMPLEMENTATIONS:
@@ -3501,6 +3501,7 @@ def _sm107_spec() -> EngineSpec:
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
             delegated_exact=frozenset(((10, 7), shape) for shape in _sm107_shared_half.SHAPES | {(512, 512), (576, 512)}),
+            delegated_envelope=True,
             phase="prefill",
             # Every f16 flavor has a Rubin module -- api_dsl._SM107_KERNEL_FILES
             # is the other half of this claim, and _pick_flavor lands a d=192
@@ -3670,7 +3671,7 @@ def _sm107_half_specs():
     # The legacy policy owns the legal width envelopes and common features.
     # Each local contract narrows that declaration to one fixed body. Keep
     # the original flavor pool so exact D32 can retain its D64/D128 envelope.
-    base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), sm_hi=107, tile_ms_by_d_shape=())
+    base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), delegated_envelope=False, sm_hi=107, tile_ms_by_d_shape=())
     rows = (
         (_sm107_small_half.MULTI_Q, lower_multi_q, frozenset({128})),
         (_sm107_small_half.BATCH_PAIR, lower_pair, frozenset({128})),
@@ -3680,7 +3681,7 @@ def _sm107_half_specs():
         (_sm107_shared_half.SINGLE_Q, lower_shared_single_q, frozenset({128})),
         (_sm107_shared_half.LOOKAHEAD, lower_shared_lookahead, frozenset({128})),
     )
-    exact_shapes = {
+    body_shapes = {
         _sm107_small_half.BATCH_PAIR: frozenset({(32, 32), (64, 64)}),
         _sm107_mid_half.D192: frozenset({(192, 128)}),
         _sm107_mid_half.LOOKAHEAD: frozenset({(128, 128), (256, 256)}),
@@ -3694,14 +3695,14 @@ def _sm107_half_specs():
                 base,
                 implementation=name,
                 tile_ms=tiles,
-                d_shapes=exact_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
+                d_shapes=body_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
                 epilogue_gate=name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB),
                 epilogue_gate_d_shapes=(base.epilogue_gate_d_shapes if name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB) else None),
                 score_max=name == _sm107_small_half.MULTI_Q,
                 score_sum_exp=name == _sm107_small_half.MULTI_Q,
                 score_stats_d_shapes=base.score_stats_d_shapes if name == _sm107_small_half.MULTI_Q else None,
                 split_kv_supported=name != _sm107_small_half.BATCH_PAIR,
-                **({"d_pad_multiple": 0, "d_envelope_floors": ()} if name in exact_shapes else {}),
+                **({"d_pad_multiple": 8, "d_envelope_floors": ()} if name in body_shapes else {}),
             ),
             partial(
                 lower,
@@ -3722,10 +3723,11 @@ def _sm107_wide_half_specs():
     base = replace(
         _sm107_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         sm_hi=107,
         d_shapes=frozenset({(512, 512), (576, 512)}),
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=8,
+        d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
         paged_d_shapes=frozenset({(512, 512), (576, 512)}),
         mixed_fp8_kv_d_shapes=frozenset({(512, 512)}),
         pack_gqa_d_shapes=frozenset({(512, 512), (576, 512)}),
@@ -3905,7 +3907,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 if rubin_row
                 else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
             ),
-            delegated_envelope=not rubin_row,
+            delegated_envelope=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
@@ -4118,7 +4120,7 @@ def select_sm107_half_geometry(facts, knobs):
     from .sm107_half_selection import select_sm107_half_geometry as select
 
     if not _sm107_shared_half.in_domain(facts):
-        raise ValueError("SM107 half selection requires exact supported small/mid-width forward declarations")
+        raise ValueError("SM107 half selection requires supported small/mid-width forward envelopes")
     caps = sm100_legacy_policy_spec(_sm107_shared_half.LEGACY_ROW).capabilities
     flavor = _selected_d_shape(caps, facts, knobs)
     if flavor not in _sm107_shared_half.SHAPES:
@@ -4351,9 +4353,10 @@ def _sm107_small_fp8_specs():
         _sm100_fp8_spec(arch="sm107").capabilities,
         implementation=_sm107_small_fp8_owner.NAME,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         sm_hi=107,
         d_shapes=shapes,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=d128,
         paged_kv=False,
@@ -4405,9 +4408,10 @@ def _sm107_mid_fp8_specs():
             base,
             implementation=owner.NAME,
             delegated_exact=frozenset(),
+            delegated_envelope=False,
             sm_hi=107,
             d_shapes=shape,
-            d_pad_multiple=0,
+            d_pad_multiple=16,
             d_envelope_floors=(),
             thd_d_shapes=shape,
             paged_kv=False,
@@ -4437,10 +4441,11 @@ def _sm107_d512_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec(arch="sm107").capabilities,
         implementation=_sm107_d512_fp8_owner.NAME,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         sm_hi=107,
         d_shapes=shape,
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=16,
+        d_envelope_floors=(((512, 512), 256),),
         thd_d_shapes=shape,
         paged_d_shapes=shape,
         split_d_shapes=shape,

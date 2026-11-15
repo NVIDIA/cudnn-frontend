@@ -108,7 +108,7 @@ def _case(
     from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
 
     facts = graph_analyzer.analyze(g)
-    explicit = (d, dv) == (128, 128) or (_arch() == "sm100" and padded_shape(facts) == (128, 128))
+    explicit = padded_shape(facts) == (128, 128)
     if explicit:
         from cudnn.engines.manifest import family_for
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -370,7 +370,7 @@ def test_domain(cc):
     def actual_mismatch(f, k):
         from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
 
-        if (f.d_qk, f.d_v) == (128, 128) or (cc in ((10, 0), (10, 3)) and padded_shape(f) == (128, 128)):
+        if padded_shape(f) == (128, 128):
             if cc == (10, 7):
                 from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_swap_ab.contract import Geometry
             else:

@@ -15,10 +15,11 @@ import test_sdpa_prepared_fp8 as shared
 pytestmark = [pytest.mark.L0, requires_dsl, requires_rubin]
 
 
+@pytest.mark.parametrize("d,dv", [(512, 512), (384, 320)])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split", [1, 4])
-def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, output, split):
+def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dv, dtype, output, split):
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
@@ -30,7 +31,7 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, o
     monkeypatch.setattr(heuristics, "recommend", forbidden)
 
     def build(saved):
-        result = shared._case(arch="sm107", d=512, sq=17, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
+        result = shared._case(arch="sm107", d=d, dv=dv, sq=17, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
         graph = result[0]
         assert graph.get_engine_and_knobs_at_index(graph._plan_index) == saved
         compiled = graph._compiled_plans[graph._plan_index]._compiled
@@ -73,10 +74,11 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, o
     shared._check(bufs, thd=False, sq=17, skv=256)
 
 
-def test_retired_fp8_recipe_is_rejected_without_silent_substitution():
+@pytest.mark.parametrize("d,dv", [(512, 512), (384, 320)])
+def test_retired_fp8_recipe_is_rejected_without_silent_substitution(d, dv):
     import cudnn._plan_serdes as ps
 
-    graph, _, _, _, _ = shared._case(arch="sm107", d=512, sq=17, skv=256)
+    graph, _, _, _, _ = shared._case(arch="sm107", d=d, dv=dv, sq=17, skv=256)
     blob = graph.serialize(as_bytes=True, include_kernels=False)
     start = len(ps.MAGIC) + ps._LEN.size
     (length,) = ps._LEN.unpack_from(blob, len(ps.MAGIC))

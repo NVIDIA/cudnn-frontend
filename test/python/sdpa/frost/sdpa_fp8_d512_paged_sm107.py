@@ -61,7 +61,6 @@ def native_paged_contract():
     from cudnn.sdpa.fwd import engines
     import cudnn
 
-    caps = next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == engines.engine_name(arch="sm107", fp8=True))
     facts = ga.SdpaGraphFacts(
         b=2,
         h_q=4,
@@ -80,7 +79,7 @@ def native_paged_contract():
     )
     for dims in ((512, 512), (384, 320)):
         selected = replace(facts, d_qk=dims[0], d_v=dims[1])
-        selected_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d512_fp8_role_split") if dims == (512, 512) else caps
+        selected_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d512_fp8_role_split")
         assert engines.mismatch(selected_caps, selected) is None
     for dims in ((64, 64), (128, 128), (192, 128), (256, 256)):
         name = {
