@@ -624,7 +624,7 @@ for _band, _width, _atoms in _P_SLOT_ALIAS_BANDS:
 
 # --- scale-factor slabs: F8_128x4 atoms (512 B = 128 rows x 4 K-groups = 4 TMEM columns each), UTCCP'd 32x128b ------------------
 # The UTCCP descriptor of an SF slab: leading 16 B / stride 128 B / layout 0 (no swizzle) -- the atom layout IS the F8_128x4 atom
-# (the forward's SF_LEADING_BYTE_OFFSET / SF_STRIDE_BYTE_OFFSET / SMEM_LAYOUT_SF, sm107/prefill_d256_mxfp8.py).
+# (the forward's SF_LEADING_BYTE_OFFSET / SF_STRIDE_BYTE_OFFSET / SMEM_LAYOUT_SF, sm107/d256_mxfp8_single_q/kernel.py).
 SF_LEADING_BYTE_OFFSET = 16
 SF_STRIDE_BYTE_OFFSET = 128
 SMEM_LAYOUT_SF = 0
@@ -1515,7 +1515,7 @@ def _kernel(
     tma_mcast_mask = cutlass.Int16(1) << cta_in_pair
     # Q / dO / dO_T SF boxes: each CTA loads its share and multicasts it to BOTH CTAs (both hold the full N tile's atoms).  The literal
     # 3 == (3 << leader_cta_id) as an Int16 because the config validates the cluster as (CGA_M, CGA_N, 1) = (2, 1, 1): the pair IS the
-    # cluster, so leader_cta_id is 0 in every CTA (the forward's spelling, prefill_d256_mxfp8.py sf_mcast_mask).
+    # cluster, so leader_cta_id is 0 in every CTA (the forward's spelling, sm107/d256_mxfp8_single_q sf_mcast_mask).
     sf_mcast_mask = cutlass.Int16(3)
     is_cga_first_cta = cta_id_x == cutlass.Int32(0)
 

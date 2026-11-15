@@ -161,6 +161,18 @@ def _fp8_case(
     g.validate()
     g.build_operation_graph()
     name = engine_name(arch=arch, fp8=not mxfp8, mxfp8=mxfp8)
+    if arch in ("sm100", "sm107") and not mxfp8:
+        name = f"sdpa_fwd_{arch}_d128_fp8_multi_q"
+    if arch == "sm100" and mxfp8:
+        name = "sdpa_fwd_sm100_d128_mxfp8_multi_q"
+    if arch == "sm120":
+        from frost_test_utils import sm120_owner
+
+        name = sm120_owner(name, d, d)
+    if arch == "sm107" and mxfp8:
+        from frost_test_utils import sm107_mxfp8_owner
+
+        name = sm107_mxfp8_owner(d, d)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     knobs = SdpaFwdKnobs(tile_m=max(caps.tile_ms), tile_n=max(caps.tile_ns), cga=max(caps.cgas), sched_policy=0, pack_gqa=False, split_kv=1)
@@ -378,7 +390,8 @@ def test_block_output_compiler_rejects_narrow_v(arch, block, d_v, monkeypatch):
     from cudnn.sdpa.fwd.kernels import _fp8_host
 
     params_type = import_module(f"cudnn.sdpa.fwd.config_{arch}").TemplateParams
-    path = Path(api_dsl.__file__).parent / "kernels" / arch / "prefill_d128_fp8.py"
+    relative = "d128_fp8_multi_q/kernel.py" if arch == "sm107" else "d128_fp8_multi_q/kernel.py"
+    path = Path(api_dsl.__file__).parent / "kernels" / arch / relative
     params = params_type(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_O_NVFP4 if block == 16 else DTYPE_O_MXFP8)
     mod = load_template(str(path), params, tag=f"block_width_{arch}_{block}")
     marker = object()

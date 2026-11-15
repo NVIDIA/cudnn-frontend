@@ -23,6 +23,7 @@ import atexit
 import ctypes
 from dataclasses import dataclass
 import logging
+import numbers
 import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
@@ -80,6 +81,8 @@ atexit.register(_destroy_default_handles)
 
 
 _PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded", "adaptive"})
+# Integer python-only attributes whose 0 is the default (off): ``causal_exclude_own_block=0`` is plain causal.
+_PYTHON_ONLY_ZERO_OFF_ATTRS = frozenset({"causal_exclude_own_block"})
 
 
 def _python_only_attr_is_set(attr: str, value) -> bool:
@@ -92,6 +95,8 @@ def _python_only_attr_is_set(attr: str, value) -> bool:
         return False
     if attr in _PYTHON_ONLY_BOOL_ATTRS:
         return bool(value)
+    if attr in _PYTHON_ONLY_ZERO_OFF_ATTRS and isinstance(value, numbers.Integral) and not isinstance(value, bool):
+        return int(value) != 0
     return True
 
 
@@ -389,7 +394,7 @@ class pygraph:
             # recorded (engine_id, knobs) on a fresh graph.
             from .engines import manifest
 
-            engine = manifest.engine_for_id(engine_id)
+            engine = manifest.engine_for_id(engine_id, self)
             if engine is not None:
                 out.append(engine)
         return out
@@ -421,8 +426,9 @@ class pygraph:
         cuDNN backend serves the selected entry; otherwise ``.name`` is the
         engine's manifest name (``sdpa_fwd_prefill_sm100`` /
         ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
-        identifier -- manifest names and slots are append-only, never renamed
-        or reused -- so a caller may compare against one.
+        identifier for diagnostics and explicit selection. Execution capabilities
+        belong to the selected plan's ``get_behavior_notes()``; names do not
+        establish which runtime layouts or overrides a plan accepts.
         ``get_plan_name_at_index`` reports the same name with the plan's
         public knobs appended in brackets.
 
@@ -1289,7 +1295,7 @@ class pygraph:
         from .engines import manifest
 
         family = manifest.family_for(self)
-        if family is not None and family.offered_ids():
+        if family is not None and family.offered_ids(self):
             analyzer = manifest.resolve_analyzer(family)
             if analyzer is not None:
                 self._facts_for(analyzer)
@@ -1600,7 +1606,11 @@ class pygraph:
         """The declared notes of a python plan; () for a backend entry, whose
         notes the backend owns and filters itself."""
         eng = self._engine_for(cfg)
-        return tuple(getattr(eng, f"{kind}_notes", ()) or ()) if eng is not None else ()
+        if eng is None:
+            return ()
+        if kind == "behavior":
+            return tuple(eng.get_behavior_notes(self, cfg) or ())
+        return tuple(getattr(eng, f"{kind}_notes", ()) or ())
 
     def _resolve_stream(self, handle: Any) -> Any:
         """Stream for a supplied handle (classic set_stream semantics). A failed
@@ -2047,11 +2057,11 @@ class pygraph:
         return (cfg.engine_id, dict(cfg.knobs) if cfg.knobs else {})
 
     def get_behavior_notes_for_plan_at_index(self, index: int, *args, **kwargs):
-        """Classic backend behaviour notes for the plan at ``index``.
+        """Declared behavior notes for this backend or Python plan.
 
-        Backend-only by construction: a python plan has no ``BehaviorNote_t``.
-        Saying so is better than forwarding the index and returning some other
-        plan's notes."""
+        Python engines answer for the graph and the indexed configuration;
+        capabilities are not inferred from an engine's name or provider.
+        """
         if not self._planning_done:
             return self._lowered_graph.get_behavior_notes_for_plan_at_index(index, *args, **kwargs)
         cfg = self._plans[self._check_plan_index(index)]
@@ -2063,8 +2073,11 @@ class pygraph:
         return self._lowered_graph.get_behavior_notes_for_plan_at_index(cfg.cpp_index, *args, **kwargs)
 
     def get_behavior_notes(self, *args, **kwargs):
-        """Classic behaviour notes for the SELECTED plan — backend-only, for the
-        same reason as the at-index query."""
+        """Declared behavior notes for the selected backend or Python plan.
+
+        Query after final plan selection when choosing an execution layout.
+        Absence of a capability note means the plan makes no such guarantee.
+        """
         eng = self.selected_engine
         if eng is not None:
             return list(self._notes_of(self._selected_plan_config, "behavior"))
@@ -4582,13 +4595,23 @@ _CAPTURED_OPS = {
         # The same two op attributes as "sdpa".  Without this entry a SET
         # softmax_precision would be forwarded to the C++ sdpa_mxfp8 (which has
         # no such argument) instead of keeping the node on the python engines.
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),
+        # ``causal_exclude_own_block`` (int block size, None = off): the causal
+        # mask also drops the query's own aligned block of that many keys, so
+        # query i reads keys j < B * floor(i / B) only (rows 0 .. B-1 read none:
+        # O = 0, Stats = -inf, the FROST empty-row contract).  With B = 32, the
+        # MXFP8 V scale block, every V scale the kernel reads covers fully
+        # visible tokens only: the completed-block half of causal MXFP8
+        # attention whose PV stays MXFP8 (NVIDIA/TransformerEngine#3248); the
+        # caller adds the query's own block separately.  Numerics-changing,
+        # hence an op attribute; the backend has no field for it.
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         maybe={"Stats": _stats_expected},
         infer={"O": _sdpa_o_dims, "Stats": _sdpa_stats_dims, "Amax_O": _AMAX},
     ),
     "sdpa_mxfp8_backward": dict(
         node_type=NodeType.SDPA_MXFP8_BWD,
-        python_only_attrs=("softmax_precision", "attn_scale_prefolded"),  # forward-only, see "sdpa_backward"
+        # forward-only, see "sdpa_backward" and "sdpa_mxfp8"
+        python_only_attrs=("softmax_precision", "attn_scale_prefolded", "causal_exclude_own_block"),
         pos=(
             "q",
             "q_T",

@@ -19,7 +19,7 @@ import torch
 
 import cudnn
 import cudnn.sdpa  # noqa: F401 — the SM80 capability tables live here
-from frost_test_utils import select_engine
+from frost_test_utils import half_engine_names, select_engine
 
 
 def _is_sm80() -> bool:
@@ -114,7 +114,7 @@ def _assert_stream_respect(run, out_bufs, handle):
 def test_sm80_fwd_respects_handle_stream_and_is_capturable():
     torch.manual_seed(0)
     g, t = _build_fwd()
-    _build_and_pin(g, "sdpa_fwd_prefill_sm80")
+    _build_and_pin(g, half_engine_names("sm80"))
     q_gpu, k_gpu, v_gpu = _mk_buf(), _mk_buf(), _mk_buf()
     o_gpu = torch.empty_like(q_gpu)
     ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8) if g.get_workspace_size() else None
@@ -135,7 +135,7 @@ def test_sm80_bwd_respects_handle_stream_and_is_capturable():
     o, stats = gf.sdpa(name="sdpa", q=q, k=k, v=v, attn_scale=1.0 / math.sqrt(_D), generate_stats=True, use_causal_mask=True)
     o.set_output(True).set_dim(dims).set_stride(_STRIDES)
     stats.set_output(True).set_data_type(_F32)
-    _build_and_pin(gf, "sdpa_fwd_prefill_sm80")
+    _build_and_pin(gf, half_engine_names("sm80"))
     q_gpu, k_gpu, v_gpu = _mk_buf(), _mk_buf(), _mk_buf()
     o_gpu = torch.empty_like(q_gpu)
     stats_gpu = torch.empty(_B, _H, _S, 1, device="cuda", dtype=torch.float32)

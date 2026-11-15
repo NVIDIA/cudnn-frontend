@@ -81,8 +81,13 @@ def _facts(direction, descs, *, thd=False):
 
 
 def _mismatch(direction, facts):
-    module = backward if direction == "bwd" else forward
-    return module.mismatch(module._sm80_spec().capabilities, facts)
+    if direction == "bwd":
+        return backward.mismatch(backward._sm80_spec().capabilities, facts)
+    from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as half
+
+    owner = half.implementation_for(facts.d_qk, facts.d_v)
+    spec = next((s for s in forward.ENGINE_SPECS if s.name == owner), None) or forward._sm80_spec()
+    return forward.mismatch(spec.capabilities, facts)
 
 
 @pytest.mark.parametrize("d,dv", [(512, 512), (576, 512), (288, 384), (520, 504)])

@@ -77,7 +77,7 @@ def test_batch_and_golden(dtype_name):
             api.check_support()
             api.compile()
             assert api.flavor == (256, 256) and api.packed_thd_split
-            assert api._k_mod.__file__.endswith("sm100/prefill_d256_f16.py")
+            assert api._k_mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py")
             assert api._k_mod.CFG.PACK_GQA and api._k_mod.CFG.SPLIT_KV == splits
             plans[batch] = api
         api = plans[batch]

@@ -45,7 +45,7 @@ requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"gated_attention_bl
 
 
 # Qwen3.5's full-attention geometry: d_qk == d_v == 256 picks the (256, 256)
-# flavor, which on Rubin is sdpa/fwd/kernels/sm107/prefill_d256_f16.py -- and,
+# flavor, which on Rubin is sdpa/fwd/kernels/sm107/d256_f16_lookahead/kernel.py -- and,
 # under fuse_gate, the SAME kernel's epilogue_gate specialization.
 def _geoms(**over):
     common = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)

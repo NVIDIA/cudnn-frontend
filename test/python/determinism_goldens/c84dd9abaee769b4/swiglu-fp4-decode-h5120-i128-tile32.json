@@ -1,0 +1,88 @@
+{
+  "inputs": {
+    "activation": {
+      "dtype": "torch.uint8",
+      "sha256": "4b1567c3f34b29303e06e8ab7e0be02d48767301db521c02a7b75bf231309bfe",
+      "shape": [
+        20,
+        2560
+      ]
+    },
+    "activation_scale": {
+      "dtype": "torch.uint8",
+      "sha256": "675abb118e259ecc9bcdfb8d83809f686cfa1e803a70442674a864de8b0c0ee8",
+      "shape": [
+        40960
+      ]
+    },
+    "alpha": {
+      "dtype": "torch.float32",
+      "sha256": "a50c4fe393bde2a458935daf4e5413dc0efab26d466fa63ef8fb2457423c3b42",
+      "shape": [
+        1
+      ]
+    },
+    "out_global_scale": {
+      "dtype": "torch.float32",
+      "sha256": "ea2845900b5856c9bf354b1aa9761b5aa6888e5ed61738fe9579ca42bc0f6054",
+      "shape": [
+        1
+      ]
+    },
+    "weight": {
+      "dtype": "torch.uint8",
+      "sha256": "03a1fbd3e8739739268f3934fd4da07abf219415fa8147489204110aa21fb813",
+      "shape": [
+        256,
+        2560
+      ]
+    },
+    "weight_scale": {
+      "dtype": "torch.uint8",
+      "sha256": "c4c2674b625dd65b52c171b0c0b263104eca1024f17ab9af7b2bd427e6fd6e00",
+      "shape": [
+        81920
+      ]
+    }
+  },
+  "outputs": {
+    "out": {
+      "dtype": "torch.uint8",
+      "sha256": "5d604ee8043c69d0f42923ff2aeb7c76f7438d52c0c5824753ad6e25061944cd",
+      "shape": [
+        20,
+        64
+      ]
+    },
+    "scale": {
+      "dtype": "torch.uint8",
+      "sha256": "a5c4ea5afcb9338e729f4fce1a793eadd24e934cb753bfbae82c4aa81fd5960b",
+      "shape": [
+        20,
+        8
+      ]
+    },
+    "scale_band": {
+      "dtype": "torch.uint8",
+      "sha256": "d0fa6c40831da6a81583437255f560f36477adb764dd33723a36731d9d1d60af",
+      "shape": [
+        1024
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13010,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.13.0+cu130",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}

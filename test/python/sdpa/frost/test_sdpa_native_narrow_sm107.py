@@ -40,7 +40,7 @@ def test_native_narrow_graph_admission(thd, cga, split, packed, monkeypatch):
     from cudnn.sdpa.fwd import engines
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d128_multi_q")
     facts = _f16_facts(h_q=16, h_kv=4, thd=thd)
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=split, pack_gqa=packed, tile_m=128, tile_n=64, sched_policy=0)
     assert engines.effective_tile_ns(caps, facts, knobs) == frozenset({64, 128})
@@ -58,7 +58,7 @@ def test_native_narrow_keeps_other_body_domains(change, monkeypatch):
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     facts = _f16_facts()
     knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, tile_n=64)
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d128_multi_q")
     if change == "dense_cga1":
         knobs = dataclasses.replace(knobs, cga=1)
     elif change == "ragged_split":

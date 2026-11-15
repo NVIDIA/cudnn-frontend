@@ -20,7 +20,12 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    count of the run (`Session.plan_table(later)`: one memory sentence for the whole run). Print `[NN] SKIP <requirement>` and
    exit 0; the sentence names the fix. After the plan nothing skips: a provider that declines the operands an adapter built
    is an error, never a skip (a faulty adapter must not look like an unsupported GPU), and no `SKIP` can follow a check that
-   ran. A test that honours a `SKIP` looks for a failed check in the output first.
+   ran. A test that honours a `SKIP` looks for a failed check in the output first. An entry that declines the geometry or
+   the row count of a row that claims the device is an `ERROR`: a wrong table. An adapter to an entry asks it at plan
+   time, on the real device, for the launch of the run's row count, and builds the entry's kernel for that row count on
+   scratch operands: an entry asks what it needs of the installed toolchain where it builds, not where it is
+   constructed, and that answer is a `SKIP` in the entry's own words before the load. A decline at that point which no
+   requirement the adapter can name explains is of the adapter's operands, and an `ERROR`.
 2. **State the environment before the first load.** `check_environment()` compares the installed distribution of cuDNN
    Frontend with `cudnn.__version__`, says whether `cudnn` is an editable checkout and prints a source hash (never a path). A
    mismatch is an error that names both. It runs after the plan, so a GPU the sample does not serve still skips.
@@ -35,18 +40,26 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    `describe`): the plan, the memory sentence and every decline come before a tensor is read. No output names a local path:
    a directory or a file is printed by its own name. No tokenizer, template or weight file of a real checkpoint is committed;
    the tests generate what they read.
-6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `--stack
+6. **The stack is explicit.** `fe-cublas` unless `--stack` says otherwise; never chosen by what is installed. `native` is
+   defined by the target kernel set of the family's census, not by a list of what happens to be fast; `fe-entries` is its
+   cuDNN Frontend rows with every other block on a fallback row, so that those rows run where no further package is
+   installed. `--stack
    reference` reports `[NN] RAN reference stack (no provider checked)`, never `PASS`. So does a run whose `--provider`
    flags leave no provider block to judge (`[NN] RAN (no provider block was judged)`, the blocks line `REPORTED`):
    `PASS` is kept for a run in which provider blocks were compared with the reference and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
    classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. To add a provider: add its
-   key to `providers.KEYS` with its factory, add its row above the rows it should win against, name its tie-out band, and
-   regenerate the family README's table (`configs.readme_table`); a host test keeps the two in agreement. A third-party
+   key to `providers.KEYS` with its factory, add its row above the rows it should win against (and below a row of the
+   same key that an existing command selects with `--provider`), name its tie-out band, and regenerate the family
+   README's tables (`configs.readme_table`); a host test keeps them in agreement. A third-party
    provider is imported inside its adapter, its version is checked there, and a missing or unvalidated version is a `SKIP`
    that names it.
 8. **Bands are never widened in place.** The band of a block against the reference is named in its provider row
-   (`tie_out.BANDS`). A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   (`tie_out.BANDS`). A provider whose kernel rounds at other points than the reference chain is compared with its twin
+   (`Block.twin`): a reference block written at the kernel's rounding points, in the reference's accumulation precision.
+   The reference is matched to the kernel's documented arithmetic; the band is then the kernel's own contract, never a
+   width that covers the distance between two chains. A band names the outputs it applies to; an output it does not name
+   is judged by its dtype, and state a call updates byte for byte. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -74,7 +87,8 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     when the stream reaches it, so a pair spans every gap in which the GPU waited for the host. The traced pass
     (`Session.trace`, `timing.trace_steps`) replays recorded steps under the profiler and takes a step to end at its one
     host read; a block that reads the device would show as an extra step, which the pass reports instead of guessing.
-    Only the profiler's own start and stop are reported as a missing trace; an error of a step under it propagates.
+    Only the profiler's own start and stop -- and, where launch records are asked for, the export and the read of its
+    trace -- are reported as a missing trace, in a sentence that names no path; an error of a step under it propagates.
 14. **What a user can get wrong ends in one `[NN] ERROR` line, never in a traceback.** A path that is not a directory, a
     file that is missing or is not what its name says, a copy of a checkpoint that is not whole (a shard missing, or one
     that does not hold the bytes its header describes), an entry of a side file that holds another kind than it stands
@@ -82,6 +96,37 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     an output file that cannot be written: each is raised as a `ValueError` whose text names the file by its own name, and
     the sample prints it before the plan. Whatever a checkpoint's chat template raises is its refusal. That template is
     untrusted input: it is compiled in `jinja2`'s immutable sandbox, and a host test holds templates that try to leave it.
+
+15. **A kernel is declared, then observed; a name proves no form.** Every adapter declares its census entries (`kernels`,
+    `model_samples/census.py`): the kernels one call launches, as `exact` (judged one by one: name, order, count, and the
+    launch shape where the entry states one), or as the families of a `fallback` row or of the `host` path. A provider row
+    names the form its entry is called in (`form`: fields of the entry's own form), the adapter passes exactly those, and
+    the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. A row of an entry that
+    states its launch names at least one field: with none the entry runs on its own pick and nothing is compared, so
+    the check fails it. The call log of a traced step is an observation: after each call the adapter says which entry
+    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. The
+    check then holds the profiler's record of every launch of the traced steps against the plan. Where those records
+    cannot be had the run ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check
+    stays `FAIL`. A new adapter comes with its census entries, and a chain that gains an operator whose kernel no
+    pattern of `census.FAMILIES` names adds the pattern in the same change: an unnamed kernel fails the check by name.
+    The host tests of the check are in `test/python/misc/test_model_samples_census.py`; each constructed defect there
+    must fail with its own sentence, and the last line of a run is held by running `main()` to its end.
+16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
+    target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
+    SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
+    `not the target`) is decided against that file from the row's kernel and form, never written into an adapter or a
+    row. A count of target launches is always given as three numbers -- the target's own compiled kernels, cuDNN
+    Frontend entries with byte-equal results, declared stand-ins -- never as one, wherever it stands: a sentence of a
+    README, a cell of a table, the line in which a run says what it compared. The three numbers of the set count what a
+    complete stack launches; a text that gives them says how many of the entries a stack calls today. Byte equality
+    with a target kernel is the entry's own record (the census names where it stands: `tie_out`, `differences`), never
+    a measurement of the sample. A section is `claimed` only on a `recorded` basis and only when no row selected on it
+    is a fallback; until then a run prints `NOT CLAIMED` with every reason that applies, and a section of one GPU
+    class, SM count, row count or set of layer widths is never used for another. `EQUAL` says what was compared: a
+    claimed section records the launch shape of every target kernel but a tuner's pick and a stand-in, and a fact the
+    reader of the file does not know is refused, never read as "nothing recorded". A pull request
+    that changes a form the kernel census names updates the census in the same commit. Public text of this area calls
+    it "the target kernel set" and names no product, repository or person for it.
 
 ## What the first GPU run of this area taught
 
@@ -175,3 +220,89 @@ behind; the host tests hold each.
   switched on cuts or pads a prompt without a word; switch both off, and hold it with a tokenizer saved that way.
 - A command block is typed as it is written. A step that stands in a sentence elsewhere, such as fetching the checkpoint,
   is a step the reader does not take: put it in the block, in order, with what it costs.
+
+## What building the kernel check taught
+
+- A generated kernel symbol is the kernel's name and the text of its compile-time arguments, cut at a fixed length. Two
+  forms of one kernel can share a symbol, and a launch shape too: the grid, the block and the shared memory of a launch
+  do not say whether the kernel waits for its predecessor. Compare the form on the objects (the row's fields against the
+  entry's own form), and use the name and the launch shape for what they do show: whose kernel it is, and in which shape.
+- In a stack with reference chains the kernel names of a step are not the same in every step, although their number is:
+  the softmax kernel of the reference attention is instantiated by the length of the cache, and its fp64 multiplies
+  over a cache of one position are served by other kernels than over a longer one. So only the kernels of an entry are
+  judged one by one; a chain is attributed by family, and no test may assume one name sequence per step for a plan that
+  has chains.
+- The profiler's `events()` carry names and times; the grid, the block and the shared memory of a launch are in its
+  exported trace. That trace grows with the launches of a step (32 steps of the two-layer model: about 30 MB), so it
+  is read event by event and never held as a whole.
+- A copy inside a launch graph that was captured before the process's first profiler pass was seen to be replayed as a
+  kernel record, not as a copy record (PyTorch 2.14). Count a copy by either spelling, or a captured step has one more
+  kernel than the same step launched from Python.
+- A check that could not look must not read as one that looked and found nothing: a run without the profiler's records
+  is `RAN`, and the reason is in its last line.
+
+## What the review of the kernel check taught
+
+Each of these passed every test of the first version; the host tests now hold the defect that shows it.
+
+- A log line that is copied from the plan cannot disagree with the plan. The call log's form was the row's own tuple,
+  so "every logged call carries the row's form" could fail on a hand-built line only. Write the line after the call,
+  from the object that was called.
+- An empty statement compares equal to anything. A row without a form passed the form check with nothing compared
+  while its entry ran on its own pick. Fail an entry row that names no field.
+- The last line of a run is code. The verdict function and the check were each tested; that `main()` hands the reason
+  from one to the other was not, and one dropped line turned `RAN` into `PASS` with every test green. Run `main()` to
+  its last line in a host test, with stand-in providers and a stand-in profiler.
+- The text of an `OSError` carries the path of its file. A reason built from it put a temporary path into the last
+  line of a run. Say the system's words for the error number, and name a file by its own name or not at all.
+
+## What building the native stack taught
+
+- How a row stands to a target kernel set is not a property of its adapter. One adapter serves the fused step in the
+  entry's own pick and in the target's form; the kernel is the same and the form is not. Decide the identity from the
+  row's kernel id and form against the census file, per run, and let a host test hold the rows of the stack to it.
+- A kernel with no pattern of its own reads as a missing launch. The first run of the gate entry on a GPU failed with
+  "did not launch gate_quant": its symbol had fallen to the pattern for any other cuDNN Frontend kernel. A new adapter
+  adds its kernel's pattern in front of that one, and a host test holds every exactly judged kernel id of the provider
+  list to a pattern of its own.
+- An entry that returns a view of one buffer of its own hands back bytes that its next call overwrites. The tie-out
+  calls a block again on one sequence alone, so the first call's result would no longer be the first call's. An adapter
+  to such an entry passes an output buffer of its own per call.
+- A recorded section holds for its row count. The default run decodes at 1 and at 4 sequences; the census was recorded
+  at 1 row, so at 4 the run states no identity and says why. Do not carry the kernels of one row count, SM count or GPU
+  class over to another: which kernel serves a block changes with each of them.
+- Compare the versions of what the stack imports, not of what is installed. The first census line named two packages
+  that sat in the environment and that no provider of the stack had loaded.
+- A new row of an existing provider key changes what `--provider BLOCK=KEY` selects when it is placed first: the first
+  declared row of that key that serves the run wins. Put it below the row an existing command selects.
+- The profiler's name of a kernel is right only in a process that has unloaded no kernel module. The GPU test of the
+  second stack failed its kernel check one run in three, by the name of the fused step alone: the test session had run
+  the default stack first and dropped its entries, and the new form's kernel was recorded under the old form's symbol.
+  Two raw CUDA kernels, loaded and unloaded in turn, showed the same on about every second launch, each writing its own
+  output; nothing of it where every module stayed loaded. So the kernel that runs is right and its recorded name is not.
+  A sample process never unloads an entry; a test that checks kernels runs the sample in a fresh interpreter. When a
+  kernel check fails by one name only, and the name is another form of the same entry, look for an unload before the
+  run before looking for a wrong launch -- and then look for the wrong launch.
+
+## What the review of the native stack taught
+
+Each of these passed every test and every GPU run of the first version; a host test now holds each.
+
+- A count given as one number was attributed wrongly in the next clause: "two entries (65 launches)" where the two
+  entries are 64 and the 65th is PyTorch's gather. The split is what makes a count checkable; a host test refuses a
+  count of target launches in the READMEs that is not followed by it.
+- "273 have an entry" was the number of the complete stack in the present tense: 257 of them were not called through
+  an entry by any stack. Say whose number it is, and how much of it exists today.
+- A record holds for what it was taken on, and the model is part of that. The census was keyed by GPU class, SM count
+  and row count; a checkpoint of the family with other layer widths was told `target` and then failed on the 27B's
+  grids. A section names the widths it holds for, and a launch shape that depends on one more field names that field.
+- A decision taken in two places is taken in neither. "A target stack always checks its kernels" held in the script,
+  which set its own flag; the helper's check function defaulted to off, so the next script of the stack would have
+  printed `PASS` for a run that never looked. The decision is the session's, and the helper reads it there.
+- `EQUAL` printed for a comparison that was not made. An entry without its launch shape, or with the key misspelt, was
+  read as "nothing recorded" and the line still said `EQUAL`. Refuse the file; print what was compared.
+- A comparison of three fields tested by varying one field holds one field. Weakening "grid, block and shared memory
+  are equal" to the grid alone left every host test green. Vary each field in a case of its own.
+- An entry gates the installed toolchain where it builds its kernel, not where it is constructed or asked for a launch
+  shape. Planned without a build, a GPU whose target the installed CuTe DSL cannot assemble passed the plan, read 55 GiB
+  of weights and ended in a traceback that blamed the adapter. The entry's first use belongs to the plan.

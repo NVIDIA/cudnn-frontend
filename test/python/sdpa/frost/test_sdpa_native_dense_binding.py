@@ -40,7 +40,7 @@ def _fixture(dtype="bfloat16", paged=False, hnd=False, lse=True, lengths=True, d
     s.ragged = s.fp32_partial = s.shape_fixed = s.lpt_grid_fixed = s.kv_tail_native = s.causal = s.causal_bottom_right = False
     s.gate_expect = s.quant = s.combine = None
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)
-    host_name = "prefill_d512_f16_2x2.py" if d > 512 else f"decode_d{256 if d == 256 else 128}_f16.py"
+    host_name = "d512_f16_2x2/kernel.py" if d > 512 else "d256_f16_swap_ab/kernel.py" if d == 256 else "d128_f16_single_q/kernel.py"
     host_path = Path(prep.__file__).parent / "kernels/sm100" / host_name
     host = next(n for n in ast.parse(host_path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_host")
     s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
@@ -434,9 +434,33 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     # Manifest slot 15 is the distinct Rubin half engine.
     engine_id = 20505 if cc[0] == 12 else (20515 if cc == (10, 7) else _SM100_ID)
     if cc[0] == 12:
+        from cudnn.engines.manifest import MANIFEST
+        from frost_test_utils import sm120_half_owner
+
         tile_m, tile_n, cga = 64, 32 if d > 256 else 64, 1
+        # Exact native tiles have explicit owners; padded envelopes keep 20505.
+        engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[sm120_half_owner(d, d_v, tile_m)]
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
+    if cc in ((10, 0), (10, 3)):
+        if (d, d_v) == (192, 128):
+            engine_id = 20531
+        elif d == d_v and d in (32, 64, 128):
+            # Preserve this fixture's native prefill/single-Q ABI. Short D64
+            # packed rows use the separate quadrant body.
+            engine_id = 20535 if prefill else 20532
+            if not prefill and d <= 64 and sq * (h // kh) <= 32:
+                # The quadrant body admits 32 live rows in a physical M128 tile.
+                engine_id, tile_m = 20536, 128
+            elif not prefill and d == 128 and paged and sq * (h // kh) <= 8:
+                engine_id, tile_m = 20520, 16
+    if cc in ((10, 0), (10, 3)) and (d, d_v) == (256, 256):
+        # Pin the same body this fixture exercised before the row split.
+        # Its short packed Q rows used swap-AB even with the old CGA2 knob.
+        engine_id, tile_m, cga = (20519, 128, 2) if prefill else (20520, 16, 1)
+    if cc in ((10, 0), (10, 3)) and (d, d_v) == (512, 512):
+        # Preserve this native-binder fixture's original role-split ABI.
+        engine_id, tile_m, cga = 20521, 128, 4
     graph.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, tile_n=tile_n, cga=cga, pack_gqa=cc != (10, 7), split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared

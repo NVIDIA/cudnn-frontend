@@ -52,6 +52,36 @@ capture stream used by Torch. A Python-engine path may follow Torch's current st
 stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
 evidence of a backend replay defect. Check the captured graph and changed-input replay before attributing it.
 
+Scope sync-debug mode to the execute call inside the CUDA-graph context.
+Torch's capture entry may synchronize before capture begins; guarding that
+entry tests Torch's setup rather than the executor. Restore the previous mode
+before leaving capture, including on exceptions.
+
+Moving a kernel requires checking dynamic fixture paths as well as full-path
+imports. The D256 implementation contract's `test_dynamic_kernel_fixture_paths_exist`
+checks the actual paged-kernel and service-register-release case providers;
+their deeper numerical/PTX tests may not run in a bounded smoke selection.
+Splitting an engine also updates the shared `test_mhas_v2` routing assertions
+and explicit plan pins, not only the architecture-local FROST suites. Keep
+concrete owner/body assertions so native fallback cannot count as a pass.
+Also audit legacy-name prefix filters, shared helper defaults, behavior-note
+controls and compiled-module spies. A retired identity can make negative tests
+pass at ownership rejection before reaching the intended stride or binder check.
+Select an eligible current owner for those controls; retain legacy owners only
+for their still-served envelopes and explicit record-invalidation tests.
+For an engine ownership split, also run `test_band_capabilities.py`,
+`test_sdpa_frontend_integration.py`, and affected paged/native-binding cases.
+The band matrix synthesizes facts: include current Q/K/V/O declarations so
+mandatory native-binding validation cannot hide the band decision. Explicit
+pins in shared helpers must migrate both the engine ID and physical cluster
+knob; updating architecture-local body tests alone misses these consumers.
+When a fixture changes an unsplit record into a split record, select its
+implementation after computing the final knobs. Small-head SM100 paged THD
+split uses single-Q even when the ranked unsplit candidate used multi-Q.
+`test_paged_thd_split_capture_lengths_and_stats` and
+`test_native_paged_thd_capture_and_rebind` cover that transition, including
+default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
+
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
 For FP8/MXFP8, quantize each sequence once and preserve its payload and scale
@@ -147,6 +177,19 @@ tests and samples use this separation.
 
 ## Python tests (`test/python`)
 
+Architecture-specific test adjustments use device capability, not an engine-name
+suffix. Explicit implementation names can change during a migration while the
+scheduler domain stays the same. The D64 origins-helper host control exercises
+the actual helper and engine admission across SM100/SM103/SM107, including all
+eight dtype/Stats-layout/compact combinations of the SM107 scheduler clamp.
+
+Shared SDPA test helpers accept both public knob mappings and native knob
+dataclasses. Normalize mappings with `SdpaFwdKnobs.from_public` before attribute
+access or `dataclasses.replace`, preserving native callers and caller-owned
+mappings. The native SM107 paging cases `TestNativeD512HalfPaged::test_dense`
+and `TestNativeD576Half::test_paged` pass public mappings and detect this
+otherwise pre-compilation fixture failure.
+
 When changing direct CPython C API calls in the bindings, build with
 `CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` and import the resulting abi3 module.
 `PyFloat_AS_DOUBLE` is unavailable under `Py_LIMITED_API`; after successful
@@ -205,6 +248,13 @@ CI may run source tests against an installed wheel while the source checkout
 contains no native extension; prepending `<checkout>/python` then fails before
 compilation. The native FP8 decode score-release probe exercises this contract.
 
+For original-versus-candidate linear-attention tests, use a separate test tree
+for each source tree. `linear_attention/conftest.py` prepends its own checkout
+to `cudnn.__path__`, so `cudnn.__file__` alone does not prove that child modules
+come from the intended baseline. Check the loaded kernel/helper paths (and
+source hashes for benchmark records); copy only the identical test harness
+into the baseline tree when a new regression must run against old production code.
+
 
 - Source-package subprocess probes must exclude `__pycache__` and bytecode
   when copying a tree shared by xdist workers. Python atomically renames its
@@ -237,6 +287,28 @@ compilation. The native FP8 decode score-release probe exercises this contract.
   ```
 
 ### Native flavor routing assertions
+
+Audit dotted module names as well as file paths when retiring a kernel.
+Check direct imports, `from package import old_module`, and strings passed
+to `find_spec` or `import_module`;
+a search for the old `.py` basename misses them. The SM107 D256 descriptor
+version cases and the gated-block EXTEND PDL source check cover both forms.
+
+Include embedded subprocess scripts when auditing retired kernel paths. A
+filename inside a Python source string is invisible to ordinary import/path
+analysis. Run its actual child process and retain the instruction-level
+assertions after migrating the path; the FP8 decode score-release probe in
+`sdpa/frost/native_fp8_decode_sm100.py` exercises this boundary.
+
+When retiring a kernel file, run its shared binding and pointer-ABI fixtures:
+they may construct the old filename dynamically, so a literal-path search is
+not sufficient. Source inventories must include isolated `kernel.py` paths
+relative to the architecture directory. When one file splits into two bodies,
+check each body's barrier back-edge separately rather than keeping the old
+aggregate count or dropping a body from coverage. Detectors include
+`test_sdpa_native_dense_binding.py`, `test_sdpa_native_prefill_binding.py`,
+`test_sdpa_fwd_pointer_abi.py`, `test_sdpa_fwd_o_empty_backedge.py`, and the
+MXFP8 credit-arrive inventory in `test_sdpa_fwd_mxfp8_sm100.py`.
 
 PTX hash records also depend on imported helpers and the trace probe's fake
 tensor geometry. A scheduler or shared decoder change can invalidate a record
@@ -1520,3 +1592,9 @@ An origin operand can land independently on SM100 and SM107; borrowing the
 other architecture's parameter list hides missing slots or rejects a valid
 new slot. `test_two_by_two_host_slots_match_role_split` pins each pair and
 checks the native SM107 origin operand explicitly.
+
+When a graph-ranking test helper catches an unsupported-graph exception, its
+fallback must match each caller's verdict shape. A three-field caller cannot
+unpack the helper's two-field rejection: it masks the actual graph diagnostic.
+Let that caller propagate the original exception, and exercise the rejection
+path as well as the normal callback (the SM90 D128 packed-plan test is an example).

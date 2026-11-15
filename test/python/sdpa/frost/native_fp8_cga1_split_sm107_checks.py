@@ -2,16 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native D128 FP8 single-CTA dense splits, exposed by the SM107 CI entry."""
 
-from contextlib import contextmanager
-from unittest.mock import patch
-
 import pytest
 import torch
 
 import cudnn
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 import test_sdpa_prepared_fp8 as shared
-from test_sdpa_fwd_fp8_sm100 import _check, _ref, _ref_kwargs
+from fp8_test_reference import _bound_handle, _check, _ref, _ref_kwargs
 
 
 @pytest.mark.L0
@@ -19,7 +16,7 @@ def test_dense_split_domain():
     from cudnn.sdpa.fwd import engines
     from test_sdpa_fwd_dsl_sm107 import _caps, _quant_facts
 
-    caps = _caps("sdpa_fwd_prefill_sm107_fp8")
+    caps = _caps("sdpa_fwd_sm107_d128_fp8_multi_q")
     facts = _quant_facts(b=1, h_q=64, h_kv=8, s_q=1, s_kv=131072)
     for split in (2, 9, 64):
         for cga in (1, 2):
@@ -30,23 +27,7 @@ def test_dense_split_domain():
     assert 1 not in engines.effective_cgas(mx, _quant_facts(is_mx=True), split_kv=2)
 
 
-@contextmanager
-def _bound_handle(handle):
-    previous = cudnn.get_stream(handle)
-    try:
-        yield lambda g, vp, ws: _execute(g, vp, ws, handle)
-    finally:
-        cudnn.set_stream(handle, previous)
-
-
-def _execute(g, vp, ws, handle):
-    cudnn.set_stream(handle, torch.cuda.current_stream().cuda_stream)
-    g.execute(vp, ws, handle=handle)
-
-
 def _case(*, split=3, pack=True, dtype=torch.float8_e4m3fn, output=torch.bfloat16, b=2, sq=17, skv=1024, d=128, dv=128, mask=None, stats=True, sink=False):
-    from cudnn.sdpa.fwd import api_dsl
-
     sinks = torch.linspace(-3, 3, 4, device="cuda").view(1, 4, 1, 1) if sink else None
     g, vp, _, bufs, tensors = shared._case(
         arch="sm107",
@@ -67,21 +48,12 @@ def _case(*, split=3, pack=True, dtype=torch.float8_e4m3fn, output=torch.bfloat1
     g.create_execution_plan(eid, knobs)
     g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
-    original = api_dsl._load_kernel_template
-    seen = []
-
-    def record(filename, params, tag, part=None):
-        module = original(filename, params, tag, part=part)
-        seen.append(filename)
-        assert filename == "sm107/prefill_d128_fp8.py"
-        assert module.CFG.CTA_MMA == 1 and module.CFG.STAGES_KV == 4
-        assert module.CFG.TILE_K_HW_BMM1 == module.CFG.TILE_K_HW_BMM2 == 64
-        assert module.CFG.SPLIT_KV == split and bool(module.CFG.PACK_GQA) == pack
-        return module
-
-    with patch.object(api_dsl, "_load_kernel_template", record):
-        g.build_plans()
-    assert seen
+    g.build_plans()
+    module = g._compiled_plans[g._plan_index]._compiled.kernel_module
+    assert module.__file__.endswith("sm107/d128_fp8_multi_q/kernel.py")
+    assert module.CFG.CTA_MMA == 1 and module.CFG.STAGES_KV == 4
+    assert module.CFG.TILE_K_HW_BMM1 == module.CFG.TILE_K_HW_BMM2 == 64
+    assert module.CFG.SPLIT_KV == split and bool(module.CFG.PACK_GQA) == pack
     prepared = g._compiled_plans[g._plan_index]._prepared
     assert prepared.spec.split == split and prepared.spec.combine is not None
     workspace = torch.empty(max(1, g.get_workspace_size()), device="cuda", dtype=torch.uint8)

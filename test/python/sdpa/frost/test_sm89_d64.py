@@ -3,7 +3,7 @@
 
 """SM89 (Ada / L20) d64 dense SDPA forward: ``sdpa_fwd_prefill_sm89``.
 
-The row is the SAME ``sm80/prefill_f16.py`` template and the same frozen gptoss
+The row is the SAME ``prefill_f16`` template (``sm80/f16_k_prefetch/kernel.py``) and the same frozen gptoss
 geometry as the A100 row, served on a 99 KiB-opt-in-SMEM part.  What this file
 pins, at the level of the engine row rather than any one kernel run:
 

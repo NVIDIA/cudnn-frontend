@@ -232,7 +232,7 @@ _FLAVOR = {FAMILY_F16: "sm107 bwd d256 f16", FAMILY_FP8: "sm107 bwd d256 fp8", F
 MX_BLOCK = 32
 # A scale-factor ATOM covers 128 operand rows x 4 K-groups (= 128 K elements):
 # 512 B in SMEM (the TMA box / UTCCP source unit), 4 TMEM columns once UTCCP'd
-# (``SF_REGISTERS_PER_BLOCK`` in ``sm107/prefill_d256_mxfp8.py``: 16 swizzled
+# (``SF_REGISTERS_PER_BLOCK`` in ``sm107/d256_mxfp8_single_q/kernel.py``: 16 swizzled
 # K bytes x 8 bit / 32).
 SF_ATOM_ROWS = 128
 SF_ATOM_K = 4 * MX_BLOCK
@@ -283,7 +283,7 @@ def sf_smem_bytes(rows: int, k: int) -> int:
     """Bytes of one scale-factor slab (one ring stage) for a ``rows x k`` MMA
     operand: whole F8_128x4 atoms, ``ceil(rows/128) * ceil(k/128) * 512`` (=
     ``ceil128(rows) * ceil128(k) / 32``, the forward's ``SF_SMEM_SIZE_*`` in
-    ``sm107/prefill_d256_mxfp8.py`` / ``fwd/config_sm107._d256_mxfp8_sf_sizes``).
+    ``sm107/d256_mxfp8_single_q/kernel.py`` / ``fwd/config_sm107._d256_mxfp8_sf_sizes``).
     Full-size regardless of CTA_MMA: the cga2 peers multicast their halves into
     the same slab."""
     return _ceil_div(rows, SF_ATOM_ROWS) * _ceil_div(k, SF_ATOM_K) * SF_ATOM_BYTES

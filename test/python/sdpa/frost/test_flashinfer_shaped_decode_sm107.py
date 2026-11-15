@@ -42,8 +42,8 @@ Q_UID, K_UID, V_UID = 1, 2, 3
 ACTUAL_SEQ_LENS_Q_UID, ACTUAL_SEQ_LENS_KV_UID = 100, 101
 BLOCK_TABLES_K_UID, BLOCK_TABLES_V_UID = 201, 202
 O_UID = 1000
-FROST_PREFIX = "sdpa_fwd_prefill_sm107["
-FROST_ENGINE = "frost:sdpa_fwd_prefill_sm107"
+FROST_PREFIX = "sdpa_fwd_sm107_d256_swap_ab["
+FROST_ENGINE = "frost:sdpa_fwd_sm107_d256_swap_ab"
 DECODE_TILE = "decode_d256_f16"
 D = 256
 

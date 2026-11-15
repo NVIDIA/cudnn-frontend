@@ -16,9 +16,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ..census import Kernel
 from ..sampling import greedy
 from ..weights import Dequantized, ScaledTensor, _e4m3, dequantize, quantize_fp8, quantize_nvfp4
-from . import BlockBase, acc_dtype
+from . import PYTORCH_CHAIN, PYTORCH_CHAIN_WITH_MULTIPLY, BlockBase, acc_dtype
 
 BF16 = torch.bfloat16
 
@@ -119,6 +120,54 @@ def gate_quantize(o: torch.Tensor, gate: torch.Tensor, quant):
     return quantize((o.float() * torch.sigmoid(gate.float()).to(BF16).float()).to(BF16), quant)
 
 
+#: the largest fp32 value: an fp32 exponential beyond it is +inf, and the value it divides is then +-0
+FP32_MAX = 3.4028234663852886e38
+
+
+def _bf16_bits(v: torch.Tensor) -> torch.Tensor:
+    return v.view(torch.int16).to(torch.int32) & 0xFFFF
+
+
+def _bf16_from_bits(bits: torch.Tensor) -> torch.Tensor:
+    return bits.to(torch.int16).view(BF16)
+
+
+def gate_quotient_bracket(o: torch.Tensor, gate: torch.Tensor, acc):
+    """The gated attention output formed as the QUOTIENT ``o / (1 + exp(-gate))``, accumulated in ``acc`` on the bf16 operands,
+    with its bf16 bracket: ``(nearest, other, margin)``.  ``nearest`` is the round-to-nearest-even bf16 of the quotient,
+    decided by comparing the quotient with the midpoint of the two bf16 values around it (never by a cast that rounds
+    twice); ``other`` is the bf16 value on the other side of the quotient (``nearest`` itself where the quotient is a bf16
+    value); ``margin`` is the distance of the quotient from the midpoint of the two, in fp32 units of the quotient (+inf
+    where it is a bf16 value).  A kernel that forms the same quotient in fp32 rounds to ``nearest`` wherever the margin
+    exceeds its own fp32 error, and to one of the two everywhere.  The exponential is formed as the kernel forms it: where
+    it overflows fp32 it is +inf and the gated value +-0, whatever ``acc`` could still represent."""
+    exponential = torch.exp(-gate.to(acc))
+    exponential = torch.where(exponential > FP32_MAX, torch.full_like(exponential, float("inf")), exponential)
+    t = o.to(acc) / (1.0 + exponential)
+    v = t.float().to(BF16)  # one end of the bracket (both roundings are monotone); which end is decided below, in ``acc``
+    bits = _bf16_bits(v)
+    sign, magnitude = bits & 0x8000, bits & 0x7FFF
+    away = _bf16_from_bits(sign | (magnitude + 1).clamp(max=0x7F80))
+    toward = _bf16_from_bits(sign | (magnitude - 1).clamp(min=0))
+    va = v.to(acc)
+    other = torch.where(t.abs() > va.abs(), away, torch.where(t.abs() < va.abs(), toward, v))
+    oa = other.to(acc)
+    exact = t == va
+    to_v, to_other = (t - va).abs(), (t - oa).abs()
+    # ``v`` unless the other end is strictly nearer.  A quotient ON the midpoint is exact in fp32, so the cast above has
+    # already rounded it to the even end: at equal distances ``v`` is the nearest-even value
+    at_v = exact | (to_v <= to_other)
+    nearest = torch.where(at_v, v, other)
+    # ... and where the other end is the nearer one, ``v`` stays in the bracket as its second value.  That happens where the
+    # quotient rounds to the midpoint itself in fp32 and the even end is the farther one: ``v`` is then what an fp32 chain
+    # rounds to, and a bracket without it would hold the nearest value twice
+    second = torch.where(at_v, other, v)
+    exponent = torch.frexp(t.abs()).exponent.clamp(min=-125)
+    unit = torch.pow(torch.tensor(2.0, dtype=acc, device=t.device), (exponent - 24).to(acc))  # one fp32 unit of the quotient
+    margin = torch.where(exact, torch.full_like(t, float("inf")), (t - (va + oa) * 0.5).abs() / unit)
+    return nearest, second, margin
+
+
 def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> ScaledTensor:
     """One decode step of a gated delta-rule linear-attention layer, for ``rows`` sequences whose slots are ``slot_ids``:
     the beta / alpha projection of the normed hidden state, the causal conv over the slot's history with SiLU, the scaled query
@@ -156,7 +205,10 @@ def gdn_decode_step(x, z, hidden, slot_ids, p, slots, eps: float, acc) -> Scaled
 
 
 class _Reference(BlockBase):
-    """A block served by this module.  ``eps`` is the model's norm epsilon; ``acc`` the accumulation dtype of the run."""
+    """A block served by this module.  ``eps`` is the model's norm epsilon; ``acc`` the accumulation dtype of the run.  Its
+    census entry is the family of PyTorch's own kernels; a chain that multiplies (``matmul``, ``einsum``) adds cuBLAS's."""
+
+    kernels = PYTORCH_CHAIN
 
     def __init__(self, row, model, facts, options):
         super().__init__(row, model, facts, options)
@@ -165,11 +217,19 @@ class _Reference(BlockBase):
 
 
 class Embedding(_Reference):
+    """One gather per call: an exact kernel, known by its name.  Its launch shape is PyTorch's and is declared nowhere."""
+
+    kernels = (Kernel("embedding_gather", "PyTorch", "exact", launches=1),)
+
     def __call__(self, ids, table):
         return table.index_select(0, ids)
 
 
 class TokenChoice(_Reference):
+    """The sample's host path: what it launches is listed by the kernel check and compared with nothing."""
+
+    kernels = (Kernel("pytorch", "PyTorch", "host"),)
+
     def __call__(self, logits):
         return greedy(logits)
 
@@ -182,11 +242,15 @@ class AddNormQuantize(_Reference):
 
 
 class Linear(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+
     def __call__(self, qx, weight):
         return linear(qx, weight, self.acc)
 
 
 class GateUp(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
+
     def __call__(self, qx, weight, quant):
         self.product = linear(qx, weight, self.acc)
         return silu_mul_quantize(self.product, quant)
@@ -204,6 +268,7 @@ class AttentionPrepare(_Reference):
 
 
 class Attention(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
     per_row = (0, 1)
 
     def __call__(self, q, cache, position):
@@ -217,7 +282,28 @@ class GateQuantize(_Reference):
         return gate_quantize(o, gate, quant)
 
 
+class GateQuantizeQuotient(_Reference):
+    """The gate + quantise at the rounding points of a kernel that forms the gated value as a quotient
+    (``cudnn.AttentionGateQuantDecode``): ``code = e4m3(bf16(o / (1 + exp(-gate))) * (1 / scale))``, the quotient accumulated
+    in ``acc`` and rounded ONCE to bf16.  The reference chain (``gate_quantize``) rounds the sigmoid to bf16 first and then
+    the product: another function, one code apart on rare elements.  This block is the twin of that entry's adapter, not a
+    row of any table; ``bracket`` keeps, of the last call, the codes of the other bf16 value around each quotient and the
+    quotient's distance from the midpoint, which the band of the entry is judged with (``tie_out``: ``gate_fp8``)."""
+
+    entry = "torch_ref.gate_quantize at the kernel's rounding points"
+    per_row = (0, 1)
+    bracket = None
+
+    def __call__(self, o, gate, quant):
+        if quant is None or quant.fmt != "fp8":
+            raise ValueError("the gate's twin quantises to static 8-bit codes")
+        nearest, other, margin = gate_quotient_bracket(o, gate, self.acc)
+        self.bracket = (quantize_fp8(other, quant.scale).codes, margin)
+        return quantize_fp8(nearest, quant.scale)
+
+
 class GdnDecodeStep(_Reference):
+    kernels = PYTORCH_CHAIN_WITH_MULTIPLY
     per_row = (0, 1, 2, 3)
     state_args = (5,)
 
