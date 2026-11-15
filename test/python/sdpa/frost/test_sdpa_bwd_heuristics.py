@@ -34,6 +34,8 @@ _OFFERED = {
     "sdpa_bwd_sm120": 20600,
     "sdpa_bwd_sm80": 20601,
     "sdpa_bwd_sm100": 20602,
+    "sdpa_bwd_sm100_d512_role_split": 20626,
+    "sdpa_bwd_sm100_d512_2x2": 20627,
     "sdpa_bwd_sm100_mxfp8": 20603,
     "sdpa_bwd_sm107": 20604,
     "sdpa_bwd_sm107_fp8": 20605,
@@ -68,7 +70,7 @@ def test_sm120_row_lists_the_kernels_per_head_dim_default(d):
 def test_fixed_geometry_row_lists_no_knobs():
     # sm100 f16: the kernel takes no tile choice, so {} is the complete record.
     plans = recommend("A", _facts(d_qk=512, d_v=512, device_cc=(10, 0)), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in plans] == [(20602, None)]
+    assert [(p.engine_id, p.knobs) for p in plans] == [(20626, None), (20627, None)]
 
 
 def test_single_point_domain_row_lists_its_sole_tiles():
@@ -178,8 +180,8 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
         ((11, 0), 512, [20608]),
         ((10, 7), 264, [20608]),
         ((10, 7), 504, [20608]),
-        ((10, 0), 512, [20602]),
-        ((10, 3), 512, [20602]),
+        ((10, 0), 512, [20626, 20627]),
+        ((10, 3), 512, [20626, 20627]),
         ((10, 7), 256, [20604]),
         ((10, 7), 128, [20609]),  # d128 on cc 10.7: the admitted d128 family row (slot 9), never the d512 row
         ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
@@ -190,13 +192,15 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
 def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(cc, d, want):
     """The cc 10.7 d512 bf16 / fp16 backward row (slot 8 -> 20608) is fixed-geometry: on the Rubin line (cc 10.7-11.x) a
     d in (256, 512] graph lists exactly one entry with NO knobs (``{}`` is the complete record); the SM100 line keeps its
-    own d512 row (20602); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
+    explicit d512 owners (20626 then 20627); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
     d = 128 on cc 10.7 lists the admitted d128 family row (20609; the Rubin admission of 2026-11-03), past that row's range (cc 11.0)
     on SM120 the native wide row lists its 16x16 tile pair."""
     assert any(s.name == "sdpa_bwd_sm107_d512" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_d512 is not registered"
     plans = recommend("A", _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
-    assert all(p.knobs is None for p in plans if p.engine_id in (20602, 20604, 20608)), "the fixed-geometry rows have no tile axis: {} is the complete record"
+    assert all(
+        p.knobs is None for p in plans if p.engine_id in (20626, 20627, 20604, 20608)
+    ), "the fixed-geometry rows have no tile axis: {} is the complete record"
     assert all(p.mode is None and p.cpp_index is None for p in plans)
 
 

@@ -4,6 +4,39 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Explicit SM100 D512 half backward owners (2026-11-15)
+
+The role-split and 2x2 bodies moved without executable AST changes. Fixed
+hosts name the body, parameter record and artifact independently; both retain
+the shared native binder's overlap checks. The legacy graph record declines,
+and the ordinary default remains role split. No numerical golden changed.
+
+On SM100, cuDNN 9.30, CuTe DSL 4.8 and CUDA 13.4 compilation, a frozen source
+snapshot passed the following selections. The loaded source was checked in
+each process. Run from `test/python` with `-m L0`; paths below are under
+`sdpa/frost/`. Counts include host contracts and must not be presented as
+counts of native numerical cases.
+
+| Selection | Result |
+|---|---|
+| `test_sdpa_bwd_config_sm100_2x2.py`; `test_sdpa_bwd_d512_explicit_engines.py`; `test_sdpa_bwd_heuristics.py`; `test_sdpa_bwd_explicit_engines.py` | 659 passed, including four native public-record rebuild/refusal checks |
+| `test_sdpa_bwd_dsl_sm100.py`: `test_dense`, `test_causal_dtypes`, `test_head_dim_band`, `test_gqa_mqa`, `test_deterministic_request_is_bitwise_across_launches`, `test_prepared_sm100_rebind_stream_and_replay`, both `test_prepared_backward_artifact_reloads_in_fresh_process` variants, `test_stage2_2x2_is_bitwise_the_role_split` | 62 passed |
+| `test_sdpa_bwd_thd_sm100.py`: `test_graph_thd_self_attention`, `test_graph_thd_cross_attention`, `test_graph_thd_stats_packings`, `test_graph_thd_zero_length_sequence`, `test_graph_thd_gqa`, `test_graph_thd_causal`, `test_graph_thd_causal_bottom_right`; `test_sdpa_bwd_thd_origins_sm100.py` | 45 passed |
+| `test_band_capabilities.py`; `test_sdpa_graph_analyzer.py`; `test_sdpa_bwd_native_layouts_sm100.py` | 692 passed, 8 skipped because only one CUDA device was allocated |
+| `test_sdpa_bwd_dsl_sm100.py`: `test_stage2_2x2_debug_clk_dump_accounts_the_waits`, `test_stage2_4x1_debug_clk_dump_accounts_the_waits`, `test_stage2_2x2_waits_for_delayed_empty_observer`, `test_stage2_2x2_sass_pins` | 8 passed; the SASS checks include cross-target compilation, not SM107 execution |
+
+The two pytest summaries were **766 passed, 74 deselected** and
+**700 passed, 8 skipped**. The deselections retain the suites' L1 cases.
+Both public owner records rebuild the same body with opposite legacy-switch
+values and compare all three gradient outputs as raw bits. Existing dense
+and packed suites retain independent references, poisoned storage, fresh
+bindings, capture/replay, GQA and physical-origin checks. Standalone fixed
+hosts had separately passed 16 dense/replay and D384/Stats-packing cases.
+
+This establishes repeatability for the tested records. General batch
+invariance, SM103 execution and multi-device execution remain unverified by
+this run; existing support claims elsewhere keep their original scope.
+
 ### Forward SDPA body retirement (2026-11-15)
 
 The retirement candidate redirects standalone and retained envelope routes
