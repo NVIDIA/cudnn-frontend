@@ -1817,7 +1817,7 @@ def test_fp8_sm100_device_scales_execute_reads_no_device_memory():
 #
 # Same cga4x1 role-split kernel family as the d512 f16 sibling; the FP8 fork
 # runs STAGES_KV = XFER_STAGES = 3 with a 128-column TMEM-resident Q and the
-# Blackwell K=32 QMMA step (the Rubin sibling sm107/prefill_d512_fp8.py takes
+# Blackwell K=32 QMMA step (the Rubin sibling sm107/d512_fp8_role_split/kernel.py takes
 # the K=64 form).  Both arch lines serve the flavor, so this section runs on
 # both; the MXFP8 d512 kernels have their own suites.
 # ===========================================================================

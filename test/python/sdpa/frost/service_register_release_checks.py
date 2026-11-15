@@ -142,7 +142,7 @@ def release_cases(arch):
             "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
             "prefill_d512_mxfp8.py": "d512_mxfp8_slice_recompute/kernel.py",
         }
-        path = moved.get(name, name) if arch == "sm100" else name
+        path = moved.get(name, name) if arch == "sm100" or name == "prefill_d512_fp8.py" else name
         cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))
     if arch == "sm100":
         # The retained-P body compiles only for exact top-left SWA of one KV tile.
