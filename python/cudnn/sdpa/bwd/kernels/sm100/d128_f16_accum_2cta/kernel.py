@@ -1533,22 +1533,9 @@ def _ship_xchg(slab, bars, rank, ship_pred, stage, geo: cutlass.Constexpr, b2: c
     ``stage`` of the PEER's sDS at its recv half (= our own-half offset of that stage), completing on the PEER's ``ds_recv_full[stage]`` (P9: a plain
     bulk copy is local to the destination CTA's mbar, never routed); under sm100 ``stage`` is None and the single slabs / slot are the audited ones."""
     peer = rank ^ cutlass.Int32(1)
-    if cutlass.const_expr(b2):
-        local_src = _view(slab, geo.XCHG, cutlass.Uint8, geo.XCHG_STAGES * geo.XCHG_BYTES, alignment=1024).subview(stage * cutlass.Int32(geo.XCHG_BYTES))
-        peer_dst = nvvm.mapa(
-            _view(slab, geo.DS, cutlass.Uint8, geo.DS_STAGES * geo.DS_BYTES, alignment=1024).subview(
-                stage * cutlass.Int32(geo.DS_BYTES) + rank * cutlass.Int32(geo.DS_HALF_BYTES)
-            ),
-            peer,
-            addrspace=7,
-        )
-        peer_mbar = nvvm.mapa(bars.ds_recv_full[stage].smem_ptr, peer, addrspace=7)
-    else:
-        local_src = _view(slab, geo.XCHG, cutlass.Uint8, geo.XCHG_BYTES, alignment=1024)
-        peer_dst = nvvm.mapa(
-            _view(slab, geo.DS, cutlass.Uint8, geo.DS_BYTES, alignment=1024).subview(rank * cutlass.Int32(geo.DS_HALF_BYTES)), peer, addrspace=7
-        )
-        peer_mbar = nvvm.mapa(bars.ds_recv_full.smem_ptr, peer, addrspace=7)
+    local_src = _view(slab, geo.XCHG, cutlass.Uint8, geo.XCHG_BYTES, alignment=1024)
+    peer_dst = nvvm.mapa(_view(slab, geo.DS, cutlass.Uint8, geo.DS_BYTES, alignment=1024).subview(rank * cutlass.Int32(geo.DS_HALF_BYTES)), peer, addrspace=7)
+    peer_mbar = nvvm.mapa(bars.ds_recv_full.smem_ptr, peer, addrspace=7)
     cp_async_bulk_shared_cluster_shared_cta(peer_dst, local_src, peer_mbar, geo.XCHG_TX, pred=ship_pred)
 
 
@@ -2071,12 +2058,11 @@ def _s_lookahead(
     is the leader's None and is returned unchanged (the S^T(t+1) WAR over the softmax's S^T(t) read rests on p_ready(t), waited at slot 3)."""
     if qtile + 1 < hi:
         _wait_tcgen(bars.q1_full[q1_next.idx], q1_next.phase, dbg, _W["wait:leader:q1_full"])
-        if cutlass.const_expr(not dq576):
-            # DIAGNOSTIC s_tail_wait_off: the guard holds the wait only; the advance below is unconditional (D1 ii)
-            if qtile > lo:
-                if cutlass.const_expr(not s_tail_off):
-                    _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
-                s_tail_state = advance(s_tail_state, 1)
+        # DIAGNOSTIC s_tail_wait_off: the guard holds the wait only; the advance below is unconditional (D1 ii)
+        if qtile > lo:
+            if cutlass.const_expr(not s_tail_off):
+                _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
+            s_tail_state = advance(s_tail_state, 1)
         q1d_next = _operand_k_major(slab, geo.Q1 + q1_next.idx * geo.Q1_BYTES, dtype, CFG.Q_HALF).desc()  # the sQ1 ring stage (geo.Q1_STAGES)
         mma_ss(score, k1d, q1d_next, s_acc)
         _commit_pair(bars.s_done, elect_p)
@@ -2119,14 +2105,7 @@ def _dq_issue(
     if cutlass.const_expr(dbg is not None):
         _clk_recv(dbg, _W["tiles_leader"], _W["recv_leader_sum"], _W["recv_leader_matched"], _W["recv_leader_missed"], tag_back)
     _wait_tcgen(_slot(bars.ds_pair_ready, xchg_state, geo.DS_STAGES), xchg_state.phase, dbg, _W["wait:leader:ds_pair_ready"])
-    if cutlass.const_expr(b2):
-        # BARRIER dq_read_done (LEADER 256, st(1)): the previous dQ issue's image was read out by the four epilogue warps of BOTH CTAs (their LDTM +
-        # tcgen05_wait(LOAD) + fence precede the relaxed arrive); the wait's after_thread_sync fence closes the tcgen05 side before the overwrite
-        _wait_tcgen(bars.dq_read_done, dq_read_state.phase, dbg, _W["wait:leader:dq_read_done"])
-        dq_read_state = advance(dq_read_state, 1)
-        dsd_s = dsd + cutlass.Int64(xchg_state.idx) * cutlass.Int64(geo.DS_BYTES >> 4)  # the sDS stage of this issue: one pinned root + the stage advance
-    else:
-        dsd_s = dsd
+    dsd_s = dsd
     # skew lever 7 (SOFTMAX_DQ_WAR): the LEADER holds the dQ issue -- under 16w_fa4 both softmaxes' dS STS wait dq_war_done ALONE
     if cutlass.const_expr(DEBUG_SOFTMAX_DQ_WAR_DELAY_US > 0):
         for _us in cutlass.range(DEBUG_SOFTMAX_DQ_WAR_DELAY_US, unroll=1):
@@ -2162,10 +2141,9 @@ def _dq_slot(
     ``s_read_off`` (DIAGNOSTIC s_read_wait_off, header section 11): the s_read wait is skipped; ready_state (advanced by the caller per tile) and
     the softmax's 512-lane arrive stay -- dQ(t-1) may land under the softmax's S^T(t) read: WRONG BY DESIGN.  The three dS gates of _dq_issue are
     never under a probe.  ``dq576`` (tmem_map dq_576): no s_read row (the dQ image shares no column with S^T): the slot is the gated issue alone."""
-    if cutlass.const_expr(not dq576):
-        # DIAGNOSTIC s_read_wait_off: the guard holds the wait only
-        if cutlass.const_expr(not s_read_off):
-            _wait_tcgen(bars.s_read, ready_state.phase, dbg, _W["wait:leader:s_read"])
+    # DIAGNOSTIC s_read_wait_off: the guard holds the wait only
+    if cutlass.const_expr(not s_read_off):
+        _wait_tcgen(bars.s_read, ready_state.phase, dbg, _W["wait:leader:s_read"])
     if qtile > lo:
         xchg_state, dq_read_state = _dq_issue(
             bars, dqdesc, dsd, k2d, dq_acc, xchg_state, dq_read_state, elect_p, fa4_roles, b2, geo, dbg, DBG_CLK.TAG_BACK_IN_TILE
@@ -2310,9 +2288,8 @@ def _softmax_loop(
             a, b = _s_values(tmem_base, group)
             # s_tail map: the S^T registers are held, dQ(t-1) may land in the tail (s_read, 512, EVERY tile); dq_576: no row, no fence, no arrive --
             # the tail is S^T's alone and the next fence precedes p_ready
-            if cutlass.const_expr(not dq576):
-                nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                _arrive_leader(bars.s_read)
+            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            _arrive_leader(bars.s_read)
             stats_base = geo.STATS  # stats_form ldg: the single slab `_stats` filled (a trace-time constant: the LDS immediates of today's rendering)
             if cutlass.const_expr(tma_ring):
                 # RESOURCE-NOTE: stats_full wait AFTER the s_read arrive, before _p_values: dQ(t-1) never waits stats
@@ -2447,8 +2424,6 @@ def _epilogue_loop(
     ds_state = PipelineState.start()
     dq_state = PipelineState.start()
     empty_state = PipelineState.start(phase=1)  # pre-armed (P5 b): both slots of the ring are free before the first round; NO bootstrap
-    if cutlass.const_expr(b2):
-        sds_state = PipelineState.start()  # rubin_b2: the sDS / XCHG ring (geo.DS_STAGES = 2), +1 per LIVE tile, carried across items, never reset (P2)
     if cutlass.const_expr(dkv_fp32):
         stage_state = (
             PipelineState.start()
@@ -2474,20 +2449,11 @@ def _epilogue_loop(
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             # dp_empty = dS^T readout only (arrive before the XCHG STS); dP^T(t+1) never waits dQ
             _arrive_leader(bars.dp_empty)
-            if cutlass.const_expr(not b2):
-                stage = None
-                own_sts = own_base
-                xchg_sts = geo.XCHG
-                recv_bar = bars.ds_recv_full
-                smem_bar = bars.ds_smem
-            else:
-                # smem_map rubin_b2 (header sections 5 / 8): tile t stages into sDS / XCHG stage s = sds_state.idx and arms / arrives that stage's slots; the
-                # arm's back-edge (P14-B) is this warp's dq_done(t-2) wait of iteration t-1: phase t-2 of slot s completed (bytes landed) before dQ(t-2) issued
-                stage = sds_state.idx
-                own_sts = own_base + stage * cutlass.Int32(geo.DS_BYTES)
-                xchg_sts = cutlass.Int32(geo.XCHG) + stage * cutlass.Int32(geo.XCHG_BYTES)
-                recv_bar = bars.ds_recv_full[stage]
-                smem_bar = bars.ds_smem[stage]
+            stage = None
+            own_sts = own_base
+            xchg_sts = geo.XCHG
+            recv_bar = bars.ds_recv_full
+            smem_bar = bars.ds_smem
             _skew_leader_arm(rank)  # skew lever 8: the LEADER holds its ds_recv_full[s] arm (the follower's ship of slot s lands first)
             recv_bar.arrive(n_bytes=xchg_tx, pred=ship_pred)  # XCHG_TX; the probe arms CFG.DIAG_EXCHANGE_OFF_TX = 0 (completes at the arm)
             _store_words(slab, xchg_sts, lane, _concat32(x0, x1))
@@ -2504,82 +2470,34 @@ def _epilogue_loop(
             nvvm.fence_proxy("async.shared", space="cta")
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             smem_bar.arrive()
-            if cutlass.const_expr(not b2):
-                if qtile > lo:
-                    # round B of dQ(t-1): slice 2 dhalf + 1
-                    empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, carried, empty_state, sts_off, dbg)
-                _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])
-                if cutlass.const_expr(dbg is not None):
-                    t_dq = cute.arch.clock64()  # STAMPS: dQ(t) landed
-                    _clk_add(dbg, _W["seg_dq_done_sum"], cutlass.Int32(t_dq - t_ds))
-                # skew lever 6: the FOLLOWER holds its dQ readout (s_tail: s_tail_empty alone holds S^T(t+1); dq_576: a timing probe of the carrier)
-                _skew_follower_dq_readout(rank)
-                dq = _tmem_load(tmem_base + dq_col, CFG.DQ_COLS)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                # s_tail map: s_tail_empty right after wait(LOAD): S^T(t+1) waits the readout, never the STS.  dq_576: no row -- the wait(LOAD) + fence above
-                # are the local half of the reuse edge dQ(t) readout -> dQ(t+1) write; this warp's next-tile ds_smem.arrive() carries it (header section 5)
-                if cutlass.const_expr(not dq576):
-                    _arrive_leader(bars.s_tail_empty)
-                if cutlass.const_expr(dbg is not None):
-                    _clk_add(dbg, _W["seg_readout_sum"], cutlass.Int32(cute.arch.clock64() - t_dq))  # STAMPS: dq_done pass -> the readout's arrive
-                    _clk_add(dbg, _W["tiles"], cutlass.Int32(1))
-                # round A of dQ(t): slice 2 dhalf
-                empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, 0), empty_state, sts_off, dbg)
-                carried = _dq_half(dq, CFG.DQ_BOX)
-                ds_state = advance(ds_state, 1)
-                dq_state = advance(dq_state, 1)
-            else:
-                # the LAGGING order (header section 5; smem_map rubin_b2): dS(t) is staged ABOVE without waiting dQ(t-1); now round B of dQ(t-2) (the
-                # carried half), then dQ(t-1): dq_done -> the readout trio -> dq_read_done (LEADER 256: the dQ image's REUSE edge, the leader's gate on
-                # its next issue) -> round A; the second half is carried across the next tile's staging (today's register shape).  Both runtime guards
-                # are the item's loop-structure predicate (pair-uniform _item_bounds): the counts of section 5 hold on both CTAs
-                if qtile - 1 > lo:
-                    empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, carried, empty_state, sts_off, dbg)  # round B of dQ(t-2)
-                if qtile > lo:
-                    _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])  # dQ(t-1): issued at slot 2 of the leader's tile t
-                    if cutlass.const_expr(dbg is not None):
-                        t_dq = cute.arch.clock64()  # STAMPS: dQ(t-1) landed
-                        _clk_add(dbg, _W["seg_dq_done_sum"], cutlass.Int32(t_dq - t_ds))
-                    _skew_follower_dq_readout(rank)  # skew lever 6: the FOLLOWER holds its dQ readout (dq_read_done alone holds the leader's next issue)
-                    dq = _tmem_load(tmem_base + dq_col, CFG.DQ_COLS)
-                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    _arrive_leader(bars.dq_read_done)  # LEADER, bare, 128 x 2 = 256: the image is read out; the leader may overwrite it with its next dQ
-                    if cutlass.const_expr(dbg is not None):
-                        _clk_add(dbg, _W["seg_readout_sum"], cutlass.Int32(cute.arch.clock64() - t_dq))  # STAMPS: dq_done pass -> the readout's arrive
-                    # round A of dQ(t-1): slice 2 dhalf
-                    empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, 0), empty_state, sts_off, dbg)
-                    carried = _dq_half(dq, CFG.DQ_BOX)
-                    dq_state = advance(dq_state, 1)
-                if cutlass.const_expr(dbg is not None):
-                    _clk_add(dbg, _W["tiles"], cutlass.Int32(1))
-                ds_state = advance(ds_state, 1)
-                sds_state = advance(sds_state, geo.DS_STAGES)
-        if cutlass.const_expr(not b2):
-            if lo < hi:
-                empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, carried, empty_state, sts_off, dbg)  # round B of dQ(hi-1)
-            else:
-                # the zero-trip empty commit (both epilogues observe it: dq_state +1 per item)
-                _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])
-                dq_state = advance(dq_state, 1)
+            if qtile > lo:
+                # round B of dQ(t-1): slice 2 dhalf + 1
+                empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, carried, empty_state, sts_off, dbg)
+            _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])
+            if cutlass.const_expr(dbg is not None):
+                t_dq = cute.arch.clock64()  # STAMPS: dQ(t) landed
+                _clk_add(dbg, _W["seg_dq_done_sum"], cutlass.Int32(t_dq - t_ds))
+            # skew lever 6: the FOLLOWER holds its dQ readout (s_tail: s_tail_empty alone holds S^T(t+1); dq_576: a timing probe of the carrier)
+            _skew_follower_dq_readout(rank)
+            dq = _tmem_load(tmem_base + dq_col, CFG.DQ_COLS)
+            nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+            nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            # s_tail map: s_tail_empty right after wait(LOAD): S^T(t+1) waits the readout, never the STS.  dq_576: no row -- the wait(LOAD) + fence above
+            # are the local half of the reuse edge dQ(t) readout -> dQ(t+1) write; this warp's next-tile ds_smem.arrive() carries it (header section 5)
+            _arrive_leader(bars.s_tail_empty)
+            if cutlass.const_expr(dbg is not None):
+                _clk_add(dbg, _W["seg_readout_sum"], cutlass.Int32(cute.arch.clock64() - t_dq))  # STAMPS: dq_done pass -> the readout's arrive
+                _clk_add(dbg, _W["tiles"], cutlass.Int32(1))
+            # round A of dQ(t): slice 2 dhalf
+            empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, 0), empty_state, sts_off, dbg)
+            carried = _dq_half(dq, CFG.DQ_BOX)
+            ds_state = advance(ds_state, 1)
+            dq_state = advance(dq_state, 1)
+        if lo < hi:
+            empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, carried, empty_state, sts_off, dbg)  # round B of dQ(hi-1)
         else:
-            if lo < hi:
-                # the item end under the lagging order: round B of dQ(hi-2) (the carried half, N >= 2), then the tail dQ(hi-1): dq_done -> the readout trio
-                # -> dq_read_done (the next item's first issue, or the leader's drain, consumes it) -> rounds A and B back to back (today's item-end shape)
-                if hi - 1 > lo:
-                    empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, carried, empty_state, sts_off, dbg)  # round B of dQ(hi-2)
-                _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])  # dQ(hi-1): the tail issue
-                _skew_follower_dq_readout(rank)
-                dq = _tmem_load(tmem_base + dq_col, CFG.DQ_COLS)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                _arrive_leader(bars.dq_read_done)  # LEADER, bare, 256: the item's last readout
-                empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, 0), empty_state, sts_off, dbg)  # round A of dQ(hi-1)
-                empty_state = _dq_round(slab, bars, slot_base, dhalf, qrow, _dq_half(dq, CFG.DQ_BOX), empty_state, sts_off, dbg)  # round B of dQ(hi-1)
-            else:
-                # the zero-trip empty commit (both epilogues observe it: dq_state +1 per item); no readout, no dq_read_done flip (the leader issued no dQ)
-                _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])
+            # the zero-trip empty commit (both epilogues observe it: dq_state +1 per item)
+            _wait_tcgen(bars.dq_done, dq_state.phase, dbg, _W["wait:epilogue:dq_done"])
             dq_state = advance(dq_state, 1)
         live = lo < hi
         _skew_follower_item_end(rank)  # skew lever 3: the FOLLOWER holds its dV / dK TMEM readout at the item end
@@ -2693,14 +2611,8 @@ def _mma_loop_leader(
     kv_state = PipelineState.start()
     ready_state = PipelineState.start()
     xchg_state = PipelineState.start()  # the P2 split: +1 per dQ ISSUE (one tile behind ready_state); advances by geo.DS_STAGES (the ring's slots)
-    if cutlass.const_expr(not dq576):
-        s_tail_state = PipelineState.start(phase=1)  # pre-armed: the kernel's first S^T(lo) finds the S tail free
-    else:
-        s_tail_state = None  # dq_576: no S-tail row, no state; `_s_lookahead` threads the None through unchanged (no site reads it)
-    if cutlass.const_expr(b2):
-        dq_read_state = PipelineState.start(phase=1)  # rubin_b2: dq_read_done, pre-armed (the kernel's first dQ issue has no previous tenant); +1 per wait
-    else:
-        dq_read_state = None  # sm100: no row, no wait; `_dq_slot` / `_dq_issue` thread the None through unchanged
+    s_tail_state = PipelineState.start(phase=1)  # pre-armed: the kernel's first S^T(lo) finds the S tail free
+    dq_read_state = None  # sm100: no row, no wait; `_dq_slot` / `_dq_issue` thread the None through unchanged
     dp_empty_state = PipelineState.start(phase=1)
     out_empty = PipelineState.start(phase=1)
     sched_state = PipelineState.start()
@@ -2721,13 +2633,12 @@ def _mma_loop_leader(
         if lo < hi:
             _wait_tcgen(bars.k1_full, kv_state.phase, dbg, _W["wait:leader:k1_full"])
             _wait_tcgen(bars.q1_full[q1_state.idx], q1_state.phase, dbg, _W["wait:leader:q1_full"])
-            if cutlass.const_expr(not dq576):
-                # each S^T issue waits s_tail_empty (dQ(t-1) read out of the S tail); st(1)
-                # D1 (i): the previous item's tail dQ(hi_prev - 1) has been read out of [64, 128)
-                # DIAGNOSTIC s_tail_wait_off: the guard holds the wait only; the advance stays
-                if cutlass.const_expr(not s_tail_off):
-                    _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
-                s_tail_state = advance(s_tail_state, 1)
+            # each S^T issue waits s_tail_empty (dQ(t-1) read out of the S tail); st(1)
+            # D1 (i): the previous item's tail dQ(hi_prev - 1) has been read out of [64, 128)
+            # DIAGNOSTIC s_tail_wait_off: the guard holds the wait only; the advance stays
+            if cutlass.const_expr(not s_tail_off):
+                _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
+            s_tail_state = advance(s_tail_state, 1)
             q1d = _operand_k_major(slab, geo.Q1 + q1_state.idx * geo.Q1_BYTES, dtype, CFG.Q_HALF).desc()
             mma_ss(score, k1d, q1d, s_acc)
             _commit_pair(bars.s_done, elect_p)
@@ -2743,12 +2654,7 @@ def _mma_loop_leader(
             _skew_leader_slot1()  # skew lever 9: the LEADER holds slot 1 of tile t (relay(t) + the staging of t land before flip t-1 is consumed)
             _wait_tcgen(bars.dp_empty, dp_empty_state.phase, dbg, _W["wait:leader:dp_empty"])
             # dp_empty OUT: packed dS^T(t) read by dK(t) in-order; dP^T(t) fp32 by ds_ready(t)
-            if cutlass.const_expr(not b2):
-                do1d_t = do1d  # the pinned single stage
-            else:
-                do1d_t = _operand_k_major(
-                    slab, geo.DO1 + do1_state.idx * geo.DO1_BYTES, dtype, CFG.Q_HALF
-                ).desc()  # the sDO1 ring stage of tile t (DO1_STAGES 2)
+            do1d_t = do1d  # the pinned single stage
             _wait_tcgen(_do1_slot(bars, do1_state, 0, geo.DO1_STAGES), do1_state.phase, dbg, _W["wait:leader:do1_full"])
             mma_ss(score, vd, do1d_t, dp_acc, k_start=0, k_count=CFG.K_STEPS_PER_BOX)
             _wait_tcgen(_do1_slot(bars, do1_state, 1, geo.DO1_STAGES), do1_state.phase, dbg, _W["wait:leader:do1_full"])
@@ -2779,14 +2685,13 @@ def _mma_loop_leader(
             ready_state = advance(ready_state, 1)
             dp_empty_state = advance(dp_empty_state, 1)
         if lo < hi:
-            if cutlass.const_expr(not dq576):
-                # tail: dQ(hi-1) -- the S tail holds the UNREAD dQ(hi-2) image iff a dQ was issued in the loop (N >= 2): wait its readout (D1 iii);
-                # at N == 1 the previous tenant is S^T(lo), whose softmax read is implied by the dS gates (lo) on both CTAs
-                # DIAGNOSTIC s_tail_wait_off: the guard holds the wait only; the advance stays (D1 iii)
-                if hi - 1 > lo:
-                    if cutlass.const_expr(not s_tail_off):
-                        _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
-                    s_tail_state = advance(s_tail_state, 1)
+            # tail: dQ(hi-1) -- the S tail holds the UNREAD dQ(hi-2) image iff a dQ was issued in the loop (N >= 2): wait its readout (D1 iii);
+            # at N == 1 the previous tenant is S^T(lo), whose softmax read is implied by the dS gates (lo) on both CTAs
+            # DIAGNOSTIC s_tail_wait_off: the guard holds the wait only; the advance stays (D1 iii)
+            if hi - 1 > lo:
+                if cutlass.const_expr(not s_tail_off):
+                    _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
+                s_tail_state = advance(s_tail_state, 1)
             # dq_576: the tail dQ(hi-1)'s previous tenant (dQ(hi-2), or the previous item's last dQ at N == 1) was read out before the epilogues
             # arrived the dS gates of hi-1 (program order): the three gates inside _dq_issue carry the edge
             xchg_state, dq_read_state = _dq_issue(
@@ -2802,16 +2707,11 @@ def _mma_loop_leader(
     # readout) land on a resident leader.
     _wait_tcgen(bars.dp_empty, dp_empty_state.phase, dbg, _W["wait:leader:dp_empty"])
     _wait_tcgen(bars.dvk_empty, out_empty.phase, dbg, _W["wait:leader:dvk_empty"])
-    if cutlass.const_expr(b2):
-        # P15 (rubin_b2): the last readout's dq_read_done (both epilogues' relaxed arrives of the last live item's dQ(hi-1); the pre-arm on a leader
-        # without a live item) lands on a resident leader; the state carries W waits for W issues, so the drain consumes flip W exactly
-        _wait_tcgen(bars.dq_read_done, dq_read_state.phase, dbg, _W["wait:leader:dq_read_done"])
     # dq_576: no s_tail_empty row, no drain (dp_empty's and dvk_empty's drains above stay)
-    if cutlass.const_expr(not dq576):
-        # DIAGNOSTIC s_tail_wait_off: the P15 drain is a wait site too -- skipped under the probe (the follower's last arrive lands on a resident
-        # leader regardless: the final barrier_cta_sync + the pair-symmetric dealloc wait follow)
-        if cutlass.const_expr(not s_tail_off):
-            _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
+    # DIAGNOSTIC s_tail_wait_off: the P15 drain is a wait site too -- skipped under the probe (the follower's last arrive lands on a resident
+    # leader regardless: the final barrier_cta_sync + the pair-symmetric dealloc wait follow)
+    if cutlass.const_expr(not s_tail_off):
+        _wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])
 
 
 @cute.jit
@@ -3273,10 +3173,12 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
     stats_empty fed from ``stats2`` (the chain's padded pre-scaled stats region) at ``rowoff[batch]`` (the sequence's padded token base), ``lse`` /
     ``delta`` None = dropped, the CFG_RING geometry: SMEM_BYTES == the cap, the bar block / TMEM handle / CLC payload re-based +1024), from the
     typed ``stats_form`` field; read by the softmax and the loader; declines by name under 16w_fa4."""
+    if cutlass.const_expr(tmem_map_code != TMEM_MAP_S_TAIL or smem_map_code == SMEM_MAP_RUBIN_B2):
+        raise ValueError("this fixed main implementation requires s_tail")
     if cutlass.const_expr(warp_roles_code != WARP_ROLES_16W):
         raise ValueError("this fixed main implementation requires warp_roles 16w")
     softmax_regs, epilogue_regs, service_regs = CFG.SOFTMAX_REGS, CFG.EPILOGUE_REGS, CFG.SERVICE_REGS  # config = truth: the 144 / 144 / 80 split
-    fa4_roles = False  # fixed main protocol; callers cannot switch the role ownership
+    fa4_roles = False  # fixed main protocol
     tma_ring = stats_form_code == STATS_FORM_TMA_RING  # the stats form (trace-time)
     # Trace-time invariants (const_expr: a Python raise, never a staged early exit); the config's validate_fields_for_roles declines first by name.
     if cutlass.const_expr(warp_roles_code not in (WARP_ROLES_16W, WARP_ROLES_16W_FA4)):
@@ -3285,7 +3187,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
         raise ValueError(f"stats_form_code must be one of {(STATS_FORM_LDG, STATS_FORM_TMA_RING)}; got {stats_form_code!r}")
     if cutlass.const_expr(tma_ring and fa4_roles):  # the first build: the stats ring rows are the 16w bundle's (validate_fields_for_roles)
         raise ValueError("stats_form tma_ring is not built under warp_roles 16w_fa4 (the stats ring rows and waits are sited in the 16w bundle)")
-    dq576 = tmem_map_code == TMEM_MAP_DQ576  # the TMEM map (header section 9): the independent dQ image of the 576-column carve
+    dq576 = False  # fixed main protocol
     if cutlass.const_expr(tmem_map_code not in (TMEM_MAP_S_TAIL, TMEM_MAP_DQ576)):
         raise ValueError(f"tmem_map_code must be one of {(TMEM_MAP_S_TAIL, TMEM_MAP_DQ576)}; got {tmem_map_code!r}")
     # the reduce group has no program-order carrier for the independent image's reuse edge (validate_fields_for_roles)
@@ -3295,7 +3197,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel(
         )
     if cutlass.const_expr(dq576 and diag_2cta_code in (DIAG_S_TAIL_WAIT_OFF, DIAG_S_READ_WAIT_OFF, DIAG_S_TAIL_AND_S_READ_WAIT_OFF)):
         raise ValueError("the S-tail wait probes are not defined under tmem_map dq_576 (the s_read / s_tail_empty rows they skip are deleted)")
-    b2 = smem_map_code == SMEM_MAP_RUBIN_B2  # the SMEM map (header section 8): the two-stage dS / exchange staging ring of the 327 KiB carveout
+    b2 = False  # fixed main protocol
     ovs = smem_map_code == SMEM_MAP_SM100_OVERSIZED  # the DIAGNOSTIC map (section 11): the sm100 map declared in the oversized carveout (byte-identical body)
     if cutlass.const_expr(smem_map_code not in (SMEM_MAP_SM100, SMEM_MAP_RUBIN_B2, SMEM_MAP_SM100_OVERSIZED)):
         raise ValueError(f"smem_map_code must be one of {(SMEM_MAP_SM100, SMEM_MAP_RUBIN_B2, SMEM_MAP_SM100_OVERSIZED)}; got {smem_map_code!r}")

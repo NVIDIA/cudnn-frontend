@@ -265,9 +265,11 @@ def _run_case(case, repeats=2, **fields):
     return api, workspace
 
 
-def _body_source():
+def _body_source(protocol="s_tail"):
     """The dedicated pair main body: source pins exclude the separate setup/fold chain."""
     path = _TREE / _BODY_REL
+    if protocol != "s_tail":
+        path = path.parent / protocol / "kernel.py"
     if not path.exists():
         pytest.skip(f"{path} is not in this checkout")
     text = path.read_text()
@@ -1383,7 +1385,7 @@ def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
     """RED 3: dp_empty arrived after the dQ readout under the rotated order is a deterministic HANG (dP^T(t+1) waits a readout of a dQ issued
     after it).  The epilogue's ONE dp_empty arrive precedes the ds_recv_full arm and the dQ readout."""
     full = _function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader")
-    code = _sm100_arm(full)  # the sm100 SMEM maps' view (one readout site); the rubin_b2 view has two readout sites, both after the arm (below)
+    code = full  # the sm100 SMEM maps' view (one readout site); the rubin_b2 view has two readout sites, both after the arm (below)
     arrive = [i for i, ln in enumerate(code) if "_arrive_leader(bars.dp_empty)" in ln]
     recv = [i for i, ln in enumerate(code) if "recv_bar.arrive(" in ln]  # the ds_recv_full arm (the slot of the stage under rubin_b2, the bar under sm100)
     dq_ld = [i for i, ln in enumerate(code) if "_tmem_load(tmem_base + dq_col, CFG.DQ_COLS)" in ln]  # the map-keyed column base (header section 9)
@@ -1391,7 +1393,7 @@ def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
     assert arrive[0] < recv[0] < dq_ld[0], "dp_empty must be arrived right after the dS^T readout, before the XCHG arm, never after the dQ readout"
     s_tail = [i for i, ln in enumerate(code) if "_arrive_leader(bars.s_tail_empty)" in ln]
     assert len(s_tail) == 1 and dq_ld[0] < s_tail[0], "s_tail_empty is arrived right after the dQ readout"
-    b2 = _b2_arm(full)
+    b2 = _function_code(_body_source("rubin_b2"), "_epilogue_loop")
     dq_ld_b2 = [i for i, ln in enumerate(b2) if "_tmem_load(tmem_base + dq_col, CFG.DQ_COLS)" in ln]
     arrive_b2, recv_b2 = [i for i, ln in enumerate(b2) if "_arrive_leader(bars.dp_empty)" in ln], [i for i, ln in enumerate(b2) if "recv_bar.arrive(" in ln]
     assert len(arrive_b2) == 1 and len(recv_b2) == 1 and len(dq_ld_b2) == 2 and arrive_b2[0] < recv_b2[0] < dq_ld_b2[0] < dq_ld_b2[1], (
@@ -1401,12 +1403,13 @@ def test_2cta_stail_dp_empty_is_arrived_at_the_ds_readout_before_the_recv_arm():
     )
 
 
-def test_2cta_stail_ds_gates_ride_the_xchg_state():
+@pytest.mark.parametrize("protocol", ("s_tail", "dq576", "rubin_b2"))
+def test_2cta_stail_ds_gates_ride_the_xchg_state(protocol):
     """RED 4: the three dS gates waited on ready_state (the P2 split missing) hang at tile lo+1 of the first N >= 2 item.  Every ds_smem /
     ds_recv_full / ds_pair_ready wait of the leader names ``xchg_state.phase`` (one helper ``_dq_issue``, called from the in-tile slot helper
     ``_dq_slot`` and at the tail), never ready_state.  The in-tile slot is ONE helper at ONE site (before dV(t)); the s_read wait lives inside it,
     every tile, and nowhere else in the leader."""
-    source = _body_source()
+    source = _body_source(protocol)
     # the slot of each gate is the state's (`_slot(bar, state, geo.DS_STAGES)`: the bar under one stage, bar[state.idx] under the two-stage ring)
     gates = re.findall(
         r"_wait_tcgen\(_slot\(bars\.(ds_smem|ds_recv_full|ds_pair_ready), (\w+), geo\.DS_STAGES\), \2\.phase, dbg, _W\[\"wait:leader:\w+\"\]\)", source
@@ -1415,10 +1418,9 @@ def test_2cta_stail_ds_gates_ride_the_xchg_state():
     assert {g[1] for g in gates} == {"xchg_state"}, gates
     issue = _function_code(source, "_dq_issue", "_dq_slot")
     # the three gates are UNCONDITIONAL (no const_expr guard: they are the ds_recv_full arm's only back-edge); the trace-time branches in the
-    # helper are the STAMPS handshake, the test-only skew lever and the dq_war_done commit of the alternate role shape; none guards a gate
+    # helper are the STAMPS handshake and the test-only skew lever; none guards a gate.
     assert [ln.strip() for ln in issue if ln.strip().startswith("if ")] == [
         "if cutlass.const_expr(dbg is not None):",
-        "if cutlass.const_expr(b2):",  # the FOURTH gate of smem_map rubin_b2 (dq_read_done) + the per-issue dS stage advance: after the three, never guarding them
         "if cutlass.const_expr(DEBUG_SOFTMAX_DQ_WAR_DELAY_US > 0):",
     ], issue
     gate_lines = [ln for ln in issue if "_wait_tcgen(_slot(bars.ds_" in ln]
@@ -1432,7 +1434,7 @@ def test_2cta_stail_ds_gates_ride_the_xchg_state():
     assert not any("_wait_tcgen(bars.s_read" in ln for ln in leader), "s_read is waited inside the ONE slot helper only"
     slot = _function_code(source, "_dq_slot", "_dq_round")
     assert (
-        sum('_wait_tcgen(bars.s_read, ready_state.phase, dbg, _W["wait:leader:s_read"])' in ln for ln in slot) == 1
+        sum('_wait_tcgen(bars.s_read, ready_state.phase, dbg, _W["wait:leader:s_read"])' in ln for ln in slot) == int(protocol == "s_tail")
         and sum("_dq_issue(" in ln for ln in slot) == 1
     ), slot
     assert any(ln.strip() == "if qtile > lo:" for ln in slot), "the in-tile issue is guarded (no dQ at tile lo)"
@@ -1482,54 +1484,24 @@ def test_2cta_stail_s_tail_empty_waits_sit_at_the_three_guarded_sites():
     s_read = [i for i, ln in enumerate(softmax) if "_arrive_leader(bars.s_read)" in ln]
     s_done = [i for i, ln in enumerate(softmax) if "_wait_tcgen(bars.s_done" in ln]
     assert len(s_read) == 1 and len(s_done) == 1
-    # D2: EVERY tile -- the arrive carries no RUNTIME guard: its only guard is the trace-time map guard (two statements under it: the fence, the
-    # arrive), whose indentation is the s_done wait's; the fence + arrive go together under tmem_map dq_576 (the row does not exist there)
-    guard_at = s_read[0] - 2
-    assert softmax[guard_at].strip() == "if cutlass.const_expr(not dq576):" and "tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)" in softmax[guard_at + 1]
+    # D2: every tile in this fixed body publishes the read after its fence.
     depth = lambda ln: len(ln) - len(ln.lstrip())  # noqa: E731
-    assert depth(softmax[guard_at]) == depth(softmax[s_done[0]]) and depth(softmax[s_read[0]]) == depth(softmax[guard_at + 1]) == depth(softmax[guard_at]) + 4
-    assert depth(softmax[s_read[0] + 1]) <= depth(softmax[guard_at]), "only the fence and the arrive sit under the s_tail map's guard"
-    # tmem_map dq_576 (the kernel header sections 5 / 9): EVERY s_tail_empty / s_read / s_tail_state statement of the leader sits under
-    # `if cutlass.const_expr(not dq576):` (the probe guard may sit between); the state's dq_576 arm is the None the lookahead threads through
-    leader_lines = leader
-
-    def enclosing_guards(i):
-        guards, indent = [], depth(leader_lines[i])
-        for j in range(i - 1, -1, -1):
-            if depth(leader_lines[j]) < indent:
-                indent = depth(leader_lines[j])
-                if leader_lines[j].strip().startswith("if cutlass.const_expr("):
-                    guards.append(leader_lines[j].strip())
-        return guards
-
-    s_tail_sites = [i for i, ln in enumerate(leader_lines) if any(tok in ln for tok in ("bars.s_tail_empty", "bars.s_read", "s_tail_state"))]
-    assert (
-        len(s_tail_sites) >= 8
-    ), s_tail_sites  # the state pair, the prologue wait + advance, the slot-2 call, the lookahead call, the tail wait + advance, the drain
-    for i in s_tail_sites:
-        stmt = leader_lines[i].strip()
-        if stmt in ("s_tail_state = PipelineState.start(phase=1)  # pre-armed: the kernel's first S^T(lo) finds the S tail free",) or stmt.startswith(
-            "s_tail_state = None"
-        ):
-            continue  # the definition pair: the s_tail arm under `not dq576`, the dq_576 arm (None) under its else
-        if "_dq_slot(" in stmt or "_s_lookahead(" in stmt:
-            continue  # the two helper calls thread the flags / the state through (the helpers guard their own S-tail sites)
-        assert "if cutlass.const_expr(not dq576):" in enclosing_guards(i), (stmt, enclosing_guards(i))
-    assert any(
-        ln.strip() == "s_tail_state = None  # dq_576: no S-tail row, no state; `_s_lookahead` threads the None through unchanged (no site reads it)"
-        for ln in leader_lines
-    )
-    helper = _function_code(source, "_s_lookahead", "_dq_issue") + _function_code(source, "_dq_slot", "_dq_round")
-    for i, ln in enumerate(helper):
-        if "bars.s_tail_empty" in ln or "bars.s_read" in ln or "s_tail_state = advance" in ln:
-            guards, indent = [], depth(ln)
-            for j in range(i - 1, -1, -1):
-                if depth(helper[j]) < indent:
-                    indent = depth(helper[j])
-                    if helper[j].strip().startswith("if cutlass.const_expr("):
-                        guards.append(helper[j].strip())
-            assert "if cutlass.const_expr(not dq576):" in guards, (ln.strip(), guards)
-    assert not any("s_tail_empty" in ln or "bars.s_read" in ln for ln in _function_code(source, "_dq_issue", "_dq_slot")), "the three gates know no S-tail row"
+    fence_at = s_read[0] - 1
+    assert "tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)" in softmax[fence_at]
+    assert s_done[0] < fence_at < s_read[0]
+    assert depth(softmax[s_done[0]]) == depth(softmax[fence_at]) == depth(softmax[s_read[0]])
+    assert any("s_tail_state = PipelineState.start(phase=1)" in ln for ln in leader)
+    assert not any("s_tail_state = None" in ln for ln in leader)
+    # The independent-image bodies have no executable access to either row;
+    # the old conditional guards are gone together with the guarded operations.
+    for protocol in ("dq576", "rubin_b2"):
+        independent = _body_source(protocol)
+        for name in ("_s_lookahead", "_dq_slot", "_softmax_loop", "_epilogue_loop", "_mma_loop_leader"):
+            code = _function_code(independent, name)
+            assert not any("bars.s_tail_empty" in ln or "bars.s_read" in ln or "s_tail_state = advance" in ln for ln in code), (protocol, name)
+        other_leader = _function_code(independent, "_mma_loop_leader")
+        assert any("s_tail_state = None" in ln for ln in other_leader), protocol
+    assert not any("s_tail_empty" in ln or "bars.s_read" in ln for ln in _function_code(source, "_dq_issue")), "the three gates know no S-tail row"
 
 
 def test_2cta_stail_geometry_keyed_bodies_take_every_depth_and_offset_from_geo():
@@ -1547,65 +1519,18 @@ def test_2cta_stail_geometry_keyed_bodies_take_every_depth_and_offset_from_geo()
     differing = sorted(n for n in dir(base) if not n.startswith("_") and not callable(getattr(base, n)) and getattr(base, n) != getattr(b2, n))
     assert {"Q1_STAGES", "DO1_STAGES", "DS_STAGES", "XCHG_STAGES", "DS", "XCHG", "DQ", "SMEM_BYTES", "BARS"} <= set(differing), differing
     pattern = re.compile(r"\bCFG\.(" + "|".join(differing) + r")\b")
-    bodies = ("_softmax_loop", "_epilogue_loop", "_mma_loop_leader", "_mma_loop_follower", "_reduce_loop", "_load_loop", "_store_loop")
-    nexts = ("_epilogue_loop", "_mma_loop_leader", "_mma_loop_follower", "_reduce_loop", "_load_loop", "_store_loop", "_scheduler_loop")
-    src = _body_source()
     offenders = []
-    for name, nxt in zip(bodies, nexts):
-        in_doc = False
-        body_source = (_TREE / _BODY_REL.parent / "fa4/kernel.py").read_text() if name == "_reduce_loop" else src
-        for ln in _function_code(body_source, name, nxt):
-            quotes = ln.count('"""')
-            if in_doc:
-                in_doc = quotes % 2 == 0
-                continue
-            if quotes % 2 == 1:
-                in_doc = True
-                continue
-            if quotes >= 2 and ln.strip().startswith('"""'):
-                continue  # a one-line docstring
-            code = ln.split("#", 1)[0]
-            m = pattern.search(code)
-            if m:
-                offenders.append((name, code.strip(), m.group(1)))
+    for protocol in ("s_tail", "dq576", "rubin_b2", "fa4"):
+        source = _body_source(protocol)
+        names = ("_softmax_loop", "_mma_loop_leader", "_mma_loop_follower", "_load_loop", "_store_loop")
+        names += ("_reduce_loop",) if protocol == "fa4" else ("_epilogue_loop",)
+        for name in names:
+            for line in _function_code(source, name):
+                code = line.split("#", 1)[0]
+                match = pattern.search(code)
+                if match:
+                    offenders.append((protocol, name, code.strip(), match.group(1)))
     assert offenders == [], offenders
-
-
-def _const_expr_arm(code, keep_first):
-    """The epilogue's statement lines as ONE SMEM map traces them: every `if cutlass.const_expr(not b2):` keeps its first arm (``keep_first``: the sm100
-    maps) or its `else:` arm (the rubin_b2 map), dedented; the kernel header section 5 is one such view per map."""
-    depth = lambda ln: len(ln) - len(ln.lstrip())  # noqa: E731
-    out, i = [], 0
-    while i < len(code):
-        ln = code[i]
-        if ln.strip() == "if cutlass.const_expr(not b2):":
-            d = depth(ln)
-            i += 1
-            first = []
-            while i < len(code) and depth(code[i]) > d:
-                first.append(code[i][4:])
-                i += 1
-            assert i < len(code) and code[i].strip() == "else:" and depth(code[i]) == d, (ln, code[i] if i < len(code) else None)
-            i += 1
-            second = []
-            while i < len(code) and depth(code[i]) > d:
-                second.append(code[i][4:])
-                i += 1
-            out.extend(first if keep_first else second)
-            continue
-        out.append(ln)
-        i += 1
-    return out
-
-
-def _sm100_arm(code):
-    """The epilogue as the sm100 SMEM map traces it (the audited order: the readout of dQ(t) BEFORE the staging of dS(t+1))."""
-    return _const_expr_arm(code, keep_first=True)
-
-
-def _b2_arm(code):
-    """The epilogue as the rubin_b2 SMEM map traces it (the LAGGING order: the staging of dS(t) BEFORE the readout of dQ(t-1), the dq_read_done arrives)."""
-    return _const_expr_arm(code, keep_first=False)
 
 
 def _assert_epilogue_readout_precedes_next_staging(code):
@@ -1614,7 +1539,7 @@ def _assert_epilogue_readout_precedes_next_staging(code):
     dq_done wait + the dQ readout trio (the LDTM at the map-keyed column base, tcgen05_wait(LOAD), tcgen05_fence(BEFORE_THREAD_SYNC)) come AFTER them at
     the loop body's depth -- so the readout of dQ(t) precedes the staging (hence the gate) of dQ(t+1) in the SAME warps' program order; the loaded
     registers are consumed by the rounds of the same iteration (no lagging readout); no second staging follows the readout inside the body.  ``code``
-    = the statement lines of ``_epilogue_loop`` as the sm100 map traces them (``_sm100_arm(_function_code(..))``) -- or a deliberately reordered copy
+    = the statement lines of the fixed dq576 body's ``_epilogue_loop`` -- or a deliberately reordered copy
     (the RED half of the test)."""
     idx = lambda needle: [i for i, ln in enumerate(code) if needle in ln]  # noqa: E731
     depth = lambda i: len(code[i]) - len(code[i].lstrip())  # noqa: E731
@@ -1640,7 +1565,7 @@ def test_2cta_stail_dq576_reuse_edge_rides_the_epilogue_program_order():
     own-half STS + ``smem_bar.arrive()`` in the loop body.  RED: a deliberately reordered copy of the epilogue (the readout block moved ahead of the
     staging = the lagging-readout form the two-stage ring takes, which under rubin_b2 is why the dq_read_done row exists; the gate arrive moved
     behind the readout) FAILS the detector; GREEN: the sm100 arm of the body passes.  The detector reads the statements only."""
-    code = _sm100_arm(_function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader"))
+    code = _function_code(_body_source("dq576"), "_epilogue_loop")
     _assert_epilogue_readout_precedes_next_staging(code)  # GREEN
     idx = lambda needle, lines: [i for i, ln in enumerate(lines) if needle in ln]  # noqa: E731
     wait = [i for i in idx("_wait_tcgen(bars.dq_done, dq_state.phase", code) if i < idx("dq = _tmem_load(tmem_base + dq_col", code)[0]][0]
@@ -1666,7 +1591,7 @@ def test_2cta_stail_dq576_reuse_edge_rides_the_epilogue_program_order():
         _assert_epilogue_readout_precedes_next_staging(red3)
     # RED 4: the rubin_b2 arm itself (the lagging order) FAILS this detector -- that is why the row dq_read_done exists under that map (the next test)
     with pytest.raises(AssertionError):
-        _assert_epilogue_readout_precedes_next_staging(_b2_arm(_function_code(_body_source(), "_epilogue_loop", "_mma_loop_leader")))
+        _assert_epilogue_readout_precedes_next_staging(_function_code(_body_source("rubin_b2"), "_epilogue_loop"))
 
 
 _READOUT_TRIO = (
@@ -1682,8 +1607,8 @@ def _assert_dq_read_done_row(epi_b2, issue, leader):
     b / 1.7): the epilogue's rubin_b2 arm arrives ``dq_read_done`` bare at EXACTLY two sites, each right after the readout trio, the first in the loop
     body AFTER the staging's ``smem_bar.arrive()`` under the item's ``qtile > lo`` guard, the second at the item end under ``lo < hi`` (both the
     loop-structure predicate of _item_bounds, pair-uniform); `_dq_issue` waits the row (``_wait_tcgen``: the after-thread-sync fence) on
-    ``dq_read_state`` after the three dS gates and before the dQ MMA, under its b2 guard, and advances the state right after; the leader pre-arms the
-    state (st(1)) under the b2 guard and drains the row exactly once after its persistent loop (P15).  ``epi_b2`` / ``issue`` / ``leader`` = the
+    ``dq_read_state`` unconditionally after the three dS gates and before the dQ MMA, and advances the state right after; the leader pre-arms the
+    state (st(1)) before the persistent loop and drains the row exactly once after it (P15).  ``epi_b2`` / ``issue`` / ``leader`` = the
     statement lines of the three functions (the epilogue's as the rubin_b2 map traces them) -- or deliberately altered copies (the RED half)."""
     idx = lambda needle, lines: [i for i, ln in enumerate(lines) if needle in ln]  # noqa: E731
     depth = lambda lines, i: len(lines[i]) - len(lines[i].lstrip())  # noqa: E731
@@ -1712,15 +1637,15 @@ def _assert_dq_read_done_row(epi_b2, issue, leader):
     mma = idx("mma_ss(dqdesc, dsd_s, k2d, dq_acc)", issue)
     gates = idx("_slot(bars.ds_pair_ready, xchg_state, geo.DS_STAGES)", issue)
     assert len(waits) == 1 and len(mma) == 1 and len(gates) == 1 and gates[0] < waits[0] < mma[0], (gates, waits, mma)
-    assert issue[waits[0] - 1].strip() == "if cutlass.const_expr(b2):" and issue[waits[0] + 1].strip() == "dq_read_state = advance(dq_read_state, 1)", issue[
-        waits[0] - 1 : waits[0] + 2
-    ]
+    assert issue[waits[0] + 1].strip() == "dq_read_state = advance(dq_read_state, 1)"
+    assert depth(issue, waits[0]) == depth(issue, gates[0]) == depth(issue, mma[0]), "the fixed B2 body always waits before issuing"
     pre_arm = idx("dq_read_state = PipelineState.start(phase=1)", leader)
-    assert len(pre_arm) == 1 and leader[pre_arm[0] - 1].strip() == "if cutlass.const_expr(b2):", pre_arm
+    assert len(pre_arm) == 1 and depth(leader, pre_arm[0]) == 4, pre_arm
+    assert pre_arm[0] < idx("while valid != 0:", leader)[0], "pre-arm before the persistent loop"
     drains = idx(_DQ_READ_DONE_WAIT, leader)
     loop_end = max(idx("_next_tile(sched, bars, sched_state, dbg,", leader))
     assert len(drains) == 1 and drains[0] > loop_end and drains[0] > idx("_wait_tcgen(bars.dvk_empty, out_empty.phase", leader)[-1], (drains, loop_end)
-    assert leader[drains[0] - 1].strip() == "if cutlass.const_expr(b2):", leader[drains[0] - 1]
+    assert depth(leader, drains[0]) == 4, "the fixed B2 body drains unconditionally after the persistent loop"
 
 
 def test_2cta_stail_rubin_b2_reuse_edge_is_the_dq_read_done_row():
@@ -1737,8 +1662,8 @@ def test_2cta_stail_rubin_b2_reuse_edge_is_the_dq_read_done_row():
     assert names_b2.index("dq_read_done") == names_b2.index("dp_empty") + 1
     for table in (cfgmod.BAR_LAYOUT, cfgmod.BAR_LAYOUT_RING, cfgmod.BAR_LAYOUT_DQ576, cfgmod.BAR_LAYOUT_RING_DQ576, cfgmod.BAR_LAYOUT_XFA4):
         assert "dq_read_done" not in {r[0] for r in table}  # the row exists under the two-stage ring only
-    src = _body_source()
-    epi = _b2_arm(_function_code(src, "_epilogue_loop", "_mma_loop_leader"))
+    src = _body_source("rubin_b2")
+    epi = _function_code(src, "_epilogue_loop")
     issue = _function_code(src, "_dq_issue", "_dq_slot")
     leader = _function_code(src, "_mma_loop_leader", "_mma_loop_follower")
     _assert_dq_read_done_row(epi, issue, leader)  # GREEN
@@ -1779,9 +1704,11 @@ def test_2cta_stail_dq_ring_release_cadence_is_the_d4_pair():
     assert any("for s in cutlass.range_constexpr(CFG.DQ_SLOTS)" in ln for ln in rnd) and any("_wait(bars.dq_empty[s], empty_state.phase" in ln for ln in rnd)
     epi = _function_code(source, "_epilogue_loop", "_mma_loop_leader")
     assert not any("dq_empty" in ln for ln in epi), "the epilogue waits dq_empty only inside _dq_round (both slots, per round)"
-    assert sum("_dq_round(" in ln for ln in _sm100_arm(epi)) == 3  # round B of dQ(t-1), round A of dQ(t), the item-end round B of dQ(hi-1)
+    assert sum("_dq_round(" in ln for ln in epi) == 3  # round B of dQ(t-1), round A of dQ(t), the item-end round B of dQ(hi-1)
     # smem_map rubin_b2 (the lagging order): round B of dQ(t-2), round A of dQ(t-1), the item end's round B of dQ(hi-2) + rounds A, B of dQ(hi-1)
-    assert sum("_dq_round(" in ln for ln in _b2_arm(epi)) == 5
+    b2 = _function_code(_body_source("rubin_b2"), "_epilogue_loop")
+    assert sum("_dq_round(" in ln for ln in b2) == 5
+    assert not any("empty_state = advance" in ln for ln in b2), "no B2 item-end flip"
     assert not any("empty_state = advance" in ln for ln in epi), "no item-end flip: 2N rounds == 2N releases per slot"
 
 
@@ -2614,14 +2541,15 @@ def test_sdpa_bwd_d128_2cta_stail_survives_pair_skew(site, dkv_accum, stats_form
         fields["smem_map"] = smem_map  # the SMEM map in the child (the ``-rubin_b2`` ids, ON dq_576): a part without the carveout declines -> exit 77 -> skip
     form = "bf16_partials" if dkv_accum is None else dkv_accum
     seam = _DKV_ACCUM_SEAM_ROWS.get(site, "(the field does not move this lever's bytes)") if dkv_accum else ""
-    assert row["lever"] in set(LEVER_LINE.findall(_body_source())), f"the second body must expose {row['lever']}"
+    protocol = "rubin_b2" if smem_map == "rubin_b2" else ("dq576" if tmem_map == "dq_576" else "s_tail")
+    assert row["lever"] in set(LEVER_LINE.findall(_body_source(protocol))), f"the selected body must expose {row['lever']}"
     _require_2cta()
     _adapter_class()
     import cudnn
 
     script = _CHILD.format(
         testdir=str(pathlib.Path(__file__).resolve().parent),
-        body=_BODY_MODULE,
+        body=_BODY_MODULE if protocol == "s_tail" else _BODY_MODULE.removesuffix(".kernel") + f".{protocol}.kernel",
         global_name=f"{GLOBAL_PREFIX}{row['lever']}_DELAY_US",
         attr=f"DEBUG_{row['lever']}_DELAY_US",
         delay=row["delay_us"],

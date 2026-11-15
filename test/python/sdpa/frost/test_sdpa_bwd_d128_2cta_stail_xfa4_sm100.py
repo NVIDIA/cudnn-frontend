@@ -359,7 +359,7 @@ def test_xfa4_dp_empty_and_ds_tmem_absent_from_the_16w_fa4_paths():
     assert not any("dp_empty" in ln for ln in leader), "the independent main has no dp_empty state, wait or drain"
     assert leader[-1].strip() == '_wait_tcgen(bars.s_tail_empty, s_tail_state.phase, dbg, _W["wait:leader:s_tail_empty"])'
     assert leader[-2].strip() == "if cutlass.const_expr(not s_tail_off):" and "dvk_empty" in leader[-3]
-    kernel = _function_code(src, "bprop_d128_accum_grouped_2cta_stail_kernel_fa4")
+    kernel = _function_code(src, "bprop_d128_accum_grouped_2cta_stail_kernel")
     assert any("bars = _bars(slab, fa4_roles, tma_ring, dq576, b2)" in ln for ln in kernel) and any("fa4_roles = True" in ln for ln in kernel)
     assert any("tma_ring = stats_form_code == STATS_FORM_TMA_RING" in ln for ln in kernel)
     i_red = next(i for i, ln in enumerate(kernel) if "_reduce_loop(" in ln)

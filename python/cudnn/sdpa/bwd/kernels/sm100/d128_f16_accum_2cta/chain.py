@@ -26,8 +26,13 @@ from cudnn.sdpa.bwd.kernels.sm100._d128_thd_chain import _origin_row, _zero_grou
 
 from .kernel import main_thd_2cta_stail_host
 from .fa4.kernel import main_thd_2cta_stail_host as fa4_main_host
+from .dq576.kernel import main_thd_2cta_stail_host as dq576_main_host
+from .rubin_b2.kernel import main_thd_2cta_stail_host as b2_main_host
+from .config import TMEM_MAP_CODES, SMEM_MAP_CODES
 
 _FA4_ROLE = warp_roles_code("16w_fa4")
+_DQ576_MAP = TMEM_MAP_CODES["dq_576"]
+_B2_MAP = SMEM_MAP_CODES["rubin_b2"]
 
 LOG2E = 1.4426950408889634
 STATS_FORM_LDG = stats_form_code("ldg")
@@ -544,6 +549,58 @@ def host_thd_2cta(
             )
     if cutlass.const_expr(warp_roles_code == _FA4_ROLE):
         fa4_main_host(
+            maps,
+            rowoff if cutlass.const_expr(tma_ring) else lse,  # the stats slots by form (the body's header section 14): the padded row offsets | the LSE
+            stats2 if cutlass.const_expr(tma_ring) else delta,  # the padded pre-scaled stats region | the compact delta
+            meta,
+            origins,
+            cutlass.Int32(batch),
+            q.shape[2],
+            max_skv,
+            _origin_row(origin_specs, 8),
+            scale,
+            causal,
+            q.element_type,
+            q.shape[2] // k.shape[2],
+            diag_2cta_code,
+            warp_roles_code,
+            mask_form_code,
+            stats_form_code,
+            tmem_map_code,
+            smem_map_code,
+            dkv_fp32,
+            debug_clk,
+            dbg_clk,
+            stream,
+        )
+    elif cutlass.const_expr(smem_map_code == _B2_MAP):
+        b2_main_host(
+            maps,
+            rowoff if cutlass.const_expr(tma_ring) else lse,  # the stats slots by form (the body's header section 14): the padded row offsets | the LSE
+            stats2 if cutlass.const_expr(tma_ring) else delta,  # the padded pre-scaled stats region | the compact delta
+            meta,
+            origins,
+            cutlass.Int32(batch),
+            q.shape[2],
+            max_skv,
+            _origin_row(origin_specs, 8),
+            scale,
+            causal,
+            q.element_type,
+            q.shape[2] // k.shape[2],
+            diag_2cta_code,
+            warp_roles_code,
+            mask_form_code,
+            stats_form_code,
+            tmem_map_code,
+            smem_map_code,
+            dkv_fp32,
+            debug_clk,
+            dbg_clk,
+            stream,
+        )
+    elif cutlass.const_expr(tmem_map_code == _DQ576_MAP):
+        dq576_main_host(
             maps,
             rowoff if cutlass.const_expr(tma_ring) else lse,  # the stats slots by form (the body's header section 14): the padded row offsets | the LSE
             stats2 if cutlass.const_expr(tma_ring) else delta,  # the padded pre-scaled stats region | the compact delta

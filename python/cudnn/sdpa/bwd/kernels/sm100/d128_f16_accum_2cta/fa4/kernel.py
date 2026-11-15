@@ -2840,7 +2840,7 @@ def _scheduler_loop(sched, is_leader, regs: cutlass.Constexpr[int]):
 
 
 @cute.kernel
-def bprop_d128_accum_grouped_2cta_stail_kernel_fa4(
+def bprop_d128_accum_grouped_2cta_stail_kernel(
     maps: cute.Tensor,
     stats_tokens: cute.Tensor,
     stats_rows: cute.Tensor,
@@ -3095,7 +3095,7 @@ def bprop_d128_accum_grouped_2cta_stail_kernel_fa4(
         _tmem_dealloc_pair(bars, tmem_slot, rank, geo.TMEM_COLS)
 
 
-bprop_d128_accum_grouped_2cta_stail_kernel_fa4.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+bprop_d128_accum_grouped_2cta_stail_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -3134,7 +3134,7 @@ def main_thd_2cta_stail_host(
     default; 1 = rubin_b2, selectable by name on cc 10.7 ON dq_576: the 314368-B slab the launcher declares)."""
     n_pairs = cute.math.max((max_skv + CFG.THD_UNIT_ROWS - 1) // CFG.THD_UNIT_ROWS, cutlass.Int32(1))
     dbg_clk_on = dbg_clk if cutlass.const_expr(debug_clk) else None
-    bprop_d128_accum_grouped_2cta_stail_kernel_fa4(
+    bprop_d128_accum_grouped_2cta_stail_kernel(
         maps,
         stats_tokens,
         stats_rows,
