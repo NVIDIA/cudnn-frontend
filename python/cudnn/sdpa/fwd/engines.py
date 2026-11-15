@@ -133,6 +133,11 @@ from .kernels.sm120.quantized_general_contract import (
     SHAPES as _SM120_QUANT_GENERAL_SHAPES,
     mismatch as _sm120_quant_general_mismatch,
 )
+from .kernels.sm80.half_flavor_contract import (
+    IMPLEMENTATIONS as _SM80_HALF_IMPLEMENTATIONS,
+    SHAPES as _SM80_HALF_SHAPES,
+    mismatch as _sm80_half_mismatch,
+)
 from .kernels.sm120.half_exact_contract import (
     ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
     D256 as _SM120_D256,
@@ -1183,6 +1188,10 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     that know the knobs pass them (``mismatch``, ``effective_cgas``); a
     knob-less call sees the graph-fact legs only."""
 
+    exact = (facts.d_qk, facts.d_v)
+    if exact in capabilities.d_shapes and exact not in capabilities.dense_only_d_shapes and exact not in dict(capabilities.native_legs_by_d_shape):
+        # The exact shape is the smallest covering one; explicit engines declare thousands of exact pairs.
+        return exact
     floors = dict(capabilities.d_envelope_floors)
     covering = [
         shape
@@ -1910,6 +1919,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
+    if capabilities.implementation in _SM80_HALF_IMPLEMENTATIONS:
+        reason = _sm80_half_mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation in _SM120_HALF_EXACT_IMPLEMENTATIONS:
         reason = _sm120_half_exact_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
@@ -2466,7 +2479,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     arch_error = cutedsl_arch_requirement_error(cc)
     if arch_error is not None:
         return arch_error
-    shapes = sorted(capabilities.d_shapes)
     if capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         # Envelope family: native flavor shapes are upper bounds (TMA
         # zero-padding semantics — see Capabilities.d_shapes/d_pad_multiple);
@@ -2475,14 +2487,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # where a per-shape floor (d_envelope_floors) may also apply.
         floors = dict(capabilities.d_envelope_floors)
         if not any(facts.d_qk <= sq and facts.d_v <= sv and min(facts.d_qk, facts.d_v) > floors.get((sq, sv), 0) for sq, sv in capabilities.d_shapes):
-            return f"no kernel-flavor envelope covers (D_QK={facts.d_qk}, D_V={facts.d_v}); native shapes: {shapes}"
+            return f"no kernel-flavor envelope covers (D_QK={facts.d_qk}, D_V={facts.d_v}); native shapes: {sorted(capabilities.d_shapes)}"
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return (
                 f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
-        return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+        return f"serves exact native shapes {sorted(capabilities.d_shapes)} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if (
         capabilities.sm_lo == 120
         and not facts.thd
@@ -2869,6 +2881,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         elem = 4 if facts.bias_t.get_data_type() == cudnn.data_type.FLOAT else 2
         if len(strides) != 4 or strides[3] != 1 or any(n > 1 and (st * elem) % 16 for n, st in zip(dims[:3], strides[:3])):
             return "SM120 bias requires contiguous keys and 16-byte aligned outer pitches"
+
+    if facts.has_bias and capabilities.sm_lo == 80:
+        # prepared_sm80.build_spec binds one compact (1, H_q, S_q, S_kv) plane (#2598).
+        dims, strides = facts.bias_dim, facts.bias_stride
+        compact = (facts.h_q * facts.s_q * facts.s_kv, facts.s_q * facts.s_kv, facts.s_kv, 1)
+        if dims != (1, facts.h_q, facts.s_q, facts.s_kv) or any(n > 1 and st != c for n, st, c in zip(dims, strides, compact)):
+            return f"SM80 bias must be one compact (1, H_q, S_q, S_kv) plane; got dims {dims} strides {strides}"
 
     if facts.has_bias and capabilities.bias and facts.bias_t is not None:
         # uniform_dtype covers K/V/O only; the serving adapters compile the
@@ -4283,9 +4302,45 @@ def _sm80_spec() -> EngineSpec:
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             # Explicit geometry is admitted by the shared native flavor domains
             # above. Leave the row domains empty to preserve A/FALLBACK choices.
+            delegated_exact=frozenset(((8, 0), shape) for shapes in _SM80_HALF_SHAPES.values() for shape in shapes),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
+
+
+def _sm80_explicit_spec(implementation: str, host_lower) -> EngineSpec:
+    """An SM80 half body on the eight-aligned head dims its flavor envelopes cover; shared graph binding and launch."""
+    legacy = _sm80_spec()
+    capabilities = replace(
+        legacy.capabilities,
+        implementation=implementation,
+        delegated_exact=frozenset(),
+        d_shapes=_SM80_HALF_SHAPES[implementation],
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+    )
+    return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM80), knob_type=SdpaFwdKnobs))
+
+
+def _sm80_f16_k_prefetch_spec() -> EngineSpec:
+    from .kernels.sm80.f16_k_prefetch.contract import NAME
+    from .kernels.sm80.f16_k_prefetch.host import lower
+
+    return _sm80_explicit_spec(NAME, lower)
+
+
+def _sm80_d256_kv_prefetch_spec() -> EngineSpec:
+    from .kernels.sm80.d256_kv_prefetch.contract import NAME
+    from .kernels.sm80.d256_kv_prefetch.host import lower
+
+    return _sm80_explicit_spec(NAME, lower)
+
+
+def _sm80_wide_cooperative_spec() -> EngineSpec:
+    from .kernels.sm80.wide_cooperative.contract import NAME
+    from .kernels.sm80.wide_cooperative.host import lower
+
+    return _sm80_explicit_spec(NAME, lower)
 
 
 def _sm120_spec() -> EngineSpec:
@@ -4690,7 +4745,7 @@ def lower_dsl_prefill(
     # The immutable implementation selection is attached before support or
     # compilation; the shared host code consumes it without choosing again.
     api._selected_kernel = selected_kernel
-    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+    if facts.thd and lowering_row_name == "sdpa_fwd_prefill_sm80":
         # Graph carriers expose raw storage; the declaration owns the sink's
         # head pitch, independently of the carrier's observed dimensions.
         api._thd_sink_stride = int(facts.sink_t.get_stride()[1]) if facts.has_sink else None
@@ -4700,7 +4755,7 @@ def lower_dsl_prefill(
             for i, t in enumerate((facts.q_t, facts.k_t, facts.v_t, facts.o_t, facts.stats_t))
         )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
-    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+    if facts.thd and lowering_row_name == "sdpa_fwd_prefill_sm80":
         # Variant-pack buffers may be flat or capacity-shaped; the graph's
         # Stats descriptor, rather than the carrier's shape, owns the packing.
         api._thd_lse_raw_storage = True
@@ -5467,6 +5522,9 @@ ENGINE_SPECS = (
     _sm120_d512_mxfp8_paired_spec(),
     _sm120_mxfp8_general_spec(),
     _sm80_spec(),
+    _sm80_f16_k_prefetch_spec(),
+    _sm80_d256_kv_prefetch_spec(),
+    _sm80_wide_cooperative_spec(),
     *_sm90_specs(),
 )
 

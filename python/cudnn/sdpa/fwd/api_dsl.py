@@ -7455,21 +7455,25 @@ def _sm80_resolve_scheduler(
 _LOG2E = math.log2(math.e)
 
 _SM80_KERNEL_FILES = {
-    "d256": "sm80/prefill_d256_f16.py",
-    "f16": "sm80/prefill_f16.py",
+    "d256": "sm80/d256_kv_prefetch/kernel.py",
+    "wide": "sm80/wide_cooperative/kernel.py",
+    "f16": "sm80/f16_k_prefetch/kernel.py",
 }
 
 
-def _sm80_load_kernel_module(flavor: str, params):
+def _sm80_load_kernel_module(flavor: str, params, kernel_file: Optional[str] = None):
     """One uniquely-named module per (kernel file, TemplateParams) — the same
     ``frost.template_loader`` mechanism the SM100/SM120 templates use. qwen
     (d=256) routes to the symmetric-K+V-prefetch file; the rest share the
-    generic kernel."""
-    filename = _SM80_KERNEL_FILES["d256" if flavor in _SM80_D256_FLAVORS else "f16"]
+    generic kernel. ``kernel_file`` (an explicit engine's selected body) replaces the flavor walk."""
+    family = "f16" if flavor not in _SM80_D256_FLAVORS else ("d256" if flavor == "qwen" else "wide")
+    filename = kernel_file or _SM80_KERNEL_FILES[family]
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
     # Tag from the BASENAME: `filename` carries the arch subdirectory, and a
     # slash would land in the generated template module name.
     stem = os.path.splitext(os.path.basename(filename))[0]
+    if stem == "kernel":  # an implementation directory names its body
+        stem = os.path.basename(os.path.dirname(filename))
     from cudnn.sdpa.fwd.kernels.sm80.paged_load import FROST_SOURCE_DIGEST as paged_load_digest
 
     from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import FROST_SOURCE_DIGEST as ragged_origin_digest
@@ -7928,7 +7932,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             split_kv=self.split_kv,
             pack_g=self.h_q // self.h_kv if self.pack_gqa else 1,
         )
-        self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        self._k_mod = _sm80_load_kernel_module(self.flavor, self._params, getattr(selected_kernel, "kernel_file", None))
+        self.kernel_template = getattr(self._k_mod, "TEMPLATE_NAME", os.path.splitext(os.path.basename(self._k_mod.__file__))[0])
         if self.thd:
             from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
 
