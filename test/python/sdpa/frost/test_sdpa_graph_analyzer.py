@@ -465,10 +465,10 @@ def test_probe_rejects_misaligned_head_dim():
 
 
 def test_probe_envelope_covers_small_head_dim():
-    # d=64 <= every f16 flavor's envelope: all three are eligible, and the
-    # registration order (smallest-first) makes d128 the auto-select winner.
+    # Non-exact d=56 still uses the legacy zero-padded envelope. Exact D64
+    # now belongs to fixed implementations and is covered separately.
     g = _mk_graph()
-    q, k, v, dims, strides = _mk_qkv(g, d=64)
+    q, k, v, dims, strides = _mk_qkv(g, d=56)
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, dims, strides)
     elig = _eligible(g)
