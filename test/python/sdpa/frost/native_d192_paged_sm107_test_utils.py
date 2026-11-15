@@ -21,7 +21,7 @@ def test_dense_replay(dtype, packed, hnd, page, stats, dims, monkeypatch):
     def compile_native(api):
         compile_plan(api)
         assert api.flavor == (192, 128)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (192, 128)
         assert api._k_mod.CFG.STAGES_KV == 2 and api._k_mod.CFG.CTA_MMA == 2
         seen.append(api.flavor)

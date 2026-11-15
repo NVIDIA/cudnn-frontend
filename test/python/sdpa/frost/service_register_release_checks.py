@@ -133,6 +133,11 @@ def release_cases(arch):
             cga = 1
         kwargs = dict(cta_mma=cga, dtype_qkv=2 if "f16" in name else 0, dtype_o=2, mma_2x2="2x2" in name)
         moved = {
+            "prefill_d128_f16.py": "d128_f16_multi_q/kernel.py",
+            "decode_d128_f16.py": "d128_f16_single_q/kernel.py",
+            "prefill_d128_mxfp8.py": "d128_mxfp8_multi_q/kernel.py",
+            "prefill_d192_d128_mxfp8.py": "d192_mxfp8_multi_q/kernel.py",
+            "prefill_d256_mxfp8.py": "d256_mxfp8_single_q/kernel.py",
             "prefill_d192_d128_f16.py": "d192_f16_multi_q/kernel.py",
             "prefill_d192_d128_fp8.py": "d192_fp8_multi_q/kernel.py",
             "prefill_d128_fp8.py": "d128_fp8_multi_q/kernel.py",
@@ -144,6 +149,10 @@ def release_cases(arch):
             "prefill_d512_mxfp8.py": "d512_mxfp8_slice_recompute/kernel.py",
         }
         moved_sm107 = {
+            "prefill_d192_d128_f16.py": "d192_f16_multi_q/kernel.py",
+            "prefill_d256_f16.py": "d256_f16_lookahead/kernel.py",
+            "prefill_d512_f16.py": "d512_f16_role_split/kernel.py",
+            "prefill_d512_f16_2x2.py": "d512_f16_2x2/kernel.py",
             "prefill_d128_fp8.py": "d128_fp8_multi_q/kernel.py",
             "prefill_d192_d128_fp8.py": "d192_fp8_multi_q/kernel.py",
             "prefill_d256_fp8.py": "d256_fp8_single_q/kernel.py",
@@ -186,7 +195,7 @@ def check_service_release(tmp_path, filename, params, *, negative=""):
 @pytest.mark.parametrize("filename,params", release_cases("sm100"))
 def test_sm100_service_register_release(tmp_path, filename, params):
     check_service_release(tmp_path, filename, params)
-    if filename == "sm100/prefill_d128_fp8.py":
+    if filename == "sm100/d128_fp8_multi_q/kernel.py":
         # Compile only: never launch the deliberately invalid redistribution.
         check_service_release(tmp_path, filename, params, negative="single_warp")
     if filename == "sm100/d512_mxfp8_slice_recompute/kernel.py":

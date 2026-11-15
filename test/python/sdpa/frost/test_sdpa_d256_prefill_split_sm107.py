@@ -147,7 +147,7 @@ def _run_case(case, dtype, monkeypatch, *, graph_mode=False, stats_log2=False, o
         api = inspect.getclosurevars(graph._compiled_plans[0]._compiled.default_stream).nonlocals["api"]
     else:
         api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d256_f16.py")
+    assert api._k_mod.__file__.endswith("sm107/d256_f16_lookahead/kernel.py")
     assert api._k_mod.CFG.SPLIT_KV == splits and api._k_mod._FP32_PARTIALS == (splits > 1)
     assert api._dense_spec.native is not None
     assert api._dense_spec.fp32_partial == (splits > 1)

@@ -25,9 +25,17 @@ HEAD_TILES = tuple(range(32, 257, 32))
 SHAPES = frozenset((q, v) for q in HEAD_TILES for v in HEAD_TILES)
 
 
+def padded_shape(facts):
+    """The 32-wide tile a sixteen-aligned head pair runs on (the legacy rows' envelope), or None."""
+    if facts.d_qk % 16 or facts.d_v % 16:
+        return None
+    shape = (-(-facts.d_qk // 32) * 32, -(-facts.d_v // 32) * 32)
+    return shape if shape in SHAPES else None
+
+
 def owner(facts):
     """The explicit owner of these facts, or None."""
-    if facts.device_cc not in DEVICE_CCS or (facts.d_qk, facts.d_v) not in SHAPES or facts.invalid or facts.is_backward:
+    if facts.device_cc not in DEVICE_CCS or padded_shape(facts) is None or facts.invalid or facts.is_backward:
         return None
     if facts.dtype not in (data_type.FP8_E4M3, data_type.FP8_E5M2):
         return None
@@ -108,7 +116,7 @@ def mismatch(implementation, facts, knobs):
         return f"requires SM12x (the SM120 family); current device is {facts.device_cc}"
     if owner(facts) != implementation:
         kind = "MXFP8" if implementation == MXFP8 else "per-tensor FP8"
-        return f"requires {kind} exact general head tiles (multiples of 32 up to 256) on the SM120 family"
+        return f"requires {kind} sixteen-aligned heads on 32-wide general tiles up to 256 on the SM120 family"
     if knobs is not None and knobs.tile_m not in (None, *_CONTRACTS[implementation].QUERY_TILES):
         return f"{implementation} runs TILE_M in {_CONTRACTS[implementation].QUERY_TILES}"
     if knobs is not None and knobs.cga not in (None, 1):

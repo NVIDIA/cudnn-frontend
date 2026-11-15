@@ -228,15 +228,15 @@ _SM100_KERNEL_FILES = {
     SM100_NATIVE_D576_SHAPE: "sm100/d512_f16_2x2/kernel.py",
     (512, 512): "sm100/d512_f16_role_split/kernel.py",
     (256, 256): "sm100/d256_f16_lookahead/kernel.py",
-    (192, 128): "sm100/prefill_d192_d128_f16.py",
-    (128, 128): "sm100/prefill_d128_f16.py",
+    (192, 128): "sm100/d192_f16_multi_q/kernel.py",
+    (128, 128): "sm100/d128_f16_multi_q/kernel.py",
     # Same file as (128, 128): one pipeline, two head-dim geometries, selected
     # by TemplateParams.d_flavor. d<=64 graphs used to ride the d128 envelope
     # and pay a zero-filled 128-wide MMA tile for it.
-    (64, 64): "sm100/prefill_d128_f16.py",
+    (64, 64): "sm100/d128_f16_multi_q/kernel.py",
     # The 32-wide small tile of the same file (TemplateParams.d_flavor = 32; config_sm100.make_cfg_d32): the SM100 twin of the Rubin
     # small tile.  A kernel-file entry only until the engine row and the flavor walk (_SM100_FLAVORS) serve it.
-    (32, 32): "sm100/prefill_d128_f16.py",
+    (32, 32): "sm100/d128_f16_multi_q/kernel.py",
 }
 # The d512 f16/bf16 forward on the 2x2 DATAPATH (TemplateParams.mma_2x2 -> the sibling file below):
 # one pipeline per CTA on the cta_group::2 M=128 atom instead of the cga4x1 role split.  Selected by
@@ -249,7 +249,7 @@ _SM100_KERNEL_FILES = {
 # mma_2x2=False for the original plans. Native Rubin dense packed/split plans require 2x2 under either
 # value. Other plans the twin does not serve (paged, quantized, SM100 split / G128) retain the role split.
 _SM100_D512_2X2_KERNEL_FILE = "sm100/d512_f16_2x2/kernel.py"
-_SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
+_SM107_D512_2X2_KERNEL_FILE = "sm107/d512_f16_2x2/kernel.py"
 D512_2X2: bool = True
 # The SM90 D128 template's overlap switch (config_sm90.TemplateParams.intra_wg_overlap). A CALL-TIME module
 # constant that SdpaFwdDslSm90.check_support writes into a D128 plan's record (the D512_2X2 precedent above: a module
@@ -343,7 +343,7 @@ D128_CLAIM_MIN_ROUNDS: int = 93
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
 # tile; the TILES_Q=2 prefill body at cga1 stays reachable only by loading its
 # template directly (its cga1 arm is kept for that).
-_SM100_DECODE_KERNEL_FILE = "sm100/decode_d128_f16.py"
+_SM100_DECODE_KERNEL_FILE = "sm100/d128_f16_single_q/kernel.py"
 _SM100_DECODE_FLAVOR = (128, 128)
 # Q rows one d64 decode tile covers (CfgD64Decode: TILES_Q=1 x TILE_M=128).
 _D64_DECODE_TILE_ROWS = 128
@@ -365,7 +365,7 @@ _SM100_DECODE_KERNEL_FILES = {
 # validators, the module's DESC_VERSION / SPIN_RING_WAITS constants).  Selected by the
 # same record field; _decode_q_tile routes both arch lines.
 _SM107_DECODE_KERNEL_FILES = {
-    (256, 256): "sm107/decode_d256_f16.py",
+    (256, 256): "sm107/d256_f16_swap_ab/kernel.py",
 }
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
 # FP8 kernel families; the output dtype is encoded the same way.
@@ -397,12 +397,12 @@ def _with_fp4(dtypes):
 # FP8 kernels use E4M3/E5M2 inputs and BF16/FP16/FP8 outputs. Block-scale
 # Per-tensor and block-scale FP8 select independently from their native maps.
 _SM100_MXFP8_KERNEL_FILES = {
-    (128, 128): "sm100/prefill_d128_mxfp8.py",
+    (128, 128): "sm100/d128_mxfp8_multi_q/kernel.py",
     # Native d64: the same file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor),
     # instead of zero-filling a 128-wide tile for gpt-oss-class head dims.
-    (64, 64): "sm100/prefill_d128_mxfp8.py",
-    (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
-    (256, 256): "sm100/prefill_d256_mxfp8.py",
+    (64, 64): "sm100/d128_mxfp8_multi_q/kernel.py",
+    (192, 128): "sm100/d192_mxfp8_multi_q/kernel.py",
+    (256, 256): "sm100/d256_mxfp8_single_q/kernel.py",
     (512, 512): "sm100/d512_mxfp8_slice_recompute/kernel.py",
 }
 _SM100_MXFP8_D512_RETAINED_P_KERNEL_FILE = "sm100/d512_mxfp8_retained_p/kernel.py"
@@ -411,17 +411,17 @@ _SM100_MXFP8_D512_RETAINED_P_KERNEL_FILE = "sm100/d512_mxfp8_retained_p/kernel.p
 # version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
 # same reason engines.py keeps one row per ARCH LINE.
 _SM107_KERNEL_FILES = {
-    SM100_NATIVE_D576_SHAPE: "sm107/prefill_d512_f16_2x2.py",
-    (512, 512): "sm107/prefill_d512_f16.py",
-    (256, 256): "sm107/prefill_d256_f16.py",
-    (192, 128): "sm107/prefill_d192_d128_f16.py",
-    (128, 128): "sm107/prefill_d128_f16.py",
+    SM100_NATIVE_D576_SHAPE: "sm107/d512_f16_2x2/kernel.py",
+    (512, 512): "sm107/d512_f16_role_split/kernel.py",
+    (256, 256): "sm107/d256_f16_lookahead/kernel.py",
+    (192, 128): "sm107/d192_f16_multi_q/kernel.py",
+    (128, 128): "sm107/d128_f16_multi_q/kernel.py",
     # The same file at TILE_K = TILE_O = 64 and 32 (TemplateParams.d_flavor; config_sm107.make_cfg_d64 / make_cfg_d32):
     # a head dim <= 64 used to ride the d128 envelope and pay a zero-filled 128-wide MMA tile (2x / 4x the BMM1 work and
     # the full d128 SMEM) for it.  The loader sets d_flavor from the flavor so no caller can pair the key with the
     # d128 geometry (config_sm107.SM107_F16_SMALL_D_SHAPES is the row's claim).
-    (64, 64): "sm107/prefill_d128_f16.py",
-    (32, 32): "sm107/prefill_d128_f16.py",
+    (64, 64): "sm107/d128_f16_multi_q/kernel.py",
+    (32, 32): "sm107/d128_f16_multi_q/kernel.py",
 }
 # The Rubin f16/bf16 flavor walk (smallest-first envelopes) -- _SM100_FLAVORS plus the 32-wide tile, which has no SM100
 # kernel: a graph's head dim lands on the smallest covering width (8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, 72..120 -> 128,
@@ -441,10 +441,10 @@ _SM107_MXFP8_KERNEL_FILES = {
     (128, 128): "sm107/d128_mxfp8_multi_q/kernel.py",
 }
 _SM100_FP8_KERNEL_FILES = {
-    (128, 128): "sm100/prefill_d128_fp8.py",
+    (128, 128): "sm100/d128_fp8_multi_q/kernel.py",
     # Native d64: the same file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor),
     # instead of zero-filling a 128-wide tile for gpt-oss-class head dims.
-    (64, 64): "sm100/prefill_d128_fp8.py",
+    (64, 64): "sm100/d128_fp8_multi_q/kernel.py",
     (192, 128): "sm100/d192_fp8_multi_q/kernel.py",
     (256, 256): "sm100/d256_fp8_single_q/kernel.py",
     (512, 512): "sm100/d512_fp8_role_split/kernel.py",
@@ -492,7 +492,7 @@ _SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/d512_mxfp8_paired/kernel
 # Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
 # selectable only once it has an entry here: SdpaFwdDslSm90.check_support builds the
 # config_sm90.pick_flavor pool from these keys.
-_SM90_KERNEL_FILES = {_SM90_D512_FLAVOR: "sm90/prefill_d512_f16.py", _SM90_D128_FLAVOR: "sm90/prefill_d128_f16.py"}
+_SM90_KERNEL_FILES = {_SM90_D512_FLAVOR: "sm90/f16_three_wg/kernel.py", _SM90_D128_FLAVOR: "sm90/d128_f16_multi_q/kernel.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -675,7 +675,7 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 
 
 # The exp2 MUFU / FMA split of the sm100 softmax (``TemplateParams.exp2_fma_split``, the ``_E2E_*`` block of
-# sm100/prefill_d128_mxfp8.py, prefill_d128_fp8.py and prefill_d192_d128_f16.py) is claimed per KERNEL and per
+# sm100/d128_mxfp8_multi_q/kernel.py, prefill_d128_fp8.py and prefill_d192_d128_f16.py) is claimed per KERNEL and per
 # ARCH.  It trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's MUFU rate -- MEASURED
 # 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
 # costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, and a B300 A/B
@@ -719,7 +719,7 @@ _EXP2_FMA_SPLIT_KERNELS: frozenset[tuple[str, tuple[int, int]]] = frozenset(
 
 
 # The L2-prefetching loader of the half-input single-CTA d192x128 f16 tile (``TemplateParams.cga1_l2_prefetch``,
-# sm100/prefill_d192_d128_f16.py at cta_mma=1) is claimed per arch the same way: on the cc it is measured on; off
+# sm100/d192_f16_multi_q/kernel.py at cta_mma=1) is claimed per arch the same way: on the cc it is measured on; off
 # elsewhere, where the tile keeps the develop loader.
 _CGA1_L2_PREFETCH_CC: frozenset[tuple[int, int]] = frozenset({(10, 3)})
 
@@ -736,7 +736,7 @@ def _quant_kind(fp8: bool, pertensor: bool) -> str:
     return ("fp8" if pertensor else "mxfp8") if fp8 else "f16"
 
 
-# The d64 decode tile (``TemplateParams.decode_tile``: sm100/decode_d128_f16.py at d_flavor 64) shares its (kind, flavor) key with the d64 prefill
+# The d64 decode tile (``TemplateParams.decode_tile``: sm100/d128_f16_single_q/kernel.py at d_flavor 64) shares its (kind, flavor) key with the d64 prefill
 # tile but is another kernel, so it claims the split in its own set: the tile's one softmax warpgroup is MUFU-bound at a long KV on cc 10.0, and the
 # FMA pipe takes a quarter of every row's exp2 columns.  MEASURED on B200 (same-node A/B/A/B, kernel time, gpt-oss d64 full attention with a sink,
 # all four tp shards): -8..-9 % from 8 sequences x 32K keys up (b=128 x 128K keys 919 -> 841 us at tp8), -3..-6 % at 2K keys, 0 at b=1 x 2K; S_q = 4
@@ -815,7 +815,7 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         # collective MMA, three K/V stages), cga2 the 2-CTA pair; heuristics._auto_sched_cga picks between them.
         return (1, 2)
     if not fp8 and flavor == _SM100_DECODE_FLAVOR:
-        # cga1 on the d128 f16/bf16 flavor selects the DECODE tile (sm100/decode_d128_f16.py) on the SM100 line and,
+        # cga1 on the d128 f16/bf16 flavor selects the DECODE tile (sm100/d128_f16_single_q/kernel.py) on the SM100 line and,
         # since issue #1472, on cc 10.7 (the same body compiled for sm_107a, inside the version-0 descriptor window);
         # dense graphs only -- check_support declines it for THD, mirroring engines.mismatch / effective_cgas.
         return (1, 2)
@@ -873,15 +873,27 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     and, on dense (128, 128) half graphs, the shared d128 decode tile at cga1
     and native D128 prefill under PackGQA."""
 
+    def load_body(filename, params, tag, part=None):
+        # Standalone records encode the chosen pipeline already. Resolve the
+        # former combined files on every return, including shared-target legs.
+        # Explicit engine lowering bypasses this compatibility loader.
+        if filename == _SM100_DECODE_KERNEL_FILE and params.decode_quad:
+            filename = "sm100/d64_f16_quadrant/kernel.py"
+        elif filename == "sm100/d128_fp8_multi_q/kernel.py" and params.dual_kv_stream:
+            filename = "sm100/d128_fp8_dual_kv/kernel.py"
+        elif filename == "sm107/d128_f16_multi_q/kernel.py" and params.n_chunk > 0:
+            filename = "sm107/small_f16_batch_pair/kernel.py"
+        return _load_kernel_template(filename, params, tag, part=part)
+
     tag = _flavor_tag(flavor)
     if rubin and not fp8 and flavor == (128, 128) and params.softmax_wgs == 1:
-        return _load_kernel_template("sm107/prefill_d256_f16.py", params, "sdpa_fwd_sm107_d128_single_q")
+        return load_body("sm107/d256_f16_lookahead/kernel.py", params, "sdpa_fwd_sm107_d128_single_q")
     mixed_kv_flavors = ((64, 64), (128, 128), (256, 256), (512, 512)) if rubin else ((128, 128),)
     if params.dtype_kv != -1 and (fp8 or flavor not in mixed_kv_flavors):
         raise ValueError("independent FP8 KV storage requires SM100 D128 or native SM107 D64/D128/D256/D512 half prefill")
     if rubin and not fp8 and flavor == (192, 128) and params.paged_kv:
         params = replace(params, d_flavor=192)
-        return _load_kernel_template("sm107/prefill_d128_f16.py", params, f"sdpa_fwd_sm107_{tag}_paged")
+        return load_body("sm107/d128_f16_multi_q/kernel.py", params, f"sdpa_fwd_sm107_{tag}_paged")
     if (
         rubin
         and not fp8
@@ -897,16 +909,16 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # wastes an MMA/softmax chain on decode; retain the native prefill body
         # for two CTAs and N64. The shared body is compiled for the actual part.
         params = replace(params, d_flavor=64, decode_tile=True)
-        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
+        return load_body(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.ragged_q:
         # The single-query paged split ABI uses the shared decode tile, as
         # on SM100/SM103, compiled for the actual SM107 target.
-        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_ragged_decode")
+        return load_body(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_ragged_decode")
     if rubin and not fp8 and getattr(params, "decode_q_tile", 0):
         # Decode-shaped d256 f16/bf16 graphs on cc 10.7: the Rubin twin of the swap-AB
         # tile (the record field routes, exactly as on the SM100 arm below).  It serves
         # the paged contract natively, so it precedes the shared paged-prefill arm.
-        return _load_kernel_template(_SM107_DECODE_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_decode_{tag}")
+        return load_body(_SM107_DECODE_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_decode_{tag}")
     if (
         rubin
         and not fp8
@@ -917,20 +929,20 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # The single-CTA half pipeline stays below the version-0 descriptor
         # window and can compile natively for Rubin without another kernel body.
         params = replace(params, single_q_head_dim=flavor[0])
-        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
+        return load_body(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and flavor == (256, 256) and params.thd_varlen and not params.paged_kv and params.split_kv > 1:
-        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed_split")
+        return load_body(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed_split")
     if rubin and not fp8 and params.paged_kv and flavor == (256, 256) and params.dtype_kv == -1:
-        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
+        return load_body(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen and not params.paged_kv and not params.ragged_q:
         # Dense d128 half at TILE_CGA_M=1 on cc 10.7: the shared 128-row DECODE tile (CfgD128Decode, 224 KiB, inside the
         # version-0 descriptor window) -- the dense twin of the single-CTA THD leg above (issue #1472).  THD_VARLEN at cga1
         # is the two-slab paged prefill (above) or the single-Q split (above); never this body.
-        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
+        return load_body(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
     if rubin and fp8 and pertensor and flavor == (128, 128) and getattr(params, "decode_q_tile", 0):
         # This shared body has a dense TMA loader and fits the version-0 SMEM
         # descriptor window. Compile it for the actual Rubin target.
-        return _load_kernel_template("sm100/decode_d128_fp8.py", params, f"sdpa_fwd_sm107_fp8_decode_{tag}")
+        return load_body("sm100/d128_fp8_swap_ab/kernel.py", params, f"sdpa_fwd_sm107_fp8_decode_{tag}")
     if rubin:
         # Tag spelling is load-bearing: it keys the template-module cache, and
         # "sdpa_fwd_sm107_fp8_<flavor>" is what the shipped d128 FP8 row has
@@ -961,7 +973,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         filename = _SM100_D512_2X2_KERNEL_FILE
         tag = f"sdpa_fwd_sm100_{tag}_2x2"
     elif fp8 and pertensor and flavor in ((64, 64), (128, 128)) and getattr(params, "decode_q_tile", 0):
-        filename = "sm100/decode_d128_fp8.py"
+        filename = "sm100/d128_fp8_swap_ab/kernel.py"
         tag = f"sdpa_fwd_sm100_fp8_decode_{tag}"
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
@@ -992,7 +1004,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     else:
         filename = _SM100_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{tag}"
-    return _load_kernel_template(filename, params, tag, part=None if rubin else part)
+    return load_body(filename, params, tag, part=None if rubin else part)
 
 
 def _load_sm120_kernel_module(
@@ -1014,7 +1026,7 @@ def _load_sm90_kernel_module(flavor: tuple[int, int], params: Sm90TemplateParams
     flavor's exact dense D64 subset (``native_d64``: SdpaFwdDslSm90._native_d64, config_sm90.native_d64_mismatch) loads
     the D64 body."""
     if native_d64:
-        return _load_kernel_template("sm90/prefill_d64_f16.py", params, tag="sdpa_fwd_sm90_d64")
+        return _load_kernel_template("sm90/d64_f16_one_wg/kernel.py", params, tag="sdpa_fwd_sm90_d64")
     return _load_kernel_template(_SM90_KERNEL_FILES[flavor], params, tag=f"sdpa_fwd_sm90_{_flavor_tag(flavor)}")
 
 
@@ -1879,7 +1891,7 @@ class SdpaFwdDsl(APIBase):
           tile, and it keeps half partials.
         * SM107 (Rubin) outside per-tensor FP8 and half D64/D128/D192, native
           half D256 dense prefill, half D512 2x2, and the d256 DECODE tile: the other siblings do not carry the FP32
-          partial-output slot.  The decode tile (sm107/decode_d256_f16.py) is
+          partial-output slot.  The decode tile (sm107/d256_f16_swap_ab/kernel.py) is
           the SM100 body and stores fp32 partials unconditionally under a split
           (its O slot and o_partial slot are both Float32 then), so it takes
           this path like its SM100 twin -- sized half, its fp32 stores would
@@ -2004,7 +2016,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._k_mod = None
         # The decode tile's ragged-Q leg (resolved in check_support): a THD
         # graph over PAGED K/V at S_q(max) == 1 on the (128, 128) f16 flavor
-        # with cga=1 rides sm100/decode_d128_f16.py's RAGGED_Q mode -- the
+        # with cga=1 rides sm100/d128_f16_single_q/kernel.py's RAGGED_Q mode -- the
         # dense prepared launch with the Q rows at the ragged offsets and the
         # split combine placing the final O / Stats rows -- instead of the
         # prefill tile's THD leg.
@@ -2636,7 +2648,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.pack_gqa and self._fp8 and not self._pertensor and self.thd,
             "PackGQA on MXFP8 is served by the d128 flavor on dense batches only: the kernel gathers "
             "the packed tile's scale factors out of the group's F8_128x4 atoms per CTA "
-            "(see the PackGQA note in sm100/prefill_d128_mxfp8.py)",
+            "(see the PackGQA note in sm100/d128_mxfp8_multi_q/kernel.py)",
         )
         self._check_dtype(
             self.k_desc, kv_dtype, name=self.k_desc.name, extra_error_msg=f"{self.k_desc.name} must match Q dtype or use supported FP8 KV storage"
@@ -2959,10 +2971,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._thd_origin_specs = (None,) * 5
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
-            "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
+            "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/d128_mxfp8_multi_q/kernel.py)",
         )
         if self.pack_gqa:
-            # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row
+            # The d256 DECODE tile (sm107/d256_f16_swap_ab/kernel.py) packs the WHOLE group into its 16-row
             # Q tile over a dense OR paged cache (HEADS_PER_TILE = QH_PER_KH), so a decode-shaped
             # half d256 graph packs on cc 10.7 whatever its cache form; every other Rubin half
             # packing rides the paged / packed-split D128 pipelines.  engines.mismatch mirrors this
@@ -3551,7 +3563,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # dense Q over pools; other FP8 flavors retain their paging decline.
             # Native half D64/D128 also serves dense Q
             # directly, including split/PackGQA; engines.mismatch shares its admission predicate.
-            # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and
+            # The d256 DECODE tile (sm107/d256_f16_swap_ab/kernel.py) walks the block table itself and
             # folds the sink per Q row, so a decode-shaped half d256 graph is served paged on
             # cc 10.7 whatever its THD-ness or sink -- the same exception engines.mismatch makes
             # (d256_decode_tile_selected); the paged PREFILL pipeline keeps its THD-only scope.
@@ -3659,7 +3671,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "split_kv > 1 serves unpadded dense graphs only",
             )
             # Keep the standalone contract aligned with the Rubin engine row.  The d256 DECODE tile
-            # (sm107/decode_d256_f16.py) writes the SM100 tile's fp32 split partials into the split-major
+            # (sm107/d256_f16_swap_ab/kernel.py) writes the SM100 tile's fp32 split partials into the split-major
             # workspace that sm100/split_combine reduces, packed or not, over a dense or paged cache -- so a
             # decode-shaped half d256 graph keeps its split on cc 10.7 (engines.mismatch lifts the same two
             # rules through d256_decode_tile_selected); half d256 prefill also splits on its native dense
@@ -4066,7 +4078,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _decode_q_tile(self) -> int:
         """N extent of the decode tile (config_sm100.decode_d256_q_tile) when this
         plan lowers onto the d256 decode tile -- sm100/d256_f16_swap_ab/kernel.py on the
-        Blackwell line, sm107/decode_d256_f16.py on cc 10.7 -- else 0 (the prefill tile).
+        Blackwell line, sm107/d256_f16_swap_ab/kernel.py on cc 10.7 -- else 0 (the prefill tile).
 
         A LOWERING choice, like the flavor pick: the decode tile serves the same
         graph contract as prefill_d256_f16 (paged / dense, padding, causal
@@ -4094,7 +4106,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         streams over one 128-row Q tile (TemplateParams.dual_kv_stream).
 
         The same LOWERING choice as the f16 decode tiles: the decode-shaped step
-        of sm100/prefill_d128_fp8.py is bound by its per-KV-tile chain, not by
+        of sm100/d128_fp8_multi_q/kernel.py is bound by its per-KV-tile chain, not by
         the MMA, so a 128-row graph gains nothing from the second Q sub-tile's
         rows and everything from a second KV tile per step.  cga1 only (the pair
         shares no K/V ring), dense or paged K/V, not THD; off while
@@ -4173,7 +4185,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return int(self.s_q_max) * pack_g <= _D64_QUAD_ROWS
 
     def _decode_early_q(self, params) -> bool:
-        """Whether the decode tile (sm100/decode_d128_f16.py: the d64 decode tile, the d128 cga1 tile) takes its early-Q form (``TemplateParams.early_q``)
+        """Whether the decode tile (sm100/d128_f16_single_q/kernel.py: the d64 decode tile, the d128 cga1 tile) takes its early-Q form (``TemplateParams.early_q``)
         on this build. Unsplit THD keeps its staged O store; split THD writes FP32 partials directly and leaves the Q slab free."""
         if tuple(self._device_cc) not in _EARLY_Q_CC or self._fp8:
             return False
@@ -6121,7 +6133,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         # Which template serves this plan ("prefill_d128_f16", "prefill_d512_f16" or "prefill_d64_f16"), as the SM100
         # adapter records it: the engine's executor exposes it, so a test or the routing tally names the template without
         # inferring it from the source.
-        self.kernel_template = selected_kernel.template if selected_kernel is not None else os.path.splitext(os.path.basename(template.__file__))[0]
+        self.kernel_template = getattr(template, "TEMPLATE_NAME", os.path.splitext(os.path.basename(template.__file__))[0])
         strides, lse_stride = self._strides, self._lse_stride
         if self.split_kv > 1:
             # The producer TMA maps describe split-major partials; final layouts

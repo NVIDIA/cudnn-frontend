@@ -77,8 +77,6 @@ def test_paged_fp8_kv_storage_follows_the_policy_domain():
     [
         {"device_cc": (10, 0), "device_sm_count": 148},
         {"device_cc": (10, 7), "device_sm_count": 216},
-        {"d_qk": 384, "d_v": 384},
-        {"d_qk": 576, "d_v": 384},
         {"d_qk": 256, "d_v": 256},
         {"dtype": cudnn.data_type.FP8_E4M3, "dtype_o": cudnn.data_type.HALF, "is_fp8": True},
         {"dtype": cudnn.data_type.FP8_E4M3, "is_mxfp8": True},
@@ -89,11 +87,17 @@ def test_other_implementations_do_not_enter_the_owner(overrides):
 
 
 @pytest.mark.parametrize("dims", [(264, 264), (384, 448), (512, 384), (520, 512), (576, 384)])
-def test_padded_envelope_keeps_the_legacy_owner(dims):
+def test_padded_envelope_is_owned_by_the_paired_engine(dims):
     f = facts(d_qk=dims[0], d_v=dims[1])
-    assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, f) is None
-    assert engines.mismatch(SPECS[NAME].capabilities, f) is not None
-    assert all(p.engine_id == 20505 for p in heuristics.recommend("A", f, OFFERED))
+    assert "padded to" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, f)
+    assert engines.mismatch(SPECS[NAME].capabilities, f) is None
+    plans = heuristics.recommend("A", f, OFFERED)
+    assert plans and {p.engine_id for p in plans} == {20526}
+
+
+@pytest.mark.parametrize("dims", [(256, 512), (264, 256), (584, 512), (516, 512)])
+def test_heads_outside_the_wide_envelope_do_not_enter_the_owner(dims):
+    assert engines.mismatch(SPECS[NAME].capabilities, facts(d_qk=dims[0], d_v=dims[1])) is not None
 
 
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])

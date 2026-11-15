@@ -157,7 +157,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
             compiled = graph._compiled_plans[0]
             assert compiled._prepared.spec.origin_specs is not None
             mod = compiled._compiled.kernel_module
-            body = "decode_d128_f16.py" if splits > 1 else "prefill_d128_f16.py"
+            body = "d128_f16_single_q/kernel.py" if splits > 1 else "d128_f16_multi_q/kernel.py"
             owned_path = {
                 "sdpa_fwd_sm100_d128_multi_q": "sm100/d128_f16_multi_q/kernel.py",
                 "sdpa_fwd_sm100_d128_single_q": "sm100/d128_f16_single_q/kernel.py",

@@ -2616,7 +2616,7 @@ def test_mxfp8_block_scaled_output_declines_wide_flavor():
 
 # ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the SASS per arch
 # Both are invisible to every numerics test (O to the bf16 rounding, LSE within 6e-6, Amax_O exact before and after) and
-# worth +10.9 % at S=16K on B200 (`sm100/prefill_d128_mxfp8.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
+# worth +10.9 % at S=16K on B200 (`sm100/d128_mxfp8_multi_q/kernel.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
 # these pins compile the kernel here for the target arch (`CUTE_DSL_ARCH` needs no matching device -- the module-level
 # `requires_blackwell` is what confines them to the Blackwell-line lanes) and count the instructions.  Two arms, one per
 # cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True: the split is ON) and
@@ -2731,7 +2731,7 @@ _CREDIT_ARRIVE_SITES = {
     (128, 128): 6,
     (192, 128): 7,
 }  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the softmax (d128: one site at the loop top for every mask arm; d192x128: one per mask arm)
-_SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
+_SM100_MXFP8_OPTED_OUT = ("d128_mxfp8_multi_q/kernel.py", "d192_mxfp8_multi_q/kernel.py")  # the ONLY sm100 kernels that pass predicated=
 # Representative graph masks for exercising the module constant and bindings.
 _CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": {}, "causal": {"window_right": 0}, "padded": {"seq_kv_lens_present": True}}
 # d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).

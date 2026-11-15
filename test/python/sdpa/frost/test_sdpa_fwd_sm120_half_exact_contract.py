@@ -66,18 +66,30 @@ def test_tile_m_names_the_owner(cc, dims, tile_m):
     assert engines.SdpaFwdKnobs.from_public(knobs.to_public()) == knobs
 
 
-@pytest.mark.parametrize("dims", [(248, 248), (248, 256), (120, 120), (72, 200), (512, 512), (576, 512)])
-def test_envelopes_and_wide_tiles_do_not_enter_the_owners(dims):
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512), (264, 264), (132, 132)])
+def test_wide_and_unaligned_heads_do_not_enter_the_owners(dims):
     f = facts(d_qk=dims[0], d_v=dims[1])
     for owner in exact.IMPLEMENTATIONS:
         assert engines.mismatch(SPECS[owner].capabilities, f) is not None, (owner, dims)
 
 
-@pytest.mark.parametrize("dims", [(248, 256), (120, 120)])
-def test_envelope_keeps_the_legacy_owner(dims):
+@pytest.mark.parametrize(
+    "dims,owner", [((248, 248), exact.ALL_COMPUTE), ((248, 256), exact.ALL_COMPUTE), ((120, 120), exact.GENERAL), ((72, 200), exact.GENERAL)]
+)
+def test_padded_heads_enter_the_owner_of_their_tile(dims, owner):
     f = facts(d_qk=dims[0], d_v=dims[1])
-    assert engines.mismatch(SPECS[exact.LEGACY_ROW].capabilities, f) is None
-    assert all(p.engine_id == 20505 for p in heuristics.recommend("A", f, OFFERED))
+    other = exact.GENERAL if owner == exact.ALL_COMPUTE else exact.ALL_COMPUTE
+    assert engines.mismatch(SPECS[owner].capabilities, f) is None
+    assert engines.mismatch(SPECS[exact.KEY_GROUP].capabilities, f) is None
+    assert engines.mismatch(SPECS[other].capabilities, f) is not None
+
+
+@pytest.mark.parametrize("dims", [(248, 256), (120, 120)])
+def test_padded_heads_leave_the_legacy_row(dims):
+    f = facts(d_qk=dims[0], d_v=dims[1])
+    assert "padded to" in engines.mismatch(SPECS[exact.LEGACY_ROW].capabilities, f)
+    plans = heuristics.recommend("A", f, OFFERED)
+    assert plans and 20505 not in {p.engine_id for p in plans}
 
 
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])

@@ -24,7 +24,7 @@ def _identity(graph, name, template, split):
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (64, 64, 3), (192, 128, 1), (256, 256, 2)])
+@pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (64, 64, 3), (192, 128, 1), (256, 256, 2), (80, 112, 1), (240, 240, 2)])
 def test_fp8_public_record_names_and_replays_its_body(monkeypatch, dtype, d, dv, split):
     from cudnn.sdpa.fwd import heuristics
     import test_sdpa_prepared_fp8 as shared
@@ -48,7 +48,7 @@ def test_fp8_public_record_names_and_replays_its_body(monkeypatch, dtype, d, dv,
     shared._check(rbufs, thd=False, sq=97, skv=301)
 
 
-def test_fp8_retired_legacy_record_is_declined_and_envelope_keeps_legacy():
+def test_fp8_retired_legacy_record_is_declined_and_envelope_has_an_owner():
     import test_sdpa_prepared_fp8 as shared
 
     g, *_ = shared._case(arch="sm120", d=128, sq=97, skv=301)
@@ -56,12 +56,14 @@ def test_fp8_retired_legacy_record_is_declined_and_envelope_keeps_legacy():
     with pytest.raises((ValueError, RuntimeError, NotImplementedError), match="owned by|No execution plans"):
         shared._case(arch="sm120", d=128, sq=97, skv=301, record=(_FP8_LEGACY_ID, knobs))
     envelope, vp, ws, bufs, _ = shared._case(arch="sm120", d=80, sq=97, skv=301)
-    assert envelope.selected_engine.name == "sdpa_fwd_prefill_sm120_fp8"
+    assert envelope.selected_engine.name == _FP8
+    with pytest.raises((ValueError, RuntimeError, NotImplementedError), match="owned by|No execution plans"):
+        shared._case(arch="sm120", d=80, sq=97, skv=301, record=(_FP8_LEGACY_ID, knobs))
     envelope.execute(vp, ws)
     shared._check(bufs, thd=False, sq=97, skv=301)
 
 
-@pytest.mark.parametrize("d_qk,d_v,split", [(128, 128, None), (64, 64, 3), (256, 128, None)])
+@pytest.mark.parametrize("d_qk,d_v,split", [(128, 128, None), (64, 64, 3), (256, 128, None), (80, 112, None)])
 def test_mxfp8_selected_body_and_retired_legacy_record(monkeypatch, d_qk, d_v, split):
     import cudnn
     import test_sdpa_fwd_mxfp8_sm120 as mx

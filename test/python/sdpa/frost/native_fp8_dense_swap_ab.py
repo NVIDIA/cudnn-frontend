@@ -133,7 +133,7 @@ def _case(
     def record(filename, params, *args, **kwargs):
         module = original(filename, params, *args, **kwargs)
         seen.append(filename)
-        expected = geometry.kernel_file if explicit else "sm100/decode_d128_fp8.py" if swap == 1 else _arch() + "/prefill_d128_fp8.py"
+        expected = geometry.kernel_file if explicit else "sm100/d128_fp8_swap_ab/kernel.py" if swap == 1 else _arch() + "/d128_fp8_multi_q/kernel.py"
         assert filename.endswith(expected)
         assert params.cta_mma == 1 and module.CFG.SPLIT_KV == split
         assert bool(module.CFG.PACK_GQA) == pack
@@ -302,7 +302,7 @@ def test_standalone_current_lengths_and_logbase(split, log2):
     )
     api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm100/decode_d128_fp8.py")
+    assert api._k_mod.__file__.endswith("sm100/d128_fp8_swap_ab/kernel.py")
 
     for iteration in range(2):
         if iteration:

@@ -81,8 +81,8 @@ def test_exact_owner_and_public_tile_geometry(quant, cc, dtype):
     "overrides",
     [
         {"device_cc": (10, 0), "device_sm_count": 148},
-        {"d_qk": 384, "d_v": 384},
         {"d_qk": 256, "d_v": 256},
+        {"d_qk": 264, "d_v": 512},
         {"dtype": cudnn.data_type.BFLOAT16, "is_fp8": False, "is_mxfp8": False},
     ],
 )
@@ -97,12 +97,13 @@ def test_the_two_quantizations_do_not_cross():
 
 @pytest.mark.parametrize("quant", sorted(OWNERS))
 @pytest.mark.parametrize("dims", [(272, 272), (384, 448), (512, 384), (496, 512)])
-def test_padded_envelope_keeps_the_legacy_owner(quant, dims):
-    contract, _, legacy_id, _ = OWNERS[quant]
+def test_padded_envelope_is_owned_by_the_paired_engine(quant, dims):
+    contract, _, _, owner_id = OWNERS[quant]
     f = facts(quant, d_qk=dims[0], d_v=dims[1])
-    assert engines.mismatch(SPECS[contract.LEGACY_ROW].capabilities, f) is None
-    assert engines.mismatch(SPECS[contract.NAME].capabilities, f) is not None
-    assert all(p.engine_id == legacy_id for p in heuristics.recommend("A", f, offered(quant)))
+    assert "padded to" in engines.mismatch(SPECS[contract.LEGACY_ROW].capabilities, f)
+    assert engines.mismatch(SPECS[contract.NAME].capabilities, f) is None
+    plans = heuristics.recommend("A", f, offered(quant))
+    assert plans and {p.engine_id for p in plans} == {owner_id}
 
 
 @pytest.mark.parametrize("quant", sorted(OWNERS))

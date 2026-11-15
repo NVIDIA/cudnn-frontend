@@ -53,7 +53,7 @@ def test_contract(cc, cga, paged):
         page_size=16 if paged else 0,
     )
     module = _load_sm100_kernel_module((64, 64), params, part=cc)
-    assert module.__file__.endswith("sm100/prefill_d128_f16.py")
+    assert module.__file__.endswith("sm100/d128_f16_multi_q/kernel.py")
     assert module.CFG.TILE_K == module.CFG.TILE_O == 64
     assert module.CFG.PACK_G == 4 and module.CFG.THD_VARLEN
     assert module.CFG.CTA_MMA == cga and not module._FP32_PARTIALS
@@ -67,7 +67,7 @@ def _assert_direct_body(monkeypatch):
 
     def compile_direct(api):
         original(api)
-        assert api._k_mod.__file__.endswith(("sm100/prefill_d128_f16.py", "sm100/d128_f16_multi_q/kernel.py"))
+        assert api._k_mod.__file__.endswith(("sm100/d128_f16_multi_q/kernel.py", "sm100/d128_f16_multi_q/kernel.py"))
         assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
         assert api._k_mod.CFG.PACK_GQA and api._k_mod.CFG.THD_VARLEN
         assert not api._k_mod._FP32_PARTIALS and not api.packed_thd_split

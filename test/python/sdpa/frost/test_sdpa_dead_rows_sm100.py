@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The STORED dead rows of the SM100 (cc 10.0 / 10.3) f16/bf16 small head-dim tiles under the dead-sub-tile QUIET body
-(``sm100/prefill_d128_f16.py``, ``TemplateParams.dead_subtile_quiet = 1`` on the -inf body): a softmax sub-tile whose first row is at or
+(``sm100/d128_f16_multi_q/kernel.py``, ``TemplateParams.dead_subtile_quiet = 1`` on the -inf body): a softmax sub-tile whose first row is at or
 past its batch entry's Q length runs the quiet body -- the live body's barrier sequence and no math -- so its BMM2 multiplies whatever
 the P region of the S slot holds (the S accumulator's fp32 bits read as bf16 pairs: NaN / Inf in roughly one low half per 256).  Without
 per-batch Q lengths every dead row is at or past S_q and the O descriptor clips it; WITH them (``SEQ_Q_LENS_PRESENT``, the padded-Q trim),

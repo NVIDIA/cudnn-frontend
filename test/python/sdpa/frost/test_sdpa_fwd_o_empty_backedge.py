@@ -32,18 +32,18 @@ from frost_test_utils import requires_blackwell, requires_dsl
 pytestmark = [pytest.mark.L0]
 
 _KERNELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "python", "cudnn", "sdpa", "fwd", "kernels")
-# Every forward kernel with TWO softmax warpgroups on the classic pipeline (sub_tile_id 0 / 1).  ``sm100/decode_d128_f16.py`` is
+# Every forward kernel with TWO softmax warpgroups on the classic pipeline (sub_tile_id 0 / 1).  ``sm100/d128_f16_single_q/kernel.py`` is
 # deliberately absent: SOFTMAX_WARPGROUPS=1 there, so its single warpgroup's own publish IS slot 0's back-edge.
 _TWO_WARPGROUP_KERNELS = (
-    "sm100/prefill_d128_f16.py",
-    "sm100/prefill_d128_fp8.py",
-    "sm100/prefill_d128_mxfp8.py",
+    "sm100/d128_f16_multi_q/kernel.py",
+    "sm100/d128_fp8_multi_q/kernel.py",
+    "sm100/d128_mxfp8_multi_q/kernel.py",
     "sm100/d192_fp8_multi_q/kernel.py",
-    "sm100/prefill_d192_d128_mxfp8.py",
-    "sm107/prefill_d128_f16.py",
+    "sm100/d192_mxfp8_multi_q/kernel.py",
+    "sm107/d128_f16_multi_q/kernel.py",
     "sm107/d128_fp8_multi_q/kernel.py",
     "sm107/d128_mxfp8_multi_q/kernel.py",
-    "sm107/prefill_d192_d128_f16.py",
+    "sm107/d192_f16_multi_q/kernel.py",
     "sm107/d192_fp8_multi_q/kernel.py",
     "sm107/d192_mxfp8_multi_q/kernel.py",
 )
@@ -73,7 +73,7 @@ def test_softmax_top_of_tile_wait_is_on_the_warpgroups_own_o_slot(kernel):
         assert re.search(r"mb_o_empty\[qs\]\.wait\(o_empty_phase", code), f"{kernel}: the correction group waits its own O slot"
         return
     assert waits == (
-        2 if kernel == "sm107/prefill_d128_f16.py" else 1
+        2 if kernel == "sm107/d128_f16_multi_q/kernel.py" else 1
     ), f"{kernel}: expected one per-warpgroup top-of-tile mb_o_empty wait per tile body, found {waits}"
 
 

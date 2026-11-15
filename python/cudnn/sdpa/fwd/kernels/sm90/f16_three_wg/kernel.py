@@ -93,6 +93,10 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
     zero_v_tail_rows,
 )
 
+from cudnn.sdpa.fwd.kernels.sm90.f16_three_wg import contract as _template_contract
+
+# Public metadata consumed by the shared loader after dynamic module loading.
+TEMPLATE_NAME = _template_contract.TEMPLATE_NAME
 from cudnn.sdpa.fwd.kernels.sm90.f16_three_wg.config import TemplateParams, from_shared, validate_params
 
 # The FROST loader injects one immutable specialization before executing this module. A

@@ -472,7 +472,7 @@ def _api_at(d, h_q=8, h_kv=8, s=96, b=2, stats=False, **kw):
     return SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, **kw)
 
 
-_D128_FILE, _D512_FILE = ("sm90/prefill_d128_f16.py", "sdpa_fwd_sm90_d128"), ("sm90/prefill_d512_f16.py", "sdpa_fwd_sm90_d512")
+_D128_FILE, _D512_FILE = ("sm90/d128_f16_multi_q/kernel.py", "sdpa_fwd_sm90_d128"), ("sm90/f16_three_wg/kernel.py", "sdpa_fwd_sm90_d512")
 _FLAVOR_CASES = [
     # What D128 serves, each taking it.
     pytest.param(128, {}, _D128_FILE, id="d128-dense"),

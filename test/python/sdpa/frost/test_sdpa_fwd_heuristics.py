@@ -478,12 +478,24 @@ def _sm120_offered(row, row_id):
 _SM120_HALF_OFFERED = _sm120_offered("sdpa_fwd_prefill_sm120", 20505)
 
 
+def _sm120_padded(row, f):
+    """The native tile these head dims run on for ``row`` (padded heads included), via the owner contracts."""
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as half_wide
+    from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8_wide
+    from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
+
+    general = sm120_half.padded_shape(f) if row == sm120_half.LEGACY_ROW else sm120_quant_general.padded_shape(f)
+    wide = {"sdpa_fwd_prefill_sm120": half_wide, "sdpa_fwd_prefill_sm120_fp8": fp8_wide, "sdpa_fwd_prefill_sm120_mxfp8": mxfp8_wide}[row]
+    return general or wide.padded_shape(f) or (f.d_qk, f.d_v)
+
+
 def _sm120_owner_caps(d_qk, d_v, row="sdpa_fwd_prefill_sm120", tile_m=None):
-    """Capabilities of the SM120 row that owns these head dims (exact half tiles: the TILE_M-named owner)."""
-    if row == sm120_half.LEGACY_ROW and (d_qk, d_v) in sm120_half.SHAPES:
-        f = SdpaGraphFacts(d_qk=d_qk, d_v=d_v)
+    """Capabilities of the SM120 engine that owns these head dims, padded heads included (half tiles: the TILE_M-named owner)."""
+    f = SdpaGraphFacts(d_qk=d_qk, d_v=d_v)
+    if row == sm120_half.LEGACY_ROW and sm120_half.padded_shape(f) is not None:
         return _sm120_spec(sm120_half.select_geometry(f, engines.SdpaFwdKnobs(tile_m=tile_m)).implementation).capabilities
-    return _sm120_spec(next((owner for owner, _, shapes in _SM120_OWNERS.get(row, ()) if (d_qk, d_v) in shapes), row)).capabilities
+    shape = _sm120_padded(row, f)
+    return _sm120_spec(next((owner for owner, _, shapes in _SM120_OWNERS.get(row, ()) if shape in shapes), row)).capabilities
 
 
 # Graph facts of each SM120 row's input type.

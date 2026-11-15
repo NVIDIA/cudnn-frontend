@@ -389,7 +389,7 @@ def _check_rubin_ragged_pack_rebind(
     g.check_support()
     g.build_plans()
     api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
-    assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
     assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == head_dim
     if tile_n is not None:
         assert api._k_mod.PARAMS.tile_n == api._k_mod.CFG.TILE_N == tile_n

@@ -264,26 +264,29 @@ def sm80_owner(d_qk, d_v):
 def sm120_owner(row, d_qk, d_v, tile_m=None):
     """The SM120 forward engine that may serve these head dims for ``row``'s input type (legality only, no ranking).
 
-    Exact half head tiles have two owners named by TILE_M; without one, both are returned for a ranked pin."""
+    Half head tiles and their envelopes have two owners named by TILE_M; without one, both are returned for a ranked pin."""
     from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as exact
     from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as half
     from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8
     from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8
 
-    if row == exact.LEGACY_ROW and (d_qk, d_v) in exact.SHAPES:
-        prefill = exact.ALL_COMPUTE if (d_qk, d_v) == exact.D256 else exact.GENERAL
+    from types import SimpleNamespace
+
+    facts = SimpleNamespace(d_qk=d_qk, d_v=d_v)
+    shape = exact.padded_shape(facts)
+    if row == exact.LEGACY_ROW and shape is not None:
+        prefill = exact.ALL_COMPUTE if shape == exact.D256 else exact.GENERAL
         if tile_m is None:
             return (prefill, exact.KEY_GROUP)
         return exact.KEY_GROUP if tile_m in exact.key_group.QUERY_TILES else prefill
     from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as quant
 
-    if (d_qk, d_v) in quant.SHAPES:
+    if quant.padded_shape(facts) is not None:
         general = {quant.fp8.LEGACY_ROW: quant.FP8, quant.mxfp8.LEGACY_ROW: quant.MXFP8}
         if row in general:
             return general[row]
-    wide = {half.LEGACY_ROW: (half.NAME, half.SHAPES), fp8.LEGACY_ROW: (fp8.NAME, (fp8.SHAPE,)), mxfp8.LEGACY_ROW: (mxfp8.NAME, (mxfp8.SHAPE,))}
-    owner, shapes = wide.get(row, (row, ()))
-    return owner if (d_qk, d_v) in shapes else row
+    wide = {half.LEGACY_ROW: half, fp8.LEGACY_ROW: fp8, mxfp8.LEGACY_ROW: mxfp8}.get(row)
+    return wide.NAME if wide is not None and wide.padded_shape(facts) is not None else row
 
 
 def sm90_half_owner(d_qk, d_v, *, paged=False) -> str:

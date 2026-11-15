@@ -61,7 +61,7 @@ def test_thd(dtype_name, cga, packed, layout, page, tile_n, policy, split, monke
         assert api.flavor == (64, 64)
         assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
         assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.THD_VARLEN
-        expected = "sm100/decode_d128_f16.py" if split > 1 else "sm107/prefill_d128_f16.py"
+        expected = "sm100/d128_f16_single_q/kernel.py" if split > 1 else "sm107/d128_f16_multi_q/kernel.py"
         assert api._k_mod.__file__.endswith(expected)
         if split > 1:
             assert api._k_mod._FP32_PARTIALS and api._k_mod.SPLIT_KV == split

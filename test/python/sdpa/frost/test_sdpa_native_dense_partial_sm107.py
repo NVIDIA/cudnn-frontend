@@ -129,7 +129,7 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     g.build_plans()
     selected = g._compiled_plans[g._plan_index]
     compiled_api = inspect.getclosurevars(selected._compiled.default_stream).nonlocals["api"]
-    assert compiled_api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert compiled_api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
     cfg = compiled_api._k_mod.CFG
     assert (cfg.PACK_G, cfg.CGA_M, cfg.SPLIT_KV) == (math.gcd(group, 128), 2, splits)
     stream = torch.cuda.Stream()

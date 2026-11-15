@@ -80,8 +80,8 @@ def test_native_d64_exports_the_prepared_pointer_contract():
     from cudnn.sdpa.fwd.prepared import _host_parameter_order
 
     params = TemplateParams()
-    native = _load_kernel_template("sm90/prefill_d64_f16.py", params, tag="sm90_d64_host_contract")
-    control = _load_kernel_template("sm90/prefill_d512_f16.py", params, tag="sm90_d512_host_contract")
+    native = _load_kernel_template("sm90/d64_f16_one_wg/kernel.py", params, tag="sm90_d64_host_contract")
+    control = _load_kernel_template("sm90/f16_three_wg/kernel.py", params, tag="sm90_d512_host_contract")
     # These are the required exports read by adapter compilation and the
     # prepared dense binder; CFG/N_Q and THD-only entries are optional or unused.
     required = (
@@ -143,7 +143,8 @@ def test_standalone_d64_retains_existing_feature_routes(monkeypatch, dtype, extr
     assert api.check_support()
     with pytest.raises(TemplateSelected):
         api.compile()
-    assert selected == [f"sm90/prefill_{flavor}_f16.py"]
+    folder = "d64_f16_one_wg" if flavor == "d64" else "f16_three_wg"
+    assert selected == [f"sm90/{folder}/kernel.py"]
 
 
 @pytest.mark.skipif(_SM != 90, reason="standalone head-envelope execution requires actual Hopper SM90")
@@ -170,7 +171,7 @@ def test_standalone_d64_head_envelope_reference_and_replay(dtype, feature):
         if api is None:
             api = SdpaFwdDslSm90(q, k, v, o, sample_lse=stats, **extra)
             api.compile()
-            assert Path(api._k_mod.__file__).name == "prefill_d512_f16.py"
+            assert Path(api._k_mod.__file__).parts[-3:] == ("sm90", "f16_three_wg", "kernel.py")
             assert api._k_mod.SM90FusedMultiHeadAttentionForward.HEAD_TILE == 128
 
         def execute():
@@ -259,7 +260,8 @@ params = TemplateParams(dtype_qkv=(DTYPE_FP16, DTYPE_BF16)[int(sys.argv[2])], ha
                         bottom_right=False if case == "causal-tl-stats" else None, qh_per_kh=4//h_kv,
                         sched_policy=0 if not causal else 1 if stats else 2, stats_log2=case == "dense-log2-stats",
                         scale_mode=0 if case.startswith("zero") else -1 if case.startswith("negative") else 1)
-mod = _load_kernel_template(f"sm90/prefill_{flavor}_f16.py", params, tag=f"sm90_{flavor}_compile_test")
+folder = "d64_f16_one_wg" if flavor == "d64" else "f16_three_wg"
+mod = _load_kernel_template(f"sm90/{folder}/kernel.py", params, tag=f"sm90_{flavor}_compile_test")
 kernel = mod.SM90FusedMultiHeadAttentionForward((2, 4, h_kv, 70, 100), qh_per_kh=4//h_kv)
 assert kernel.HEAD_TILE == d and kernel.o_fragment_slots == (32 if d == 64 else 128)
 assert kernel.threads_per_cta == (256 if d == 64 else 384)
@@ -313,7 +315,7 @@ def test_native_d64_forward_and_changed_input_replay(dtype, causal, bottom_right
     lse = torch.empty(b, h, sq, device="cuda", dtype=torch.float32) if stats else None
     api = SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, is_causal=causal, causal_bottom_right=bottom_right, scale_softmax=scale)
     api.compile()
-    assert Path(api._k_mod.__file__).name == "prefill_d64_f16.py"
+    assert Path(api._k_mod.__file__).parts[-3:] == ("sm90", "d64_f16_one_wg", "kernel.py")
 
     def reference(q=q, k=k, v=v, o=o, lse=lse, storage=storage):
         scores = (q.double() @ k.double().repeat_interleave(h // h_kv, dim=1).transpose(-1, -2)) * (d**-0.5 if scale is None else scale)
