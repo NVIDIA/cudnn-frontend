@@ -34,7 +34,7 @@ def test_contract(cc, cga, paged):
         device_cc=cc,
         device_sm_count=148,
     )
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm100_d128_multi_q")
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=1, pack_gqa=True, tile_n=128, sched_policy=0)
     assert engines.mismatch(caps, facts, knobs) is None, engines.mismatch(caps, facts, knobs)
     assert engines.mismatch(caps, facts, replace(knobs, tile_n=64)) is not None
@@ -67,7 +67,7 @@ def _assert_direct_body(monkeypatch):
 
     def compile_direct(api):
         original(api)
-        assert api._k_mod.__file__.endswith("sm100/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith(("sm100/prefill_d128_f16.py", "sm100/d128_f16_multi_q/kernel.py"))
         assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 64
         assert api._k_mod.CFG.PACK_GQA and api._k_mod.CFG.THD_VARLEN
         assert not api._k_mod._FP32_PARTIALS and not api.packed_thd_split
@@ -118,7 +118,7 @@ def test_nonpaged_origins(dtype, cga, stats, monkeypatch):
     from test_sdpa_fwd_thd_origins import test_independent_thd_origins_rebind_and_capture as run
 
     seen = _assert_direct_body(monkeypatch)
-    run(64, dtype, stats, True, True, 1, engine_name="sdpa_fwd_prefill_sm100", cga=cga)
+    run(64, dtype, stats, True, True, 1, engine_name="sdpa_fwd_sm100_d128_multi_q", cga=cga)
     assert seen
 
 
@@ -137,7 +137,7 @@ def test_batch_and_golden(dtype, cga, paged, monkeypatch):
     from test_sdpa_single_sequence_setup_sm107 import test_single_sequence_batch_bytes as run
 
     seen = _assert_direct_body(monkeypatch)
-    run(64, dtype, cga, True, 128, engine_name="sdpa_fwd_prefill_sm100", paged=paged)
+    run(64, dtype, cga, True, 128, engine_name="sdpa_fwd_sm100_d128_multi_q", paged=paged)
     assert seen
 
 

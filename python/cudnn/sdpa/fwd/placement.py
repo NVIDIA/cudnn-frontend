@@ -686,6 +686,10 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d128_fp8_swap_ab.contract import NAME as SMALL_FP8_SWAP_AB
     from .kernels.sm100.d192_f16_multi_q.contract import NAME as D192_HALF_MULTI_Q
     from .kernels.sm100.d128_f16_single_q.contract import NAME as HALF_SINGLE_Q
+    from .kernels.sm100.d128_f16_multi_q.contract import NAME as SMALL_HALF_MULTI_Q
+    from .kernels.sm100.d64_f16_quadrant.contract import NAME as HALF_QUADRANT
+    from .kernels.sm100.d256_f16_contract import SWAP_AB as HALF_SWAP_AB
+    from .kernels.sm100.small_half_contract import in_domain as in_small_half_domain
 
     from .kernels.sm120.d512_f16_paired.contract import NAME as SM120_D512_PAIRED, LEGACY_ROW as SM120_LEGACY_ROW
 
@@ -694,6 +698,16 @@ def place(spec, facts, knobs=None) -> str:
     measured = placement_table.lookup(spec.name, facts)
     if measured is not None:
         return LEAD if measured else TRAIL
+
+    if in_small_half_domain(facts) and spec.capabilities.implementation in (SMALL_HALF_MULTI_Q, HALF_SINGLE_Q, HALF_QUADRANT, HALF_SWAP_AB):
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm100_small_half_geometry
+
+        selected = select_sm100_small_half_geometry(facts, replace(knobs, tile_m=128))
+        if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
+            return TRAIL
+        spec = sm100_legacy_policy_spec()
 
     if spec.capabilities.implementation in IMPLEMENTATIONS:
         # Preserve the frozen parent's placement only for the implementation
@@ -796,7 +810,7 @@ def place(spec, facts, knobs=None) -> str:
         from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
         from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
 
-        if in_pilot_domain(facts) or in_wide_half_domain(facts) or in_d192_half_domain(facts):
+        if in_pilot_domain(facts) or in_wide_half_domain(facts) or in_d192_half_domain(facts) or in_small_half_domain(facts):
             # Historical study queries can still use the old row name. Its
             # class and hand-rule fallback must use the same policy domain.
             spec = sm100_legacy_policy_spec()

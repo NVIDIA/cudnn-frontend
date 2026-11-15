@@ -48,7 +48,7 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
 
     def record_template(path, params, *args, **kwargs):
         module = original_load(path, params, *args, **kwargs)
-        if path.endswith("/sm100/prefill_d128_f16.py") and params.d_flavor == 64:
+        if path.endswith("/sm100/d128_f16_multi_q/kernel.py") and params.d_flavor == 64:
             loaded_modules.append(module)
         return module
 
@@ -91,7 +91,7 @@ def test_d64_causal_softmax_rebind_and_replay(cga, packed, bottom_right, with_si
         stats.set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
-        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm100"]
+        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_sm100_d128_multi_q"]
         knobs = {
             getattr(cudnn.knob_type, n): v for n, v in dict(TILE_M=128, TILE_N=128, TILE_CGA_M=cga, PACK_GQA=int(packed), SPLIT_KV=1, SCHED_POLICY=1).items()
         }

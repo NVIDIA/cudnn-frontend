@@ -32,7 +32,7 @@ from frost_test_utils import _SM, requires_dsl, requires_rubin
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_ROW_SM100 = "sdpa_fwd_prefill_sm100"
+_ROW_SM100 = "sdpa_fwd_sm100_d128_multi_q"
 _ROW_SM107 = "sdpa_fwd_prefill_sm107"
 requires_sm100_line = pytest.mark.skipif(_SM not in (100, 103), reason="needs a cc 10.0 / 10.3 device, have " + ("none" if _SM is None else f"sm_{_SM}"))
 

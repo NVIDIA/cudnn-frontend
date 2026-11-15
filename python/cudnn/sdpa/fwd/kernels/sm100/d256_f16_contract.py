@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Lightweight identities/geometry shared by the two exact-D256 half engines.
+"""Lightweight identities/geometry for lookahead and half swap-AB engines.
 
 No performance policy, DSL imports or adapter state lives here. Heuristics
 chooses a geometry; support and build consume that same immutable choice.
@@ -34,6 +34,9 @@ def in_pilot_domain(facts):
 class D256Geometry:
     implementation: str
     query_tile: int
+    head_dim: int = 256
+    live_columns: int = 0
+    early_q: bool = False
 
     @property
     def cga(self):
@@ -62,12 +65,23 @@ class D256Geometry:
             split_kv=1 if knobs.split_kv is None else knobs.split_kv,
         )
 
+    def configure_params(self, params):
+        if self.head_dim == 256:
+            return params
+        from cudnn.sdpa.fwd.config_fp8_decode_common import TemplateParamsDecode
 
-def explicit_geometry(implementation, knobs):
+        values = vars(replace(params, decode_q_tile=self.query_tile, dual_kv_stream=False, early_q=self.early_q)).copy()
+        values.update(decode_head_dim=self.head_dim, decode_live_columns=self.live_columns)
+        return TemplateParamsDecode(**values)
+
+
+def explicit_geometry(implementation, knobs, *, facts=None):
     """Fixed defaults within an already-selected implementation; no crossover."""
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown D256 implementation: {implementation}")
     default = 16 if implementation == SWAP_AB else 128
+    if implementation == SWAP_AB and facts is not None and (facts.d_qk, facts.d_v) == (128, 128):
+        return D256Geometry(implementation, default if knobs is None or knobs.tile_m is None else knobs.tile_m, head_dim=128, live_columns=8, early_q=True)
     return D256Geometry(implementation, default if knobs is None or knobs.tile_m is None else knobs.tile_m)
 
 
@@ -75,11 +89,14 @@ def mismatch(implementation, facts, knobs):
     """The implementation-specific part of support, after common graph checks."""
     if facts.device_cc not in ((10, 0), (10, 3)):
         return f"requires SM100/SM103; current device is {facts.device_cc}"
-    if not in_pilot_domain(facts):
+    from .small_half_contract import in_domain as in_small_domain
+
+    small_swap = implementation == SWAP_AB and (facts.d_qk, facts.d_v) == (128, 128) and in_small_domain(facts) and facts.uniform_dtype
+    if not (in_pilot_domain(facts) or small_swap):
         return "this implementation serves exact D_qk=D_v=256 half graphs on SM100/SM103"
     if facts.has_epilogue_gate or facts.attn_scale_prefolded:
         return "the SM100 D256 half implementations do not carry a gate or pre-folded scale"
-    geometry = explicit_geometry(implementation, knobs)
+    geometry = explicit_geometry(implementation, knobs, facts=facts)
     reason = _CONTRACTS[implementation].mismatch(facts, knobs)
     if reason is not None:
         return reason

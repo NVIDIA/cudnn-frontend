@@ -106,9 +106,11 @@ from .kernels.sm100.d128_fp8_dual_kv import contract as _small_fp8_dual_kv
 from .kernels.sm100.d128_fp8_swap_ab import contract as _small_fp8_swap_ab
 from .kernels.sm100.d192_f16_multi_q import contract as _d192_half_multi_q
 from .kernels.sm100.d128_f16_single_q import contract as _half_single_q
+from .kernels.sm100.d128_f16_multi_q import contract as _small_half_multi_q
+from .kernels.sm100.d64_f16_quadrant import contract as _half_quadrant
 
 _SMALL_FP8_CONTRACTS = {module.NAME: module for module in (_small_fp8_multi_q, _small_fp8_dual_kv, _small_fp8_swap_ab)}
-_D192_HALF_CONTRACTS = {module.NAME: module for module in (_d192_half_multi_q, _half_single_q)}
+_HALF_CONTRACTS = {module.NAME: module for module in (_d192_half_multi_q, _half_single_q, _small_half_multi_q, _half_quadrant)}
 
 from .kernels.sm120.d512_f16_paired.contract import (
     DEVICE_CCS as _SM120_DEVICE_CCS,
@@ -1869,8 +1871,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _SMALL_FP8_CONTRACTS[capabilities.implementation].mismatch(facts, knobs)
         if reason is not None:
             return reason
-    if capabilities.implementation in _D192_HALF_CONTRACTS:
-        reason = _D192_HALF_CONTRACTS[capabilities.implementation].mismatch(facts, knobs)
+    if capabilities.implementation in _HALF_CONTRACTS:
+        reason = _HALF_CONTRACTS[capabilities.implementation].mismatch(facts, knobs)
         if reason is not None:
             return reason
     if capabilities.implementation in _D256_IMPLEMENTATIONS:
@@ -2981,15 +2983,14 @@ class EngineSpec:
 def _sm100_spec() -> EngineSpec:
     """Legacy f16/bf16 SM100 row for widths/envelopes not yet delegated.
 
-    Exact D192/V128 and D256/D512/D576 on SM100/SM103 have explicit implementation owners.
+    Exact D32/D64/D128, D192/V128 and D256/D512/D576 on SM100/SM103 have explicit implementation owners.
     For retained graphs the adapter picks the smallest kernel flavor (d128 / d192xd128 / d256 / d512) covering the graph's head
     dims (api_dsl._pick_flavor), and every flavor serves its envelope via TMA
     zero-padding. The d128 flavor has two tiles behind one knob: TILE_CGA_M=2
     is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
     tile (128 rows per CTA, sm100/decode_d128_f16.py) -- the "decode vs prefill
     by S_q" kernel choice EngineSpec.lower anticipates, driven by the
-    heuristics' cga rule. sm_hi=106: no f16 lowering exists on the Rubin line —
-    when one lands it gets its own row (the per-arch-line row doctrine)."""
+    heuristics' cga rule. The separate SM107 row owns Rubin lowering."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100",
         capabilities=Capabilities(
@@ -2997,7 +2998,11 @@ def _sm100_spec() -> EngineSpec:
             sm_lo=_BLACKWELL[0],
             sm_hi=106,
             phase="prefill",
-            delegated_exact=frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE)),
+            delegated_exact=frozenset(
+                (cc, shape)
+                for cc in ((10, 0), (10, 3))
+                for shape in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE)
+            ),
             # (64, 64) is a NATIVE flavor, not an envelope: it compiles the d128
             # file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of
             # zero-filling a 128-wide tile for gpt-oss-class head dims.  (32, 32)
@@ -3114,7 +3119,7 @@ def _sm100_spec() -> EngineSpec:
 
 
 def _sm100_d192_half_specs():
-    """Two fixed half bodies retain the exact D192/V128 graph domain."""
+    """The D192 multi-Q owner and the shared D64/D128/D192 single-Q owner."""
     from .kernels.sm100.d192_f16_multi_q.host import lower as lower_multi_q
     from .kernels.sm100.d128_f16_single_q.host import lower as lower_single_q
 
@@ -3143,22 +3148,73 @@ def _sm100_d192_half_specs():
         sched_policies_by_d_shape=(),
     )
     multi_q = replace(base, implementation=_d192_half_multi_q.NAME)
+    single_shapes = frozenset({(64, 64), (128, 128), (192, 128)})
     single_q = replace(
-        base,
+        _sm100_spec().capabilities,
+        delegated_exact=frozenset(),
         implementation=_half_single_q.NAME,
+        d_shapes=single_shapes,
+        d_envelope_floors=(),
+        # Exact D32 paged THD already used the D64 single-Q envelope.
+        thd_d_shapes=single_shapes | {(32, 32)},
+        paged_d_shapes=single_shapes,
+        split_d_shapes=single_shapes,
+        pack_gqa_d_shapes=single_shapes,
+        pack_gqa_partial_d_shapes=frozenset({(128, 128)}),
+        thd_pack_gqa_d_shapes=frozenset({(64, 64), (128, 128)}),
+        dense_only_d_shapes=frozenset(),
+        bias=False,
+        kv_mask=False,
+        score_max=False,
+        score_sum_exp=False,
         cgas=frozenset({1}),
-        paged_kv=False,
-        paged_d_shapes=frozenset(),
-        split_kv_supported=True,
-        split_d_shapes=shape,
+        cgas_by_d_shape=(),
         split_cgas_by_d_shape=(),
-        pack_gqas=frozenset({False}),
-        pack_gqa_d_shapes=frozenset(),
-        thd_pack_gqa_d_shapes=frozenset(),
+        tile_ns_by_d_shape=(),
+        sched_policies_by_d_shape=(),
     )
     return tuple(
         EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
         for caps, lower in ((multi_q, lower_multi_q), (single_q, lower_single_q))
+    )
+
+
+def _sm100_small_half_specs():
+    """Independent multi-Q and quadrant bodies; exact widths retain legal envelopes."""
+    from .kernels.sm100.d128_f16_multi_q.host import lower as lower_multi_q
+    from .kernels.sm100.d64_f16_quadrant.host import lower as lower_quadrant
+
+    shapes = frozenset({(32, 32), (64, 64), (128, 128)})
+    multi_q = replace(
+        _sm100_spec().capabilities,
+        delegated_exact=frozenset(),
+        implementation=_small_half_multi_q.NAME,
+        d_shapes=shapes,
+        d_envelope_floors=(),
+    )
+    quadrant = replace(
+        multi_q,
+        implementation=_half_quadrant.NAME,
+        d_shapes=frozenset({(64, 64)}),
+        dense_only_d_shapes=frozenset(),
+        mixed_fp8_kv_d_shapes=frozenset(),
+        thd=False,
+        thd_padded_stats=False,
+        bias=False,
+        kv_mask=False,
+        score_max=False,
+        score_sum_exp=False,
+        cgas=frozenset({1}),
+        cgas_by_d_shape=(),
+        tile_ns_by_d_shape=(),
+    )
+    return (
+        EngineSpec(
+            multi_q.implementation,
+            multi_q,
+            partial(lower_multi_q, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs, selected_shape=_selected_d_shape),
+        ),
+        EngineSpec(quadrant.implementation, quadrant, partial(lower_quadrant, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs)),
     )
 
 
@@ -3234,6 +3290,8 @@ def _sm100_d256_specs():
     swap_ab = replace(
         base,
         implementation=_D256_SWAP_AB,
+        d_shapes=frozenset({(128, 128), (256, 256)}),
+        paged_d_shapes=frozenset({(128, 128), (256, 256)}),
         thd=False,
         thd_padded_stats=False,
         cgas=frozenset({1}),
@@ -5368,6 +5426,7 @@ def _sm90_specs():
 ENGINE_SPECS = (
     _sm100_spec(),
     *_sm100_d192_half_specs(),
+    *_sm100_small_half_specs(),
     *_sm100_d256_specs(),
     *_sm100_d512_specs(),
     _sm100_mxfp8_spec(),

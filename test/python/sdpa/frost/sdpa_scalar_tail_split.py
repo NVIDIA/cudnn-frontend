@@ -18,6 +18,8 @@ def test_half_scalar_tail_explicit_candidate_admission(device_cc, d_shape):
     if device_cc in ((10, 0), (10, 3)) and d_shape == (256, 256):
         name = "sdpa_fwd_sm100_d256_lookahead"
     cga = 2
+    if device_cc in ((10, 0), (10, 3)) and d_shape in ((64, 64), (128, 128), (192, 128)):
+        name = "sdpa_fwd_sm100_d192_multi_q" if d_shape == (192, 128) else "sdpa_fwd_sm100_d128_multi_q"
     if device_cc in ((10, 0), (10, 3)) and d_shape == (512, 512):
         name, cga = "sdpa_fwd_sm100_d512_role_split", 4
     caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == name)
