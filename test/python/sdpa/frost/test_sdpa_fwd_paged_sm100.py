@@ -223,7 +223,13 @@ def _run_graph(
     elif explicit_knobs is None:
         g.create_execution_plans([cudnn.heur_mode.A])
     else:
+        from collections.abc import Mapping
+
         from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        if isinstance(explicit_knobs, Mapping):
+            explicit_knobs = SdpaFwdKnobs.from_public(explicit_knobs)
 
         explicit_name = engine_name(arch=arch)
         if arch == "sm100":
@@ -236,6 +242,11 @@ def _run_graph(
             if d == d_v and d in (32, 64, 128):
                 # Explicit layout fixtures request the single-Q or multi-Q body directly.
                 explicit_name = "sdpa_fwd_sm100_d128_single_q" if explicit_knobs.cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+        if arch == "sm107" and (d, d_v) in ((512, 512), (576, 512)):
+            from dataclasses import replace
+
+            explicit_name = "sdpa_fwd_sm107_d512_2x2"
+            explicit_knobs = replace(explicit_knobs, tile_m=64, cga=2 if d == 576 else 4)
         g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
     plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:

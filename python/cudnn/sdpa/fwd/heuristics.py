@@ -50,6 +50,7 @@ from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 import cudnn
 
 from cudnn.engines.base import PlanConfig
+from .implementation_selection import select_sm107_d512_geometry
 from cudnn.frost.tile_dsl.constants import (
     DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
@@ -3823,6 +3824,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
     """
+    from .kernels.sm107 import d512_half_contract as sm107_wide_half
+
+    if sm107_wide_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm107_d512_geometry, policy=sm100_legacy_policy_spec(sm107_wide_half.LEGACY_ROW))
     from .kernels.sm100.d256_f16_contract import in_pilot_domain
 
     if in_pilot_domain(facts):

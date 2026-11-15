@@ -983,7 +983,7 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     assert facts.attn_scale_prefolded is True and facts.scale is None and not facts.dynamic_scale
     # Served by the rows claiming the arm for the SELECTED flavor (the cc 10.7 half row at d512 here), by no other.
     served = _eligible(g)
-    assert "sdpa_fwd_prefill_sm107" in served
+    assert {"sdpa_fwd_sm107_d512_role_split", "sdpa_fwd_sm107_d512_2x2"} <= served
     assert all(specs[n].capabilities.attn_scale_prefolded_d_shapes is not None for n in served), served
     # False is the default: the same eligibility as no request, and the node stays backend-lowerable.
     g_false = _mk_prefolded_graph(False)
@@ -1060,11 +1060,11 @@ def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
     assert "owned by" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, ordinary_fp8)
     # Routing declines on a claiming row: the paged-KV bodies and the single-CTA half THD legs apply the
     # scale in-kernel (api_dsl._load_sm100_kernel_module), so the fold must never reach them.
-    half = specs["sdpa_fwd_prefill_sm107"].capabilities
+    half = specs["sdpa_fwd_sm107_d512_2x2"].capabilities
     assert engines.mismatch(half, facts) is None
     assert "paged" in engines.mismatch(half, dataclasses.replace(facts, has_paged_kv=True))
     thd192 = dataclasses.replace(facts, thd=True, d_qk=192, d_v=128)
-    assert engines.mismatch(half, thd192, engines.SdpaFwdKnobs(cga=1)) is not None
+    assert engines.mismatch(specs["sdpa_fwd_prefill_sm107"].capabilities, thd192, engines.SdpaFwdKnobs(cga=1)) is not None
 
 
 def test_knob_request_lpt_sched_is_in_domain():
@@ -1171,6 +1171,8 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert by_name["sdpa_fwd_sm100_d256_lookahead"].pack_gqa_partial_d_shapes == frozenset({(256, 256)})
     assert by_name["sdpa_fwd_sm100_d512_2x2"].pack_gqa_partial_d_shapes == frozenset({(576, 512)})
     assert by_name["sdpa_fwd_sm100_d512_role_split"].pack_gqa_partial_d_shapes is None
+    assert by_name["sdpa_fwd_sm107_d512_role_split"].pack_gqa_partial_d_shapes is None
+    assert by_name["sdpa_fwd_sm107_d512_2x2"].pack_gqa_partial_d_shapes == frozenset({(512, 512), (576, 512)})
     small_half_owners = ("sdpa_fwd_sm100_d128_multi_q", "sdpa_fwd_sm100_d128_single_q", "sdpa_fwd_sm100_d64_quadrant")
     for name, shapes in zip(small_half_owners, ({(128, 128)}, {(128, 128)}, set())):
         caps = by_name[name]
@@ -1189,6 +1191,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
             "sdpa_fwd_sm100_d256_lookahead",
             "sdpa_fwd_sm100_d512_2x2",
             native_sm107,
+            "sdpa_fwd_sm107_d512_2x2",
             native_sm90,
             native_sm120,
             "sdpa_fwd_sm120_d512_paired",

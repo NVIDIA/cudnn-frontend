@@ -76,6 +76,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
 )
 from cudnn.sdpa.fwd.config_d128_family import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
+from cudnn.sdpa.fwd.kernels.sm107 import d512_half_contract as _sm107_wide_half
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import (
     LOOKAHEAD as _D256_LOOKAHEAD,
     SWAP_AB as _D256_SWAP_AB,
@@ -1507,6 +1508,8 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     cga1-only 32-wide one), so the domain returned is that flavor's.  Without
     it (the heuristics' auto pick) the domain is the dense selection's."""
 
+    if capabilities.implementation in _sm107_wide_half.IMPLEMENTATIONS:
+        return frozenset({_sm107_wide_half.explicit_geometry(capabilities.implementation, facts).cluster_m})
     if capabilities.implementation == _sm107_swap_fp8_owner.NAME:
         return frozenset({1})
     if capabilities.implementation in _D512_IMPLEMENTATIONS:
@@ -1893,6 +1896,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _d256_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
+    if capabilities.implementation in _sm107_wide_half.IMPLEMENTATIONS:
+        reason = _sm107_wide_half.mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
+        # The legacy shared checks name the MMA pair and logical 128-row recipe.
+        # Physical cluster and actual CTA tile were validated by the owner above.
+        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), cgas=frozenset({2}))
+        legacy_knobs = replace(knobs, tile_m=128, cga=2) if knobs is not None else None
+        return mismatch(legacy_caps, facts, legacy_knobs)
     if capabilities.implementation in _D512_IMPLEMENTATIONS:
         reason = _d512_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
@@ -3431,6 +3443,7 @@ def _sm107_spec() -> EngineSpec:
             layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
+            delegated_exact=frozenset({((10, 7), (512, 512)), ((10, 7), (576, 512))}),
             phase="prefill",
             # Every f16 flavor has a Rubin module -- api_dsl._SM107_KERNEL_FILES
             # is the other half of this claim, and _pick_flavor lands a d=192
@@ -3584,6 +3597,57 @@ def _sm107_spec() -> EngineSpec:
             tile_ns_by_d_shape=SM107_TILE_NS_BY_D_SHAPE,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
+    )
+
+
+def _sm107_wide_half_specs():
+    """Native Rubin wide-half owners; common graph semantics stay shared."""
+    from .kernels.sm107.d512_f16_role_split.host import lower as lower_role_split
+    from .kernels.sm107.d512_f16_2x2.host import lower as lower_two_by_two
+
+    base = replace(
+        _sm107_spec().capabilities,
+        delegated_exact=frozenset(),
+        sm_hi=107,
+        d_shapes=frozenset({(512, 512), (576, 512)}),
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        paged_d_shapes=frozenset({(512, 512), (576, 512)}),
+        mixed_fp8_kv_d_shapes=frozenset({(512, 512)}),
+        pack_gqa_d_shapes=frozenset({(512, 512), (576, 512)}),
+        pack_gqa_partial_d_shapes=frozenset({(512, 512), (576, 512)}),
+        thd_d_shapes=frozenset({(512, 512)}),
+        thd_pack_gqa_d_shapes=frozenset(),
+        dense_only_d_shapes=frozenset(),
+        native_legs_by_d_shape=(),
+        epilogue_gate=False,
+        epilogue_gate_d_shapes=None,
+        bias=False,
+        kv_mask=False,
+        score_max=False,
+        score_sum_exp=False,
+        cgas_by_d_shape=(),
+        split_cgas_by_d_shape=(),
+        tile_ms_by_d_shape=(),
+        tile_ns_by_d_shape=(),
+        sched_policies_by_d_shape=(),
+    )
+    role_split = replace(
+        base,
+        implementation=_sm107_wide_half.ROLE_SPLIT,
+        d_shapes=frozenset({(512, 512)}),
+        tile_ms=frozenset({128}),
+        cgas=frozenset({4}),
+        paged_kv=False,
+        mixed_fp8_kv_d_shapes=frozenset(),
+        pack_gqas=frozenset({False}),
+        pack_gqa_partial_d_shapes=None,
+        split_kv_supported=False,
+    )
+    two_by_two = replace(base, implementation=_sm107_wide_half.TWO_BY_TWO, tile_ms=frozenset({64}), cgas=frozenset({2, 4}))
+    return tuple(
+        EngineSpec(caps.implementation, caps, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+        for caps, lower in ((role_split, lower_role_split), (two_by_two, lower_two_by_two))
     )
 
 
@@ -4998,7 +5062,7 @@ def lower_dsl_prefill(
             # Native D64 and paged D192 use the same per-port origins as native D128.
             facts.thd
             and facts.epilogue_gate_t is None
-            and spec.name == "sdpa_fwd_prefill_sm107"
+            and lowering_row_name == "sdpa_fwd_prefill_sm107"
             and (api._rubin_native_d64_pack_leg() or api._rubin_native_d192_paged_leg())
         )
         or (
@@ -5015,7 +5079,7 @@ def lower_dsl_prefill(
             # Q/K/V/O origins, including interior padding in every port.
             facts.thd
             and facts.epilogue_gate_t is None
-            and spec.name == "sdpa_fwd_prefill_sm107"
+            and lowering_row_name == "sdpa_fwd_prefill_sm107"
             and facts.device_cc == (10, 7)
             and (facts.d_qk, facts.d_v) == (256, 256)
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
@@ -5034,7 +5098,7 @@ def lower_dsl_prefill(
         )
         or (
             facts.thd
-            and spec.name == "sdpa_fwd_prefill_sm107"
+            and lowering_row_name == "sdpa_fwd_prefill_sm107"
             and api.flavor == (512, 512)
             and not facts.has_paged_kv
             and facts.epilogue_gate_t is None
@@ -5700,6 +5764,7 @@ ENGINE_SPECS = (
     *_sm100_small_fp8_specs(),
     _sm100_fp8_spec(arch="sm107"),
     _sm107_spec(),
+    *_sm107_wide_half_specs(),
     _sm107_mxfp8_spec(),
     _sm120_spec(),
     _sm120_d512_paired_spec(),

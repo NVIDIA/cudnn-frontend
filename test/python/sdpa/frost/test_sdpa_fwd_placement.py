@@ -1095,7 +1095,7 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
         ("sdpa_fwd_sm100_d512_2x2", (10, 0), 148, {}),
         ("sdpa_fwd_sm100_d512_fp8_role_split", (10, 0), 148, _SM107_FP8_QUANT),
         ("sdpa_fwd_sm90_f16_three_wg", (9, 0), 132, {}),
-        ("sdpa_fwd_prefill_sm107", (10, 7), 216, {}),
+        ("sdpa_fwd_sm107_d512_2x2", (10, 7), 216, {}),
         ("sdpa_fwd_sm107_d512_fp8_role_split", (10, 7), 216, _SM107_FP8_QUANT),
     ],
 )

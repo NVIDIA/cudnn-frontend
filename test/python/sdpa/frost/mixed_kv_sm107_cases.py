@@ -327,7 +327,18 @@ def d256_admission(qdtype, kvdtype, monkeypatch):
 @torch_fork_set_rng(seed=40144)
 def d512_dense_paged(qdtype, kvdtype, layout, splits, monkeypatch, cudnn_handle):
     checks.check_dense_paged_rebind_capture(
-        qdtype, kvdtype, 2, layout, splits, "graph", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=True, cpu_reference=True, head_dim=512
+        qdtype,
+        kvdtype,
+        2,
+        layout,
+        splits,
+        "graph",
+        monkeypatch,
+        cudnn_handle,
+        engine_name="sdpa_fwd_sm107_d512_2x2",
+        pack=True,
+        cpu_reference=True,
+        head_dim=512,
     )
 
 
@@ -341,7 +352,18 @@ def d512_standalone(qdtype, kvdtype, splits, monkeypatch, cudnn_handle):
     # The uniform-half A/B seam must not route mixed KV into a half-only body.
     monkeypatch.setattr(api_dsl, "D512_2X2", False)
     checks.check_dense_paged_rebind_capture(
-        qdtype, kvdtype, 2, "dense", splits, "standalone", monkeypatch, cudnn_handle, engine_name=_ENGINE, pack=False, cpu_reference=True, head_dim=512
+        qdtype,
+        kvdtype,
+        2,
+        "dense",
+        splits,
+        "standalone",
+        monkeypatch,
+        cudnn_handle,
+        engine_name="sdpa_fwd_sm107_d512_2x2",
+        pack=False,
+        cpu_reference=True,
+        head_dim=512,
     )
 
 
@@ -359,7 +381,7 @@ def d512_mqa(qdtype, kvdtype, layout, q_tokens, monkeypatch, cudnn_handle):
         "graph",
         monkeypatch,
         cudnn_handle,
-        engine_name=_ENGINE,
+        engine_name="sdpa_fwd_sm107_d512_2x2",
         pack=True,
         cpu_reference=True,
         head_dim=512,
@@ -389,7 +411,9 @@ def d512_admission(qdtype, kvdtype, monkeypatch):
     from cudnn.sdpa.fwd import engines, config_sm107
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams, d512_2x2_smem_bytes
 
-    spec, facts = checks.check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 7), head_dim=512, cga=2)
+    spec, facts = checks.check_graph_dtype_facts_and_admission(
+        qdtype, kvdtype, monkeypatch, cc=(10, 7), head_dim=512, cga=2, engine_name="sdpa_fwd_sm107_d512_2x2"
+    )
     for changed, knobs in [
         (facts, engines.SdpaFwdKnobs(cga=1)),
         (replace(facts, thd=True, stats_t=None), engines.SdpaFwdKnobs(cga=2)),
