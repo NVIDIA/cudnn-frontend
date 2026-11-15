@@ -18,7 +18,7 @@ from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.cuda import tensor_map as tmap
 from typing import Optional
 
-from cudnn.sdpa.bwd.config_sm100_d192_dkdv_fp8 import make_config
+from cudnn.sdpa.bwd.kernels.sm100.fp8_pair.config_dkdv import make_config
 
 LOG2E = 1.4426950408889634
 FP8 = cutlass.Float8E4M3FN
