@@ -1097,6 +1097,20 @@ def make_cfg_d512_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
     return cfg, _tma_iters(cfg)
 
 
+def d512_mxfp8_retains_p(cfg: CfgD256, split_kv: int) -> bool:
+    """Whether a D512 MXFP8 configuration runs the retained-P body (exact top-left SWA of one KV tile, unsplit);
+    every other configuration runs output-slice recompute."""
+    return (
+        cfg.CTA_MMA == 1
+        and (cfg.MASK_FLAGS & ~MASK_PADDED) == (MASK_CAUSAL | MASK_SWA)
+        and cfg.WINDOW_LEFT == cfg.TILE_N - 1
+        and cfg.WINDOW_RIGHT == 0
+        and cfg.BOTTOM_RIGHT == 0
+        and (cfg.SEQ_KV_LENS_PRESENT == 0 or cfg.THD_VARLEN == 1)
+        and split_kv == 1
+    )
+
+
 # ---------------------------------------------------------------------------
 # d512 flavor on the 2x2 DATAPATH -- d_qk = d_v = 512, SM100, sm100/d512_f16_2x2/kernel.py
 #

@@ -2975,9 +2975,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(
-            g, (engine_name(mxfp8=True), *(mxfp8_engine_name("sm100", d, v) for d, v in ((128, 128), (192, 128), (256, 256))))
-        )
+        return g is not None and offers_engine(g, mxfp8_engine_names())
 
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"

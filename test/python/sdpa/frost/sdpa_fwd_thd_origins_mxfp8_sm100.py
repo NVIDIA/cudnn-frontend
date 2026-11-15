@@ -5,7 +5,7 @@
 import pytest
 from frost_test_utils import mxfp8_engine_name
 
-from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl
+from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, sm100_mxfp8_owner
 from sdpa.frost.test_sdpa_fwd_thd_origins import test_independent_thd_origins_rebind_and_capture as _check_origins
 from sdpa.frost.test_sdpa_fwd_thd_origins_fp8_sm120 import _check_routes_and_invariance
 from sdpa.frost.test_sdpa_physical_origins_shared import _check_native_origins

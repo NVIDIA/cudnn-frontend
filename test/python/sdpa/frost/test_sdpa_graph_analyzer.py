@@ -3440,11 +3440,11 @@ def _mk_paged_mxfp8(*, page=128, max_pages=8, d=256, kh=2, s_q=1, thd=False, v_n
     return g
 
 
-def _mxfp8_reason(g):
+def _mxfp8_reason(g, name=None):
     from frost_test_utils import mxfp8_engine_name
 
     facts = _facts(g)
-    name = mxfp8_engine_name("sm100", facts.d_qk, facts.d_v)
+    name = name or mxfp8_engine_name("sm100", facts.d_qk, facts.d_v)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     return engines.analyze_for(spec, g)[1]
 
@@ -3457,8 +3457,11 @@ def test_paged_mxfp8_probe_accepts_and_declines():
     assert tuple(facts.sf_k_t.get_dim()) == (B * 8 + 3, 2, 128, 8)
     assert tuple(facts.sf_v_t.get_dim()) == (B * 8 + 3, 2, 4, 256)
     assert MXFP8_ENGINE in _eligible(g)
-    for kw in (dict(page=256), dict(d=128), dict(d=512)):
+    for kw in (dict(page=256), dict(d=128)):
         assert _mxfp8_reason(_mk_paged_mxfp8(**kw)) is None, kw
+    # Exact D512 has explicit owners; paged KV carries per-batch lengths, so output-slice recompute serves it.
+    assert "owned by" in _mxfp8_reason(_mk_paged_mxfp8(d=512), "sdpa_fwd_prefill_sm100_mxfp8")
+    assert _mxfp8_reason(_mk_paged_mxfp8(d=512), "sdpa_fwd_sm100_d512_mxfp8_slice_recompute") is None
     # a page holds whole 128-row SF atoms
     reason = _mxfp8_reason(_mk_paged_mxfp8(page=64))
     assert reason is not None and "multiple of 128" in reason, reason

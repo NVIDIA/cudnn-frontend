@@ -99,8 +99,11 @@ def test_other_implementations_do_not_enter_the_owner(overrides):
     assert engines.mismatch(SPECS[NAME].capabilities, facts(**overrides)) is not None
 
 
-def test_other_native_shape_keeps_legacy_owner():
-    assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, facts(d_qk=512, d_v=512)) is None
+def test_other_native_shape_keeps_its_explicit_owner():
+    wide = facts(d_qk=512, d_v=512)
+    assert "owned by" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, wide)
+    assert engines.mismatch(SPECS["sdpa_fwd_sm100_d512_mxfp8_slice_recompute"].capabilities, wide) is None
+    assert engines.mismatch(SPECS[NAME].capabilities, wide) is not None
     assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, facts(d_qk=224, d_v=208)) is not None
 
 
