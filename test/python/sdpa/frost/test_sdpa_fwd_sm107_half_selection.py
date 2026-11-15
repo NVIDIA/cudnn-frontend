@@ -184,3 +184,73 @@ def test_placement_does_not_import_selection_from_candidate_generator(monkeypatc
 
     monkeypatch.setattr(builtins, "__import__", guarded)
     assert placement.place(spec, f, knobs) in (placement.LEAD, placement.TRAIL)
+
+
+def test_selection_module_imports_without_registry_or_candidate_generator(monkeypatch):
+    import builtins
+    import importlib.util
+    from pathlib import Path
+
+    source = Path(engines.__file__).with_name("sm107_half_selection.py")
+    spec = importlib.util.spec_from_file_location("cudnn.sdpa.fwd._selection_import_probe", source)
+    module = importlib.util.module_from_spec(spec)
+    original = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if (
+            name in ("engines", "heuristics", "placement")
+            or name.startswith("cudnn.sdpa.fwd.")
+            and name.rsplit(".", 1)[-1] in ("engines", "heuristics", "placement")
+        ):
+            raise AssertionError("body policy imports the registry or candidate generator")
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    spec.loader.exec_module(module)
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("stats_layout", ["token", "head"])
+@pytest.mark.parametrize("compact", [False, True])
+def test_d64_origins_helper_keeps_architecture_scheduler_domain(monkeypatch, cc, dtype_name, stats_layout, compact):
+    import torch
+    from cudnn.frost import buffers
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+    import sdpa_d64_thd_split as helper
+    import test_sdpa_fwd_thd_origins as origins
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: cc)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    f = SdpaGraphFacts(
+        b=2,
+        h_q=8,
+        h_kv=2,
+        s_q=129,
+        s_kv=2048,
+        d_qk=64,
+        d_v=64,
+        dtype=cudnn.data_type.BFLOAT16 if dtype_name == "bfloat16" else cudnn.data_type.HALF,
+        thd=True,
+        device_cc=cc,
+        device_sm_count=148,
+    )
+    seen = []
+
+    def record(graph, engine_name, knobs=None):
+        k = engines.SdpaFwdKnobs.from_public(knobs)
+        seen.append(k.sched_policy)
+        spec = next(s for s in engines.ENGINE_SPECS if s.name == engine_name)
+        assert engines.mismatch(spec.capabilities, f, k) is None
+
+    def probe(d, dtype, layout, packed_stats, packed, splits, *, engine_name, cga, compact):
+        assert (d, dtype, layout, packed, splits) == (64, dtype_name, stats_layout, True, 9)
+        spec = next(s for s in engines.ENGINE_SPECS if s.name == engine_name)
+        k = engines.SdpaFwdKnobs(cga=cga, tile_n=128, pack_gqa=packed, split_kv=splits)
+        cudnn.pygraph.create_execution_plan(None, spec.name, k.to_public())
+
+    monkeypatch.setattr(cudnn.pygraph, "create_execution_plan", record)
+    monkeypatch.setattr(origins, "test_independent_thd_origins_rebind_and_capture", probe)
+    helper.test_origins_and_replay(dtype_name, stats_layout, True, 9, 2, compact, monkeypatch)
+    assert seen == [1 if cc == (10, 7) else 2]

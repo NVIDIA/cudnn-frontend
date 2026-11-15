@@ -51,7 +51,6 @@ import cudnn
 
 from cudnn.engines.base import PlanConfig
 from .implementation_selection import select_sm107_d512_geometry
-from .sm107_half_selection import select_sm107_half_geometry
 from cudnn.frost.tile_dsl.constants import (
     DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
@@ -110,6 +109,7 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    select_sm107_half_geometry,
     sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,

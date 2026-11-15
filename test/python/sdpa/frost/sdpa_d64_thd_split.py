@@ -55,9 +55,10 @@ def test_origins_and_replay(dtype_name, stats_layout, packed, splits, policy, co
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("SM100/SM103/SM107 nonpaged D64 split")
-    name = "sdpa_fwd_sm107_shared_single_q" if torch.cuda.get_device_capability() == (10, 7) else "sdpa_fwd_sm100_d128_single_q"
+    is_sm107 = torch.cuda.get_device_capability() == (10, 7)
+    name = "sdpa_fwd_sm107_shared_single_q" if is_sm107 else "sdpa_fwd_sm100_d128_single_q"
     original = cudnn.pygraph.create_execution_plan
-    effective_policy = min(policy, 1) if name.endswith("sm107") else policy
+    effective_policy = min(policy, 1) if is_sm107 else policy
 
     def select_schedule(graph, engine_id, knobs=None):
         return original(graph, engine_id, {**(knobs or {}), cudnn.knob_type.SCHED_POLICY: effective_policy})

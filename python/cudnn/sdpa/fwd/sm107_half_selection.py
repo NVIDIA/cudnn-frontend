@@ -1,30 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Capability-aware half body selection shared by recommendation and placement.
+"""Half body-selection policy shared by recommendation and placement.
 
-The registry supplies the historical domain and geometry helpers. Fixed hosts
-consume their selected contracts and never call this policy or the candidate
-generator.
+The registry resolves the historical capability domain into scalar geometry
+facts before calling this policy. This module never imports that registry or
+the candidate generator; fixed hosts do not call it.
 """
 
 from dataclasses import replace
 
-import cudnn
-
 from .config_sm100 import supports_paged_prefill_cga1
-from .engines import (
-    _facts_decode_form_kw,
-    _selected_d_shape,
-    _thd_decode_leg,
-    d256_decode_tile_selected,
-    decode_d256_q_tile_for_row,
-    packed_thd_split,
-    sm100_legacy_policy_spec,
-)
 
 
-def select_sm107_half_geometry(facts, knobs):
+def select_sm107_half_geometry(facts, knobs, *, flavor, packed_split, thd_decode, decode_tile):
     """Name the existing small/mid-width Rubin body before fixed lowering.
 
     Logical head width does not identify a body: native small tiles may use
@@ -37,20 +26,6 @@ def select_sm107_half_geometry(facts, knobs):
     from .kernels.sm107 import mid_half_contract as mid, small_half_contract as small
     from .kernels.sm107 import shared_half_contract as shared
 
-    if (
-        facts.device_cc != (10, 7)
-        or facts.invalid
-        or facts.is_backward
-        or facts.is_fp8
-        or facts.is_mxfp8
-        or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
-        or (facts.d_qk, facts.d_v) not in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256))
-    ):
-        raise ValueError("SM107 half selection requires exact supported small/mid-width forward declarations")
-    policy = sm100_legacy_policy_spec(small.LEGACY_ROW)
-    flavor = _selected_d_shape(policy.capabilities, facts, knobs)
-    if flavor not in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256)):
-        raise ValueError("SM107 half selection has no supported width envelope")
     d = flavor[0]
     split = knobs.split_kv or 1
     group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
@@ -63,7 +38,7 @@ def select_sm107_half_geometry(facts, knobs):
         if tile_n is None:
             tile_n = (
                 128
-                if d == 64 and packed_thd_split(policy.capabilities, facts, knobs)
+                if d == 64 and packed_split
                 else config.sm107_tile_n_pick(
                     d,
                     facts.s_kv,
@@ -118,15 +93,14 @@ def select_sm107_half_geometry(facts, knobs):
     if (
         d == 128
         and cga == 1
-        and _thd_decode_leg(policy.capabilities, facts)
+        and thd_decode
         and not supports_paged_prefill_cga1(
             flavor, device_cc=facts.device_cc, thd=facts.thd, paged=facts.has_paged_kv, fp8=False, split_kv=split, max_q=facts.s_q
         )
     ):
         return single_q()
-    if d == 256 and d256_decode_tile_selected(policy.capabilities, facts, group, split):
-        tile = decode_d256_q_tile_for_row(policy.capabilities, facts.s_q, group, **_facts_decode_form_kw(facts))
-        return mid.explicit_geometry(mid.SWAP_AB, facts, replace(resolved, tile_m=tile))
+    if d == 256 and decode_tile:
+        return mid.explicit_geometry(mid.SWAP_AB, facts, replace(resolved, tile_m=decode_tile))
     if cga == 1 and facts.thd and ((d == 192 and not facts.has_paged_kv) or (d == 128 and split > 1)):
         return single_q()
     if d == 256:

@@ -4092,6 +4092,30 @@ def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
 
 
+def select_sm107_half_geometry(facts, knobs):
+    """Resolve capability geometry for the shared policy, never for fixed hosts."""
+    from .sm107_half_selection import select_sm107_half_geometry as select
+
+    if not _sm107_shared_half.in_domain(facts):
+        raise ValueError("SM107 half selection requires exact supported small/mid-width forward declarations")
+    caps = sm100_legacy_policy_spec(_sm107_shared_half.LEGACY_ROW).capabilities
+    flavor = _selected_d_shape(caps, facts, knobs)
+    if flavor not in _sm107_shared_half.SHAPES:
+        raise ValueError("SM107 half selection has no supported width envelope")
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    decode_tile = 0
+    if flavor[0] == 256 and d256_decode_tile_selected(caps, facts, group, knobs.split_kv or 1):
+        decode_tile = decode_d256_q_tile_for_row(caps, facts.s_q, group, **_facts_decode_form_kw(facts))
+    return select(
+        facts,
+        knobs,
+        flavor=flavor,
+        packed_split=flavor[0] == 64 and knobs.tile_n is None and packed_thd_split(caps, facts, knobs),
+        thd_decode=flavor[0] == 128 and knobs.warp_spec_cfg != 1 and _thd_decode_leg(caps, facts),
+        decode_tile=decode_tile,
+    )
+
+
 def _sm100_small_fp8_specs():
     """Three fixed pipelines, each reusing the common graph lowering service."""
     from .kernels.sm100.d128_fp8_multi_q.host import lower as lower_multi_q
