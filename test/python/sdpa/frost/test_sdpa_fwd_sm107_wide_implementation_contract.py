@@ -31,6 +31,7 @@ def test_explicit_owner_and_physical_cluster(name, dq):
     assert engines.SdpaFwdKnobs.from_public(k.to_public()) == k
     assert (k.tile_m, k.cga, g.cta_group) == (128 if name == ROLE_SPLIT else 64, 2 if dq == 576 else 4, 2)
     assert engines.effective_cgas(SPECS[name].capabilities, f) == frozenset({g.cluster_m})
+    assert g.configure_params(TemplateParams()).d_flavor == (576 if dq == 576 else 128)
     assert engines.mismatch(SPECS[name].capabilities, f, replace(k, cga=1))
     assert engines.mismatch(SPECS[name].capabilities, f, replace(k, tile_m=32))
 
@@ -65,7 +66,8 @@ def test_fixed_host_does_not_reenter_selection(monkeypatch, sq, name):
     assert g.implementation == name
     assert args[2].tile_m == g.query_tile
     for before in (False, True):
-        assert g.configure_params(TemplateParams(mma_2x2=before)).mma_2x2 == (name == TWO_BY_TWO)
+        params = TemplateParams(mma_2x2=before)
+        assert g.configure_params(params) == replace(params, mma_2x2=name == TWO_BY_TWO)
 
 
 @pytest.mark.parametrize("paged", [False, True])
@@ -95,7 +97,7 @@ def test_central_policy_keeps_budget_order_and_placement(kind, dq):
     f = facts(d_qk=dq)
     policy = engines.sm100_legacy_policy_spec(LEGACY_ROW)
     old = heuristics._knob_sets(policy, f) if kind == "A" else [heuristics._fallback_knobs(policy, f)]
-    offered = {ROLE_SPLIT: 20554, TWO_BY_TWO: 20555, LEGACY_ROW: 20514}
+    offered = {ROLE_SPLIT: 20554, TWO_BY_TWO: 20555, LEGACY_ROW: 20515}
     expected = []
     for k in old:
         if engines.mismatch(policy.capabilities, f, k) is not None:
