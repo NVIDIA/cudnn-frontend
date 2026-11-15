@@ -3822,6 +3822,11 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_d512_fp8_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
+    if d512_mxfp8.in_domain(facts):
+        # The SWA band and SPLIT_KV name the body: retained P for exact top-left SWA of one KV tile, unsplit.
+        return _recommend_sm100_implementation(kind, facts, offered, d512_mxfp8.select_geometry, policy=sm100_legacy_policy_spec(d512_mxfp8.LEGACY_ROW))
     from .kernels.sm100.d256_fp8_single_q.contract import Geometry as Fp8D256Geometry, in_domain as in_d256_fp8_domain
 
     if in_d256_fp8_domain(facts):

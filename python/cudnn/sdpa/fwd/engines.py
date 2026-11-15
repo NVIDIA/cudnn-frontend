@@ -101,6 +101,7 @@ from .kernels.sm100.d512_fp8_role_split.contract import (
     NAME as _D512_FP8_ROLE_SPLIT,
     mismatch as _d512_fp8_implementation_mismatch,
 )
+from .kernels.sm100 import d512_mxfp8_contract as _d512_mxfp8
 from .kernels.sm100.d128_fp8_multi_q import contract as _small_fp8_multi_q
 from .kernels.sm100.d128_fp8_dual_kv import contract as _small_fp8_dual_kv
 from .kernels.sm100.d128_fp8_swap_ab import contract as _small_fp8_swap_ab
@@ -1895,6 +1896,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _d512_fp8_implementation_mismatch(facts, knobs)
         if reason is not None:
             return reason
+    if capabilities.implementation in _d512_mxfp8.IMPLEMENTATIONS:
+        reason = _d512_mxfp8.mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation == _SM120_D512_PAIRED:
         reason = _sm120_d512_paired_mismatch(facts, knobs)
         if reason is not None:
@@ -3565,6 +3570,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm100_mxfp8",
         capabilities=Capabilities(
+            delegated_exact=frozenset((cc, _d512_mxfp8.SHAPE) for cc in _d512_mxfp8.DEVICE_CCS),
             layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=_BLACKWELL[0],
             sm_hi=106,  # no Rubin MXFP8 lowering
@@ -4028,6 +4034,41 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         swap_abs=frozenset(),
     )
     return EngineSpec(_D512_FP8_ROLE_SPLIT, capabilities, partial(lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+
+
+def _sm100_d512_mxfp8_spec(implementation, host_lower) -> EngineSpec:
+    """One MXFP8 D512 body; shared graph binding and launch construction."""
+    shape = frozenset({_d512_mxfp8.SHAPE})
+    capabilities = replace(
+        _sm100_mxfp8_spec().capabilities,
+        implementation=implementation,
+        delegated_exact=frozenset(),
+        d_shapes=shape,
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+        thd_d_shapes=shape,
+        paged_d_shapes=shape,
+        split_d_shapes=shape,
+        cgas=frozenset({1}),
+        cgas_by_d_shape=(),
+        split_cgas_by_d_shape=(),
+    )
+    if implementation == _d512_mxfp8.RETAINED_P:
+        # The retained-P body runs unsplit; a split of the same band runs output-slice recompute.
+        capabilities = replace(capabilities, split_kv_supported=False, split_d_shapes=frozenset())
+    return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=lower_dsl_prefill, knob_type=SdpaFwdKnobs))
+
+
+def _sm100_d512_mxfp8_slice_recompute_spec() -> EngineSpec:
+    from .kernels.sm100.d512_mxfp8_slice_recompute.host import lower
+
+    return _sm100_d512_mxfp8_spec(_d512_mxfp8.SLICE_RECOMPUTE, lower)
+
+
+def _sm100_d512_mxfp8_retained_p_spec() -> EngineSpec:
+    from .kernels.sm100.d512_mxfp8_retained_p.host import lower
+
+    return _sm100_d512_mxfp8_spec(_d512_mxfp8.RETAINED_P, lower)
 
 
 def _sm107_mxfp8_spec() -> EngineSpec:
@@ -4810,7 +4851,7 @@ def lower_dsl_prefill(
         )
         or (
             facts.thd
-            and spec.name == "sdpa_fwd_prefill_sm100_mxfp8"
+            and lowering_row_name == "sdpa_fwd_prefill_sm100_mxfp8"
             and api.flavor in ((128, 128), (256, 256), (512, 512))
             and not facts.has_paged_kv
             and facts.epilogue_gate_t is None
@@ -5430,6 +5471,8 @@ ENGINE_SPECS = (
     *_sm100_d256_specs(),
     *_sm100_d512_specs(),
     _sm100_mxfp8_spec(),
+    _sm100_d512_mxfp8_slice_recompute_spec(),
+    _sm100_d512_mxfp8_retained_p_spec(),
     _sm100_fp8_spec(),
     _sm100_d512_fp8_spec(),
     _sm100_d256_fp8_spec(),
