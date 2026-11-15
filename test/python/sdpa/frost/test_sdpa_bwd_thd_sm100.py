@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``sdpa_bwd_sm100`` THD / varlen: the packed backward, end to end.
+"""Explicit SM100 D512 half owners on THD / varlen: the packed backward, end to end.
 
 Two surfaces, deliberately both:
 
@@ -35,7 +35,7 @@ import cudnn
 
 pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 
-_ENGINE = "sdpa_bwd_sm100"
+_ENGINE = "sdpa_bwd_sm100_d512_role_split"
 _D = 512
 _TOL_COS = 0.999
 
@@ -278,7 +278,8 @@ def test_thd_requires_declared_totals():
 # ---------------------------------------------------------------------------
 
 
-def _plan_index(g, name=_ENGINE):
+def _plan_index(g, name=None):
+    name = _ENGINE if name is None else name
     for i in range(g.get_execution_plan_count()):
         if name in g.get_plan_name_at_index(i):
             return i
@@ -558,12 +559,21 @@ def stage2_datapath(request, monkeypatch):
 
     from cudnn.sdpa.bwd import api_dsl
 
-    monkeypatch.setattr(api_dsl, "STAGE2_2X2", request.param)
+    owner = "sdpa_bwd_sm100_d512_2x2" if request.param else "sdpa_bwd_sm100_d512_role_split"
+    monkeypatch.setitem(globals(), "_ENGINE", owner)
+    # The physical-origin suite reuses this fixture with its own graph helper.
+    monkeypatch.setattr(request.module, "_ENGINE", owner)
+    if hasattr(request.module, "_ADAPTER"):
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+        monkeypatch.setattr(request.module, "_ADAPTER", SdpaBwdDslSm100D512TwoByTwo if request.param else SdpaBwdDslSm100D512RoleSplit)
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not request.param)
     served = []
     original = api_dsl.load_template
 
     def spy(path, params, tag="template"):
-        if tag == "sdpa_bwd_sm100_stage2":
+        if tag == owner + "_stage2":
             served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
@@ -572,7 +582,7 @@ def stage2_datapath(request, monkeypatch):
     with guard:
         yield request.param
     want = api_dsl._SM100_STAGE2_FILE_2X2 if request.param else api_dsl._SM100_STAGE2_FILE
-    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
+    assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (owner={owner})"
 
 
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
