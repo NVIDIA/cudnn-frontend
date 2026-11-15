@@ -976,7 +976,7 @@ def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[Cfg
 
 
 def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
-    """The 32-wide head-dim tile of ``sm100/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim <= 32 with
+    """The 32-wide head-dim tile of ``sm100/d128_f16_multi_q/kernel.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim <= 32 with
     D % 8 == 0 by TMA zero fill; cga1 (SM100_SMALL_D_CGAS); dense / causal / bottom-right / SWA / padded / sink / GQA like d128 plus the
     small-tile seams; THD / split-KV / paged KV / PackGQA / the score side outputs ride the d128 flavor (the row's ``dense_only_d_shapes``)."""
     if params.dtype_qkv not in (DTYPE_FP16, DTYPE_BF16):

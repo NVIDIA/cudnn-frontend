@@ -44,7 +44,7 @@ head-major); the amax_o atomicMax is gated on live rows. Dense path
 byte-identical.
 
 Paged KV (``CFG.PAGED_KV=1``, issue #920) is the f16 d128 kernel's specialization
-ported hunk-for-hunk (see sm100/prefill_d128_f16.py): K/V are page POOLS —
+ported hunk-for-hunk (see sm100/d128_f16_multi_q/kernel.py): K/V are page POOLS —
 ``[num_pages, page_size, H_kv, D]`` (NHD) or ``[num_pages, H_kv, page_size, D]``
 (HND, a stride permutation of the same descriptor) — and a per-batch
 ``block_table`` [B, max_pages] int32 names the pages of each sequence.  Only
@@ -94,7 +94,7 @@ from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_multi_q.config import TemplateParams,
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
 # One pipeline, two head-dim geometries: d128 and the native d64 (gpt-oss class),
-# selected by TemplateParams.d_flavor exactly as in prefill_d128_f16.py.
+# selected by TemplateParams.d_flavor exactly as in d128_f16_multi_q/kernel.py.
 _MAKE_CFG = {64: make_cfg_d64, 128: make_cfg_d128}
 if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_fp8: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
@@ -199,7 +199,7 @@ P_CAST_LOG2_SCALE = 4.0
 # exp2 stays on MUFU.  The pattern is the same SHAPE as the cuDNN backend fprop
 # kernel's (of every _E2E_FREQ columns the LAST _E2E_RES are emulated, none at or
 # past _E2E_LIMIT) with the distribution taken from the MXFP8 sibling
-# (``prefill_d128_mxfp8.py``), where it was tuned on B200 (B=1 H=24/8 S=16K dense,
+# (``d128_mxfp8_multi_q/kernel.py``), where it was tuned on B200 (B=1 H=24/8 S=16K dense,
 # A/B/A): (16, 4, 128) = 32 columns in blocks of 4 over BOTH chunks, +1.63 % over the
 # backend's own (16, 8, 72) and +9.73 % over the all-MUFU kernel; 24 / 40 / 48 / 64
 # emulated columns and blocks of 2 / 8 all lost 0.9-8.7 pt.  At TILE_N=128 this
@@ -215,7 +215,7 @@ P_CAST_LOG2_SCALE = 4.0
 # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the kernels that measured
 # a win) and folded here at trace time: off, ``_E2E_PAIRS`` are empty and both exp2
 # sites trace ``cute.math.exp2`` -- the develop spelling.  Full rationale and the
-# measured rates: the ``_E2E_*`` block of ``prefill_d128_mxfp8.py``.
+# measured rates: the ``_E2E_*`` block of ``d128_mxfp8_multi_q/kernel.py``.
 _E2E_FREQ = 16
 _E2E_RES = 4
 _E2E_LIMIT = CFG.TILE_N

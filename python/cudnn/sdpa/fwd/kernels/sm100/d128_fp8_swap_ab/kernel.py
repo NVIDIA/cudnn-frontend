@@ -99,7 +99,7 @@ if Q_BOX_TOKENS < 1:
 # the direct test driver): a module without the flag covers S_q x HEADS_PER_TILE <= N_Q only.
 Q_TOKEN_UNITS: bool = True
 
-# === Paged KV (same contract as prefill_d256_f16.py) ===
+# === Paged KV (same contract as d256_f16_lookahead/kernel.py) ===
 PAGED_KV = bool(CFG.PAGED_KV)
 PAGE_SIZE = CFG.PAGE_SIZE if PAGED_KV else 0
 KV_BOX_ROWS = min(PAGE_SIZE, TILE_N) if PAGED_KV else TILE_N
