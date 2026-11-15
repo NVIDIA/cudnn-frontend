@@ -288,6 +288,12 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+Include embedded subprocess scripts when auditing retired kernel paths. A
+filename inside a Python source string is invisible to ordinary import/path
+analysis. Run its actual child process and retain the instruction-level
+assertions after migrating the path; the FP8 decode score-release probe in
+`sdpa/frost/native_fp8_decode_sm100.py` exercises this boundary.
+
 When retiring a kernel file, run its shared binding and pointer-ABI fixtures:
 they may construct the old filename dynamically, so a literal-path search is
 not sufficient. Source inventories must include isolated `kernel.py` paths
