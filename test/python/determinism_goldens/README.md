@@ -75,6 +75,24 @@ dense graph is accepted by the current owner. The support page records the
 scalar-tail split limit. Arithmetic, eligibility and tolerances are unchanged;
 these results extend the named selected groups, not whole-tree qualification.
 
+The shared-consumer follow-up on source `0cafa2907` passed **1,550 checks
+with nine pre-Rubin-only skips** on native SM107. It covers the complete
+analyzer, heuristic-geometry, band and frontend-integration files, D512
+owner contracts and the shared graph case `test693`. The initial run had
+1,517 passes and 12 band-fixture failures before stopping: the SM107 swap-AB
+row was sampled outside its eight-query domain, and its implementation
+declines were missing from the fixture oracle. Legal short-query samples
+and the current owner contracts fix those assertions without excluding
+any row. All 26 host band checks and 21 host routing controls pass.
+
+Three additional unchanged shared graph cases pass numerics and an exact
+owner tally: `test1350` uses D128 multi-Q, `test522` uses D192/V128 multi-Q,
+and `test670` uses D256 single-Q, all with HALF softmax. Run these cases from
+`sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_fwd_cc107_L0` at the default
+`MHAS_CC107_MULT=4`; the test seed and CUDA data generator are unchanged.
+This follow-up changes test consumers only; it does not claim a complete
+cc107 graph sweep or relax any numerical tolerance.
+
 ### SM107 D192/D256 FP8 implementation identity (2026-11-15)
 
 Exact D192/V128 and D256 per-tensor FP8 now use engines 20561 and 20562,
