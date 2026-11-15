@@ -9,7 +9,7 @@ the ``dkv_reduce_thd_origins`` fold launch sums the group in fp32 (five launches
 fold launch gone, the bf16 convert folded into ``cast_dq_thd`` (four launches).  A ROUNDING CHANGE (the group accumulates in fp32 in a
 non-deterministic order instead of 8 bf16-rounded partials summed in a fixed order): an op ATTRIBUTE the caller sets, never a knob; dQ is
 untouched by the field.  Both bodies carry it: the 1-CTA body (the grouped THD kernel through the THD body, sections 7 / 5 of
-``kernels/sm100/bprop_d128_f16.py``) and the cta_group::2 pair body (section 8 of the same module).
+``kernels/sm100/d128_f16_accum/kernel.py``) and the cta_group::2 pair body (section 8 of the same module).
 
 Host rows (no GPU): the typed domain, config = truth (the fp32 staging slots of both bodies), the default renderings of BOTH chains equal to
 their committed records with the field unset AND with ``bf16_partials`` named, the fp32 renderings' census (the reduce-adds up by the eight
@@ -83,10 +83,10 @@ _PROBE = textwrap.dedent(r"""
     specs = tuple((i, 1, H if p == "stats" else (HK if p in kv else H) * 128, "int32") for i, p in enumerate(ports))
     dtypes = tuple("int32" for _ in ports)
     if chain == "pair":
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     else:
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.prepared_host import compile_host_grouped_thd as compile_host
         compile_host((B, H, HK, True), specs, dtypes, cutlass.BFloat16, True, 100, **fields)
     ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
     if not ptxs:
@@ -227,7 +227,7 @@ def test_dkv_accum_fp32_renders_for_sm_100a_with_the_documented_census(tmp_path,
 def test_dkv_accum_declines_by_name_at_the_pair_chain_entry():
     """A value outside the domain and the one unbuilt combination (``fp32_reduce`` under ``warp_roles = "16w_fa4"``) decline BY NAME at the pair
     chain's compile_host before any trace."""
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     with pytest.raises(ValueError, match="dkv_accum must be one of"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, dkv_accum="fp32")
@@ -248,9 +248,8 @@ def test_dkv_accum_fp32_store_path_credits_the_ring_after_the_dv_reads():
     releases BEFORE the dk_full wait (its bootstrapped ring carries the dK staging's WAR edge) and its epilogue's dK round waits them before it
     stores; the pair's rounds go through the NEW row ``dvk_stage_empty`` (commit -> drain -> arrive -> the dk_full wait; the epilogue waits it
     between dv_full and dk_full) and never touch the pre-armed dq_empty ring; the pair's new row is initialised only under the field."""
-    import cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 as pair_body  # one module: the THD body's helpers carry the `_thd` suffix, the pair body's are bare
-
-    one_body = pair_body
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum import kernel as one_body
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import kernel as pair_body
 
     one = pathlib.Path(one_body.__file__).read_text()
     store = "\n".join(_code_lines(one[one.index("def _store_loop_thd(") : one.index("def _scheduler_loop_thd(")]))

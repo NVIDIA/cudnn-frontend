@@ -32,7 +32,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # reaches it, and the compiled-plan cache keys the armed build apart.  Not a knob (it changes the function), never shipped armed.
     diag_delete_dq_reduce_add: bool = False
     # The per-S selector of the grouped THD route: which body serves a BF16 grouped THD request -- the one-CTA body
-    # (the grouped bodies of ``kernels/sm100/bprop_d128_f16.py``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
+    # (the grouped bodies of ``kernels/sm100/d128_f16_accum/kernel.py``, implementation ``accumulation_grouped_thd``) or the cta_group::2 PAIR body
     # (the pair body of the same module, implementation ``accumulation_grouped_thd_2cta``; five launches either way).  A typed op-level
     # field (``d128_grouped_2cta_contract.CTA_PAIR_MODES``): "auto" = THE default = the per-S rule -- the pair iff both declared S_q and S_kv >=
     # ``CTA_PAIR_MIN_SEQ[cc]`` (PART-KEYED; 8192 on every admitted part today: the smallest S where the pair body won the measured backward step

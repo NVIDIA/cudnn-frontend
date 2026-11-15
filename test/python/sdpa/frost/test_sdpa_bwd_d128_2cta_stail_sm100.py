@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""L0 tests of the d128 grouped THD cta_group::2 pair body (section 8 of ``kernels/sm100/bprop_d128_f16.py``: the dQ half-row image in S^T's dead
+"""L0 tests of the d128 grouped THD cta_group::2 pair body (section 8 of ``kernels/sm100/d128_f16_accum_2cta/kernel.py``: the dQ half-row image in S^T's dead
 tail, FAv4's rotated leader order, the dedicated sDQ ring, 35 barriers).
 
 Rows: the THD matrix (uniform pairs, GQA 8, a varlen ramp, non-causal, the suite's degenerate THD row, a half-dead pair, pair tail 300),
@@ -62,8 +62,8 @@ _ROUTE_CENSUS = {
     "fence_proxy_async": r"fence\.proxy\.async",
     "bulk_commit_group": r"cp\.async\.bulk\.commit_group",
 }
-_BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16"  # the d128 family module; the pair body is its section 8
-_BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/bprop_d128_f16.py")
+_BODY_MODULE = "cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.kernel"  # the d128 family module; the pair body is its section 8
+_BODY_REL = pathlib.Path("python/cudnn/sdpa/bwd/kernels/sm100/d128_f16_accum_2cta/kernel.py")
 _BODY_SECTION = ("# section 8:", "# section 9:")  # the pair body's banners in the family module: the source assertions read that section only
 _TREE = pathlib.Path(__file__).resolve().parents[4]  # test/python/sdpa/frost/<file> -> the checkout
 _RECORD = pathlib.Path(__file__).resolve().parent / "renderings" / "md5_d128_accum_grouped_2cta_stail_default_sm_100a.txt"
@@ -623,7 +623,7 @@ def test_2cta_stail_stats_form_is_typed():
 
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import stats_form
 
     c = cfgmod.CFG
@@ -675,7 +675,7 @@ def test_2cta_stail_tmem_map_is_typed_and_part_keyed(monkeypatch):
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd import prepared_sm100_d128_grouped_2cta as prepared
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     c = cfgmod.CFG
     assert c.TMEM_MAPS == _TMEM_MAPS and tuple(cfgmod.TMEM_MAP_CODES) == _TMEM_MAPS and c.TMEM_MAP == "s_tail" and cfgmod.CFG_DQ576.TMEM_MAP == "dq_576"
@@ -758,7 +758,7 @@ def test_2cta_stail_smem_map_is_typed_and_part_keyed(monkeypatch):
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd import prepared_sm100_d128_grouped_2cta as prepared
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     c = cfgmod.CFG
     assert (
@@ -1075,7 +1075,7 @@ def test_2cta_stail_host_renders_probes_under_dq576_for_sm_107a(tmp_path):
     under the map (their wait sites are the deleted rows) -- never a rendering (the barrier AUDIT's u4).  Skips BY NAME on a DSL without the sm_107a
     target."""
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
     from frost_test_utils import arch_known_to_the_dsl
 
     if not arch_known_to_the_dsl("sm_107a"):
@@ -1184,7 +1184,7 @@ def test_2cta_stail_probes_resolve_the_same_way_under_fp32_dkv_accum(tmp_path):
     row moves; nothing asynchronous writes the recv-half slots under the probe).  The combination is reachable through the typed fields only;
     the ``--validate`` refusal is per probe name."""
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     for accum in (None, "fp32_reduce"):
         with pytest.raises(ValueError, match="diag_2cta must be None or one of"):
@@ -1203,7 +1203,7 @@ def test_2cta_stail_fields_under_16w_fa4_decline_or_resite_by_name(tmp_path):
     ship under 16w_fa4 and renders with its own transfer delta only (the one bulk copy + its two mapa gone, the arm's bytes 0; every arrive / wait
     stays), a different md5 from the 16w_fa4 default; both fields pass under the default shape (16w)."""
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     with pytest.raises(ValueError, match="debug_clk is not defined under warp_roles '16w_fa4'"):
         compile_host((2, 8, 2, True), (None,) * 9, (None,) * 9, None, True, 100, warp_roles="16w_fa4", debug_clk=True)

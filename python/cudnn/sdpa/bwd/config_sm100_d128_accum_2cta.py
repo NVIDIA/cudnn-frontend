@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Grouped THD d128 accumulation geometry on the cta_group::2 datapath (one cga2 PAIR per 256 kv rows).
 
-Layout-only record of the d128 pair chain (the base record ``config_sm100_d128_accum_2cta_stail`` refines; the pair chain kernels of ``kernels/sm100/bprop_d128_f16.py`` read it): every byte offset, TMEM column and
+Layout-only record of the d128 pair chain (the base record ``config_sm100_d128_accum_2cta_stail`` refines; the pair chain kernels of ``kernels/sm100/d128_f16_accum_2cta/kernel.py`` read it): every byte offset, TMEM column and
 register count derives from the geometry fields below and is re-derived by :func:`validate_config` at import.  The
 barrier table (``BAR_LAYOUT``) is FILLED BY the barrier audit; this module only reserves its bytes.
 

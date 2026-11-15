@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Grouped THD d128 accumulation geometry on the cta_group::2 datapath: the dQ image in S^T's dead tail with FAv4's rotated MMA order.
 
-Layout-only record for the pair body of ``kernels/sm100/bprop_d128_f16.py`` (``bprop_d128_accum_grouped_2cta_stail_kernel``, the grouped THD route's cta_group::2 implementation) on top of the
+Layout-only record for the pair body of ``kernels/sm100/d128_f16_accum_2cta/kernel.py`` (``bprop_d128_accum_grouped_2cta_stail_kernel``, the grouped THD route's cta_group::2 implementation) on top of the
 base pair geometry ``config_sm100_d128_accum_2cta.Config``.  Every byte offset, TMEM column and ring depth derives from the geometry below
 and is re-derived by :func:`validate_config` at import; the barrier tables (``BAR_LAYOUT``, ``BAR_LAYOUT_XFA4``) are the barrier audit's
 tables, pasted, never re-derived.

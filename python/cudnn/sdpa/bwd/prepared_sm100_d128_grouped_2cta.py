@@ -390,7 +390,7 @@ def compile_plan(api):
     import torch
 
     from cudnn.frost.device import compute_capability, resolve_device
-    from .kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from .kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     b, h, hk = api.batch_size, api.h_q, api.h_kv
     layout = layout_form(api)

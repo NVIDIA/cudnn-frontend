@@ -178,7 +178,7 @@ def test_xfa4_warp_roles_is_typed_and_declines_by_name():
 
     from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_2cta as compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import warp_roles
 
     assert cfgmod.resolve_warp_roles(None) == "16w" == cfgmod.resolve_warp_roles("16w")

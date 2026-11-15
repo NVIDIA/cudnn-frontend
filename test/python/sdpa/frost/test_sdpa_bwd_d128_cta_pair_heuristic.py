@@ -522,9 +522,9 @@ def test_cta_pair_dense_layout_form_is_typed():
     assert c.dense_capacities(4, 8192, 16384) == (4 * 8192, 4 * 16384, 4 * 8192, 4 * 16384)
     with pytest.raises(ValueError, match="positive integer"):
         c.dense_capacities(0, 8192, 8192)
-    helpers = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16")  # the pair chain kernels: section 9 of the family module
+    helpers = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.kernel")  # the pair chain kernels: section 9 of the family module
     assert (helpers.LAYOUT_FORM_THD, helpers.LAYOUT_FORM_DENSE) == (c.LAYOUT_FORM_CODES["thd"], c.LAYOUT_FORM_CODES["dense"])
-    host = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host")
+    host = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host")
     import cutlass
 
     with pytest.raises(ValueError, match="layout must be one of"):
@@ -823,7 +823,7 @@ def test_cta_pair_launch_census_per_selection(mode, s, body, pair_map, layout):
         assert api._prepared.artifact.implementation == c.IMPLEMENTATIONS[layout] and res.pair_map == pair_map
         import importlib
 
-        cfg = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16").CFG  # the pair body's config binding (section 8)
+        cfg = importlib.import_module("cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.kernel").CFG  # the pair body's config binding (section 8)
         assert (cfg.CGA_M, cfg.CGA_N) == (c.CTA_PAIR_CLUSTER, 1)
 
 
