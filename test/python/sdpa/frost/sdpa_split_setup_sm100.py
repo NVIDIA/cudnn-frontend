@@ -51,4 +51,4 @@ def test_single_sequence_mixed_origins(qdtype, kvdtype, paged):
 def test_runtime_batch_bytes(dim, packed, paged, dtype_name):
     from test_sdpa_single_sequence_setup_sm107 import test_single_sequence_batch_bytes as check
 
-    check(dim, dtype_name, 1, packed, 128, engine_name="sdpa_fwd_prefill_sm100", paged=paged, splits=5)
+    check(dim, dtype_name, 1, packed, 128, engine_name="sdpa_fwd_sm100_d128_single_q", paged=paged, splits=5)

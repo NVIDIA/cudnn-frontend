@@ -29,7 +29,7 @@ def test_single_sequence_physical_origins(dtype_name, packed):
 def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, paged):
     from test_sdpa_single_sequence_setup_sm107 import test_single_sequence_batch_bytes as check_batch
 
-    check_batch(dim, dtype_name, cga, packed, 128, engine_name="sdpa_fwd_prefill_sm100", paged=paged)
+    check_batch(dim, dtype_name, cga, packed, 128, engine_name="sdpa_fwd_sm100_d128_multi_q", paged=paged)
 
 
 @pytest.mark.parametrize("dim,cga,packed,layout", [(64, 1, False, "hnd"), (64, 2, False, "mixed"), (128, 1, True, "nhd"), (128, 2, False, "hnd")])
