@@ -55,7 +55,7 @@ def compile_plan(api):
     window = 0 if api.window_size_left is None else api.window_size_left + 1
     # compile_cached owns device/context-aware reuse; no argument-only outer cache.
     if api._implementation == ACCUMULATION:
-        from .kernels.sm100.prepared_d128_host import compile_host_accum
+        from .kernels.sm100.d128_f16_accum.prepared_host import compile_host_accum
 
         regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
         with torch.cuda.device(device):

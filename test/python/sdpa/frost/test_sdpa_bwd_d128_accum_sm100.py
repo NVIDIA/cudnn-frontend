@@ -103,7 +103,7 @@ def test_accumulation_tail_keys_with_negative_lse(dt):
     well conditioned: with a constant K the oracle's dQ is a pure cancellation residual.)"""
     _require_accumulation()
     from frost_test_utils import select_engine
-    from test_sdpa_bwd_d128_sm100 import _ENGINE
+    from test_sdpa_bwd_d128_sm100 import _ACCUMULATION_ENGINE as _ENGINE
     from test_sdpa_bwd_dsl_sm107 import _bshd_empty, _build_graph, _check
 
     b, h, sq, sk = 1, 1, 65, 129

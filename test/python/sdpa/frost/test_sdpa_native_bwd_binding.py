@@ -43,7 +43,7 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0, workspace_by
         "sm100_d128_grouped_thd": "host_grouped_thd",
     }.get(arch)
     filename = {"sm100_d128": "d128_f16_recompute/prepared_host.py", "sm100_d128_pair": "d128_f16_pair/prepared_host.py"}.get(
-        arch, "prepared_d128_host.py" if d128_entry else "prepared_host.py"
+        arch, "d128_f16_accum/prepared_host.py" if d128_entry else "prepared_host.py"
     )
     path = Path(prep.__file__).parent / "kernels" / family / filename
     entry = d128_entry or ("host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host")

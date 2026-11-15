@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The d128 accumulation DIAGNOSTIC lever ``diag_delete_dq_reduce_add`` (default OFF) renders the shipped kernels byte-identically.
 
-The lever makes the store warp of the THD body of ``kernels/sm100/bprop_d128_f16.py`` (shared by the grouped THD kernel) skip the four fp32 dQ
+The lever makes the store warp of the THD body of ``kernels/sm100/d128_f16_accum/kernel.py`` (shared by the grouped THD kernel) skip the four fp32 dQ
 ``tma_reduce_add`` issues per q tile while every barrier arrive / wait, ``tma_store_commit`` and ``tma_store_wait`` stay.
 Armed, dQ stays zero BY DESIGN: it is a timing-only ceiling for the L2 reduce-add term, set on the adapter instance before
 ``compile()`` by a probe driver, never by a graph.  Pins (host trace-compiles for sm_100a, no device):
@@ -60,10 +60,10 @@ _PROBE = textwrap.dedent(r"""
     dtypes = tuple("int32" for _ in ports)
     kw = {"diag_delete_dq_reduce_add": True} if flag else {}
     if host == "grouped_thd":
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.prepared_host import compile_host_grouped_thd as compile_host
         compile_host((B, H, HK, True), spec_for(H, HK), dtypes, cutlass.BFloat16, True, sm, **kw)
     else:
-        from cudnn.sdpa.bwd.kernels.sm100.prepared_d128_host import compile_host_thd as compile_host
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.prepared_host import compile_host_thd as compile_host
         compile_host((B, H, True), spec_for(H, H), dtypes, cutlass.BFloat16, True, sm, **kw)
     ptxs = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
     if not ptxs:
@@ -196,8 +196,8 @@ def test_flag_defaults_to_false_everywhere():
     """The record field is a typed ``bool`` default ``False``; the kernel, the host entries and ``compile_host`` default it too
     (a plain import renders the shipped kernel), and a non-bool on the record is a ``ValueError`` before any compile."""
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_f16 as packed  # the family module: the THD body (section 5) and the grouped bodies (section 7)
-    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d128_host as hosts
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum import kernel as packed  # the family module: the THD body (section 5) and the grouped bodies (section 7)
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum import prepared_host as hosts
     from cudnn.sdpa.bwd.prepared_sm100_d128_thd import diag_delete_dq_reduce_add
 
     assert SdpaBwdDslSm100D128.diag_delete_dq_reduce_add is False
