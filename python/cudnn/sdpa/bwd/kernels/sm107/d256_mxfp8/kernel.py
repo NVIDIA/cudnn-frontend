@@ -4,7 +4,7 @@
 """SM107 (Rubin) SDPA backward, d_qk = d_v = 256, MXFP8 (E4M3 payloads + E8M0 block scale factors): dV in-kernel + the dS workspace
 (P-b, the default: block-scaled e4m3 x 2 with E8M0 atoms | P-c: bf16).
 
-The per-tensor FP8 body ``bprop_d256_fp8.py`` with block scaling plumbed in (exactly seven deltas, listed at the end of this
+The per-tensor FP8 body ``sm107/d256_fp8/kernel.py`` with block scaling plumbed in (exactly seven deltas, listed at the end of this
 docstring; the e4m3 P ring stays in TMEM and every scale-factor atom aliases its dead slot).  One cga2 pair (CGA_M=2, CGA_N=1, CTA_MMA=2) owns one
 256-row kv block of one (batch, head) and walks the q tiles that attend it.  It computes **dV in-kernel** (TMEM accumulator over the
 q loop, TRUE units, stored per Q-head as bf16 / fp16) and writes **dS** = the fp32 ``attn_scale * P * (dP - delta)`` to GMEM
@@ -239,7 +239,7 @@ issue order -- the forward's per-stage refill pattern, in production.  What the 
 thread's prior tcgen05 ops.  It holds because the MMA warp is a converged full-mask warp at every site (``elect_sync`` picks the
 lowest active lane; the predicated arrives branch round the native op and reconverge) -- checked lane by lane in the barrier-table audit.
 
-The seven deltas vs ``bprop_d256_fp8.py``: (1) the fp8 P pipeline is KEPT (TMEM ring, ``tcgen05_st`` + ``tcgen05_wait(STORE)`` +
+The seven deltas vs ``sm107/d256_fp8/kernel.py``: (1) the fp8 P pipeline is KEPT (TMEM ring, ``tcgen05_st`` + ``tcgen05_wait(STORE)`` +
 the relaxed LEADER arrive, BMM2 = ``mma_ts``); every SF atom ALIASES the dead P slot of its iteration (the slot rule above) and ONE
 commit ring ``mb_p_sf_consumed`` closes the softmax-store-vs-SF-read race; (2) six SF TMA loads on the existing ``_full`` bars, tx
 grown by ``CFG.*_SF_TX``; (3) UTCCP in the MMA warp right before the MMA that reads the atoms, into the alias slot,
@@ -422,7 +422,7 @@ from cudnn.frost.tile_dsl.thd import (
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.sdpa.bwd.kernels.thd_helpers import THD_SF_CU_K_OFF, THD_SF_CU_Q_OFF, THD_SF_META_WORDS, thd_claim_unit
-from cudnn.sdpa.bwd.config_sm107 import (
+from cudnn.sdpa.bwd.kernels.sm107.d256_mxfp8.config import (
     DS_SF_P_A,
     DS_SF_P_B,
     DS_SF_P_C,

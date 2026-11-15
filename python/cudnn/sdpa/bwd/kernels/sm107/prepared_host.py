@@ -2068,7 +2068,7 @@ def host_mxfp8(
     stream: driver.CUstream,
     ds_sf_policy: cutlass.Constexpr = DS_SF_POLICY_DEFAULT,
 ):
-    """The MXFP8 row's chain (``sdpa_mxfp8_backward`` at d = 256 on Rubin; ``sm107/bprop_d256_mxfp8.py``) under the dS policy
+    """The MXFP8 row's chain (``sdpa_mxfp8_backward`` at d = 256 on Rubin; ``sm107/d256_mxfp8/kernel.py``) under the dS policy
     ``ds_sf_policy`` (appended, default ``DS_SF_POLICY_DEFAULT``; ``DS_SF_P_B`` = the block-scaled chain that ships, ``DS_SF_P_C`` = the
     bf16-dS oracle twin):
 

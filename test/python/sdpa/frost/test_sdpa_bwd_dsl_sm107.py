@@ -98,7 +98,7 @@ _BF16_ULP_REL = 2.0**-7
 # ---------------------------------------------------------------------------- the two kernel bodies (plan s1; the fp8 row shares this module's static pins)
 # The MXFP8 body (its own module is test_sdpa_bwd_mxfp8_sm107.py) shares
 # every family-parametrized static pin and SASS pin below.
-_KERNEL_FILES = {"f16": "sm107/d256_f16_4x1/kernel.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+_KERNEL_FILES = {"f16": "sm107/d256_f16_4x1/kernel.py", "fp8": "sm107/d256_fp8/kernel.py", "mxfp8": "sm107/d256_mxfp8/kernel.py"}
 _TEMPLATE_TAGS = {"f16": "sdpa_bwd_sm107_main_f16", "fp8": "sdpa_bwd_sm107_main_fp8", "mxfp8": "sdpa_bwd_sm107_main_mxfp8"}
 _FAMILIES = tuple(_KERNEL_FILES)
 
@@ -3291,7 +3291,7 @@ def test_2x2_twin_is_off_by_default_and_selects_the_2x2_body_when_on(monkeypatch
             api._datapath_2x2_profile()
     monkeypatch.setattr(sm107, "BWD_D256_2X2_PROFILE", c2.PROFILE_SM107_INTERLEAVED)
     fp8 = _adapter(SdpaBwdDslSm107Fp8, dt=torch.float8_e4m3fn, grad_dt=torch.float8_e4m3fn)
-    assert (fp8._kernel_file(), fp8._datapath_2x2_profile()) == ("sm107/bprop_d256_fp8.py", 0), "the twin is f16-only"
+    assert (fp8._kernel_file(), fp8._datapath_2x2_profile()) == ("sm107/d256_fp8/kernel.py", 0), "the twin is f16-only"
 
 
 def _cfg_records_equal_default(api):
@@ -3719,7 +3719,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP32
     from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
-    FILES = {"f16": "sm107/d256_f16_4x1/kernel.py", "fp8": "sm107/bprop_d256_fp8.py", "mxfp8": "sm107/bprop_d256_mxfp8.py"}
+    FILES = {"f16": "sm107/d256_f16_4x1/kernel.py", "fp8": "sm107/d256_fp8/kernel.py", "mxfp8": "sm107/d256_mxfp8/kernel.py"}
     # *_f32dv: the fp8 body at dtype_o = FP32 -- the GQA fold's unrounded dV partial (the 128 KiB staging, two 32-col stores per chunk).
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640),
              "thd": dict(thd_varlen=True), "thd_causal": dict(thd_varlen=True, window_right=0),

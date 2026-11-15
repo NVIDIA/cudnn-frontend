@@ -234,7 +234,16 @@ from cudnn.frost.tile_dsl.thd import (
 )
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
-from cudnn.sdpa.bwd.config_sm107 import FAMILY_FP8, TMEM_IS_EXCLUSIVE, TemplateParams, buffer_elems, desc_version, make_cfg_d256_bwd, q_write_tiles, tmem_layout
+from cudnn.sdpa.bwd.kernels.sm107.d256_fp8.config import (
+    FAMILY_FP8,
+    TMEM_IS_EXCLUSIVE,
+    TemplateParams,
+    buffer_elems,
+    desc_version,
+    make_cfg_d256_bwd,
+    q_write_tiles,
+    tmem_layout,
+)
 
 # Config comes from the FROST template loader, never an environment variable: the loader injects FROST_TEMPLATE_PARAMS
 # before this body runs; the default keeps a plain `import` usable as a standalone driver (E4M3 is the only io this body
