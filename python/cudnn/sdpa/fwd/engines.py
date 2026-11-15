@@ -130,10 +130,10 @@ from .kernels.sm120.quantized_general_contract import (
     SHAPES as _SM120_QUANT_GENERAL_SHAPES,
     mismatch as _sm120_quant_general_mismatch,
 )
-from .kernels.sm80.f16_k_prefetch.contract import (
-    NAME as _SM80_F16_K_PREFETCH,
-    SHAPES as _SM80_F16_K_PREFETCH_SHAPES,
-    mismatch as _sm80_f16_k_prefetch_mismatch,
+from .kernels.sm80.half_flavor_contract import (
+    IMPLEMENTATIONS as _SM80_HALF_IMPLEMENTATIONS,
+    SHAPES as _SM80_HALF_SHAPES,
+    mismatch as _sm80_half_mismatch,
 )
 from .kernels.sm120.half_exact_contract import (
     ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
@@ -1901,8 +1901,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
         if reason is not None:
             return reason
-    if capabilities.implementation == _SM80_F16_K_PREFETCH:
-        reason = _sm80_f16_k_prefetch_mismatch(facts, knobs)
+    if capabilities.implementation in _SM80_HALF_IMPLEMENTATIONS:
+        reason = _sm80_half_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
     if capabilities.implementation in _SM120_HALF_EXACT_IMPLEMENTATIONS:
@@ -4171,26 +4171,45 @@ def _sm80_spec() -> EngineSpec:
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             # Explicit geometry is admitted by the shared native flavor domains
             # above. Leave the row domains empty to preserve A/FALLBACK choices.
-            delegated_exact=frozenset(((8, 0), shape) for shape in _SM80_F16_K_PREFETCH_SHAPES),
+            delegated_exact=frozenset(((8, 0), shape) for shapes in _SM80_HALF_SHAPES.values() for shape in shapes),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
 
 
-def _sm80_f16_k_prefetch_spec() -> EngineSpec:
-    """The SM80 K-prefetch body on its own eight-aligned shapes; shared graph binding and launch."""
-    from .kernels.sm80.f16_k_prefetch.host import lower
-
+def _sm80_explicit_spec(implementation: str, host_lower) -> EngineSpec:
+    """An SM80 half body on the eight-aligned head dims its flavor envelopes cover; shared graph binding and launch."""
     legacy = _sm80_spec()
     capabilities = replace(
         legacy.capabilities,
-        implementation=_SM80_F16_K_PREFETCH,
+        implementation=implementation,
         delegated_exact=frozenset(),
-        d_shapes=_SM80_F16_K_PREFETCH_SHAPES,
+        d_shapes=_SM80_HALF_SHAPES[implementation],
         d_pad_multiple=0,
         d_envelope_floors=(),
     )
-    return EngineSpec(_SM80_F16_K_PREFETCH, capabilities, partial(lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM80), knob_type=SdpaFwdKnobs))
+    return EngineSpec(implementation, capabilities, partial(host_lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM80), knob_type=SdpaFwdKnobs))
+
+
+def _sm80_f16_k_prefetch_spec() -> EngineSpec:
+    from .kernels.sm80.f16_k_prefetch.contract import NAME
+    from .kernels.sm80.f16_k_prefetch.host import lower
+
+    return _sm80_explicit_spec(NAME, lower)
+
+
+def _sm80_d256_kv_prefetch_spec() -> EngineSpec:
+    from .kernels.sm80.d256_kv_prefetch.contract import NAME
+    from .kernels.sm80.d256_kv_prefetch.host import lower
+
+    return _sm80_explicit_spec(NAME, lower)
+
+
+def _sm80_wide_cooperative_spec() -> EngineSpec:
+    from .kernels.sm80.wide_cooperative.contract import NAME
+    from .kernels.sm80.wide_cooperative.host import lower
+
+    return _sm80_explicit_spec(NAME, lower)
 
 
 def _sm120_spec() -> EngineSpec:
@@ -5363,6 +5382,8 @@ ENGINE_SPECS = (
     _sm120_mxfp8_general_spec(),
     _sm80_spec(),
     _sm80_f16_k_prefetch_spec(),
+    _sm80_d256_kv_prefetch_spec(),
+    _sm80_wide_cooperative_spec(),
     *_sm90_specs(),
 )
 

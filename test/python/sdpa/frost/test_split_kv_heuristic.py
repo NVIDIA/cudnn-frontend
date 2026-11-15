@@ -380,6 +380,8 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_sm120_mxfp8_general",
         "sdpa_fwd_sm120_f16_general",
         "sdpa_fwd_sm80_f16_k_prefetch",
+        "sdpa_fwd_sm80_d256_kv_prefetch",
+        "sdpa_fwd_sm80_wide_cooperative",
     }, f"split domains drifted from the wired lowerings: {sorted(advertising)}"
 
 

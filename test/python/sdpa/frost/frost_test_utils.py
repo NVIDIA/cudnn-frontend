@@ -177,15 +177,15 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
     if arch == "sm90":
         return ("sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg", "sdpa_fwd_sm90_d128_multi_q")
     if arch == "sm80":
-        return ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch")
+        return ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative")
     return (f"sdpa_fwd_prefill_{arch}",)
 
 
 def sm80_owner(d_qk, d_v):
     """The SM80 forward engine that serves these head dims (legality only, no ranking)."""
-    from cudnn.sdpa.fwd.kernels.sm80.f16_k_prefetch import contract as k_prefetch
+    from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as half
 
-    return k_prefetch.NAME if (d_qk, d_v) in k_prefetch.SHAPES else k_prefetch.LEGACY_ROW
+    return half.implementation_for(d_qk, d_v) or half.LEGACY_ROW
 
 
 def sm120_owner(row, d_qk, d_v, tile_m=None):

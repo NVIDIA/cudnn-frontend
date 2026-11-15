@@ -7455,7 +7455,8 @@ def _sm80_resolve_scheduler(
 _LOG2E = math.log2(math.e)
 
 _SM80_KERNEL_FILES = {
-    "d256": "sm80/prefill_d256_f16.py",
+    "d256": "sm80/d256_kv_prefetch/kernel.py",
+    "wide": "sm80/wide_cooperative/kernel.py",
     "f16": "sm80/f16_k_prefetch/kernel.py",
 }
 
@@ -7465,7 +7466,8 @@ def _sm80_load_kernel_module(flavor: str, params, kernel_file: Optional[str] = N
     ``frost.template_loader`` mechanism the SM100/SM120 templates use. qwen
     (d=256) routes to the symmetric-K+V-prefetch file; the rest share the
     generic kernel. ``kernel_file`` (an explicit engine's selected body) replaces the flavor walk."""
-    filename = kernel_file or _SM80_KERNEL_FILES["d256" if flavor in _SM80_D256_FLAVORS else "f16"]
+    family = "f16" if flavor not in _SM80_D256_FLAVORS else ("d256" if flavor == "qwen" else "wide")
+    filename = kernel_file or _SM80_KERNEL_FILES[family]
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
     # Tag from the BASENAME: `filename` carries the arch subdirectory, and a
     # slash would land in the generated template module name.

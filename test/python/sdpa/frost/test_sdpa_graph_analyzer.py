@@ -179,7 +179,15 @@ def test_zero_attn_scale_claims():
     (score_sign / SCALE_ZERO) and the SM80 / SM100 / SM107 backward families. A new row claims it only with that qualification."""
     fwd = {s.name for s in engines.ENGINE_SPECS if s.capabilities.zero_scale}
     bwd = {s.name for s in bwd_engines.ENGINE_SPECS if s.capabilities.zero_scale}
-    assert fwd == {"sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg", "sdpa_fwd_sm90_d128_multi_q"}
+    assert fwd == {
+        "sdpa_fwd_prefill_sm80",
+        "sdpa_fwd_sm80_f16_k_prefetch",
+        "sdpa_fwd_sm80_d256_kv_prefetch",
+        "sdpa_fwd_sm80_wide_cooperative",
+        "sdpa_fwd_sm90_d64_one_wg",
+        "sdpa_fwd_sm90_f16_three_wg",
+        "sdpa_fwd_sm90_d128_multi_q",
+    }
     assert bwd == {
         "sdpa_bwd_sm80",
         "sdpa_bwd_sm100",
@@ -520,7 +528,7 @@ def test_d192_fp8_sink_dtype_support():
     assert engines.mismatch(spec.capabilities, facts(cudnn.data_type.FP8_E5M2, sink=True)) is None
 
 
-@pytest.mark.parametrize("device_cc, expected", [((7, 0), set()), ((8, 0), {"sdpa_fwd_prefill_sm80"})])
+@pytest.mark.parametrize("device_cc, expected", [((7, 0), set()), ((8, 0), {"sdpa_fwd_sm80_wide_cooperative"})])
 def test_probe_rejects_wrong_device_family(monkeypatch, device_cc, expected):
     monkeypatch.setattr(ga, "_device_cc", lambda: device_cc)
     g = _mk_graph()
@@ -2056,7 +2064,10 @@ def test_sm120_probe_accepts_stats_output(monkeypatch):
 @pytest.mark.parametrize(
     ("cc", "engine"),
     [
-        ((8, 0), frozenset({engines.engine_name(arch="sm80"), "sdpa_fwd_sm80_f16_k_prefetch"})),
+        (
+            (8, 0),
+            frozenset({engines.engine_name(arch="sm80"), "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative"}),
+        ),
         ((10, 0), frozenset({engines.engine_name(arch="sm100")})),
         ((12, 0), _SM120_HALF_FAMILY),
     ],
@@ -2073,7 +2084,10 @@ def test_fwd_probe_accepts_strided_stats(monkeypatch, cc, engine):
 @pytest.mark.parametrize(
     ("cc", "engine"),
     [
-        ((8, 0), frozenset({engines.engine_name(arch="sm80"), "sdpa_fwd_sm80_f16_k_prefetch"})),
+        (
+            (8, 0),
+            frozenset({engines.engine_name(arch="sm80"), "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative"}),
+        ),
         ((10, 0), frozenset({engines.engine_name(arch="sm100")})),
         ((12, 0), _SM120_HALF_FAMILY),
     ],
