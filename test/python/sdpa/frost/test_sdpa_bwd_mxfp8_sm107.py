@@ -1340,7 +1340,7 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     """AGENTS.md Rule 7 (review 2026-09-30): a cc 10.7 box on a DSL that does not know ``sm_107a`` (4.7.x is above FROST's floor
     yet below Rubin's need) gets a TYPED decline at eligibility from every sm107 backward row -- never ``KeyError: 'sm_107a'``
     out of ``Arch.from_string`` inside the template compile after the plan is ranked (fwd/engines.py has had this gate; the
-    bwd copy lacked it).  The SM100 MXFP8 row on a cc 10.0 device is untouched."""
+    bwd copy lacked it).  The SM100 D256 MXFP8 engine, which owns this graph on a cc 10.0 device, is untouched."""
     from cudnn.frost import buffers
 
     dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
@@ -1349,7 +1349,7 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     for engine in (_ENGINE, "sdpa_bwd_sm107", "sdpa_bwd_sm107_fp8"):
         reason = _decline_reason(monkeypatch, engine=engine)
         assert reason is not None and "sm_107a" in reason and dsl_version in reason, (engine, reason)
-    assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_mxfp8", cc=(10, 0)) is None
+    assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_d256_mxfp8", cc=(10, 0)) is None
 
 
 def _facts_of_served_graph(monkeypatch):
@@ -1878,7 +1878,7 @@ def _run_mxfp8(
     dO_f16 = do32.permute(0, 2, 1, 3).contiguous().to(bf16)
     lse_exact = lse
     if frost_forward:
-        # The FROST d256 MXFP8 forward (sm107/prefill_d256_mxfp8.py through the SM100-named adapter, as test_sdpa_fwd_dsl_sm107 drives
+        # The FROST d256 MXFP8 forward (sm107/d256_mxfp8_single_q/kernel.py through the SM100-named adapter, as test_sdpa_fwd_dsl_sm107 drives
         # it) on the SAME rowwise q / k and columnwise v payloads: its Stats must be the exact fp32 log-sum-exp (sdpa-invariants s4,
         # within 1e-4 of the dequantized-input value) and its O the o_f16 this row folds delta from.
         from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -2591,7 +2591,7 @@ def test_graph_routes_to_the_row_when_opted_in_and_declines_typed_otherwise(monk
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), names
-    assert not any(n.startswith("sdpa_bwd_sm100_mxfp8") for n in names), names
+    assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), names
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     g2, _t, _outs = _mxfp8_graph()
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):

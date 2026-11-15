@@ -170,6 +170,12 @@ def test_sdpa_fwd_knobs_round_trip():
         kt.SPLIT_KV: 4,
     }
     assert SdpaFwdKnobs.from_public(public) == native
+    for value in (0, 1):
+        swapped = SdpaFwdKnobs(swap_ab=value)
+        assert swapped.to_public() == {kt.SWAP_AB: value}
+        assert SdpaFwdKnobs.from_public({int(kt.SWAP_AB): value}) == swapped
+    with pytest.raises(ValueError):
+        SdpaFwdKnobs.from_public({kt.SWAP_AB: True})
     # A persisted record is ints; anything that would round-trip to a different
     # native knob than the one recorded is refused rather than coerced.
     assert SdpaFwdKnobs.from_public({kt.PACK_GQA: True}) == SdpaFwdKnobs(pack_gqa=True)

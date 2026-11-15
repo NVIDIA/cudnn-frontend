@@ -365,6 +365,52 @@ def test_blk64_paired_kv_cache_rebinds_bitset_lengths(monkeypatch):
     assert len(paired_builds) == 1
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize("kv_blocks,tail", [(19, 0), (24, 0), (19, 3)], ids=["odd", "even", "odd_unattended_tail"])
+def test_blk64_paired_kv_unattended_blocks_and_odd_tail(monkeypatch, kv_blocks, tail):
+    """KV blocks no Q block attends get exactly zero dK/dV although their FP32 accumulators are never written (no
+    workspace memset), including a partial tail block; the lone last block of an odd KV count (one WG per pair) and
+    blocks several Q groups reduce into are correct, and so is a second call (fresh arrival tickets)."""
+    bsa = import_bsa(archs=(90, 100, 103), reason="requires SM90 or SM100/SM103")
+    paired_builds = _force_paired_kv(monkeypatch)
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    monkeypatch.setattr(interface._bsa_attn_bwd_bucketed_k2q_csr, "compile_cache", {})
+    torch.manual_seed(31000 + kv_blocks + tail)
+    nq, width = 12, 4
+    sk = kv_blocks * 64 - tail
+    q = torch.randn((1, 2, nq * 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, sk, 128), device="cuda", dtype=torch.bfloat16)
+    v, do = torch.randn_like(k), torch.randn_like(q)
+    # A natural pair (0, 1), a pair straddling two groups of eight (7, 8), a singleton and the last block (or, with a
+    # partial unattended tail block, the block before the tail's pair); every Q block attends four of them, so each
+    # attended block collects contributions from every Q group.
+    last = kv_blocks - 1 if tail == 0 else kv_blocks - 3
+    attended = [0, 1, 4, 7, 8, last]
+    rows = [[attended[(row + slot) % len(attended)] for slot in range(width)] for row in range(nq)]
+    indices = torch.tensor(rows, device="cuda", dtype=torch.int32).view(1, 1, nq, width).expand(1, 2, nq, width).contiguous()
+    counts = torch.full((1, 2, nq), width, device="cuda", dtype=torch.int32)
+    counts[:, :, 5] = 2
+    counts[:, :, 9] = 0
+    sizes = torch.full((kv_blocks,), 64, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(indices, width, sizes, nq * 64, sk, 64, counts)
+    _, _, *grads_ref = attention_reference(q, k, v, mask, do=do)
+    kwargs = dict(block_sparse_num=width, q2k_block_nums=counts, sparse_block_size=64)
+    output, lse = bsa.block_sparse_attention_forward(q, k, v, indices, **kwargs, allow_empty_block_nums=True)
+    unattended = torch.tensor([block for block in range(kv_blocks) if block not in attended], device="cuda")
+    unattended_rows = (unattended[:, None] * 64 + torch.arange(64, device="cuda")).flatten()
+    unattended_rows = unattended_rows[unattended_rows < sk]
+    last_rows = slice(last * 64, last * 64 + 64)
+    for bucket_size in (3, nq):
+        for _ in range(2):
+            gradients = bsa.block_sparse_attention_backward(do, q, k, v, output, lse, indices, **kwargs, bucket_size_blocks=bucket_size)
+            for got, ref in zip(gradients, grads_ref):
+                torch.testing.assert_close(got.float(), ref, atol=0.03, rtol=0.03)
+            _, dk, dv = gradients
+            assert not dk[:, :, unattended_rows].any() and not dv[:, :, unattended_rows].any()
+            assert dk[:, :, last_rows].any() and dv[:, :, last_rows].any()
+    assert paired_builds, "the dispatcher did not build the paired-KV kernel"
+
+
 # ---- SM90 blk64
 
 

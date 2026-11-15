@@ -13,12 +13,13 @@ watchdog (``CUDNN_TEST_TIMEOUT`` in ``test/python/conftest.py``), which a second
 The operand builders, the reference and the device gate live in ``gate_quant_utils.py`` beside this module."""
 
 import glob
+import json
 import os
 import shutil
 import subprocess
 import sys
 import textwrap
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,7 @@ from gate_quant_utils import (  # noqa: E402  (the operand builders, the referen
 
 from cudnn.attention_gate.frost import gate_quant_decode as entry  # noqa: E402
 from cudnn.attention_gate.frost.kernel import gate_quant_decode_config as kcfg  # noqa: E402
+from launch_records import assert_facts_equal_the_launch  # noqa: E402
 
 pytestmark = [pytest.mark.L0]
 
@@ -344,6 +346,88 @@ def test_slab_views_bind_a_runtime_extent():
     for scale in (torch.tensor([0.01]), torch.tensor(0.01)):
         view = entry._flat(scale)
         assert tuple(view.shape) == (1,) and tuple(view.dynamic_shapes_mask) == (0,), f"scale {tuple(scale.shape)}: one static element ({view})"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# host-only: the launch facts (cudnn.frost.launch_facts) -- the symbol of the compiled config, the form as plain data, the launch shape
+# ---------------------------------------------------------------------------------------------------------------------------
+def _launch_arithmetic(cfg, rows, width):
+    """The launch of ``kernel/gate_quant_decode_f16.py`` restated: a flat grid that covers ``rows x width`` elements at eight per thread
+    and ``THREADS`` threads per thread block; no shared memory."""
+    threads_needed = rows * width // 8
+    return ((-(-threads_needed // cfg.THREADS), 1, 1), (cfg.THREADS, 1, 1), 0)
+
+
+LAUNCH_FACT_ARMS = [dict(), dict(pdl_release=True), dict(cfg=kcfg.Cfg(THREADS=128)), dict(cfg=kcfg.Cfg(THREADS=128, PDL_RELEASE=True))]
+
+
+@pytest.mark.parametrize("arm", LAUNCH_FACT_ARMS, ids=["pick", "release", "threads128", "threads128-release"])
+@pytest.mark.parametrize("width", (8, 1032, 2048, 6144, kcfg.MAX_WIDTH))
+def test_launch_facts_equal_the_configuration_arithmetic_at_every_row_count(width, arm):
+    """EVERY served row count, 1 .. 160, per width and config arm: the launch shape is the configuration arithmetic of the config
+    ``cfg_for`` returns (the grid follows ``rows x width`` and ``THREADS``; no shared memory), and the form is that config's fields --
+    nothing else, because the compile key is the config alone."""
+    k = entry.AttentionGateQuantDecode("cpu", width, **arm)
+    for rows in range(1, kcfg.MAX_ROWS + 1):
+        cfg = k.cfg_for(rows)
+        shape = k.launch_shape_for(rows)
+        assert shape == _launch_arithmetic(cfg, rows, width), (rows, shape)
+        assert all(type(v) is int for v in (*shape.grid, *shape.block, shape.shared_memory)), shape
+        assert shape.grid[0] * cfg.THREADS * 8 >= rows * width > (shape.grid[0] - 1) * cfg.THREADS * 8, "the grid covers the slab with no empty block"
+        assert k.form_for(rows) == asdict(cfg) == dict(THREADS=cfg.THREADS, PDL_RELEASE=cfg.PDL_RELEASE), rows
+    assert k.form_for(1)["PDL_RELEASE"] is bool(arm.get("pdl_release") or (arm.get("cfg") or kcfg.Cfg()).PDL_RELEASE), "the launch knob is part of the form"
+
+
+def test_launch_shape_of_the_served_configs_at_the_recorded_slabs():
+    """The shapes a profiler recorded for launches on a cc 10.0 part at width 6144: 256 threads at 1 and at 6 rows, 128 threads at 3 rows
+    (the device cell below repeats the comparison on whatever part runs it)."""
+    k = entry.AttentionGateQuantDecode("cpu", 6144)
+    assert k.launch_shape_for(1) == ((3, 1, 1), (256, 1, 1), 0) and k.launch_shape_for(6) == ((18, 1, 1), (256, 1, 1), 0)
+    assert entry.AttentionGateQuantDecode("cpu", 6144, cfg=kcfg.Cfg(THREADS=128)).launch_shape_for(3) == ((18, 1, 1), (128, 1, 1), 0)
+
+
+def test_launch_facts_are_plain_fresh_and_decline_an_unserved_row_count():
+    """The facts are plain data, a fresh object per call (a caller's edit reaches nothing of the entry) and the entry's typed declines
+    for a row count outside 1 .. 160; a row count that is not an ``int`` is a ``ValueError`` that says so, as on every entry's launch
+    facts (never the per-row table's index error)."""
+    k = entry.AttentionGateQuantDecode("cpu", 2048, pdl_release=True)
+    form = k.form_for(7)
+    assert json.loads(json.dumps(form)) == form == dict(THREADS=256, PDL_RELEASE=True) and type(form) is dict
+    form["PDL_RELEASE"] = "edited"
+    assert k.form_for(7)["PDL_RELEASE"] is True and k.cfg_for(7).PDL_RELEASE is True
+    for fact in (k.kernel_symbols_for, k.form_for, k.launch_shape_for):
+        for rows in (0, -1):
+            with pytest.raises(ValueError, match="a call holds at least one row"):
+                fact(rows)
+        with pytest.raises(NotImplementedError, match="at most 160 rows.*got 161"):
+            fact(161)
+        for rows in (1.0, "1", None, True):
+            with pytest.raises(ValueError, match="rows must be an int"):
+                fact(rows)
+        fact(160)
+
+
+class _CompiledStandIn:
+    """What the entry keeps per compile key, as far as the launch facts read it: a compiled DSL host function carries ``kernel_info``,
+    keyed by the symbols of the kernels it launches."""
+
+    def __init__(self, *symbols):
+        self.kernel_info = {symbol: {} for symbol in symbols}
+
+
+def test_kernel_symbol_is_that_of_the_compiled_config_at_every_row_count():
+    """Host-only, with a stand-in in the entry's compile cache: nothing compiled -> an empty tuple; once the config is compiled its ONE
+    symbol answers every row count (one compiled kernel serves them all); a compiled kernel of another config is not named; a compiled
+    object that does not expose its kernels is the typed decline, never a guess."""
+    k = entry.AttentionGateQuantDecode("cpu", 2048)
+    assert k.kernel_symbols_for(1) == () == k.kernel_symbols_for(160)
+    k.compiled[(kcfg.Cfg(THREADS=128),)] = _CompiledStandIn("cudnn_kernel_frost_attention_gate_quant_other_0")
+    assert k.kernel_symbols_for(1) == (), "a config the row count does not run is not named"
+    k.compiled[k.key(1)] = _CompiledStandIn("cudnn_kernel_frost_attention_gate_quant_A_0")
+    assert all(k.kernel_symbols_for(rows) == ("cudnn_kernel_frost_attention_gate_quant_A_0",) for rows in range(1, kcfg.MAX_ROWS + 1))
+    k.compiled[k.key(1)] = object()
+    with pytest.raises(NotImplementedError, match="the attention gate \\+ quantize decode step: the installed CuTe DSL .* does not expose the kernel symbols"):
+        k.kernel_symbols_for(1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------
@@ -1014,3 +1098,25 @@ def test_reciprocal_primitive_is_the_correctly_rounded_division():
     assert not bool(
         diff.any()
     ), f"{int(diff.sum())} of {scales.numel()} reciprocals differ from the IEEE division (first: scale {float(scales.cpu()[diff][0])!r})"
+
+
+@pytest.mark.parametrize(
+    "rows, arm", [(1, dict()), (6, dict(pdl_release=True)), (3, dict(cfg=kcfg.Cfg(THREADS=128)))], ids=["rows1", "rows6-release", "rows3-threads128"]
+)
+def test_launch_facts_equal_the_profilers_record_of_a_launch(rows, arm):
+    """On the device, width 6144: one launch of the entry (the pick, the released form, the 128-thread config) is ONE kernel whose
+    profiler record -- name, grid, block, shared memory -- equals the entry's launch facts; nothing is named before the first compile;
+    and the SAME compiled kernel serves another row count, whose launch record follows its own row count's shape."""
+    dev = _device_or_skip()
+    width = 6144
+    k = entry.AttentionGateQuantDecode(dev, width, **arm)
+    scale = scale_tensor(0.02, dev)
+    assert k.kernel_symbols_for(rows) == (), "nothing is compiled yet"
+    records = []
+    for call_rows in (rows, 17):
+        attn, gate = make_operands(call_rows, width, dev, seed=3)
+        out = torch.empty(call_rows, width, dtype=E4M3, device=dev)
+        records.append(assert_facts_equal_the_launch(k, lambda: k(attn, gate, scale, out), call_rows, what=entry.NAME))
+    assert records[0].name == records[1].name and records[0].name.startswith("cudnn_kernel_frost_attention_gate_quant_"), records
+    assert records[0].grid != records[1].grid and records[0].block == records[1].block, "one kernel, the grid of each call's row count"
+    assert k.form_for(rows) == asdict(k.cfg_for(rows)) and len(k.compiled) == 1

@@ -122,14 +122,39 @@ the normed hidden, and releases its successor at entry). The caller then owes th
 the config docstrings: the launch's immediate predecessor must not write this layer's state,
 conv state or slot indices. The default forms keep PDL off.
 
+## Launch facts
+
+Both entries state what a step launches without launching it: three read-only answers per served row count -- `(rows)`
+on `GdnDecodeFused`, the step shape `(requests, tokens)` on `GdnVerifyFused`. Both verify arguments are required:
+`cfg_for` reads a missing `tokens` as the minimum (2) because one config can stand behind every tokens count, but the
+launch differs per tokens count (shared memory, compiled kernel), so a fact never answers for an assumed step.
+
+| fact | answer |
+|---|---|
+| `kernel_symbols_for(...)` | the symbols of the kernels the entry has compiled for that row count, as a tuple without repeats in compile order; empty until a form of that row count is compiled. A step compiles once per operand layout (and, for verify, per parameter dtype set), so several compiled kernels can stand behind one row count; they share one symbol wherever the layout sits behind the symbol's cut |
+| `form_for(...)` | the form as plain data: every field of the config `cfg_for` returns under the config's own field names (the pick or the caller's `cfg`, with the part's shared-memory readings, the geometry as a nested `dict` and the `pdl` / `pdl_release` knobs applied), plus `ROWS` and `EPS` (decode) or `REQUESTS`, `TOKENS` and `EPS` (verify). A fresh `dict` of `bool` / `int` / `float` / `str` values on every call |
+| `launch_shape_for(...)` | `(grid, block, shared_memory)`: grid `(V heads x CTAs per head, rows or requests, 1)`, block `(threads, 1, 1)`, and the bytes of shared memory one thread block holds (verify: growing with the tokens per request). A profiler's kernel record of the launch reads the same three values |
+
+The symbol is the kernel's name followed by the head of its config's text, cut at a fixed length. What sits behind the
+cut is not in the name -- with CuTe DSL 4.8.0 the two-CTAs-per-head field, the geometry and the operand layout of both
+kernels, and the launch knobs and the tokens per request of the verify kernel -- so two forms can share a symbol.
+Compare the form, not the name. On a cc 10.0 part at the default geometry, one request: decode
+`((96, 1, 1), (256, 1, 1), 42112)`, verify at six tokens `((96, 1, 1), (256, 1, 1), 126512)`, with or without `pdl`. A
+step no launch of the entry serves is a typed decline: `ValueError` for a count that is not a positive `int` (or a
+`tokens` that is not an `int`), `NotImplementedError` past the grid's limit, past the 32-bit row-address bound of the
+decode entry's geometry, or for a tokens count outside the verify form's bounds on the part. A call's operand strides
+can bound the decode rows lower still; that decline is the call's. None of the three compiles, launches or touches
+device memory.
+
 ## Validation
 
 `test/python/linear_attention/frost/test_gdn_decode_fused.py` and `test_gdn_verify_fused.py`
 cover the host entries (typed declines, the plan-time compile key, the knob validation, the
 shared-memory budget per tokens count on the cc 10.0 and cc 12.0 readings, the budget-derived
 pick tables of both parts, the geometry envelope and the per-rank geometries' derived constants,
-operand shapes and BA-partition coverage, the DSL and architecture gates) and, on an SM100-class or SM120-class
-device, the null-slot and padding contracts, determinism, CUDA-graph replay over distinct
+operand shapes and BA-partition coverage, the DSL and architecture gates, the launch facts against the configuration
+arithmetic) and, on an SM100-class or SM120-class device, the launch facts against the profiler's record of a launch,
+the null-slot and padding contracts, determinism, CUDA-graph replay over distinct
 layers, a torch reference of the fused chain and the bitwise agreement of every knob arm the part's
 shared memory holds with the default pick (an arm the part does not hold is its typed decline,
 reported as a skip). When `CUDNN_FROST_GDN_VERIFY_REFERENCE_DIR` names a directory of saved verify

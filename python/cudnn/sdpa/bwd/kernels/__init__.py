@@ -9,9 +9,11 @@ One package per arch line -- ``sm80/``, ``sm100/`` (SM100/SM103), ``sm107/``
 (Rubin), ``sm120/`` (SM120/SM121) -- holding the kernels that arch owns, the
 same shape as ``sdpa/fwd/kernels/``.  Within a package the filename encodes the rest of the
 coverage matrix: ``bprop_d<dim>_<dtype-family>.py``, e.g.
-``sm100/bprop_d512_f16.py`` (``f16`` covers fp16 and bf16, picked by
+``sm100/d512_f16_role_split/kernel.py`` (``f16`` covers fp16 and bf16, picked by
 ``TemplateParams``).  A file omits the dimension when one implementation
-covers every supported head dim (``sm80/bprop_f16.py``, ``sm120/bprop_f16.py``);
+covers every supported head dim; an explicit implementation engine's body is
+``<arch>/<implementation>/kernel.py`` beside its ``contract.py`` and ``host.py`` (``sm120/f16_fused/``),
+and ``<arch>/half_contract.py`` names the body a multi-body row selects for a declaration;
 ``sm120/bprop_chain_f16.py`` is the SM120-only part of the launch chain around
 that arch's fused main kernel (the deterministic dQ GEMM and the converts), and
 the ``_common.py`` / ``_bprop_mxfp8_*.py`` modules inside a package are that
@@ -43,11 +45,11 @@ import time (module global ``FROST_TEMPLATE_PARAMS``, injected by
 ``cudnn.frost.template_loader.load_template``). Tensor geometry remains an
 input to each module's cached ``compile()`` function. The adapter's
 ``_SM*_KERNEL_FILE`` constants hold paths RELATIVE to this directory
-(``"sm120/bprop_f16.py"``), which the loader joins onto it. Import a template
+(``"sm120/f16_fused/kernel.py"``), which the loader joins onto it. Import a template
 directly only for its all-defaults standalone path.
 
-The SM100 d=256 MXFP8 kernels (``sm100/bprop_dq_d256_mxfp8``,
-``sm100/bprop_dkdv_d256_mxfp8``, their shared ``sm100/_bprop_mxfp8_*`` helpers
+The SM100 d=256 MXFP8 kernels (``sm100/d256_mxfp8/dq``,
+``sm100/d256_mxfp8/dkdv``, their shared ``sm100/_bprop_mxfp8_*`` helpers
 and the ``sm100/bprop_sf_repack_mxfp8`` scale-factor repack) are the exception:
 ported CuTe DSL kernel CLASSES that specialize through their constructors, so
 they are ordinary importable modules with no template parameters.

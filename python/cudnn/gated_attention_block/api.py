@@ -128,7 +128,7 @@ is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
   rotates AND quantizes in its epilogue -- e4m3 Q / K / V into COMPACT
   per-tensor ``q8`` / ``k8`` / ``v8`` (each == compact BSHD ``[B, S, H, d]``,
   exactly what the unfused FP8 SDPA reads), the GATE as bf16 into ``gate16``
-  -- and the production FP8 d256 SDPA (``prefill_d256_fp8.py`` with
+  -- and the production FP8 d256 SDPA (``sm107/d256_fp8_single_q/kernel.py`` with
   ``epilogue_gate`` on and ``has_amax_o=False``: the block runs static scales
   and reads no ``Amax_O``, so the atomic is compiled out) reads those compact
   buffers, multiplies by ``sigmoid(gate16)`` after the dead-row select and
@@ -161,7 +161,7 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   write compact e4m3 ``q8`` / ``k8`` / ``v8`` + the SDPA's own F8_128x4 SF
   blobs (``sf_q`` / ``sf_k`` / ``sf_v``, one 1 KiB tile per ``(b, h, 128-row
   tile)``; V's is D-PLANE-MAJOR, ``mma-tma-matrix.md`` § 7); the production
-  ``sm107/prefill_d256_mxfp8.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
+  ``sm107/d256_mxfp8_single_q/kernel.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
   NATURAL at (256, 256), the 2-CTA pair on dense legs) writes bf16 O; the bf16 gate; a PER-TENSOR
   ``quantize_o`` (``MxQuantSpec.scale_o``; D1 -- never the rowwise recipe) and
   the per-tensor FP8 ``out_proj`` with ``alpha_o = descale_w_o / scale_o``.
@@ -635,13 +635,13 @@ it (and wherever no two-unit route holds the step, whatever the batch).  ``decod
 batch the route was decided at; without a batch (the envelope's ``routes``) the route is the small-batch one."""
 
 DECODE_TILE = "decode_d256_f16"
-"""``kernel_template`` of the d256 decode tile: the Rubin rendering ``sdpa/fwd/kernels/sm107/decode_d256_f16.py`` on cc 10.7 and its
-SM100 sibling ``sdpa/fwd/kernels/sm100/decode_d256_f16.py`` on cc 10.0 (the swap-AB tile; ONE template name, the adapter picks the file
+"""``kernel_template`` of the d256 decode tile: the Rubin rendering ``sdpa/fwd/kernels/sm107/d256_f16_swap_ab/kernel.py`` on cc 10.7 and its
+SM100 sibling ``sdpa/fwd/kernels/sm100/d256_f16_swap_ab/kernel.py`` on cc 10.0 (the swap-AB tile; ONE template name, the adapter picks the file
 by the device -- the readback ``_Sdpa._impl._k_mod.__file__`` names which)."""
 
 PREFILL_TILE = "prefill_d256_f16"
 """``kernel_template`` of the paged d256 prefill tile the DECODE form's prefill route runs: the shared SM100 half d256 body
-(``sdpa/fwd/kernels/sm100/prefill_d256_f16.py``) on its paged THD arm with PackGQA -- the EXTEND form's kernel."""
+(``sdpa/fwd/kernels/sm100/d256_f16_lookahead/kernel.py``) on its paged THD arm with PackGQA -- the EXTEND form's kernel."""
 
 DECODE_ROUTE_SINGLE_UNIT = "single_unit"
 """The default route policy: one KV stream per sequence and KV head wherever a kernel offers it AND the step fills the part -- the
@@ -736,13 +736,13 @@ def _resolve_decode_route_policy(policy: Optional[str]) -> str:
 @dataclass(frozen=True)
 class DecodeRoute:
     """Which SDPA kernel serves a DECODE step of ``s_q`` tokens at a geometry under a route policy -- the Rubin decode tile
-    (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``, the swap-AB tile: ``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` names the
+    (``sdpa/fwd/kernels/sm107/d256_f16_swap_ab/kernel.py``, the swap-AB tile: ``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` names the
     widths it takes in ONE token unit, ``config_sm107.decode_d256_q_tile`` the adapter's token-unit arm past them) or the paged d256
     PREFILL tile with the group packed (the EXTEND form's kernel at the dense step's envelope); ``_Sdpa.compile`` pins the compiled
     ``kernel_template`` against this record.  ``kv_streams`` is the figure the HBM-bound decode step is priced by: how many times the
     KV range of a (sequence, KV head) is streamed -- the token units on the packed decode tile, the group on the unpacked arm (one
     head per CTA), one on the prefill tile and on the single-unit decode tile.  On the SM100 line (``device_cc`` cc 10.0, appended
-    2026-10-29) the same record names the SM100 decode tile (``sm100/decode_d256_f16.py`` at 16 columns; its 32-column arm is a typed
+    2026-10-29) the same record names the SM100 decode tile (``sm100/d256_f16_swap_ab/kernel.py`` at 16 columns; its 32-column arm is a typed
     decline there until its cells run, :data:`DECODE_WIDE_TILE_CCS`) or the prefill tile under the line's own rule (:func:`decode_route`);
     ``claimed`` is False on every SM100 cell."""
 
@@ -1044,7 +1044,7 @@ def _decode_unpacked_decline_sm100(cc: Tuple[int, int], s_q: int, group: int, ba
 
 def _decode_wide_arm_decline_sm100(cc: Tuple[int, int], s_q: int, group: int, packed: bool, batch: int, heads: int, max_kv_len: int) -> str:
     """The SM100 line's reason for a step the SDPA adapter's rule puts on the 32-COLUMN decode tile at a WIDE launch
-    (``sm100/decode_d256_f16.py`` at ``N_Q`` 32: 17 .. 32 packed rows with the group packed, or an UNPACKED step of 17 .. 32 tokens) on a
+    (``sm100/d256_f16_swap_ab/kernel.py`` at ``N_Q`` 32: 17 .. 32 packed rows with the group packed, or an UNPACKED step of 17 .. 32 tokens) on a
     part off :data:`DECODE_WIDE_TILE_CCS` -- the arm's plumbing is in place and its cc 10.0 accept cells have not run, so the block
     declines it by name until they do (a served route has an accept test that ran); the envelope's ``route(s_q, batch, max_kv_len)``
     predicts it, the declaration raises it."""
@@ -5046,7 +5046,7 @@ _SM107_CC = (10, 7)
 # same knobs declined; its accept cells (the dense, EXTEND and DECODE oracle rows) ran on a B300 -- functional only, UNMEASURED there.
 DENSE_SERVING_CCS: Tuple[Tuple[int, int], ...] = ((10, 7), (10, 0), (10, 3))
 # The Blackwell-line parts whose 32-COLUMN SM100 decode arm the block ROUTES (2026-10-29, the review follow-up of the cc 10.0 admission):
-# the SDPA adapter's own rule off cc 10.7 takes the 32-column decode tile (`sm100/decode_d256_f16.py` at N_Q 32) for 17 .. 32 packed rows
+# the SDPA adapter's own rule off cc 10.7 takes the 32-column decode tile (`sm100/d256_f16_swap_ab/kernel.py` at N_Q 32) for 17 .. 32 packed rows
 # and for an UNPACKED step of 17 .. 32 tokens on a WIDE launch (config_sm100.d256_wide_decode_launch), but no cc 10.0 cell of the block
 # has run that arm (the 2026-10-29 cc 10.0 run read every DECODE cell at the small-launch reading: the 16-column tile packed / unpacked
 # and the paged prefill tile packed), so `decode_route` declines it by name on every part off this tuple.  cc 10.3 (B300, 2026-11-01):
@@ -5209,12 +5209,12 @@ class _Sdpa(_Stage):
     the SM107 sibling kernels automatically from the live device —
     ``rubin=(self._device_cc == (10, 7))`` in ``SdpaFwdDslSm100.compile`` — so the
     ``(256, 256)`` flavor Qwen3.5 needs lands on
-    ``sdpa/fwd/kernels/sm107/prefill_d256_f16.py`` (bf16 / f16) or, under
-    ``pertensor_fp8=True``, ``prefill_d256_fp8.py`` (e4m3).  There is no flag to
+    ``sdpa/fwd/kernels/sm107/d256_f16_lookahead/kernel.py`` (bf16 / f16) or, under
+    ``pertensor_fp8=True``, ``d256_fp8_single_q/kernel.py`` (e4m3).  There is no flag to
     pass; there IS an arch to check, which :meth:`check_support` does: the
     bf16 / f16 stage is served on the parts of :data:`DENSE_SERVING_CCS` (on
-    cc 10.0 the adapter's own SM100 kernels -- ``sm100/prefill_d256_f16.py``
-    dense / paged THD, ``sm100/decode_d256_f16.py`` over the pools --; 2026-10-29),
+    cc 10.0 the adapter's own SM100 kernels -- ``sm100/d256_f16_lookahead/kernel.py``
+    dense / paged THD, ``sm100/d256_f16_swap_ab/kernel.py`` over the pools --; 2026-10-29),
     the quantized stage on cc 10.7 alone (the Rubin FP8 / MXFP8 d256 rows).
 
     **``fuse_gate=True`` is the SAME adapter with a gate descriptor.**  The
@@ -5231,7 +5231,7 @@ class _Sdpa(_Stage):
     happens anywhere -- and stage (5) disappears.
 
     **MXFP8** (``mxfp8=True``, e4m3 codes + F8_128x4 E8M0 scale factors): the
-    SAME adapter with ``pertensor_fp8=False`` -> ``sm107/prefill_d256_mxfp8.py``
+    SAME adapter with ``pertensor_fp8=False`` -> ``sm107/d256_mxfp8_single_q/kernel.py``
     (the production block-scale kernel; the per-tensor fork machinery is gone,
     so nothing can route block-scaled data into the per-tensor kernel).  The
     three SF blobs ride ``execute(sf_q=, sf_k=, sf_v=)`` and are REQUIRED;
@@ -5503,8 +5503,8 @@ class _Sdpa(_Stage):
         ts = self.token_stride
         # has_amax_o=False: static scales, no Amax_O consumer -> the FP8 kernel
         # compiles the atomicMax out (and execute() refuses an amax_o tensor).
-        # pertensor_fp8 picks the kernel FAMILY: True -> prefill_d256_fp8.py
-        # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
+        # pertensor_fp8 picks the kernel FAMILY: True -> sm107/d256_fp8_single_q/kernel.py
+        # (scalar descales), False -> sm107/d256_mxfp8_single_q/kernel.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
         if self.use_pdl:
             # a decode-tile route (the block never hands the switch to a prefill tile: pdl_capable); the adapter declines at compile()
@@ -9411,7 +9411,7 @@ class GatedAttentionBlockFwd(APIBase):
     typed declines are the same table's rows (:data:`_EXTEND_DECLINES`) a dense declaration can hit -- the diagonal, a
     window, another head dim, an LSE, a step wider than ``DECODE_MAX_ROWS`` -- and :meth:`serving_envelope`
     publishes them with the route per ``S_q`` (``decode``).  **On cc 10.0 (2026-10-29; :data:`DENSE_SERVING_CCS`)** the same
-    form runs the SM100 d256 decode tile (``sm100/decode_d256_f16.py``) under the SM100 line's route (:func:`decode_route` with
+    form runs the SM100 d256 decode tile (``sm100/d256_f16_swap_ab/kernel.py``) under the SM100 line's route (:func:`decode_route` with
     ``device_cc``: the 16-column tile to 16 packed rows, the paged prefill tile packed for a group dividing 128, the 16-column tile
     unpacked past them; the 32-column arm a wide launch would take is a typed decline until its cells run,
     :data:`DECODE_WIDE_TILE_CCS`; no cap, no token units) with the split combine in the combine module's own forms (the decode-grid
@@ -9556,7 +9556,7 @@ class GatedAttentionBlockFwd(APIBase):
         (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
         (2+3) norm+rope    in place (out of place into compact bf16 Q/K under save_for_backward)   this block's kernel
         (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
-        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, pair on dense legs)
+        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production sm107/d256_mxfp8_single_q (NATURAL, pair on dense legs)
         (5)  gate          O, PROJ[G] -> O in place                this block's kernel
         (5q) quantize_o    O -> o8 (PER-TENSOR scale_o, D1)        kernels/quantize.py
         (6)  out_proj      o8 -> out (alpha_o = descale_w_o / scale_o)   per-tensor FP8 FROST GEMM

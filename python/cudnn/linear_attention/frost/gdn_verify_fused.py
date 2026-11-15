@@ -55,6 +55,7 @@ from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error, cutedsl_state
+from cudnn.frost.launch_facts import LaunchShape, kernel_symbols, plain_form
 
 from .kernel.gdn_geometry import DEFAULT_GEOMETRY, Geometry
 from .kernel.gdn_verify_fused_config import (
@@ -210,6 +211,13 @@ def resolve_geometry(geometry, cfg: Optional[Cfg] = None) -> Geometry:
     return cfg.GEOM if cfg is not None else DEFAULT_GEOMETRY
 
 
+def check_requests(requests: int) -> int:
+    """``requests`` when the kernel's grid holds it: at most ``MAX_REQUESTS`` (``NotImplementedError``: one grid row per request)."""
+    if requests > MAX_REQUESTS:
+        raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_REQUESTS} (CUDA's grid Y limit); got requests={requests}")
+    return requests
+
+
 def step_shape(state_indices) -> Tuple[int, int]:
     """``(requests, tokens per request)`` of a verify step: the two extents of the slot-index table."""
     if state_indices.dim() != 2:
@@ -307,8 +315,7 @@ def check_binding(
     requests, tokens = step_shape(state_indices)
     if requests < 1:
         raise ValueError(f"{NAME}: state_indices must hold at least one request; got {tuple(state_indices.shape)}")
-    if requests > MAX_REQUESTS:
-        raise NotImplementedError(f"{NAME} launches one grid row per request, at most {MAX_REQUESTS} (CUDA's grid Y limit); got requests={requests}")
+    check_requests(requests)
     if state_indices.stride(1) != 1:
         raise NotImplementedError(f"{NAME} needs the tokens of a request contiguous in state_indices; got strides {tuple(state_indices.stride())}")
     if cfg is None and tokens > CFG.max_tokens():  # a check without a form: the module default form's bound, never a statement about a part
@@ -462,7 +469,9 @@ class GdnVerifyFused:
     opt-in; a part holding none is a typed ``NotImplementedError`` at construction).  An entry built for a non-CUDA device (host tests)
     has no SM count to pick by and keeps the one-CTA form ``CFG`` on the cc 10.0 readings.  The device is resolved to a concrete CUDA
     ordinal at construction (:func:`resolve_device`), and every operand of every compile / launch must live on exactly it.  ``pdl`` /
-    ``pdl_release`` (None = the form's own fields) are the launch knobs on top of the form that serves."""
+    ``pdl_release`` (None = the form's own fields) are the launch knobs on top of the form that serves.  What a step shape launches is
+    readable without a launch: :meth:`kernel_symbols_for`, :meth:`form_for` and :meth:`launch_shape_for` (the launch facts of
+    :mod:`cudnn.frost.launch_facts`)."""
 
     def __init__(
         self,
@@ -550,6 +559,47 @@ class GdnVerifyFused:
         if self.cfg_given or self.sm_count is None:
             return self.cfg.max_tokens()
         return max_tokens_served(requests, self.sm_count, *self.readings, self.geometry)
+
+    # ---- launch facts (cudnn.frost.launch_facts): three read-only answers per served step shape ----
+    def _step_form(self, requests: int, tokens: int) -> Cfg:
+        """The config of the step shape a launch fact is asked for, behind the typed declines of a step shape the entry does not serve:
+        ``ValueError`` for a ``requests`` that is not a positive int or a ``tokens`` that is not an int, ``NotImplementedError`` for more
+        requests than the grid holds and for a tokens count the form of that step shape cannot hold on this part (``validate_tokens``,
+        the bound :meth:`max_tokens_for` names).  ``tokens`` is REQUIRED here, ``None`` included in the ``ValueError``: :meth:`cfg_for`
+        reads a missing tokens count as the minimum because the config rarely depends on it, but the launch does (the shared memory of
+        a thread block, the compiled kernel), and a fact answers for the step it is given, never for an assumed one."""
+        if isinstance(requests, bool) or not isinstance(requests, int) or requests < 1:
+            raise ValueError(f"{NAME}: requests must be a positive int, got {requests!r}")
+        if isinstance(tokens, bool) or not isinstance(tokens, int):
+            raise ValueError(f"{NAME}: tokens must be an int, the tokens per request of the step (a launch fact assumes none), got {tokens!r}")
+        cfg = self.cfg_for(check_requests(requests), tokens)
+        validate_tokens(cfg, tokens)
+        return cfg
+
+    def kernel_symbols_for(self, requests: int, tokens: int) -> Tuple[str, ...]:
+        """The symbols of the kernels this entry has compiled for the step shape ``(requests, tokens)`` in the form :meth:`cfg_for`
+        names: without repeats, in compile order, empty until a form of that step shape is compiled.  One step shape compiles once per
+        operand layout and parameter dtype set, so several compiled kernels can stand behind it; they share one symbol wherever what
+        tells them apart sits behind the symbol's cut -- as the tokens per request and the launch knobs do, so the symbol never proves a
+        form (:meth:`form_for` states it).  ``tokens`` is required: a kernel compiled for one tokens count is not another's."""
+        cfg = self._step_form(requests, tokens)
+        return kernel_symbols((fn for key, fn in self.compiled.items() if key[:3] == (requests, tokens, cfg)), NAME)
+
+    def form_for(self, requests: int, tokens: int) -> Dict[str, Any]:
+        """The form of the step shape as plain data: every field of the config :meth:`cfg_for` returns (the pick or the caller's
+        ``cfg``, its ``NORM_FORM`` resolved for ``requests``, with this part's readings, the geometry as a nested ``dict`` and the launch
+        knobs applied) plus ``REQUESTS``, ``TOKENS`` and ``EPS``, the facts of the compile key the config does not hold.  The operand
+        strides and parameter dtypes a compile is also keyed on belong to a call, not to a step shape.  ``tokens`` is required."""
+        cfg = self._step_form(requests, tokens)
+        return plain_form(cfg, REQUESTS=requests, TOKENS=tokens, EPS=self.eps)
+
+    def launch_shape_for(self, requests: int, tokens: int) -> LaunchShape:
+        """``(grid, block, shared memory)`` of the launch of the step shape: one thread block per (V head, request) -- two per V head on
+        the two-CTAs-per-head form -- so grid ``(V_HEADS x CTAS_PER_HEAD, requests, 1)``; 256 threads; ``smem_bytes(tokens)`` of shared
+        memory per thread block (the per-token buffers, the state ring and the occupancy pad of the form: it grows with ``tokens``,
+        which is why ``tokens`` is required -- one config can stand behind every tokens count, one launch shape cannot)."""
+        cfg = self._step_form(requests, tokens)
+        return LaunchShape((cfg.GEOM.V_HEADS * cfg.CTAS_PER_HEAD, requests, 1), (cfg.THREADS, 1, 1), cfg.smem_bytes(tokens))
 
     @property
     def debug(self) -> bool:

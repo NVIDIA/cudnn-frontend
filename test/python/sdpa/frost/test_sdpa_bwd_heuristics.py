@@ -34,6 +34,8 @@ _OFFERED = {
     "sdpa_bwd_sm120": 20600,
     "sdpa_bwd_sm80": 20601,
     "sdpa_bwd_sm100": 20602,
+    "sdpa_bwd_sm100_d512_role_split": 20626,
+    "sdpa_bwd_sm100_d512_2x2": 20627,
     "sdpa_bwd_sm100_mxfp8": 20603,
     "sdpa_bwd_sm107": 20604,
     "sdpa_bwd_sm107_fp8": 20605,
@@ -41,6 +43,18 @@ _OFFERED = {
     "sdpa_bwd_sm100_d256": 20607,
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
+    "sdpa_bwd_sm100_d128_recompute": 20628,
+    "sdpa_bwd_sm100_d128_pair": 20629,
+    "sdpa_bwd_sm100_d128_accumulation": 20630,
+    "sdpa_bwd_sm100_d128_accumulation_2cta": 20631,
+    "sdpa_bwd_sm120_f16_fused": 20618,
+    "sdpa_bwd_sm80_f16_d64": 20619,
+    "sdpa_bwd_sm80_f16_two_subgroup": 20620,
+    "sdpa_bwd_sm120_f16_two_subgroup": 20621,
+    "sdpa_bwd_sm100_d128_fp8_pair": 20622,
+    "sdpa_bwd_sm100_d128_fp8_accumulation": 20623,
+    "sdpa_bwd_sm100_mxfp8_pair": 20624,
+    "sdpa_bwd_sm100_d256_mxfp8": 20625,
 }
 
 
@@ -53,7 +67,7 @@ def _facts(**over):
 @pytest.mark.parametrize("d", [32, 40, 64, 128, 192, 256])
 def test_sm120_row_lists_the_kernels_per_head_dim_default(d):
     plans = recommend("A", _facts(d_qk=d, d_v=d), _OFFERED)
-    assert [p.engine_id for p in plans] == [20600]
+    assert [p.engine_id for p in plans] == [20618]  # the fused body; the SM120 row keeps its packed and D > 256 bodies
     q_tile, kv_tile = DEFAULT_TILES[padded_head_dims(d, d)[0]]  # d=40 runs at the padded 64
     assert plans[0].knobs == SdpaBwdKnobs(tile_m=q_tile, tile_n=kv_tile)
     kt = cudnn.knob_type
@@ -64,13 +78,13 @@ def test_sm120_row_lists_the_kernels_per_head_dim_default(d):
 def test_fixed_geometry_row_lists_no_knobs():
     # sm100 f16: the kernel takes no tile choice, so {} is the complete record.
     plans = recommend("A", _facts(d_qk=512, d_v=512, device_cc=(10, 0)), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in plans] == [(20602, None)]
+    assert [(p.engine_id, p.knobs) for p in plans] == [(20626, None), (20627, None)]
 
 
 def test_single_point_domain_row_lists_its_sole_tiles():
     facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_mxfp8=True, device_cc=(10, 0))
     plans = recommend("A", facts, _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in plans] == [(20603, SdpaBwdKnobs(tile_m=128, tile_n=128))]
+    assert [(p.engine_id, p.knobs) for p in plans] == [(20625, SdpaBwdKnobs(tile_m=128, tile_n=128))]  # the MXFP8 row's D256 chain
 
 
 def test_listed_knobs_are_admissible_and_kind_does_not_matter():
@@ -96,19 +110,19 @@ def test_every_row_with_a_tile_choice_resolves_a_default():
             assert default_knobs(spec, _facts()) is None
             continue
         single_point = len(caps.tile_ms) == 1 and len(caps.tile_ns) == 1
-        assert single_point or spec.name in _DEFAULT_TILE_RESOLVERS, spec.name
+        assert single_point or bwd_engines.policy_name(spec) in _DEFAULT_TILE_RESOLVERS, spec.name
 
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20600])],
+    [((10, 7), [20604]), ((11, 0), [20604]), ((10, 0), [20607]), ((10, 3), [20607]), ((12, 0), [20618])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     """The Rubin d256 bf16 / fp16 backward row (slot 4 -> 20604) is fixed-geometry: on cc 10.7-11.x it lists exactly one
     entry with NO knobs (``{}`` is the complete record), and off the Rubin line it is absent -- on the SM100 line the
     d256 half graph lists exactly the 2x2-datapath row (slot 7 -> 20607, knobless too; the sm100 d512 row's envelope floor
-    is exclusive at 256), on SM120 only that line's own continuum row (20600, with its tiles) lists."""
+    is exclusive at 256), on SM120 only that line's own fused continuum body (20618, with its tiles) lists."""
     assert any(s.name == "sdpa_bwd_sm107" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107 is not registered (plan s7)"
     plans = recommend("A", _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
@@ -121,11 +135,12 @@ def test_sm107_half_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     [((10, 0), True), ((10, 3), True), ((10, 4), True), ((10, 5), True), ((10, 6), True), ((10, 7), False), ((12, 0), False), ((8, 0), False)],
     ids=["cc10.0", "cc10.3", "cc10.4", "cc10.5", "cc10.6", "cc10.7", "cc12.0", "cc8.0"],
 )
-def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
+def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(monkeypatch, cc, listed):
     """The SM100 d256 bf16 / fp16 backward row (slot 7 -> 20607, the 2x2-datapath body) lists one knob-less entry on the
     SM100 line (cc 10.0-10.6: the row's ``sm_hi = 106`` admits every pre-Rubin Blackwell datacenter cc, like the MXFP8
     row) for the causal GQA graph too, and nowhere else (the other lines list their own rows); on the SM100 line it never
     lists for d != 256 or for a decode-shaped graph."""
+    monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     assert any(s.name == "sdpa_bwd_sm100_d256" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm100_d256 is not registered"
     facts = _facts(d_qk=256, d_v=256, h_kv=2, dtype=cudnn.data_type.BFLOAT16, causal=True, device_cc=cc)
     plans = recommend("A", facts, _OFFERED)
@@ -134,7 +149,8 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(cc, listed):
     if listed:
         assert [p.engine_id for p in plans] == [20607]
         assert 20607 not in [p.engine_id for p in recommend("A", _facts(d_qk=512, d_v=512, device_cc=cc), _OFFERED)]
-        assert [p.engine_id for p in recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED)] == [20609]
+        expected = [20630, 20628, 20629] if cc in ((10, 0), (10, 3)) else [20628]
+        assert [p.engine_id for p in recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED)] == expected
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
 
 
@@ -152,17 +168,18 @@ def test_sm100_d256_row_lists_ahead_of_the_d192_half_row_on_dense_graphs(monkeyp
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 6), (10, 7)], ids=["cc10.0", "cc10.3", "cc10.6", "cc10.7"])
-def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
-    """The d128 row (slot 9 -> 20609) lists one knob-less entry for a dense MHA graph on every cc of its sm range (the recompute body serves
-    the SM100-line envelope, cc 10.0-10.6, and Rubin, cc 10.7); the grouped (and THD) chains list on the accumulation parts ONLY -- the
-    family's cc tuple ``d128_contract.ACCUMULATION_CCS`` (cc 10.0 / 10.3 / 10.7), read from the contract, never a copy."""
+def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
+    """Dense MHA offers recompute explicitly; grouped and THD retain the accumulation row."""
     from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
 
     monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     facts = _facts(device_cc=cc)
-    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == [(20609, None)]
+    expected = [(20630, None), (20628, None)] if cc in ACCUMULATION_CCS else [(20628, None)]
+    if cc in ((10, 0), (10, 3)):
+        expected.append((20629, None))
+    assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == expected
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc in ACCUMULATION_CCS else [])
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20630, None), (20631, None)] if cc in ACCUMULATION_CCS else [])
     assert ((10, 7) in ACCUMULATION_CCS) and ((10, 6) not in ACCUMULATION_CCS)  # the admitted parts are named, the envelope's hypothetical ccs are not
     assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
@@ -174,25 +191,28 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
         ((11, 0), 512, [20608]),
         ((10, 7), 264, [20608]),
         ((10, 7), 504, [20608]),
-        ((10, 0), 512, [20602]),
-        ((10, 3), 512, [20602]),
+        ((10, 0), 512, [20626, 20627]),
+        ((10, 3), 512, [20626, 20627]),
         ((10, 7), 256, [20604]),
-        ((10, 7), 128, [20609]),  # d128 on cc 10.7: the admitted d128 family row (slot 9), never the d512 row
+        ((10, 7), 128, [20630, 20628]),  # accumulation default, followed by explicit recompute; never the d512 row
         ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
-        ((12, 0), 512, [20600]),
+        ((12, 0), 512, [20621]),  # SM120's two-subgroup body
     ],
     ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
 )
-def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(cc, d, want):
+def test_sm107_d512_row_lists_one_knobless_entry_on_the_rubin_line(monkeypatch, cc, d, want):
     """The cc 10.7 d512 bf16 / fp16 backward row (slot 8 -> 20608) is fixed-geometry: on the Rubin line (cc 10.7-11.x) a
     d in (256, 512] graph lists exactly one entry with NO knobs (``{}`` is the complete record); the SM100 line keeps its
-    own d512 row (20602); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
-    d = 128 on cc 10.7 lists the admitted d128 family row (20609; the Rubin admission of 2026-11-03), past that row's range (cc 11.0)
+    explicit d512 owners (20626 then 20627); d = 256 on the Rubin line stays the d256 row's (20604: the envelope floor is exclusive at 256);
+    d = 128 on cc 10.7 lists accumulation then explicit recompute; past that range (cc 11.0) neither is listed,
     on SM120 the native wide row lists its 16x16 tile pair."""
+    monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     assert any(s.name == "sdpa_bwd_sm107_d512" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_d512 is not registered"
     plans = recommend("A", _facts(d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, causal=False, device_cc=cc), _OFFERED)
     assert [p.engine_id for p in plans] == want
-    assert all(p.knobs is None for p in plans if p.engine_id in (20602, 20604, 20608)), "the fixed-geometry rows have no tile axis: {} is the complete record"
+    assert all(
+        p.knobs is None for p in plans if p.engine_id in (20626, 20627, 20604, 20608)
+    ), "the fixed-geometry rows have no tile axis: {} is the complete record"
     assert all(p.mode is None and p.cpp_index is None for p in plans)
 
 
@@ -208,13 +228,13 @@ def test_sm107_fp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20603]), ((10, 3), [20603]), ((12, 0), [])],
+    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20625]), ((10, 3), [20625]), ((12, 0), [])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_mxfp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     """The block-scale MXFP8 d256 backward row (slot 6 -> 20606): one knob-less entry for an E4M3 ``sdpa_mxfp8_backward`` graph
     with bf16 gradients on the Rubin line (the sm107 rows have no tile axis, unlike the SM100 MXFP8 row's single-point domain);
-    on the SM100 line only that line's own row (20603) lists; nothing on SM120."""
+    on the SM100 line only that line's own D256 chain (20625, the 20603 row's body) lists; nothing on SM120."""
     assert any(s.name == "sdpa_bwd_sm107_mxfp8" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_mxfp8 is not registered"
     facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, causal=True, device_cc=cc)
     plans = recommend("A", facts, _OFFERED)
@@ -233,7 +253,7 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert not family.slots["sdpa_bwd_sm100_d128"].opt_in
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    eid = _OFFERED["sdpa_bwd_sm100_d128"]
+    eid = _OFFERED["sdpa_bwd_sm100_d128_accumulation"]
     monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
 
     def order(**over):
@@ -430,7 +450,7 @@ def test_sm120_short_square_class_keeps_default_and_long_square_leads(monkeypatc
     for s in (5, 16, 63, 64, 127, 128, 129, 2037):
         facts = _facts(dtype=dtype, d_qk=d, d_v=d, h_q=6, h_kv=h_kv, s_q=s, s_kv=s, causal=mask != "none", window_left=3 if mask == "window" else None)
         key = pt.class_key("sdpa_bwd_sm120", facts)
-        plans = propose("A", facts, {"sdpa_bwd_sm120": 20600})
+        plans = propose("A", facts, {"sdpa_bwd_sm120": 20600, "sdpa_bwd_sm120_f16_fused": 20618})
         if s < 128:
             assert key[4] == "prefill_short_square"
             assert pt.lookup("sdpa_bwd_sm120", facts) is None
@@ -438,7 +458,7 @@ def test_sm120_short_square_class_keeps_default_and_long_square_leads(monkeypatc
         else:
             assert key[4] == "prefill"
             assert pt.lookup("sdpa_bwd_sm120", facts) is True
-            assert plans[0].engine_id == 20600
+            assert plans[0].engine_id == 20618  # the fused body inherits the row's measured entries
 
 
 @pytest.mark.parametrize("row,cc", [("sdpa_bwd_sm120", (12, 1)), ("sdpa_bwd_sm80", (8, 0)), ("sdpa_fwd_prefill_sm120", (12, 0))])

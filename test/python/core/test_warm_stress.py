@@ -363,3 +363,26 @@ def test_release_dependence_sees_a_dropped_value_a_visible_zero_and_a_guard():
     add.s32 %r20, %r10, %r11;""")
     found = ws.release_dependence(guarded)
     assert len(found) == 1 and not found[0].dependent and found[0].loaded_registers == 0
+
+
+@pytest.mark.parametrize("words", [7, 8])
+def test_release_dependence_counts_tmem_words_before_reuse(words):
+    registers = ", ".join(f"%r{i}" for i in range(10, 18))
+    body = "\n".join(f"    add.s32 %r{20+i}, %r{19+i}, %r{10+i};" for i in range(1, words))
+    ptx = f"""
+    ld.param.u32 %r9, [kernel_param_1];
+    tcgen05.ld.sync.aligned.32x32b.x8.b32 {{{registers}}}, [%r1];
+    tcgen05.wait::ld.sync.aligned;
+    mov.b32 %r20, %r10;
+{body}
+    and.b32 %r30, %r{19+words}, %r9;
+    shl.b32 %r31, %r30, 3;
+    add.s32 %r32, %r2, %r31;
+    mbarrier.arrive.shared::cta.b64 _, [%r32];
+    """
+    if words == 7:
+        with pytest.raises(AssertionError, match="computed from 7 loaded registers, expected at least 8"):
+            ws.assert_release_dependence(ptx, sites=1, words=8)
+    else:
+        (site,) = ws.assert_release_dependence(ptx, sites=1, words=8)
+        assert (site.parameter, site.loads, site.loaded_registers) == ("kernel_param_1", 1, 8)

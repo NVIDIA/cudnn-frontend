@@ -299,6 +299,11 @@ python/cudnn/
   frost/                        kernel-authoring framework ONLY
     template_loader.py          (path, TemplateParams) -> uniquely-named
                                 kernel module
+    launch_facts.py             what a direct-call entry states about the
+                                kernel it launches per row count: the symbols
+                                of its compiled forms, the form as plain data,
+                                the launch shape (kernel_symbols_for /
+                                form_for / launch_shape_for on the entry)
     tile_dsl/                   shared CuTe-DSL primitives (barriers, TMA,
                                 MMA, softmax pieces, masks). Import by dotted
                                 path: cudnn.frost.tile_dsl.<module>
@@ -314,33 +319,42 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
-      config_sm90.py            TemplateParams + the D512 envelope check +
-                                raising validation
+      config_sm90.py            TemplateParams + flavor picker + the D512
+                                envelope check + raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
-        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
-                                      the Hopper line's only flavor: one D512
-                                      tile over three warpgroups
+        sm80/f16_k_prefetch/          SM80 K-prefetch half body (D_QK <= 192,
+                                      D_V <= 128; explicit engine)
+        sm80/d256_kv_prefetch/        SM80 D256 K+V-prefetch body (qwen envelope;
+                                      explicit engine)
+        sm80/wide_cooperative/        SM80 wide-head cooperative body (wide512 /
+                                      mla576 envelopes; explicit engine)
+        sm90/f16_three_wg/            the D512 body: one 64-row tile over
+                                      three warpgroups, every D up to 512 on
+                                      native 128/256/512-column storage
+        sm90/d64_f16_one_wg/          the D512 body's exact dense D64 subset
+        sm90/d128_f16_multi_q/        dedicated exact D128: 128-row tile, two
+                                      64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
-        sm100/prefill_d256_f16.py
-        sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
+        sm100/d256_f16_lookahead/kernel.py
+        sm100/d256_f16_swap_ab/kernel.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
-        sm100/prefill_d512_f16.py
+        sm100/d512_f16_role_split/kernel.py
         sm100/split_combine.py        the split-KV reduction pass
-        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
-        sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
+        sm107/d128_fp8_multi_q/kernel.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm107/d256_f16_swap_ab/kernel.py      the d256 decode tile's Rubin sibling (same
                                       swap-AB body; config_sm107.make_cfg_d256_decode)
-        sm120/prefill_f16.py          general SM120 template (d <= 256)
-        sm120/prefill_d256_f16.py     d256 flavor
-        sm120/prefill_d512_f16.py     d512 flavor
-        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
-        sm120/prefill_mxfp8.py        block-scaled MXFP8 template (d <= 256)
-        sm120/prefill_d512_fp8.py     d512 flavor for FP8
-        sm120/prefill_d512_mxfp8.py   d512 flavor for MXFP8
+        sm120/f16_general/            general SM120 template (d <= 256; explicit engine)
+        sm120/d256_f16_all_compute/   d256 flavor (explicit engine)
+        sm120/d512_f16_paired/        d512 / d576 flavors (explicit engine)
+        sm120/fp8_general/            general SM120 FP8 template (d <= 256; explicit engine)
+        sm120/mxfp8_general/          block-scaled MXFP8 template (d <= 256; explicit engine)
+        sm120/d512_fp8_paired/        d512 flavor for FP8 (explicit engine)
+        sm120/d512_mxfp8_paired/      d512 flavor for MXFP8 (explicit engine)
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
@@ -348,15 +362,15 @@ python/cudnn/
     bwd/                        same shape, its own api_dsl.py / engines.py /
                                 config_sm*.py
       kernels/                  one package per ARCH LINE, like fwd/
-        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
-        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
-        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
+        sm80/f16_two_subgroup/kernel.py  one directory per explicit engine body
+        sm100/d512_f16_role_split/kernel.py       stage 2 of the large-head-dim chain
+        sm100/d256_mxfp8/dq.py        ported MXFP8 kernel classes (+ dkdv,
                                       _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
         sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
                                       TMEM, dS to a kv-major GMEM workspace)
         sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
                                       the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
-        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/f16_fused/kernel.py     fused SM120 main kernel
         sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
                                       (dq2k, converts)
         bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
@@ -599,7 +613,8 @@ expressible, with one discipline separating them:
   only unmasked graphs, or only a causal diagonal, says so instead of leaving an
   axis to default (one coupling is expressible: `window_right`, the right modes
   a left window pairs with), and the matcher asks every axis in both directions so an
-  unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  unset graph flag cannot bypass a restricted claim. See the
+  [SDPA support reference](../sdpa/frost/support/README.md).
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
   per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
@@ -683,7 +698,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
+  lowers fp16 and bf16 graphs to `sm100/d512_f16_role_split/kernel.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -848,7 +863,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
+  `_require` in `sm100/d512_f16_role_split/kernel.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -1112,11 +1127,16 @@ Contract:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum**, and ARCH is the only
-    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
-    Every other axis -- phase, head dim, dtype family -- goes in the filename and
-    the engine name. A module shared across arch lines stays at `kernels/` level
-    rather than inside one arch package.
+10. **One directory per implementation, under its arch.** ARCH is the only
+    coverage axis that is a directory level of its own; each implementation then
+    gets one directory holding its body (`kernel.py`), its declaration contract
+    (`contract.py`), its fixed host (`host.py`) and, where needed, `config.py`
+    (`kernels/sm107/d128_fp8_multi_q/kernel.py`). Head dim, dtype family and the
+    pipeline shape go in the implementation directory name and the engine name.
+    Contracts and helpers shared by several implementations of one arch stay at
+    the arch level (`kernels/sm100/small_half_contract.py`); a module shared
+    across arch lines stays at `kernels/` level. Backward kernels are migrating
+    to this layout and are still flat files in some arch packages.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.
@@ -1129,15 +1149,16 @@ Contract:
     `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
-14. **Coverage changes update the support matrix.** A change to any SDPA
+14. **Coverage changes update the architecture support page.** A change to any SDPA
     `Capabilities` field that affects graph eligibility, or adding/retiring
     an `EngineSpec`, updates
-    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
-    That tracker is the only arch x pass x head-dim x dtype view of what
-    FROST serves, it is maintained by hand from these rows, and it silently
-    rots otherwise. Knob-domain-only changes are exempt (it does not track
-    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
-    exact scope and is the number to cite in review.
+    the affected section under [SDPA support](../sdpa/frost/support/README.md)
+    in the same commit. Use its template and SM90 example to migrate a section
+    from current source; label unreviewed scopes pending. The old tracker remains
+    historical reference and receives no new development logs. Knob-domain-only
+    changes are exempt; refactors still update moved links and engine identities.
+    `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the exact scope and
+    is the number to cite in review.
 15. **A stage that was read is released through `tile_dsl.consume`.** A bare
     arrive behind shared-memory loads of the stage it frees is not accepted
     in new or changed kernel code, even when every test passes

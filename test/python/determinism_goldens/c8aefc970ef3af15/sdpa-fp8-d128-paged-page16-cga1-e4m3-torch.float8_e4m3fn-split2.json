@@ -114,7 +114,7 @@
   "outputs": {
     "amax_o": {
       "dtype": "torch.float32",
-      "sha256": "05a5b2b593bc79f19b977271a5e5010d9fc1cdb3462ffab013dd3fddf2c98a0c",
+      "sha256": "554584f583484f5046d1dfafb31d12d8fe3818ae37c6da5625342c24cfb77df2",
       "shape": [
         1,
         1,
@@ -124,7 +124,7 @@
     },
     "lse": {
       "dtype": "torch.float32",
-      "sha256": "0839cd78c9df935a50bf4911d7c471ab71099e97eeb63aa3023811efd5eb74f5",
+      "sha256": "7fffaf4bfa1b516c13944855c2d02632795c9df9ff5e037dda2482d31887fb7d",
       "shape": [
         3,
         4,
@@ -134,7 +134,7 @@
     },
     "o": {
       "dtype": "torch.float8_e4m3fn",
-      "sha256": "329675971c3938eb5f42a80fe9958d2c9cbe98f1b1fedceec221723b638d9bb8",
+      "sha256": "b09d2f1eb5f01bc4f21d69499874e3adf37e479155408ec37fca074bb15fed5b",
       "shape": [
         3,
         4,

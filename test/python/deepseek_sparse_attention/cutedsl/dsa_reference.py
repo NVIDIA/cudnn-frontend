@@ -582,16 +582,6 @@ def _batched_ratio_causal_mask(
     return k_pos < col_limit.unsqueeze(-1)
 
 
-def _bottom_right_causal_mask(
-    s_q: int,
-    s_k: int,
-    ratio: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Compatibility alias for the offset-0 ratio-causal mask."""
-    return _ratio_causal_mask(s_q, s_k, ratio, device)
-
-
 def ref_dense_indexer_score_recompute(
     q_indexer: torch.Tensor,  # (B, S_q, H_q, D)
     k_indexer: torch.Tensor,  # (B, S_k, H_kv, D) — H_kv=1 for MQA

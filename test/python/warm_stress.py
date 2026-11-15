@@ -554,6 +554,7 @@ def assert_warm_stress(case: StressCase, *, validation: Optional[Validation] = N
 # The rendering pin: is the address of an arrive computed from the loaded registers through the kernel-argument mask?
 # ---------------------------------------------------------------------------
 
+_STAGE_LOADS = ("ld.shared", "tcgen05.ld")
 _REGISTER = re.compile(r"%[a-z]+\d+")
 _NO_RESULT = ("st.", "bra", "barrier", "bar.", "cp.async", "fence", "mbarrier.init", "ret", "prefetch", "griddepcontrol", "trap", "exit")
 
@@ -564,8 +565,8 @@ class ArriveSite:
     text: str
     dependent: bool  # the address reaches an `and` whose mask comes from a kernel parameter
     parameter: str = ""  # the parameter symbol of the mask
-    loaded_registers: int = 0  # distinct ld.shared destination registers the masked value is computed from
-    loads: int = 0  # ld.shared instructions among them
+    loaded_registers: int = 0  # distinct shared/TMEM destination registers the masked value is computed from
+    loads: int = 0  # shared/TMEM load instructions among them
 
 
 def release_dependence(ptx_text: str) -> List[ArriveSite]:
@@ -574,7 +575,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
     A definition-use walk, not an instruction pattern: from the address operand of the arrive backwards through every
     instruction that defines a register on the way (flow-insensitive: every definition of a register counts).  The site is
     ``dependent`` when the walk meets an ``and`` one of whose operands is computed from a kernel parameter alone
-    (``ld.param``) -- the release-zero -- and it reports how many ``ld.shared`` destination registers the other operand is
+    (``ld.param``) -- the release-zero -- and it reports how many shared-memory or TMEM destination registers the other operand is
     computed from.  The walk does not look through a shared-memory load's own address.
     """
     instructions = []  # (line number, predicate register, opcode, results, sources, parameter symbol, text)
@@ -614,7 +615,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
             definitions.setdefault(register, []).append(index)
 
     def closure(registers):
-        """Indices of every instruction the registers are computed from; loads from shared memory and parameters end the walk."""
+        """Indices of every instruction the registers are computed from; stage loads and parameters end the walk."""
         seen, todo = set(), list(registers)
         visited = set()
         while todo:
@@ -627,7 +628,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
                     continue
                 seen.add(index)
                 opcode = instructions[index][2]
-                if opcode.startswith(("ld.shared", "ld.param")):
+                if opcode.startswith((*_STAGE_LOADS, "ld.param")):
                     continue
                 todo.extend(instructions[index][4])
         return seen
@@ -646,9 +647,9 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
             for mask, value in ((and_sources[0], and_sources[1]), (and_sources[1], and_sources[0])):
                 mask_from = closure([mask])
                 symbols = {instructions[i][5] for i in mask_from if instructions[i][2].startswith("ld.param")}
-                if not symbols or any(instructions[i][2].startswith("ld.shared") for i in mask_from):
+                if not symbols or any(instructions[i][2].startswith(_STAGE_LOADS) for i in mask_from):
                     continue
-                loads = [i for i in closure([value]) if instructions[i][2].startswith("ld.shared")]
+                loads = [i for i in closure([value]) if instructions[i][2].startswith(_STAGE_LOADS)]
                 wanted = closure([value])
                 registers = set()
                 for i in loads:
@@ -667,7 +668,7 @@ def release_dependence(ptx_text: str) -> List[ArriveSite]:
 
 def assert_release_dependence(ptx_text: str, *, sites: int, words: int) -> List[ArriveSite]:
     """Pin a rendering: exactly ``sites`` arrives whose address is computed, through an ``and`` with a kernel parameter, from at
-    least ``words`` loaded shared-memory registers each.  Returns every arrive site of the PTX for further checks."""
+    least ``words`` loaded shared-memory or TMEM registers each.  Returns every arrive site of the PTX for further checks."""
     found = release_dependence(ptx_text)
     dependent = [site for site in found if site.dependent]
     listing = "\n".join(f"  line {s.line}: dependent={s.dependent} loaded registers={s.loaded_registers} ({s.loads} loads) :: {s.text}" for s in found)

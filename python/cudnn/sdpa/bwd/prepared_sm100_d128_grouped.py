@@ -224,7 +224,7 @@ def compile_plan(api):
     if required != api.scratch_workspace_bytes():
         raise RuntimeError("grouped d128 compiled workspace disagrees with its advertised size")
     if api.thd:
-        from .kernels.sm100.prepared_d128_host import compile_host_grouped_thd as compile_host
+        from .kernels.sm100.d128_f16_accum.prepared_host import compile_host_grouped_thd as compile_host
 
         operands.extend(Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2))
         for name in api._thd_origin_dtypes:
@@ -232,7 +232,7 @@ def compile_plan(api):
             operands.append(None if name is None else Operand(name, (b + 1,), (1,), b + 1, width, width))
         args = ((b, h, hk, bool(api.thd_stats_token_major)), api._thd_origins, api._thd_origin_dtypes, dtype, api.is_causal, sm)
     else:
-        from .kernels.sm100.prepared_d128_host import compile_host_grouped_dense as compile_host
+        from .kernels.sm100.d128_f16_accum.prepared_host import compile_host_grouped_dense as compile_host
 
         args = (tuple(geometry), regions, dtype, api.is_causal, sm)
     form = dkv_accum(api)
@@ -264,7 +264,7 @@ def compile_plan(api):
         required,
         device,
         api.scale_softmax,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         length_form=api.thd,
         roles=THD_ROLES if api.thd else ROLES[:9],
         attributes=THD_ATTRIBUTES if api.thd else ATTRIBUTES[:9],

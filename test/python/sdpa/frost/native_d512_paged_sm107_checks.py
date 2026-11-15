@@ -23,7 +23,7 @@ def test_dense(dtype, packed, split, layout, monkeypatch):
     def compile_native(api):
         original(api)
         assert api.flavor == (512, 512)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.KV_SHARE == 2
         assert api._k_mod.DESC_VERSION == 1
         seen.append(True)
@@ -87,7 +87,7 @@ def test_boundaries(dims, page, sq, split, packed, empty, monkeypatch):
     def compile_native(api):
         original(api)
         assert api.flavor == (512, 512)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if dims == (512, 512) else "sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.KV_SHARE == 2
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
@@ -119,15 +119,15 @@ def test_admission_and_config_boundaries():
     from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
     from cudnn.sdpa.fwd import engines, config_sm100, config_sm107
 
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d512_2x2")
     for thd in (False, True):
-        for cga in (1, 2):
+        for cga in (1, 2, 4):
             for pack in (False, True):
                 for split in (1, 4):
                     facts = _f16_facts(d_qk=512, d_v=512, thd=thd, padded=True, has_paged_kv=True, page_size=16)
                     knobs = engines.SdpaFwdKnobs(cga=cga, pack_gqa=pack, split_kv=split)
                     why = engines.mismatch(caps, facts, knobs)
-                    assert (why is None) == (not thd and cga == 2), (thd, knobs, why)
+                    assert (why is None) == (not thd and cga == 4), (thd, knobs, why)
     params = config_sm100.TemplateParams(dtype_qkv=2, dtype_o=2, cta_mma=2, mma_2x2=True, paged_kv=True, page_size=16, seq_kv_lens_present=True)
     cfg, _ = config_sm107.make_cfg_d512_2x2(params)
     assert cfg.PAGED_KV and cfg.PAGE_SIZE == 16 and cfg.KV_SHARE == 2

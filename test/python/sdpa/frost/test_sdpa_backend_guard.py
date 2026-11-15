@@ -23,7 +23,7 @@ from frost_test_utils import requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-_ROW = "sdpa_fwd_prefill_sm107_mxfp8"
+_ROW = "sdpa_fwd_sm107_d128_mxfp8_multi_q"  # the cc 10.7 owner of the D128 graphs below
 _GUARD = "backend crashes the process while planning or building single-query MXFP8 SDPA graphs on cc 10.0 / 10.3 / 10.7"
 _TAIL = "the backend is not consulted for this graph"
 _FAMILY = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")

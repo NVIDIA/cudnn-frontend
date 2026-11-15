@@ -95,7 +95,7 @@ def _runner(dtype, sq, h, d, dv, split):
             )
             api.check_support()
             api.compile()
-            assert api._k_mod.__file__.endswith("sm100/decode_d256_f16.py")
+            assert api._k_mod.__file__.endswith("sm100/d256_f16_swap_ab/kernel.py")
             assert api._k_mod.CFG.TILE_K == api._k_mod.CFG.TILE_O == 128
             assert api._k_mod.N_Q == 16 and api._k_mod.COLS == 8
             plans[b] = api

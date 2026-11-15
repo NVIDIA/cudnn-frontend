@@ -21,7 +21,7 @@ hold); the THD rendering of the setup kernel is byte-identical (the dense operan
 from dataclasses import dataclass
 from typing import Optional
 
-from .config_sm100_d128_accum_2cta import CFG
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG
 from .d128_contract import WORKSPACE_ALIGNMENT, WORKSPACE_SLACK
 from .d128_grouped_contract import PARTIAL_ITEMSIZE
 from .d128_grouped_contract import validate_thd_bounds as _validate_grouped_thd_bounds
@@ -44,7 +44,7 @@ DENSE_ORIGIN_SPECS = (None,) * 8 + (DENSE_STATS_ORIGIN_SPEC,)
 DENSE_ORIGIN_DTYPES = (None,) * 9
 MAPS_PER_SEQUENCE = CFG.MAPS_PER_SEQUENCE
 UNIT_ROWS = CFG.THD_UNIT_ROWS  # 256 kv rows per CLC work item (one cga2 pair)
-# --- stats_form = "tma_ring" (the s_tail body's header section 11; config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS): the delta launch
+# --- stats_form = "tma_ring" (the s_tail body's header section 11; d128_f16_accum_2cta.config.CFG.STATS_FORMS): the delta launch
 # writes the softmax's stat words PRE-SCALED and q-tile-PADDED into ``stats2`` = fp32 [heads][PAD_TOTAL / N][STATS_KINDS][N] -- kind 0 =
 # -log2(e) * LSE (0 for an LSE of -inf), kind 1 = -scale * delta; the pad rows [S_b, ceil(S_b / N) * N) of every sequence hold 0.0 = the ldg
 # form's `stat = 0` for a row past the sequence, bit for bit -- and the main kernel's loader bulk-copies ONE (head, q tile) block = STATS_KINDS
@@ -124,7 +124,7 @@ CTA_PAIR_CCS = tuple(CTA_PAIR_MIN_SEQ)
 # own support check, after the selector.
 CTA_PAIR_LAYOUTS = LAYOUT_FORMS
 CTA_PAIR_CLUSTER = CFG.CGA_M  # the pair = one cluster of two CTAs; the device must admit at least one such cluster (the occupancy query)
-# the pair body's identity token (the s_tail module, config_sm100_d128_accum_2cta_stail; its TMEM MAP is the typed, PART-KEYED op-level field
+# the pair body's identity token (the s_tail module, d128_f16_accum_2cta.config; its TMEM MAP is the typed, PART-KEYED op-level field
 # ``tmem_map`` -- "s_tail" | "dq_576" -- resolved by the prepared module per device cc and carried by the compile key, never by this token)
 CTA_PAIR_BODY = "s_tail"
 PAIR_BODY = "2cta"

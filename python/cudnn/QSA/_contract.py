@@ -10,15 +10,6 @@ import torch
 # (query heads, KV heads) geometries the attention kernels serve: the full 24Q/2KV model and its 12Q/1KV (two-way) and
 # 6Q/1KV (four-way, KV head replicated) tensor-parallel shards.
 HEAD_GEOMETRIES = ((6, 1), (12, 1), (24, 2))
-# bf16 parts of dS that reach the dQ MMAs: dS rounded to bf16 (on the dense prefix P too) or three parts of its fp32
-# value
-DS_PRECISIONS = {"bf16": 1, "fp32": 3}
-
-
-def ds_parts(ds_precision):
-    if not isinstance(ds_precision, str) or ds_precision not in DS_PRECISIONS:
-        raise ValueError("ds_precision must be 'bf16' or 'fp32'")
-    return DS_PRECISIONS[ds_precision]
 
 
 def check_tensor(name, tensor, shape, dtype, device, alignment=4):

@@ -112,7 +112,7 @@ def test_graph_wide_dense(dtype, deterministic, mask, padded):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_bwd_sm120")
+    select_engine(graph, "sdpa_bwd_sm120_f16_two_subgroup")
     graph.check_support()
     graph.build_plans()
     workspace = make_workspace(graph.get_workspace_size())
