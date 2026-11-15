@@ -114,3 +114,18 @@ def test_sm120_fused_host_refuses_other_bodies():
 
     with pytest.raises(ValueError, match="dense graphs with D_QK <= 256 only"):
         lower(None, _sm120_facts(thd=True), None, lower_impl=_lower)
+
+
+@pytest.mark.parametrize("fmt,slot", [("fp8", 16), ("mxfp8", 17)])
+def test_sm120_quantized_rows_name_their_one_body(fmt, slot):
+    import importlib
+    import pathlib
+
+    from cudnn.engines.manifest import MANIFEST
+
+    contract = importlib.import_module(f"cudnn.sdpa.bwd.kernels.sm120.{fmt}.contract")
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
+    assert family.slots[contract.NAME].slot == slot and family.slots[contract.NAME].opt_in
+    caps = _spec(contract.NAME).capabilities
+    assert (caps.implementation, caps.select_implementation, caps.delegated) == (contract.NAME, None, frozenset())
+    assert (pathlib.Path(bwd_engines.__file__).parent / "kernels" / contract.KERNEL_FILE).is_file()

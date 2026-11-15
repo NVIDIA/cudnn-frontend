@@ -2374,8 +2374,11 @@ def _sm120_fp8_mismatch(facts, version):
 
 
 def _sm120_fp8_spec():
+    from .kernels.sm120.fp8 import contract
+    from .kernels.sm120.fp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_sm120_fp8",
+        name=contract.NAME,
         capabilities=Capabilities(
             sm_lo=120,
             sm_hi=121,
@@ -2394,14 +2397,18 @@ def _sm120_fp8_spec():
             deterministic=True,
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
+            implementation=contract.NAME,
         ),
-        lower=partial(lower_dsl_bwd_fp8, api_type=_SM120_FP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_fp8, api_type=_SM120_FP8)),
     )
 
 
 def _sm120_mxfp8_spec():
+    from .kernels.sm120.mxfp8 import contract
+    from .kernels.sm120.mxfp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_sm120_mxfp8",
+        name=contract.NAME,
         capabilities=Capabilities(
             sm_lo=120,
             sm_hi=121,
@@ -2420,8 +2427,9 @@ def _sm120_mxfp8_spec():
             deterministic=True,
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
+            implementation=contract.NAME,
         ),
-        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM120_MXFP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_mxfp8, api_type=_SM120_MXFP8)),
     )
 
 

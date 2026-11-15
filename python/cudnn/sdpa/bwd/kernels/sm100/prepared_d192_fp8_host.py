@@ -43,8 +43,11 @@ def _spec(dqk, dv, sm, mx, window):
 def _kernel_hosts(spec):
     here = pathlib.Path(__file__).resolve()
     if len(spec) == 6 and spec[5] == "sm120":
+        from cudnn.sdpa.bwd.kernels.sm120.fp8 import contract as fp8
+        from cudnn.sdpa.bwd.kernels.sm120.mxfp8 import contract as mxfp8
+
         fmt = "mxfp8" if spec[3] else "fp8"
-        module = load_template(str(here.parent.parent / "sm120" / f"bprop_{fmt}.py"), spec, tag=f"sdpa_bwd_sm120_{fmt}")
+        module = load_template(str(here.parent.parent / (mxfp8 if spec[3] else fp8).KERNEL_FILE), spec, tag=f"sdpa_bwd_sm120_{fmt}")
         return module.dkdv_host, module.dq_host
     if tuple(spec[:2]) == (512, 512):
         fmt = "mxfp8" if spec[3] else "fp8"
@@ -80,7 +83,7 @@ def _bind():
         if dkdv_host is None:
             dkdv_host, dq_host = _kernel_hosts(tuple(SPEC))
             if len(SPEC) == 6 and SPEC[5] == "sm120":
-                from cudnn.sdpa.bwd.kernels.sm120.bprop_fp8 import delta_host as native_delta
+                from cudnn.sdpa.bwd.kernels.sm120._fp8_common import delta_host as native_delta
 
                 delta_host = native_delta
 
