@@ -400,7 +400,7 @@ def test_the_32_wide_tile_matches_the_fp64_oracle_on_sm100(case, dtype, d=32):
     from small_tile_cells import case_inputs, check, check_degenerate_rows, run_graph
 
     q, k, v, kw, oracle = case_inputs(case, d, dtype)
-    out = run_graph(q, k, v, row="sdpa_fwd_sm100_d128_multi_q" if d == 32 else _SM100_ROW, **kw)
+    out = run_graph(q, k, v, row="sdpa_fwd_sm100_d128_multi_q", **kw)
     assert out["knobs"].cga == 1 and out["knobs"].split_kv == 1, out["knobs"]
     check(out, oracle)
     check_degenerate_rows(out, case)

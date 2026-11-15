@@ -104,10 +104,13 @@ def _case(
     eid, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     knobs.update({cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: split, cudnn.knob_type.SCHED_POLICY: 0})
     knobs.pop(cudnn.knob_type.SWAP_AB, None)
-    explicit = (d, dv) == (128, 128)
+    from cudnn.sdpa import graph_analyzer
+    from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
+
+    facts = graph_analyzer.analyze(g)
+    explicit = (d, dv) == (128, 128) or (_arch() == "sm100" and padded_shape(facts) == (128, 128))
     if explicit:
         from cudnn.engines.manifest import family_for
-        from cudnn.sdpa import graph_analyzer
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
         if _arch() == "sm107":
@@ -117,7 +120,6 @@ def _case(
             from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry as select_geometry
             from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
 
-        facts = graph_analyzer.analyze(g)
         requested = replace(SdpaFwdKnobs.from_public(knobs), tile_m=128, swap_ab=swap)
         geometry = SwapAB() if swap == 1 else select_geometry(facts, requested)
         eid = family_for(g).offered_ids()[geometry.implementation]
@@ -366,7 +368,9 @@ def test_domain(cc):
     knobs = engines.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=True, swap_ab=1)
 
     def actual_mismatch(f, k):
-        if (f.d_qk, f.d_v) == (128, 128):
+        from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
+
+        if (f.d_qk, f.d_v) == (128, 128) or (cc in ((10, 0), (10, 3)) and padded_shape(f) == (128, 128)):
             if cc == (10, 7):
                 from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_swap_ab.contract import Geometry
             else:

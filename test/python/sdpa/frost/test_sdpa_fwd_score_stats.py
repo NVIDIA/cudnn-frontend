@@ -126,8 +126,7 @@ def test_mismatch_accepts_and_rejects(row):
     if row == "sdpa_fwd_sm100_d128_multi_q":
         # The native d64 flavor is the same file at d_flavor=64 but is not validated with the outputs: not claimed.
         assert "wired on the d128" in reason(d_qk=64, d_v=64)
-        assert "exact D32/D64/D128" in reason(d_qk=24, d_v=24)
-        assert "wired on the d128" in engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), _facts(d_qk=24, d_v=24))
+        assert "wired on the d128" in reason(d_qk=24, d_v=24)
     else:
         # RE-INVERTED 2026-10-08: on Rubin a d64 / d24 graph WITH the outputs rides the d128 envelope, i.e. the kernel that
         # carries the store, exactly as before the small head-dim tiles -- the tiles carry the dense leg only
