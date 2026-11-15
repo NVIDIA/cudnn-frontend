@@ -152,32 +152,18 @@ candidate order, budget and placement; explicit records pin this body. Old
 exact-wide 20505 recipes must be invalidated and replanned. No additional
 numerical, determinism or batch-invariance claim is introduced.
 
-**SM120-family exact general-tile FP8 and MXFP8 implementation engines:**
-`sdpa_fwd_sm120_fp8_general` (20542) and `sdpa_fwd_sm120_mxfp8_general` (20543)
-own their rows' exact general head tiles (both dims multiples of 32 up to 256)
-on cc 12.x, E4M3/E5M2. The legacy 20507 / 20518 rows delegate those cells and
-keep the sixteen-aligned envelopes. Kernels, contracts and hosts live in
-`sm120/fp8_general/` and `sm120/mxfp8_general/`; `sm120/quantized_general_contract.py`
-holds the shared identity. Capabilities (outputs, block-scaled O, split-KV and
-the exact-D128 sink split, masks, THD, PackGQA) are the legacy rows' at these
-shapes. Central selection preserves the old candidate order, budget and
-placement; explicit records pin the body. Old exact general-tile 20507/20518
-recipes must be replanned. No additional numerical, determinism or
-batch-invariance claim is introduced.
-
-**SM120-family exact half implementation engines:**
-`sdpa_fwd_sm120_d256_all_compute` (20537), `sdpa_fwd_sm120_f16_general` (20544)
-and `sdpa_fwd_sm120_decode_key_group` (20538) own exact FP16/BF16 cells on
-16-wide head tiles (D/V in 16..256) on cc 12.x. TILE_M names the body: 16 / 32
-run the key-group decode body on every tile; 64 / 128 run the all-compute body
-at D256/V256 and the general body elsewhere. The legacy 20505 row delegates
-those cells and keeps the eight-aligned envelopes. Kernels, contracts and hosts
-live in `sm120/d256_f16_all_compute/`, `sm120/f16_general/` and
-`sm120/decode_f16_key_group/`; `sm120/half_exact_contract.py` holds the shared
+**SM120-family exact D256 half implementation engines:**
+`sdpa_fwd_sm120_d256_all_compute` (20537) and `sdpa_fwd_sm120_decode_key_group`
+(20538) own exact FP16/BF16 D256/V256 on cc 12.x; TILE_M names the body
+(64 / 128 all-compute, 16 / 32 key-group decode). The legacy 20505 row
+delegates exact D256 and keeps the eight-aligned (240, 256] envelope and the
+decode tile at smaller head dims, which run the same key-group body. Kernels,
+contracts and hosts live in `sm120/d256_f16_all_compute/` and
+`sm120/decode_f16_key_group/`; `sm120/d256_f16_contract.py` holds the shared
 identity and the TILE_M selection. Capabilities, masks, sinks, PackGQA,
-split-KV, paging, THD and the exact-D128 additive bias are the legacy row's at
-these shapes. Central selection preserves the old candidate order, budget and
-placement; explicit records pin the body. Old exact-tile 20505 recipes must be
+split-KV, paging (decode tile only) and THD (all-compute only) are the legacy
+row's at D256. Central selection preserves the old candidate order, budget and
+placement; explicit records pin the body. Old exact-D256 20505 recipes must be
 replanned. No additional numerical, determinism or batch-invariance claim is
 introduced.
 
@@ -3120,7 +3106,7 @@ FP8 FPROP (`sm120/d512_fp8_paired/kernel.py`) adds the same independent band wit
 **multiples of 16** and a **64 x 64 CTA**. Half, per-tensor E4M3 and MXFP8
 BPROP extend through D512 under their respective contracts described below.
 
-MXFP8 FPROP (`sm120/mxfp8_general/kernel.py`) runs the FP8 pipeline on the block-scaled
+MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
 16**; both head dims in (256, 512] run `sm120/d512_mxfp8_paired/kernel.py`, the d512
 FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.
