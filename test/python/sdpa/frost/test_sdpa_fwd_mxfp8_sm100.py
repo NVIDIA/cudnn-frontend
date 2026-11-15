@@ -67,7 +67,7 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # the test cannot run.  Flip the condition to False when the gap closes.
 #
 # INVERTED 2026-09-09: the d192xd128 MXFP8 gap CLOSED
-# (sm107/prefill_d192_d128_mxfp8.py), so every DENSE d192 case below now runs on
+# (sm107/d192_mxfp8_multi_q/kernel.py), so every DENSE d192 case below now runs on
 # Rubin.  It runs at cga2 there and only cga2 -- at cga1 that flavor's four
 # scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window
 # -- which the row expresses by leaving (192, 128) on its default cgas={2}, so
@@ -3043,7 +3043,16 @@ def test_mxfp8_thd_batched_setup(batch, cu_lens):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize(
+    "d_qk,d_v",
+    [
+        pytest.param(64, 64, marks=pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 line has no D64 body")),
+        (128, 128),
+        (192, 128),
+        (256, 256),
+        (512, 512),
+    ],
+)
 @pytest.mark.parametrize("mask", ["none", "causal"])
 def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
     """A negative attn_scale negates S in the block-scaled BMM1 (a_negate) and runs at |scale| (#1435). Block

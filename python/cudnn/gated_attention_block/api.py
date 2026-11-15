@@ -161,7 +161,7 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   write compact e4m3 ``q8`` / ``k8`` / ``v8`` + the SDPA's own F8_128x4 SF
   blobs (``sf_q`` / ``sf_k`` / ``sf_v``, one 1 KiB tile per ``(b, h, 128-row
   tile)``; V's is D-PLANE-MAJOR, ``mma-tma-matrix.md`` § 7); the production
-  ``sm107/prefill_d256_mxfp8.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
+  ``sm107/d256_mxfp8_single_q/kernel.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
   NATURAL at (256, 256), the 2-CTA pair on dense legs) writes bf16 O; the bf16 gate; a PER-TENSOR
   ``quantize_o`` (``MxQuantSpec.scale_o``; D1 -- never the rowwise recipe) and
   the per-tensor FP8 ``out_proj`` with ``alpha_o = descale_w_o / scale_o``.
@@ -5231,7 +5231,7 @@ class _Sdpa(_Stage):
     happens anywhere -- and stage (5) disappears.
 
     **MXFP8** (``mxfp8=True``, e4m3 codes + F8_128x4 E8M0 scale factors): the
-    SAME adapter with ``pertensor_fp8=False`` -> ``sm107/prefill_d256_mxfp8.py``
+    SAME adapter with ``pertensor_fp8=False`` -> ``sm107/d256_mxfp8_single_q/kernel.py``
     (the production block-scale kernel; the per-tensor fork machinery is gone,
     so nothing can route block-scaled data into the per-tensor kernel).  The
     three SF blobs ride ``execute(sf_q=, sf_k=, sf_v=)`` and are REQUIRED;
@@ -5504,7 +5504,7 @@ class _Sdpa(_Stage):
         # has_amax_o=False: static scales, no Amax_O consumer -> the FP8 kernel
         # compiles the atomicMax out (and execute() refuses an amax_o tensor).
         # pertensor_fp8 picks the kernel FAMILY: True -> prefill_d256_fp8.py
-        # (scalar descales), False -> prefill_d256_mxfp8.py (block scales).
+        # (scalar descales), False -> sm107/d256_mxfp8_single_q/kernel.py (block scales).
         kw = dict(pertensor_fp8=self.pertensor, dtype_o=self.o_dtype, has_amax_o=False) if self.fp8 else {}
         if self.use_pdl:
             # a decode-tile route (the block never hands the switch to a prefill tile: pdl_capable); the adapter declines at compile()
@@ -9556,7 +9556,7 @@ class GatedAttentionBlockFwd(APIBase):
         (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
         (2+3) norm+rope    in place (out of place into compact bf16 Q/K under save_for_backward)   this block's kernel
         (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
-        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, pair on dense legs)
+        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production sm107/d256_mxfp8_single_q (NATURAL, pair on dense legs)
         (5)  gate          O, PROJ[G] -> O in place                this block's kernel
         (5q) quantize_o    O -> o8 (PER-TENSOR scale_o, D1)        kernels/quantize.py
         (6)  out_proj      o8 -> out (alpha_o = descale_w_o / scale_o)   per-tensor FP8 FROST GEMM

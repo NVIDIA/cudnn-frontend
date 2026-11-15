@@ -16,7 +16,7 @@ block; ``max_rel`` printed), never bit-identity.
 
 Two MXFP8 configurations exist and both are covered end to end here.  UNFUSED (9 stages
 = 9 kernel launches: block-scale GEMM, norm+RoPE, THREE ``quantize_mxfp8`` launches, the
-production ``sm107/prefill_d256_mxfp8.py``, gate, per-tensor ``quantize_o``, FP8
+production ``sm107/d256_mxfp8_single_q/kernel.py``, gate, per-tensor ``quantize_o``, FP8
 ``out_proj``) and FULLY FUSED (``fuse_norm_rope=True, fuse_gate=True``, 3 launches through
 the MXFP8 GEMM fork twin ``run_fused_proj_gemm_mxfp8`` and the gated production MXFP8
 SDPA).  The fused oracle tests SKIP typed on a checkout without the twin; the two

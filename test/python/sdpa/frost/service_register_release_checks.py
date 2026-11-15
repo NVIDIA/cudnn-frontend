@@ -143,11 +143,17 @@ def release_cases(arch):
             "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
             "prefill_d512_mxfp8.py": "d512_mxfp8_slice_recompute/kernel.py",
         }
-        path = (
-            moved.get(name, name)
-            if arch == "sm100" or name in ("prefill_d128_fp8.py", "prefill_d192_d128_fp8.py", "prefill_d256_fp8.py", "prefill_d512_fp8.py")
-            else name
-        )
+        moved_sm107 = {
+            "prefill_d128_fp8.py": "d128_fp8_multi_q/kernel.py",
+            "prefill_d192_d128_fp8.py": "d192_fp8_multi_q/kernel.py",
+            "prefill_d256_fp8.py": "d256_fp8_single_q/kernel.py",
+            "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
+            "prefill_d128_mxfp8.py": "d128_mxfp8_multi_q/kernel.py",
+            "prefill_d192_d128_mxfp8.py": "d192_mxfp8_multi_q/kernel.py",
+            "prefill_d256_mxfp8.py": "d256_mxfp8_single_q/kernel.py",
+            "prefill_d512_mxfp8.py": "d512_mxfp8_role_split/kernel.py",
+        }
+        path = (moved if arch == "sm100" else moved_sm107).get(name, name)
         cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))
     if arch == "sm100":
         # The retained-P body compiles only for exact top-left SWA of one KV tile.

@@ -1470,7 +1470,7 @@ def make_sdpa_helpers(
 # ======================================================================# Fused epilogue gate  --  O := O * sigmoid(G)   (Rubin d256 f16 / per-tensor FP8 / MXFP8)
 # =============================================================================
 # Shared between the three SM107 d256 prefill kernels (``sm107/prefill_d256_f16.py``,
-# ``sm107/prefill_d256_fp8.py``, ``sm107/prefill_d256_mxfp8.py``); each kernel splices these under
+# ``sm107/prefill_d256_fp8.py``, ``sm107/d256_mxfp8_single_q/kernel.py``); each kernel splices these under
 # ``cutlass.const_expr(CFG.EPILOGUE_GATE)`` at its ``EPILOGUE_FUSION_SEAM``
 # tokens (one per splice; a source test counts them per kernel).  The gate ``SmemTile(`` itself is constructed INLINE in each kernel
 # (multi-line, ``desc_version=DESC_VERSION``) so the per-kernel "every SmemTile
@@ -1610,7 +1610,7 @@ def gate_epilogue_pairs(o_scaled, g_vals: list, half_opaque, o_chunk: int) -> li
     UNGATED value halved -- exactly, see ``gate_inv_sum``) and doubles the
     running max once per tile: Amax_O is a statistic of the sdpa node, which
     precedes the gate, so it must not depend on G
-    (``sm107/prefill_d256_fp8.py`` and ``sm107/prefill_d256_mxfp8.py``,
+    (``sm107/prefill_d256_fp8.py`` and ``sm107/d256_mxfp8_single_q/kernel.py``,
     corr_chunk / corr_release)."""
     out = []
     for p in range(o_chunk // 2):

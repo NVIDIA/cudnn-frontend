@@ -110,11 +110,14 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d512_mxfp8
+from cudnn.sdpa.fwd.kernels.sm107.d512_mxfp8_role_split import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 if PARAMS.paged_kv:
     raise ValueError(
-        "prefill_d512_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/prefill_d128_mxfp8 and sm107/prefill_d256_mxfp8)"
+        "prefill_d512_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/d128_mxfp8_multi_q and sm107/d256_mxfp8_single_q)"
     )
 CFG, _TMA = make_cfg_d512_mxfp8(PARAMS)
 
@@ -1240,6 +1243,7 @@ def _kernel(
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+_kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 # ============================================================================

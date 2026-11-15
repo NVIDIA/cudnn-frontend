@@ -704,7 +704,7 @@ def test_sm107_mxfp8_thd_shapes_match_the_row():
     from cudnn.sdpa.fwd.config_sm107 import _MXFP8_THD_FLAVORS, SM107_MXFP8_THD_SHAPES
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    rubin = caps[engines.engine_name(arch="sm107", mxfp8=True)]
+    rubin = engines.sm100_legacy_policy_spec(engines.engine_name(arch="sm107", mxfp8=True)).capabilities
     assert rubin.thd and rubin.cu_seq_len and rubin.thd_padded_stats
     assert rubin.thd_d_shapes is SM107_MXFP8_THD_SHAPES
     assert _SM107_MXFP8_THD_SHAPES is SM107_MXFP8_THD_SHAPES

@@ -2516,6 +2516,8 @@ def _exec_sdpa_mxfp8_expect_frost(cfg, request, cudnn_handle, strict=True, engin
     """exec_sdpa_mxfp8, then assert the FROST MXFP8 row ``engine`` (the SM100 row by default;
     the cc 10.7 sweeps pass their own row's name) served the graph; with ``strict`` a harness
     skip (every engine declined) is a failure, so an unserved config cannot pass silently."""
+    if engine == _cc107_engine("mxfp8"):
+        engine = _cc107_mxfp8_owner(cfg.d_qk, cfg.d_v)
     owners = {
         (64, 64): ("sdpa_fwd_sm100_d128_mxfp8_multi_q",),
         (128, 128): ("sdpa_fwd_sm100_d128_mxfp8_multi_q",),
@@ -3371,6 +3373,19 @@ def _cc107_engine(family):
     """The cc 10.7 FROST forward row of a dtype family ("half", "fp8", "mxfp8")."""
     from cudnn.sdpa.fwd.engines import engine_name
     return engine_name(arch="sm107", fp8=family == "fp8", mxfp8=family == "mxfp8")
+
+
+def _cc107_mxfp8_owner(d_qk, d_v):
+    """The cc 10.7 MXFP8 body that serves an exact head shape; the row keeps only shapes it does not delegate."""
+    from cudnn.sdpa.fwd.kernels.sm107 import mxfp8_contract
+    return mxfp8_contract.owner_of_shape((d_qk, d_v)) if (d_qk, d_v) in mxfp8_contract.SHAPES else _cc107_engine("mxfp8")
+
+
+def _mxfp8_engines_of(row):
+    """The MXFP8 row and every MXFP8 engine of its arch line (the explicit bodies its exact shapes delegate to)."""
+    from cudnn.sdpa.fwd import engines
+    lo = next(s.capabilities.sm_lo for s in engines.ENGINE_SPECS if s.name == row)
+    return [s.name for s in engines.ENGINE_SPECS if s.capabilities.is_mxfp8 and s.capabilities.sm_lo == lo]
 
 
 def _frost_sm107_unavailable_reason(engine):
@@ -4411,11 +4426,11 @@ def test_sdpa_mxfp8_paged_cc107_plan_pins_L0(env_info, case_id, policy, request,
     served plan's SCHED_POLICY read back.  Qualification of the knob domain, never a winner."""
     from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
-    engine = _cc107_engine("mxfp8")
-    _require_frost_sm107(engine)
+    _require_frost_sm107(_cc107_engine("mxfp8"))
     value = {"NATURAL": SCHED_NATURAL, "LPT": SCHED_LPT, "LPT_L2": SCHED_LPT_L2}[policy]
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p6a_pinned_cfg(next(c for c in P6A_PAGED_MXFP8_PINNED_CASES if c[0] == case_id))
+    engine = _cc107_mxfp8_owner(test.cfg.d_qk, test.cfg.d_v)
     test.cfg.plan_pin = {"engine": engine, "knobs": {"SCHED_POLICY": value}}
     test.showConfig((request.node.name, len(_P6A_PLAN_PINS)), request)
     with _must_run(request):
@@ -4523,11 +4538,11 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
     d192x128_pools / d512_pools / sf_o_over_pools are RED before the row-aware admission (the reason is the generic 'graph
     uses paged attention' today); the three controls pin the precedence of the earlier rules.  (Once the planning error
     quotes the rows' reasons -- the P1 lane's decline_reasons -- the needle can move onto the error text itself.)"""
-    engine = _cc107_engine("mxfp8")
-    _require_frost_sm107(engine)
+    _require_frost_sm107(_cc107_engine("mxfp8"))
     from cudnn.sdpa.fwd import engines
 
     kw, expected = _P6A_DECLINES[case]
+    engine = _cc107_mxfp8_owner(kw.get("d", 128), kw.get("d_v") or kw.get("d", 128))
     g, decl = _p6a_pool_graph(**kw)
     before = _p6a_declaration_snapshot(decl)
     with pytest.MonkeyPatch.context() as mp:
@@ -4559,8 +4574,8 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
 def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
     """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split: the row's split-KV serves
     dense graphs only, so the sink-free pool graph is declined by that clause and the sink graph by the shared sink rule."""
-    engine = _cc107_engine("mxfp8")
-    _require_frost_sm107(engine)
+    _require_frost_sm107(_cc107_engine("mxfp8"))
+    engine = _cc107_mxfp8_owner(128, 128)
     from cudnn.sdpa.fwd import engines
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
@@ -5291,7 +5306,9 @@ def _p1_is_backend_plan(g, i):
 def _p1_plan_pin(pin, frost):
     """A ``plan_pin`` for exec_sdpa_mxfp8: applied to the dense forward graph between create_execution_plans and
     check_support (every failure through pytest.fail -- see exec_sdpa_mxfp8)."""
-    from cudnn.engines.engine_ids import FROST_SDPA_FWD_ID_BASE
+    from cudnn.engines.manifest import MANIFEST
+
+    frost_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[frost]
 
     def apply(g):
         names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
@@ -5307,7 +5324,7 @@ def _p1_plan_pin(pin, frost):
             g.select_plan(fi[0])
         elif pin == "frost_replay":
             engine_id, knobs = g.get_engine_and_knobs_at_index(fi[0])
-            if engine_id != FROST_SDPA_FWD_ID_BASE + 16 or not knobs:
+            if engine_id != frost_id or not knobs:
                 pytest.fail(f"unexpected replay record for the row: {(engine_id, knobs)}", pytrace=False)
             g.create_execution_plan(engine_id, knobs)  # appends; resolves WITHOUT the flag once the slot is a default one
             g.select_plan(g.get_execution_plan_count() - 1)
@@ -5327,9 +5344,9 @@ def test_sdpa_mxfp8_cc107_explicit_plan_pins_L0(env_info, graph_case, pin, reque
     xfails with BACKEND_AMAX_O_ISSUE only (Rule 9: outputs and declines, never plan order).  A backend pin on a graph
     whose backend plans do not build on the measured backends (``backend_builds=False``) must surface the backend's own
     typed build failure through the strict pin / the barred walk -- a decline, never a silent fall-through to the row."""
-    frost = _cc107_engine("mxfp8")
-    _require_frost_sm107_default(frost)
     cfg = _p1_pin_cfg(graph_case)
+    frost = _cc107_mxfp8_owner(cfg.d_qk, cfg.d_v)
+    _require_frost_sm107_default(frost)
     backend_pin = pin in ("backend_first", "deselect_frost")
     backend_builds = _P1_PIN_GRAPHS[graph_case]["backend_builds"]
     key, native = f"frost:{frost}", "native:mxfp8-fwd"
@@ -5493,9 +5510,9 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
     except ImportError:  # no guard module in this tree: every known backend is treated as crashing
         fixed_in = None
 
-    frost = _cc107_engine("mxfp8")
-    _require_frost_sm107_default(frost)
     kwargs, expectation, row_reason = _P1_DECLINE_CASES[case]
+    frost = _cc107_mxfp8_owner(kwargs.get("d", 128), kwargs.get("dv", 128))
+    _require_frost_sm107_default(frost)
     with pytest.MonkeyPatch.context() as mp:
         mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
         g, tensors = _p1_mxfp8_graph(**kwargs)
@@ -5605,7 +5622,7 @@ for name, kwargs in {items!r}:
         continue
     n = g.get_execution_plan_count()
     print("STAGE", name, "planned", n, flush=True)
-    g.deselect_engines([{row!r}])  # the backend's plans alone are the candidates from here on
+    g.deselect_engines({rows!r})  # the backend's plans alone are the candidates from here on
     try:
         g.check_support()
     except Exception as e:
@@ -5634,7 +5651,7 @@ def _p1_crash_probe(items, timeout=2400, row=None):
     start = 0
     while start < len(items):
         batch = items[start:]
-        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, row=row or _cc107_engine("mxfp8"))
+        script = _P1_CRASH_PROBE.format(paths=paths, items=batch, rows=_mxfp8_engines_of(row or _cc107_engine("mxfp8")))
         p = subprocess.run([sys.executable, "-c", script], cwd=paths[1], capture_output=True, text=True, timeout=timeout)
         lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip() and "RuntimeWarning" not in l and "AttrBuilder" not in l]
         seen, stage = 0, "plan"

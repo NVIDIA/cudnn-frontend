@@ -858,7 +858,8 @@ def _f16_facts(**kw):
 def _caps(name):
     from cudnn.sdpa.fwd import engines
 
-    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[name]
+    # A row that delegates exact shapes to explicit owners keeps its policy domain; the owners serve those shapes.
+    return engines.sm100_legacy_policy_spec(name).capabilities
 
 
 def _half_mismatch(facts, knobs=None):
@@ -2070,7 +2071,13 @@ _GATE_ROWS = ("sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_sm107_d256_fp8_single_q
 # The retained half row still supplies the legacy policy's feature constants,
 # but its delegated exact D256 graph must decline. Split-gated decode belongs
 # to its own fixed implementation, not the unsplit lookahead engine.
-_GATE_DECLARED_ROWS = (*_GATE_ROWS, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_sm107_d256_swap_ab")
+_GATE_DECLARED_ROWS = (
+    *_GATE_ROWS,
+    "sdpa_fwd_prefill_sm107",
+    "sdpa_fwd_prefill_sm107_fp8",
+    "sdpa_fwd_sm107_d256_swap_ab",
+    "sdpa_fwd_sm107_d256_mxfp8_single_q",
+)
 _D256 = (256, 256)
 _GATE_SEAMS = (
     "cfg",
@@ -2182,11 +2189,14 @@ def test_sm107_gate_rows_claim_exactly_d256():
             assert spec.capabilities.epilogue_gate_d_shapes is None, spec.name
     # The envelope row retains historical policy metadata; its exact gated
     # D256 cell is delegated and cannot be selected under the old recipe.
-    assert "owned by" in engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), _fp8_gate_facts())
+    specs = {spec.name: spec for spec in engines.ENGINE_SPECS}
+    assert "owned by" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, _fp8_gate_facts())
+    assert "owned by" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_mxfp8"].capabilities, _mxfp8_gate_facts())
+    assert engines.mismatch(specs["sdpa_fwd_sm107_d256_mxfp8_single_q"].capabilities, _mxfp8_gate_facts()) is None
     # The gate is a FEATURE of the Rubin rows, never a row of its own -- a claim
     # unrelated rows landing cannot falsify (a bare spec count could not say it).
     assert {s.name for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate} == set(_GATE_DECLARED_ROWS)
-    assert "owned by" in engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _gate_facts())
+    assert "owned by" in engines.mismatch(specs["sdpa_fwd_prefill_sm107"].capabilities, _gate_facts())
 
     f16, fp8, mxfp8 = _caps(_GATE_ROWS[0]), _caps(_GATE_ROWS[1]), _caps(_GATE_ROWS[2])
     assert engines.mismatch(f16, _gate_facts()) is None
@@ -4032,7 +4042,7 @@ def test_paged_thd_gate_keyless_sequence_is_exactly_zero_and_a_padded_entry_owns
 # ============================================================================
 # Fused epilogue gate on the MXFP8 d256 kernel (PR-B slice S7, 2026-09-15)
 #
-# The block-scale ``sm107/prefill_d256_mxfp8.py`` carries the SAME shared hook
+# The block-scale ``sm107/d256_mxfp8_single_q/kernel.py`` carries the SAME shared hook
 # and the same 16 seams as its f16 / per-tensor FP8 siblings (the tests above
 # now iterate all three modules).  What is specific to this body, and what the
 # tests below pin:
@@ -4082,9 +4092,9 @@ def test_sm107_mxfp8_gate_row_reaches_the_lowering_with_the_ctor_kwargs():
     assert why is not None and "shape" in why, why
     why = engines.mismatch(caps, _mxfp8_gate_facts(epilogue_gate_layout_ok=False))
     assert why is not None and "zero-copy" in why, why
-    # No row outside the three d256 ones claims MXFP8 + gate.
+    # No MXFP8 spec other than the row and its D256 owner claims the gate.
     for spec in engines.ENGINE_SPECS:
-        if spec.capabilities.is_mxfp8 and spec.name != _GATE_ROWS[2]:
+        if spec.capabilities.is_mxfp8 and spec.name not in (_GATE_ROWS[2], "sdpa_fwd_sm107_d256_mxfp8_single_q"):
             assert spec.capabilities.epilogue_gate is False, spec.name
     _ = cudnn  # imported for symmetry with the sibling tests
 
@@ -6175,7 +6185,7 @@ def test_fp8_d192_masked_leading_tile_keeps_rows_with_later_keys_finite(precisio
 
 
 # ------------------------------------------------------------------ the d512 MXFP8 softmax levers (the role-split kernel, SMEM P pack)
-# sm107/prefill_d512_mxfp8.py packs P per 16-B vector straight into the SMEM transfer ring (no TMEM P), normalizes O with a
+# sm107/d512_mxfp8_role_split/kernel.py packs P per 16-B vector straight into the SMEM transfer ring (no TMEM P), normalizes O with a
 # REGISTER row-sum (no ones-MMA) and traces its softmax body twice (dense / masked arm).  The port keeps the bitcast + 16-B
 # store + DSMEM ship untouched and switches only the exponent arm: the f32 chain (default), HALF (MUFU EX2.F16x2 and
 # f16x2 -> FP8 words per 16-elem unit; stats-less row-sum = the HADD2 pair tree over the stored P words, Stats = the exact
@@ -6199,7 +6209,7 @@ def test_d512_mxfp8_softmax_lever_constants_and_call_sites(dtype_qkv, f16, prefo
     from cudnn.frost.tile_dsl import softmax_f16 as sf
 
     mod = _load(_D512, rubin=True, dtype_qkv=dtype_qkv, softmax_f16=f16, softmax_scale_prefolded=prefolded, **_D512_MXFP8_LEVER_KW)
-    assert mod.__file__.endswith("sm107/prefill_d512_mxfp8.py")
+    assert mod.__file__.endswith("sm107/d512_mxfp8_role_split/kernel.py")
     assert (mod.SOFTMAX_F16, mod.SCALE_PREFOLDED) == (int(f16), int(prefolded))
     assert mod._FUSED_SHIFT_CVT == (f16 and prefolded and sf.FUSED_SHIFT_CVT_AVAILABLE)
     assert mod._FP8_TAG_P == ("e5m2" if dtype_qkv == 1 else "e4m3")
@@ -6290,7 +6300,7 @@ def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b,
     assert api.check_support()
     api.compile()
     mod = api._k_mod
-    assert mod.__file__.endswith("sm107/prefill_d512_mxfp8.py"), mod.__file__
+    assert mod.__file__.endswith("sm107/d512_mxfp8_role_split/kernel.py"), mod.__file__
     assert (mod.SOFTMAX_F16, mod.SCALE_PREFOLDED) == (int(precision == "half"), int(prefolded))
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
@@ -7152,7 +7162,7 @@ def _d256_mxfp8_lever_run(precision, prefolded, with_stats, mask_kw, fp8, *, b, 
     assert api.check_support()
     api.compile()
     mod = api._k_mod
-    assert mod.__file__.endswith("sm107/prefill_d256_mxfp8.py"), mod.__file__
+    assert mod.__file__.endswith("sm107/d256_mxfp8_single_q/kernel.py"), mod.__file__
     assert (mod.SOFTMAX_F16, mod.SCALE_PREFOLDED) == (int(precision == "half"), int(prefolded)), "the adapter must compile the requested arms"
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
     api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, seq_kv_lens=kv_lens, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
