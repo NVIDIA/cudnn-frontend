@@ -19,19 +19,20 @@ from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer
 from cudnn.frost.tile_dsl.handles import GmemTileTma
 from cudnn.frost.tile_dsl.mma import mma_ss
-from cudnn.frost.tile_dsl.pointwise import abs_max_tree, fmax_f32, fp32_to_fp16, opaque_f32_zero
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import (
+from cudnn.frost.tile_dsl.pointwise import abs_max_tree, fmax_f32, opaque_f32_zero
+from cudnn.frost.tile_dsl.tma import tma_load_tile
+from cudnn.sdpa.bwd.kernels.sm100._fp8_common import (
     FP8,
     HALF_DTYPES,
     LOG2E,
     _bpe,
     _fold_amax,
+    _join,
     _mma_desc,
     _operand,
+    _output,
     _pack_fp8,
     _scalar,
-    _scale_pairs,
     _store_chunks,
     _tensor_map,
     _tmem_load,
@@ -53,13 +54,6 @@ TG = 256
 TV = 384
 SPEC = globals().get("FROST_TEMPLATE_PARAMS", (512, 512, False, False, 0))
 WINDOW = int(SPEC[4])
-
-
-@cute.jit
-def _join(bar, phase):
-    bar.wait(phase, spin=True)
-    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
 
 
 @cute.jit
@@ -160,34 +154,6 @@ def _grad(slab, done, phase, tmem, accumulate, dq: cutlass.Constexpr[bool]):
         if nvvm.elect_sync():
             done.arrive(cta_group=1)
     _join(done, phase)
-    nvvm.barrier_cta_sync()
-
-
-@cute.jit
-def _output(
-    slab, tmem, desc, owner, head, batch, chunk, plane: cutlass.Constexpr[int], factor, out_scale, live, dtype: cutlass.Constexpr, amax: Optional[cute.Tensor]
-):
-    tid = cute.arch.thread_idx()[0]
-    row, group = tid % M, tid // M
-    vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(64)), cutlass.Float32)
-    if live:
-        vals = _tmem_load(tmem + plane + group * 64, 64)
-        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-    scaled = _scale_pairs([vals[i] for i in range(64)], factor)
-    if cutlass.const_expr(amax is not None):
-        _fold_amax(abs_max_tree(scaled), amax)
-    if cutlass.const_expr(dtype == FP8):
-        _store_chunks(slab, A, row, _pack_fp8(_scale_pairs(scaled, out_scale)), group * 4, 4)
-    else:
-        words = cutlass.Vector.from_elements(tuple(fp32_to_fp16(scaled[2 * i], scaled[2 * i + 1], dtype=dtype) for i in range(32)), cutlass.Int32)
-        _store_chunks(slab, A + group * M * 128, row, words, 0, 8)
-    nvvm.fence_proxy("async.shared", space="cta")
-    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-    nvvm.barrier_cta_sync()
-    if cute.arch.warp_idx() == 0:
-        tma_store_tile(_operand(slab, A, dtype, M, C), GmemTileTma(desc)(chunk * C, owner * M, head, batch))
-        tma_store_commit()
-        tma_store_wait(0)
     nvvm.barrier_cta_sync()
 
 

@@ -48,8 +48,8 @@ input to each module's cached ``compile()`` function. The adapter's
 (``"sm120/f16_fused/kernel.py"``), which the loader joins onto it. Import a template
 directly only for its all-defaults standalone path.
 
-The SM100 d=256 MXFP8 kernels (``sm100/bprop_dq_d256_mxfp8``,
-``sm100/bprop_dkdv_d256_mxfp8``, their shared ``sm100/_bprop_mxfp8_*`` helpers
+The SM100 d=256 MXFP8 kernels (``sm100/d256_mxfp8/dq``,
+``sm100/d256_mxfp8/dkdv``, their shared ``sm100/_bprop_mxfp8_*`` helpers
 and the ``sm100/bprop_sf_repack_mxfp8`` scale-factor repack) are the exception:
 ported CuTe DSL kernel CLASSES that specialize through their constructors, so
 they are ordinary importable modules with no template parameters.

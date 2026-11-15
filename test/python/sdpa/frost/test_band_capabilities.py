@@ -352,7 +352,7 @@ def test_a_window_coupling_is_declared_and_decided_after_the_anchor():
     ):
         with pytest.raises(ValueError):
             band.BandSupport(right=right, left=left, window_right=window_right)
-    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8")
+    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8_pair")
     assert caps.band.window_right == frozenset({band.RIGHT_CAUSAL}) and caps.swa and caps.causal
     assert caps.band.as_dict()["window_right"] == [band.RIGHT_CAUSAL]
     reason = band.window_right_reason(caps.band.window_right)
