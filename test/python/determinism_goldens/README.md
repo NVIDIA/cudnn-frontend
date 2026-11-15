@@ -6150,3 +6150,19 @@ CUDNN_TEST_NO_ISOLATION=1 pytest -o addopts= -q -rs \
 Public documentation CI subsequently passed on `00a232ea0`; the local `fern`
 command remains unavailable. This test-only follow-up preserves production
 source from that qualified head.
+
+
+### SM107 small/mid half explicit records — registration checkpoint, 2026-11-15
+
+The new fixed native and shared-body contracts are exercised by
+`sdpa/frost/test_sdpa_fwd_sm107_half_selection.py`: 37 host tests pass,
+including nine registered-host public-knob round trips, preserved physical
+width envelopes, and N64 split ownership. These are metadata/host checks;
+they do not launch a GPU or compare output bytes. The configuration audit
+compares the real registered admission and host adapters with the legacy
+loader, including complete configuration/TMA records.
+
+The new owners' native output/replay/batch-invariance checks remain pending.
+Existing native body tests and cross-compiled PTX equality do not by themselves
+qualify these new graph records. No numerical tolerance, golden hash, runtime
+skip or deterministic status is changed by this checkpoint.

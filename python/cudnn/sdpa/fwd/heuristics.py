@@ -3764,8 +3764,7 @@ def select_sm107_half_geometry(facts, knobs):
     """
     from . import config_sm107 as config
     from .kernels.sm107 import mid_half_contract as mid, small_half_contract as small
-    from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
-    from .kernels.sm100.d256_f16_contract import D256Geometry, LOOKAHEAD
+    from .kernels.sm107 import shared_half_contract as shared
 
     if (
         facts.device_cc != (10, 7)
@@ -3833,7 +3832,7 @@ def select_sm107_half_geometry(facts, knobs):
     resolved = replace(knobs, cga=cga, tile_n=tile_n)
 
     def single_q():
-        return SingleQ(lowering_row_name=small.LEGACY_ROW, d_flavor=64 if d == 64 else 128, head_dim=192 if d == 192 else 128)
+        return shared.Geometry(shared.SINGLE_Q, d)
 
     if d == 192 and facts.has_paged_kv:
         return small.explicit_geometry(small.MULTI_Q, facts, resolved, d_flavor=d)
@@ -3861,7 +3860,7 @@ def select_sm107_half_geometry(facts, knobs):
         return single_q()
     if d == 256:
         if (facts.thd and not facts.has_paged_kv and split > 1) or (facts.has_paged_kv and facts.uniform_dtype):
-            return D256Geometry(LOOKAHEAD, 128, lowering_row_name=small.LEGACY_ROW)
+            return shared.Geometry(shared.LOOKAHEAD, d)
         return mid.explicit_geometry(mid.LOOKAHEAD, facts, resolved)
     if d == 128 and cga == 1 and not facts.thd and not facts.has_paged_kv:
         return single_q()
@@ -3933,6 +3932,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     """
     from .kernels.sm107 import d512_half_contract as sm107_wide_half
 
+    from .kernels.sm107 import shared_half_contract as sm107_half
+
+    if sm107_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm107_half_geometry, policy=sm100_legacy_policy_spec(sm107_half.LEGACY_ROW))
     if sm107_wide_half.in_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm107_d512_geometry, policy=sm100_legacy_policy_spec(sm107_wide_half.LEGACY_ROW))
     from .kernels.sm100.d256_f16_contract import in_pilot_domain

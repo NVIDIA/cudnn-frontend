@@ -42,7 +42,7 @@ def test_other_architectures_decline(name, cc):
     assert engines.mismatch(SPECS[name].capabilities, replace(facts(), device_cc=cc))
 
 
-@pytest.mark.parametrize("dims", [(504, 504), (128, 128), (256, 256)])
+@pytest.mark.parametrize("dims", [(504, 504), (120, 120), (248, 248)])
 def test_legacy_retains_nonmigrated_domain(dims):
     f = facts(d_qk=dims[0], d_v=dims[1])
     assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, f) is None

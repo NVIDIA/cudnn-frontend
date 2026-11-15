@@ -1159,6 +1159,9 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
         # A fixed owner may inherit shared feature declarations, but only its
         # own head shapes can reach that feature's admission check.
         assert caps.pack_gqa_partial_d_shapes & caps.d_shapes == shapes
+    sm107_half_owners = tuple(s.name for s in engines.ENGINE_SPECS if s.capabilities.implementation in engines._SM107_HALF_IMPLEMENTATIONS)
+    for name in sm107_half_owners:
+        assert by_name[name].pack_gqa_partial_d_shapes == by_name[native_sm107].pack_gqa_partial_d_shapes
     no_partial_owners = ("sdpa_fwd_sm100_d192_multi_q",)
     for name in no_partial_owners:
         assert by_name[name].pack_gqa_partial_d_shapes == frozenset()
@@ -1176,6 +1179,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
             native_sm120,
             "sdpa_fwd_sm120_d512_paired",
             *small_half_owners,
+            *sm107_half_owners,
             *no_partial_owners,
             "sdpa_fwd_sm120_d256_all_compute",
             "sdpa_fwd_sm120_decode_key_group",
@@ -1361,7 +1365,8 @@ def test_capabilities_positional_prefix_is_append_only():
 # declines of the one row that serves them (the Rubin f16/bf16 32- / 64-wide tiles) against every other row.  GPU-free.
 # ---------------------------------------------------------------------------------------------------------------------------------
 
-_SM107_F16_ROW = "sdpa_fwd_prefill_sm107"
+_SM107_F16_ROW = "sdpa_fwd_sm107_d128_multi_q"
+_SM107_PAIR_ROW = "sdpa_fwd_sm107_small_batch_pair"
 
 
 def _mk_small_d_graph(d: int = 32, *, s_q: int = 256, s_kv: int = 256, dtype=cudnn.data_type.BFLOAT16, bias=None, kv_mask=None, **sdpa_kwargs):
@@ -1507,7 +1512,7 @@ def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms
     g = _mk_small_d_graph(
         bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.BFLOAT16)
     )
-    assert _eligible(g) == {_SM107_F16_ROW}, "the io-dtype vector together with the bias (the fast path)"
+    assert _eligible(g) == {_SM107_F16_ROW, _SM107_PAIR_ROW}, "both fixed work items serve this broadcast bias"
     # The fp32 vector WITH the bias: its 128-wide rendering spills on the softmax role (MEASURED -- the rendering pins of
     # test_sdpa_bias_tile_n_additive_sm107.py), so the form is served at TILE_N 64 only: the knob-less probe accepts (the heuristics pick
     # 64 for it, heuristics._resident_arm_tile_n), the TILE_N 64 knob accepts, an EXPLICIT 128 is a typed decline naming the two routes.
@@ -1515,7 +1520,7 @@ def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms
         bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.FLOAT)
     )
     assert engines.mismatch(caps, _facts(g)) is None
-    assert _eligible(g) == {_SM107_F16_ROW}
+    assert _eligible(g) == {_SM107_F16_ROW, _SM107_PAIR_ROW}
     assert engines.mismatch(caps, _facts(g), engines.SdpaFwdKnobs(tile_n=64)) is None
     why = engines.mismatch(caps, _facts(g), engines.SdpaFwdKnobs(tile_n=128))
     assert why is not None and "TILE_N 64" in why and "fp32" in why, why
@@ -1587,7 +1592,7 @@ def test_rubin_d192_unsplit_cta_does_not_require_split_workspace_bound(monkeypat
     from types import SimpleNamespace
 
     _rubin(monkeypatch)
-    caps = _sm107_f16_caps()
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_shared_single_q")
     facts = ga.SdpaGraphFacts(
         b=4096,
         h_q=32,
@@ -1607,7 +1612,9 @@ def test_rubin_d192_unsplit_cta_does_not_require_split_workspace_bound(monkeypat
     )
     unsplit = engines.SdpaFwdKnobs(cga=1, split_kv=1, tile_n=128, pack_gqa=False, sched_policy=policy)
     assert engines.mismatch(caps, facts, unsplit) is None
-    assert engines.mismatch(caps, facts, replace(unsplit, cga=2)) is None
+    pair_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d192_multi_q")
+    assert engines.mismatch(pair_caps, facts, replace(unsplit, cga=2)) is None
+    assert engines.mismatch(caps, facts, replace(unsplit, cga=2)) is not None
     # No partial workspace is needed by the unsplit plan. Split plans still
     # require the caller's bound, and unrelated unsupported features stay out.
     assert not engines.thd_split_domain(caps, facts)
@@ -1722,7 +1729,9 @@ def test_sm107_paged_partial_pack_admission_agrees_with_adapter(monkeypatch, dty
         page_size=16,
         device_cc=(10, 7),
     )
-    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    caps = next(
+        s.capabilities for s in engines.ENGINE_SPECS if s.name == ("sdpa_fwd_sm107_d128_multi_q" if dim == 128 else "sdpa_fwd_sm107_shared_d256_lookahead")
+    )
     reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=split, pack_gqa=True))
     assert (reason is None) == accepted, reason
 
@@ -3011,14 +3020,15 @@ def test_gate_tail_is_recognised(monkeypatch, mul_order, intermediate, dtype):
     assert facts.sdpa_o_virtual_dtype in (None, cudnn.data_type.FLOAT, dtype)
     assert facts.q_t is ts["q"] and facts.d_qk == facts.d_v == _D256 and facts.causal is True
     assert ga._single_sdpa_node(g) is not None, "the sdpa node is still reachable through the single-node accessor"
-    assert _eligible(g) == {"sdpa_fwd_prefill_sm107"}
+    assert _eligible(g) == {"sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_sm107_d256_swap_ab"}
     # The 4-node SdpaBinding must demand G and never O_v / s.
     assert "gate" in ga.SdpaBinding.__dataclass_fields__
 
     g128, _ = _mk_gated_graph(d=128, mul_order=mul_order, intermediate=intermediate, dtype=dtype)
     assert _facts(g128).has_epilogue_gate is True
     assert not _eligible(g128)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _SM107_F16_ROW)
     _, why = engines.analyze_for(spec, g128)
     assert why is not None and "epilogue gate" in why, why
     # The same tail on the SM100 line (the autouse cc) is declined by every row.
@@ -3036,10 +3046,10 @@ def test_gate_tail_o_v_dtype_decision(monkeypatch):
     for ok in (None, cudnn.data_type.FLOAT, cudnn.data_type.HALF):
         g, _ = _mk_gated_graph(o_v_dtype=ok)
         assert _facts(g).sdpa_o_virtual_dtype == ok
-        assert _eligible(g) == {"sdpa_fwd_prefill_sm107"}, ok
+        assert _eligible(g) == {"sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_sm107_d256_swap_ab"}, ok
     g, _ = _mk_gated_graph(o_v_dtype=cudnn.data_type.BFLOAT16)
     assert not _eligible(g)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
     assert "virtual O" in engines.analyze_for(spec, g)[1]
 
 
@@ -3124,7 +3134,7 @@ def test_gate_tail_declines_a_broadcast_g_and_an_undeclared_o_v(monkeypatch):
     not declare) that the tail matcher DOES recognise and every row then
     declines BY MESSAGE -- never facts.invalid, so the backend still serves them."""
     _rubin(monkeypatch)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
     g, ts = _mk_gated_graph(gate_dims=(B, 1, S, _D256))
     facts = _facts(g)
     assert facts.has_epilogue_gate is True and facts.epilogue_gate_shape_ok is False
@@ -3145,7 +3155,7 @@ def test_gate_tail_declines_a_broadcast_g_and_an_undeclared_o_v(monkeypatch):
 def test_gate_tail_uses_native_dense_stride_contract(monkeypatch, gate_strides, accepted):
     """Aligned head-major gates bind directly; unaligned pitches decline early."""
     _rubin(monkeypatch)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
     g, ts = _mk_gated_graph(gate_strides=gate_strides)
     facts = _facts(g)
     assert facts.has_epilogue_gate is True and facts.epilogue_gate_t is ts["gate"]
@@ -3155,7 +3165,7 @@ def test_gate_tail_uses_native_dense_stride_contract(monkeypatch, gate_strides, 
     assert (reason is None) is accepted
     if not accepted:
         assert "zero-copy" in reason
-    assert _eligible(_mk_gated_graph()[0]) == {"sdpa_fwd_prefill_sm107"}
+    assert _eligible(_mk_gated_graph()[0]) == {"sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_sm107_d256_swap_ab"}
 
 
 def test_virtual_amax_o_is_not_a_fact():

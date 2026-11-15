@@ -724,6 +724,17 @@ def place(spec, facts, knobs=None) -> str:
         spec = sm100_legacy_policy_spec()
 
     from .kernels.sm107 import d512_half_contract as sm107_wide_half
+    from .kernels.sm107 import small_half_contract as sm107_small, mid_half_contract as sm107_mid, shared_half_contract as sm107_shared
+
+    if spec.capabilities.implementation in sm107_small.IMPLEMENTATIONS | sm107_mid.IMPLEMENTATIONS | sm107_shared.IMPLEMENTATIONS:
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm107_half_geometry
+
+        selected = select_sm107_half_geometry(facts, knobs)
+        if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
+            return TRAIL
+        spec = sm100_legacy_policy_spec(sm107_shared.LEGACY_ROW)
 
     if spec.capabilities.implementation in sm107_wide_half.IMPLEMENTATIONS:
         if knobs is None:

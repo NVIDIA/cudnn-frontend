@@ -169,7 +169,18 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
             "sdpa_fwd_sm100_d512_2x2",
         )
     if arch == "sm107":
-        return ("sdpa_fwd_prefill_sm107", "sdpa_fwd_sm107_d512_role_split", "sdpa_fwd_sm107_d512_2x2")
+        return (
+            "sdpa_fwd_prefill_sm107",
+            "sdpa_fwd_sm107_d128_multi_q",
+            "sdpa_fwd_sm107_small_batch_pair",
+            "sdpa_fwd_sm107_d192_multi_q",
+            "sdpa_fwd_sm107_d256_lookahead",
+            "sdpa_fwd_sm107_d256_swap_ab",
+            "sdpa_fwd_sm107_shared_single_q",
+            "sdpa_fwd_sm107_shared_d256_lookahead",
+            "sdpa_fwd_sm107_d512_role_split",
+            "sdpa_fwd_sm107_d512_2x2",
+        )
     if arch == "sm120":
         return (
             "sdpa_fwd_prefill_sm120",

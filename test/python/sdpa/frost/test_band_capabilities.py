@@ -83,7 +83,7 @@ def _dims(kind: str, caps):
         # A smaller native flavor can support fewer features than the row's
         # full envelope (SM90 D64 versus D512). Sample the full envelope for
         # the row-wide band claims; dedicated flavor tests pin its restrictions.
-        if caps.implementation == "sdpa_fwd_sm100_d256_swap_ab":
+        if caps.implementation in ("sdpa_fwd_sm100_d256_swap_ab", "sdpa_fwd_sm107_d256_lookahead"):
             # D128 swap-AB only serves paged short queries; D256 also serves
             # the dense geometry varied by this matrix.
             return (256, 256)
@@ -110,6 +110,9 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
             contract = fwd_engines._SMALL_FP8_CONTRACTS.get(caps.implementation) or fwd_engines._HALF_CONTRACTS.get(caps.implementation)
             if contract is not None:
                 return contract.mismatch(facts, None)
+            for contract in (fwd_engines._sm107_small_half, fwd_engines._sm107_mid_half, fwd_engines._sm107_shared_half):
+                if caps.implementation in contract.IMPLEMENTATIONS:
+                    return contract.mismatch(caps.implementation, facts, None)
         return None
     if kind == "fwd":
         return check(facts)
@@ -155,6 +158,11 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     # shape overrides. Keep the non-mask baseline legal after geometry changes.
     b, hq, hk = values["b"], values["h_q"], values["h_kv"]
     sq, sk, dq, dv = (values[k] for k in ("s_q", "s_kv", "d_qk", "d_v"))
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm107_small_batch_pair":
+        # This body always includes a batch-broadcast bias. Preserve that
+        # legal declaration when the band matrix varies sequence lengths.
+        bias_pitch = (sk + 7) // 8 * 8
+        values.update(has_bias=True, bias_dim=(1, hq, sq, sk), bias_stride=(hq * sq * bias_pitch, sq * bias_pitch, bias_pitch, 1), bias_dtype=values["dtype"])
     for role, dim, dtype in (
         ("q_t", (b, hq, sq, dq), values["dtype"]),
         ("k_t", (b, hk, sk, dq), values["dtype"]),
@@ -202,6 +210,9 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
         values["s_q"] = 32
     if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_single_q" and (d_qk, d_v) == (192, 128):
         # D192 single-Q is THD-only; the same body also serves dense small heads.
+        values.update(thd=True, padded=True)
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm107_shared_d256_lookahead":
+        # Its nonpaged domain is THD split, not the native dense lookahead.
         values.update(thd=True, padded=True)
     return values
 

@@ -21,7 +21,7 @@ def mismatch(facts, knobs):
     if cga not in (1, 2):
         return "ordinary multi-Q requires one or two CTAs"
     if facts.uniform_dtype and facts.d_qk in (64, 128) and cga == 1:
-        if (knobs.split_kv or 1) > 1 and (facts.thd or not facts.has_paged_kv):
+        if (knobs.split_kv or 1) > 1 and (facts.thd or not facts.has_paged_kv) and (facts.d_qk == 128 or knobs.tile_n in (None, 128)):
             return "this split geometry uses the shared SM100 single-Q body"
         if facts.d_qk == 128 and not facts.thd and not facts.has_paged_kv:
             return "dense D128 CTA1 uses the shared SM100 single-Q body"

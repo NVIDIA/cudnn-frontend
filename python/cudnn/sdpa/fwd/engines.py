@@ -78,6 +78,10 @@ from cudnn.sdpa.fwd.config_d128_family import BIAS_MODE_RESIDENT, BIAS_MODE_STRE
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.kernels.sm107 import d512_half_contract as _sm107_wide_half
 from cudnn.sdpa.fwd.kernels.sm107 import small_half_contract as _sm107_small_half
+from cudnn.sdpa.fwd.kernels.sm107 import mid_half_contract as _sm107_mid_half
+from cudnn.sdpa.fwd.kernels.sm107 import shared_half_contract as _sm107_shared_half
+
+_SM107_HALF_IMPLEMENTATIONS = _sm107_small_half.IMPLEMENTATIONS | _sm107_mid_half.IMPLEMENTATIONS | _sm107_shared_half.IMPLEMENTATIONS
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import (
     LOOKAHEAD as _D256_LOOKAHEAD,
     SWAP_AB as _D256_SWAP_AB,
@@ -937,6 +941,8 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
     binds G to the plan's declared (B, H_q, S_q, D_v) (``prepared.CombineGate``), so
     such a graph keeps the unsplit fused-gate kernel (``mismatch`` names the
     overrides).  Keep the three in lockstep."""
+    if capabilities.implementation in _SM107_HALF_IMPLEMENTATIONS:
+        return capabilities.implementation == _sm107_mid_half.SWAP_AB
     if capabilities.implementation in _D256_IMPLEMENTATIONS:
         return capabilities.implementation == _D256_SWAP_AB
     if capabilities.sm_lo == 100 and _in_d256_pilot_domain(facts):
@@ -1499,6 +1505,12 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
     if capabilities.implementation in _sm107_wide_half.IMPLEMENTATIONS:
         return frozenset({_sm107_wide_half.explicit_geometry(capabilities.implementation, facts).cluster_m})
+    if capabilities.implementation in _sm107_mid_half.IMPLEMENTATIONS:
+        return frozenset({_sm107_mid_half.explicit_geometry(capabilities.implementation, facts, SdpaFwdKnobs()).cga})
+    if capabilities.implementation in _sm107_shared_half.IMPLEMENTATIONS:
+        return frozenset({_sm107_shared_half.explicit_geometry(capabilities.implementation, facts, SdpaFwdKnobs()).cga})
+    if capabilities.implementation == _sm107_small_half.BATCH_PAIR:
+        return frozenset({1})
     if capabilities.implementation in _D512_IMPLEMENTATIONS:
         from .kernels.sm100.d512_f16_contract import explicit_geometry
 
@@ -1880,6 +1892,23 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         precision = "MXFP8" if capabilities.is_mxfp8 else "FP8" if capabilities.is_fp8 else "half"
         major, minor = facts.device_cc
         return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
+    if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS:
+        if not _sm107_small_half.in_domain(facts):
+            return "requires SM107 and supported half small-head graph declarations"
+        shape = _selected_d_shape(capabilities, facts, knobs)
+        if shape is None:
+            return "no native small-half width envelope serves this declaration"
+        reason = _sm107_small_half.mismatch(capabilities.implementation, replace(facts, d_qk=shape[0], d_v=shape[1]), knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation in _sm107_mid_half.IMPLEMENTATIONS:
+        reason = _sm107_mid_half.mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation in _sm107_shared_half.IMPLEMENTATIONS:
+        reason = _sm107_shared_half.mismatch(capabilities.implementation, facts, knobs)
+        if reason is not None:
+            return reason
     if capabilities.implementation in _SMALL_FP8_CONTRACTS:
         reason = _SMALL_FP8_CONTRACTS[capabilities.implementation].mismatch(facts, knobs)
         if reason is not None:
@@ -3417,7 +3446,7 @@ def _sm107_spec() -> EngineSpec:
             layouts=frozenset({"bshd", "dense_flex"}),
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
-            delegated_exact=frozenset({((10, 7), (512, 512)), ((10, 7), (576, 512))}),
+            delegated_exact=frozenset(((10, 7), shape) for shape in _sm107_shared_half.SHAPES | {(512, 512), (576, 512)}),
             phase="prefill",
             # Every f16 flavor has a Rubin module -- api_dsl._SM107_KERNEL_FILES
             # is the other half of this claim, and _pick_flavor lands a d=192
@@ -3571,6 +3600,57 @@ def _sm107_spec() -> EngineSpec:
             tile_ns_by_d_shape=SM107_TILE_NS_BY_D_SHAPE,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
+    )
+
+
+def _sm107_half_specs():
+    """Five native bodies plus two architecture contracts for shared bodies."""
+    from .kernels.sm107.d128_f16_multi_q.host import lower as lower_multi_q
+    from .kernels.sm107.small_f16_batch_pair.host import lower as lower_pair
+    from .kernels.sm107.d192_f16_multi_q.host import lower as lower_d192
+    from .kernels.sm107.d256_f16_lookahead.host import lower as lower_lookahead
+    from .kernels.sm107.d256_f16_swap_ab.host import lower as lower_swap_ab
+    from .kernels.sm107.shared_f16_single_q.host import lower as lower_shared_single_q
+    from .kernels.sm107.shared_d256_f16_lookahead.host import lower as lower_shared_lookahead
+
+    # The legacy policy owns the legal width envelopes and common features.
+    # Each local contract narrows that declaration to one fixed body. Keep
+    # the original flavor pool so exact D32 can retain its D64/D128 envelope.
+    base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), sm_hi=107, tile_ms_by_d_shape=())
+    rows = (
+        (_sm107_small_half.MULTI_Q, lower_multi_q, frozenset({128})),
+        (_sm107_small_half.BATCH_PAIR, lower_pair, frozenset({128})),
+        (_sm107_mid_half.D192, lower_d192, frozenset({128})),
+        (_sm107_mid_half.LOOKAHEAD, lower_lookahead, frozenset({128})),
+        (_sm107_mid_half.SWAP_AB, lower_swap_ab, frozenset({16, 32, 64})),
+        (_sm107_shared_half.SINGLE_Q, lower_shared_single_q, frozenset({128})),
+        (_sm107_shared_half.LOOKAHEAD, lower_shared_lookahead, frozenset({128})),
+    )
+    exact_shapes = {
+        _sm107_small_half.BATCH_PAIR: frozenset({(32, 32), (64, 64)}),
+        _sm107_mid_half.D192: frozenset({(192, 128)}),
+        _sm107_mid_half.LOOKAHEAD: frozenset({(128, 128), (256, 256)}),
+        _sm107_mid_half.SWAP_AB: frozenset({(256, 256)}),
+        _sm107_shared_half.LOOKAHEAD: frozenset({(256, 256)}),
+    }
+    return tuple(
+        EngineSpec(
+            name,
+            replace(
+                base,
+                implementation=name,
+                tile_ms=tiles,
+                d_shapes=exact_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
+                **({"d_pad_multiple": 0, "d_envelope_floors": ()} if name in exact_shapes else {}),
+            ),
+            partial(
+                lower,
+                lower_impl=lower_dsl_prefill,
+                knob_type=SdpaFwdKnobs,
+                **({"shape_of": _selected_d_shape} if name in _sm107_small_half.IMPLEMENTATIONS else {}),
+            ),
+        )
+        for name, lower, tiles in rows
     )
 
 
@@ -5518,6 +5598,7 @@ ENGINE_SPECS = (
     *_sm100_small_fp8_specs(),
     _sm100_fp8_spec(arch="sm107"),
     _sm107_spec(),
+    *_sm107_half_specs(),
     *_sm107_wide_half_specs(),
     _sm107_mxfp8_spec(),
     _sm120_spec(),

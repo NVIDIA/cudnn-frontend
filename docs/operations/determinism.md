@@ -935,3 +935,19 @@ B300 preserve O/Stats bytes for the tested configurations under CUDA13.4.
 The refill checks cover the native one-CTA-per-SM persistent grid; their
 stress bound is limited to that geometry.
 Backward uses separate kernels and is outside this forward-path change.
+
+
+## SM107 half explicit implementation records
+
+The small and medium half forward engines name their main implementation
+before compilation. Their public engine/knob records retain that implementation
+on replay; this is an identity contract, not a numerical determinism guarantee.
+Native replay and batch-invariance qualification of the newly registered owners
+is **Unverified** until their architecture-specific execution checks are complete.
+Existing SDPA status rows retain their documented scopes. In particular, neither
+registration nor host-only configuration equality establishes a general
+Stats-stride-override or batch-invariance claim.
+
+See the [SM107 support reference](../../python/cudnn/sdpa/frost/support/sm107.md)
+for the implementation boundaries and the
+[coverage report](../../test/python/determinism_goldens/README.md) for measured scope.
