@@ -38,7 +38,7 @@ def test_fixed_record_replay_batch_and_golden(dtype_name, hkv, record_id, d, dv)
     o, stats, _, *expected = helper._reference64(*(inputs[name] for name in ("q", "k", "v", "do")), keep, h // hkv)
     inputs["o"] = helper._bshd_empty(3, sq, h, dv, dt=dtype)
     inputs["o"].copy_(o)
-    inputs["stats"] = stats.unsqueeze(-1).contiguous()
+    inputs["stats"] = stats.float().unsqueeze(-1).contiguous()
     compiled = {}
 
     def run(indices, *, change_neighbors=False):
