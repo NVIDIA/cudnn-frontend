@@ -9,5 +9,5 @@ from ..d256_f16_contract import SWAP_AB, explicit_geometry
 def lower(spec, facts, knobs):
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, lower_dsl_prefill
 
-    geometry = explicit_geometry(SWAP_AB, knobs)
+    geometry = explicit_geometry(SWAP_AB, knobs, facts=facts)
     return lower_dsl_prefill(spec, facts, geometry.canonical_knobs(knobs or SdpaFwdKnobs()), selected_kernel=geometry)

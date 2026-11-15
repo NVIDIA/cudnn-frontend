@@ -116,16 +116,41 @@ guarantee accompanies this ownership migration.
 `sdpa_fwd_sm100_d192_multi_q` (20531) owns the multi-Q pipeline with
 TILE_M=128 and one/two-CTA internal variants. K-subtile release granularity
 and the coupled K/V ring depths remain internal configuration of this body.
-`sdpa_fwd_sm100_d128_single_q` (20532) initially owns only its exact D192/V128
+`sdpa_fwd_sm100_d128_single_q` (20532) owns its exact D192/V128
 unpacked nonpaged THD leg, including supported splits, with TILE_M=128 and one CTA. Its shared
 single-Q body is kept separate from multi-Q and quadrant cooperation; this
-batch does not transfer D64/D128 or SM107 consumers of the old shared file.
+SM107 consumers retain the old shared file. Small-head ownership is listed below.
 The legacy 20511 row declines exact half D192/V128 on SM100/SM103, while
 dense head envelopes retain their previous owner. Central selection preserves
 the existing candidate order, budget and placement. Fixed public records
 select the body directly; old exact-D192 20511 records require replanning.
 Mask, sink, Stats, packing/split and physical-origin checks remain shared.
 This ownership migration adds no numerical or behavior-note guarantee.
+
+**SM100/SM103 exact small-head half implementation engines:**
+Exact D32/D64/D128 FP16/BF16 graphs now delegate from 20511 to fixed bodies:
+`sdpa_fwd_sm100_d128_multi_q` (20535), `sdpa_fwd_sm100_d128_single_q`
+(20532), `sdpa_fwd_sm100_d64_quadrant` (20536), and the existing half
+`sdpa_fwd_sm100_d256_swap_ab` (20520). Multi-Q keeps native D32/D64/D128
+geometry and the existing D32-to-D64 envelope for restricted features.
+Single-Q keeps its D64/D128 geometry, including exact D32 paged THD served
+by the D64 envelope and the existing mixed FP8-KV D128 leg. Quadrant
+cooperation requires dense queries with at most 32 packed live rows.
+The D128 swap-AB variant requires paged KV, a physical TILE_M=16, at most
+eight live Q columns, CGA1 and NATURAL scheduling; its D256 domain remains
+unchanged. Bias/KV-mask and score stores stay on multi-Q. An omitted CGA
+for a D128 score-output request resolves to legal CGA2 instead of the old
+late decode selection that failed to build. Multi-Q explicitly declines THD
+split-KV before compilation: that entry point belongs to single-Q. Generated
+THD split candidates already use single-Q; their ordering is unchanged. Explicit
+requests retain their support checks. Central selection keeps the existing candidate order,
+budgets and placement; duplicate swap-AB scheduler records canonicalize to
+NATURAL. Single-Q/quadrant records reject TILE_N=64, which the old D64
+decode factory silently built as TILE_N=128. Old exact-small 20511 recipes
+require replanning. Other head
+envelopes and SM107 consumers retain their current owners. No new numerical,
+determinism, batch-invariance or behavior-note claim is introduced.
+
 **SM120-family exact wide half implementation engine:**
 `sdpa_fwd_sm120_d512_paired` (20526) owns exact FP16/BF16 D512/V512 and
 D576/V512, including paged FP8-KV storage. The legacy 20505 row delegates

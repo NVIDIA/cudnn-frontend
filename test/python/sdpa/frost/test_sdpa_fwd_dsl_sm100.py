@@ -837,6 +837,14 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, fp8_engine_names(_ARCH))
         _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
         engine = family_for(g).offered_ids()[name]
+    elif not fp8 and _SM in (100, 103) and d_shape[0] == d_shape[1] and d_shape[0] in (32, 64, 128):
+        from cudnn.engines.manifest import family_for
+
+        # The scalar-tail fixture requests a prefill body at this CTA width;
+        # the ranked list may instead lead with a short-Q implementation.
+        _select_engine(g, half_engine_names(_ARCH))
+        _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+        engine = family_for(g).offered_ids()["sdpa_fwd_sm100_d128_multi_q"]
     elif not fp8 and _SM in (100, 103) and d_shape == (512, 512):
         from cudnn.engines.manifest import family_for
 

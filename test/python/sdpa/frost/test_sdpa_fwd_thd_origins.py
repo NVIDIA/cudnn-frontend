@@ -73,6 +73,8 @@ def test_independent_thd_origins_rebind_and_capture(
         engine_name = "sdpa_fwd_sm100_d256_lookahead"
     if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (192, 128):
         engine_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d192_multi_q"
+    if engine_name == "sdpa_fwd_prefill_sm100" and d_qk == d_v and d_qk in (32, 64, 128):
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if splits > 1 and cga in (None, 1) else "sdpa_fwd_sm100_d128_multi_q"
     if sm120:
         from frost_test_utils import sm120_owner
 
@@ -482,7 +484,7 @@ def test_compact_thd_origins_use_single_load_maps(dim):
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    expected_engine = "sdpa_fwd_sm100_d256_lookahead" if dim == 256 else "sdpa_fwd_prefill_sm100"
+    expected_engine = "sdpa_fwd_sm100_d256_lookahead" if dim == 256 else "sdpa_fwd_sm100_d128_multi_q"
     index = next(i for i in range(len(graph.plans)) if graph.get_plan_name_at_index(i).startswith(expected_engine))
     graph.select_plan(index)
     graph.check_support()

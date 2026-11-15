@@ -351,6 +351,8 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_prefill_sm80",
         "sdpa_fwd_prefill_sm90",
         "sdpa_fwd_prefill_sm100",
+        "sdpa_fwd_sm100_d128_multi_q",
+        "sdpa_fwd_sm100_d64_quadrant",
         "sdpa_fwd_sm100_d192_multi_q",
         "sdpa_fwd_sm100_d128_single_q",
         "sdpa_fwd_sm100_d256_lookahead",
