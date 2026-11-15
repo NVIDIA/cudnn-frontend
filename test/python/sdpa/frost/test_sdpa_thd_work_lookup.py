@@ -112,7 +112,13 @@ def _build_graph(q, k, v, cu, max_seqlen, stats_layout, pack, policy, monkeypatc
     with monkeypatch.context() as patch:
         patch.setattr(api_dsl, "load_template", record_module)
         g.build_plans()
-    assert loaded and all(m._BOUNDED_THD_DECODE == (q.dtype == torch.bfloat16) for m in loaded)
+    assert loaded
+    if arch == "sm107":
+        # The native Rubin body uses its own scheduler; the bounded lookup
+        # switch belongs to the shared SM100 implementation.
+        assert all(m.__file__.endswith("sm107/d128_f16_multi_q/kernel.py") and m.CFG.THD_VARLEN for m in loaded)
+    else:
+        assert all(m._BOUNDED_THD_DECODE == (q.dtype == torch.bfloat16) for m in loaded)
     assert all(int(m.CFG.PACK_GQA) == pack for m in loaded), "The executed kernel must honor the requested packing mode"
     expected_group = math.gcd(hq // hkv, 128) if pack else 1
     assert all(m.CFG.PACK_G == expected_group for m in loaded), "The kernel must use the expected partial head group"

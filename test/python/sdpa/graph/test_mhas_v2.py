@@ -3268,7 +3268,7 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
         want = "sdpa_fwd_sm100_d512_2x2"
     elif sm == 107:
         want = {(128, 128): "sdpa_fwd_sm107_d128_multi_q", (192, 128): "sdpa_fwd_sm107_d192_multi_q",
-                (256, 256): "sdpa_fwd_sm107_shared_d256_lookahead", (512, 512): "sdpa_fwd_sm107_d512_2x2"}[(d_qk, d_v)]
+                (256, 256): "sdpa_fwd_sm107_d256_lookahead", (512, 512): "sdpa_fwd_sm107_d512_2x2"}[(d_qk, d_v)]
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
     graph.check_support()

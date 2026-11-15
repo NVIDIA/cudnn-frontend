@@ -1582,7 +1582,11 @@ def test_explicit_natural_unsplit_plan_builds_and_matches_reference():
 # already predate the slot re-cut).  20515 = base + slot 15 (f16), 20514 = base + slot 14 (fp8) today.
 _SDPA_FWD_FAMILY = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
 _RUBIN_F16, _RUBIN_FP8 = "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8"
-_RUBIN_OFFERED = {name: _SDPA_FWD_FAMILY.engine_id + _SDPA_FWD_FAMILY.slots[name].slot for name in (_RUBIN_F16, _RUBIN_FP8)}
+# Keep the historical row for pure policy-model checks. Candidate checks use
+# all registered implementation owners and re-admit every returned record.
+_RUBIN_HALF_NAMES = {s.name for s in engines.ENGINE_SPECS if s.capabilities.sm_lo == 107 and not (s.capabilities.is_fp8 or s.capabilities.is_mxfp8)}
+_RUBIN_OFFERED = {name: _SDPA_FWD_FAMILY.engine_id + _SDPA_FWD_FAMILY.slots[name].slot for name in (*_RUBIN_HALF_NAMES, _RUBIN_FP8)}
+_RUBIN_HALF_IDS = {_RUBIN_OFFERED[name] for name in _RUBIN_HALF_NAMES}
 
 
 @pytest.mark.L0
@@ -1599,7 +1603,7 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _split_points
 
     gated = dict(has_epilogue_gate=True, epilogue_gate_dtype=cudnn.data_type.HALF, d_qk=256, d_v=256, device_cc=(10, 7))
-    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    row = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     permissive = dataclasses.replace(row, split_kv_supported=True, split_d_shapes=None, pack_gqas=frozenset({False, True}), pack_gqa_d_shapes=None)
     # Ungated: the underfilled causal grid (s_q=128, s_kv=8192, 148 SMs) asks for a split; gated: never.
     assert any(p > 1 for p in _split_points(permissive, _facts(d_qk=256, d_v=256, device_cc=(10, 7)), 128, 128, 2)), "the control must split"
@@ -1617,7 +1621,7 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     for facts in (_facts(**gated), _facts(h_q=8, h_kv=2, **gated), _facts(causal=False, **gated)):
         plans = recommend("A", facts, _RUBIN_OFFERED)
         assert plans, "the Rubin f16 row serves the gated d256 graph"
-        assert {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_F16]}
+        assert {p.engine_id for p in plans} == {_RUBIN_OFFERED["sdpa_fwd_sm107_d256_lookahead"]}
         for p in plans:
             assert (p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa, p.knobs
             spec = next(s for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
@@ -1651,7 +1655,8 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
         plans = recommend("A", f, _RUBIN_OFFERED)
         assert plans and plans[0].knobs.pack_gqa is True and plans[0].knobs.split_kv >= 2, [p.knobs for p in plans]
         for p in plans:
-            assert engines.mismatch(row, f, p.knobs) is None, (cache, p.knobs, engines.mismatch(row, f, p.knobs))
+            caps = next(s.capabilities for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
+            assert engines.mismatch(caps, f, p.knobs) is None, (cache, p.knobs, engines.mismatch(caps, f, p.knobs))
             assert not (p.knobs.pack_gqa and (p.knobs.split_kv or 1) == 1), p.knobs
         assert any((p.knobs.split_kv or 1) == 1 for p in plans) == (not f.has_paged_kv), [p.knobs for p in plans]
 
@@ -1669,7 +1674,7 @@ def test_rubin_gated_decode_tile_split_declines_execute_time_shape_overrides(sm1
     from cudnn.sdpa.fwd.engines import _prepared_decline_reason, d256_decode_tile_selected
     from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _split_points
 
-    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    row = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     gated = _decode_d256_facts(
         device_cc=(10, 7),
         device_sm_count=204,
@@ -1723,10 +1728,10 @@ def _sm107_d128_facts(**over):
 
 def _sm107_f16_plans(facts):
     """The cc 10.7 half row's proposals for ``facts``, each re-admitted by mismatch() (honored-or-never-listed)."""
-    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id in _RUBIN_HALF_IDS]
     assert plans, "the cc 10.7 half row must serve this graph"
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
-    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans), [p.knobs for p in plans]
+    specs = {_RUBIN_OFFERED[s.name]: s for s in engines.ENGINE_SPECS if s.name in _RUBIN_HALF_NAMES}
+    assert all(engines.mismatch(specs[p.engine_id].capabilities, facts, p.knobs) is None for p in plans), [p.knobs for p in plans]
     return plans
 
 
@@ -1773,7 +1778,7 @@ def test_sm107_d128_prefolded_graphs_keep_the_native_body(sm107_metadata_target)
     FLOAT+fold cases keep their plan)."""
     from cudnn.sdpa.fwd.engines import effective_cgas
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
     facts = _sm107_d128_facts(attn_scale_prefolded=True)
     assert effective_cgas(spec.capabilities, facts) == frozenset({2})
     plans = _sm107_f16_plans(facts)
@@ -1794,7 +1799,7 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
 
     from cudnn.sdpa.fwd.engines import effective_cgas
 
-    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    caps = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     pack = engines.SdpaFwdKnobs(pack_gqa=True)
     for cga in (1, 2):
         assert engines.mismatch(caps, _sm107_d128_facts(), engines.SdpaFwdKnobs(cga=cga)) is None, cga
@@ -1867,7 +1872,7 @@ def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_
     if over.get("d_qk") == 128:
         # D128 still reaches the shared decode tile when packed. D64 has
         # its own native packed tile and is covered by the flavor contract test.
-        caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+        caps = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
         assert any(p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
         assert any(not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
         assert all(engines.mismatch(caps, facts, p.knobs) is None for p in plans), [p.knobs for p in plans]
@@ -1902,7 +1907,7 @@ def test_sm107_unpacked_causal_thd_scheduler(sm107_metadata_target, over, lpt):
     _SM107_THD_LPT_MAX_WAVES, NATURAL otherwise; the other policy stays listed for autotune (rubin_sched_thd study)."""
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
-    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    caps = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     facts = _sm107_d128_facts(**{**dict(h_q=32, h_kv=32, thd=True, padded=True, has_sink=False), **over})
     points = _sched_points(caps, facts)
     assert points[0] == (SCHED_LPT if lpt else SCHED_NATURAL), points
@@ -2030,7 +2035,7 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     no-split rules."""
     from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _pack_gqa_eligible, _pack_gqa_group
 
-    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    row = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     assert (256, 256) in row.pack_gqa_d_shapes and (256, 256) in row.split_d_shapes
 
     def facts(**over):
@@ -2038,10 +2043,8 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
 
     def sets(**over):
         f = facts(**over)
-        out = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+        out = [p.knobs for p in _sm107_f16_plans(f)]
         assert out, over
-        for k in out:
-            assert engines.mismatch(row, f, k) is None, (over, k, engines.mismatch(row, f, k))
         return out
 
     serving = sets()
@@ -2165,7 +2168,7 @@ def test_rubin_decode_width_is_64_exactly_when_two_32_column_units_would_be_need
             assert decode_d256_q_tile(s_q, g, paged=True, masked=True, max_q_tile=32) == 32, (g, s_q)
     assert decode_d256_q_tile(2, 12, paged=True, masked=True, max_q_tile=32) == 32 and decode_d256_q_units(2, 12, 32) == 1
     # the facts-level twin the heuristics read agrees on the Rubin row and is 0 past 16 rows on the Blackwell row
-    caps107 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    caps107 = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     caps100 = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
     assert [engines.decode_d256_q_tile_for_row(caps107, s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 32, 64, 64]
     assert [engines.decode_d256_q_tile_for_row(caps100, s, 12, paged=True, masked=True) for s in (1, 2, 3, 4)] == [16, 0, 0, 0]
@@ -2182,9 +2185,9 @@ def test_rubin_paged_thd_d256_keeps_its_packed_candidate(sm107_metadata_target, 
     packed knobs passing mismatch() is not enough -- the candidate LIST is what a caller without knobs sees."""
     from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible
 
-    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    row = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     f = _decode_d256_facts(device_cc=(10, 7), device_sm_count=212, s_q=s_q, thd=True, page_size=128, causal=True, bottom_right=True)
-    plans = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+    plans = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id in _RUBIN_HALF_IDS]
     assert plans, "the Rubin half row serves the paged THD d256 graph"
     for k in plans:
         assert engines.mismatch(row, f, k) is None, (k, engines.mismatch(row, f, k))
@@ -2268,7 +2271,7 @@ def test_sm107_paged_thd_sink_sets_pack_and_order_like_their_sink_free_twins(sm1
     from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
 
     facts = _sm107_paged_thd_facts(**over)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
     assert _sm107_paged_half(spec.capabilities, facts) and _prefer_thd_pack_gqa(spec.capabilities, facts)
     plans = _sm107_f16_plans(facts)
     first = plans[0].knobs
@@ -2422,7 +2425,7 @@ def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target)
 
     from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
 
-    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    caps = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     base = dict(
         b=3,
         h_q=8,
@@ -2452,7 +2455,7 @@ def test_sm107_paged_prefill_split_budget_spans_two_waves(sm107_metadata_target)
     assert paged_thd_split_choice(caps, f)[0] == 8 and paged_thd_split_choice(caps, f, first_wave=True)[0] == 4
     plans = _sm107_f16_plans(f)
     assert [p.knobs.split_kv for p in plans[:2]] == [8, 4], [p.knobs for p in plans[:3]]
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
     assert all(engines.mismatch(spec.capabilities, f, p.knobs) is None for p in plans)
 
 
@@ -2465,7 +2468,7 @@ def test_sm107_paged_split_ties_go_to_the_packed_grid(sm107_metadata_target):
 
     from cudnn.sdpa.fwd.heuristics import _d128_thd_split_wave_choice, paged_thd_split_choice
 
-    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    caps = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     base = dict(
         s_q=128,
         dtype=cudnn.data_type.BFLOAT16,
@@ -2500,7 +2503,7 @@ def test_paged_gqa16_admits_split_and_prefers_packing(sm107_metadata_target):
     paged = dict(
         b=1, h_q=32, h_kv=2, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, causal=True, thd=True, padded=True, has_paged_kv=True, page_size=16, k_t=kt
     )
-    rubin = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    rubin = engines.sm100_legacy_policy_spec(_RUBIN_F16).capabilities
     f = _facts(**paged, s_q=248, s_kv=32768, bottom_right=True, max_total_seq_len_q=248, device_cc=(10, 7), device_sm_count=216)
     assert paged_thd_split_choice(rubin, f)[0] > 1
     sm100 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100").capabilities
@@ -2639,7 +2642,7 @@ def test_sm107_paged_d64_prefix_splits_on_the_rubin_budget(sm107_metadata_target
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    spec = engines.sm100_legacy_policy_spec(_RUBIN_F16)
     base = dict(
         b=1,
         h_q=64,

@@ -286,7 +286,11 @@ def test_paged_thd_origins_rebind_and_capture(
         import inspect
 
         api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
-        expected_template = "sm100/decode_d128_f16.py" if native_rubin_split else "sm107/prefill_d256_f16.py" if single_q else "sm107/prefill_d128_f16.py"
+        expected_template = (
+            "sm100/d128_f16_single_q/kernel.py"
+            if native_rubin_split
+            else "sm107/d256_f16_lookahead/kernel.py" if single_q else "sm107/d128_f16_multi_q/kernel.py"
+        )
         assert api._k_mod.__file__.endswith(expected_template)
         assert api._k_mod.CFG.STAGES_KV == (3 if native_rubin_split else 4 if d_qk == 64 else 2 if d_qk == 192 else 2 * cga)
         assert (api._k_mod.CFG.TILE_K, api._k_mod.CFG.TILE_O) == (d_qk, d_v)
