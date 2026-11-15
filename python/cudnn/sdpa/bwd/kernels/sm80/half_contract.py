@@ -22,11 +22,41 @@ def _packed_stats(facts) -> bool:
     return True
 
 
+def d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token, right_bound, causal_bottom_right, bw_kwargs) -> bool:
+    """Whether the D64 body can serve this call EXACTLY: it computes a plain dense MHA backward and nothing else, so
+    every condition here guards a feature it would silently ignore. The adapter's choice and the graph's are this rule."""
+    if (d_qk, d_v) != (64, 64) or h_q != h_kv:
+        return False
+    if s_q % D64_TILE[0] != 0 or s_kv % D64_TILE[1] != 0:
+        return False
+    if mask_token != "none" or right_bound != 0 or causal_bottom_right:
+        return False
+    for feature in ("seq_kv_lens", "seq_len_q", "bias", "sinks", "rope_freqs"):
+        if bw_kwargs.get(feature) is not None:
+            return False
+    return not bw_kwargs.get("deterministic")
+
+
 def select_implementation(facts):
-    """The D64 body serves plain dense MHA D64 graphs on whole tiles with packed Stats; the two-subgroup body serves
-    every other graph. The adapter's own choice (api_dsl._sm80_d64_fast_path_eligible) is the same rule."""
-    masked = facts.causal or facts.window_left is not None or facts.bottom_right or facts.padded
-    extras = facts.has_bias or facts.has_sink or facts.deterministic
-    whole_tiles = facts.s_q % D64_TILE[0] == 0 and facts.s_kv % D64_TILE[1] == 0
-    plain_mha_d64 = not facts.thd and (facts.d_qk, facts.d_v) == (64, 64) and facts.h_q == facts.h_kv
-    return D64 if plain_mha_d64 and whole_tiles and not masked and not extras and _packed_stats(facts) else TWO_SUBGROUP
+    """The body the SM80 half row runs: the adapter's rule on the arguments lowering hands it (lower_dsl_bwd:
+    is_causal = causal or right_band_widening, window_size_right = right_bound under a widened band). THD and
+    strided Stats always take the two-subgroup body, as in the adapter."""
+    is_causal = facts.causal or facts.right_band_widening
+    eligible = d64_fast_path_eligible(
+        d_qk=facts.d_qk,
+        d_v=facts.d_v,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        s_q=facts.s_q,
+        s_kv=facts.s_kv,
+        mask_token="none" if not is_causal and facts.window_left is None else "masked",
+        right_bound=(facts.right_bound or 0) if facts.right_band_widening else 0,
+        causal_bottom_right=facts.bottom_right,
+        bw_kwargs=dict(
+            seq_kv_lens=True if facts.padded else None,
+            bias=True if facts.has_bias else None,
+            sinks=True if facts.has_sink else None,
+            deterministic=facts.deterministic,
+        ),
+    )
+    return D64 if eligible and not facts.thd and _packed_stats(facts) else TWO_SUBGROUP

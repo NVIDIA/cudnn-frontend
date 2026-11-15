@@ -232,3 +232,28 @@ def test_sm80_backward_causal_flag_with_right_bound_uses_the_bound(d):
     _run(g, SM80_BWD_OWNERS, {qt: q, kt: k, vt: v, ot: o, dot: do, st: stats, dqt: dq, dkt: dk, dvt: dv})
     for got, ref in ((dq, q64.grad), (dk, k64.grad), (dv, v64.grad)):
         torch.testing.assert_close(got.double(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@_SM80
+@requires_dsl
+def test_sm80_backward_right_band_alone_names_the_two_subgroup_body():
+    """diagonal_band_right_bound=R alone: lowering hands the adapter a causal mask with right bound R, which the D64 body
+    cannot serve, so the graph is owned by the two-subgroup body even at D64 on whole tiles (review on #2609)."""
+    from cudnn.sdpa.bwd import engines
+
+    d, right_bound = 64, 64
+    q, k, v, do = (_bshd(d, seed) for seed in (8, 9, 10, 11))
+    ref_o, ref_lse, (q64, k64, v64) = _reference(q, k, v, right_bound, need_grad=True)
+    ref_o.backward(do.double())
+    o = torch.empty_like(q).copy_(ref_o.detach())
+    stats = ref_lse.detach().float().unsqueeze(-1).contiguous()
+    dq, dk, dv = (torch.empty_like(q) for _ in range(3))
+    g, (qt, kt, vt, ot, dot, st, dqt, dkt, dvt) = _bwd_graph(d=d, diagonal_band_right_bound=right_bound)
+    _run(g, SM80_BWD_OWNERS, {qt: q, kt: k, vt: v, ot: o, dot: do, st: stats, dqt: dq, dkt: dk, dvt: dv})
+    assert g.selected_engine.name == "sdpa_bwd_sm80_f16_two_subgroup"
+    facts = g._facts_for(engines.ga.analyze)
+    d64 = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm80_f16_d64")
+    assert engines.mismatch(d64.capabilities, facts) is not None
+    for got, ref in ((dq, q64.grad), (dk, k64.grad), (dv, v64.grad)):
+        torch.testing.assert_close(got.double(), ref, atol=2e-2, rtol=2e-2)
