@@ -104,7 +104,6 @@ import cutlass.cute as cute
 
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
-from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass._mlir.dialects import arith
 
 from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
@@ -115,6 +114,7 @@ from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.scheduler import lpt_l2_tile_coords  # noqa: E402
 from cudnn.frost.tile_dsl.thd import thd_port_origin  # noqa: E402
+from cudnn.sdpa.bwd.kernels.sm80._common import _atomic_add_f32  # noqa: E402
 
 # Pull the default geometry from the flavor config (single source of truth).
 from cudnn.sdpa.bwd.config_sm80 import LLAMA_CFG as _LLAMA_CFG  # noqa: E402
@@ -1370,18 +1370,6 @@ def _sdq_off(row, col, d_qk: cutlass.Constexpr[int]):
         return row * cutlass.Int32(d_qk) + (col ^ swz)
     else:
         return row * cutlass.Int32(d_qk) + col
-
-
-@cute.jit
-def _atomic_add_f32(addr_i64, val):
-    """``atom.global.add.f32`` on a 32-bit GMEM float element.  ``addr_i64`` is
-    an element pointer offset (Int64 byte address via the view's data_ptr +
-    element offset); the returned old value is discarded."""
-    inline_ptx(
-        "atom.global.add.f32 $0, [$1], $2;",
-        write_only_types=[cutlass.Float32],
-        read_only_args=[addr_i64, val],
-    )
 
 
 @cute.jit

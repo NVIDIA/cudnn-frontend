@@ -35,7 +35,8 @@ from cudnn.sdpa.bwd.config_sm120 import (
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
 from cudnn.sdpa.fwd import config_sm80 as _fwd_config_sm80
 
-_SM120_KERNEL_FILE = "sm120/bprop_f16.py"
+from .kernels.sm120.f16_fused.contract import KERNEL_FILE as _SM120_KERNEL_FILE
+
 _SM120_DTYPE_QKV_CODE = {
     torch.bfloat16: DTYPE_BF16,
     torch.float16: DTYPE_FP16,
@@ -773,12 +774,12 @@ def _sm80_bwd_kernel_mod(key: str = "d64"):
     silently swallows every feature kwarg, so callers must never rely on the
     signature filter and only select it through
     :func:`_sm80_d64_fast_path_eligible`.  The GENERIC kernel
-    (``sm80/bprop_f16``) is a TemplateParams module loaded per-specialization
+    (``sm80/f16_two_subgroup/kernel.py``) is a TemplateParams module loaded per-specialization
     via :func:`_load_sm80_bwd_module` instead.
     """
     assert key == "d64", f"generic SM80 bwd kernels load via _load_sm80_bwd_module; got {key!r}"
     if key not in _SM80_BWD_KERNEL_MOD:
-        from .kernels.sm80 import bprop_d64_f16 as _mod
+        from .kernels.sm80.f16_d64 import kernel as _mod
 
         _SM80_BWD_KERNEL_MOD[key] = _mod
     return _SM80_BWD_KERNEL_MOD[key]
@@ -790,19 +791,21 @@ def _sm80_d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token,
     The perf variant computes a plain dense MHA backward and nothing else;
     every condition here guards a feature it would silently ignore.
     """
-    d64 = _sm80_bwd_kernel_mod("d64")
-    if (d_qk, d_v) != (64, 64) or h_q != h_kv:
-        return False
-    if s_q % d64.M_BLOCK != 0 or s_kv % d64.N_BLOCK != 0:
-        return False
-    if mask_token != "none" or right_bound != 0 or causal_bottom_right:
-        return False
-    for feature in ("seq_kv_lens", "seq_len_q", "bias", "sinks", "rope_freqs"):
-        if bw_kwargs.get(feature) is not None:
-            return False
-    if bw_kwargs.get("deterministic"):
-        return False
-    return True
+    from .kernels.sm80.half_contract import d64_fast_path_eligible
+
+    # One rule for the adapter and for graph ownership (sdpa_bwd_sm80_f16_d64).
+    return d64_fast_path_eligible(
+        d_qk=d_qk,
+        d_v=d_v,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        mask_token=mask_token,
+        right_bound=right_bound,
+        causal_bottom_right=causal_bottom_right,
+        bw_kwargs=bw_kwargs,
+    )
 
 
 def _sm80_bwd_pick_flavor(d_qk: int, d_v: int, flavor_dims=None) -> str:
@@ -1028,7 +1031,8 @@ def _sm80_thd_backward(
 _cache_of_objects: dict = {}
 
 
-_SM80_BWD_KERNEL_FILE = "sm80/bprop_f16.py"
+from .kernels.sm80.f16_two_subgroup.contract import KERNEL_FILE as _SM80_BWD_KERNEL_FILE  # noqa: E402
+
 # The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
 # decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
 from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _BWD_SCHED_LPT_L2  # noqa: E402

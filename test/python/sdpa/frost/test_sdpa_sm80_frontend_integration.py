@@ -17,7 +17,7 @@ import torch
 import cudnn
 import cudnn.sdpa  # noqa: F401 — the SM80 capability tables live here
 from cudnn.engines import MANIFEST, is_python_engine
-from frost_test_utils import half_engine_names, select_engine, sm80_owner
+from frost_test_utils import SM80_BWD_OWNERS, half_engine_names, select_engine, sm80_owner
 
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.bwd import engines as engines_bwd_sm80
@@ -231,7 +231,7 @@ def _check_bwd_engine_end_to_end(d):
     # IR-inferred output strides are provisional) — bind BSHD-physical.
     for t in (dq, dk, dv):
         t.set_output(True).set_data_type(_HALF).set_stride(st)
-    _native_then_pin(gb, _BWD)
+    _native_then_pin(gb, SM80_BWD_OWNERS)
 
     do_buf = _buf(d)
     dq_buf, dk_buf, dv_buf = torch.empty_like(q_buf), torch.empty_like(k_buf), torch.empty_like(v_buf)
@@ -336,7 +336,7 @@ def test_bwd_engine_bhsd_contiguous_layout():
     dq, dk, dv = gb.sdpa_backward(q=qb, k=kb, v=vb, o=ob, dO=dob, stats=statsb, attn_scale=_SCALE, use_causal_mask=True)
     for t in (dq, dk, dv):
         t.set_output(True).set_data_type(_HALF)
-    _native_then_pin(gb, _BWD)
+    _native_then_pin(gb, SM80_BWD_OWNERS)
 
     dq_buf, dk_buf, dv_buf = (torch.empty(dims, dtype=torch.float16, device="cuda") for _ in range(3))
     gb.execute(
@@ -404,7 +404,7 @@ def test_engine_execute_does_not_allocate():
     dq.set_output(True).set_data_type(_HALF).set_stride(st)
     dk.set_output(True).set_data_type(_HALF).set_stride(st_kv)
     dv.set_output(True).set_data_type(_HALF).set_stride(st_kv)
-    _native_then_pin(gb, _BWD)
+    _native_then_pin(gb, SM80_BWD_OWNERS)
     assert gb.get_workspace_size() > 0, "the SM80 bwd executor must report its carved scratch"
     do_buf = _buf()
     dq_buf = torch.empty_like(q_buf)

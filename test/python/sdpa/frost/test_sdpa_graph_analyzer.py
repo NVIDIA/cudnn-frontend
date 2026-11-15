@@ -197,6 +197,8 @@ def test_zero_attn_scale_claims():
     }
     assert bwd == {
         "sdpa_bwd_sm80",
+        "sdpa_bwd_sm80_f16_d64",
+        "sdpa_bwd_sm80_f16_two_subgroup",
         "sdpa_bwd_sm100",
         "sdpa_bwd_sm107",
         "sdpa_bwd_sm107_fp8",
@@ -2395,6 +2397,7 @@ def test_sm120_knob_domains(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _BWD_ENGINE = "sdpa_bwd_sm120"
+_BWD_FUSED = "sdpa_bwd_sm120_f16_fused"  # the row's dense body for D_QK <= 256
 _BWD_D = 64
 
 
@@ -2506,11 +2509,11 @@ def test_bwd_facts_kv_transposed_view_canonicalized():
 
 def test_bwd_probe_accepts(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph())
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph())
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True))
     for d in (32, 128):
-        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=d))
+        assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(d=d))
 
 
 def test_bwd_probe_rejects_forward_graph(monkeypatch):
@@ -2526,9 +2529,9 @@ def test_bwd_probe_rejects_forward_graph(monkeypatch):
 
 def test_bwd_probe_gqa(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=1))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2, use_deterministic_algorithm=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(h_kv=1))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2, use_deterministic_algorithm=True))
     # H_q must be a multiple of H_kv
     assert not _bwd_eligible(_mk_bwd_graph(h_kv=3))
 
@@ -2539,17 +2542,17 @@ def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(d=100))
     assert not _bwd_eligible(_mk_bwd_graph(d=520))
     for width in (264, 504, 512):
-        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=width))
+        assert "sdpa_bwd_sm120_f16_two_subgroup" in _bwd_eligible(_mk_bwd_graph(d=width))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask=True))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask_bottom_right=True))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, sliding_window_length=64))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sliding_window_length=64))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True, sliding_window_length=64))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(s_q=2 * S, use_causal_mask_bottom_right=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, sliding_window_length=64))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(sliding_window_length=64))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, use_causal_mask_bottom_right=True, sliding_window_length=64))
 
 
 def test_bwd_probe_accepts_right_band_widening(monkeypatch):
@@ -2557,23 +2560,23 @@ def test_bwd_probe_accepts_right_band_widening(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     import cudnn
 
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(diagonal_band_right_bound=16))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, diagonal_band_right_bound=16, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(diagonal_band_right_bound=16))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(s_q=S // 2, diagonal_band_right_bound=16, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT))
 
 
 def test_bwd_probe_accepts_deterministic(monkeypatch):
     # use_deterministic_algorithm is served by the ordered-relay dQ path.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
 
 
 def test_bwd_probe_accepts_padding_mask(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="kv"))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both"))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask_bottom_right=True))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask=True, sliding_window_length=64))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_deterministic_algorithm=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(seq_lens="kv"))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(seq_lens="both"))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask_bottom_right=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_causal_mask=True, sliding_window_length=64))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(seq_lens="both", use_deterministic_algorithm=True))
 
 
 def test_bwd_probe_rejects_seq_len_q_without_padding_mask(monkeypatch):
@@ -2585,8 +2588,8 @@ def test_bwd_probe_rejects_seq_len_q_without_padding_mask(monkeypatch):
 def test_bwd_probe_accepts_sink(monkeypatch):
     # dSink without the sink input is rejected.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sink=True))
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(sink=True, dsink=True, use_causal_mask=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(sink=True))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(sink=True, dsink=True, use_causal_mask=True))
     assert not _bwd_eligible(_mk_bwd_graph(dsink=True))
 
 
@@ -2601,7 +2604,7 @@ def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
     # head dim innermost; the declared strides are served natively.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     bhsd_contig = (H * S * _BWD_D, S * _BWD_D, _BWD_D, 1)
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(grad_strides=bhsd_contig))
     # Head dim NOT innermost (S innermost instead) is outside dense_flex.
     s_innermost = (H * S * _BWD_D, S * _BWD_D, 1, S)
     assert not _bwd_eligible(_mk_bwd_graph(grad_strides=s_innermost))
@@ -2610,7 +2613,7 @@ def test_bwd_probe_accepts_dense_flex_layouts(monkeypatch):
 def test_bwd_probe_accepts_strided_stats(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     # Padded stats strides bind natively (baked into the compiled kernel).
-    assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(stats_stride=(2 * H * S, 2 * S, 2, 1)))
+    assert _BWD_FUSED in _bwd_eligible(_mk_bwd_graph(stats_stride=(2 * H * S, 2 * S, 2, 1)))
 
 
 def test_bwd_knob_domains(monkeypatch):
@@ -2618,8 +2621,8 @@ def test_bwd_knob_domains(monkeypatch):
     g = _mk_bwd_graph()
     # In-domain requests are eligible (final per-head-dim feasibility is the
     # kernel constructor's, at build).
-    assert _BWD_ENGINE in _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128))
-    assert _BWD_ENGINE in _bwd_eligible(g, bwd_engines.SdpaBwdKnobs())  # all-None = no preference
+    assert _BWD_FUSED in _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128))
+    assert _BWD_FUSED in _bwd_eligible(g, bwd_engines.SdpaBwdKnobs())  # all-None = no preference
     # Out-of-domain values are rejected.
     assert not _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_m=48))
     assert not _bwd_eligible(g, bwd_engines.SdpaBwdKnobs(tile_n=32))
@@ -2638,7 +2641,10 @@ def test_bwd_mismatch_reason_strings(monkeypatch):
     assert reason is not None and "knob" in reason
     reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=48))
     assert reason is not None and "tile_m=48" in reason
-    assert bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128)) is None
+    reason = bwd_engines.mismatch(caps, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128))
+    assert reason == f"this graph is owned by the explicit implementation engine {_BWD_FUSED}"
+    fused = next(spec.capabilities for spec in bwd_engines.ENGINE_SPECS if spec.name == _BWD_FUSED)
+    assert bwd_engines.mismatch(fused, _facts(_mk_bwd_graph()), bwd_engines.SdpaBwdKnobs(tile_m=64, tile_n=128)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2647,18 +2653,21 @@ def test_bwd_mismatch_reason_strings(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _BWD_SM80 = "sdpa_bwd_sm80"
+# The row's bodies: plain dense MHA D64 on whole tiles, and everything else.
+_BWD_SM80_D64, _BWD_SM80_TWO_SUBGROUP = "sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm80_f16_two_subgroup"
 
 
 def test_bwd_sm80_probe_accepts_the_sm120_rejections(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph())
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))  # GQA
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    assert _bwd_eligible(_mk_bwd_graph()) == {_BWD_SM80_D64}
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))  # GQA
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
     # Flavor envelope: any head dim <= 256 (no multiple-of-16 rule) and
     # top-left causal with S_q != S_kv.
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(d=96))
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, s_q=S // 2))
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(d=96))
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, s_q=S // 2))
+    assert _BWD_SM80 not in _bwd_eligible(_mk_bwd_graph(d=96))  # every body is delegated
 
 
 def test_bwd_sm80_probe_rejections(monkeypatch):

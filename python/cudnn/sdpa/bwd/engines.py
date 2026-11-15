@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -156,6 +156,8 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_HEAD_DIMS,
 )
+from cudnn.sdpa.bwd.kernels.sm120 import half_contract as _sm120_half
+from cudnn.sdpa.bwd.kernels.sm80 import half_contract as _sm80_half
 
 _LOG = logging.getLogger(__name__)
 
@@ -372,6 +374,16 @@ class Capabilities:
     # Joint geometry/resource constraints that independent knob domains cannot
     # express. Declaration-only, with the same resolved geometry as lowering.
     knob_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
+    # The fixed main implementation of an engine that names one body. Append-only.
+    implementation: str = ""
+    # The bodies a multi-body row can run for a graph, from declaration facts alone: one name, or a tuple
+    # of every legal body with the row's default first. The lowering dispatches on the same function. An
+    # owner admits any graph it is legal for; the row declines a graph whose default it delegated. None =
+    # one body.
+    select_implementation: Optional[Callable[["ga.SdpaGraphFacts"], Any]] = None
+    # Bodies a row has handed to explicit engines (:func:`explicit_engine`). A graph selecting one is
+    # declined here, so neither an automatic route nor an old record reaches the row for it.
+    delegated: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         """Single normalization layer: legacy mask flags -> canonical band set."""
@@ -412,6 +424,26 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     """First reason this engine is not a candidate for these facts and tuning
     knobs, or ``None`` when lowering should perform the final feasibility check.
     """
+    reason = _declared_mismatch(capabilities, facts, requested)
+    if reason is not None or capabilities.select_implementation is None:
+        return reason
+    legal = legal_implementations(capabilities, facts)
+    if capabilities.implementation and capabilities.implementation not in legal:
+        return f"{capabilities.implementation} does not run this graph; its declaration selects {legal[0]}"
+    if legal[0] in capabilities.delegated:
+        return f"this graph is owned by the explicit implementation engine {legal[0]}"
+    return None
+
+
+def legal_implementations(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> tuple:
+    """The bodies ``capabilities``' row can run for ``facts``, its default first; ``()`` for a one-body engine."""
+    if capabilities.select_implementation is None:
+        return ()
+    selected = capabilities.select_implementation(facts)
+    return (selected,) if isinstance(selected, str) else tuple(selected)
+
+
+def _declared_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any) -> Optional[str]:
     if facts.invalid:
         return facts.invalid
     if not facts.is_backward:
@@ -693,6 +725,21 @@ class EngineSpec:
     name: str
     capabilities: Capabilities
     lower: "Callable[[EngineSpec, ga.SdpaGraphFacts, Any], Any]"
+    # The row whose candidate position, default tiles and placement decisions this engine inherits
+    # (:func:`policy_name`); empty = its own name.
+    policy: str = ""
+
+
+def policy_name(spec: EngineSpec) -> str:
+    """The row name the heuristics and ``placement_table`` key ``spec``'s decisions by."""
+    return spec.policy or spec.name
+
+
+def explicit_engine(row: EngineSpec, implementation: str, lower, **narrowed) -> EngineSpec:
+    """One of ``row``'s bodies as its own engine: the row's contract, admitted where the row's
+    ``select_implementation`` picks ``implementation``. ``narrowed`` replaces fields the body does not span."""
+    capabilities = replace(row.capabilities, implementation=implementation, delegated=frozenset(), **narrowed)
+    return EngineSpec(implementation, capabilities, lower, policy=row.name)
 
 
 def _sm120_spec() -> EngineSpec:
@@ -732,8 +779,44 @@ def _sm120_spec() -> EngineSpec:
             knob_check=knob_mismatch,
             tile_ms=frozenset((*_SM120_Q_TILES, 16)),
             tile_ns=frozenset((*_SM120_KV_TILES, 16)),
+            select_implementation=_sm120_half.select_implementation,
+            delegated=frozenset({_sm120_half.FUSED, _sm120_half.TWO_SUBGROUP}),
         ),
         lower=lower_dsl_bwd,
+    )
+
+
+def _sm120_f16_fused_spec() -> EngineSpec:
+    """The row's dense body for D_QK <= 256."""
+    from .kernels.sm120.f16_fused.host import lower
+
+    return explicit_engine(
+        _sm120_spec(),
+        _sm120_half.FUSED,
+        partial(lower, lower_impl=partial(lower_dsl_bwd, api_type=_SM120)),
+        d=frozenset(_SM120_HEAD_DIMS),
+        tile_ms=frozenset(_SM120_Q_TILES),
+        tile_ns=frozenset(_SM120_KV_TILES),
+        thd=False,
+        thd_declared_totals=False,
+        thd_ragged_offsets=False,
+        thd_head_stride=False,
+        thd_tile_ms=frozenset(),
+        thd_tile_ns=frozenset(),
+    )
+
+
+def _sm120_f16_two_subgroup_spec() -> EngineSpec:
+    """The SM80 two-subgroup body compiled for SM120: THD graphs and every D_QK > 256."""
+    from .kernels.sm120.f16_two_subgroup.host import lower
+
+    # A dense graph reaches it only above D_QK 256, where the tile is 16 x 16.
+    return explicit_engine(
+        _sm120_spec(),
+        _sm120_half.TWO_SUBGROUP,
+        partial(lower, lower_impl=partial(lower_dsl_bwd, api_type=_SM120)),
+        tile_ms=frozenset({16}),
+        tile_ns=frozenset({16}),
     )
 
 
@@ -856,11 +939,13 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    if api_type == _SM120 and facts.d_qk > 256:
+    legal = legal_implementations(spec.capabilities, facts)
+    selected = spec.capabilities.implementation if spec.capabilities.implementation in legal else legal[0] if legal else None
+    if selected == _sm120_half.TWO_SUBGROUP and facts.d_qk > 256:
         from .api_dsl_sm120_wide import SdpaBwdDslSm120Wide
 
         adapter_cls = SdpaBwdDslSm120Wide
-    elif api_type == _SM120 and thd:
+    elif selected == _sm120_half.TWO_SUBGROUP:
         from .api_dsl_sm120_thd import SdpaBwdDslSm120Thd
 
         adapter_cls = SdpaBwdDslSm120Thd
@@ -1139,9 +1224,33 @@ def _sm80_spec() -> EngineSpec:
             # #712 analogue for the backward's loads), same as sm120 — no
             # gather staging.
             strided_stats=True,
+            select_implementation=_sm80_half.select_implementation,
+            delegated=frozenset({_sm80_half.D64, _sm80_half.TWO_SUBGROUP}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM80),
     )
+
+
+def _sm80_f16_d64_spec() -> EngineSpec:
+    """The SM80 row's D64 body: plain dense MHA D64 graphs on whole tiles with packed Stats."""
+    from .kernels.sm80.f16_d64.host import lower
+
+    return explicit_engine(
+        _sm80_spec(),
+        _sm80_half.D64,
+        partial(lower, lower_impl=partial(lower_dsl_bwd, api_type=_SM80)),
+        thd=False,
+        thd_declared_totals=False,
+        thd_ragged_offsets=False,
+        thd_head_stride=False,
+    )
+
+
+def _sm80_f16_two_subgroup_spec() -> EngineSpec:
+    """The SM80 row's two-subgroup body: every graph the D64 body does not serve."""
+    from .kernels.sm80.f16_two_subgroup.host import lower
+
+    return explicit_engine(_sm80_spec(), _sm80_half.TWO_SUBGROUP, partial(lower, lower_impl=partial(lower_dsl_bwd, api_type=_SM80)))
 
 
 def _sm100_dense_layout_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
@@ -2324,8 +2433,11 @@ def _sm120_fp8_mismatch(facts, version):
 
 
 def _sm120_fp8_spec():
+    from .kernels.sm120.fp8 import contract
+    from .kernels.sm120.fp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_sm120_fp8",
+        name=contract.NAME,
         capabilities=Capabilities(
             sm_lo=120,
             sm_hi=121,
@@ -2344,14 +2456,18 @@ def _sm120_fp8_spec():
             deterministic=True,
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
+            implementation=contract.NAME,
         ),
-        lower=partial(lower_dsl_bwd_fp8, api_type=_SM120_FP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_fp8, api_type=_SM120_FP8)),
     )
 
 
 def _sm120_mxfp8_spec():
+    from .kernels.sm120.mxfp8 import contract
+    from .kernels.sm120.mxfp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_sm120_mxfp8",
+        name=contract.NAME,
         capabilities=Capabilities(
             sm_lo=120,
             sm_hi=121,
@@ -2370,14 +2486,19 @@ def _sm120_mxfp8_spec():
             deterministic=True,
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
+            implementation=contract.NAME,
         ),
-        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM120_MXFP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_mxfp8, api_type=_SM120_MXFP8)),
     )
 
 
 ENGINE_SPECS = (
     _sm120_spec(),
+    _sm120_f16_fused_spec(),
+    _sm120_f16_two_subgroup_spec(),
     _sm80_spec(),
+    _sm80_f16_d64_spec(),
+    _sm80_f16_two_subgroup_spec(),
     _sm100_spec(),
     _sm100_mxfp8_spec(),
     _sm100_d192_spec(),
@@ -2403,5 +2524,8 @@ __all__ = [
     "SdpaBwdKnobs",
     "analyze_for",
     "engine_name",
+    "explicit_engine",
+    "legal_implementations",
     "mismatch",
+    "policy_name",
 ]

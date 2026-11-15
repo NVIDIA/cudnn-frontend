@@ -1909,3 +1909,16 @@ Compare canonical compiled geometry when old public knobs were ignored.
 `test_explicit_d256_body_does_not_reselect_for_query_extent` exports the public
 engine/knob record into a fresh graph, checks the actual body/tile/CGA and
 replays changed inputs under CUDA Graph capture.
+
+Backward rows delegate by selected body, not by exact head pair: their head
+dims are a set plus an envelope, so exact pairs would leave every padded width
+on the row. The row declares `select_implementation` (the same function its
+lowering dispatches on) and `delegated`. Owners come from `explicit_engine`,
+which keeps the row's contract and its name as `policy`. Heuristics and
+`placement_table` read row-keyed decisions through `policy_name`. When one
+graph admits two bodies (a knob choice on the same facts), return a tuple of
+legal bodies, default first, so that each owner's explicit record stays
+valid. If a row restates an adapter's own body test on facts, test the two
+against each other. Detectors: `test_sdpa_bwd_explicit_engines.py` covers the
+partition, legal-tuple ranking, identities and
+`test_sm80_selector_is_the_adapters_d64_rule`.
