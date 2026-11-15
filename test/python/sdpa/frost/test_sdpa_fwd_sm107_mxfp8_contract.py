@@ -14,7 +14,6 @@ import pytest
 import cudnn
 from cudnn.sdpa.fwd import engines, heuristics, placement
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_MXFP8_SPLIT_SHAPES
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 from cudnn.sdpa.fwd.kernels.sm107 import mxfp8_contract as mx
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
