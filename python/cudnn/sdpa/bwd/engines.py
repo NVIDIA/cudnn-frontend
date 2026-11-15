@@ -62,7 +62,7 @@ def _adapter(name: str):
 
         return SdpaBwdDslSm100D128Fp8
     if name == _SM100_D192:
-        from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
+        from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.host import SdpaBwdDslSm100D192
 
         return SdpaBwdDslSm100D192
     if name == _SM100_D192_FP8:
@@ -2265,7 +2265,7 @@ def _sm100_d192_half_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[s
     import re
 
     from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
-    from .d192_thd_contract import validate_bounds, validate_stats_span
+    from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.thd_contract import validate_bounds, validate_stats_span
 
     if (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
         return "d192 THD requires MHA with exact (192, 128) head dimensions"
