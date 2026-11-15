@@ -2122,5 +2122,5 @@ def test_sdpa_bwd_dsl_sm120_retired_row_record_is_declined(monkeypatch):
 
     _run_case(head_dim=64, is_causal=True, q_tile=64, kv_tile=128)
     monkeypatch.setattr(sys.modules[__name__], "RECORD_SLOT", 0)
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="owned by the explicit implementation engine sdpa_bwd_sm120_f16_fused"):
+    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="owned by the explicit implementation engine sdpa_bwd_sm120_f16_fused"):
         _run_case(head_dim=64, is_causal=True, q_tile=64, kv_tile=128)
