@@ -195,7 +195,7 @@ def test_ragged_wide_token_table_strides_and_per_port_divisors():
 def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_binding=False, standalone=False, square_stats=False):
     import inspect
     import torch
-    from frost_test_utils import select_engine, _dsl_installed
+    from frost_test_utils import select_engine, half_engine_names, _dsl_installed
     from test_sdpa_fwd_decode_d128_sm100 import _pools, _gather_kv, _ref
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
@@ -272,7 +272,7 @@ def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_bin
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(graph, "sdpa_fwd_prefill_sm100")
+    select_engine(graph, half_engine_names("sm100"))
     graph.check_support()
     graph.build_plans()
     launch = graph._compiled_plans[graph._plan_index]._prepared

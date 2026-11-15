@@ -117,6 +117,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+| `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;
@@ -214,6 +215,18 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- `grouped_gemm_glu_hadamard_wrapper_sm100` with `act_func="srelu"`: no deterministic
+  mode is needed for replay. The qualified case sets `tanh_clamp_scale` and
+  `rht_sign_mask`, covers both `use_tmem_post_rht_amax` paths, and uses unequal
+  expert sizes with one empty expert; C, D, Amax and PostRhtAmax keep identical
+  bytes across repeated calls under concurrent work on another stream. Batch
+  invariance is not established: Amax and PostRhtAmax are whole-expert
+  reductions and PostRhtAmax depends on 16-token block membership. Unclamped
+  SReLU D is additionally bit-identical to the activation recomputed from the
+  saved C for BF16 and FP16 C/D. The clamped path's approximate `tanh` is not
+  bitwise equal to a host `tanh`. Other activations and SM107 are not covered
+  by this row.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed

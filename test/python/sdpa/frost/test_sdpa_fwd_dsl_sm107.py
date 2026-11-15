@@ -533,10 +533,11 @@ def test_sm107_d512_packed_split_graph_and_adapter_contract(monkeypatch, group, 
     assert module.FOLD_SINK == (splits == 1)
     dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     facts = _f16_facts(d_qk=512, d_v=512, h_q=2 * group, h_kv=2, s_q=3, s_kv=257, dtype=dt, dtype_o=dt, causal=True, bottom_right=True, has_sink=True)
-    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=True, split_kv=splits, sched_policy=0)
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), facts, knobs) is None
+    knobs = engines.SdpaFwdKnobs(cga=4, pack_gqa=True, split_kv=splits, sched_policy=0)
+    caps = _caps("sdpa_fwd_sm107_d512_2x2")
+    assert engines.mismatch(caps, facts, knobs) is None
     for changed in (dict(thd=True, padded=True), dict(has_paged_kv=True, page_size=16), dict(device_cc=(10, 0))):
-        assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), dataclasses.replace(facts, **changed), knobs) is not None
+        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None
 
 
 def test_sm107_d512_2x2_descriptor_version_matches_the_smem_budget():
@@ -2133,8 +2134,10 @@ def test_sm107_gate_rows_claim_exactly_d256():
     assert engines.mismatch(mxfp8, _mxfp8_gate_facts()) is None, "PR-B: the MXFP8 row serves the tail at (256, 256) with a bf16 G"
     # Every other flavor -- and the d=200 envelope ride -- declines by the gate's reason.
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512), (200, 200)):
-        why = engines.mismatch(f16, _gate_facts(d_qk=d_qk, d_v=d_v))
-        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+        caps = _caps("sdpa_fwd_sm107_d512_2x2") if (d_qk, d_v) == (512, 512) else f16
+        assert engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v)) is None
+        why = engines.mismatch(caps, _gate_facts(d_qk=d_qk, d_v=d_v))
+        assert why is not None and "epilogue" in why, (d_qk, d_v, why)
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
         why = engines.mismatch(fp8, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)

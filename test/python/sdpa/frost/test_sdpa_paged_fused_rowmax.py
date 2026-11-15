@@ -28,7 +28,7 @@ def test_paged_rowmax_architecture_replay(dtype, packed):
         pytest.skip("requires SM100, SM103 or SM107")
     if cc == (10, 7) and (reason := cutedsl_arch_requirement_error(cc)) is not None:
         pytest.skip(reason)
-    engine = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_prefill_sm100"
+    engine = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_multi_q"
     io_type = cudnn.data_type.BFLOAT16 if dtype == torch.bfloat16 else cudnn.data_type.HALF
     nq, nk, h, hk, d, page = 137, 1155, 8, 2, 128, 16
     npages = (nk + page - 1) // page
@@ -89,7 +89,7 @@ def test_paged_rowmax_architecture_replay(dtype, packed):
         assert "tmem_load_max_reduction_tile(" in native_source
         assert "_tmem_load_max_reduction(" in native_source
     else:
-        assert route.endswith("sm100/prefill_d128_f16.py"), route
+        assert route.endswith("sm100/d128_f16_multi_q/kernel.py"), route
         assert bool(api._k_mod.FUSED_LDTM_STAT) == (cc == (10, 3))
         assert api._k_mod._D128_PAGED_JOINT_ROW_MAX == (cc == (10, 0) and dtype == torch.bfloat16 and packed)
     pack = {qn: q, kn: k, vn: v, on: o, sn: lse, tn: table, qln: qlens, kln: klens, qon: qo, son: so}

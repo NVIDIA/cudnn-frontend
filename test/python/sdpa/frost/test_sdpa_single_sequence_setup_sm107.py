@@ -158,7 +158,12 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
             assert compiled._prepared.spec.origin_specs is not None
             mod = compiled._compiled.kernel_module
             body = "decode_d128_f16.py" if splits > 1 else "prefill_d128_f16.py"
-            assert mod.__file__.endswith(engine_name.rsplit("_", 1)[1] + "/" + body)
+            owned_path = {
+                "sdpa_fwd_sm100_d128_multi_q": "sm100/d128_f16_multi_q/kernel.py",
+                "sdpa_fwd_sm100_d128_single_q": "sm100/d128_f16_single_q/kernel.py",
+            }.get(engine_name)
+            expected_path = owned_path or (engine_name.rsplit("_", 1)[1] + "/" + body)
+            assert mod.__file__.endswith(expected_path)
             assert compiled._prepared.spec.b == declared_batch
             plans["shared"] = graph, nodes
         graph, nodes = plans["shared"]
@@ -230,7 +235,7 @@ def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engin
     source["q"][1].copy_(neighbor)
     preserved = snapshot(source)
     assert_bitwise(run([0]), alone, "single sequence after multi-sequence bindings")
-    arch = engine_name.rsplit("_", 1)[1]
+    arch = "sm100" if "_sm100" in engine_name else engine_name.rsplit("_", 1)[1]
     suffix = ("-paged" if paged else "") + (f"-split{splits}" if splits > 1 else "")
     assert_golden(
         f"sdpa-{arch}-single-sequence-d{dim}-{dtype_name}-cga{cga}-pack{int(packed)}-n{tile_n}{suffix}", source, alone, allowed_inf={"stats": -torch.inf}

@@ -158,6 +158,11 @@ def _case(
     g.validate()
     g.build_operation_graph()
     name = engine_name(arch=arch, mxfp8=True)
+    if arch == "sm100":
+        from frost_test_utils import sm100_mxfp8_owner
+
+        # Exact SM100 MXFP8 D512 has its own owners (20552 / 20553).
+        name = sm100_mxfp8_owner(d, dv)
     if arch == "sm120":
         from frost_test_utils import sm120_owner
 

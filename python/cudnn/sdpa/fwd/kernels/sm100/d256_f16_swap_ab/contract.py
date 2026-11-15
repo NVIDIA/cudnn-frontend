@@ -21,6 +21,11 @@ def mismatch(facts, knobs):
     if facts.h_kv <= 0 or facts.h_q <= 0 or facts.h_q % facts.h_kv:
         return "D256 swap-AB requires positive heads and an integral Q/KV head ratio"
     group = facts.h_q // facts.h_kv if knobs is not None and knobs.pack_gqa else 1
+    if (facts.d_qk, facts.d_v) == (128, 128):
+        if not facts.has_paged_kv or tile != 16 or not 0 < facts.s_q * group <= 8:
+            return "D128 half swap-AB requires paged KV, TILE_M=16 and at most eight live Q columns"
+        if facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp:
+            return "D128 half swap-AB has no bias, KV-mask or score-output stores"
     if group > tile:
         return "D256 swap-AB packs a whole KV-head group, which must fit TILE_M (N_Q)"
     if knobs is not None and knobs.pack_gqa and not pack_gqa_supported(facts.h_q, facts.h_kv, partial=True):

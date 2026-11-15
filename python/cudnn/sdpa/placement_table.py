@@ -76,6 +76,7 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
     from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
     from cudnn.sdpa.fwd.kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
+    from cudnn.sdpa.fwd.kernels.sm100.small_half_contract import in_domain as in_small_half_domain
     from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.contract import LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q.contract import in_domain as in_d256_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.d192_fp8_multi_q.contract import in_domain as in_d192_fp8_domain
@@ -85,7 +86,8 @@ def _unpacked_decode(row: str, facts) -> bool:
 
     caps = (
         heuristics.sm100_legacy_policy_spec().capabilities
-        if row == "sdpa_fwd_prefill_sm100" and (in_pilot_domain(facts) or in_wide_half_domain(facts) or in_d192_half_domain(facts))
+        if row == "sdpa_fwd_prefill_sm100"
+        and (in_pilot_domain(facts) or in_wide_half_domain(facts) or in_d192_half_domain(facts) or in_small_half_domain(facts))
         else spec.capabilities
     )
     from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8_wide
@@ -98,6 +100,12 @@ def _unpacked_decode(row: str, facts) -> bool:
         (m.LEGACY_ROW, m.in_domain) for m in (fp8_wide, mxfp8_wide)
     )
     sm120_wide += tuple((row, sm120_quant_general.in_domain) for row in sm120_quant_general.LEGACY_ROWS)
+    from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as sm80_half
+
+    sm120_wide += ((sm80_half.LEGACY_ROW, sm80_half.in_domain),)
+    from cudnn.sdpa.fwd.kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
+    sm120_wide += ((d512_mxfp8.LEGACY_ROW, d512_mxfp8.in_domain),)
     if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts))) or any(
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):
@@ -119,8 +127,13 @@ def _packed_split(row: str, facts) -> bool:
         return False
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain
     from cudnn.sdpa.fwd.kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+    from cudnn.sdpa.fwd.kernels.sm100.small_half_contract import in_domain as in_small_half_domain
 
-    caps = heuristics.sm100_legacy_policy_spec().capabilities if in_pilot_domain(facts) or in_wide_half_domain(facts) else spec.capabilities
+    caps = (
+        heuristics.sm100_legacy_policy_spec().capabilities
+        if in_pilot_domain(facts) or in_wide_half_domain(facts) or in_small_half_domain(facts)
+        else spec.capabilities
+    )
     return heuristics.sm100_paged_packed_split_choice(caps, facts) > 1
 
 

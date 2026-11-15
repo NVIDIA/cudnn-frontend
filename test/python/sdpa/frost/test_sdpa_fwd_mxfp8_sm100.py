@@ -52,6 +52,7 @@ from frost_test_utils import (
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
+from frost_test_utils import mxfp8_engine_names
 
 # Rubin (cc10.7) now has MXFP8 lowerings of its own, so this suite is no longer
 # pre-Rubin only.  ONE engine per arch line: pin the row that serves the device
@@ -321,7 +322,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -1486,7 +1487,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     g.execute(
@@ -1825,7 +1826,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amax_o: amax})

@@ -403,8 +403,9 @@ _SM100_MXFP8_KERNEL_FILES = {
     (64, 64): "sm100/prefill_d128_mxfp8.py",
     (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
     (256, 256): "sm100/prefill_d256_mxfp8.py",
-    (512, 512): "sm100/prefill_d512_mxfp8.py",
+    (512, 512): "sm100/d512_mxfp8_slice_recompute/kernel.py",
 }
+_SM100_MXFP8_D512_RETAINED_P_KERNEL_FILE = "sm100/d512_mxfp8_retained_p/kernel.py"
 # Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
 # ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
 # version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
@@ -965,6 +966,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
+        if not pertensor and flavor == (512, 512):
+            from cudnn.sdpa.fwd.config_sm100 import d512_mxfp8_retains_p, make_cfg_d512_mxfp8
+
+            if d512_mxfp8_retains_p(make_cfg_d512_mxfp8(params)[0], params.split_kv):
+                filename, tag = _SM100_MXFP8_D512_RETAINED_P_KERNEL_FILE, f"{tag}_retained_p"
     elif flavor == (192, 128) and params.cta_mma == 1 and params.thd_varlen and not params.paged_kv:
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
@@ -1880,9 +1886,9 @@ class SdpaFwdDsl(APIBase):
           overrun the partial slab and the combine would read half words from
           fp32 bytes (garbage O, the first Rubin graph-path split showed exactly
           that); native per-tensor D256 prefill also uses FP32 partials.
-        * MXFP8 d512: sm100/prefill_d512_mxfp8 wires SplitHelpers but was
-          written against the staged epilogue, so it keeps half partials until
-          it is ported.
+        * MXFP8 d512: the sm100/d512_mxfp8_slice_recompute body wires SplitHelpers
+          but was written against the staged epilogue, so it keeps half partials
+          until it is ported (the retained-P body runs unsplit).
 
         Tracking the wired FLAVOR rather than the arch is what keeps this true
         to the kernels; test_every_split_capable_sm100_kernel_has_the_slot fails
@@ -4451,6 +4457,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     thd_decode_leg=self.thd_decode_leg,
                 ),
             )
+        if self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
+            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
+
+            auto_sched, auto_cga = select_d512_auto_knobs(params)
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
+            params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         selected = getattr(self, "_selected_kernel", None)
         if selected is not None:
             # A replayed engine record already names its pipeline. Keep the
@@ -4465,16 +4481,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             params = replace(params, decode_quad=self._d64_decode_quad())
         if self._fp8_dual_kv_stream():
             params = replace(params, dual_kv_stream=True)
-        elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
-            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
-
-            auto_sched, auto_cga = select_d512_auto_knobs(params)
-            params = replace(
-                params,
-                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
-                cta_mma=auto_cga if self.cga is None else params.cta_mma,
-            )
-            params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         if self.flavor == SM100_NATIVE_D576_SHAPE and not self._fp8:
             params = replace(params, mma_2x2=True)
         elif self.flavor == (512, 512) and not self._fp8:
@@ -7455,21 +7461,25 @@ def _sm80_resolve_scheduler(
 _LOG2E = math.log2(math.e)
 
 _SM80_KERNEL_FILES = {
-    "d256": "sm80/prefill_d256_f16.py",
-    "f16": "sm80/prefill_f16.py",
+    "d256": "sm80/d256_kv_prefetch/kernel.py",
+    "wide": "sm80/wide_cooperative/kernel.py",
+    "f16": "sm80/f16_k_prefetch/kernel.py",
 }
 
 
-def _sm80_load_kernel_module(flavor: str, params):
+def _sm80_load_kernel_module(flavor: str, params, kernel_file: Optional[str] = None):
     """One uniquely-named module per (kernel file, TemplateParams) — the same
     ``frost.template_loader`` mechanism the SM100/SM120 templates use. qwen
     (d=256) routes to the symmetric-K+V-prefetch file; the rest share the
-    generic kernel."""
-    filename = _SM80_KERNEL_FILES["d256" if flavor in _SM80_D256_FLAVORS else "f16"]
+    generic kernel. ``kernel_file`` (an explicit engine's selected body) replaces the flavor walk."""
+    family = "f16" if flavor not in _SM80_D256_FLAVORS else ("d256" if flavor == "qwen" else "wide")
+    filename = kernel_file or _SM80_KERNEL_FILES[family]
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
     # Tag from the BASENAME: `filename` carries the arch subdirectory, and a
     # slash would land in the generated template module name.
     stem = os.path.splitext(os.path.basename(filename))[0]
+    if stem == "kernel":  # an implementation directory names its body
+        stem = os.path.basename(os.path.dirname(filename))
     from cudnn.sdpa.fwd.kernels.sm80.paged_load import FROST_SOURCE_DIGEST as paged_load_digest
 
     from cudnn.sdpa.fwd.kernels.sm80.ragged_origin import FROST_SOURCE_DIGEST as ragged_origin_digest
@@ -7928,7 +7938,9 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
             split_kv=self.split_kv,
             pack_g=self.h_q // self.h_kv if self.pack_gqa else 1,
         )
-        self._k_mod = _sm80_load_kernel_module(self.flavor, self._params)
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        self._k_mod = _sm80_load_kernel_module(self.flavor, self._params, getattr(selected_kernel, "kernel_file", None))
+        self.kernel_template = getattr(self._k_mod, "TEMPLATE_NAME", os.path.splitext(os.path.basename(self._k_mod.__file__))[0])
         if self.thd:
             from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
 

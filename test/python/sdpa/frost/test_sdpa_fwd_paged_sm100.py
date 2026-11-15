@@ -6,7 +6,7 @@
 The graph is cuDNN's own paged-cache contract — ``graph.sdpa(..., k=<page pool>,
 v=<page pool>, use_padding_mask=True, seq_len_q=, seq_len_kv=,
 paged_attention_k_table=, paged_attention_v_table=,
-paged_attention_max_seq_len_kv=)`` — served by ``sdpa_fwd_prefill_sm100``
+paged_attention_max_seq_len_kv=)`` — served by the SM100 half implementation owners
 through the d128 / d192x128 / d256 kernels' ``PAGED_KV`` specialization:
 block-table indirection on the K/V TMA loads, HND and NHD page layouts,
 per-batch lengths read on device, KV split + combine.  The K and V pools may
@@ -143,6 +143,8 @@ def _run_graph(
     replay=False,
     explicit_knobs=None,
     arch="sm100",
+    record=None,
+    extra_checks=None,
 ):
     """Build, pin the FROST engine, execute, compare every Q row against ``_ref_rows``.
 
@@ -214,7 +216,10 @@ def _run_graph(
         st.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    if explicit_knobs is None:
+    if record is not None:
+        assert explicit_knobs is None, "provide a public record or native knobs, not both"
+        g.create_execution_plan(*record)
+    elif explicit_knobs is None:
         g.create_execution_plans([cudnn.heur_mode.A])
     else:
         from cudnn.engines.manifest import family_for
@@ -227,6 +232,9 @@ def _run_graph(
                 (512, 512): "sdpa_fwd_sm100_d512_role_split",
                 (576, 512): "sdpa_fwd_sm100_d512_2x2",
             }.get((d, d_v), explicit_name)
+            if d == d_v and d in (32, 64, 128):
+                # Explicit layout fixtures request the single-Q or multi-Q body directly.
+                explicit_name = "sdpa_fwd_sm100_d128_single_q" if explicit_knobs.cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
         if arch == "sm107" and (d, d_v) in ((512, 512), (576, 512)):
             from dataclasses import replace
 
@@ -315,6 +323,8 @@ def _run_graph(
         if stats:
             torch.testing.assert_close(stats_gpu.view(B, H, s_q), ref_lse, atol=5e-3, rtol=0)
         captured.reset()
+    if extra_checks is not None:
+        extra_checks(g, vp, ws)
     return plan
 
 
@@ -462,7 +472,6 @@ def test_paged_graph_prefill_shaped_s_q():
     prefill); all q rows attend the whole live KV (no causal mask)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
 
     B, H, KH, P, max_pages, s_q = 2, 4, 4, 16, 8, 3
     dev, dtype = "cuda", torch.float16
@@ -493,7 +502,7 @@ def test_paged_graph_prefill_shaped_s_q():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    select_engine(g, half_engine_names())
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -1298,7 +1307,6 @@ def test_paged_graph_batch_innermost_block_table():
     as views: the table strides are part of the compile key, not a contract."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
 
     dev, dtype = "cuda", torch.float16
     B, H, KH, P, max_pages = 3, 8, 2, 32, 12
@@ -1332,7 +1340,7 @@ def test_paged_graph_batch_innermost_block_table():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    select_engine(g, half_engine_names())
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -2640,7 +2648,9 @@ def _run_graph_mxfp8(B, H, KH, P, max_pages, lens, hnd, *, want_split=None, **bu
     from cudnn.sdpa.fwd.engines import engine_name
 
     g, vp, Ob, stats_gpu, amax, ref_in = _build_mxfp8(B, H, KH, P, max_pages, lens, hnd, **build_kw)
-    name = engine_name(mxfp8=True)
+    from frost_test_utils import mxfp8_engine_names
+
+    name = mxfp8_engine_names()
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -2971,7 +2981,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name(mxfp8=True))
+        return g is not None and offers_engine(g, mxfp8_engine_names())
 
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"

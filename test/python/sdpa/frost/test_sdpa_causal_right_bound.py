@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from cudnn.sdpa import graph_analyzer as ga
-from frost_test_utils import requires_dsl, select_engine
+from frost_test_utils import half_engine_names, requires_dsl, select_engine
 
 B, H, S, D = 2, 4, 256, 64
 DTYPE = cudnn.data_type.HALF
@@ -208,7 +208,7 @@ def test_sm80_forward_serves_right_band_widening(d, right_bound):
     o = torch.empty_like(q)
     stats = torch.empty(B, H, S, 1, device="cuda", dtype=torch.float32)
     g, (qt, kt, vt, ot, st) = _fwd_graph(d=d, diagonal_band_right_bound=right_bound)
-    _run(g, "sdpa_fwd_prefill_sm80", {qt: q, kt: k, vt: v, ot: o, st: stats})
+    _run(g, half_engine_names("sm80"), {qt: q, kt: k, vt: v, ot: o, st: stats})
     ref_o, ref_lse, _ = _reference(q, k, v, right_bound)
     torch.testing.assert_close(o.double(), ref_o, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(stats.squeeze(-1).double(), ref_lse, atol=2e-3, rtol=2e-3)

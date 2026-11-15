@@ -248,7 +248,7 @@ def test_shared_metadata_serves_both_forward_providers(provider, return_lse, mon
         candidates = [
             i
             for i, cfg in enumerate(graph.plans)
-            if (graph._engine_for(cfg) is None if provider == "backend" else graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm100"))
+            if (graph._engine_for(cfg) is None if provider == "backend" else graph.get_plan_name_at_index(i).split("[")[0] == "sdpa_fwd_sm100_d128_multi_q")
         ]
         assert candidates, [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
         graph.select_plan(candidates[0])
