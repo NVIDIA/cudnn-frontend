@@ -3722,6 +3722,14 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     for wide in (fp8_wide, mxfp8_wide):
         if wide.in_domain(facts):
             return _recommend_sm100_implementation(kind, facts, offered, lambda f, k, g=wide.Geometry: g(), policy=sm100_legacy_policy_spec(wide.LEGACY_ROW))
+    from .kernels.sm90.d64_f16_one_wg import contract as sm90_d64
+    from .kernels.sm90.f16_three_wg import contract as sm90_three_wg
+
+    for owner in (sm90_d64, sm90_three_wg):
+        if owner.in_domain(facts):
+            return _recommend_sm100_implementation(
+                kind, facts, offered, lambda f, k, geometry=owner.Geometry: geometry(), policy=sm100_legacy_policy_spec(owner.LEGACY_ROW)
+            )
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

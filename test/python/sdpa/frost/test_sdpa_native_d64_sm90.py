@@ -29,8 +29,9 @@ def _facts(**over):
     return SdpaGraphFacts(**values)
 
 
-def _caps():
-    return next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
+def _caps(native=True):
+    name = "sdpa_fwd_sm90_d64_one_wg" if native else "sdpa_fwd_prefill_sm90"
+    return next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -40,7 +41,7 @@ def test_native_d64_admission_and_backend_first_placement(causal, h_kv):
     caps = _caps()
     assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=False)) is None
     assert engines._selected_d_shape(caps, facts) == (64, 64)
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_sm90_d64_one_wg")
     assert place(spec, facts) == TRAIL
 
 
@@ -52,7 +53,7 @@ def test_d64_admission_does_not_remove_d512_envelope_floor(head):
 @pytest.mark.parametrize("head,tile", [((128, 128), 128), ((120, 72), 128), ((256, 256), 256), ((192, 128), 256), ((248, 136), 256)])
 def test_native_head_admission_retains_backend_first_placement(head, tile):
     facts = _facts(d_qk=head[0], d_v=head[1])
-    caps = _caps()
+    caps = _caps(native=False)
     assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=False)) is None
     assert engines._selected_d_shape(caps, facts) == (tile, tile)
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
@@ -203,7 +204,7 @@ def test_standalone_d64_head_envelope_reference_and_replay(dtype, feature):
 
 
 def test_native_d64_recommendations_stay_unpacked():
-    plans = recommend("A", _facts(h_q=8, h_kv=1, causal=True), {"sdpa_fwd_prefill_sm90": 20517})
+    plans = recommend("A", _facts(h_q=8, h_kv=1, causal=True), {"sdpa_fwd_sm90_d64_one_wg": 20539})
     assert plans
     for plan in plans:
         assert plan.knobs.pack_gqa is False
@@ -213,8 +214,8 @@ def test_native_d64_recommendations_stay_unpacked():
 @pytest.mark.parametrize("head", [(512, 512), (264, 504)])
 def test_native_d512_domain_and_placement_are_preserved(head):
     facts = _facts(d_qk=head[0], d_v=head[1])
-    assert engines.mismatch(_caps(), facts) is None
-    assert engines._selected_d_shape(_caps(), facts) == (512, 512)
+    assert engines.mismatch(_caps(native=False), facts) is None
+    assert engines._selected_d_shape(_caps(native=False), facts) == (512, 512)
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
     assert place(spec, facts) == (LEAD if head == (512, 512) else TRAIL)
 
@@ -376,7 +377,7 @@ def test_native_d64_graph_uses_prepared_native_body(monkeypatch, dtype, causal, 
 
     def checked_compile(api):
         compile_api(api)
-        assert Path(api._k_mod.__file__).name == "prefill_d64_f16.py"
+        assert Path(api._k_mod.__file__).as_posix().endswith("sm90/d64_f16_one_wg/kernel.py")
         assert api._dense_spec is not None
         compiled.append(True)
 

@@ -1,5 +1,16 @@
 # FROST SDPA — support matrix
 
+**SM90 exact D64 implementation ownership:** `sdpa_fwd_sm90_d64_one_wg`
+(20539) owns the existing nonpaged native D64 FP16/BF16 subset. It keeps
+dense unpadded and unpacked Q/K/V, optional Stats, sign-aware scales and
+the existing causal/scheduler boundaries. `sdpa_fwd_sm90_f16_three_wg`
+(20540) owns the existing exact D64 paged-KV subset, including its existing
+band/sink/length behavior. Both use TILE_M=TILE_N=64 and CGA1. The old
+20517 row declines exact D64; saved D64 recipes require replanning. Other
+SM90 widths and envelopes remain on 20517 in this first migration batch.
+The central policy preserves candidate order, budget and backend placement.
+No new Stats stride-override behavior note is advertised for either owner.
+
 **Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
 graph/config for admitted override-enabled half THD plans with packed HN Stats
 and the matching prepared binder on qualified SM100/SM103 devices. SM107 and
