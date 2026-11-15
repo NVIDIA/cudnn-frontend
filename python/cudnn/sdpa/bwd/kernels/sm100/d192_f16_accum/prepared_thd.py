@@ -9,8 +9,8 @@ from functools import partial
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
-from .prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
-from .d192_thd_contract import (
+from cudnn.sdpa.bwd.prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.thd_contract import (
     IMPLEMENTATION,
     KV_PORTS,
     ORIGIN_PORTS,
@@ -34,7 +34,7 @@ def check_support(api):
     from cudnn.frost.buffers import cutedsl_state
     from cudnn.frost.device import compute_capability, resolve_device
     from cudnn.sdpa.graph_analyzer import thd_stats_packing
-    from .d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
+    from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS, validate_accumulation_scale
 
     def require(condition, reason):
         if not condition:
@@ -156,7 +156,7 @@ def compile_plan(api):
     import torch
 
     from cudnn.frost.device import compute_capability, resolve_device
-    from .kernels.sm100.prepared_d192_thd_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.prepared_thd_host import compile_host
 
     b, h = api.batch_size, api.h_q
     operands = []
@@ -214,7 +214,7 @@ def execute_standalone(api, tensors, workspace, current_stream, scale, optional)
 
     from cudnn._device import ensure_current_context
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
-    from .prepared import execute
+    from cudnn.sdpa.bwd.prepared import execute
 
     allowed = {"seq_q_lens", "seq_kv_lens", "thd_ragged_offsets"}
     if any(value is not None for name, value in optional.items() if name not in allowed):
