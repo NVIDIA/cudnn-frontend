@@ -4,6 +4,49 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Fixed D256 and D192 half backward implementations (2026-11-15)
+
+The SM107 native D256 and shared SM100/SM107 two-by-two bodies now have
+explicit implementation directories and hosts. Engine 20632 fixes the native
+SM107 body; opt-in 20633 fixes the dense Rubin interleaved profile. SM100
+20607 and SM107 D192/V128 20610 keep their records and shared body. Legacy
+20604 delegates and requires replanning. The 57 moved device definitions
+retain identical ASTs; workspace and reduction order are unchanged.
+
+On CUDA 13.4 compilation, CuTe DSL 4.8, cuDNN 9.30 and Torch 2.14.1+cu130,
+frozen source `42508c7e4` passed the following `-m L0` selections. All source
+hashes and the actual import path were checked before execution.
+
+| Native GPU | Suites under `test/python/sdpa/frost/` | Result |
+|---|---|---|
+| SM107 | `test_sdpa_bwd_dsl_sm107.py`, `test_sdpa_bwd_thd_sm107.py`, `test_sdpa_bwd_d192_sm107.py`, `test_sdpa_bwd_sm107_d256_implementations.py`, `test_sdpa_bwd_sm107_d256_contract.py` | 490 passed, 88 skipped |
+| SM100 B200 | `test_sdpa_bwd_d256_sm100.py`, `test_sdpa_bwd_d192_sm100.py`, `test_sdpa_bwd_thd_d256_sm100.py`, `test_sdpa_bwd_thd_d192_sm100.py`, `test_sdpa_bwd_config_d256_2x2.py` | 405 passed, 26 skipped |
+
+The SM107 skips were 34 fingerprints pinned to DSL 4.7, six unavailable
+historical reference dumps, 46 unavailable nvdisasm checks and two documented
+graph-padding declines. The SM100 skips were 26 nvdisasm checks. The 12 new
+native record tests exercised FP16/BF16, dense GQA and causal MHA/GQA, actual
+body/profile identity, public-record rebuild despite legacy half switches,
+fresh bindings and changed-input CUDA Graph replay.
+
+`test_sdpa_bwd_d256_implementation_determinism.py` at source `d96a3583e`
+adds 20 bounded cases: 12 on SM107 (20632, 20633 and D192/V128 20610), eight
+on SM100 (D256/D256 and D192/V128 20607). Every case uses FP16 or BF16,
+causal S=257 and MHA 4/4 or GQA 4/2. It checks all gradients against an
+FP64 reference, finite results, unmodified inputs, fresh poisoned buffers,
+eight executions with concurrent work, batch size one versus three, reordered
+and duplicated sequences, and changed neighbor gradients. An initial test
+incorrectly bound FP64 oracle Stats; the corrected test binds FP32 Stats
+without changing production or tolerance.
+
+All 20 cases passed through new golden recording, then all passed in a
+separate process with recording disabled and strict checking enabled. The
+new records use runtime keys `c8aefc970ef3af15` (SM100) and `22fb9766a4ab5fdc` (SM107);
+no existing golden was replaced. Other-architecture parameter cases are
+explicitly skipped in each lane. These are tested-configuration results:
+general batch invariance, SM103 and the existing L1 stress cases are not
+newly qualified. Existing graph deterministic-mode declarations are unchanged.
+
 ### Fixed SM107 D512 backward implementation (2026-11-15)
 
 Engine 20608 retains its public record, the D264–D512 aligned envelope,
