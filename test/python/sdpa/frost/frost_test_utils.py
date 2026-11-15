@@ -159,6 +159,8 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
     if arch == "sm100":
         return (
             "sdpa_fwd_prefill_sm100",
+            "sdpa_fwd_sm100_d128_multi_q",
+            "sdpa_fwd_sm100_d64_quadrant",
             "sdpa_fwd_sm100_d192_multi_q",
             "sdpa_fwd_sm100_d128_single_q",
             "sdpa_fwd_sm100_d256_lookahead",

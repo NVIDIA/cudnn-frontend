@@ -78,7 +78,7 @@ def explicit_geometry(implementation, facts):
 
 def mismatch(implementation, facts, knobs):
     if not in_domain(facts):
-        return "requires exact SM107 D512/V512 or D576/V512 half graphs"
+        return "requires SM107 and exact D512/V512 or D576/V512 half graphs"
     reason = _CONTRACTS[implementation].mismatch(facts, knobs)
     if reason is not None:
         return reason

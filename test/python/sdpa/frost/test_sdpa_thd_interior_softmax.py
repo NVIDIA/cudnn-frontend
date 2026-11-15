@@ -95,7 +95,8 @@ def _build_graph(values, kv_heads, bottom_right, layout, cta_mma=2):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next((i for i, name in enumerate(names) if name.split("[")[0] == "sdpa_fwd_prefill_sm100"), None)
+    owner = "sdpa_fwd_sm100_d128_multi_q" if (d_qk, d_v) == (128, 128) else "sdpa_fwd_prefill_sm100"
+    index = next((i for i, name in enumerate(names) if name.split("[")[0] == owner), None)
     assert index is not None, names
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     knobs.update(

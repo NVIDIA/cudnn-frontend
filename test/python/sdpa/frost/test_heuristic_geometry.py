@@ -14,11 +14,13 @@ from frost_test_utils import requires_dsl
 import cudnn
 from cudnn.sdpa.fwd import heuristics as heur
 from cudnn.sdpa.fwd.config_sm100 import CfgD512, cga_ctas
-from cudnn.sdpa.fwd.engines import ENGINE_SPECS, effective_cgas, mismatch
+from cudnn.sdpa.fwd.engines import ENGINE_SPECS, effective_cgas, mismatch, sm100_legacy_policy_spec
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 
 pytestmark = pytest.mark.L0
-SPEC = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm100")
+# Geometry-model tests exercise the shared union policy. Public exact-head
+# admission belongs to the explicit owners, covered by their record tests.
+SPEC = sm100_legacy_policy_spec()
 
 
 def _d192_owner(facts, knobs, fallback=SPEC):
@@ -127,8 +129,7 @@ def test_each_geometry_runner_recomputes_split_and_obeys_cap(monkeypatch):
 
     monkeypatch.setattr(heur, "_split_points", recording)
     facts = _facts(h_q=32, h_kv=4, s_q=17, s_kv=8192)
-    plans = heur.recommend("A", facts, {SPEC.name: 20500})
-    knobs = [p.knobs for p in plans]
+    knobs = heur._knob_sets(SPEC, facts)
     assert len(knobs) == len(set(knobs)) <= heur._MAX_SETS_PER_ENGINE
     assert {k.pack_gqa for k in knobs} == {False, True}
     # 17 unpacked rows fit one 128-row decode tile (cga 1); the 17 * 8 packed rows overflow it, so both widths serve
@@ -359,7 +360,7 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q"))
     facts = _mla_split_facts(d_qk=128, h_q=8, h_kv=2, device_cc=device_cc)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=pack_gqa)
     assert mismatch(spec.capabilities, facts, knobs) is None

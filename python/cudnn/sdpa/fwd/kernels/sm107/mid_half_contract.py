@@ -79,7 +79,7 @@ def explicit_geometry(implementation, facts, knobs):
 
 def mismatch(implementation, facts, knobs):
     if facts.device_cc != (10, 7) or facts.dtype not in (data_type.HALF, data_type.BFLOAT16):
-        return "native mid-width half implementations require SM107 and FP16/BF16 queries"
+        return "requires SM107 and FP16/BF16 queries for native mid-width half implementations"
     if facts.invalid or facts.is_backward or facts.is_fp8 or facts.is_mxfp8:
         return "requires a valid half forward graph"
     return _CONTRACTS[implementation].mismatch(facts, knobs)

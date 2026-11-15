@@ -22,7 +22,8 @@ def check_graph_dtype_facts_and_admission(qdtype, kvdtype, monkeypatch, cc=(10, 
     o, stats = graph.sdpa(q=q, k=k, v=v, generate_stats=True, attn_scale=128**-0.5, use_causal_mask=True)
     o.set_output(True).set_dim(dim).set_stride(stride).set_data_type(io)
     stats.set_output(True).set_dim((2, 8, 256, 1)).set_stride((2048, 256, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == (engine_name or ("sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_prefill_sm100")))
+    default_name = "sdpa_fwd_prefill_sm107" if cc == (10, 7) else "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == (engine_name or default_name))
     facts, reason = engines.analyze_for(spec, graph, engines.SdpaFwdKnobs(cga=cga))
     assert reason is None, reason
     assert facts.kv_dtype == kv and facts.uniform_qo_dtype and not facts.uniform_dtype
@@ -66,10 +67,13 @@ def check_dense_paged_rebind_capture(
 
     def load(*args, **kwargs):
         module = original(*args, **kwargs)
-        loaded.append(module)
+        if hasattr(module, "MIXED_FP8_KV"):
+            loaded.append(module)
         return module
 
     monkeypatch.setattr(api_dsl, "load_template", load)
+    if engine_name == "sdpa_fwd_prefill_sm100" and entry == "graph":
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
     paged = layout == "paged"
     hnd = kvdtype == torch.float8_e5m2
     page = 128 if hnd else 8
@@ -181,6 +185,8 @@ def check_dense_paged_rebind_capture(
             if cga == 1 and not (native_sm107 and (paged or head_dim == 64))
             else ("sm107/prefill_d128_f16.py" if native_sm107 else "sm100/prefill_d128_f16.py")
         )
+        if entry == "graph" and engine_name in ("sdpa_fwd_sm100_d128_single_q", "sdpa_fwd_sm100_d128_multi_q"):
+            expected_file = "sm100/d128_f16_single_q/kernel.py" if cga == 1 else "sm100/d128_f16_multi_q/kernel.py"
         if native_sm107 and head_dim in (256, 512):
             expected_file = "sm107/prefill_d256_f16.py" if head_dim == 256 else "sm107/prefill_d512_f16_2x2.py"
         if entry == "graph" and engine_name == "sdpa_fwd_sm107_d512_2x2":
@@ -257,6 +263,8 @@ def check_single_q_ragged_decode(qdtype, kvdtype, prefix_q, entry, cudnn_handle,
     pages = b * blocks
     hnd = kvdtype in (torch.float8_e5m2, torch.float16)
     splits = (5 if hnd else 2) if splits is None else splits
+    if engine_name == "sdpa_fwd_prefill_sm100" and entry == "graph":
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if splits > 1 and cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
     odtype = torch.int64 if hnd else torch.int32
     io = cudnn.data_type.BFLOAT16 if qdtype == torch.bfloat16 else cudnn.data_type.HALF
 

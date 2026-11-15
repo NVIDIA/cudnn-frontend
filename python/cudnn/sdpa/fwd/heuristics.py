@@ -114,6 +114,7 @@ from cudnn.sdpa.fwd.engines import (
     EngineSpec,
     SdpaFwdKnobs,
     paged_thd_split_domain,
+    packed_thd_split,
     thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
@@ -3638,6 +3639,95 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     return MultiQ(d_flavor=facts.d_qk, cga=cga)
 
 
+def resolve_sm100_half_multi_q_geometry(facts, knobs, *, d_flavor):
+    """Resolve local defaults of a fixed multi-Q body, without body selection.
+
+    Keep the shared bias-budget and TILE_N policy used by the existing adapter.
+    Explicit knobs remain requests; unsupported pairs are declined by support.
+    """
+    from .kernels.sm100.d128_f16_multi_q.contract import Geometry
+
+    caps = sm100_legacy_policy_spec().capabilities
+    shape = (d_flavor, d_flavor)
+    tile_n = knobs.tile_n
+    if tile_n is None:
+        tile_n = sm100_tile_n_pick(
+            d_flavor,
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            kv_mask_fp32=facts.kv_mask_dtype == cudnn.data_type.FLOAT,
+            padded=facts.padded,
+            domain=dict(caps.tile_ns_by_d_shape).get(shape, frozenset({128})),
+        )
+    cga = knobs.cga
+    if cga is None:
+        if facts.has_bias and d_flavor <= 64:
+            widths = dict(caps.cgas_by_d_shape).get(shape, caps.cgas)
+            cga = sm100_bias_auto_cga(d_flavor, facts.s_kv, widths, tile_n=tile_n) or 1
+        else:
+            cga = 1 if d_flavor <= 64 else 2
+    return Geometry(d_flavor=d_flavor, cga=cga, tile_n=tile_n)
+
+
+def select_sm100_small_half_geometry(facts, knobs):
+    """Resolve small-half main bodies centrally, preserving the existing policy.
+
+    Width-envelope selection is common legality. Short-Q, quadrant and the
+    paged live-column swap-AB choices happen here before a fixed engine is
+    compiled; an implementation's host never re-enters this selector.
+    """
+    from .kernels.sm100.small_half_contract import in_domain
+    from .kernels.sm100.d128_f16_single_q.contract import small_geometry as single_q
+    from .kernels.sm100.d64_f16_quadrant.contract import Geometry as Quadrant
+    from .kernels.sm100.d256_f16_contract import D256Geometry, SWAP_AB
+
+    if not in_domain(facts):
+        raise ValueError("small-head half selection requires exact SM100/SM103 D32/D64/D128 half queries")
+    policy = sm100_legacy_policy_spec()
+    flavor = _selected_d_shape(policy.capabilities, facts, knobs)
+    if flavor not in ((32, 32), (64, 64), (128, 128)):
+        raise ValueError("small-head half selection has no supported width envelope")
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    rows = facts.s_q * group
+    split = knobs.split_kv or 1
+    multi_q = resolve_sm100_half_multi_q_geometry(facts, knobs, d_flavor=flavor[0])
+    cga = multi_q.cga
+    # Optional score outputs need the multi-Q epilogue. An omitted CGA must
+    # keep that legal default instead of selecting a body without the stores.
+    if knobs.cga is None and flavor == (128, 128) and not (facts.has_score_max or facts.has_score_sum_exp):
+        # The adapter enables ragged decode only for an explicit CGA1 request.
+        # An omitted width retains the THD prefill default, even if the graph
+        # would qualify for a separately requested split decode plan.
+        cga = select_d128_auto_cga(s_q=facts.s_q, pack_g=gcd(group, 128), thd=facts.thd, thd_decode_leg=False)
+    decode_tile = False
+    if flavor == (64, 64) and facts.uniform_dtype:
+        if facts.thd and packed_thd_split(policy.capabilities, facts, knobs):
+            decode_tile = True
+        elif not (facts.has_bias or facts.has_kv_mask) and knobs.cga in (None, 1):
+            if facts.thd:
+                decode_tile = facts.has_paged_kv and split == 1 and not knobs.pack_gqa and facts.s_q <= 128
+            else:
+                decode_tile = rows <= 128
+    swap_ab = (
+        flavor == (128, 128)
+        and cga == 1
+        and facts.has_paged_kv
+        and not facts.thd
+        and facts.uniform_dtype
+        and facts.dtype_o in (None, facts.dtype)
+        and 0 < rows <= 8
+        and not (facts.has_epilogue_gate or facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp or facts.attn_scale_prefolded)
+    )
+    if swap_ab:
+        return D256Geometry(SWAP_AB, 16, head_dim=128, live_columns=8, early_q=True)
+    if decode_tile and not facts.thd and rows <= 32:
+        return Quadrant()
+    if decode_tile or (flavor == (128, 128) and cga == 1 and (not facts.thd or split > 1)):
+        return single_q(facts, knobs, d_flavor=flavor[0])
+    return replace(multi_q, cga=cga)
+
+
 def select_sm90_geometry(facts, knobs):
     """Resolve the old candidate's body once; explicit replay never calls this."""
     from .kernels.sm90.d64_f16_one_wg import contract as native
@@ -3741,6 +3831,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_d192_half_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d192_half_geometry)
+    from .kernels.sm100.small_half_contract import in_domain as in_small_half_domain
+
+    if in_small_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_half_geometry)
     from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
 
     if in_d512_fp8_domain(facts):

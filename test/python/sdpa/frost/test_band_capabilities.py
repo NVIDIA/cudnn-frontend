@@ -80,6 +80,10 @@ def _dims(kind: str, caps):
         # A smaller native flavor can support fewer features than the row's
         # full envelope (SM90 D64 versus D512). Sample the full envelope for
         # the row-wide band claims; dedicated flavor tests pin its restrictions.
+        if caps.implementation == "sdpa_fwd_sm100_d256_swap_ab":
+            # D128 swap-AB only serves paged short queries; D256 also serves
+            # the dense geometry varied by this matrix.
+            return (256, 256)
         return (128, 128) if (128, 128) in shapes else shapes[-1]
     # A backward row lists head dims, not pairs, and may serve only some pairs of
     # them (the SM100 d256 row: exact (256, 256) and dense (192, 128)). Take the
@@ -100,7 +104,7 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
     check = getattr(caps, "declaration_check", None)
     if check is None:
         if kind == "fwd":
-            contract = fwd_engines._SMALL_FP8_CONTRACTS.get(caps.implementation)
+            contract = fwd_engines._SMALL_FP8_CONTRACTS.get(caps.implementation) or fwd_engines._HALF_CONTRACTS.get(caps.implementation)
             if contract is not None:
                 return contract.mismatch(facts, None)
         return None
@@ -189,8 +193,12 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
         # This body has eight live query columns. A 128-row sample would
         # exercise its implementation boundary before any mask decision.
         values["s_q"] = 1
-    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_single_q":
-        # The initial single-Q owner admits the D192 nonpaged THD leg only.
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d64_quadrant":
+        # Quadrant cooperation serves at most 32 live query rows. Keep the
+        # baseline inside that domain before varying any mask axis.
+        values["s_q"] = 32
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_single_q" and (d_qk, d_v) == (192, 128):
+        # D192 single-Q is THD-only; the same body also serves dense small heads.
         values.update(thd=True, padded=True)
     return values
 
@@ -528,9 +536,9 @@ def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
         tile = int(caps.skv_tile)
         s_kv = tile * 2 - 1  # not a tile multiple: the tail rule is live
         uncovered = legal_facts(kind, caps, s_q=tile * 2, s_kv=s_kv, **band_causal_top_left())
-        if caps.implementation == "sdpa_fwd_sm100_d128_fp8_swap_ab":
-            # Keep Q inside the body's eight live columns. An unmasked KV
-            # tail is also uncovered and reaches the same tile-tail gate.
+        if caps.implementation in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm100_d64_quadrant"}:
+            # Keep Q inside the body's live-query limit. An unmasked KV tail
+            # is also uncovered and reaches the same tile-tail gate.
             uncovered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_unmasked())
         covered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_causal_top_left())
         reason = _probe(kind)(caps, uncovered)
@@ -803,10 +811,12 @@ def test_non_mask_rejections_keep_their_own_vocabulary():
 def test_arch_gate_precedes_the_band_decision():
     for kind, spec in _rows():
         caps = spec.capabilities
-        reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, device_cc=(5, 0), **band_causal_top_left()))
-        assert reason is not None and (
-            reason.startswith("requires SM") or (getattr(caps, "implementation", "") and "requires exact" in reason and "SM" in reason)
-        ), (spec.name, reason)
+        facts = legal_facts(kind, caps, s_kv=128, device_cc=(5, 0), **band_causal_top_left())
+        reason = _probe(kind)(caps, facts)
+        assert reason is not None and (reason.startswith("requires SM") or (reason == declaration_reason(kind, caps, facts) and "SM" in reason)), (
+            spec.name,
+            reason,
+        )
 
 
 # ---------------------------------------------------------------------------
