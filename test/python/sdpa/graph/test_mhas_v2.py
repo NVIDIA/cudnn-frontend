@@ -563,7 +563,18 @@ def _exec_sdpa_on_frost(
     ``tensor_checker`` too (an exact check on the outputs before the tolerance
     compare)."""
     engines = (engine,)
+    small_owners = {
+        "prefill_d128_f16": "sdpa_fwd_sm100_d128_multi_q",
+        "decode_d128_f16": "sdpa_fwd_sm100_d128_single_q",
+    }
+    if cfg.d_qk == cfg.d_v and cfg.d_qk in (32, 64):
+        small_owners["decode_d64_f16_quadrant"] = "sdpa_fwd_sm100_d64_quadrant"
+    else:
+        small_owners["decode_d256_f16"] = "sdpa_fwd_sm100_d256_swap_ab"
     owners = {
+        (32, 32): small_owners,
+        (64, 64): small_owners,
+        (128, 128): small_owners,
         (192, 128): {"prefill_d192_d128_f16": "sdpa_fwd_sm100_d192_multi_q",
                      "decode_d128_f16": "sdpa_fwd_sm100_d128_single_q"},
         (256, 256): {"prefill_d256_f16": "sdpa_fwd_sm100_d256_lookahead",
@@ -575,9 +586,13 @@ def _exec_sdpa_on_frost(
     if engine == "sdpa_fwd_prefill_sm100" and owners is not None:
         # Preserve the concrete owner/body assertion after splitting a row.
         engines = (owners[template],) if template in owners else tuple(owners.values())
+        if template == "decode_d128_f16" and cfg.d_qk == cfg.d_v and cfg.d_qk in (32, 64):
+            # The legacy module held both single-Q and quadrant cooperation.
+            # Their new owners retain separate, concrete body identities.
+            engines = (owners[template], owners["decode_d64_f16_quadrant"])
     keys = [[f"frost:{name}" for name in engines]]
     if template:
-        keys.append([f"frost:{name}:{template}" for name in engines])
+        keys.append([f"frost:{name}:" + ("decode_d64_f16_quadrant" if name == "sdpa_fwd_sm100_d64_quadrant" else template) for name in engines])
     before = [sum(frost_routing.snapshot().get(k, 0) for k in group) for group in keys]
     # The assertion is "FROST served it": opt FROST in for the call so the placement
     # tree (sdpa/fwd/placement.py) ranks ours first even on a shard measured behind
@@ -2089,16 +2104,24 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=
     rejection, "unsupported forward graph") into failures: a config that claims FROST
     coverage must run."""
     import frost_routing
-    key = f"frost:{engine}"
-    before = frost_routing.snapshot().get(key, 0)
+    owners = {
+        (64, 64): ("sdpa_fwd_sm100_d128_fp8_multi_q", "sdpa_fwd_sm100_d128_fp8_dual_kv", "sdpa_fwd_sm100_d128_fp8_swap_ab"),
+        (128, 128): ("sdpa_fwd_sm100_d128_fp8_multi_q", "sdpa_fwd_sm100_d128_fp8_dual_kv", "sdpa_fwd_sm100_d128_fp8_swap_ab"),
+        (192, 128): ("sdpa_fwd_sm100_d192_fp8_multi_q",),
+        (256, 256): ("sdpa_fwd_sm100_d256_fp8_single_q",),
+        (512, 512): ("sdpa_fwd_sm100_d512_fp8_role_split",),
+    }
+    names = owners.get((cfg.d_qk, cfg.d_v), (engine,)) if engine == FROST_FP8_ENGINE else (engine,)
+    keys = tuple(f"frost:{name}" for name in names)
+    before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:
         exec_sdpa_fp8(cfg, request, cudnn_handle)
     except pytest.skip.Exception as e:
         if strict and not request.config.option.dryrun:
             pytest.fail(f"FROST-asserting fp8 config must run, not skip: {e}", pytrace=False)
         raise
-    after = frost_routing.snapshot().get(key, 0)
-    assert after == before + 1, f"expected {key} to serve this graph; routing tally: {frost_routing.snapshot()}"
+    after = sum(frost_routing.snapshot().get(key, 0) for key in keys)
+    assert after == before + 1, f"expected {keys} to serve this graph; routing tally: {frost_routing.snapshot()}"
 
 
 @pytest.mark.L0
@@ -3219,7 +3242,11 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
     want = engine_name(arch="sm107" if sm >= 107 else "sm100")
-    if sm in (100, 103) and (d_qk, d_v) == (256, 256):
+    if sm in (100, 103) and (d_qk, d_v) == (128, 128):
+        want = "sdpa_fwd_sm100_d128_multi_q"
+    elif sm in (100, 103) and (d_qk, d_v) == (192, 128):
+        want = "sdpa_fwd_sm100_d192_multi_q"
+    elif sm in (100, 103) and (d_qk, d_v) == (256, 256):
         want = "sdpa_fwd_sm100_d256_lookahead"
     elif sm in (100, 103) and (d_qk, d_v) == (512, 512):
         want = "sdpa_fwd_sm100_d512_2x2"

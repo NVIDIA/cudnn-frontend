@@ -203,11 +203,11 @@ def test_fixed_host_owns_its_geometry(owner, cga, query_tiles):
 
     module = importlib.import_module(f"cudnn.sdpa.fwd.kernels.sm100.{owner}.host")
     config = importlib.import_module(f"cudnn.sdpa.fwd.kernels.sm100.{owner}.config")
-    spec, facts = object(), object()
+    spec, graph_facts = object(), facts(thd=query_tiles == 1)
     seen = []
 
     def lower_impl(actual_spec, actual_facts, knobs, *, selected_kernel):
-        assert actual_spec is spec and actual_facts is facts
+        assert actual_spec is spec and actual_facts is graph_facts
         params = legacy.TemplateParams(dtype_qkv=2, cta_mma=cga, thd_varlen=query_tiles == 1, seq_kv_lens_present=query_tiles == 1)
         params = selected_kernel.configure_params(params)
         factory = config.make_cfg_d192 if query_tiles == 2 else config.make_cfg_d128_decode
@@ -218,7 +218,7 @@ def test_fixed_host_owns_its_geometry(owner, cga, query_tiles):
         seen.append(selected_kernel)
         return selected_kernel
 
-    result = module.lower(spec, facts, SdpaFwdKnobs(cga=cga), lower_impl=lower_impl, knob_type=SdpaFwdKnobs)
+    result = module.lower(spec, graph_facts, SdpaFwdKnobs(cga=cga), lower_impl=lower_impl, knob_type=SdpaFwdKnobs)
     assert seen == [result]
 
 

@@ -4,6 +4,44 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM107 D192/D256 FP8 implementation identity (2026-11-15)
+
+Exact D192/V128 and D256 per-tensor FP8 now use engines 20561 and 20562,
+`sdpa_fwd_sm107_d192_fp8_multi_q` and `sdpa_fwd_sm107_d256_fp8_single_q`.
+Their device definitions are AST-identical to the parent bodies. Public
+record reconstruction, fresh tensors/workspace, changed scales and retained
+CUDA Graph execution collect through `TestMidFp8Implementation` in
+`sdpa/frost/test_sdpa_fp8_sm107.py`. The same entry retains independent THD
+origins, packing/split, padded-head and fused D256 gate coverage.
+
+Frozen source snapshots corresponding to `6a41dfff3` ran on native cc 10.7
+with 208 SMs, cuDNN 9.30.0, CuTe DSL 4.8.0, compiler/NVRTC 13.4,
+Torch 2.14.1+cu130 and driver API 13040. Imports and target were asserted.
+The first completed native batch passed 282 cases and skipped 16: 12 lacked
+historical THD goldens and four target another architecture. The second
+batch passed 204 cases without skips or failures: D192 CGA1 public records,
+D192/D256 dense head envelopes, both service-register PTX checks, metadata
+and D192 HALF-softmax/keyless-row reference cases. These batches include
+host contract tests run on the GPU worker. Historical comparisons remain
+unverified for fingerprint `bc17a6445417eec9`; no new goldens were recorded.
+
+Both refill stress cases launch 1,024 CTAs with multiple K/V ring refills.
+After independent numerical checks, each passed 256 warm and 256
+shared-memory-poisoned launches with zero byte mismatches. The unsafe-ring
+control failed 200/200 launches. Finite stress is not a proof of race freedom.
+
+A frozen parent/head/head/parent comparison covered ten cases: each width's
+dense E4M3-to-BF16, packed split E5M2-to-E4M3, HALF-softmax and nonpaged THD,
+plus D192 causal single-CTA E4M3 output and D256 BF16 sigmoid gate. Full
+configuration, template parameters, TMA metadata, normalized public knobs,
+workspace, inputs, O/Stats/Amax and changed-scale capture digests were equal
+in all four processes. This evidence applies to those fixed plans only.
+
+After integrating actual develop `e555c3955`, head `6f7bc694c` retained 1,126
+host passes and eight skips. Its runtime delta from the frozen snapshots is
+formatting and parent integration; the new implementation bodies are unchanged.
+No other architecture or backward path is newly qualified here.
+
 ### SM107 D512 FP8 implementation identity (2026-11-15)
 
 The exact D512 per-tensor FP8 graph now uses engine 20549,
@@ -65,6 +103,14 @@ Historical paging and THD goldens are unavailable for runtime fingerprint
 `aa97de087283f297`. Strict historical-golden qualification therefore remains
 unverified for this runtime; no replacement baselines were recorded. No
 other architecture or backward path is newly qualified by this change.
+
+After integrating the shared admission changes from `a766c397a`, head
+`bf16a8a5d` passed 43 additional native record/origin/paged-capture and owner
+contract checks with zero failures or skips (one unchanged warm case was
+deselected because the larger stress above was already qualified). The
+shared CPU suites retained 1,089 passes and eight skips. Repeating the
+1,152 graph/mode comparison against that new parent preserved all 1,760
+ordered candidate records and placement decisions.
 
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
