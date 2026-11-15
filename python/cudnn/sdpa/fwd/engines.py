@@ -121,6 +121,7 @@ from .kernels.sm120.d256_f16_contract import (
     ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
     IMPLEMENTATIONS as _SM120_D256_IMPLEMENTATIONS,
     KEY_GROUP as _SM120_DECODE_KEY_GROUP,
+    explicit_geometry as _sm120_d256_explicit_geometry,
     mismatch as _sm120_d256_implementation_mismatch,
 )
 
@@ -1879,6 +1880,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         reason = _sm120_d256_implementation_mismatch(capabilities.implementation, facts, knobs)
         if reason is not None:
             return reason
+        if isinstance(knobs, SdpaFwdKnobs) and knobs.tile_m is None:
+            # A partial record runs the owner's fixed Q tile, not the legacy row's default.
+            knobs = replace(knobs, tile_m=_sm120_d256_explicit_geometry(capabilities.implementation, knobs).query_tile)
     if capabilities.sm_lo == 90 and (facts.d_qk, facts.d_v) == (64, 64) and not facts.has_paged_kv:
         from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 

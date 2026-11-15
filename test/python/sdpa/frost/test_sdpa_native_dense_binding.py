@@ -436,7 +436,12 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     # Manifest slot 15 is the distinct Rubin half engine.
     engine_id = 20505 if cc[0] == 12 else (20515 if cc == (10, 7) else _SM100_ID)
     if cc[0] == 12:
+        from cudnn.engines.manifest import MANIFEST
+        from frost_test_utils import sm120_half_owner
+
         tile_m, tile_n, cga = 64, 32 if d > 256 else 64, 1
+        # Exact native tiles have explicit owners; padded envelopes keep 20505.
+        engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[sm120_half_owner(d, d_v, tile_m)]
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
     if cc in ((10, 0), (10, 3)) and (d, d_v) == (256, 256):

@@ -3,7 +3,6 @@
 
 """Host contracts for the two exact-D256 SM120 half owners (all-compute and key-group decode)."""
 
-from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -87,6 +86,17 @@ def test_candidate_order_and_budget_preserve_the_legacy_policy(kind, overrides):
     assert [p.knobs for p in plans] == expected
     for plan in plans:
         assert IDS[plan.engine_id] == d256.select_geometry(f, plan.knobs).implementation
+
+
+def test_partial_public_record_takes_the_owner_default():
+    """A record naming only TILE_N runs the owner's fixed Q tile, as an empty record does; a wrong stage still declines."""
+    decode = facts(s_q=3)
+    key_group = SPECS[d256.KEY_GROUP].capabilities
+    assert engines.mismatch(key_group, decode, engines.SdpaFwdKnobs()) is None
+    assert engines.mismatch(key_group, decode, engines.SdpaFwdKnobs(tile_n=16)) is None
+    assert "16-key K/V stages" in engines.mismatch(key_group, decode, engines.SdpaFwdKnobs(tile_n=64))
+    assert engines.mismatch(SPECS[d256.ALL_COMPUTE].capabilities, facts(), engines.SdpaFwdKnobs(tile_n=64)) is None
+    assert engines.mismatch(key_group, decode, engines.SdpaFwdKnobs(tile_m=64, tile_n=16)) is not None
 
 
 def test_placement_inherits_the_legacy_study_keys():
