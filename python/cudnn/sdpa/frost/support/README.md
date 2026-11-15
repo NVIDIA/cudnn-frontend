@@ -14,6 +14,7 @@ features.** It means this new reference has not yet been checked for that scope.
 | Architecture | Current reference | Documentation coverage |
 |---|---|---|
 | SM80 (cc 8.0) | [SM80 support](sm80.md) | FP16/BF16 forward documented; backward pending migration |
+| SM89 (cc 8.9) | [SM89 support](sm89.md) | FP16/BF16 forward documented; no FROST SDPA backward engine |
 | SM90 (cc 9.0) | [SM90 support](sm90.md) | Forward documented; no FROST SDPA backward engine |
 | SM100 / SM103 (cc 10.0 / 10.3) | [SM100 / SM103 support](sm100.md) | Forward exact D32/D64/D128 half and D64/D128/D192/V128/D256/D512 MXFP8 documented; remaining forward and backward pending |
 | SM107 (cc 10.7) | [SM107 support](sm107.md) | FP16/BF16, per-tensor FP8 and MXFP8 forward documented; non-exact half envelopes and backward pending migration |

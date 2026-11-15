@@ -635,8 +635,8 @@ def test_sm89_row_claims_exactly_its_measured_band():
     # the flags could not express it.
     assert _band.ANCHOR_BOTTOM_RIGHT not in caps.band.anchors
     assert caps.bottom_right is False
-    # ... and the head-count claim is enforced for the same reason: the tracker
-    # marks GQA/MQA unsupported, so the probe has to decline it (the L20 run
+    # ... and the head-count claim is enforced for the same reason: the support
+    # page lists GQA/MQA as unsupported, so the probe has to decline it (the L20 run
     # covered the equal-head layout only).
     import unittest.mock as mock
 
