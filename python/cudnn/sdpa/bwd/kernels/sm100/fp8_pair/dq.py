@@ -19,21 +19,17 @@ from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
 from cudnn.sdpa.bwd.config_sm100_d192_dq_fp8 import make_config
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import (
+from cudnn.sdpa.bwd.kernels.sm100.fp8_pair.dkdv import _commit, _credit, _decode_flat, _mma_desc, _service_regs, _wait, _wait_tcgen
+from cudnn.sdpa.bwd.kernels.sm100._fp8_common import (
     FP8,
     HALF_DTYPES,
     LOG2E,
     _bpe,
-    _commit,
-    _credit,
-    _decode_flat,
     _fold_amax,
-    _mma_desc,
     _operand,
     _pack_fp8,
     _scalar,
     _scale_pairs,
-    _service_regs,
     _sf_copy,
     _sf_map,
     _sf_ptr,
@@ -42,8 +38,6 @@ from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_dkdv_fp8 import (
     _tensor_map,
     _tmem_load,
     _view,
-    _wait,
-    _wait_tcgen,
 )
 
 _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", (192, 128))

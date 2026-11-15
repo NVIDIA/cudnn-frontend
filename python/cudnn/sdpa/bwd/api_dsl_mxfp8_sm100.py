@@ -427,8 +427,8 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         from cudnn.frost.compiled_cache import positional_entry
         from cudnn.frost.device import compute_capability, resolve_device
         from .prepared import BwdLaunchSpec, Operand
-        from .kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
-        from .kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
+        from .kernels.sm100.d256_mxfp8.dkdv import BlackwellFmhaBackwardDKDV256
+        from .kernels.sm100.d256_mxfp8.dq import BlackwellFmhaBackwardDQ256
         from .kernels.sm100.bprop_sf_repack_mxfp8 import Mxfp8SfRepackSm100
         from .kernels.sm100.prepared_mxfp8_host import compile_host
 
