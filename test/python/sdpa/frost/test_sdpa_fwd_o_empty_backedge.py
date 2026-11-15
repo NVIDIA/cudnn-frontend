@@ -41,15 +41,15 @@ _TWO_WARPGROUP_KERNELS = (
     "sm100/d192_fp8_multi_q/kernel.py",
     "sm100/prefill_d192_d128_mxfp8.py",
     "sm107/prefill_d128_f16.py",
-    "sm107/prefill_d128_fp8.py",
+    "sm107/d128_fp8_multi_q/kernel.py",
     "sm107/prefill_d128_mxfp8.py",
     "sm107/prefill_d192_d128_f16.py",
-    "sm107/prefill_d192_d128_fp8.py",
+    "sm107/d192_fp8_multi_q/kernel.py",
     "sm107/prefill_d192_d128_mxfp8.py",
 )
 # The sm107 d192x128 quantized kernels start a tile on ``mb_tile_go``: softmax warpgroup 1 and the correction group (after O
 # sub-tile 0) arrive it, and the correction group waits its own O slot, so the softmax warpgroups carry no top-of-tile mb_o_empty wait.
-_TILE_GATE_KERNELS = ("sm107/prefill_d192_d128_fp8.py", "sm107/prefill_d192_d128_mxfp8.py")
+_TILE_GATE_KERNELS = ("sm107/d192_fp8_multi_q/kernel.py", "sm107/prefill_d192_d128_mxfp8.py")
 
 
 @pytest.mark.parametrize("kernel", _TWO_WARPGROUP_KERNELS)

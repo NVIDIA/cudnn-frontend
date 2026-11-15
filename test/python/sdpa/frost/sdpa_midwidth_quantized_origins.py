@@ -15,6 +15,10 @@ def origin_checks(family, arch="sm100", shapes=None):
             from frost_test_utils import mxfp8_engine_name
 
             return mxfp8_engine_name(arch, *(dims if isinstance(dims, tuple) else (dims, 128 if dims == 192 else dims)))
+        if arch == "sm107" and family == "fp8" and dims in (192, (192, 128)):
+            return "sdpa_fwd_sm107_d192_fp8_multi_q"
+        if arch == "sm107" and family == "fp8" and dims in (256, (256, 256)):
+            return "sdpa_fwd_sm107_d256_fp8_single_q"
         if arch == "sm107" and family == "fp8" and dims in (512, (512, 512)):
             return "sdpa_fwd_sm107_d512_fp8_role_split"
         if arch == "sm100" and family == "fp8" and dims in (256, (256, 256)):
@@ -37,6 +41,9 @@ def origin_checks(family, arch="sm100", shapes=None):
         if arch == "sm100" and family == "mxfp8" and width in (128, 192, 256):
             implementation = "d256_mxfp8_single_q" if width == 256 else f"d{width}_mxfp8_multi_q"
             expected = f"sm100/{implementation}/kernel.py"
+        if arch == "sm107" and family == "fp8" and width in (192, 256):
+            owner = "d192_fp8_multi_q" if width == 192 else "d256_fp8_single_q"
+            expected = f"sm107/{owner}/kernel.py"
         if arch == "sm107" and family == "fp8" and width == 512:
             expected = "sm107/d512_fp8_role_split/kernel.py"
         assert plan._compiled.kernel_module.__file__.endswith(expected)

@@ -346,6 +346,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             # Opt-in like the MXFP8 row they split; that row's causal_exclude_own_block unlock serves D128 only.
             "sdpa_fwd_sm100_d512_mxfp8_slice_recompute": EngineSlot(52, opt_in=True),
             "sdpa_fwd_sm100_d512_mxfp8_retained_p": EngineSlot(53, opt_in=True),
+            "sdpa_fwd_sm107_d192_fp8_multi_q": EngineSlot(61),
+            "sdpa_fwd_sm107_d256_fp8_single_q": EngineSlot(62),
+            "sdpa_fwd_sm107_d128_fp8_multi_q": EngineSlot(63),
+            "sdpa_fwd_sm107_d128_fp8_swap_ab": EngineSlot(64),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),

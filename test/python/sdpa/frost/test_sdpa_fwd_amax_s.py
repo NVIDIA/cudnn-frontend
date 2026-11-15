@@ -47,7 +47,7 @@ def _fp8_facts(**kw):
     return SdpaGraphFacts(**base)
 
 
-@pytest.mark.parametrize("row, cc", [("sdpa_fwd_sm100_d256_fp8_single_q", (10, 0)), ("sdpa_fwd_prefill_sm107_fp8", (10, 7))])
+@pytest.mark.parametrize("row, cc", [("sdpa_fwd_sm100_d256_fp8_single_q", (10, 0)), ("sdpa_fwd_sm107_d256_fp8_single_q", (10, 7))])
 def test_declared_amax_s_declines_and_warns_once(row, cc, caplog, monkeypatch):
     monkeypatch.setattr(engines, "_amax_s_warned", False)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == row)
