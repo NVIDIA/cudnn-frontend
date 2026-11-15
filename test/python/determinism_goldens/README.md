@@ -4,6 +4,54 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Fixed SM107 quantized backward implementations (2026-11-15)
+
+Per-tensor FP8 engine 20605 and MXFP8 engine 20606 retain their records,
+domains and diagnostic numerical policies. Their bodies, fixed hosts,
+contracts and configuration helpers now live in `sm107/d256_fp8` and
+`sm107/d256_mxfp8`. The 59 moved device definitions have identical ASTs;
+the shared parser, workspace and prepared binding chain are preserved.
+
+On native SM107 with CUDA 13.4 compilation, CuTe DSL 4.8, cuDNN 9.30 and
+Torch 2.14.1+cu130, frozen source `916d60187` produced the following L0
+results. Every frozen source hash and the actual import path were checked.
+
+| Suite under `test/python/sdpa/frost/` | Result |
+|---|---|
+| `test_sdpa_bwd_sm107_quant_implementations.py` | 8 passed |
+| `test_sdpa_bwd_fp8_sm107.py` | 247 passed, 8 skipped, 1 stale classic-admission fixture failed |
+| `test_sdpa_bwd_mxfp8_sm107.py` | 163 passed, 29 skipped |
+| `test_sdpa_bwd_thd_fp8_sm107.py` | 152 passed |
+| `test_sdpa_bwd_thd_mxfp8_sm107.py` | 148 passed |
+
+The 37 skips were 30 unavailable nvdisasm checks, six unavailable historical
+reference dumps and one superseded bring-up placeholder. The admission
+failure was reproduced with the identical assertion on frozen parent
+`42508c7e4` in the same environment. Disabling opt-in no longer removes
+default Python engines, so that test did not reach the classic C++ path it
+intended to exercise. Source `ae13f0299` explicitly withholds Python
+candidates in that test; the native admission test and the existing eight
+head/architecture boundary cases then all passed. The original C++ admission
+assertion remains. This correction changes no production behavior or tolerance.
+
+The eight new cases cover causal D256, S=257, MHA 4/4 and GQA 4/2 with
+BF16 gradients. Both default and diagnostic dS policies are exercised for
+each family. They check reference gradients, requested FP8 gradient/dP amax,
+actual body/profile identity, exported-record rebuild, fresh port bindings,
+input preservation and four poisoned CUDA Graph replays after changing dO.
+All eight passed new golden recording and separate-process strict checking
+under runtime key `22fb9766a4ab5fdc`; no existing golden was replaced.
+
+The strict/control job's final summary command used an unavailable bare
+`python` executable after all pytest processes had finished. Its preserved
+XML confirmed eight strict passes and matching parent/candidate admission
+failures; the summary was recovered without rerunning those GPU tests.
+
+These results qualify the tested fixed-plan repeatability and rebinding
+cases. General batch invariance, other GPU architectures, absent SASS checks
+and cross-runtime byte identity remain unverified. Deterministic-mode
+declarations are unchanged.
+
 ### Fixed D256 and D192 half backward implementations (2026-11-15)
 
 The SM107 native D256 and shared SM100/SM107 two-by-two bodies now have
