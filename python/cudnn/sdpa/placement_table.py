@@ -117,6 +117,9 @@ def _unpacked_decode(row: str, facts) -> bool:
 
     sm120_wide += ((d512_mxfp8.LEGACY_ROW, d512_mxfp8.in_domain),)
     sm120_wide += tuple((owner.LEGACY_ROW, owner.in_domain) for owner in (sm107_d192_fp8, sm107_d256_fp8, sm107_small_fp8))
+    from cudnn.sdpa.fwd.kernels.sm107 import mxfp8_contract as sm107_mxfp8
+
+    sm120_wide += ((sm107_mxfp8.LEGACY_ROW, sm107_mxfp8.in_domain),)
     if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts))) or any(
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):

@@ -25,6 +25,7 @@ from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+from cudnn.sdpa.fwd.kernels.sm107 import mxfp8_contract as sm107_mxfp8
 from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as sm120_half
 from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as sm120_quant_general
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
@@ -916,7 +917,8 @@ def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
     does not hold whole 128-row SF atoms the page-size clause.  The SM100 MXFP8 row, which serves THD and pools, is
     untouched."""
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    rubin, sm100 = caps[engines.engine_name(mxfp8=True, arch="sm107")], caps["sdpa_fwd_sm100_d128_mxfp8_multi_q"]
+    rubin = engines.sm100_legacy_policy_spec(engines.engine_name(mxfp8=True, arch="sm107")).capabilities
+    sm100 = caps["sdpa_fwd_sm100_d128_mxfp8_multi_q"]
     thd_leg = "THD (ragged) rides the packed native-tile leg on this engine (shapes [(256, 256)]); the head-dim envelope is dense-only"
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
     thd = dict(thd=True, padded=True, **quant)
@@ -960,7 +962,8 @@ def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm10
     LPT, which that row's domain honours).  The width is the 2-CTA pair: the graph is a dense unsplit d256 MXFP8
     leg on cc 10.7 (config_sm100.d256_mxfp8_pair_leg)."""
     name = engines.engine_name(mxfp8=True, arch="sm107")
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
+    owner = sm107_mxfp8.owner_of_shape((256, 256))
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == owner)
     facts = _facts(
         b=2,
         h_q=8,
@@ -975,8 +978,9 @@ def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm10
         device_cc=(10, 7),
         device_sm_count=216,
     )
-    plans = recommend(kind, facts, {name: 20516})
-    assert plans, f"{kind}: the row admits the graph (mismatch={engines.mismatch(spec.capabilities, facts)!r}) and must propose a set"
+    plans = recommend(kind, facts, {name: 20516, owner: 20567})
+    assert plans, f"{kind}: the owner admits the graph (mismatch={engines.mismatch(spec.capabilities, facts)!r}) and must propose a set"
+    assert {p.engine_id for p in plans} == {20567}
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
     # the dense unsplit d256 MXFP8 graph leads with the 2-CTA pair (config_sm100.d256_mxfp8_pair_leg); the policy stays
     # clamped to NATURAL and the leg unsplit
@@ -1092,9 +1096,10 @@ def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
     assert {plan.engine_id for plan in causal + dense + thd} == {20552}
 
     rubin_name = engines.engine_name(mxfp8=True, arch="sm107")
-    rubin = recommend("A", _facts(device_cc=(10, 7), **base), {rubin_name: 20511})
+    rubin = recommend("A", _facts(device_cc=(10, 7), **base), {rubin_name: 20511, sm107_mxfp8.owner_of_shape((512, 512)): 20568})
     assert rubin
     assert all((plan.knobs.cga, plan.knobs.sched_policy) == (2, 0) for plan in rubin)
+    assert {plan.engine_id for plan in rubin} == {20568}
 
 
 @pytest.mark.L0

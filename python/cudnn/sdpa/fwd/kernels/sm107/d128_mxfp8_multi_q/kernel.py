@@ -24,7 +24,7 @@ LSE = max + log(sum P) moves by the relative rounding of a >= 128-term sum.
 
 At d_qk=128 every scale-factor tile is 4 TMEM columns, so the same map ends at
 564 with 12 columns spare; the body is kept byte-identical to
-``sm107/prefill_d192_d128_mxfp8.py`` (diff the two files) rather than spending
+``sm107/d192_mxfp8_multi_q/kernel.py`` (diff the two files) rather than spending
 that slack on a second stats placement.  The 1 KiB ones tile is the top SMEM
 slab, at 167 KiB with a half-precision O.
 """
@@ -56,6 +56,9 @@ from typing import NamedTuple
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d128_mxfp8
+from cudnn.sdpa.fwd.kernels.sm107.d128_mxfp8_multi_q import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d128_mxfp8(PARAMS)
@@ -1012,6 +1015,7 @@ def _kernel(
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+_kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 # === Warp-group functions ===
@@ -2723,7 +2727,7 @@ def _correction_warp_group(
                 # Safe inverse: avoid div by 0 (rows fully masked).
                 inv_sum = o_scale_fused / cute.math.max(total_sum, cutlass.Float32(1e-30))
             # --- empty KV range (fully-masked / zero-length KV for this tile) ---
-            # Same guard as sm107/prefill_d256_mxfp8.py.  With bounds.right <=
+            # Same guard as sm107/d256_mxfp8_single_q/kernel.py.  With bounds.right <=
             # bounds.left the kv loop ran ZERO iterations, so BMM2 never
             # overwrote the O accumulator (mma_ss overwrites only on its first
             # k-step) and TMEM still holds the PREVIOUS persistent tile's O --

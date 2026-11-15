@@ -107,6 +107,9 @@ from typing import NamedTuple
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TCGEN05_V0_ADDR_LIMIT, TemplateParams, make_cfg_d256_mxfp8
+from cudnn.sdpa.fwd.kernels.sm107.d256_mxfp8_single_q import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256_mxfp8(PARAMS)
@@ -1135,6 +1138,7 @@ def _kernel(
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+_kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 # === TMA-LDG warp group ===

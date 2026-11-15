@@ -5,7 +5,7 @@
 inputs + per-32-block E8M0 scale factors), d_qk=192 / d_v=128, SM107 (Rubin).
 
 Geometry is ``make_cfg_d192_mxfp8``; the BODY is the same as
-``sm107/prefill_d128_mxfp8.py`` (TILES_Q = 2, 2 softmax warpgroups, 4 correction
+``sm107/d128_mxfp8_multi_q/kernel.py`` (TILES_Q = 2, 2 softmax warpgroups, 4 correction
 warps, persistent try_cancel scheduler).  The pre-upstream base kernel was
 flavor-generic — one file served the d128 and d192xd128 geometries by swapping
 the config — and ``CfgD192`` only widens ``TILE_K``, so the config factory is the
@@ -96,11 +96,14 @@ from typing import NamedTuple
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d192_mxfp8
+from cudnn.sdpa.fwd.kernels.sm107.d192_mxfp8_multi_q import contract as _implementation_contract
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 if PARAMS.paged_kv:
     raise ValueError(
-        "prefill_d192_d128_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/prefill_d128_mxfp8 and sm107/prefill_d256_mxfp8)"
+        "prefill_d192_d128_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/d128_mxfp8_multi_q and sm107/d256_mxfp8_single_q)"
     )
 CFG, _TMA = make_cfg_d192_mxfp8(PARAMS)
 
@@ -237,7 +240,7 @@ _P_ALIAS = CFG.CTA_MMA == 1
 _FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
 # The arms themselves (f16_exp_chunk / f16_exp_chunk_sum / fused_shift_f16_exp_chunk) live in
 # cudnn.frost.tile_dsl.softmax_f16, shared with the d128 / d256 / d512 quantized siblings; the softmax
-# body below stays byte-identical to sm107/prefill_d128_mxfp8.py's (diff the two _softmax_kv_body ranges).
+# body below stays byte-identical to sm107/d128_mxfp8_multi_q/kernel.py's (diff the two _softmax_kv_body ranges).
 
 
 SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
@@ -990,6 +993,7 @@ def _kernel(
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+_kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 # === Warp-group functions ===
@@ -2694,7 +2698,7 @@ def _correction_warp_group(
                 # Safe inverse: avoid div by 0 (rows fully masked).
                 inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
             # --- empty KV range (fully-masked / zero-length KV for this tile) ---
-            # Same guard as sm107/prefill_d256_mxfp8.py.  With bounds.right <=
+            # Same guard as sm107/d256_mxfp8_single_q/kernel.py.  With bounds.right <=
             # bounds.left the kv loop ran ZERO iterations, so BMM2 never
             # overwrote the O accumulator (mma_ss overwrites only on its first
             # k-step) and TMEM still holds the PREVIOUS persistent tile's O --
