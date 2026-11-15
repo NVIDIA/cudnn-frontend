@@ -50,6 +50,20 @@ def test_prefill_factory_cannot_switch_main_implementation(dual):
         module.make_cfg_d128(legacy.TemplateParams(dtype_qkv=0, dual_kv_stream=not dual))
 
 
+@pytest.mark.parametrize("variant", ["multi_q", "dual_kv"])
+def test_per_tensor_body_refuses_mxfp8_only_mask_at_load(variant):
+    from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip(cutedsl_requirement_error("FP8 template load check"))
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    params = legacy.TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=1, dual_kv_stream=variant == "dual_kv", window_right=0, causal_exclude_own_block=32)
+    with pytest.raises(ValueError, match="causal_exclude_own_block is served by the MXFP8 d128 body only"):
+        _load_kernel_template(f"sm100/d128_fp8_{variant}/kernel.py", params, tag="per_tensor_mxfp8_mask_refusal")
+
+
 @pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
 def test_factories_do_not_call_legacy_implementations(variant, monkeypatch):
     module = importlib.import_module(f"cudnn.sdpa.fwd.kernels.sm100.d128_fp8_{variant}.config")
@@ -167,8 +181,8 @@ OFFERED = {PREFIX + variant: engine for variant, engine in (("multi_q", 20527), 
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
-@pytest.mark.parametrize("d", [64, 128])
-def test_exact_domain_moves_to_explicit_owners(cc, d):
+@pytest.mark.parametrize("d", [48, 64, 112, 128])
+def test_native_and_envelope_domains_move_to_explicit_owners(cc, d):
     facts = _facts(device_cc=cc, d_qk=d, d_v=d)
     assert "owned by" in engines.mismatch(SPECS["sdpa_fwd_prefill_sm100_fp8"].capabilities, facts)
     for kind in ("A", "FALLBACK"):
@@ -180,7 +194,7 @@ def test_exact_domain_moves_to_explicit_owners(cc, d):
 
 
 @pytest.mark.parametrize("variant", ["multi_q", "dual_kv", "swap_ab"])
-@pytest.mark.parametrize("changes", [{"device_cc": (10, 7)}, {"d_qk": 112, "d_v": 112}, {"is_mxfp8": True}, {"is_fp8": False}])
+@pytest.mark.parametrize("changes", [{"device_cc": (10, 7)}, {"d_qk": 112, "d_v": 120}, {"is_mxfp8": True}, {"is_fp8": False}])
 def test_other_implementations_remain_outside_owner(variant, changes):
     assert engines.mismatch(SPECS[PREFIX + variant].capabilities, _facts(**changes)) is not None
 

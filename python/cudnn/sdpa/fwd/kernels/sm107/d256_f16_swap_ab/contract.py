@@ -4,6 +4,7 @@
 """Local identity and admission for the native SM107 d256_f16_swap_ab body."""
 
 from cudnn.sdpa.fwd.config_sm107 import decode_d256_wide_tile_admits
+from ..half_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm107_d256_swap_ab"
 TEMPLATE_NAME = "decode_d256_f16"
@@ -11,8 +12,8 @@ KERNEL_FILE = "sm107/d256_f16_swap_ab/kernel.py"
 
 
 def mismatch(facts, knobs):
-    if (facts.d_qk, facts.d_v) != (256, 256) or not facts.uniform_dtype:
-        return "native D256 swap-AB requires exact same-dtype D256/V256"
+    if padded_shape(facts) != (256, 256) or not facts.uniform_dtype:
+        return "native D256 swap-AB requires a same-dtype D256/V256 envelope"
     if facts.thd or facts.attn_scale_prefolded:
         return "native D256 swap-AB has dense queries and applies the scale in-kernel"
     if facts.has_epilogue_gate and knobs is not None and (knobs.split_kv or 1) <= 1:

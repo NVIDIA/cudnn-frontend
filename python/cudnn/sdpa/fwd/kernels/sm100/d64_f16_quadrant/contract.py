@@ -41,7 +41,7 @@ class Geometry:
 
 
 def mismatch(facts, knobs):
-    if not in_domain(facts) or facts.d_qk > 64:
+    if not in_domain(facts) or max(facts.d_qk, facts.d_v) > 64:
         return "quadrant half implementation requires the D64 envelope on SM100/SM103"
     if facts.thd or facts.has_bias or facts.has_kv_mask:
         return "quadrant cooperation does not support THD, bias or KV-mask operands"

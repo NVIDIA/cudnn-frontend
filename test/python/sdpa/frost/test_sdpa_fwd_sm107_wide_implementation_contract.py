@@ -21,9 +21,9 @@ def facts(**kwargs):
     return _facts(device_cc=(10, 7), device_sm_count=208, **kwargs)
 
 
-@pytest.mark.parametrize("name,dq", [(ROLE_SPLIT, 512), (TWO_BY_TWO, 512), (TWO_BY_TWO, 576)])
-def test_explicit_owner_and_physical_cluster(name, dq):
-    f = facts(d_qk=dq)
+@pytest.mark.parametrize("name,dq,dv", [(ROLE_SPLIT, 512, 512), (TWO_BY_TWO, 512, 512), (TWO_BY_TWO, 576, 512), (ROLE_SPLIT, 384, 320), (TWO_BY_TWO, 384, 320)])
+def test_explicit_owner_and_physical_cluster(name, dq, dv):
+    f = facts(d_qk=dq, d_v=dv)
     g = explicit_geometry(name, f)
     k = g.canonical_knobs(engines.SdpaFwdKnobs())
     assert "owned by" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, f)
@@ -42,11 +42,17 @@ def test_other_architectures_decline(name, cc):
     assert engines.mismatch(SPECS[name].capabilities, replace(facts(), device_cc=cc))
 
 
-@pytest.mark.parametrize("dims", [(504, 504), (120, 120), (248, 248)])
-def test_legacy_retains_nonmigrated_domain(dims):
+@pytest.mark.parametrize("dims,owner", [((504, 504), ROLE_SPLIT), ((120, 120), "sdpa_fwd_sm107_d128_multi_q"), ((248, 248), "sdpa_fwd_sm107_d256_lookahead")])
+def test_envelope_uses_its_explicit_owner(dims, owner):
     f = facts(d_qk=dims[0], d_v=dims[1])
-    assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, f) is None
-    assert all(engines.mismatch(SPECS[name].capabilities, f) for name in (ROLE_SPLIT, TWO_BY_TWO))
+    assert "owned by" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, f)
+    assert engines.mismatch(SPECS[owner].capabilities, f) is None
+
+
+@pytest.mark.parametrize("dims", [(513, 512), (520, 512), (568, 512), (512, 513), (384, 319)])
+def test_wide_envelope_retains_alignment_and_exact_d576_boundary(dims):
+    f = facts(d_qk=dims[0], d_v=dims[1])
+    assert all(engines.mismatch(SPECS[name].capabilities, f) for name in (LEGACY_ROW, ROLE_SPLIT, TWO_BY_TWO))
 
 
 @pytest.mark.parametrize("sq", [1, 129, 8192])
@@ -88,6 +94,7 @@ def test_mixed_kv_uses_one_pair_and_declines_other_storage():
     assert (g.cluster_m, g.cta_group) == (2, 2)
     assert engines.mismatch(SPECS[TWO_BY_TWO].capabilities, f, k) is None
     assert engines.mismatch(SPECS[TWO_BY_TWO].capabilities, replace(f, thd=True), k)
+    assert engines.mismatch(SPECS[TWO_BY_TWO].capabilities, replace(f, d_qk=384, d_v=320), k)
     assert engines.mismatch(SPECS[ROLE_SPLIT].capabilities, f)
 
 

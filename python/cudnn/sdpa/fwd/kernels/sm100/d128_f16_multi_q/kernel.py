@@ -50,8 +50,8 @@ the shared ``_common_blackwell`` / ``thd_helpers`` mechanism (same as the SM100 
 / dsv4 kernels).  The dense ``[B,S,H,D]`` path is byte-identical (folds out at
 ``THD_VARLEN=0``).
 
-FP8 (E4M3 / E5M2, incl. output-dtype override) lives in the sibling
-``sm100/prefill_d128_fp8.py`` (shares this flavor's config).
+FP8 (E4M3 / E5M2, incl. output-dtype override) lives in the siblings
+``sm100/d128_fp8_multi_q/kernel.py`` and ``sm100/d128_fp8_dual_kv/kernel.py``.
 
 KV split (``CFG.SPLIT_KV > 1``): each chunk runs the UNCHANGED mainloop and
 epilogue, writing its partial O and LSE into a split-major workspace at batch
@@ -128,7 +128,7 @@ if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_f16: d_flavor must be 32, 64 or 128; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 if PARAMS.dual_kv_stream:
-    raise ValueError("sm100/prefill_d128_f16: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
+    raise ValueError("sm100/prefill_d128_f16: dual_kv_stream (two KV streams over one Q tile) is served by sm100/d128_fp8_dual_kv/kernel.py only")
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -587,7 +587,7 @@ class KernelTmemLayout:
 LAYOUT = KernelTmemLayout()
 
 # === Additive bias (resident row-block) + per-key kv_mask: CFG.BIAS_MODE / CFG.KV_MASK_FORM -- the SM100 port of the Rubin small tiles'
-# arms (sm107/prefill_d128_f16.py; the same const_expr fields, the shared tile_dsl.bias / tile_dsl.mask primitives, the same two item-level
+# arms (sm107/d128_f16_multi_q/kernel.py; the same const_expr fields, the shared tile_dsl.bias / tile_dsl.mask primitives, the same two item-level
 # barrier rows of make_classic_bars(bias_resident=True)).  Both arms fold on their Cfg field (TemplateParams.bias_mode / kv_mask_form):
 # 0 / 0 traces the pre-bias instruction stream byte for byte (the committed sm_100a records pin it).  Either arm routes EVERY kv tile of
 # the item through the -inf masked softmax body (_softmax_kv_body_inf): the bias in NATURAL units added pre-scale as one packed FFMA per

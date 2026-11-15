@@ -42,7 +42,7 @@ one (2.8 vs 1.75 us; 90 us unsplit at b=32 x 2 KV heads x 4096 keys where the
 prefill tile takes 66 us), so it compiles and is tested at the template level
 but the Blackwell adapter does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
 its per-CTA issue rate is the open kernel item here.  The Rubin sibling
-(sm107/decode_d256_f16.py) IS routed onto it, in up to two TOKEN UNITS for a
+(sm107/d256_f16_swap_ab/kernel.py) IS routed onto it, in up to two TOKEN UNITS for a
 packed MTP step (config_sm107.decode_d256_q_tile, measured on cc 10.7 at the
 24/2 geometry; the other geometries inside that route ride the rule unmeasured).
 P^T is stored to a small swizzled SMEM tile (the B operand of BMM2 is
@@ -151,7 +151,7 @@ if Q_BOX_TOKENS < 1:
 # the direct test driver): a module without the flag covers S_q x HEADS_PER_TILE <= N_Q only.
 Q_TOKEN_UNITS: bool = True
 
-# === Paged KV (same contract as prefill_d256_f16.py) ===
+# === Paged KV (same contract as d256_f16_lookahead/kernel.py) ===
 PAGED_KV = bool(CFG.PAGED_KV)
 PAGE_SIZE = CFG.PAGE_SIZE if PAGED_KV else 0
 KV_BOX_ROWS = min(PAGE_SIZE, TILE_N) if PAGED_KV else TILE_N

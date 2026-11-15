@@ -400,7 +400,7 @@ def test_the_32_wide_tile_matches_the_fp64_oracle_on_sm100(case, dtype, d=32):
     from small_tile_cells import case_inputs, check, check_degenerate_rows, run_graph
 
     q, k, v, kw, oracle = case_inputs(case, d, dtype)
-    out = run_graph(q, k, v, row="sdpa_fwd_sm100_d128_multi_q" if d == 32 else _SM100_ROW, **kw)
+    out = run_graph(q, k, v, row="sdpa_fwd_sm100_d128_multi_q", **kw)
     assert out["knobs"].cga == 1 and out["knobs"].split_kv == 1, out["knobs"]
     check(out, oracle)
     check_degenerate_rows(out, case)
@@ -414,7 +414,7 @@ def test_padded_head_dim_is_bitwise_the_zero_padded_32_wide_tile_on_sm100(d):
     from small_tile_cells import case_inputs, run_graph
 
     q, k, v, kw, _ = case_inputs("dense_nkv2", d, torch.bfloat16)
-    out = run_graph(q, k, v, row=_SM100_ROW, **kw)
+    out = run_graph(q, k, v, row="sdpa_fwd_sm100_d128_multi_q", **kw)
 
     def pad(t):  # (b, h, s, d) view of a (b, s, h, d) buffer -> the same with d zero-padded to 32, same layout
         bshd = torch.nn.functional.pad(t.transpose(1, 2).contiguous(), (0, 32 - d))

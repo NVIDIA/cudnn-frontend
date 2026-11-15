@@ -26,9 +26,7 @@ def _configure(monkeypatch, dtype, two_by_two, dims=512):
 
     monkeypatch.setattr(api_dsl, "D512_2X2", two_by_two)
     fp8 = dtype.startswith("float8_")
-    engine = "sdpa_fwd_prefill_sm100_fp8" if fp8 else "sdpa_fwd_prefill_sm100"
-    if dims == 512:
-        engine = "sdpa_fwd_sm100_d512_fp8_role_split" if fp8 else "sdpa_fwd_sm100_d512_2x2" if two_by_two else "sdpa_fwd_sm100_d512_role_split"
+    engine = "sdpa_fwd_sm100_d512_fp8_role_split" if fp8 else "sdpa_fwd_sm100_d512_2x2" if two_by_two else "sdpa_fwd_sm100_d512_role_split"
     template = "prefill_d512_fp8" if fp8 else "prefill_d512_f16_2x2" if two_by_two else "prefill_d512_f16"
     return engine, template
 

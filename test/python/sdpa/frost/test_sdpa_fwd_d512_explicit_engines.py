@@ -22,8 +22,11 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
         (20521, 512, 128, 4, "prefill_d512_f16", 4),
         (20522, 512, 64, 1, "prefill_d512_f16_2x2", 4),
         (20522, 576, 64, 1, "prefill_d512_f16_2x2", 2),
+        (20521, (384, 320), 128, 1, "prefill_d512_f16", 4),
+        (20521, (384, 320), 128, 4, "prefill_d512_f16", 4),
+        (20522, (384, 320), 64, 1, "prefill_d512_f16_2x2", 4),
     ],
-    ids=["d512-role", "d512-role-split4", "d512-2x2", "d576-2x2"],
+    ids=["d512-role", "d512-role-split4", "d512-2x2", "d576-2x2", "envelope-role", "envelope-role-split4", "envelope-2x2"],
 )
 def test_public_record_rebuild_and_retained_capture(monkeypatch, dtype, engine_id, dq, tile, split, template, cluster):
     from cudnn.sdpa.fwd import api_dsl
@@ -33,10 +36,11 @@ def test_public_record_rebuild_and_retained_capture(monkeypatch, dtype, engine_i
     monkeypatch.setattr(api_dsl, "D512_2X2", engine_id != 20522)
     torch.manual_seed(47)
     b, h, sq, sk = 1, 4, 33, 256
+    dq, dv = (dq, 512) if isinstance(dq, int) else dq
     q = torch.randn(b, sq, h, dq, device="cuda", dtype=dtype).transpose(1, 2)
     k = torch.randn(b, sk, h, dq, device="cuda", dtype=dtype).transpose(1, 2)
-    v = torch.randn(b, sk, h, 512, device="cuda", dtype=dtype).transpose(1, 2)
-    o = torch.empty(b, sq, h, 512, device="cuda", dtype=dtype).transpose(1, 2)
+    v = torch.randn(b, sk, h, dv, device="cuda", dtype=dtype).transpose(1, 2)
+    o = torch.empty(b, sq, h, dv, device="cuda", dtype=dtype).transpose(1, 2)
     stats = torch.empty(b, h, sq, 1, device="cuda", dtype=torch.float32)
     io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     public = SdpaFwdKnobs(tile_m=tile, tile_n=128, cga=cluster, sched_policy=0, pack_gqa=False, split_kv=split).to_public()

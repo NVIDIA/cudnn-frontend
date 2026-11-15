@@ -3,14 +3,16 @@
 
 """Local identity and admission for the native SM107 d192_f16_multi_q body."""
 
+from ..half_flavor_contract import padded_shape
+
 NAME = "sdpa_fwd_sm107_d192_multi_q"
 TEMPLATE_NAME = "prefill_d192_d128_f16"
 KERNEL_FILE = "sm107/d192_f16_multi_q/kernel.py"
 
 
 def mismatch(facts, knobs):
-    if (facts.d_qk, facts.d_v) != (192, 128):
-        return "native D192 multi-Q requires exact D192/V128"
+    if padded_shape(facts) != (192, 128):
+        return "native D192 multi-Q requires a D192/V128 envelope"
     if facts.has_paged_kv:
         return "paged D192 uses the native small-half multi-Q body"
     if not facts.uniform_dtype:

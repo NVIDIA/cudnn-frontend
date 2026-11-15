@@ -15,10 +15,11 @@ import test_sdpa_prepared_fp8 as shared
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
 
 
+@pytest.mark.parametrize("d,dv", [(192, 128), (176, 112)])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(("cga", "split"), [(1, 1), (2, 1), (2, 4)])
-def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, output, cga, split):
+def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dv, dtype, output, cga, split):
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
@@ -30,7 +31,7 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, o
     monkeypatch.setattr(heuristics, "recommend", forbidden)
 
     def build(saved):
-        result = shared._case(d=192, dv=128, sq=17, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
+        result = shared._case(d=d, dv=dv, sq=17, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
         graph = result[0]
         assert graph.get_engine_and_knobs_at_index(graph._plan_index) == saved
         compiled = graph._compiled_plans[graph._plan_index]._compiled
@@ -69,6 +70,23 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtype, o
         vp[tensors[name]] = bufs[name]
     g.execute(vp, torch.empty_like(ws))
     shared._check(bufs, thd=False, sq=17, skv=256)
+
+
+@pytest.mark.parametrize("d,dv", [(16, 144), (176, 112), (224, 208), (384, 320)])
+@pytest.mark.parametrize("block", [16, 32])
+def test_wide_envelopes_keep_the_adapter_block_output_decline(d, dv, block):
+    """A broad legacy fallback proposal did not make this epilogue supported."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dtype_o = torch.float4_e2m1fn_x2 if block == 16 else torch.float8_e4m3fn
+    q = torch.empty((1, 1, 17, d), device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.empty((1, 1, 128, d), device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty((1, 1, 128, dv), device="cuda", dtype=torch.float8_e4m3fn)
+    o = torch.empty((1, 1, 17, dv // 2 if block == 16 else dv), device="cuda", dtype=dtype_o)
+    sf = torch.empty((1, 1, 128, max(4, (dv + block - 1) // block)), device="cuda", dtype=torch.float8_e4m3fn if block == 16 else torch.uint8)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_sf_o=sf, pertensor_fp8=True)
+    with pytest.raises(NotImplementedError, match="d128 flavor only"):
+        api.check_support()
 
 
 def test_retired_fp8_recipe_is_rejected_without_silent_substitution():

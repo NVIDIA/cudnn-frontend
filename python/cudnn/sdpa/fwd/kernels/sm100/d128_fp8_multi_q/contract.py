@@ -6,6 +6,7 @@
 from dataclasses import dataclass, replace
 
 from ..small_fp8_contract import in_domain
+from ..fp8_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm100_d128_fp8_multi_q"
 TEMPLATE_NAME = "prefill_d128_fp8"
@@ -50,9 +51,9 @@ class Geometry:
 
 def mismatch(facts, knobs):
     if not in_domain(facts):
-        return "requires exact D64/D128 per-tensor FP8 on SM100/SM103"
+        return "requires per-tensor FP8 covered by D64/D128 on SM100/SM103"
     if knobs is not None:
-        widths = (None, 1) if facts.d_qk == 64 else (None, 1, 2)
+        widths = (None, 1) if padded_shape(facts) == (64, 64) else (None, 1, 2)
         if knobs.cga not in widths:
             return "multi-Q requires one CTA for D64, or one/two CTAs for D128"
         if knobs.tile_m not in (None, 128):

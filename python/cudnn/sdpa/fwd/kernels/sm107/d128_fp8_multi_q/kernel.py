@@ -4,7 +4,7 @@
 """
 DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2), d=64/128, SM107 (Rubin).
 
-Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9) with the
+Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9; now ``sm100/d128_fp8_multi_q/kernel.py``) with the
 Rubin-specific deltas baked in — the ``_rubin`` sibling-module pattern from
 skills/cutedsl-kernel-integration (grouped_gemm precedent), so Rubin levers
 never touch the shipping Blackwell kernel:
@@ -45,7 +45,7 @@ count (issue #618; units past that total decode the batch == n_batch sentinel
 and drain without loads or stores).
 Ragged Stats ride the caller's declared layout (token-major (T, H) or
 head-major); the amax_o atomicMax is gated on live rows. Dense path
-byte-identical. Hunk-symmetric with sm100/prefill_d128_fp8.py.
+byte-identical. Hunk-symmetric with sm100/d128_fp8_multi_q/kernel.py.
 """
 
 from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
@@ -78,7 +78,7 @@ TEMPLATE_NAME = "prefill_d128_fp8"
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
 CFG, _TMA = (make_cfg_d64 if PARAMS.d_flavor == 64 else make_cfg_d128)(PARAMS)
 if PARAMS.dual_kv_stream:
-    raise ValueError("sm107/prefill_d128_fp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
+    raise ValueError("sm107/prefill_d128_fp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/d128_fp8_dual_kv/kernel.py only")
 if PARAMS.paged_kv:
     raise ValueError(
         "prefill_d128_fp8_sm107: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"

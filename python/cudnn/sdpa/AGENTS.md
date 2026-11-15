@@ -273,7 +273,7 @@ ordered after that read.**
   half that stores alpha must also be the one that owns key 0 — the
   original ownership is forced, only the ordering was missing.
 - The same kernel family can hide the split behind a different role name.
-  `sm100/prefill_d256_mxfp8.py` has no `mb_softmax_max`: its
+  `sm100/d256_mxfp8_single_q/kernel.py` has no `mb_softmax_max`: its
   `FUSED_CORR_SPLIT_P` schedule (mxfp8 + strict top-left causal) gives
   keys 64–127 to the *correction* warpgroup (`_fused_p1_step`), and half 0
   stored P into cols 96–111 with nothing ordering it after that
@@ -821,7 +821,7 @@ load/MMA/result-store/release order and retain the refilling warm stress.
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
-Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
+Kernels on this atom: forward `fwd/kernels/sm100/d512_f16_2x2/kernel.py` + `fwd/kernels/sm107/d512_f16_2x2/kernel.py`
 (`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/bprop_d512_f16_2x2.py` (`config_sm100.CfgBwdD512x2`,
 `TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
@@ -1621,7 +1621,8 @@ heuristics made before it, and the public knob record's round trip through
 with its margin and its process's node class, clock and control pair -- never a
 default flip from one cell. The per-rendering constants were re-measured on the
 new renderings: see the module constants' comments in
-`fwd/kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+`fwd/kernels/sm107/d128_f16_multi_q/kernel.py` and `fwd/kernels/sm107/small_f16_batch_pair/kernel.py`
+for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 

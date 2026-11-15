@@ -6,10 +6,10 @@ DSL prefill SDPA kernel — classic pipeline, per-tensor FP8 (E4M3 / E5M2),
 d_qk=192 / d_v=128, SM107 (Rubin).
 
 Geometry is ``make_cfg_d192`` (d_qk=192, d_v=128); the BODY is the same as
-``sm107/prefill_d128_fp8.py``.  The pre-upstream base kernel was flavor-generic
+``sm107/d128_fp8_multi_q/kernel.py``.  The pre-upstream base kernel was flavor-generic
 (one file served d128 and d192xd128 by swapping the config), and ``CfgD192``
 only widens ``TILE_K`` over ``CfgD128``, so the config factory is the ONLY
-difference — exactly the relationship ``sm107/prefill_d192_d128_f16.py`` has to
+difference — exactly the relationship ``sm107/d192_f16_multi_q/kernel.py`` has to
 its own d128 sibling.
 
 SMEM at cga2, bf16-out: Q 48 KiB + K ring 48 + V ring 32 + O 64, so the last
@@ -26,7 +26,7 @@ earlier revision of this docstring argued cga1 was safe "at 208 KiB", which was
 Q+K+V with sO and the ones tile omitted.  The engine row and the standalone
 adapter both keep this flavor at cga2 on Rubin.
 
-Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9) with the
+Verbatim sibling of ``sm100/prefill_d128_fp8.py`` (at 923fcb1a9; now ``sm100/d128_fp8_multi_q/kernel.py``) with the
 Rubin-specific deltas baked in — the ``_rubin`` sibling-module pattern from
 skills/cutedsl-kernel-integration (grouped_gemm precedent), so Rubin levers
 never touch the shipping Blackwell kernel:
@@ -67,7 +67,7 @@ count (issue #618; units past that total decode the batch == n_batch sentinel
 and drain without loads or stores).
 Ragged Stats ride the caller's declared layout (token-major (T, H) or
 head-major); the amax_o atomicMax is gated on live rows. Dense path
-byte-identical. Hunk-symmetric with sm100/prefill_d128_fp8.py.
+byte-identical. Hunk-symmetric with sm100/d128_fp8_multi_q/kernel.py.
 """
 
 from cudnn.frost.compiled_cache import template_key as _template_key

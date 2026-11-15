@@ -457,7 +457,7 @@ class Capabilities:
     # the classic-pipeline TMEM stats race — the next tile's prologue BMM1
     # overwrote the S_acc-head (total_max, total_sum) before the correction
     # epilogue read them — and fixed by the mb_stats_read barrier (same fix as
-    # the f16 kernel's; see sm100/prefill_d128_fp8.py / _common_blackwell.Bars).
+    # the f16 kernel's; see sm100/d128_fp8_multi_q/kernel.py / _common_blackwell.Bars).
     single_wave_only: bool = False
     # Serve ragged S_kv on unmasked graphs through the kernel's padded mask
     # compiled against the scalar S_kv (TemplateParams.kv_tail_mask, no
@@ -857,7 +857,7 @@ def _thd_decode_leg_int64(facts: "ga.SdpaGraphFacts") -> bool:
 
 def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """True when a THD (ragged Q/O/Stats) graph rides the SM100 d128 DECODE tile's
-    ragged-Q leg (``sm100/decode_d128_f16.py``, ``TemplateParams.ragged_q``)
+    ragged-Q leg (``sm100/d128_f16_single_q/kernel.py``, ``TemplateParams.ragged_q``)
     instead of the prefill tile's THD leg: the FlashInfer prefill-style paged
     graph at one token per sequence.
 
@@ -936,7 +936,7 @@ def _facts_decode_form_kw(facts: "ga.SdpaGraphFacts") -> dict:
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 DECODE tile -- the
     swap-AB tile, ``sm100/d256_f16_swap_ab/kernel.py`` on the Blackwell row and
-    ``sm107/decode_d256_f16.py`` on the Rubin row -- the facts-level twin of
+    ``sm107/d256_f16_swap_ab/kernel.py`` on the Rubin row -- the facts-level twin of
     ``SdpaFwdDslSm100._decode_q_tile`` (and of the heuristics' cost-model gate):
     half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
     (not wired on the decode tile), and ``S_q x pack_g`` packed Q rows within the
@@ -1948,7 +1948,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return reason
         # The legacy shared checks name the MMA pair and logical 128-row recipe.
         # Physical cluster and actual CTA tile were validated by the owner above.
-        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), cgas=frozenset({2}))
+        legacy_caps = replace(capabilities, implementation="", tile_ms=frozenset({128}), tile_ms_by_d_shape=(), cgas=frozenset({2}))
         legacy_knobs = replace(knobs, tile_m=128, cga=2) if knobs is not None else None
         return mismatch(legacy_caps, facts, legacy_knobs)
     if capabilities.implementation in _D512_IMPLEMENTATIONS:
@@ -2152,7 +2152,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             cga=knobs.cga,
             split_kv=knobs.split_kv or 1,
         )
-        # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row Q tile
+        # The d256 DECODE tile (sm107/d256_f16_swap_ab/kernel.py) packs the WHOLE group into its 16-row Q tile
         # over a dense or paged cache (HEADS_PER_TILE = QH_PER_KH) and writes the SM100 tile's fp32 split
         # partials for sm100/split_combine, so a decode-shaped half d256 graph packs and splits whatever
         # its cache form; every other Rubin half packing / d256 split rides the paged / packed-split
@@ -2877,7 +2877,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
-        # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/decode_d256_f16.py)
+        # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/d256_f16_swap_ab/kernel.py)
         # walks the block table itself and folds the sink per Q row, so a decode-shaped half d256
         # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries
         # also use native half D128; the MXFP8 row answers through its own flags above.
@@ -3086,7 +3086,7 @@ def _sm100_spec() -> EngineSpec:
     dims (api_dsl._pick_flavor), and every flavor serves its envelope via TMA
     zero-padding. The d128 flavor has two tiles behind one knob: TILE_CGA_M=2
     is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
-    tile (128 rows per CTA, sm100/decode_d128_f16.py) -- the "decode vs prefill
+    tile (128 rows per CTA, sm100/d128_f16_single_q/kernel.py) -- the "decode vs prefill
     by S_q" kernel choice EngineSpec.lower anticipates, driven by the
     heuristics' cga rule. The separate SM107 row owns Rubin lowering."""
     return EngineSpec(
@@ -3101,6 +3101,7 @@ def _sm100_spec() -> EngineSpec:
                 for cc in ((10, 0), (10, 3))
                 for shape in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE)
             ),
+            delegated_envelope=True,
             # (64, 64) is a NATIVE flavor, not an envelope: it compiles the d128
             # file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of
             # zero-filling a 128-wide tile for gpt-oss-class head dims.  (32, 32)
@@ -3158,7 +3159,7 @@ def _sm100_spec() -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
             # (128, 128): TILE_CGA_M=1 IS the d128 DECODE tile
-            # (sm100/decode_d128_f16.py -- TILES_Q=1, one softmax warpgroup,
+            # (sm100/d128_f16_single_q/kernel.py -- TILES_Q=1, one softmax warpgroup,
             # three KV stages; config_sm100.CfgD128Decode), which the lowering
             # selects for that knob value on dense graphs (THD keeps cga2, see
             # mismatch).  The heuristics propose it when one 128-row tile
@@ -3225,10 +3226,11 @@ def _sm100_d192_half_specs():
     base = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
+        d_pad_multiple=8,
         d_envelope_floors=(),
-        thd_d_shapes=shape,
+        thd_d_shapes=None,
         paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
@@ -3250,11 +3252,13 @@ def _sm100_d192_half_specs():
     single_q = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         implementation=_half_single_q.NAME,
         d_shapes=single_shapes,
         d_envelope_floors=(),
-        # Exact D32 paged THD already used the D64 single-Q envelope.
-        thd_d_shapes=single_shapes | {(32, 32)},
+        # Preserve the legacy THD envelope; the fixed body contract checks
+        # whether this declaration can use single-Q.
+        thd_d_shapes=None,
         paged_d_shapes=single_shapes,
         split_d_shapes=single_shapes,
         pack_gqa_d_shapes=single_shapes,
@@ -3286,6 +3290,7 @@ def _sm100_small_half_specs():
     multi_q = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         implementation=_small_half_multi_q.NAME,
         d_shapes=shapes,
         d_envelope_floors=(),
@@ -3324,9 +3329,10 @@ def _sm100_d512_specs():
     base = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=frozenset({(512, 512), SM100_NATIVE_D576_SHAPE}),
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=8,
+        d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
         paged_d_shapes=frozenset({(512, 512), SM100_NATIVE_D576_SHAPE}),
         pack_gqa_partial_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
         thd_pack_gqa_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
@@ -3365,8 +3371,9 @@ def _sm100_d256_specs():
     base = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=frozenset({(256, 256)}),
-        d_pad_multiple=0,
+        d_pad_multiple=8,
         d_envelope_floors=(),
         paged_d_shapes=frozenset({(256, 256)}),
         pack_gqa_partial_d_shapes=frozenset({(256, 256)}),
@@ -3413,7 +3420,7 @@ def _sm107_spec() -> EngineSpec:
     (a version-0 descriptor addresses only 256 KiB, and Rubin's 327 KiB budget
     puts the d512 flavor's P ring at exactly that boundary).  The f16 line
     carries all four SM100 flavors, d192xd128 included
-    (``sm107/prefill_d192_d128_f16.py`` — the d128 body with ``make_cfg_d192``);
+    (``sm107/d192_f16_multi_q/kernel.py`` — the d128 body with ``make_cfg_d192``);
     the QUANTIZED Rubin rows are the ones that ship a strict subset.
 
     Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
@@ -3458,7 +3465,7 @@ def _sm107_spec() -> EngineSpec:
       Dense (non-THD) paged queries stay declined EXCEPT a DECODE-shaped half d256 graph
       (dense Q, ``S_q x G`` packed rows within the tile's routed envelope -- 16 rows, or the
       32-column tile in up to two token units for a packed MTP step -- sink or not), which
-      rides the d256 decode tile ``sm107/decode_d256_f16.py`` instead
+      rides the d256 decode tile ``sm107/d256_f16_swap_ab/kernel.py`` instead
       (``d256_decode_tile_selected``), which walks the block table itself.
     - ``decode``: stated, not inherited -- ``S_q == 1`` is served on every
       flavor, and on d256 it is the decode tile above (the swap-AB body ported
@@ -3494,6 +3501,7 @@ def _sm107_spec() -> EngineSpec:
             sm_lo=107,
             sm_hi=_BLACKWELL[1],
             delegated_exact=frozenset(((10, 7), shape) for shape in _sm107_shared_half.SHAPES | {(512, 512), (576, 512)}),
+            delegated_envelope=True,
             phase="prefill",
             # Every f16 flavor has a Rubin module -- api_dsl._SM107_KERNEL_FILES
             # is the other half of this claim, and _pick_flavor lands a d=192
@@ -3593,8 +3601,8 @@ def _sm107_spec() -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
             # (128, 128) half carries two tiles behind TILE_CGA_M on cc 10.7 as on the SM100 row: cga2 = the Rubin prefill
-            # pipeline (sm107/prefill_d128_f16.py; a packed set runs the shared SM100 prefill body), cga1 = the shared 128-row
-            # decode tile (sm100/decode_d128_f16.py compiled for cc 10.7, issue #1472).  Dense graphs only: effective_cgas
+            # pipeline (sm107/d128_f16_multi_q/kernel.py; a packed set runs the shared SM100 prefill body), cga1 = the shared 128-row
+            # decode tile (sm100/d128_f16_single_q/kernel.py compiled for cc 10.7, issue #1472).  Dense graphs only: effective_cgas
             # keeps THD, dense paged and the pre-folded scale on cga2.  A split rides either width (no split_cgas entry).
             # The small tiles run at the widths their bodies are validated at (one constant with the config factory, which
             # refuses any other): cga1 for both -- the narrow slabs need no collective MMA to halve K/V, and a 512-row
@@ -3663,7 +3671,7 @@ def _sm107_half_specs():
     # The legacy policy owns the legal width envelopes and common features.
     # Each local contract narrows that declaration to one fixed body. Keep
     # the original flavor pool so exact D32 can retain its D64/D128 envelope.
-    base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), sm_hi=107, tile_ms_by_d_shape=())
+    base = replace(_sm107_spec().capabilities, delegated_exact=frozenset(), delegated_envelope=False, sm_hi=107, tile_ms_by_d_shape=())
     rows = (
         (_sm107_small_half.MULTI_Q, lower_multi_q, frozenset({128})),
         (_sm107_small_half.BATCH_PAIR, lower_pair, frozenset({128})),
@@ -3673,7 +3681,7 @@ def _sm107_half_specs():
         (_sm107_shared_half.SINGLE_Q, lower_shared_single_q, frozenset({128})),
         (_sm107_shared_half.LOOKAHEAD, lower_shared_lookahead, frozenset({128})),
     )
-    exact_shapes = {
+    body_shapes = {
         _sm107_small_half.BATCH_PAIR: frozenset({(32, 32), (64, 64)}),
         _sm107_mid_half.D192: frozenset({(192, 128)}),
         _sm107_mid_half.LOOKAHEAD: frozenset({(128, 128), (256, 256)}),
@@ -3687,14 +3695,14 @@ def _sm107_half_specs():
                 base,
                 implementation=name,
                 tile_ms=tiles,
-                d_shapes=exact_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
+                d_shapes=body_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
                 epilogue_gate=name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB),
                 epilogue_gate_d_shapes=(base.epilogue_gate_d_shapes if name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB) else None),
                 score_max=name == _sm107_small_half.MULTI_Q,
                 score_sum_exp=name == _sm107_small_half.MULTI_Q,
                 score_stats_d_shapes=base.score_stats_d_shapes if name == _sm107_small_half.MULTI_Q else None,
                 split_kv_supported=name != _sm107_small_half.BATCH_PAIR,
-                **({"d_pad_multiple": 0, "d_envelope_floors": ()} if name in exact_shapes else {}),
+                **({"d_pad_multiple": 8, "d_envelope_floors": ()} if name in body_shapes else {}),
             ),
             partial(
                 lower,
@@ -3715,10 +3723,11 @@ def _sm107_wide_half_specs():
     base = replace(
         _sm107_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         sm_hi=107,
         d_shapes=frozenset({(512, 512), (576, 512)}),
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=8,
+        d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
         paged_d_shapes=frozenset({(512, 512), (576, 512)}),
         mixed_fp8_kv_d_shapes=frozenset({(512, 512)}),
         pack_gqa_d_shapes=frozenset({(512, 512), (576, 512)}),
@@ -3831,7 +3840,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             split_kv_supported=True,
             # PackGQA on the d128 flavor: the kernel gathers the packed tile's
             # per-row scale factors out of the group's F8_128x4 atoms (see
-            # sm100/prefill_d128_mxfp8.py); plain O, dense only -- mismatch() declines
+            # sm100/d128_mxfp8_multi_q/kernel.py); plain O, dense only -- mismatch() declines
             # the rest.  The other flavors keep the one-atom TMA path.
             pack_gqas=frozenset({False, True}),
             pack_gqa_d_shapes=frozenset({(128, 128)}),
@@ -3898,6 +3907,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 if rubin_row
                 else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
             ),
+            delegated_envelope=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
@@ -4110,7 +4120,7 @@ def select_sm107_half_geometry(facts, knobs):
     from .sm107_half_selection import select_sm107_half_geometry as select
 
     if not _sm107_shared_half.in_domain(facts):
-        raise ValueError("SM107 half selection requires exact supported small/mid-width forward declarations")
+        raise ValueError("SM107 half selection requires supported small/mid-width forward envelopes")
     caps = sm100_legacy_policy_spec(_sm107_shared_half.LEGACY_ROW).capabilities
     flavor = _selected_d_shape(caps, facts, knobs)
     if flavor not in _sm107_shared_half.SHAPES:
@@ -4140,8 +4150,9 @@ def _sm100_small_fp8_specs():
     base = replace(
         _sm100_fp8_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shapes,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=d128,
         paged_d_shapes=shapes,
@@ -4192,8 +4203,9 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec().capabilities,
         implementation=_D192_FP8_MULTI_Q,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
         paged_kv=False,
@@ -4285,8 +4297,9 @@ def _sm100_d256_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec().capabilities,
         implementation=_D256_FP8_SINGLE_Q,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
         paged_d_shapes=shape,
@@ -4311,9 +4324,10 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec().capabilities,
         implementation=_D512_FP8_ROLE_SPLIT,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=16,
+        d_envelope_floors=(((512, 512), 256),),
         thd_d_shapes=shape,
         paged_d_shapes=shape,
         split_d_shapes=shape,
@@ -4339,9 +4353,10 @@ def _sm107_small_fp8_specs():
         _sm100_fp8_spec(arch="sm107").capabilities,
         implementation=_sm107_small_fp8_owner.NAME,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         sm_hi=107,
         d_shapes=shapes,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=d128,
         paged_kv=False,
@@ -4393,9 +4408,10 @@ def _sm107_mid_fp8_specs():
             base,
             implementation=owner.NAME,
             delegated_exact=frozenset(),
+            delegated_envelope=False,
             sm_hi=107,
             d_shapes=shape,
-            d_pad_multiple=0,
+            d_pad_multiple=16,
             d_envelope_floors=(),
             thd_d_shapes=shape,
             paged_kv=False,
@@ -4425,10 +4441,11 @@ def _sm107_d512_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec(arch="sm107").capabilities,
         implementation=_sm107_d512_fp8_owner.NAME,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         sm_hi=107,
         d_shapes=shape,
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=16,
+        d_envelope_floors=(((512, 512), 256),),
         thd_d_shapes=shape,
         paged_d_shapes=shape,
         split_d_shapes=shape,

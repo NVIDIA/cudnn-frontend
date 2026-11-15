@@ -185,7 +185,7 @@ _SM90_D128_SHIPPED_SWITCHES = (
     ("D128_PERSISTENT_CAUSAL_WALK", 2),
     ("D128_CAUSAL_WALK_ROUTE", True),
 )
-# cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
+# cc 10.7 half, the shared d128 DECODE tile (sm100/d128_f16_single_q/kernel.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
 # verify tables, bottom-right causal, no window): LPT / NATURAL median 0.989 over 224 (cell, policy) pairs at KV 2k-16k
@@ -549,7 +549,7 @@ def decode_tile_split_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
 _DECODE_TILE_WIDE_Q_TILE_COST = 1.6
 # A KV tile's cost to a lone CTA by the tile's N extent (its packed Q rows), in
 # units of the 16-column tile's, PER ARCH LINE -- the two lines' decode tiles are
-# sibling kernels (sm100/ and sm107/decode_d256_f16.py), so each carries its own
+# sibling kernels (sm100/ and sm107/d256_f16_swap_ab/kernel.py), so each carries its own
 # fit and the model reads the caller's ``device_cc``:
 #   * the Blackwell line (B200 fit): the 32-column tile at _DECODE_TILE_WIDE_Q_TILE_COST.
 #   * cc 10.7 (measured on the Rubin performance class, 212 SMs, per-CTA device
@@ -1043,7 +1043,7 @@ def choose_decode_tile_split_kv(
     declared S_kv; ``q_tile`` the tile's N extent (16, 32 or 64 packed Q rows,
     :func:`config_sm107.decode_d256_q_tile`).  ``device_cc`` names the ARCH LINE
     the launch is priced on, and the two lines are two fits of two sibling
-    kernels (sm100/ and sm107/decode_d256_f16.py), each measured on its own
+    kernels (sm100/ and sm107/d256_f16_swap_ab/kernel.py), each measured on its own
     part -- the model answers for one line exactly as that line's fit says:
 
     * the Blackwell line (cc 10.0 / 10.3, measured on B200 / B300):
@@ -1545,7 +1545,7 @@ def _sched_points(caps: Capabilities, facts, *, d128: bool = False) -> List[Opti
         # band above the decode tile is unmeasured and keeps the L2-budget rule.
         primary = SCHED_NATURAL
     elif causal_ish and caps.sm_lo == 100 and facts.is_mxfp8 and _selected_d_shape(caps, facts) == (128, 128):
-        # SM100 d128 MXFP8 (sm100/prefill_d128_mxfp8.py): plain LPT beats the L2-budget
+        # SM100 d128 MXFP8 (sm100/d128_mxfp8_multi_q/kernel.py): plain LPT beats the L2-budget
         # arm's LPT_L2 on EVERY measured causal shape -- MEASURED on B200 (cc 10.0,
         # 148 SMs, 2026-09-22; CUPTI device time, L2 flushed per launch, 3 rounds,
         # one process per slot, controls <= 0.35 %): LPT over LPT_L2 +5.1 / +7.2 /
@@ -1812,7 +1812,7 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
 #
 # The SM100 f16 row's (128, 128) flavor has two tiles behind TILE_CGA_M
 # (_d128_decode_tile_fits below): cga1 IS the decode tile -- one independent
-# 128-row CTA per (batch, packed head) unit, sm100/decode_d128_f16.py -- and
+# 128-row CTA per (batch, packed head) unit, sm100/d128_f16_single_q/kernel.py -- and
 # cga2 the prefill pipeline, 512 rows per cluster.  The rules here measure a
 # unit by its live rows, S_q * PACK_G -- the kernel's packed subgroup (the
 # whole GQA group when it divides the tile, its largest divisor that does
@@ -1925,7 +1925,7 @@ def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm10
 # The d128 decode tile's Q rows per CTA (config_sm100.CfgD128Decode: TILES_Q=1 x
 # TILE_M=128 x CTA_MMA=1).  The SM100 f16 row's (128, 128) flavor has two
 # tiles behind TILE_CGA_M: cga2 is the prefill pipeline (512 rows per
-# cluster), cga1 the decode tile (sm100/decode_d128_f16.py).
+# cluster), cga1 the decode tile (sm100/d128_f16_single_q/kernel.py).
 _D128_DECODE_TILE_ROWS = 128
 # The d64 f16 decode tile's Q rows (api_dsl._D64_DECODE_TILE_ROWS): the one d64 leg
 # narrower than the flavor's 256-row cga1 prefill, selected by the adapter once
@@ -2328,7 +2328,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/d256_f16_swap_ab/kernel.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
@@ -3572,8 +3572,10 @@ def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_
 
 
 def select_sm100_d512_geometry(facts, knobs):
+    from .kernels.sm100.half_flavor_contract import padded_shape
+
     return select_sm100_d512_geometry_for_shape(
-        facts.d_qk,
+        padded_shape(facts)[0],
         paged=facts.has_paged_kv,
         split_kv=knobs.split_kv or 1,
         pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
@@ -3592,11 +3594,12 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
     from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
     from .kernels.sm100.small_fp8_contract import in_domain
+    from .kernels.sm100.fp8_flavor_contract import padded_shape
 
-    shape = (facts.d_qk, facts.d_v)
+    shape = padded_shape(facts)
     if not in_domain(facts):
-        raise ValueError("small-head FP8 selection requires exact SM100/SM103 D64 or D128 per-tensor inputs")
-    cga = knobs.cga if knobs.cga is not None else 1 if facts.d_qk == 64 else 2
+        raise ValueError("small-head FP8 selection requires SM100/SM103 per-tensor inputs covered by D64 or D128")
+    cga = knobs.cga if knobs.cga is not None else 1 if shape[0] == 64 else 2
     group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
     rows = facts.s_q * group
     decode_semantics = (
@@ -3622,20 +3625,22 @@ def select_sm100_small_fp8_geometry(facts, knobs):
         facts.device_cc == (10, 0) and shape == (128, 128) and cga == 1 and facts.has_paged_kv and not facts.thd and 0 < rows <= 8 and facts.b <= 65535
     )
     if decode_semantics and (explicit_decode or automatic_decode):
-        return SwapAB(d_flavor=facts.d_qk)
+        return SwapAB(d_flavor=shape[0])
     if fp8_dual_kv_stream_routed() and shape == (128, 128) and knobs.cga == 1 and not facts.thd and rows <= FP8_DUAL_KV_STREAM_MAX_ROWS:
         return DualKV()
-    return MultiQ(d_flavor=facts.d_qk, cga=cga)
+    return MultiQ(d_flavor=shape[0], cga=cga)
 
 
 def select_sm107_small_fp8_geometry(facts, knobs):
     """Resolve the existing Rubin native/swap-AB choice before fixed lowering."""
     from .kernels.sm107.d128_fp8_multi_q.contract import Geometry as MultiQ
     from .kernels.sm107.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .kernels.sm107.fp8_flavor_contract import padded_shape
     from .config_sm100 import supports_dense_fp8_swap_ab
 
+    shape = padded_shape(facts)
     if knobs.swap_ab == 1 and supports_dense_fp8_swap_ab(
-        (facts.d_qk, facts.d_v),
+        shape,
         device_cc=facts.device_cc,
         paged=facts.has_paged_kv,
         thd=facts.thd,
@@ -3648,7 +3653,7 @@ def select_sm107_small_fp8_geometry(facts, knobs):
         tile_n=knobs.tile_n,
     ):
         return SwapAB()
-    return MultiQ(d_flavor=facts.d_qk, cga=(1 if facts.d_qk == 64 else 2) if knobs.cga is None else knobs.cga)
+    return MultiQ(d_flavor=shape[0], cga=(1 if shape[0] == 64 else 2) if knobs.cga is None else knobs.cga)
 
 
 def resolve_sm100_half_multi_q_geometry(facts, knobs, *, d_flavor):
@@ -3695,7 +3700,7 @@ def select_sm100_small_half_geometry(facts, knobs):
     from .kernels.sm100.d256_f16_contract import D256Geometry, SWAP_AB
 
     if not in_domain(facts):
-        raise ValueError("small-head half selection requires exact SM100/SM103 D32/D64/D128 half queries")
+        raise ValueError("small-head half selection requires SM100/SM103 queries covered by the D32/D64/D128 half geometries")
     policy = sm100_legacy_policy_spec()
     flavor = _selected_d_shape(policy.capabilities, facts, knobs)
     if flavor not in ((32, 32), (64, 64), (128, 128)):
@@ -3758,7 +3763,7 @@ def select_sm100_d192_half_geometry(facts, knobs):
     from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
 
     if not in_domain(facts):
-        raise ValueError("D192 half selection requires exact SM100/SM103 D192/V128 half inputs")
+        raise ValueError("D192 half selection requires SM100/SM103 half inputs covered by D192/V128")
     cga = 2 if knobs.cga is None else knobs.cga
     if facts.thd and not facts.has_paged_kv and cga == 1:
         return SingleQ()

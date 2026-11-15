@@ -15,17 +15,34 @@ import test_sdpa_prepared_fp8 as shared
 pytestmark = [pytest.mark.L0, requires_dsl, requires_rubin]
 
 
-@pytest.mark.parametrize("d", [192, 256])
+@pytest.mark.parametrize("d,dv", [(16, 144), (176, 112), (224, 208), (384, 320)])
+@pytest.mark.parametrize("block", [16, 32])
+def test_wide_envelopes_keep_the_adapter_block_output_decline(d, dv, block):
+    """Removing a broad fallback proposal does not remove a buildable plan."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dtype_o = torch.float4_e2m1fn_x2 if block == 16 else torch.float8_e4m3fn
+    q = torch.empty((1, 1, 17, d), device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.empty((1, 1, 128, d), device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty((1, 1, 128, dv), device="cuda", dtype=torch.float8_e4m3fn)
+    o = torch.empty((1, 1, 17, dv // 2 if block == 16 else dv), device="cuda", dtype=dtype_o)
+    sf = torch.empty((1, 1, 128, max(4, (dv + block - 1) // block)), device="cuda", dtype=torch.float8_e4m3fn if block == 16 else torch.uint8)
+    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_sf_o=sf, pertensor_fp8=True)
+    with pytest.raises(NotImplementedError, match="d128 flavor only"):
+        api.check_support()
+
+
+@pytest.mark.parametrize("d,dv,flavor", [(192, 128, 192), (256, 256, 256), (176, 112, 192), (224, 208, 256)])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split", [1, 4])
-def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dtype, output, split):
+def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dv, flavor, dtype, output, split):
     from cudnn.sdpa.fwd import heuristics
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
-    owner = "d192_fp8_multi_q" if d == 192 else "d256_fp8_single_q"
-    engine_id = 20561 if d == 192 else 20562
-    cga = 2 if d == 192 else 1
+    owner = "d192_fp8_multi_q" if flavor == 192 else "d256_fp8_single_q"
+    engine_id = 20561 if flavor == 192 else 20562
+    cga = 2 if flavor == 192 else 1
     record = (engine_id, SdpaFwdKnobs(tile_m=128, tile_n=128, cga=cga, sched_policy=0, pack_gqa=True, split_kv=split).to_public())
 
     def forbidden(*args, **kwargs):
@@ -34,11 +51,11 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dtype
     monkeypatch.setattr(heuristics, "recommend", forbidden)
 
     def build(saved):
-        result = shared._case(arch="sm107", d=d, dv=128 if d == 192 else 256, sq=17, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
+        result = shared._case(arch="sm107", d=d, dv=dv, sq=17, skv=256, dtype=dtype, output_dtype=output, split_kv=split, record=saved)
         graph = result[0]
         assert graph.get_engine_and_knobs_at_index(graph._plan_index) == saved
         compiled = graph._compiled_plans[graph._plan_index]._compiled
-        assert compiled.kernel_template == ("prefill_d192_d128_fp8" if d == 192 else "prefill_d256_fp8")
+        assert compiled.kernel_template == ("prefill_d192_d128_fp8" if flavor == 192 else "prefill_d256_fp8")
         assert compiled.kernel_module.__file__.endswith(f"sm107/{owner}/kernel.py")
         assert type(compiled.kernel_module.CFG).__module__ == f"cudnn.sdpa.fwd.kernels.sm107.{owner}.config"
         metadata = compiled.implementation_config
@@ -77,11 +94,11 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, d, dtype
     shared._check(bufs, thd=False, sq=17, skv=256)
 
 
-@pytest.mark.parametrize("d", [192, 256])
-def test_retired_fp8_recipe_is_rejected_without_silent_substitution(d):
+@pytest.mark.parametrize("d,dv,engine_id", [(192, 128, 20561), (176, 112, 20561), (256, 256, 20562), (224, 208, 20562)])
+def test_retired_fp8_recipe_is_rejected_without_silent_substitution(d, dv, engine_id):
     import cudnn._plan_serdes as ps
 
-    graph, _, _, _, _ = shared._case(arch="sm107", d=d, dv=128 if d == 192 else 256, sq=17, skv=256)
+    graph, _, _, _, _ = shared._case(arch="sm107", d=d, dv=dv, sq=17, skv=256)
     blob = graph.serialize(as_bytes=True, include_kernels=False)
     start = len(ps.MAGIC) + ps._LEN.size
     (length,) = ps._LEN.unpack_from(blob, len(ps.MAGIC))
@@ -94,7 +111,7 @@ def test_retired_fp8_recipe_is_rejected_without_silent_substitution(d):
     assert not target._nodes and not target._planning_done
     # The same empty destination remains reusable for an eligible current recipe.
     target.deserialize(blob)
-    assert target.get_engine_and_knobs_at_index(target._plan_index)[0] == (20561 if d == 192 else 20562)
+    assert target.get_engine_and_knobs_at_index(target._plan_index)[0] == engine_id
 
 
 @pytest.mark.parametrize("d", [192, 256])

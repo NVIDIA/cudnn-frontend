@@ -81,6 +81,19 @@ split uses single-Q even when the ranked unsplit candidate used multi-Q.
 `test_paged_thd_split_capture_lengths_and_stats` and
 `test_native_paged_thd_capture_and_rebind` cover that transition, including
 default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
+Owner migrations must also update shared fixtures at non-exact head widths.
+An exact-width owner map can pass the new contract suite while scalar-tail,
+THD-interior and D512-origin fixtures still select a delegated row. Resolve the
+fixture's covering physical shape, keep its logical tensor dimensions, and run
+the existing envelope cases; do not discard their address or replay assertions.
+When splitting a template, retain its module-load refusals as well as graph
+eligibility gates. `test_per_tensor_body_refuses_mxfp8_only_mask_at_load` covers
+the MXFP8-only mask that a shared parameter factory accepts but per-tensor FP8
+bodies must reject even when called directly.
+Structural pins must follow the isolated body too: a generic `kernel.py`
+basename no longer identifies a 2x2 pipeline. Check its owner directory and
+retain the compiled SASS assertions. When a combined body splits, pin each
+body's barrier sites separately, including both ordinary and batch-pair work.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
@@ -331,6 +344,13 @@ new flavor tests. Keep the routing assertion, numerical comparisons and shape
 unchanged. The SM107 GPT-OSS D64 case in
 `test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0` exercises native D64
 prefill; a short query alone does not imply the D128 decode template.
+
+When transferring an entire head envelope to an explicit engine, migrate
+non-exact fixture widths too. Use the implementation's domain predicate rather
+than an exact-head list in a shared routing helper. Compiler-target rejection
+tests must select the current owner; otherwise legacy delegation rejects the
+record before the intended compiler check runs. The SM107 D24 bias, D248/V224
+prefill-split and D80 FP8 target tests cover these three boundaries.
 
 When a kernel gains an architecture-specific branch, update cross-architecture
 source-parity tests with exact, counted replacements for the declared delta.
