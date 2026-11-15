@@ -124,13 +124,8 @@ from cudnn.sdpa.bwd.kernels.sm100._d128_chain import (
     RN,
     ROWS_PER_CTA,
     THREADS,
-    cast_dq_d128_kernel,
     cast_dq_host,
-    delta_only_host,
     delta_zero_host,
-    dot_do_o_kernel,
-    fold_dkv_d128_kernel,
-    fold_dkv_host,
 )
 from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host
 
