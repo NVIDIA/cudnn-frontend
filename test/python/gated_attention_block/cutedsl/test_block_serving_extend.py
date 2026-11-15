@@ -1766,7 +1766,7 @@ def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_depe
     assert blk_on.use_pdl is True and blk_on._cache_write.use_pdl is True
     blk_on._cache_write.compile()
     assert len(calls) == 2 and all(c.get("use_pdl") is True for c in calls), calls
-    for mod in ("cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.kernel", "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16"):
+    for mod in ("cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.kernel", "cudnn.sdpa.fwd.kernels.sm107.d256_f16_lookahead.kernel"):
         src = _kernel_source(mod)
         for token in ("griddepcontrol", "wait_on_dependent_grids", "launch_dependent_grids", "use_pdl=True"):
             assert token not in src, (mod, token)
