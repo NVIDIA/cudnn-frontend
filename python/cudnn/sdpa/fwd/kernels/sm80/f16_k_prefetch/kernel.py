@@ -124,6 +124,9 @@ from cudnn.frost.tile_dsl.constants import (  # noqa: E402
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm80 import TemplateParams, validate_params  # noqa: E402
+from cudnn.sdpa.fwd.kernels.sm80.f16_k_prefetch import contract as _implementation_contract  # noqa: E402
+
+TEMPLATE_NAME = _implementation_contract.TEMPLATE_NAME
 
 ELEM_BYTES = 2  # fp16 (Phase 2/3 baseline)
 ELEMS_PER_LD = 8  # 8 fp16 per cp.async = 16 B (max throughput)
@@ -1643,6 +1646,8 @@ def _sdpa_kernel(
 
 
 _sdpa_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+# Profilers and nsys report the owning engine's name; a symbol change, not a program change.
+_sdpa_kernel.set_name_prefix(f"cudnn_{_implementation_contract.NAME}", remove_cutlass_symbol=True)
 
 
 # ---------------------------------------------------------------------------

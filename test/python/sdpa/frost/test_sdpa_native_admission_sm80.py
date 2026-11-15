@@ -81,8 +81,12 @@ def _facts(direction, descs, *, thd=False):
 
 
 def _mismatch(direction, facts):
-    module = backward if direction == "bwd" else forward
-    return module.mismatch(module._sm80_spec().capabilities, facts)
+    if direction == "bwd":
+        return backward.mismatch(backward._sm80_spec().capabilities, facts)
+    from cudnn.sdpa.fwd.kernels.sm80.f16_k_prefetch import contract as k_prefetch
+
+    owned = (facts.d_qk, facts.d_v) in k_prefetch.SHAPES
+    return forward.mismatch((forward._sm80_f16_k_prefetch_spec() if owned else forward._sm80_spec()).capabilities, facts)
 
 
 @pytest.mark.parametrize("d,dv", [(512, 512), (576, 512), (288, 384), (520, 504)])

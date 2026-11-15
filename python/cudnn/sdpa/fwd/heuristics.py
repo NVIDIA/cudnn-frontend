@@ -3757,6 +3757,12 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if owner is not None:
         legacy = sm120_quant_general.explicit_geometry(owner, None).lowering_row_name
         return _recommend_sm100_implementation(kind, facts, offered, sm120_quant_general.select_geometry, policy=sm100_legacy_policy_spec(legacy))
+    from .kernels.sm80.f16_k_prefetch import contract as sm80_k_prefetch
+
+    if sm80_k_prefetch.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, sm80_k_prefetch.select_geometry, policy=sm100_legacy_policy_spec(sm80_k_prefetch.LEGACY_ROW)
+        )
     from .kernels.sm120 import half_exact_contract as sm120_half
 
     if sm120_half.in_domain(facts):

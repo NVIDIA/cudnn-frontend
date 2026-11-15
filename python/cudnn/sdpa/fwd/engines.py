@@ -130,6 +130,11 @@ from .kernels.sm120.quantized_general_contract import (
     SHAPES as _SM120_QUANT_GENERAL_SHAPES,
     mismatch as _sm120_quant_general_mismatch,
 )
+from .kernels.sm80.f16_k_prefetch.contract import (
+    NAME as _SM80_F16_K_PREFETCH,
+    SHAPES as _SM80_F16_K_PREFETCH_SHAPES,
+    mismatch as _sm80_f16_k_prefetch_mismatch,
+)
 from .kernels.sm120.half_exact_contract import (
     ALL_COMPUTE as _SM120_D256_ALL_COMPUTE,
     D256 as _SM120_D256,
@@ -1894,6 +1899,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return reason
     if capabilities.implementation == _SM120_D512_MXFP8_PAIRED:
         reason = _sm120_d512_mxfp8_paired_mismatch(facts, knobs)
+        if reason is not None:
+            return reason
+    if capabilities.implementation == _SM80_F16_K_PREFETCH:
+        reason = _sm80_f16_k_prefetch_mismatch(facts, knobs)
         if reason is not None:
             return reason
     if capabilities.implementation in _SM120_HALF_EXACT_IMPLEMENTATIONS:
@@ -4162,9 +4171,26 @@ def _sm80_spec() -> EngineSpec:
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
             # Explicit geometry is admitted by the shared native flavor domains
             # above. Leave the row domains empty to preserve A/FALLBACK choices.
+            delegated_exact=frozenset(((8, 0), shape) for shape in _SM80_F16_K_PREFETCH_SHAPES),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
     )
+
+
+def _sm80_f16_k_prefetch_spec() -> EngineSpec:
+    """The SM80 K-prefetch body on its own eight-aligned shapes; shared graph binding and launch."""
+    from .kernels.sm80.f16_k_prefetch.host import lower
+
+    legacy = _sm80_spec()
+    capabilities = replace(
+        legacy.capabilities,
+        implementation=_SM80_F16_K_PREFETCH,
+        delegated_exact=frozenset(),
+        d_shapes=_SM80_F16_K_PREFETCH_SHAPES,
+        d_pad_multiple=0,
+        d_envelope_floors=(),
+    )
+    return EngineSpec(_SM80_F16_K_PREFETCH, capabilities, partial(lower, lower_impl=partial(lower_dsl_prefill, api_type=_SM80), knob_type=SdpaFwdKnobs))
 
 
 def _sm120_spec() -> EngineSpec:
@@ -4561,7 +4587,7 @@ def lower_dsl_prefill(
     # The immutable implementation selection is attached before support or
     # compilation; the shared host code consumes it without choosing again.
     api._selected_kernel = selected_kernel
-    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+    if facts.thd and lowering_row_name == "sdpa_fwd_prefill_sm80":
         # Graph carriers expose raw storage; the declaration owns the sink's
         # head pitch, independently of the carrier's observed dimensions.
         api._thd_sink_stride = int(facts.sink_t.get_stride()[1]) if facts.has_sink else None
@@ -4571,7 +4597,7 @@ def lower_dsl_prefill(
             for i, t in enumerate((facts.q_t, facts.k_t, facts.v_t, facts.o_t, facts.stats_t))
         )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
-    if facts.thd and spec.name == "sdpa_fwd_prefill_sm80":
+    if facts.thd and lowering_row_name == "sdpa_fwd_prefill_sm80":
         # Variant-pack buffers may be flat or capacity-shaped; the graph's
         # Stats descriptor, rather than the carrier's shape, owns the packing.
         api._thd_lse_raw_storage = True
@@ -5336,6 +5362,7 @@ ENGINE_SPECS = (
     _sm120_d512_mxfp8_paired_spec(),
     _sm120_mxfp8_general_spec(),
     _sm80_spec(),
+    _sm80_f16_k_prefetch_spec(),
     *_sm90_specs(),
 )
 

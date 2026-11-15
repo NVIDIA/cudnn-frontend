@@ -1053,6 +1053,8 @@ multiples of 32 up to 256) move from 20507 / 20518 to 20542 / 20543.
 Exact SM120-family half recipes on the other 16-wide head tiles (both dims
 multiples of 16 up to 256) move from 20505 to 20544 (TILE_M 64 / 128) or 20538
 (TILE_M 16 / 32) with unchanged knobs.
+SM80 recipes on 20508 whose eight-aligned head dims are at most D_QK 192 and
+D_V 128 move to 20546 with unchanged knobs.
 The blob's `frontend_version` is provenance, not an automatic fallback switch;
 the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 
