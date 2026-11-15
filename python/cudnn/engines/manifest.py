@@ -339,6 +339,9 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_sm80_f16_k_prefetch": EngineSlot(46),
             "sdpa_fwd_sm80_d256_kv_prefetch": EngineSlot(47),
             "sdpa_fwd_sm80_wide_cooperative": EngineSlot(48),
+            # Opt-in like the MXFP8 row they split; that row's causal_exclude_own_block unlock serves D128 only.
+            "sdpa_fwd_sm100_d512_mxfp8_slice_recompute": EngineSlot(52, opt_in=True),
+            "sdpa_fwd_sm100_d512_mxfp8_retained_p": EngineSlot(53, opt_in=True),
             "sdpa_fwd_sm107_d128_mxfp8_multi_q": EngineSlot(65),
             "sdpa_fwd_sm107_d192_mxfp8_multi_q": EngineSlot(66),
             "sdpa_fwd_sm107_d256_mxfp8_single_q": EngineSlot(67),

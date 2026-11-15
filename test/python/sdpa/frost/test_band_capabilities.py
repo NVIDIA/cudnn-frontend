@@ -50,12 +50,17 @@ def _compiler_targets_available(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
+# (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p"})
+
+
 def _rows():
     """``[(kind, EngineSpec)]`` -- every row the registry actually ships that serves some graph.
 
     A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample."""
     rows = [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
-    return [(kind, spec) for kind, spec in rows if _dims(kind, spec.capabilities) is not None]
+    return [(kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and _dims(kind, spec.capabilities) is not None]
 
 
 def _probe(kind: str):

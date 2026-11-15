@@ -101,6 +101,9 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as sm80_half
 
     sm120_wide += ((sm80_half.LEGACY_ROW, sm80_half.in_domain),)
+    from cudnn.sdpa.fwd.kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
+    sm120_wide += ((d512_mxfp8.LEGACY_ROW, d512_mxfp8.in_domain),)
     from cudnn.sdpa.fwd.kernels.sm107 import mxfp8_contract as sm107_mxfp8
 
     sm120_wide += ((sm107_mxfp8.LEGACY_ROW, sm107_mxfp8.in_domain),)
