@@ -679,6 +679,7 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d256_f16_contract import IMPLEMENTATIONS
     from .kernels.sm100.d512_f16_contract import IMPLEMENTATIONS as WIDE_IMPLEMENTATIONS
     from .kernels.sm100.d512_fp8_role_split.contract import NAME as D512_FP8_ROLE_SPLIT, LEGACY_ROW as FP8_LEGACY_ROW
+    from .kernels.sm100.d256_mxfp8_single_q.contract import NAME as D256_MXFP8_SINGLE_Q, LEGACY_ROW as MXFP8_LEGACY_ROW
     from .kernels.sm100.d256_fp8_single_q.contract import NAME as D256_FP8_SINGLE_Q
     from .kernels.sm100.d192_fp8_multi_q.contract import NAME as D192_FP8_MULTI_Q
     from .kernels.sm100.d128_fp8_multi_q.contract import NAME as SMALL_FP8_MULTI_Q
@@ -732,6 +733,12 @@ def place(spec, facts, knobs=None) -> str:
         if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
             return TRAIL
         spec = sm100_legacy_policy_spec()
+
+    from .kernels.sm100.d128_mxfp8_multi_q.contract import NAME as SMALL_MXFP8
+    from .kernels.sm100.d192_mxfp8_multi_q.contract import NAME as MID_MXFP8
+
+    if spec.capabilities.implementation in (D256_MXFP8_SINGLE_Q, SMALL_MXFP8, MID_MXFP8):
+        spec = sm100_legacy_policy_spec(MXFP8_LEGACY_ROW)
 
     if spec.capabilities.implementation in (D512_FP8_ROLE_SPLIT, D256_FP8_SINGLE_Q, D192_FP8_MULTI_Q):
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
