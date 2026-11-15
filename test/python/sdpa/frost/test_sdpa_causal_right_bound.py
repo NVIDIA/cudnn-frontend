@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from cudnn.sdpa import graph_analyzer as ga
-from frost_test_utils import half_engine_names, requires_dsl, select_engine
+from frost_test_utils import SM80_BWD_OWNERS, half_engine_names, requires_dsl, select_engine
 
 B, H, S, D = 2, 4, 256, 64
 DTYPE = cudnn.data_type.HALF
@@ -229,6 +229,6 @@ def test_sm80_backward_causal_flag_with_right_bound_uses_the_bound(d):
     stats = ref_lse.detach().float().unsqueeze(-1).contiguous()
     dq, dk, dv = (torch.empty_like(q) for _ in range(3))
     g, (qt, kt, vt, ot, dot, st, dqt, dkt, dvt) = _bwd_graph(d=d, use_causal_mask=True, diagonal_band_right_bound=right_bound)
-    _run(g, "sdpa_bwd_sm80", {qt: q, kt: k, vt: v, ot: o, dot: do, st: stats, dqt: dq, dkt: dk, dvt: dv})
+    _run(g, SM80_BWD_OWNERS, {qt: q, kt: k, vt: v, ot: o, dot: do, st: stats, dqt: dq, dkt: dk, dvt: dv})
     for got, ref in ((dq, q64.grad), (dk, k64.grad), (dv, v64.grad)):
         torch.testing.assert_close(got.double(), ref, atol=2e-2, rtol=2e-2)

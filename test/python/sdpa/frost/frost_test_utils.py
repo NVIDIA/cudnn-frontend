@@ -322,6 +322,10 @@ def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
     return (f"sdpa_fwd_prefill_{arch}_fp8",)
 
 
+# The SM80 backward row's bodies; a pin to the pair takes whichever the graph selects.
+SM80_BWD_OWNERS = ("sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm80_f16_two_subgroup")
+
+
 def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
     """Pin the ranked entry for engine ``name`` (or an explicit tuple of names; graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /

@@ -95,14 +95,15 @@ def test_sm120_fused_body_owns_dense_graphs_through_d256(d, cc):
 
 
 @pytest.mark.parametrize("over", [{"d_qk": 264, "d_v": 264}, {"d_qk": 512, "d_v": 512}, {"thd": True, "max_total_seq_len_q": 512, "max_total_seq_len_kv": 512}])
-def test_sm120_row_keeps_its_packed_and_wide_bodies(over):
+def test_sm120_two_subgroup_body_owns_packed_and_wide_graphs(over):
     from cudnn.frost.buffers import cutedsl_state
 
     if not cutedsl_state()[0]:
         pytest.skip("mismatch declines every row without the DSL")
     facts = _sm120_facts(**over)
-    assert mismatch(_spec("sdpa_bwd_sm120").capabilities, facts) is None
+    assert mismatch(_spec("sdpa_bwd_sm120_f16_two_subgroup").capabilities, facts) is None
     assert mismatch(_spec("sdpa_bwd_sm120_f16_fused").capabilities, facts) is not None
+    assert mismatch(_spec("sdpa_bwd_sm120").capabilities, facts) == "this graph is owned by the explicit implementation engine sdpa_bwd_sm120_f16_two_subgroup"
 
 
 def test_sm120_fused_identity():
@@ -148,3 +149,104 @@ def test_sm120_quantized_rows_name_their_one_body(fmt, slot):
     caps = _spec(contract.NAME).capabilities
     assert (caps.implementation, caps.select_implementation, caps.delegated) == (contract.NAME, None, frozenset())
     assert (pathlib.Path(bwd_engines.__file__).parent / "kernels" / contract.KERNEL_FILE).is_file()
+
+
+@pytest.mark.parametrize(
+    "name,slot,kernel_file",
+    [
+        ("sdpa_bwd_sm80_f16_d64", 19, "sm80/f16_d64/kernel.py"),
+        ("sdpa_bwd_sm80_f16_two_subgroup", 20, "sm80/f16_two_subgroup/kernel.py"),
+        ("sdpa_bwd_sm120_f16_two_subgroup", 21, "sm80/f16_two_subgroup/kernel.py"),
+    ],
+)
+def test_two_subgroup_and_d64_identities(name, slot, kernel_file):
+    import importlib
+    import pathlib
+
+    from cudnn.engines.manifest import MANIFEST
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
+    assert family.slots[name].slot == slot and not family.slots[name].opt_in
+    arch, impl = ("sm120", "f16_two_subgroup") if name.startswith("sdpa_bwd_sm120") else ("sm80", name.split("sdpa_bwd_sm80_")[1])
+    contract = importlib.import_module(f"cudnn.sdpa.bwd.kernels.{arch}.{impl}.contract")
+    assert (contract.NAME, contract.KERNEL_FILE) == (name, kernel_file)
+    assert (pathlib.Path(bwd_engines.__file__).parent / "kernels" / kernel_file).is_file()
+    spec = _spec(name)
+    assert (spec.capabilities.implementation, policy_name(spec)) == (name, contract.LEGACY_ROW)
+    names = [s.name for s in bwd_engines.ENGINE_SPECS]
+    assert names.index(contract.LEGACY_ROW) < names.index(name) <= names.index(contract.LEGACY_ROW) + 2
+
+
+def test_sm80_loaders_and_d64_tile_follow_the_contracts():
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm80 import half_contract
+    from cudnn.sdpa.bwd.kernels.sm80.f16_d64 import kernel as d64
+    from cudnn.sdpa.bwd.kernels.sm80.f16_two_subgroup import contract as two_subgroup
+
+    assert api_dsl._SM80_BWD_KERNEL_FILE == two_subgroup.KERNEL_FILE
+    assert api_dsl._sm80_bwd_kernel_mod("d64") is d64
+    assert half_contract.D64_TILE == (d64.M_BLOCK, d64.N_BLOCK)
+
+
+def _sm80_facts(**over):
+    base = dict(device_cc=(8, 0), d_qk=64, d_v=64, causal=False, s_q=256, s_kv=256)
+    base.update(over)
+    return _sm120_facts(**base)
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {},
+        {"causal": True},
+        {"window_left": 64},
+        {"bottom_right": True, "causal": True},
+        {"padded": True},
+        {"has_bias": True},
+        {"has_sink": True},
+        {"deterministic": True},
+        {"h_kv": 2},
+        {"d_qk": 128, "d_v": 128},
+        {"s_q": 200},
+        {"s_kv": 192},
+        {"thd": True, "max_total_seq_len_q": 512, "max_total_seq_len_kv": 512},
+    ],
+)
+def test_sm80_selector_is_the_adapters_d64_rule(over):
+    """The D64 owner's domain is the adapter's own fast-path rule (api_dsl._sm80_d64_fast_path_eligible), restated on facts."""
+    from cudnn.sdpa.bwd.api_dsl import _sm80_d64_fast_path_eligible
+    from cudnn.sdpa.bwd.kernels.sm80 import half_contract
+
+    f = _sm80_facts(**over)
+    mask = "none" if not (f.causal or f.window_left is not None) else "masked"
+    adapter = not f.thd and _sm80_d64_fast_path_eligible(
+        d_qk=f.d_qk,
+        d_v=f.d_v,
+        h_q=f.h_q,
+        h_kv=f.h_kv,
+        s_q=f.s_q,
+        s_kv=f.s_kv,
+        mask_token=mask,
+        right_bound=0,
+        causal_bottom_right=f.bottom_right,
+        bw_kwargs=dict(
+            seq_kv_lens=object() if f.padded else None,
+            bias=object() if f.has_bias else None,
+            sinks=object() if f.has_sink else None,
+            deterministic=f.deterministic,
+        ),
+    )
+    assert (half_contract.select_implementation(f) == half_contract.D64) == adapter
+    assert adapter == (over == {})
+
+
+def test_sm80_row_delegates_every_body():
+    from cudnn.frost.buffers import cutedsl_state
+
+    if not cutedsl_state()[0]:
+        pytest.skip("mismatch declines every row without the DSL")
+    row = _spec("sdpa_bwd_sm80")
+    for over, owner in (({}, "sdpa_bwd_sm80_f16_d64"), ({"causal": True}, "sdpa_bwd_sm80_f16_two_subgroup")):
+        f = _sm80_facts(**over)
+        assert mismatch(_spec(owner).capabilities, f) is None
+        assert mismatch(row.capabilities, f) == f"this graph is owned by the explicit implementation engine {owner}"

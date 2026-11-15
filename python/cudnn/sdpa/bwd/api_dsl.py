@@ -774,12 +774,12 @@ def _sm80_bwd_kernel_mod(key: str = "d64"):
     silently swallows every feature kwarg, so callers must never rely on the
     signature filter and only select it through
     :func:`_sm80_d64_fast_path_eligible`.  The GENERIC kernel
-    (``sm80/bprop_f16``) is a TemplateParams module loaded per-specialization
+    (``sm80/f16_two_subgroup/kernel.py``) is a TemplateParams module loaded per-specialization
     via :func:`_load_sm80_bwd_module` instead.
     """
     assert key == "d64", f"generic SM80 bwd kernels load via _load_sm80_bwd_module; got {key!r}"
     if key not in _SM80_BWD_KERNEL_MOD:
-        from .kernels.sm80 import bprop_d64_f16 as _mod
+        from .kernels.sm80.f16_d64 import kernel as _mod
 
         _SM80_BWD_KERNEL_MOD[key] = _mod
     return _SM80_BWD_KERNEL_MOD[key]
@@ -1029,7 +1029,8 @@ def _sm80_thd_backward(
 _cache_of_objects: dict = {}
 
 
-_SM80_BWD_KERNEL_FILE = "sm80/bprop_f16.py"
+from .kernels.sm80.f16_two_subgroup.contract import KERNEL_FILE as _SM80_BWD_KERNEL_FILE  # noqa: E402
+
 # The shared tile_dsl scheduler vocabulary maps identity onto the bwd grid
 # decode (NATURAL == plain 3-D == 0, LPT == kv-major == 1).
 from cudnn.frost.tile_dsl.constants import SCHED_LPT_L2 as _BWD_SCHED_LPT_L2  # noqa: E402

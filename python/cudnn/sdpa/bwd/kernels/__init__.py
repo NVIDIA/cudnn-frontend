@@ -11,8 +11,9 @@ same shape as ``sdpa/fwd/kernels/``.  Within a package the filename encodes the 
 coverage matrix: ``bprop_d<dim>_<dtype-family>.py``, e.g.
 ``sm100/bprop_d512_f16.py`` (``f16`` covers fp16 and bf16, picked by
 ``TemplateParams``).  A file omits the dimension when one implementation
-covers every supported head dim (``sm80/bprop_f16.py``); an explicit implementation engine's body is
-``<arch>/<implementation>/kernel.py`` beside its ``contract.py`` and ``host.py`` (``sm120/f16_fused/``);
+covers every supported head dim; an explicit implementation engine's body is
+``<arch>/<implementation>/kernel.py`` beside its ``contract.py`` and ``host.py`` (``sm120/f16_fused/``),
+and ``<arch>/half_contract.py`` names the body a multi-body row selects for a declaration;
 ``sm120/bprop_chain_f16.py`` is the SM120-only part of the launch chain around
 that arch's fused main kernel (the deterministic dQ GEMM and the converts), and
 the ``_common.py`` / ``_bprop_mxfp8_*.py`` modules inside a package are that

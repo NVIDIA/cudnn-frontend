@@ -42,6 +42,9 @@ _OFFERED = {
     "sdpa_bwd_sm107_d512": 20608,
     "sdpa_bwd_sm100_d128": 20609,
     "sdpa_bwd_sm120_f16_fused": 20618,
+    "sdpa_bwd_sm80_f16_d64": 20619,
+    "sdpa_bwd_sm80_f16_two_subgroup": 20620,
+    "sdpa_bwd_sm120_f16_two_subgroup": 20621,
 }
 
 
@@ -180,7 +183,7 @@ def test_sm100_d128_dense_row_lists_one_knobless_entry(monkeypatch, cc):
         ((10, 7), 256, [20604]),
         ((10, 7), 128, [20609]),  # d128 on cc 10.7: the admitted d128 family row (slot 9), never the d512 row
         ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
-        ((12, 0), 512, [20600]),
+        ((12, 0), 512, [20621]),  # SM120's two-subgroup body
     ],
     ids=["sm107-d512", "sm110-d512", "sm107-d264", "sm107-d504", "sm100-d512", "sm103-d512", "sm107-d256", "sm107-d128", "sm110-d128", "sm120-d512"],
 )

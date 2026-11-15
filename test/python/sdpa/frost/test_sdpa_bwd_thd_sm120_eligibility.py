@@ -27,7 +27,7 @@ def facts(**overrides):
 
 def reason(**overrides):
     value = facts(device_cc=(12, 0), **overrides)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_two_subgroup")
     return engines.mismatch(spec.capabilities, value)
 
 
@@ -59,20 +59,21 @@ def test_frost_thd_sm120_declines_outside_scope(overrides, token):
 @pytest.mark.parametrize("device_cc", [(12, 0), (12, 1)])
 def test_frost_thd_sm120_family_admission(device_cc):
     value = facts(device_cc=device_cc)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_two_subgroup")
     assert engines.mismatch(spec.capabilities, value) is None
 
 
 def test_frost_dense_sm120_eligibility_unchanged():
     dense = facts(device_cc=(12, 0), thd=False, padded=False, d_qk=64, d_v=64, h_kv=1)
     assert engines.mismatch(next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_fused").capabilities, dense) is None
-    assert reason(thd=False, padded=False, d_qk=64, d_v=64, h_kv=1) == "this graph is owned by the explicit implementation engine sdpa_bwd_sm120_f16_fused"
+    row = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    assert engines.mismatch(row.capabilities, dense) == "this graph is owned by the explicit implementation engine sdpa_bwd_sm120_f16_fused"
 
 
 @pytest.mark.parametrize("tile_m,tile_n,accepted", [(64, 64, True), (32, 32, True), (64, 32, True), (None, None, True), (32, 64, False), (64, 128, False)])
 def test_frost_thd_tile_domain_is_exact(tile_m, tile_n, accepted):
     value = facts(device_cc=(12, 0))
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_two_subgroup")
     result = engines.mismatch(spec.capabilities, value, engines.SdpaBwdKnobs(tile_m=tile_m, tile_n=tile_n))
     assert (result is None) == accepted
 
@@ -85,7 +86,7 @@ def test_frost_thd_gqa_wide_admission(dims):
 @pytest.mark.parametrize("tiles,accepted", [((None, None), True), ((32, 32), True), ((32, 64), False), ((64, 32), False), ((64, 64), False)])
 def test_frost_thd_wide_tile_resource_boundary(tiles, accepted):
     value = facts(device_cc=(12, 0), d_qk=256, d_v=256, h_kv=1)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_two_subgroup")
     result = engines.mismatch(spec.capabilities, value, engines.SdpaBwdKnobs(tile_m=tiles[0], tile_n=tiles[1]))
     assert (result is None) == accepted
 
@@ -95,7 +96,7 @@ def test_frost_thd_listed_tiles_replay_native_geometry(d, expected):
     from cudnn.sdpa.bwd.heuristics import default_knobs
 
     value = facts(device_cc=(12, 0), d_qk=d, d_v=d)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_two_subgroup")
     knobs = default_knobs(spec, value)
     assert (knobs.tile_m, knobs.tile_n) == expected
     assert engines.mismatch(spec.capabilities, value, knobs) is None
@@ -123,12 +124,13 @@ def test_wide_native_row_and_knobs(thd, dims, deterministic):
     from cudnn.sdpa.bwd.heuristics import default_knobs
 
     value = facts(device_cc=(12, 0), thd=thd, d_qk=dims[0], d_v=dims[1], deterministic=deterministic, window_left=17, h_kv=1)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_bwd_sm120_f16_two_subgroup")
     assert engines.mismatch(spec.capabilities, value) is None
     knobs = default_knobs(spec, value)
     assert knobs.to_public() == {cudnn.knob_type.TILE_M: 16, cudnn.knob_type.TILE_N: 16}
     assert engines.mismatch(spec.capabilities, value, knobs) is None
-    assert "16x16" in engines.mismatch(spec.capabilities, value, engines.SdpaBwdKnobs(tile_m=64, tile_n=64))
+    reason = engines.mismatch(spec.capabilities, value, engines.SdpaBwdKnobs(tile_m=64, tile_n=64))
+    assert "16x16" in reason if thd else "outside this engine's domain [16]" in reason  # dense graphs reach it only above D 256
 
 
 @pytest.mark.parametrize(

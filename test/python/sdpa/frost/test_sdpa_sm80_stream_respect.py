@@ -19,7 +19,7 @@ import torch
 
 import cudnn
 import cudnn.sdpa  # noqa: F401 — the SM80 capability tables live here
-from frost_test_utils import half_engine_names, select_engine
+from frost_test_utils import SM80_BWD_OWNERS, half_engine_names, select_engine
 
 
 def _is_sm80() -> bool:
@@ -155,7 +155,7 @@ def test_sm80_bwd_respects_handle_stream_and_is_capturable():
     # provisional) — bind BSHD-physical to match the buffers below.
     for x in (dq, dk, dv):
         x.set_output(True).set_data_type(_HALF).set_stride(_STRIDES)
-    _build_and_pin(gb, "sdpa_bwd_sm80")
+    _build_and_pin(gb, SM80_BWD_OWNERS)
 
     do_gpu = _mk_buf()
     dq_gpu, dk_gpu, dv_gpu = torch.empty_like(q_gpu), torch.empty_like(k_gpu), torch.empty_like(v_gpu)

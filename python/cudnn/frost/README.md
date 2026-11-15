@@ -363,7 +363,7 @@ python/cudnn/
     bwd/                        same shape, its own api_dsl.py / engines.py /
                                 config_sm*.py
       kernels/                  one package per ARCH LINE, like fwd/
-        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
+        sm80/f16_two_subgroup/kernel.py  one directory per explicit engine body
         sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
         sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
                                       _bprop_mxfp8_*, bprop_sf_repack_mxfp8)

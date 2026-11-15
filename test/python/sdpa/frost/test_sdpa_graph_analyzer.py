@@ -193,6 +193,8 @@ def test_zero_attn_scale_claims():
     }
     assert bwd == {
         "sdpa_bwd_sm80",
+        "sdpa_bwd_sm80_f16_d64",
+        "sdpa_bwd_sm80_f16_two_subgroup",
         "sdpa_bwd_sm100",
         "sdpa_bwd_sm107",
         "sdpa_bwd_sm107_fp8",
@@ -2532,7 +2534,7 @@ def test_bwd_probe_rejects_unsupported_head_dim(monkeypatch):
     assert not _bwd_eligible(_mk_bwd_graph(d=100))
     assert not _bwd_eligible(_mk_bwd_graph(d=520))
     for width in (264, 504, 512):
-        assert _BWD_ENGINE in _bwd_eligible(_mk_bwd_graph(d=width))
+        assert "sdpa_bwd_sm120_f16_two_subgroup" in _bwd_eligible(_mk_bwd_graph(d=width))
 
 
 def test_bwd_probe_causal_notches(monkeypatch):
@@ -2643,18 +2645,21 @@ def test_bwd_mismatch_reason_strings(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _BWD_SM80 = "sdpa_bwd_sm80"
+# The row's bodies: plain dense MHA D64 on whole tiles, and everything else.
+_BWD_SM80_D64, _BWD_SM80_TWO_SUBGROUP = "sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm80_f16_two_subgroup"
 
 
 def test_bwd_sm80_probe_accepts_the_sm120_rejections(monkeypatch):
     monkeypatch.setattr(ga, "_device_cc", lambda: (8, 0))
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph())
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))  # GQA
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
+    assert _bwd_eligible(_mk_bwd_graph()) == {_BWD_SM80_D64}
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True))
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(h_kv=H // 2))  # GQA
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(use_deterministic_algorithm=True))
     # Flavor envelope: any head dim <= 256 (no multiple-of-16 rule) and
     # top-left causal with S_q != S_kv.
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(d=96))
-    assert _BWD_SM80 in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, s_q=S // 2))
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(d=96))
+    assert _BWD_SM80_TWO_SUBGROUP in _bwd_eligible(_mk_bwd_graph(use_causal_mask=True, s_q=S // 2))
+    assert _BWD_SM80 not in _bwd_eligible(_mk_bwd_graph(d=96))  # every body is delegated
 
 
 def test_bwd_sm80_probe_rejections(monkeypatch):

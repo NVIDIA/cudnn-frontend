@@ -16,7 +16,8 @@ Two integration surfaces are provided:
 * FROST engines (see `cudnn.sdpa.bwd.engines`) that serve single-node
   `sdpa_backward()` graphs built with `cudnn.pygraph`:
   `sdpa_bwd_sm120_f16_fused` runs dense graphs with D_QK <= 256 on the fused
-  kernel, and `sdpa_bwd_sm120` runs packed (THD) graphs and D_QK > 256. Both
+  kernel, and `sdpa_bwd_sm120_f16_two_subgroup` runs packed (THD) graphs and
+  D_QK > 256 on the SM80 two-subgroup kernel compiled for SM120. Both
   are default candidates ranked behind the backend, so the default dispatch
   uses them when the backend declines a graph; select one explicitly from the
   ranked plan list (`graph.plans` / `graph.select_plan(i)`), or set
