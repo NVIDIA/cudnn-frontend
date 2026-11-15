@@ -95,6 +95,17 @@ explicitly skipped in each lane. These are tested-configuration results:
 general batch invariance, SM103 and the existing L1 stress cases are not
 newly qualified. Existing graph deterministic-mode declarations are unchanged.
 
+An additional CPU-only differential run selected L0 cases across every
+`test/python/sdpa` file, excluding PTX/SASS/render/compile/cubin test names.
+It used no CUDA device and `--noconftest` to inspect host consumers across
+the tree. Candidate/parent passed 11,479/11,470 cases and had identical
+14,779 call/setup failure IDs and 16 collection-error IDs; no candidate-only
+failure was introduced. The 65 differing traces contained the same
+CUDA-unavailable error messages, with changed source lines or relocated
+adapter paths. The additional nine passes are the new fixed-owner host
+contracts; 32 additional native cases were skipped without a GPU. This
+differential audit is not a green full-suite runtime result.
+
 ### Fixed SM107 D512 backward implementation (2026-11-15)
 
 Engine 20608 retains its public record, the D264–D512 aligned envelope,
