@@ -223,7 +223,13 @@ def _run_graph(
     elif explicit_knobs is None:
         g.create_execution_plans([cudnn.heur_mode.A])
     else:
+        from collections.abc import Mapping
+
         from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        if isinstance(explicit_knobs, Mapping):
+            explicit_knobs = SdpaFwdKnobs.from_public(explicit_knobs)
 
         explicit_name = engine_name(arch=arch)
         if arch == "sm100":

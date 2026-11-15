@@ -177,6 +177,13 @@ tests and samples use this separation.
 
 ## Python tests (`test/python`)
 
+Shared SDPA test helpers accept both public knob mappings and native knob
+dataclasses. Normalize mappings with `SdpaFwdKnobs.from_public` before attribute
+access or `dataclasses.replace`, preserving native callers and caller-owned
+mappings. The native SM107 paging cases `TestNativeD512HalfPaged::test_dense`
+and `TestNativeD576Half::test_paged` pass public mappings and detect this
+otherwise pre-compilation fixture failure.
+
 When changing direct CPython C API calls in the bindings, build with
 `CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON` and import the resulting abi3 module.
 `PyFloat_AS_DOUBLE` is unavailable under `Py_LIMITED_API`; after successful
