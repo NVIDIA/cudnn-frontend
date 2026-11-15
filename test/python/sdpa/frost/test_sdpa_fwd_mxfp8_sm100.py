@@ -38,7 +38,6 @@ from mxfp8_test_reference import _cdiv, _quantize, _quantize_seq, _ref
 
 from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import mxfp8_engine_name
 from frost_test_utils import (
     _SM,
     assert_no_new_spills,
