@@ -135,7 +135,7 @@ def test_d512_packed_split_rebind_replay(case, graph_api, cudnn_handle):
         else:
             api.compile()
             workspace_bytes = api.scratch_workspace_bytes()
-        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if graph_api else "sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if graph_api else "sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.SPLIT_KV == splits
         assert api._k_mod.CFG.PACK_G == (math.gcd(group, 64) if packed else 1)
         assert api._partial_torch_dtype() == (torch.float32 if splits > 1 else getattr(torch, dtype_name))

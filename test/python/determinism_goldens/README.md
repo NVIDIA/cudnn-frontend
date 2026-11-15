@@ -4,6 +4,34 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Forward SDPA body retirement (2026-11-15)
+
+The retirement candidate redirects standalone and retained envelope routes
+onto the existing isolated bodies, removes 17 replaced source files and 18
+unreachable private helpers, and transfers SM120 envelopes to explicit owners.
+All retained device function/class ASTs are unchanged. Backward and the
+existing numerical support statuses are unchanged; no golden was replaced.
+
+The bounded runs used cuDNN 9.30, CuTe DSL 4.8 and CUDA 13.4 compilation,
+with source imports checked in each frozen checkout. Source `6b61ce82c`
+contains the tested production files; earlier snapshots differ only in test
+path/owner fixes described below. Run the named suites/selectors from
+`test/python` with `-m "L0 or L1"`:
+
+| Target | Checks | Result and limits |
+|---|---|---|
+| SM100 B200 | `test_sdpa_fwd_small_half_explicit_engines.py`, `test_sdpa_fwd_small_fp8_explicit_engines.py`; decode quadrant/D64 envelope, paged mixed-head/D384 envelope, MXFP8 D128/D192/D256 Stats selectors | 98 passed; fixed records, rebind, changed-input capture and independent references included |
+| SM107 | `test_sdpa_fwd_sm107_half_explicit_engines.py`; small-head zero-padding identity and served widths; pair and streamed-bias oracle selectors; adapter contract controls | 106 passed, 2 existing XFAIL: nonpaged D256 split lowering omits independent physical origins. These were not newly skipped or fixed by retirement |
+| SM90 H100 | `test_sdpa_native_d64_sm90.py` standalone feature/envelope selectors and D64/D512 compile probes; dedicated D128 adapter/graph API; `test_owned_three_wg_split_replay_batch_and_golden` | 43 passed, 4 skipped. The skipped three-WG cases reached the missing runtime-golden check; they do not count as complete golden passes. Initial filename assertions were repaired to check the owner directory and `kernel.py` |
+| SM120 RTX PRO 6000 | Half and quantized general/wide explicit-engine suites; envelope ownership, obsolete-record rejection, rebind and capture | 88 passed initially, with one stale MXFP8 helper pin. After fixing the helper, 16 targeted cases passed, including that case and additional FP8 envelope/THD and half THD/padded-Stats controls |
+
+The four missing H100 goldens are for split3/unpacked and split17/packed,
+FP16/BF16, under Torch 2.14.1+cu130 and the runtime above. Existing goldens
+and support claims from earlier measured runtimes remain intact. SM103 and
+SM121 were not rerun for this cleanup; neither inherits these new results.
+The SM120 envelope tests establish identity, reference correctness and the
+replay exercised by their suites, not general batch invariance.
+
 ### SM107 small-head FP8 implementation identity (2026-11-15)
 
 Exact D64/D128 per-tensor FP8 uses engine 20563,

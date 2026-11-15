@@ -61,7 +61,7 @@ def _check(bufs):
     torch.testing.assert_close(bufs["lse"][..., 0].double(), scores.logsumexp(-1), atol=3e-4, rtol=3e-4)
 
 
-@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512), (384, 320), (568, 504)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("split", [1, 3])
 def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dims, dtype, split):
@@ -115,7 +115,7 @@ def test_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dims, dt
     _check(rbufs)
 
 
-@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512), (384, 320), (568, 504)])
 def test_retired_legacy_record_is_declined_without_substitution(dims):
     g, *_ = _graph(*dims, torch.bfloat16)
     _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
@@ -123,9 +123,9 @@ def test_retired_legacy_record_is_declined_without_substitution(dims):
         _graph(*dims, torch.bfloat16, record=(_LEGACY_ID, knobs))
 
 
-def test_padded_envelope_record_keeps_the_legacy_row():
-    g, vp, ws, bufs, _ = _graph(384, 320, torch.bfloat16, record=(_LEGACY_ID, {}))
-    assert g.selected_engine.name == "sdpa_fwd_prefill_sm120"
-    assert g._compiled_plans[g._plan_index]._compiled.implementation_config is None
+def test_padded_envelope_record_uses_the_explicit_owner():
+    g, vp, ws, bufs, _ = _graph(384, 320, torch.bfloat16, record=(_ID, {}))
+    assert g.selected_engine.name == _NAME
+    assert g._compiled_plans[g._plan_index]._compiled.implementation_config is not None
     g.execute(vp, ws)
     _check(bufs)

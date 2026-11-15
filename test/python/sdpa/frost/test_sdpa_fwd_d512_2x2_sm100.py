@@ -83,9 +83,9 @@ def test_two_by_two_host_slots_match_role_split():
     assert parent[-2:] == ["thd_origin_ptrs", "stream"]
     assert runtime_slots(_KERNEL_FILE) == parent[:-2] + ["table_v_strides", *parent[-2:]]
     # Native SM107 D512 paging adds the independent V-table pitch as well.
-    rubin_parent = runtime_slots("sm107/prefill_d512_f16.py")
+    rubin_parent = runtime_slots("sm107/d512_f16_role_split/kernel.py")
     assert rubin_parent[-2:] == ["thd_origin_ptrs", "stream"]
-    assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == rubin_parent[:-2] + ["table_v_strides", *rubin_parent[-2:]]
+    assert runtime_slots("sm107/d512_f16_2x2/kernel.py") == rubin_parent[:-2] + ["table_v_strides", *rubin_parent[-2:]]
 
 
 @pytest.mark.L0

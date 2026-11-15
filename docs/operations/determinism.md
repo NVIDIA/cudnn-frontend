@@ -21,6 +21,14 @@ when its batch size, order, or neighbors change, with its inputs and upstream
 gradients held fixed. Support is limited to the documented configurations;
 unverified status does not imply an unavailable API.
 
+Forward SDPA standalone loaders and fixed-body engines share the isolated
+main implementations. SM120 padded head envelopes now use their covering
+body's explicit engine identity; this ownership change does not extend the
+repeatability or batch-invariance claims below. Replayed records still fix
+split count, packing and tile choices. See the [retirement validation
+record](../../test/python/determinism_goldens/README.md#forward-sdpa-body-retirement-2026-11-15)
+for current-runtime checks and retained verification gaps.
+
 ## API support by GPU
 
 The four linear-attention APIs are in `cudnn.linear_attention.ops`; bprop uses

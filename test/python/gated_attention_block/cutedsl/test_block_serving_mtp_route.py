@@ -746,7 +746,7 @@ def _pin_route(case):
         assert (rb["pack_gqa"], rb["thd"], rb["paged"], rb["adapter_split"]) == (1, 1, 1, 1), rb
         assert bool(rb["epilogue_gate"]) is case.blk.fuse_gate and case.blk.gate_fused is case.blk.fuse_gate and case.blk.decode_split_kv == 1, rb
     else:
-        assert rb["file"].endswith("sm107/decode_d256_f16.py") and rb["n_q"] == r.n_q and rb["heads_per_tile"] == (r.group if r.pack_gqa else 1), rb
+        assert rb["file"].endswith("sm107/d256_f16_swap_ab/kernel.py") and rb["n_q"] == r.n_q and rb["heads_per_tile"] == (r.group if r.pack_gqa else 1), rb
         assert (rb["adapter_pack"] is True) == r.pack_gqa and rb["adapter_split"] == case.blk.decode_split_kv, rb
     k0, v0 = case.block0_bits
     assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"

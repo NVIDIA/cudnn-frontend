@@ -2142,7 +2142,7 @@ def test_fp8_gate_tail_graph_api(out_key):
 
 
 # ============================================================================ sm100 d128 per-tensor FP8: the exp2 MUFU / FMA split, pinned on the SASS per arch
-# The split (`sm100/prefill_d128_fp8.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
+# The split (`sm100/d128_fp8_multi_q/kernel.py`, the `_E2E_*` block) is invisible to every numerics test (O within the fp8 budget,
 # the fp32 row-sum moves by ~1e-5) and worth +4.5 % at S=8K on the llama chart layer on B200, so its only tripwire is the
 # SASS.  Two arms per specialization, one per cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds
 # (exp2_fma_split=True: 32 of the 128 columns per row on the FMA pipe) and sm_103a with the cc 10.3 record

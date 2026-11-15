@@ -86,7 +86,7 @@ def test_pv_bf16_rejects_unsupported_architectures(monkeypatch, api_cls, device_
 @pytest.mark.L0
 def test_d192_hybrid_elides_pv_scale_factor_storage_and_transactions():
     """The hybrid D192 specialization must compile out unused P/V SF traffic."""
-    kernel = Path(__file__).parents[4] / "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d192_d128_mxfp8.py"
+    kernel = Path(__file__).parents[4] / "python/cudnn/sdpa/fwd/kernels/sm100/d192_mxfp8_multi_q/kernel.py"
     source = kernel.read_text()
 
     assert "sP_SF = sQ_SF" in source

@@ -1886,8 +1886,12 @@ _SM120_HALF_FAMILY = frozenset(s.name for s in engines.ENGINE_SPECS if s.capabil
 
 
 def _sm120_half(d_qk, d_v):
-    """The SM120 half row that owns these head dims: exact native wide tiles have their own engine."""
-    return _SM120_PAIRED if (d_qk, d_v) in ((512, 512), (576, 512)) else _SM120
+    """The SM120 half engine that owns these head dims: wide heads (exact or padded) run the paired engine."""
+    from types import SimpleNamespace
+
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as paired
+
+    return _SM120_PAIRED if paired.padded_shape(SimpleNamespace(d_qk=d_qk, d_v=d_v)) is not None else _SM120
 
 
 def _mk_sm120_graph(d: int = 128, *, d_v: int | None = None, **sdpa_kwargs):
@@ -2009,7 +2013,7 @@ def test_sm120_probe_head_dim_envelope(monkeypatch):
     # stays ineligible. Both dimensions in (256, 512] use the d512 envelope.
     monkeypatch.setattr(ga, "_device_cc", lambda: (12, 0))
     assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=192))
-    assert _SM120 in _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16
+    assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=136))  # multiple of 8, not of 16: padded onto the D144 tile
     assert not _eligible(_mk_sm120_graph(d=132))  # multiple of 4, not of 8
     assert _SM120_PAIRED in _eligible(_mk_sm120_graph(d=512))
     assert _SM120_HALF_FAMILY & _eligible(_mk_sm120_graph(d=504))

@@ -1628,7 +1628,7 @@ def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
     assert rb["adapter_split"] == case.blk.decode_split_kv and (rb["adapter_pack"] is True) == r.pack_gqa, (rb, r)
     assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == _ROUTE_TABLE[group][s_q], (r, _ROUTE_TABLE[group][s_q])
     if r.decode_tile:
-        assert rb["file"].endswith("/sm107/decode_d256_f16.py") and rb["heads_per_tile"] == (group if r.pack_gqa else 1), rb
+        assert rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py") and rb["heads_per_tile"] == (group if r.pack_gqa else 1), rb
         assert rb["n_q"] == r.n_q and rb["split"] == case.blk.decode_split_kv, rb
         assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2, "the gate rides the COMBINE, never the tile"
     else:
@@ -1761,7 +1761,7 @@ def test_qwen35_shards_decode_match_the_oracle(name):
     case.check_against_oracle(what=f"{name} p{page} out")
     r, rb = case.blk.decode_route, case.route_readback()
     assert r.claimed and r.pack_gqa and r.n_q == 16 and r.token_units == 1, r
-    assert rb["template"] == r.tile == DECODE_TILE and rb["file"].endswith("/sm107/decode_d256_f16.py"), rb
+    assert rb["template"] == r.tile == DECODE_TILE and rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py"), rb
     assert rb["heads_per_tile"] == group and rb["adapter_pack"] is True and rb["n_q"] == 16, rb
     assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2, "the gate rides the COMBINE, never the tile"
     assert case.geom.d_model == _D_MODEL_397B and case.geom.h_kv == 1 and case.k_cache.shape[1] == 1
@@ -2215,7 +2215,7 @@ def test_decode_s_q_four_on_the_64_column_tile_matches_the_oracle(group):
     case = _w64_case(group)
     r, rb = case.blk.decode_route, case.route_readback()
     assert (r.n_q, r.token_units, r.pack_gqa, r.served, r.tile) == (64, 1, True, True, DECODE_TILE), r
-    assert rb["template"] == DECODE_TILE and rb["file"].endswith("/sm107/decode_d256_f16.py"), rb
+    assert rb["template"] == DECODE_TILE and rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py"), rb
     assert (rb["n_q"], rb["heads_per_tile"], rb["adapter_pack"]) == (64, group, True), rb
     assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2 and rb["split"] == case.blk.decode_split_kv, rb
     case.run()
@@ -3171,7 +3171,7 @@ def test_packed_kv_rows_of_a_serving_stack_bind_as_two_half_views_on_the_decode_
     r = case.blk.decode_route
     if _cc() == _SM107:
         assert (r.tile, r.n_q, r.token_units, r.pack_gqa) == _ROUTE_TABLES[DECODE_ROUTE_SINGLE_UNIT][6][s_q] and case.blk.gate_fused, r
-        assert case.route_readback()["file"].endswith("/sm107/decode_d256_f16.py")
+        assert case.route_readback()["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py")
     else:
         _sm100_pin(case, _SM100_ROUTE_TABLE[6][s_q])
 
@@ -3268,7 +3268,7 @@ def _mode_pin(case):
     if _cc() == _SM107:
         assert r.device_cc == _SM107 and (blk.gate_fused == (r.prefill_tile or blk.decode_split_kv >= 2))
         if r.decode_tile:
-            assert rb["file"].endswith("/sm107/decode_d256_f16.py") and rb["n_q"] == r.n_q
+            assert rb["file"].endswith("/sm107/d256_f16_swap_ab/kernel.py") and rb["n_q"] == r.n_q
     else:
         _sm100_pin(case, _SM100_ROUTE_TABLE[r.group][r.s_q])
     k0, v0 = case.block0_bits

@@ -68,7 +68,7 @@ def test_fp8_public_record_rebuild_rebind_and_retained_capture(monkeypatch, dtyp
     shared._check(rbufs, thd=False, sq=97, skv=301)
 
 
-def test_fp8_retired_legacy_record_is_declined_and_envelope_keeps_legacy():
+def test_fp8_retired_legacy_record_is_declined_and_envelope_has_an_owner():
     import test_sdpa_prepared_fp8 as shared
 
     g, *_ = shared._case(arch="sm120", d=512, sq=97, skv=301)
@@ -76,8 +76,12 @@ def test_fp8_retired_legacy_record_is_declined_and_envelope_keeps_legacy():
     with pytest.raises((ValueError, RuntimeError, NotImplementedError), match="owned by|No execution plans"):
         shared._case(arch="sm120", d=512, sq=97, skv=301, record=(_FP8_LEGACY_ID, knobs))
     envelope, vp, ws, bufs, _ = shared._case(arch="sm120", d=384, dv=320, sq=97, skv=301)
-    assert envelope.selected_engine.name == "sdpa_fwd_prefill_sm120_fp8"
-    assert envelope._compiled_plans[envelope._plan_index]._compiled.implementation_config is None
+    assert envelope.selected_engine.name == _FP8
+    assert envelope._compiled_plans[envelope._plan_index]._compiled.implementation_config is not None
+    envelope.execute(vp, ws)
+    shared._check(bufs, thd=False, sq=97, skv=301)
+    with pytest.raises((ValueError, RuntimeError, NotImplementedError), match="owned by|No execution plans"):
+        shared._case(arch="sm120", d=384, dv=320, sq=97, skv=301, record=(_FP8_LEGACY_ID, knobs))
 
 
 @pytest.mark.parametrize("split", [None, 3])

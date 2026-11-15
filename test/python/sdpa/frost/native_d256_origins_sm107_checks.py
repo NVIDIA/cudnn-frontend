@@ -33,7 +33,7 @@ def test_native_d256_independent_origins(dtype_name, stats_layout, policy, total
         result = build(graph, *args, **kwargs)
         plan = graph._compiled_plans[graph._plan_index]
         module = plan._compiled.kernel_module
-        assert module.__file__.endswith("sm107/prefill_d256_f16.py")
+        assert module.__file__.endswith("sm107/d256_f16_lookahead/kernel.py")
         assert module.CFG.TILE_K == module.CFG.TILE_O == 256
         assert module.CFG.CTA_MMA == 2 and module.CFG.SPLIT_KV == 1
         spec = plan._prepared.spec

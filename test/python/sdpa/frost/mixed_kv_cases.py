@@ -191,14 +191,14 @@ def check_dense_paged_rebind_capture(
 
         assert loaded and loaded[-1].MIXED_FP8_KV
         expected_file = (
-            "sm100/decode_d128_f16.py"
+            "sm100/d128_f16_single_q/kernel.py"
             if cga == 1 and not (native_sm107 and (paged or head_dim == 64))
-            else ("sm107/prefill_d128_f16.py" if native_sm107 else "sm100/prefill_d128_f16.py")
+            else ("sm107/d128_f16_multi_q/kernel.py" if native_sm107 else "sm100/d128_f16_multi_q/kernel.py")
         )
         if entry == "graph" and engine_name in ("sdpa_fwd_sm100_d128_single_q", "sdpa_fwd_sm100_d128_multi_q"):
             expected_file = "sm100/d128_f16_single_q/kernel.py" if cga == 1 else "sm100/d128_f16_multi_q/kernel.py"
         if native_sm107 and head_dim in (256, 512):
-            expected_file = "sm107/prefill_d256_f16.py" if head_dim == 256 else "sm107/prefill_d512_f16_2x2.py"
+            expected_file = "sm107/d256_f16_lookahead/kernel.py" if head_dim == 256 else "sm107/d512_f16_2x2/kernel.py"
         if entry == "graph" and native_sm107:
             expected_file = {
                 "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",

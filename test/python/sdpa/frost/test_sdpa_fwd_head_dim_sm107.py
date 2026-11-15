@@ -3,7 +3,7 @@
 
 """The small head-dim tiles of the Rubin (SM107) f16/bf16 forward row: ``TILE_K = TILE_O`` in {32, 64} as Cfg flavors of the d128 file.
 
-``sm107/prefill_d128_f16.py`` is one body with three head-dim geometries (``TemplateParams.d_flavor`` 32 / 64 / 128 ->
+``sm107/d128_f16_multi_q/kernel.py`` is one body with three head-dim geometries (``TemplateParams.d_flavor`` 32 / 64 / 128 ->
 ``config_sm107.make_cfg_d32`` / ``make_cfg_d64`` / ``make_cfg_d128``).  A graph's head dim lands on the SMALLEST width covering
 max(d_qk, d_v) -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, the natives on themselves -- and the TMA load zero-fills the columns
 past D (exact zero terms in QK^T and in P.V's padded V columns; the ``expect_tx`` count is the FULL box; the O store clips at
@@ -54,7 +54,7 @@ _ROW = "sdpa_fwd_prefill_sm107"
 # the bitwise zero-fill pin).
 _SERVED = {8: 32, 16: 32, 24: 32, 32: 32, 40: 64, 48: 64, 56: 64, 64: 64}
 _DECLINED = (4, 12, 20, 36, 60)  # D % 8 != 0: the TMA 16-byte global-stride rule, a typed decline
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
+_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "d128_f16_multi_q" / "kernel.py"
 
 
 @pytest.fixture(autouse=True)
@@ -308,7 +308,7 @@ def test_one_constant_feeds_the_row_the_adapter_and_the_factory():
     for shape, domain in SM107_SMALL_D_CGAS.items():
         assert by_shape[shape] == domain, shape
         assert supported_cgas_for(shape, fp8=False, device_cc=(10, 7)) == tuple(sorted(domain)), shape
-        assert _SM107_KERNEL_FILES[shape] == _SM107_KERNEL_FILES[(128, 128)] == "sm107/prefill_d128_f16.py", shape
+        assert _SM107_KERNEL_FILES[shape] == _SM107_KERNEL_FILES[(128, 128)] == "sm107/d128_f16_multi_q/kernel.py", shape
     with pytest.raises(ValueError, match="outside the validated widths"):
         make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=2))
     for cta in (1, 2):

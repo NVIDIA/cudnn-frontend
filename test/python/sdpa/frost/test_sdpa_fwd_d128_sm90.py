@@ -3,7 +3,7 @@
 
 """The SM90 native D128 forward template (issue #378), through the direct adapter and the graph.
 
-``SdpaFwdDslSm90`` runs ``sm90/prefill_d128_f16.py`` for an exact (128, 128) dense declaration
+``SdpaFwdDslSm90`` runs ``sm90/d128_f16_multi_q/kernel.py`` for an exact (128, 128) dense declaration
 it serves (``config_sm90.pick_flavor``). The direct-route cases build the adapter and assert the
 D128 flavor before they trust a number; O and Stats start as NaN, so a row the kernel never writes
 cannot pass. The graph-route cases (the engine row proposes the 128 x 128 tile, the D128 template,
@@ -61,7 +61,7 @@ _D = 128
 _SCALE = 1.0 / math.sqrt(_D)
 _ROW = "sdpa_fwd_sm90_f16_three_wg"
 _D128_OWNER = "sdpa_fwd_sm90_d128_multi_q"
-_D128_FILE = "sm90/prefill_d128_f16.py"
+_D128_FILE = "sm90/d128_f16_multi_q/kernel.py"
 _DTYPES = (torch.float16, torch.bfloat16)
 
 
@@ -1532,7 +1532,9 @@ def test_d128_adapter_passes_the_cta_count_exactly_when_persistent(monkeypatch):
         raise Stop
 
     monkeypatch.setattr(
-        api_dsl, "_load_sm90_kernel_module", lambda flavor, params, native_d64=False: SimpleNamespace(__file__="prefill_d128_f16.py", compile=fake_compile)
+        api_dsl,
+        "_load_sm90_kernel_module",
+        lambda flavor, params, native_d64=False: SimpleNamespace(__file__="d128_f16_multi_q/kernel.py", compile=fake_compile),
     )
     monkeypatch.setattr(api_dsl.SdpaFwdDslSm90, "_persistent_ctas", lambda self, device: 7)
     q, k, v = _inputs(1, 2, 2, 64, 128, torch.float16)
@@ -1677,7 +1679,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     b, h_q, h_kv, s_q, s_kv = case["shape"]
     order = {"sched_policy": case["sched"]} if "sched" in case else {}
     params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=case["causal"], has_lse=True, qh_per_kh=h_q // h_kv, **order), **fields)
-    mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="sass_sm90_d128")
+    mod = _load_kernel_template("sm90/d128_f16_multi_q/kernel.py", params, tag="sass_sm90_d128")
     print("SWITCHES", *(int(getattr(mod, name.upper())) for name in sorted(fields)))
     if fields.get("causal_walk"):
         # The walk the record takes: the template's rule over the probe's record, shape and CTA count, as the kernel's

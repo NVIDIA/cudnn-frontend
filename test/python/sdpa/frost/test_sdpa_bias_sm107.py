@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The additive attention bias and the per-key boolean mask on the Rubin (SM107) f16/bf16 small head-dim tiles -- the RESIDENT
-row-block arm of ``sm107/prefill_d128_f16.py`` (``TemplateParams.bias_mode = 1`` / ``kv_mask_form = 1``).
+row-block arm of ``sm107/d128_f16_multi_q/kernel.py`` (``TemplateParams.bias_mode = 1`` / ``kv_mask_form = 1``).
 
 One work item (a CTA's ``TILES_Q x TILE_M = 256`` query rows of one (batch, head)) loads its bias rows x its whole KV range into
 SMEM ONCE (the TMA-LDG warp, after the item's Q / K / V prologue loads; one ``expect_tx`` for the FULL boxes of every tile), and
@@ -46,7 +46,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
 _ROWS = (_ROW, "sdpa_fwd_sm107_d128_multi_q", "sdpa_fwd_sm107_small_batch_pair", "sdpa_fwd_sm107_shared_single_q")
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
+_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "d128_f16_multi_q" / "kernel.py"
 _RENDERINGS = Path(__file__).resolve().parent / "renderings"
 # (head-dim tile, cga) -> the resident block's S_kv budget, DERIVED by config_sm107 from the carveout (pinned here as the
 # numbers the row and the adapter must agree on).
@@ -1036,7 +1036,7 @@ def test_signed_attn_scale_keeps_the_additive_arms_sign(sign, form):
     _check_signed_scale(_run(q, k, v, **kw), ref)
 
 
-_D128_HOST_FILES = {"sm100": _KERNEL.parents[1] / "sm100" / "prefill_d128_f16.py", "sm107": _KERNEL}
+_D128_HOST_FILES = {"sm100": _KERNEL.parents[2] / "sm100" / "d128_f16_multi_q" / "kernel.py", "sm107": _KERNEL}
 
 
 def _dense_plan_stand_in(kernel_file, *, scale):

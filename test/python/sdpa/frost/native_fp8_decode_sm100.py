@@ -35,7 +35,7 @@ def _observe_loader(monkeypatch):
 
 
 def _assert_decode(mod, *, envelope=False):
-    expected = "sm100/decode_d128_fp8.py" if envelope else "sm100/d128_fp8_swap_ab/kernel.py"
+    expected = "sm100/d128_fp8_swap_ab/kernel.py" if envelope else "sm100/d128_fp8_swap_ab/kernel.py"
     assert mod.__file__.endswith(expected)
     assert mod.FROST_SOURCE_DIGEST
     assert (mod.TILE_K, mod.TILE_O, mod.N_Q, mod.COLS, mod.STAGES) == (128, 128, 16, 8, 5)

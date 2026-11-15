@@ -769,7 +769,7 @@ def test_sdpa_fwd_paged_gqa_partial_pack_pinned_frost_L0(env_info, s_q, request,
 # ASSERT that FROST served them (_require_frost_sm100 / _exec_sdpa_on_frost above).
 #
 # Two tiles can serve them since #1094: on the d128 flavor a decode / MTP shape
-# (s_q * PACK_G <= 128) rides the d128 decode tile (sm100/decode_d128_f16.py,
+# (s_q * PACK_G <= 128) rides the d128 decode tile (sm100/d128_f16_single_q/kernel.py,
 # TILE_CGA_M=1), whose sink fold carries the same keyless-row select as the
 # prefill kernels'; every other flavor's decode graph runs its prefill kernel.
 # The routing tally names the engine only, so each pinned graph asserts its
@@ -2855,7 +2855,7 @@ def test_sdpa_fwd_paged_decode_tile_flashinfer_pinned_L0(env_info, request, cudn
     s_kv=4096, page 16, bf16, padding mask, no causal mask) pinned deterministically,
     asserting FROST's d128 decode tile (TILE_CGA_M=1) serves it. This is the shape
     the decode tile was measured on (B200: 117.9 us prefill tile -> decode tile, see
-    sm100/decode_d128_f16.py); a git bisect of that number lands here.
+    sm100/d128_f16_single_q/kernel.py); a git bisect of that number lands here.
     """
     _require_frost_sm100()
 
@@ -3807,7 +3807,7 @@ def _p2_keyless_rows(cfg):
     bottom-right causal (right_bound 0) the first len_q - len_kv rows of a request whose cache is shorter than its query
     count; under top-left causal with a left window the rows whose window ends past the cache.  Such a row holds the
     sink's mass alone and its contract is exact: O := 0, LSE := sink (the kernels SELECT both; see the sink fold in
-    sm100/prefill_d128_f16.py)."""
+    sm100/d128_f16_multi_q/kernel.py)."""
     rows, base = [], 0
     bottom_right = cfg.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT
     for len_q, len_kv in zip(cfg.seq_len_q, cfg.seq_len_kv):
@@ -4604,8 +4604,8 @@ def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
 # depth (B128 64/8 Q8 KV2056) ran the cc 10.7 half row's 512-row two-CTA prefill tile UNPACKED: one (batch, q-head) unit
 # per 2-CTA cluster with 8 live rows, the KV head re-streamed once per query head.  The row now lowers dense d128 half
 # graphs (the d64 envelope included; not with the pre-folded scale) onto the shared SM100 d128 bodies compiled for
-# cc 10.7: the 128-row DECODE tile at TILE_CGA_M=1 (sm100/decode_d128_f16.py) and the prefill body under PackGQA at
-# cga2 (sm100/prefill_d128_f16.py).  The cells below assert the CONTRACT through the common graph API (test/AGENTS.md:
+# cc 10.7: the 128-row DECODE tile at TILE_CGA_M=1 (sm100/d128_f16_single_q/kernel.py) and the prefill body under PackGQA at
+# cga2 (sm100/d128_f16_multi_q/kernel.py).  The cells below assert the CONTRACT through the common graph API (test/AGENTS.md:
 # outputs and declines, never a workload winner): the tile-fit rule S_q * pack_g <= 128 names the served width (the
 # SM100 precedent, _exec_sdpa_on_frost(cga=1)); explicit pins (ExecConfig.plan_pin -- graph.create_execution_plan +
 # select_plan, strict, and part of the printed config so a --repro replay pins the same plan) prove every newly admitted

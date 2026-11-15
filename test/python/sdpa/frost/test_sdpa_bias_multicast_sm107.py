@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The streamed bias ring's MULTICAST form on the Rubin (SM107) f16/bf16 small head-dim tiles -- ``TemplateParams.bias_mode = 3``
-(``config_sm107.BIAS_MODE_STREAMED_MULTICAST``) on ``sm107/prefill_d128_f16.py``.
+(``config_sm107.BIAS_MODE_STREAMED_MULTICAST``) on ``sm107/d128_f16_multi_q/kernel.py``.
 
 The (n, n+1) PAIR item's streamed ring (``bias_mode = 2``: one ``128 x TILE_N`` bias tile per kv tile through a 2- / 3-stage SMEM ring)
 launched as a CLUSTER of two INDEPENDENT CTAs along the grid's chunk axis (cluster (1, 1, 2); CTA_MMA / CGA_M / CGA_N stay 1 -- no

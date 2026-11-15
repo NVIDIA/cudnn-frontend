@@ -52,6 +52,10 @@ from cudnn.sdpa.fwd.kernels.sm90._common_hopper import (
 )
 from cudnn.frost.compiled_cache import template_key
 from cudnn.frost.tile_dsl.wgmma import wgmma_m64nNk16_f32
+from cudnn.sdpa.fwd.kernels.sm90.d64_f16_one_wg import contract as _template_contract
+
+# Public metadata consumed by the shared loader after dynamic module loading.
+TEMPLATE_NAME = _template_contract.TEMPLATE_NAME
 from cudnn.sdpa.fwd.kernels.sm90.d64_f16_one_wg.config import TemplateParams, from_shared, native_d64_mismatch, validate_params
 
 PARAMS: TemplateParams = from_shared(globals().get("FROST_TEMPLATE_PARAMS", TemplateParams()))

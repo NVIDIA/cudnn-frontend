@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The second half of the Rubin small-tile bias / kv_mask arm (``sm107/prefill_d128_f16.py``; the first half is
+"""The second half of the Rubin small-tile bias / kv_mask arm (``sm107/d128_f16_multi_q/kernel.py``; the first half is
 ``test_sdpa_bias_sm107.py``, whose helpers this module reuses): the TILE_N = 64 renderings as REAL cells, the ADDITIVE per-key
 ``kv_mask`` vector, and the strided outer axes.
 

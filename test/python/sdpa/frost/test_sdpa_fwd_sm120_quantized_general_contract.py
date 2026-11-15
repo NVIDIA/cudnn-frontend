@@ -60,8 +60,18 @@ def test_exact_general_tiles_have_one_owner(kind, cc, dims):
 
 
 @pytest.mark.parametrize("kind", sorted(OWNERS))
-@pytest.mark.parametrize("dims", [(16, 16), (48, 48), (80, 112), (144, 128), (512, 512)])
-def test_envelopes_and_wide_shapes_do_not_enter_the_owner(kind, dims):
+@pytest.mark.parametrize("dims", [(16, 16), (48, 48), (80, 112), (144, 128)])
+def test_padded_heads_enter_the_owner_of_their_tile(kind, dims):
+    owner, _, legacy_id, owner_id = OWNERS[kind]
+    f = facts(kind, d_qk=dims[0], d_v=dims[1])
+    legacy = quant.explicit_geometry(owner, None).lowering_row_name
+    assert "padded to" in engines.mismatch(SPECS[legacy].capabilities, f)
+    assert engines.mismatch(SPECS[owner].capabilities, f) is None
+
+
+@pytest.mark.parametrize("kind", sorted(OWNERS))
+@pytest.mark.parametrize("dims", [(512, 512), (8, 8), (40, 40), (264, 128)])
+def test_wide_and_unaligned_heads_do_not_enter_the_owner(kind, dims):
     owner = OWNERS[kind][0]
     assert engines.mismatch(SPECS[owner].capabilities, facts(kind, d_qk=dims[0], d_v=dims[1])) is not None
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The FROST SM100 d128 DECODE tile (``sm100/decode_d128_f16.py``).
+"""The FROST SM100 d128 DECODE tile (``sm100/d128_f16_single_q/kernel.py``).
 
 ``sdpa_fwd_prefill_sm100``'s (128, 128) f16/bf16 flavor has two tiles behind
 one knob: ``TILE_CGA_M=2`` is the prefill pipeline (512 Q rows per cga2
@@ -435,7 +435,12 @@ def _load_decode(params, tag):
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
 
-    path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", "sm100", "decode_d128_f16.py")
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(api_dsl.__file__)),
+        "kernels",
+        "sm100",
+        "d64_f16_quadrant/kernel.py" if params.decode_quad else "d128_f16_single_q/kernel.py",
+    )
     return load_template(path, params, tag=tag)
 
 
@@ -468,7 +473,7 @@ def _run_kernel(
     quad=False,
     early_q=True,
 ):
-    """Drive sm100/decode_d128_f16.py directly (the split-KV suite's idiom).
+    """Drive sm100/d128_f16_single_q/kernel.py directly (the split-KV suite's idiom).
 
     ``paged=False`` binds dense [B, S_kv, KH, d] K/V with per-batch KV lengths
     (the padded path) instead of pools + tables.  ``q_lens`` (per batch, <= s_q)

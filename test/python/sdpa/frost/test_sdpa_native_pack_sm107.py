@@ -88,7 +88,7 @@ def _check_native_d128_packing_dense_replay(dtype_name, sched_policy, with_stats
         api.cga = cga
     assert api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+    assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
     cfg = api._k_mod.CFG
     if head_dims is not None:
         assert api.flavor == (64, 64) and cfg.TILE_K == cfg.TILE_O == 64

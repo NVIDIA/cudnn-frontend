@@ -87,7 +87,7 @@ def test_boundaries(dims, page, sq, split, packed, empty, monkeypatch):
     def compile_native(api):
         original(api)
         assert api.flavor == (512, 512)
-        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if dims == (512, 512) else "sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py" if dims == (512, 512) else "sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.KV_SHARE == 2
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)

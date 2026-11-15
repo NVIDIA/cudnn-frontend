@@ -745,6 +745,9 @@ class Capabilities:
     # tile_ms_by_d_shape (append-only contract above).
     causal_exclude_own_block_d_shapes: Optional[frozenset] = None
 
+    # Delegate by the native shape a padded graph selects, so an owner also serves the row's envelope onto its tile.
+    delegated_envelope: bool = False
+
 
 # The block sizes the own-block-excluded causal bound is wired for: the MXFP8 V
 # scale block.  Any power of two dividing the q sub-tile would keep the kernel's
@@ -1901,10 +1904,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return "this engine serves sdpa() forward graphs only"
     if knobs is not None and not isinstance(knobs, SdpaFwdKnobs):
         return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
-    if (facts.device_cc, (facts.d_qk, facts.d_v)) in capabilities.delegated_exact:
+    delegated = (facts.d_qk, facts.d_v)
+    if capabilities.delegated_envelope and (facts.device_cc, delegated) not in capabilities.delegated_exact:
+        delegated = _selected_d_shape(capabilities, facts, knobs) or delegated
+    if (facts.device_cc, delegated) in capabilities.delegated_exact:
         precision = "MXFP8" if capabilities.is_mxfp8 else "FP8" if capabilities.is_fp8 else "half"
         major, minor = facts.device_cc
-        return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
+        if delegated == (facts.d_qk, facts.d_v):
+            return f"exact sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} is owned by the explicit implementation engines"
+        return f"sm{major}{minor} {precision} D{facts.d_qk}/V{facts.d_v} (padded to D{delegated[0]}/V{delegated[1]}) is owned by the explicit implementation engines"
     if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS:
         if not _sm107_small_half.in_domain(facts):
             return "requires SM107 and supported half small-head graph declarations"
@@ -4821,20 +4829,25 @@ def _sm120_spec() -> EngineSpec:
             pack_gqa_partial_d_shapes=WIDE_F16_FLAVORS,
             pack_gqa_requires_divisible=False,
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in WIDE_F16_FLAVORS | _SM120_HALF_EXACT_SHAPES),
+            delegated_envelope=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
 
 
 def _sm120_explicit_spec(legacy: EngineSpec, implementation: str, shapes, tile_ms, host_lower, tile_ns=None) -> EngineSpec:
-    """An SM120 body on exact native head tiles; shared graph binding and launch. ``tile_ns`` None keeps the legacy domain."""
+    """An SM120 body on its native head tiles; shared graph binding and launch. ``tile_ns`` None keeps the legacy domain.
+
+    A row that delegates its envelope keeps the padding rule on the owners, so padded graphs land on the owner's tile."""
+    envelope = legacy.capabilities.delegated_envelope
     capabilities = replace(
         legacy.capabilities,
         implementation=implementation,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=frozenset(shapes),
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=legacy.capabilities.d_pad_multiple if envelope else 0,
+        d_envelope_floors=legacy.capabilities.d_envelope_floors if envelope else (),
         tile_ms=frozenset(tile_ms),
         tile_ns=legacy.capabilities.tile_ns if tile_ns is None else frozenset(tile_ns),
     )
@@ -5757,6 +5770,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in {D512_FLAVOR} | _SM120_QUANT_GENERAL_SHAPES),
+            delegated_envelope=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -5806,6 +5820,7 @@ def _sm120_mxfp8_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in {D512_FLAVOR} | _SM120_QUANT_GENERAL_SHAPES),
+            delegated_envelope=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
