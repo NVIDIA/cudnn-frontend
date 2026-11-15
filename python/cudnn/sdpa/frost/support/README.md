@@ -13,7 +13,7 @@ features.** It means this new reference has not yet been checked for that scope.
 
 | Architecture | Current reference | Documentation coverage |
 |---|---|---|
-| SM80 | Pending migration | Forward and backward not yet documented here |
+| SM80 (cc 8.0) | [SM80 support](sm80.md) | FP16/BF16 forward documented; backward pending migration |
 | SM90 (cc 9.0) | [SM90 support](sm90.md) | Forward documented; no FROST SDPA backward engine |
 | SM100 / SM103 | Pending migration | Forward and backward not yet documented here |
 | SM107 (cc 10.7) | [SM107 support](sm107.md) | Per-tensor FP8 D512 forward documented; other forward domains and backward pending migration |

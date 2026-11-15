@@ -97,7 +97,9 @@ def _unpacked_decode(row: str, facts) -> bool:
         (m.LEGACY_ROW, m.in_domain) for m in (fp8_wide, mxfp8_wide)
     )
     sm120_wide += tuple((row, sm120_quant_general.in_domain) for row in sm120_quant_general.LEGACY_ROWS)
-    sm120_wide += ((sm107_d512_fp8.LEGACY_ROW, sm107_d512_fp8.in_domain),)
+    from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as sm80_half
+
+    sm120_wide += ((sm80_half.LEGACY_ROW, sm80_half.in_domain), (sm107_d512_fp8.LEGACY_ROW, sm107_d512_fp8.in_domain))
     if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts))) or any(
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):

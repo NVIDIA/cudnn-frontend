@@ -327,6 +327,12 @@ python/cudnn/
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
+        sm80/f16_k_prefetch/          SM80 K-prefetch half body (D_QK <= 192,
+                                      D_V <= 128; explicit engine)
+        sm80/d256_kv_prefetch/        SM80 D256 K+V-prefetch body (qwen envelope;
+                                      explicit engine)
+        sm80/wide_cooperative/        SM80 wide-head cooperative body (wide512 /
+                                      mla576 envelopes; explicit engine)
         sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
                                       the D512 body: one 64-row tile over
                                       three warpgroups, every D up to 512 on
