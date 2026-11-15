@@ -11,16 +11,26 @@ NAME = "sdpa_fwd_sm120_d512_paired"
 TEMPLATE_NAME = "prefill_d512_f16"
 KERNEL_FILE = "sm120/d512_f16_paired/kernel.py"
 LEGACY_ROW = "sdpa_fwd_prefill_sm120"
-# The legacy row's arch range (120..129); exact native head tiles only, its
-# envelope shapes keep the legacy owner.
+# The legacy row's arch range (120..129); eight-aligned heads above the floor pad onto these tiles, as on the row.
 DEVICE_CCS = tuple((12, minor) for minor in range(10))
 SHAPES = ((512, 512), (576, 512))
+ENVELOPE_FLOOR = 256
+
+
+def padded_shape(facts):
+    """The wide tile this head pair runs on, or None: exact, or eight-aligned with both heads above the floor."""
+    exact = (facts.d_qk, facts.d_v)
+    if exact in SHAPES:
+        return exact
+    if facts.d_qk % 8 or facts.d_v % 8 or min(exact) <= ENVELOPE_FLOOR:
+        return None
+    return next((s for s in SHAPES if facts.d_qk <= s[0] and facts.d_v <= s[1]), None)
 
 
 def in_domain(facts):
     return (
         facts.device_cc in DEVICE_CCS
-        and (facts.d_qk, facts.d_v) in SHAPES
+        and padded_shape(facts) is not None
         and not (facts.invalid or facts.is_backward)
         and not (facts.is_fp8 or facts.is_mxfp8)
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
@@ -75,7 +85,7 @@ def mismatch(facts, knobs):
     if facts.device_cc not in DEVICE_CCS:
         return f"requires SM12x (the SM120 family); current device is {facts.device_cc}"
     if not in_domain(facts):
-        return "requires exact D512/V512 or D576/V512 FP16/BF16 on the SM120 family"
+        return "requires D512/V512 or D576/V512 FP16/BF16 (eight-aligned heads above 256) on the SM120 family"
     if knobs is not None:
         if knobs.tile_m not in (None, 64) or knobs.tile_n not in (None, 32):
             return "SM120 wide-head paired-warp requires TILE_M=64 and TILE_N=32"
