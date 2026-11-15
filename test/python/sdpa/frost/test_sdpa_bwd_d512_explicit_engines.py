@@ -53,11 +53,26 @@ def test_d512_owners_preserve_admission_and_default_order(cc, dtype, d, profile)
 @pytest.mark.parametrize("name,slot", [(contract.ROLE_SPLIT, 26), (contract.TWO_BY_TWO, 27)])
 def test_d512_explicit_identity_and_no_tile_knobs(name, slot):
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
-    assert family.slots[name].slot == slot and not family.slots[name].opt_in
+    assert family.slots[name].slot == slot
+    assert family.slots[name].opt_in == (name == contract.TWO_BY_TWO)
     spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     assert spec.capabilities.implementation == name
     assert not spec.capabilities.tile_ms and not spec.capabilities.tile_ns
     assert not spec.capabilities.delegated
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_d512_discovery_keeps_additional_body_opt_in(monkeypatch, enabled):
+    if enabled:
+        monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    else:
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
+    offered = family.offered_ids()
+    assert contract.ROLE_SPLIT in offered
+    assert (contract.TWO_BY_TWO in offered) == enabled
+    facts = SdpaGraphFacts(is_backward=True, b=2, h_q=4, h_kv=4, s_q=256, s_kv=256, d_qk=512, d_v=512, dtype=cudnn.data_type.BFLOAT16, device_cc=(10, 0))
+    assert [p.engine_id for p in heuristics.recommend("A", facts, offered)] == ([20626, 20627] if enabled else [20626])
 
 
 @requires_dsl

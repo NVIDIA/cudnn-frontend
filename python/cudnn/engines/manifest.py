@@ -399,7 +399,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_sm80_f16_two_subgroup": EngineSlot(20),
             "sdpa_bwd_sm120_f16_two_subgroup": EngineSlot(21),
             "sdpa_bwd_sm100_d512_role_split": EngineSlot(26),
-            "sdpa_bwd_sm100_d512_2x2": EngineSlot(27),
+            "sdpa_bwd_sm100_d512_2x2": EngineSlot(27, opt_in=True),
             "sdpa_bwd_sm100_d128_recompute": EngineSlot(28),
             "sdpa_bwd_sm100_d128_pair": EngineSlot(29),
         },

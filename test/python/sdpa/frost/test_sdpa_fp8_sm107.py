@@ -102,7 +102,7 @@ def test_sm107_missing_dsl_target_declines_before_compile(monkeypatch, dsl_versi
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
     caps = {spec.name: spec.capabilities for spec in engines.ENGINE_SPECS}
-    error = engines.mismatch(caps[engines.engine_name(arch="sm107", fp8=True)], _fp8_facts(device_cc=(10, 7)))
+    error = engines.mismatch(caps["sdpa_fwd_sm107_d128_fp8_multi_q"], _fp8_facts(device_cc=(10, 7)))
     assert "sm_107a" in error and dsl_version in error
     assert engines.mismatch(caps["sdpa_fwd_sm100_d128_fp8_multi_q"], _fp8_facts()) is None
     with pytest.raises(NotImplementedError, match="sm_107a") as exc:
