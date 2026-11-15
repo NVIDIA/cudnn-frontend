@@ -5769,6 +5769,7 @@ def _sm120_fp8_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in {D512_FLAVOR} | _SM120_QUANT_GENERAL_SHAPES),
+            delegated_envelope=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
@@ -5818,6 +5819,7 @@ def _sm120_mxfp8_spec() -> EngineSpec:
             pack_gqas=frozenset({False, True}),
             pack_gqa_requires_divisible=False,
             delegated_exact=frozenset((cc, shape) for cc in _SM120_DEVICE_CCS for shape in {D512_FLAVOR} | _SM120_QUANT_GENERAL_SHAPES),
+            delegated_envelope=True,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM120),
     )
