@@ -2112,6 +2112,8 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=
         (512, 512): ("sdpa_fwd_sm100_d512_fp8_role_split",),
     }
     names = owners.get((cfg.d_qk, cfg.d_v), (engine,)) if engine == FROST_FP8_ENGINE else (engine,)
+    if engine == "sdpa_fwd_prefill_sm107_fp8" and (cfg.d_qk, cfg.d_v) == (512, 512):
+        names = ("sdpa_fwd_sm107_d512_fp8_role_split",)
     keys = tuple(f"frost:{name}" for name in names)
     before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:

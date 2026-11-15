@@ -4,6 +4,96 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM107 D512 FP8 implementation identity (2026-11-15)
+
+The exact D512 per-tensor FP8 graph now uses engine 20549,
+`sdpa_fwd_sm107_d512_fp8_role_split`. Its role-split body and arithmetic are
+unchanged. `TestD512Fp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py`
+checks explicit public records without candidate generation, reconstruction,
+fresh bindings and retained capture for E4M3/E5M2 inputs, BF16/FP8 outputs
+and fixed split counts. Independent THD origins cover token/head Stats and
+present/absent total hints, including replay and batch invariance through the
+shared numerical reference. The existing D512 packing, split and paging
+suites also collect through that entry point.
+
+The refill stress uses eight KV tiles per work item, a three-slot K/V ring
+and four-slot transfer ring, with 1,024 CTAs. It checks the numerical reference
+before byte comparisons and runs 256 warm plus 256 shared-memory-poisoned
+launches alongside the unsafe-ring control. This finite test is not a proof
+of race freedom. Historical THD golden keys retain their old `cga2` MMA-group
+suffix while public records now state the physical cluster width `cga4`;
+this preserves the original baselines instead of recording replacements.
+
+Qualification used isolated frozen snapshots culminating in `c501e487d`,
+on native cc 10.7 with cuDNN 9.30.0, CuTe DSL 4.8.0, compiler/NVRTC 13.4,
+Torch 2.14.1+cu130 and driver API 13050. The source import and target
+architecture were asserted before pytest. Run the selected groups from
+`test/python` with `-m L0`:
+
+```text
+sdpa/frost/test_sdpa_fp8_sm107.py::TestD512Fp8Implementation
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Pack
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Split
+sdpa/frost/test_sdpa_fp8_sm107.py::TestNativeD512Fp8Paged
+sdpa/frost/test_sdpa_fp8_sm107.py::TestWideFp8PhysicalOrigins
+sdpa/frost/test_sdpa_fp8_sm107.py::TestServiceRegisterRelease::test_service_register_release[prefill_d512_fp8]
+sdpa/frost/test_sdpa_fwd_sm107_d512_fp8_contract.py
+```
+
+The first functional run had 218 passes, four missing-golden skips and two
+failures in a stale route observer: selected implementations load directly,
+so the old router hook was not called. The numerical/capture checks completed
+before that observer failed. The test now inspects the actual compiled
+artifact, owner and physical/MMA geometry, including cache hits. The final
+paged group plus larger stress and PTX detector passed 27 cases with six
+missing-golden skips. The separate final-owner/origins/metadata run passed
+52 with eight missing-golden skips; it also included the three affected
+packing/scheduler/gate metadata tests and the running-max source inventory.
+Taking the latest result for each selected case gives **266 passes,
+14 missing-golden skips and no unresolved failures**; this total includes
+host contract checks collected on the GPU worker.
+
+The 1,024-CTA stress had zero byte mismatches in both 256-launch phases;
+the unsafe-ring control failed all 200 launches. A frozen parent/head/head/parent
+comparison covered dense E4M3-to-BF16, packed split E5M2-to-E4M3, HALF softmax
+E4M3-to-BF16 and nonpaged THD E5M2-to-BF16. Complete configurations, template
+parameters, TMA metadata, workspace, normalized public records, inputs,
+outputs and changed-scale capture results matched exactly across all four
+processes. This is bounded equivalence evidence, not a cross-runtime promise.
+
+Historical paging and THD goldens are unavailable for runtime fingerprint
+`aa97de087283f297`. Strict historical-golden qualification therefore remains
+unverified for this runtime; no replacement baselines were recorded. No
+other architecture or backward path is newly qualified by this change.
+
+After integrating the shared admission changes from `a766c397a`, head
+`bf16a8a5d` passed 43 additional native record/origin/paged-capture and owner
+contract checks with zero failures or skips (one unchanged warm case was
+deselected because the larger stress above was already qualified). The
+shared CPU suites retained 1,089 passes and eight skips. Repeating the
+1,152 graph/mode comparison against that new parent preserved all 1,760
+ordered candidate records and placement decisions.
+
+A follow-up caller audit migrated the generic envelope assertion and scalar
+KV-tail helper to the D512 owner and physical CGA4. The helper passed native
+E4M3-to-BF16 cases with split counts 1 and 4 at D512, checking six execute-time
+KV lengths, fresh binding and changed-input CUDA Graph replay. The envelope
+contract also passed (three cases total, zero skips). Separate host entrypoint
+checks passed 43 cases, with 34 GPU skips and nine runtime cases deselected.
+These are additional selected fixture checks; device/runtime code is unchanged.
+
+The shared-consumer review follow-up on source `34350c64e` passed
+1,550 selected checks on the native SM107 worker, with nine pre-Rubin-only
+frontend integration skips. This covers the complete graph-analyzer,
+heuristic-geometry, band-capability and frontend-integration files, the
+D512 owner contracts, and shared graph `test_sdpa_fp8_fwd_cc107_L0[test693]`.
+The count is primarily host contracts; the shared graph reproducer completed
+its numerical checks and exact tally through engine 20549. The two analyzer
+failures are fixed with current-owner semantic checks and separate retired
+record rejection; 12 host tally controls retain exact counts and reject
+backend/wrong-owner fallback. Runtime code and numerical tolerances did not
+change, and the wider cc107 graph sweep is not claimed as qualified.
+
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
 `sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`

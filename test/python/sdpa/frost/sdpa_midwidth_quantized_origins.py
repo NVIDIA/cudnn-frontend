@@ -15,6 +15,8 @@ def origin_checks(family, arch="sm100", shapes=None):
             from frost_test_utils import mxfp8_engine_name
 
             return mxfp8_engine_name(arch, *(dims if isinstance(dims, tuple) else (dims, 128 if dims == 192 else dims)))
+        if arch == "sm107" and family == "fp8" and dims in (512, (512, 512)):
+            return "sdpa_fwd_sm107_d512_fp8_role_split"
         if arch == "sm100" and family == "fp8" and dims in (256, (256, 256)):
             return "sdpa_fwd_sm100_d256_fp8_single_q"
         if arch == "sm100" and family == "fp8" and dims in (192, (192, 128)):
@@ -35,6 +37,8 @@ def origin_checks(family, arch="sm100", shapes=None):
         if arch == "sm100" and family == "mxfp8" and width in (128, 192, 256):
             implementation = "d256_mxfp8_single_q" if width == 256 else f"d{width}_mxfp8_multi_q"
             expected = f"sm100/{implementation}/kernel.py"
+        if arch == "sm107" and family == "fp8" and width == 512:
+            expected = "sm107/d512_fp8_role_split/kernel.py"
         assert plan._compiled.kernel_module.__file__.endswith(expected)
         assert graph.selected_engine.name == engine_for(width)
         assert plan._prepared.spec.origin_specs is not None and plan._prepared.spec.native is not None
@@ -94,6 +98,9 @@ def origin_checks(family, arch="sm100", shapes=None):
 
         _check_origins(dims, dtype, stats, True, False, 1, engine_name=engine_for(dims), cga=cga, extra_checks=collect)
         shape = "192x128" if isinstance(dims, tuple) else str(dims)
-        assert_golden(f"sdpa-{arch}-{family}-thd-origins-d{shape}-{dtype}-{stats}-cga{cga}", record["inputs"], record["outputs"])
+        # Keep the historical golden key, which encoded the two-CTA MMA
+        # group before this owner exposed the physical four-CTA cluster.
+        golden_cga = 2 if arch == "sm107" and family == "fp8" and dims == 512 else cga
+        assert_golden(f"sdpa-{arch}-{family}-thd-origins-d{shape}-{dtype}-{stats}-cga{golden_cga}", record["inputs"], record["outputs"])
 
     return tuple(map(staticmethod, (test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden)))
