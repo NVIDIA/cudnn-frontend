@@ -23,7 +23,7 @@ def test_dense(dtype, packed, split, layout, monkeypatch):
     def compile_native(api):
         original(api)
         assert api.flavor == (576, 512)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.KV_SHARE == 1
         assert api._k_mod.CFG.N_BMM1_CHUNKS == 3
         assert api._k_mod.DESC_VERSION == 1
@@ -160,7 +160,7 @@ def test_boundaries(page, sq, split, packed, empty, monkeypatch):
     def compile_native(api):
         original(api)
         assert api.flavor == (576, 512) and api._k_mod.CFG.N_BMM1_CHUNKS == 3
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py")
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
     paged._run_graph(
@@ -194,7 +194,7 @@ def test_admission():
 
     import cudnn
 
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d512_2x2")
     graph = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     def desc(width):
@@ -236,7 +236,7 @@ def test_shared_mla_record(dtype, heads, sq, hnd, monkeypatch):
     def compile_native(api):
         original_compile(api)
         assert api.flavor == (576, 512)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d512_f16_2x2.py")
+        assert api._k_mod.__file__.endswith("sm107/d512_f16_2x2/kernel.py")
         assert api._k_mod.CFG.N_BMM1_CHUNKS == 3
 
     monkeypatch.setattr(paged, "_pools", pools)

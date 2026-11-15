@@ -14,6 +14,13 @@ placement need not import the candidate generator to retrieve it. The cold
 host-import and explicit-lowering tests in
 `test_sdpa_fwd_d512_fp8_implementation_contract.py` detect these boundaries.
 
+Pure body-selection functions used by both recommendation and placement can
+live in `fwd/implementation_selection.py`, independent of either caller and
+the registry. Keep performance policy out of fixed kernel contracts. The
+wide-placement import-guard test detects a reverse dependency on the candidate
+generator; preserving the selector's logic and candidate/placement comparison
+checks that moving it does not change ranking.
+
 For explicit implementation records, distinguish the physical CTA cluster
 (`TILE_CGA_M/N`) from the MMA group (`CTA_GROUP`). D512 uses a four-CTA
 cluster containing two-CTA MMA groups; D576 uses a single pair. Translate

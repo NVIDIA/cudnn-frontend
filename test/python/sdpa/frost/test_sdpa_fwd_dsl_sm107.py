@@ -132,7 +132,25 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
     shared_call = re.compile(
         r"running_max_step_finite_sentinel\(\s*(\w+),\s*current_max,\s*total_max,\s*(NEG_INF(?:_F32)?),\s*RESCALE_THRESHOLD(?:_F32)?,\s*masked=CFG\.MASK_FLAGS != MASK_NONE\s*\)"
     )
-    seen_shared = 0
+    # Some original paths have become compatibility shims. Count their logical
+    # bodies once, while checking every old and isolated source independently.
+    isolated_origins = {
+        "d128_f16_multi_q": "prefill_d128_f16.py",
+        "small_f16_batch_pair": "prefill_d128_f16.py",
+        "d192_f16_multi_q": "prefill_d192_d128_f16.py",
+        "d256_f16_lookahead": "prefill_d256_f16.py",
+        "d512_f16_role_split": "prefill_d512_f16.py",
+        "d128_fp8_multi_q": "prefill_d128_fp8.py",
+        "d192_fp8_multi_q": "prefill_d192_d128_fp8.py",
+        "d256_fp8_single_q": "prefill_d256_fp8.py",
+        "d512_fp8_role_split": "prefill_d512_fp8.py",
+        "d128_mxfp8_multi_q": "prefill_d128_mxfp8.py",
+        "d192_mxfp8_multi_q": "prefill_d192_d128_mxfp8.py",
+        "d256_mxfp8_single_q": "prefill_d256_mxfp8.py",
+        "d512_mxfp8_role_split": "prefill_d512_mxfp8.py",
+    }
+    expected = {f"prefill_{shape}_{dtype}.py" for shape in ("d128", "d192_d128", "d256", "d512") for dtype in ("f16", "fp8", "mxfp8")}
+    seen_shared = set()
     for f in files:
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
@@ -151,10 +169,12 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         }, f"{name}: the first operand must be the RAW tile max: {calls}"
         for frag in ("is_first = total_max ==", "update_cond = is_first", "exp_input = ", "new_total_max = total_max"):
             assert frag not in code, f"{name}: the inlined running-max chain {frag!r} remains beside the shared helper"
-        seen_shared += 1
-    assert (
-        seen_shared == 12
-    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; the sm107 d128 f16 file counts through its plain body) take the helper; saw {seen_shared}"
+        seen_shared.add(isolated_origins.get(os.path.basename(os.path.dirname(f)), name))
+    assert expected <= seen_shared, (
+        "the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; "
+        "the sm107 d128 f16 file counts through its plain body) take the helper; "
+        f"missing {sorted(expected - seen_shared)}, saw {sorted(seen_shared)}"
+    )
 
 
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
@@ -534,10 +554,11 @@ def test_sm107_d512_packed_split_graph_and_adapter_contract(monkeypatch, group, 
     assert module.FOLD_SINK == (splits == 1)
     dt = cudnn.data_type.HALF if dtype_name == "float16" else cudnn.data_type.BFLOAT16
     facts = _f16_facts(d_qk=512, d_v=512, h_q=2 * group, h_kv=2, s_q=3, s_kv=257, dtype=dt, dtype_o=dt, causal=True, bottom_right=True, has_sink=True)
-    knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=True, split_kv=splits, sched_policy=0)
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), facts, knobs) is None
+    knobs = engines.SdpaFwdKnobs(cga=4, pack_gqa=True, split_kv=splits, sched_policy=0)
+    caps = _caps("sdpa_fwd_sm107_d512_2x2")
+    assert engines.mismatch(caps, facts, knobs) is None
     for changed in (dict(thd=True, padded=True), dict(has_paged_kv=True, page_size=16), dict(device_cc=(10, 0))):
-        assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), dataclasses.replace(facts, **changed), knobs) is not None
+        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None
 
 
 def test_sm107_d512_2x2_descriptor_version_matches_the_smem_budget():
@@ -2158,8 +2179,10 @@ def test_sm107_gate_rows_claim_exactly_d256():
     assert engines.mismatch(mxfp8, _mxfp8_gate_facts()) is None, "PR-B: the MXFP8 row serves the tail at (256, 256) with a bf16 G"
     # Every other flavor -- and the d=200 envelope ride -- declines by the gate's reason.
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512), (200, 200)):
-        why = engines.mismatch(f16, _gate_facts(d_qk=d_qk, d_v=d_v))
-        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+        caps = _caps("sdpa_fwd_sm107_d512_2x2") if (d_qk, d_v) == (512, 512) else f16
+        assert engines.mismatch(caps, _f16_facts(d_qk=d_qk, d_v=d_v)) is None
+        why = engines.mismatch(caps, _gate_facts(d_qk=d_qk, d_v=d_v))
+        assert why is not None and "epilogue" in why, (d_qk, d_v, why)
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
         fp8_owner = _caps(_fp8_owner((d_qk, d_v)))
         why = engines.mismatch(fp8_owner, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
