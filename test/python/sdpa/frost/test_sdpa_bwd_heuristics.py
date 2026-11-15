@@ -51,6 +51,10 @@ _OFFERED = {
     "sdpa_bwd_sm80_f16_d64": 20619,
     "sdpa_bwd_sm80_f16_two_subgroup": 20620,
     "sdpa_bwd_sm120_f16_two_subgroup": 20621,
+    "sdpa_bwd_sm100_d128_fp8_pair": 20622,
+    "sdpa_bwd_sm100_d128_fp8_accumulation": 20623,
+    "sdpa_bwd_sm100_mxfp8_pair": 20624,
+    "sdpa_bwd_sm100_d256_mxfp8": 20625,
 }
 
 
@@ -80,7 +84,7 @@ def test_fixed_geometry_row_lists_no_knobs():
 def test_single_point_domain_row_lists_its_sole_tiles():
     facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.HALF, is_mxfp8=True, device_cc=(10, 0))
     plans = recommend("A", facts, _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in plans] == [(20603, SdpaBwdKnobs(tile_m=128, tile_n=128))]
+    assert [(p.engine_id, p.knobs) for p in plans] == [(20625, SdpaBwdKnobs(tile_m=128, tile_n=128))]  # the MXFP8 row's D256 chain
 
 
 def test_listed_knobs_are_admissible_and_kind_does_not_matter():
@@ -224,13 +228,13 @@ def test_sm107_fp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
 
 @pytest.mark.parametrize(
     "cc, want",
-    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20603]), ((10, 3), [20603]), ((12, 0), [])],
+    [((10, 7), [20606]), ((11, 0), [20606]), ((10, 0), [20625]), ((10, 3), [20625]), ((12, 0), [])],
     ids=["sm107", "sm110", "sm100", "sm103", "sm120"],
 )
 def test_sm107_mxfp8_row_lists_one_knobless_entry_on_the_rubin_line(cc, want):
     """The block-scale MXFP8 d256 backward row (slot 6 -> 20606): one knob-less entry for an E4M3 ``sdpa_mxfp8_backward`` graph
     with bf16 gradients on the Rubin line (the sm107 rows have no tile axis, unlike the SM100 MXFP8 row's single-point domain);
-    on the SM100 line only that line's own row (20603) lists; nothing on SM120."""
+    on the SM100 line only that line's own D256 chain (20625, the 20603 row's body) lists; nothing on SM120."""
     assert any(s.name == "sdpa_bwd_sm107_mxfp8" for s in bwd_engines.ENGINE_SPECS), "sdpa_bwd_sm107_mxfp8 is not registered"
     facts = _facts(d_qk=256, d_v=256, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, causal=True, device_cc=cc)
     plans = recommend("A", facts, _OFFERED)

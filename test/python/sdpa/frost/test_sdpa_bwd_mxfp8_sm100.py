@@ -186,6 +186,13 @@ def _build_graph(
 
 
 def _plan_index(g, name=_ENGINE):
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
+
+    if name == quantized_contract.MXFP8_ROW:
+        # The row delegates both bodies: the graph is offered under the explicit engine its declaration selects.
+        from cudnn.sdpa import graph_analyzer as ga
+
+        name = quantized_contract.select_mxfp8(ga.analyze(g))
     for i in range(g.get_execution_plan_count()):
         pn = g.get_plan_name_at_index(i)
         if pn == name or pn.startswith(name + "["):
@@ -434,8 +441,8 @@ def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b
     The graph adapter normally selects non-persistent scheduling. Force the
     kernel constructor flag here to cover the CLC zero-trip path as well.
     """
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.dq import BlackwellFmhaBackwardDQ256
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.dkdv import BlackwellFmhaBackwardDKDV256
 
     def with_schedule(init):
         def wrapped(self, *args, **kwargs):
@@ -580,7 +587,8 @@ def _decline_reason(**kw):
     b, hq, hkv = kw.pop("b", 1), kw.pop("hq", 2), kw.pop("hkv", 2)
     sq, skv, d = kw.pop("sq", 256), kw.pop("skv", 256), kw.pop("d", _D)
     scale = kw.pop("scale", 1.0 / math.sqrt(d))
-    spec = next(s for s in ENGINE_SPECS if s.name == _ENGINE)
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
+
     try:
         g, _t, _outs = _build_graph(b, hq, hkv, sq, skv, d, scale=scale, **kw)
     except (cudnn.cudnnGraphNotSupportedError, RuntimeError) as e:
@@ -588,6 +596,9 @@ def _decline_reason(**kw):
     facts = ga.analyze(g)
     if facts is None:
         return "analyzer did not recognise the graph"
+    # The row delegates both bodies: its verdict for a graph is the selected explicit engine's.
+    name = quantized_contract.select_mxfp8(facts) if _ENGINE == quantized_contract.MXFP8_ROW else _ENGINE
+    spec = next(s for s in ENGINE_SPECS if s.name == name)
     return mismatch(spec.capabilities, facts, knobs)
 
 
@@ -706,8 +717,11 @@ def test_half_row_declines_mxfp8_graph():
     g, _t, _outs = _build_graph(1, 2, 2, 256, 256, scale=1.0 / math.sqrt(_D))
     facts = ga.analyze(g)
     assert facts is not None and facts.is_mxfp8 and facts.is_backward
+    from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract
+
+    owner = quantized_contract.select_mxfp8(facts)
     for spec in ENGINE_SPECS:
-        if spec.name != _ENGINE:
+        if spec.name not in (_ENGINE, owner):
             assert mismatch(spec.capabilities, facts) is not None, spec.name
 
 
