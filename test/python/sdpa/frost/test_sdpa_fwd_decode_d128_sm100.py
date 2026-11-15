@@ -51,7 +51,9 @@ from frost_test_utils import launch_f16, offers_engine, requires_dsl, requires_p
 pytestmark = [requires_pre_rubin_blackwell, requires_dsl]
 
 D = 128
-ENGINE = "sdpa_fwd_prefill_sm100"
+LEGACY_ENGINE = "sdpa_fwd_prefill_sm100"
+ENGINE = ("sdpa_fwd_sm100_d128_multi_q", "sdpa_fwd_sm100_d128_single_q", "sdpa_fwd_sm100_d64_quadrant", "sdpa_fwd_sm100_d256_swap_ab")
+OFFERED = dict(zip(ENGINE, (20535, 20532, 20536, 20520)))
 _SM100_ID = 20511  # FROST_SDPA_FWD_ID_BASE + manifest slot 11 (sdpa_fwd_prefill_sm100)
 
 
@@ -286,7 +288,7 @@ def _facts(**over):
 def _plans(facts):
     from cudnn.sdpa.fwd.heuristics import recommend
 
-    plans = recommend("A", facts, {ENGINE: _SM100_ID})
+    plans = recommend("A", facts, OFFERED)
     assert plans, "the SM100 f16 row must be eligible for these facts"
     return plans
 
@@ -344,7 +346,7 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
     # broad D128 row must offer no candidate for that former control case.
     from cudnn.sdpa.fwd.heuristics import recommend
 
-    assert recommend("A", _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), {ENGINE: _SM100_ID}) == []
+    assert recommend("A", _facts(h_q=32, h_kv=2, d_qk=256, d_v=256), OFFERED) == []
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
     # LPT_L2: one head's K+V here is 4096 * 256 * 2 B = 2 MiB, under the SM100 d128 row's 8 MiB floor for the L2 grouping,
     # heuristics._SM100_D128_LPT_L2_MIN_BYTES.)
@@ -371,12 +373,12 @@ def test_heuristics_decode_geometry_follows_the_selected_packing():
     assert legs[0][0] is True, legs
     assert (False, 1) in legs and (False, 2) not in legs and {(True, 1), (True, 2)} <= set(legs), legs
     assert {p.knobs.cga for p in _plans(_facts(s_q=129))} == {1, 2}, "129 rows overflow one tile unpacked too: both widths"
-    fallback = recommend("B", _facts(s_q=16), {ENGINE: _SM100_ID})
+    fallback = recommend("B", _facts(s_q=16), OFFERED)
     assert [(p.knobs.pack_gqa, p.knobs.cga) for p in fallback] == [(False, 1)], fallback
     # MHA has no group: one rule for the only leg.
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=64, h_q=8, h_kv=8)))
     assert {p.knobs.cga for p in _plans(_facts(s_q=129, h_q=8, h_kv=8))} == {1, 2}
-    caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == ENGINE).capabilities
+    caps = engines.sm100_legacy_policy_spec(LEGACY_ENGINE).capabilities
     for f in (_facts(s_q=16), _facts(s_q=9, causal=True, bottom_right=True)):
         for p in _plans(f):
             assert engines.mismatch(caps, f, p.knobs) is None, p.knobs
@@ -399,7 +401,7 @@ def test_heuristics_split_the_decode_tile_on_an_underfilled_launch():
 def test_mismatch_admits_cga1_on_dense_d128_and_declines_it_for_thd():
     from cudnn.sdpa.fwd import engines
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == ENGINE)
+    spec = engines.sm100_legacy_policy_spec(LEGACY_ENGINE)
     caps = spec.capabilities
     assert engines.mismatch(caps, _facts(), engines.SdpaFwdKnobs(cga=1)) is None
     assert engines.mismatch(caps, _facts(s_q=512, padded=False), engines.SdpaFwdKnobs(cga=1)) is None, "a pinned cga=1 is honored on any dense S_q"
@@ -1050,7 +1052,9 @@ def _paged_graph(
         assert all(
             g.plans[i].knobs.cga != pin_cga for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(ENGINE)
         ), "cga already proposed; pin is moot"
-        g.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=pin_cga, pack_gqa=plan.knobs.pack_gqa, split_kv=1))
+        g.create_execution_plan(
+            20535 if pin_cga == 2 else 20532, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=pin_cga, pack_gqa=plan.knobs.pack_gqa, split_kv=1)
+        )
         g.select_plan(len(g.plans) - 1)
         plan = g.plans[len(g.plans) - 1]
     g.check_support()
@@ -1239,7 +1243,7 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     assert offers_engine(g, ENGINE)
     # SM100 admits the two-slab single-CTA prefill body; SM103 keeps its existing domain.
     g2 = _build()
-    g2.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
+    g2.create_execution_plan(20535, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
     g2.select_plan(0)
     if torch.cuda.get_device_capability() == (10, 0):
         g2.check_support()
@@ -1328,7 +1332,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
 
     specs = list(engines.ENGINE_SPECS.values()) if isinstance(engines.ENGINE_SPECS, dict) else list(engines.ENGINE_SPECS)
-    caps = next(s for s in specs if s.name == ENGINE).capabilities
+    caps = engines.sm100_legacy_policy_spec(LEGACY_ENGINE).capabilities
     leg = _ragged_paged_facts()
     assert _thd_decode_leg(caps, leg)
     assert _thd_decode_leg_divisors(leg) == (64 * 128, 64 * 128, 64) and not _thd_decode_leg_int64(leg)

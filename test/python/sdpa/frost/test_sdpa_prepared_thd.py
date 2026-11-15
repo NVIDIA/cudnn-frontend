@@ -2031,7 +2031,7 @@ def test_packed_thd_grid_capture_changes_lengths(hnd, dtype, page, geometry):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names()))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
     for policy in (0, 1):
@@ -3116,8 +3116,19 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         # Exercise the public default without pinning a particular split count.
         g.build_plans()
     else:
+        if arch == "sm100" and d in (128, 192):
+            # The explicit single-CTA split request belongs to single-Q,
+            # even when the ranked unsplit candidate used multi-Q.
+            engine = 20532
         g.create_execution_plan(
-            engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
+            engine,
+            {
+                **knobs,
+                cudnn.knob_type.TILE_M: 128,
+                cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1,
+                cudnn.knob_type.SPLIT_KV: splits,
+                cudnn.knob_type.PACK_GQA: int(pack_gqa),
+            },
         )
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
     ws = torch.empty(g.get_workspace_size(), device=DEV, dtype=torch.uint8)

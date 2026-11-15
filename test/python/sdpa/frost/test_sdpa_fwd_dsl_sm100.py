@@ -825,6 +825,8 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
             (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
             (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
         }.get(d_shape, name)
+    if not fp8 and _SM in (100, 103) and d_shape == (192, 128):
+        name = "sdpa_fwd_sm100_d192_multi_q"
     if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"

@@ -439,6 +439,17 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
         tile_m, tile_n, cga = 64, 32 if d > 256 else 64, 1
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
+    if cc in ((10, 0), (10, 3)):
+        if (d, d_v) == (192, 128):
+            engine_id = 20531
+        elif d == d_v and d in (32, 64, 128):
+            # Preserve this fixture's native prefill/single-Q ABI. Short D64
+            # packed rows use the separate quadrant body.
+            engine_id = 20535 if prefill else 20532
+            if not prefill and d <= 64 and sq * (h // kh) <= 32:
+                engine_id, tile_m = 20536, 32
+            elif not prefill and d == 128 and paged and sq * (h // kh) <= 8:
+                engine_id, tile_m = 20520, 16
     if cc in ((10, 0), (10, 3)) and (d, d_v) == (256, 256):
         # Pin the same body this fixture exercised before the row split.
         # Its short packed Q rows used swap-AB even with the old CGA2 knob.

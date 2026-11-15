@@ -2104,16 +2104,24 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=
     rejection, "unsupported forward graph") into failures: a config that claims FROST
     coverage must run."""
     import frost_routing
-    key = f"frost:{engine}"
-    before = frost_routing.snapshot().get(key, 0)
+    owners = {
+        (64, 64): ("sdpa_fwd_sm100_d128_fp8_multi_q", "sdpa_fwd_sm100_d128_fp8_dual_kv", "sdpa_fwd_sm100_d128_fp8_swap_ab"),
+        (128, 128): ("sdpa_fwd_sm100_d128_fp8_multi_q", "sdpa_fwd_sm100_d128_fp8_dual_kv", "sdpa_fwd_sm100_d128_fp8_swap_ab"),
+        (192, 128): ("sdpa_fwd_sm100_d192_fp8_multi_q",),
+        (256, 256): ("sdpa_fwd_sm100_d256_fp8_single_q",),
+        (512, 512): ("sdpa_fwd_sm100_d512_fp8_role_split",),
+    }
+    names = owners.get((cfg.d_qk, cfg.d_v), (engine,)) if engine == FROST_FP8_ENGINE else (engine,)
+    keys = tuple(f"frost:{name}" for name in names)
+    before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:
         exec_sdpa_fp8(cfg, request, cudnn_handle)
     except pytest.skip.Exception as e:
         if strict and not request.config.option.dryrun:
             pytest.fail(f"FROST-asserting fp8 config must run, not skip: {e}", pytrace=False)
         raise
-    after = frost_routing.snapshot().get(key, 0)
-    assert after == before + 1, f"expected {key} to serve this graph; routing tally: {frost_routing.snapshot()}"
+    after = sum(frost_routing.snapshot().get(key, 0) for key in keys)
+    assert after == before + 1, f"expected {keys} to serve this graph; routing tally: {frost_routing.snapshot()}"
 
 
 @pytest.mark.L0
