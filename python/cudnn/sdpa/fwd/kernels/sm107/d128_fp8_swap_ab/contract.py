@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from cudnn import data_type
 from ...sm100.d128_fp8_swap_ab.contract import Geometry as SharedGeometry
 from ..small_fp8_contract import in_domain
+from ..fp8_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm107_d128_fp8_swap_ab"
 LEGACY_ROW = "sdpa_fwd_prefill_sm107_fp8"
@@ -19,8 +20,8 @@ class Geometry(SharedGeometry):
 
 
 def mismatch(facts, knobs):
-    if not in_domain(facts) or (facts.d_qk, facts.d_v) != (128, 128):
-        return "swap-AB requires exact D128 per-tensor FP8 on SM107"
+    if not in_domain(facts) or padded_shape(facts) != (128, 128):
+        return "swap-AB requires a D128 per-tensor FP8 envelope on SM107"
     if facts.thd or facts.has_paged_kv or not (0 < facts.b <= 65535):
         return "swap-AB requires dense nonpaged queries and batch in [1, 65535]"
     if facts.o_block_scale or facts.dtype_o not in (data_type.FP8_E4M3, data_type.FP8_E5M2, data_type.HALF, data_type.BFLOAT16):

@@ -50,7 +50,7 @@ class Geometry:
 
 def mismatch(facts, knobs):
     if not in_domain(facts):
-        return "requires exact D64/D128 per-tensor FP8 on SM107"
+        return "requires a D64/D128 per-tensor FP8 envelope on SM107"
     if knobs is not None:
         widths = (None, 1, 2)
         if knobs.cga not in widths:

@@ -229,7 +229,14 @@ def test_sm107_decode_body_matches_the_sm100_body():
         return [ln for ln in _code_lines(src[end:]).splitlines() if ln.strip()]
 
     a, b = _body(sm100), _body(sm107)
-    a = [ln for ln in a if ln != "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME"]
+    sm100_name_import = "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME as TEMPLATE_NAME"
+    assert a.count(sm100_name_import) == 1
+    from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.contract import TEMPLATE_NAME
+
+    sm107_name_assignment = f'TEMPLATE_NAME = "{TEMPLATE_NAME}"'
+    assert b.count(sm107_name_assignment) == 1
+    a = [ln for ln in a if ln != sm100_name_import]
+    b = [ln for ln in b if ln != sm107_name_assignment]
     # Pin the exact SM100-only specialization before comparing the shared body.
     # Removing an arbitrary AST branch would hide edits to its zero-fill/fence.
     sm100_only = {
@@ -269,10 +276,12 @@ def test_sm107_decode_body_matches_the_sm100_body():
         )
     ]
     b = [ln for ln in b if ln != "from cudnn.frost.buffers import cutedsl_arch_requirement_error"]
+    sm107_config_import = "from cudnn.sdpa.fwd.kernels.sm107.d256_f16_swap_ab.config import d256_decode_desc_version, make_cfg_d256_decode"
+    assert b.count(sm107_config_import) == 1
     b = [
         ln.replace(
-            "from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d256_decode_desc_version, make_cfg_d256_decode",
-            "from cudnn.sdpa.fwd.config_common import TemplateParams\nfrom cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode",
+            sm107_config_import,
+            "from cudnn.sdpa.fwd.kernels.sm100.d256_f16_swap_ab.config import make_cfg_d256_decode",
         )
         for ln in b
     ]
