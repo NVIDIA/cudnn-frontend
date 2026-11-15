@@ -457,7 +457,7 @@ class Capabilities:
     # the classic-pipeline TMEM stats race — the next tile's prologue BMM1
     # overwrote the S_acc-head (total_max, total_sum) before the correction
     # epilogue read them — and fixed by the mb_stats_read barrier (same fix as
-    # the f16 kernel's; see sm100/prefill_d128_fp8.py / _common_blackwell.Bars).
+    # the f16 kernel's; see sm100/d128_fp8_multi_q/kernel.py / _common_blackwell.Bars).
     single_wave_only: bool = False
     # Serve ragged S_kv on unmasked graphs through the kernel's padded mask
     # compiled against the scalar S_kv (TemplateParams.kv_tail_mask, no
@@ -857,7 +857,7 @@ def _thd_decode_leg_int64(facts: "ga.SdpaGraphFacts") -> bool:
 
 def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     """True when a THD (ragged Q/O/Stats) graph rides the SM100 d128 DECODE tile's
-    ragged-Q leg (``sm100/decode_d128_f16.py``, ``TemplateParams.ragged_q``)
+    ragged-Q leg (``sm100/d128_f16_single_q/kernel.py``, ``TemplateParams.ragged_q``)
     instead of the prefill tile's THD leg: the FlashInfer prefill-style paged
     graph at one token per sequence.
 
@@ -936,7 +936,7 @@ def _facts_decode_form_kw(facts: "ga.SdpaGraphFacts") -> dict:
 def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 DECODE tile -- the
     swap-AB tile, ``sm100/d256_f16_swap_ab/kernel.py`` on the Blackwell row and
-    ``sm107/decode_d256_f16.py`` on the Rubin row -- the facts-level twin of
+    ``sm107/d256_f16_swap_ab/kernel.py`` on the Rubin row -- the facts-level twin of
     ``SdpaFwdDslSm100._decode_q_tile`` (and of the heuristics' cost-model gate):
     half inputs, dense (not THD) queries, the (256, 256) flavor, no pre-folded scale
     (not wired on the decode tile), and ``S_q x pack_g`` packed Q rows within the
@@ -2152,7 +2152,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             cga=knobs.cga,
             split_kv=knobs.split_kv or 1,
         )
-        # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row Q tile
+        # The d256 DECODE tile (sm107/d256_f16_swap_ab/kernel.py) packs the WHOLE group into its 16-row Q tile
         # over a dense or paged cache (HEADS_PER_TILE = QH_PER_KH) and writes the SM100 tile's fp32 split
         # partials for sm100/split_combine, so a decode-shaped half d256 graph packs and splits whatever
         # its cache form; every other Rubin half packing / d256 split rides the paged / packed-split
@@ -2877,7 +2877,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if not capabilities.independent_paged_pool_counts and facts.paged_pool_counts[0] != facts.paged_pool_counts[1]:
             return "this engine requires equal K/V page-pool capacities"
         # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
-        # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/decode_d256_f16.py)
+        # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/d256_f16_swap_ab/kernel.py)
         # walks the block table itself and folds the sink per Q row, so a decode-shaped half d256
         # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries
         # also use native half D128; the MXFP8 row answers through its own flags above.
@@ -3086,7 +3086,7 @@ def _sm100_spec() -> EngineSpec:
     dims (api_dsl._pick_flavor), and every flavor serves its envelope via TMA
     zero-padding. The d128 flavor has two tiles behind one knob: TILE_CGA_M=2
     is the prefill pipeline (512 Q rows per cluster), TILE_CGA_M=1 the decode
-    tile (128 rows per CTA, sm100/decode_d128_f16.py) -- the "decode vs prefill
+    tile (128 rows per CTA, sm100/d128_f16_single_q/kernel.py) -- the "decode vs prefill
     by S_q" kernel choice EngineSpec.lower anticipates, driven by the
     heuristics' cga rule. The separate SM107 row owns Rubin lowering."""
     return EngineSpec(
@@ -3159,7 +3159,7 @@ def _sm100_spec() -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
             # (128, 128): TILE_CGA_M=1 IS the d128 DECODE tile
-            # (sm100/decode_d128_f16.py -- TILES_Q=1, one softmax warpgroup,
+            # (sm100/d128_f16_single_q/kernel.py -- TILES_Q=1, one softmax warpgroup,
             # three KV stages; config_sm100.CfgD128Decode), which the lowering
             # selects for that knob value on dense graphs (THD keeps cga2, see
             # mismatch).  The heuristics propose it when one 128-row tile
@@ -3420,7 +3420,7 @@ def _sm107_spec() -> EngineSpec:
     (a version-0 descriptor addresses only 256 KiB, and Rubin's 327 KiB budget
     puts the d512 flavor's P ring at exactly that boundary).  The f16 line
     carries all four SM100 flavors, d192xd128 included
-    (``sm107/prefill_d192_d128_f16.py`` — the d128 body with ``make_cfg_d192``);
+    (``sm107/d192_f16_multi_q/kernel.py`` — the d128 body with ``make_cfg_d192``);
     the QUANTIZED Rubin rows are the ones that ship a strict subset.
 
     Every capability below was MEASURED on Rubin (`w2u1g-lc-0030`) against an
@@ -3465,7 +3465,7 @@ def _sm107_spec() -> EngineSpec:
       Dense (non-THD) paged queries stay declined EXCEPT a DECODE-shaped half d256 graph
       (dense Q, ``S_q x G`` packed rows within the tile's routed envelope -- 16 rows, or the
       32-column tile in up to two token units for a packed MTP step -- sink or not), which
-      rides the d256 decode tile ``sm107/decode_d256_f16.py`` instead
+      rides the d256 decode tile ``sm107/d256_f16_swap_ab/kernel.py`` instead
       (``d256_decode_tile_selected``), which walks the block table itself.
     - ``decode``: stated, not inherited -- ``S_q == 1`` is served on every
       flavor, and on d256 it is the decode tile above (the swap-AB body ported
@@ -3600,8 +3600,8 @@ def _sm107_spec() -> EngineSpec:
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
             # (128, 128) half carries two tiles behind TILE_CGA_M on cc 10.7 as on the SM100 row: cga2 = the Rubin prefill
-            # pipeline (sm107/prefill_d128_f16.py; a packed set runs the shared SM100 prefill body), cga1 = the shared 128-row
-            # decode tile (sm100/decode_d128_f16.py compiled for cc 10.7, issue #1472).  Dense graphs only: effective_cgas
+            # pipeline (sm107/d128_f16_multi_q/kernel.py; a packed set runs the shared SM100 prefill body), cga1 = the shared 128-row
+            # decode tile (sm100/d128_f16_single_q/kernel.py compiled for cc 10.7, issue #1472).  Dense graphs only: effective_cgas
             # keeps THD, dense paged and the pre-folded scale on cga2.  A split rides either width (no split_cgas entry).
             # The small tiles run at the widths their bodies are validated at (one constant with the config factory, which
             # refuses any other): cga1 for both -- the narrow slabs need no collective MMA to halve K/V, and a 512-row
@@ -3838,7 +3838,7 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             split_kv_supported=True,
             # PackGQA on the d128 flavor: the kernel gathers the packed tile's
             # per-row scale factors out of the group's F8_128x4 atoms (see
-            # sm100/prefill_d128_mxfp8.py); plain O, dense only -- mismatch() declines
+            # sm100/d128_mxfp8_multi_q/kernel.py); plain O, dense only -- mismatch() declines
             # the rest.  The other flavors keep the one-atom TMA path.
             pack_gqas=frozenset({False, True}),
             pack_gqa_d_shapes=frozenset({(128, 128)}),

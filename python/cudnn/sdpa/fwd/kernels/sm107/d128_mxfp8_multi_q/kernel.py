@@ -7,7 +7,7 @@
 scheduler).  Same pipeline structure as the FP8 twin.
 
 The softmax ROW-SUM rides the tensor core, exactly as the per-tensor FP8 sibling
-``sm107/prefill_d192_d128_fp8.py`` does it: an N=16 ones-BMM runs over the same
+``sm107/d192_fp8_multi_q/kernel.py`` does it: an N=16 ones-BMM runs over the same
 quantized P tile that BMM2 consumes, accumulating the softmax denominator into
 16 TMEM columns behind each sub-tile's O.  The softmax warps never build it in
 registers, and the correction warp's alpha-rescale covers O and the running
@@ -64,7 +64,7 @@ PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams()
 CFG, _TMA = make_cfg_d128_mxfp8(PARAMS)
 # Paged KV (CFG.PAGED_KV): K/V and their F8_128x4 scale-factor pools are addressed through the block tables -- the page
 # id is the TMA batch coordinate of the K/V AND SF descriptors and the tile inside the page the SF tile coordinate (the
-# SM100 sibling's specialization, sm100/prefill_d128_mxfp8.py); page -1 past a sequence's live pages is TMA-OOB zero
+# SM100 sibling's specialization, sm100/d128_mxfp8_multi_q/kernel.py); page -1 past a sequence's live pages is TMA-OOB zero
 # fill.  A page holds whole 128-row SF atom sets, so PAGE_SIZE is a multiple of TILE_N (config_sm107 backstops it).
 # Paging changes the TMA-LDG warp's coordinates and the host's descriptor extents only: no SMEM, so the version-0
 # descriptor window and the k_dim=1 / TILE_K_HW=64 pin below are untouched.
@@ -3054,7 +3054,7 @@ def _host(
     o_partial_f32: Optional[cute.Tensor] = None,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    # sm107/d128_fp8_multi_q/kernel.py sibling does.
     stream: _cuda_driver.CUstream = None,
     prepared_sfo_geometry: cutlass.Constexpr = None,
 ) -> None:

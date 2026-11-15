@@ -2249,7 +2249,7 @@ def _correction_warp_group(
             inv_sum = cutlass.Float32(1.0) / cute.math.max(total_sum, cutlass.Float32(1e-30))
 
         # --- empty KV range (zero-length sequence under the padding mask) ---
-        # Same guard as sm107/prefill_d256_fp8.py: with bounds.right <=
+        # Same guard as sm107/d256_fp8_single_q/kernel.py: with bounds.right <=
         # bounds.left the mainloop never ran, so total_max/total_sum are still 0
         # and the 1e-30 denominator floor yields LSE = log(1e-30) = -69.08 and
         # inv_sum = 1/1e-30 -> +inf, making O = (TMEM residue) * inf.

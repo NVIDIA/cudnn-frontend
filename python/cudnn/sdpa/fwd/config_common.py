@@ -137,9 +137,9 @@ class TemplateParams:
     # capability at compile time (MXFP8 + the per-tensor FP8 d192x128 kernel; the f16
     # kernels do not read it, and the SM107 siblings carry the instruction unconditionally).
     fused_ldtm_stat: bool = False
-    # exp2 MUFU / FMA split of the sm100 softmax (the _E2E_* block of sm100/prefill_d128_mxfp8.py,
-    # prefill_d128_fp8.py and prefill_d192_d128_f16.py; the _exp2_* helper mix of
-    # prefill_d192_d128_fp8.py): a slice of the exp2 per row on the FMA pipe instead of MUFU.EX2.
+    # exp2 MUFU / FMA split of the sm100 softmax (the _E2E_* block of sm100/d128_mxfp8_multi_q/kernel.py,
+    # d128_fp8_multi_q/kernel.py and d192_f16_multi_q/kernel.py; the _exp2_* helper mix of
+    # d192_fp8_multi_q/kernel.py): a slice of the exp2 per row on the FMA pipe instead of MUFU.EX2.
     # Claimed per KERNEL and per ARCH, because its sign follows the part's MUFU.EX2 rate: MEASURED
     # 16 elements/clk/SM on cc 10.0 (B200, where the split is +7.8 % on d128 MXFP8, +4.5 % on d128
     # FP8, +1.9 % on d192x128 bf16 at the chart layers, +7.0 % causal / +5.7 % dense on d192x128 FP8
@@ -147,12 +147,12 @@ class TemplateParams:
     # exp2 costs 1.99x the MUFU time it frees); cc 10.3 (B300) has the doubled rate too -- MEASURED
     # -10 % causal / -6 % dense on d192x128 FP8 with the split on.  Auto-set by the adapter from the
     # BUILD device (api_dsl._exp2_fma_split_for: cc == (10, 0) x the four kernels above, and the d64
-    # decode tile, sm100/decode_d128_f16.py, through its own set) -- widen only after an A/B on the new
+    # decode tile, sm100/d128_f16_single_q/kernel.py and sm100/d64_f16_quadrant/kernel.py, through its own set) -- widen only after an A/B on the new
     # cc / kernel.  Off, the kernel traces the plain MUFU exp2 (the develop spelling).  Only those
     # kernels read it; make_cfg_d192 also derives CfgD192.EXP2_TAIL_MIX, the d192x128 f16 kernel's dense-causal arm
     # spelling, from it.
     exp2_fma_split: bool = False
-    # The L2-prefetching loader of the half-input single-CTA d192x128 tile (sm100/prefill_d192_d128_f16.py at cta_mma=1,
+    # The L2-prefetching loader of the half-input single-CTA d192x128 tile (sm100/d192_f16_multi_q/kernel.py at cta_mma=1,
     # half precision): the TMA-LDG warp prefetches the K/V tiles one kv step ahead and the next tile's Q / first K/V
     # into L2, runs its kv loop unrolled 1x, and the dense-causal arm keeps the plain MUFU exp2.  Claimed per arch like
     # exp2_fma_split: set by the adapter (api_dsl._cga1_l2_prefetch_for) on the cc it is measured on; off, the tile
@@ -208,7 +208,7 @@ class TemplateParams:
     # and 64 on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
     # Plan-time only (S_q is a declared shape).
     decode_q_tile: int = 0
-    # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
+    # The 128-row DECODE tile (sm100/d128_f16_single_q/kernel.py) for flavors that do not
     # key it off cta_mma.  d128 routes that tile by cga1, because its prefill
     # pipeline wants cga2 anyway; d64's prefill is FASTEST at cga1 (a 512-row
     # cga2 cluster wastes most of a narrow diagonal band), so the two legs would
@@ -216,16 +216,16 @@ class TemplateParams:
     # cache key, so one record must never name two kernels.  Set by
     # SdpaFwdDslSm100._d64_decode_tile, the twin of _decode_q_tile.
     decode_tile: bool = False
-    # The quadrant-cooperative softmax of the d64 decode tile (sm100/decode_d128_f16.py QUAD): the live Q rows (S_q x packed heads <= 32) are loaded into
+    # The quadrant-cooperative softmax of the d64 decode tile (sm100/d64_f16_quadrant/kernel.py): the live Q rows (S_q x packed heads <= 32) are loaded into
     # all four TMEM lane quadrants and each softmax warp owns a quarter of the key columns, the correction warps merging the four partials per unit.
     # Needs decode_tile; set by SdpaFwdDslSm100._d64_decode_quad.
     decode_quad: bool = False
-    # The decode tile's early-Q form (sm100/decode_d128_f16.py EARLY_Q): the Q slab is released by the last BMM1 of a unit instead of the O store's
+    # The decode tile's early-Q form (sm100/d128_f16_single_q/kernel.py EARLY_Q): the Q slab is released by the last BMM1 of a unit instead of the O store's
     # return edge, and the correction warps store the half output straight from TMEM.  Claimed per arch, like exp2_fma_split: set by
     # SdpaFwdDslSm100._decode_early_q on the cc it was measured on (10.0, 10.3); an unmeasured part (cc 10.7 loads the same tile) keeps the staged
     # TMA store.  The THD / ragged legs keep it whatever the field says.
     early_q: bool = False
-    # Per-tensor FP8 d128 decode: the two Q sub-tiles of sm100/prefill_d128_fp8.py
+    # Per-tensor FP8 d128 decode: the two Q sub-tiles of sm100/d128_fp8_dual_kv/kernel.py
     # become two KV STREAMS over one 128-row Q tile (even KV tiles on sub-tile 0,
     # odd on sub-tile 1, each with its own running max / sum, merged once in
     # the epilogue).  Doubles the K/V bytes per pipeline step, which is what the
@@ -285,8 +285,8 @@ class TemplateParams:
     # item and the softmax warps read their row slice with swizzled lane loads, adding it pre-scale as one FFMA per
     # score (``s + bias * inv_scale``) before the band mask and the software row max.  A compile-time axis (the SMEM
     # block, two mbarriers and the masked-path softmax arm fold on it) and therefore part of the module-cache key.
-    # Served by ``sm107/prefill_d128_f16.py`` at the widths whose SMEM holds at least one 128-column block
-    # (``config_sm107.sm107_bias_resident_s_kv_max``); the SM100 line and every other flavor decline it.
+    # Served by ``sm107/d128_f16_multi_q/kernel.py`` and ``sm107/small_f16_batch_pair/kernel.py`` at the widths whose SMEM
+    # holds at least one 128-column block (``config_sm107.sm107_bias_resident_s_kv_max``); the SM100 line and every other flavor decline it.
     bias_mode: int = 0
     # Per-key mask (the python-only ``kv_mask`` input of ``sdpa``, ``[1|B, 1, 1, S_kv]``): 0 = none; 1 = the BOOLEAN
     # mask in the bit-word form -- each softmax warp assembles one 32-bit keep word per 32 kv columns of the tile by a
@@ -381,7 +381,7 @@ class TemplateParams:
     # j < B * floor(i / B) -- query i never reads its own B-token block, so with B = 32 every V scale block it reads
     # covers fully visible tokens only.  0 = plain causal (every record so far renders byte-identically).  A
     # template-key field: the mask band and the empty-row geometry are traced from it.  Read by the SM100 MXFP8 d128
-    # body only (kernels/sm100/prefill_d128_mxfp8.py); _validate_params refuses it everywhere else.
+    # body only (kernels/sm100/d128_mxfp8_multi_q/kernel.py); _validate_params refuses it everywhere else.
     causal_exclude_own_block: int = 0
 
 
@@ -470,14 +470,14 @@ def _validate_params(
     if k.cta_mma not in (1, 2):
         raise ValueError(f"{flavor}: cta_mma must be 1 (cga1) or 2 (cga2); got {k.cta_mma}")
     if k.decode_tile and flavor != "d64":
-        # The loader routes a decode_tile record to sm100/decode_d128_f16.py at
+        # The loader routes a decode_tile record to sm100/d128_f16_single_q/kernel.py (sm100/d64_f16_quadrant/kernel.py under decode_quad) at
         # d_flavor=64 (make_cfg_d64_decode); no other template consumes it.
         raise ValueError(f"{flavor}: decode_tile selects the d64 decode tile; this template does not consume it")
     if k.decode_quad and not (k.decode_tile and k.early_q):
         raise ValueError(f"{flavor}: decode_quad is the d64 decode tile's quadrant softmax; it needs decode_tile and early_q")
     if k.dual_kv_stream and (flavor != "d128" or k.dtype_qkv > 1 or k.cta_mma != 1 or k.thd_varlen or k.pv_bf16):
         # Two KV streams over one Q tile: the per-tensor FP8 d128 pipeline at cga1
-        # on a dense or paged graph (sm100/prefill_d128_fp8.py); nothing else
+        # on a dense or paged graph (sm100/d128_fp8_dual_kv/kernel.py); nothing else
         # consumes the record (the sibling templates raise on it at import).
         raise ValueError(
             f"{flavor}: dual_kv_stream is the per-tensor FP8 d128 cga1 dense/paged decode specialization; got dtype_qkv={k.dtype_qkv} cta_mma={k.cta_mma} thd={k.thd_varlen}"
@@ -549,7 +549,7 @@ def _validate_params(
                 "paged half d256 cga2, or native half d576 cga2"
             )
     if k.ragged_q:
-        # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
+        # The decode tile's ragged-Q leg (sm100/d128_f16_single_q/kernel.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
         # placed by the split combine -- so the split path is mandatory and the
         # K/V side must be the page pools (a ragged K/V needs the THD leg).
