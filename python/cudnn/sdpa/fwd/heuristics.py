@@ -50,6 +50,7 @@ from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 import cudnn
 
 from cudnn.engines.base import PlanConfig
+from .implementation_selection import select_sm107_d512_geometry
 from cudnn.frost.tile_dsl.constants import (
     DECODE_COMBINE_MAX_LEAN_BLOCKS,
     DTYPE_BF16,
@@ -3559,19 +3560,6 @@ def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
         prefolded=facts.attn_scale_prefolded,
         gated=facts.has_epilogue_gate,
     )
-
-
-def select_sm107_d512_geometry(facts, knobs):
-    """Resolve the native wide-half body before compile, preserving the old default."""
-    from .kernels.sm107.d512_half_contract import ROLE_SPLIT, TWO_BY_TWO, explicit_geometry
-
-    pack = bool(knobs.pack_gqa)
-    split = knobs.split_kv or 1
-    group = facts.h_q // facts.h_kv if pack else 1
-    two_by_two = facts.d_qk == 576 or (split == 1 and not facts.has_paged_kv and 64 % group == 0)
-    # Native dense packed, paged, split and mixed-KV plans already require 2x2.
-    two_by_two = two_by_two or not facts.uniform_dtype or (not facts.thd and (facts.has_paged_kv or pack or split > 1))
-    return explicit_geometry(TWO_BY_TWO if two_by_two else ROLE_SPLIT, facts)
 
 
 def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
