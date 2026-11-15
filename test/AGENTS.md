@@ -288,6 +288,28 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+Audit dotted module names as well as file paths when retiring a kernel.
+Check direct imports, `from package import old_module`, and strings passed
+to `find_spec` or `import_module`;
+a search for the old `.py` basename misses them. The SM107 D256 descriptor
+version cases and the gated-block EXTEND PDL source check cover both forms.
+
+Include embedded subprocess scripts when auditing retired kernel paths. A
+filename inside a Python source string is invisible to ordinary import/path
+analysis. Run its actual child process and retain the instruction-level
+assertions after migrating the path; the FP8 decode score-release probe in
+`sdpa/frost/native_fp8_decode_sm100.py` exercises this boundary.
+
+When retiring a kernel file, run its shared binding and pointer-ABI fixtures:
+they may construct the old filename dynamically, so a literal-path search is
+not sufficient. Source inventories must include isolated `kernel.py` paths
+relative to the architecture directory. When one file splits into two bodies,
+check each body's barrier back-edge separately rather than keeping the old
+aggregate count or dropping a body from coverage. Detectors include
+`test_sdpa_native_dense_binding.py`, `test_sdpa_native_prefill_binding.py`,
+`test_sdpa_fwd_pointer_abi.py`, `test_sdpa_fwd_o_empty_backedge.py`, and the
+MXFP8 credit-arrive inventory in `test_sdpa_fwd_mxfp8_sm100.py`.
+
 PTX hash records also depend on imported helpers and the trace probe's fake
 tensor geometry. A scheduler or shared decoder change can invalidate a record
 even when the kernel file itself is unchanged. Before refreshing a record,

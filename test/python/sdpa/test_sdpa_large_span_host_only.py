@@ -26,7 +26,7 @@ pytestmark = pytest.mark.L0
 
 _SM120_BWD_PROBE = textwrap.dedent("""
     import sys
-    from cudnn.sdpa.bwd.kernels.sm120 import bprop_f16 as m
+    from cudnn.sdpa.bwd.kernels.sm120.f16_fused import kernel as m
     b, s, h, kvh = (int(x) for x in sys.argv[1:5])
     m.compile((12, 0), b=b, qh=h, sq=s, skv=s, d_qk=128, kvh=kvh)
 """)
@@ -44,6 +44,8 @@ def _lower_sm120_bwd(b, s, h, kvh):
         )
         run = subprocess.run([sys.executable, "-c", _SM120_BWD_PROBE, *map(str, (b, s, h, kvh))], env=env, capture_output=True, text=True)
         if run.returncode != 0:
+            # A broken project import is a failure; only a missing compiler target is a skip.
+            assert "ImportError" not in run.stderr and "ModuleNotFoundError" not in run.stderr, run.stderr[-2000:]
             pytest.skip(f"the installed CuTe DSL cannot lower sm_120a here: {run.stderr[-300:]}")
         texts = []
         for path in glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True):

@@ -138,7 +138,7 @@ def test_the_epilogue_selects_the_trimmed_rows_after_the_scale():
     """Static detector (sdpa-invariants s 2): the SM100 d128 file's O store multiplies ``o_chunk * inv_sum`` exactly once, and the
     per-batch-Q-length arm SELECTS ``row_trim | row_dead`` to zero right after it (``vec_select_zero``), before the cast -- never a
     zero folded into the scale alone."""
-    from cudnn.sdpa.fwd.kernels.sm100 import prefill_d128_f16 as kmod
+    from cudnn.sdpa.fwd.kernels.sm100.d128_f16_multi_q import kernel as kmod
     from cudnn.frost.tile_dsl import pointwise
 
     src = inspect.getsource(kmod)

@@ -210,6 +210,8 @@ def _sm80_facts(**over):
         {"s_q": 200},
         {"s_kv": 192},
         {"thd": True, "max_total_seq_len_q": 512, "max_total_seq_len_kv": 512},
+        {"right_band_widening": True, "right_bound": 64},
+        {"right_band_widening": True, "right_bound": 64, "causal": True},
     ],
 )
 def test_sm80_selector_is_the_adapters_d64_rule(over):
@@ -218,7 +220,8 @@ def test_sm80_selector_is_the_adapters_d64_rule(over):
     from cudnn.sdpa.bwd.kernels.sm80 import half_contract
 
     f = _sm80_facts(**over)
-    mask = "none" if not (f.causal or f.window_left is not None) else "masked"
+    is_causal = f.causal or f.right_band_widening  # what lower_dsl_bwd hands the adapter
+    mask = "none" if not (is_causal or f.window_left is not None) else "masked"
     adapter = not f.thd and _sm80_d64_fast_path_eligible(
         d_qk=f.d_qk,
         d_v=f.d_v,
@@ -227,7 +230,7 @@ def test_sm80_selector_is_the_adapters_d64_rule(over):
         s_q=f.s_q,
         s_kv=f.s_kv,
         mask_token=mask,
-        right_bound=0,
+        right_bound=f.right_bound if f.right_band_widening else 0,
         causal_bottom_right=f.bottom_right,
         bw_kwargs=dict(
             seq_kv_lens=object() if f.padded else None,

@@ -791,19 +791,21 @@ def _sm80_d64_fast_path_eligible(*, d_qk, d_v, h_q, h_kv, s_q, s_kv, mask_token,
     The perf variant computes a plain dense MHA backward and nothing else;
     every condition here guards a feature it would silently ignore.
     """
-    d64 = _sm80_bwd_kernel_mod("d64")
-    if (d_qk, d_v) != (64, 64) or h_q != h_kv:
-        return False
-    if s_q % d64.M_BLOCK != 0 or s_kv % d64.N_BLOCK != 0:
-        return False
-    if mask_token != "none" or right_bound != 0 or causal_bottom_right:
-        return False
-    for feature in ("seq_kv_lens", "seq_len_q", "bias", "sinks", "rope_freqs"):
-        if bw_kwargs.get(feature) is not None:
-            return False
-    if bw_kwargs.get("deterministic"):
-        return False
-    return True
+    from .kernels.sm80.half_contract import d64_fast_path_eligible
+
+    # One rule for the adapter and for graph ownership (sdpa_bwd_sm80_f16_d64).
+    return d64_fast_path_eligible(
+        d_qk=d_qk,
+        d_v=d_v,
+        h_q=h_q,
+        h_kv=h_kv,
+        s_q=s_q,
+        s_kv=s_kv,
+        mask_token=mask_token,
+        right_bound=right_bound,
+        causal_bottom_right=causal_bottom_right,
+        bw_kwargs=bw_kwargs,
+    )
 
 
 def _sm80_bwd_pick_flavor(d_qk: int, d_v: int, flavor_dims=None) -> str:

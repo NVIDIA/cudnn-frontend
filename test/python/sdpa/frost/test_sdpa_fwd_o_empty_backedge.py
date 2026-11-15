@@ -11,7 +11,7 @@ second phase before warpgroup 1's parity wait; the wait aliased, warpgroup 1 nev
 cc 10.3 at ~80 % of launches on square bottom-right-causal split-KV graphs (#1532) and intermittently on the cc 10.0 paged-THD
 capture/replay CI case (#1525).  Fix: each warpgroup waits ITS OWN slot, whose chain runs through its own stats publish.
 
-Two pins.  (1) Source, no GPU: none of the eleven two-warpgroup forward kernels waits ``mb_o_empty[0]`` at the top of the tile any more.  (2) Device,
+Two pins.  (1) Source, no GPU: none of the two-warpgroup forward kernels below waits ``mb_o_empty[0]`` at the top of the tile any more.  (2) Device,
 in a SUBPROCESS under a wall budget so a regression can never wedge the suite: the smallest shape that hung deterministically on a
 cc 10.3 part (B=1, H=32, S_q = S_kv = 2048, D=128, bf16, bottom-right causal, TILE_CGA_M=2, SPLIT_KV=16, PACK_GQA=0) runs 20
 back-to-back synchronised executes and matches an fp32 reference.
@@ -41,6 +41,7 @@ _TWO_WARPGROUP_KERNELS = (
     "sm100/d192_fp8_multi_q/kernel.py",
     "sm100/d192_mxfp8_multi_q/kernel.py",
     "sm107/d128_f16_multi_q/kernel.py",
+    "sm107/small_f16_batch_pair/kernel.py",
     "sm107/d128_fp8_multi_q/kernel.py",
     "sm107/d128_mxfp8_multi_q/kernel.py",
     "sm107/d192_f16_multi_q/kernel.py",
@@ -61,8 +62,8 @@ def test_softmax_top_of_tile_wait_is_on_the_warpgroups_own_o_slot(kernel):
     assert not re.search(
         r"mb_o_empty\[0\].*epilogue_state", code
     ), f"{kernel}: a softmax warpgroup waits slot 0 of mb_o_empty at the top of the tile (no back-edge from warpgroup 1)"
-    # One own-slot wait per tile body: the sm107 d128 kernel carries a second body (the resident-bias pair-step tile) whose
-    # top-of-step wait follows the same slot discipline; every other kernel has one body.
+    # Each isolated body owns one wait. The resident-bias pair-step body has
+    # its own entry above, so both sides of the split keep this regression pin.
     waits = len(re.findall(r"mb_o_empty\[sub_tile_id\].*epilogue_state", code))
     if kernel in _TILE_GATE_KERNELS:
         assert waits == 0 and not re.search(r"mb_o_empty\[sub_tile_id\]", code), f"{kernel}: the softmax warpgroups wait the tile gate, not mb_o_empty"
@@ -72,9 +73,7 @@ def test_softmax_top_of_tile_wait_is_on_the_warpgroups_own_o_slot(kernel):
         assert re.search(r"qs == 0\):\n\s+mb_tile_go\.arrive\(\)", code), f"{kernel}: the correction group arrives the gate after O sub-tile 0"
         assert re.search(r"mb_o_empty\[qs\]\.wait\(o_empty_phase", code), f"{kernel}: the correction group waits its own O slot"
         return
-    assert waits == (
-        2 if kernel == "sm107/d128_f16_multi_q/kernel.py" else 1
-    ), f"{kernel}: expected one per-warpgroup top-of-tile mb_o_empty wait per tile body, found {waits}"
+    assert waits == 1, f"{kernel}: expected one per-warpgroup top-of-tile mb_o_empty wait per tile body, found {waits}"
 
 
 _CHILD = textwrap.dedent(r"""
