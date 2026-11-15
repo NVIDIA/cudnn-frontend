@@ -991,7 +991,7 @@ Backward (d512 stage 2):
 - **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
   CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
   rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
-  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  (`bwd/kernels/sm107/d512_f16_2x2/kernel.py`, parent `sm100/`) differs from its
   parent in a handful of code lines (the ring-arm default record, the
   hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
   fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
