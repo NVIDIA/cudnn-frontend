@@ -28,7 +28,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload
 from cudnn.frost.tile_dsl.tma import st_shared_v4, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
-from cudnn.sdpa.bwd.config_sm100_d192_dkdv_fp8 import make_config
+from cudnn.sdpa.bwd.kernels.sm100.fp8_pair.config_dkdv import make_config
 from cudnn.sdpa.bwd.kernels.sm100._fp8_common import (
     FP8,
     HALF_DTYPES,
