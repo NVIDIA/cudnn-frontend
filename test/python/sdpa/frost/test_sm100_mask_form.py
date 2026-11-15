@@ -38,17 +38,18 @@ _E4M3, _BF16 = 0, 2
 # the port: a count that moves means an arm was added or dropped and the table (and this pin) must say so.
 _KERNELS = {
     ("f16", (128, 128)): ("prefill_d128_f16.py", 3),  # + the resident-block bias / kv_mask arms' two sites (pre-masked tail, masked body)
-    ("f16", (192, 128)): ("prefill_d192_d128_f16.py", 5),
-    ("f16", (256, 256)): ("prefill_d256_f16.py", 3),  # fused correction masks its P1 slice independently
-    ("f16", (512, 512)): ("prefill_d512_f16.py", 1),
+    ("f16", (192, 128)): ("d192_f16_multi_q/kernel.py", 5),
+    ("f16", (256, 256)): ("d256_f16_lookahead/kernel.py", 3),  # fused correction masks its P1 slice independently
+    ("f16", (512, 512)): ("d512_f16_role_split/kernel.py", 1),
     ("fp8", (128, 128)): ("prefill_d128_fp8.py", 1),
-    ("fp8", (192, 128)): ("prefill_d192_d128_fp8.py", 2),
-    ("fp8", (256, 256)): ("prefill_d256_fp8.py", 4),
-    ("fp8", (512, 512)): ("prefill_d512_fp8.py", 1),
+    ("fp8", (192, 128)): ("d192_fp8_multi_q/kernel.py", 2),
+    ("fp8", (256, 256)): ("d256_fp8_single_q/kernel.py", 4),
+    ("fp8", (512, 512)): ("d512_fp8_role_split/kernel.py", 1),
     ("mxfp8", (128, 128)): ("prefill_d128_mxfp8.py", 2),
     ("mxfp8", (192, 128)): ("prefill_d192_d128_mxfp8.py", 3),
     ("mxfp8", (256, 256)): ("prefill_d256_mxfp8.py", 3),
-    ("mxfp8", (512, 512)): ("prefill_d512_mxfp8.py", 3),
+    ("mxfp8", (512, 512)): ("d512_mxfp8_slice_recompute/kernel.py", 3),
+    ("mxfp8_swa", (512, 512)): ("d512_mxfp8_retained_p/kernel.py", 3),  # exact top-left SWA of one KV tile, unsplit
     ("decode", (128, 128)): ("decode_d128_f16.py", 2),  # the key-sharded softmax arm of the d64 quadrant tile (``QUAD``) is the second site
     ("bwd", (512, 512)): ("bprop_d512_f16.py", 1),
 }
@@ -76,6 +77,14 @@ def _load(kind, flavor):
     # the d128 f16 flavor would select the decode kernel above), cga1 where that is the only width (fp8 d256, mxfp8 d512).
     cta_mma = max(supported_cgas_for(flavor, fp8=fp8, device_cc=(10, 0), pertensor=pertensor))
     params = TemplateParams(dtype_qkv=_E4M3 if fp8 else _BF16, dtype_o=_BF16, cta_mma=cta_mma)
+    if kind == "mxfp8_swa":
+        params = replace(params, window_left=127, window_right=0)
+    if kind == "f16" and flavor == (192, 128):
+        from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+        from cudnn.sdpa.fwd.kernels.sm100.d192_f16_multi_q.contract import Geometry, KERNEL_FILE, NAME
+
+        geometry = Geometry(cga=cta_mma)
+        return _load_kernel_template(KERNEL_FILE, geometry.configure_params(params), NAME)
     return _load_sm100_kernel_module(flavor, params, fp8=fp8, pertensor=pertensor, rubin=False)
 
 
@@ -121,7 +130,8 @@ def test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain(rubin):
     ), f"window_right={params.window_right} is not below MASK_BOUND_LIMIT={MASK_BOUND_LIMIT}"
     assert params.window_right >= 1 << 28, f"window_right={params.window_right} no longer exceeds every dense d192 sequence a TMA coordinate can address"
     mod = _load_sm100_kernel_module((192, 128), params, fp8=True, pertensor=True, rubin=rubin)
-    assert mod.__file__.endswith("prefill_d192_d128_fp8.py") and (("/sm107/" in mod.__file__) == rubin), mod.__file__
+    expected = "sm107/prefill_d192_d128_fp8.py" if rubin else "sm100/d192_fp8_multi_q/kernel.py"
+    assert mod.__file__.endswith(expected), mod.__file__
     assert int(mod.CFG.MASK_FLAGS) & MASK_CAUSAL, "the dense fp8 d192 plan is expected to lower through the causal arm"
     assert int(mod.CFG.WINDOW_RIGHT) == params.window_right < MASK_BOUND_LIMIT
     # a graph-stated right band is passed through untouched, and the canonicalization stays confined to the dense plan

@@ -427,7 +427,7 @@ def test_sm107_d512_2x2_routes_to_the_rubin_sibling():
     # The loader's tag is "sdpa_fwd_sm107_f16_d512_2x2" (the role-split tag + "_2x2"); the template cache appends a per-record suffix.
     assert mod.__file__.endswith(_D512_2X2_FILE) and "sdpa_fwd_sm107_f16_d512_2x2" in mod.__name__, mod.__name__
     assert _load(_D512, rubin=True).__file__.endswith("sm107/prefill_d512_f16.py")
-    assert _load(_D512, rubin=False, **_D512_2X2_KW).__file__.endswith("sm100/prefill_d512_f16_2x2.py")
+    assert _load(_D512, rubin=False, **_D512_2X2_KW).__file__.endswith("sm100/d512_f16_2x2/kernel.py")
     assert mod.CFG.CGA_M == 4 and mod.KV_SHARE == 2 and mod.CFG.TILE_M == 64
 
 
@@ -1034,7 +1034,7 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
         assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None, changed
     for changed in (dict(cga=1), dict(split_kv=2)):
         assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
-    blackwell_caps = _caps("sdpa_fwd_prefill_sm100")
+    blackwell_caps = _caps("sdpa_fwd_sm100_d256_lookahead")
     for cc in ((10, 0), (10, 3)):
         blackwell = dataclasses.replace(facts, device_cc=cc)
         assert engines.mismatch(blackwell_caps, blackwell, knobs) is None
@@ -1686,7 +1686,7 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     # Append-only: the ragged-Q decode leg's two plan-time facts follow the block-scale tail; then (2026-10-15) the Rubin decode
     # route's width cap and the programmatic-dependent-launch switch, in landing order; then this branch's tail (the score side
     # outputs, the resident-block operands of the small tiles and their knobs), appended after the public tree's.
-    assert params[extension_start:] == [
+    assert params[extension_start : params.index("swap_ab") + 1] == [
         "sample_amax_o",
         "pv_bf16",
         "stats_log2",
@@ -1716,6 +1716,9 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "swap_ab",
     ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["swap_ab"].default is None
+    # The sdpa_mxfp8 op attribute causal_exclude_own_block is appended after swap_ab and defaults off.
+    assert params[params.index("swap_ab") + 1] == "causal_exclude_own_block"
+    assert inspect.signature(SdpaFwdDsl.__init__).parameters["causal_exclude_own_block"].default == 0
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["decode_q_tile_max"].default is None
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["use_pdl"].default is False
@@ -2385,7 +2388,7 @@ def test_sm107_gate_template_loads_for_d256_only():
     # ~258 KiB of SMEM (the 64 KiB gate tile after the 192 KiB of operands), so it is a cc 10.7 rendering -- the adapter
     # routes it there only -- but the CONFIG admits the record on either line (one config, one body).
     sm100_gate = _load(_D256, rubin=False, epilogue_gate=True)
-    assert sm100_gate.CFG.EPILOGUE_GATE == 1 and sm100_gate.CFG.GATE_BPE == 2 and sm100_gate.__file__.endswith("sm100/prefill_d256_f16.py")
+    assert sm100_gate.CFG.EPILOGUE_GATE == 1 and sm100_gate.CFG.GATE_BPE == 2 and sm100_gate.__file__.endswith("sm100/d256_f16_lookahead/kernel.py")
     for quant_kw in (_FP8_LOAD_KW, _MXFP8_LOAD_KW):
         with pytest.raises(ValueError, match="epilogue_gate"):
             _load(_D256, rubin=False, epilogue_gate=True, **quant_kw)
@@ -2406,7 +2409,7 @@ def test_sm107_gate_template_loads_for_d256_only():
     for extra in ({}, dict(thd_varlen=True), dict(thd_varlen=True, pack_gqa=True, qh_per_kh=4)):
         pg = _load(_D256, rubin=True, epilogue_gate=True, **paged, **extra)
         # the module TAG is the Rubin route's (sdpa_fwd_sm107_<tag>_paged); the BODY is the shared SM100 file
-        assert pg.CFG.EPILOGUE_GATE == 1 and pg.CFG.PAGED_KV == 1 and pg.__file__.endswith("sm100/prefill_d256_f16.py"), (extra, pg.__file__)
+        assert pg.CFG.EPILOGUE_GATE == 1 and pg.CFG.PAGED_KV == 1 and pg.__file__.endswith("sm100/d256_f16_lookahead/kernel.py"), (extra, pg.__file__)
         assert pg.CFG.PACK_GQA == int(bool(extra.get("pack_gqa"))) and pg.CFG.THD_VARLEN == int(bool(extra.get("thd_varlen")))
     with pytest.raises(ValueError, match="epilogue_gate"):
         _load(_D256, rubin=True, epilogue_gate=True, **{**_MXFP8_LOAD_KW, **paged})
@@ -3671,7 +3674,7 @@ def test_shared_d256_body_gate_is_wired_through_every_layer():
     # the body: the gate geometry from the shared hook, the staging tile after the V ring, the appended Optional arguments
     mod = _load(_D256, rubin=True, epilogue_gate=True, **paged)
     src = inspect.getsource(mod._kernel)
-    assert mod.__file__.endswith("sm100/prefill_d256_f16.py") and mod.EPILOGUE_GATE and mod.gateTmaTransactionBytes == 64 * 1024
+    assert mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py") and mod.EPILOGUE_GATE and mod.gateTmaTransactionBytes == 64 * 1024
     assert src.index("sV_raw = cutlass.Array") < src.index("sGate_raw = (") < src.index("bars = make_d256_bars(")
     assert "epilogue_gate=EPILOGUE_GATE" in src and src.count("issue_gate_load(") == 0  # the issue sites live in the TMA-LDG group
     assert inspect.getsource(mod._tmaldg_warp_group).count("issue_gate_load(sGate, tma_gate, bars.mb_gate_full") == 2, "both arms of the tile loop"
@@ -3839,7 +3842,7 @@ def _run_paged_thd_gated(pr, lens_q, lens_kv, *, page, gate_on=True, pack_gqa=Fa
     assert api.check_support()
     api.compile()
     cfg = api._k_mod.CFG
-    assert api._k_mod.__file__.endswith("sm100/prefill_d256_f16.py") and cfg.THD_VARLEN == 1 and cfg.PAGED_KV == 1
+    assert api._k_mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py") and cfg.THD_VARLEN == 1 and cfg.PAGED_KV == 1
     assert int(cfg.EPILOGUE_GATE) == int(gate_on) and int(cfg.PACK_GQA) == int(pack_gqa)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
     run_kw = dict(

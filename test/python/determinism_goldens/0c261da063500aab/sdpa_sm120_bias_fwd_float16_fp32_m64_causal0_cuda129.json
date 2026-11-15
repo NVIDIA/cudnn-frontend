@@ -1,0 +1,80 @@
+{
+  "inputs": {
+    "bias": {
+      "dtype": "torch.float32",
+      "sha256": "9e999032463cb7b3e93b19128b69a8abc8440d5720060a7c8d4605b7dbe7f0cf",
+      "shape": [
+        3,
+        64,
+        129,
+        257
+      ]
+    },
+    "k": {
+      "dtype": "torch.float16",
+      "sha256": "f529ad486372ee03f581a25db77b7466074949902ccca28ee08aadc586ed8d2d",
+      "shape": [
+        3,
+        16,
+        257,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.float16",
+      "sha256": "a01771dc9e3f1e08bb6af11779d964e488d6cb322194693914632294231b6f67",
+      "shape": [
+        3,
+        64,
+        129,
+        128
+      ]
+    },
+    "v": {
+      "dtype": "torch.float16",
+      "sha256": "2e25dd75c497309ccca1cba976670fc4e40685c5efd588616ce1c76889a76141",
+      "shape": [
+        3,
+        16,
+        257,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "dfc12b6cd9f4e2e22343dc6788e9644705421bb6a5f34c0cc1e2295d4656c934",
+      "shape": [
+        3,
+        64,
+        129
+      ]
+    },
+    "o": {
+      "dtype": "torch.float16",
+      "sha256": "9eb5897596928fae77606c18529fcc9f1f303ed0238fc12555f108897f6b49f6",
+      "shape": [
+        3,
+        64,
+        129,
+        128
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13040,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA RTX 6000D",
+    "sm": [
+      12,
+      0
+    ],
+    "sm_count": 156,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

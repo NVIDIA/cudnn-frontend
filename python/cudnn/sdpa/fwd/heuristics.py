@@ -42,6 +42,7 @@ the honest answer while nobody has timed it.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from math import gcd
 from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
@@ -59,6 +60,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
 )
+from cudnn.sdpa.fwd.config_sm90 import d128_causal_route as _sm90_d128_causal_route
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     FP8_DUAL_KV_STREAM_MAX_ROWS,
@@ -106,11 +108,13 @@ from cudnn.sdpa.fwd.config_sm120 import (
     tile_domain,
 )
 from cudnn.sdpa.fwd.engines import (
+    sm100_legacy_policy_spec,
     ENGINE_SPECS,
     Capabilities,
     EngineSpec,
     SdpaFwdKnobs,
     paged_thd_split_domain,
+    packed_thd_split,
     thd_split_domain,
     _selected_d_shape,
     _synth_kv_padding,
@@ -121,6 +125,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    effective_tile_ms,
     launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
@@ -167,6 +172,17 @@ _SM100_MEASURED_SMS = 148
 _SM100_D192_LPT_MAX_WAVES = 12
 # GB10 (cc 12.1): its SM count, the fallback where the graph facts carry none (the causal NATURAL rule in _sched_points).
 _SM121_MEASURED_SMS = 48
+# The SM90 D128 causal route's CTA count where the facts carry no device (a host without CUDA): an H100 SXM's SM count,
+# the board the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+_SM90_MEASURED_SMS = 132
+# api_dsl's call-time switches that decide whether a causal D128 plan runs the walk's record, at the values api_dsl
+# ships them with: _sm90_d128_causal_walks reads the module's own once it is loaded.
+_SM90_D128_SHIPPED_SWITCHES = (
+    ("D128_INTRA_WG_OVERLAP", True),
+    ("D128_PERSISTENT", True),
+    ("D128_PERSISTENT_CAUSAL_WALK", 2),
+    ("D128_CAUSAL_WALK_ROUTE", True),
+)
 # cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
 # packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
 # and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
@@ -461,7 +477,7 @@ def choose_split_kv(
 
 
 # --- KV split on the d256 decode tile (see choose_decode_tile_split_kv) ------
-# sm100/decode_d256_f16.py is not the machine choose_split_kv was fitted on: one
+# sm100/d256_f16_swap_ab/kernel.py is not the machine choose_split_kv was fitted on: one
 # cta_group::1 CTA per (KV-head group, batch, split) unit streams 128-key K/V
 # tiles (128 KiB each at d256 half) with about one tile of fixed cost, and the
 # kernel is HBM-bound rather than MMA-bound. Its costs, in units of one KV tile
@@ -1346,13 +1362,35 @@ def _sm107_cluster_waves(facts) -> float:
     return (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
 
 
-def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
+def _sm90_d128_causal_walks(facts) -> bool:
+    """Whether check_support gives a causal SM90 D128 graph of ``facts`` the walk's record (persistent, causal_walk 1,
+    the NATURAL order unless pinned) rather than the one-tile record (the causal order): the choice a check_support
+    without a pinned order makes, mirrored here because a graph-route plan carries its proposal as a pin. A record
+    check_support then hands to the claim counter (api_dsl.D128_CAUSAL_CLAIM, past its gate) is persistent and NATURAL
+    too, so the counter's switches do not move this answer. The walk's
+    record needs api_dsl's switches at the walk (D128_INTRA_WG_OVERLAP, D128_PERSISTENT, D128_PERSISTENT_CAUSAL_WALK 2,
+    as api_dsl._sm90_d128_persistence reads them) and a plan the route keeps (config_sm90.d128_causal_route, while
+    D128_CAUSAL_WALK_ROUTE is on) at the device's SM count, the CTA count compile() gives the record. The switches are
+    api_dsl's call-time module constants, read from the module once it is loaded; it imports torch, so this module does
+    not load it, and until something does they hold the values it ships with (_SM90_D128_SHIPPED_SWITCHES; getattr on
+    the absent module's None returns them)."""
+    api = sys.modules.get("cudnn.sdpa.fwd.api_dsl")
+    overlap, persistent, walk, route = (getattr(api, name, shipped) for name, shipped in _SM90_D128_SHIPPED_SWITCHES)
+    if not (overlap and persistent and walk == 2):
+        return False
+    shape = (int(facts.b), int(facts.h_q), int(facts.h_kv), int(facts.s_q), int(facts.s_kv))
+    return not (route and _sm90_d128_causal_route(shape, bool(facts.bottom_right), int(facts.device_sm_count or _SM90_MEASURED_SMS)))
+
+
+def _sched_points(caps: Capabilities, facts, *, d128: bool = False) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
     The PRIMARY follows the measured preference for the graph's shape; the
     remaining domain follows for autotune. This is the one causal LPT/LPT_L2 oracle on
     the graph path — the adapters keep a None-input derivation only for
-    standalone wrapper users who bypass ranking.
+    standalone wrapper users who bypass ranking. ``d128`` asks for the SM90 row's
+    128 x 128 sets (the dedicated D128 template, :func:`_sm90_d128_knob_sets`),
+    whose causal walk record takes its own order; every other set leaves it False.
     """
     # The FLAVOR's domain, not the row-wide floor: a `sched_policies_by_d_shape`
     # claim (the Rubin f16 / FP8 (256, 256) LPT entries) must reach the ranking,
@@ -1533,6 +1571,18 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     ):
         # Quantized d128 with GQA under a causal band on the 107 line: plain LPT first, LPT_L2 the runner.
         primary = SCHED_LPT
+    elif causal_ish and d128 and not facts.thd and _sm90_d128_causal_walks(facts):
+        # The SM90 row's 128 x 128 tile (the D128 template; ``d128``, _sm90_d128_knob_sets), on a causal plan
+        # check_support gives the walk's record (_sm90_d128_causal_walks): its
+        # persistent loop walks the work in NATURAL order, a head's Q tiles side by side, so they run at once on
+        # neighbouring CTAs and share the head's K and V in L2 (the stride deals its rounds straight or snaked by the
+        # planner's busiest-CTA cost). MEASURED on an H100 SXM (2026-11-06, Nsight, 8 causal shapes): the LPT_L2 walk
+        # read K and V from HBM 1.26 to 2.16 times the read-once floor where cuDNN 9.27 read it once; the NATURAL stride
+        # read it 1.00 to 1.03 times. A graph-route plan carries this knob, and the adapter honours a carried knob as a
+        # pin, so the proposal here is what a causal D128 graph runs. LPT and LPT_L2 stay behind for autotune. A plan
+        # the route sends one tile per CTA takes the causal rule below instead, the order the one-tile record keeps and
+        # the route was measured on (config_sm90.D128_ROUTE_MAX_L).
+        primary = SCHED_NATURAL
     elif causal_ish:
         # SM100/SM120: balance the triangular load; pick the LPT variant by
         # whether one head's K+V working set fits the L2 budget.
@@ -2276,7 +2326,7 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv: Optional[int] = None) -> bool:
     """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
+    (sm100/d256_f16_swap_ab/kernel.py on the Blackwell row, sm107/decode_d256_f16.py on
     the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
     (256, 256) flavor, half inputs, dense (not THD), no pre-folded scale,
     S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
@@ -2290,7 +2340,7 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int, split_kv:
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
     """The heads the DECODE tile packs per token for a set whose prefill-tile
     group is ``pack_g`` (:func:`_pack_gqa_group`; 1 = unpacked): the whole GQA
-    ratio.  sm100/decode_d256_f16.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
+    ratio.  sm100/d256_f16_swap_ab/kernel.py packs ``HEADS_PER_TILE = QH_PER_KH`` --
     one unit per (KV head, batch) with every head of the group in its 16-column
     tile (96/8: 12 live rows, four zero-filled) -- and has no partial form, so
     the prefill tile's ``gcd(G, 128)`` (4 for 96/8, partial PackGQA) is not
@@ -2688,9 +2738,16 @@ def _split_points(
         # (head group, batch) into: every unit is one more CTA streaming the KV range (the MTP step at
         # 24/2 = two units of two tokens), so the model sees them as streams; the KV range of a unit
         # spans its tokens (token_span = tokens per unit).
-        decode_q_tile = decode_d256_q_tile_for_row(
-            caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
-        )
+        from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+        if caps.sm_lo == 100 and in_pilot_domain(facts):
+            # Cost the same immutable geometry that becomes the public plan;
+            # there is no adapter route to predict for these candidates.
+            decode_q_tile = select_sm100_d256_geometry(facts, decode_pack_g > 1).query_tile
+        else:
+            decode_q_tile = decode_d256_q_tile_for_row(
+                caps, facts.s_q, decode_pack_g, wide_launch=d256_wide_decode_launch_for_facts(facts, decode_pack_g), **_facts_decode_form_kw(facts)
+            )
         tok_units = decode_d256_q_units(facts.s_q, decode_pack_g, decode_q_tile)
         geometry = dict(
             units=facts.b * (facts.h_q // decode_pack_g) * tok_units,
@@ -3236,6 +3293,27 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return splits, pack
 
 
+def _sm90_d128_knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
+    """The SM90 row's 128 x 128 set: the dedicated D128 template (#378). Its tile names the template, and mismatch()
+    admits it only on an exact (128, 128) graph the template serves (engines._sm90_d128_tile_mismatch), so the set
+    exists there alone and leads the D512 body's 64 x 64 sets (:func:`_knob_sets`). One CTA, unsplit, unpacked, in the
+    order the template's route proposes (_sched_points with ``d128``): its other orders measured slower on causal
+    graphs on H100 SXM, so the remaining slots go to the D512 body's sets, split and packed runners among them. Empty on
+    every other row and graph, and below config_sm90.D128_LEAD_MIN_SQ query rows, where the D512 body's 64-row and
+    packed decode tiles keep the row's order (the template stays reachable by pinning its tile)."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_LEAD_MIN_SQ
+
+    caps = spec.capabilities
+    lead = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    if caps.sm_lo != 90 or 128 not in effective_tile_ms(caps, facts, lead) or mismatch(caps, facts, lead) is not None:
+        return []
+    if facts.s_q < D128_LEAD_MIN_SQ:
+        return []
+    scheds = _sched_points(caps, facts, d128=True)
+    first, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)
+    return [replace(lead, sched_policy=first)]
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -3416,7 +3494,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         unique.insert(
             0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
         )
-    return unique[:_MAX_SETS_PER_ENGINE]
+    # SM90 at exact (128, 128): the dedicated D128 template's 128 x 128 set first, where it serves the graph, then the
+    # D512 body's 64 x 64 sets above.
+    lead = _sm90_d128_knob_sets(spec, facts)
+    return (lead + [knobs for knobs in unique if knobs not in lead])[:_MAX_SETS_PER_ENGINE]
 
 
 def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
@@ -3448,6 +3529,254 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     )
 
 
+def select_sm100_d256_geometry_for_shape(s_q, pack_g, *, batch=None, h_q=None, s_kv=None, windowed=False, thd=False, prefolded=False, gated=False):
+    """The sole SM100 half D256 implementation/Q-tile performance choice.
+
+    Both the graph candidate generator and standalone auto use this result.
+    A selected engine instead receives a fixed geometry and never calls this
+    selector during build or execution.
+    """
+    from .config_sm100 import decode_d256_q_tile, d256_wide_decode_launch
+    from .kernels.sm100.d256_f16_contract import D256Geometry, LOOKAHEAD, SWAP_AB
+
+    if not (thd or prefolded or gated):
+        wide = batch is not None and h_q is not None and s_kv is not None and d256_wide_decode_launch(batch, h_q // pack_g, s_kv, windowed)
+        q_tile = decode_d256_q_tile(s_q, pack_g, wide_launch=wide)
+        if q_tile:
+            return D256Geometry(SWAP_AB, q_tile)
+    return D256Geometry(LOOKAHEAD, 128)
+
+
+def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
+    return select_sm100_d256_geometry_for_shape(
+        facts.s_q,
+        (facts.h_q // facts.h_kv if pack_gqa else 1) if pack_g is None else pack_g,
+        batch=facts.b,
+        h_q=facts.h_q,
+        s_kv=facts.s_kv,
+        windowed=facts.window_left is not None,
+        thd=facts.thd,
+        prefolded=facts.attn_scale_prefolded,
+        gated=facts.has_epilogue_gate,
+    )
+
+
+def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
+    """Central wide-half body choice; explicit implementation replay never calls it."""
+    from .kernels.sm100.d512_f16_contract import D512Geometry, ROLE_SPLIT, TWO_BY_TWO
+
+    two_by_two = d_qk == 576 or (prefer_two_by_two and split_kv == 1 and not paged and 64 % max(1, pack_g) == 0)
+    return D512Geometry(TWO_BY_TWO if two_by_two else ROLE_SPLIT, d_qk)
+
+
+def select_sm100_d512_geometry(facts, knobs):
+    return select_sm100_d512_geometry_for_shape(
+        facts.d_qk,
+        paged=facts.has_paged_kv,
+        split_kv=knobs.split_kv or 1,
+        pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
+    )
+
+
+def select_sm100_small_fp8_geometry(facts, knobs):
+    """Resolve the existing small-head FP8 policy before compiling an engine.
+
+    The explicit swap-AB request and automatic SM100 paged D128 route precede
+    the dual-KV policy, matching the legacy adapter's final parameter override.
+    This selector is not used when replaying a fixed implementation record.
+    """
+    from .config_sm100 import supports_d64_fp8_swap_ab, supports_dense_fp8_swap_ab
+    from .kernels.sm100.d128_fp8_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
+    from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .kernels.sm100.small_fp8_contract import in_domain
+
+    shape = (facts.d_qk, facts.d_v)
+    if not in_domain(facts):
+        raise ValueError("small-head FP8 selection requires exact SM100/SM103 D64 or D128 per-tensor inputs")
+    cga = knobs.cga if knobs.cga is not None else 1 if facts.d_qk == 64 else 2
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    rows = facts.s_q * group
+    decode_semantics = (
+        facts.o_block_scale == 0
+        and facts.dtype_o in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.softmax_precision in (None, cudnn.data_type.FLOAT)
+        and not facts.attn_scale_prefolded
+        and not (facts.has_epilogue_gate or facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp)
+    )
+    geometry = dict(
+        device_cc=facts.device_cc,
+        paged=facts.has_paged_kv,
+        thd=facts.thd,
+        batch_size=facts.b,
+        s_q=facts.s_q,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        pack_gqa=knobs.pack_gqa,
+        cga=knobs.cga,
+    )
+    explicit_decode = knobs.swap_ab == 1 and (supports_d64_fp8_swap_ab(shape, **geometry) or supports_dense_fp8_swap_ab(shape, **geometry, tile_n=knobs.tile_n))
+    automatic_decode = (
+        facts.device_cc == (10, 0) and shape == (128, 128) and cga == 1 and facts.has_paged_kv and not facts.thd and 0 < rows <= 8 and facts.b <= 65535
+    )
+    if decode_semantics and (explicit_decode or automatic_decode):
+        return SwapAB(d_flavor=facts.d_qk)
+    if fp8_dual_kv_stream_routed() and shape == (128, 128) and knobs.cga == 1 and not facts.thd and rows <= FP8_DUAL_KV_STREAM_MAX_ROWS:
+        return DualKV()
+    return MultiQ(d_flavor=facts.d_qk, cga=cga)
+
+
+def resolve_sm100_half_multi_q_geometry(facts, knobs, *, d_flavor):
+    """Resolve local defaults of a fixed multi-Q body, without body selection.
+
+    Keep the shared bias-budget and TILE_N policy used by the existing adapter.
+    Explicit knobs remain requests; unsupported pairs are declined by support.
+    """
+    from .kernels.sm100.d128_f16_multi_q.contract import Geometry
+
+    caps = sm100_legacy_policy_spec().capabilities
+    shape = (d_flavor, d_flavor)
+    tile_n = knobs.tile_n
+    if tile_n is None:
+        tile_n = sm100_tile_n_pick(
+            d_flavor,
+            facts.s_kv,
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            kv_mask_fp32=facts.kv_mask_dtype == cudnn.data_type.FLOAT,
+            padded=facts.padded,
+            domain=dict(caps.tile_ns_by_d_shape).get(shape, frozenset({128})),
+        )
+    cga = knobs.cga
+    if cga is None:
+        if facts.has_bias and d_flavor <= 64:
+            widths = dict(caps.cgas_by_d_shape).get(shape, caps.cgas)
+            cga = sm100_bias_auto_cga(d_flavor, facts.s_kv, widths, tile_n=tile_n) or 1
+        else:
+            cga = 1 if d_flavor <= 64 else 2
+    return Geometry(d_flavor=d_flavor, cga=cga, tile_n=tile_n)
+
+
+def select_sm100_small_half_geometry(facts, knobs):
+    """Resolve small-half main bodies centrally, preserving the existing policy.
+
+    Width-envelope selection is common legality. Short-Q, quadrant and the
+    paged live-column swap-AB choices happen here before a fixed engine is
+    compiled; an implementation's host never re-enters this selector.
+    """
+    from .kernels.sm100.small_half_contract import in_domain
+    from .kernels.sm100.d128_f16_single_q.contract import small_geometry as single_q
+    from .kernels.sm100.d64_f16_quadrant.contract import Geometry as Quadrant
+    from .kernels.sm100.d256_f16_contract import D256Geometry, SWAP_AB
+
+    if not in_domain(facts):
+        raise ValueError("small-head half selection requires exact SM100/SM103 D32/D64/D128 half queries")
+    policy = sm100_legacy_policy_spec()
+    flavor = _selected_d_shape(policy.capabilities, facts, knobs)
+    if flavor not in ((32, 32), (64, 64), (128, 128)):
+        raise ValueError("small-head half selection has no supported width envelope")
+    group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
+    rows = facts.s_q * group
+    split = knobs.split_kv or 1
+    multi_q = resolve_sm100_half_multi_q_geometry(facts, knobs, d_flavor=flavor[0])
+    cga = multi_q.cga
+    # Optional score outputs need the multi-Q epilogue. An omitted CGA must
+    # keep that legal default instead of selecting a body without the stores.
+    if knobs.cga is None and flavor == (128, 128) and not (facts.has_score_max or facts.has_score_sum_exp):
+        # The adapter enables ragged decode only for an explicit CGA1 request.
+        # An omitted width retains the THD prefill default, even if the graph
+        # would qualify for a separately requested split decode plan.
+        cga = select_d128_auto_cga(s_q=facts.s_q, pack_g=gcd(group, 128), thd=facts.thd, thd_decode_leg=False)
+    decode_tile = False
+    if flavor == (64, 64) and facts.uniform_dtype:
+        if facts.thd and packed_thd_split(policy.capabilities, facts, knobs):
+            decode_tile = True
+        elif not (facts.has_bias or facts.has_kv_mask) and knobs.cga in (None, 1):
+            if facts.thd:
+                decode_tile = facts.has_paged_kv and split == 1 and not knobs.pack_gqa and facts.s_q <= 128
+            else:
+                decode_tile = rows <= 128
+    swap_ab = (
+        flavor == (128, 128)
+        and cga == 1
+        and facts.has_paged_kv
+        and not facts.thd
+        and facts.uniform_dtype
+        and facts.dtype_o in (None, facts.dtype)
+        and 0 < rows <= 8
+        and not (facts.has_epilogue_gate or facts.has_bias or facts.has_kv_mask or facts.has_score_max or facts.has_score_sum_exp or facts.attn_scale_prefolded)
+    )
+    if swap_ab:
+        return D256Geometry(SWAP_AB, 16, head_dim=128, live_columns=8, early_q=True)
+    if decode_tile and not facts.thd and rows <= 32:
+        return Quadrant()
+    if decode_tile or (flavor == (128, 128) and cga == 1 and (not facts.thd or split > 1)):
+        return single_q(facts, knobs, d_flavor=flavor[0])
+    return replace(multi_q, cga=cga)
+
+
+def select_sm90_geometry(facts, knobs):
+    """Resolve the old candidate's body once; explicit replay never calls this."""
+    from .kernels.sm90.d64_f16_one_wg import contract as native
+    from .kernels.sm90.f16_three_wg import contract as three_wg
+    from .kernels.sm90.d128_f16_multi_q import contract as d128
+
+    if native.in_domain(facts):
+        return native.Geometry()
+    return d128.Geometry() if 128 in (knobs.tile_m, knobs.tile_n) else three_wg.Geometry()
+
+
+def select_sm100_d192_half_geometry(facts, knobs):
+    """Name the existing D192 body choice before entering a fixed engine."""
+    from .kernels.sm100.d192_half_contract import in_domain
+    from .kernels.sm100.d192_f16_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
+
+    if not in_domain(facts):
+        raise ValueError("D192 half selection requires exact SM100/SM103 D192/V128 half inputs")
+    cga = 2 if knobs.cga is None else knobs.cga
+    if facts.thd and not facts.has_paged_kv and cga == 1:
+        return SingleQ()
+    return MultiQ(cga=cga)
+
+
+def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
+    """Retain the existing candidate budget/order, naming each actual body.
+
+    The old row's policy domain generates pack/split and scheduler combinations.
+    It is not an offered engine: each combination resolves to one explicit
+    implementation before being returned, and its split model consumes the
+    same selected geometry.
+    """
+    policy = sm100_legacy_policy_spec() if policy is None else policy
+    if mismatch(policy.capabilities, facts) is not None:
+        return []
+    sets = _knob_sets(policy, facts) if kind == "A" else [_fallback_knobs(policy, facts)]
+    by_name = {s.name: s for s in ENGINE_SPECS}
+    out = []
+    for knobs in sets:
+        if mismatch(policy.capabilities, facts, knobs) is not None:
+            if knobs.split_kv != 1 or launch_grid_mismatch(policy.capabilities, facts, knobs) is None:
+                continue
+            knobs = next(
+                (lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(policy.capabilities, facts, lpt) is None),
+                None,
+            )
+            if knobs is None:
+                continue
+        geometry = select_geometry(facts, knobs)
+        engine_id = offered.get(geometry.implementation)
+        if engine_id is None:
+            continue
+        resolved = geometry.canonical_knobs(knobs)
+        if mismatch(by_name[geometry.implementation].capabilities, facts, resolved) is not None:
+            continue
+        plan = PlanConfig(engine_id, resolved)
+        if plan not in out:
+            out.append(plan)
+    return out
+
+
 def _eligible(facts, offered: Dict[str, int]) -> Iterator[Tuple[int, EngineSpec]]:
     """(engine_id, spec) for each offered cell whose capability row admits ``facts``."""
     for spec in ENGINE_SPECS:
@@ -3471,6 +3800,73 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
     """
+    from .kernels.sm100.d256_f16_contract import in_pilot_domain
+
+    if in_pilot_domain(facts):
+        # Only the explicit D256 implementations admit this domain. Keep the
+        # eligible-row contract test in sync before adding another owner here.
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: select_sm100_d256_geometry(f, k.pack_gqa))
+    from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+
+    if in_wide_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
+    from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
+
+    if in_d192_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d192_half_geometry)
+    from .kernels.sm100.small_half_contract import in_domain as in_small_half_domain
+
+    if in_small_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_half_geometry)
+    from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
+
+    if in_d512_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
+    if d512_mxfp8.in_domain(facts):
+        # The SWA band and SPLIT_KV name the body: retained P for exact top-left SWA of one KV tile, unsplit.
+        return _recommend_sm100_implementation(kind, facts, offered, d512_mxfp8.select_geometry, policy=sm100_legacy_policy_spec(d512_mxfp8.LEGACY_ROW))
+    from .kernels.sm100.d256_fp8_single_q.contract import Geometry as Fp8D256Geometry, in_domain as in_d256_fp8_domain
+
+    if in_d256_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D256Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.d192_fp8_multi_q.contract import Geometry as Fp8D192Geometry, in_domain as in_d192_fp8_domain
+
+    if in_d192_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D192Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm100.small_fp8_contract import in_domain as in_small_fp8_domain
+
+    if in_small_fp8_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_small_fp8_geometry, policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+
+    from .kernels.sm120.d512_f16_paired.contract import Geometry as Sm120PairedGeometry, LEGACY_ROW as SM120_LEGACY_ROW, in_domain as in_sm120_paired_domain
+
+    if in_sm120_paired_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Sm120PairedGeometry(), policy=sm100_legacy_policy_spec(SM120_LEGACY_ROW))
+    from .kernels.sm120.d512_fp8_paired import contract as fp8_wide
+    from .kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
+
+    for wide in (fp8_wide, mxfp8_wide):
+        if wide.in_domain(facts):
+            return _recommend_sm100_implementation(kind, facts, offered, lambda f, k, g=wide.Geometry: g(), policy=sm100_legacy_policy_spec(wide.LEGACY_ROW))
+    from .kernels.sm120 import quantized_general_contract as sm120_quant_general
+
+    owner = sm120_quant_general.owner(facts)
+    if owner is not None:
+        legacy = sm120_quant_general.explicit_geometry(owner, None).lowering_row_name
+        return _recommend_sm100_implementation(kind, facts, offered, sm120_quant_general.select_geometry, policy=sm100_legacy_policy_spec(legacy))
+    from .kernels.sm80 import half_flavor_contract as sm80_half
+
+    if sm80_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, sm80_half.select_geometry, policy=sm100_legacy_policy_spec(sm80_half.LEGACY_ROW))
+    from .kernels.sm120 import half_exact_contract as sm120_half
+
+    if sm120_half.in_domain(facts):
+        # TILE_M names the body: the decode tile (16 / 32), else the all-compute D256 or general tile (64 / 128).
+        return _recommend_sm100_implementation(kind, facts, offered, sm120_half.select_geometry, policy=sm100_legacy_policy_spec(sm120_half.LEGACY_ROW))
+    if facts.device_cc == (9, 0) and not (facts.is_fp8 or facts.is_mxfp8 or facts.is_backward):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm90_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm90"))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities
@@ -3510,7 +3906,8 @@ def propose(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if not rest:
         return [BACKEND, LAST_RESORT] + last
     spec = next(s for s in ENGINE_SPECS if offered.get(s.name) == rest[0].engine_id)
-    placed = rest + [BACKEND] if place(spec, facts) == LEAD else [BACKEND] + rest
+    position = place(spec, facts, rest[0].knobs) if spec.capabilities.implementation else place(spec, facts)
+    placed = rest + [BACKEND] if position == LEAD else [BACKEND] + rest
     return placed + [LAST_RESORT] + last if last else placed
 
 

@@ -7,7 +7,7 @@ Today every BMM1 of the d128-file body reads Q from SMEM through its tcgen05 des
 (``mb_q_empty``) only after the step's LAST BMM1.  With the arm the MMA warp copies each sub-tile's Q tile SMEM -> TMEM once per n-step
 (``tcgen05.cp 128x128b``, ``Q_COLS / 4`` calls through the same descriptor, one elect block) right after its ``mb_q_full`` wait, commits
 ``mb_q_empty`` from that block (the slab is free the moment the copy lands, so the TMA-LDG warp prefetches the next step's Q / K / V during the
-current kv loop) and issues every BMM1 as an A-from-TMEM ``tcgen05.mma`` (``sm107/prefill_d128_f16.py``; the ``sm100/prefill_d512_f16.py``
+current kv loop) and issues every BMM1 as an A-from-TMEM ``tcgen05.mma`` (``sm107/prefill_d128_f16.py``; the ``sm100/d512_f16_role_split/kernel.py``
 Q-in-TMEM precedent).  The same MMAs over the same operands in the same k-step order: O and Stats are BITWISE the SMEM-Q kernel's.  The switch
 is a TemplateParams FIELD (appended, default 0; ``config_sm107.sm107_q_in_tmem_pick`` is the MEASURED rule per body class, the sweep seam's
 value verbatim): the template-module cache keys on the record alone.  Q in TMEM is a DEFAULT on three bodies (the plain 128-wide body; the

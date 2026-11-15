@@ -145,11 +145,120 @@ def _dsl_installed() -> bool:
 def _is_plan_for(plan_name, engine) -> bool:
     """A plan reads ``<engine>[<knobs>]``: the heuristics name a concrete config
     for every entry, so match on the engine, not on the whole plan name."""
+    if isinstance(engine, tuple):
+        return any(_is_plan_for(plan_name, name) for name in engine)
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
+def mxfp8_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Allowed MXFP8 engines for feature tests that exercise default selection: the row and, on SM100, its exact D512 owners."""
+    row = f"sdpa_fwd_prefill_{arch}_mxfp8"
+    if arch == "sm100":
+        return (row, "sdpa_fwd_sm100_d512_mxfp8_slice_recompute", "sdpa_fwd_sm100_d512_mxfp8_retained_p")
+    return (row,)
+
+
+def sm100_mxfp8_owner(d_qk, d_v, *, retained_p=False) -> str:
+    """The SM100 MXFP8 engine that serves these head dims (legality only); exact top-left SWA of one KV tile, unsplit, is retained P."""
+    if (d_qk, d_v) != (512, 512):
+        return "sdpa_fwd_prefill_sm100_mxfp8"
+    return "sdpa_fwd_sm100_d512_mxfp8_retained_p" if retained_p else "sdpa_fwd_sm100_d512_mxfp8_slice_recompute"
+
+
+def half_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Allowed half engines for feature tests that exercise default selection.
+
+    Implementation/routing tests pin a single concrete name instead. This
+    list only follows ownership; it contains no shape or performance policy.
+    """
+    if arch == "sm100":
+        return (
+            "sdpa_fwd_prefill_sm100",
+            "sdpa_fwd_sm100_d128_multi_q",
+            "sdpa_fwd_sm100_d64_quadrant",
+            "sdpa_fwd_sm100_d192_multi_q",
+            "sdpa_fwd_sm100_d128_single_q",
+            "sdpa_fwd_sm100_d256_lookahead",
+            "sdpa_fwd_sm100_d256_swap_ab",
+            "sdpa_fwd_sm100_d512_role_split",
+            "sdpa_fwd_sm100_d512_2x2",
+        )
+    if arch == "sm120":
+        return (
+            "sdpa_fwd_prefill_sm120",
+            "sdpa_fwd_sm120_d512_paired",
+            "sdpa_fwd_sm120_d256_all_compute",
+            "sdpa_fwd_sm120_decode_key_group",
+            "sdpa_fwd_sm120_f16_general",
+        )
+    if arch == "sm90":
+        return ("sdpa_fwd_sm90_d64_one_wg", "sdpa_fwd_sm90_f16_three_wg", "sdpa_fwd_sm90_d128_multi_q")
+    if arch == "sm80":
+        return ("sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative")
+    return (f"sdpa_fwd_prefill_{arch}",)
+
+
+def sm80_owner(d_qk, d_v):
+    """The SM80 forward engine that serves these head dims (legality only, no ranking)."""
+    from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as half
+
+    return half.implementation_for(d_qk, d_v) or half.LEGACY_ROW
+
+
+def sm120_owner(row, d_qk, d_v, tile_m=None):
+    """The SM120 forward engine that may serve these head dims for ``row``'s input type (legality only, no ranking).
+
+    Exact half head tiles have two owners named by TILE_M; without one, both are returned for a ranked pin."""
+    from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as exact
+    from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired import contract as half
+    from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8
+    from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8
+
+    if row == exact.LEGACY_ROW and (d_qk, d_v) in exact.SHAPES:
+        prefill = exact.ALL_COMPUTE if (d_qk, d_v) == exact.D256 else exact.GENERAL
+        if tile_m is None:
+            return (prefill, exact.KEY_GROUP)
+        return exact.KEY_GROUP if tile_m in exact.key_group.QUERY_TILES else prefill
+    from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as quant
+
+    if (d_qk, d_v) in quant.SHAPES:
+        general = {quant.fp8.LEGACY_ROW: quant.FP8, quant.mxfp8.LEGACY_ROW: quant.MXFP8}
+        if row in general:
+            return general[row]
+    wide = {half.LEGACY_ROW: (half.NAME, half.SHAPES), fp8.LEGACY_ROW: (fp8.NAME, (fp8.SHAPE,)), mxfp8.LEGACY_ROW: (mxfp8.NAME, (mxfp8.SHAPE,))}
+    owner, shapes = wide.get(row, (row, ()))
+    return owner if (d_qk, d_v) in shapes else row
+
+
+def sm90_half_owner(d_qk, d_v, *, paged=False) -> str:
+    if (d_qk, d_v) == (64, 64):
+        return "sdpa_fwd_sm90_f16_three_wg" if paged else "sdpa_fwd_sm90_d64_one_wg"
+    return "sdpa_fwd_sm90_f16_three_wg"
+
+
+def sm120_half_owner(d_qk, d_v, tile_m=None):
+    return sm120_owner("sdpa_fwd_prefill_sm120", d_qk, d_v, tile_m)
+
+
+def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Per-tensor FP8 owners for feature tests; routing tests pin one name."""
+    if arch == "sm100":
+        return (
+            "sdpa_fwd_prefill_sm100_fp8",
+            "sdpa_fwd_sm100_d512_fp8_role_split",
+            "sdpa_fwd_sm100_d256_fp8_single_q",
+            "sdpa_fwd_sm100_d192_fp8_multi_q",
+            "sdpa_fwd_sm100_d128_fp8_multi_q",
+            "sdpa_fwd_sm100_d128_fp8_dual_kv",
+            "sdpa_fwd_sm100_d128_fp8_swap_ab",
+        )
+    if arch == "sm120":
+        return ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_sm120_d512_fp8_paired", "sdpa_fwd_sm120_fp8_general")
+    return (f"sdpa_fwd_prefill_{arch}_fp8",)
+
+
 def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
-    """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
+    """Pin the ranked entry for engine ``name`` (or an explicit tuple of names; graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 

@@ -83,6 +83,18 @@ def test_paged_thd_origins_rebind_and_capture(
         pytest.skip("CGA1 paged prefill is currently admitted on SM100/SM107")
     torch.manual_seed(261026737)
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
+    if not rubin and (d_qk, d_v) == (256, 256):
+        engine = "sdpa_fwd_sm100_d256_lookahead"
+    elif not rubin and (d_qk, d_v) == (192, 128):
+        engine = "sdpa_fwd_sm100_d192_multi_q"
+    elif not rubin and (d_qk, d_v) == (576, 512):
+        engine = "sdpa_fwd_sm100_d512_2x2"
+    elif not rubin and d_qk == d_v and d_qk in (32, 64, 128):
+        engine = (
+            "sdpa_fwd_sm100_d128_single_q"
+            if cga == 1 and (splits > 1 or single_q or (d_qk <= 64 and q_bound is not None and q_bound <= 128 and not pack_gqa))
+            else "sdpa_fwd_sm100_d128_multi_q"
+        )
     batch, heads, kv_heads, maximum, page, kv_max = (
         2,
         (24 if d_qk in (192, 576) else 16),

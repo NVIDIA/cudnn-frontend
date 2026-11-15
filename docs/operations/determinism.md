@@ -86,8 +86,10 @@ arbitrary user callbacks.
 | `block_sparse_attention_backward` (blk64, `sparse_block_size=64`; the default route and, on SM90, the `metadata=` route of `block_sparse_attention_prepare_backward`) | bprop | BF16 | Not guaranteed | Not guaranteed (cc 10.3 measured; cc 10.0 unverified; the prepared route is SM90-only) | Unverified |
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
-| FROST native D512 dense-Q split forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
-| FROST native D128/D256 dense-Q forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
+| FROST SM90 three-WG D512 dense-Q split forward (standalone and fixed-body qualification; fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported for this owner | Unsupported for this owner |
+| FROST native D128/D256 dense-Q forward on the D512 body (64 x 64 tile; standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
+| `pygraph.sdpa`, FROST SM90 native D64 owner (dense, unpadded, unsplit, unpacked; fixed scheduler; O and FP32 Stats) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested noncausal and top-left causal configurations) | Unsupported for this owner | Unsupported for this owner |
+| FROST SM90 dedicated D128 owner (exact dense D128, 128 x 128 tile; unpadded, unsplit, unpacked, no sink or window) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported | Unsupported |
 | FROST grid / lean-walk split-combine component (fixed reducer form and split count) | fprop combine only | FP32 partial O/LSE, FP16/BF16 O | Unverified | Supported (tested configurations) | Supported (tested configurations) |
 | FROST native D576/V512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
@@ -102,7 +104,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D128 nonpaged THD with independent physical origins (CGA2, split1, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D128 dense single-CTA splits (fixed split count and packing) | fprop | E4M3 to BF16; E5M2 to FP16; FP32 tensor scales | Unsupported | Unverified by this suite | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST D128 dense `SWAP_AB=1` (at most eight live query rows per packed unit; fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | Supported (tested configurations) | Supported (tested configurations) |
-| `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
+| `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); full SM103 suite unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D192/V128 and D256 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
@@ -112,8 +114,17 @@ arbitrary user callbacks.
 | `pygraph.sdpa` / standalone FROST D64 packed THD prefill (CGA1/2, N128, unsplit, independent origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (tested configurations) | Unverified by this suite |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
+| `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+
+Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
+engine entries. The public engine/knob record fixes the main body and Q tile;
+this alone does not guarantee batch invariance across all legal configurations.
+The refactor retains the existing arithmetic and support conclusions above.
+Its fresh-graph replay and parent-output comparisons are bounded correctness
+checks, not a new general determinism qualification. Backward is unchanged.
+See the [coverage record](../../test/python/determinism_goldens/README.md#sm100sm103-d256-engine-isolation-pilot--2026-11-14).
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -406,6 +417,7 @@ a row alone and inside a batch under the entry's own picks.
   batch schedule to the default schedule. Forward is therefore Replay only. Replay and
   committed goldens cover the generic ratio-2, generic ratio-4 overlap, and dedicated
   ratio-128 numerical paths. SM90 and SM107 remain unverified for batch invariance.
+- `sdpa_mxfp8(causal_exclude_own_block=32)`: no determinism switch. Every plan is repeatable. PackGQA does not change a row's bytes. A split-KV plan adds its per-split partials in a fixed order, so its bytes follow the split count; the heuristics choose that count from the launch grid (on B200 only a single sequence at one or two KV heads splits), so a row keeps its bytes across batches while the plan keeps its split count. The option is forward-only: `sdpa_mxfp8_backward` refuses it, so there is no bprop row. It is served by the SM100/SM103 MXFP8 D128 kernel only; SM90 and SM107 decline it. Rows 0-31 keep no key and return O = 0 and Stats = -inf, which the tests accept as the declared sentinel.
 - MXFP8 indexer forward uses E8M0 block scales, one scale per 32 values.
   The Hopper FP8 path uses FP32 token/head scales. Indexer forward returns
   FP32 scores; the Hopper FP8 path also returns FP32 LSE.
@@ -516,6 +528,20 @@ retain bytewise identity under replay, reordered/duplicated batches and changed
 neighbors on the qualified A100 runtime. THD PackGQA remains unsupported;
 this forward result does not establish a backward or cross-runtime guarantee.
 
+## SM120 D128 additive-bias forward
+
+FP16/BF16 dense D128 forward with FP32 or matching-input bias is repeatable
+and batch invariant for the tested fixed M64 dense and M128 causal plans.
+O and FP32 Stats preserve their bytes across fresh allocations, concurrent
+work, isolated/reordered/duplicated batches, changed neighbors and CUDA Graph
+replay on SM120 (cc 12.0). The M128 path also passes sustained K/V stage-refill
+stress with its result-dependent stores before stage reuse.
+
+This covers unpaged, unpacked, unsplit forward with no physical origins;
+bias backward is unsupported. SM121 execution and cross-GPU, cross-plan or
+cross-runtime bitwise identity remain unverified. The coverage report records
+both tested DSL compiler flavors and the original stress failure.
+
 ## SM120 paged SDPA
 
 Native FP16/BF16 dense-query forward over paged K/V is repeatable and batch
@@ -580,13 +606,38 @@ forward-only evidence; SM121 and other runtimes remain unverified.
 
 SM90 D512 dense split forward preserves per-sequence O/Stats bytes across replay, fresh storage, duplicated/reordered batches and changed neighbors under a fixed split count and PackGQA choice. The qualification covers FP16 and BF16 with masked, padded inputs and sinks, including partial PackGQA groups G12 and G128. Different split counts or packing configurations may round differently. THD split and backward are outside this addition.
 
-SM90 native D128/D256 forward also preserves O/Stats bytes under those batch changes
-for FP16/BF16, with unsplit unpacked and split3 PackGQA plans. The tested declarations
-include padding, a bottom-right causal window and sinks. This is fixed-plan,
-fixed-runtime forward qualification; THD batch invariance and backward remain
-outside this addition.
+SM90 native D128/D256 forward on the D512 body (its head_tile 128/256 path at the
+64 x 64 tile) also preserves O/Stats bytes under those batch changes for FP16/BF16,
+with unsplit unpacked and split3 PackGQA plans. The tested declarations include
+padding, a bottom-right causal window and sinks. This is fixed-plan, fixed-runtime
+forward qualification; THD batch invariance and backward remain outside this
+addition. An exact dense (128, 128) declaration with no tile pinned runs the
+dedicated D128 template instead (next paragraph); these results describe the
+64 x 64 tile only.
+
+The dedicated SM90 D128 implementation (its fixed owner uses a 128 x 128 tile) has its own
+forward suite: replay with fresh storage under concurrent work; a sequence alone
+against first, reordered, duplicated and changed-neighbor batches whose plans run
+different records of the template (the persistent loop, the paired causal walk,
+the NATURAL stride and the claim counter); an FP64 reference; goldens; and warm
+stress on the K/V stages (the claim counter's ring has its own in the main suite). Its H100 run (2026-11-13) passed replay and batch invariance
+on every arrangement, so its status is supported for the tested configurations. It serves only uniform-length dense declarations
+(no THD, paged KV, split-KV, PackGQA, sinks, windows or per-batch lengths) and
+has no backward.
 
 
+The fixed SM90 D128 owner and three-WG D512 owner retain these observed byte
+properties in FP16 and BF16 on H100. The owned-body checks assert the loaded
+implementation and its local parameter type before comparing replay, fresh
+storage, reordered/duplicated batches and changed neighbors. D128 covers the
+persistent, causal-walk, stride and claim configurations; three-WG covers
+split3 unpacked and split17 packed plans with masking, sinks and empty rows.
+Explicit graph-record checks also retain the standalone parameter values and
+O/Stats bytes, including changed-input capture replay. The current runtime's
+strict golden baselines are missing; none were generated for this migration.
+These results do not extend THD batch invariance or backward support. Detailed
+counts, runtime and stress limits are in the
+[coverage report](../../test/python/determinism_goldens/README.md).
 
 ## SM100/SM107 forward register redistribution
 
@@ -810,8 +861,19 @@ byte comparisons: readable bytes after deallocation do not establish safe
 ownership. This check is measured on SM100 and does not extend the GPU
 qualification below.
 
-All six dtype/implementation lowerings compile for SM103, whose execution
-remains unverified. These results do not qualify MXFP8, SM107 or backward.
+All six dtype/implementation lowerings compile for SM103. The explicit-engine
+migration additionally checks FP16/BF16 role-split and 2x2 plans on SM103 with
+token/head-major Stats, raw-byte replay, batch reordering/duplication, an
+isolated sequence and changed neighbors. The full SM103 suite, including FP8
+execution and runtime goldens, remains unverified. These results do not
+qualify MXFP8, SM107 or backward.
+
+Exact SM100/SM103 half D512 graph plans now name the role-split or 2x2 main
+implementation explicitly. Their public cluster width is four; D576/V512 uses
+the 2x2 implementation with width two. Replaying an engine/knob record fixes
+that implementation. This identity contract does not make results invariant
+across different engines, packing choices or split counts, and does not add a
+general determinism or batch-invariance note to these engines.
 See the coverage report for the exact cases and validation receipts.
 
 ## SM100 MXFP8 THD physical origins

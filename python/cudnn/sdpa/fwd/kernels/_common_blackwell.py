@@ -38,7 +38,7 @@ from cudnn.frost.tile_dsl.tma import ld_shared_v4, st_global_v4, st_shared_v4, t
 # module off the Rubin package (engine-contract S8: a shared module never leans
 # on one arch's package) and is cycle-free -- config_sm100 imports only
 # tile_dsl.constants, never this package.
-from cudnn.sdpa.fwd.config_sm100 import o_swz_bytes as _o_swz_bytes
+from cudnn.sdpa.fwd.config_common import o_swz_bytes as _o_swz_bytes
 
 
 @cute.jit
@@ -259,7 +259,7 @@ def make_d256_bars(CFG, *, N_O_CHUNKS: int, epilogue_gate: bool = False) -> D256
 
 
 class D512X2Bars(NamedTuple):
-    """Barrier bundle of the d512 2x2-datapath forward (sm100/prefill_d512_f16_2x2.py)."""
+    """Barrier bundle of the d512 2x2-datapath forward (sm100/d512_f16_2x2/kernel.py)."""
 
     mb_q_full: object
     mb_q_empty: object

@@ -217,6 +217,7 @@ cudnn.behavior_note.REQUIRES_BIAS_INT8x32_REORDER
 cudnn.behavior_note.REQUIRES_FILTER_INT8x32_REORDER
 cudnn.behavior_note.RUNTIME_COMPILATION
 cudnn.behavior_note.SUPPORTS_CUDA_GRAPH_NATIVE_API
+cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
 cudnn.behavior_note.name
 cudnn.behavior_note.value
 cudnn.block_sparse_attention
@@ -452,6 +453,7 @@ cudnn.engines.BaseEngine.build_plan
 cudnn.engines.BaseEngine.check_support
 cudnn.engines.BaseEngine.engine_id
 cudnn.engines.BaseEngine.execute
+cudnn.engines.BaseEngine.get_behavior_notes
 cudnn.engines.BaseEngine.get_workspace_size
 cudnn.engines.BaseEngine.knobs_from_public
 cudnn.engines.BaseEngine.knobs_to_public

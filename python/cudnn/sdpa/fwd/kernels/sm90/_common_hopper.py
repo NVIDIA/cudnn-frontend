@@ -1,10 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Shared tile, reduction, and softmax helpers for the SM90 D512 kernel.
+"""Shared tile, reduction, and softmax helpers for the SM90 prefill kernels.
 
-``prefill_d512_f16.py`` owns launch state and scheduling; these helpers are
-stateless. For local thread ``tid``, C slot ``i`` uses row
+The kernel modules (``prefill_d512_f16.py``, ``prefill_d64_f16.py``,
+``prefill_d128_f16.py``) own launch state and scheduling; these helpers are
+stateless. The MMA helpers take the tile geometry (C slots, k16 steps, slab
+rows) as keywords whose defaults are the D512 kernel's. For local thread
+``tid``, C slot ``i`` uses row
 ``16*(tid//32) + (tid%32)//4 + 8*((i//2)%2)`` and column
 ``2*(tid%4) + i%2 + 8*(i//4)``. Helpers keep their units, fragment order, and
 caller-owned synchronization at the boundary where those details matter.
@@ -21,8 +24,9 @@ from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b
 from cudnn.frost.tile_dsl.wgmma import wgmma_m64nNk16_f32, wgmma_smem_desc
 from cudnn.sdpa.fwd.config_sm90 import SCALE_POSITIVE, SCALE_ZERO
 
-# The SCHED_LPT_L2 budget; api_dsl and heuristics keep their own copies.
-SCHED_L2_BUDGET_BYTES = 50 * 1024 * 1024
+# The SCHED_LPT_L2 budget, which the SM90 templates import from here: single-sourced in config_sm90, whose D128 planner
+# reads it; api_dsl and heuristics keep their own copies.
+from cudnn.sdpa.fwd.config_sm90 import SCHED_L2_BUDGET_BYTES  # noqa: E402,F401
 
 # FP64 FLT_MAX used by the positive-scale overflow guards.
 FLT_MAX_F64 = 3.4028234663852886e38
@@ -43,14 +47,16 @@ class RolePipelineStates(NamedTuple):
 
 
 @cute.jit
-def wgmma_descriptor(region, mn_major: cutlass.Constexpr = False):
-    """Build a descriptor for a 64-column SW128 region.
+def wgmma_descriptor(region, mn_major: cutlass.Constexpr = False, slab_rows: cutlass.Constexpr = 64):
+    """Build a descriptor for a region of 64-column SW128 slabs.
 
-    K-major Q/K/P use LBO=16 B; MN-major V uses LBO=8192 B. Both use
-    SBO=1024 B. Hot-loop offsets are 16-byte start-field units and must not
-    carry into another descriptor field.
+    K-major Q/K/P use LBO=16 B and ignore ``slab_rows``. MN-major V uses
+    LBO = ``slab_rows`` x 128 B, the distance between its 64-column slabs; the
+    default 64 rows (8192 B) is the D512 kernel's V tile. Both use SBO=1024 B.
+    Hot-loop offsets are 16-byte start-field units and must not carry into
+    another descriptor field.
     """
-    leading = 8192 if cutlass.const_expr(mn_major) else 16
+    leading = slab_rows * 128 if cutlass.const_expr(mn_major) else 16
     return wgmma_smem_desc(region, leading_byte_offset=leading, stride_byte_offset=1024)
 
 
@@ -61,39 +67,73 @@ def owned_row(tid, row_half: cutlass.Constexpr):
 
 
 @cute.jit
-def mma_qk(mma_params, scores, *, ab_dtype: cutlass.Constexpr, head_tile: cutlass.Constexpr = 512):
-    """Compute one 64x64 QK tile over the native K-major contraction.
+def mma_qk(
+    mma_params,
+    scores,
+    *,
+    ab_dtype: cutlass.Constexpr,
+    head_tile: cutlass.Constexpr = 512,
+    c_slots: cutlass.Constexpr = 32,
+    k_steps: cutlass.Constexpr = 0,
+    q_slab_rows: cutlass.Constexpr = 64,
+    k_slab_rows: cutlass.Constexpr = 64,
+    wg_wait: cutlass.Constexpr = 0,
+):
+    """Compute one 64-row QK tile of ``2 * c_slots`` keys with K-major k16 SS steps over the native contraction.
 
-    ``mma_params`` supplies 16-byte-unit Q/K descriptors; wait(0) completes
-    the 32-slot C fragment before it is stored in ``scores``.
+    ``mma_params`` supplies 16-byte-unit Q/K descriptors over 64-column SW128
+    slabs of ``q_slab_rows`` / ``k_slab_rows`` rows. The geometry defaults are
+    the D512 template's (64 keys, 64-row Q and K slabs, ``head_tile // 16`` k16
+    steps over its native head width); another tile shape passes its own
+    ``k_steps`` (non-zero) and slab rows. ``wg_wait=0`` (the default) waits for the
+    group, so C is complete when it is stored in ``scores``. ``wg_wait=-1``
+    returns right after the commit: ``scores`` then holds registers the
+    hardware is still writing, and the caller must run
+    ``wgmma_wait_group_sync_aligned`` before anything reads them.
     """
+    if cutlass.const_expr(wg_wait not in (-1, 0)):
+        raise ValueError(f"mma_qk: wg_wait is 0 (complete C) or -1 (issue only), got {wg_wait}")
+    if cutlass.const_expr(q_slab_rows < 64 or k_slab_rows < 2 * c_slots):
+        raise ValueError(f"mma_qk: the 64 Q rows and {2 * c_slots} K rows must each fit one slab, got {q_slab_rows} and {k_slab_rows} slab rows")
     q_desc, k_desc = mma_params.q_desc, mma_params.k_desc
-    c = cutlass.Vector.from_elements((cutlass.Float32(0.0),) * 32, cutlass.Float32)
-    # One group keeps the k steps in flight; wait(0) completes C before the store.
+    c = cutlass.Vector.from_elements((cutlass.Float32(0.0),) * c_slots, cutlass.Float32)
+    # One group keeps the k steps in flight; wg_wait=0 completes C before the store.
     prims.wgmma_fence_aligned()
-    for k in cutlass.range_constexpr(head_tile // 16):
-        offset = (k // 4) * 512 + (k % 4) * 2
-        c = wgmma_m64nNk16_f32(c, q_desc + offset, k_desc + offset, ab_dtype, accumulate=k != 0)
+    for k in cutlass.range_constexpr(head_tile // 16 if k_steps == 0 else k_steps):
+        # A k16 step is 32 B (2 units) inside a 64-column slab; every fourth step enters the next slab (rows x 8 units).
+        q_offset = (k // 4) * (q_slab_rows * 8) + (k % 4) * 2
+        k_offset = (k // 4) * (k_slab_rows * 8) + (k % 4) * 2
+        c = wgmma_m64nNk16_f32(c, q_desc + q_offset, k_desc + k_offset, ab_dtype, accumulate=k != 0)
     prims.wgmma_commit_group_sync_aligned()
-    prims.wgmma_wait_group_sync_aligned(0)
+    if cutlass.const_expr(wg_wait == 0):
+        prims.wgmma_wait_group_sync_aligned(0)
     scores.store(c)
 
 
 @cute.jit
-def mma_pv(mma_params, p, is_first_kv_tile: cutlass.Constexpr, *, ab_dtype: cutlass.Constexpr):
-    """Compute one native-width O half with four k16 PV steps.
+def mma_pv(mma_params, p, is_first_kv_tile: cutlass.Constexpr, *, ab_dtype: cutlass.Constexpr, k_steps: cutlass.Constexpr = 4, wg_wait: cutlass.Constexpr = 0):
+    """Accumulate P V into the native-width O fragment with ``k_steps`` k16 PV steps (16 keys each).
 
-    ``p`` is 16 RS words for WG1 or a K-major P descriptor for WG2. The
-    fence/commit/wait group completes C before the output store.
+    ``p`` is ``4 * k_steps`` RS words or a K-major P descriptor (SS, at most
+    four steps: one 64-key slab). The default four steps are the D512
+    kernel's 64-key tile. ``wg_wait`` is as in :func:`mma_qk`: the default 0
+    completes C before the output store; -1 leaves O in flight.
     """
+    if cutlass.const_expr(wg_wait not in (-1, 0)):
+        raise ValueError(f"mma_pv: wg_wait is 0 (complete C) or -1 (issue only), got {wg_wait}")
+    if cutlass.const_expr(isinstance(p, cutlass.Vector) and p.shape[0] != 4 * k_steps):
+        raise ValueError(f"mma_pv: RS P needs four words per k16 step, got {p.shape[0]} words for {k_steps} steps")
+    if cutlass.const_expr(not isinstance(p, cutlass.Vector) and k_steps > 4):
+        raise ValueError(f"mma_pv: an SS P descriptor advances inside one 64-key slab, so at most 4 k16 steps, got {k_steps}")
     output, v_desc = mma_params.o_regs, mma_params.v_desc
     c = output.load(0, output.shape[0])
     prims.wgmma_fence_aligned()
-    for k in cutlass.range_constexpr(4):
+    for k in cutlass.range_constexpr(k_steps):
         a = p[4 * k : 4 * k + 4] if cutlass.const_expr(isinstance(p, cutlass.Vector)) else p + 2 * k
         c = wgmma_m64nNk16_f32(c, a, v_desc + 128 * k, ab_dtype, transpose_b=True, accumulate=not is_first_kv_tile or k != 0)
     prims.wgmma_commit_group_sync_aligned()
-    prims.wgmma_wait_group_sync_aligned(0)
+    if cutlass.const_expr(wg_wait == 0):
+        prims.wgmma_wait_group_sync_aligned(0)
     output.store(c)
 
 

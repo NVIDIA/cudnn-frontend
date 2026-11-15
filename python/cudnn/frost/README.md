@@ -319,33 +319,43 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
-      config_sm90.py            TemplateParams + the D512 envelope check +
-                                raising validation
+      config_sm90.py            TemplateParams + flavor picker + the D512
+                                envelope check + raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
+        sm80/f16_k_prefetch/          SM80 K-prefetch half body (D_QK <= 192,
+                                      D_V <= 128; explicit engine)
+        sm80/d256_kv_prefetch/        SM80 D256 K+V-prefetch body (qwen envelope;
+                                      explicit engine)
+        sm80/wide_cooperative/        SM80 wide-head cooperative body (wide512 /
+                                      mla576 envelopes; explicit engine)
         sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
-                                      the Hopper line's only flavor: one D512
-                                      tile over three warpgroups
+                                      the D512 body: one 64-row tile over
+                                      three warpgroups, every D up to 512 on
+                                      native 128/256/512-column storage
+        sm90/prefill_d64_f16.py       the D512 body's exact dense D64 subset
+        sm90/prefill_d128_f16.py      dedicated exact D128: 128-row tile, two
+                                      64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
-        sm100/prefill_d256_f16.py
-        sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
+        sm100/d256_f16_lookahead/kernel.py
+        sm100/d256_f16_swap_ab/kernel.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
         sm100/split_combine.py        the split-KV reduction pass
         sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
         sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
                                       swap-AB body; config_sm107.make_cfg_d256_decode)
-        sm120/prefill_f16.py          general SM120 template (d <= 256)
-        sm120/prefill_d256_f16.py     d256 flavor
-        sm120/prefill_d512_f16.py     d512 flavor
-        sm120/prefill_fp8.py          general SM120 FP8 template (d <= 256)
-        sm120/prefill_mxfp8.py        block-scaled MXFP8 template (d <= 256)
-        sm120/prefill_d512_fp8.py     d512 flavor for FP8
-        sm120/prefill_d512_mxfp8.py   d512 flavor for MXFP8
+        sm120/f16_general/            general SM120 template (d <= 256; explicit engine)
+        sm120/d256_f16_all_compute/   d256 flavor (explicit engine)
+        sm120/d512_f16_paired/        d512 / d576 flavors (explicit engine)
+        sm120/fp8_general/            general SM120 FP8 template (d <= 256; explicit engine)
+        sm120/mxfp8_general/          block-scaled MXFP8 template (d <= 256; explicit engine)
+        sm120/d512_fp8_paired/        d512 flavor for FP8 (explicit engine)
+        sm120/d512_mxfp8_paired/      d512 flavor for MXFP8 (explicit engine)
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
@@ -604,7 +614,8 @@ expressible, with one discipline separating them:
   only unmasked graphs, or only a causal diagonal, says so instead of leaving an
   axis to default (one coupling is expressible: `window_right`, the right modes
   a left window pairs with), and the matcher asks every axis in both directions so an
-  unset graph flag cannot bypass a restricted claim. See `sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  unset graph flag cannot bypass a restricted claim. See the
+  [SDPA support reference](../sdpa/frost/support/README.md).
 - A notch is a rule in `mismatch()` gated by a conjunction flag on the row
   (e.g. `padded_stats: bool` — padding mask + generate_stats needs the
   per-batch LSE trim). The matcher encodes the SHAPE of the interaction once;
@@ -1134,15 +1145,16 @@ Contract:
     `pre-commit run --all-files` (black, 160 cols) before pushing.
 13. **Keep this document true.** If code and this contract disagree and you
     change the code, change this file in the same commit.
-14. **Coverage changes update the support matrix.** A change to any SDPA
+14. **Coverage changes update the architecture support page.** A change to any SDPA
     `Capabilities` field that affects graph eligibility, or adding/retiring
     an `EngineSpec`, updates
-    `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.
-    That tracker is the only arch x pass x head-dim x dtype view of what
-    FROST serves, it is maintained by hand from these rows, and it silently
-    rots otherwise. Knob-domain-only changes are exempt (it does not track
-    knobs). `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the
-    exact scope and is the number to cite in review.
+    the affected section under [SDPA support](../sdpa/frost/support/README.md)
+    in the same commit. Use its template and SM90 example to migrate a section
+    from current source; label unreviewed scopes pending. The old tracker remains
+    historical reference and receives no new development logs. Knob-domain-only
+    changes are exempt; refactors still update moved links and engine identities.
+    `python/cudnn/sdpa/AGENTS.md` **Rule S2** is canonical for the exact scope and
+    is the number to cite in review.
 15. **A stage that was read is released through `tile_dsl.consume`.** A bare
     arrive behind shared-memory loads of the stage it frees is not accepted
     in new or changed kernel code, even when every test passes

@@ -1,4 +1,184 @@
-# FROST SDPA — support matrix
+# FROST SDPA — legacy support tracker
+
+> **Historical reference; migration in progress.** Current support documentation
+> starts at [support/README.md](support/README.md), with a
+> [completed SM90 example](support/sm90.md) and a [template](support/TEMPLATE.md).
+> This legacy tracker mixes snapshots and development notes; claims below may be
+> stale or contradict later entries. Preserve it for historical context, but add
+> current support changes to the relevant new architecture section as it is
+> refactored. Do not append development logs here. A pending new section means
+> its documentation has not yet migrated, not that the feature is unsupported.
+
+**SM90 fixed implementation ownership — 2026-11-14**
+
+`sdpa_fwd_sm90_d64_one_wg` (20539) owns the existing nonpaged native D64
+FP16/BF16 subset. `sdpa_fwd_sm90_f16_three_wg` (20540) owns the existing
+64 x 64 tile domain: exact D64 paged KV, wider native heads and bounded
+head envelopes, with the same dense/THD/paged/split/packing restrictions.
+`sdpa_fwd_sm90_d128_multi_q` (20541) owns the dedicated dense 128 x 128
+D128 pipeline. Each public record fixes its body; shared binding, caching
+and launch services remain common.
+
+Legacy ID 20517 is retired, reserved and never reused. Old recipes must
+replan. The historical policy remains private solely to preserve ordered
+candidates and placement study keys. No graph feature, numerical contract,
+policy threshold or selected-plan Stats-stride behavior note is added.
+
+**Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
+graph/config for admitted override-enabled half THD plans with packed HN Stats
+and the matching prepared binder on qualified SM100/SM103 devices. SM107 and
+SM120 do not advertise this note pending hardware qualification. This includes the
+explicit D256 lookahead entry and eligible legacy entries, not swap-AB or all
+FROST plans. See [the graph contract](../../../../docs/utilities/python_graph_and_execution_backends.md#plan-specific-stats-stride-override-note).
+
+**SM100/SM103 exact half D256 implementation engines (refactor pilot):**
+`sdpa_fwd_sm100_d256_lookahead` (20519) and
+`sdpa_fwd_sm100_d256_swap_ab` (20520) own exact D_qk=D_v=256 FP16/BF16
+on cc 10.0/10.3. The old `sdpa_fwd_prefill_sm100` row declines these exact
+cells; its other widths, envelopes and targets retain their existing owner.
+Lookahead uses TILE_M=128/CGA2 and preserves the existing dense/paged/THD
+and split/packing contracts, including the existing nonpaged THD PackGQA
+decline. Swap-AB uses TILE_M=N_Q=16/32, TILE_N=128,
+CGA1 and SCHED_POLICY=0, with dense queries over dense/paged KV; it does
+not admit THD. PACK_GQA on swap-AB packs the whole group, which must fit
+N_Q; lookahead retains partial packing. Both reuse the common graph and
+prepared-execution contract. Central heuristics retains the old default
+routes and candidate budget; explicit engine selection fixes the body.
+The main kernel bodies and arithmetic are unchanged; only implementation
+selection, configuration ownership and public replay identities move.
+
+**SM100/SM103 exact wide half implementation engines:**
+`sdpa_fwd_sm100_d512_role_split` (20521) owns exact D512/V512;
+`sdpa_fwd_sm100_d512_2x2` (20522) owns exact D512/V512 and D576/V512.
+The old 20511 row delegates these exact cells and retains their envelopes.
+Role-split uses TILE_M=128 and a four-CTA launch cluster; 2x2 uses TILE_M=64,
+a four-CTA cluster for D512, and one two-CTA pair for D576.
+TILE_CGA_M reports that physical cluster (4 for D512, 2 for D576); the
+MMA group is fixed at two CTAs and recorded separately in plan metadata.
+The retired 20511 D512 pair encoding is not a recipe for these new rows. D512 2x2 declines paging/split-KV and packs
+whole groups dividing 64; role-split preserves D512 paging and whole-group
+packing into 128, with no partial-packing shapes. Only the 2x2 row declares
+D576 partial packing and retains its existing paged/THD contract. Common dtype, mask, split, Stats and binding checks remain shared.
+Default policy retains the prior body choices, order and candidate budget;
+explicit replay fixes the implementation without a second body crossover.
+No additional determinism or batch-invariance guarantee is introduced.
+
+**SM100/SM103 exact per-tensor FP8 D512 implementation engine:**
+`sdpa_fwd_sm100_d512_fp8_role_split` (20523) owns exact D512/V512
+E4M3/E5M2 inputs with FP16/BF16/E4M3/E5M2 output. The legacy 20513 row
+delegates these exact cells and retains smaller flavors and head envelopes.
+The explicit row reports TILE_M=128 and physical TILE_CGA_M=4, with a fixed
+two-CTA MMA group. Its kernel, configuration, contract and host entry live in
+`sm100/d512_fp8_role_split/`; half and block-scaled kernels keep separate owners.
+Dense Q over dense/paged KV retains masks, sinks, whole-group packing and split-KV;
+nonpaged THD retains its existing unsplit contract. Paged THD and block-scaled
+output remain declined. Central selection preserves the old candidate order,
+budget and placement; explicit records pin this body. Old exact-D512 20513
+recipes must be invalidated and replanned. No additional numerical, Stats
+stride-override, determinism or batch-invariance claim is introduced.
+
+**SM100/SM103 exact per-tensor FP8 D256 implementation engine:**
+`sdpa_fwd_sm100_d256_fp8_single_q` (20524) owns exact D256/V256
+E4M3/E5M2 inputs and scalar FP16/BF16/E4M3/E5M2 outputs. The legacy 20513
+row delegates these exact cells, retaining smaller flavors and head envelopes.
+The independent body/configuration/contract/host directory is
+`sm100/d256_fp8_single_q/`; one/two softmax warpgroup schedules remain local
+variants, while half and MXFP8 retain their own configuration owners. Public
+geometry is TILE_M=128/CGA1 with one-CTA MMA. Dense and paged dense-Q
+packing/splits retain the existing domain. Nonpaged and paged THD retain
+independent origins, unsplit/unpacked execution and their existing Stats
+contracts; this split does not widen THD packing, splits or block-scaled O.
+The old candidate order, budget and placement are preserved. Explicit records
+pin the body; old exact-D256 20513 recipes must be replanned. No additional
+Stats override note, determinism or batch-invariance guarantee is introduced.
+
+**SM100/SM103 exact per-tensor FP8 D192/V128 implementation engine:**
+`sdpa_fwd_sm100_d192_fp8_multi_q` (20525) owns exact D192/V128
+E4M3/E5M2 with existing scalar FP16/BF16/E4M3/E5M2 outputs. The legacy
+20513 row delegates this exact domain and retains dense head envelopes.
+The independent `sm100/d192_fp8_multi_q/` body/configuration/contract/host
+keeps one/two-CTA multi-Q variants and uses the shared graph binder/launcher.
+Public TILE_M=128 and TILE_CGA_M=1/2 name the physical cluster and MMA group;
+existing split plans require two CTAs. Paging and block-scaled O remain
+unsupported. Dense and nonpaged THD retain existing mask, packing, split,
+Stats and physical-origin restrictions. Central policy preserves candidate
+order and placement. Old exact-D192 20513 recipes must be replanned.
+No additional numerical, stride-override or determinism guarantee is introduced.
+
+**SM100/SM103 exact small-head per-tensor FP8 implementation engines:**
+`sdpa_fwd_sm100_d128_fp8_multi_q` (20527) serves D64/D128 with the existing
+multi-Q body, M128 and one CTA for D64 or one/two CTAs for D128.
+`sdpa_fwd_sm100_d128_fp8_dual_kv` (20528) serves D128 dense queries with
+one CTA and two KV streams over each M128 query tile. Nonpaged/paged D128
+THD retains the multi-Q owner. Dense and paged masks, sinks, packing, splits
+and output formats retain their common eligibility checks.
+`sdpa_fwd_sm100_d128_fp8_swap_ab` (20529) has a 16-column MMA tile with
+eight live softmax columns, CGA1 and NATURAL scheduling. It serves the
+existing SM100 D64 paged (up to four token units), SM100 D128 paged and
+SM100/SM103 D128 dense (one unit) domains with scalar half/FP8 output.
+THD, block-scaled output and extra score/output epilogues remain declined.
+The legacy 20513 row delegates exact D64/D128 on SM100/SM103; envelopes
+and SM107 retain their previous owners. Each new entry fixes the main
+pipeline and owns a separate kernel/configuration/contract/host directory.
+Central selection retains prior effective candidates and order; duplicate
+swap-AB records that differed only in an unused scheduler are canonicalized.
+Old exact-width recipes must be replanned. No new numerical or behavior-note
+guarantee accompanies this ownership migration.
+
+**SM100/SM103 exact half D192/V128 implementation engines:**
+`sdpa_fwd_sm100_d192_multi_q` (20531) owns the multi-Q pipeline with
+TILE_M=128 and one/two-CTA internal variants. K-subtile release granularity
+and the coupled K/V ring depths remain internal configuration of this body.
+`sdpa_fwd_sm100_d128_single_q` (20532) initially owns only its exact D192/V128
+unpacked nonpaged THD leg, including supported splits, with TILE_M=128 and one CTA. Its shared
+single-Q body is kept separate from multi-Q and quadrant cooperation; this
+batch does not transfer D64/D128 or SM107 consumers of the old shared file.
+The legacy 20511 row declines exact half D192/V128 on SM100/SM103, while
+dense head envelopes retain their previous owner. Central selection preserves
+the existing candidate order, budget and placement. Fixed public records
+select the body directly; old exact-D192 20511 records require replanning.
+Mask, sink, Stats, packing/split and physical-origin checks remain shared.
+This ownership migration adds no numerical or behavior-note guarantee.
+**SM120-family exact wide half implementation engine:**
+`sdpa_fwd_sm120_d512_paired` (20526) owns exact FP16/BF16 D512/V512 and
+D576/V512, including paged FP8-KV storage. The legacy 20505 row delegates
+these exact cells and retains the general/D256 tiles and the eight-aligned
+head envelopes the same body pads. The explicit row reports TILE_M=64,
+TILE_N=32 and TILE_CGA_M=1. Its kernel, contract and host entry live in
+`sm120/d512_f16_paired/`; FP8 and MXFP8 wide kernels keep separate owners.
+Capabilities, masks, sinks, partial PackGQA, split-KV, paging and THD are
+the legacy row's at these shapes. Central selection preserves the old
+candidate order, budget and placement; explicit records pin this body. Old
+exact-wide 20505 recipes must be invalidated and replanned. No additional
+numerical, determinism or batch-invariance claim is introduced.
+
+**SM120-family exact D256 half implementation engines:**
+`sdpa_fwd_sm120_d256_all_compute` (20537) and `sdpa_fwd_sm120_decode_key_group`
+(20538) own exact FP16/BF16 D256/V256 on cc 12.x; TILE_M names the body
+(64 / 128 all-compute, 16 / 32 key-group decode). The legacy 20505 row
+delegates exact D256 and keeps the eight-aligned (240, 256] envelope and the
+decode tile at smaller head dims, which run the same key-group body. Kernels,
+contracts and hosts live in `sm120/d256_f16_all_compute/` and
+`sm120/decode_f16_key_group/`; `sm120/d256_f16_contract.py` holds the shared
+identity and the TILE_M selection. Capabilities, masks, sinks, PackGQA,
+split-KV, paging (decode tile only) and THD (all-compute only) are the legacy
+row's at D256. Central selection preserves the old candidate order, budget and
+placement; explicit records pin the body. Old exact-D256 20505 recipes must be
+replanned. No additional numerical, determinism or batch-invariance claim is
+introduced.
+
+**SM120-family exact wide FP8 and MXFP8 implementation engines:**
+`sdpa_fwd_sm120_d512_fp8_paired` (20533) owns exact per-tensor FP8 D512/V512
+and `sdpa_fwd_sm120_d512_mxfp8_paired` (20534) owns exact MXFP8 D512/V512,
+both E4M3/E5M2 on cc 12.x. The legacy 20507 and 20518 rows delegate these
+exact cells and retain their general tiles and the sixteen-aligned (256, 512]
+envelopes. Each explicit row reports TILE_M=64, TILE_N=64 and TILE_CGA_M=1;
+kernels, contracts and host entries live in `sm120/d512_fp8_paired/` and
+`sm120/d512_mxfp8_paired/`. Capabilities, output dtypes, block-scaled O,
+masks, sinks, split-KV and THD are the legacy rows' at D512. Central selection
+preserves the old candidate order, budget and placement; explicit records pin
+the body. Old exact-D512 20507/20518 recipes must be replanned. No additional
+numerical, determinism or batch-invariance claim is introduced.
 
 **SM120 wide half partial PackGQA:** dense-query D512 and D576/V512 flavors
 retain full groups that fit the 64-row tile, including nondividing groups.
@@ -174,7 +354,7 @@ graphs). The graph-level contract and the masked-row conventions of the other
 implementations are in `docs/operations/Attention.md`.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, the three fixed SM90 forward owners (20539/20540/20541), and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
 declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
 running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
@@ -211,7 +391,7 @@ unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
 directions, so a mode the graph requests by leaving a flag unset (unbounded
 right band, no left bound, top-left anchor) is part of the row's claim too.
 
-`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16),
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, the three fixed SM90 forward owners (20539/20540/20541, f16/bf16),
 `sdpa_fwd_prefill_sm100_fp8`, `sdpa_fwd_prefill_sm107_fp8` and `sdpa_fwd_prefill_sm120_fp8` (per-tensor FP8),
 `sdpa_fwd_prefill_sm107_mxfp8` (block-scale MXFP8, exact cc 10.7) and `sdpa_fwd_prefill_sm120_mxfp8` (block-scale MXFP8,
 cc 12.x) are default candidates, ranked against the backend per measured shard or qualification verdict
@@ -368,8 +548,9 @@ plan time · — not applicable · ⁿ footnote.
 
 ## SM90 (Hopper, cc 9.0 exactly)
 
-Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (default candidate,
-ranked against the backend by `placement._place_sm90_f16`).
+Engines: **20539** native D64, **20540** three-WG split-output, and **20541**
+dedicated D128. All are default candidates ranked using the retained historical
+SM90 policy and `placement._place_sm90_f16`; ID 20517 is retired.
 Dense and THD execute through the shared prepared pointer binder; graph shape/stride
 overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
@@ -379,7 +560,8 @@ all use FP16 or all BF16. The shared body has native **D128, D256 and D512**
 contraction/storage specializations. QK uses 8/16/32 k16 WGMMA steps and the
 PV warpgroups each own 64/128/256 columns, respectively. Smaller head pairs
 inside each admitted envelope pay that envelope's cost, with TMA zero-fill
-and clipped output stores:
+and clipped output stores. At exact (128, 128) a 128 x 128 tile also selects
+a dedicated D128 template (#378), described after the D64 specialization below:
 
 | Native tile | Graph envelope (both D_QK and D_V independently, multiple of 8) |
 |---|---|
@@ -418,7 +600,7 @@ check fixed-plan repeatability and B129 reorder/duplication/neighbor isolation
 against independent FP64 references. This is forward qualification only.
 
 **Native D64 specialization.** Exact `D_QK=D_V=64` dense FP16/BF16
-MHA and unpacked GQA select `sm90/prefill_d64_f16.py`: two warpgroups (256
+MHA and unpacked GQA select `sm90/d64_f16_one_wg/kernel.py`: two warpgroups (256
 threads), QK and PV both m64n64k64 (four SS k16 steps each), one shared P tile,
 and a full 64-column output fragment. No D512 zero-padding. Optional FP32 Stats
 (natural or base 2), causal top-left/bottom-right (the existing unpadded
@@ -436,6 +618,24 @@ on SM120 is evidence of valid target code generation only. Later H100 D64
 execution and prepared-body controls are recorded in the 2026-11-10 dense-split
 qualification in `test/python/determinism_goldens/README.md`; the earlier D512
 hardware results below do not independently qualify D64.
+
+**The 128 x 128 tile at exact (128, 128) (#378).** The historical policy
+retains both tile domains. A 64 x 64 candidate resolves to owner 20540; a
+128 x 128 candidate resolves to 20541 (`sm90/d128_f16_multi_q/kernel.py`,
+ʰ¹²⁸). Each owner accepts only its own tile. Eligibility is unchanged: every (128, 128) graph it
+admits keeps the 64 x 64 plans, and the 128 x 128 tile is admitted only for
+exact (128, 128) dense graphs the template serves (the table's last column;
+`engines._sm90_d128_tile_mismatch` with `config_sm90.d128_decline`). It is
+declined for THD, paged KV, split-KV, sinks, sliding windows, widened right
+bands, per-batch lengths, PackGQA, `S_q == 1` (a scope decline: the template
+runs it on the direct route, but decode is outside the slice #378 accepted) and
+the pending unpadded bottom-right `S_q > S_kv`. Where the tile serves a graph,
+the heuristics propose its 128 x 128 plans first and the 64 x 64 plans after
+them; the fallback plan stays 64 x 64. The direct adapter takes the template a
+pinned tile names, refusing a 128 x 128 pin the template does not serve, and
+with no tile pinned runs the dedicated template on the exact (128, 128) dense
+declarations it serves. Placement is the row's: the template's plans trail the
+backend with the other non-D512 shapes.
 
 H200 validation (2026-09-20, on `b100e342`; DSL 4.8.0.dev0, cuDNN 9.24.0,
 torch 2.14.0+cu130). The SM90 L0/L1 conformance suites — 21 files, not yet in
@@ -472,35 +672,35 @@ GH200 validation (2026-10-26, on `4cd4e613`; DSL 4.8.1, cuDNN 9.27.0, torch
 in: 271 passed, 0 skipped, 0 failed. The 21 conformance files above are not in
 this tree and were not run.
 
-| Feature | Shared native D128/D256/D512 bodies, within the graph envelopes above |
-|---|:--:|
-| FP16 / BF16 Q/K/V/O | ✅ / ⚠️ |
-| Dense layouts within `dense_flex`, with native TMA stride alignment | ✅ / ⚠️ |
-| Packed token-major THD Q/K/V/O | ✅ / ⚠️ |
-| Gapped THD (TE's `cu_seqlens_padded`, per side or per port): every port's INT32/INT64 ragged offsets and multiplier read on device | ✅ / ⚠️ |
-| Optional FP32 Stats, natural-log or base-2 (`stats_use_log2`); strided / permuted dense Stats within `dense_flex`; packed THD token-major / head-major Stats | ✅ / ⚠️ |
-| Unmasked / top-left causal / bottom-right causal | ✅ / ⚠️ |
-| Left/right diagonal bands; bottom-right requires a right bound | ✅ / ⚠️ |
-| Bottom-right or left-window `S_q > S_kv` with padding or THD | ✅ / ⚠️ |
-| Dense padding with INT32 per-batch Q/KV lengths and Stats | ✅ / ⚠️ |
-| THD INT32 sequence or cumulative Q/KV lengths | ✅ / ⚠️ |
-| Ragged `S_kv` (no tile rule; masked natively, no synthesized lengths) | ✅ / ⚠️ |
-| GQA / MQA; dense PackGQA when the head ratio divides 64 | ✅ / ⚠️ |
-| Dense split-KV, including supported PackGQA, lengths, bands, sinks and optional/base-two Stats | ✅ / ⚠️ |
-| Decode-shaped (`S_q == 1`) | ✅ / ⚠️ |
-| Per-head FP32 sink at any `S_q`, decode (`S_q == 1`, declared explicitly by the row) included: a keyless row is O = 0 / LSE = sink, a `seq_len_q`-trimmed row stays O = 0 / LSE = −inf | ✅ / ⚠️ |
-| Host scale, including literal zero and negative values (the sign is a compile-time specialization) | ✅ / ⚠️ |
-| Softmax precision unset / FLOAT | ✅ / ⚠️ |
-| Dense-Q paged KV, independent K/V pools and tables, with device lengths | ✅ / ⚠️ |
-| FP8/MXFP8, Amax_O output, mixed output dtype, bias, THD paged KV, fused epilogue gate, backward | ❌ |
-| Dense-padded THD Stats; dense cumulative lengths or Q-only trim | ❌ |
-| Head pairs outside the bounded graph envelopes (standalone retains the wider ×8 domain) | ❌ |
+| Feature | Shared native D128/D256/D512 bodies, within the graph envelopes above | 128 x 128 tile at exact (128, 128) (the dedicated D128 template)ʰ¹²⁸ |
+|---|:--:|:--:|
+| FP16 / BF16 Q/K/V/O | ✅ / ⚠️ | ✅ |
+| Dense layouts within `dense_flex`, with native TMA stride alignment | ✅ / ⚠️ | ✅ |
+| Packed token-major THD Q/K/V/O | ✅ / ⚠️ | ❌ |
+| Gapped THD (TE's `cu_seqlens_padded`, per side or per port): every port's INT32/INT64 ragged offsets and multiplier read on device | ✅ / ⚠️ | ❌ |
+| Optional FP32 Stats, natural-log or base-2 (`stats_use_log2`); strided / permuted dense Stats within `dense_flex`; packed THD token-major / head-major Stats | ✅ / ⚠️ | ✅ dense; THD ❌ |
+| Unmasked / top-left causal / bottom-right causal | ✅ / ⚠️ | ✅ |
+| Left/right diagonal bands; bottom-right requires a right bound | ✅ / ⚠️ | ❌ |
+| Bottom-right or left-window `S_q > S_kv` with padding or THD | ✅ / ⚠️ | ❌ |
+| Dense padding with INT32 per-batch Q/KV lengths and Stats | ✅ / ⚠️ | ❌ |
+| THD INT32 sequence or cumulative Q/KV lengths | ✅ / ⚠️ | ❌ |
+| Ragged `S_kv` (no tile rule; masked natively, no synthesized lengths) | ✅ / ⚠️ | ✅ |
+| GQA / MQA; dense PackGQA when the head ratio divides 64 | ✅ / ⚠️ | ✅ GQA / MQA, unpacked; PackGQA ❌ |
+| Dense split-KV, including supported PackGQA, lengths, bands, sinks and optional/base-two Stats | ✅ / ⚠️ | ❌ |
+| Decode-shaped (`S_q == 1`) | ✅ / ⚠️ | ❌ (scope, ʰ¹²⁸) |
+| Per-head FP32 sink at any `S_q`, decode (`S_q == 1`, declared explicitly by the row) included: a keyless row is O = 0 / LSE = sink, a `seq_len_q`-trimmed row stays O = 0 / LSE = −inf | ✅ / ⚠️ | ❌ |
+| Host scale, including literal zero and negative values (the sign is a compile-time specialization) | ✅ / ⚠️ | ✅ |
+| Softmax precision unset / FLOAT | ✅ / ⚠️ | ✅ |
+| Dense-Q paged KV, independent K/V pools and tables, with device lengths | ✅ / ⚠️ | ❌ |
+| FP8/MXFP8, Amax_O output, mixed output dtype, bias, THD paged KV, fused epilogue gate, backward | ❌ | ❌ |
+| Dense-padded THD Stats; dense cumulative lengths or Q-only trim | ❌ | ❌ |
+| Head pairs outside the bounded graph envelopes (standalone retains the wider ×8 domain) | ❌ | ❌ |
 
 The following are **declined, pending**:
 
 | Case | Current enforcement |
 |---|---|
-| Unpadded bottom-right `S_q > S_kv` | Shared validator; native declaration for direct callers |
+| Unpadded bottom-right `S_q > S_kv` | Shared validator; native declaration for direct callers; the row's 128 x 128 tile at (128, 128) |
 | Unpadded left-window `S_q > S_kv`, including vacuous raw bounds | Shared validator; native declaration |
 | Bottom-right band with only a left bound | Shared eligibility; contradictory direct constructor arguments |
 | Tight-tail dense layouts outside `dense_flex` | Shared eligibility; native declaration |
@@ -514,7 +714,9 @@ declarations take LPT_L2 while one KV head's K+V (`S_kv·(D_QK+D_V)·2` bytes)
 fits 50 MiB and LPT above it, the shared SM100/SM120 rule; others take NATURAL. Heuristics use the shared
 ordering (for example, 8/2 GQA packs first at `S_q=32`, unpacked first at `S_q=1024`), and
 THD offers NATURAL/unpacked only. Requested values remain unchanged; public
-float and string knob keys follow shared integer coercion. Tiles are 64/64,
+float and string knob keys follow shared integer coercion. Tiles are 64/64, plus
+128/128 at exact (128, 128) (the dedicated D128 template, offered unpacked and
+unsplit and proposed first where it serves the graph),
 CGA is 1; dense split-KV accepts 1..65535 (subject to launch limits), while THD stays unsplit. Schedulers are NATURAL, plain
 LPT, and LPT_L2 blocks of a power of two of whole KV groups within 50 MiBʷ.
 
@@ -554,16 +756,15 @@ sibling adapters (Rule S1). Accessed padded V rows must be finite. O, Stats and
 workspace must not overlap other operands (caller contract, unchecked as on the
 sibling adapters), and storage must outlive the stream.
 
-SM90 is an ordinary `ENGINE_SPECS` row using the unchanged shared validator,
-matcher, heuristics, lowering and binding. Native refusals are owned by
-`SdpaFwdDslSm90.check_support`, as in the sibling adapters; the adapter shares
-`api_dsl.py` with SM80 and SM120 and is exported lazily from `cudnn.sdpa.fwd`.
-The row is additive: `mismatch`, `recommend`, the validator, the lowering and
-the binding are unchanged by it, so the nine other rows' eligibility and
-ordering are what they were. That is a statement about the host code, not
-numerical validation on those architectures.
+SM90's three fixed `ENGINE_SPECS` rows use the shared validator, matcher,
+lowering and binding. The private historical policy retains per-shape tile
+domains solely for candidate generation and placement; it is not an offered
+engine. Native refusals remain checked by `SdpaFwdDslSm90.check_support`.
+Its fixed-owner route bypasses automatic flavor/body selection, while the
+public standalone adapter retains its existing selection and entry files.
+The adapter is exported lazily from `cudnn.sdpa.fwd`.
 
-ʷ **The kernel (`sm90/prefill_d512_f16.py`).** Three warpgroups (384 threads),
+ʷ **The kernel (`sm90/f16_three_wg/kernel.py`; standalone entry `sm90/prefill_d512_f16.py`).** Three warpgroups (384 threads),
 `setmaxnreg` (24, 240, 240). WG0 issues the TMA loads, WG1 runs QK (m64n64k512,
 SS), the online softmax and PV on O columns [0, 256) (RS), WG2 PV on [256, 512)
 (SS) from the P WG1 stages in SMEM — the head dim splits because a 64-row FP32 O
@@ -593,6 +794,67 @@ TFLOPS against 55–57, 18.8–20.3 % SOL. Gemma4 full attention (b=1, 32/4 head
 causal), same lengths: 5.46 / 5.72 / 5.78 / 5.72x, 491–577 TFLOPS against
 90–100, 45.8–53.9 % SOL. The windowed shape's lower SOL is per-CTA fixed cost
 over its three KV tiles.
+
+ʰ¹²⁸ **The D128 kernel (`sm90/d128_f16_multi_q/kernel.py`; standalone entry `sm90/prefill_d128_f16.py`, #378).** Three warpgroups
+(384 threads), `setmaxnreg` (24, 240, 240). WG0 issues the TMA loads; WG1 and
+WG2 each own 64 of the CTA's 128 query rows and every head column, and each runs
+its own QK (m64n128k16, SS), online softmax and PV (m64n128k16, RS) with no
+handoff between them, so a 64-row FP32 O accumulator costs 64 registers per
+thread. The CTA tile is 128 x 128 (Q rows by keys). K and V ride two-stage
+rings, so the producer loads KV tile j+1 while tile j is in use: 196,704 B of
+SMEM, one CTA per SM. A non-causal plan's grid is persistent: at most one CTA
+per SM (the SM count is a compile argument), each walking its work items by a
+stride of the grid, so the producer loads the next item's first K tile, Q and
+first V tile while the current item finishes. A causal plan's items differ in
+length, and a stride by the grid ran three long causal shapes at 0.889-0.922x
+the one-item-per-CTA kernel on an H100 (an earlier run on 2026-10-20 that timed
+a development build of the loop), so a causal plan's persistent grid follows a
+plan-time rule: with at least 9 Q tiles per (head, batch) a paired walk, each
+(head, batch)'s heavy and light Q tiles going out in pairs of equal KV work,
+unless the stride by the grid balances better; with fewer, the stride, on a
+plan of at most 8 query heads per KV head (with more, the paired walk's rule
+decides at every Q tile count). Such a
+record walks the NATURAL order unless the caller pins one, so a stride runs a
+(head, batch)'s Q tiles in one round on neighbouring CTAs and reads K and V from
+HBM about once (Nsight Compute on H100, 2026-11-06: the LPT_L2 order the rule
+used before read them 1.26 to 2.16 times the read-once floor on causal MHA plans
+with short S_q), dealt each round from CTA 0 or with odd rounds reversed,
+whichever leaves the busiest CTA lighter. A plan-time route
+(`_sm90_d128_causal_route`, `api_dsl.D128_CAUSAL_WALK_ROUTE`) runs a causal plan
+of at most one item per CTA, or of at least 48 KV tiles per Q tile on average,
+one work item per CTA. The rule was chosen on 88 causal shapes timed on H100 SXM
+GPUs against cuDNN 9.27, its head limit and route cutoff on 56 fresh ones, and
+checked on 48 fresh shapes (2026-11-06) and 48 more (2026-11-11), where it ran
+faster than cuDNN beyond the run-to-run band on 44 of the 45 scored (the other:
+causal MHA h24 S 1280 b9, 0.962). A causal plan with more than 93 work items per
+CTA (`api_dsl.D128_CLAIM_MIN_ROUNDS`) takes its items from an Int32 counter
+instead (`api_dsl.D128_CAUSAL_CLAIM`), so the CTAs keep a head's Q tiles
+together however far they drift: the plan reports 128 bytes of workspace, which
+the native dense binder zeroes on the launch stream before each launch (one
+memset, 3.4 to 3.8 us per call under CUDA graphs). The online
+softmax, the sign-aware row anchor, the FP64 path for extreme scales and the
+reverse KV walk are D512's arithmetic (shared helpers in
+`sm90/_common_hopper.py`). Dense only: a direct caller's
+declarations naming a `config_sm90.D128_NOT_SERVED` feature run on the D512
+body, or are refused under a pinned 128 x 128 tile; the row declines the 128 x
+128 tile for them. `S_q == 1` is a scope decline at the row, not a kernel
+limit: the kernel runs it on the direct route, and the row keeps the 128 x 128
+tile off it on the graph route because decode is outside the slice #378
+accepted. Measured on one H100 SXM against cuDNN 9.27
+(2026-10-20, bf16, 22 non-causal shapes, s512 to 16k): the persistent kernel
+ran at 1.021-1.144x cuDNN's speed (geometric mean 1.085x; 1.021-1.144x at
+b1-16, 1.064-1.111x at b33 and b66, 1.072-1.111x at s1024, 1.073-1.144x at
+s4k-16k; medians of per-round ratios), where one work item per CTA ran at
+0.821-1.140x. The persistent kernel's lead is larger than the run-to-run noise
+band on 3 of the 22 shapes (per shape, the worst per-round gap between the
+persistent kernel and an independently compiled copy of it, or between two
+timings of the same cuDNN call, whichever is larger; median 0.14). Causal
+plans as shipped, on one H100 SXM (2026-11-03, #1159's harness, bf16, O + Stats,
+9 causal shapes, 5 rounds): 1.026-1.380x the one-item-per-CTA kernel on the
+eight plans the route keeps and 1.0005x on the one it routes (both kernels then
+run the same record), and 0.905-1.101x cuDNN's speed, below 1 beyond the noise
+band on one (b5 h64/64 S_q 768 S_kv 1536, an MHA stride, at 0.905x). Placement
+keeps it behind the backend with the row's other non-D512 shapes.
 
 ---
 
@@ -909,6 +1171,7 @@ MMA as d=512.
 | Causal (top-left) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ ᵍ |  ✅ᵇ² ᵍ  |
 | Causal bottom-right | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵈ · ❌ᵍ |  ✅ᵇ² · ❌ᵍ  |
 | Causal right-band widening | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |  ❌ᵇ² · ❌ᵍ  |
+| Causal excluding the query's own block (`sdpa_mxfp8(causal_exclude_own_block=32)` op attribute: keys `j < 32 · floor(i / 32)`, rows 0–31 empty; top-left or square bottom-right, dense, unpadded, unpaged, no scalar KV-tail mask (`S_q > S_kv` with `S_kv % 128 != 0` declines); split-KV and PackGQA plans included) | ❌ | ❌ | mxfp8 ✅ (cc 10.0 / 10.3) | ❌ | ❌ | ❌ | — | — |
 | Sliding window (left) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ · ❌ᵍ |  ✅ᵇ² · ❌ᵍ  |
 | Padding mask (`seq_len_q/kv`) | ✅ᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | THD onlyᵇ ʰ · ❌ᵍ | THD onlyᵇ² · ❌ᵍ |
 | THD + causal family (top-left / bottom-right / SWA / band) | via the native d64 flavorᵗ⁰ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ʰ · ❌ᵍ | top-left / bottom-right / SWAᵇ²; no band |
@@ -1146,7 +1409,7 @@ masks over the default walk and asserts the row served every draw). Not yet: pac
 half / per-tensor FP8 siblings (the SM107 MXFP8 d128 / d256 siblings serve pools -- SM107 table), sink + KV split on the FP8 / MXFP8 pool rows (their epilogues fold the sink per tile, so a quantized sink graph runs unsplit; the half rows split with a sink -- see ˢ), block-scaled O
 (`sf_o`) over FP8 and MXFP8 pools.
 Served by the `PAGED_KV` specialization of
-`sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py`, `sm100/prefill_d256_f16.py`
+`sm100/prefill_d128_f16.py`, `sm100/prefill_d192_d128_f16.py`, `sm100/d256_f16_lookahead/kernel.py`
 and `sm100/prefill_d128_fp8.py`, and of the four `sm100/prefill_d*_mxfp8.py` kernels
 (**MXFP8 pools**, below) (block-table indirection on the K/V TMA loads; boxes past
 a sequence's live pages are TMA-OOB zero-filled; under paged KV the d192×d128 kernel
@@ -1277,7 +1540,7 @@ D128/D192 partials exclude the sink, as do the shared D128 and native D256 decod
 empty splits, natural/base-2 Stats, fresh bindings and retained capture replay. The packed
 THD sink domain remains the D128 half paged Q>1 exception ᵖˢ.
 
-ᵈ **d256 decode tile (`sm100/decode_d256_f16.py`, 2026-09-16).** Same engine row,
+ᵈ **d256 decode tile (`sm100/d256_f16_swap_ab/kernel.py`, 2026-09-16).** Same engine row,
 same graph contract, a second template: f16/bf16 d256 graphs (d_qk = d_v in
 (128, 256], the d256 envelope) whose packed Q rows fit 16 -- `S_q * G <= 16` with
 `G` the PackGQA group (16:1 at S_q = 1, 8:1 at S_q <= 2, 4:1 at S_q <= 4, MHA at
@@ -2468,7 +2731,7 @@ d256 f16/bf16, per-tensor FP8 and block-scale MXFP8 Rubin kernels
 `Capabilities.epilogue_gate_d_shapes = config_sm107.SM107_EPILOGUE_GATE_SHAPES`, the
 same constant the standalone adapter's `check_support` twin reads) — and, over PAGED
 pools, of the SHARED SM100 d256 f16/bf16 body compiled for sm_107a
-(`sm100/prefill_d256_f16.py`: the paged / THD / PackGQA prefill a Rubin paged half
+(`sm100/d256_f16_lookahead/kernel.py`: the paged / THD / PackGQA prefill a Rubin paged half
 (256, 256) plan loads; `config_sm100._EPILOGUE_GATE_FLAVORS = {"d256"}` for half
 inputs; its gate seams are the sm107 body's through the shared hook, the gate tile's
 TMA box the Q / O box's packed-row convention, the staging tile declared after the V
@@ -2826,10 +3089,10 @@ Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
 `sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`, `sdpa_bwd_sm120_fp8`,
 `sdpa_bwd_sm120_mxfp8`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
-tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
+tile at 256 on both sides run a dedicated template, `sm120/d256_f16_all_compute/kernel.py`
 with the same support).
 
-D512 FP16/BF16 FPROP (`sm120/prefill_d512_f16.py`) supports **both D_QK and D_V
+D512 FP16/BF16 FPROP (`sm120/d512_f16_paired/kernel.py`) supports **both D_QK and D_V
 in (256, 512]**, in multiples of 8. It uses a 64 x 32 CTA and 512 x 512 head
 tiles: (512, 512) is **native**; smaller shapes are **envelope-served** by
 zero-padding, with the same MMA and on-chip storage cost.
@@ -2839,13 +3102,13 @@ and THD retain their existing layout/mask contracts; dense-Q paging includes
 half or FP8 K/V, packing and split. Q loads directly and O stages through the
 drained K/V slab; no global staging allocation or kernel is introduced.
 
-FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
+FP8 FPROP (`sm120/d512_fp8_paired/kernel.py`) adds the same independent band with
 **multiples of 16** and a **64 x 64 CTA**. Half, per-tensor E4M3 and MXFP8
 BPROP extend through D512 under their respective contracts described below.
 
 MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
 `m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
-16**; both head dims in (256, 512] run `sm120/prefill_d512_mxfp8.py`, the d512
+16**; both head dims in (256, 512] run `sm120/d512_mxfp8_paired/kernel.py`, the d512
 FP8 layout on block-scaled MMAs, with the same **64 x 64 CTA**.
 
 On **SM120 / SM121 (cc 12.0 / 12.1)**, FP16/BF16 backward also serves native
@@ -2889,7 +3152,7 @@ graphs retain typed declines. The new D_QK > 256 native route additionally suppo
 | Padding mask (+ stats, + padded-Q trim) | ✅ | ✅ | ✅ | ❌ |
 | Attention sink / dSink (forward at `S_q == 1`: per-tensor FP8 ✅, MXFP8 ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
 | Base-2 stats (`stats_use_log2`) | ✅ | ✅ FP8 · ❔ MXFP8 | — | ❌ |
-| Bias / dBias | ❌ | ❌ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
+| Bias / dBias | ✅ᵇ / ❌ | ❌ | ✅ / ✅ (D_QK ≤ 256) | ❌ |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ |
 | Deterministic (`use_deterministic_algorithm`) | — | — | ✅ | ✅ |
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ | ✅ |
@@ -2933,6 +3196,17 @@ poisoned dead pages/tails, mixed pool layouts including singleton heads,
 rebinding, capture/replay, sink endpoints, physical page-offset products above
 2**32 elements, and storage canaries. The physical wide-pool case requires
 40 GiB free and runs outside sanitizer; compact cases retain sanitizer coverage.
+
+ᵇ Additive forward bias is served on dense exact D_QK = D_V = 128 FP16/BF16,
+unsplit, unpacked prefill tiles (M = 64 / 128). Bias uses FP32 or Q's dtype
+with shape `[1|B, 1|H_q, S_q, S_kv]`, contiguous keys and 16-byte aligned
+outer pitches. Native declared Q/K/V/O layouts bind directly. Top-left causal,
+right-band, sliding-window and padding masks retain their existing semantics;
+bias is added after attention scaling and before masking and softmax. THD,
+paged KV, split-KV, PackGQA, decode tiles, bottom-right causal and other head dimensions decline.
+The original bias-free host remains the default specialization.
+`test_frost_sdpa_bias_sm120.py` covers O/Stats numerics, storage rebinding,
+changed-input CUDA Graph replay, output canaries and prelaunch validation.
 
 Base-2 stats are wired into all four f16 templates (the decode tile included) and
 the FP8 and MXFP8 templates, including the final Split-KV combine. `sdpa_mxfp8` graphs take no
@@ -3196,7 +3470,7 @@ THD graphs.
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | **d512 paged decode tile** | SM100, SM103 — paged d512 is served (ᵖ) but a decode-shaped (`S_q ≤ 8`) paged d512 graph runs the d512 PREFILL tile (cga4 role-split, 256 Q rows per cluster). Measured on the FlashInfer decode shape (`S_q = 1`, `B = 8`, `d_qk = d_v = 512`, page 16, bf16, mixed `S_kv ≤ 4096`, B200, CUDA-graph replay, kernel time): 64/1 MQA prefill tile **77.8 µs vs 65.1 µs on the backend's paged decode engine**; 64/8 GQA 136.9 vs 102.5 µs. `sdpa/fwd/placement.py` keeps the backend first for paged d512 at `S_q = 1` by default (the FROST plan serves it under the opt-in; multi-token paged d512 keeps the decode-shaped lead). Follow-up: a d512 decode tile, the d128 ᵈᵗ recipe on the d512 geometry (`test_sdpa_fwd_paged_d512_decode_frost_pinned_L0` pins the shape) |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
-| Bias forward | SM90, SM120; on SM100 / SM103 every flavor except the f16/bf16 32- / 64-wide tiles (ᵗ⁰: the resident row-block up to S_kv 256 / 320 at the 32-wide tile's cga1 (TILE_N 128 / 64), 128 at the 64-wide tile's cga2 and 192 at its cga1 at TILE_N 64, the 2- / 3-stage streamed ring above the block at any S_kv, the one-batch-entry item); on SM107 every flavor except the f16/bf16 32- / 64-wide tiles, which serve it as a resident row-block up to S_kv 768 / 384 (the 32- / 64-wide tile; the (n, n+1) pair work item for a batch-broadcast bias on >= 2 flattened batch rows at cga1) or 384 / 128 (cga1) / 256 (cga2) for a per-batch bias, a single row or a requested cga2 (the one-batch-entry item) together with the per-key `kv_mask` in its BOOLEAN or additive (io dtype / fp32 vector) form (ᵗᵇ; the `kv_mask` ALONE has no S_kv bound there -- nothing is staged) -- above the block the same tiles stream the bias as a 2- / 3-stage per-kv-tile ring (any S_kv; a per-batch bias at the 64-wide tile above 256 on cga2 only), the d128 / d192 / d256 / d512 flavors decline; a compact bias at S_kv % 8 != 0 declines (TMA stride rule; pad the row stride) |
+| Bias forward | SM90; on SM120 every flavor except dense exact D128 FP16/BF16 unsplit, unpacked prefill (ᵇ); on SM100 / SM103 every flavor except the f16/bf16 32- / 64-wide tiles (ᵗ⁰: the resident row-block up to S_kv 256 / 320 at the 32-wide tile's cga1 (TILE_N 128 / 64), 128 at the 64-wide tile's cga2 and 192 at its cga1 at TILE_N 64, the 2- / 3-stage streamed ring above the block at any S_kv, the one-batch-entry item); on SM107 every flavor except the f16/bf16 32- / 64-wide tiles, which serve it as a resident row-block up to S_kv 768 / 384 (the 32- / 64-wide tile; the (n, n+1) pair work item for a batch-broadcast bias on >= 2 flattened batch rows at cga1) or 384 / 128 (cga1) / 256 (cga2) for a per-batch bias, a single row or a requested cga2 (the one-batch-entry item) together with the per-key `kv_mask` in its BOOLEAN or additive (io dtype / fp32 vector) form (ᵗᵇ; the `kv_mask` ALONE has no S_kv bound there -- nothing is staged) -- above the block the same tiles stream the bias as a 2- / 3-stage per-kv-tile ring (any S_kv; a per-batch bias at the 64-wide tile above 256 on cga2 only), the d128 / d192 / d256 / d512 flavors decline; a compact bias at S_kv % 8 != 0 declines (TMA stride rule; pad the row stride) |
 | Forward with more than 65535 heads, or batch × split_kv (#1573) | every arch: CUDA caps `gridDim.y/z` at 65535 and `SCHED_POLICY=NATURAL` launches heads and batch × split_kv there, so `mismatch` (`launch_grid_mismatch`) declines a NATURAL set and the heuristic re-emits each unsplit set under LPT (flat grid). Declined outright: a flavor whose scheduler domain is NATURAL only, the d256 decode tile past 65535 batch (batch on `gridDim.y` under every policy), ragged graphs on SM80 / SM90 (3-D grid under every policy) and split_kv > 1 past 65535 heads or batch (the combine launches both on `gridDim.y/z` under every policy); the packed THD split combine launches only heads on `gridDim.y`, so it is declined past 65535 heads only. Measured 2026-10-11, cuDNN 9.27, b or h = 65536: NATURAL fails to launch on B200 (d64 / d128, prefill and `S_q = 1`), A100 (d64 / d128) and H100 (d512); LPT and LPT_L2 match the fp64 reference (max error ≤ 5.3e-4) |
 | Score side outputs (`score_max` / `score_sum_exp`) outside the f16/bf16 d128 prefill flavor — the d192×d128 / d256 / d512 files, the decode tiles (`cga = 1`), THD, paged KV, `split_kv > 1`, the native SM100 d64 flavor, every quantized row | every arch (the d128 f16/bf16 FPROP on SM100 / SM103 / SM107 serves them, ˢᶜ; SM107 d ≤ 64 through its d128 flavor, ᵗ); SM80 / SM90 / SM120 entirely |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
@@ -3445,7 +3719,7 @@ remain outside this extension. No default selection is changed.
 The cc 10.7 half row serves paged KV for packed (THD / ragged-Q) queries on the exact D128 and D256 flavors with
 or without `sink_token` (2026-10-08). The two Rubin-specific sink gates (`engines.mismatch`'s paged rule and
 `SdpaFwdDslSm100.check_support`'s Rubin paged clause) were lifted; no kernel changed: the legs run the shared
-`sm100/prefill_d128_f16.py` / `sm100/prefill_d256_f16.py` bodies compiled for sm_107a, whose per-row sink fold
+`sm100/prefill_d128_f16.py` / `sm100/d256_f16_lookahead/kernel.py` bodies compiled for sm_107a, whose per-row sink fold
 indexes sinks by packed query head (PackGQA composes) and selects a keyless row to O := 0 / LSE := sink. Validated
 on cc 10.7 (216-SM board, cuDNN 9.26.0.51 and 9.27.0.28) by test_mhas_v2.py's P2 block: per-request Q 1 / 4 / 8
 (and 0) mixed in one packed batch, chunked prefill (128 / 77 / 1 / 128), KV lengths 0 / 1 / page-1 / page / tile
@@ -3707,7 +3981,7 @@ green (the sm107 module and the native MXFP8 binder test are not on that lane's 
 a maintainers' follow-up); the SM100 / SM103 FROST lanes were red on the PR's pipeline with a
 pre-existing, develop-wide failure under the public DSL 4.7.0 -- `TYPE_UNSTABLE_JOIN` on `k_row` /
 `kv_row_base` ("has type None on one path and Int32 on another") in the untouched
-`sm100/prefill_d256_fp8.py`, `sm100/prefill_d256_mxfp8.py` and `sm100/prefill_d512_mxfp8.py`, whose
+`sm100/d256_fp8_single_q/kernel.py`, `sm100/prefill_d256_mxfp8.py` and `sm100/prefill_d512_mxfp8.py`, whose
 K/V row bindings are first bound inside the dynamic empty-KV `else:`; the same cells fail on develop's
 own pipeline. The sm107 ports copy that construct (it compiles under 4.8.0a0), so the binding hoist is
 ONE shared follow-up for the sm100 kernels and their sm107 siblings (sibling lockstep, S6).
@@ -3948,7 +4222,7 @@ two steps the same day; the table above is the route of record).  The route (`de
 `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` -- the decode tile's single-unit widths, `D256_DECODE_ROUTED_MAX_Q_ROWS = 64`
 --, under ONE rule per policy.  `"single_unit"` (the default): packed rows `S_q x group` within a width ride the narrowest such width in ONE
 token unit (the KV streamed once per sequence and KV head); past the table the step rides the paged d256 PREFILL tile with the whole group
-packed (the EXTEND form's binding at the dense step's `(B, S_q)` envelope: the shared `sm100/prefill_d256_f16.py` body, paged THD, PackGQA,
+packed (the EXTEND form's binding at the dense step's `(B, S_q)` envelope: the shared `sm100/d256_f16_lookahead/kernel.py` body, paged THD, PackGQA,
 unsplit, `fuse_gate` in its epilogue -- one Q tile per sequence and KV head, the KV streamed once) wherever that body packs the group within
 its 128 rows (`DECODE_PREFILL_TILE_ROWS`: a group dividing 128 -- 16, 8, 4, 32, ...; the cc 10.7 paged THD leg takes whole-group PackGQA
 only); a group it cannot pack (12 = 24 / 2, 6 = 24 / 4 and 6 / 1), or a step past its 128 rows, keeps the decode tile's token-unit arm (up to
@@ -4068,9 +4342,9 @@ own K / V, an e4m3 KV cache under the mode, `use_pdl=True`, `num_tokens_live`.
 FUNCTIONAL ONLY, UNMEASURED; the cc 10.0 cells RAN 2026-10-29 (the run record in the cells table below).**  The block's part gate reads ONE tuple (`_Sdpa.check_support`, the envelope's part
 row, the block-level `_check_part_support`, the suite's `requires_blackwell` / `requires_dense_part` markers): the dense prefill form
 (`kv_source="self"`, a dense `[B, S]` inference block), the EXTEND form and the DECODE form of the bf16 / f16 block are served on cc 10.0
-through the shared SM100 d256 kernels -- the paged prefill tile with PackGQA (`sm100/prefill_d256_f16.py`: the sm100 f16 row's paged THD
+through the shared SM100 d256 kernels -- the paged prefill tile with PackGQA (`sm100/d256_f16_lookahead/kernel.py`: the sm100 f16 row's paged THD
 leg, CGA2, unsplit, unpacked on EXTEND, the whole group packed on the DECODE form's prefill route, NATURAL, no gate, no LSE), the SM100
-d256 decode tile (`sm100/decode_d256_f16.py` at 16 columns; its 32-column arm -- the width the adapter's rule takes on a wide launch -- is
+d256 decode tile (`sm100/d256_f16_swap_ab/kernel.py` at 16 columns; its 32-column arm -- the width the adapter's rule takes on a wide launch -- is
 declined by name until its cells run, `DECODE_WIDE_TILE_CCS`, the route paragraph below) and its split combine in the combine module's OWN
 forms, UNMEASURED on this line (`split_combine.DECODE_GRID_OFF` through `prepared._split_combine_decode_grid`: the decode-grid pin is the cc
 10.7 rule's, `heuristics._DECODE_COMBINE_RULE_CC`, and the lean route's cc 10.0 pin of 2026-10-29 is the standalone sparse adapter's -- the
@@ -4774,6 +5048,11 @@ The SM107 fused epilogue gate port follows the same contract
 (`config_sm107.epilogue_gate_layout_declarable` is `dense_bind_strides`), so a
 batch-1, one-token gate sliced out of a projection slab, whose singleton axes
 carry the slab's token pitch, is declarable on the graph and the standalone path alike.
+The SM90 half row (D512 and D128) declines the same unaligned outer strides at
+the graph, through `config_sm90.dense_bind_strides` (`dense_flex` strides, a unit
+axis pinned to D), the predicate its prepared launch uses; its standalone adapter
+declines them in `check_support()`. Before, the row ranked such a graph and the
+adapter declined it at build.
 
 ### SM100/SM103 large-head backward native dense strides
 

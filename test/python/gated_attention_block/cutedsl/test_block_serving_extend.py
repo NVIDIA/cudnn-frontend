@@ -1766,7 +1766,7 @@ def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_depe
     assert blk_on.use_pdl is True and blk_on._cache_write.use_pdl is True
     blk_on._cache_write.compile()
     assert len(calls) == 2 and all(c.get("use_pdl") is True for c in calls), calls
-    for mod in ("cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16", "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16"):
+    for mod in ("cudnn.sdpa.fwd.kernels.sm100.d256_f16_lookahead.kernel", "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16"):
         src = _kernel_source(mod)
         for token in ("griddepcontrol", "wait_on_dependent_grids", "launch_dependent_grids", "use_pdl=True"):
             assert token not in src, (mod, token)
@@ -2204,9 +2204,12 @@ def test_extend_fuse_gate_rides_the_paged_sdpa_epilogue(layout, page):
     assert hz_g.blk.fuse_gate and hz_g.blk.gate_fused and hz_g.blk._gate is None and sd.fuse_gate
     mod = sd._impl._k_mod
     assert (
-        mod.__file__.endswith("sm100/prefill_d256_f16.py") and int(mod.CFG.EPILOGUE_GATE) == 1 and int(mod.CFG.PAGED_KV) == 1 and int(mod.CFG.THD_VARLEN) == 1
+        mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py")
+        and int(mod.CFG.EPILOGUE_GATE) == 1
+        and int(mod.CFG.PAGED_KV) == 1
+        and int(mod.CFG.THD_VARLEN) == 1
     )
-    assert hz_u.blk._sdpa._impl._k_mod.__file__.endswith("sm100/prefill_d256_f16.py") and int(hz_u.blk._sdpa._impl._k_mod.CFG.EPILOGUE_GATE) == 0
+    assert hz_u.blk._sdpa._impl._k_mod.__file__.endswith("sm100/d256_f16_lookahead/kernel.py") and int(hz_u.blk._sdpa._impl._k_mod.CFG.EPILOGUE_GATE) == 0
     rec_g = hz_g.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
     hz_g.check(rec_g, label=f"(g) gated matrix {layout} p{page}")
     hz_u.adopt(hz_g)
@@ -2875,7 +2878,7 @@ def _sm100_pin_extend(hz):
     sd = hz.blk._sdpa
     impl = sd._impl
     assert sd.kv_source == KV_SOURCE_PAGED and sd.thd and not sd.fuse_gate and impl.kernel_template == "prefill_d256_f16", impl.kernel_template
-    assert impl._k_mod.__file__.endswith("/sm100/prefill_d256_f16.py") and impl.split_kv == 1 and not impl.pack_gqa
+    assert impl._k_mod.__file__.endswith("/sm100/d256_f16_lookahead/kernel.py") and impl.split_kv == 1 and not impl.pack_gqa
     assert impl.template_params().epilogue_gate is False and not hz.blk.gate_fused and hz.blk._gate is not None
     assert hz.blk.decode_route is None and hz.blk.use_pdl is False and hz.blk.pdl_stages == ()
 
@@ -3088,7 +3091,11 @@ def _mode_pin_extend(hz):
     if _cc() != (10, 7):
         _sm100_pin_extend(hz)
     else:
-        assert blk.gate_fused == blk.fuse_gate and (blk._gate is None) == blk.fuse_gate and sd._impl._k_mod.__file__.endswith("/sm100/prefill_d256_f16.py")
+        assert (
+            blk.gate_fused == blk.fuse_gate
+            and (blk._gate is None) == blk.fuse_gate
+            and sd._impl._k_mod.__file__.endswith("/sm100/d256_f16_lookahead/kernel.py")
+        )
 
 
 @requires_dense_part

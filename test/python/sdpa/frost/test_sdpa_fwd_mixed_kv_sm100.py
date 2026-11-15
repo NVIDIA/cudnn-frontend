@@ -51,14 +51,15 @@ def test_mixed_physical_thd_origins(qdtype, kvdtype, paged, splits, monkeypatch)
     from test_sdpa_fwd_thd_origins import test_independent_thd_origins_rebind_and_capture as thd_case
 
     loaded = []
-    original = api_dsl._load_sm100_kernel_module
+    original = api_dsl.load_template
 
     def load(*args, **kwargs):
         module = original(*args, **kwargs)
-        loaded.append(module)
+        if hasattr(module, "MIXED_FP8_KV"):
+            loaded.append(module)
         return module
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", load)
+    monkeypatch.setattr(api_dsl, "load_template", load)
     stats = "head" if kvdtype == "float8_e5m2" else "token"
     if paged:
         paged_case(

@@ -3,7 +3,7 @@
 
 """Rubin SM107 bf16/fp16 d=512 forward on the 2x2 DATAPATH (TemplateParams.mma_2x2).
 
-The SM100 body (sm100/prefill_d512_f16_2x2.py -- the per-arch sibling-file convention of every flavor; a diff against
+The SM100 body (sm100/d512_f16_2x2/kernel.py -- the per-arch sibling-file convention of every flavor; a diff against
 it is the review surface) with the Rubin deltas of the design (section 13), re-probed on a cc 10.7 board (
 2026-10-01: the 2SM M=128 lane map, the TS duplication and the full-rate 2x2 atoms are IDENTICAL to the B200 facts):
   * 3-deep K and V sub-chunk rings (config_sm107.make_cfg_d512_2x2: STAGES_K_SUB = STAGES_V_SUB = 3, one extra KV
@@ -2339,7 +2339,7 @@ def _host(
     thd_origin_specs: cutlass.Constexpr = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    """Host entry (same positional ABI as sm100/prefill_d512_f16.py so the prepared binder serves both):
+    """Host entry (same positional ABI as sm100/d512_f16_role_split/kernel.py so the prepared binder serves both):
     device pointers, runtime extents and Int64 strides in, TMA encodes and launches out.  ``problem_size``
     = (B, QH, KH, SQ, SKV, 0); ``lse_kind`` in dense / token / head / padded; ``lse_ptr`` None compiles the
     Stats store out. Paged plans bind independent K/V page tables and pool strides."""
@@ -2522,7 +2522,7 @@ def compile(  # noqa: A001
     paged_v_hnd: Optional[bool] = None,
     thd_origin_specs=None,
 ) -> Callable:
-    """Compile the host entry for one layout kind (same key surface as sm100/prefill_d512_f16.py: the
+    """Compile the host entry for one layout kind (same key surface as sm100/d512_f16_role_split/kernel.py: the
     head-dim ENVELOPE, whether the Stats store exists, the Stats layout kind)."""
     if paged_v_hnd is None:
         paged_v_hnd = paged_hnd

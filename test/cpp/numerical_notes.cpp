@@ -29,3 +29,15 @@ TEST_CASE("Full-precision numerical note backend conversion", "[numerical_notes]
     REQUIRE(backend_note == CUDNN_NUMERICAL_NOTE_TENSOR_CORE);
 #endif
 }
+
+TEST_CASE("Frontend Stats stride override behavior note", "[behavior_notes][serialize]") {
+    auto note = fe::BehaviorNote_t::SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE;
+    REQUIRE(static_cast<int64_t>(fe::BehaviorNote_t::CUBLASLT_DEPENDENCY) == 5);
+    REQUIRE(static_cast<int64_t>(note) == 1000);
+    json encoded = note;
+    REQUIRE(encoded == "SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE");
+    REQUIRE(json::parse(encoded.dump()).get<fe::BehaviorNote_t>() == note);
+    auto backend_note = CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION;
+    REQUIRE(fe::detail::convert_to_cudnn_type(note, backend_note) == CUDNN_STATUS_INVALID_VALUE);
+    REQUIRE(backend_note == CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION);
+}

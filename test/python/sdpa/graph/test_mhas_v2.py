@@ -562,23 +562,53 @@ def _exec_sdpa_on_frost(
     ``tensor_initializer`` is exec_sdpa's (a sink-value override, for one);
     ``tensor_checker`` too (an exact check on the outputs before the tolerance
     compare)."""
-    keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
-    before = [frost_routing.snapshot().get(k, 0) for k in keys]
+    engines = (engine,)
+    small_owners = {
+        "prefill_d128_f16": "sdpa_fwd_sm100_d128_multi_q",
+        "decode_d128_f16": "sdpa_fwd_sm100_d128_single_q",
+    }
+    if cfg.d_qk == cfg.d_v and cfg.d_qk in (32, 64):
+        small_owners["decode_d64_f16_quadrant"] = "sdpa_fwd_sm100_d64_quadrant"
+    else:
+        small_owners["decode_d256_f16"] = "sdpa_fwd_sm100_d256_swap_ab"
+    owners = {
+        (32, 32): small_owners,
+        (64, 64): small_owners,
+        (128, 128): small_owners,
+        (192, 128): {"prefill_d192_d128_f16": "sdpa_fwd_sm100_d192_multi_q",
+                     "decode_d128_f16": "sdpa_fwd_sm100_d128_single_q"},
+        (256, 256): {"prefill_d256_f16": "sdpa_fwd_sm100_d256_lookahead",
+                     "decode_d256_f16": "sdpa_fwd_sm100_d256_swap_ab"},
+        (512, 512): {"prefill_d512_f16": "sdpa_fwd_sm100_d512_role_split",
+                     "prefill_d512_f16_2x2": "sdpa_fwd_sm100_d512_2x2"},
+        (576, 512): {"prefill_d512_f16_2x2": "sdpa_fwd_sm100_d512_2x2"},
+    }.get((cfg.d_qk, cfg.d_v))
+    if engine == "sdpa_fwd_prefill_sm100" and owners is not None:
+        # Preserve the concrete owner/body assertion after splitting a row.
+        engines = (owners[template],) if template in owners else tuple(owners.values())
+        if template == "decode_d128_f16" and cfg.d_qk == cfg.d_v and cfg.d_qk in (32, 64):
+            # The legacy module held both single-Q and quadrant cooperation.
+            # Their new owners retain separate, concrete body identities.
+            engines = (owners[template], owners["decode_d64_f16_quadrant"])
+    keys = [[f"frost:{name}" for name in engines]]
+    if template:
+        keys.append([f"frost:{name}:" + ("decode_d64_f16_quadrant" if name == "sdpa_fwd_sm100_d64_quadrant" else template) for name in engines])
+    before = [sum(frost_routing.snapshot().get(k, 0) for k in group) for group in keys]
     # The assertion is "FROST served it": opt FROST in for the call so the placement
     # tree (sdpa/fwd/placement.py) ranks ours first even on a shard measured behind
     # the backend -- the routing, not the default winner, is under test here.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
         exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=tensor_initializer, plan_hook=plan_hook, tensor_checker=tensor_checker)
-    after  = [frost_routing.snapshot().get(k, 0) for k in keys]
+    after = [sum(frost_routing.snapshot().get(k, 0) for k in group) for group in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
     if cga is not None:
         served, got = frost_routing.LAST_PLAN
-        assert served == engine and got is not None and got.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {got}"
+        assert served in engines and got is not None and got.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {got}"
     if knobs is not None:
         served, got = frost_routing.LAST_PLAN
-        assert served == engine and got is not None, f"expected {knobs} on {engine!r}, got {served} {got}"
+        assert served in engines and got is not None, f"expected {knobs} on {engine!r}, got {served} {got}"
         for name, want in knobs.items():
             have = getattr(got, name)
             assert (bool(have) if isinstance(want, bool) else have) == want, f"expected {name}={want} on {engine!r}, got {got}"
@@ -2074,16 +2104,24 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=
     rejection, "unsupported forward graph") into failures: a config that claims FROST
     coverage must run."""
     import frost_routing
-    key = f"frost:{engine}"
-    before = frost_routing.snapshot().get(key, 0)
+    owners = {
+        (64, 64): ("sdpa_fwd_sm100_d128_fp8_multi_q", "sdpa_fwd_sm100_d128_fp8_dual_kv", "sdpa_fwd_sm100_d128_fp8_swap_ab"),
+        (128, 128): ("sdpa_fwd_sm100_d128_fp8_multi_q", "sdpa_fwd_sm100_d128_fp8_dual_kv", "sdpa_fwd_sm100_d128_fp8_swap_ab"),
+        (192, 128): ("sdpa_fwd_sm100_d192_fp8_multi_q",),
+        (256, 256): ("sdpa_fwd_sm100_d256_fp8_single_q",),
+        (512, 512): ("sdpa_fwd_sm100_d512_fp8_role_split",),
+    }
+    names = owners.get((cfg.d_qk, cfg.d_v), (engine,)) if engine == FROST_FP8_ENGINE else (engine,)
+    keys = tuple(f"frost:{name}" for name in names)
+    before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:
         exec_sdpa_fp8(cfg, request, cudnn_handle)
     except pytest.skip.Exception as e:
         if strict and not request.config.option.dryrun:
             pytest.fail(f"FROST-asserting fp8 config must run, not skip: {e}", pytrace=False)
         raise
-    after = frost_routing.snapshot().get(key, 0)
-    assert after == before + 1, f"expected {key} to serve this graph; routing tally: {frost_routing.snapshot()}"
+    after = sum(frost_routing.snapshot().get(key, 0) for key in keys)
+    assert after == before + 1, f"expected {keys} to serve this graph; routing tally: {frost_routing.snapshot()}"
 
 
 @pytest.mark.L0
@@ -3063,7 +3101,7 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
     sliding-window / band masks, mixed per-batch lengths (zeros included); inference
     graphs (the harness runs a backward otherwise, and paged KV is forward-only).
     The FROST engine row must serve every config -- the decode tile
-    (sm100/decode_d256_f16.py) while S_q x group <= 16 rows, the prefill d256 tile
+    (sm100/d256_f16_swap_ab/kernel.py) while S_q x group <= 16 rows, the prefill d256 tile
     above that -- so the routing tally is asserted: a decline would fall back to
     the backend silently and pass on the wrong kernel, and a decode-shaped draw
     quietly served by the prefill tile would pass on the slower one.
@@ -3204,6 +3242,14 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A])
     want = engine_name(arch="sm107" if sm >= 107 else "sm100")
+    if sm in (100, 103) and (d_qk, d_v) == (128, 128):
+        want = "sdpa_fwd_sm100_d128_multi_q"
+    elif sm in (100, 103) and (d_qk, d_v) == (192, 128):
+        want = "sdpa_fwd_sm100_d192_multi_q"
+    elif sm in (100, 103) and (d_qk, d_v) == (256, 256):
+        want = "sdpa_fwd_sm100_d256_lookahead"
+    elif sm in (100, 103) and (d_qk, d_v) == (512, 512):
+        want = "sdpa_fwd_sm100_d512_2x2"
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
     graph.check_support()
