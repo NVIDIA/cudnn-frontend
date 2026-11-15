@@ -1,0 +1,105 @@
+{
+  "pr": {
+    "k_prep": {
+      "gpu__time_duration.sum": {
+        "value": "547.072000",
+        "unit": "us"
+      },
+      "launch__registers_per_thread": {
+        "value": "116",
+        "unit": "register/thread"
+      },
+      "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+        "value": "0.743995",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio": {
+        "value": "2.027948",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+        "value": "2.787259",
+        "unit": "inst"
+      }
+    },
+    "k_scan_t": {
+      "gpu__time_duration.sum": {
+        "value": "632.512000",
+        "unit": "us"
+      },
+      "launch__registers_per_thread": {
+        "value": "130",
+        "unit": "register/thread"
+      },
+      "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+        "value": "0.322692",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio": {
+        "value": "0.000004",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+        "value": "0.000115",
+        "unit": "inst"
+      }
+    }
+  },
+  "current": {
+    "k_prep": {
+      "gpu__time_duration.sum": {
+        "value": "468.800000",
+        "unit": "us"
+      },
+      "launch__registers_per_thread": {
+        "value": "114",
+        "unit": "register/thread"
+      },
+      "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+        "value": "0.988293",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio": {
+        "value": "0.204134",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+        "value": "1.964411",
+        "unit": "inst"
+      }
+    },
+    "k_scan_t": {
+      "gpu__time_duration.sum": {
+        "value": "601.728000",
+        "unit": "us"
+      },
+      "launch__registers_per_thread": {
+        "value": "128",
+        "unit": "register/thread"
+      },
+      "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+        "value": "0.252279",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio": {
+        "value": "0",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+        "value": "0",
+        "unit": "inst"
+      }
+    }
+  },
+  "source_hashes": {
+    "pr": {
+      "host": "28bffaec434a95e382e919cf365890b7b3f0895b229d83be1f0b0349e0621deb",
+      "kernel": "6b7c7040d3df109999c549de0551b8d80ed18ee9a45bc80bde4e6e7183763c84"
+    },
+    "current": {
+      "host": "7e7c839e3942ae831bf5b9216a930e7346a5ba1f98254adeb10f62c7725ef31e",
+      "kernel": "aa112a57601273e9086febe85593f67da0c181edf78ff0b49ac9b766567042c8"
+    }
+  },
+  "method": "Nsight Compute; 16K/H8; single selected kernel, kernel replay; MemoryWorkloadAnalysis, WarpStateStats, LaunchStats, SpeedOfLight. Profiled durations are not graph timing samples."
+}

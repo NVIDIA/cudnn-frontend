@@ -1,0 +1,147 @@
+[
+  {
+    "version": "early",
+    "kernel": "_Z8k_scan_tILi32ELi256ELb1ELb1EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": [
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51
+    ]
+  },
+  {
+    "version": "early",
+    "kernel": "_Z8k_scan_tILi32ELi256ELb1ELb0EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": [
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51
+    ]
+  },
+  {
+    "version": "early",
+    "kernel": "_Z8k_scan_tILi32ELi256ELb0ELb0EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": [
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51
+    ]
+  },
+  {
+    "version": "early",
+    "kernel": "_Z8k_scan_tILi16ELi128ELb1ELb1EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": [
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51
+    ]
+  },
+  {
+    "version": "early",
+    "kernel": "_Z8k_scan_tILi16ELi128ELb1ELb0EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": [
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51
+    ]
+  },
+  {
+    "version": "final",
+    "kernel": "_Z8k_scan_tILi32ELi256ELb1ELb1EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": []
+  },
+  {
+    "version": "final",
+    "kernel": "_Z8k_scan_tILi32ELi256ELb1ELb0EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": []
+  },
+  {
+    "version": "final",
+    "kernel": "_Z8k_scan_tILi32ELi256ELb0ELb0EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": []
+  },
+  {
+    "version": "final",
+    "kernel": "_Z8k_scan_tILi16ELi128ELb1ELb1EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": []
+  },
+  {
+    "version": "final",
+    "kernel": "_Z8k_scan_tILi16ELi128ELb1ELb0EEvPK13__nv_bfloat16S2_S2_PKfS2_S2_S4_S4_S4_PKiS6_S6_S6_PS0_S7_S7_S7_Pfii",
+    "seed_loads": 16,
+    "seed_registers_not_consumed_before_release": []
+  }
+]
