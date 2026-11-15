@@ -95,7 +95,7 @@ def test_central_policy_keeps_budget_order_and_placement(kind, dq):
     f = facts(d_qk=dq)
     policy = engines.sm100_legacy_policy_spec(LEGACY_ROW)
     old = heuristics._knob_sets(policy, f) if kind == "A" else [heuristics._fallback_knobs(policy, f)]
-    offered = {ROLE_SPLIT: 20554, TWO_BY_TWO: 20555, LEGACY_ROW: 20514}
+    offered = {ROLE_SPLIT: 20554, TWO_BY_TWO: 20555, LEGACY_ROW: 20515}
     expected = []
     for k in old:
         if engines.mismatch(policy.capabilities, f, k) is not None:
