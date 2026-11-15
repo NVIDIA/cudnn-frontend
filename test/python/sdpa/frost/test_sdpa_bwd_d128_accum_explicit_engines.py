@@ -61,6 +61,51 @@ def test_cluster_decline_does_not_change_explicit_body(monkeypatch):
 
 @requires_dsl
 @requires_bwd_engine_row(ACCUMULATION_OWNER)
+@pytest.mark.parametrize("d,left", [(64, None), (64, 17), (128, None)])
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+def test_public_dense_accumulation_record_rebuild(monkeypatch, d, left, dtype_name):
+    import torch
+
+    import test_sdpa_bwd_d128_sm100 as helper
+    from cudnn.sdpa.bwd import api_dsl_sm100_d128 as legacy
+    from test_sdpa_bwd_d128_accum_sm100 import _require_accumulation
+
+    _require_accumulation()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a fixed accumulation record consulted the legacy selector")
+
+    monkeypatch.setattr(legacy, "select_implementation", forbidden)
+    dtype = getattr(torch, dtype_name)
+    case = helper._case(dt=dtype, d=d, causal=True, left=left, sq=65, sk=129, accumulation=True)
+    record = case.graph.get_engine_and_knobs_at_index(case.graph._plan_index)
+    assert record == (20630, {})
+    graph, refs, outputs = helper._build_graph(
+        b=1,
+        hq=2,
+        hkv=2,
+        sq=65,
+        skv=129,
+        d=d,
+        dt=dtype,
+        use_causal_mask=True,
+        **({"diagonal_band_left_bound": left} if left is not None else {}),
+    )
+    graph.create_execution_plan(*record)
+    graph.select_plan(0)
+    graph.check_support()
+    graph.build_plans()
+    assert graph.get_workspace_size() == case.workspace.numel()
+    assert graph._compiled_plans[0]._prepared.spec.artifact.implementation == "accumulation"
+    refs.update(zip(("dq", "dk", "dv"), outputs))
+    for name in ("dq", "dk", "dv"):
+        case.tensors[name].fill_(float("nan"))
+    graph.execute({refs[name]: value for name, value in case.tensors.items()}, case.workspace)
+    helper._check_case(case)
+
+
+@requires_dsl
+@requires_bwd_engine_row(ACCUMULATION_OWNER)
 @pytest.mark.parametrize("owner", [ACCUMULATION_OWNER, TWO_CTA_OWNER])
 @pytest.mark.parametrize("thd,packing", [(False, "TH1"), (True, "TH1"), (True, "HN")])
 def test_public_grouped_record_rebuild_and_capture(monkeypatch, owner, thd, packing):
