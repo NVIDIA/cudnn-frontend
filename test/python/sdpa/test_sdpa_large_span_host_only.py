@@ -44,7 +44,7 @@ def _lower_sm120_bwd(b, s, h, kvh):
         )
         run = subprocess.run([sys.executable, "-c", _SM120_BWD_PROBE, *map(str, (b, s, h, kvh))], env=env, capture_output=True, text=True)
         if run.returncode != 0:
-            # A broken project import is a failure; only a missing compiler target is a skip.
+            # A failing project import fails the test; only a missing compiler target is a skip.
             assert "ImportError" not in run.stderr and "ModuleNotFoundError" not in run.stderr, run.stderr[-2000:]
             pytest.skip(f"the installed CuTe DSL cannot lower sm_120a here: {run.stderr[-300:]}")
         texts = []
