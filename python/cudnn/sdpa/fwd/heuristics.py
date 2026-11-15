@@ -3626,6 +3626,29 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     return MultiQ(d_flavor=facts.d_qk, cga=cga)
 
 
+def select_sm107_small_fp8_geometry(facts, knobs):
+    """Resolve the existing Rubin native/swap-AB choice before fixed lowering."""
+    from .kernels.sm107.d128_fp8_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm107.d128_fp8_swap_ab.contract import Geometry as SwapAB
+    from .config_sm100 import supports_dense_fp8_swap_ab
+
+    if knobs.swap_ab == 1 and supports_dense_fp8_swap_ab(
+        (facts.d_qk, facts.d_v),
+        device_cc=facts.device_cc,
+        paged=facts.has_paged_kv,
+        thd=facts.thd,
+        batch_size=facts.b,
+        s_q=facts.s_q,
+        h_q=facts.h_q,
+        h_kv=facts.h_kv,
+        pack_gqa=knobs.pack_gqa,
+        cga=knobs.cga,
+        tile_n=knobs.tile_n,
+    ):
+        return SwapAB()
+    return MultiQ(d_flavor=facts.d_qk, cga=(1 if facts.d_qk == 64 else 2) if knobs.cga is None else knobs.cga)
+
+
 def resolve_sm100_half_multi_q_geometry(facts, knobs, *, d_flavor):
     """Resolve local defaults of a fixed multi-Q body, without body selection.
 
@@ -3822,6 +3845,23 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_d512_fp8_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, lambda f, k: Fp8D512Geometry(), policy=sm100_legacy_policy_spec(FP8_LEGACY_ROW))
+    from .kernels.sm107.small_fp8_contract import in_domain as in_sm107_small_fp8
+
+    if in_sm107_small_fp8(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, select_sm107_small_fp8_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm107_fp8")
+        )
+    from .kernels.sm107.d192_fp8_multi_q import contract as sm107_d192_fp8
+    from .kernels.sm107.d256_fp8_single_q import contract as sm107_d256_fp8
+
+    if sm107_d192_fp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: sm107_d192_fp8.Geometry(cga=k.cga), policy=sm100_legacy_policy_spec(sm107_d192_fp8.LEGACY_ROW)
+        )
+    if sm107_d256_fp8.in_domain(facts):
+        return _recommend_sm100_implementation(
+            kind, facts, offered, lambda f, k: sm107_d256_fp8.Geometry(), policy=sm100_legacy_policy_spec(sm107_d256_fp8.LEGACY_ROW)
+        )
     from .kernels.sm107.d512_fp8_role_split import contract as sm107_d512_fp8
 
     if sm107_d512_fp8.in_domain(facts):

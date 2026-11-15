@@ -2034,10 +2034,10 @@ def test_paged_graph_fp8_declines_off_contract():
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/d192_fp8_multi_q/kernel.py", 0, 1),
     ("sm100/d512_f16_2x2/kernel.py", 2, 2),
-    ("sm107/prefill_d128_fp8.py", 0, 2),
+    ("sm107/d128_fp8_multi_q/kernel.py", 0, 2),
     ("sm107/d192_mxfp8_multi_q/kernel.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
-    ("sm107/prefill_d256_fp8.py", 0, 1),
+    ("sm107/d256_fp8_single_q/kernel.py", 0, 1),
     ("sm107/d512_mxfp8_role_split/kernel.py", 0, 2),
 ]
 
@@ -2059,7 +2059,7 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", *rel.split("/"))
     params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=cta_mma)
-    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/prefill_d128_fp8.py" else "paged_kv is not wired"
+    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/d128_fp8_multi_q/kernel.py" else "paged_kv is not wired"
     with pytest.raises(ValueError, match=expected_error):
         load_template(path, params, tag=f"paged_unwired_probe_{rel.replace('/', '_')}")
 
