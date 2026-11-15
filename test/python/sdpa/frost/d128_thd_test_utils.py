@@ -244,7 +244,7 @@ def adapter_arguments(case):
     return args
 
 
-def make_graph(case, engine_name="sdpa_bwd_sm100_d128", engine_id=20609):
+def make_graph(case, engine_name="sdpa_bwd_sm100_d128_accumulation", engine_id=20630):
     import cudnn
     from frost_test_utils import select_engine
 

@@ -9,7 +9,7 @@ import pytest
 
 import cudnn
 from cudnn.sdpa.bwd import engines, heuristics
-from cudnn.sdpa.bwd.d128_selection import LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER
+from cudnn.sdpa.bwd.d128_selection import ACCUMULATION_OWNER, LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER, TWO_CTA_OWNER
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 from frost_test_utils import requires_bwd_engine_row, requires_dsl
 
@@ -39,11 +39,11 @@ def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profil
         **(dict(is_backward=True, b=2, h_q=2, h_kv=2, s_q=128, s_kv=256, d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, device_cc=cc) | changes)
     )
     baseline = engines.mismatch(old, facts)
-    reasons = [engines.mismatch(s.capabilities, facts) for s in (row, owner)]
+    reasons = [engines.mismatch(s.capabilities, facts) for s in (row, owner, specs[PAIR_OWNER], specs[ACCUMULATION_OWNER], specs[TWO_CTA_OWNER])]
     assert (None in reasons) == (baseline is None)
     if baseline is None and profile not in ("grouped", "thd"):
         assert reasons[1] is None
-    offered = {LEGACY_ROW: 20609, RECOMPUTE_OWNER: 20628, PAIR_OWNER: 20629}
+    offered = {LEGACY_ROW: 20609, RECOMPUTE_OWNER: 20628, PAIR_OWNER: 20629, ACCUMULATION_OWNER: 20630, TWO_CTA_OWNER: 20631}
     plans = heuristics.recommend("A", facts, offered)
     if baseline is None:
         expected = [offered[name] for name in engines.legal_implementations(row.capabilities, facts)]
