@@ -299,7 +299,7 @@ def test_softmax_half_declines_by_row_domain():
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
-    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
+    sm107 = caps["sdpa_fwd_sm107_d128_fp8_multi_q"]
     half = _c.data_type.HALF
 
     assert "softmax_precision" in engines.mismatch(sm100, facts((10, 0), half), None)
@@ -307,7 +307,7 @@ def test_softmax_half_declines_by_row_domain():
     # It is not a tuning knob: the knob vocabulary has no such axis.
     assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
     # And the rows keep their arch lanes regardless of the attribute.
-    assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
+    assert "on SM107" in engines.mismatch(sm107, facts((10, 0)), None)
     assert "SM100-106" in engines.mismatch(caps[engines.engine_name(fp8=True)], facts((10, 7)), None)
 
 
@@ -842,7 +842,9 @@ def test_fp8_envelope_mismatch_rules():
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
     # Native SM107 serves the same aligned dense D192 envelope.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    native192 = caps["sdpa_fwd_sm107_d192_fp8_multi_q"]
+    assert engines.mismatch(native192, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
         assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
@@ -850,7 +852,9 @@ def test_fp8_envelope_mismatch_rules():
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined, and the (256, 512]
     # floor applies here exactly as on the SM100 row.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    native512 = caps["sdpa_fwd_sm107_d512_fp8_role_split"]
+    assert engines.mismatch(native512, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
     # ...and straddling the floor declines on BOTH rows, identically.
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))

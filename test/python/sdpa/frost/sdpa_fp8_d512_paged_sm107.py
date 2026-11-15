@@ -83,8 +83,17 @@ def native_paged_contract():
         selected_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d512_fp8_role_split") if dims == (512, 512) else caps
         assert engines.mismatch(selected_caps, selected) is None
     for dims in ((64, 64), (128, 128), (192, 128), (256, 256)):
-        reason = engines.mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]))
-        assert reason is not None and "paged KV is wired" in reason
+        name = {
+            (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
+            (128, 128): "sdpa_fwd_sm107_d128_fp8_multi_q",
+            (192, 128): "sdpa_fwd_sm107_d192_fp8_multi_q",
+            (256, 256): "sdpa_fwd_sm107_d256_fp8_single_q",
+        }[dims]
+        selected_caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
+        selected = replace(facts, d_qk=dims[0], d_v=dims[1])
+        assert engines.mismatch(selected_caps, replace(selected, has_paged_kv=False, page_size=0, padded=False)) is None
+        reason = engines.mismatch(selected_caps, selected)
+        assert reason is not None and "paged attention" in reason
     owner = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d512_fp8_role_split")
     assert "THD" in engines.mismatch(owner, replace(facts, thd=True))
 
