@@ -66,6 +66,14 @@ Historical paging and THD goldens are unavailable for runtime fingerprint
 unverified for this runtime; no replacement baselines were recorded. No
 other architecture or backward path is newly qualified by this change.
 
+After integrating the shared admission changes from `a766c397a`, head
+`bf16a8a5d` passed 43 additional native record/origin/paged-capture and owner
+contract checks with zero failures or skips (one unchanged warm case was
+deselected because the larger stress above was already qualified). The
+shared CPU suites retained 1,089 passes and eight skips. Repeating the
+1,152 graph/mode comparison against that new parent preserved all 1,760
+ordered candidate records and placement decisions.
+
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
 `sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`
