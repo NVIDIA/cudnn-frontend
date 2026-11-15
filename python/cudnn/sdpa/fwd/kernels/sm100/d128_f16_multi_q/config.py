@@ -17,9 +17,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_O_MXFP8,
     DTYPE_O_NVFP4,
     O_BLOCK_SCALE_BY_DTYPE,
-    MASK_NONE,
     MASK_PADDED,
-    SCHED_NATURAL,
 )
 
 
