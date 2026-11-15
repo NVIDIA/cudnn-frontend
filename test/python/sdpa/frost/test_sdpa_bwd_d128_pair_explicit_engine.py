@@ -60,9 +60,9 @@ def test_pair_preserves_admission_and_default_order(monkeypatch, cc, d, dtype, p
 @requires_bwd_engine_row(PAIR_OWNER)
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
-@pytest.mark.parametrize("hkv", [1, 2])
+@pytest.mark.parametrize("hkv,deterministic", [(1, True), (2, True), (2, False)])
 @pytest.mark.parametrize("left", [None, 17])
-def test_public_pair_record_rebuild_ignores_legacy_selector(monkeypatch, d, dtype_name, hkv, left):
+def test_public_pair_record_rebuild_ignores_legacy_selector(monkeypatch, d, dtype_name, hkv, deterministic, left):
     import torch
 
     from cudnn.sdpa.bwd import api_dsl_sm100_d128 as legacy
@@ -87,7 +87,7 @@ def test_public_pair_record_rebuild_ignores_legacy_selector(monkeypatch, d, dtyp
         d=d,
         dt=dtype,
         use_causal_mask=True,
-        use_deterministic_algorithm=True,
+        use_deterministic_algorithm=deterministic,
         **({"diagonal_band_left_bound": left} if left is not None else {}),
     )
     graph.validate()
