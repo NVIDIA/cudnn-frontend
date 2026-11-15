@@ -749,6 +749,214 @@ eight-wave or forward concurrency rerun. Compile-cache and CUDA Graph audits:
 passed for the exercised runtime-head, prefix and replay configurations;
 other architectures remain unverified for this addition.
 
+### H96 exact state reuse and dense-THD workspace — SM100 CP4, 2026-11-15
+
+This experiment branches from `a1de8974`. The budget is now **workspace only**:
+external Q/K/V/G/Beta/dO, output and input gradients are excluded. Earlier
+all-resident H96 figures above must not be interpreted as workspace figures.
+The target is decimal 20 GB (18.626 GiB).
+
+Forward H and X use exactly the same FP32 region. A row-owning lane loads its
+H vector before storing X, in one inline PTX block with named temporary
+registers. M remains separate; no other lane reads that H vector. This saves
+one of three forward state arrays for square K/V without extra launches.
+Normal shapes retain one/two forward waves. Above 16 GiB of live state per
+wave, four/eight waves are allowed only with at least four planned tasks per
+SM. Backward can additionally use sixteen waves above a conservative 128 GiB
+full-arena estimate, with the same task guard. These are bounded shape
+policies, not occupancy guarantees or a universal workspace cap.
+
+Per-head recurrence, arithmetic order, chunking, FP32 states and CP merge,
+public tensor layouts, coarse checkpoints and numerical tolerances are
+unchanged. No golden is updated. The existing compile-key divisor domain is
+bounded; token counts, sequence prefixes, pointer values and runtime head
+counts do not become new specialization axes.
+
+#### Measurement
+
+The specified four-GPU environment runs real CP4, global 1,048,576 tokens,
+262,144 tokens per rank, H96 per rank, K=V=128, BF16 Q/K/V/dO, FP32 gates and
+states, and `batch_invariant=True`. The same cuLA working-package snapshot
+is used by both arms. It includes pre-existing contiguous CP summary and
+backward context-range fixes; no cuLA source is changed in this branch.
+
+Each case starts in a fresh process: three warmups and fifteen eager F+B
+iterations, including CP boundary communication when needed. Latency is the
+median of the per-iteration slowest rank. Planning, compilation, random input
+creation and hashing are excluded. Full input and O/dQ/dK/dV/dG/dBeta hashes
+are compared per rank. Source-module hashes and loaded runtime are recorded.
+
+Native workspace is the exact requested per-graph buffer size. A separate,
+untimed audit samples active internal allocations at every cuDNN execution,
+subtracting deduplicated external I/O storage live at that phase; it includes
+summary/context and Torch-owned CP transport. This is an execution-boundary
+sample, not an allocation-event trace or a whole-device/NCCL allocation cap.
+Allocator reservations are reported separately. CUDA Graph is checked for
+correctness, not used for these performance measurements.
+
+All memory values below are decimal GB. Layouts are in packed document order;
+`n × length` denotes n documents. Every row has full per-rank byte parity.
+
+| Global THD layout | Native workspace GB, parent → candidate | Sampled internal GB, parent → candidate | F+B ms, parent → candidate | Latency change |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 1,048,576 | 13.117 → 13.117 | 13.388 → 13.388 | 174.246 → 174.570 | +0.19% |
+| 20 × 1,024 + 2 × 514,048 | 13.331 → 13.331 | 13.401 → 13.401 | 209.410 → 209.891 | +0.23% |
+| 256 × 4,096 | 7.701 → 7.701 | 7.752 → 7.752 | 80.165 → 80.124 | -0.05% |
+| 2,048 × 512 | 7.530 → 7.530 | 7.581 → 7.581 | 82.711 → 82.714 | +0.00% |
+| 1,024 × (480, 544) | 7.530 → 7.530 | 7.581 → 7.581 | 82.651 → 82.676 | +0.03% |
+| 2,047 × 256 + 524,544 | 13.117 → 13.117 | 13.388 → 13.388 | 172.667 → 173.322 | +0.38% |
+| 1,536 × 64; 512 × 1,856 | 15.652 → 10.440 | 15.715 → 10.503 | 106.016 → 106.027 | +0.01% |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 8.643 → 8.270 | 8.712 → 8.333 | 92.881 → 92.802 | -0.08% |
+| 4,096 × 256 | 9.975 → 8.542 | 10.025 → 8.593 | 91.462 → 91.444 | -0.02% |
+| 8,192 × 128 | 19.648 → 13.105 | 19.699 → 13.155 | 109.656 → 109.629 | -0.02% |
+| 16,384 × 64 | 38.993 → 14.616 | 39.044 → 14.666 | 151.345 → 151.547 | +0.13% |
+| 32,768 × 32 | 77.684 → 13.037 | 77.735 → 13.087 | 234.933 → 237.908 | +1.27% |
+
+All twelve layouts are below 20 GB: the maximum native workspace is
+**14.616 GB**, and maximum sampled internal storage is **14.666 GB**.
+The largest measured latency regression is **1.27%**, on 32,768 documents.
+The parent already meets the workspace target for ten of twelve layouts;
+the two dense extremes are reduced from 39.044/77.735 GB sampled internal
+storage to 14.666/13.087 GB. Some forward savings do not lower the overall
+maximum because backward was already the larger phase.
+
+Measurement provenance: V2 measured all twelve layouts. Final V3 adds only
+the guarded backward-sixteen-wave selection; one-document, skew2048 and
+32,768-document rows were rerun on V3. The other nine rows retain their V2
+measurements. Captured geometry replay through both selectors confirms
+identical decisions for those nine; constructor/allocation/execution ASTs
+outside the two policy helpers and constant are identical, and the state-chain
+source has the same SHA256. They are not presented as exact-V3 reruns.
+
+The comparison is against the already-optimized parent `a1de8974`, not the
+original pre-wave baseline in the earlier B300 report. Earlier performance
+exceptions in that report are not resolved by this comparison.
+
+#### Native and safety validation
+
+Runtime: Torch 2.14.1+cu130, CUDA 13.0, cuDNN 9.24.0, CuTeDSL 4.8.1 with
+CUDA 13.4 compiler. Both arms use the same extension rebuilt from the parent
+source in an isolated venv. Commands run from `test/python`, with
+`CUDNN_TEST_NO_ISOLATION=1` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`.
+
+```bash
+python -m pytest -q -x -rs linear_attention/frost/test_kda_state_reuse.py \
+  linear_attention/frost/test_kda_forward_waves.py \
+  linear_attention/frost/test_kda_wave_boundaries.py -k 'not warm_stress'
+python -m pytest -q -x -rs linear_attention/frost/test_kda_checkpoint_waves.py \
+  -k '(bitwise_and_capture and (equal-16 or gqa-16 or gva-16)) or capacity_policy or (runtime_heads and 16)'
+```
+
+- V1: **35 passed, 6 deselected in 482.99 s**. Warm stress completed
+  3,000 warm and 3,000 poisoned launches with zero wrong bytes; the unsafe
+  control failed 200/200. The tested shape has only two total CTAs, below
+  the control's three CTAs/SM, so this is limited schedule coverage rather
+  than a universal race-free guarantee.
+- V2: **41 passed, 1 deselected in 764.14 s**, no skips or failures. The
+  deselected warm-stress case ran in V1 with identical state-chain source.
+  Includes forward four/eight-wave coverage, cache reuse and independent
+  FP64 state-chain references.
+- V3 backward sixteen-wave selection: **27 passed, 84 deselected in
+  569.96 s**, no skips or failures. The 24 parity/capture combinations cover
+  two storage modes, three head patterns and four dtype/gate cases; two
+  additional runtime-head checks include H96, plus the policy boundary test.
+- V3 forward policy: **1 passed, 16 deselected in 2.39 s**.
+
+These selections overlap; their counts are not a count of unique tests.
+Compile-cache audit: passed for the exercised forward/backward head waves;
+runtime head changes reuse the same two baseline/wave compiled objects.
+CUDA Graph audit: passed for the exercised preallocated native calls,
+poisoned workspaces, changed-input replay and prefix changes. This is not a
+whole distributed CP4 captured-graph pool benchmark. No C++ port is involved.
+
+Standalone alias coverage includes K/V64/128 square and rectangular states,
+forward/reverse, one/three pieces, tail and transition product, changed values
+at stable addresses, graph replay and a trailing canary. Shared chain entry
+checks also compare with an independent FP64 recurrence. Forward wave tests
+cover grouped heads, log/safe gates, FP16/BF16, public checkpoints and all
+autograd gradients; backward sixteen-wave tests cover grouped heads,
+checkpoint-only/owned-state paths, changed lengths and H96 runtime reuse.
+
+Compute Sanitizer 13.4.92, scoped to the sixteen standalone alias/capture
+cases: Memcheck **16 passed, 1 deselected, 0 errors (15.22 s)**;
+Synccheck **16 passed, 1 deselected, 0 errors (11.78 s)**; Racecheck
+**16 passed, 1 deselected, 0 hazards, 0 errors, 0 warnings (133.80 s)**.
+No device kernel filter or memory/race/synchronization suppression is used.
+These are small native tests, not a sanitized distributed CP4 1M run.
+
+This is a **qualified, not unfiltered, sanitizer pass**. Unfiltered memcheck
+on the candidate reports 41 `cuGetProcAddress_v2` / error-1 API queries;
+the unchanged parent independently reports the same 41 queries while both
+of its default-chain FP64-reference tests pass. The newer tool's default
+extended mode additionally prints 41 driver diagnostics: requested API
+versions 13010–13041 exceed driver version 13000. The saved parent XML
+attributes all 41 explicit errors to `cuda.bindings._internal.driver`.
+Neither unfiltered run reports a device memory violation, but both exit 99
+and are retained as failures, not counted as clean tool passes.
+
+The qualified runs retain explicit API error checking and suppress only
+`kind=Api`, `api=cuGetProcAddress_v2`, `result=1`; all other explicit API
+results and device checks remain enabled. A parent control with this exact
+suppression reports **2 passed, 6 deselected, 0 errors (3.37 s)**.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` is used only in this
+instrumentation lane. Original logs, the failed narrower stack-filter
+attempt, XML and the final suppression are retained in the experiment
+artifacts. No CUDA library, driver or production dependency is changed.
+
+```xml
+<ComputeSanitizerOutput>
+  <record>
+    <kind>Api</kind>
+    <what><api>cuGetProcAddress_v2</api><result>1</result></what>
+  </record>
+</ComputeSanitizerOutput>
+```
+
+The invocation is `compute-sanitizer --tool <memcheck|synccheck|racecheck>
+--report-api-errors explicit --suppressions <file.xml> --error-exitcode 99`,
+followed by `python -m pytest -q -x -rs
+linear_attention/frost/test_kda_state_reuse.py -k summary_alias`.
+The API-reporting modes and XML suppression semantics follow the
+[Compute Sanitizer documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#error-suppression).
+Racecheck detects shared-memory hazards; it does not prove global alias
+ownership. H/X safety additionally relies on the documented single-lane
+ownership, same-block load-before-store PTX and exact-view contract.
+
+The negative control runs the new alias test from an isolated parent source
+and test tree, verifying the loaded state-chain path and SHA256 before each
+case. With caches disabled, the unchanged parent fails the first case
+(`1-False-64-64`): **177,678/196,608 tail bytes differ**, pytest exit 1,
+**1 failed, 1 deselected in 1.57 s**, stopped at first failure. Saved PTX
+shows the parent's store before its load, while the candidate PTX has the
+single load-before-store block. This validates the detector for the newly
+supported alias contract; it is not a failure of the parent's supported
+separate-storage contract.
+
+Earlier attempts launched parent/mutant controls from the candidate test tree;
+its conftest overlaid candidate kernel sources despite the parent top-level
+`cudnn.__file__`. Those controls are invalid and excluded. Native candidate
+suites and parent API controls use matching source/test trees. The CP4
+benchmark is a standalone harness with per-module hashes, unaffected by this
+pytest overlay. The corrected control's wrapper also expected a `state`
+mismatch specifically, so it exits 1 on the actual `tail` mismatch; the saved
+pytest traceback and source check, not that wrapper status, establish the
+expected negative result.
+
+The initial pilot used an older cuLA snapshot and failed the contiguous-summary
+contract before producing a measurement. Its log is retained and excluded.
+An initial extension import lacked its runtime library path; subsequent
+imports and all reported tests use the corrected launch environment. No
+partial or failed run is counted as a pass.
+
+Changed-file pre-commit and Python compilation checks pass. All four
+production/test hashes match the measured V3 snapshot. Fern reports zero
+errors and one warning for the skipped unauthenticated redirects check.
+
+Other GPUs, independent-stream concurrency for this new alias, safe-gate
+CP4 1M performance, and full-model/CSA measurements are unverified here.
+Existing earlier-architecture evidence is retained, not represented as a
+rerun of this change.
+
 ## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
 

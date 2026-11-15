@@ -247,10 +247,15 @@ a row alone and inside a batch under the entry's own picks.
   with BF16/log gates and FP32 states (two/four-wave backward). Forward state
   waves and eight-wave backward have additional SM103 byte-parity coverage
   for grouped heads, rectangular forward states, public checkpoints and
-  changed-prefix graph replay. Their automatic policy may retain more storage
-  to protect parallelism; it is not a hard workspace cap. These additional
-  workspace regressions have not been rerun on SM100 or SM107; their earlier
-  determinism coverage remains recorded in the test report.
+  changed-prefix graph replay. Exact FP32 forward H/X storage reuse has
+  additional SM100 byte-parity coverage, including rectangular states,
+  forward/reverse chains, changed-input graph replay and public checkpoints.
+  Four/eight-wave forward and sixteen-wave backward also have SM100 coverage
+  for grouped heads, log/safe gates and runtime-head reuse through H96.
+  Their automatic policy may retain more storage to protect parallelism;
+  it is not a hard workspace cap. The new H/X alias and sixteen-wave paths
+  have not been requalified on SM103 or SM107; earlier architecture coverage
+  remains recorded separately in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

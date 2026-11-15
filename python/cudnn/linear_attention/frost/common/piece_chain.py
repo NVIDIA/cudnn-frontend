@@ -459,6 +459,32 @@ def piece_table_body(
 # ---- state chain ----------------------------------------------------------------------------------
 
 
+@cute.jit
+def load_summary_store_state(h_addr, x_addr, state_values, width: cutlass.Constexpr[int]):
+    """Read a row owner's H vector before replacing it with the incoming state.
+
+    Exact H/X aliasing is safe because the same lane owns both vectors and no
+    other lane reads H. Keep load and store in one assembly block: independent
+    inline loads/stores do not describe this alias to the compiler. Named PTX
+    temporaries retain H until all input operands have been consumed, so output
+    register allocation cannot clobber the state values before the store.
+    """
+    if cutlass.const_expr(width == 2):
+        return nvvm.inline_ptx(
+            "{ .reg .f32 h0, h1; ld.global.v2.f32 {h0, h1}, [$2]; " "st.global.v2.f32 [$3], {$4, $5}; mov.f32 $0, h0; mov.f32 $1, h1; }",
+            write_only_types=[cutlass.Float32] * 2,
+            read_only_args=[h_addr, x_addr, state_values[0], state_values[1]],
+        )
+    else:
+        return nvvm.inline_ptx(
+            "{ .reg .f32 h0, h1, h2, h3; ld.global.v4.f32 {h0, h1, h2, h3}, [$4]; "
+            "st.global.v4.f32 [$5], {$6, $7, $8, $9}; "
+            "mov.f32 $0, h0; mov.f32 $1, h1; mov.f32 $2, h2; mov.f32 $3, h3; }",
+            write_only_types=[cutlass.Float32] * 4,
+            read_only_args=[h_addr, x_addr, state_values[0], state_values[1], state_values[2], state_values[3]],
+        )
+
+
 @cute.kernel
 def frost_state_chain(
     heads_out: cutlass.Int32,
@@ -497,7 +523,9 @@ def frost_state_chain(
     ``h = state_h * head_divisor + head_phase``. Internal H/M/X buffers have
     ``HO // head_divisor`` heads, while caller seed/composed/tail/summary ports
     retain all HO heads. Row tables always retain the original HO stride.
-    Divisor one and phase zero preserve the ordinary full-head launch."""
+    Divisor one and phase zero preserve the ordinary full-head launch.
+    Internal FP32 H and X may be exactly the same view: each lane reads its H
+    vector before writing X. Partial overlaps and aliasing M are not supported."""
     K = cutlass.const_expr(dim_k)
     V = cutlass.const_expr(dim_v)
     HO = heads_out
@@ -735,16 +763,19 @@ def frost_state_chain(
                 x_slot_off = cutlass.Int64(slot) * x_slot_bytes
                 h_slot_off = cutlass.Int64(slot) * h_slot_bytes
                 for rr in cutlass.range_constexpr(walk_own_rows):
+                    h_addr = h_row_addrs[rr] + h_slot_off
                     if cutlass.const_expr(emit_states):
                         x_addr = x_row_addrs[rr] + x_slot_off
                         x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                         if cutlass.const_expr(cols_per_lane == 2):
-                            st_global_v2(x_addr, x_vals, cutlass.Float32)
+                            h_vals = list(load_summary_store_state(h_addr, x_addr, x_vals, 2))
                         else:
+                            h_vals = []
                             for q in cutlass.range_constexpr(cols_per_lane // 4):
-                                st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
-                    h_addr = h_row_addrs[rr] + h_slot_off
-                    if cutlass.const_expr(cols_per_lane == 2):
+                                h_vals += list(
+                                    load_summary_store_state(h_addr + cutlass.Int64(16 * q), x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], 4)
+                                )
+                    elif cutlass.const_expr(cols_per_lane == 2):
                         h_vals = list(ld_global_v2(h_addr, cutlass.Float32))
                     else:
                         h_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(h_addr + cutlass.Int64(16 * q), cutlass.Float32)]

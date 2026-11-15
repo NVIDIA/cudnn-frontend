@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group
     [(torch.bfloat16, False, 64), (torch.bfloat16, True, 128), (torch.float16, False, 128), (torch.float16, True, 64)],
     ids=["bf16-log-d64", "bf16-safe-d128", "fp16-log-d128", "fp16-safe-d64"],
 )
-@pytest.mark.parametrize("divisor", [2, 4, 8])
+@pytest.mark.parametrize("divisor", [2, 4, 8, 16])
 @pytest.mark.parametrize("head_pattern", ["equal", "gqa", "gva"])
 @pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
 def test_checkpoint_waves_bitwise_and_capture(monkeypatch, dtype, safe, dim, divisor, head_pattern, state_waves):
@@ -96,17 +96,19 @@ def test_checkpoint_wave_capacity_policy():
     gib = 1024**3
     budget = kda_engine._KDA_CHECKPOINT_WAVE_BYTES
     for heads in (1, 2, 3, 4, 8, 12, 16, 32, 64, 96, 128):
-        for size in (0, budget, budget + 1, 2 * budget, 2 * budget + 1, 32 * gib):
+        for size in (0, budget, budget + 1, 2 * budget, 2 * budget + 1, 32 * gib, 128 * gib, 128 * gib + 1):
             divisor = kda_engine._checkpoint_head_divisor(heads, size, 1024, 148)
-            assert divisor in (1, 2, 4, 8)
+            assert divisor in (1, 2, 4, 8, 16)
             assert heads % divisor == 0
-            if divisor == 8:
+            if divisor >= 8:
                 assert 1024 * heads // divisor >= 4 * 148
             forward = kda_engine._forward_head_divisor(heads, size, 1024, 148)
-            assert forward in (1, 2) and heads % forward == 0
+            assert forward in (1, 2, 4, 8) and heads % forward == 0
             assert divisor == 1 or size > (divisor // 2) * budget
     assert kda_engine._checkpoint_head_divisor(32, 2 * budget + 1, 16, 148) == 4
     assert kda_engine._checkpoint_head_divisor(4, 2 * budget + 1, 16, 148) == 1
+    assert kda_engine._checkpoint_head_divisor(96, 128 * gib, 8192, 148) == 8
+    assert kda_engine._checkpoint_head_divisor(96, 128 * gib + 1, 8192, 148) == 16
     assert kda_engine._checkpoint_head_divisor(16, 16 * gib, 16, 148) == 2
 
 
@@ -148,7 +150,7 @@ def test_checkpoint_wave_compile_count(monkeypatch):
         cudnn.destroy_handle(handle)
 
 
-@pytest.mark.parametrize("divisor", [2, 4, 8])
+@pytest.mark.parametrize("divisor", [2, 4, 8, 16])
 @pytest.mark.parametrize("state_waves", [False, True], ids=["checkpoint-only", "all-states"])
 def test_checkpoint_wave_runtime_heads(monkeypatch, divisor, state_waves):
     """A compiled wave must use the current head count, including non-power-of-two counts."""

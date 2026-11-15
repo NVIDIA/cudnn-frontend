@@ -1019,6 +1019,20 @@ binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
 for its P operand. Its public forward/backward reference and byte-golden
 tests in `simplified_sparse_attention/cutedsl/` cover this layout.
 
+Exact workspace reuse requires both an ownership proof and compiler-visible
+load-before-store ordering. If one lane consumes a vector before replacing it,
+keep the aliased load/store in one inline PTX block. Retain loaded values in
+named PTX temporaries until every input operand is consumed: write-only output
+registers may overlap registers holding a later store's inputs. This does not
+make partial overlaps or cross-lane readers safe. KDA's
+`test_state_chain_summary_alias_capture` compares disjoint and exactly aliased
+FP32 H/X for square/rectangular states, both walk directions and changed-input
+capture replay; the unmodified separate-storage implementation is a negative
+control for that alias contract.
+Run that control from a parent source/test tree and verify the nested kernel
+module path: the linear-attention test conftest overlays its sibling source
+tree, so checking only `cudnn.__file__` does not identify the tested kernel.
+
 When sharing a kernel with JAX, match scratch flag storage to its native ABI.
 A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
 CuTe tensor can reject that store during lowering. The long-key cases in

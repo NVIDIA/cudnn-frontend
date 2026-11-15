@@ -25,36 +25,49 @@ from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_ga
 PREP_TILE_FRACTION = 0.475
 _KDA_STATE_WAVE_BYTES = 1024**3
 _KDA_CHECKPOINT_WAVE_BYTES = 5 * 1024**3
+_KDA_LARGE_WAVE_BYTES = 16 * 1024**3
 
 
 def _checkpoint_head_divisor(heads: int, checkpoint_bytes: int, num_pieces: int, num_sm: int) -> int:
-    """Limit private state/checkpoint storage with four bounded codegen variants.
+    """Limit private state/checkpoint storage with five bounded codegen variants.
 
     Each wave retains a complete recurrence per head. Avoid further splitting
     a wave below half the SM count: a few long sequences need their head-level
-    parallelism. Eight waves additionally require at least four tasks per SM
+    parallelism. Eight or more waves require at least four tasks per SM
     per wave to amortize repeated scheduling and ragged tails. The storage
-    budget is a preference, not an allocation limit.
+    budget is a preference, not an allocation limit. Sixteen waves are reserved
+    for arenas whose conservative capacity still exceeds 16 GiB after eight
+    waves; ordinary shapes retain their existing launch count.
     """
     selected = 1
-    for divisor in (2, 4, 8):
+    for divisor in (2, 4, 8, 16):
         if checkpoint_bytes <= selected * _KDA_CHECKPOINT_WAVE_BYTES:
             break
-        minimum_tasks = 4 * num_sm if divisor == 8 else max(1, num_sm // 2)
+        if divisor == 16 and checkpoint_bytes <= 8 * _KDA_LARGE_WAVE_BYTES:
+            break
+        minimum_tasks = 4 * num_sm if divisor >= 8 else max(1, num_sm // 2)
         if heads % divisor == 0 and num_pieces * heads // divisor >= minimum_tasks:
             selected = divisor
     return selected
 
 
-def _forward_head_divisor(heads: int, state_bytes: int, num_pieces: int, num_sm: int) -> int:
-    """Use at most two forward waves to reuse H/M/X without repeated short queues.
+def _forward_head_divisor(heads: int, state_bytes: int, num_pieces: int, num_sm: int, live_state_bytes: int | None = None) -> int:
+    """Retain the latency policy unless a dense shape needs a smaller state arena.
 
-    Forward states precede allocation of the input gradients in training.
-    Halving a large arena can remove that phase's peak without paying the
-    scheduling cost of the deeper checkpoint partition used by backward.
-    This remains a shape-only preference, not a whole-layer memory cap.
+    ``state_bytes`` retains the previous three-state cost for the usual one/two
+    wave choice. Exact H/X reuse reduces the live cost without adding launches.
+    Above 16 GiB of live states per wave, allow four/eight waves only when each
+    retains four planned tasks per SM. This is a shape-only preference, not a
+    cap on all workspace, transport, or caller-owned storage.
     """
-    return min(2, _checkpoint_head_divisor(heads, state_bytes, num_pieces, num_sm))
+    selected = min(2, _checkpoint_head_divisor(heads, state_bytes, num_pieces, num_sm))
+    live_state_bytes = state_bytes if live_state_bytes is None else live_state_bytes
+    for divisor in (4, 8):
+        if live_state_bytes <= selected * _KDA_LARGE_WAVE_BYTES:
+            break
+        if heads % divisor == 0 and num_pieces * heads // divisor >= 4 * num_sm:
+            selected = divisor
+    return selected
 
 
 def build_kda(graph):
@@ -256,7 +269,8 @@ class CompiledKda:
         if self.chain:
             self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             state_bytes = self.num_pieces * HO * (2 * V * K + K * K) * 4
-            self.state_head_divisor = _forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm)
+            live_state_bytes = self.num_pieces * HO * (V * K + K * K) * 4
+            self.state_head_divisor = _forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm, live_state_bytes)
             state_heads = HO // self.state_head_divisor
             if self.state_head_divisor > 1:
                 regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
@@ -272,6 +286,9 @@ class CompiledKda:
             ]
             table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
+            # The state chain reads each lane-owned H vector before replacing
+            # it with X. H has no later consumer; M remains a separate arena.
+            off_state_hx = layout.add(self.num_pieces * state_heads * V * K * 4)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
                 ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
@@ -279,9 +296,9 @@ class CompiledKda:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_h", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", (self.num_pieces, state_heads, V, K)),
+                ("state_h", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)),
                 ("state_m", layout.add(self.num_pieces * state_heads * K * K * 4), "float32", (self.num_pieces, state_heads, K, K)),
-                ("state_x", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", (self.num_pieces, state_heads, V, K)),
+                ("state_x", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)),
             ]
             from .kernel import kda_summary_f16 as summary_module
 
