@@ -1185,6 +1185,10 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     that know the knobs pass them (``mismatch``, ``effective_cgas``); a
     knob-less call sees the graph-fact legs only."""
 
+    exact = (facts.d_qk, facts.d_v)
+    if exact in capabilities.d_shapes and exact not in capabilities.dense_only_d_shapes and exact not in dict(capabilities.native_legs_by_d_shape):
+        # The exact shape is the smallest covering one; explicit engines declare thousands of exact pairs.
+        return exact
     floors = dict(capabilities.d_envelope_floors)
     covering = [
         shape
@@ -2461,7 +2465,6 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     arch_error = cutedsl_arch_requirement_error(cc)
     if arch_error is not None:
         return arch_error
-    shapes = sorted(capabilities.d_shapes)
     if capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
         # Envelope family: native flavor shapes are upper bounds (TMA
         # zero-padding semantics — see Capabilities.d_shapes/d_pad_multiple);
@@ -2470,14 +2473,14 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # where a per-shape floor (d_envelope_floors) may also apply.
         floors = dict(capabilities.d_envelope_floors)
         if not any(facts.d_qk <= sq and facts.d_v <= sv and min(facts.d_qk, facts.d_v) > floors.get((sq, sv), 0) for sq, sv in capabilities.d_shapes):
-            return f"no kernel-flavor envelope covers (D_QK={facts.d_qk}, D_V={facts.d_v}); native shapes: {shapes}"
+            return f"no kernel-flavor envelope covers (D_QK={facts.d_qk}, D_V={facts.d_v}); native shapes: {sorted(capabilities.d_shapes)}"
         m = capabilities.d_pad_multiple
         if m > 1 and (facts.d_qk % m != 0 or facts.d_v % m != 0):
             return (
                 f"envelope zero-padding requires D_QK/D_V multiples of {m} (TMA 16-byte global-stride constraint); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
             )
     elif not capabilities.d_pad_multiple and (facts.d_qk, facts.d_v) not in capabilities.d_shapes:
-        return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+        return f"serves exact native shapes {sorted(capabilities.d_shapes)} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if (
         capabilities.sm_lo == 120
         and not facts.thd
