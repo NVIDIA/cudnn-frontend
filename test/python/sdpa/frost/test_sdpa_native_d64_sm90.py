@@ -30,7 +30,7 @@ def _facts(**over):
 
 
 def _caps(native=True):
-    name = "sdpa_fwd_sm90_d64_one_wg" if native else "sdpa_fwd_prefill_sm90"
+    name = "sdpa_fwd_sm90_d64_one_wg" if native else "sdpa_fwd_sm90_f16_three_wg"
     return next(spec.capabilities for spec in engines.ENGINE_SPECS if spec.name == name)
 
 
@@ -56,7 +56,7 @@ def test_native_head_admission_retains_backend_first_placement(head, tile):
     caps = _caps(native=False)
     assert engines.mismatch(caps, facts, engines.SdpaFwdKnobs(pack_gqa=False)) is None
     assert engines._selected_d_shape(caps, facts) == (tile, tile)
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_sm90_f16_three_wg")
     assert place(spec, facts) == TRAIL
 
 
@@ -216,7 +216,7 @@ def test_native_d512_domain_and_placement_are_preserved(head):
     facts = _facts(d_qk=head[0], d_v=head[1])
     assert engines.mismatch(_caps(native=False), facts) is None
     assert engines._selected_d_shape(_caps(native=False), facts) == (512, 512)
-    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm90")
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == "sdpa_fwd_sm90_f16_three_wg")
     assert place(spec, facts) == (LEAD if head == (512, 512) else TRAIL)
 
 

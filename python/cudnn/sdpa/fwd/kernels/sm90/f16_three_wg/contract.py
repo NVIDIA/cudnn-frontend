@@ -13,12 +13,11 @@ LEGACY_ROW = "sdpa_fwd_prefill_sm90"
 
 
 def in_domain(facts):
-    # First migration batch: exact D64. The three-WG body owns its paged leg;
-    # the native two-WG body owns only the already-admitted nonpaged subset.
+    # All existing 64 x 64 tile graphs, including bounded head envelopes.
+    # Native nonpaged D64 keeps its separate body and feature bounds.
     return (
         facts.device_cc == (9, 0)
-        and (facts.d_qk, facts.d_v) == (64, 64)
-        and facts.has_paged_kv
+        and ((facts.d_qk, facts.d_v) != (64, 64) or facts.has_paged_kv)
         and not (facts.invalid or facts.is_backward or facts.is_fp8 or facts.is_mxfp8)
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
     )
@@ -73,7 +72,7 @@ class Geometry:
 
 def mismatch(facts, knobs):
     if not in_domain(facts):
-        return "requires exact D64/V64 FP16/BF16 on SM90 with paged KV"
+        return "requires SM90 FP16/BF16 outside the native nonpaged D64 domain"
     if knobs is not None:
         if knobs.tile_m not in (None, 64) or knobs.tile_n not in (None, 64):
             return "SM90 sdpa_fwd_sm90_f16_three_wg requires TILE_M=TILE_N=64"

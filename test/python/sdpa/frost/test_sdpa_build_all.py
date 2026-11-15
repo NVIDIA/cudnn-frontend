@@ -7,8 +7,7 @@ import pytest
 import torch
 
 from cudnn.engines import is_backend_engine
-from frost_test_utils import half_engine_names
-from frost_test_utils import _SM, requires_dsl, select_engine
+from frost_test_utils import _SM, requires_dsl, select_engine, half_engine_names, sm90_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM not in (90, 100, 103), reason="native/FROST SDPA parity on Hopper and Blackwell")]
 
@@ -17,8 +16,7 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM not in (90, 1
 def test_build_all_preserves_selection_and_executes_both_providers(selected_provider, monkeypatch):
     import cudnn
 
-    # Hopper runs its d512 FROST template here (at exact d128 its row also proposes the dedicated D128 template, #378);
-    # Blackwell serves d128.
+    # Hopper runs the three-WG D512 body; Blackwell serves D128.
     head_dim = 512 if _SM == 90 else 128
     q = torch.zeros(1, 128, 2, head_dim, device="cuda", dtype=torch.float16).transpose(1, 2)
     k = torch.zeros_like(q)
@@ -50,7 +48,7 @@ def test_build_all_preserves_selection_and_executes_both_providers(selected_prov
         native = record
         break
     assert native is not None, "the representative graph must offer a buildable backend plan"
-    select_engine(source, half_engine_names(arch="sm90" if _SM == 90 else "sm100"))
+    select_engine(source, sm90_half_owner(head_dim, head_dim) if _SM == 90 else half_engine_names(arch="sm100"))
     frost = source.get_engine_and_knobs_at_index(source._plan_index)
     source.build_plans()
 

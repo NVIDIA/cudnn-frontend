@@ -772,8 +772,9 @@ def place(spec, facts, knobs=None) -> str:
 
     from .kernels.sm90.d64_f16_one_wg import contract as sm90_d64
     from .kernels.sm90.f16_three_wg import contract as sm90_three_wg
+    from .kernels.sm90.d128_f16_multi_q import contract as sm90_d128
 
-    if spec.capabilities.implementation in (sm90_d64.NAME, sm90_three_wg.NAME):
+    if spec.capabilities.implementation in (sm90_d64.NAME, sm90_three_wg.NAME, sm90_d128.NAME):
         spec = sm100_legacy_policy_spec(sm90_d64.LEGACY_ROW)
 
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:

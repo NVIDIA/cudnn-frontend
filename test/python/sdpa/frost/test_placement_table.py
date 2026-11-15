@@ -46,7 +46,11 @@ def test_entries_are_well_formed_and_name_known_rows():
     from cudnn.sdpa.bwd.engines import ENGINE_SPECS as BWD
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS as FWD
 
-    rows = {s.name for s in FWD} | {s.name for s in BWD}
+    # Retired SM90 records keep their measured study key through a private
+    # policy domain; no public engine registration is implied by that key.
+    from cudnn.sdpa.fwd.engines import sm100_legacy_policy_spec
+
+    rows = {s.name for s in FWD} | {s.name for s in BWD} | {sm100_legacy_policy_spec("sdpa_fwd_prefill_sm90").name}
     for key, entry in pt.TABLE.items():
         row, cc, dtype, heads, phase, layout, mask, sink, group, kv_off_tile = key
         assert row in rows, key
@@ -908,8 +912,8 @@ def test_sm90_d128_hand_rule_answers_exactly_its_classes(monkeypatch):
     from cudnn.sdpa.fwd import placement
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm90")
-    row = spec.name
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_sm90_f16_three_wg")
+    row = "sdpa_fwd_prefill_sm90"
     assert placement.SM90_D128_HAND_RULE_CLASSES == _SM90_D128_HAND_RULE_CLASSES
     for key in sorted(_SM90_D128_HAND_RULE_CLASSES, key=repr):
         found = [f for f in _sm90_d128_candidates(key) if pt.class_key(row, f) == key]

@@ -59,7 +59,8 @@ def _level(l0):
 
 _D = 128
 _SCALE = 1.0 / math.sqrt(_D)
-_ROW = "sdpa_fwd_prefill_sm90"
+_ROW = "sdpa_fwd_sm90_f16_three_wg"
+_D128_OWNER = "sdpa_fwd_sm90_d128_multi_q"
 _D128_FILE = "sm90/prefill_d128_f16.py"
 _DTYPES = (torch.float16, torch.bfloat16)
 
@@ -183,7 +184,7 @@ def graph_d128(sm100, monkeypatch):
     loaded, load = [], api_dsl._load_kernel_template
     monkeypatch.setattr(api_dsl, "_load_kernel_template", lambda filename, *a, **kw: loaded.append(filename) or load(filename, *a, **kw))
     yield sm100
-    assert loaded and set(loaded) == {_D128_FILE}, f"a (128, 128) graph loaded {loaded}, not only {_D128_FILE}"
+    assert loaded and set(loaded) == {"sm90/d128_f16_multi_q/kernel.py"}, f"a (128, 128) graph loaded {loaded}, not only {_D128_FILE}"
 
 
 @pytest.mark.L0
@@ -200,7 +201,7 @@ def test_d128_graph_compiles_the_d128_template(graph_d128, monkeypatch):
     (graph,) = graphs
     executor = graph._compiled_plans[graph._plan_index]._compiled
     assert executor.kernel_template == "prefill_d128_f16", executor.kernel_template
-    assert executor.kernel_module.__file__.endswith(os.path.join("sm90", "prefill_d128_f16.py")), executor.kernel_module.__file__
+    assert executor.kernel_module.__file__.endswith(os.path.join("sm90", "d128_f16_multi_q", "kernel.py")), executor.kernel_module.__file__
 
 
 @pytest.mark.L0
@@ -295,7 +296,9 @@ def _ranking(sm100, monkeypatch, check, *, unsupported_as_verdict=True):
     seen = []
 
     def probe(graph, name, **_):
-        assert name == _ROW, name
+        from frost_test_utils import half_engine_names
+
+        assert name == half_engine_names("sm90"), name
         seen.append(check(graph))
         raise _Ranked
 
@@ -319,7 +322,7 @@ def _row_verdict(graph):
     """(offered, the row's reason to decline the 128 x 128 tile or None) for a ranked graph."""
     from cudnn.sdpa.fwd import engines
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _ROW)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _D128_OWNER)
     facts = engines.analyze_for(spec, graph)[0]
     return offers_engine(graph, _ROW), engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128))
 
@@ -373,7 +376,7 @@ def test_d128_graph_pinned_pack_gqa_runs_on_the_64_tile(sm100, monkeypatch):
     at (512, 512) the same graph has a packed plan."""
     from cudnn.sdpa.fwd import engines
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _ROW)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _D128_OWNER)
 
     def packed(graph):
         try:
