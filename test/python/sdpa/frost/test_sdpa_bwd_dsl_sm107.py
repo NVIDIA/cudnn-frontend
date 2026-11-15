@@ -4204,7 +4204,7 @@ def test_plan_declines_typed_when_the_workspace_exceeds_what_the_caller_can_hold
 
 
 # =========================================================================== the d512 2x2 stage-2 twin's Rubin arm (host-only)
-# The SM100 d512 backward's 2x2 stage 2 (``kernels/sm100/bprop_d512_f16_2x2.py``) is also the first FROST d512 backward
+# The SM100 d512 backward's 2x2 stage 2 (``kernels/sm100/d512_f16_2x2/kernel.py``) is also the first FROST d512 backward
 # that FITS Rubin: the same kernel at ``stages_kv=8, cast_stages=2`` fills the 325 KiB SMEM with an 8-stage K / V chunk
 # ring.  No engine row serves cc 10.7 yet (that is a Capabilities change -- a SUPPORT_MATRIX_TRACKER.md edit in its own
 # PR, Rule S2); what lands here is the arm's resource pins and its sm_107a trace-compile (Rule S6: a kernel feature lands on
@@ -4249,7 +4249,7 @@ def test_stage2_2x2_rubin_arm_trace_compiles_for_sm_107a(tmp_path, mask):
     dump.mkdir()
     script = dump / "ptx_probe.py"
     script.write_text(_STAGE2_PTX_PROBE)
-    kw = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
+    kw = dict(dtype_qkv=2, kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True, stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
     if mask == "causal":
         kw["window_right"] = 0
     import json

@@ -9,7 +9,7 @@ One package per arch line -- ``sm80/``, ``sm100/`` (SM100/SM103), ``sm107/``
 (Rubin), ``sm120/`` (SM120/SM121) -- holding the kernels that arch owns, the
 same shape as ``sdpa/fwd/kernels/``.  Within a package the filename encodes the rest of the
 coverage matrix: ``bprop_d<dim>_<dtype-family>.py``, e.g.
-``sm100/bprop_d512_f16.py`` (``f16`` covers fp16 and bf16, picked by
+``sm100/d512_f16_role_split/kernel.py`` (``f16`` covers fp16 and bf16, picked by
 ``TemplateParams``).  A file omits the dimension when one implementation
 covers every supported head dim (``sm80/bprop_f16.py``, ``sm120/bprop_f16.py``);
 ``sm120/bprop_chain_f16.py`` is the SM120-only part of the launch chain around

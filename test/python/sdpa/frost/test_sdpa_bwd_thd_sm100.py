@@ -542,14 +542,14 @@ def stage2_datapath(request, monkeypatch):
 
     def spy(path, params, tag="template"):
         if tag == "sdpa_bwd_sm100_stage2":
-            served.append(path.rsplit("/", 1)[-1])
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
     guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
     with guard:
         yield request.param
-    want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
+    want = api_dsl._SM100_STAGE2_FILE_2X2 if request.param else api_dsl._SM100_STAGE2_FILE
     assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
 
 

@@ -63,7 +63,7 @@ _SM_RANGE = (107, 119)  # the row mirrors the other Rubin rows (engines._RUBIN)
 _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
 _FORK_FILE = "sm107/bprop_d512_f16_2x2.py"
-_SM100_FILE = "sm100/bprop_d512_f16_2x2.py"
+_SM100_FILE = "sm100/d512_f16_2x2/kernel.py"
 _TAG = "sdpa_bwd_sm107_stage2_2x2"
 _RUBIN_ARM = dict(stages_kv=8, cast_stages=2)  # + smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2, the kernel's RUBIN_ARM
 _MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage2_2x2_sm107a.txt"
@@ -161,7 +161,7 @@ def test_adapter_is_the_sm100_chain_over_the_cc107_twin(monkeypatch):
         rec = SdpaBwdDslSm107D512._stage2_record(None, fields)
         assert isinstance(rec, TemplateParams2x2) and (rec.stages_kv, rec.cast_stages, rec.smem_cap_bytes) == (8, 2, SM107_USABLE_DYN_SMEM_2X2)
         # The SM100 row: the 4x1 role split by default, the SM100-arm twin when the module constant is flipped.
-        assert api_dsl.SdpaBwdDslSm100._stage2_file(None) == (_SM100_FILE if twin else "sm100/bprop_d512_f16.py")
+        assert api_dsl.SdpaBwdDslSm100._stage2_file(None) == (_SM100_FILE if twin else "sm100/d512_f16_role_split/kernel.py")
         if not twin:
             base = api_dsl.SdpaBwdDslSm100._stage2_record(None, fields)
             assert type(base) is TemplateParams, "the 4x1 record is the BASE TemplateParams (its PTX md5 is pinned)"
@@ -763,7 +763,7 @@ def _direct_capture(Adapter, tensors, *, b, hq, hkv, sq, skv, dt, akw):
 
     def spy(path, params, tag="template"):
         if "stage2" in tag:
-            served.append(path.rsplit("/", 1)[-1])
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     with patch.object(api_dsl, "load_template", spy):
@@ -853,7 +853,7 @@ def test_fork_is_bitwise_the_sm100_body_at_rubin_params(monkeypatch, case, watch
     base, served_base = _direct_capture(api_dsl.SdpaBwdDslSm100, tensors, **geom)
     monkeypatch.setattr(api_dsl, "STAGE2_2X2", False)
     fork, served_fork = _direct_capture(SdpaBwdDslSm107D512, tensors, **geom)
-    assert served_base == ["bprop_d512_f16_2x2.py"] and served_fork == ["bprop_d512_f16_2x2.py"], (served_base, served_fork)
+    assert served_base == ["sm100/d512_f16_2x2/kernel.py"] and served_fork == [_FORK_FILE], (served_base, served_fork)
     for name, x, y in zip(("dQ", "dK", "dV", "S_ws", "dS_ws"), base, fork):
         assert torch.isfinite(y.view(torch.bfloat16 if dt == torch.bfloat16 else torch.float16).float()).all() or name.endswith("_ws"), name
         assert torch.equal(x, y), f"{name}: the fork is NOT bitwise the SM100 body at Rubin params ({(x != y).sum().item()} of {x.numel()} differ)"

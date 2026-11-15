@@ -3,7 +3,7 @@
 
 """SDPA backward stage 2, d_qk = d_v = 512, bf16/fp16, cc 10.7 (the Rubin-line, 107 <= SM <= 119) -- the 2x2-datapath twin.
 
-The SM100 body (``sm100/bprop_d512_f16_2x2.py`` -- the per-arch sibling-file convention of every flavor; a diff against
+The SM100 body (``sm100/d512_f16_2x2/kernel.py`` -- the per-arch sibling-file convention of every flavor; a diff against
 it is the review surface) at the cc 10.7 ring arm, forked AFTER that body ran on the board at these parameters (direct-adapter
 first launches 2026-10-01: dense / causal / bottom-right / SWA / right band / GQA / non-tile / S=8K, all within tolerance of
 the fp32 reference).  The deltas, each a deliberate, pinned line:

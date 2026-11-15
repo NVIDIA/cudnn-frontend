@@ -188,8 +188,8 @@ _TWIN_WATCHDOG_S = 900.0
 
 @pytest.fixture(params=[False, True], ids=["4x1", "2x2"])
 def stage2_datapath(request, monkeypatch):
-    """Both stage-2 datapaths of the chain: the cga4x1 role split (``bprop_d512_f16.py``, what ships) and the fused
-    2x2 twin (``bprop_d512_f16_2x2.py``, ``api_dsl.STAGE2_2X2``).  The twin is a module constant read at compile()
+    """Both stage-2 datapaths: ``d512_f16_role_split/kernel.py`` and ``d512_f16_2x2/kernel.py``. The legacy adapter's
+    ``api_dsl.STAGE2_2X2`` constant is read at compile()
     time, so flipping it here reaches every plan the test builds; the 4x1 arm runs with the constant at its default
     (not merely unpatched) so the pair is a real A/B.  A spy on ``load_template`` records which stage-2 FILE served
     the plan -- the two kernels share a symbol name, so the file is the only honest witness.
@@ -210,14 +210,14 @@ def stage2_datapath(request, monkeypatch):
 
     def spy(path, params, tag="template"):
         if tag == "sdpa_bwd_sm100_stage2":
-            served.append(path.rsplit("/", 1)[-1])
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
     guard = process_watchdog(_TWIN_WATCHDOG_S, f"the 2x2 stage-2 arm of {request.node.nodeid}") if request.param else contextlib.nullcontext()
     with guard:
         yield request.param
-    want = api_dsl._SM100_STAGE2_FILE_2X2.rsplit("/", 1)[-1] if request.param else api_dsl._SM100_STAGE2_FILE.rsplit("/", 1)[-1]
+    want = api_dsl._SM100_STAGE2_FILE_2X2 if request.param else api_dsl._SM100_STAGE2_FILE
     assert served and all(s == want for s in served), f"stage 2 served by {served}, expected {want} (STAGE2_2X2={request.param})"
 
 
@@ -1132,7 +1132,7 @@ def test_stage2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     dump.mkdir()
     script = dump / "ptx_probe.py"
     script.write_text(_STAGE2_PTX_PROBE)
-    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/bprop_d512_f16.py", twin=False)
+    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/d512_f16_role_split/kernel.py", twin=False)
     proc = _subprocess.run([_sys.executable, str(script), str(dump), "sm_100a", _json.dumps(kw)], capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, f"sm_100a trace-compile of the 4x1 stage-2 {record} rendering failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     out = dict(ln.split(maxsplit=1) for ln in proc.stdout.splitlines() if ln.startswith(("PTX_MD5", "CLUSTER_Q_ROWS", "DESC_VERSION")))
@@ -1204,7 +1204,7 @@ def test_stage2_2x2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
     All debug levers are off; the armed-lever test below checks that instrumentation renders different code.
     Host trace-compile for sm_100a, no device."""
     want = _stage2_2x2_md5_want(record)
-    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True)
+    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True)
     got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_{record}", kw)
     assert out["CLUSTER_Q_ROWS"] == "256" and out["N_CHUNKS"] == "8"
     print(f"\nSM100 stage-2 2x2 {record}: PTX md5 {got} (record {want})")
@@ -1217,7 +1217,7 @@ def test_stage2_2x2_debug_clk_lever_renders_code(tmp_path, record):
     accumulators and the exit dump are real code), so a lever that leaked into the default rendering would trip the md5
     pin rather than ride along unnoticed."""
     want = _stage2_2x2_md5_want(record)
-    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
+    kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
     got, _out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_clk_{record}", kw)
     assert got != want, f"{record}: the armed debug_clk lever rendered the SAME PTX as the default -- the lever traces no code"
 
@@ -1232,7 +1232,7 @@ def test_stage2_2x2_debug_clk_dump_accounts_the_waits(monkeypatch):
     from cuda.bindings import driver as cu
 
     from cudnn.sdpa.bwd import api_dsl
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16_2x2 as K2
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2 import kernel as K2
 
     b, hq, hkv, sq, skv, d, dt = 1, 4, 4, 1024, 1024, _D, torch.bfloat16
     torch.manual_seed(2026)
@@ -1313,7 +1313,9 @@ def test_stage2_4x1_debug_clk_lever_renders_code(tmp_path, record):
     have = " ".join(version) if version else None
     if dsl is not None and have != dsl:
         pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}")
-    kw = dict(_STAGE2_4X1_RECORDS[record], kernel_file="sm100/bprop_d512_f16.py", twin=False, dbg=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR)
+    kw = dict(
+        _STAGE2_4X1_RECORDS[record], kernel_file="sm100/d512_f16_role_split/kernel.py", twin=False, dbg=True, debug_clk=1, debug_dump_addr=_FAKE_DUMP_ADDR
+    )
     got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_4x1_clk_{record}", kw)
     assert out["CLUSTER_Q_ROWS"] == "256"
     assert got != want[record], f"{record}: the armed 4x1 debug_clk lever rendered the SAME PTX as the shipped kernel -- the lever traces no code"
@@ -1331,7 +1333,7 @@ def test_stage2_4x1_debug_clk_dump_accounts_the_waits(monkeypatch):
 
     from cudnn.sdpa.bwd import api_dsl
     from cudnn.sdpa.bwd import config_sm100 as cfgmod
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16 as K1
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split import kernel as K1
 
     b, hq, hkv, sq, skv, d, dt = 1, 4, 4, 1024, 1024, _D, torch.bfloat16
     torch.manual_seed(2027)
@@ -1406,7 +1408,7 @@ def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **s
 
     def spy(path, params, tag="template"):
         if tag == "sdpa_bwd_sm100_stage2":
-            served.append(path.rsplit("/", 1)[-1])
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     monkeypatch.setattr(api_dsl, "load_template", spy)
@@ -1443,7 +1445,7 @@ def _twin_capture(monkeypatch, twin, tensors, *, b, hq, hkv, sq, skv, d, dt, **s
     delta = align(b * hq * (-(-sq // 128) * 128) * 4)
     region = align(b * qh_chunk * sq_pad * skv_pad * 2)
     s_ws, ds_ws = ws[delta : delta + region].clone(), ws[delta + region : delta + 2 * region].clone()
-    assert served == ["bprop_d512_f16_2x2.py" if twin else "bprop_d512_f16.py"], served
+    assert served == ["sm100/d512_f16_2x2/kernel.py" if twin else "sm100/d512_f16_role_split/kernel.py"], served
     return [x.contiguous().view(torch.int16).clone() for x in (dq, dk, dv)] + [s_ws, ds_ws]
 
 
@@ -1741,7 +1743,7 @@ def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
 
     masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256), "thd": dict(thd_varlen=True)}
-    params = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, **masks[arm])
+    params = dict(dtype_qkv=2, kernel_file="sm100/d512_f16_2x2/kernel.py", twin=True, **masks[arm])
     if arch == "sm_107a":
         params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
     st, expect = _stage2_sass_probe(tmp_path, arch, params, tag=f"stage2_2x2_{arm}")
@@ -2132,7 +2134,7 @@ def test_ring_drain_walks_every_used_slot(stages):
     ``range_constexpr(STAGES_*)`` loop; the source pin below keeps the residual rule from coming back."""
     import inspect
 
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d512_f16_2x2 as K2
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2 import kernel as K2
 
     for total in range(0, 2 * stages + 2):
         assert not _ring_drain_model(total, stages, stages), f"total={total}: the full-ring walk left releases un-awaited"

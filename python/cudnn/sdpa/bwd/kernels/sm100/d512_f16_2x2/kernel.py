@@ -10,7 +10,7 @@ dV / dK / dQ.  Computes no gradient itself::
     dS = (attn_scale_for_dS * dS_acc - do_dot * attn_scale_in) * S
 
 Same ABI, workspace format, LSE / do_dot contract and mask-after-exp2 rule as
-the cga4x1 role-split sibling ``bprop_d512_f16.py``; what differs is the
+the cga4x1 role-split sibling ``d512_f16_role_split/kernel.py``; what differs is the
 datapath:
 
 **One FUSED pipeline per ``cta_group::2`` pair** (CGA_M=4 -> pairs {0,1}, {2,3}):
@@ -164,7 +164,7 @@ from cudnn.sdpa.bwd.config_sm100 import (
 
 # Injected by the loader before this body executes; a plain import gets the
 # all-defaults config (dense bf16, SM100 ring), which keeps
-# `python sm100/bprop_d512_f16_2x2.py` usable as a standalone benchmark.
+# `python sm100/d512_f16_2x2/kernel.py` usable as a standalone benchmark.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams2x2())
 CFG = make_cfg_d512_2x2(PARAMS)
 _decode_initial, _decode_payload = make_bwd_decode(CFG)

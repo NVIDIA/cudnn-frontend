@@ -1836,12 +1836,12 @@ def sdpa_bwd_wrapper_sm80(
 _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 # Stage 2's descriptor scratch: Q / dO / K / V, clamped on device.
 _THD_STAGE2_DESC_SLOTS = 4
-_SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
+_SM100_STAGE2_FILE = "sm100/d512_f16_role_split/kernel.py"
 # The 2x2-datapath twin of stage 2: one fused cta_group::2 pipeline per pair (64 q rows per CTA, both BMMs on every
 # SM, S never leaves the lane's registers) inside the same (4,1,1) cluster, K / V shared across the two pairs by TMA
 # multicast.  Same host ABI, workspace format and LSE / do_dot contract as the role-split file; a SIBLING file so the
 # 4x1 rendering stays byte-identical (its own FROST_SOURCE_DIGEST, its own config record).
-_SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
+_SM100_STAGE2_FILE_2X2 = "sm100/d512_f16_2x2/kernel.py"
 # Which stage-2 datapath the SM100 d512 chain renders.  False = the cga4x1 role split (what ships).  True = the 2x2 twin
 # (the Rubin d512 bring-up vehicle; on SM100 the A/B gate for a default flip is >= +3 % stage-2 median on BOTH dense and
 # causal at B=1 H=128 S=8192 d=512 bf16, see the twin's docstring).  A module constant read at CALL time (``compile``),
