@@ -53,7 +53,7 @@ def test_fp8_d192_padded_heads_rebind_replay(d, dv, split, pack, sched, sink, dt
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    expected = "sm100/d192_fp8_multi_q/kernel.py" if arch == "sm100" else f"{arch}/prefill_d192_d128_fp8.py"
+    expected = "sm100/d192_fp8_multi_q/kernel.py" if arch == "sm100" else "sm107/d192_fp8_multi_q/kernel.py"
     assert expected in seen
     assert all(name.startswith(arch + "/") for name in seen)
     for name in ("q", "k", "v"):

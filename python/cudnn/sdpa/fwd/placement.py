@@ -749,8 +749,12 @@ def place(spec, facts, knobs=None) -> str:
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
 
     from .kernels.sm107.d512_fp8_role_split import contract as sm107_d512_fp8
+    from .kernels.sm107.d192_fp8_multi_q import contract as sm107_d192_fp8
+    from .kernels.sm107.d256_fp8_single_q import contract as sm107_d256_fp8
+    from .kernels.sm107.d128_fp8_multi_q import contract as sm107_small_fp8
+    from .kernels.sm107.d128_fp8_swap_ab import contract as sm107_swap_fp8
 
-    if spec.capabilities.implementation == sm107_d512_fp8.NAME:
+    if spec.capabilities.implementation in (sm107_d512_fp8.NAME, sm107_d192_fp8.NAME, sm107_d256_fp8.NAME, sm107_small_fp8.NAME, sm107_swap_fp8.NAME):
         spec = sm100_legacy_policy_spec(sm107_d512_fp8.LEGACY_ROW)
 
     if spec.capabilities.implementation in (D192_HALF_MULTI_Q, HALF_SINGLE_Q):

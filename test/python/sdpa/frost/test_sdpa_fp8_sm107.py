@@ -4,7 +4,7 @@
 """SM107 (Rubin) routing of the per-tensor FP8 d128 SDPA kernel.
 
 The adapter routes cc10.7 per-tensor-FP8 graphs to the SM107 sibling module
-(``sm107/prefill_d128_fp8.py``), which bakes the Rubin dense-FP8 K=64 MMA
+(``sm107/d128_fp8_multi_q/kernel.py``), which bakes the Rubin dense-FP8 K=64 MMA
 geometry; Blackwell keeps the untouched SM100 module. These tests pin the
 routing and both modules' derived constants — device-independent (everything
 here happens before any compile). End-to-end coverage rides the existing
@@ -299,7 +299,7 @@ def test_softmax_half_declines_by_row_domain():
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     sm100 = caps["sdpa_fwd_sm100_d128_fp8_multi_q"]
-    sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
+    sm107 = caps["sdpa_fwd_sm107_d128_fp8_multi_q"]
     half = _c.data_type.HALF
 
     assert "softmax_precision" in engines.mismatch(sm100, facts((10, 0), half), None)
@@ -307,7 +307,7 @@ def test_softmax_half_declines_by_row_domain():
     # It is not a tuning knob: the knob vocabulary has no such axis.
     assert "softmax_precision" not in engines.SdpaFwdKnobs.__dataclass_fields__
     # And the rows keep their arch lanes regardless of the attribute.
-    assert "SM107-119" in engines.mismatch(sm107, facts((10, 0)), None)
+    assert "on SM107" in engines.mismatch(sm107, facts((10, 0)), None)
     assert "SM100-106" in engines.mismatch(caps[engines.engine_name(fp8=True)], facts((10, 7)), None)
 
 
@@ -563,7 +563,7 @@ def _run_fp8_d128_leading_tile(q8, k8, v8, *, precision, scale, bottom_right, wi
     )
     assert api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d128_fp8.py"), api._k_mod.__file__
+    assert api._k_mod.__file__.endswith("sm107/d128_fp8_multi_q/kernel.py"), api._k_mod.__file__
     unit = torch.ones(1, device="cuda", dtype=torch.float32)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
     kw = dict(descale_q=unit, descale_k=unit, descale_v=unit, workspace=ws)
@@ -842,7 +842,9 @@ def test_fp8_envelope_mismatch_rules():
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7))) is None
     # Native SM107 serves the same aligned dense D192 envelope.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    native192 = caps["sdpa_fwd_sm107_d192_fp8_multi_q"]
+    assert engines.mismatch(native192, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) is None
+    assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128))
     assert engines._selected_d_shape(sm107, _fp8_facts(device_cc=(10, 7), d_qk=192, d_v=128)) == (192, 128)
     for dq, dv in ((160, 96), (176, 128), (192, 96)):
         assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=dq, d_v=dv)) is None, (dq, dv)
@@ -1224,7 +1226,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
 # Fused epilogue gate on the per-tensor FP8 d256 kernel (PR-A, 2026-09-15)
 #
-# ``sm107/prefill_d256_fp8.py`` carries O := O * sigmoid(G) behind
+# ``sm107/d256_fp8_single_q/kernel.py`` carries O := O * sigmoid(G) behind
 # ``TemplateParams.epilogue_gate`` with a bf16 G (``GATE_STORAGE_DTYPE``), and
 # ``Amax_O`` became a COMPILE-TIME fact (``compile(has_amax=False)`` folds the
 # |o| tree and the atomic out) and, when requested, is the amax of the UNGATED
@@ -2192,6 +2194,38 @@ class TestNativeD256Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestSmallFp8Implementation:
+    """Native and shared-decode public records through current bindings."""
+
+    from sm107_small_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_native_small_fp8_refilled_stage_warm_stress as _warm,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_warm_stress = staticmethod(_warm)
+
+
+@requires_rubin
+class TestMidFp8Implementation:
+    """Public recipes retain native D192/D256 owners through binding/capture."""
+
+    from sm107_mid_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_mid_fp8_refilled_stage_warm_stress as _warm,
+        test_d192_cga1_causal_public_record as _cga1,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_warm_stress = staticmethod(_warm)
+    test_cga1 = staticmethod(_cga1)
 
 
 @requires_rubin

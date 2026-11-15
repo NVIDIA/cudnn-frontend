@@ -590,6 +590,11 @@ def _exec_sdpa_on_frost(
             # The legacy module held both single-Q and quadrant cooperation.
             # Their new owners retain separate, concrete body identities.
             engines = (owners[template], owners["decode_d64_f16_quadrant"])
+    if engine == "sdpa_fwd_prefill_sm107" and (cfg.d_qk, cfg.d_v) in ((512, 512), (576, 512)):
+        rubin_owners = {"prefill_d512_f16_2x2": "sdpa_fwd_sm107_d512_2x2"}
+        if cfg.d_qk == 512:
+            rubin_owners["prefill_d512_f16"] = "sdpa_fwd_sm107_d512_role_split"
+        engines = (rubin_owners[template],) if template in rubin_owners else tuple(rubin_owners.values())
     keys = [[f"frost:{name}" for name in engines]]
     if template:
         keys.append([f"frost:{name}:" + ("decode_d64_f16_quadrant" if name == "sdpa_fwd_sm100_d64_quadrant" else template) for name in engines])
@@ -2112,8 +2117,14 @@ def _exec_sdpa_fp8_expect_frost(cfg, request, cudnn_handle, strict=True, engine=
         (512, 512): ("sdpa_fwd_sm100_d512_fp8_role_split",),
     }
     names = owners.get((cfg.d_qk, cfg.d_v), (engine,)) if engine == FROST_FP8_ENGINE else (engine,)
-    if engine == "sdpa_fwd_prefill_sm107_fp8" and (cfg.d_qk, cfg.d_v) == (512, 512):
-        names = ("sdpa_fwd_sm107_d512_fp8_role_split",)
+    if engine == "sdpa_fwd_prefill_sm107_fp8":
+        names = {
+            (64, 64): ("sdpa_fwd_sm107_d128_fp8_multi_q",),
+            (128, 128): ("sdpa_fwd_sm107_d128_fp8_multi_q", "sdpa_fwd_sm107_d128_fp8_swap_ab"),
+            (192, 128): ("sdpa_fwd_sm107_d192_fp8_multi_q",),
+            (256, 256): ("sdpa_fwd_sm107_d256_fp8_single_q",),
+            (512, 512): ("sdpa_fwd_sm107_d512_fp8_role_split",),
+        }.get((cfg.d_qk, cfg.d_v), (engine,))
     keys = tuple(f"frost:{name}" for name in names)
     before = sum(frost_routing.snapshot().get(key, 0) for key in keys)
     try:
@@ -3252,6 +3263,8 @@ def test_sdpa_thd_output_stride_int64(d_qk, d_v, binder, monkeypatch):
         want = "sdpa_fwd_sm100_d256_lookahead"
     elif sm in (100, 103) and (d_qk, d_v) == (512, 512):
         want = "sdpa_fwd_sm100_d512_2x2"
+    elif sm == 107 and (d_qk, d_v) == (512, 512):
+        want = "sdpa_fwd_sm107_d512_2x2"
     names = [graph.get_plan_name_at_index(i) for i in range(len(graph.plans))]
     graph.select_plan(next(i for i, name in enumerate(names) if name == want or name.startswith(want + "[")))
     graph.check_support()

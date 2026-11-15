@@ -115,6 +115,15 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
             contract = fwd_engines._SMALL_FP8_CONTRACTS.get(caps.implementation) or fwd_engines._HALF_CONTRACTS.get(caps.implementation)
             if contract is not None:
                 return contract.mismatch(facts, None)
+            for owner in (
+                fwd_engines._sm107_small_fp8_owner,
+                fwd_engines._sm107_swap_fp8_owner,
+                fwd_engines._sm107_d192_fp8_owner,
+                fwd_engines._sm107_d256_fp8_owner,
+                fwd_engines._sm107_d512_fp8_owner,
+            ):
+                if caps.implementation == owner.NAME:
+                    return owner.mismatch(facts, None)
         return None
     if kind == "fwd":
         return check(facts)
@@ -197,7 +206,7 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
         device_sm_count=1024,
         scale=0.1,
     )
-    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_fp8_swap_ab":
+    if getattr(caps, "implementation", "") in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab"}:
         # This body has eight live query columns. A 128-row sample would
         # exercise its implementation boundary before any mask decision.
         values["s_q"] = 1
@@ -504,7 +513,11 @@ def test_geometry_relations_do_not_change_the_band_decision():
     for kind, spec in _rows():
         caps = spec.capabilities
         expected = None if declares(caps, right=band.RIGHT_CAUSAL) else band.feature_reason(band.LABEL_RIGHT_CAUSAL)
-        for s_q, s_kv in ((128, 128), (64, 128), (256, 128)):
+        geometries = ((128, 128), (64, 128), (256, 128))
+        if getattr(caps, "implementation", "") in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab"}:
+            # Exercise all three relations within the eight-column domain.
+            geometries = ((4, 4), (4, 8), (8, 4))
+        for s_q, s_kv in geometries:
             facts = legal_facts(kind, caps, s_q=s_q, s_kv=s_kv, **band_causal_top_left())
             reason = _probe(kind)(caps, facts)
             assert probe_matches(kind, caps, facts, expected), (spec.name, s_q, s_kv, reason)
@@ -544,7 +557,7 @@ def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
         tile = int(caps.skv_tile)
         s_kv = tile * 2 - 1  # not a tile multiple: the tail rule is live
         uncovered = legal_facts(kind, caps, s_q=tile * 2, s_kv=s_kv, **band_causal_top_left())
-        if caps.implementation in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm100_d64_quadrant"}:
+        if caps.implementation in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab", "sdpa_fwd_sm100_d64_quadrant"}:
             # Keep Q inside the body's live-query limit. An unmasked KV tail
             # is also uncovered and reaches the same tile-tail gate.
             uncovered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_unmasked())
