@@ -15,8 +15,8 @@ from frost_test_utils import arch_known_to_the_dsl
 
 
 def _service_entries(ptx):
-    """Select the template's named _kernel, excluding reset/unscale helpers."""
-    return [entry for entry in re.split(r"\.visible\s+\.entry\s+", ptx)[1:] if entry.startswith("cudnn_kernel__kernel_")]
+    """Select the template's named _kernel (optionally prefixed by its engine name), excluding reset/unscale helpers."""
+    return [entry for entry in re.split(r"\.visible\s+\.entry\s+", ptx)[1:] if re.match(r"cudnn_(?:sdpa_fwd_\w+_)?kernel__kernel_", entry)]
 
 
 def _assert_service_guard(entry, first_warp, n_warps):
@@ -140,7 +140,13 @@ def release_cases(arch):
             "prefill_d512_f16_2x2.py": "d512_f16_2x2/kernel.py",
             "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
         }
-        path = moved.get(name, name) if arch == "sm100" else name
+        moved_sm107 = {
+            "prefill_d128_mxfp8.py": "d128_mxfp8_multi_q/kernel.py",
+            "prefill_d192_d128_mxfp8.py": "d192_mxfp8_multi_q/kernel.py",
+            "prefill_d256_mxfp8.py": "d256_mxfp8_single_q/kernel.py",
+            "prefill_d512_mxfp8.py": "d512_mxfp8_role_split/kernel.py",
+        }
+        path = (moved if arch == "sm100" else moved_sm107).get(name, name)
         cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))
     return cases
 

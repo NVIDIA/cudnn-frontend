@@ -1604,7 +1604,7 @@ _MX_BLOCK = 32  # MXFP8: 32 elements share one E8M0 scale byte
 
 def _d256_mxfp8_sf_sizes(tile_m: int, tile_n: int, tile_k: int, tile_o: int) -> Tuple[int, int, int, int]:
     """(Q, K-per-stage, P, V-per-stage) scale-factor slab sizes in bytes, the
-    kernel's own formulas (``sm107/prefill_d256_mxfp8.py`` SF_SMEM_SIZE_*): a
+    kernel's own formulas (``sm107/d256_mxfp8_single_q/kernel.py`` SF_SMEM_SIZE_*): a
     128-row tile x ceil(D/128)*128 / 32 for the rowwise operands, TILE_N/32 x
     the 128-padded non-K extent for the BMM2 pair.  Full-size regardless of
     CTA_MMA (the cga2 peers multicast halves into the same slab)."""
@@ -1762,7 +1762,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
         if flavor not in _PAGED_KV_FLAVORS_SM107 and not (flavor == "sm107 d256" and k.dtype_kv in (_DTYPE_E4M3, _DTYPE_E5M2)):
             raise ValueError(
                 f"{flavor}: paged_kv is not wired on this Rubin flavor (the cc 10.7 PAGED_KV specialization lives in "
-                f"sm107/prefill_d128_f16.py, sm107/prefill_d128_mxfp8.py, sm107/prefill_d256_mxfp8.py and per-tensor sm107/prefill_d512_fp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
+                f"sm107/prefill_d128_f16.py, sm107/d128_mxfp8_multi_q/kernel.py, sm107/d256_mxfp8_single_q/kernel.py and per-tensor sm107/prefill_d512_fp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
             )
         if not k.seq_kv_lens_present:
             raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
@@ -2657,7 +2657,7 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     # not govern, so this vector budget is not the lever.  The split itself IS
     # applied (USETMAXREG.TRY_ALLOC / DEALLOC present in the sm_107a SASS).  Do
     # not retry the bump; see the REGISTER NOTE in
-    # sm107/prefill_d256_mxfp8.py's TMA-LDG warp for the levers not yet tried.
+    # sm107/d256_mxfp8_single_q/kernel.py's TMA-LDG warp for the levers not yet tried.
     other_regs = 40
 
     cfg = CfgD256(

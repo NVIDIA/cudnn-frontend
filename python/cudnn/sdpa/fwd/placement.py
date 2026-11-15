@@ -783,6 +783,11 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in (sm90_d64.NAME, sm90_three_wg.NAME, sm90_d128.NAME):
         spec = sm100_legacy_policy_spec(sm90_d64.LEGACY_ROW)
 
+    from .kernels.sm107 import mxfp8_contract as sm107_mxfp8
+
+    if spec.capabilities.implementation in sm107_mxfp8.IMPLEMENTATIONS:
+        spec = sm100_legacy_policy_spec(sm107_mxfp8.LEGACY_ROW)
+
     from .kernels.sm80 import half_flavor_contract as sm80_half
 
     if spec.capabilities.implementation in sm80_half.IMPLEMENTATIONS:

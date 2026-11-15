@@ -52,6 +52,7 @@ from frost_test_utils import (
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
+from frost_test_utils import mxfp8_engine_names
 
 # Rubin (cc10.7) now has MXFP8 lowerings of its own, so this suite is no longer
 # pre-Rubin only.  ONE engine per arch line: pin the row that serves the device
@@ -66,7 +67,7 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # the test cannot run.  Flip the condition to False when the gap closes.
 #
 # INVERTED 2026-09-09: the d192xd128 MXFP8 gap CLOSED
-# (sm107/prefill_d192_d128_mxfp8.py), so every DENSE d192 case below now runs on
+# (sm107/d192_mxfp8_multi_q/kernel.py), so every DENSE d192 case below now runs on
 # Rubin.  It runs at cga2 there and only cga2 -- at cga1 that flavor's four
 # scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window
 # -- which the row expresses by leaving (192, 128) on its default cgas={2}, so
@@ -321,7 +322,7 @@ def _run(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     if not stats:
@@ -1486,7 +1487,7 @@ def _run_rect(B, H, S_q, S_kv, in_key, out_dt, *, scale, sdpa_kwargs, d_qk=128, 
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     g.execute(
@@ -1825,7 +1826,7 @@ def _run_thd(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH, mxfp8=True))
+    _select_engine(g, mxfp8_engine_names(_ARCH))
     g.check_support()
     g.build_plans()
     vp.update({o: o_gpu, amax_o: amax})

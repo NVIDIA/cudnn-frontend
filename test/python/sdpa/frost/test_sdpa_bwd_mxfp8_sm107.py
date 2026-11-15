@@ -1878,7 +1878,7 @@ def _run_mxfp8(
     dO_f16 = do32.permute(0, 2, 1, 3).contiguous().to(bf16)
     lse_exact = lse
     if frost_forward:
-        # The FROST d256 MXFP8 forward (sm107/prefill_d256_mxfp8.py through the SM100-named adapter, as test_sdpa_fwd_dsl_sm107 drives
+        # The FROST d256 MXFP8 forward (sm107/d256_mxfp8_single_q/kernel.py through the SM100-named adapter, as test_sdpa_fwd_dsl_sm107 drives
         # it) on the SAME rowwise q / k and columnwise v payloads: its Stats must be the exact fp32 log-sum-exp (sdpa-invariants s4,
         # within 1e-4 of the dequantized-input value) and its O the o_f16 this row folds delta from.
         from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100

@@ -150,6 +150,22 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
+def mxfp8_engine_names(arch="sm100") -> tuple[str, ...]:
+    """Allowed MXFP8 engines for feature tests that exercise default selection: the row and its exact owners."""
+    row = f"sdpa_fwd_prefill_{arch}_mxfp8"
+    if arch == "sm100":
+        return (row, "sdpa_fwd_sm100_d512_mxfp8_slice_recompute", "sdpa_fwd_sm100_d512_mxfp8_retained_p")
+    if arch == "sm107":
+        return (
+            row,
+            "sdpa_fwd_sm107_d128_mxfp8_multi_q",
+            "sdpa_fwd_sm107_d192_mxfp8_multi_q",
+            "sdpa_fwd_sm107_d256_mxfp8_single_q",
+            "sdpa_fwd_sm107_d512_mxfp8_role_split",
+        )
+    return (row,)
+
+
 def half_engine_names(arch="sm100") -> tuple[str, ...]:
     """Allowed half engines for feature tests that exercise default selection.
 
