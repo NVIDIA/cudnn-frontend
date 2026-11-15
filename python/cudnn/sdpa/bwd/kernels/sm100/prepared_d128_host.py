@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The pointer hosts of the SM100 d128 (and d64 recompute) backward family: one ``compile_host_<route>`` per route of ``bprop_d128_f16.py``.
+"""The accumulation and paired pointer hosts of the SM100 d128 backward family: one ``compile_host_<route>`` per route of ``bprop_d128_f16.py``.
 
 | route | entry | traced host | chain it calls (``bprop_d128_f16``) | symbol |
 |---|---|---|---|---|
-| recompute | ``compile_host_recompute`` | ``host_recompute`` | ``host_recompute`` (as ``tensor_host``; d64 by template) | ``frost_sdpa_bwd_sm100_d128_prepared`` |
 | accumulation | ``compile_host_accum`` | ``host_accum`` | delta_zero -> ``host_accum`` (as ``accumulation_host``) -> cast_dq | ``frost_sdpa_bwd_sm100_d128_accumulation_prepared`` |
 | grouped dense | ``compile_host_grouped_dense`` | ``host_grouped_dense`` | ``host_grouped_dense`` (as ``grouped_dense_chain_host``) | ``frost_sdpa_bwd_sm100_d128_grouped_dense_prepared`` |
 | THD | ``compile_host_thd`` | ``host_thd`` | ``host_thd`` (as ``thd_chain_host``) | ``frost_sdpa_bwd_sm100_d128_thd_prepared`` |
@@ -71,80 +70,16 @@ from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import cast_dq_host, delta_only
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_accum as accumulation_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_grouped_dense as grouped_dense_chain_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_grouped_thd as grouped_thd_chain_host
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_recompute as tensor_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_thd as thd_chain_host
 from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_f16 import host_thd_2cta as grouped_2cta_chain_host
 
 # ======================================================================================================================
-# route recompute (was kernels/sm100/prepared_d128_host.py)
+# Shared head-width specialization for accumulation and the deterministic pair
 # ======================================================================================================================
-"""Pointer entry for the single-launch dense d128 backward kernel."""
+"""Recompute has its own pointer entry in d128_f16_recompute/prepared_host.py."""
 
 _TEMPLATE = globals().get("FROST_TEMPLATE_PARAMS", 128)
 HEAD_DIM = int(_TEMPLATE) if isinstance(_TEMPLATE, int) else int(_TEMPLATE[0])
-
-
-@cute.jit
-def host_recompute(
-    q_ptr: cute.Pointer,
-    k_ptr: cute.Pointer,
-    v_ptr: cute.Pointer,
-    o_ptr: cute.Pointer,
-    do_ptr: cute.Pointer,
-    lse_ptr: cute.Pointer,
-    dq_ptr: cute.Pointer,
-    dk_ptr: cute.Pointer,
-    dv_ptr: cute.Pointer,
-    workspace: cutlass.Int64,
-    scale: cutlass.Float32,
-    geometry: cutlass.Constexpr,
-    causal: cutlass.Constexpr[bool],
-    stream: driver.CUstream,
-    window_left: cutlass.Constexpr[int] = 0,
-):
-    # The shared backward binder carries a workspace address even for a plan
-    # requiring zero bytes. This unused scalar accepts a null address.
-    q = cute.make_tensor(q_ptr, cute.make_layout(geometry[0][0], stride=geometry[0][1]))
-    k = cute.make_tensor(k_ptr, cute.make_layout(geometry[1][0], stride=geometry[1][1]))
-    v = cute.make_tensor(v_ptr, cute.make_layout(geometry[2][0], stride=geometry[2][1]))
-    o = cute.make_tensor(o_ptr, cute.make_layout(geometry[3][0], stride=geometry[3][1]))
-    do = cute.make_tensor(do_ptr, cute.make_layout(geometry[4][0], stride=geometry[4][1]))
-    lse = cute.make_tensor(lse_ptr, cute.make_layout(geometry[5][0], stride=geometry[5][1]))
-    dq = cute.make_tensor(dq_ptr, cute.make_layout(geometry[6][0], stride=geometry[6][1]))
-    dk = cute.make_tensor(dk_ptr, cute.make_layout(geometry[7][0], stride=geometry[7][1]))
-    dv = cute.make_tensor(dv_ptr, cute.make_layout(geometry[8][0], stride=geometry[8][1]))
-    tensor_host(q, k, v, o, do, lse, dq, dk, dv, scale, causal, stream, window_left)
-
-
-def compile_host_recompute(geometry, dtype, causal, sm, window_left=0):
-    """Compile only plan-time geometry; bind storage and scale at execution."""
-    global tensor_host
-    head_dim = geometry[0][0][3]
-    if head_dim == 64 and HEAD_DIM != 64:
-        module = load_template(__file__, 64, tag="sdpa_bwd_d64_host")
-        return module.compile_host_recompute(geometry, dtype, causal, sm, window_left)
-    if head_dim != HEAD_DIM:
-        raise ValueError("prepared backward head dimension does not match the kernel specialization")
-    if HEAD_DIM == 64:
-        # Load after this specialized module is initialized: load_template
-        # holds a non-reentrant lock while executing module-level code.
-        # Each host module is fixed to one width, so this assignment is invariant.
-        tensor_host = load_template(str(Path(__file__).with_name("bprop_d128_f16.py")), 64, tag="sdpa_bwd_d64").host_recompute
-    types = [dtype] * 5 + [cutlass.Float32] + [dtype] * 3
-    args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
-    return compile_cached(
-        host_recompute,
-        *args,
-        cutlass.Int64(0),
-        cutlass.Float32(1),
-        geometry,
-        bool(causal),
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        int(window_left),
-        options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
-        cache_key=repr(("sdpa_bwd_sm100_d128", geometry, str(dtype), bool(causal), sm, int(window_left), HEAD_DIM)),
-        symbol="frost_sdpa_bwd_sm100_d128_prepared",
-    )
 
 
 # ======================================================================================================================

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense d128 backward: graph eligibility, one launch, zero workspace, replay."""
 
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,20 +14,10 @@ from test_sdpa_bwd_dsl_sm107 import _TOL, _adapter, _bshd_empty, _build_graph, _
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 _ENGINE = "sdpa_bwd_sm100_d128"
+_RECOMPUTE_ENGINE = "sdpa_bwd_sm100_d128_recompute"
 # The GPU rows run on every part the row declares (its sm range: the SM100 line and, since the Rubin admission, cc 10.7 -- the bodies are
 # compiled per device, ``--gpu-arch sm_{cc}a``), read from the row; a pre-Rubin gate here would skip the one lane that proves the sm_107a body.
 requires_d128_part = requires_bwd_engine_row(_ENGINE)
-
-
-@contextmanager
-def _recompute_route():
-    """Pin the one-launch recompute kernel: SM100 / SM103 select accumulation for every dense shape, so its
-    coverage below forces the host-side selection the way an older compiler or a negative scale would."""
-    from cudnn.sdpa.bwd import api_dsl_sm100_d128
-    from cudnn.sdpa.bwd.d128_contract import RECOMPUTE
-
-    with mock.patch.object(api_dsl_sm100_d128, "select_implementation", return_value=RECOMPUTE):
-        yield
 
 
 def _spec():
@@ -45,7 +34,10 @@ def _reason(monkeypatch, cc=(10, 0), **kw):
     graph, _, _ = _half_bwd_graph(d=kw.pop("d", 128), **kw)
     facts = ga.analyze(graph)
     assert facts is not None
-    return mismatch(_spec().capabilities, facts)
+    from cudnn.sdpa.bwd.engines import ENGINE_SPECS, policy_name
+
+    reasons = [mismatch(spec.capabilities, facts) for spec in ENGINE_SPECS if policy_name(spec) == _ENGINE]
+    return None if None in reasons else reasons[0]
 
 
 @pytest.mark.parametrize(
@@ -166,7 +158,7 @@ def _case(
     d=128,
     left=None,
 ):
-    """``accumulation`` True = the default accumulation route; False = pin the recompute kernel (``_recompute_route``);
+    """``accumulation`` True = the default accumulation route; False = select the explicit recompute engine;
     None = leave the selection alone: a deterministic request takes the kernel pair under the accumulation gates, anything
     else falls back to recompute (e.g. a negative scale).
     ``allow_zero`` = compare an identically-zero oracle gradient by absolute tolerance."""
@@ -184,34 +176,32 @@ def _case(
         dk=_bshd_empty(b, sk, h, d, dt, fill=float("nan")),
         dv=_bshd_empty(b, sk, h, d, dt, fill=float("nan")),
     )
-    # The implementation is chosen while the plans are created, so the pin spans the whole build.
-    with _recompute_route() if accumulation is False else nullcontext():
-        graph, refs, outputs = _build_graph(
-            b=b,
-            hq=h,
-            sq=sq,
-            skv=sk,
-            d=d,
-            dt=dt,
-            use_causal_mask=causal,
-            scale="default" if scale is None else scale,
-            use_deterministic_algorithm=deterministic,
-            **({"diagonal_band_left_bound": left} if left is not None else {}),
-        )
-        select_engine(graph, _ENGINE)
-        before = torch.cuda.memory_allocated()
+    implementation, required = _expected_implementation(accumulation, deterministic, b, h, sq, sk, d, scale, left)
+    graph, refs, outputs = _build_graph(
+        b=b,
+        hq=h,
+        sq=sq,
+        skv=sk,
+        d=d,
+        dt=dt,
+        use_causal_mask=causal,
+        scale="default" if scale is None else scale,
+        use_deterministic_algorithm=deterministic,
+        **({"diagonal_band_left_bound": left} if left is not None else {}),
+    )
+    select_engine(graph, _RECOMPUTE_ENGINE if implementation == "recompute" else _ENGINE)
+    before = torch.cuda.memory_allocated()
+    if check_build:
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        graph.check_support()
+        graph.build_plans()
+    finally:
         if check_build:
-            torch.cuda.set_sync_debug_mode("error")
-        try:
-            graph.check_support()
-            graph.build_plans()
-        finally:
-            if check_build:
-                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.set_sync_debug_mode("default")
     if check_build:
         assert torch.cuda.memory_allocated() == before
     rounded = (sq + 127) // 128 * 128  # the accumulation workspace covers whole dQ tiles
-    implementation, required = _expected_implementation(accumulation, deterministic, b, h, sq, sk, d, scale, left)
     required = {"accumulation": 4 * b * h * rounded * (d + 1) + 240, "pair": 4 * b * h * rounded + 240, "recompute": 0}[implementation]
     assert graph.get_workspace_size() == required
     refs.update(zip(("dq", "dk", "dv"), outputs))
