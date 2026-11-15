@@ -163,3 +163,24 @@ def test_dense_n64_split_keeps_the_native_ordinary_body(d):
     assert engines.mismatch(spec.capabilities, f, g.canonical_knobs(k)) is None
     single_q = next(s for s in engines.ENGINE_SPECS if s.name == SINGLE_Q)
     assert engines.mismatch(single_q.capabilities, f, k) is not None
+
+
+@pytest.mark.parametrize("d,cga", [(32, 1), (128, 1), (192, 2), (256, 2)])
+def test_placement_does_not_import_selection_from_candidate_generator(monkeypatch, d, cga):
+    import builtins
+    from cudnn.sdpa.fwd import placement
+
+    f = facts(d, s_q=129)
+    geometry = heuristics.select_sm107_half_geometry(f, engines.SdpaFwdKnobs(cga=cga, tile_n=128))
+    knobs = geometry.canonical_knobs(engines.SdpaFwdKnobs(cga=cga, tile_n=128))
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == geometry.implementation)
+    assert engines.mismatch(spec.capabilities, f, knobs) is None
+    original = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.endswith("heuristics") and "select_sm107_half_geometry" in fromlist:
+            raise AssertionError("placement imports its body selector from the candidate generator")
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    assert placement.place(spec, f, knobs) in (placement.LEAD, placement.TRAIL)
