@@ -134,17 +134,35 @@ def test_explicit_lowering_does_not_consult_candidate_selection(monkeypatch, sha
         mx.LEGACY_ROW,
         f"sm107/{name.removeprefix('sdpa_fwd_sm107_')}/kernel.py",
     )
-    # A partial record leaves every knob unset: the adapter derives them as on the legacy row; D256 keeps its CTA width a knob.
+    # A partial record leaves every knob unset: the adapter derives them as on the legacy row.
     assert knobs == engines.SdpaFwdKnobs()
-    assert geometry.cta_group == (None if shape == (256, 256) else 2)
+    assert geometry.cta_group is None
+
+
+@pytest.mark.parametrize("shape,overrides", [((128, 128), {}), ((192, 128), {"causal": True, "h_kv": 8}), ((256, 256), {})])
+def test_explicit_one_cta_record_keeps_its_width(monkeypatch, shape, overrides):
+    # The row admits CGA1 on these graphs; the owner must lower the same width, not substitute its pair.
+    calls = []
+    monkeypatch.setattr(engines, "lower_dsl_prefill", lambda spec, f, k, *, selected_kernel: calls.append(selected_kernel))
+    spec = next(s for s in engines._sm107_mxfp8_owner_specs() if s.name == OWNERS[shape])
+    knobs = engines.SdpaFwdKnobs(cga=1)
+    f = facts(shape, **overrides)
+    assert engines.mismatch(heuristics.sm100_legacy_policy_spec(mx.LEGACY_ROW).capabilities, f, knobs) is None
+    assert engines.mismatch(spec.capabilities, f, knobs) is None
+    spec.lower(spec, f, knobs)
+    (geometry,) = calls
+    assert geometry.cta_group == 1
+    assert geometry.compiled_mismatch(geometry.template, SimpleNamespace(cta_mma=1, sched_policy=0, split_kv=1), knobs)[1] is None
 
 
 def test_compiled_identity_check_names_the_disagreement():
     params = SimpleNamespace(cta_mma=2, sched_policy=0, split_kv=1)
-    d128 = mx.explicit_geometry(OWNERS[(128, 128)])
-    assert d128.compiled_mismatch("prefill_d128_mxfp8", params, engines.SdpaFwdKnobs())[1] is None
-    assert d128.compiled_mismatch("prefill_d256_mxfp8", params, engines.SdpaFwdKnobs())[1] is not None
-    assert d128.compiled_mismatch("prefill_d128_mxfp8", SimpleNamespace(cta_mma=1, sched_policy=0, split_kv=1), engines.SdpaFwdKnobs())[1] is not None
+    d128 = mx.explicit_geometry(OWNERS[(128, 128)], engines.SdpaFwdKnobs(cga=2))
+    assert d128.compiled_mismatch("prefill_d128_mxfp8", params, engines.SdpaFwdKnobs(cga=2))[1] is None
+    assert d128.compiled_mismatch("prefill_d256_mxfp8", params, engines.SdpaFwdKnobs(cga=2))[1] is not None
+    one_cta = SimpleNamespace(cta_mma=1, sched_policy=0, split_kv=1)
+    assert d128.compiled_mismatch("prefill_d128_mxfp8", one_cta, engines.SdpaFwdKnobs(cga=2))[1] is not None
+    assert mx.explicit_geometry(OWNERS[(128, 128)]).compiled_mismatch("prefill_d128_mxfp8", one_cta, engines.SdpaFwdKnobs())[1] is None
     assert d128.compiled_mismatch("prefill_d128_mxfp8", params, engines.SdpaFwdKnobs(split_kv=2))[1] is not None
     d256 = mx.explicit_geometry(OWNERS[(256, 256)], engines.SdpaFwdKnobs(cga=1))
     assert d256.compiled_mismatch("prefill_d256_mxfp8", SimpleNamespace(cta_mma=1, sched_policy=0, split_kv=1), engines.SdpaFwdKnobs(cga=1))[1] is None

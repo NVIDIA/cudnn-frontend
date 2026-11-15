@@ -17,8 +17,6 @@ _BY_SHAPE = {c.SHAPE: c for c in (d128, d192, d256, d512)}
 _CONTRACTS = {c.NAME: c for c in _BY_SHAPE.values()}
 IMPLEMENTATIONS = frozenset(_CONTRACTS)
 SHAPES = frozenset(_BY_SHAPE)
-# The row's one CTA width per shape; D256 also runs one CTA (its THD leg), so a record names that width.
-_FIXED_CGA = {d128.NAME: 2, d192.NAME: 2, d512.NAME: 2}
 
 
 def owner_of_shape(shape):
@@ -74,8 +72,8 @@ class Geometry:
 def explicit_geometry(implementation, knobs=None):
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown SM107 MXFP8 implementation: {implementation}")
-    cga = _FIXED_CGA.get(implementation, None if knobs is None else knobs.cga)
-    return Geometry(implementation, cga)
+    # A record's CTA width stays its own; unset, the adapter derives it as on the row.
+    return Geometry(implementation, None if knobs is None else knobs.cga)
 
 
 def select_geometry(facts, knobs):

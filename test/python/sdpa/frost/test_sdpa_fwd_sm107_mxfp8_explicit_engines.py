@@ -43,8 +43,10 @@ def _run(shape, band, **kwargs):
     "shape,band,knobs",
     [
         ((128, 128), {}, {}),
+        ((128, 128), {}, {"cga": 1}),
         ((128, 128), CAUSAL, {"split_kv": 2}),
         ((192, 128), CAUSAL, {}),
+        ((192, 128), CAUSAL, {"cga": 1}),
         ((256, 256), {}, {"cga": 1}),
         ((256, 256), CAUSAL, {"cga": 2}),
         ((512, 512), CAUSAL, {}),
