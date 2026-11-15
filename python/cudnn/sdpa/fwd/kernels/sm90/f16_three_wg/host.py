@@ -14,7 +14,7 @@ def lower(spec, facts, knobs, *, lower_impl, knob_type):
     if knobs.sched_policy is None:
         from cudnn.sdpa.fwd.api_dsl import _causal_sched_policy
 
-        scheduler = _causal_sched_policy(facts.s_kv, facts.d_qk, facts.d_v, 2) if facts.causal or facts.right_band_widening else 0
+        scheduler = _causal_sched_policy(facts.s_kv, facts.d_qk, facts.d_v, 2) if not facts.thd and (facts.causal or facts.right_band_widening) else 0
         knobs = replace(knobs, sched_policy=scheduler)
     geometry = Geometry()
     return lower_impl(spec, facts, geometry.canonical_knobs(knobs), selected_kernel=geometry)

@@ -31,7 +31,7 @@ def test_graph_never_enters_tensor_adapter(sm100, monkeypatch, thd, d):
         sm100._run_thd_stats_case(seq_lens_q=[130, 0, 64, 7], seq_lens_kv=[130, 5, 200, 7], d=d, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)
     else:
         sm100.test_sdpa_fwd_dsl_sm100_graph_api(torch.float16, True, d)
-    assert loaded and set(loaded) == {f"sm90/prefill_d{d}_f16.py"}, loaded
+    assert loaded and set(loaded) == {"sm90/d128_f16_multi_q/kernel.py" if d == 128 else "sm90/f16_three_wg/kernel.py"}, loaded
 
 
 # THD at D=128 runs the D512 template (config_sm90.NOT_SERVED), so only the dense arm adds D128.

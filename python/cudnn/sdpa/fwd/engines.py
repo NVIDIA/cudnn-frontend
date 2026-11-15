@@ -39,6 +39,7 @@ from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_er
 from cudnn.sdpa import band
 from .kernels.sm90.d64_f16_one_wg import contract as _sm90_d64_owner
 from .kernels.sm90.f16_three_wg import contract as _sm90_three_wg_owner
+from .kernels.sm90.d128_f16_multi_q import contract as _sm90_d128_owner
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm80 import graph_tile_domains as _sm80_graph_tile_domains
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -2400,7 +2401,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     sm = None if cc is None else cc[0] * 10 + cc[1]
     if sm is None or not (capabilities.sm_lo <= sm <= capabilities.sm_hi):
         return f"requires SM{capabilities.sm_lo}-{capabilities.sm_hi}; current device is {cc}"
-    for owner in (_sm90_d64_owner, _sm90_three_wg_owner):
+    for owner in (_sm90_d64_owner, _sm90_three_wg_owner, _sm90_d128_owner):
         if capabilities.implementation == owner.NAME:
             reason = owner.mismatch(facts, knobs)
             if reason is not None:
@@ -3731,7 +3732,7 @@ def sm100_legacy_policy_spec(name="sdpa_fwd_prefill_sm100"):
     This is never an offered engine. Delegation changes ownership, not the
     pack/split decisions on which the existing placement studies were fitted.
     """
-    legacy = next(s for s in ENGINE_SPECS if s.name == name)
+    legacy = _sm90_spec() if name == "sdpa_fwd_prefill_sm90" else next(s for s in ENGINE_SPECS if s.name == name)
     return replace(legacy, capabilities=replace(legacy.capabilities, delegated_exact=frozenset()))
 
 
@@ -4589,13 +4590,13 @@ def lower_dsl_prefill(
             # The SM90 row (f16/bf16, nonpaged, unsplit, ungated by its capabilities) reads every
             # port's offsets: its setup launch builds per-sequence K/V/O maps at the origins.
             facts.thd
-            and spec.name == "sdpa_fwd_prefill_sm90"
+            and lowering_row_name == "sdpa_fwd_prefill_sm90"
         )
     ):
         from .thd_origins import graph_origin_specs
 
         api._thd_origin_specs = graph_origin_specs(facts)
-        if spec.name == "sdpa_fwd_prefill_sm90" and all(origin is None for origin in api._thd_origin_specs):
+        if lowering_row_name == "sdpa_fwd_prefill_sm90" and all(origin is None for origin in api._thd_origin_specs):
             api._thd_origin_specs = None  # no port binds offsets: the packed layout and its B + 3 maps
     if facts.shape_overrides:
         reason = _prepared_decline_reason(spec.capabilities, facts, getattr(api, "split_kv", 1))
@@ -4942,9 +4943,10 @@ def engine_name(
     mxfp8: bool = False,
     fp8: bool = False,
 ) -> str:
-    """The registered engine name for a coverage cell (test/user convenience).
+    """The historical broad-row name for a coverage cell (test convenience).
 
-    This names the broad legacy row. Exact SM100/SM103 half D256/D512/D576
+    SM90 has retired this broad row; its public plans name fixed implementations.
+    Exact SM100/SM103 half D256/D512/D576
     and per-tensor FP8 D256/D512 have explicit implementation entries; callers
     select them by name or use the ordinary heuristics candidates."""
 
@@ -5086,7 +5088,9 @@ def _sm120_mxfp8_spec() -> EngineSpec:
 
 
 def _sm90_spec() -> EngineSpec:
-    """Native D64/D128/D256/D512 with bounded TMA padding. At (128, 128) the tile knob also offers 128 x 128, the dedicated
+    """Private historical SM90 policy domain; never registered as an engine.
+
+    Native D64/D128/D256/D512 with bounded TMA padding. At (128, 128) the tile knob also offers 128 x 128, the dedicated
     D128 template (#378), beside the D512 body's 64 x 64: mismatch() declines that tile for what the template does not
     serve (_sm90_d128_tile_mismatch, config_sm90.d128_decline), so those graphs keep the D512 body. The D128 tile comes
     from the config_sm90 constants the adapter reads (rule 8b')."""
@@ -5096,7 +5100,6 @@ def _sm90_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_fwd_prefill_sm90",
         capabilities=Capabilities(
-            delegated_exact=frozenset({((9, 0), (64, 64))}),
             zero_scale=True,
             sm_lo=90,
             sm_hi=90,
@@ -5144,37 +5147,43 @@ def _sm90_spec() -> EngineSpec:
     )
 
 
-def _sm90_d64_specs():
-    """Exact D64 owners: native nonpaged and the existing three-WG paged body."""
+def _sm90_specs():
+    """One offered row per Hopper body; historical policy remains private."""
     from .kernels.sm90.d64_f16_one_wg.host import lower as native_lower
-    from .kernels.sm90.f16_three_wg.host import lower as paged_lower
+    from .kernels.sm90.f16_three_wg.host import lower as three_wg_lower
+    from .kernels.sm90.d128_f16_multi_q.host import lower as d128_lower
 
     legacy = _sm90_spec().capabilities
     specs = []
-    for owner, lower in ((_sm90_d64_owner, native_lower), (_sm90_three_wg_owner, paged_lower)):
+    for owner, lower in ((_sm90_d64_owner, native_lower), (_sm90_three_wg_owner, three_wg_lower), (_sm90_d128_owner, d128_lower)):
         capabilities = replace(
             legacy,
             implementation=owner.NAME,
             delegated_exact=frozenset(),
-            d_shapes=frozenset({(64, 64)}),
-            d_pad_multiple=0,
-            d_envelope_floors=(),
             tile_ms_by_d_shape=(),
             tile_ns_by_d_shape=(),
-            pack_gqa_partial_d_shapes=None,
-            pack_gqas=frozenset({False}),
-            split_kv_supported=False,
-            thd=False,
-            cu_seq_len=False,
         )
-        if owner is _sm90_d64_owner:
+        if owner is not _sm90_three_wg_owner:
+            dim = 64 if owner is _sm90_d64_owner else 128
+            tile = dim
             capabilities = replace(
                 capabilities,
+                d_shapes=frozenset({(dim, dim)}),
+                d_pad_multiple=0,
+                d_envelope_floors=(),
+                tile_ms=frozenset({tile}),
+                tile_ns=frozenset({tile}),
+                pack_gqa_partial_d_shapes=None,
+                pack_gqas=frozenset({False}),
+                split_kv_supported=False,
+                thd=False,
+                cu_seq_len=False,
                 right_band_widening=False,
                 swa=False,
                 padded=False,
                 paged_kv=False,
                 sink=False,
+                decode=owner is _sm90_d64_owner,
                 band=None,
                 declaration_check=owner.declaration_mismatch,
             )
@@ -5202,8 +5211,7 @@ ENGINE_SPECS = (
     _sm120_mxfp8_spec(),
     _sm120_d512_mxfp8_paired_spec(),
     _sm80_spec(),
-    _sm90_spec(),
-    *_sm90_d64_specs(),
+    *_sm90_specs(),
 )
 
 __all__ = ["Capabilities", "EngineSpec", "ENGINE_SPECS", "SdpaFwdKnobs", "analyze_for", "build", "engine_name", "mismatch"]

@@ -210,7 +210,7 @@ def test_graph_native_route_without_python_facts(monkeypatch, thd, d):
         graph_tests._run_thd_stats_case(seq_lens_q=[33, 0, 7], seq_lens_kv=[65, 5, 7], d=d, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)
     else:
         graph_tests.test_sdpa_fwd_dsl_sm100_graph_api(torch.bfloat16, True, d)
-    assert loaded and set(loaded) == {f"sm90/prefill_d{d}_f16.py"}, loaded
+    assert loaded and set(loaded) == {"sm90/d128_f16_multi_q/kernel.py" if d == 128 else "sm90/f16_three_wg/kernel.py"}, loaded
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")

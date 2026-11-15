@@ -14,7 +14,7 @@ from frost_test_utils import _SM, requires_dsl
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 SPECS = {s.name: s for s in engines.ENGINE_SPECS}
-OFFERED = {native.LEGACY_ROW: 20517, native.NAME: 20539, paged.NAME: 20540}
+OFFERED = {native.NAME: 20539, paged.NAME: 20540}
 
 
 def facts(**over):
@@ -24,7 +24,7 @@ def facts(**over):
 @pytest.mark.parametrize("is_paged", [False, True])
 def test_exact_d64_legacy_recipe_declines_and_has_one_owner(is_paged):
     f = facts(has_paged_kv=is_paged, page_size=16 if is_paged else 0)
-    assert "owned by" in engines.mismatch(SPECS[native.LEGACY_ROW].capabilities, f)
+    assert native.LEGACY_ROW not in SPECS
     assert native.in_domain(f) != paged.in_domain(f)
     other = native if is_paged else paged
     assert engines.mismatch(SPECS[other.NAME].capabilities, f) is not None

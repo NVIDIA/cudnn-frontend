@@ -66,9 +66,9 @@ def _unpacked_decode(row: str, facts) -> bool:
     if not row.startswith("sdpa_fwd") or facts.s_q > 4 or facts.h_q == facts.h_kv:
         return False
     from cudnn.sdpa.fwd import heuristics
-    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, sm100_legacy_policy_spec
 
-    spec = next((s for s in ENGINE_SPECS if s.name == row), None)
+    spec = sm100_legacy_policy_spec(row) if row == "sdpa_fwd_prefill_sm90" else next((s for s in ENGINE_SPECS if s.name == row), None)
     if spec is None:
         return False
     from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import in_pilot_domain

@@ -309,9 +309,10 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14),
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
-            "sdpa_fwd_prefill_sm90": EngineSlot(17),
+            # Slot 17 retired: SM90 recipes must replan onto the fixed bodies below; never reuse.
             "sdpa_fwd_sm90_d64_one_wg": EngineSlot(39),
             "sdpa_fwd_sm90_f16_three_wg": EngineSlot(40),
+            "sdpa_fwd_sm90_d128_multi_q": EngineSlot(41),
             "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18),
             "sdpa_fwd_sm100_d256_lookahead": EngineSlot(19),
             "sdpa_fwd_sm100_d256_swap_ab": EngineSlot(20),

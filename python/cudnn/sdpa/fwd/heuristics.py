@@ -3625,6 +3625,17 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     return MultiQ(d_flavor=facts.d_qk, cga=cga)
 
 
+def select_sm90_geometry(facts, knobs):
+    """Resolve the old candidate's body once; explicit replay never calls this."""
+    from .kernels.sm90.d64_f16_one_wg import contract as native
+    from .kernels.sm90.f16_three_wg import contract as three_wg
+    from .kernels.sm90.d128_f16_multi_q import contract as d128
+
+    if native.in_domain(facts):
+        return native.Geometry()
+    return d128.Geometry() if 128 in (knobs.tile_m, knobs.tile_n) else three_wg.Geometry()
+
+
 def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
     """Retain the existing candidate budget/order, naming each actual body.
 
@@ -3722,14 +3733,8 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     for wide in (fp8_wide, mxfp8_wide):
         if wide.in_domain(facts):
             return _recommend_sm100_implementation(kind, facts, offered, lambda f, k, g=wide.Geometry: g(), policy=sm100_legacy_policy_spec(wide.LEGACY_ROW))
-    from .kernels.sm90.d64_f16_one_wg import contract as sm90_d64
-    from .kernels.sm90.f16_three_wg import contract as sm90_three_wg
-
-    for owner in (sm90_d64, sm90_three_wg):
-        if owner.in_domain(facts):
-            return _recommend_sm100_implementation(
-                kind, facts, offered, lambda f, k, geometry=owner.Geometry: geometry(), policy=sm100_legacy_policy_spec(owner.LEGACY_ROW)
-            )
+    if facts.device_cc == (9, 0) and not (facts.is_fp8 or facts.is_mxfp8 or facts.is_backward):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm90_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm90"))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

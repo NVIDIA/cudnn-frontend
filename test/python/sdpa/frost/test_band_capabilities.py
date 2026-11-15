@@ -144,10 +144,6 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
     dtype / envelope / layout rejection can never stand in for a mask decision.
     """
     values = _values(kind, caps, *_dims(kind, caps))
-    if kind == "fwd" and caps.implementation == "sdpa_fwd_sm90_f16_three_wg":
-        # This batch's three-WG owner serves only the D64 paged leg. Its mask
-        # samples must preserve that non-mask declaration, including page size.
-        values.update(has_paged_kv=True, page_size=16, padded=True)
     values.update(overrides)
     # Wide native rows validate the actual binding declarations even without
     # shape overrides. Keep the non-mask baseline legal after geometry changes.

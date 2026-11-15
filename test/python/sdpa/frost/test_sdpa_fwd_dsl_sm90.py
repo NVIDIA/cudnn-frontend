@@ -8,7 +8,7 @@ forward suite. At exact (128, 128) a 128 x 128 tile names the dedicated D128 tem
 whose numerics and graph route are test_sdpa_fwd_d128_sm90.py's. The end-to-end half runs
 through test_sdpa_fwd_dsl_sm100.py: its runners, fp32 references and tolerances are
 arch-neutral apart from a module-level ``_ARCH`` fed to
-``engine_name(arch=...)``, so the ``sm100`` fixture repins that one string and SM90 runs the same
+``half_engine_names(arch)``, so the ``sm100`` fixture selects the Hopper owners and SM90 runs the same
 graphs and assertions at its own head dim (test/AGENTS.md). The rest is what only SM90 has: the
 row's envelope floors, the options its adapter declines, the adapter's flavor pick, and its own
 templates, THD arm and wrapper.
@@ -23,7 +23,7 @@ from test_utils import torch_fork_set_rng
 
 import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
-from frost_test_utils import _SM, _is_plan_for, requires_dsl
+from frost_test_utils import _SM, _is_plan_for, requires_dsl, half_engine_names
 
 import test_sdpa_fwd_dsl_sm100 as _sm100  # module scope: the mask table below is read at collection
 from test_sdpa_fwd_dsl_sm100 import _bhsd
@@ -41,7 +41,7 @@ pytestmark = [
 
 _D = 512
 _SCALE = 1.0 / math.sqrt(_D)
-_ROW = "sdpa_fwd_prefill_sm90"
+_ROW = "sdpa_fwd_sm90_f16_three_wg"
 _SHAPE = (1, 2, 64, _D)
 
 
@@ -62,11 +62,11 @@ def _api(s_kv=_SHAPE[2], dtype=torch.float16, d=_D, **kw):
     return SdpaFwdDslSm90(q, k, v, o, **kw)
 
 
-def _offered_id():
-    """The row's public engine id, as the manifest assigns it (family base + slot)."""
+def _offered_ids():
     from cudnn.engines import manifest
 
-    return next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_ROW]
+    family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
+    return {name: family.offered_ids()[name] for name in half_engine_names("sm90")}
 
 
 def _facts(gated=False, **kw):
@@ -416,7 +416,7 @@ def test_sm90_graph_loads_its_own_template(sm100, monkeypatch):
     monkeypatch.setattr(api_dsl, "_load_kernel_template", lambda filename, *a, **kw: loaded.append(filename) or load(filename, *a, **kw))
     q, k, v = (sm100._bhsd(1, 2, 96, _D, torch.float16) for _ in range(3))
     sm100._run_dsl_graph(q, k, v, scale=_SCALE, dtype=torch.float16, sdpa_kwargs={})
-    assert loaded == ["sm90/prefill_d512_f16.py"], loaded
+    assert loaded == ["sm90/f16_three_wg/kernel.py"], loaded
 
 
 @torch_fork_set_rng(seed=0)
@@ -599,16 +599,16 @@ def test_sm90_template_params_are_validated(over, why):
     [
         pytest.param(dict(device_cc=(8, 9)), id="sm89"),
         pytest.param(dict(device_cc=(10, 0)), id="sm100"),
-        pytest.param(dict(has_paged_kv=True, page_size=128, padded=True), id="paged"),
+        pytest.param(dict(has_paged_kv=True, page_size=128, padded=True, thd=True), id="paged-thd"),
     ],
 )
 def test_sm90_row_declines_what_it_never_claimed(declared):
-    """sm_lo == sm_hi == 90, and paged KV is declined by the ROW as well as by the adapter: a row
-    that admitted what its adapter refuses would rank a plan that cannot build, and no graph can
-    reach these through the end-to-end cases. The served (9, 0) control is the gate test's."""
+    """SM90 is exact cc9.0. Paged KV serves dense Q; THD paging remains declined."""
     from cudnn.sdpa.fwd import engines
 
     assert engines.mismatch(_caps(_ROW), _facts(**declared)) is not None
+    if declared.get("has_paged_kv"):
+        assert engines.mismatch(_caps(_ROW), _facts(**(declared | {"thd": False}))) is None
 
 
 # --- Options the base adapter accepts and SM90 declines -------
@@ -757,7 +757,7 @@ def test_sm90_d128_pending_s_q_above_s_kv_is_declined_by_the_row_and_at_build():
 
     why = "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
     facts = _facts(d_qk=128, d_v=128, s_q=_SHAPE[2], s_kv=32, causal=True, bottom_right=True)
-    assert engines.mismatch(_caps(_ROW), facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128)) == why
+    assert engines.mismatch(_caps("sdpa_fwd_sm90_d128_multi_q"), facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128)) == why
     with pytest.raises(NotImplementedError, match=why):
         _api(s_kv=32, d=128, is_causal=True, causal_bottom_right=True).check_support()
 
@@ -765,18 +765,14 @@ def test_sm90_d128_pending_s_q_above_s_kv_is_declined_by_the_row_and_at_build():
 # --- Registration and the plans offered for the row -------
 
 
-def test_sm90_is_a_default_row_at_its_shipped_id(monkeypatch):
-    """A shipped slot is fixed forever: an autotune record is ``(engine_id, knobs)`` and downstream
-    caches persist the integer, so the id is pinned here rather than spelled at each use. The row is
-    offered without the env flag; ``placement._place_sm90_f16`` ranks it against the backend."""
+def test_sm90_fixed_bodies_have_stable_default_ids(monkeypatch):
     from cudnn.engines import manifest
 
     family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
-    slot = family.slots[_ROW]
-    assert not slot.opt_in and family.engine_id + slot.slot == 20517
-    assert _offered_id() == 20517 and manifest.engine_for_id(20517).name == _ROW
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    assert family.offered_ids().get(_ROW) == 20517
+    expected = dict(zip(half_engine_names("sm90"), (20539, 20540, 20541)))
+    assert all(family.offered_ids().get(name) == value for name, value in expected.items())
+    assert "sdpa_fwd_prefill_sm90" not in family.slots and manifest.engine_for_id(20517) is None
 
 
 def test_sm90_every_candidate_is_valid():
@@ -797,11 +793,13 @@ def test_sm90_every_candidate_is_valid():
         (thd, {(64, 64)}, {SCHED_NATURAL}, {False}),
         (d128, {(128, 128), (64, 64)}, all_policies, {False, True}),
     ):
-        plans = recommend("A", facts, {_ROW: _offered_id()})
+        plans = recommend("A", facts, _offered_ids())
         assert plans and len(plans) <= _MAX_SETS_PER_ENGINE and len({p.knobs for p in plans}) == len(plans), plans
         assert ((plans[0].knobs.tile_m, plans[0].knobs.tile_n) == (128, 128)) is ((128, 128) in tiles), plans[0]
-        for knobs in (p.knobs for p in plans):
-            assert engines.mismatch(_caps(_ROW), facts, knobs) is None, knobs
+        for plan in plans:
+            knobs = plan.knobs
+            owner = "sdpa_fwd_sm90_d128_multi_q" if knobs.tile_m == 128 else _ROW
+            assert engines.mismatch(_caps(owner), facts, knobs) is None, knobs
             assert (knobs.tile_m, knobs.tile_n) in tiles and knobs.cga == 1, knobs
             assert 1 <= knobs.split_kv <= 65535 and (not facts.thd or knobs.split_kv == 1), knobs
             if (knobs.tile_m, knobs.tile_n) == (128, 128):
@@ -822,10 +820,10 @@ def test_sm90_pack_gqa_uses_its_64_row_cta():
 
     for d_qk, d_v in ((512, 512), (264, 504), (192, 128)):
         assert _pack_gqa_tile_q(caps, sm90(d_qk=d_qk, d_v=d_v), 64, 1) == 64, (d_qk, d_v)
-    assert {p.knobs.pack_gqa for p in recommend("A", sm90(d_qk=128, d_v=128), {_ROW: _offered_id()}) if p.knobs.tile_m == 128} == {False}
+    assert {p.knobs.pack_gqa for p in recommend("A", sm90(d_qk=128, d_v=128), _offered_ids()) if p.knobs.tile_m == 128} == {False}
 
     def leads_packed(s_q):
-        plans = recommend("A", sm90(s_q=s_q), {_ROW: _offered_id()})
+        plans = recommend("A", sm90(s_q=s_q), _offered_ids())
         assert {p.knobs.pack_gqa for p in plans} == {True, False}, plans
         return plans[0].knobs.pack_gqa
 
