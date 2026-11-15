@@ -474,10 +474,12 @@ def test_standalone_twin_is_default_off_and_names_the_owner_file():
 def test_fixed_stage2_identity_ignores_legacy_switch(twin, cc, dtype, profile, monkeypatch):
     """Each fixed host retains its path and exact parameter record across unrelated legacy callers."""
     from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.engines import _adapter
     from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
     from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
 
     Adapter = SdpaBwdDslSm100D512TwoByTwo if twin else SdpaBwdDslSm100D512RoleSplit
+    assert _adapter(Adapter.__name__) is Adapter
     fixed, legacy = object.__new__(Adapter), object.__new__(api_dsl.SdpaBwdDslSm100)
     fixed._device_cc = legacy._device_cc = lambda: cc
     fields = dict(

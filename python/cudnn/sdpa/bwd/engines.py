@@ -36,6 +36,8 @@ from cudnn.sdpa import graph_analyzer as ga
 _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
 _SM100 = "SdpaBwdDslSm100"
+_SM100_D512_ROLE_SPLIT = "SdpaBwdDslSm100D512RoleSplit"
+_SM100_D512_TWO_BY_TWO = "SdpaBwdDslSm100D512TwoByTwo"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
@@ -53,6 +55,14 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM100_D512_ROLE_SPLIT:
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+        return SdpaBwdDslSm100D512RoleSplit
+    if name == _SM100_D512_TWO_BY_TWO:
+        from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+
+        return SdpaBwdDslSm100D512TwoByTwo
     if name == _SM100_D128:
         from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
 

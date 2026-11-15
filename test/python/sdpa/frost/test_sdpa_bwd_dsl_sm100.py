@@ -913,6 +913,68 @@ def test_prepared_sm100_execute_has_no_tensor_wrapping(causal, hkv, monkeypatch)
     _check_prepared(case)
 
 
+@pytest.mark.parametrize("twin", [False, True], ids=["role_split", "2x2"])
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("causal", [False, True])
+def test_fixed_d512_standalone_rebind_and_replay(twin, dtype, causal, monkeypatch):
+    """A fixed host keeps its body under the opposite legacy switch and rebinds current storage."""
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+    case = _prepared_case(dtype=dtype, causal=causal, hkv=2)
+    Adapter = SdpaBwdDslSm100D512TwoByTwo if twin else SdpaBwdDslSm100D512RoleSplit
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not twin)
+    served, original = [], api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == Adapter._STAGE2_TAG:
+            served.append(path.rsplit("/kernels/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    api = Adapter(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=causal, scale_softmax=512**-0.5)
+    assert api.check_support()
+    api.compile()
+    assert served == ["sm100/d512_f16_2x2/kernel.py" if twin else "sm100/d512_f16_role_split/kernel.py"]
+    tensors = {name: value.clone() for name, value in case.tensors.items()}
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+
+    def refresh():
+        tensors["q"].mul_(0.75)
+        tensors["do"].mul_(1.25)
+        o, stats, _, dq, dk, dv = _reference(*(tensors[name] for name in ("q", "k", "v", "do")), case.keep, case.group)
+        tensors["o"].copy_(o)
+        tensors["stats"].copy_(stats.unsqueeze(-1))
+        for name in ("dq", "dk", "dv"):
+            tensors[name].fill_(float("nan"))
+        workspace.fill_(0xBD)
+        return dq, dk, dv
+
+    def execute():
+        api.execute(**{name + "_tensor": value for name, value in tensors.items()}, workspace=workspace)
+
+    expected = refresh()
+    execute()
+    _check_prepared(case, tensors, expected)
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            execute()
+        expected = refresh()
+        capture.replay()
+        _check_prepared(case, tensors, expected)
+        first = [tensors[name].clone() for name in ("dq", "dk", "dv")]
+        for name in ("dq", "dk", "dv"):
+            tensors[name].fill_(float("nan"))
+        workspace.fill_(0xBD)
+        capture.replay()
+        for name, want in zip(("dq", "dk", "dv"), first):
+            assert torch.equal(tensors[name], want), name
+    finally:
+        capture.reset()
+
+
 @pytest.mark.parametrize("stride", [2**32 + 512, 2**30 + 512])
 @pytest.mark.parametrize("hkv", [4, 2])
 def test_prepared_sm100_retains_strided_stats_decline(stride, hkv):

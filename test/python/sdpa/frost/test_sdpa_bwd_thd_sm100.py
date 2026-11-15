@@ -94,7 +94,7 @@ def _cos(a, b):
     return float((a @ b) / (a.norm() * b.norm() + 1e-30))
 
 
-def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=False):
+def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=False, adapter=None):
     from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
 
     dev, b = "cuda", len(lens_q)
@@ -138,7 +138,7 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
     # kernel garbage that looks correctly shaped.
     stats = lse_p[0].transpose(0, 1).contiguous() if token_major_stats else lse_p
 
-    api = SdpaBwdDslSm100(
+    api = (adapter or SdpaBwdDslSm100)(
         sample_q=eq,
         sample_k=ekv,
         sample_v=ekv,
@@ -196,6 +196,28 @@ def _run(lens_q, lens_kv, h=2, d=_D, dtype=torch.bfloat16, token_major_stats=Fal
             bad.append(f"seq {i} {name}: cos {_cos(got, want):.6f} (lens q={lens_q[i]} kv={lens_kv[i]})")
     failures = [m for m in bad if _below_tol(m)]
     assert not failures, "\n".join(bad)
+
+
+@pytest.mark.parametrize("twin", [False, True], ids=["role_split", "2x2"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("token_major_stats", [False, True])
+def test_fixed_d512_thd_envelope(twin, dtype, token_major_stats, monkeypatch):
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+    Adapter = SdpaBwdDslSm100D512TwoByTwo if twin else SdpaBwdDslSm100D512RoleSplit
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", not twin)
+    served, original = [], api_dsl.load_template
+
+    def spy(path, params, tag="template"):
+        if tag == Adapter._STAGE2_TAG:
+            served.append(path.rsplit("/kernels/", 1)[-1])
+        return original(path, params, tag)
+
+    monkeypatch.setattr(api_dsl, "load_template", spy)
+    _run([128, 64], [96, 192], d=384, dtype=dtype, token_major_stats=token_major_stats, adapter=Adapter)
+    assert served == ["sm100/d512_f16_2x2/kernel.py" if twin else "sm100/d512_f16_role_split/kernel.py"]
 
 
 @pytest.mark.parametrize("dt", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
