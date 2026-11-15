@@ -1,4 +1,13 @@
-# FROST SDPA — support matrix
+# FROST SDPA — legacy support tracker
+
+> **Historical reference; migration in progress.** Current support documentation
+> starts at [support/README.md](support/README.md), with a
+> [completed SM90 example](support/sm90.md) and a [template](support/TEMPLATE.md).
+> This legacy tracker mixes snapshots and development notes; claims below may be
+> stale or contradict later entries. Preserve it for historical context, but add
+> current support changes to the relevant new architecture section as it is
+> refactored. Do not append development logs here. A pending new section means
+> its documentation has not yet migrated, not that the feature is unsupported.
 
 **SM90 fixed implementation ownership — 2026-11-14**
 
