@@ -228,9 +228,10 @@ def _run_graph(
                 (576, 512): "sdpa_fwd_sm100_d512_2x2",
             }.get((d, d_v), explicit_name)
         if arch == "sm107" and (d, d_v) in ((512, 512), (576, 512)):
+            from dataclasses import replace
+
             explicit_name = "sdpa_fwd_sm107_d512_2x2"
-            explicit_knobs = dict(explicit_knobs)
-            explicit_knobs[cudnn.knob_type.TILE_CGA_M] = 2 if d == 576 else 4
+            explicit_knobs = replace(explicit_knobs, tile_m=64, cga=2 if d == 576 else 4)
         g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
     plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:
