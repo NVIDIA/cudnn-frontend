@@ -197,6 +197,8 @@ def _case(*, fp8=False, layout="bsh", arch=None):
 
     arch = arch or _gpu_arch()
     owner = ("sdpa_fwd_sm100_d128_fp8_multi_q" if fp8 else "sdpa_fwd_sm100_d128_multi_q") if arch == "sm100" else engine_name(arch=arch, fp8=fp8)
+    if arch == "sm107" and not fp8:
+        owner = "sdpa_fwd_sm107_d128_multi_q"
     row = next(row for row in ENGINE_SPECS if row.name == owner)
     if not row.capabilities.thd_padded_stats:
         pytest.skip(f"{row.name} currently requires packed THD Stats")

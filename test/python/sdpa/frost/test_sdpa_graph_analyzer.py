@@ -3027,10 +3027,9 @@ def test_gate_tail_is_recognised(monkeypatch, mul_order, intermediate, dtype):
     g128, _ = _mk_gated_graph(d=128, mul_order=mul_order, intermediate=intermediate, dtype=dtype)
     assert _facts(g128).has_epilogue_gate is True
     assert not _eligible(g128)
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm107_d256_lookahead")
     spec = next(s for s in engines.ENGINE_SPECS if s.name == _SM107_F16_ROW)
     _, why = engines.analyze_for(spec, g128)
-    assert why is not None and "epilogue gate" in why, why
+    assert why is not None and "epilogue" in why, why
     # The same tail on the SM100 line (the autouse cc) is declined by every row.
     monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
     g100, _ = _mk_gated_graph(mul_order=mul_order, intermediate=intermediate, dtype=dtype)

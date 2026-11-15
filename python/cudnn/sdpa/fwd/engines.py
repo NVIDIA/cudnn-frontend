@@ -3641,6 +3641,8 @@ def _sm107_half_specs():
                 implementation=name,
                 tile_ms=tiles,
                 d_shapes=exact_shapes.get(name, frozenset({(32, 32), (64, 64), (128, 128), (192, 128)})),
+                epilogue_gate=name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB),
+                epilogue_gate_d_shapes=(base.epilogue_gate_d_shapes if name in (_sm107_mid_half.LOOKAHEAD, _sm107_mid_half.SWAP_AB) else None),
                 **({"d_pad_multiple": 0, "d_envelope_floors": ()} if name in exact_shapes else {}),
             ),
             partial(
@@ -3675,6 +3677,7 @@ def _sm107_wide_half_specs():
         dense_only_d_shapes=frozenset(),
         native_legs_by_d_shape=(),
         epilogue_gate=False,
+        epilogue_gate_d_shapes=None,
         bias=False,
         kv_mask=False,
         score_max=False,

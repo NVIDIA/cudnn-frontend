@@ -4,7 +4,7 @@
 """Local identity and admission for the native SM107 d192_f16_multi_q body."""
 
 NAME = "sdpa_fwd_sm107_d192_multi_q"
-TEMPLATE_NAME = "prefill_d192_f16"
+TEMPLATE_NAME = "prefill_d192_d128_f16"
 KERNEL_FILE = "sm107/d192_f16_multi_q/kernel.py"
 
 

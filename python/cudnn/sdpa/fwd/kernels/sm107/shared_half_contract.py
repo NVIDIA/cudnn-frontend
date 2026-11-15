@@ -93,6 +93,8 @@ def mismatch(implementation, facts, knobs):
     else:
         if facts.d_qk > 192:
             return "shared single-Q serves D32/D64/D128 and D192/V128"
+        if facts.d_qk == 128 and not facts.thd and not facts.has_paged_kv and facts.attn_scale_prefolded:
+            return "dense D128 shared single-Q does not support the pre-folded attention scale"
         if not facts.uniform_dtype and facts.d_qk != 128:
             return "shared single-Q mixed KV is supported at D128 only"
         if facts.d_qk == 192:

@@ -46,7 +46,7 @@ def test_admission_and_record(dtype_name, cga, tile_n, monkeypatch):
     assert params.paged_kv and params.thd_varlen and params.split_kv == 1
     assert params.tile_n == (128 if tile_n is None else tile_n)
     assert params.s_slots == (2 if tile_n == 64 else 1)
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d128_multi_q")
     facts = dataclasses.replace(
         _f16_facts(h_q=16, h_kv=4, thd=True),
         has_paged_kv=True,

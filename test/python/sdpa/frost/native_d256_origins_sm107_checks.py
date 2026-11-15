@@ -56,5 +56,5 @@ def test_native_d256_independent_origins(dtype_name, stats_layout, policy, total
     monkeypatch.setattr(cudnn.pygraph, "create_execution_plan", select_schedule)
     monkeypatch.setattr(cudnn.pygraph, "build_plans", verify_native_build)
     monkeypatch.setattr(cudnn.pygraph, "execute", execute_without_sync)
-    run(256, dtype_name, stats_layout, total_hints, False, 1, engine_name="sdpa_fwd_prefill_sm107", cga=2)
+    run(256, dtype_name, stats_layout, total_hints, False, 1, engine_name="sdpa_fwd_sm107_d256_lookahead", cga=2)
     assert checked

@@ -54,7 +54,7 @@ def test_native_d64_independent_origins(dtype_name, cga, packed, monkeypatch):
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
     test_independent_thd_origins_rebind_and_capture(
-        64, dtype_name, "head" if packed else "token", True, packed, 1, engine_name="sdpa_fwd_prefill_sm107", cga=cga
+        64, dtype_name, "head" if packed else "token", True, packed, 1, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=cga
     )
     assert seen
 
