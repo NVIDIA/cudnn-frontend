@@ -23,7 +23,7 @@ pytestmark = pytest.mark.L0
 def test_pair_preserves_admission_and_default_order(monkeypatch, cc, d, dtype, profile):
     from cudnn.frost import buffers
 
-    monkeypatch.setattr(engines, "cutedsl_state", lambda: (None, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     specs = {s.name: s for s in engines.ENGINE_SPECS}
     row = specs[LEGACY_ROW]

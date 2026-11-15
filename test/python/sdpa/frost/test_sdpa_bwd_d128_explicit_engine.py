@@ -22,7 +22,7 @@ pytestmark = pytest.mark.L0
 def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profile):
     from cudnn.frost import buffers
 
-    monkeypatch.setattr(engines, "cutedsl_state", lambda: (None, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     specs = {s.name: s for s in engines.ENGINE_SPECS}
     row, owner = specs[LEGACY_ROW], specs[RECOMPUTE_OWNER]
@@ -35,7 +35,9 @@ def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profil
         "grouped": {"h_kv": 1},
         "thd": {"thd": True, "padded": True, "max_total_seq_len_q": 256, "max_total_seq_len_kv": 512},
     }[profile]
-    facts = SdpaGraphFacts(**(dict(is_backward=True, b=2, h_q=2, h_kv=2, s_q=128, s_kv=256, d_qk=d, d_v=d, device_cc=cc) | changes))
+    facts = SdpaGraphFacts(
+        **(dict(is_backward=True, b=2, h_q=2, h_kv=2, s_q=128, s_kv=256, d_qk=d, d_v=d, dtype=cudnn.data_type.BFLOAT16, device_cc=cc) | changes)
+    )
     baseline = engines.mismatch(old, facts)
     reasons = [engines.mismatch(s.capabilities, facts) for s in (row, owner)]
     assert (None in reasons) == (baseline is None)
