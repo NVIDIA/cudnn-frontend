@@ -28,7 +28,7 @@ from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, fp32_to_fp16
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload
 from cudnn.frost.tile_dsl.tma import tma_load_tile
 
-from cudnn.sdpa.bwd.config_sm100_d128_dq import make_bar_layout, make_config
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_pair.config_dq import make_bar_layout, make_config
 
 HEAD_DIM = globals().get("FROST_TEMPLATE_PARAMS", 128)
 CFG = make_config(HEAD_DIM)

@@ -9,7 +9,7 @@ import pytest
 
 import cudnn
 from cudnn.sdpa.bwd import engines, heuristics
-from cudnn.sdpa.bwd.d128_selection import LEGACY_ROW, RECOMPUTE_OWNER
+from cudnn.sdpa.bwd.d128_selection import LEGACY_ROW, PAIR_OWNER, RECOMPUTE_OWNER
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
 from frost_test_utils import requires_bwd_engine_row, requires_dsl
 
@@ -43,7 +43,7 @@ def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profil
     assert (None in reasons) == (baseline is None)
     if baseline is None and profile not in ("grouped", "thd"):
         assert reasons[1] is None
-    offered = {LEGACY_ROW: 20609, RECOMPUTE_OWNER: 20628}
+    offered = {LEGACY_ROW: 20609, RECOMPUTE_OWNER: 20628, PAIR_OWNER: 20629}
     plans = heuristics.recommend("A", facts, offered)
     if baseline is None:
         expected = [offered[name] for name in engines.legal_implementations(row.capabilities, facts)]

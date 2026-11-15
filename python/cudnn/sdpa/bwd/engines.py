@@ -46,6 +46,7 @@ _SM100_D256 = "SdpaBwdDslSm100D256"
 _SM107_D512 = "SdpaBwdDslSm107D512"
 _SM100_D128 = "SdpaBwdDslSm100D128"
 _SM100_D128_RECOMPUTE = "SdpaBwdDslSm100D128Recompute"
+_SM100_D128_PAIR = "SdpaBwdDslSm100D128Pair"
 _SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
 _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
@@ -56,6 +57,10 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM100_D128_PAIR:
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_pair.host import SdpaBwdDslSm100D128Pair
+
+        return SdpaBwdDslSm100D128Pair
     if name == _SM100_D512_ROLE_SPLIT:
         from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
 
@@ -2256,7 +2261,7 @@ def _sm100_d128_spec() -> EngineSpec:
             gqa=True,
             declaration_check=_sm100_d128_declaration_mismatch,
             select_implementation=_sm100_d128_implementations,
-            delegated=frozenset({"sdpa_bwd_sm100_d128_recompute"}),
+            delegated=frozenset({"sdpa_bwd_sm100_d128_recompute", "sdpa_bwd_sm100_d128_pair"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100_D128),
     )
@@ -2270,6 +2275,20 @@ def _sm100_d128_recompute_spec() -> EngineSpec:
         RECOMPUTE_OWNER,
         partial(lower_dsl_bwd, api_type=_SM100_D128_RECOMPUTE),
         gqa=False,
+        thd=False,
+        thd_declared_totals=False,
+        thd_ragged_offsets=False,
+    )
+
+
+def _sm100_d128_pair_spec() -> EngineSpec:
+    from .d128_selection import PAIR_OWNER
+
+    return explicit_engine(
+        _sm100_d128_spec(),
+        PAIR_OWNER,
+        partial(lower_dsl_bwd, api_type=_SM100_D128_PAIR),
+        sm_hi=103,
         thd=False,
         thd_declared_totals=False,
         thd_ragged_offsets=False,
@@ -2550,6 +2569,7 @@ ENGINE_SPECS = (
     _sm107_d512_spec(),
     _sm100_d128_spec(),
     _sm100_d128_recompute_spec(),
+    _sm100_d128_pair_spec(),
     _sm107_d192_spec(),
     _sm100_d128_fp8_spec(),
     _d512_fp8_spec(),
