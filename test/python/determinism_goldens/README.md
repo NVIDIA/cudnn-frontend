@@ -4,6 +4,28 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### SM107 D512 FP8 implementation identity (2026-11-15)
+
+The exact D512 per-tensor FP8 graph now uses engine 20549,
+`sdpa_fwd_sm107_d512_fp8_role_split`. Its role-split body and arithmetic are
+unchanged. `TestD512Fp8Implementation` in `sdpa/frost/test_sdpa_fp8_sm107.py`
+checks explicit public records without candidate generation, reconstruction,
+fresh bindings and retained capture for E4M3/E5M2 inputs, BF16/FP8 outputs
+and fixed split counts. Independent THD origins cover token/head Stats and
+present/absent total hints, including replay and batch invariance through the
+shared numerical reference. The existing D512 packing, split and paging
+suites also collect through that entry point.
+
+The refill stress uses eight KV tiles per work item, a three-slot K/V ring
+and four-slot transfer ring, with 1,024 CTAs. It checks the numerical reference
+before byte comparisons and runs 256 warm plus 256 shared-memory-poisoned
+launches alongside the unsafe-ring control. This finite test is not a proof
+of race freedom. Historical THD golden keys retain their old `cga2` MMA-group
+suffix while public records now state the physical cluster width `cga4`;
+this preserves the original baselines instead of recording replacements.
+
+Native qualification results are recorded below after the frozen-source runs.
+
 ### Dense D128 FP8 swap-AB qualification (2026-11-13)
 
 `sdpa/frost/native_fp8_dense_swap_ab.py` is exposed as `TestDenseFp8SwapAB`

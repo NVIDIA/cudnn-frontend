@@ -67,7 +67,7 @@ class TestWideFp8PhysicalOrigins:
 
     from sdpa.frost.sdpa_midwidth_quantized_origins import origin_checks as _origin_checks
 
-    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 2)])
+    test_independent_origins_rebind_replay, test_origins_without_total_hints, test_origin_golden = _origin_checks("fp8", "sm107", [(256, 1), (512, 4)])
 
 
 @requires_rubin
@@ -2190,6 +2190,23 @@ class TestNativeD256Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestD512Fp8Implementation:
+    """A public recipe fixes the role-split body through binding and capture."""
+
+    from sm107_d512_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_independent_thd_origins as _origins,
+        test_d512_fp8_refilled_stage_warm_stress as _warm,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_thd_origins = staticmethod(_origins)
+    test_warm_stress = staticmethod(_warm)
 
 
 @requires_rubin
