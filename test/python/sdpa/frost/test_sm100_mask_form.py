@@ -38,7 +38,7 @@ _E4M3, _BF16 = 0, 2
 # the port: a count that moves means an arm was added or dropped and the table (and this pin) must say so.
 _KERNELS = {
     ("f16", (128, 128)): ("prefill_d128_f16.py", 3),  # + the resident-block bias / kv_mask arms' two sites (pre-masked tail, masked body)
-    ("f16", (192, 128)): ("prefill_d192_d128_f16.py", 5),
+    ("f16", (192, 128)): ("d192_f16_multi_q/kernel.py", 5),
     ("f16", (256, 256)): ("d256_f16_lookahead/kernel.py", 3),  # fused correction masks its P1 slice independently
     ("f16", (512, 512)): ("d512_f16_role_split/kernel.py", 1),
     ("fp8", (128, 128)): ("prefill_d128_fp8.py", 1),
@@ -76,6 +76,12 @@ def _load(kind, flavor):
     # the d128 f16 flavor would select the decode kernel above), cga1 where that is the only width (fp8 d256, mxfp8 d512).
     cta_mma = max(supported_cgas_for(flavor, fp8=fp8, device_cc=(10, 0), pertensor=pertensor))
     params = TemplateParams(dtype_qkv=_E4M3 if fp8 else _BF16, dtype_o=_BF16, cta_mma=cta_mma)
+    if kind == "f16" and flavor == (192, 128):
+        from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+        from cudnn.sdpa.fwd.kernels.sm100.d192_f16_multi_q.contract import Geometry, KERNEL_FILE, NAME
+
+        geometry = Geometry(cga=cta_mma)
+        return _load_kernel_template(KERNEL_FILE, geometry.configure_params(params), NAME)
     return _load_sm100_kernel_module(flavor, params, fp8=fp8, pertensor=pertensor, rubin=False)
 
 

@@ -3636,6 +3636,20 @@ def select_sm90_geometry(facts, knobs):
     return d128.Geometry() if 128 in (knobs.tile_m, knobs.tile_n) else three_wg.Geometry()
 
 
+def select_sm100_d192_half_geometry(facts, knobs):
+    """Name the existing D192 body choice before entering a fixed engine."""
+    from .kernels.sm100.d192_half_contract import in_domain
+    from .kernels.sm100.d192_f16_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
+
+    if not in_domain(facts):
+        raise ValueError("D192 half selection requires exact SM100/SM103 D192/V128 half inputs")
+    cga = 2 if knobs.cga is None else knobs.cga
+    if facts.thd and not facts.has_paged_kv and cga == 1:
+        return SingleQ()
+    return MultiQ(cga=cga)
+
+
 def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
     """Retain the existing candidate budget/order, naming each actual body.
 
@@ -3706,6 +3720,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_wide_half_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
+    from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
+
+    if in_d192_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d192_half_geometry)
     from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
 
     if in_d512_fp8_domain(facts):

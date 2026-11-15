@@ -32,6 +32,7 @@ def _sm100_half_owner(graph):
     f = ga.analyze(graph)
     if f is not None and f.device_cc in ((10, 0), (10, 3)):
         return {
+            (192, 128): "sdpa_fwd_sm100_d192_multi_q",
             (256, 256): "sdpa_fwd_sm100_d256_lookahead",
             (512, 512): "sdpa_fwd_sm100_d512_role_split",
             (576, 512): "sdpa_fwd_sm100_d512_2x2",
@@ -474,8 +475,8 @@ def test_probe_envelope_covers_small_head_dim():
 
 
 def test_probe_envelope_mixed_dims_pick_covering_flavor():
-    # (d_qk=192, d_v=128) uses the native d192/d128 flavor; larger envelopes
-    # remain eligible for explicit A/B selection.
+    # Exact (d_qk=192, d_v=128) uses its explicit native owner; the legacy
+    # envelope row delegates this domain instead of offering a duplicate.
     g = _mk_graph()
     d_qk, d_v = 192, 128
     q = g.tensor(dim=(B, H, S, d_qk), stride=(S * H * d_qk, d_qk, H * d_qk, 1), data_type=DTYPE, name="q")
@@ -484,9 +485,11 @@ def test_probe_envelope_mixed_dims_pick_covering_flavor():
     o, _ = g.sdpa(name="s", q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
     _finish_output(o, (B, H, S, d_v), (S * H * d_v, d_v, H * d_v, 1))
     elig = _eligible(g)
-    assert engines.engine_name() in elig
+    owner = _sm100_half_owner(g)
+    assert owner in elig
+    assert engines.engine_name() not in elig
     ordered = [s.name for s in engines.ENGINE_SPECS if s.name in elig]
-    assert ordered[0] == engines.engine_name()
+    assert ordered[0] == owner
 
 
 def test_d192_fp8_sink_dtype_support():
@@ -1133,6 +1136,9 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
     assert by_name["sdpa_fwd_sm100_d256_lookahead"].pack_gqa_partial_d_shapes == frozenset({(256, 256)})
     assert by_name["sdpa_fwd_sm100_d512_2x2"].pack_gqa_partial_d_shapes == frozenset({(576, 512)})
     assert by_name["sdpa_fwd_sm100_d512_role_split"].pack_gqa_partial_d_shapes is None
+    d192_owners = ("sdpa_fwd_sm100_d192_multi_q", "sdpa_fwd_sm100_d128_single_q")
+    for name in d192_owners:
+        assert by_name[name].pack_gqa_partial_d_shapes == frozenset()
     others = {
         name: caps.pack_gqa_partial_d_shapes
         for name, caps in by_name.items()
@@ -1145,6 +1151,7 @@ def test_pack_gqa_partial_d_shapes_in_lockstep_with_the_adapter():
             native_sm90,
             native_sm120,
             "sdpa_fwd_sm120_d512_paired",
+            *d192_owners,
         )
     }
     assert all(v is None for v in others.values()), others
