@@ -298,12 +298,12 @@ def _function_code(source, name, next_name):
 
 # ------------------------------------------------------------------------------------------------------------ host (no GPU)
 def test_2cta_stail_config_is_the_truth():
-    """Every number the second body's header quotes is a derived, asserted field of ``config_sm100_d128_accum_2cta_stail.CFG`` (G10 config-as-truth):
+    """Every number the second body's header quotes is a derived, asserted field of ``d128_f16_accum_2cta.config.CFG`` (G10 config-as-truth):
     the slab chain (Q1 one stage, the dedicated sDQ ring at 212992, STATS / DELTA / scaffold unchanged), the TMEM map (dQ at S^T's dead tail),
     the ring depths, the 35-row BAR_LAYOUT (kinds, counts, END 230960 with the fp32_reduce row), the three alias rows, the probe domain.
     """
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta as first
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import geometry as first
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
 
     c = cfgmod.CFG
     assert c.TMEM_MAP == "s_tail"
@@ -549,8 +549,8 @@ def test_2cta_stail_fields_are_typed():
     None / False; the pruned perf knobs of the measurement measurement series are not fields of the adapter (one body, one order, one load form)."""
     from types import SimpleNamespace
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta as base
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import geometry as base
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk, diag_2cta
 
@@ -585,7 +585,7 @@ def test_2cta_stail_mask_form_is_typed():
     engine name; the record default is None."""
     from types import SimpleNamespace
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import mask_form
 
@@ -621,7 +621,7 @@ def test_2cta_stail_stats_form_is_typed():
     words), "tma_ring" x every probe / mask form passes."""
     from types import SimpleNamespace
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import stats_form
@@ -672,7 +672,7 @@ def test_2cta_stail_tmem_map_is_typed_and_part_keyed(monkeypatch):
     "16w_fa4", the three S-tail WAIT probes x "dq_576"); the kernel's constants are the config's code space; the record default is None."""
     from types import SimpleNamespace
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd import prepared_sm100_d128_grouped_2cta as prepared
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
@@ -755,7 +755,7 @@ def test_2cta_stail_smem_map_is_typed_and_part_keyed(monkeypatch):
     config's code space; the record default is None."""
     from types import SimpleNamespace
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd import prepared_sm100_d128_grouped_2cta as prepared
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
@@ -1013,7 +1013,7 @@ def test_2cta_stail_host_renders_dq576_named_for_sm_107a_and_matches_its_record(
     512 form gone); the same register split; the record is its OWN per-kernel file at its OWN target (``_RECORD_DQ576``); the three kernels that do
     not read the map (setup, delta-and-stats, cast) hash to the s_tail record's rows.  Skips BY NAME on a DSL without the sm_107a target or on
     another DSL build."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from frost_test_utils import arch_known_to_the_dsl
 
     if not arch_known_to_the_dsl("sm_107a"):
@@ -1042,7 +1042,7 @@ def test_2cta_stail_host_renders_dq576_ldg_for_sm_107a_and_matches_its_record(tm
     and the s_tail x ldg one's; the three kernels that do not read the map (setup without the row-offset pass, compact delta, cast) hash to the ldg
     record's rows (sm_100a: per-kernel `.entry` md5s are target-independent); the record is its OWN token in the dq_576 file at its own target.
     Skips BY NAME on a DSL without the sm_107a target or on another DSL build."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from frost_test_utils import arch_known_to_the_dsl
 
     if not arch_known_to_the_dsl("sm_107a"):
@@ -1074,7 +1074,7 @@ def test_2cta_stail_host_renders_probes_under_dq576_for_sm_107a(tmp_path):
     map's delta, the route rows untouched), each a different md5 from that default; the three S-tail WAIT probes decline BY NAME at ``compile_host``
     under the map (their wait sites are the deleted rows) -- never a rendering (the barrier AUDIT's u4).  Skips BY NAME on a DSL without the sm_107a
     target."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
     from frost_test_utils import arch_known_to_the_dsl
 
@@ -1105,7 +1105,7 @@ def test_2cta_stail_host_renders_sm100_oversized_byte_identical_to_sm100(tmp_pat
     the census equal, the register split equal): the dynamic-SMEM declaration (`.extern .shared ... []`) carries no size in PTX -- the padded size
     reaches the launcher alone (``geo.SMEM_BYTES`` 262144 of the two padded records).  The real maps' records hold (dq_576: the R1 record; s_tail named
     on sm_107a: the sm_100a default record).  Skips BY NAME on a DSL without the sm_107a target or on another DSL build."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from frost_test_utils import arch_known_to_the_dsl
 
     if not arch_known_to_the_dsl("sm_107a"):
@@ -1131,7 +1131,7 @@ def test_2cta_stail_host_renders_rubin_b2_named_for_sm_107a_and_matches_its_reco
     exclusive alloc, .local 0, nanosleep 0 and the register split unchanged); the record is its OWN per-kernel file at its OWN target (``_RECORD_B2``);
     the three kernels that read neither map hash to the dq_576 record's rows; the dq_576 x sm100 rendering (the SMEM map unset or NAMED "sm100")
     stays the dq_576 record's.  Skips BY NAME on a DSL without the sm_107a target or on another DSL build."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from frost_test_utils import arch_known_to_the_dsl
 
     if not arch_known_to_the_dsl("sm_107a"):
@@ -1162,8 +1162,8 @@ def test_2cta_stail_host_renders_probes_for_sm_100a(tmp_path, probe):
     sDQ slice STS + their 3 proxy fences) or WAIT sites (s_tail_wait_off: the leader's 4 s_tail_empty `_wait_tcgen`; s_read_wait_off: its 1 s_read
     `_wait_tcgen`; the combined name: 5 -- each site one try_wait + one bar.warp.sync + one tcgen05.fence::after) and nothing else -- every
     arrive site stays (the barrier table is identical: the purity census); the probe renders a different md5 from the default."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta as base
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import geometry as base
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
 
     md5_d, census_d, _ = _render(tmp_path, {}, _ROUTE_CENSUS)
     assert census_d == dict(_EXPECTED, sts_dq_v2_b64=24, fence_proxy_async=15, bulk_commit_group=5), census_d
@@ -1183,7 +1183,7 @@ def test_2cta_stail_probes_resolve_the_same_way_under_fp32_dkv_accum(tmp_path):
     arrive / wait census with exchange_off's own transfer delta only (the arm's bytes go to 0, the one bulk copy + its two mapa gone; no barrier
     row moves; nothing asynchronous writes the recv-half slots under the probe).  The combination is reachable through the typed fields only;
     the ``--validate`` refusal is per probe name."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     for accum in (None, "fp32_reduce"):
@@ -1202,7 +1202,7 @@ def test_2cta_stail_fields_under_16w_fa4_decline_or_resite_by_name(tmp_path):
     fp32 row ``dvk_stage_empty`` is UNSERVED there (absent from ``BAR_LAYOUT_XFA4`` / ``BarsXFA4``); ``exchange_off`` is sited at the softmax's arm +
     ship under 16w_fa4 and renders with its own transfer delta only (the one bulk copy + its two mapa gone, the arm's bytes 0; every arrive / wait
     stays), a different md5 from the 16w_fa4 default; both fields pass under the default shape (16w)."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
 
     with pytest.raises(ValueError, match="debug_clk is not defined under warp_roles '16w_fa4'"):
@@ -1243,7 +1243,7 @@ def test_2cta_stail_host_renders_mask_forms_for_sm_100a(tmp_path):
     selects and keep-word shifts (the mask body is kept, inside the branch) and exactly CFG.QUARTERS_PER_GROUP more branches (one CTA-uniform
     `if mask_tile:` per q quarter); "diag_mask_off" drops exactly CFG.MASK_SELECTS_PER_LANE_PER_TILE selects and CFG.MASK_WORDS_PER_LANE_PER_TILE
     upper-edge shifts (the whole mask body) under the same census; the three md5s differ."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     md5_d, census_d, regs_d, kernels_d = _render_kernels(tmp_path, {}, _MASK_CENSUS)
     md5_f, census_f, regs_f = _render(tmp_path, {"mask_form": "fsel"}, _MASK_CENSUS)
@@ -1273,7 +1273,7 @@ def test_2cta_stail_host_renders_stats_forms_for_sm_100a(tmp_path):
     (the softmax's six loads against the loader's one and the setup / delta launches' five); every other row of the module census identical (no proxy
     fence, no tcgen05 fence, no LDS.128 moved, the 144 / 144 / 80 split, no local memory, no nanosleep); each form matches its committed per-kernel
     record rows (the ldg rows under their own token); the default x ``debug_clk`` renders with the ring's barrier census + the clock reads only."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG_RING, STATS_RING_ROWS
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG_RING, STATS_RING_ROWS
 
     md5_d, census_d, regs_d, kernels_d = _render_kernels(tmp_path, {}, _STATS_CENSUS)
     md5_r, census_r, regs_r = _render(tmp_path, {"stats_form": "tma_ring"}, _STATS_CENSUS)
@@ -1448,7 +1448,7 @@ def test_2cta_stail_s_tail_empty_waits_sit_at_the_three_guarded_sites():
     `if hi - 1 > lo`, and the post-loop drain; the lookahead's and the tail's advance sit with their waits.  Each of the four sits under the ONE
     DIAGNOSTIC guard `if cutlass.const_expr(not s_tail_off):` (s_tail_wait_off, header section 11) and its advance stays OUTSIDE the guard (the
     phase flips unobserved under the probe; CFG.DIAG_S_TAIL_WAIT_SITES == 4); the s_read wait of `_dq_slot` sits under `not s_read_off` the same way."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
 
     source = _body_source()
     wait_s_tail = r'_wait_tcgen\(bars\.s_tail_empty, s_tail_state\.phase, dbg, _W\["wait:leader:s_tail_empty"\]\)'
@@ -1544,7 +1544,7 @@ def test_2cta_stail_geometry_keyed_bodies_take_every_depth_and_offset_from_geo()
     from the config module (config as truth); NO ``CFG.<field>`` of that set may appear in a role body -- the arms rubin_b2 declines by name (stats_form
     ldg's `_stats` slab, the 16w_fa4 softmax arm and reduce body) read the record too (the record IS the base config there: byte-identical renderings);
     comments and docstrings are prose."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfg_mod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfg_mod
 
     base, b2 = cfg_mod.CFG, cfg_mod.CFG_RING_DQ576_B2
     differing = sorted(n for n in dir(base) if not n.startswith("_") and not callable(getattr(base, n)) and getattr(base, n) != getattr(b2, n))
@@ -1731,7 +1731,7 @@ def test_2cta_stail_rubin_b2_reuse_edge_is_the_dq_read_done_row():
     is void and the LEADER row ``dq_read_done`` (PAIR_EPILOGUE_LANES 256, after dp_empty; in the B2 table only) carries the edge -- the epilogue
     arrives it after each readout trio (two sites), `_dq_issue` waits it before every dQ issue on the pre-armed state, the leader drains it once.
     RED: the arrive removed, the arrive moved ahead of its trio, the wait removed, or the drain removed FAILS the detector; GREEN: the body passes."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
 
     c = cfgmod.CFG
     assert cfgmod.DQ_READ_DONE_ROW == ("dq_read_done", 1, c.PAIR_EPILOGUE_LANES, "leader", "LEADER") and cfgmod.ADDED_BARRIERS_B2 == ("dq_read_done",)
@@ -1915,7 +1915,7 @@ def test_2cta_stail_launch_count_and_cluster_facts():
     assert (body.CFG_RING_DQ576_B2.SMEM_BYTES, body.CFG_RING_DQ576_B2.DS_STAGES, body.CFG_RING_DQ576_B2.SMEM_CAP) == (314368, 2, 334848)  # header section 8
     case = make_case((256, 256), (256, 256), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True)
     api, workspace = _run_case(case, repeats=1)
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import SMEM_MAP_DEFAULT_BY_PART, TMEM_MAP_DEFAULT_BY_PART
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import SMEM_MAP_DEFAULT_BY_PART, TMEM_MAP_DEFAULT_BY_PART
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import smem_map, tmem_map
 
     assert tmem_map(api) == TMEM_MAP_DEFAULT_BY_PART[torch.cuda.get_device_capability()]  # the map this device rendered = its part's default
@@ -1985,7 +1985,7 @@ def test_2cta_stail_stats_forms_agree_bitwise(spec):
     layouts (token-major TH1 and head-major HN: the delta launch reads either), the all-empty THD case, the zero-trip mix, and n_q == 1 with more
     pairs than SMs (two items per CTA: the k-indexed ring across items, never a per-item stage reset)."""
     _require_2cta()
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     spec = dict(spec)
     lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
@@ -2042,7 +2042,7 @@ _TMEM_MAP_TWIN_CASES = [
 
 def _require_tmem_map(name):
     """The GPU rows of a TMEM map run on the parts that SERVE it (``TMEM_MAP_PARTS``: the library's own set, never a copy) and skip elsewhere."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import TMEM_MAP_PARTS
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import TMEM_MAP_PARTS
 
     _require_2cta()
     cc = torch.cuda.get_device_capability()
@@ -2058,7 +2058,7 @@ def test_2cta_stail_tmem_maps_agree_bitwise(spec):
     first.  The rows: the uniform cell, the ramp with dead pairs (N up to 8), the partial last q tile with a half-dead CTA, the zero-trip mix (N = 3 /
     1 / 0: the independent image's N-walk), the all-empty case, and n_q == 1 with more pairs than SMs (the tail dQ(lo) alone, two items per CTA)."""
     _require_tmem_map("dq_576")
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     spec = dict(spec)
     lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
@@ -2090,7 +2090,7 @@ def test_2cta_stail_tmem_maps_agree_under_fp32_dkv_accum():
     workspace, the fp32 form pinned on the artifact), and dK / dV are BITWISE between the maps (the same fp32 reduce-adds -- Hq / Hkv = 2 per element
     into a zero-filled image, order-free -- the map changes no arithmetic: a claim by construction); dQ bitwise too at <= _DQ_ORDER_FREE_PAIRS kv pairs."""
     _require_tmem_map("dq_576")
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     hq, hkv = 4, 2
     case = make_case((256, 512), (256, 512), hq=hq, hkv=hkv, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")
@@ -2109,7 +2109,7 @@ def test_2cta_stail_tmem_maps_agree_under_fp32_dkv_accum():
 def test_2cta_stail_dq576_declines_by_name_on_a_512_column_part():
     """``tmem_map = "dq_576"`` NAMED on a part without the 576-column carve (cc 10.0 / 10.3) is the engine's typed decline at ``check_support``
     (NotImplementedError naming the field, the map and the part) -- never a compile, never a silent s_tail; on cc 10.7 the row is the twin above."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import TMEM_MAP_PARTS
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import TMEM_MAP_PARTS
 
     _require_2cta()
     cc = torch.cuda.get_device_capability()
@@ -2123,7 +2123,7 @@ def test_2cta_stail_dq576_declines_by_name_on_a_512_column_part():
 
 def _require_smem_map(name):
     """The GPU rows of an SMEM map run on the parts that SERVE it (``SMEM_MAP_PARTS``: the library's own set, never a copy) and skip elsewhere."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import SMEM_MAP_PARTS
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import SMEM_MAP_PARTS
 
     _require_2cta()
     cc = torch.cuda.get_device_capability()
@@ -2141,7 +2141,7 @@ def test_2cta_stail_smem_maps_agree_bitwise(spec):
     with more pairs than SMs = the tail dQ(lo) alone, two items per CTA: the P14 killers of the kernel header section 12).  The first launch of the
     314368-B slab IS the oversized-SMEM launch proof (a launcher that did not set the mode fails the launch)."""
     _require_smem_map("rubin_b2")
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     spec = dict(spec)
     lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
@@ -2172,7 +2172,7 @@ def test_2cta_stail_sm100_oversized_agrees_bitwise_with_sm100(tmem):
     (the same kernel bytes; dQ bitwise at <= _DQ_ORDER_FREE_PAIRS kv pairs) and each passes the fp64 gate; the launch under the map IS the proof that
     the 262144-B declaration launched in the carveout (the opt-in cap cannot hold it).  The declared size is read back from the geometry record."""
     _require_smem_map("sm100_oversized")
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG, cfg_for_part
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG, cfg_for_part
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import smem_map
 
     cc = torch.cuda.get_device_capability()
@@ -2202,7 +2202,7 @@ def test_2cta_stail_rubin_b2_declines_by_name_on_a_sm100_part():
     """``smem_map = "rubin_b2"`` NAMED on a part without the oversized carveout (cc 10.0 / 10.3) is the engine's typed decline at ``check_support``
     (NotImplementedError by name, through the prepared module's reader); "sm100" named is served.  On a part that serves rubin_b2 the row skips (the
     bitwise twin covers it)."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import SMEM_MAP_PARTS
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import SMEM_MAP_PARTS
 
     _require_2cta()
     cc = torch.cuda.get_device_capability()
@@ -2223,7 +2223,7 @@ def test_2cta_stail_mask_forms_agree_bitwise(spec):
     per pair), the THD edges (S % 256 = 44; a ramp with a sequence shorter than one tile, an empty one and a 3-row one; all-empty), the non-causal
     edges and the N-walk with dead blocks."""
     _require_2cta()
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     spec = dict(spec)
     lq, lk, causal = spec.pop("lq"), spec.pop("lk"), spec.pop("causal")
@@ -2278,7 +2278,7 @@ def test_2cta_stail_debug_clk_dump_accounts_the_waits(maps):
         _require_smem_map(maps["smem_map"])
     else:
         _require_tmem_map(maps["tmem_map"])
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import debug_clk_record, debug_clk_records
 
     on_map = dict(maps)
@@ -2352,7 +2352,7 @@ def test_2cta_stail_probes_launch_and_return(probe):
     `--validate` refuses them by name in the driver.  exchange_off is the SAFE form (every wait kept).  The three S-tail WAIT probes are built on
     the map that defines them (``tmem_map = "s_tail"``, NAMED: under dq_576 they decline by name), so the row RUNS on every admitted part whatever
     its default; the other probes run on the part's default map."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     _require_2cta()
     case = make_case((256, 512), (256, 512), hq=4, hkv=2, thd=True, dtype=torch.bfloat16, causal=True, stats_layout="TH1")

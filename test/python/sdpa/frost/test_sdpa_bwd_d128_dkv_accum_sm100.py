@@ -165,7 +165,7 @@ def test_dkv_accum_config_is_the_truth():
     """Every number the fp32 store path uses is a config field: the 1-CTA body's four [M x DQ_BOX] fp32 slices fill exactly the 64 KiB ALIAS slab
     (= one fp32 [M x D] tile); the pair body's four slots are the dV / dK bf16 staging bytes re-cut (K2's two halves + ds_own(rank) + XCHG),
     1024-B aligned, disjoint, 16 KiB each; the fp32 workspace per KV head fits inside the bf16 per-Q-head partial region on every grouped ratio."""
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as stail
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as stail
     from cudnn.sdpa.bwd.config_sm100_d128_accum import CFG
     from cudnn.sdpa.bwd.d128_grouped_contract import ACCUM_ITEMSIZE, PARTIAL_ITEMSIZE, thd_fp32_accum_bytes
 

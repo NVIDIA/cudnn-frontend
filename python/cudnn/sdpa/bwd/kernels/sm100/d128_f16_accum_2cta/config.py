@@ -3,7 +3,7 @@
 """Grouped THD d128 accumulation geometry on the cta_group::2 datapath: the dQ image in S^T's dead tail with FAv4's rotated MMA order.
 
 Layout-only record for the pair body of ``kernels/sm100/d128_f16_accum_2cta/kernel.py`` (``bprop_d128_accum_grouped_2cta_stail_kernel``, the grouped THD route's cta_group::2 implementation) on top of the
-base pair geometry ``config_sm100_d128_accum_2cta.Config``.  Every byte offset, TMEM column and ring depth derives from the geometry below
+base pair geometry ``d128_f16_accum_2cta.geometry.Config``.  Every byte offset, TMEM column and ring depth derives from the geometry below
 and is re-derived by :func:`validate_config` at import; the barrier tables (``BAR_LAYOUT``, ``BAR_LAYOUT_XFA4``) are the barrier audit's
 tables, pasted, never re-derived.
 
@@ -31,7 +31,7 @@ What the body does against the base geometry:
   (the SMEM audit PASS, bank check PASS).
 * dQ ROUTE: the sDQ ring STS + the store warp's four ``tma_reduce_add`` per tile into the fp32 ``dq_accum`` workspace (the one-CTA chain's
   route); the fp32 partial is summed in a non-deterministic order across the pairs and folded by ``cast_dq_thd`` in the next launch.
-* DIAGNOSTIC PROBES + STAMPS: the ``diag_2cta`` values this body has code for (the code space ``config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES``)
+* DIAGNOSTIC PROBES + STAMPS: the ``diag_2cta`` values this body has code for (the code space ``d128_f16_accum_2cta.geometry.CFG.DIAG_2CTA_NAMES``)
   -- ``"dq_reduce_add_off"`` (the store warp's reduce-add issues skipped), ``"exchange_off"`` (the XCHG ship skipped and ds_recv_full armed
   with 0 tx bytes, EVERY wait kept = the SAFE exchange-family ceiling), ``"stats_one_chunk"`` (one LDS.128 stats / delta chunk per quarter
   reused for all eight), ``"sdq_sts_off"`` (the sDQ slice STS + its proxy fence skipped), ``"s_tail_wait_off"`` (the leader's four
@@ -57,11 +57,11 @@ What the body does against the base geometry:
 
 from dataclasses import dataclass, replace
 
-from .config_sm100_d128_accum_2cta import CFG as CFG_BASE
-from .config_sm100_d128_accum_2cta import Config, resolve_diag_2cta
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG as CFG_BASE
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import Config, resolve_diag_2cta
 
 # chain-level truth: the admitted parts (the TMEM map's part keys), the tma_ring stats region
-from .d128_grouped_2cta_contract import CTA_PAIR_CCS, STATS_KINDS, stats2_pad_total, stats2_shape_strides  # noqa: F401
+from cudnn.sdpa.bwd.d128_grouped_2cta_contract import CTA_PAIR_CCS, STATS_KINDS, stats2_pad_total, stats2_shape_strides  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -140,7 +140,7 @@ class ConfigSTail(Config):
 
     @property
     def DIAG_2CTA_NAMES_ON_MAP(self):
-        # The probes this body has code for (== the code space config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES; every other name declines).
+        # The probes this body has code for (== the code space d128_f16_accum_2cta.geometry.CFG.DIAG_2CTA_NAMES; every other name declines).
         # Two probes of an earlier pair body are NOT defined here: a skipped dp_empty wait measures nothing on this map (dp_empty is arrived at
         # the dS^T readout, four GEMMs before dP^T(t+1) needs it) and skipping the three dS gates removes the ONLY back-edge of the ds_recv_full
         # expect_tx arm (the arm of tile t+1 lands on a tx-pending phase = an over-arrival fault); the safe exchange ceiling is exchange_off.
@@ -820,7 +820,10 @@ def validate_fields_for_roles(roles, diag_2cta=None, debug_clk=False, dkv_accum=
             f"waits are sited in the 16w bundle; the 16w_fa4 softmax keeps the ldg form); choose warp_roles {CFG.WARP_ROLES_DEFAULT!r} or "
             f"stats_form {CFG.STATS_FORM_FA4!r}"
         )
-    from .d128_grouped_contract import DKV_ACCUM_DEFAULT, resolve_dkv_accum  # local: the contract module is the field's truth, the config stays light
+    from cudnn.sdpa.bwd.d128_grouped_contract import (
+        DKV_ACCUM_DEFAULT,
+        resolve_dkv_accum,
+    )  # local: the contract module is the field's truth, the config stays light
 
     if resolve_dkv_accum(dkv_accum) != DKV_ACCUM_DEFAULT:
         raise ValueError(
@@ -1718,7 +1721,7 @@ def validate_config():
         "v_full",
         "k2_full",
     }  # the seven cga2 tensor-load barriers: LEADER-armed, LEADER-waited (P9)
-    first_body = [row[0] for row in __import__("cudnn.sdpa.bwd.config_sm100_d128_accum_2cta", fromlist=["BAR_LAYOUT"]).BAR_LAYOUT]
+    first_body = [row[0] for row in __import__("cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry", fromlist=["BAR_LAYOUT"]).BAR_LAYOUT]
     assert [n for n in names if n not in ("s_read", "s_tail_empty", "dvk_stage_empty")] == first_body  # every other row keeps the base table's name and order
     assert names[-1] == "dvk_stage_empty"  # the fp32_reduce row is appended after the base table's last row (tmem_dealloc)
     assert len(ALIASES) == 3 and [a[0] for a in ALIASES] == ["dk_store", "dv_store", "ds_recv(rank)"]  # the dq_staging alias is deleted

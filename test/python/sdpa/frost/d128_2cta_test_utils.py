@@ -211,7 +211,7 @@ EXPECTED_BASE = {
 
 def _setmaxnreg_of():
     """The setmaxnreg immediates the register split renders: inc x (softmax + epilogue roles = 2 sites), dec x (service roles = 5 sites)."""
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG
 
     return sorted([("inc", CFG.SOFTMAX_REGS), ("inc", CFG.EPILOGUE_REGS)] + [("dec", CFG.SERVICE_REGS)] * (CFG.SERVICE_WARPS + 1))
 

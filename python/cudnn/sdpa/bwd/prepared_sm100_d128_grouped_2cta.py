@@ -14,8 +14,8 @@ from functools import partial
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
-from .config_sm100_d128_accum_2cta import resolve_diag_2cta
-from .config_sm100_d128_accum_2cta_stail import (
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import resolve_diag_2cta
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import (
     TmemMapNotServed,
     dbg_clk_records,
     dbg_clk_region_offset,
@@ -281,7 +281,7 @@ def debug_clk_record(api):
     four S-tail words dead under dq_576), its WORDS / BYTES the bar block's spare DERIVED from that layout ((TMEM_HANDLE - the layout's end) / 4;
     config = truth, never a literal) and asserted here against the rendering's geometry, so a layout change can never leave a stale record size
     behind."""
-    from .config_sm100_d128_accum_2cta_stail import cfg_for_geometry
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import cfg_for_geometry
 
     form, roles, tmap, smap = stats_form(api), warp_roles(api), tmem_map(api), smem_map(api)
     record = dbg_clk_for_stats_form(form, roles, tmap, smap)
@@ -334,7 +334,7 @@ def check_support(api):
     except ValueError as error:
         require(False, str(error))
     # The body's whole typed field bundle, resolved HERE: a value outside a domain is a ValueError BY NAME at support time (never first at
-    # compile, after auto committed to the pair); then the role shape's cross-field rule (config_sm100_d128_accum_2cta_stail.
+    # compile, after auto committed to the pair); then the role shape's cross-field rule (d128_f16_accum_2cta.config.
     # validate_fields_for_roles): a combination that is not built is a typed DECLINE -- under cta_pair=auto the dispatch then serves the
     # one-CTA body with this text in its reason, under on it is the answer.  ``stats_form`` joins the bundle (tma_ring x 16w_fa4 declines here);
     # ``tmem_map`` joins it PART-KEYED (``tmem_map(api)``: a map the part does not serve is the typed decline itself; dq_576 x 16w_fa4 and the

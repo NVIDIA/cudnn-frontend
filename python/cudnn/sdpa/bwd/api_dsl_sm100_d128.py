@@ -65,7 +65,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # values straight; measured neutral against "fsel" on GB200 at 16K / 32K, kept selectable) | "diag_mask_off" (DIAGNOSTIC: the mask body
     # skipped on EVERY tile = the lever's ceiling; OUTPUT WRONG BY DESIGN on the diagonal / edge tiles, set on the adapter INSTANCE by a probe
     # driver, never a knob, never shipped armed, refused by the driver's `--validate`).  Bitwise on dQ / dK / dV between fsel and predicated (a
-    # masked P / dS cell is exactly 0 in both forms).  Typed (``config_sm100_d128_accum_2cta_stail.CFG.MASK_FORMS``); read only on the 2-CTA
+    # masked P / dS cell is exactly 0 in both forms).  Typed (``d128_f16_accum_2cta.config.CFG.MASK_FORMS``); read only on the 2-CTA
     # route; the compile key carries it.
     mask_form: "str | None" = None
     # How the GQA group's dK / dV are accumulated on the grouped THD chain -- "bf16_partials" (``None`` = the same, THE default: one bf16 partial
@@ -83,7 +83,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # straight from its registers and its lead warp ships; warps 8-11 become the REDUCE group (dQ readout + the fp32 slice rounds + the item-end
     # dV / dK staging); two barrier rows deleted, one added; measured slower on GB200 at 8K-64K).  Perf-only on dK / dV (bitwise under both
     # values: the same accumulation chain per GEMM); dQ by the fp64 gate.  Under "16w_fa4" ``debug_clk`` and ``dkv_accum = "fp32_reduce"``
-    # decline by name.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
+    # decline by name.  Typed (``d128_f16_accum_2cta.config.CFG.WARP_ROLES``); read only on the 2-CTA route; the compile key carries it.
     warp_roles: "str | None" = None
     # The pair body's STATS FORM -- how the softmax gets each q tile's LSE / delta rows: "tma_ring" (``None`` = the same under the default role
     # shape; THE default since the day-4 measurement, +1.8 / +1.9 % at the step at 16K / 32K and +3.3 % on the graph replay against "ldg": the
@@ -92,7 +92,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # between the forms; the workspace carries the q-tile-padded pre-scaled stats for the LSE copy) | "ldg" (the previous default, selectable;
     # the form "16w_fa4" resolves to when unset: the softmax fetches them per tile with one global load per lane, scales, stores them into one
     # SMEM slab and fences the 8 warps with a named-barrier pair).  Perf-only; "tma_ring" NAMED declines by name under "16w_fa4"; served
-    # together with ``debug_clk``.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
+    # together with ``debug_clk``.  Typed (``d128_f16_accum_2cta.config.CFG.STATS_FORMS``); read only on the 2-CTA route; the compile
     # key carries it.
     stats_form: "str | None" = None
     # The pair body's TMEM MAP, PART-KEYED -- "s_tail" (the dQ image in S^T's dead TMEM tail behind two LEADER barrier rows; the 512-column parts'
@@ -102,7 +102,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # so the map is a neutral structural base for the two-stage staging arm and ``None`` = "s_tail" on every part until that arm's own row lands).
     # Perf-only (dK / dV bitwise between the maps: the same accumulation chain per GEMM; dQ by the fp64 gate); SMEM and the
     # workspace unchanged.  "dq_576" NAMED on a 512-column part is the engine's typed decline (NotImplementedError by name); under "16w_fa4" and
-    # with the three S-tail WAIT probes it declines by name too.  Typed (``config_sm100_d128_accum_2cta_stail.CFG.TMEM_MAPS``); read only on the
+    # with the three S-tail WAIT probes it declines by name too.  Typed (``d128_f16_accum_2cta.config.CFG.TMEM_MAPS``); read only on the
     # 2-CTA route; the compile key carries it.
     tmem_map: "str | None" = None
     # The pair body's SMEM MAP, PART-KEYED -- "sm100" (the slab chain of the 232448-B opt-in cap: every part's rendering and default; ``None`` = the
@@ -112,7 +112,7 @@ class SdpaBwdDslSm100D128(SdpaBwdDsl):
     # "sm100" on that part measured a LOSS (2026-11-03, a Rubin class node: -2.5..-5.0 % step at 8K / 16K / 32K) -- no default flips).  Perf-only (dK / dV bitwise between the maps: the same
     # accumulation chain per GEMM; dQ by the fp64 gate); the workspace unchanged.  "rubin_b2" NAMED on a 512-column part is the engine's typed decline
     # (NotImplementedError by name); under "s_tail", "16w_fa4" or stats_form "ldg" it declines by name too.  Typed
-    # (``config_sm100_d128_accum_2cta_stail.CFG.SMEM_MAPS``); read only on the 2-CTA route; the compile key carries it.
+    # (``d128_f16_accum_2cta.config.CFG.SMEM_MAPS``); read only on the 2-CTA route; the compile key carries it.
     smem_map: "str | None" = None
 
     def __init__(

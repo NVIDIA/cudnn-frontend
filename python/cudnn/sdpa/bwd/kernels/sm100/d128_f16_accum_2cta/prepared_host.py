@@ -7,9 +7,9 @@ import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver
 from cudnn.frost.compiled_cache import compile_cached
-from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import diag_2cta_code, resolve_diag_2cta
-from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
-from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import (
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import diag_2cta_code, resolve_diag_2cta
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG as STAIL_CFG
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import (
     SMEM_MAP_CODES,
     STATS_FORM_CODES,
     TMEM_MAP_CODES,

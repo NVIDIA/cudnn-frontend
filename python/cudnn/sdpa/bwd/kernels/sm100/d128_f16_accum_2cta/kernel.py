@@ -37,9 +37,9 @@ from cudnn.frost.tile_dsl.tma import (
 )
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.sdpa.bwd.kernels.sm100._d128_device_common import _tmem_load, _tmem_store, _view
-from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG as CFG_PAIR_BASE
-from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import diag_2cta_code
-from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import (
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG as CFG_PAIR_BASE
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import diag_2cta_code
+from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import (
     ADDED_BARRIERS_B2,
     ADDED_BARRIERS_XFA4,
     BAR_LAYOUT,
@@ -84,7 +84,7 @@ LOG2E = 1.4426950408889634
 HEADER FIRST: the tables below come before the body; a reader checks the body against them instead of reconstructing the
 pipeline from code.  This is the pair body of the grouped THD route (``accumulation_grouped_thd_2cta``): one cluster of two CTAs owns
 a 256-row KV work item, each CTA computes its 128-row half with cta_group::2 MMAs and the dS^T halves are exchanged through DSMEM.
-Config as truth: ``config_sm100_d128_accum_2cta_stail.CFG`` (every number below is derived there and asserted at import; the barrier
+Config as truth: ``d128_f16_accum_2cta.config.CFG`` (every number below is derived there and asserted at import; the barrier
 table ``BAR_LAYOUT`` is the audited table, pasted, never re-derived).  FAv4's flash_bwd_sm100.py was READ as the structural reference
 only (NOTE [2CTA schedules], the pipelined MMA loop, the deferred dS commit, ``Q_stage = 1``); nothing copied.
 TMEM MAP (PART-KEYED; the typed field ``tmem_map`` -> ``tmem_map_code``; sections 5 / 9 / 11): ``s_tail`` = this header's tables as written (the
@@ -173,7 +173,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     mma / tma_ldg / tma_stg / sched: unchanged (dp_empty GONE from the leader: no slot-1 wait, no state, no drain)
     The split 144/144/80 is unchanged under both shapes (pool 2048); the softmax carries +4..8 transient registers under 16w_fa4.
 
-5. BARRIER TABLE  (the barrier audit's table; ``config_sm100_d128_accum_2cta_stail.BAR_LAYOUT`` = offsets / counts / kinds; 35 names /
+5. BARRIER TABLE  (the barrier audit's table; ``d128_f16_accum_2cta.config.BAR_LAYOUT`` = offsets / counts / kinds; 35 names /
    40 slots in [230400, 230960) of the 944-B bar block, re-packed, 16 B per row; under warp_roles 16w_fa4 ``BAR_LAYOUT_XFA4`` = 33 names /
    38 slots in [230400, 230928): ds_tmem and dp_empty deleted, dvk_stage_empty unserved, dq_war_done added).  L = pair LEADER
    (rank 0, the only MMA issuer), F = FOLLOWER (rank 1); "(-)" = the follower's copy is initialised with the SAME count and never armed /
@@ -273,7 +273,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     tmem_dealloc[1]  THREAD (+peer)    2 / 2          MMA warp, each CTA, after the final CTA sync: `if elect: arrive(); arrive_on_peer(peer rank)` = 1 + 1 == 2
         waiter: the MMA warp of each CTA, wait(0) -> tcgen05_fence -> tcgen05.dealloc.cta_group::2  x 1
     stats_form tma_ring (section 11; the barrier audit's S1 SKELETON 2026-10-27 17:30 + its 17:46 reconciliation with the bulk-copy form,
-    resources/s1-barrier-table.md sections 1 / 2 / 14; the resource plan s1-stats-ring.md; ``config_sm100_d128_accum_2cta_stail.BAR_LAYOUT_RING``
+    resources/s1-barrier-table.md sections 1 / 2 / 14; the resource plan s1-stats-ring.md; ``d128_f16_accum_2cta.config.BAR_LAYOUT_RING``
     = the 35 rows above RE-BASED onto CFG_RING.BARS 231424 (+1024 per row: ring stage 1 took the 1 KiB the scaffold sat on) + the two rows below,
     37 names / 44 slots, END 232016; LOCAL rows: each CTA arms / waits its OWN copy, no "(-)" copy, no pair interaction; AUDIT of the committed
     body owed; NOT built under 16w_fa4 (declines by name)):
@@ -336,7 +336,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     sites: named barrier 0 (3 x barrier_cta_sync: init, TMEM-base publish, final), CFG.SOFTMAX_BARRIER (256 lanes, 2 per _stats; ldg only --
     0 sites under stats_form tma_ring), CFG.XCHG_BARRIER (128 lanes, 1 per tile, P11 KEEP: the ship's operand is all four warps' XCHG stores).
     the alternate role shape (``warp_roles = "16w_fa4"``; the barrier audit;
-    ``config_sm100_d128_accum_2cta_stail.BAR_LAYOUT_XFA4`` = 32 names / 37 slots / END 230912, re-packed; its rows = the 34 above MINUS:
+    ``d128_f16_accum_2cta.config.BAR_LAYOUT_XFA4`` = 32 names / 37 slots / END 230912, re-packed; its rows = the 34 above MINUS:
       ds_tmem[1]   DEL  (THREAD 256: producer and consumer both vanish -- the softmax writes sDS from registers, nobody reads dS^T out of TMEM)
       dp_empty[1]  DEL  (LEADER 256: its ONLY arrive site was the epilogue's dS^T readout; dP^T(t+1) over the packed dS^T(t) [128,192) is ordered by the
                         in-order tensor pipe after dK(t) (issued first by the same thread); over dP^T(t)'s fp32 [128,256) by the softmax's ld +
@@ -726,7 +726,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
 
 11. OPTIONAL ARMS (const_expr; each states what the default rendering does)
     THD (the unit is 256 kv rows per pair) | GQA grouped loaders (head // ratio) | causal |
-    stats_form (``stats_form_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.STATS_FORM_CODES; lever S1 = the user's "LSE
+    stats_form (``stats_form_code`` Constexpr[int] from d128_f16_accum_2cta.config.STATS_FORM_CODES; lever S1 = the user's "LSE
     optimization", day 4): "ldg" = the previous default, selectable (the form "16w_fa4" resolves to when the field is unset; main-kernel md5
     7de23bd7 @ 4/32/4, ca665f06 @ 2/8/2 = the merged rendering's main body, byte-identical; per-kernel records): the softmax's
     per-tile `_stats` -- one LDG per lane (group 0 the LSE through the Stats port's token origin, group 1 the delta), the FMUL scale with the -inf
@@ -752,7 +752,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     first build sites the ring in the 16w bundle: BAR_LAYOUT_RING); SERVED with debug_clk (DBG_CLK_RING: 88 words, the two ring wait words), with
     every diag_2cta probe (`stats_one_chunk` reads one chunk of the stage) and every mask_form / dkv_accum value.  Measured on GB200
     (cc 10.0, 2026-10-28): +1.4 .. +1.9 % step at 16K / 32K against "ldg" -- the default since |
-    tmem_map (``tmem_map_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.TMEM_MAP_CODES; PART-KEYED: ``resolve_tmem_map(name, cc,
+    tmem_map (``tmem_map_code`` Constexpr[int] from d128_f16_accum_2cta.config.TMEM_MAP_CODES; PART-KEYED: ``resolve_tmem_map(name, cc,
     roles)`` in the prepared module (Q's device cc) and in compile_host (``sm`` -> cc); the compile key carries the NAME; the SOL card's arm R1 of
     the Rubin task, 2026-11-03): "s_tail" = THE default on EVERY part (the only map served on the 512-column parts cc 10.0 / 10.3: a NAMED
     "dq_576" is the engine's typed decline there, the 576-column carve does not exist) = the rendering of sections 5 / 9 as written,
@@ -780,7 +780,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     oversized carveout for the shipping map: the probe of the carveout's own cost (the SKU card's L1 shrink: tensor-map / descriptor / CLC payload
     fetches) raised by the R2.c STAMPS; output CORRECT (--validate may run it); 16w x tma_ring, both TMEM maps; the benchmarker's A/B/A against the
     part's default at 16K / 32K is its number.
-    smem_map (``smem_map_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.SMEM_MAP_CODES; PART-KEYED: ``resolve_smem_map(name, cc, roles,
+    smem_map (``smem_map_code`` Constexpr[int] from d128_f16_accum_2cta.config.SMEM_MAP_CODES; PART-KEYED: ``resolve_smem_map(name, cc, roles,
     stats_form, tmem_map)`` in the prepared module (Q's device cc) and in compile_host (``sm`` -> cc); the compile key carries the NAME; the SOL card's
     arm R2.c of the Rubin task, 2026-11-03): "sm100" = THE default on every part (the 232448-B opt-in slab chain of section 8 as written, byte-identical:
     the sm_100a / sm_103a / sm_107a records, main-kernel md5 d9b419aa @ 2/8/2; dq_576 x sm100 11df3211) | "rubin_b2" = the 327 KiB oversized carveout
@@ -804,7 +804,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     dq_read_done pair live).  Perf-only: dK / dV BITWISE between the SMEM maps (the test module's twin on cc 10.7), dQ by the fp64 gate.  Measured 2026-11-03 on a Rubin
     class node (cc 10.7, 212 SMs, A/B/A x3 x100 both build orders; control dq_576 x sm100 NEUTRAL): a LOSS, -2.5..-5.0 % step at 8K / 16K / 32K (the
     stamped tile loop is 4.4 % faster; the loss sits outside the loop or in the SMEM pipe) -- kept as a selectable map, not a default (section 13) |
-    warp_roles (``warp_roles_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.WARP_ROLES_CODES: "16w" = THE default = the
+    warp_roles (``warp_roles_code`` Constexpr[int] from d128_f16_accum_2cta.config.WARP_ROLES_CODES: "16w" = THE default = the
     shipped rendering, byte-identical (md5 4b3d0bbb @ 4/32/4, 645f8a24 @ 2/8/2) | "16w_fa4" = an alternate role shape kept for follow-up
     work: the softmax writes sDS own + XCHG from its dS^T registers and ships, warps 8-11 = the REDUCE group (`_reduce_loop`), ds_tmem +
     dp_empty deleted and dq_war_done added (BAR_LAYOUT_XFA4, 33 rows), the softmax's dq_war_done WAR wait, XCHG_BARRIER at 256 lanes, s_read
@@ -814,7 +814,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     fp32 staging rounds live in the 16w epilogue loop) decline BY NAME at compile_host and at the trace; ``exchange_off`` is sited at the
     softmax's arm + ship (the same two guards: the arm's bytes 0, no ship); dvk_stage_empty is UNSERVED (absent from BAR_LAYOUT_XFA4 /
     BarsXFA4); mask_form, stats_one_chunk, sdq_sts_off and dq_reduce_add_off serve both role shapes) |
-    mask_form (``mask_form_code`` Constexpr[int] from config_sm100_d128_accum_2cta_stail.MASK_FORM_CODES: "fsel" = THE default, the shipped
+    mask_form (``mask_form_code`` Constexpr[int] from d128_f16_accum_2cta.config.MASK_FORM_CODES: "fsel" = THE default, the shipped
     rendering: _p_values applies the keep-word band mask (band_mask_words + apply_mask_words; CFG.MASK_WORDS_PER_LANE_PER_TILE = 2 keep-words,
     CFG.MASK_SELECTS_PER_LANE_PER_TILE = 64 selects = R2P + FSEL per cell) on EVERY q tile | "predicated" = the SAME mask body under the
     CTA-uniform runtime branch `if mask_tile:` of _p_values (one branch per q quarter = 2 per tile), mask_tile = tile_may_mask(pair, rank,
@@ -837,7 +837,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
     cast_dq; a ROUNDING CHANGE (fp32 accumulation across the q heads of a kv head in hardware order, one bf16 rounding at the output; dK / dV
     not bitwise reproducible across runs), an op attribute, never a knob; dQ untouched; declines BY NAME on dense and MHA and under 16w_fa4;
     measured neutral on the backward step at 8K-32K: the removed fold launch is paid back by the in-kernel fp32 reduce-add traffic) |
-    diag_2cta (DIAGNOSTIC; ``diag_2cta_code``, the code space config_sm100_d128_accum_2cta.CFG.DIAG_2CTA_NAMES = the four probes this body
+    diag_2cta (DIAGNOSTIC; ``diag_2cta_code``, the code space d128_f16_accum_2cta.geometry.CFG.DIAG_2CTA_NAMES = the four probes this body
     has code for, every other name declines BY NAME before the trace: None = this body | dq_reduce_add_off (the store warp's four reduce-add
     ISSUES skipped; the per-round `tma_store_wait` returns at once and the two dq_empty arrives per round stay, so the 2-slot ring balance
     holds with dQ staying zero) | exchange_off (the SAFE exchange-family ceiling: the epilogue's `_ship_xchg` is NOT issued and
@@ -971,7 +971,7 @@ it waits dQ(t-1) (the LAGGING order: the WAR on a stage is dq_done(t-2), one til
 
 PDL SITES: none in the accum family today (CLC-scheduled persistent envelope); unchanged.
 
-Sources: config_sm100_d128_accum_2cta_stail.py (the pasted barrier tables; BAR_LAYOUT_RING derived); the one-CTA grouped THD body (section 7)
+Sources: d128_f16_accum_2cta.config.py (the pasted barrier tables; BAR_LAYOUT_RING derived); the one-CTA grouped THD body (section 7)
 (the chain's other launches); FAv4 flash_bwd_sm100.py NOTE [2CTA schedules] + the pipelined MMA loop (read as the structural cross-check only:
 S(t+1) first, dQ before dV, Q_stage 1, sdQaccum not aliased, the deferred dS commit = our dS gates + s_read, pipeline_dQ empty before S(t+1) =
 our s_tail_empty; nothing copied).
@@ -981,7 +981,7 @@ our s_tail_empty; nothing copied).
 MAP_Q1, MAP_K, MAP_V, MAP_DO1, MAP_DQ, MAP_DK, MAP_DV, MAP_Q2, MAP_DO2 = range(CFG.MAPS_PER_SEQUENCE)
 MAP_COUNT = CFG.MAPS_PER_SEQUENCE
 # STATS FORM (header section 11): the typed adapter field ``stats_form`` reaches the kernel as the ``stats_form_code`` Constexpr[int]
-# (config_sm100_d128_accum_2cta_stail.STATS_FORM_CODES).  STATS_FORM_LDG = the default (the softmax's per-tile `_stats` LDG fetch under the
+# (d128_f16_accum_2cta.config.STATS_FORM_CODES).  STATS_FORM_LDG = the default (the softmax's per-tile `_stats` LDG fetch under the
 # SOFTMAX_BARRIER pair, today's rendering); STATS_FORM_TMA_RING = the loader-fed two-stage SMEM stats ring (stats_full / stats_empty, the
 # CFG_RING geometry: SMEM_BYTES == the cap, the scaffold re-based +1024) fed by ONE 1 KiB bulk copy per q tile from the chain's padded
 # pre-scaled stats region (the delta launch writes it; no tensor map).
@@ -1028,7 +1028,7 @@ DEBUG_SOFTMAX_DQ_WAR_DELAY_US: int = int(globals().get("FROST_D128_2CTA_DEBUG_SO
 DEBUG_LEADER_ARM_DELAY_US: int = int(globals().get("FROST_D128_2CTA_DEBUG_LEADER_ARM_DELAY_US", 0))
 DEBUG_LEADER_SLOT1_DELAY_US: int = int(globals().get("FROST_D128_2CTA_DEBUG_LEADER_SLOT1_DELAY_US", 0))
 # DIAGNOSTIC probes (header section 11): the typed adapter field ``diag_2cta`` reaches the kernel as the ``diag_2cta_code`` Constexpr[int] in
-# the shared code space (config_sm100_d128_accum_2cta.diag_2cta_code); every other name declines BY NAME before the trace.
+# the shared code space (d128_f16_accum_2cta.geometry.diag_2cta_code); every other name declines BY NAME before the trace.
 #   DIAG_DQ_REDUCE_ADD_OFF (dq_reduce_add_off): _store_loop skips the four tma_reduce_add issues (commit / wait / the per-round dq_empty arrives stay)
 #   DIAG_EXCHANGE_OFF      (exchange_off):     _epilogue_loop skips the XCHG ship and arms ds_recv_full with CFG.DIAG_EXCHANGE_OFF_TX = 0 bytes; EVERY wait kept
 #   DIAG_STATS_ONE_CHUNK   (stats_one_chunk):     _p_values / _ds_values load ONE stats / delta chunk per quarter and reuse it (LDS.128 32 -> 4 per lane per tile)
@@ -1060,7 +1060,7 @@ assert set(CFG.DIAG_2CTA_NAMES_ON_MAP) == {
 # the header and segment names; the kernel never spells a word index).
 _W = DBG_CLK.WORD
 # MASK FORM (header section 11, the mask-form lever): the typed adapter field ``mask_form`` reaches the kernel as the ``mask_form_code`` Constexpr[int]
-# (config_sm100_d128_accum_2cta_stail.MASK_FORM_CODES).  MASK_FORM_FSEL = the default (the keep-word mask selected on every tile);
+# (d128_f16_accum_2cta.config.MASK_FORM_CODES).  MASK_FORM_FSEL = the default (the keep-word mask selected on every tile);
 # MASK_FORM_PREDICATED = the same mask body only on `tile_may_mask` tiles; MASK_FORM_DIAG_OFF = no mask on any tile (OUTPUT WRONG BY DESIGN).
 MASK_FORM_FSEL = mask_form_code("fsel")
 MASK_FORM_PREDICATED = mask_form_code("predicated")
@@ -1071,7 +1071,7 @@ if {mask_form_code(n) for n in CFG.MASK_FORMS} != {MASK_FORM_FSEL, MASK_FORM_PRE
 if CFG.MASK_WORD_COLS != MASK_WORD_COLS:  # config = truth: the config's keep-word width is the mask helper's (both 32; the config stays cutlass-free)
     raise ValueError(f"CFG.MASK_WORD_COLS {CFG.MASK_WORD_COLS} != tile_dsl.mask.MASK_WORD_COLS {MASK_WORD_COLS}")
 # ROLE SHAPE (header sections 4 / 5 / 11; the later rank 1 "the alternate role shape"): the typed adapter field ``warp_roles`` reaches the kernel as the ``warp_roles_code``
-# Constexpr[int] (config_sm100_d128_accum_2cta_stail.WARP_ROLES_CODES).  WARP_ROLES_16W = the default (today's rendering, byte-identical);
+# Constexpr[int] (d128_f16_accum_2cta.config.WARP_ROLES_CODES).  WARP_ROLES_16W = the default (today's rendering, byte-identical);
 # WARP_ROLES_16W_FA4 = FAv4's role shape: the softmax writes sDS own + XCHG from its dS^T registers and ships, warps 8-11 = the REDUCE group
 # (_reduce_loop), ds_tmem / dp_empty deleted (BAR_LAYOUT_XFA4), the softmax's dq_done WAR wait (the barrier audit the audit record).
 WARP_ROLES_16W = warp_roles_code("16w")
@@ -1081,7 +1081,7 @@ XCHG_BARRIER_LANES_16W = CFG.xchg_barrier_lanes("16w")  # bar.sync 2, 128: the 4
 XCHG_BARRIER_LANES_16W_FA4 = CFG.xchg_barrier_lanes("16w_fa4")  # bar.sync 2, 256: the 8 softmax warps (inspector X3)
 assert (WARP_ROLES_16W, WARP_ROLES_16W_FA4) == (0, 1) and XCHG_BARRIER_LANES_16W == CFG.EPILOGUE_LANES and XCHG_BARRIER_LANES_16W_FA4 == CFG.SOFTMAX_LANES
 # TMEM MAP (header sections 9 / 11; PART-KEYED): the typed adapter field ``tmem_map`` reaches the kernel as the ``tmem_map_code`` Constexpr[int]
-# (config_sm100_d128_accum_2cta_stail.TMEM_MAP_CODES; resolved per device cc by the prepared module / compile_host).  TMEM_MAP_S_TAIL = the dQ image in
+# (d128_f16_accum_2cta.config.TMEM_MAP_CODES; resolved per device cc by the prepared module / compile_host).  TMEM_MAP_S_TAIL = the dQ image in
 # S^T's dead tail behind the s_read / s_tail_empty rows (the 512-column parts' rendering, byte-identical); TMEM_MAP_DQ576 = the INDEPENDENT dQ image
 # at [DK_COL + DK_COLS, +DQ_COLS) of the 576-column carve (selectable by name on cc 10.7): the two rows, the leader's five wait sites + its s_tail state + the
 # P15 drain and the two arrives are not traced; the alloc / dealloc constant (geo.TMEM_COLS, exclusive) and the dQ column base come from the map's
@@ -1101,7 +1101,7 @@ def _dq_col(tmem_map_code: int) -> int:
 
 
 # SMEM MAP (header sections 5 / 8 / 11; PART-KEYED): the typed adapter field ``smem_map`` reaches the kernel as the ``smem_map_code`` Constexpr[int]
-# (config_sm100_d128_accum_2cta_stail.SMEM_MAP_CODES; resolved per device cc by the prepared module / compile_host).  SMEM_MAP_SM100 = the slab chain
+# (d128_f16_accum_2cta.config.SMEM_MAP_CODES; resolved per device cc by the prepared module / compile_host).  SMEM_MAP_SM100 = the slab chain
 # of section 8 as written (the 232448-B opt-in cap of every part, byte-identical); SMEM_MAP_RUBIN_B2 = the 327 KiB oversized carveout of cc 10.7 ON the
 # dq_576 TMEM map (CFG_RING_DQ576_B2: sQ1 x2, sDO1 x2, sDS x2 + sDS_xchg x2 = the TWO-STAGE dS / exchange staging ring, SMEM_BYTES 314368): every ring
 # depth below is the geometry's stage field (Q1_STAGES / DO1_STAGES / DS_STAGES / XCHG_STAGES; one PipelineState per ring and stage count), the

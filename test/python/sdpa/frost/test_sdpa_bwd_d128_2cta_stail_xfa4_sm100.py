@@ -120,13 +120,13 @@ def _run_case(case, repeats=2, **fields):
 
 # ------------------------------------------------------------------------------------------------------------ host (no GPU)
 def test_xfa4_role_shape_config_is_the_truth():
-    """Every number the the alternate role shape header block quotes is a derived, asserted field of ``config_sm100_d128_accum_2cta_stail`` (G10 config-as-truth): the
+    """Every number the the alternate role shape header block quotes is a derived, asserted field of ``d128_f16_accum_2cta.config`` (G10 config-as-truth): the
     typed domain, the 32-row ``BAR_LAYOUT_XFA4`` (pasted from the barrier audit AND re-derived from the audited 34-row table: the two deletions +
     ds_smem counted from the softmax, re-packed, END 230912), the kind counts, the role-derived lane counts (XCHG named barrier 256, ds_smem 256), the
     lead warp, the dS STS image counts, and the bundles the body builds from them (``Bars`` 34 fields, ``BarsXFA4`` 32)."""
     import importlib
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
 
     c = cfgmod.CFG
     assert c.WARP_ROLES == ("16w", "16w_fa4") and c.WARP_ROLES_DEFAULT == "16w" and cfgmod.WARP_ROLES_CODES == {"16w": 0, "16w_fa4": 1}
@@ -176,7 +176,7 @@ def test_xfa4_warp_roles_is_typed_and_declines_by_name():
     ``compile_host`` before any trace); the adapter reader prefixes the engine name; the record default is None."""
     from types import SimpleNamespace
 
-    from cudnn.sdpa.bwd import config_sm100_d128_accum_2cta_stail as cfgmod
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta import config as cfgmod
     from cudnn.sdpa.bwd.api_dsl_sm100_d128 import SdpaBwdDslSm100D128
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.prepared_host import compile_host_grouped_2cta as compile_host
     from cudnn.sdpa.bwd.prepared_sm100_d128_grouped_2cta import warp_roles

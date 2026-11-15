@@ -83,8 +83,8 @@ def test_cta_pair_config_is_the_truth():
     default, the S threshold (a multiple of the pair's kv unit and of the q tile), the measured part, the cluster width = the pair body's
     CGA_M, the pair body's identity = the pair body's TMEM-map name, the two body tokens."""
     c = _contract()
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG as STAIL_CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.geometry import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG as STAIL_CFG
     from cudnn.sdpa.bwd.d128_contract import ACCUMULATION_CCS
 
     assert c.CTA_PAIR_MODES == ("auto", "off", "on") and c.CTA_PAIR_MODE_DEFAULT == "auto"
@@ -899,7 +899,7 @@ def test_cta_pair_dense_twin_on_tmem_map_dq576_matches_s_tail():
 
     _require_pair_part()
     _require_tmem_map("dq_576")
-    from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import CFG
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.config import CFG
 
     c = _contract()
     p = _prepared()
