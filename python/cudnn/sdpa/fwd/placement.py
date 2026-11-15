@@ -736,6 +736,11 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in (D512_FP8_ROLE_SPLIT, D256_FP8_SINGLE_Q, D192_FP8_MULTI_Q):
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
 
+    from .kernels.sm107.d512_fp8_role_split import contract as sm107_d512_fp8
+
+    if spec.capabilities.implementation == sm107_d512_fp8.NAME:
+        spec = sm100_legacy_policy_spec(sm107_d512_fp8.LEGACY_ROW)
+
     if spec.capabilities.implementation in (D192_HALF_MULTI_Q, HALF_SINGLE_Q):
         if knobs is None:
             return TRAIL

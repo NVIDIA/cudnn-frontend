@@ -254,6 +254,8 @@ def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
         )
     if arch == "sm120":
         return ("sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_sm120_d512_fp8_paired", "sdpa_fwd_sm120_fp8_general")
+    if arch == "sm107":
+        return ("sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_sm107_d512_fp8_role_split")
     return (f"sdpa_fwd_prefill_{arch}_fp8",)
 
 

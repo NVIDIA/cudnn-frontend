@@ -199,6 +199,11 @@ checks preserve quantized payloads and scalar scales, and compare per-sequence
 O and Stats. Amax is a whole-batch reduction: repeated calls compare its bytes,
 while changed batches check its numerical value against the full batch reference.
 The paging addition does not add an FP8 paged backward path.
+The SM107 exact D512 public record names `sdpa_fwd_sm107_d512_fp8_role_split`
+(engine 20549). Its fixed-plan checks include independent THD origins, fresh
+bindings and retained CUDA Graph execution. Packing and split count remain
+fixed during byte comparisons; the implementation identity does not extend
+the numerical or cross-runtime guarantees of the table.
 
 The native D128 FP8 single-CTA split checks fix the plan's split count and
 packing, preserve quantized payloads, and compare O/Stats across fresh

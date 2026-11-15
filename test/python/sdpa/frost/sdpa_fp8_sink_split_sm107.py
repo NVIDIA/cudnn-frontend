@@ -90,9 +90,9 @@ def test_native_fp8_sink_keeps_independent_split_domain(d):
     from cudnn.sdpa.fwd import engines
     from test_sdpa_fwd_dsl_sm107 import _caps, _quant_facts
 
-    knobs = engines.SdpaFwdKnobs(split_kv=4, cga=2)
+    knobs = engines.SdpaFwdKnobs(split_kv=4, cga=4)
     facts = _quant_facts(d_qk=d, d_v=d, s_q=16, s_kv=256, has_sink=True)
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), facts, knobs) is None
+    assert engines.mismatch(_caps("sdpa_fwd_sm107_d512_fp8_role_split"), facts, knobs) is None
     # Per-tensor D512 gained split partials; the block-scaled sibling retains its own decline.
-    blocked = engines.mismatch(_caps("sdpa_fwd_prefill_sm107_mxfp8"), _quant_facts(is_mx=True, d_qk=d, d_v=d, has_sink=True), knobs)
+    blocked = engines.mismatch(_caps("sdpa_fwd_prefill_sm107_mxfp8"), _quant_facts(is_mx=True, d_qk=d, d_v=d, has_sink=True), replace(knobs, cga=2))
     assert blocked is not None and "split" in blocked, blocked
