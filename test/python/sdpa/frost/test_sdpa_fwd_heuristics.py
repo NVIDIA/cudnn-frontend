@@ -2389,10 +2389,12 @@ def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, 
         device_cc=(10, 7),
         device_sm_count=216,
     )
-    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
+    name = "sdpa_fwd_sm107_d128_fp8_multi_q"
+    offered = {name: _SDPA_FWD_FAMILY.offered_ids()[name]}
+    plans = recommend("A", facts, offered)
     assert plans
     assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
     import dataclasses
 

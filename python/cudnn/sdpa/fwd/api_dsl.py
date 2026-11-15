@@ -430,8 +430,8 @@ _SM107_FP8_KERNEL_FILES = {
     (512, 512): "sm107/d512_fp8_role_split/kernel.py",
     (256, 256): "sm107/d256_fp8_single_q/kernel.py",
     (192, 128): "sm107/d192_fp8_multi_q/kernel.py",
-    (128, 128): "sm107/prefill_d128_fp8.py",
-    (64, 64): "sm107/prefill_d128_fp8.py",
+    (128, 128): "sm107/d128_fp8_multi_q/kernel.py",
+    (64, 64): "sm107/d128_fp8_multi_q/kernel.py",
 }
 _SM107_MXFP8_KERNEL_FILES = {
     (512, 512): "sm107/prefill_d512_mxfp8.py",

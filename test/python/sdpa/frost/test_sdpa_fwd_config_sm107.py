@@ -807,7 +807,7 @@ def test_fp8_d64_narrow_tile_keeps_graph_defaults(s_kv, dtype_name, monkeypatch)
     from cudnn.sdpa.fwd import engines, heuristics
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    name = "sdpa_fwd_prefill_sm107_fp8"
+    name = "sdpa_fwd_sm107_d128_fp8_multi_q"
     facts = SdpaGraphFacts(
         b=1,
         h_q=4,

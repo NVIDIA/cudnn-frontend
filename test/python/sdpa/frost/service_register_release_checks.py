@@ -134,13 +134,18 @@ def release_cases(arch):
         moved = {
             "prefill_d192_d128_f16.py": "d192_f16_multi_q/kernel.py",
             "prefill_d192_d128_fp8.py": "d192_fp8_multi_q/kernel.py",
+            "prefill_d128_fp8.py": "d128_fp8_multi_q/kernel.py",
             "prefill_d256_f16.py": "d256_f16_lookahead/kernel.py",
             "prefill_d256_fp8.py": "d256_fp8_single_q/kernel.py",
             "prefill_d512_f16.py": "d512_f16_role_split/kernel.py",
             "prefill_d512_f16_2x2.py": "d512_f16_2x2/kernel.py",
             "prefill_d512_fp8.py": "d512_fp8_role_split/kernel.py",
         }
-        path = moved.get(name, name) if arch == "sm100" or name in ("prefill_d192_d128_fp8.py", "prefill_d256_fp8.py", "prefill_d512_fp8.py") else name
+        path = (
+            moved.get(name, name)
+            if arch == "sm100" or name in ("prefill_d128_fp8.py", "prefill_d192_d128_fp8.py", "prefill_d256_fp8.py", "prefill_d512_fp8.py")
+            else name
+        )
         cases.append(pytest.param(f"{arch}/{path}", kwargs, id=name.removesuffix(".py")))
     return cases
 

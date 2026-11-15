@@ -96,7 +96,7 @@ def test_f16_host_entries_carry_only_record_reproducible_defaults(flavor, rubin)
 # Q(u)O and K(u)V slabs are 128 KiB each, putting the P transfer ring at exactly
 # 262144 (and, on the MXFP8 sibling, the scale-factor tiles near 292 KiB).  Keep
 # d128/d256 on version 0 so they stay byte-identical to the shipped
-# sm107/prefill_d128_fp8.py sibling.
+# sm107/d128_fp8_multi_q/kernel.py sibling.
 _NEEDS_DESC_V1 = {(512, 512)}
 
 # (kind, loader kwargs) for every SM107 dtype family, so the check below covers
@@ -1072,6 +1072,8 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
 
 def _fp8_owner(shape):
     return {
+        (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
+        (128, 128): "sdpa_fwd_sm107_d128_fp8_multi_q",
         (192, 128): "sdpa_fwd_sm107_d192_fp8_multi_q",
         (256, 256): "sdpa_fwd_sm107_d256_fp8_single_q",
         (512, 512): "sdpa_fwd_sm107_d512_fp8_role_split",
@@ -1101,7 +1103,7 @@ def test_sm107_fp8_paged_sink_declines():
     THD + sink FP8 graph on cc 10.7 keeps its typed decline (the fp8 row's `paged_kv=not rubin_row`)."""
     from cudnn.sdpa.fwd import engines
 
-    why = engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), _quant_facts(has_paged_kv=True, page_size=16, padded=True, thd=True, has_sink=True))
+    why = engines.mismatch(_caps("sdpa_fwd_sm107_d128_fp8_multi_q"), _quant_facts(has_paged_kv=True, page_size=16, padded=True, thd=True, has_sink=True))
     assert why is not None and "paged" in why, why
 
 
@@ -2155,7 +2157,7 @@ def test_sm107_gate_rows_claim_exactly_d256():
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
         fp8_owner = _caps(_fp8_owner((d_qk, d_v)))
         why = engines.mismatch(fp8_owner, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
-        expected = "graph fuses O * sigmoid(G)" if (d_qk, d_v) in ((192, 128), (512, 512)) else "epilogue gate"
+        expected = "graph fuses O * sigmoid(G)" if (d_qk, d_v) in ((192, 128), (512, 512)) else "graph fuses O * sigmoid(G)"
         assert why is not None and expected in why, (d_qk, d_v, why)
         why = engines.mismatch(mxfp8, _mxfp8_gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
@@ -2186,21 +2188,18 @@ def test_sm107_gate_accepts_every_dtype_member():
     fp8 = _caps(_GATE_ROWS[1])
     assert fp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert fp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert fp8.out_dtypes == frozenset(
-        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
-    )
-    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), which is its own
-    # O store: it is never gated, so the gate matrix runs over the other members.
+    assert fp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    # The exact D256 owner has scalar O only; every declared member is gate-capable.
     for dt in sorted(fp8.dtypes, key=int):
-        for dto in sorted(fp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
+        for dto in sorted(fp8.out_dtypes, key=int):
             assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
     # ...and the two epilogues decline each other, each naming the block-scaled O.
     why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
-    assert why is not None and "block-scaled" in why, why
+    assert why is not None and "O dtype" in why, why
     why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
-    assert why is not None and "epilogue gate" in why, why
+    assert why is not None and "block-scaled" in why, why
 
     # The MXFP8 row (PR-B): the same per-member claims -- every input dtype x
     # every O dtype with the bf16 G its kernel stages (GATE_STORAGE_DTYPE); a
@@ -2249,9 +2248,10 @@ def test_sm107_gate_declines_the_interactions():
     # The half row serves ungated paged THD; the gate block must decline
     # the interaction before paged layout admission. FP8 paging is limited to D512,
     # which has no gate; the D256 gate flavor remains nonpaged.
-    assert f16.paged_kv and fp8.paged_kv
-    assert fp8.paged_d_shapes == frozenset({(512, 512)})
-    assert (256, 256) not in fp8.paged_d_shapes
+    assert f16.paged_kv and not fp8.paged_kv
+    d512_fp8 = _caps("sdpa_fwd_sm107_d512_fp8_role_split")
+    assert d512_fp8.paged_d_shapes == frozenset({(512, 512)})
+    assert engines.mismatch(fp8, _fp8_gate_facts(**paged)) is not None
     assert engines.mismatch(f16, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(f16, _gate_facts(**paged))
     assert why is not None and "paged" in why and "gate" in why, why

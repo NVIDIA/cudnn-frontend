@@ -4,7 +4,7 @@
 """SM107 (Rubin) routing of the per-tensor FP8 d128 SDPA kernel.
 
 The adapter routes cc10.7 per-tensor-FP8 graphs to the SM107 sibling module
-(``sm107/prefill_d128_fp8.py``), which bakes the Rubin dense-FP8 K=64 MMA
+(``sm107/d128_fp8_multi_q/kernel.py``), which bakes the Rubin dense-FP8 K=64 MMA
 geometry; Blackwell keeps the untouched SM100 module. These tests pin the
 routing and both modules' derived constants — device-independent (everything
 here happens before any compile). End-to-end coverage rides the existing
@@ -563,7 +563,7 @@ def _run_fp8_d128_leading_tile(q8, k8, v8, *, precision, scale, bottom_right, wi
     )
     assert api.check_support()
     api.compile()
-    assert api._k_mod.__file__.endswith("sm107/prefill_d128_fp8.py"), api._k_mod.__file__
+    assert api._k_mod.__file__.endswith("sm107/d128_fp8_multi_q/kernel.py"), api._k_mod.__file__
     unit = torch.ones(1, device="cuda", dtype=torch.float32)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
     kw = dict(descale_q=unit, descale_k=unit, descale_v=unit, workspace=ws)
@@ -2190,6 +2190,21 @@ class TestNativeD256Fp8Split:
     test_omitted_scales = staticmethod(_scales)
 
     test_scalar_kv_tail = staticmethod(_tail)
+
+
+@requires_rubin
+class TestSmallFp8Implementation:
+    """Native and shared-decode public records through current bindings."""
+
+    from sm107_small_fp8_engine_checks import (
+        test_public_record_rebuild_rebind_and_retained_capture as _record,
+        test_retired_fp8_recipe_is_rejected_without_silent_substitution as _retired,
+        test_native_small_fp8_refilled_stage_warm_stress as _warm,
+    )
+
+    test_public_record = staticmethod(_record)
+    test_retired_record = staticmethod(_retired)
+    test_warm_stress = staticmethod(_warm)
 
 
 @requires_rubin

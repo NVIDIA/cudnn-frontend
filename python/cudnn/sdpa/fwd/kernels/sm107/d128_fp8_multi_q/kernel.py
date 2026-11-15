@@ -69,11 +69,13 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d64, make_cfg_d128
+from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_multi_q.config import TemplateParams, make_cfg_d64, make_cfg_d128
+
+TEMPLATE_NAME = "prefill_d128_fp8"
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body runs; the default keeps direct import usable.
-PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
 CFG, _TMA = (make_cfg_d64 if PARAMS.d_flavor == 64 else make_cfg_d128)(PARAMS)
 if PARAMS.dual_kv_stream:
     raise ValueError("sm107/prefill_d128_fp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
