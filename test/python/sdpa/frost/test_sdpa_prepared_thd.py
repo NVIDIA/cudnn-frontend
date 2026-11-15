@@ -1752,6 +1752,9 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
     g.select_plan(index)
     if cga is not None:
         engine, knobs = g.get_engine_and_knobs_at_index(index)
+        if arch == "sm100" and d in (64, 128) and splits > 1:
+            # Choose the body for the final split record, not the unsplit candidate.
+            engine = 20532
         g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: cga, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: packed})
         g.select_plan(g.get_execution_plan_count() - 1)
         _, selected = g.get_engine_and_knobs_at_index(g._plan_index)
@@ -2031,7 +2034,7 @@ def test_packed_thd_grid_capture_changes_lengths(hnd, dtype, page, geometry):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-    index = next(i for i, name in enumerate(names) if name == engine_name() or name.startswith(engine_name() + "["))
+    index = next(i for i, name in enumerate(names) if _is_plan_for(name, half_engine_names()))
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     captures, workspaces = [], []
     for policy in (0, 1):
@@ -2779,7 +2782,10 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         }
         if "_default_cga" in geometry:
             chosen.pop(cudnn.knob_type.TILE_CGA_M)
-        g.create_execution_plan(engine, chosen)
+        # Final split geometry owns the implementation; the unsplit ranked
+        # record can name multi-Q, which does not serve small-head THD split.
+        chosen_engine = 20532 if arch == "sm100" and d in (64, 128) and splits > 1 else engine
+        g.create_execution_plan(chosen_engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
         if "mha" in geometry.split("_"):
@@ -3116,8 +3122,19 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         # Exercise the public default without pinning a particular split count.
         g.build_plans()
     else:
+        if arch == "sm100" and d in (128, 192):
+            # The explicit single-CTA split request belongs to single-Q,
+            # even when the ranked unsplit candidate used multi-Q.
+            engine = 20532
         g.create_execution_plan(
-            engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
+            engine,
+            {
+                **knobs,
+                cudnn.knob_type.TILE_M: 128,
+                cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1,
+                cudnn.knob_type.SPLIT_KV: splits,
+                cudnn.knob_type.PACK_GQA: int(pack_gqa),
+            },
         )
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
     ws = torch.empty(g.get_workspace_size(), device=DEV, dtype=torch.uint8)
