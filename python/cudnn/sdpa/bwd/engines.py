@@ -40,6 +40,9 @@ _SM100_D512_ROLE_SPLIT = "SdpaBwdDslSm100D512RoleSplit"
 _SM100_D512_TWO_BY_TWO = "SdpaBwdDslSm100D512TwoByTwo"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
+_SM107_D256_NATIVE = "SdpaBwdDslSm107D256FourByOne"
+_SM107_D256_2X2 = "SdpaBwdDslSm107D256TwoByTwo"
+_SM107_D192_2X2 = "SdpaBwdDslSm107D192TwoByTwo"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
@@ -59,6 +62,14 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM107_D256_NATIVE:
+        from .kernels.sm107.d256_f16_4x1.host import SdpaBwdDslSm107D256FourByOne
+
+        return SdpaBwdDslSm107D256FourByOne
+    if name in (_SM107_D256_2X2, _SM107_D192_2X2):
+        from .kernels.sm100.d256_f16_2x2 import host
+
+        return getattr(host, name)
     if name == _SM100_D128_ACCUMULATION:
         from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.host import SdpaBwdDslSm100D128Accumulation
 
@@ -112,9 +123,9 @@ def _adapter(name: str):
         return getattr(api_dsl_sm107, name)
     if name == _SM100_D256:
         # The SM100 d=256 half row: the Rubin half chain's adapter over the 2x2-datapath body.
-        from cudnn.sdpa.bwd import api_dsl_sm100_d256
+        from .kernels.sm100.d256_f16_2x2.host_sm100 import SdpaBwdDslSm100D256
 
-        return api_dsl_sm100_d256.SdpaBwdDslSm100D256
+        return SdpaBwdDslSm100D256
     if name == _SM107_D512:
         # The cc 10.7 d512 half row: the SM100 large-head-dim chain's adapter over the cc 10.7 2x2-datapath stage 2.
         from .kernels.sm107.d512_f16_2x2.host import SdpaBwdDslSm107D512
@@ -176,6 +187,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_HEAD_DIMS,
 )
+from cudnn.sdpa.bwd.kernels.sm107 import d256_half_contract as _sm107_d256_half
 from cudnn.sdpa.bwd.kernels.sm100 import d512_half_contract as _sm100_d512_half
 from cudnn.sdpa.bwd.kernels.sm120 import half_contract as _sm120_half
 from cudnn.sdpa.bwd.kernels.sm80 import half_contract as _sm80_half
@@ -1661,6 +1673,8 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107",
         capabilities=Capabilities(
+            select_implementation=_sm107_d256_half.select_implementation,
+            delegated=frozenset({_sm107_d256_half.NATIVE, _sm107_d256_half.TWO_BY_TWO}),
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -1684,6 +1698,20 @@ def _sm107_spec() -> EngineSpec:
             layouts=frozenset({"bshd"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM107),
+    )
+
+
+def _sm107_d256_native_spec() -> EngineSpec:
+    return explicit_engine(_sm107_spec(), _sm107_d256_half.NATIVE, partial(lower_dsl_bwd, api_type=_SM107_D256_NATIVE))
+
+
+def _sm107_d256_two_by_two_spec() -> EngineSpec:
+    return explicit_engine(
+        _sm107_spec(),
+        _sm107_d256_half.TWO_BY_TWO,
+        partial(lower_dsl_bwd, api_type=_SM107_D256_2X2),
+        thd=False,
+        thd_declared_totals=False,
     )
 
 
@@ -2020,7 +2048,7 @@ def _sm100_d256_spec() -> EngineSpec:
 
     The Rubin half chain (``_sm107_spec``: dot -> main kernel with dV in TMEM and a kv-major dS workspace -> the two
     ``bprop_matmul_blackwell`` GEMMs at the (256, 256) tile -> the GQA fold) over the **2x2-datapath** main kernel
-    ``kernels/bprop_d256_2x2_f16.py`` at profile 1: ``tcgen05.mma.cta_group::2`` with the collective M = 128 (64 kv rows per
+    ``kernels/sm100/d256_f16_2x2/kernel.py`` at profile 1: ``tcgen05.mma.cta_group::2`` with the collective M = 128 (64 kv rows per
     CTA, a 128-row kv block per cga2 pair), every operand an SMEM SS operand, 512 non-exclusive TMEM columns and 210 KiB
     of SMEM -- the footprint that lets a bf16 d=256 backward exist on SM100 at all (the 4x1 body needs Rubin's 576
     columns / 327 KiB).  The kv WRITE PAIR stays 256 rows (``STAGE3_GRAN_ROWS``), so the stage-3 renderings and the
@@ -2038,6 +2066,7 @@ def _sm100_d256_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100_d256",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm100_d256",
             zero_scale=True,
             sm_lo=100,
             sm_hi=106,
@@ -2070,6 +2099,7 @@ def _sm107_d192_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_d192",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_d192",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -2089,7 +2119,7 @@ def _sm107_d192_spec() -> EngineSpec:
             decode=False,  # prefill body: a 128-row q tile per iteration
             layouts=frozenset({"bshd"}),
         ),
-        lower=partial(lower_dsl_bwd, api_type=_SM107),
+        lower=partial(lower_dsl_bwd, api_type=_SM107_D192_2X2),
     )
 
 
@@ -2646,6 +2676,8 @@ ENGINE_SPECS = (
     _sm100_d192_spec(),
     _sm100_d192_fp8_spec(),
     _sm107_spec(),
+    _sm107_d256_native_spec(),
+    _sm107_d256_two_by_two_spec(),
     _sm107_fp8_spec(),
     _sm107_mxfp8_spec(),
     _sm100_d256_spec(),

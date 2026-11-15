@@ -1346,7 +1346,7 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
-    for engine in (_ENGINE, "sdpa_bwd_sm107", "sdpa_bwd_sm107_fp8"):
+    for engine in (_ENGINE, "sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_fp8"):
         reason = _decline_reason(monkeypatch, engine=engine)
         assert reason is not None and "sm_107a" in reason and dsl_version in reason, (engine, reason)
     assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_d256_mxfp8", cc=(10, 0)) is None

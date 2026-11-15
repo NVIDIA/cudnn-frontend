@@ -116,7 +116,7 @@ of a pair walk the identical, pair-rounded range, the extra tiles fully masked b
 range is FORCED to one fully-masked q tile.  The per-cell mask is the bit-word form (``band_mask_words`` /
 ``apply_mask_words``, one keep-word per 32 q columns).
 
-## Launch ABI (identical to ``sm107/bprop_d256_f16.py`` so ``kernels/sm107/prepared_host.host_f16`` runs this body)
+## Launch ABI (identical to ``sm107/d256_f16_4x1/kernel.py`` so ``kernels/sm107/prepared_host.host_f16`` runs this body)
 
 ``compile(b, qh, kh, sq, skv, qh_chunk=0, b_chunk=0, sq_real=0, skv_real=0)``; ``sq % 128 == 0``, ``skv % 256 == 0``
 (the kv write pair; the adapter pads).  Call, positionally::
@@ -189,7 +189,7 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 # Config comes from the FROST template loader, never an env var: the loader injects FROST_TEMPLATE_PARAMS before this
 # body runs; the default keeps a plain import usable (profile 1 = the SM100 body; profile 0 is the 4x1 bodies' and the
 # 2x2 factory refuses it).
-from cudnn.sdpa.bwd.config_d256_2x2 import (
+from cudnn.sdpa.bwd.kernels.sm100.d256_f16_2x2.config import (
     FAMILY_F16,
     PROFILE_SM100,
     TemplateParams,

@@ -66,7 +66,7 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
 
 
 _ENGINE = "sdpa_bwd_sm107_fp8"
-_HALF_ENGINE = "sdpa_bwd_sm107"
+_HALF_ENGINE = "sdpa_bwd_sm107_d256_f16_4x1"
 _FAMILY_NAME = "frost_sdpa_bwd"
 _SLOT = 5  # engines/manifest.py: EngineSlot(5, opt_in=True) -> FROST_SDPA_BWD_ID_BASE + 5
 _ENGINE_ID = 20_605
@@ -260,7 +260,8 @@ def test_engine_name_grammar():
 
     if "fp8" in inspect.signature(engine_name).parameters:
         assert engine_name("sm107", fp8=True) == _ENGINE
-        assert engine_name("sm107") == _HALF_ENGINE
+        assert engine_name("sm107") == "sdpa_bwd_sm107"  # legacy delegated row
+        assert _HALF_ENGINE == "sdpa_bwd_sm107_d256_f16_4x1"
     assert _spec().name == _ENGINE
 
 

@@ -831,7 +831,7 @@ load/MMA/result-store/release order and retain the refilling warm stress.
 
 Kernels on this atom: forward `fwd/kernels/sm100/d512_f16_2x2/kernel.py` + `fwd/kernels/sm107/d512_f16_2x2/kernel.py`
 (`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/d512_f16_2x2/kernel.py` (`config_sm100.CfgBwdD512x2`,
-`TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
+`TemplateParams2x2`), backward d256 `bwd/kernels/sm100/d256_f16_2x2/kernel.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
 `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
 
