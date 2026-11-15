@@ -365,9 +365,11 @@ class Capabilities:
     knob_check: Optional[Callable[["ga.SdpaGraphFacts", Any], Optional[str]]] = None
     # The fixed main implementation of an engine that names one body. Append-only.
     implementation: str = ""
-    # The body a multi-body row runs for a graph, from declaration facts alone; the lowering dispatches on
-    # the same function. None = one body.
-    select_implementation: Optional[Callable[["ga.SdpaGraphFacts"], str]] = None
+    # The bodies a multi-body row can run for a graph, from declaration facts alone: one name, or a tuple
+    # of every legal body with the row's default first. The lowering dispatches on the same function. An
+    # owner admits any graph it is legal for; the row declines a graph whose default it delegated. None =
+    # one body.
+    select_implementation: Optional[Callable[["ga.SdpaGraphFacts"], Any]] = None
     # Bodies a row has handed to explicit engines (:func:`explicit_engine`). A graph selecting one is
     # declined here, so neither an automatic route nor an old record reaches the row for it.
     delegated: frozenset[str] = frozenset()
@@ -414,12 +416,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
     reason = _declared_mismatch(capabilities, facts, requested)
     if reason is not None or capabilities.select_implementation is None:
         return reason
-    selected = capabilities.select_implementation(facts)
-    if capabilities.implementation and selected != capabilities.implementation:
-        return f"{capabilities.implementation} does not run this graph; its declaration selects {selected}"
-    if selected in capabilities.delegated:
-        return f"this graph is owned by the explicit implementation engine {selected}"
+    legal = legal_implementations(capabilities, facts)
+    if capabilities.implementation and capabilities.implementation not in legal:
+        return f"{capabilities.implementation} does not run this graph; its declaration selects {legal[0]}"
+    if legal[0] in capabilities.delegated:
+        return f"this graph is owned by the explicit implementation engine {legal[0]}"
     return None
+
+
+def legal_implementations(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> tuple:
+    """The bodies ``capabilities``' row can run for ``facts``, its default first; ``()`` for a one-body engine."""
+    if capabilities.select_implementation is None:
+        return ()
+    selected = capabilities.select_implementation(facts)
+    return (selected,) if isinstance(selected, str) else tuple(selected)
 
 
 def _declared_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any) -> Optional[str]:
@@ -904,8 +914,8 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     bias_geom = (tuple(facts.bias_t.get_dim()), tuple(facts.bias_t.get_stride())) if facts.has_bias else None
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
-    select = spec.capabilities.select_implementation
-    selected = None if select is None else select(facts)
+    legal = legal_implementations(spec.capabilities, facts)
+    selected = spec.capabilities.implementation if spec.capabilities.implementation in legal else legal[0] if legal else None
     if selected == _sm120_f16_fused.WIDE:
         from .api_dsl_sm120_wide import SdpaBwdDslSm120Wide
 
@@ -2463,6 +2473,7 @@ __all__ = [
     "analyze_for",
     "engine_name",
     "explicit_engine",
+    "legal_implementations",
     "mismatch",
     "policy_name",
 ]

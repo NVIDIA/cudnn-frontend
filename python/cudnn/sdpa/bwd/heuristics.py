@@ -27,7 +27,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from cudnn.engines.base import PlanConfig
 
-from .engines import ENGINE_SPECS, EngineSpec, SdpaBwdKnobs, mismatch, policy_name
+from .engines import ENGINE_SPECS, EngineSpec, SdpaBwdKnobs, legal_implementations, mismatch, policy_name
 
 
 def _sm120_default_tiles(facts) -> Optional[Tuple[int, int]]:
@@ -186,13 +186,23 @@ def _lists_last(spec: EngineSpec, facts) -> bool:
     return policy_name(spec) == "sdpa_bwd_sm100_d192" and not facts.thd
 
 
+def _default_rank(spec: EngineSpec, facts) -> int:
+    """An explicit engine's place among its row's legal bodies for ``facts`` (0 = the row's default)."""
+    legal = legal_implementations(spec.capabilities, facts)
+    return legal.index(spec.capabilities.implementation) if spec.capabilities.implementation in legal else 0
+
+
 def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
-    """One complete entry per eligible row, in ``ENGINE_SPECS`` order except for :func:`_lists_last`; ``kind``
-    does not change the answer (no runner-up candidates to thin out)."""
+    """One complete entry per eligible engine, in ``ENGINE_SPECS`` order except for :func:`_lists_last` and, among
+    owners legal for the same graph, the row's default first; ``kind`` does not change the answer (no runner-up
+    candidates to thin out)."""
     out: List[Tuple[EngineSpec, PlanConfig]] = []
     for engine_id, spec in _eligible(facts, offered):
         knobs = default_knobs(spec, facts)
         if knobs is None or mismatch(spec.capabilities, facts, knobs) is None:
             out.append((spec, PlanConfig(engine_id, knobs)))
-    out.sort(key=lambda entry: _lists_last(entry[0], facts))
+    row_position = {}
+    for position, spec in enumerate(ENGINE_SPECS):
+        row_position.setdefault(policy_name(spec), position)
+    out.sort(key=lambda entry: (_lists_last(entry[0], facts), row_position[policy_name(entry[0])], _default_rank(entry[0], facts)))
     return [plan for _, plan in out]

@@ -4,6 +4,7 @@
 """Backward explicit engines (no GPU): a multi-body row and the engines that own its bodies partition the row's graphs by
 the body its declaration selects, and the owners inherit the row's heuristics decisions."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,24 @@ def test_selected_body_partitions_row_and_owner(monkeypatch):
     assert mismatch(row.capabilities, a) == "this graph is owned by the explicit implementation engine owner_a"
     assert mismatch(owner.capabilities, b) == "owner_a does not run this graph; its declaration selects b"
     assert mismatch(row.capabilities, b) is None
+
+
+def test_two_legal_bodies_are_both_selectable_and_the_default_ranks_first(monkeypatch):
+    """Legality is not the default choice: when a graph admits two bodies, each owner keeps its explicit record and
+    the candidate list names the row's default first."""
+    from cudnn.sdpa.bwd import heuristics
+
+    monkeypatch.setattr(bwd_engines, "_declared_mismatch", lambda caps, facts, requested: None)
+    caps = Capabilities(sm_lo=120, sm_hi=121, d=frozenset({64}), select_implementation=lambda facts: facts.bodies)
+    row = EngineSpec("row", replace(caps, delegated=frozenset({"pair"})), _lower)
+    one, pair = explicit_engine(row, "one", _lower), explicit_engine(row, "pair", _lower)
+    both = SimpleNamespace(bodies=("pair", "one"))
+    assert mismatch(one.capabilities, both) is None and mismatch(pair.capabilities, both) is None
+    assert mismatch(row.capabilities, both) == "this graph is owned by the explicit implementation engine pair"
+    assert mismatch(row.capabilities, SimpleNamespace(bodies=("one", "pair"))) is None  # its default is still the row's
+    monkeypatch.setattr(heuristics, "ENGINE_SPECS", (row, one, pair))
+    plans = heuristics.recommend("A", both, {"row": 1, "one": 2, "pair": 3})
+    assert [p.engine_id for p in plans] == [3, 2]
 
 
 def test_declared_reason_comes_before_the_selection(monkeypatch):
