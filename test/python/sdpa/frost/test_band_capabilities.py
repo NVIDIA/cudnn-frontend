@@ -50,12 +50,17 @@ def _compiler_targets_available(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
+# (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p"})
+
+
 def _rows():
     """``[(kind, EngineSpec)]`` -- every row the registry actually ships that serves some graph.
 
     A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample."""
     rows = [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
-    return [(kind, spec) for kind, spec in rows if _dims(kind, spec.capabilities) is not None]
+    return [(kind, spec) for kind, spec in rows if spec.name not in _BAND_OWNED and _dims(kind, spec.capabilities) is not None]
 
 
 def _probe(kind: str):
@@ -113,6 +118,16 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
             for contract in (fwd_engines._sm107_small_half, fwd_engines._sm107_mid_half, fwd_engines._sm107_shared_half):
                 if caps.implementation in contract.IMPLEMENTATIONS:
                     return contract.mismatch(caps.implementation, facts, None)
+
+            for owner in (
+                fwd_engines._sm107_small_fp8_owner,
+                fwd_engines._sm107_swap_fp8_owner,
+                fwd_engines._sm107_d192_fp8_owner,
+                fwd_engines._sm107_d256_fp8_owner,
+                fwd_engines._sm107_d512_fp8_owner,
+            ):
+                if caps.implementation == owner.NAME:
+                    return owner.mismatch(facts, None)
         return None
     if kind == "fwd":
         return check(facts)
@@ -200,7 +215,7 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
         device_sm_count=1024,
         scale=0.1,
     )
-    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_fp8_swap_ab":
+    if getattr(caps, "implementation", "") in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab"}:
         # This body has eight live query columns. A 128-row sample would
         # exercise its implementation boundary before any mask decision.
         values["s_q"] = 1
@@ -510,7 +525,11 @@ def test_geometry_relations_do_not_change_the_band_decision():
     for kind, spec in _rows():
         caps = spec.capabilities
         expected = None if declares(caps, right=band.RIGHT_CAUSAL) else band.feature_reason(band.LABEL_RIGHT_CAUSAL)
-        for s_q, s_kv in ((128, 128), (64, 128), (256, 128)):
+        geometries = ((128, 128), (64, 128), (256, 128))
+        if getattr(caps, "implementation", "") in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab"}:
+            # Exercise all three relations within the eight-column domain.
+            geometries = ((4, 4), (4, 8), (8, 4))
+        for s_q, s_kv in geometries:
             facts = legal_facts(kind, caps, s_q=s_q, s_kv=s_kv, **band_causal_top_left())
             reason = _probe(kind)(caps, facts)
             assert probe_matches(kind, caps, facts, expected), (spec.name, s_q, s_kv, reason)
@@ -550,7 +569,7 @@ def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
         tile = int(caps.skv_tile)
         s_kv = tile * 2 - 1  # not a tile multiple: the tail rule is live
         uncovered = legal_facts(kind, caps, s_q=tile * 2, s_kv=s_kv, **band_causal_top_left())
-        if caps.implementation in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm100_d64_quadrant"}:
+        if caps.implementation in {"sdpa_fwd_sm100_d128_fp8_swap_ab", "sdpa_fwd_sm107_d128_fp8_swap_ab", "sdpa_fwd_sm100_d64_quadrant"}:
             # Keep Q inside the body's live-query limit. An unmasked KV tail
             # is also uncovered and reaches the same tile-tail gate.
             uncovered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_unmasked())

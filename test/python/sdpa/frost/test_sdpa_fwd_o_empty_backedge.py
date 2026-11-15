@@ -41,15 +41,15 @@ _TWO_WARPGROUP_KERNELS = (
     "sm100/d192_fp8_multi_q/kernel.py",
     "sm100/prefill_d192_d128_mxfp8.py",
     "sm107/prefill_d128_f16.py",
-    "sm107/prefill_d128_fp8.py",
+    "sm107/d128_fp8_multi_q/kernel.py",
     "sm107/prefill_d128_mxfp8.py",
     "sm107/prefill_d192_d128_f16.py",
-    "sm107/prefill_d192_d128_fp8.py",
+    "sm107/d192_fp8_multi_q/kernel.py",
     "sm107/prefill_d192_d128_mxfp8.py",
 )
 # The sm107 d192x128 quantized kernels start a tile on ``mb_tile_go``: softmax warpgroup 1 and the correction group (after O
 # sub-tile 0) arrive it, and the correction group waits its own O slot, so the softmax warpgroups carry no top-of-tile mb_o_empty wait.
-_TILE_GATE_KERNELS = ("sm107/prefill_d192_d128_fp8.py", "sm107/prefill_d192_d128_mxfp8.py")
+_TILE_GATE_KERNELS = ("sm107/d192_fp8_multi_q/kernel.py", "sm107/prefill_d192_d128_mxfp8.py")
 
 
 @pytest.mark.parametrize("kernel", _TWO_WARPGROUP_KERNELS)
@@ -152,7 +152,7 @@ _D512_SWA_CHILD = textwrap.dedent(r"""
 
     def delayed(path, params, tag="template", **kwargs):
         p = Path(path)
-        if p.parent.name == "sm100" and p.name == "prefill_d512_mxfp8.py":
+        if p.parent.name == "d512_mxfp8_retained_p" and p.name == "kernel.py":
             source = p.read_text()
             begin = source.index("def _softmax_warp_group(")
             end = source.index("\n@cute.jit", begin)
@@ -162,15 +162,14 @@ _D512_SWA_CHILD = textwrap.dedent(r"""
             # P is already published for BOTH Dv slices. Delay the softmax role
             # here so their two O-empty phases finish before its next tile wait.
             delay = (
-                "        if cutlass.const_expr(_SWA_REUSE_P):\n"
-                "            delayed_start = cute.arch.globaltimer()\n"
-                "            while cute.arch.globaltimer() - delayed_start < cutlass.Int64(10_000_000):\n"
-                "                pass\n"
+                "        delayed_start = cute.arch.globaltimer()\n"
+                "        while cute.arch.globaltimer() - delayed_start < cutlass.Int64(10_000_000):\n"
+                "            pass\n"
             )
             target = Path(work) / "template_d512_delayed_softmax.py"
             target.write_text(source[:begin] + section.replace(anchor, delay + anchor) + source[end:])
             module = original_load(str(target), params, tag, **kwargs)
-            assert module._SWA_REUSE_P, "the two-output-slice path was not exercised"
+            assert module.TEMPLATE_NAME == "prefill_d512_mxfp8_retained_p", "the retained-P two-output-slice path was not exercised"
             if params.thd_varlen:
                 # This kernel's THD claim loop normally gets the full envelope
                 # grid. Enable the existing test launch cap on this private

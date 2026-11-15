@@ -96,7 +96,7 @@ def test_f16_host_entries_carry_only_record_reproducible_defaults(flavor, rubin)
 # Q(u)O and K(u)V slabs are 128 KiB each, putting the P transfer ring at exactly
 # 262144 (and, on the MXFP8 sibling, the scale-factor tiles near 292 KiB).  Keep
 # d128/d256 on version 0 so they stay byte-identical to the shipped
-# sm107/prefill_d128_fp8.py sibling.
+# sm107/d128_fp8_multi_q/kernel.py sibling.
 _NEEDS_DESC_V1 = {(512, 512)}
 
 # (kind, loader kwargs) for every SM107 dtype family, so the check below covers
@@ -126,16 +126,35 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
 
     from cudnn.sdpa.fwd.kernels import sm107 as pkg
 
-    files = sorted(glob.glob(os.path.join(os.path.dirname(pkg.__file__), "prefill_*.py")))
+    directory = os.path.dirname(pkg.__file__)
+    files = sorted(glob.glob(os.path.join(directory, "prefill_*.py")) + glob.glob(os.path.join(directory, "*", "kernel.py")))
     assert len(files) >= 13, files
     shared_call = re.compile(
         r"running_max_step_finite_sentinel\(\s*(\w+),\s*current_max,\s*total_max,\s*(NEG_INF(?:_F32)?),\s*RESCALE_THRESHOLD(?:_F32)?,\s*masked=CFG\.MASK_FLAGS != MASK_NONE\s*\)"
     )
-    seen_shared = 0
+    # Some original paths have become compatibility shims. Count their logical
+    # bodies once, while checking every old and isolated source independently.
+    isolated_origins = {
+        "d128_f16_multi_q": "prefill_d128_f16.py",
+        "small_f16_batch_pair": "prefill_d128_f16.py",
+        "d192_f16_multi_q": "prefill_d192_d128_f16.py",
+        "d256_f16_lookahead": "prefill_d256_f16.py",
+        "d512_f16_role_split": "prefill_d512_f16.py",
+        "d128_fp8_multi_q": "prefill_d128_fp8.py",
+        "d192_fp8_multi_q": "prefill_d192_d128_fp8.py",
+        "d256_fp8_single_q": "prefill_d256_fp8.py",
+        "d512_fp8_role_split": "prefill_d512_fp8.py",
+        "d128_mxfp8_multi_q": "prefill_d128_mxfp8.py",
+        "d192_mxfp8_multi_q": "prefill_d192_d128_mxfp8.py",
+        "d256_mxfp8_single_q": "prefill_d256_mxfp8.py",
+        "d512_mxfp8_role_split": "prefill_d512_mxfp8.py",
+    }
+    expected = {f"prefill_{shape}_{dtype}.py" for shape in ("d128", "d192_d128", "d256", "d512") for dtype in ("f16", "fp8", "mxfp8")}
+    seen_shared = set()
     for f in files:
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
-        name = os.path.basename(f)
+        name = os.path.relpath(f, directory)
         if "row_max_for_exp2(" in code and "running_max_step_finite_sentinel(" not in code:
             continue  # the -inf-masked twin alone (the 2x2 bodies)
         # sm107/prefill_d128_f16.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
@@ -150,10 +169,12 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         }, f"{name}: the first operand must be the RAW tile max: {calls}"
         for frag in ("is_first = total_max ==", "update_cond = is_first", "exp_input = ", "new_total_max = total_max"):
             assert frag not in code, f"{name}: the inlined running-max chain {frag!r} remains beside the shared helper"
-        seen_shared += 1
-    assert (
-        seen_shared == 12
-    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; the sm107 d128 f16 file counts through its plain body) take the helper; saw {seen_shared}"
+        seen_shared.add(isolated_origins.get(os.path.basename(os.path.dirname(f)), name))
+    assert expected <= seen_shared, (
+        "the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; "
+        "the sm107 d128 f16 file counts through its plain body) take the helper; "
+        f"missing {sorted(expected - seen_shared)}, saw {sorted(seen_shared)}"
+    )
 
 
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
@@ -1086,6 +1107,16 @@ def test_sm107_nonpaged_d128_thd_pack_gqa_contract(dtype_name, group, cga):
     assert _half_mismatch(facts, dataclasses.replace(knobs, cga=4)) is not None
 
 
+def _fp8_owner(shape):
+    return {
+        (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
+        (128, 128): "sdpa_fwd_sm107_d128_fp8_multi_q",
+        (192, 128): "sdpa_fwd_sm107_d192_fp8_multi_q",
+        (256, 256): "sdpa_fwd_sm107_d256_fp8_single_q",
+        (512, 512): "sdpa_fwd_sm107_d512_fp8_role_split",
+    }.get(shape, "sdpa_fwd_prefill_sm107_fp8")
+
+
 def test_sm107_fp8_pack_gqa_serves_native_split_flavors():
     """All native FP8 flavors pack and split; THD packing remains declined."""
     from cudnn.sdpa.fwd import engines
@@ -1094,11 +1125,13 @@ def test_sm107_fp8_pack_gqa_serves_native_split_flavors():
     shapes = frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert caps.pack_gqa_d_shapes == shapes
     for d_qk, d_v in shapes:
+        caps = _caps(_fp8_owner((d_qk, d_v)))
         packed = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=d_qk, d_v=d_v))
         assert engines.mismatch(caps, packed) is None
         assert engines.mismatch(caps, packed, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    caps = _caps("sdpa_fwd_sm107_d512_fp8_role_split")
     d512 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=512, d_v=512))
-    assert engines.mismatch(caps, d512, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2, cga=2)) is None
+    assert engines.mismatch(caps, d512, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2, cga=4)) is None
     assert engines.mismatch(caps, dataclasses.replace(d512, thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
 
@@ -1107,7 +1140,7 @@ def test_sm107_fp8_paged_sink_declines():
     THD + sink FP8 graph on cc 10.7 keeps its typed decline (the fp8 row's `paged_kv=not rubin_row`)."""
     from cudnn.sdpa.fwd import engines
 
-    why = engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), _quant_facts(has_paged_kv=True, page_size=16, padded=True, thd=True, has_sink=True))
+    why = engines.mismatch(_caps("sdpa_fwd_sm107_d128_fp8_multi_q"), _quant_facts(has_paged_kv=True, page_size=16, padded=True, thd=True, has_sink=True))
     assert why is not None and "paged" in why, why
 
 
@@ -1383,7 +1416,7 @@ def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
     nobody validated."""
     from cudnn.sdpa.fwd import engines
 
-    for row, is_mx in (("sdpa_fwd_prefill_sm107_fp8", False), ("sdpa_fwd_prefill_sm107_mxfp8", True)):
+    for row, is_mx in (("sdpa_fwd_sm107_d192_fp8_multi_q", False), ("sdpa_fwd_prefill_sm107_mxfp8", True)):
         caps = _caps(row)
         assert (192, 128) in caps.d_shapes, row
         for dt in sorted(caps.dtypes, key=lambda d: int(d)):
@@ -1587,10 +1620,13 @@ def test_sm107_fp8_lpt_knob_is_honored_or_ineligible_per_d_shape():
     caps = _caps("sdpa_fwd_prefill_sm107_fp8")
     fp8 = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_fp8=True)
     for shape in ((512, 512), (256, 256), (192, 128), (128, 128)):
+        caps = _caps(_fp8_owner(shape))
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT)) is None, shape
     for shape in ((192, 128), (128, 128)):
+        caps = _caps(_fp8_owner(shape))
         assert engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2)) is None, shape
     for shape in ((256, 256), (512, 512)):
+        caps = _caps(_fp8_owner(shape))
         why = engines.mismatch(caps, _f16_facts(d_qk=shape[0], d_v=shape[1], **fp8), SdpaFwdKnobs(sched_policy=SCHED_LPT_L2))
         assert why is not None and "sched_policy" in why, shape
 
@@ -2030,11 +2066,11 @@ def test_sm107_stats_log2_specializes_every_dtype_and_flavor(flavor, kind, load_
 # Three rows, one per dtype family of the d256 flavor: f16/bf16, per-tensor FP8
 # (PR-A) and block-scale MXFP8 (PR-B slice S7).  Order is load-bearing for the
 # `f16, fp8 = ...` destructurings below; the MXFP8 row is indexed explicitly.
-_GATE_ROWS = ("sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8")
+_GATE_ROWS = ("sdpa_fwd_sm107_d256_lookahead", "sdpa_fwd_sm107_d256_fp8_single_q", "sdpa_fwd_prefill_sm107_mxfp8")
 # The retained half row still supplies the legacy policy's feature constants,
 # but its delegated exact D256 graph must decline. Split-gated decode belongs
 # to its own fixed implementation, not the unsplit lookahead engine.
-_GATE_DECLARED_ROWS = (*_GATE_ROWS, "sdpa_fwd_prefill_sm107", "sdpa_fwd_sm107_d256_swap_ab")
+_GATE_DECLARED_ROWS = (*_GATE_ROWS, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_sm107_d256_swap_ab")
 _D256 = (256, 256)
 _GATE_SEAMS = (
     "cfg",
@@ -2144,6 +2180,9 @@ def test_sm107_gate_rows_claim_exactly_d256():
         if spec.name not in _GATE_DECLARED_ROWS:
             assert spec.capabilities.epilogue_gate is False, spec.name
             assert spec.capabilities.epilogue_gate_d_shapes is None, spec.name
+    # The envelope row retains historical policy metadata; its exact gated
+    # D256 cell is delegated and cannot be selected under the old recipe.
+    assert "owned by" in engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), _fp8_gate_facts())
     # The gate is a FEATURE of the Rubin rows, never a row of its own -- a claim
     # unrelated rows landing cannot falsify (a bare spec count could not say it).
     assert {s.name for s in engines.ENGINE_SPECS if s.capabilities.epilogue_gate} == set(_GATE_DECLARED_ROWS)
@@ -2159,8 +2198,10 @@ def test_sm107_gate_rows_claim_exactly_d256():
         assert why is not None and "epilogue" in why, (d_qk, d_v, why)
         assert _half_mismatch(_f16_facts(d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
     for d_qk, d_v in ((128, 128), (192, 128), (512, 512)):
-        why = engines.mismatch(fp8, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
-        assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
+        fp8_owner = _caps(_fp8_owner((d_qk, d_v)))
+        why = engines.mismatch(fp8_owner, _fp8_gate_facts(d_qk=d_qk, d_v=d_v))
+        expected = "graph fuses O * sigmoid(G)" if (d_qk, d_v) in ((192, 128), (512, 512)) else "graph fuses O * sigmoid(G)"
+        assert why is not None and expected in why, (d_qk, d_v, why)
         why = engines.mismatch(mxfp8, _mxfp8_gate_facts(d_qk=d_qk, d_v=d_v))
         assert why is not None and "epilogue gate" in why, (d_qk, d_v, why)
     # The MXFP8 row's UNGATED (256, 256) graph is untouched by the new fields.
@@ -2190,21 +2231,18 @@ def test_sm107_gate_accepts_every_dtype_member():
     fp8 = _caps(_GATE_ROWS[1])
     assert fp8.epilogue_gate_dtypes == frozenset({cudnn.data_type.BFLOAT16})
     assert fp8.dtypes == frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
-    assert fp8.out_dtypes == frozenset(
-        {cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1}
-    )
-    # FP4_E2M1 is listed for the block-scaled O epilogue (sf_o), which is its own
-    # O store: it is never gated, so the gate matrix runs over the other members.
+    assert fp8.out_dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2})
+    # The exact D256 owner has scalar O only; every declared member is gate-capable.
     for dt in sorted(fp8.dtypes, key=int):
-        for dto in sorted(fp8.out_dtypes - {cudnn.data_type.FP4_E2M1}, key=int):
+        for dto in sorted(fp8.out_dtypes, key=int):
             assert engines.mismatch(fp8, _fp8_gate_facts(dtype=dt, dtype_o=dto)) is None, (dt, dto)
     why = engines.mismatch(fp8, _fp8_gate_facts(epilogue_gate_dtype=cudnn.data_type.HALF))
     assert why is not None and "gate dtype" in why, why
     # ...and the two epilogues decline each other, each naming the block-scaled O.
     why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP4_E2M1))
-    assert why is not None and "block-scaled" in why, why
+    assert why is not None and "O dtype" in why, why
     why = engines.mismatch(fp8, _fp8_gate_facts(dtype_o=cudnn.data_type.FP8_E4M3, o_block_scale=32))
-    assert why is not None and "epilogue gate" in why, why
+    assert why is not None and "block-scaled" in why, why
 
     # The MXFP8 row (PR-B): the same per-member claims -- every input dtype x
     # every O dtype with the bf16 G its kernel stages (GATE_STORAGE_DTYPE); a
@@ -2253,9 +2291,10 @@ def test_sm107_gate_declines_the_interactions():
     # The half row serves ungated paged THD; the gate block must decline
     # the interaction before paged layout admission. FP8 paging is limited to D512,
     # which has no gate; the D256 gate flavor remains nonpaged.
-    assert f16.paged_kv and fp8.paged_kv
-    assert fp8.paged_d_shapes == frozenset({(512, 512)})
-    assert (256, 256) not in fp8.paged_d_shapes
+    assert f16.paged_kv and not fp8.paged_kv
+    d512_fp8 = _caps("sdpa_fwd_sm107_d512_fp8_role_split")
+    assert d512_fp8.paged_d_shapes == frozenset({(512, 512)})
+    assert engines.mismatch(fp8, _fp8_gate_facts(**paged)) is not None
     shared = _caps("sdpa_fwd_sm107_shared_d256_lookahead")
     assert engines.mismatch(shared, _f16_facts(d_qk=256, d_v=256, thd=True, **paged)) is None
     why = engines.mismatch(shared, _gate_facts(thd=True, **paged))
@@ -5916,7 +5955,7 @@ def test_softmax_scale_prefolded_api_rejections():
 # ============================================================================
 # softmax_precision=HALF on the per-tensor FP8 d192x128 kernel (cc10.7)
 #
-# ``sm107/prefill_d192_d128_fp8.py`` carries the f16x2 exponent arm through the shared
+# ``sm107/d192_fp8_multi_q/kernel.py`` carries the f16x2 exponent arm through the shared
 # ``cudnn.frost.tile_dsl.softmax_f16`` helpers (``f16_exp_chunk`` stats-less, ``f16_exp_chunk_sum``
 # with Stats); the engine row, the adapter gate and the config backstop all admit HALF at (192, 128).
 # The pre-folded scale is declined on per-tensor FP8 by contract (the kernel folds
@@ -6385,7 +6424,7 @@ def test_d512_mxfp8_masked_leading_tile_keeps_rows_with_later_keys_finite(precis
 
 
 # ------------------------------------------------------------------------------------- d256 per-tensor FP8: softmax_precision=HALF
-# The d256 per-tensor FP8 kernel (sm107/prefill_d256_fp8.py) normalizes O with a REGISTER row-sum -- there is no ones-MMA
+# The d256 per-tensor FP8 kernel (sm107/d256_fp8_single_q/kernel.py) normalizes O with a REGISTER row-sum -- there is no ones-MMA
 # Sigma column -- so its HALF arm has two shapes: a stats-less build sums the f16x2 P words it stores (an HADD2 pair tree,
 # softmax_f16.f16_exp_chunk_f16sum) and a Stats build keeps the exact f32 sum of a second f32 exp2 for the published LSE
 # (softmax_f16.f16_exp_chunk_sum).  The pre-folded scale is not served on per-tensor FP8 (the kernel folds descale_q *
@@ -8263,7 +8302,7 @@ def test_d512_half_prefolded_scale_sass_drops_the_per_score_multiply(tmp_path, s
 
 
 # ============================================================================ d512 per-tensor FP8: the HALF softmax arm
-# The role-split d512 per-tensor FP8 kernel (sm107/prefill_d512_fp8.py) honors softmax_precision=HALF: MUFU EX2.F16x2 on
+# The role-split d512 per-tensor FP8 kernel (sm107/d512_fp8_role_split/kernel.py) honors softmax_precision=HALF: MUFU EX2.F16x2 on
 # packed pairs and an f16x2 -> FP8 cast per 16-byte P vector through the SHARED helpers (tile_dsl/softmax_f16.py); the
 # SMEM pack and the DSMEM ship are untouched.  The kernel has no ones-MMA row-sum, so the stats-less build normalizes O
 # by the f16 pair-tree sum of the P words it stores while a build with Stats keeps the exact f32 denominator (honored,
@@ -8272,7 +8311,7 @@ def test_d512_half_prefolded_scale_sass_drops_the_per_score_multiply(tmp_path, s
 # keyless rows under the masked arm.  Oracle: float64 on the DEQUANTIZED inputs the kernel actually saw.
 _D512_FP8_HALF_FMT = {"e4m3": "float8_e4m3fn", "e5m2": "float8_e5m2"}
 _D512_FP8_HALF_D = 512
-_D512_FP8_KERNEL_FILE = os.path.join("sm107", "prefill_d512_fp8.py")
+_D512_FP8_KERNEL_FILE = os.path.join("sm107", "d512_fp8_role_split", "kernel.py")
 
 
 @pytest.mark.L0
@@ -8600,7 +8639,7 @@ _SM107_D512_FP8_HALF_SASS_PROBE = textwrap.dedent("""
     (cta_mma,) = supported_cgas_for((512, 512), fp8=True, device_cc=(10, 7), pertensor=True)
     params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, softmax_f16=True)
     mod = _load_sm100_kernel_module((512, 512), params, fp8=True, pertensor=True, rubin=True)
-    assert mod.SOFTMAX_F16 == 1 and mod.__file__.endswith(os.path.join("sm107", "prefill_d512_fp8.py")), mod.__file__
+    assert mod.SOFTMAX_F16 == 1 and mod.__file__.endswith(os.path.join("sm107", "d512_fp8_role_split", "kernel.py")), mod.__file__
     mod.compile_prepared(d_qk=512, d_v=512, has_lse=bool(has_lse))
     cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
     if not cubins:

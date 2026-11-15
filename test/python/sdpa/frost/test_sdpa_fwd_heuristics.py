@@ -761,6 +761,10 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     """Each selected owner must advertise the geometry it launches."""
 
     name = "sdpa_fwd_sm100_d256_fp8_single_q" if not mxfp8 and d_qk == 256 else engines.engine_name(mxfp8=mxfp8, fp8=not mxfp8)
+    if mxfp8:
+        from frost_test_utils import mxfp8_engine_name
+
+        name = mxfp8_engine_name("sm100", d_qk, d_v)
     small_fp8 = not mxfp8 and d_qk == 128
     if small_fp8:
         name = "sdpa_fwd_sm100_d128_fp8_multi_q"
@@ -795,7 +799,7 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     if (d_qk, d_v) == (128, 128):
         assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
-        reason = "outside this engine's domain" if mxfp8 else "requires TILE_CGA_M=1"
+        reason = "requires TILE_CGA_M=1"
         assert reason in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
 
@@ -888,7 +892,7 @@ def test_d256_config_honors_explicit_scheduler(mxfp8, sched_policy):
     ids=["per_tensor_lpt_l2", "block_scale_lpt"],
 )
 def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
-    name = engines.engine_name(mxfp8=True) if mxfp8 else "sdpa_fwd_sm100_d256_fp8_single_q"
+    name = "sdpa_fwd_sm100_d256_mxfp8_single_q" if mxfp8 else "sdpa_fwd_sm100_d256_fp8_single_q"
     facts = _facts(
         s_q=8192,
         d_qk=256,
@@ -912,7 +916,7 @@ def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
     does not hold whole 128-row SF atoms the page-size clause.  The SM100 MXFP8 row, which serves THD and pools, is
     untouched."""
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    rubin, sm100 = caps[engines.engine_name(mxfp8=True, arch="sm107")], caps[engines.engine_name(mxfp8=True)]
+    rubin, sm100 = caps[engines.engine_name(mxfp8=True, arch="sm107")], caps["sdpa_fwd_sm100_d128_mxfp8_multi_q"]
     thd_leg = "THD (ragged) rides the packed native-tile leg on this engine (shapes [(256, 256)]); the head-dim envelope is dense-only"
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
     thd = dict(thd=True, padded=True, **quant)
@@ -934,7 +938,7 @@ def test_sm100_mxfp8_row_serves_a_ragged_mask_free_kv_tail():
     predicate selects that graph and not a covered causal tail or real per-batch lengths; the split gate keeps it
     unsplit."""
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    sm100 = caps[engines.engine_name(mxfp8=True)]
+    sm100 = caps["sdpa_fwd_sm100_d128_mxfp8_multi_q"]
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
     ragged = dict(s_q=2100, s_kv=2100, causal=False, **quant)
     assert sm100.skv_tail_via_padding
@@ -993,7 +997,7 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
     from cudnn.sdpa.fwd.heuristics import _sched_points
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    mx_name, fp8_name = engines.engine_name(mxfp8=True), "sdpa_fwd_sm100_d128_fp8_multi_q"
+    mx_name, fp8_name = "sdpa_fwd_sm100_d128_mxfp8_multi_q", "sdpa_fwd_sm100_d128_fp8_multi_q"
     quant = dict(s_q=8192, h_q=24, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16)
     for h_kv in (8, 24):  # GQA 3 and no GQA, both measured
         mx = _facts(is_mxfp8=True, h_kv=h_kv, **quant)
@@ -1012,7 +1016,11 @@ def test_d128_mxfp8_causal_primary_uses_measured_scheduler():
         fp8_long = _facts(is_fp8=True, h_kv=h_kv, **{**quant, "s_q": 65536, "s_kv": 65536})
         assert _sched_points(caps[fp8_name], fp8_long) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL], h_kv
     # Scope: d128 only, SM100 row only, causal only.
-    assert _sched_points(caps[mx_name], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert _sched_points(caps["sdpa_fwd_sm100_d192_mxfp8_multi_q"], _facts(is_mxfp8=True, h_kv=8, d_qk=192, d_v=128, **quant)) == [
+        SCHED_LPT_L2,
+        SCHED_LPT,
+        SCHED_NATURAL,
+    ]
     rubin_mx = caps[engines.engine_name(mxfp8=True, arch="sm107")]
     rubin_fp8 = caps[engines.engine_name(fp8=True, arch="sm107")]
     assert _sched_points(rubin_mx, _facts(is_mxfp8=True, h_kv=8, device_cc=(10, 7), **quant)) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
@@ -1061,8 +1069,10 @@ def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
 
 @pytest.mark.L0
 def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
+    from cudnn.sdpa.fwd.kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
     name = engines.engine_name(mxfp8=True)
-    offered = {name: 20510}
+    offered = {name: 20510, d512_mxfp8.SLICE_RECOMPUTE: 20552, d512_mxfp8.RETAINED_P: 20553}
     base = dict(
         s_q=8192,
         d_qk=512,
@@ -1079,6 +1089,7 @@ def test_d512_mxfp8_primary_uses_measured_scheduler(sm107_metadata_target):
     assert (causal[0].knobs.cga, causal[0].knobs.sched_policy) == (1, 1)
     assert (dense[0].knobs.cga, dense[0].knobs.sched_policy) == (1, 0)
     assert (thd[0].knobs.cga, thd[0].knobs.sched_policy) == (1, 0)
+    assert {plan.engine_id for plan in causal + dense + thd} == {20552}
 
     rubin_name = engines.engine_name(mxfp8=True, arch="sm107")
     rubin = recommend("A", _facts(device_cc=(10, 7), **base), {rubin_name: 20511})
@@ -1626,8 +1637,10 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
             assert (p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa, p.knobs
             spec = next(s for s in engines.ENGINE_SPECS if _RUBIN_OFFERED.get(s.name) == p.engine_id)
             assert engines.mismatch(spec.capabilities, facts, p.knobs) is None
-    plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), _RUBIN_OFFERED)
-    assert plans and {p.engine_id for p in plans} == {_RUBIN_OFFERED[_RUBIN_FP8]}
+    fp8_owner = "sdpa_fwd_sm107_d256_fp8_single_q"
+    offered = dict(_RUBIN_OFFERED, **{fp8_owner: _SDPA_FWD_FAMILY.offered_ids()[fp8_owner]})
+    plans = recommend("A", _facts(h_q=8, h_kv=2, **fp8), offered)
+    assert plans and {p.engine_id for p in plans} == {offered[fp8_owner]}
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
@@ -2214,10 +2227,10 @@ def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
 @pytest.mark.L0
 @pytest.mark.parametrize("quant", ["fp8", "mxfp8"])
 def test_quantized_thd_proposals_are_admissible(quant):
-    name = "sdpa_fwd_sm100_d128_fp8_multi_q" if quant == "fp8" else engines.engine_name(**{quant: True})
+    name = f"sdpa_fwd_sm100_d128_{quant}_multi_q"
     facts = _facts(thd=True, padded=True, s_q=2048, dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, **{"is_" + quant: True})
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
-    plans = recommend("A", facts, {name: 20527 if quant == "fp8" else 20510})
+    plans = recommend("A", facts, {name: 20527 if quant == "fp8" else 20550})
     assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
 
 
@@ -2403,10 +2416,12 @@ def test_sm107_fp8_d128_proposes_admissible_pack_sets(sm107_metadata_target, b, 
         device_cc=(10, 7),
         device_sm_count=216,
     )
-    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_FP8]]
+    name = "sdpa_fwd_sm107_d128_fp8_multi_q"
+    offered = {name: _SDPA_FWD_FAMILY.offered_ids()[name]}
+    plans = recommend("A", facts, offered)
     assert plans
     assert any(p.knobs.pack_gqa for p in plans) is (h_q != h_kv), [p.knobs for p in plans]
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_FP8)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
     import dataclasses
 

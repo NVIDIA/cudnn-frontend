@@ -244,7 +244,7 @@ def _check_dense(d, dv, dtype, output, monkeypatch, *, causal=False, bottom_righ
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" else f"{arch}/prefill_d256_fp8.py"
+    expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" else "sm107/d256_fp8_single_q/kernel.py"
     assert expected in seen and all(n.startswith(arch + "/") for n in seen), seen
     for name in ("q", "k", "v"):
         value = bufs[name]

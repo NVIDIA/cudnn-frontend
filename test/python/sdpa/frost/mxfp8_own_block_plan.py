@@ -9,7 +9,6 @@ import math
 import torch
 
 import cudnn
-from cudnn.sdpa.fwd import engines
 
 from frost_test_utils import _is_plan_for, make_dense_stats, select_engine
 from mxfp8_test_reference import _quantize
@@ -23,7 +22,7 @@ _PAYLOADS = ("q", "k", "v")
 
 _FP8 = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2}
 _ITYPE = {"e4m3": cudnn.data_type.FP8_E4M3, "e5m2": cudnn.data_type.FP8_E5M2}
-_PIN = engines.engine_name(arch="sm100", mxfp8=True)
+_PIN = "sdpa_fwd_sm100_d128_mxfp8_multi_q"
 
 
 class _Plan:

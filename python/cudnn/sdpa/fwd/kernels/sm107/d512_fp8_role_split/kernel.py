@@ -95,9 +95,11 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 # parameters travel as typed dataclasses). The loader injects
 # FROST_TEMPLATE_PARAMS before this body runs; the default keeps a plain
 # `import` usable as a standalone driver.
-from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d512
+from cudnn.sdpa.fwd.kernels.sm107.d512_fp8_role_split.config import TemplateParams, make_cfg_d512
 
-PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+TEMPLATE_NAME = "prefill_d512_fp8"
+
+PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
 CFG, _TMA = make_cfg_d512(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE

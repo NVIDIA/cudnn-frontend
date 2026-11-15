@@ -26,6 +26,7 @@ empty ranges, cga1, page sizes across the 128-row tile.
 import math
 import os
 
+from frost_test_utils import mxfp8_engine_name
 from frost_test_utils import fp8_engine_names, half_engine_names
 
 import pytest
@@ -2039,10 +2040,10 @@ def test_paged_graph_fp8_declines_off_contract():
 _PAGED_UNWIRED_KERNELS = [
     ("sm100/d192_fp8_multi_q/kernel.py", 0, 1),
     ("sm100/d512_f16_2x2/kernel.py", 2, 2),
-    ("sm107/prefill_d128_fp8.py", 0, 2),
+    ("sm107/d128_fp8_multi_q/kernel.py", 0, 2),
     ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
-    ("sm107/prefill_d256_fp8.py", 0, 1),
+    ("sm107/d256_fp8_single_q/kernel.py", 0, 1),
     ("sm107/prefill_d512_mxfp8.py", 0, 2),
 ]
 
@@ -2064,7 +2065,7 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", *rel.split("/"))
     params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=cta_mma)
-    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/prefill_d128_fp8.py" else "paged_kv is not wired"
+    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/d128_fp8_multi_q/kernel.py" else "paged_kv is not wired"
     with pytest.raises(ValueError, match=expected_error):
         load_template(path, params, tag=f"paged_unwired_probe_{rel.replace('/', '_')}")
 
@@ -2648,7 +2649,7 @@ def _run_graph_mxfp8(B, H, KH, P, max_pages, lens, hnd, *, want_split=None, **bu
     from cudnn.sdpa.fwd.engines import engine_name
 
     g, vp, Ob, stats_gpu, amax, ref_in = _build_mxfp8(B, H, KH, P, max_pages, lens, hnd, **build_kw)
-    name = engine_name(mxfp8=True)
+    name = mxfp8_engine_name("sm100", build_kw.get("d_qk", 256), build_kw.get("d_v", 256))
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -2979,7 +2980,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name(mxfp8=True))
+        return g is not None and offers_engine(g, mxfp8_engine_names())
 
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"

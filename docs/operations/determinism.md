@@ -106,6 +106,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_fp8`, FROST D128 dense `SWAP_AB=1` (at most eight live query rows per packed unit; fixed packing and split count) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; FP16/BF16 or FP8 O | Unsupported for this lowering | Supported (tested configurations) | Supported (tested configurations) |
 | `pygraph.sdpa` / `sdpa_fp8`, FROST D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | FP16/BF16; E4M3/E5M2 with FP32 tensor scales and BF16 O | Unverified by this suite | Supported (SM100, tested configurations); full SM103 suite unverified | Supported (tested configurations) |
 | `pygraph.sdpa_fp8`, FROST native D192/V128 and D256 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, FP32 tensor scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
+| `pygraph.sdpa_mxfp8`, explicit SM100 D64/D128, D192/V128 and D256 implementation records | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 or FP8 O | Unsupported for these engines | Unverified for general batch invariance; fixed-plan replay verified on SM100 and SM103 in the tested configurations | Unsupported for these engines |
 | `pygraph.sdpa_mxfp8`, FROST D128/D512 nonpaged THD with independent physical origins (unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unverified |
 | `pygraph.sdpa_mxfp8`, FROST D256 nonpaged THD with independent physical origins (CGA1, unsplit, unpacked) | fprop | E4M3/E5M2 Q/K/V, E8M0 block scales; BF16 O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Supported (tested configurations) |
 | `pygraph.sdpa` / standalone FROST D256 paged THD (CGA2, fixed PackGQA and split count, independent physical origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (SM100, tested configurations); SM103 execution unverified | Unsupported for this combined path |
@@ -117,6 +118,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+| `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;
@@ -198,6 +200,27 @@ checks preserve quantized payloads and scalar scales, and compare per-sequence
 O and Stats. Amax is a whole-batch reduction: repeated calls compare its bytes,
 while changed batches check its numerical value against the full batch reference.
 The paging addition does not add an FP8 paged backward path.
+The SM107 exact D512 public record names `sdpa_fwd_sm107_d512_fp8_role_split`
+(engine 20549). Its fixed-plan checks include independent THD origins, fresh
+bindings and retained CUDA Graph execution. Packing and split count remain
+fixed during byte comparisons; the implementation identity does not extend
+the numerical or cross-runtime guarantees of the table.
+
+Exact SM107 D192/V128 and D256 per-tensor FP8 use engines 20561 and 20562.
+Their fixed-record checks cover fresh bindings, retained captures, independent
+THD origins and dense packing/splits, including the bounded D192 single-CTA
+causal case and D256 sigmoid gate. Reference checks and replay/batch-byte
+checks pass on the qualified runtime; strict historical THD goldens are
+unavailable for that runtime. These identities preserve the existing math
+and do not promise equal bytes across split counts or softmax precisions.
+
+Exact SM107 D64/D128 per-tensor FP8 uses native multi-Q engine 20563;
+explicit dense D128 swap-AB uses 20564 with the existing shared device body.
+Fixed-record checks preserve rebuild, fresh bindings and retained capture
+across supported splits, while independent D128 THD origins and dense batch
+transformations keep their existing byte guarantees. Rebinding block-scaled
+D128 output includes its caller-owned scale-factor storage. Historical
+goldens remain unverified where the runtime has no matching baseline.
 
 The native D128 FP8 single-CTA split checks fix the plan's split count and
 packing, preserve quantized payloads, and compare O/Stats across fresh
@@ -214,6 +237,18 @@ association its bytes are identical. `GdnDecodeFused` writes the same bytes for
 a row alone and inside a batch under the entry's own picks.
 
 ## Required settings and precision limits
+
+- `grouped_gemm_glu_hadamard_wrapper_sm100` with `act_func="srelu"`: no deterministic
+  mode is needed for replay. The qualified case sets `tanh_clamp_scale` and
+  `rht_sign_mask`, covers both `use_tmem_post_rht_amax` paths, and uses unequal
+  expert sizes with one empty expert; C, D, Amax and PostRhtAmax keep identical
+  bytes across repeated calls under concurrent work on another stream. Batch
+  invariance is not established: Amax and PostRhtAmax are whole-expert
+  reductions and PostRhtAmax depends on 16-token block membership. Unclamped
+  SReLU D is additionally bit-identical to the activation recomputed from the
+  saved C for BF16 and FP16 C/D. The clamped path's approximate `tanh` is not
+  bitwise equal to a host `tanh`. Other activations and SM107 are not covered
+  by this row.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed

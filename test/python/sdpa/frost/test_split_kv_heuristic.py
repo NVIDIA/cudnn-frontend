@@ -360,14 +360,29 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_sm100_d512_role_split",
         "sdpa_fwd_sm100_d512_2x2",
         "sdpa_fwd_sm100_d512_fp8_role_split",
+        "sdpa_fwd_sm107_d512_fp8_role_split",
+        "sdpa_fwd_sm107_d192_fp8_multi_q",
+        "sdpa_fwd_sm107_d128_fp8_multi_q",
+        "sdpa_fwd_sm107_d128_fp8_swap_ab",
+        "sdpa_fwd_sm107_d256_fp8_single_q",
         "sdpa_fwd_sm100_d256_fp8_single_q",
         "sdpa_fwd_sm100_d192_fp8_multi_q",
         "sdpa_fwd_sm100_d128_fp8_multi_q",
         "sdpa_fwd_sm100_d128_fp8_dual_kv",
         "sdpa_fwd_sm100_d128_fp8_swap_ab",
         "sdpa_fwd_prefill_sm100_mxfp8",
+        "sdpa_fwd_sm100_d256_mxfp8_single_q",
+        "sdpa_fwd_sm100_d128_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d192_mxfp8_multi_q",
+        "sdpa_fwd_sm100_d512_mxfp8_slice_recompute",
         "sdpa_fwd_prefill_sm100_fp8",
         "sdpa_fwd_prefill_sm107",
+        "sdpa_fwd_sm107_d128_multi_q",
+        "sdpa_fwd_sm107_d192_multi_q",
+        "sdpa_fwd_sm107_d256_lookahead",
+        "sdpa_fwd_sm107_d256_swap_ab",
+        "sdpa_fwd_sm107_shared_single_q",
+        "sdpa_fwd_sm107_shared_d256_lookahead",
         "sdpa_fwd_sm107_d512_2x2",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm107_mxfp8",
@@ -1328,7 +1343,7 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     _fp32_partial_split() is unconditional for SM100, so a kernel that wires
     make_split_helpers WITHOUT the slot gets handed an argument it never
     declares -- a launch-time arity error on whatever shape happens to split.
-    That is exactly how sm100/prefill_d512_mxfp8 arrived: split-capable from the
+    That is exactly how the SM100 D512 MXFP8 body arrived: split-capable from the
     day it landed, written against the staged epilogue. Scanning the directory
     means the NEXT such kernel fails here instead of in production.
 
@@ -1340,7 +1355,7 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     from cudnn.sdpa.fwd import api_dsl
 
     # (mxfp8, d_shape) pairs the adapter deliberately keeps on half partials.
-    _SLOTLESS_FLAVORS = {"prefill_d512_mxfp8.py"}
+    _SLOTLESS_FLAVORS = {"d512_mxfp8_slice_recompute/kernel.py", "d512_mxfp8_retained_p/kernel.py"}
 
     kdir = pathlib.Path(api_dsl.__file__).parent / "kernels" / "sm100"
     assert kdir.is_dir(), f"kernel directory moved: {kdir}"
@@ -1355,15 +1370,17 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
             return "o_partial_ptr" in sig
         return "o_partial_f32" in src
 
-    for f in sorted(kdir.glob("prefill_*.py")):
+    # Explicit implementations keep their body in <implementation>/kernel.py.
+    for f in sorted([*kdir.glob("prefill_*.py"), *kdir.glob("*/kernel.py")]):
         src = f.read_text()
+        name = f.relative_to(kdir).as_posix()
         if "make_split_helpers" not in src:
             continue  # not split-capable, nothing to carry
         if has_slot(src):
             continue  # wired
-        if f.name in _SLOTLESS_FLAVORS:
+        if name in _SLOTLESS_FLAVORS:
             continue  # known, and excluded by _fp32_partial_split
-        offenders.append(f.name)
+        offenders.append(name)
 
     assert not offenders, (
         f"split-capable SM100 kernels with no o_partial_f32 slot: {offenders}. "

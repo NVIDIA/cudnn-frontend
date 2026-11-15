@@ -403,8 +403,9 @@ _SM100_MXFP8_KERNEL_FILES = {
     (64, 64): "sm100/prefill_d128_mxfp8.py",
     (192, 128): "sm100/prefill_d192_d128_mxfp8.py",
     (256, 256): "sm100/prefill_d256_mxfp8.py",
-    (512, 512): "sm100/prefill_d512_mxfp8.py",
+    (512, 512): "sm100/d512_mxfp8_slice_recompute/kernel.py",
 }
+_SM100_MXFP8_D512_RETAINED_P_KERNEL_FILE = "sm100/d512_mxfp8_retained_p/kernel.py"
 # Rubin (SM107) siblings.  Separate maps rather than entries in the SM100
 # ones: the lowerings genuinely diverge (dense K=64 FP8 MMA, 576-column TMEM,
 # version-1 tcgen05 SMEM descriptors for operands above 256 KiB), which is the
@@ -427,11 +428,11 @@ _SM107_KERNEL_FILES = {
 # the natives on themselves; config_sm107.sm107_f16_tile_width is the same pick as a function).
 _SM107_FLAVORS = ((32, 32),) + _SM100_FLAVORS
 _SM107_FP8_KERNEL_FILES = {
-    (512, 512): "sm107/prefill_d512_fp8.py",
-    (256, 256): "sm107/prefill_d256_fp8.py",
-    (192, 128): "sm107/prefill_d192_d128_fp8.py",
-    (128, 128): "sm107/prefill_d128_fp8.py",
-    (64, 64): "sm107/prefill_d128_fp8.py",
+    (512, 512): "sm107/d512_fp8_role_split/kernel.py",
+    (256, 256): "sm107/d256_fp8_single_q/kernel.py",
+    (192, 128): "sm107/d192_fp8_multi_q/kernel.py",
+    (128, 128): "sm107/d128_fp8_multi_q/kernel.py",
+    (64, 64): "sm107/d128_fp8_multi_q/kernel.py",
 }
 _SM107_MXFP8_KERNEL_FILES = {
     (512, 512): "sm107/prefill_d512_mxfp8.py",
@@ -965,6 +966,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     elif fp8:
         filename = _SM100_FP8_KERNEL_FILES[flavor] if pertensor else _SM100_MXFP8_KERNEL_FILES[flavor]
         tag = f"sdpa_fwd_sm100_{'fp8' if pertensor else 'mxfp8'}_{tag}"
+        if not pertensor and flavor == (512, 512):
+            from cudnn.sdpa.fwd.config_sm100 import d512_mxfp8_retains_p, make_cfg_d512_mxfp8
+
+            if d512_mxfp8_retains_p(make_cfg_d512_mxfp8(params)[0], params.split_kv):
+                filename, tag = _SM100_MXFP8_D512_RETAINED_P_KERNEL_FILE, f"{tag}_retained_p"
     elif flavor == (192, 128) and params.cta_mma == 1 and params.thd_varlen and not params.paged_kv:
         params = replace(params, single_q_head_dim=192)
         filename = _SM100_DECODE_KERNEL_FILE
@@ -1880,9 +1886,9 @@ class SdpaFwdDsl(APIBase):
           overrun the partial slab and the combine would read half words from
           fp32 bytes (garbage O, the first Rubin graph-path split showed exactly
           that); native per-tensor D256 prefill also uses FP32 partials.
-        * MXFP8 d512: sm100/prefill_d512_mxfp8 wires SplitHelpers but was
-          written against the staged epilogue, so it keeps half partials until
-          it is ported.
+        * MXFP8 d512: the sm100/d512_mxfp8_slice_recompute body wires SplitHelpers
+          but was written against the staged epilogue, so it keeps half partials
+          until it is ported (the retained-P body runs unsplit).
 
         Tracking the wired FLAVOR rather than the arch is what keeps this true
         to the kernels; test_every_split_capable_sm100_kernel_has_the_slot fails
@@ -4451,6 +4457,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     thd_decode_leg=self.thd_decode_leg,
                 ),
             )
+        if self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
+            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
+
+            auto_sched, auto_cga = select_d512_auto_knobs(params)
+            params = replace(
+                params,
+                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
+                cta_mma=auto_cga if self.cga is None else params.cta_mma,
+            )
+            params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         selected = getattr(self, "_selected_kernel", None)
         if selected is not None:
             # A replayed engine record already names its pipeline. Keep the
@@ -4465,16 +4481,6 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             params = replace(params, decode_quad=self._d64_decode_quad())
         if self._fp8_dual_kv_stream():
             params = replace(params, dual_kv_stream=True)
-        elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
-            from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
-
-            auto_sched, auto_cga = select_d512_auto_knobs(params)
-            params = replace(
-                params,
-                sched_policy=auto_sched if self.sched_policy is None else params.sched_policy,
-                cta_mma=auto_cga if self.cga is None else params.cta_mma,
-            )
-            params = canonicalize_d512_mxfp8_lowering(params, s_q=self.s_q_max, s_kv=self.s_k_max)
         if self.flavor == SM100_NATIVE_D576_SHAPE and not self._fp8:
             params = replace(params, mma_2x2=True)
         elif self.flavor == (512, 512) and not self._fp8:

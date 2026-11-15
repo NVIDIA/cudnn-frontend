@@ -78,9 +78,14 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
     from cudnn.sdpa.fwd.kernels.sm100.small_half_contract import in_domain as in_small_half_domain
     from cudnn.sdpa.fwd.kernels.sm100.d512_fp8_role_split.contract import LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
+    from cudnn.sdpa.fwd.kernels.sm100.d256_mxfp8_single_q.contract import LEGACY_ROW as MXFP8_LEGACY_ROW, in_domain as in_d256_mxfp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.d256_fp8_single_q.contract import in_domain as in_d256_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.d192_fp8_multi_q.contract import in_domain as in_d192_fp8_domain
     from cudnn.sdpa.fwd.kernels.sm100.small_fp8_contract import in_domain as in_small_fp8_domain
+    from cudnn.sdpa.fwd.kernels.sm107.d512_fp8_role_split import contract as sm107_d512_fp8
+    from cudnn.sdpa.fwd.kernels.sm107.d192_fp8_multi_q import contract as sm107_d192_fp8
+    from cudnn.sdpa.fwd.kernels.sm107.d256_fp8_single_q import contract as sm107_d256_fp8
+    from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_multi_q import contract as sm107_small_fp8
 
     from cudnn.sdpa.fwd.kernels.sm120.d512_f16_paired.contract import LEGACY_ROW as SM120_LEGACY_ROW, in_domain as in_sm120_paired_domain
 
@@ -93,6 +98,11 @@ def _unpacked_decode(row: str, facts) -> bool:
     from cudnn.sdpa.fwd.kernels.sm120.d512_fp8_paired import contract as fp8_wide
     from cudnn.sdpa.fwd.kernels.sm120.d512_mxfp8_paired import contract as mxfp8_wide
 
+    from cudnn.sdpa.fwd.kernels.sm100.d128_mxfp8_multi_q.contract import in_domain as in_small_mxfp8_domain
+    from cudnn.sdpa.fwd.kernels.sm100.d192_mxfp8_multi_q.contract import in_domain as in_mid_mxfp8_domain
+
+    if row == MXFP8_LEGACY_ROW and (in_d256_mxfp8_domain(facts) or in_small_mxfp8_domain(facts) or in_mid_mxfp8_domain(facts)):
+        caps = heuristics.sm100_legacy_policy_spec(row).capabilities
     from cudnn.sdpa.fwd.kernels.sm120 import half_exact_contract as sm120_half
     from cudnn.sdpa.fwd.kernels.sm120 import quantized_general_contract as sm120_quant_general
 
@@ -102,7 +112,11 @@ def _unpacked_decode(row: str, facts) -> bool:
     sm120_wide += tuple((row, sm120_quant_general.in_domain) for row in sm120_quant_general.LEGACY_ROWS)
     from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as sm80_half
 
-    sm120_wide += ((sm80_half.LEGACY_ROW, sm80_half.in_domain),)
+    sm120_wide += ((sm80_half.LEGACY_ROW, sm80_half.in_domain), (sm107_d512_fp8.LEGACY_ROW, sm107_d512_fp8.in_domain))
+    from cudnn.sdpa.fwd.kernels.sm100 import d512_mxfp8_contract as d512_mxfp8
+
+    sm120_wide += ((d512_mxfp8.LEGACY_ROW, d512_mxfp8.in_domain),)
+    sm120_wide += tuple((owner.LEGACY_ROW, owner.in_domain) for owner in (sm107_d192_fp8, sm107_d256_fp8, sm107_small_fp8))
     if (row == FP8_LEGACY_ROW and (in_d512_fp8_domain(facts) or in_d256_fp8_domain(facts) or in_d192_fp8_domain(facts) or in_small_fp8_domain(facts))) or any(
         row == legacy and in_domain(facts) for legacy, in_domain in sm120_wide
     ):
