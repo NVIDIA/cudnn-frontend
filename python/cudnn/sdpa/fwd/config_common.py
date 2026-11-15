@@ -431,7 +431,7 @@ def _validate_params(
         # The one body that reads the field is the MXFP8 d128 prefill (dense, unpadded, unpaged).
         if k.causal_exclude_own_block != 32:
             raise ValueError(f"{flavor}: causal_exclude_own_block must be 32 (the MXFP8 V scale block); got {k.causal_exclude_own_block}")
-        # (The per-tensor FP8 d128 body shares this factory; it refuses the field at load, see prefill_d128_fp8.py.)
+        # (Per-tensor FP8 shares this factory; d128_fp8_{multi_q,dual_kv}/kernel.py refuse the field at load.)
         if not fp8 or flavor != "d128" or k.d_flavor != 128 or k.pv_bf16:
             raise ValueError(f"{flavor}: causal_exclude_own_block is served by the MXFP8 d128 prefill body only")
         # bottom_right is admitted for the square case only (S_q == S_kv: a zero diagonal offset); the adapter checks the shapes.
