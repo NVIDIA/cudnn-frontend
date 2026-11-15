@@ -69,6 +69,7 @@ HEAD_DIM = 128
 ENGINE = "GdnHopperCudaEngine"
 STATE_ITEM = HEAD_DIM * HEAD_DIM * 4  # one fp32 [128, 128] state, bytes
 MAX_GRID_Y = 65535  # CUDA's limit on a launch grid's y extent
+_DLPACK_CUDA = 2  # DLDeviceType kDLCUDA, as VariantPack.observed_device reports it
 
 # (device, is_bwd) -> why the kernels could not be compiled or loaded there. The op builds a graph
 # per distinct token count, so without this an environment that cannot compile or cache would
@@ -111,10 +112,18 @@ class _GdnHopperCudaPlanBase(CompiledPlan):
                 raise ValueError(
                     f"{ENGINE}: {name} has shape {tuple(view.shape)}, but the plan was built for {want}; execute-time shape changes are not supported"
                 )
+        # Checked on every call, not only the first: a plan that has run on its build device must still refuse
+        # an execute that moved. The views are made for the execute's device, so that is checked, and so is
+        # every operand whose producer reported a CUDA device (DLPack kDLCUDA).
+        if self._build_device is not None:
+            if variant_pack.device != self._build_device:
+                raise ValueError(f"{ENGINE}: the operands are on cuda:{variant_pack.device}, but the plan was built for cuda:{self._build_device}")
+            for name, index in zip(self.names, self.indices):
+                kind, ordinal = variant_pack.observed_device(index)
+                if kind == _DLPACK_CUDA and ordinal != self._build_device:
+                    raise ValueError(f"{ENGINE}: {name} is on cuda:{ordinal}, but the plan was built for cuda:{self._build_device}")
         if self._device is None:
             self._device = torch.from_dlpack(views[0]).device
-        if self._build_device is not None and self._device.index != self._build_device:
-            raise ValueError(f"{ENGINE}: the operands are on cuda:{self._device.index}, but the plan was built for cuda:{self._build_device}")
         return views
 
     def _slab(self, cursor, stream, zero):

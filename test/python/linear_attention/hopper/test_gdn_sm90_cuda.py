@@ -850,19 +850,30 @@ def test_new_shapes_after_warm_up_never_compile(monkeypatch):
 
 @pytest.mark.L0
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2 or not _hopper(), reason="needs two Hopper GPUs")
-def test_a_plan_built_for_one_device_refuses_another():
-    """Rule 4: the plan's kernels were loaded for the device build_plan saw; operands on another device raise."""
+@pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
+def test_a_plan_built_for_one_device_refuses_another(backward):
+    """Rule 4: the plan's kernels were loaded for the device build_plan saw. An execute on another device, or one
+    whose operands live on another device, raises, and keeps raising after the plan has run on its own device."""
     from cudnn.linear_attention.ops import common
 
     lengths, heads = [200, 56], 4
     with torch.cuda.device(0):
-        graph, ports = _graph(False, sum(lengths), len(lengths), heads, with_state=False)
+        graph, ports = _graph(backward, sum(lengths), len(lengths), heads, with_state=False)
         workspace = common.graph_workspace(graph, torch.device("cuda:0"))
+        # Warm the plan up on its own device first: the check must hold on every call, not only the first.
+        tensors, cu, d_out = make_case(lengths, heads, "init")
+        home, outs = _pack(ports, tensors, cu, d_out)
+        graph.execute(home, workspace, handle=common.get_handle(torch.device("cuda:0")))
+        torch.cuda.synchronize(0)
+        assert torch.isfinite(outs["dQ" if backward else "O"].float()).all()
     with torch.cuda.device(1):
         tensors, cu, d_out = make_case(lengths, heads, "init")
-        pack, _ = _pack(ports, tensors, cu, d_out)
+        foreign, _ = _pack(ports, tensors, cu, d_out)
         with pytest.raises(ValueError, match="the plan was built for cuda:0"):
-            graph.execute(pack, workspace.to("cuda:1"), handle=common.get_handle(torch.device("cuda:1")))
+            graph.execute(foreign, workspace.to("cuda:1"), handle=common.get_handle(torch.device("cuda:1")))
+    with torch.cuda.device(0):  # the execute on the plan's device, the operands on the other one
+        with pytest.raises(ValueError, match="is on cuda:1, but the plan was built for cuda:0"):
+            graph.execute(foreign, workspace, handle=common.get_handle(torch.device("cuda:0")))
 
 
 # ----------------------------------------------------------------------------- inputs the gate does not bound
