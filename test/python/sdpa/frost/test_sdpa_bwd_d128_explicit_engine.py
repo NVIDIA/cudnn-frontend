@@ -54,7 +54,8 @@ def test_recompute_preserves_domain_and_default_order(monkeypatch, cc, d, profil
 @requires_bwd_engine_row(RECOMPUTE_OWNER)
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
-def test_public_recompute_record_rebuild_ignores_legacy_selection(monkeypatch, d, dtype_name):
+@pytest.mark.parametrize("left", [None, 17])
+def test_public_recompute_record_rebuild_ignores_legacy_selection(monkeypatch, d, dtype_name, left):
     import torch
 
     from cudnn.sdpa.bwd import api_dsl_sm100_d128 as legacy
@@ -65,11 +66,21 @@ def test_public_recompute_record_rebuild_ignores_legacy_selection(monkeypatch, d
 
     monkeypatch.setattr(legacy, "select_implementation", forbidden)
     dtype = getattr(torch, dtype_name)
-    case = helper._case(dt=dtype, d=d, deterministic=True, causal=True)
+    case = helper._case(dt=dtype, d=d, deterministic=True, causal=True, left=left)
     record = case.graph.get_engine_and_knobs_at_index(case.graph._plan_index)
     assert record == (20628, {})
     expected = [case.tensors[name].clone() for name in ("dq", "dk", "dv")]
-    graph, refs, outputs = helper._half_bwd_graph(b=1, hq=2, sq=65, skv=129, d=d, dt=dtype, use_causal_mask=True, use_deterministic_algorithm=True)
+    graph, refs, outputs = helper._half_bwd_graph(
+        b=1,
+        hq=2,
+        sq=65,
+        skv=129,
+        d=d,
+        dt=dtype,
+        use_causal_mask=True,
+        use_deterministic_algorithm=True,
+        **({"diagonal_band_left_bound": left} if left is not None else {}),
+    )
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plan(*record)
