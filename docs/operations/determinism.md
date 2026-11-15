@@ -977,8 +977,11 @@ Backward uses separate kernels and is outside this forward-path change.
 The small and medium half forward engines name their main implementation
 before compilation. Their public engine/knob records retain that implementation
 on replay; this is an identity contract, not a numerical determinism guarantee.
-Native replay and batch-invariance qualification of the newly registered owners
-is **Unverified** until their architecture-specific execution checks are complete.
+The explicit-record tests cover native output, rebuilding, fresh bindings and
+retained CUDA Graph replay on SM107 with FP16 and BF16. They retain two strict
+expected failures for the existing shared D256 nonpaged split independent-origin
+gap; compact nonpaged split is covered positively. General batch invariance of
+the newly registered owners remains **Unverified** by this qualification.
 Existing SDPA status rows retain their documented scopes. In particular, neither
 registration nor host-only configuration equality establishes a general
 Stats-stride-override or batch-invariance claim.

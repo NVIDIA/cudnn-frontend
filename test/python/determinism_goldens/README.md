@@ -6379,10 +6379,22 @@ they do not launch a GPU or compare output bytes. The configuration audit
 compares the real registered admission and host adapters with the legacy
 loader, including complete configuration/TMA records.
 
-The new owners' native output/replay/batch-invariance checks remain pending.
-Existing native body tests and cross-compiled PTX equality do not by themselves
-qualify these new graph records. No numerical tolerance, golden hash, runtime
-skip or deterministic status is changed by this checkpoint.
+At that registration checkpoint the new owners' native output/replay and
+batch-invariance checks were pending. Existing body tests and cross-compiled
+PTX equality alone do not qualify new graph records.
+
+The integrated implementation revision subsequently passed 53 focused checks
+on SM107, CUDA 13.4, CuTe DSL 4.8 and cuDNN 9.30. These cover public-record
+reconstruction, fresh bindings, retained capture, both output-stride binders,
+and score/gate admission. Two strict expected failures retain the existing
+shared D256 nonpaged split independent-origin gap reproduced on the parent;
+compact split is covered positively. A preceding focused revision passed 38
+paged lookup, physical-origin, stride and dead-row checks, with 15 architecture
+scope skips. The runs are partly overlapping and are not a full-pool claim.
+
+No numerical tolerance or historical golden changed. These tests establish
+only their explicit output and lifecycle checks; they do not add a general
+batch-invariance or Stats-stride-override declaration.
 
 ### SM100 explicit MXFP8 implementation records — 2026-11-15
 
