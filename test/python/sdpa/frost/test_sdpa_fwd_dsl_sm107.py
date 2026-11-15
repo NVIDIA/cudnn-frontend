@@ -136,7 +136,7 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
     for f in files:
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
-        name = os.path.basename(f)
+        name = os.path.relpath(f, directory)
         if "row_max_for_exp2(" in code and "running_max_step_finite_sentinel(" not in code:
             continue  # the -inf-masked twin alone (the 2x2 bodies)
         # sm107/prefill_d128_f16.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
@@ -151,7 +151,10 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         }, f"{name}: the first operand must be the RAW tile max: {calls}"
         for frag in ("is_first = total_max ==", "update_cond = is_first", "exp_input = ", "new_total_max = total_max"):
             assert frag not in code, f"{name}: the inlined running-max chain {frag!r} remains beside the shared helper"
-        seen_shared += 1
+        # Keep the original twelve-file inventory check while validating every
+        # isolated implementation above with exactly the same helper assertions.
+        if os.path.dirname(f) == directory:
+            seen_shared += 1
     assert (
         seen_shared == 12
     ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; the sm107 d128 f16 file counts through its plain body) take the helper; saw {seen_shared}"
