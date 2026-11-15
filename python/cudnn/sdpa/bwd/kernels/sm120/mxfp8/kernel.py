@@ -15,7 +15,7 @@ from cutlass.experimental import primitives as nvvm
 from cudnn.frost.tile_dsl.mma import mma_m16n8k32_mxf8_f32
 from cudnn.frost.tile_dsl.pointwise import fmax_f32, fp32_to_fp8x2, amax_to_ue8m0_rp
 from cudnn.frost.tile_dsl.sf_layout import sf_atom_byte, sf_atom_offset
-from cudnn.sdpa.bwd.kernels.sm120.bprop_fp8 import _word, _column_word, _store
+from cudnn.sdpa.bwd.kernels.sm120._fp8_common import _word, _column_word, _store
 
 FP8 = cutlass.Float8E4M3FN
 SPEC = globals().get("FROST_TEMPLATE_PARAMS", (128, 128, False, True, 0, "sm120"))

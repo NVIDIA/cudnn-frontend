@@ -52,7 +52,8 @@ def _compiler_targets_available(monkeypatch):
 
 # Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
 # (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
-_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p"})
+# The SM80 D64 body likewise serves only the plain aligned corner its selector names; test_sdpa_bwd_explicit_engines pins it.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64"})
 
 
 def _rows():
@@ -102,7 +103,8 @@ def _dims(kind: str, caps):
     for pair in pairs:
         if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, *pair))) is None:
             return pair
-    return pairs[0]
+    # A row that delegated every body it would select keeps only its policy, as above; its explicit engines are sampled.
+    return None if caps.delegated else pairs[0]
 
 
 def declaration_reason(kind: str, caps, facts) -> Optional[str]:
