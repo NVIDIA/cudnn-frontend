@@ -12,8 +12,9 @@ from cuda.bindings import driver
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.frost.template_loader import load_template
 from cudnn.sdpa.bwd.d128_contract import ABI_VERSION
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_accum_fp8 import host as accumulation_host
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d128_fp8_helpers import cast_dq_fp8_host, delta_zero_fp8_host
+from cudnn.sdpa.bwd.kernels.sm100.d128_fp8_accumulation.kernel import host as accumulation_host
+from cudnn.sdpa.bwd.kernels.sm100.d128_fp8_accumulation.helpers import cast_dq_fp8_host, delta_zero_fp8_host
+from cudnn.sdpa.bwd.kernels.sm100.d128_fp8_accumulation import contract as accumulation
 
 HEAD_DIM = globals().get("FROST_TEMPLATE_PARAMS", 128)
 
@@ -154,8 +155,10 @@ def compile_host(geometry, regions, grad_dtype, causal, sm, amax_requested, wind
         raise ValueError("the fp8 accumulation kernel serves a sliding window at d64 only")
     if HEAD_DIM == 64:
         here = Path(__file__)
-        accumulation_host = load_template(str(here.with_name("bprop_d128_accum_fp8.py")), (64, int(window)), tag=f"sdpa_bwd_d64_fp8_accum_w{int(window)}").host
-        helpers = load_template(str(here.with_name("bprop_d128_fp8_helpers.py")), 64, tag="sdpa_bwd_d64_fp8_helpers")
+        accumulation_host = load_template(
+            str(here.parent.parent / accumulation.KERNEL_FILE), (64, int(window)), tag=f"sdpa_bwd_d64_fp8_accum_w{int(window)}"
+        ).host
+        helpers = load_template(str(here.parent.parent / accumulation.HELPERS_FILE), 64, tag="sdpa_bwd_d64_fp8_helpers")
         cast_dq_fp8_host, delta_zero_fp8_host = helpers.cast_dq_fp8_host, helpers.delta_zero_fp8_host
     types = [cutlass.Float8E4M3FN] * 5 + [cutlass.Float32] + [grad_dtype] * 3
     args = [cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=4 if i == 5 else 16) for i, t in enumerate(types)]
