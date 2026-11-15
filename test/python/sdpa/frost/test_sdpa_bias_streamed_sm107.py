@@ -40,7 +40,6 @@ import test_sdpa_bias_sm107 as _s13
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _ROW = "sdpa_fwd_prefill_sm107"
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "d128_f16_multi_q" / "kernel.py"
 _RENDERINGS = Path(__file__).resolve().parent / "renderings"
 # (head-dim tile, cga, pair item?) -> the deepest streamed ring the carveout holds beside the operands (0 = no ring).
 _RING = {(32, 1, False): 3, (32, 1, True): 3, (64, 1, False): 0, (64, 1, True): 3, (64, 2, False): 2}
