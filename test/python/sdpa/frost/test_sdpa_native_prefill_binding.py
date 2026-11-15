@@ -32,18 +32,18 @@ def _prefill_fixture(dq, dv, paged, split, dtype, hnd=False, arch="sm100"):
         strides = tuple(st // 128 * dim for st in f.strides[:-1]) + (1,)
         span = sum((n - 1) * st for n, st in zip(shape, strides)) + 1
         facts[role] = f._replace(shape=shape, strides=strides, span=span)
-    stem = "prefill_d192_d128_f16" if dq == 192 else f"prefill_d{max(128, dq)}_f16"
-    path = Path(prep.__file__).parent / "kernels" / arch / (stem + ".py")
-    if arch == "sm100" and dq in (64, 128):
-        path = path.parent / "d128_f16_multi_q/kernel.py"
-    if arch == "sm100" and dq == 192:
-        path = path.parent / "d192_f16_multi_q/kernel.py"
-    if arch == "sm100" and dq == 256:
-        path = path.parent / "d256_f16_lookahead/kernel.py"
-    if arch == "sm100" and dq == 512:
-        path = path.parent / "d512_f16_role_split/kernel.py"
+    directory = Path(prep.__file__).parent / "kernels" / arch
     if arch == "sm120":
-        path = path.with_name("prepared_host.py")
+        path = directory / "prepared_host.py"
+    else:
+        folders = {
+            64: "d128_f16_multi_q",
+            128: "d128_f16_multi_q",
+            192: "d192_f16_multi_q",
+            256: "d256_f16_lookahead",
+            512: "d512_f16_role_split",
+        }
+        path = directory / folders[dq] / "kernel.py"
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == ("host" if arch == "sm120" else "_host"))
     s.order = [arg.arg for arg in host.args.args if arg.annotation is None or "Constexpr" not in ast.unparse(arg.annotation)]
     s.index = {name: i for i, name in enumerate(s.order)}
