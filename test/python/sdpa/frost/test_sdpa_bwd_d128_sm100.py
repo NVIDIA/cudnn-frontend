@@ -16,6 +16,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _ENGINE = "sdpa_bwd_sm100_d128"
 _RECOMPUTE_ENGINE = "sdpa_bwd_sm100_d128_recompute"
 _PAIR_ENGINE = "sdpa_bwd_sm100_d128_pair"
+_ACCUMULATION_ENGINE = "sdpa_bwd_sm100_d128_accumulation"
 # The GPU rows run on every part the row declares (its sm range: the SM100 line and, since the Rubin admission, cc 10.7 -- the bodies are
 # compiled per device, ``--gpu-arch sm_{cc}a``), read from the row; a pre-Rubin gate here would skip the one lane that proves the sm_107a body.
 requires_d128_part = requires_bwd_engine_row(_ENGINE)
@@ -190,7 +191,7 @@ def _case(
         use_deterministic_algorithm=deterministic,
         **({"diagonal_band_left_bound": left} if left is not None else {}),
     )
-    select_engine(graph, {"recompute": _RECOMPUTE_ENGINE, "pair": _PAIR_ENGINE}.get(implementation, _ENGINE))
+    select_engine(graph, {"recompute": _RECOMPUTE_ENGINE, "pair": _PAIR_ENGINE, "accumulation": _ACCUMULATION_ENGINE}[implementation])
     before = torch.cuda.memory_allocated()
     if check_build:
         torch.cuda.set_sync_debug_mode("error")

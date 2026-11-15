@@ -50,6 +50,8 @@ _SM107_D512 = "SdpaBwdDslSm107D512"
 _SM100_D128 = "SdpaBwdDslSm100D128"
 _SM100_D128_RECOMPUTE = "SdpaBwdDslSm100D128Recompute"
 _SM100_D128_PAIR = "SdpaBwdDslSm100D128Pair"
+_SM100_D128_ACCUMULATION = "SdpaBwdDslSm100D128Accumulation"
+_SM100_D128_ACCUMULATION_TWO_CTA = "SdpaBwdDslSm100D128AccumulationTwoCTA"
 _SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
 _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
@@ -68,6 +70,14 @@ def _adapter(name: str):
         from .kernels.sm100.d256_f16_2x2 import host
 
         return getattr(host, name)
+    if name == _SM100_D128_ACCUMULATION:
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.host import SdpaBwdDslSm100D128Accumulation
+
+        return SdpaBwdDslSm100D128Accumulation
+    if name == _SM100_D128_ACCUMULATION_TWO_CTA:
+        from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum_2cta.host import SdpaBwdDslSm100D128AccumulationTwoCTA
+
+        return SdpaBwdDslSm100D128AccumulationTwoCTA
     if name == _SM100_D128_PAIR:
         from cudnn.sdpa.bwd.kernels.sm100.d128_f16_pair.host import SdpaBwdDslSm100D128Pair
 
@@ -2310,9 +2320,32 @@ def _sm100_d128_spec() -> EngineSpec:
             gqa=True,
             declaration_check=_sm100_d128_declaration_mismatch,
             select_implementation=_sm100_d128_implementations,
-            delegated=frozenset({"sdpa_bwd_sm100_d128_recompute", "sdpa_bwd_sm100_d128_pair"}),
+            delegated=frozenset(
+                {"sdpa_bwd_sm100_d128_recompute", "sdpa_bwd_sm100_d128_pair", "sdpa_bwd_sm100_d128_accumulation", "sdpa_bwd_sm100_d128_accumulation_2cta"}
+            ),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM100_D128),
+    )
+
+
+def _sm100_d128_accumulation_spec() -> EngineSpec:
+    from .d128_selection import ACCUMULATION_OWNER
+
+    return explicit_engine(_sm100_d128_spec(), ACCUMULATION_OWNER, partial(lower_dsl_bwd, api_type=_SM100_D128_ACCUMULATION), deterministic=False)
+
+
+def _sm100_d128_accumulation_two_cta_spec() -> EngineSpec:
+    from .d128_selection import TWO_CTA_OWNER
+
+    return explicit_engine(
+        _sm100_d128_spec(),
+        TWO_CTA_OWNER,
+        partial(lower_dsl_bwd, api_type=_SM100_D128_ACCUMULATION_TWO_CTA),
+        d=frozenset({128}),
+        dtypes=frozenset({cudnn.data_type.BFLOAT16}),
+        deterministic=False,
+        swa=False,
+        band=None,
     )
 
 
@@ -2652,6 +2685,8 @@ ENGINE_SPECS = (
     _sm100_d128_spec(),
     _sm100_d128_recompute_spec(),
     _sm100_d128_pair_spec(),
+    _sm100_d128_accumulation_spec(),
+    _sm100_d128_accumulation_two_cta_spec(),
     _sm107_d192_spec(),
     _sm100_d128_fp8_spec(),
     _sm100_d128_fp8_pair_spec(),

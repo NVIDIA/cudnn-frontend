@@ -204,6 +204,14 @@ of the dense-only `seq_q_lens_present` flag: bind against the compiled spec,
 validate ordinary B or cumulative B+1 storage, and reject uncompiled operands.
 A graph-only test misses a direct-API operand silently dropped by that flag.
 
+When narrowing a backward owner's legacy mask flags with `dataclasses.replace`,
+pass `band=None` to recompute its normalized band declaration. Otherwise the
+copied `BandSupport` still advertises the parent's masks. The band matrix must
+sample each owner's actual non-mask domain (for example grouped heads for the
+two-CTA backward body and D64 for the one-CTA body's sliding window).
+`test_every_row_carries_a_normalized_band_support` and
+`test_unmasked_baseline_is_accepted_by_every_row` detect these mismatches.
+
 **Rule S2 — A change to FROST SDPA graph eligibility updates the affected
 architecture section under [frost/support/](frost/support/README.md) in the same commit.**
 

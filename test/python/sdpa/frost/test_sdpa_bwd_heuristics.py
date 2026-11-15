@@ -46,6 +46,8 @@ _OFFERED = {
     "sdpa_bwd_sm100_d128": 20609,
     "sdpa_bwd_sm100_d128_recompute": 20628,
     "sdpa_bwd_sm100_d128_pair": 20629,
+    "sdpa_bwd_sm100_d128_accumulation": 20630,
+    "sdpa_bwd_sm100_d128_accumulation_2cta": 20631,
     "sdpa_bwd_sm120_f16_fused": 20618,
     "sdpa_bwd_sm80_f16_d64": 20619,
     "sdpa_bwd_sm80_f16_two_subgroup": 20620,
@@ -148,7 +150,7 @@ def test_sm100_d256_row_lists_one_knobless_entry_on_the_sm100_line(monkeypatch, 
     if listed:
         assert [p.engine_id for p in plans] == [20607]
         assert 20607 not in [p.engine_id for p in recommend("A", _facts(d_qk=512, d_v=512, device_cc=cc), _OFFERED)]
-        expected = [20609, 20628, 20629] if cc in ((10, 0), (10, 3)) else [20628]
+        expected = [20630, 20628, 20629] if cc in ((10, 0), (10, 3)) else [20628]
         assert [p.engine_id for p in recommend("A", _facts(d_qk=128, d_v=128, device_cc=cc), _OFFERED)] == expected
         assert recommend("A", _facts(d_qk=256, d_v=256, s_q=1, device_cc=cc), _OFFERED) == []
 
@@ -173,12 +175,12 @@ def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
 
     monkeypatch.setattr(bwd_engines, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.8.0")))
     facts = _facts(device_cc=cc)
-    expected = [(20609, None), (20628, None)] if cc in ACCUMULATION_CCS else [(20628, None)]
+    expected = [(20630, None), (20628, None)] if cc in ACCUMULATION_CCS else [(20628, None)]
     if cc in ((10, 0), (10, 3)):
         expected.append((20629, None))
     assert [(p.engine_id, p.knobs) for p in recommend("A", facts, _OFFERED)] == expected
     grouped = recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.BFLOAT16), _OFFERED)
-    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20609, None)] if cc in ACCUMULATION_CCS else [])
+    assert [(p.engine_id, p.knobs) for p in grouped] == ([(20630, None), (20631, None)] if cc in ACCUMULATION_CCS else [])
     assert ((10, 7) in ACCUMULATION_CCS) and ((10, 6) not in ACCUMULATION_CCS)  # the admitted parts are named, the envelope's hypothetical ccs are not
     assert recommend("A", _facts(device_cc=cc, h_kv=2, dtype=cudnn.data_type.HALF), _OFFERED) == []
 
@@ -193,7 +195,7 @@ def test_sm100_d128_dense_owners_keep_default_order(monkeypatch, cc):
         ((10, 0), 512, [20626, 20627]),
         ((10, 3), 512, [20626, 20627]),
         ((10, 7), 256, [20632]),
-        ((10, 7), 128, [20609, 20628]),  # accumulation default, followed by explicit recompute; never the d512 row
+        ((10, 7), 128, [20630, 20628]),  # accumulation default, followed by explicit recompute; never the d512 row
         ((11, 0), 128, []),  # d128 past the d128 row's range (SM100-107): no python row
         ((12, 0), 512, [20621]),  # SM120's two-subgroup body
     ],
@@ -252,7 +254,7 @@ def test_sm100_d128_leads_the_backend_only_on_unwindowed_d128_thd(monkeypatch):
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert not family.slots["sdpa_bwd_sm100_d128"].opt_in
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    eid = _OFFERED["sdpa_bwd_sm100_d128"]
+    eid = _OFFERED["sdpa_bwd_sm100_d128_accumulation"]
     monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered: [PlanConfig(eid, None)])
 
     def order(**over):

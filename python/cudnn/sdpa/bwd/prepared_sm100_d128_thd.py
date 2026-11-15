@@ -156,7 +156,7 @@ def compile_plan(api):
     import torch
 
     from cudnn.frost.device import compute_capability, resolve_device
-    from .kernels.sm100.prepared_d128_host import compile_host_thd as compile_host
+    from .kernels.sm100.d128_f16_accum.prepared_host import compile_host_thd as compile_host
 
     b, h = api.batch_size, api.h_q
     operands = []
@@ -201,7 +201,7 @@ def compile_plan(api):
         api._thd_workspace_bytes,
         device,
         api.scale_softmax,
-        api._NAME,
+        getattr(api, "_BINDING_NAME", api._NAME),
         length_form=True,
         roles=THD_ROLES,
         attributes=THD_ATTRIBUTES,
