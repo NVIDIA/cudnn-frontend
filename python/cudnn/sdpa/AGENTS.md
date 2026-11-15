@@ -1921,3 +1921,11 @@ valid. If a row restates an adapter's own body test on facts, test the two
 against each other. Detectors: `test_sdpa_bwd_explicit_engines.py` covers the
 partition, legal-tuple ranking, identities and
 `test_sm80_selector_is_the_adapters_d64_rule`.
+
+Moving a body into its implementation directory changes what a relative import
+resolves against (`from . import _bprop_mxfp8_masks` in `sm100/d256_mxfp8/`
+looked in the new package). An AST comparison of the moved file passes, and
+host suites never import template bodies, so import every moved module
+(`importlib.import_module`) before the GPU run. After delegating a row, diff
+failing test ids across every file under `test/python/sdpa` against the parent:
+row-name pins in band, admission and GPU suites do not match a `*bwd*` glob.

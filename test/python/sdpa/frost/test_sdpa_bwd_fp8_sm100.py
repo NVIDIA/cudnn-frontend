@@ -22,16 +22,16 @@ _GRAD_DTYPES = [torch.float8_e4m3fn, torch.bfloat16]
 
 @pytest.fixture
 def sm100_row(monkeypatch):
-    """Point the Rubin fp8 suite's helpers at this row."""
-    monkeypatch.setattr(_rubin, "_ENGINE", _ENGINE)
+    """Point the Rubin fp8 suite's helpers at this row's D128 body, which the row delegates to the pair engine."""
+    monkeypatch.setattr(_rubin, "_ENGINE", "sdpa_bwd_sm100_d128_fp8_pair")
     monkeypatch.setattr(_rubin, "_D", _D)
     return _rubin
 
 
 @pytest.fixture
 def sm100_row_d64(monkeypatch):
-    """The same row at head dimension 64."""
-    monkeypatch.setattr(_rubin, "_ENGINE", _ENGINE)
+    """The same row at head dimension 64, which it delegates to the accumulation engine."""
+    monkeypatch.setattr(_rubin, "_ENGINE", "sdpa_bwd_sm100_d128_fp8_accumulation")
     monkeypatch.setattr(_rubin, "_D", 64)
     return _rubin
 
