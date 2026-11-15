@@ -225,7 +225,6 @@ def test_fixed_host_owns_its_geometry(owner, cga, query_tiles):
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("cga", [1, 2])
 def test_thd_body_boundaries_are_explicit(paged, cga):
-    import cudnn
     from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from cudnn.sdpa.fwd.kernels.sm100.d192_f16_multi_q import contract as multi
