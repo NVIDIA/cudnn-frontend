@@ -48,7 +48,8 @@ _KERNELS = {
     ("mxfp8", (128, 128)): ("prefill_d128_mxfp8.py", 2),
     ("mxfp8", (192, 128)): ("prefill_d192_d128_mxfp8.py", 3),
     ("mxfp8", (256, 256)): ("prefill_d256_mxfp8.py", 3),
-    ("mxfp8", (512, 512)): ("prefill_d512_mxfp8.py", 3),
+    ("mxfp8", (512, 512)): ("d512_mxfp8_slice_recompute/kernel.py", 3),
+    ("mxfp8_swa", (512, 512)): ("d512_mxfp8_retained_p/kernel.py", 3),  # exact top-left SWA of one KV tile, unsplit
     ("decode", (128, 128)): ("decode_d128_f16.py", 2),  # the key-sharded softmax arm of the d64 quadrant tile (``QUAD``) is the second site
     ("bwd", (512, 512)): ("bprop_d512_f16.py", 1),
 }
@@ -76,6 +77,8 @@ def _load(kind, flavor):
     # the d128 f16 flavor would select the decode kernel above), cga1 where that is the only width (fp8 d256, mxfp8 d512).
     cta_mma = max(supported_cgas_for(flavor, fp8=fp8, device_cc=(10, 0), pertensor=pertensor))
     params = TemplateParams(dtype_qkv=_E4M3 if fp8 else _BF16, dtype_o=_BF16, cta_mma=cta_mma)
+    if kind == "mxfp8_swa":
+        params = replace(params, window_left=127, window_right=0)
     if kind == "f16" and flavor == (192, 128):
         from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
         from cudnn.sdpa.fwd.kernels.sm100.d192_f16_multi_q.contract import Geometry, KERNEL_FILE, NAME
