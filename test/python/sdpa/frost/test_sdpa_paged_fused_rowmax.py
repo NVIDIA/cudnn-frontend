@@ -84,7 +84,7 @@ def test_paged_rowmax_architecture_replay(dtype, packed):
     route = api._k_mod.__file__
     assert api._k_mod.CFG.PAGED_KV and api._k_mod.CFG.THD_VARLEN
     if cc == (10, 7):
-        assert route.endswith("sm107/prefill_d128_f16.py"), route
+        assert route.endswith("sm107/d128_f16_multi_q/kernel.py"), route
         native_source = inspect.getsource(api._k_mod)
         assert "tmem_load_max_reduction_tile(" in native_source
         assert "_tmem_load_max_reduction(" in native_source

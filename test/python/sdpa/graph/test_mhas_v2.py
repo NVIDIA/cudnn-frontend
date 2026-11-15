@@ -3834,7 +3834,8 @@ def _p2_frost(cfg, request, cudnn_handle, *, cga=None, pin=None):
     if request.config.option.dryrun:
         return None
     served, knobs = frost_routing.LAST_PLAN
-    assert served == engine and knobs is not None, frost_routing.LAST_PLAN
+    owner = "sdpa_fwd_sm107_d128_multi_q" if cfg.d_qk == 128 else "sdpa_fwd_sm107_shared_d256_lookahead"
+    assert served == owner and knobs is not None, frost_routing.LAST_PLAN
     assert knobs.split_kv in (None, 1), f"this route pins an unsplit plan, yet the served plan was {knobs}"
     print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy}")
     return knobs
