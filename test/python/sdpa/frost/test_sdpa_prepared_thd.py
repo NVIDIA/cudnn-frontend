@@ -2779,7 +2779,10 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         }
         if "_default_cga" in geometry:
             chosen.pop(cudnn.knob_type.TILE_CGA_M)
-        g.create_execution_plan(engine, chosen)
+        # Final split geometry owns the implementation; the unsplit ranked
+        # record can name multi-Q, which does not serve small-head THD split.
+        chosen_engine = 20532 if arch == "sm100" and d in (64, 128) and splits > 1 else engine
+        g.create_execution_plan(chosen_engine, chosen)
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
         if "mha" in geometry.split("_"):

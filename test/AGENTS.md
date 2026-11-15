@@ -75,6 +75,11 @@ The band matrix synthesizes facts: include current Q/K/V/O declarations so
 mandatory native-binding validation cannot hide the band decision. Explicit
 pins in shared helpers must migrate both the engine ID and physical cluster
 knob; updating architecture-local body tests alone misses these consumers.
+When a fixture changes an unsplit record into a split record, select its
+implementation after computing the final knobs. Small-head SM100 paged THD
+split uses single-Q even when the ranked unsplit candidate used multi-Q.
+`test_paged_thd_split_capture_lengths_and_stats` covers that transition,
+including default cluster, packed heads, Stats layouts and retained replay.
 
 For explicitly requested temporary skips, limit them to known failing cases,
 use a `skip until fix` reason, retain the failure report, and remove them with the fix.
