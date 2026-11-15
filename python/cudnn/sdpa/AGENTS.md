@@ -1930,3 +1930,10 @@ host suites never import template bodies, so import every moved module
 (`importlib.import_module`) before the GPU run. After delegating a row, diff
 failing test ids across every file under `test/python/sdpa` against the parent:
 row-name pins in band, admission and GPU suites do not match a `*bwd*` glob.
+
+After moving a body, search both its retired path and its basename across
+`docs`, `python` and `test` (for example, `git grep -n retired_kernel.py --
+docs python test`). Operation pages may spell the filename differently from
+loader constants, so a loader-only replacement can miss a current reference.
+Update current documentation; preserve frozen historical tracker entries and
+existing diagnostic labels.
