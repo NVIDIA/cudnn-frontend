@@ -92,7 +92,7 @@ def test_deterministic_request_selects_the_pair(monkeypatch, d, left):
 
 def test_dkdv_body_is_fixed_and_width_ratio_split_remain_local():
     from cudnn.frost.template_loader import load_template
-    from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_f16 as shipped
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum import kernel as shipped
     from cudnn.sdpa.bwd.kernels.sm100.d128_f16_pair import kernel_dkv
 
     pytest.importorskip("cutlass")
