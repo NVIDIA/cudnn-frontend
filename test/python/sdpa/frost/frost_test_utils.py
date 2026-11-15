@@ -760,7 +760,7 @@ def run_d512_delayed_observer(tmp_path, engine):
         def delayed(path, params, tag="template"):
             p = Path(path)
             relative = p.relative_to(Path(api_dsl.__file__).parent / "kernels").as_posix()
-            expected = "sm107/bprop_d512_f16_2x2.py" if engine == "sdpa_bwd_sm107_d512" else "sm100/d512_f16_2x2/kernel.py"
+            expected = "sm107/d512_f16_2x2/kernel.py" if engine == "sdpa_bwd_sm107_d512" else "sm100/d512_f16_2x2/kernel.py"
             if relative == expected:
                 source = p.read_text()
                 begin = source.index("def _ldg_kv_tile(")

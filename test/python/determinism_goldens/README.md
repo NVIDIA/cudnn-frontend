@@ -4,6 +4,45 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Fixed SM107 D512 backward implementation (2026-11-15)
+
+Engine 20608 retains its public record, the D264–D512 aligned envelope,
+workspace and reduction order. Its body, host, contract and fixed ring
+configuration now live together in `sm107/d512_f16_2x2`; the old adapter
+module re-exports the same class. All 31 moved device function/class ASTs
+are unchanged. The graph still declines deterministic mode and packed THD.
+
+On native cc 10.7 with cuDNN 9.30, CuTe DSL 4.8, CUDA 13.4 compilation and
+Torch 2.14.1+cu130, frozen source `8abfcd5b8` passed the following selections.
+The exact import path, compiler target and all frozen source hashes were
+checked before pytest. Run these files from `test/python` with `-m L0`:
+
+| Suite in `sdpa/frost/` | Result |
+|---|---|
+| `test_sdpa_bwd_d512_sm107.py` | 104 passed; 2 SASS checks skipped because nvdisasm was unavailable |
+| `test_sdpa_bwd_sm107_d512_implementation.py` | 6 passed: FP16/BF16, D384 GQA and D512 MHA/GQA, public record rebuild, fresh bindings and changed-input CUDA Graph replay |
+| `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_explicit_engines.py`, `test_sdpa_bwd_heuristics.py` | 269 host-contract checks passed on the GPU worker |
+
+After integrating the D128 pair parent, source `ecbdf5e8b` added
+`test_sdpa_bwd_sm107_d512_determinism.py`. Its four FP16/BF16 cases use
+D384 GQA (4/2 heads) and D512 MHA (4/4), causal S=257. Each checks all three
+gradients against a separate reference, finite results, unmodified inputs,
+fresh poisoned storage and eight replays with concurrent work. It compares
+the same sequence alone, in a batch of three, reordered and duplicated,
+and after changing only a neighbor's upstream gradient.
+
+All four cases passed before recording new goldens. A separate process then
+passed all four again with `CUDNN_DETERMINISM_RECORD` unset and
+`CUDNN_DETERMINISM_GOLDENS` pointing at the new records. The reviewed files
+are under runtime key `22fb9766a4ab5fdc`; no existing golden was replaced.
+The production implementation is identical between these two snapshots.
+
+These checks establish repeatability and batch isolation for the tested
+configurations, not general batch invariance across the engine's domain.
+Other GPU targets, the two SASS checks and the existing L1 time-slicing
+stress were not qualified by these runs. The existing L0 delayed-empty
+observer detector passed without changing its assertions.
+
 ### Explicit SM100 D512 half backward owners (2026-11-15)
 
 The role-split and 2x2 bodies moved without executable AST changes. Fixed

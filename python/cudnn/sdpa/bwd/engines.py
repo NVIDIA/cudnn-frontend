@@ -117,9 +117,9 @@ def _adapter(name: str):
         return api_dsl_sm100_d256.SdpaBwdDslSm100D256
     if name == _SM107_D512:
         # The cc 10.7 d512 half row: the SM100 large-head-dim chain's adapter over the cc 10.7 2x2-datapath stage 2.
-        from cudnn.sdpa.bwd import api_dsl_sm107_d512
+        from .kernels.sm107.d512_f16_2x2.host import SdpaBwdDslSm107D512
 
-        return api_dsl_sm107_d512.SdpaBwdDslSm107D512
+        return SdpaBwdDslSm107D512
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
@@ -2098,7 +2098,7 @@ def _sm107_d512_spec() -> EngineSpec:
 
     The SM100 large-head-dim chain (``_sm100_spec``: dot -> stage-2 S / dS workspaces -> the three ``bprop_matmul_blackwell``
     GEMMs at the (512, 512) tile -> the GQA fold) with stage 2 ALWAYS the **2x2-datapath** body
-    ``kernels/sm107/bprop_d512_f16_2x2.py`` at the cc 10.7 ring arm: two independent ``tcgen05.mma.cta_group::2`` pairs per
+    ``kernels/sm107/d512_f16_2x2/kernel.py`` at the cc 10.7 ring arm: two independent ``tcgen05.mma.cta_group::2`` pairs per
     (4,1,1) cluster, 64 q rows per CTA, both BMMs as SMEM SS operands, an 8-stage K / V chunk ring (SM100: 4) and two cast
     stages (SM100: 1) filling 320 of the line's 325 KiB usable SMEM, 256 TMEM columns, descriptor version 0 at zero margin.
     Its own row rather than a widened ``sdpa_bwd_sm100`` because Capabilities cannot vary per cc inside one row: the 4x1 role
@@ -2119,6 +2119,7 @@ def _sm107_d512_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_d512",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_d512",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
