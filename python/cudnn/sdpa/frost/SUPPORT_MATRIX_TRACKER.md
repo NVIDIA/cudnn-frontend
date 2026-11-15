@@ -330,7 +330,7 @@ graphs). The graph-level contract and the masked-row conventions of the other
 implementations are in `docs/operations/Attention.md`.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, the three fixed SM90 forward owners (20539/20540/20541), and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
 declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
 running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
@@ -367,7 +367,7 @@ unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
 directions, so a mode the graph requests by leaving a flag unset (unbounded
 right band, no left bound, top-left anchor) is part of the row's claim too.
 
-`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16),
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, the three fixed SM90 forward owners (20539/20540/20541, f16/bf16),
 `sdpa_fwd_prefill_sm100_fp8`, `sdpa_fwd_prefill_sm107_fp8` and `sdpa_fwd_prefill_sm120_fp8` (per-tensor FP8),
 `sdpa_fwd_prefill_sm107_mxfp8` (block-scale MXFP8, exact cc 10.7) and `sdpa_fwd_prefill_sm120_mxfp8` (block-scale MXFP8,
 cc 12.x) are default candidates, ranked against the backend per measured shard or qualification verdict
