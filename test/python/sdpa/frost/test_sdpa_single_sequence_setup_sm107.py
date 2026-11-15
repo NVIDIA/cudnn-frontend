@@ -23,7 +23,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
 
     def compile_native(api):
         original(api)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         observed.append(api.batch_size)
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)
@@ -34,7 +34,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
         True,
         packed,
         1,
-        engine_name="sdpa_fwd_prefill_sm107",
+        engine_name="sdpa_fwd_sm107_d128_multi_q",
         cga=cga,
         batch_override=1,
     )
@@ -50,7 +50,7 @@ def test_single_sequence_physical_origins(dim, dtype_name, cga, packed, monkeypa
         (128, "bfloat16", 1, True, 64),
     ],
 )
-def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engine_name="sdpa_fwd_prefill_sm107", paged=False, splits=1):
+def test_single_sequence_batch_bytes(dim, dtype_name, cga, packed, tile_n, engine_name="sdpa_fwd_sm107_d128_multi_q", paged=False, splits=1):
     import cudnn
     from cudnn.engines.manifest import family_for
 
@@ -253,9 +253,9 @@ def test_single_sequence_runtime_batch_guard(dim, monkeypatch):
     def compiled(api):
         compile_plan(api)
         assert api.batch_size == 4
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         seen.append(api.batch_size)
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compiled)
-    test_independent_thd_origins_rebind_and_capture(dim, "bfloat16", "token", True, False, 1, engine_name="sdpa_fwd_prefill_sm107", cga=1)
+    test_independent_thd_origins_rebind_and_capture(dim, "bfloat16", "token", True, False, 1, engine_name="sdpa_fwd_sm107_d128_multi_q", cga=1)
     assert seen

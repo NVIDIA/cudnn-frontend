@@ -18,19 +18,19 @@ def test_native_dense_partial_admission(group, monkeypatch):
     """A partial-group pin reaches the native tile and keeps other route boundaries."""
     import dataclasses
 
-    from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
+    from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts, _half_mismatch
 
     from cudnn.frost import buffers
     from cudnn.sdpa.fwd import engines
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    caps = _caps("sdpa_fwd_prefill_sm107")
+    caps = _caps("sdpa_fwd_sm107_d128_multi_q")
     facts = _f16_facts(h_q=group * 2, h_kv=2)
     knobs = engines.SdpaFwdKnobs(cga=2, pack_gqa=True, split_kv=1)
     for dims in ((128, 128), (64, 64), (96, 80)):
         f = dataclasses.replace(facts, d_qk=dims[0], d_v=dims[1])
-        assert engines.mismatch(caps, f, knobs) is None
-        assert engines.mismatch(caps, f, dataclasses.replace(knobs, split_kv=2)) is None
+        assert _half_mismatch(f, knobs) is None
+        assert _half_mismatch(f, dataclasses.replace(knobs, split_kv=2)) is None
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, cga=1)) is not None
     for changed in (dict(attn_scale_prefolded=True), dict(h_q=6), dict(d_qk=256, d_v=256), dict(has_paged_kv=True)):
         assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None
@@ -103,7 +103,8 @@ def test_native_dense_partial_graph_rebind(cudnn_handle, dtype_name, with_stats,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    index = next(i for i in range(g.get_execution_plan_count()) if g.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm107"))
+    owner = "sdpa_fwd_prefill_sm107" if dims == (96, 80) else "sdpa_fwd_sm107_d128_multi_q"
+    index = next(i for i in range(g.get_execution_plan_count()) if g.get_plan_name_at_index(i).split("[", 1)[0] == owner)
     engine, knobs = g.get_engine_and_knobs_at_index(index)
     # Pin the same tile knobs for native D64 and the larger flavors.
     chosen = {

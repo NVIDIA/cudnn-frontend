@@ -33,6 +33,17 @@ CASES = {
 GRAPH_CASES = [name for name, case in CASES.items() if case[2] <= case[3]]
 
 
+def _graph_owner(dims, cga, tile_n):
+    """Fixed graph body for the explicit sink/split fixtures below."""
+    if dims == (256, 256):
+        return "sdpa_fwd_sm107_d256_swap_ab"
+    if dims == (192, 128):
+        return "sdpa_fwd_sm107_d192_multi_q"
+    if dims in ((64, 64), (128, 128)):
+        return "sdpa_fwd_sm107_shared_single_q" if cga == 1 and tile_n == 128 else "sdpa_fwd_sm107_d128_multi_q"
+    return "sdpa_fwd_prefill_sm107"  # Non-native envelopes retain the old row.
+
+
 @pytest.mark.parametrize("case", GRAPH_CASES)
 def test_sink_split_graph_admission(case, monkeypatch):
     from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
@@ -45,8 +56,11 @@ def test_sink_split_graph_admission(case, monkeypatch):
         b=2, h_q=2 * group, h_kv=2, s_q=sq, s_kv=sk, d_qk=dims[0], d_v=dims[1], has_sink=True, causal=causal, bottom_right=causal, window_left=window
     )
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed, tile_m=128, tile_n=128, sched_policy=0)
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), facts, knobs) is None
-    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), dataclasses.replace(facts, has_epilogue_gate=True), knobs) is not None
+    if dims == (256, 256):
+        knobs = dataclasses.replace(knobs, cga=1, tile_m=16)
+    caps = _caps(_graph_owner(dims, cga, 128))
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_epilogue_gate=True), knobs) is not None
 
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
@@ -146,18 +160,18 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A])
-        idx = next(i for i in range(graph.get_execution_plan_count()) if graph.get_plan_name_at_index(i).startswith("sdpa_fwd_prefill_sm107"))
-        engine, knobs = graph.get_engine_and_knobs_at_index(idx)
-        knobs.update(
-            {
-                cudnn.knob_type.TILE_M: 128,
-                cudnn.knob_type.TILE_N: tile_n,
-                cudnn.knob_type.TILE_CGA_M: cga,
-                cudnn.knob_type.SPLIT_KV: splits,
-                cudnn.knob_type.PACK_GQA: int(packed),
-                cudnn.knob_type.SCHED_POLICY: 0 if dims == (192, 128) else 1,
-            }
-        )
+        from cudnn.engines.manifest import family_for
+
+        owner = _graph_owner(dims, cga, tile_n)
+        engine = family_for(graph).offered_ids(graph)[owner]
+        knobs = {
+            cudnn.knob_type.TILE_M: 16 if dims == (256, 256) else 128,
+            cudnn.knob_type.TILE_N: tile_n,
+            cudnn.knob_type.TILE_CGA_M: 1 if dims == (256, 256) else cga,
+            cudnn.knob_type.SPLIT_KV: splits,
+            cudnn.knob_type.PACK_GQA: int(packed),
+            cudnn.knob_type.SCHED_POLICY: 0 if dims in ((192, 128), (256, 256)) else 1,
+        }
         graph.create_execution_plan(engine, knobs)
         graph.select_plan(graph.get_execution_plan_count() - 1)
         graph.check_support()
@@ -171,6 +185,13 @@ def _check_sink_split(case, dtype_name, stats, *, graph_api, handle=None, tile_n
     if max(dims) <= 64 and cga == 1 and tile_n == 128 and (splits > 1 or api._d64_decode_tile()):
         kernel = "sm100/decode_d128_f16.py"
         assert api._k_mod.CFG.TILES_Q == 1
+    if graph_api and owner != "sdpa_fwd_prefill_sm107":
+        kernel = {
+            "sdpa_fwd_sm107_d128_multi_q": "sm107/d128_f16_multi_q/kernel.py",
+            "sdpa_fwd_sm107_shared_single_q": "sm100/d128_f16_single_q/kernel.py",
+            "sdpa_fwd_sm107_d192_multi_q": "sm107/d192_f16_multi_q/kernel.py",
+            "sdpa_fwd_sm107_d256_swap_ab": "sm107/d256_f16_swap_ab/kernel.py",
+        }[owner]
     assert api._k_mod.__file__.endswith(kernel), api._k_mod.__file__
     assert api._k_mod.CFG.SPLIT_KV == splits
     if max(dims) <= 64:
