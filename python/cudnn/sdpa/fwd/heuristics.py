@@ -3560,6 +3560,19 @@ def select_sm100_d256_geometry(facts, pack_gqa=False, *, pack_g=None):
     )
 
 
+def select_sm107_d512_geometry(facts, knobs):
+    """Resolve the native wide-half body before compile, preserving the old default."""
+    from .kernels.sm107.d512_half_contract import ROLE_SPLIT, TWO_BY_TWO, explicit_geometry
+
+    pack = bool(knobs.pack_gqa)
+    split = knobs.split_kv or 1
+    group = facts.h_q // facts.h_kv if pack else 1
+    two_by_two = facts.d_qk == 576 or (split == 1 and not facts.has_paged_kv and 64 % group == 0)
+    # Native dense packed, paged, split and mixed-KV plans already require 2x2.
+    two_by_two = two_by_two or not facts.uniform_dtype or (not facts.thd and (facts.has_paged_kv or pack or split > 1))
+    return explicit_geometry(TWO_BY_TWO if two_by_two else ROLE_SPLIT, facts)
+
+
 def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_g=1, prefer_two_by_two=True):
     """Central wide-half body choice; explicit implementation replay never calls it."""
     from .kernels.sm100.d512_f16_contract import D512Geometry, ROLE_SPLIT, TWO_BY_TWO
@@ -3710,6 +3723,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     autotuners) use this directly: build a ``SdpaGraphFacts``, pass the
     family's ``offered_ids()``, run or time the sets in order.
     """
+    from .kernels.sm107 import d512_half_contract as sm107_wide_half
+
+    if sm107_wide_half.in_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm107_d512_geometry, policy=sm100_legacy_policy_spec(sm107_wide_half.LEGACY_ROW))
     from .kernels.sm100.d256_f16_contract import in_pilot_domain
 
     if in_pilot_domain(facts):

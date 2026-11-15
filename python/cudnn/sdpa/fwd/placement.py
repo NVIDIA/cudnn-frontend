@@ -708,6 +708,18 @@ def place(spec, facts, knobs=None) -> str:
             return TRAIL
         spec = sm100_legacy_policy_spec()
 
+    from .kernels.sm107 import d512_half_contract as sm107_wide_half
+
+    if spec.capabilities.implementation in sm107_wide_half.IMPLEMENTATIONS:
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm107_d512_geometry
+
+        selected = select_sm107_d512_geometry(facts, knobs)
+        if selected.implementation != spec.capabilities.implementation or selected.query_tile != knobs.tile_m:
+            return TRAIL
+        spec = sm100_legacy_policy_spec(sm107_wide_half.LEGACY_ROW)
+
     if spec.capabilities.implementation in WIDE_IMPLEMENTATIONS:
         if knobs is None:
             return TRAIL

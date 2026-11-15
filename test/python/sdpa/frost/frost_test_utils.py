@@ -166,6 +166,8 @@ def half_engine_names(arch="sm100") -> tuple[str, ...]:
             "sdpa_fwd_sm100_d512_role_split",
             "sdpa_fwd_sm100_d512_2x2",
         )
+    if arch == "sm107":
+        return ("sdpa_fwd_prefill_sm107", "sdpa_fwd_sm107_d512_role_split", "sdpa_fwd_sm107_d512_2x2")
     if arch == "sm120":
         return (
             "sdpa_fwd_prefill_sm120",
