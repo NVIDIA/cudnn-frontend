@@ -13,7 +13,8 @@ from cudnn.sdpa.fwd import engines, heuristics
 
 pytestmark = pytest.mark.L0
 
-_CAPS = engines._sm80_spec().capabilities
+# The row's policy domain: the K-prefetch owner (20546) serves the shapes this module samples.
+_CAPS = heuristics.sm100_legacy_policy_spec("sdpa_fwd_prefill_sm80").capabilities
 _POINTS = [
     (d, dv, m, n)
     for d, dv, ms, ns in (
@@ -143,7 +144,7 @@ def test_default_and_scheduler_only_domains_stay_implicit(mode, causal):
         assert engines.effective_tile_ns(_CAPS, facts, knobs) == frozenset()
     assert engines.effective_cgas(_CAPS, facts) == frozenset()
     for kind in ("A", "FALLBACK"):
-        plans = heuristics.recommend(kind, facts, {"sdpa_fwd_prefill_sm80": 1})
+        plans = heuristics.recommend(kind, facts, {"sdpa_fwd_prefill_sm80": 1, "sdpa_fwd_sm80_f16_k_prefetch": 2})
         assert plans
         assert all(p.knobs.tile_m is p.knobs.tile_n is p.knobs.cga is None for p in plans)
 

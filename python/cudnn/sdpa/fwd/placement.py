@@ -654,9 +654,10 @@ def _d512_swa(facts) -> bool:
     )
 
 
-TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80"})
+TRAIL_ONLY_ROWS = frozenset({"sdpa_fwd_prefill_sm80", "sdpa_fwd_sm80_f16_k_prefetch", "sdpa_fwd_sm80_d256_kv_prefetch", "sdpa_fwd_sm80_wide_cooperative"})
 """Default-offered rows with no hand-written lead shard: offered after the backend's block, so they serve a graph only when
-the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph."""
+the backend declines it (a correctness fallback), unless a generated ``placement_table`` entry leads the graph. An SM80
+implementation engine inherits its row's policy."""
 
 
 def place(spec, facts, knobs=None) -> str:
@@ -767,6 +768,11 @@ def place(spec, facts, knobs=None) -> str:
 
     if spec.capabilities.implementation in (sm90_d64.NAME, sm90_three_wg.NAME, sm90_d128.NAME):
         spec = sm100_legacy_policy_spec(sm90_d64.LEGACY_ROW)
+
+    from .kernels.sm80 import half_flavor_contract as sm80_half
+
+    if spec.capabilities.implementation in sm80_half.IMPLEMENTATIONS:
+        spec = sm100_legacy_policy_spec(sm80_half.LEGACY_ROW)
 
     from .kernels.sm120 import quantized_general_contract as sm120_quant_general
 

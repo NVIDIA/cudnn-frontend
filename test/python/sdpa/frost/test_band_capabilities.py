@@ -51,8 +51,11 @@ def _compiler_targets_available(monkeypatch):
 
 
 def _rows():
-    """``[(kind, EngineSpec)]`` -- every row the registry actually ships."""
-    return [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
+    """``[(kind, EngineSpec)]`` -- every row the registry actually ships that serves some graph.
+
+    A legacy row whose explicit engines own its whole domain keeps only its policy, so it has no graph to sample."""
+    rows = [("fwd", spec) for spec in fwd_engines.ENGINE_SPECS] + [("bwd", spec) for spec in bwd_engines.ENGINE_SPECS]
+    return [(kind, spec) for kind, spec in rows if _dims(kind, spec.capabilities) is not None]
 
 
 def _probe(kind: str):
@@ -76,7 +79,7 @@ def _dims(kind: str, caps):
         shapes = sorted(tuple(s) for s in caps.d_shapes if tuple(s) not in delegated)
         if not shapes:
             # Explicit engines own every exact flavor; the legacy row keeps its padded envelopes. Exercise that domain.
-            return next((d, d) for d in range(120, 0, -8) if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, d, d))) is None)
+            return next(((d, d) for d in range(120, 0, -8) if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, d, d))) is None), None)
         # A smaller native flavor can support fewer features than the row's
         # full envelope (SM90 D64 versus D512). Sample the full envelope for
         # the row-wide band claims; dedicated flavor tests pin its restrictions.

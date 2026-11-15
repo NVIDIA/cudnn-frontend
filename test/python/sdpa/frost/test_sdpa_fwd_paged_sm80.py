@@ -10,7 +10,7 @@ import cudnn
 
 from cudnn.api_base import TensorDesc
 from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm80, _sm80_pick_flavor, _SM80_FLAVOR_DIMS
-from frost_test_utils import _SM, requires_dsl, select_engine
+from frost_test_utils import half_engine_names, _SM, requires_dsl, select_engine
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 80, reason="requires native SM80")]
 
@@ -179,7 +179,7 @@ def test_native_paged_adapter_rebind_replay(
         fe.validate()
         fe.build_operation_graph()
         fe.create_execution_plans([cudnn.heur_mode.A])
-        selected = select_engine(fe, "sdpa_fwd_prefill_sm80")
+        selected = select_engine(fe, half_engine_names("sm80"))
         if graph_knobs is not None:
             fe.create_execution_plan(selected.engine_id, graph_knobs)
             fe.select_plan(len(fe.plans) - 1)
