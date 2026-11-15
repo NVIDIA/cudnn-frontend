@@ -8,8 +8,8 @@ from cuda.bindings import driver
 
 from cudnn.frost.compiled_cache import compile_cached
 from cudnn.sdpa.bwd.d128_contract import ABI_VERSION
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_accum_f16 import host as accumulation_host
-from cudnn.sdpa.bwd.kernels.sm100.bprop_d192_helpers import cast_dq_d192_host, delta_zero_d192_host
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.kernel import host as accumulation_host
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.helpers import cast_dq_d192_host, delta_zero_d192_host
 
 
 @cute.jit

@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
 from cudnn.sdpa.bwd.prepared import ATTRIBUTES, ROLES, BwdLaunchSpec, Operand
-from .d128_contract import ACCUMULATION, workspace_layout
-from .prepared_sm100_d128 import _GuardedAccumulationEntry
+from cudnn.sdpa.bwd.d128_contract import ACCUMULATION, workspace_layout
+from cudnn.sdpa.bwd.prepared_sm100_d128 import _GuardedAccumulationEntry
 
 
 def compile_plan(api):
@@ -38,7 +38,7 @@ def compile_plan(api):
     cc = compute_capability(device)
     dtype = cutlass.BFloat16 if api.dtype == torch.bfloat16 else cutlass.Float16
     regions, required = workspace_layout(api.batch_size, api.h_q, api.s_q_max, api.head_dim_qk)
-    from .kernels.sm100.prepared_d192_accum_host import compile_host
+    from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.prepared_dense_host import compile_host
 
     with torch.cuda.device(device):
         entry = compile_host(tuple(geometry), regions, dtype, api.is_causal, cc[0] * 10 + cc[1])

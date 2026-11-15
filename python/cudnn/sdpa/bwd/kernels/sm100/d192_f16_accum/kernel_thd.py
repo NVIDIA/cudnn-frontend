@@ -14,8 +14,8 @@ from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload
 from cudnn.frost.tile_dsl.tma import tma_load_subtiles, tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
-from cudnn.sdpa.bwd.config_sm100_d192_accum import CFG
-from .bprop_d192_accum_f16 import (
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.config import CFG
+from cudnn.sdpa.bwd.kernels.sm100.d192_f16_accum.common import (
     _view,
     _bars,
     _operand,
