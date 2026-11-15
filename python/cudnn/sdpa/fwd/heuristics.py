@@ -3625,6 +3625,31 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     return MultiQ(d_flavor=facts.d_qk, cga=cga)
 
 
+def select_sm90_geometry(facts, knobs):
+    """Resolve the old candidate's body once; explicit replay never calls this."""
+    from .kernels.sm90.d64_f16_one_wg import contract as native
+    from .kernels.sm90.f16_three_wg import contract as three_wg
+    from .kernels.sm90.d128_f16_multi_q import contract as d128
+
+    if native.in_domain(facts):
+        return native.Geometry()
+    return d128.Geometry() if 128 in (knobs.tile_m, knobs.tile_n) else three_wg.Geometry()
+
+
+def select_sm100_d192_half_geometry(facts, knobs):
+    """Name the existing D192 body choice before entering a fixed engine."""
+    from .kernels.sm100.d192_half_contract import in_domain
+    from .kernels.sm100.d192_f16_multi_q.contract import Geometry as MultiQ
+    from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
+
+    if not in_domain(facts):
+        raise ValueError("D192 half selection requires exact SM100/SM103 D192/V128 half inputs")
+    cga = 2 if knobs.cga is None else knobs.cga
+    if facts.thd and not facts.has_paged_kv and cga == 1:
+        return SingleQ()
+    return MultiQ(cga=cga)
+
+
 def _recommend_sm100_implementation(kind, facts, offered, select_geometry, *, policy=None):
     """Retain the existing candidate budget/order, naming each actual body.
 
@@ -3695,6 +3720,10 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
 
     if in_wide_half_domain(facts):
         return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d512_geometry)
+    from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
+
+    if in_d192_half_domain(facts):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm100_d192_half_geometry)
     from .kernels.sm100.d512_fp8_role_split.contract import Geometry as Fp8D512Geometry, LEGACY_ROW as FP8_LEGACY_ROW, in_domain as in_d512_fp8_domain
 
     if in_d512_fp8_domain(facts):
@@ -3727,6 +3756,8 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
     if sm120_d256.in_domain(facts):
         # TILE_M names the body: the decode tile (16 / 32) or the all-compute D256 tile (64 / 128).
         return _recommend_sm100_implementation(kind, facts, offered, sm120_d256.select_geometry, policy=sm100_legacy_policy_spec(sm120_d256.LEGACY_ROW))
+    if facts.device_cc == (9, 0) and not (facts.is_fp8 or facts.is_mxfp8 or facts.is_backward):
+        return _recommend_sm100_implementation(kind, facts, offered, select_sm90_geometry, policy=sm100_legacy_policy_spec("sdpa_fwd_prefill_sm90"))
     out: List[PlanConfig] = []
     for engine_id, spec in _eligible(facts, offered):
         caps = spec.capabilities

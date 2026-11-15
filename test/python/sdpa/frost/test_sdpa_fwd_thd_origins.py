@@ -71,6 +71,8 @@ def test_independent_thd_origins_rebind_and_capture(
     d_qk, d_v = dim if isinstance(dim, tuple) else (dim, dim)
     if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (256, 256):
         engine_name = "sdpa_fwd_sm100_d256_lookahead"
+    if engine_name == "sdpa_fwd_prefill_sm100" and (d_qk, d_v) == (192, 128):
+        engine_name = "sdpa_fwd_sm100_d128_single_q" if cga == 1 else "sdpa_fwd_sm100_d192_multi_q"
     if sm120:
         from frost_test_utils import sm120_owner
 

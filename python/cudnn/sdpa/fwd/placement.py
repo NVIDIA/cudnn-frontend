@@ -683,6 +683,8 @@ def place(spec, facts, knobs=None) -> str:
     from .kernels.sm100.d128_fp8_multi_q.contract import NAME as SMALL_FP8_MULTI_Q
     from .kernels.sm100.d128_fp8_dual_kv.contract import NAME as SMALL_FP8_DUAL_KV
     from .kernels.sm100.d128_fp8_swap_ab.contract import NAME as SMALL_FP8_SWAP_AB
+    from .kernels.sm100.d192_f16_multi_q.contract import NAME as D192_HALF_MULTI_Q
+    from .kernels.sm100.d128_f16_single_q.contract import NAME as HALF_SINGLE_Q
 
     from .kernels.sm120.d512_f16_paired.contract import NAME as SM120_D512_PAIRED, LEGACY_ROW as SM120_LEGACY_ROW
 
@@ -719,6 +721,16 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in (D512_FP8_ROLE_SPLIT, D256_FP8_SINGLE_Q, D192_FP8_MULTI_Q):
         spec = sm100_legacy_policy_spec(FP8_LEGACY_ROW)
 
+    if spec.capabilities.implementation in (D192_HALF_MULTI_Q, HALF_SINGLE_Q):
+        if knobs is None:
+            return TRAIL
+        from .heuristics import select_sm100_d192_half_geometry
+
+        selected = select_sm100_d192_half_geometry(facts, knobs)
+        if selected.implementation != spec.capabilities.implementation:
+            return TRAIL
+        spec = sm100_legacy_policy_spec()
+
     if spec.capabilities.implementation in (SMALL_FP8_MULTI_Q, SMALL_FP8_DUAL_KV, SMALL_FP8_SWAP_AB):
         if knobs is None:
             return TRAIL
@@ -749,6 +761,13 @@ def place(spec, facts, knobs=None) -> str:
     if spec.capabilities.implementation in sm120_d256.IMPLEMENTATIONS:
         spec = sm100_legacy_policy_spec(sm120_d256.LEGACY_ROW)
 
+    from .kernels.sm90.d64_f16_one_wg import contract as sm90_d64
+    from .kernels.sm90.f16_three_wg import contract as sm90_three_wg
+    from .kernels.sm90.d128_f16_multi_q import contract as sm90_d128
+
+    if spec.capabilities.implementation in (sm90_d64.NAME, sm90_three_wg.NAME, sm90_d128.NAME):
+        spec = sm100_legacy_policy_spec(sm90_d64.LEGACY_ROW)
+
     if facts.causal and not facts.bottom_right and facts.s_q == facts.s_kv:
         # A square causal mask covers the same tiles from either corner (placement_table.class_key reads it the same way);
         # a shallow copy, as dataclasses.replace re-runs every field's init.
@@ -764,8 +783,9 @@ def place(spec, facts, knobs=None) -> str:
     if spec.name == "sdpa_fwd_prefill_sm100":
         from .kernels.sm100.d256_f16_contract import in_pilot_domain
         from .kernels.sm100.d512_f16_contract import in_domain as in_wide_half_domain
+        from .kernels.sm100.d192_half_contract import in_domain as in_d192_half_domain
 
-        if in_pilot_domain(facts) or in_wide_half_domain(facts):
+        if in_pilot_domain(facts) or in_wide_half_domain(facts) or in_d192_half_domain(facts):
             # Historical study queries can still use the old row name. Its
             # class and hand-rule fallback must use the same policy domain.
             spec = sm100_legacy_policy_spec()

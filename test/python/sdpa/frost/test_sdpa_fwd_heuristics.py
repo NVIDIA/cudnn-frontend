@@ -43,12 +43,14 @@ _OFFERED = {
     SWAP_AB: 20520,
     ROLE_SPLIT: 20521,
     TWO_BY_TWO: 20522,
+    "sdpa_fwd_sm100_d192_multi_q": 20531,
+    "sdpa_fwd_sm100_d128_single_q": 20532,
     "sdpa_fwd_sm100_d512_fp8_role_split": 20523,
     "sdpa_fwd_sm100_d256_fp8_single_q": 20524,
     "sdpa_fwd_sm100_d192_fp8_multi_q": 20525,
     **_SMALL_FP8,
 }
-_HALF_IDS = (20500, 20519, 20520, 20521, 20522)
+_HALF_IDS = (20500, 20519, 20520, 20521, 20522, 20531, 20532)
 
 
 @pytest.fixture
@@ -517,7 +519,7 @@ def test_sm120_packs_a_gqa_ratio_the_tile_does_not_divide(row):
     assert not pack_gqa_supported(128, 1, 64, requires_divisible=False) and not pack_gqa_supported(24, 5, 64, requires_divisible=False)
     assert not pack_gqa_supported(24, 4, 64)  # the full-ratio contract the other rows keep
     assert caps.pack_gqa_requires_divisible is False
-    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm90"):
+    for other in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_sm90_f16_three_wg"):
         assert _sm120_spec(other).capabilities.pack_gqa_requires_divisible, other
     assert _sm120_spec("sdpa_fwd_prefill_sm80").capabilities.pack_gqa_requires_divisible is False
 
@@ -1010,7 +1012,7 @@ def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
     from cudnn.sdpa.fwd.heuristics import _SM100_D192_LPT_MAX_WAVES, _sched_points
 
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
-    f16 = caps[engines.engine_name()]
+    f16 = caps["sdpa_fwd_sm100_d192_multi_q"]
     d192 = dict(d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16, device_sm_count=148)
 
     def points(b, h, s, **over):
@@ -1031,7 +1033,7 @@ def test_sm100_d192_f16_causal_primary_follows_the_wave_count():
     assert points(2, 96, 4096, device_cc=(10, 0)) == lpt_l2  # 20.8 waves, 192 streams
     assert points(2, 96, 4096, device_cc=(10, 3)) == natural
     plans = recommend("A", _facts(b=2, h_q=64, h_kv=64, s_q=2048, s_kv=2048, **d192), _OFFERED)
-    lead = next(p for p in plans if p.engine_id == 20500)
+    lead = next(p for p in plans if p.engine_id == 20531)
     assert (lead.knobs.split_kv, lead.knobs.cga, lead.knobs.sched_policy) == (1, 2, SCHED_LPT), lead.knobs
 
 
@@ -1307,7 +1309,7 @@ def test_sm100_d192_half_proposals_are_admissible_and_transport_the_chooser(monk
     ways).  Which width wins where is the chooser's measured business, not a contract of this test."""
     from cudnn.sdpa.fwd import heuristics as heur
 
-    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm100_d192_multi_q")
 
     def facts(**over):
         base = dict(b=8, h_q=64, h_kv=64, d_qk=192, d_v=128, dtype=cudnn.data_type.BFLOAT16)
@@ -1317,7 +1319,7 @@ def test_sm100_d192_half_proposals_are_admissible_and_transport_the_chooser(monk
     for s in (128, 256, 384, 512, 768, 1024, 1280, 1792, 2048):
         for causal in (True, False):
             f = facts(s_q=s, s_kv=s, causal=causal)
-            plans = [p for p in recommend("A", f, _OFFERED) if p.engine_id == 20500]
+            plans = [p for p in recommend("A", f, _OFFERED) if p.engine_id == 20531]
             assert plans, (s, causal)
             for p in plans:
                 assert engines.mismatch(spec.capabilities, f, p.knobs) is None, (s, causal, p.knobs)
@@ -1325,7 +1327,7 @@ def test_sm100_d192_half_proposals_are_admissible_and_transport_the_chooser(monk
     for forced in ((SCHED_LPT, 1), (SCHED_NATURAL, 2)):
         # The split leg keeps the real chooser's answer (the pair): only the unsplit lead is forced.
         monkeypatch.setattr(heur, "select_d192_auto_knobs", lambda params, _forced=forced, **kw: _forced if params.split_kv == 1 else (SCHED_NATURAL, 2))
-        lead = [p for p in recommend("A", facts(s_q=640, s_kv=640), _OFFERED) if p.engine_id == 20500][0]
+        lead = [p for p in recommend("A", facts(s_q=640, s_kv=640), _OFFERED) if p.engine_id == 20531][0]
         assert (lead.knobs.sched_policy, lead.knobs.cga) == forced
 
 

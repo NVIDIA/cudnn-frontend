@@ -1,5 +1,20 @@
 # FROST SDPA — support matrix
 
+**SM90 fixed implementation ownership — 2026-11-14**
+
+`sdpa_fwd_sm90_d64_one_wg` (20539) owns the existing nonpaged native D64
+FP16/BF16 subset. `sdpa_fwd_sm90_f16_three_wg` (20540) owns the existing
+64 x 64 tile domain: exact D64 paged KV, wider native heads and bounded
+head envelopes, with the same dense/THD/paged/split/packing restrictions.
+`sdpa_fwd_sm90_d128_multi_q` (20541) owns the dedicated dense 128 x 128
+D128 pipeline. Each public record fixes its body; shared binding, caching
+and launch services remain common.
+
+Legacy ID 20517 is retired, reserved and never reused. Old recipes must
+replan. The historical policy remains private solely to preserve ordered
+candidates and placement study keys. No graph feature, numerical contract,
+policy threshold or selected-plan Stats-stride behavior note is added.
+
 **Plan behavior notes:** `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` is declared per
 graph/config for admitted override-enabled half THD plans with packed HN Stats
 and the matching prepared binder on qualified SM100/SM103 devices. SM107 and
@@ -101,6 +116,20 @@ swap-AB records that differed only in an unused scheduler are canonicalized.
 Old exact-width recipes must be replanned. No new numerical or behavior-note
 guarantee accompanies this ownership migration.
 
+**SM100/SM103 exact half D192/V128 implementation engines:**
+`sdpa_fwd_sm100_d192_multi_q` (20531) owns the multi-Q pipeline with
+TILE_M=128 and one/two-CTA internal variants. K-subtile release granularity
+and the coupled K/V ring depths remain internal configuration of this body.
+`sdpa_fwd_sm100_d128_single_q` (20532) initially owns only its exact D192/V128
+unpacked nonpaged THD leg, including supported splits, with TILE_M=128 and one CTA. Its shared
+single-Q body is kept separate from multi-Q and quadrant cooperation; this
+batch does not transfer D64/D128 or SM107 consumers of the old shared file.
+The legacy 20511 row declines exact half D192/V128 on SM100/SM103, while
+dense head envelopes retain their previous owner. Central selection preserves
+the existing candidate order, budget and placement. Fixed public records
+select the body directly; old exact-D192 20511 records require replanning.
+Mask, sink, Stats, packing/split and physical-origin checks remain shared.
+This ownership migration adds no numerical or behavior-note guarantee.
 **SM120-family exact wide half implementation engine:**
 `sdpa_fwd_sm120_d512_paired` (20526) owns exact FP16/BF16 D512/V512 and
 D576/V512, including paged FP8-KV storage. The legacy 20505 row delegates
@@ -316,7 +345,7 @@ graphs). The graph-level contract and the masked-row conventions of the other
 implementations are in `docs/operations/Attention.md`.
 
 **An explicit `attn_scale = 0`** (`zero_scale`) is a zero scale (uniform P), never the 1/sqrt(d) default.
-It is served by `sdpa_fwd_prefill_sm80`, `sdpa_fwd_prefill_sm90` and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
+It is served by `sdpa_fwd_prefill_sm80`, the three fixed SM90 forward owners (20539/20540/20541), and the `sdpa_bwd_sm80`, `sdpa_bwd_sm100`, `sdpa_bwd_sm107`,
 `sdpa_bwd_sm107_fp8`, `sdpa_bwd_sm107_mxfp8`, `sdpa_bwd_sm100_d256` and `sdpa_bwd_sm107_d512` rows. Every other row
 declines it: the SM100/SM107/SM120 forward kernels fold the scale into exp2 after an unscaled, -inf-masked
 running max, which a zero scale turns into NaN (#1435). SM80 and SM90 compile the scale's sign into the kernel
@@ -353,7 +382,7 @@ unmentioned axis silently meaning yes. The matcher asks every axis in BOTH
 directions, so a mode the graph requests by leaving a flag unset (unbounded
 right band, no left bound, top-left anchor) is part of the row's claim too.
 
-`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm90` (f16/bf16),
+`sdpa_fwd_prefill_sm100`, `sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm120`, the three fixed SM90 forward owners (20539/20540/20541, f16/bf16),
 `sdpa_fwd_prefill_sm100_fp8`, `sdpa_fwd_prefill_sm107_fp8` and `sdpa_fwd_prefill_sm120_fp8` (per-tensor FP8),
 `sdpa_fwd_prefill_sm107_mxfp8` (block-scale MXFP8, exact cc 10.7) and `sdpa_fwd_prefill_sm120_mxfp8` (block-scale MXFP8,
 cc 12.x) are default candidates, ranked against the backend per measured shard or qualification verdict
@@ -510,8 +539,9 @@ plan time · — not applicable · ⁿ footnote.
 
 ## SM90 (Hopper, cc 9.0 exactly)
 
-Engine: `sdpa_fwd_prefill_sm90`, public ID **20517**, manifest slot 17 (default candidate,
-ranked against the backend by `placement._place_sm90_f16`).
+Engines: **20539** native D64, **20540** three-WG split-output, and **20541**
+dedicated D128. All are default candidates ranked using the retained historical
+SM90 policy and `placement._place_sm90_f16`; ID 20517 is retired.
 Dense and THD execute through the shared prepared pointer binder; graph shape/stride
 overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
@@ -561,7 +591,7 @@ check fixed-plan repeatability and B129 reorder/duplication/neighbor isolation
 against independent FP64 references. This is forward qualification only.
 
 **Native D64 specialization.** Exact `D_QK=D_V=64` dense FP16/BF16
-MHA and unpacked GQA select `sm90/prefill_d64_f16.py`: two warpgroups (256
+MHA and unpacked GQA select `sm90/d64_f16_one_wg/kernel.py`: two warpgroups (256
 threads), QK and PV both m64n64k64 (four SS k16 steps each), one shared P tile,
 and a full 64-column output fragment. No D512 zero-padding. Optional FP32 Stats
 (natural or base 2), causal top-left/bottom-right (the existing unpadded
@@ -580,11 +610,10 @@ execution and prepared-body controls are recorded in the 2026-11-10 dense-split
 qualification in `test/python/determinism_goldens/README.md`; the earlier D512
 hardware results below do not independently qualify D64.
 
-**The 128 x 128 tile at exact (128, 128) (#378).** The (128, 128) d-shape's
-tile domains are {64, 128} (`tile_ms_by_d_shape` / `tile_ns_by_d_shape`): a
-64 x 64 knob compiles the shared D128 body above, a 128 x 128 knob the
-dedicated D128 template (`sm90/prefill_d128_f16.py`, ʰ¹²⁸). The tile names the
-template, so the row's eligibility is unchanged: every (128, 128) graph it
+**The 128 x 128 tile at exact (128, 128) (#378).** The historical policy
+retains both tile domains. A 64 x 64 candidate resolves to owner 20540; a
+128 x 128 candidate resolves to 20541 (`sm90/d128_f16_multi_q/kernel.py`,
+ʰ¹²⁸). Each owner accepts only its own tile. Eligibility is unchanged: every (128, 128) graph it
 admits keeps the 64 x 64 plans, and the 128 x 128 tile is admitted only for
 exact (128, 128) dense graphs the template serves (the table's last column;
 `engines._sm90_d128_tile_mismatch` with `config_sm90.d128_decline`). It is
@@ -718,24 +747,15 @@ sibling adapters (Rule S1). Accessed padded V rows must be finite. O, Stats and
 workspace must not overlap other operands (caller contract, unchecked as on the
 sibling adapters), and storage must outlive the stream.
 
-SM90 is an ordinary `ENGINE_SPECS` row using the shared validator, matcher,
-heuristics, lowering and binding. Native refusals are owned by
-`SdpaFwdDslSm90.check_support`, as in the sibling adapters; the adapter shares
-`api_dsl.py` with SM80 and SM120 and is exported lazily from `cudnn.sdpa.fwd`.
-Its (128, 128) d-shape's two tiles use the per-d-shape tile domains
-(`tile_ms_by_d_shape` / `tile_ns_by_d_shape`), which `mismatch` and the
-heuristics read on the d-shape a graph selects, and `mismatch` judges a 128
-knob on this row alone (`engines._sm90_d128_tile_mismatch`). Every other row
-leaves the tile domains at their default `()`, which `effective_tile_ms` /
-`effective_tile_ns` read as the row-wide domain, so the ten other rows'
-eligibility and ordering are what they were. The spelled-out test checks the
-verdicts on the four other half rows: spelling the defaults out changes no
-verdict and no message there
-(`test_sdpa_fwd_d128_sm90_routing.py::test_every_flavor_spelled_out_equals_the_defaults_on_every_shipped_row`);
-no quantized row sets these fields. That is a statement about the host code,
-not numerical validation on those architectures.
+SM90's three fixed `ENGINE_SPECS` rows use the shared validator, matcher,
+lowering and binding. The private historical policy retains per-shape tile
+domains solely for candidate generation and placement; it is not an offered
+engine. Native refusals remain checked by `SdpaFwdDslSm90.check_support`.
+Its fixed-owner route bypasses automatic flavor/body selection, while the
+public standalone adapter retains its existing selection and entry files.
+The adapter is exported lazily from `cudnn.sdpa.fwd`.
 
-ʷ **The kernel (`sm90/prefill_d512_f16.py`).** Three warpgroups (384 threads),
+ʷ **The kernel (`sm90/f16_three_wg/kernel.py`; standalone entry `sm90/prefill_d512_f16.py`).** Three warpgroups (384 threads),
 `setmaxnreg` (24, 240, 240). WG0 issues the TMA loads, WG1 runs QK (m64n64k512,
 SS), the online softmax and PV on O columns [0, 256) (RS), WG2 PV on [256, 512)
 (SS) from the P WG1 stages in SMEM — the head dim splits because a 64-row FP32 O
@@ -766,7 +786,7 @@ causal), same lengths: 5.46 / 5.72 / 5.78 / 5.72x, 491–577 TFLOPS against
 90–100, 45.8–53.9 % SOL. The windowed shape's lower SOL is per-CTA fixed cost
 over its three KV tiles.
 
-ʰ¹²⁸ **The D128 kernel (`sm90/prefill_d128_f16.py`, #378).** Three warpgroups
+ʰ¹²⁸ **The D128 kernel (`sm90/d128_f16_multi_q/kernel.py`; standalone entry `sm90/prefill_d128_f16.py`, #378).** Three warpgroups
 (384 threads), `setmaxnreg` (24, 240, 240). WG0 issues the TMA loads; WG1 and
 WG2 each own 64 of the CTA's 128 query rows and every head column, and each runs
 its own QK (m64n128k16, SS), online softmax and PV (m64n128k16, RS) with no

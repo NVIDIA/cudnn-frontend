@@ -86,9 +86,10 @@ arbitrary user callbacks.
 | `block_sparse_attention_backward` (blk64, `sparse_block_size=64`; the default route and, on SM90, the `metadata=` route of `block_sparse_attention_prepare_backward`) | bprop | BF16 | Not guaranteed | Not guaranteed (cc 10.3 measured; cc 10.0 unverified; the prepared route is SM90-only) | Unverified |
 | `pygraph.custom_reduction` with `reduction_modifiers.argmax/argmin` (Torch finite-value rule; index output) | fprop | FP16, BF16, FP32 values; INT32 indices | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
 | `pygraph.custom_reduction` with a direct FLOAT ADD body (sum output) | fprop | FP32 | Unverified | Supported (SM100, tested configurations); SM103 unverified | Unverified |
-| FROST native D512 dense-Q split forward (standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
+| FROST SM90 three-WG D512 dense-Q split forward (standalone and fixed-body qualification; fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported for this owner | Unsupported for this owner |
 | FROST native D128/D256 dense-Q forward on the D512 body (64 x 64 tile; standalone qualification, fixed split count and packing) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unverified | Unverified |
-| FROST SM90 D128 template forward (exact dense D128, 128 x 128 tile; unpadded, unsplit, unpacked, no sink or window) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported | Unsupported |
+| `pygraph.sdpa`, FROST SM90 native D64 owner (dense, unpadded, unsplit, unpacked; fixed scheduler; O and FP32 Stats) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested noncausal and top-left causal configurations) | Unsupported for this owner | Unsupported for this owner |
+| FROST SM90 dedicated D128 owner (exact dense D128, 128 x 128 tile; unpadded, unsplit, unpacked, no sink or window) | fprop | matching FP16/BF16 Q/K/V/O | Supported (tested configurations) | Unsupported | Unsupported |
 | FROST grid / lean-walk split-combine component (fixed reducer form and split count) | fprop combine only | FP32 partial O/LSE, FP16/BF16 O | Unverified | Supported (tested configurations) | Supported (tested configurations) |
 | FROST native D576/V512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
 | FROST native D512 dense-Q paged forward (standalone qualification) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Unverified | Supported (tested configurations) |
@@ -598,7 +599,7 @@ addition. An exact dense (128, 128) declaration with no tile pinned runs the
 dedicated D128 template instead (next paragraph); these results describe the
 64 x 64 tile only.
 
-The dedicated SM90 D128 template (the SM90 row's 128 x 128 tile) has its own
+The dedicated SM90 D128 implementation (its fixed owner uses a 128 x 128 tile) has its own
 forward suite: replay with fresh storage under concurrent work; a sequence alone
 against first, reordered, duplicated and changed-neighbor batches whose plans run
 different records of the template (the persistent loop, the paired causal walk,
@@ -609,6 +610,18 @@ on every arrangement, so its status is supported for the tested configurations. 
 has no backward.
 
 
+The fixed SM90 D128 owner and three-WG D512 owner retain these observed byte
+properties in FP16 and BF16 on H100. The owned-body checks assert the loaded
+implementation and its local parameter type before comparing replay, fresh
+storage, reordered/duplicated batches and changed neighbors. D128 covers the
+persistent, causal-walk, stride and claim configurations; three-WG covers
+split3 unpacked and split17 packed plans with masking, sinks and empty rows.
+Explicit graph-record checks also retain the standalone parameter values and
+O/Stats bytes, including changed-input capture replay. The current runtime's
+strict golden baselines are missing; none were generated for this migration.
+These results do not extend THD batch invariance or backward support. Detailed
+counts, runtime and stress limits are in the
+[coverage report](../../test/python/determinism_goldens/README.md).
 
 ## SM100/SM107 forward register redistribution
 

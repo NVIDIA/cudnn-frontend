@@ -190,6 +190,9 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
         # This body has eight live query columns. A 128-row sample would
         # exercise its implementation boundary before any mask decision.
         values["s_q"] = 1
+    if getattr(caps, "implementation", "") == "sdpa_fwd_sm100_d128_single_q":
+        # The initial single-Q owner admits the D192 nonpaged THD leg only.
+        values.update(thd=True, padded=True)
     return values
 
 
@@ -532,6 +535,11 @@ def test_band_covers_kv_tail_is_the_band_x_geometry_rule():
             uncovered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_unmasked())
         covered = legal_facts(kind, caps, s_q=2, s_kv=s_kv, **band_causal_top_left())
         reason = _probe(kind)(caps, uncovered)
+        if uncovered.thd:
+            # Packed per-sequence lengths mask their own tails. A scalar
+            # dense S_kv alignment restriction is not this body's contract.
+            assert reason is None and _probe(kind)(caps, covered) is None, name
+            continue
         assert reason is not None and "must be a multiple of" in reason, (name, reason)
         assert _probe(kind)(caps, covered) is None, name
 
@@ -567,7 +575,10 @@ def test_negative_right_bound_is_still_refused_by_the_forward_probe():
         caps = spec.capabilities
         reason = _probe(kind)(caps, legal_facts(kind, caps, s_kv=128, **band_right(-1)))
         if kind == "fwd":
-            assert reason == "negative diagonal_band_right_bound (-1) is not supported", spec.name
+            # A row that has no finite-band path rejects that feature before
+            # validating its bound; rows serving it retain the value diagnostic.
+            expected = "negative diagonal_band_right_bound (-1) is not supported" if caps.right_band_widening else band.feature_reason(band.LABEL_RIGHT_FINITE)
+            assert reason == expected, spec.name
         else:
             # The backward probe has no such early value guard: the row's band
             # claim decides, so a row that serves widening still serves -1 (the
@@ -694,6 +705,11 @@ def test_length_metadata_decisions_follow_the_row_claims():
 def test_dense_layout_envelope_decisions():
     for kind, spec in _rows():
         caps = spec.capabilities
+        baseline = legal_facts(kind, caps)
+        if baseline.thd:
+            # A THD-only implementation has no dense envelope to exercise.
+            assert _probe(kind)(caps, dataclasses.replace(baseline, thd=False, padded=False)) is not None
+            continue
         layouts = getattr(caps, "layouts", frozenset({"bshd"}))
         cases = (
             (dict(bshd_layout=True, packed_layout=True, dense_layout=True), True),

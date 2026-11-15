@@ -5894,7 +5894,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             for flavor in _SM90_FLAVORS
             if flavor in _SM90_KERNEL_FILES and self.tile_m in (None, _SM90_FLAVOR_TILES[flavor][0]) and self.tile_n in (None, _SM90_FLAVOR_TILES[flavor][1])
         )
-        self.flavor = _sm90_pick_flavor(d_qk, d_v, pool, declared)
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        self.flavor = selected_kernel.flavor if selected_kernel is not None else _sm90_pick_flavor(d_qk, d_v, pool, declared)
         if pool and _SM90_D512_FLAVOR not in pool and self.flavor == _SM90_D512_FLAVOR and _sm90_d128_decline(d_qk, d_v) is None:
             # At (128, 128) the pinned tile names the D128 template, refused with the feature it does not serve. Other
             # head dims keep the D512 body and meet its tile refusal below ("tiles other than 64/64").
@@ -6045,8 +6046,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             persistent=persistent,
             causal_walk=causal_walk,
         )
-        self._native_d64 = False
-        if (d_qk, d_v) == (64, 64) and not self.paged:
+        self._native_d64 = selected_kernel.native_d64 if selected_kernel is not None else False
+        if selected_kernel is None and (d_qk, d_v) == (64, 64) and not self.paged:
             from cudnn.sdpa.fwd.config_sm90 import native_d64_mismatch
 
             why = native_d64_mismatch(
@@ -6106,11 +6107,15 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # (row, multiplier, token stride, bits) entry becomes the template's (bits, multiplier).
             self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
             _sm90_validate_params(self.params, self.flavor)
-        self._k_mod = template = _load_sm90_kernel_module(self.flavor, self.params, native_d64=self._native_d64)
+        selected_kernel = getattr(self, "_selected_kernel", None)
+        if selected_kernel is not None:
+            self._k_mod = template = _load_kernel_template(selected_kernel.kernel_file, self.params, tag=selected_kernel.implementation)
+        else:
+            self._k_mod = template = _load_sm90_kernel_module(self.flavor, self.params, native_d64=self._native_d64)
         # Which template serves this plan ("prefill_d128_f16", "prefill_d512_f16" or "prefill_d64_f16"), as the SM100
         # adapter records it: the engine's executor exposes it, so a test or the routing tally names the template without
         # inferring it from the source.
-        self.kernel_template = os.path.splitext(os.path.basename(template.__file__))[0]
+        self.kernel_template = selected_kernel.template if selected_kernel is not None else os.path.splitext(os.path.basename(template.__file__))[0]
         strides, lse_stride = self._strides, self._lse_stride
         if self.split_kv > 1:
             # The producer TMA maps describe split-major partials; final layouts

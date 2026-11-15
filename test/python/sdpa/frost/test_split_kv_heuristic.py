@@ -349,8 +349,10 @@ def test_split_domains_match_the_wired_lowerings():
     advertising = {sp.name for sp in ENGINE_SPECS if sp.capabilities.split_kv_supported}
     assert advertising == {
         "sdpa_fwd_prefill_sm80",
-        "sdpa_fwd_prefill_sm90",
+        "sdpa_fwd_sm90_f16_three_wg",
         "sdpa_fwd_prefill_sm100",
+        "sdpa_fwd_sm100_d192_multi_q",
+        "sdpa_fwd_sm100_d128_single_q",
         "sdpa_fwd_sm100_d256_lookahead",
         "sdpa_fwd_sm100_d256_swap_ab",
         "sdpa_fwd_sm100_d512_role_split",
