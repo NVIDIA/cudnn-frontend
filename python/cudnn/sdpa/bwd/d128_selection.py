@@ -7,6 +7,7 @@ from .d128_contract import ACCUMULATION, PAIR, PAIR_CCS, RECOMPUTE, select_imple
 
 LEGACY_ROW = "sdpa_bwd_sm100_d128"
 RECOMPUTE_OWNER = "sdpa_bwd_sm100_d128_recompute"
+PAIR_OWNER = "sdpa_bwd_sm100_d128_pair"
 
 
 def default_dense_implementation(natural, cc, head_dim, skv, window_left, deterministic):
@@ -18,11 +19,22 @@ def default_dense_implementation(natural, cc, head_dim, skv, window_left, determ
     return natural if window_in_envelope else RECOMPUTE
 
 
+def pair_available(natural, cc, head_dim, skv, window_left):
+    """The fixed pair's envelope, independent of its default ranking."""
+    return default_dense_implementation(natural, cc, head_dim, skv, window_left, True) == PAIR
+
+
 def legal_implementations(facts, version):
-    """Return the current default first, with recompute available for dense MHA."""
-    if facts.thd or facts.h_q != facts.h_kv:
+    """Return the existing default first and all admitted fixed dense bodies."""
+    if facts.thd:
         return (LEGACY_ROW,)
     scale = facts.d_qk**-0.5 if facts.scale is None else facts.scale
     natural = select_implementation(facts.device_cc, version, facts.b, facts.h_q, facts.s_q, facts.s_kv, scale, d_qk=facts.d_qk, d_v=facts.d_v)
+    pair = pair_available(natural, facts.device_cc, facts.d_qk, facts.s_kv, facts.window_left)
+    if facts.h_q != facts.h_kv:
+        return (PAIR_OWNER,) if facts.deterministic and pair else (LEGACY_ROW,)
     chosen = default_dense_implementation(natural, facts.device_cc, facts.d_qk, facts.s_kv, facts.window_left, facts.deterministic)
-    return (RECOMPUTE_OWNER,) if chosen == RECOMPUTE else (LEGACY_ROW, RECOMPUTE_OWNER)
+    if chosen == PAIR:
+        return (PAIR_OWNER, RECOMPUTE_OWNER)
+    owners = (RECOMPUTE_OWNER,) if chosen == RECOMPUTE else (LEGACY_ROW, RECOMPUTE_OWNER)
+    return (*owners, PAIR_OWNER) if pair else owners

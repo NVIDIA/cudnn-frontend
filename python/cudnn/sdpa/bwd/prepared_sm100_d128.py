@@ -61,7 +61,7 @@ def compile_plan(api):
         with torch.cuda.device(device):
             entry = compile_host_accum(tuple(geometry), regions, dtype, api.is_causal, sm, window)
     elif api._implementation == PAIR:
-        from .kernels.sm100.prepared_d128_host import compile_host_pair
+        from .kernels.sm100.d128_f16_pair.prepared_host import compile_host_pair
 
         split = api._pair_split
         regions, required = pair_workspace_layout(api.batch_size, api.h_q, api.s_q_max, split, api.h_kv, api.s_k_max, api.head_dim_qk)

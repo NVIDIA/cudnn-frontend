@@ -26,9 +26,11 @@ same name it carries that body's suffix: ``_softmax_loop_accum`` / ``_softmax_lo
 identical in every body and binds no body-specific global is defined once (``_view``, ``_commit``, ``_tmem_load``, ``_tmem_store``,
 ``_map_ptr``, ``LOG2E``).  The pair body precedes its chain kernels: the chain asserts against the body's constants at import.  The module
 is template-loaded for the d64 accumulation flavours (``FROST_TEMPLATE_PARAMS``: a head dimension, or
-``(head_dim, dq_out, ratio, split)`` for the deterministic pair's dK / dV rendering of the accumulation body), so every import is absolute.
+``(head_dim, True, 1, 1)`` for the accumulation compatibility entry), so every import is absolute.
 
 The zero-workspace recompute body is isolated in ``d128_f16_recompute/kernel.py``.
+The deterministic dK/dV + dQ chain is isolated in ``d128_f16_pair/``; shared
+delta/cast/fold launches live in ``_d128_chain.py``.
 """
 
 from typing import NamedTuple, Optional
@@ -73,6 +75,16 @@ from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.sdpa.bwd.config_sm100_d128_accum import BAR_LAYOUT as BAR_LAYOUT_ACCUM_D128
 from cudnn.sdpa.bwd.config_sm100_d128_accum import CFG as CFG_ACCUM_D128
 from cudnn.sdpa.bwd.config_sm100_d128_accum import make_bar_layout, make_config
+from cudnn.sdpa.bwd.kernels.sm100._d128_device_common import (
+    _commit,
+    _credit_accum,
+    _decode_flat,
+    _tmem_load,
+    _tmem_store,
+    _view,
+    _wait_accum,
+    _wait_tcgen_accum,
+)
 from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import CFG as CFG_PAIR_BASE
 from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta import diag_2cta_code
 from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import (
@@ -106,6 +118,20 @@ from cudnn.sdpa.bwd.config_sm100_d128_accum_2cta_stail import (
 )
 from cudnn.sdpa.bwd.d128_grouped_2cta_contract import DENSE_STATS_ORIGIN_SPEC, LAYOUT_FORM_CODES, STATS_KINDS
 from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host
+from cudnn.sdpa.bwd.kernels.sm100._d128_chain import (
+    ELEMENTS_PER_LANE,
+    LANES_PER_ROW,
+    RN,
+    ROWS_PER_CTA,
+    THREADS,
+    cast_dq_d128_kernel,
+    cast_dq_host,
+    delta_only_host,
+    delta_zero_host,
+    dot_do_o_kernel,
+    fold_dkv_d128_kernel,
+    fold_dkv_host,
+)
 from cudnn.sdpa.bwd.kernels.bprop_thd_reduce import dkv_reduce_thd_origins_host
 
 # ======================================================================================================================
@@ -120,208 +146,15 @@ their dQ accumulator rows and delta, and the conversion skips them.
 
 _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", 128)
 HEAD_DIM = int(_PARAMS) if isinstance(_PARAMS, int) else int(_PARAMS[0])
-DQ_OUT = True if isinstance(_PARAMS, int) else bool(_PARAMS[1])
+DQ_OUT = True
+if not isinstance(_PARAMS, int) and not bool(_PARAMS[1]):
+    raise ValueError("the deterministic dK/dV rendering is in d128_f16_pair/kernel_dkv.py")
 RATIO = 1 if isinstance(_PARAMS, int) or len(_PARAMS) < 3 else int(_PARAMS[2])
 SPLIT = 1 if isinstance(_PARAMS, int) or len(_PARAMS) < 4 else int(_PARAMS[3])
 if (RATIO != 1 or SPLIT != 1) and DQ_OUT:
     raise ValueError("grouped query heads and q-range splits are served by the dK / dV-only rendering")
 if SPLIT not in (1, 2, 4):
     raise ValueError("the q-range split must be 1, 2 or 4")
-
-THREADS = 128
-ROWS_PER_CTA = 8
-LANES_PER_ROW = 16
-ELEMENTS_PER_LANE = 8
-RN = cute.math.RoundingMode.NEAREST_EVEN
-
-
-@cute.kernel
-def dot_do_o_kernel(
-    o: cute.Tensor,
-    do: cute.Tensor,
-    delta: cute.Tensor,
-    dq_accum: Optional[cute.Tensor],
-    dot_factor: cutlass.Float32,
-    lanes_per_row: cutlass.Constexpr[int] = LANES_PER_ROW,
-    rows_per_cta: cutlass.Constexpr[int] = ROWS_PER_CTA,
-):
-    """``rows_per_cta`` rows per CTA, FP32 FTZ pair reduction, and dQ initialization when a dQ scratch is given."""
-    block, batch, head = cute.arch.block_idx()
-    tid, _, _ = cute.arch.thread_idx()
-    row = cutlass.Int64(block) * rows_per_cta + cutlass.Int64(tid // lanes_per_row)
-    column = cutlass.Int64(tid % lanes_per_row) * ELEMENTS_PER_LANE
-    # Tail rows past S_q read the last O / dO row (in bounds, uniform across
-    # the shuffle group) and store delta = 0; their dQ rows are still zeroed.
-    valid = row < cutlass.Int64(o.shape[1])
-    io_row = cutlass.Int64(arith.select(valid.ir_value(), row.ir_value(), cutlass.Int64(o.shape[1] - 1).ir_value()))
-    o_offset = (
-        cutlass.Int64(batch) * cutlass.Int64(o.stride[0]) + io_row * cutlass.Int64(o.stride[1]) + cutlass.Int64(head) * cutlass.Int64(o.stride[2]) + column
-    )
-    do_offset = (
-        cutlass.Int64(batch) * cutlass.Int64(do.stride[0]) + io_row * cutlass.Int64(do.stride[1]) + cutlass.Int64(head) * cutlass.Int64(do.stride[2]) + column
-    )
-    delta_offset = (
-        cutlass.Int64(batch) * cutlass.Int64(delta.stride[0]) + cutlass.Int64(head) * cutlass.Int64(delta.stride[1]) + row * cutlass.Int64(delta.stride[2])
-    )
-    if cutlass.const_expr(dq_accum is not None):
-        dq_offset = (
-            cutlass.Int64(batch) * cutlass.Int64(dq_accum.stride[0])
-            + row * cutlass.Int64(dq_accum.stride[1])
-            + cutlass.Int64(head) * cutlass.Int64(dq_accum.stride[2])
-            + column
-        )
-        zero4 = cutlass.Vector.from_elements((cutlass.Float32(0.0), cutlass.Float32(0.0), cutlass.Float32(0.0), cutlass.Float32(0.0)), cutlass.Float32)
-        (dq_accum.iterator.raw_ptr() + dq_offset).store(zero4, alignment=16)
-        (dq_accum.iterator.raw_ptr() + dq_offset + 4).store(zero4, alignment=16)
-    do_values = (do.iterator.raw_ptr() + do_offset).load(count=ELEMENTS_PER_LANE, alignment=16)
-    o_values = (o.iterator.raw_ptr() + o_offset).load(count=ELEMENTS_PER_LANE, alignment=16)
-    pairs = []
-    for j in cutlass.range_constexpr(ELEMENTS_PER_LANE // 2):
-        high = cute.math.mul(do_values[2 * j + 1].to(cutlass.Float32), o_values[2 * j + 1].to(cutlass.Float32), rounding=RN, ftz=True)
-        pairs.append(cute.math.fma(do_values[2 * j].to(cutlass.Float32), o_values[2 * j].to(cutlass.Float32), high, rounding=RN, ftz=True))
-    dot = cute.math.add(pairs[0], pairs[1], rounding=RN, ftz=True)
-    dot = cute.math.add(dot, pairs[2], rounding=RN, ftz=True)
-    dot = cute.math.add(dot, pairs[3], rounding=RN, ftz=True)
-    for step in cutlass.range_constexpr(lanes_per_row.bit_length() - 1):
-        peer = nvvm.shfl_sync(thread_mask=0xFFFFFFFF, val=dot, offset=lanes_per_row >> (step + 1), mask_and_clamp=0x1F, kind=nvvm.Shfl.BFLY)
-        dot = cute.math.add(dot, peer, rounding=RN, ftz=True)
-    dot = cute.math.mul(dot, dot_factor, rounding=RN, ftz=True)
-    dot = cutlass.Float32(arith.select(valid.ir_value(), dot.ir_value(), cutlass.Float32(0.0).ir_value()))
-    if tid % lanes_per_row == 0:
-        (delta.iterator.raw_ptr() + delta_offset).store(dot)
-
-
-dot_do_o_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@cute.jit
-def delta_zero_host(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, dq_accum: cute.Tensor, stream: cuda_driver.CUstream):
-    """One dense no-dropout launch over dQ's rounded rows (a multiple of 128)."""
-    lanes = o.shape[3] // ELEMENTS_PER_LANE
-    rows = THREADS // lanes
-    dot_do_o_kernel(o, do, delta, dq_accum, cutlass.Float32(1.0), lanes, rows).launch(
-        grid=(dq_accum.shape[1] // rows, o.shape[0], o.shape[2]), block=(THREADS, 1, 1), stream=stream
-    )
-
-
-@cute.jit
-def delta_only_host(o: cute.Tensor, do: cute.Tensor, delta: cute.Tensor, stream: cuda_driver.CUstream):
-    """One dense launch over delta's rounded rows (a multiple of 128), without a dQ scratch."""
-    lanes = o.shape[3] // ELEMENTS_PER_LANE
-    rows = THREADS // lanes
-    dot_do_o_kernel(o, do, delta, None, cutlass.Float32(1.0), lanes, rows).launch(
-        grid=(delta.shape[2] // rows, o.shape[0], o.shape[2]), block=(THREADS, 1, 1), stream=stream
-    )
-
-
-@cute.kernel
-def cast_dq_d128_kernel(
-    dq_accum: cute.Tensor,
-    dq_out: cute.Tensor,
-    io_dtype: cutlass.Constexpr,
-    lanes_per_row: cutlass.Constexpr[int] = LANES_PER_ROW,
-    rows_per_cta: cutlass.Constexpr[int] = ROWS_PER_CTA,
-):
-    """Convert eight FP32 elements per lane without rescaling."""
-    block, batch, head = cute.arch.block_idx()
-    tid, _, _ = cute.arch.thread_idx()
-    row = cutlass.Int64(block) * rows_per_cta + cutlass.Int64(tid // lanes_per_row)
-    column = cutlass.Int64(tid % lanes_per_row) * ELEMENTS_PER_LANE
-    src_offset = (
-        cutlass.Int64(batch) * cutlass.Int64(dq_accum.stride[0])
-        + row * cutlass.Int64(dq_accum.stride[1])
-        + cutlass.Int64(head) * cutlass.Int64(dq_accum.stride[2])
-        + column
-    )
-    dst_offset = (
-        cutlass.Int64(batch) * cutlass.Int64(dq_out.stride[0])
-        + row * cutlass.Int64(dq_out.stride[1])
-        + cutlass.Int64(head) * cutlass.Int64(dq_out.stride[2])
-        + column
-    )
-    lo = (dq_accum.iterator.raw_ptr() + src_offset).load(count=4, alignment=16)
-    hi = (dq_accum.iterator.raw_ptr() + src_offset + 4).load(count=4, alignment=16)
-    packed = cutlass.Vector.from_elements(
-        (
-            fp32_to_fp16(lo[0], lo[1], dtype=io_dtype),
-            fp32_to_fp16(lo[2], lo[3], dtype=io_dtype),
-            fp32_to_fp16(hi[0], hi[1], dtype=io_dtype),
-            fp32_to_fp16(hi[2], hi[3], dtype=io_dtype),
-        ),
-        cutlass.Int32,
-    )
-    if row < cutlass.Int64(dq_out.shape[1]):
-        Pointer(cutlass.make_array_view(dq_out).data_ptr() + dst_offset, dtype=cutlass.Int32).store(packed, alignment=16)
-
-
-cast_dq_d128_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@cute.kernel
-def fold_dkv_d128_kernel(
-    part: cute.Tensor,
-    out: cute.Tensor,
-    splits: cutlass.Constexpr[int],
-    io_dtype: cutlass.Constexpr,
-    lanes_per_row: cutlass.Constexpr[int] = LANES_PER_ROW,
-    rows_per_cta: cutlass.Constexpr[int] = ROWS_PER_CTA,
-):
-    """Sum the ``splits`` fp32 partial planes of a dK / dV row in plane order and convert eight elements per lane."""
-    block, batch, head = cute.arch.block_idx()
-    tid, _, _ = cute.arch.thread_idx()
-    row = cutlass.Int64(block) * rows_per_cta + cutlass.Int64(tid // lanes_per_row)
-    column = cutlass.Int64(tid % lanes_per_row) * ELEMENTS_PER_LANE
-    acc = [cutlass.Float32(0.0) for _ in range(ELEMENTS_PER_LANE)]
-    for s in cutlass.range_constexpr(splits):
-        src_offset = (
-            (cutlass.Int64(batch) * splits + s) * cutlass.Int64(part.stride[0])
-            + row * cutlass.Int64(part.stride[1])
-            + cutlass.Int64(head) * cutlass.Int64(part.stride[2])
-            + column
-        )
-        lo = (part.iterator.raw_ptr() + src_offset).load(count=4, alignment=16)
-        hi = (part.iterator.raw_ptr() + src_offset + 4).load(count=4, alignment=16)
-        for j in cutlass.range_constexpr(4):
-            acc[j] = cute.math.add(acc[j], lo[j], rounding=RN, ftz=True)
-            acc[4 + j] = cute.math.add(acc[4 + j], hi[j], rounding=RN, ftz=True)
-    packed = cutlass.Vector.from_elements(
-        (
-            fp32_to_fp16(acc[0], acc[1], dtype=io_dtype),
-            fp32_to_fp16(acc[2], acc[3], dtype=io_dtype),
-            fp32_to_fp16(acc[4], acc[5], dtype=io_dtype),
-            fp32_to_fp16(acc[6], acc[7], dtype=io_dtype),
-        ),
-        cutlass.Int32,
-    )
-    dst_offset = (
-        cutlass.Int64(batch) * cutlass.Int64(out.stride[0]) + row * cutlass.Int64(out.stride[1]) + cutlass.Int64(head) * cutlass.Int64(out.stride[2]) + column
-    )
-    if row < cutlass.Int64(out.shape[1]):
-        Pointer(cutlass.make_array_view(out).data_ptr() + dst_offset, dtype=cutlass.Int32).store(packed, alignment=16)
-
-
-fold_dkv_d128_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
-
-
-@cute.jit
-def fold_dkv_host(part: cute.Tensor, out: cute.Tensor, splits: cutlass.Constexpr[int], stream: cuda_driver.CUstream):
-    """One fold launch over the output rows; output rows must be 16-byte aligned."""
-    lanes = out.shape[3] // ELEMENTS_PER_LANE
-    rows = THREADS // lanes
-    fold_dkv_d128_kernel(part, out, splits, out.element_type, lanes, rows).launch(
-        grid=((out.shape[1] + rows - 1) // rows, out.shape[0], out.shape[2]), block=(THREADS, 1, 1), stream=stream
-    )
-
-
-@cute.jit
-def cast_dq_host(dq_accum: cute.Tensor, dq_out: cute.Tensor, io_dtype: cutlass.Constexpr, stream: cuda_driver.CUstream):
-    """One native vector cast launch; output rows must be 16-byte aligned."""
-    lanes = dq_out.shape[3] // ELEMENTS_PER_LANE
-    rows = THREADS // lanes
-    cast_dq_d128_kernel(dq_accum, dq_out, io_dtype, lanes, rows).launch(
-        grid=((dq_out.shape[1] + rows - 1) // rows, dq_out.shape[0], dq_out.shape[2]), block=(THREADS, 1, 1), stream=stream
-    )
-
 
 # ======================================================================================================================
 # section 3: the dense MHA ACCUMULATION body (3-launch chain, fp32 dQ workspace)
@@ -368,11 +201,6 @@ class BarsAccum(NamedTuple):
     sched_empty: MBarrier
 
 
-def _view(slab, offset, dtype, count, alignment=16):
-    ptr = Pointer(slab.data_ptr() + offset, dtype=dtype)
-    return cutlass.Array(ptr.ir_value(), shape=count, dtype=dtype, alignment=alignment)
-
-
 def _bars_accum(slab):
     kinds = {"mma": Producer.MMA_COMMIT, "tma": Producer.TMA_LOAD, "thread": Producer.THREAD}
     return BarsAccum(
@@ -417,41 +245,6 @@ def _mma_desc_accum(dtype, *, atranspose=False, btranspose=False, N=CFG_ACCUM.N,
 
 
 @cute.jit
-def _wait_accum(bar, phase):
-    bar.wait(phase)
-    # All full-warp consumers reconverge before any elected credit/issue.
-    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-
-
-@cute.jit
-def _wait_tcgen_accum(bar, phase):
-    _wait_accum(bar, phase)
-    nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
-
-
-@cute.jit
-def _commit(bar):
-    if nvvm.elect_sync():
-        bar.arrive(cta_group=1)
-
-
-@cute.jit
-def _credit_accum(bar):
-    if nvvm.elect_sync():
-        bar.arrive()
-
-
-@cute.jit
-def _tmem_load(address, n: cutlass.Constexpr[int], dtype: cutlass.Constexpr = cutlass.Float32):
-    return nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(address, dtype), num=n)
-
-
-@cute.jit
-def _tmem_store(address, values):
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(address, cutlass.Int32), values)
-
-
-@cute.jit
 def tma_reduce_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int]):
     """One elected source-sized FP32 add; caller owns commit and wait/credit."""
     desc = gmem_slice.tma_desc.get_ptr()
@@ -459,22 +252,6 @@ def tma_reduce_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int]):
     src = smem_tile.base.subview(subtile * smem_tile.tma_subtile_stride_elems)
     if nvvm.elect_sync():
         nvvm.cp_async_bulk_tensor_reduce(desc, src, "add", coords)
-
-
-@cute.jit
-def _decode_flat(tile, nheads, nk, swizzle: cutlass.Constexpr[int], batch_heads: cutlass.Constexpr[int]):
-    group = tile // (swizzle * nk)
-    inner = tile % (swizzle * nk)
-    block = cutlass.Int32(0)
-    residual = cutlass.Int32(0)
-    if group < batch_heads // swizzle:
-        block = inner // swizzle
-        residual = inner % swizzle
-    else:
-        block = inner // max(batch_heads % swizzle, 1)
-        residual = inner % max(batch_heads % swizzle, 1)
-    hb = group * swizzle + residual
-    return block, hb % nheads, hb // nheads
 
 
 @cute.jit
@@ -993,394 +770,6 @@ def _scheduler_loop_accum(bars, sched):
         state = advance(state, CFG_ACCUM.SCHED_STAGES)
 
 
-@cute.jit
-def _pair_exp(scores, slab, group, scale):
-    scaled = scale * cutlass.Float32(LOG2E)
-    p = []
-    for chunk in cutlass.range_constexpr(16):
-        stat = _view(slab, CFG_ACCUM.STATS, cutlass.Float32, CFG_ACCUM.N).subview(group * 64 + chunk * 4).load(vector_size=4, alignment=16)
-        for pair in cutlass.range_constexpr(2):
-            i = chunk * 4 + pair * 2
-            e0, e1 = ffma2(scaled, scaled, scores[i], scores[i + 1], stat[pair * 2], stat[pair * 2 + 1])
-            p.append(cute.math.exp2(e0, fastmath=True))
-            p.append(cute.math.exp2(e1, fastmath=True))
-    return cutlass.Vector.from_elements(tuple(p), cutlass.Float32)
-
-
-@cute.jit
-def _pair_masked_scores(scores, row, group, block, qtile, skv, causal: cutlass.Constexpr[bool], window: cutlass.Constexpr[int]):
-    # Every enabled select is applied; a cell the select cannot mask keeps its score, so the body is entered only on
-    # a tile that can hold a masked cell.
-    neg_inf = cutlass.Float32(float("-inf"))
-    kr = block * CFG_ACCUM.M + row
-    out = []
-    for i in cutlass.range_constexpr(64):
-        v = scores[i]
-        qc = qtile * CFG_ACCUM.N + group * 64 + i
-        if cutlass.const_expr(causal):
-            v = cutlass.Float32(arith.select((kr <= qc).ir_value(), v.ir_value(), neg_inf.ir_value()))
-        if cutlass.const_expr(window > 0):
-            v = cutlass.Float32(arith.select((kr + (window - 1) >= qc).ir_value(), v.ir_value(), neg_inf.ir_value()))
-        v = cutlass.Float32(arith.select((kr < skv).ir_value(), v.ir_value(), neg_inf.ir_value()))
-        out.append(v)
-    return cutlass.Vector.from_elements(tuple(out), cutlass.Float32)
-
-
-@cute.jit
-def _pair_p_values(
-    slab, tmem_base, row, group, block, qtile, lo, skv, scale, causal: cutlass.Constexpr[bool], dtype: cutlass.Constexpr, window: cutlass.Constexpr[int] = 0
-):
-    address = tmem_base + group * 64
-    a = _tmem_load(address, 32)
-    b = _tmem_load(address + 32, 32)
-    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-    scores = cutlass.Vector.from_elements(tuple(a[i] for i in range(32)) + tuple(b[i] for i in range(32)), cutlass.Float32)
-    masked = (block + 1) * CFG_ACCUM.M > skv
-    if cutlass.const_expr(causal):
-        masked = masked | (qtile == lo)
-    if cutlass.const_expr(window > 0):
-        masked = masked | ((qtile + 1) * CFG_ACCUM.N - 1 - block * CFG_ACCUM.M >= window)
-    p = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(64)), cutlass.Float32)
-    if masked:
-        p = _pair_exp(_pair_masked_scores(scores, row, group, block, qtile, skv, causal, window), slab, group, scale)
-    else:
-        p = _pair_exp(scores, slab, group, scale)
-    packed = []
-    for pair in cutlass.range_constexpr(32):
-        packed.append(fp32_to_fp16(p[2 * pair], p[2 * pair + 1], dtype=dtype))
-    _tmem_store(address, cutlass.Vector.from_elements(tuple(packed), cutlass.Int32))
-    return p
-
-
-@cute.jit
-def _pair_bounds(block, sq, causal: cutlass.Constexpr[bool], window: cutlass.Constexpr[int] = 0):
-    """The KV tile and this split's q-tile range: tile ``block`` = KV tile * SPLIT + split index."""
-    kv = block // SPLIT
-    part = block % SPLIT
-    lo, hi = _bounds_accum(kv, sq, causal, window)
-    n = hi - lo
-    return kv, lo + (part * n) // SPLIT, lo + ((part + 1) * n) // SPLIT
-
-
-@cute.jit
-def _pair_partial_epilogue(slab, tmem_base, bars, row, live, empty_state):
-    """fp32 dV then dK of this split through the dq slice ring (one credit phase per plane); returns the ring state."""
-    for plane in cutlass.range_constexpr(2):
-        vals = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(CFG_ACCUM.D)), cutlass.Float32)
-        if live:
-            if cutlass.const_expr(CFG_ACCUM.D == 128):
-                a = _tmem_load(tmem_base + 256 + plane * CFG_ACCUM.D, 64)
-                b = _tmem_load(tmem_base + 256 + plane * CFG_ACCUM.D + 64, 64)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                vals = cutlass.Vector.from_elements(tuple(a[i] for i in range(64)) + tuple(b[i] for i in range(64)), cutlass.Float32)
-            else:
-                a = _tmem_load(tmem_base + 256 + plane * CFG_ACCUM.D, 64)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                vals = cutlass.Vector.from_elements(tuple(a[i] for i in range(64)), cutlass.Float32)
-        for i in cutlass.range_constexpr(CFG_ACCUM.DQ_SLICES):
-            _wait_accum(bars.dq_empty[i], empty_state.phase)
-            _store_dq_slice_accum(slab, row, vals, i)
-            nvvm.fence_proxy("async.shared", space="cta")
-            bars.dq_full[i].arrive()
-        empty_state = advance(empty_state, 1)
-    return empty_state
-
-
-@cute.jit
-def _pair_softmax_loop(
-    slab,
-    bars,
-    sched,
-    tmem_base,
-    lse,
-    delta,
-    block,
-    head,
-    batch,
-    sq,
-    skv,
-    nk,
-    nheads,
-    batch_heads: cutlass.Constexpr[int],
-    swizzle: cutlass.Constexpr[int],
-    scale,
-    causal: cutlass.Constexpr[bool],
-    dtype: cutlass.Constexpr,
-    window: cutlass.Constexpr[int] = 0,
-):
-    nvvm.setmaxregister(CFG_ACCUM.SOFTMAX_REGS, nvvm.SetMaxRegisterAction.INCREASE)
-    tid = cute.arch.thread_idx()[0]
-    row = tid % CFG_ACCUM.M
-    group = tid // CFG_ACCUM.M
-    state = PipelineState.start()
-    sched_state = PipelineState.start()
-    valid = cutlass.Int32(1)
-    while valid != 0:
-        if cutlass.const_expr(not causal):
-            _credit_accum(bars.sched_empty[sched_state.idx])
-        kv, lo, hi = _pair_bounds(block, sq, causal, window)
-        if lo < hi:
-            _stats_accum(slab, lse, delta, row, group, lo * CFG_ACCUM.N, sq, batch, head * RATIO, scale)
-        for g in cutlass.range(0, RATIO, 1, unroll=1):
-            qh = head * RATIO + g
-            for qtile in cutlass.range(lo, hi, 1, unroll=1):
-                _wait_tcgen_accum(bars.s_done, state.phase)
-                p = _pair_p_values(slab, tmem_base, row, group, kv, qtile, lo, skv, scale, causal, dtype, window)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                bars.p_ready.arrive()
-                _wait_tcgen_accum(bars.dp_done, state.phase)
-                _ds_values_accum(slab, tmem_base, group, p, scale, dtype)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                bars.ds_ready.arrive()
-                if qtile + 1 < hi:
-                    _stats_accum(slab, lse, delta, row, group, (qtile + 1) * CFG_ACCUM.N, sq, batch, qh, scale)
-                elif g + 1 < RATIO:
-                    _stats_accum(slab, lse, delta, row, group, lo * CFG_ACCUM.N, sq, batch, qh + 1, scale)
-                state = advance(state, 1)
-        if cutlass.const_expr(causal):
-            _credit_accum(bars.sched_empty[sched_state.idx])
-        block, head, batch, valid, sched_state = _next_tile_accum(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
-
-
-@cute.jit
-def _pair_epilogue_loop(
-    slab,
-    bars,
-    sched,
-    tmem_base,
-    block,
-    head,
-    batch,
-    sq,
-    nk,
-    nheads,
-    batch_heads: cutlass.Constexpr[int],
-    swizzle: cutlass.Constexpr[int],
-    causal: cutlass.Constexpr[bool],
-    dtype: cutlass.Constexpr,
-    window: cutlass.Constexpr[int] = 0,
-):
-    nvvm.setmaxregister(CFG_ACCUM.EPILOGUE_REGS, nvvm.SetMaxRegisterAction.INCREASE)
-    row = cute.arch.thread_idx()[0] % CFG_ACCUM.M
-    dq_state = PipelineState.start()
-    empty_state = PipelineState.start()
-    sched_state = PipelineState.start()
-    valid = cutlass.Int32(1)
-    while valid != 0:
-        _credit_accum(bars.sched_empty[sched_state.idx])
-        kv, lo, hi = _pair_bounds(block, sq, causal, window)
-        # dq_done is committed once per KV tile after its last dK MMA: it orders the readout below after the MMAs.
-        _wait_tcgen_accum(bars.dq_done, dq_state.phase)
-        dq_state = advance(dq_state, 1)
-        if cutlass.const_expr(SPLIT > 1):
-            empty_state = _pair_partial_epilogue(slab, tmem_base, bars, row, lo < hi, empty_state)
-        else:
-            for i in cutlass.range_constexpr(CFG_ACCUM.DQ_SLICES):
-                _wait_accum(bars.dq_empty[i], empty_state.phase)
-            _native_epilogue_accum(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, False)
-            _native_epilogue_accum(slab, tmem_base, bars, row, lo < hi, empty_state.phase, dtype, True)
-            empty_state = advance(empty_state, 1)
-        block, head, batch, valid, sched_state = _next_tile_accum(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
-
-
-@cute.jit
-def _pair_mma_loop(
-    slab,
-    bars,
-    sched,
-    tmem_base,
-    block,
-    head,
-    batch,
-    sq,
-    nk,
-    nheads,
-    batch_heads: cutlass.Constexpr[int],
-    swizzle: cutlass.Constexpr[int],
-    causal: cutlass.Constexpr[bool],
-    dtype: cutlass.Constexpr,
-    window: cutlass.Constexpr[int] = 0,
-):
-    nvvm.setmaxregister(CFG_ACCUM.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
-    score = _mma_desc_accum(dtype)
-    grad = _mma_desc_accum(dtype, btranspose=True, N=CFG_ACCUM.D, K=CFG_ACCUM.N)
-    kd = _operand_accum(slab, CFG_ACCUM.K, dtype).desc()
-    vd = _operand_accum(slab, CFG_ACCUM.V, dtype).desc()
-    dod = _operand_accum(slab, CFG_ACCUM.DO, dtype).desc()
-    dot = _operand_accum(slab, CFG_ACCUM.DO, dtype, transpose=True).desc()
-    s = nvvm.make_tmem_ptr(tmem_base, cutlass.Float32)
-    dp = nvvm.make_tmem_ptr(tmem_base + 128, cutlass.Float32)
-    dv = nvvm.make_tmem_ptr(tmem_base + 256, cutlass.Float32)
-    dk = nvvm.make_tmem_ptr(tmem_base + 256 + CFG_ACCUM.D, cutlass.Float32)
-    q_state = PipelineState.start()
-    do_state = PipelineState.start()
-    kv_state = PipelineState.start()
-    ready_state = PipelineState.start()
-    out_empty = PipelineState.start(phase=1)
-    sched_state = PipelineState.start()
-    valid = cutlass.Int32(1)
-    while valid != 0:
-        _credit_accum(bars.sched_empty[sched_state.idx])
-        kv, lo, hi = _pair_bounds(block, sq, causal, window)
-        if lo < hi:
-            _wait_tcgen_accum(bars.k_full, kv_state.phase)
-            _wait_tcgen_accum(bars.q_full[q_state.idx], q_state.phase)
-            qd = _operand_accum(slab, CFG_ACCUM.Q + q_state.idx * CFG_ACCUM.OPERAND_BYTES, dtype).desc()
-            mma_ss(score, kd, qd, s)
-            _commit(bars.s_done)
-            _wait_tcgen_accum(bars.v_full, kv_state.phase)
-        _wait_tcgen_accum(bars.dvk_empty, out_empty.phase)
-        out_empty = advance(out_empty, 1)
-        first = cutlass.Int32(1)
-        for g in cutlass.range(0, RATIO, 1, unroll=1):
-            for qtile in cutlass.range(lo, hi, 1, unroll=1):
-                for half in cutlass.range_constexpr(CFG_ACCUM.DO_SUBTILES):
-                    _wait_tcgen_accum(bars.do_full[half], do_state.phase)
-                    mma_ss(score, vd, dod, dp, k_start=half * _DO_STEPS, k_count=_DO_STEPS, accumulate=half > 0)
-                _commit(bars.dp_done)
-                _wait_tcgen_accum(bars.p_ready, ready_state.phase)
-                _ts_accum(grad, tmem_base, dot, dv, first == 0)
-                _commit(bars.do_empty)
-                q_next = advance(q_state, CFG_ACCUM.Q_STAGES)
-                if (qtile + 1 < hi) | (g + 1 < RATIO):
-                    _wait_tcgen_accum(bars.q_full[q_next.idx], q_next.phase)
-                    qd_next = _operand_accum(slab, CFG_ACCUM.Q + q_next.idx * CFG_ACCUM.OPERAND_BYTES, dtype).desc()
-                    mma_ss(score, kd, qd_next, s)
-                    _commit(bars.s_done)
-                _wait_tcgen_accum(bars.ds_ready, ready_state.phase)
-                qt = _operand_accum(slab, CFG_ACCUM.Q + q_state.idx * CFG_ACCUM.OPERAND_BYTES, dtype, transpose=True).desc()
-                _ts_accum(grad, tmem_base + 128, qt, dk, first == 0)
-                _commit(bars.q_empty[q_state.idx])
-                first = cutlass.Int32(0)
-                q_state = q_next
-                do_state = advance(do_state, 1)
-                ready_state = advance(ready_state, 1)
-        if lo < hi:
-            _commit(bars.k_empty)
-            _commit(bars.v_empty)
-            kv_state = advance(kv_state, 1)
-        _commit(bars.dq_done)
-        block, head, batch, valid, sched_state = _next_tile_accum(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
-
-
-@cute.jit
-def _pair_load_loop(
-    slab,
-    bars,
-    sched,
-    q_desc,
-    k_desc,
-    v_desc,
-    do_desc,
-    block,
-    head,
-    batch,
-    sq,
-    nk,
-    nheads,
-    batch_heads: cutlass.Constexpr[int],
-    swizzle: cutlass.Constexpr[int],
-    causal: cutlass.Constexpr[bool],
-    dtype: cutlass.Constexpr,
-    window: cutlass.Constexpr[int] = 0,
-):
-    nvvm.setmaxregister(CFG_ACCUM.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
-    q_state = PipelineState.start(phase=1)
-    do_state = PipelineState.start(phase=1)
-    kv_state = PipelineState.start(phase=1)
-    sched_state = PipelineState.start()
-    valid = cutlass.Int32(1)
-    while valid != 0:
-        _credit_accum(bars.sched_empty[sched_state.idx])
-        kv, lo, hi = _pair_bounds(block, sq, causal, window)
-        if lo < hi:
-            _wait_accum(bars.k_empty, kv_state.phase)
-            bars.k_full.arrive(n_bytes=CFG_ACCUM.OPERAND_BYTES, pred=nvvm.elect_sync())
-            tma_load_tile(_operand_accum(slab, CFG_ACCUM.K, dtype), GmemTileTma(k_desc)(0, kv * CFG_ACCUM.M, head, batch), bars.k_full.smem_ptr)
-            _wait_accum(bars.v_empty, kv_state.phase)
-            bars.v_full.arrive(n_bytes=CFG_ACCUM.OPERAND_BYTES, pred=nvvm.elect_sync())
-            tma_load_tile(_operand_accum(slab, CFG_ACCUM.V, dtype), GmemTileTma(v_desc)(0, kv * CFG_ACCUM.M, head, batch), bars.v_full.smem_ptr)
-            kv_state = advance(kv_state, 1)
-        for g in cutlass.range(0, RATIO, 1, unroll=1):
-            qh = head * RATIO + g
-            for qtile in cutlass.range(lo, hi, 1, unroll=1):
-                _wait_accum(bars.q_empty[q_state.idx], q_state.phase)
-                bars.q_full[q_state.idx].arrive(n_bytes=CFG_ACCUM.OPERAND_BYTES, pred=nvvm.elect_sync())
-                tma_load_tile(
-                    _operand_accum(slab, CFG_ACCUM.Q + q_state.idx * CFG_ACCUM.OPERAND_BYTES, dtype),
-                    GmemTileTma(q_desc)(0, qtile * CFG_ACCUM.N, qh, batch),
-                    bars.q_full[q_state.idx].smem_ptr,
-                )
-                _wait_accum(bars.do_empty, do_state.phase)
-                for half in cutlass.range_constexpr(CFG_ACCUM.DO_SUBTILES):
-                    bars.do_full[half].arrive(n_bytes=CFG_ACCUM.SLICE_BYTES, pred=nvvm.elect_sync())
-                for half in cutlass.range_constexpr(CFG_ACCUM.DO_SUBTILES):
-                    tma_load_subtiles(
-                        _operand_accum(slab, CFG_ACCUM.DO, dtype), GmemTileTma(do_desc)(0, qtile * CFG_ACCUM.N, qh, batch), bars.do_full[half].smem_ptr, half, 1
-                    )
-                q_state = advance(q_state, CFG_ACCUM.Q_STAGES)
-                do_state = advance(do_state, 1)
-        block, head, batch, valid, sched_state = _next_tile_accum(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
-
-
-@cute.jit
-def _pair_store_loop(
-    slab,
-    bars,
-    sched,
-    dk_desc,
-    dv_desc,
-    block,
-    head,
-    batch,
-    nk,
-    nheads,
-    batch_heads: cutlass.Constexpr[int],
-    swizzle: cutlass.Constexpr[int],
-    causal: cutlass.Constexpr[bool],
-    dtype: cutlass.Constexpr,
-):
-    nvvm.setmaxregister(CFG_ACCUM.SERVICE_REGS, nvvm.SetMaxRegisterAction.DECREASE)
-    out_state = PipelineState.start()
-    full_state = PipelineState.start()
-    sched_state = PipelineState.start()
-    valid = cutlass.Int32(1)
-    while valid != 0:
-        _credit_accum(bars.sched_empty[sched_state.idx])
-        for i in cutlass.range_constexpr(CFG_ACCUM.DQ_SLICES):
-            bars.dq_empty[i].arrive()
-        kv = block // SPLIT
-        if cutlass.const_expr(SPLIT > 1):
-            # fp32 partials of this split: plane = batch * SPLIT + split index of the partial tensors
-            plane = batch * SPLIT + block % SPLIT
-            for rnd in cutlass.range_constexpr(2):
-                for i in cutlass.range_constexpr(CFG_ACCUM.DQ_SLICES):
-                    _wait_accum(bars.dq_full[i], full_state.phase)
-                if cutlass.const_expr(rnd == 0):
-                    tma_store_tile(_operand_accum(slab, CFG_ACCUM.ALIAS, cutlass.Float32, fp32=True), GmemTileTma(dv_desc)(0, kv * CFG_ACCUM.M, head, plane))
-                else:
-                    tma_store_tile(_operand_accum(slab, CFG_ACCUM.ALIAS, cutlass.Float32, fp32=True), GmemTileTma(dk_desc)(0, kv * CFG_ACCUM.M, head, plane))
-                tma_store_commit()
-                tma_store_wait(0)
-                if cutlass.const_expr(rnd == 0):
-                    # the next tile's bootstrap credits the slices after the second store
-                    for i in cutlass.range_constexpr(CFG_ACCUM.DQ_SLICES):
-                        bars.dq_empty[i].arrive()
-                full_state = advance(full_state, 1)
-        else:
-            _wait_accum(bars.dv_full, out_state.phase)
-            tma_store_tile(_operand_accum(slab, CFG_ACCUM.ALIAS, dtype), GmemTileTma(dv_desc)(0, kv * CFG_ACCUM.M, head, batch))
-            _wait_accum(bars.dk_full, out_state.phase)
-            tma_store_tile(_operand_accum(slab, CFG_ACCUM.ALIAS + CFG_ACCUM.OPERAND_BYTES, dtype), GmemTileTma(dk_desc)(0, kv * CFG_ACCUM.M, head, batch))
-            out_state = advance(out_state, 1)
-            tma_store_commit()
-            tma_store_wait(0)
-        bars.dvk_empty.arrive()
-        block, head, batch, valid, sched_state = _next_tile_accum(sched, bars, sched_state, nheads, nk, causal, swizzle, batch_heads)
-
-
 @cute.kernel
 def bprop_d128_accum_kernel(
     q_desc: cutlass.GridConstant[tmap.TensorMap],
@@ -1426,40 +815,20 @@ def bprop_d128_accum_kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
     tmem_base = tmem_slot.load()
-    if cutlass.const_expr(DQ_OUT):
-        if warp < 8:
-            _softmax_loop_accum(
-                slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype, window
-            )
-        elif warp < 12:
-            _epilogue_loop_accum(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
-        elif warp == 12:
-            _mma_loop_accum(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
-        elif warp == 13:
-            _load_loop_accum(
-                slab, bars, sched, q_desc, k_desc, v_desc, do_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window
-            )
-        elif warp == 14:
-            _store_loop_accum(
-                slab, bars, sched, dq_desc, dk_desc, dv_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, False, window
-            )
-        else:
-            _scheduler_loop_accum(bars, sched)
+    if warp < 8:
+        _softmax_loop_accum(
+            slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype, window
+        )
+    elif warp < 12:
+        _epilogue_loop_accum(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
+    elif warp == 12:
+        _mma_loop_accum(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
+    elif warp == 13:
+        _load_loop_accum(slab, bars, sched, q_desc, k_desc, v_desc, do_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
+    elif warp == 14:
+        _store_loop_accum(slab, bars, sched, dq_desc, dk_desc, dv_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, False, window)
     else:
-        if warp < 8:
-            _pair_softmax_loop(
-                slab, bars, sched, tmem_base, lse, delta, block, head, batch, sq, skv, nk, nheads, batch_heads, swizzle, scale, causal, dtype, window
-            )
-        elif warp < 12:
-            _pair_epilogue_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
-        elif warp == 12:
-            _pair_mma_loop(slab, bars, sched, tmem_base, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
-        elif warp == 13:
-            _pair_load_loop(slab, bars, sched, q_desc, k_desc, v_desc, do_desc, block, head, batch, sq, nk, nheads, batch_heads, swizzle, causal, dtype, window)
-        elif warp == 14:
-            _pair_store_loop(slab, bars, sched, dk_desc, dv_desc, block, head, batch, nk, nheads, batch_heads, swizzle, causal, dtype)
-        else:
-            _scheduler_loop_accum(bars, sched)
+        _scheduler_loop_accum(bars, sched)
     nvvm.barrier_cta_sync()
     if warp == 0:
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
