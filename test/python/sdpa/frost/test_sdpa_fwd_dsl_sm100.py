@@ -825,15 +825,22 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
             (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
             (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
         }.get(d_shape, name)
-    if fp8 and _SM == 107 and d_shape == (512, 512):
-        name = "sdpa_fwd_sm107_d512_fp8_role_split"
-        cga = 4  # public physical cluster; the existing MMA group has two CTAs
+    if fp8 and _SM == 107:
+        name = {
+            (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
+            (128, 128): "sdpa_fwd_sm107_d128_fp8_multi_q",
+            (192, 128): "sdpa_fwd_sm107_d192_fp8_multi_q",
+            (256, 256): "sdpa_fwd_sm107_d256_fp8_single_q",
+            (512, 512): "sdpa_fwd_sm107_d512_fp8_role_split",
+        }.get(d_shape, name)
+        if d_shape == (512, 512):
+            cga = 4  # public physical cluster; the MMA group has two CTAs
     if not fp8 and _SM in (100, 103) and d_shape == (192, 128):
         name = "sdpa_fwd_sm100_d192_multi_q"
     if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"
-    if fp8 and (_SM in (100, 103) or (_SM == 107 and d_shape == (512, 512))):
+    if fp8 and _SM in (100, 103, 107):
         from cudnn.engines.manifest import family_for
 
         # Keep the ranked packing/scheduler knobs, but bind this fixture's

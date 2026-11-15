@@ -11,6 +11,10 @@ from sdpa.frost.test_sdpa_fwd_thd_origins_fp8_sm120 import _check_routes_and_inv
 
 def origin_checks(family, arch="sm100", shapes=None):
     def engine_for(dims):
+        if arch == "sm107" and family == "fp8" and dims in (192, (192, 128)):
+            return "sdpa_fwd_sm107_d192_fp8_multi_q"
+        if arch == "sm107" and family == "fp8" and dims in (256, (256, 256)):
+            return "sdpa_fwd_sm107_d256_fp8_single_q"
         if arch == "sm107" and family == "fp8" and dims in (512, (512, 512)):
             return "sdpa_fwd_sm107_d512_fp8_role_split"
         if arch == "sm100" and family == "fp8" and dims in (256, (256, 256)):
@@ -30,6 +34,9 @@ def origin_checks(family, arch="sm100", shapes=None):
         expected = "sm100/d256_fp8_single_q/kernel.py" if arch == "sm100" and family == "fp8" and width == 256 else f"{arch}/prefill_{flavor}_{family}.py"
         if arch == "sm100" and family == "fp8" and width == 192:
             expected = "sm100/d192_fp8_multi_q/kernel.py"
+        if arch == "sm107" and family == "fp8" and width in (192, 256):
+            owner = "d192_fp8_multi_q" if width == 192 else "d256_fp8_single_q"
+            expected = f"sm107/{owner}/kernel.py"
         if arch == "sm107" and family == "fp8" and width == 512:
             expected = "sm107/d512_fp8_role_split/kernel.py"
         assert plan._compiled.kernel_module.__file__.endswith(expected)

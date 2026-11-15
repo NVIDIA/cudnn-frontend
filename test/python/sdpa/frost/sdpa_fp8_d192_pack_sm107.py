@@ -18,16 +18,6 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_rubin]
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("output", [torch.bfloat16, torch.float8_e4m3fn])
 def test_native_d192_fp8_pack_rebind_replay(b, split, sched, sink, dtype, output, monkeypatch):
-    from cudnn.sdpa.fwd import api_dsl
-
-    seen = []
-    load = api_dsl._load_kernel_template
-
-    def record(filename, params, tag, part=None):
-        seen.append(filename)
-        return load(filename, params, tag, part=part)
-
-    monkeypatch.setattr(api_dsl, "_load_kernel_template", record)
     d, dv = 192, 128
     sq = 129 if split == 1 else 17
     sinks = torch.linspace(-5, 8, 4, device="cuda").view(1, 4, 1, 1) if sink else None
@@ -38,8 +28,9 @@ def test_native_d192_fp8_pack_rebind_replay(b, split, sched, sink, dtype, output
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(1, g.get_workspace_size()), dtype=torch.uint8, device="cuda")
-    assert "sm107/prefill_d192_d128_fp8.py" in seen
-    assert not any(name.startswith("sm100/") for name in seen)
+    compiled = g._compiled_plans[g._plan_index]._compiled
+    assert compiled.kernel_module.__file__.endswith("sm107/d192_fp8_multi_q/kernel.py")
+    assert g.selected_engine.name == "sdpa_fwd_sm107_d192_fp8_multi_q"
     assert g._compiled_plans[g._plan_index]._prepared is not None
     g.execute(vp, ws)
     shared._check(bufs, thd=False, b=b, sq=sq, skv=256)

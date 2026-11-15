@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Dense FP8 decode through explicit SM100/103 engines and the SM107 SWAP_AB knob.
+"""Dense FP8 decode through explicit SM100/103 and SM107 implementation records.
 
 Forward only: this implementation choice adds no backward path. Every plan
 keeps its packing and split count fixed during byte comparisons. AMAX is a
@@ -104,17 +104,22 @@ def _case(
     eid, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
     knobs.update({cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.PACK_GQA: int(pack), cudnn.knob_type.SPLIT_KV: split, cudnn.knob_type.SCHED_POLICY: 0})
     knobs.pop(cudnn.knob_type.SWAP_AB, None)
-    explicit = _arch() == "sm100" and (d, dv) == (128, 128)
+    explicit = (d, dv) == (128, 128)
     if explicit:
         from cudnn.engines.manifest import family_for
         from cudnn.sdpa import graph_analyzer
         from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
-        from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry
-        from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+
+        if _arch() == "sm107":
+            from cudnn.sdpa.fwd.heuristics import select_sm107_small_fp8_geometry as select_geometry
+            from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_swap_ab.contract import Geometry as SwapAB
+        else:
+            from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry as select_geometry
+            from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
 
         facts = graph_analyzer.analyze(g)
         requested = replace(SdpaFwdKnobs.from_public(knobs), tile_m=128, swap_ab=swap)
-        geometry = SwapAB() if swap == 1 else select_sm100_small_fp8_geometry(facts, requested)
+        geometry = SwapAB() if swap == 1 else select_geometry(facts, requested)
         eid = family_for(g).offered_ids()[geometry.implementation]
         knobs = geometry.canonical_knobs(requested).to_public()
     elif swap is not None:
@@ -361,10 +366,13 @@ def test_domain(cc):
     knobs = engines.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=True, swap_ab=1)
 
     def actual_mismatch(f, k):
-        if cc in ((10, 0), (10, 3)) and (f.d_qk, f.d_v) == (128, 128):
-            from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry
-
-            return engines.mismatch(_caps("sdpa_fwd_sm100_d128_fp8_swap_ab"), f, Geometry().canonical_knobs(k))
+        if (f.d_qk, f.d_v) == (128, 128):
+            if cc == (10, 7):
+                from cudnn.sdpa.fwd.kernels.sm107.d128_fp8_swap_ab.contract import Geometry
+            else:
+                from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry
+            arch = "sm107" if cc == (10, 7) else "sm100"
+            return engines.mismatch(_caps(f"sdpa_fwd_{arch}_d128_fp8_swap_ab"), f, Geometry().canonical_knobs(k))
         return engines.mismatch(caps, f, k)
 
     for valid, choice in (
