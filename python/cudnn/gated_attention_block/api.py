@@ -635,7 +635,7 @@ it (and wherever no two-unit route holds the step, whatever the batch).  ``decod
 batch the route was decided at; without a batch (the envelope's ``routes``) the route is the small-batch one."""
 
 DECODE_TILE = "decode_d256_f16"
-"""``kernel_template`` of the d256 decode tile: the Rubin rendering ``sdpa/fwd/kernels/sm107/decode_d256_f16.py`` on cc 10.7 and its
+"""``kernel_template`` of the d256 decode tile: the Rubin rendering ``sdpa/fwd/kernels/sm107/d256_f16_swap_ab/kernel.py`` on cc 10.7 and its
 SM100 sibling ``sdpa/fwd/kernels/sm100/d256_f16_swap_ab/kernel.py`` on cc 10.0 (the swap-AB tile; ONE template name, the adapter picks the file
 by the device -- the readback ``_Sdpa._impl._k_mod.__file__`` names which)."""
 
@@ -736,7 +736,7 @@ def _resolve_decode_route_policy(policy: Optional[str]) -> str:
 @dataclass(frozen=True)
 class DecodeRoute:
     """Which SDPA kernel serves a DECODE step of ``s_q`` tokens at a geometry under a route policy -- the Rubin decode tile
-    (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``, the swap-AB tile: ``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` names the
+    (``sdpa/fwd/kernels/sm107/d256_f16_swap_ab/kernel.py``, the swap-AB tile: ``config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES`` names the
     widths it takes in ONE token unit, ``config_sm107.decode_d256_q_tile`` the adapter's token-unit arm past them) or the paged d256
     PREFILL tile with the group packed (the EXTEND form's kernel at the dense step's envelope); ``_Sdpa.compile`` pins the compiled
     ``kernel_template`` against this record.  ``kv_streams`` is the figure the HBM-bound decode step is priced by: how many times the
@@ -5209,8 +5209,8 @@ class _Sdpa(_Stage):
     the SM107 sibling kernels automatically from the live device —
     ``rubin=(self._device_cc == (10, 7))`` in ``SdpaFwdDslSm100.compile`` — so the
     ``(256, 256)`` flavor Qwen3.5 needs lands on
-    ``sdpa/fwd/kernels/sm107/prefill_d256_f16.py`` (bf16 / f16) or, under
-    ``pertensor_fp8=True``, ``prefill_d256_fp8.py`` (e4m3).  There is no flag to
+    ``sdpa/fwd/kernels/sm107/d256_f16_lookahead/kernel.py`` (bf16 / f16) or, under
+    ``pertensor_fp8=True``, ``d256_fp8_single_q/kernel.py`` (e4m3).  There is no flag to
     pass; there IS an arch to check, which :meth:`check_support` does: the
     bf16 / f16 stage is served on the parts of :data:`DENSE_SERVING_CCS` (on
     cc 10.0 the adapter's own SM100 kernels -- ``sm100/d256_f16_lookahead/kernel.py``

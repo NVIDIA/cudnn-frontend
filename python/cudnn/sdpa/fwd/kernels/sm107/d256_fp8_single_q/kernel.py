@@ -451,7 +451,7 @@ def _kernel(
     # FROST's quantized ABI: the four 1-element fp32 scales arrive as DEVICE
     # TENSORS and the amax of O is an OUTPUT.  The pre-upstream contract pre-folded the scales on
     # the host and produced no amax -- that gap is what this closes.  Template:
-    # the shipped sm107/prefill_d128_fp8.py sibling (same lineage).
+    # the shipped sm107/d128_fp8_multi_q/kernel.py sibling (same lineage).
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -2301,7 +2301,7 @@ def _host(
     # FROST's quantized ABI: the four 1-element fp32 scales arrive as DEVICE
     # TENSORS and the amax of O is an OUTPUT.  The pre-upstream contract pre-folded the scales on
     # the host and produced no amax -- that gap is what this closes.  Template:
-    # the shipped sm107/prefill_d128_fp8.py sibling (same lineage).
+    # the shipped sm107/d128_fp8_multi_q/kernel.py sibling (same lineage).
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -2315,7 +2315,7 @@ def _host(
     seq_q_lens_addr: cutlass.Int64 = 0,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    # sm107/d128_fp8_multi_q/kernel.py sibling does.
     # THD device metadata build: the CALLER's Q/KV length tensors, (B,) lengths
     # or (B+1,) cu prefix sums per side via thd_lens_form.  Consumed only by the
     # setup kernel, which writes the metadata buffer device-side.

@@ -440,7 +440,7 @@ class SM90FusedMultiHeadAttentionForward:
             if persistent_ctas < 1:
                 raise ValueError(f"prefill_d128_f16_sm90: a persistent record needs persistent_ctas >= 1; got {persistent_ctas}")
             # Every item must have KV work, so neither role needs a per-item liveness branch and both flip their Q
-            # phase once per item (the empty-tile trap of sm100/prefill_d128_f16.py, where an empty tile must still
+            # phase once per item (the empty-tile trap of sm100/d128_f16_multi_q/kernel.py, where an empty tile must still
             # consume its Q phase, cannot arise): S_kv >= 1, and S_q <= S_kv under bottom-right causal (the adapter
             # refuses the rest, api_dsl check_support).
             _, _, _, s_q, s_kv = shape

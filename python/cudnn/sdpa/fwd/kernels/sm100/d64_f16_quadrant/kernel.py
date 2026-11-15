@@ -185,7 +185,7 @@ _thd_tma_offsets = _sdpa_h.thd_tma_offsets
 # and PACKED_HEADS_PER_KV = 3 of them read the same KV head).  CFG.QH_PER_KH
 # stays the graph's GQA ratio (it drives the bottom-right diagonal).  The
 # bounds helpers take HEADS_PER_TILE (the packed group), never QH_PER_KH --
-# the same mapping as sm100/prefill_d128_f16.py.
+# the same mapping as sm100/d128_f16_multi_q/kernel.py.
 HEADS_PER_TILE = CFG.PACK_G if CFG.PACK_GQA else 1
 TOKENS_PER_TILE = CFG.TILE_M // HEADS_PER_TILE
 PACKED_HEADS_PER_KV = CFG.QH_PER_KH // HEADS_PER_TILE if CFG.PACK_GQA else 1
@@ -223,7 +223,7 @@ if QUAD and not (
     CFG.TILE_K == 64 and CFG.TILE_O == QUAD_O_COLS and CFG.N_BMM2_CHUNKS == 2 and CFG.TILES_Q == 1 and EARLY_Q and QUAD_ROWS % HEADS_PER_TILE == 0
 ):
     raise ValueError("decode_quad: the d64 tile with two P chunks, early Q and a packed group that divides 32 rows")
-# exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/prefill_d128_f16.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
+# exp2 split MUFU / FMA (``_E2E_*``), the d128 prefill kernel's pattern (sm100/d128_f16_multi_q/kernel.py): of every _E2E_FREQ P columns the LAST _E2E_RES are
 # evaluated on the FMA pipe (``exp2_emul_pair``), the rest on MUFU.EX2.  On cc 10.0 the d64 tile's one softmax warpgroup is MUFU-bound at a long KV (16
 # EX2 per clk per SM, and the 128 rows of a tile exponentiate whether live or not), so the FMA pipe takes a quarter of every row's columns.  Gate:
 # ``PARAMS.exp2_fma_split`` supplies the measured cc gate. This tile enables it for d64 decode and the measured d128 THD FP32-partial form;

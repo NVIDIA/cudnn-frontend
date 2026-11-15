@@ -333,21 +333,20 @@ python/cudnn/
                                       explicit engine)
         sm80/wide_cooperative/        SM80 wide-head cooperative body (wide512 /
                                       mla576 envelopes; explicit engine)
-        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
-                                      the D512 body: one 64-row tile over
+        sm90/f16_three_wg/            the D512 body: one 64-row tile over
                                       three warpgroups, every D up to 512 on
                                       native 128/256/512-column storage
-        sm90/prefill_d64_f16.py       the D512 body's exact dense D64 subset
-        sm90/prefill_d128_f16.py      dedicated exact D128: 128-row tile, two
+        sm90/d64_f16_one_wg/          the D512 body's exact dense D64 subset
+        sm90/d128_f16_multi_q/        dedicated exact D128: 128-row tile, two
                                       64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
         sm100/d256_f16_lookahead/kernel.py
         sm100/d256_f16_swap_ab/kernel.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
-        sm100/prefill_d512_f16.py
+        sm100/d512_f16_role_split/kernel.py
         sm100/split_combine.py        the split-KV reduction pass
-        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
-        sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
+        sm107/d128_fp8_multi_q/kernel.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm107/d256_f16_swap_ab/kernel.py      the d256 decode tile's Rubin sibling (same
                                       swap-AB body; config_sm107.make_cfg_d256_decode)
         sm120/f16_general/            general SM120 template (d <= 256; explicit engine)
         sm120/d256_f16_all_compute/   d256 flavor (explicit engine)
@@ -699,7 +698,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
+  lowers fp16 and bf16 graphs to `sm100/d512_f16_role_split/kernel.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -864,7 +863,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
+  `_require` in `sm100/d512_f16_role_split/kernel.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -1129,7 +1128,7 @@ Contract:
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
 10. **Two directory levels under the pass, maximum**, and ARCH is the only
-    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
+    coverage axis allowed to be one of them (`kernels/sm107/d128_fp8_multi_q/kernel.py`).
     Every other axis -- phase, head dim, dtype family -- goes in the filename and
     the engine name. A module shared across arch lines stays at `kernels/` level
     rather than inside one arch package.

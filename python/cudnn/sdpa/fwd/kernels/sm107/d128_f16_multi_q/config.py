@@ -454,7 +454,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
 
 
 def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
-    """The 32-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim
+    """The 32-wide head-dim tile of ``sm107/d128_f16_multi_q/kernel.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim
     <= 32 with D % 8 == 0 (8 / 16 / 24 / 32) by TMA zero fill; cga1 (SM107_SMALL_D_CGAS); dense / causal / bottom-right /
     SWA / padded / sink / GQA like d128.  THD, split-KV, paged KV, PackGQA and the score side outputs are NOT wired on the
     tile: the row routes a graph asking for them onto the d128 flavor (``engines.Capabilities.dense_only_d_shapes``), and this
@@ -463,12 +463,12 @@ def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
 
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
-    """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``).
+    """The 64-wide head-dim tile of ``sm107/d128_f16_multi_q/kernel.py`` (``TemplateParams.d_flavor=64``).
 
     Half-precision dense plans use aligned logical widths up to 64 by TMA zero fill;
     native THD uses exact D64. Both CTA widths carry THD and PackGQA;
     dense split plans use FP32 partials and the shared sink-aware combine.
-    Per-tensor FP8 uses the same native width in ``prefill_d128_fp8.py``,
+    Per-tensor FP8 uses the same native width in ``d128_fp8_multi_q/kernel.py``,
     including dense PackGQA and split-KV; its THD and paged forms remain unsupported.
     """
     if params.dtype_qkv <= _DTYPE_E5M2 and params.thd_varlen:

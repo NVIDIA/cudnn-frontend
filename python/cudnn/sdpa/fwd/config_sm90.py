@@ -3,9 +3,9 @@
 
 """Kernel-facing configuration for the FROST SM90 SDPA forward templates.
 
-Two templates ship: the dedicated D128 template (``sm90/prefill_d128_f16.py``,
+Two templates ship: the dedicated D128 template (``sm90/d128_f16_multi_q/kernel.py``,
 issue #378), a 128 x 128 tile for the exact (128, 128) dense declarations it
-serves, and the D512 body (``sm90/prefill_d512_f16.py``, with its native
+serves, and the D512 body (``sm90/f16_three_wg/kernel.py``, with its native
 128/256/512-column storage and the exact dense D64 body beside it) on a 64 x 64
 tile for every head dim up to 512 and every declared feature. A pinned tile
 names the template; with none pinned ``pick_flavor`` chooses once, from the head
@@ -547,7 +547,7 @@ class TemplateParams:
     head_tile: int = 512
     # Dense queries with native TMA loads from independently mapped K/V pages.
     page_size: int = 0
-    # Overlap switch of the D128 template (sm90/prefill_d128_f16.py), appended so every earlier specialization
+    # Overlap switch of the D128 template (sm90/d128_f16_multi_q/kernel.py), appended so every earlier specialization
     # keeps its defaults: False renders the v1 loop. intra_wg_overlap issues QK(t) and PV(t-1) as two WGMMA groups in
     # flight together inside each compute warpgroup, and computes the same O and Stats bit for bit, up to the sign of a
     # zero O element. SdpaFwdDslSm90 sets the shipped value (api_dsl.D128_INTRA_WG_OVERLAP) for the D128 flavor only;

@@ -101,7 +101,7 @@ if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_f16_sm107: d_flavor must be one of {sorted(_MAKE_CFG)}; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 if PARAMS.dual_kv_stream:
-    raise ValueError("sm107/prefill_d128_f16: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
+    raise ValueError("sm107/prefill_d128_f16: dual_kv_stream (two KV streams over one Q tile) is served by sm100/d128_fp8_dual_kv/kernel.py only")
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
 # decision point, wired into every construction below rather than repeated as a

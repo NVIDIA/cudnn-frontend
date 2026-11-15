@@ -451,7 +451,7 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     cls = _GEOMETRY_BY_D_QK[d_qk]
     if d_qk == 128 and cta_mma == 1:
         # Default D128 half CGA1 geometry is the decode/split tile
-        # (sm100/decode_d128_f16.py, TILES_Q=1), not the two-slab paged prefill.
+        # (sm100/d128_f16_single_q/kernel.py, TILES_Q=1), not the two-slab paged prefill.
         cls = CfgD128Decode
     return cls.TILES_Q * cls.TILE_M * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
@@ -1452,7 +1452,7 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
 
 @dataclass(frozen=True)
 class CfgD128Decode(CfgD128):
-    """The d128 f16/bf16 DECODE tile (``sm100/decode_d128_f16.py``).
+    """The d128 f16/bf16 DECODE tile (``sm100/d128_f16_single_q/kernel.py``).
 
     Same head geometry, masks, paged loader and split/epilogue contract as
     :class:`CfgD128` (incl. partial PackGQA: ``PACK_G`` heads per token
@@ -2384,7 +2384,7 @@ def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[Cfg
 
 
 def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
-    """The 32-wide head-dim tile of ``sm100/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim <= 32 with
+    """The 32-wide head-dim tile of ``sm100/d128_f16_multi_q/kernel.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim <= 32 with
     D % 8 == 0 by TMA zero fill; cga1 (SM100_SMALL_D_CGAS); dense / causal / bottom-right / SWA / padded / sink / GQA like d128 plus the
     small-tile seams; THD / split-KV / paged KV / PackGQA / the score side outputs ride the d128 flavor (the row's ``dense_only_d_shapes``)."""
     return _make_cfg_small_d_sm100(params, tile_k=32)
@@ -2392,7 +2392,7 @@ def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
 
 @dataclass(frozen=True)
 class CfgD64Decode(CfgD64):
-    """The d64 DECODE tile (``sm100/decode_d128_f16.py`` at ``d_flavor=64``).
+    """The d64 DECODE tile (``sm100/d128_f16_single_q/kernel.py`` at ``d_flavor=64``).
 
     :class:`CfgD128Decode` for the narrow head geometry: same Q-tile reshape
     (one 128-row slab per independent CTA instead of the prefill cluster's
@@ -2496,7 +2496,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
 
 
 def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]:
-    """Config for ``sm100/decode_d128_f16.py`` at ``d_flavor=64`` -- the d64
+    """Config for ``sm100/d128_f16_single_q/kernel.py`` at ``d_flavor=64`` -- the d64
     flavor at ``cta_mma=1``.  Backstop, like every ``make_cfg_*``."""
     _validate_params("d64", params)
     if not params.decode_tile:

@@ -44,7 +44,7 @@ head-major); the amax_o atomicMax is gated on live rows. Dense path
 byte-identical.
 
 Paged KV (``CFG.PAGED_KV=1``, issue #920) is the f16 d128 kernel's specialization
-ported hunk-for-hunk (see sm100/prefill_d128_f16.py): K/V are page POOLS —
+ported hunk-for-hunk (see sm100/d128_f16_multi_q/kernel.py): K/V are page POOLS —
 ``[num_pages, page_size, H_kv, D]`` (NHD) or ``[num_pages, H_kv, page_size, D]``
 (HND, a stride permutation of the same descriptor) — and a per-batch
 ``block_table`` [B, max_pages] int32 names the pages of each sequence.  Only

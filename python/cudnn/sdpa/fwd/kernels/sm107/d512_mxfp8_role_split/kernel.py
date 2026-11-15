@@ -3143,7 +3143,7 @@ def _host(
     total_kv_sf_tiles: cutlass.Int32 = 0,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    # sm107/d128_fp8_multi_q/kernel.py sibling does.
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.
@@ -3254,7 +3254,7 @@ def _host(
     # is why the d128 MXFP8 sibling passes with the per-tile form.  d256 was
     # correct at S=128 (one KV tile => one group) and wrong from S=256 on until
     # this was fixed; the same defect lives here at 4 planes.  Mirrors
-    # sm100/prefill_d256_mxfp8.py's dense/THD stride split.
+    # sm100/d256_mxfp8_single_q/kernel.py's dense/THD stride split.
     #
     # Box = ONE D-plane: each sg1 peer issues SF_NUM_BLOCKS_V/CTA_MMA per-plane
     # loads at INTERLEAVED SMEM offsets (see the loop in _tmaldg_warp_group), so
