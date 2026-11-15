@@ -23,7 +23,7 @@ import hashlib, json, math, sys, torch, cudnn, cudnn.sdpa
 from cudnn.frost import compiled_cache as cc
 sys.path.insert(0, %(tests)r)
 from frost_test_utils import select_engine, _SM
-from cudnn.sdpa.fwd.engines import engine_name
+from frost_test_utils import half_engine_names
 _ARCH = "sm107" if _SM == 107 else "sm100"
 b, h, s, d = 2, 8, 256, 128
 torch.manual_seed(0)
@@ -35,7 +35,7 @@ q, k, v = g.tensor_like(q_gpu), g.tensor_like(k_gpu), g.tensor_like(v_gpu)
 o, _ = g.sdpa(name="sdpa", q=q, k=k, v=v, generate_stats=False, attn_scale=1.0 / math.sqrt(d), use_causal_mask=True)
 o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
 g.validate(); g.build_operation_graph(); g.create_execution_plans([cudnn.heur_mode.A])
-select_engine(g, engine_name(arch=_ARCH)); g.check_support(); g.build_plans()
+select_engine(g, half_engine_names(arch=_ARCH)); g.check_support(); g.build_plans()
 ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
 g.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu}, ws); torch.cuda.synchronize()
 print(json.dumps({"stats": cc.stats(), "digest": hashlib.sha256(o_gpu.contiguous().view(torch.int16).cpu().numpy().tobytes()).hexdigest()}))

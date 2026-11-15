@@ -93,7 +93,11 @@ def test_graph_and_adapter_decline_unaligned_dense_port(cc, role, monkeypatch):
         scale=0.125,
         **{n + "_t": ref(desc) for n, desc in descs.items()},
     )
-    spec = {(10, 0): engines._sm100_spec, (10, 7): engines._sm107_spec, (12, 0): engines._sm120_spec}[cc]()
+    spec = (
+        next(s for s in engines.ENGINE_SPECS if s.name == "sdpa_fwd_sm100_d128_multi_q")
+        if cc == (10, 0)
+        else {(10, 7): engines._sm107_spec, (12, 0): engines._sm120_spec}[cc]()
+    )
     reason = engines.mismatch(spec.capabilities, facts)
     assert reason is not None and role in reason.lower() and "stride" in reason.lower()
 

@@ -329,6 +329,8 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_sm100_d128_single_q": EngineSlot(32),
             "sdpa_fwd_sm120_d512_fp8_paired": EngineSlot(33),
             "sdpa_fwd_sm120_d512_mxfp8_paired": EngineSlot(34),
+            "sdpa_fwd_sm100_d128_multi_q": EngineSlot(35),
+            "sdpa_fwd_sm100_d64_quadrant": EngineSlot(36),
             "sdpa_fwd_sm120_d256_all_compute": EngineSlot(37),
             "sdpa_fwd_sm120_decode_key_group": EngineSlot(38),
             "sdpa_fwd_sm120_fp8_general": EngineSlot(42),

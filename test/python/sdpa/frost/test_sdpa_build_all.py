@@ -7,8 +7,7 @@ import pytest
 import torch
 
 from cudnn.engines import is_backend_engine
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, requires_dsl, select_engine, sm90_half_owner
+from frost_test_utils import _SM, requires_dsl, select_engine, half_engine_names, sm90_half_owner
 
 pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM not in (90, 100, 103), reason="native/FROST SDPA parity on Hopper and Blackwell")]
 
@@ -49,7 +48,7 @@ def test_build_all_preserves_selection_and_executes_both_providers(selected_prov
         native = record
         break
     assert native is not None, "the representative graph must offer a buildable backend plan"
-    select_engine(source, sm90_half_owner(head_dim, head_dim) if _SM == 90 else engine_name(arch="sm100"))
+    select_engine(source, sm90_half_owner(head_dim, head_dim) if _SM == 90 else half_engine_names(arch="sm100"))
     frost = source.get_engine_and_knobs_at_index(source._plan_index)
     source.build_plans()
 

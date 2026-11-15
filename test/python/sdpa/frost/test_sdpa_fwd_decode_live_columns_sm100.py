@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.L0, requires_pre_rubin_blackwell, requires_dsl]
 def live_column_route(monkeypatch):
     from cudnn.sdpa.fwd import api_dsl
 
-    original = api_dsl._load_sm100_kernel_module
+    original = api_dsl.load_template
     observed = []
 
     def load(*args, **kwargs):
@@ -28,7 +28,7 @@ def live_column_route(monkeypatch):
         observed.append(mod)
         return mod
 
-    monkeypatch.setattr(api_dsl, "_load_sm100_kernel_module", load)
+    monkeypatch.setattr(api_dsl, "load_template", load)
     yield
     assert observed, "the test did not compile a FROST kernel"
     assert any(

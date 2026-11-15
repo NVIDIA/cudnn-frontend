@@ -16,7 +16,7 @@ from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = pytest.mark.L0
 
-ENGINE = "sdpa_fwd_prefill_sm100"
+ENGINES = ("sdpa_fwd_sm100_d128_multi_q", "sdpa_fwd_sm100_d128_single_q")
 
 
 def _dense_sdpa_graph(handle, q, k, v, o, stats):
@@ -67,7 +67,7 @@ def test_frost_plan_reports_names_and_replays_public_knobs():
     assert kt.TILE_M in knobs and kt.TILE_N in knobs, knobs
     assert not any(isinstance(key, str) for key in knobs)
     name = g.get_plan_name_at_index(frost_idx[0])
-    assert name.startswith(ENGINE + "[") and "TILE_M=" in name and "TILE_N=" in name, name
+    assert name.split("[")[0] in ENGINES and "TILE_M=" in name and "TILE_N=" in name, name
     # frontend-only axes, when set, are frontend-only types
     for key in knobs:
         if key in (kt.SCHED_POLICY, kt.PACK_GQA, kt.SPLIT_KV):
