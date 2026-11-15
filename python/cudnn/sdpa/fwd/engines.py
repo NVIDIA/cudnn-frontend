@@ -3101,6 +3101,7 @@ def _sm100_spec() -> EngineSpec:
                 for cc in ((10, 0), (10, 3))
                 for shape in ((32, 32), (64, 64), (128, 128), (192, 128), (256, 256), (512, 512), SM100_NATIVE_D576_SHAPE)
             ),
+            delegated_envelope=True,
             # (64, 64) is a NATIVE flavor, not an envelope: it compiles the d128
             # file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of
             # zero-filling a 128-wide tile for gpt-oss-class head dims.  (32, 32)
@@ -3225,10 +3226,11 @@ def _sm100_d192_half_specs():
     base = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
+        d_pad_multiple=8,
         d_envelope_floors=(),
-        thd_d_shapes=shape,
+        thd_d_shapes=None,
         paged_d_shapes=shape,
         split_d_shapes=shape,
         pack_gqa_d_shapes=shape,
@@ -3250,11 +3252,13 @@ def _sm100_d192_half_specs():
     single_q = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         implementation=_half_single_q.NAME,
         d_shapes=single_shapes,
         d_envelope_floors=(),
-        # Exact D32 paged THD already used the D64 single-Q envelope.
-        thd_d_shapes=single_shapes | {(32, 32)},
+        # Preserve the legacy THD envelope; the fixed body contract checks
+        # whether this declaration can use single-Q.
+        thd_d_shapes=None,
         paged_d_shapes=single_shapes,
         split_d_shapes=single_shapes,
         pack_gqa_d_shapes=single_shapes,
@@ -3286,6 +3290,7 @@ def _sm100_small_half_specs():
     multi_q = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         implementation=_small_half_multi_q.NAME,
         d_shapes=shapes,
         d_envelope_floors=(),
@@ -3324,9 +3329,10 @@ def _sm100_d512_specs():
     base = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=frozenset({(512, 512), SM100_NATIVE_D576_SHAPE}),
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=8,
+        d_envelope_floors=((SM100_NATIVE_D576_SHAPE, 512),),
         paged_d_shapes=frozenset({(512, 512), SM100_NATIVE_D576_SHAPE}),
         pack_gqa_partial_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
         thd_pack_gqa_d_shapes=frozenset({SM100_NATIVE_D576_SHAPE}),
@@ -3365,8 +3371,9 @@ def _sm100_d256_specs():
     base = replace(
         _sm100_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=frozenset({(256, 256)}),
-        d_pad_multiple=0,
+        d_pad_multiple=8,
         d_envelope_floors=(),
         paged_d_shapes=frozenset({(256, 256)}),
         pack_gqa_partial_d_shapes=frozenset({(256, 256)}),
@@ -3898,6 +3905,7 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 if rubin_row
                 else frozenset((cc, shape) for cc in ((10, 0), (10, 3)) for shape in ((64, 64), (128, 128), (192, 128), (256, 256), (512, 512)))
             ),
+            delegated_envelope=not rubin_row,
             layouts=frozenset({"bshd", "dense_flex"}),
             # Ranges, not the parts that exist today (see sm_lo above): the
             # split point is the Rubin line — 100-106 runs the SM100 modules,
@@ -4140,8 +4148,9 @@ def _sm100_small_fp8_specs():
     base = replace(
         _sm100_fp8_spec().capabilities,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shapes,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=d128,
         paged_d_shapes=shapes,
@@ -4192,8 +4201,9 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec().capabilities,
         implementation=_D192_FP8_MULTI_Q,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
         paged_kv=False,
@@ -4285,8 +4295,9 @@ def _sm100_d256_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec().capabilities,
         implementation=_D256_FP8_SINGLE_Q,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
+        d_pad_multiple=16,
         d_envelope_floors=(),
         thd_d_shapes=shape,
         paged_d_shapes=shape,
@@ -4311,9 +4322,10 @@ def _sm100_d512_fp8_spec() -> EngineSpec:
         _sm100_fp8_spec().capabilities,
         implementation=_D512_FP8_ROLE_SPLIT,
         delegated_exact=frozenset(),
+        delegated_envelope=False,
         d_shapes=shape,
-        d_pad_multiple=0,
-        d_envelope_floors=(),
+        d_pad_multiple=16,
+        d_envelope_floors=(((512, 512), 256),),
         thd_d_shapes=shape,
         paged_d_shapes=shape,
         split_d_shapes=shape,

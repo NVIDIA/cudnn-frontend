@@ -817,6 +817,19 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     name = engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8)
+    sm100_shape = d_shape
+    if _SM in (100, 103):
+        from types import SimpleNamespace
+
+        if fp8:
+            from cudnn.sdpa.fwd.kernels.sm100.fp8_flavor_contract import padded_shape
+        else:
+            from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
+
+        sm100_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=dv))
+        assert sm100_shape is not None
+        if sm100_shape == (512, 512):
+            cga = 4
     if fp8 and _SM in (100, 103):
         name = {
             (64, 64): "sdpa_fwd_sm100_d128_fp8_multi_q",
@@ -824,7 +837,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
             (192, 128): "sdpa_fwd_sm100_d192_fp8_multi_q",
             (256, 256): "sdpa_fwd_sm100_d256_fp8_single_q",
             (512, 512): "sdpa_fwd_sm100_d512_fp8_role_split",
-        }.get(d_shape, name)
+        }.get(sm100_shape, name)
     if fp8 and _SM == 107:
         name = {
             (64, 64): "sdpa_fwd_sm107_d128_fp8_multi_q",
@@ -835,9 +848,9 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         }.get(d_shape, name)
         if d_shape == (512, 512):
             cga = 4  # public physical cluster; the MMA group has two CTAs
-    if not fp8 and _SM in (100, 103) and d_shape == (192, 128):
+    if not fp8 and _SM in (100, 103) and sm100_shape == (192, 128):
         name = "sdpa_fwd_sm100_d192_multi_q"
-    if not fp8 and _SM in (100, 103) and d_shape == (256, 256):
+    if not fp8 and _SM in (100, 103) and sm100_shape == (256, 256):
         # This fixture explicitly requests the two-CTA scalar-tail split body.
         name = "sdpa_fwd_sm100_d256_lookahead"
     if not fp8 and _SM == 107:
@@ -854,7 +867,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, fp8_engine_names(_ARCH))
         _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
         engine = family_for(g).offered_ids()[name]
-    elif not fp8 and _SM in (100, 103) and d_shape[0] == d_shape[1] and d_shape[0] in (32, 64, 128):
+    elif not fp8 and _SM in (100, 103) and sm100_shape[0] == sm100_shape[1] and sm100_shape[0] in (32, 64, 128):
         from cudnn.engines.manifest import family_for
 
         # The scalar-tail fixture requests a prefill body at this CTA width;
@@ -862,7 +875,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(
         _select_engine(g, half_engine_names(_ARCH))
         _, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
         engine = family_for(g).offered_ids()["sdpa_fwd_sm100_d128_multi_q"]
-    elif not fp8 and _SM in (100, 103) and d_shape == (512, 512):
+    elif not fp8 and _SM in (100, 103) and sm100_shape == (512, 512):
         from cudnn.engines.manifest import family_for
 
         # This test explicitly requests split-KV, whose wide owner is the

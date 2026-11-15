@@ -101,6 +101,9 @@ if PARAMS.d_flavor not in _MAKE_CFG:
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 if PARAMS.softmax_f16:
     raise ValueError("prefill_d128_fp8_sm100: softmax_f16 is served by the SM107 sibling only (softmax_precision knob domain)")
+if PARAMS.causal_exclude_own_block:
+    # The shared parameter record includes this MXFP8-only mask; this body does not read it.
+    raise ValueError("prefill_d128_fp8_sm100: causal_exclude_own_block is served by the MXFP8 d128 body only")
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS

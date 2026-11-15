@@ -3572,8 +3572,10 @@ def select_sm100_d512_geometry_for_shape(d_qk, *, paged=False, split_kv=1, pack_
 
 
 def select_sm100_d512_geometry(facts, knobs):
+    from .kernels.sm100.half_flavor_contract import padded_shape
+
     return select_sm100_d512_geometry_for_shape(
-        facts.d_qk,
+        padded_shape(facts)[0],
         paged=facts.has_paged_kv,
         split_kv=knobs.split_kv or 1,
         pack_g=facts.h_q // facts.h_kv if knobs.pack_gqa else 1,
@@ -3592,11 +3594,12 @@ def select_sm100_small_fp8_geometry(facts, knobs):
     from .kernels.sm100.d128_fp8_dual_kv.contract import Geometry as DualKV
     from .kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
     from .kernels.sm100.small_fp8_contract import in_domain
+    from .kernels.sm100.fp8_flavor_contract import padded_shape
 
-    shape = (facts.d_qk, facts.d_v)
+    shape = padded_shape(facts)
     if not in_domain(facts):
-        raise ValueError("small-head FP8 selection requires exact SM100/SM103 D64 or D128 per-tensor inputs")
-    cga = knobs.cga if knobs.cga is not None else 1 if facts.d_qk == 64 else 2
+        raise ValueError("small-head FP8 selection requires SM100/SM103 per-tensor inputs covered by D64 or D128")
+    cga = knobs.cga if knobs.cga is not None else 1 if shape[0] == 64 else 2
     group = facts.h_q // facts.h_kv if knobs.pack_gqa else 1
     rows = facts.s_q * group
     decode_semantics = (
@@ -3622,10 +3625,10 @@ def select_sm100_small_fp8_geometry(facts, knobs):
         facts.device_cc == (10, 0) and shape == (128, 128) and cga == 1 and facts.has_paged_kv and not facts.thd and 0 < rows <= 8 and facts.b <= 65535
     )
     if decode_semantics and (explicit_decode or automatic_decode):
-        return SwapAB(d_flavor=facts.d_qk)
+        return SwapAB(d_flavor=shape[0])
     if fp8_dual_kv_stream_routed() and shape == (128, 128) and knobs.cga == 1 and not facts.thd and rows <= FP8_DUAL_KV_STREAM_MAX_ROWS:
         return DualKV()
-    return MultiQ(d_flavor=facts.d_qk, cga=cga)
+    return MultiQ(d_flavor=shape[0], cga=cga)
 
 
 def select_sm107_small_fp8_geometry(facts, knobs):
@@ -3695,7 +3698,7 @@ def select_sm100_small_half_geometry(facts, knobs):
     from .kernels.sm100.d256_f16_contract import D256Geometry, SWAP_AB
 
     if not in_domain(facts):
-        raise ValueError("small-head half selection requires exact SM100/SM103 D32/D64/D128 half queries")
+        raise ValueError("small-head half selection requires SM100/SM103 queries covered by the D32/D64/D128 half geometries")
     policy = sm100_legacy_policy_spec()
     flavor = _selected_d_shape(policy.capabilities, facts, knobs)
     if flavor not in ((32, 32), (64, 64), (128, 128)):
@@ -3758,7 +3761,7 @@ def select_sm100_d192_half_geometry(facts, knobs):
     from .kernels.sm100.d128_f16_single_q.contract import Geometry as SingleQ
 
     if not in_domain(facts):
-        raise ValueError("D192 half selection requires exact SM100/SM103 D192/V128 half inputs")
+        raise ValueError("D192 half selection requires SM100/SM103 half inputs covered by D192/V128")
     cga = 2 if knobs.cga is None else knobs.cga
     if facts.thd and not facts.has_paged_kv and cga == 1:
         return SingleQ()

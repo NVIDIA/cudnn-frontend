@@ -14,13 +14,20 @@ def test_half_scalar_tail_explicit_candidate_admission(device_cc, d_shape):
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
 
+    shape = d_shape
+    if device_cc in ((10, 0), (10, 3)):
+        from types import SimpleNamespace
+        from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
+
+        shape = padded_shape(SimpleNamespace(d_qk=d_shape[0], d_v=d_shape[1]))
+        assert shape is not None
     name = "sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"
-    if device_cc in ((10, 0), (10, 3)) and d_shape == (256, 256):
+    if device_cc in ((10, 0), (10, 3)) and shape == (256, 256):
         name = "sdpa_fwd_sm100_d256_lookahead"
     cga = 2
-    if device_cc in ((10, 0), (10, 3)) and d_shape in ((64, 64), (128, 128), (192, 128)):
-        name = "sdpa_fwd_sm100_d192_multi_q" if d_shape == (192, 128) else "sdpa_fwd_sm100_d128_multi_q"
-    if device_cc in ((10, 0), (10, 3)) and d_shape == (512, 512):
+    if device_cc in ((10, 0), (10, 3)) and shape in ((64, 64), (128, 128), (192, 128)):
+        name = "sdpa_fwd_sm100_d192_multi_q" if shape == (192, 128) else "sdpa_fwd_sm100_d128_multi_q"
+    if device_cc in ((10, 0), (10, 3)) and shape == (512, 512):
         name, cga = "sdpa_fwd_sm100_d512_role_split", 4
     caps = next(spec.capabilities for spec in ENGINE_SPECS if spec.name == name)
     # Rubin D256 dense split is the existing decode tile; scalar-tail

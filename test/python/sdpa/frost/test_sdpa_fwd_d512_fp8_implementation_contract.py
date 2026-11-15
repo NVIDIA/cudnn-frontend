@@ -58,7 +58,7 @@ def test_exact_owner_and_public_cluster_geometry(cc, dtype):
     [
         {"device_cc": (10, 7)},
         {"device_cc": (12, 0)},
-        {"d_qk": 384, "d_v": 320},
+        {"d_qk": 384, "d_v": 256},
         {"dtype": cudnn.data_type.BFLOAT16, "is_fp8": False},
         {"is_mxfp8": True},
         {"o_block_scale": 32},
@@ -69,8 +69,12 @@ def test_other_implementations_do_not_enter_the_owner(overrides):
     assert engines.mismatch(SPECS[NAME].capabilities, facts(**overrides)) is not None
 
 
-def test_dense_envelope_keeps_legacy_owner():
-    assert engines.mismatch(SPECS[LEGACY_ROW].capabilities, facts(d_qk=384, d_v=320)) is None
+def test_dense_envelope_moves_to_fixed_owner():
+    f = facts(d_qk=384, d_v=320)
+    assert "owned by" in engines.mismatch(SPECS[LEGACY_ROW].capabilities, f)
+    knobs = Geometry().canonical_knobs(engines.SdpaFwdKnobs())
+    assert engines.mismatch(SPECS[NAME].capabilities, f, knobs) is None
+    assert engines.SdpaFwdKnobs.from_public(knobs.to_public()) == knobs
 
 
 @pytest.mark.parametrize("kind", ["A", "FALLBACK"])
