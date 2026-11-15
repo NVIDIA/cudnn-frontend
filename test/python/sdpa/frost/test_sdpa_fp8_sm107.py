@@ -850,7 +850,9 @@ def test_fp8_envelope_mismatch_rules():
     # INVERTED: the Rubin line gained a d512 per-tensor FP8 kernel, so the
     # native d512 shape is now SERVED rather than declined, and the (256, 512]
     # floor applies here exactly as on the SM100 row.
-    assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    native512 = caps["sdpa_fwd_sm107_d512_fp8_role_split"]
+    assert engines.mismatch(native512, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512)) is None
+    assert "owned by" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=512))
     assert engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=384, d_v=448)) is None
     # ...and straddling the floor declines on BOTH rows, identically.
     assert "no kernel-flavor envelope" in engines.mismatch(sm107, _fp8_facts(device_cc=(10, 7), d_qk=512, d_v=256))
