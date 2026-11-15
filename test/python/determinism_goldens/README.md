@@ -1007,6 +1007,105 @@ CP4 1M performance, and full-model/CSA measurements are unverified here.
 Existing earlier-architecture evidence is retained, not represented as a
 rerun of this change.
 
+### PR integration and strict review — B200, 2026-11-15
+
+Integration commit `2be2c82d31eb33fa611a867e095a01699b03adc9` merges upstream
+`develop` through `b24979cd4640385b7b6791664c975388ac167250`. All linear-attention
+implementation and test files remain byte-identical to `edeea242` after the
+merge. The native extension was rebuilt from the merged tree. The subsequent
+review changes three internal docstrings and adds zero-initial-state alias
+coverage; stripping docstrings gives identical production Python ASTs. The
+performance tables above are retained measurements, not post-merge reruns.
+
+The full production diff against current upstream was reviewed, including
+compact/full-head indices, rectangular state arenas, empty/one-piece paths,
+summary coverage of every multi-piece slot, caller context/checkpoint ownership,
+all queue writers and counters, phase-arena lifetimes, PDL prerequisites,
+TMA/TMEM completion, reduction order and compile-key bounds. No new confirmed
+race, bounds or numerical defect was found. `run_state_chain`,
+`build_chain_backward` and `CompiledKdaBwd.run_chain` now document destructive
+exact H/X reuse, compact versus public head layouts, and independent writable
+storage for concurrent streams.
+
+The alias load/store executes in one side-effectful inline PTX block with
+named temporaries. The CuTeDSL 4.8.0 and 4.8.1 wrappers were independently read
+from their released wheels and have identical `inline_ptx` implementations;
+the NVVM op documents side-effectful lowering. Same-lane ownership handles the
+H/X edge, blocking CTA barriers publish and retire queue shared counts, and
+`griddepcontrol.wait` handles inter-kernel consumers and next-wave reuse. The
+[PTX dependency instruction](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-griddepcontrol)
+orders prerequisite completion and memory visibility. Existing numerical
+kernel async-proxy/TMA/TMEM protocols are unchanged; no speculative global
+fence was added. Earlier sanitizer and generated-code evidence above is
+retained with its stated qualifications, not counted as new runs.
+
+Merged-source native tests use Torch 2.14.1+cu130, cuDNN 9.24.0 and the same
+B200 environment as the CP4 experiment. Each compiler lane uses its own empty
+compiler/artifact caches and separate process; loaded nested module paths and
+SHA256 values are verified, not just the top-level package path.
+
+| Selection | DSL / actual compiler | Result |
+|---|---|---|
+| State alias, forward waves, boundaries, queues, forward warm/poison stress | 4.8.1 / CUDA 13.4 | 44 passed, 903.64 s |
+| Backward bitwise/capture, policy, cache, H96 runtime and independent streams | 4.8.1 / CUDA 13.4 | 104 passed, 7 deselected, 1691.33 s |
+| Alias, default FP64-reference chains, forward waves, sixteen-wave backward and policies | 4.8.0 / CUDA 12.9 | 35 passed, 118 deselected, 533.68 s |
+| Same selection | 4.8.0 / CUDA 13.4 | 35 passed, 118 deselected, 535.16 s |
+| Same selection | 4.8.1 / CUDA 12.9 | 35 passed, 118 deselected, 522.68 s |
+| Final alias file, including zero initial state | 4.8.0 / CUDA 12.9 | 33 passed, 18.75 s |
+| Same final alias file | 4.8.0 / CUDA 13.4 | 33 passed, 19.55 s |
+| Same final alias file | 4.8.1 / CUDA 12.9 | 33 passed, 19.11 s |
+| Same final alias file | 4.8.1 / CUDA 13.4 | 33 passed, 19.12 s |
+
+The final alias file contains 32 capture/byte-parity cases (four rectangular
+or square K/V pairs, both directions, one/three pieces, caller seed or implicit
+zero seed) plus one policy test. The explicit zero-seed cases exercise the
+constant FP32 operand in the load-before-store PTX. Existing seeded case
+behavior is unchanged. These selections overlap; their totals are not unique
+coverage counts. No numerical tolerance or golden changed. The cu12 lanes
+qualify that DSL compiler on the CUDA 13 framework, not a complete CUDA 12
+framework/backend deployment. No new SM103/SM107 or Hopper result is claimed.
+
+From `test/python`, the main native selections are:
+
+```bash
+python -m pytest -q -x -rs linear_attention/frost/test_kda_state_reuse.py \
+  linear_attention/frost/test_kda_forward_waves.py \
+  linear_attention/frost/test_kda_wave_boundaries.py \
+  linear_attention/frost/test_kda_wave_queues.py
+python -m pytest -q -x -rs linear_attention/frost/test_kda_checkpoint_waves.py \
+  -k '16 or capacity_policy or compile_count or independent_streams'
+```
+
+The second selector also matches `bf16`/`fp16` IDs, so it exercises the full
+backward dtype/head-pattern parity matrix across divisors 2/4/8/16, not just
+sixteen waves. Extra compiler lanes select:
+
+```text
+summary_alias or arena_policy or capacity_policy or default_state_chain
+or (forward_waves_bitwise_and_capture and 8)
+or (checkpoint_waves_bitwise_and_capture and equal-16)
+```
+
+The `8` selection also includes forward rectangular `k128`/`v128` IDs at other
+divisors. The final zero-seed qualification runs the complete
+`test_kda_state_reuse.py` in all four compiler lanes. Tests use matching source
+and test trees, `CUDNN_TEST_NO_ISOLATION=1` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`; the exact loaded compiler paths and source
+hashes are retained in the qualification manifests.
+
+The fresh forward stress again reports 0/3,000 warm and 0/3,000 poisoned
+failures, with the unsafe control failing 200/200. The target still has only
+two CTAs, so this is limited scheduling coverage. Compatibility, docstring,
+compile-cache, CUDA Graph and fence audits pass for the exercised scope.
+Changed-file pre-commit/syntax checks pass. Fern reports zero errors and one
+warning (unauthenticated redirect validation); the repository's pinned CLI
+was used after checking that no project-local executable override was present.
+
+This refresh updates the existing Draft PR. The original-baseline >5%
+performance exceptions above remain open; the CP4 incremental comparison
+against `a1de8974` does not resolve them. Old upstream CI on `a19c476` does
+not validate the refreshed head.
+
 ## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 
 

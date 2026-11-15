@@ -1027,7 +1027,10 @@ class CompiledKdaBwd:
     ) -> None:
         """Chain prologue, H and M summaries (M alone when the series is passed back), forward chain X, G summary, reverse
         chain seeded with d_final_state, dense series (the forward's or the seeded recompute), bprop over the pieces: one
-        compiled launch."""
+        compiled host call. Independent-head waves reuse private states and
+        checkpoints only after their consumers finish. Caller context and
+        checkpoint layouts stay full-head; recurrence and reduction order are
+        unchanged. The build fixes the wave topology and workspace layout."""
         series = not (self.has_state_checkpoints and not self.coarse_checkpoints)
         coarse = self.coarse_checkpoints
         buffers = dict(

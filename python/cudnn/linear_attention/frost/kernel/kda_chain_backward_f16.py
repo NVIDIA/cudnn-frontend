@@ -489,7 +489,14 @@ def build_chain_backward(
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
     kernel compiles as it does there.  ``has_piece_transitions`` / ``has_piece_state_grads``: the transition arm and the leaf summary are skipped,
-    their buffers the backward summary's intermediates."""
+    their buffers the backward summary's intermediates. The plan-selected
+    checkpoint divisor is one of 1/2/4/8/16 and divides ``heads_out``; private
+    checkpoint views have ``heads_out // checkpoint_head_divisor`` heads.
+    The state divisor is either one or the checkpoint divisor. Compact state
+    waves require fused H/M summaries, no external piece context, and two
+    separate wave counters; caller states and checkpoints keep all heads.
+    These divisors are bounded compile-key axes, while head and piece extents
+    remain runtime data. Replays need distinct writable storage per stream."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]

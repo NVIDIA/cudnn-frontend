@@ -1220,7 +1220,13 @@ def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail,
     not built), the piece table's ``main_rows`` int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in
     sequence order, with capacity covering its filled slots; otherwise ``capacity = num_seqs * compiled.pieces``),
     ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
-    ``has_composed`` (the context-parallel boundary sequence's entry state)."""
+    ``has_composed`` (the context-parallel boundary sequence's entry state).
+    H and X may be exactly the same FP32 view; this destroys H as each lane
+    replaces its summary with the incoming state. Partial overlaps and aliasing
+    M or the public seed/tail/product buffers are unsupported. The caller owns
+    all buffers and keeps them live through completion on ``stream``; concurrent
+    launches must not share writable storage. This prepared launch neither
+    allocates nor compiles and may be captured in a CUDA Graph."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
     compiled.compiled(
         int(compiled.heads_out),
