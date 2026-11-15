@@ -95,12 +95,12 @@ class Geometry:
         )
 
 
-def explicit_geometry(implementation, facts, knobs):
+def explicit_geometry(implementation, facts, knobs, *, d_flavor=None):
     """Derive internal variants of the named body, without selecting another body."""
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown native small-half implementation: {implementation}")
     is_pair = implementation == BATCH_PAIR
-    d = facts.d_qk
+    d = facts.d_qk if d_flavor is None else d_flavor
     domain = (64, 128) if d <= 128 else (128,)
     tile_n = (
         knobs.tile_n

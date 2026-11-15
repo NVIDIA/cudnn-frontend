@@ -77,6 +77,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
 from cudnn.sdpa.fwd.config_d128_family import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.kernels.sm107 import d512_half_contract as _sm107_wide_half
+from cudnn.sdpa.fwd.kernels.sm107 import small_half_contract as _sm107_small_half
 from cudnn.sdpa.fwd.kernels.sm100.d256_f16_contract import (
     LOOKAHEAD as _D256_LOOKAHEAD,
     SWAP_AB as _D256_SWAP_AB,
@@ -1793,25 +1794,34 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             domain=effective_tile_ns(capabilities, facts, knobs),
         )
     )
-    _pair = {
-        cga: sm107_pair_item_active(
-            _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0], tile_n=int(_tile_n)
-        )
-        for cga in widths
-    }
+    if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS:
+        # A named record fixes its work item independently of the default
+        # crossover. Validate the same budget the constructor will receive.
+        _pair = {cga: capabilities.implementation == _sm107_small_half.BATCH_PAIR and cga == 1 for cga in widths}
+    else:
+        _pair = {
+            cga: sm107_pair_item_active(
+                _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0], tile_n=int(_tile_n)
+            )
+            for cga in widths
+        }
     # the softmax warp-group count the plan would run at each width (3 on the bias + kv_mask pair form at TILE_N 64 above the measured S_kv;
     # config_sm107.sm107_softmax_wgs_pick -- the adapter's pick, rule 8b'): its third Q / O slab shrinks the resident bias budget
     _wgs = {
-        cga: sm107_softmax_wgs_pick(
-            d_flavor=selected[0],
-            s_kv=facts.s_kv,
-            tile_n=int(_tile_n),
-            pair=_pair[cga],
-            has_bias=facts.has_bias,
-            has_kv_mask=facts.has_kv_mask,
-            padded=facts.padded,
-            cga=cga,
-            b_flat=facts.b,
+        cga: (
+            2
+            if capabilities.implementation == _sm107_small_half.MULTI_Q
+            else sm107_softmax_wgs_pick(
+                d_flavor=selected[0],
+                s_kv=facts.s_kv,
+                tile_n=int(_tile_n),
+                pair=_pair[cga],
+                has_bias=facts.has_bias,
+                has_kv_mask=facts.has_kv_mask,
+                padded=_sm107_small_half.kv_padded(facts) if capabilities.implementation in _sm107_small_half.IMPLEMENTATIONS else facts.padded,
+                cga=cga,
+                b_flat=facts.b,
+            )
         )
         for cga in widths
     }
