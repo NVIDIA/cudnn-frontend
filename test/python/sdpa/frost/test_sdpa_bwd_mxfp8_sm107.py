@@ -1340,7 +1340,7 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     """AGENTS.md Rule 7 (review 2026-09-30): a cc 10.7 box on a DSL that does not know ``sm_107a`` (4.7.x is above FROST's floor
     yet below Rubin's need) gets a TYPED decline at eligibility from every sm107 backward row -- never ``KeyError: 'sm_107a'``
     out of ``Arch.from_string`` inside the template compile after the plan is ranked (fwd/engines.py has had this gate; the
-    bwd copy lacked it).  The SM100 MXFP8 row on a cc 10.0 device is untouched."""
+    bwd copy lacked it).  The SM100 D256 MXFP8 engine, which owns this graph on a cc 10.0 device, is untouched."""
     from cudnn.frost import buffers
 
     dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
@@ -1349,7 +1349,7 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     for engine in (_ENGINE, "sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_fp8"):
         reason = _decline_reason(monkeypatch, engine=engine)
         assert reason is not None and "sm_107a" in reason and dsl_version in reason, (engine, reason)
-    assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_mxfp8", cc=(10, 0)) is None
+    assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_d256_mxfp8", cc=(10, 0)) is None
 
 
 def _facts_of_served_graph(monkeypatch):
@@ -2596,7 +2596,7 @@ def test_graph_routes_to_the_row_when_opted_in_and_declines_typed_otherwise(monk
     g.create_execution_plans([cudnn.heur_mode.A])
     names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
     assert any(n == _ENGINE or n.startswith(_ENGINE + "[") for n in names), names
-    assert not any(n.startswith("sdpa_bwd_sm100_mxfp8") for n in names), names
+    assert not any(n.startswith(("sdpa_bwd_sm100_mxfp8", "sdpa_bwd_sm100_d256_mxfp8")) for n in names), names
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     g2, _t, _outs = _mxfp8_graph()
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):

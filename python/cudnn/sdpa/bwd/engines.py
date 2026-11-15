@@ -193,6 +193,7 @@ from cudnn.sdpa.bwd.kernels.sm107 import d256_half_contract as _sm107_d256_half
 from cudnn.sdpa.bwd.kernels.sm100 import d512_half_contract as _sm100_d512_half
 from cudnn.sdpa.bwd.kernels.sm120 import half_contract as _sm120_half
 from cudnn.sdpa.bwd.kernels.sm80 import half_contract as _sm80_half
+from cudnn.sdpa.bwd.kernels.sm100 import quantized_contract as _sm100_q
 
 _LOG = logging.getLogger(__name__)
 
@@ -1588,6 +1589,8 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             declaration_check=_sm100_mxfp8_declaration_mismatch,
+            select_implementation=_sm100_q.select_mxfp8,
+            delegated=frozenset({_sm100_q.MXFP8_PAIR, _sm100_q.D256_MXFP8}),
             # causal + swa, with the window served under the causal diagonal only
             band=band.BandSupport(
                 right=frozenset({band.RIGHT_UNBOUNDED, band.RIGHT_CAUSAL}),
@@ -1597,6 +1600,22 @@ def _sm100_mxfp8_spec() -> EngineSpec:
         ),
         lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_MXFP8),
     )
+
+
+def _sm100_mxfp8_pair_spec() -> EngineSpec:
+    """The MXFP8 row's pair heads on the FP8 dK/dV + dQ pair in block-scale mode."""
+    from .kernels.sm100.fp8_pair.host import lower
+
+    lower_impl = partial(lower_dsl_bwd_mxfp8, api_type=_SM100_MXFP8)
+    return explicit_engine(_sm100_mxfp8_spec(), _sm100_q.MXFP8_PAIR, partial(lower, lower_impl=lower_impl), d=frozenset({64, 128, 192}))
+
+
+def _sm100_d256_mxfp8_spec() -> EngineSpec:
+    """The MXFP8 row's D256 dK/dV + dQ chain."""
+    from .kernels.sm100.d256_mxfp8.host import lower
+
+    lower_impl = partial(lower_dsl_bwd_mxfp8, api_type=_SM100_MXFP8)
+    return explicit_engine(_sm100_mxfp8_spec(), _sm100_q.D256_MXFP8, partial(lower, lower_impl=lower_impl), d=frozenset({256}))
 
 
 def _sm107_spec() -> EngineSpec:
@@ -2364,9 +2383,27 @@ def _sm100_d128_fp8_spec() -> EngineSpec:
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
             declaration_check=_sm100_d128_fp8_declaration_mismatch,
+            select_implementation=_sm100_q.select_d128_fp8,
+            delegated=frozenset({_sm100_q.D128_FP8_PAIR, _sm100_q.D128_FP8_ACCUMULATION}),
         ),
         lower=partial(lower_dsl_bwd_fp8, api_type=_SM100_D128_FP8),
     )
+
+
+def _sm100_d128_fp8_pair_spec() -> EngineSpec:
+    """The D128 FP8 row's unwindowed D128 graphs on the FP8 dK/dV + dQ pair."""
+    from .kernels.sm100.fp8_pair.host import lower
+
+    lower_impl = partial(lower_dsl_bwd_fp8, api_type=_SM100_D128_FP8)
+    return explicit_engine(_sm100_d128_fp8_spec(), _sm100_q.D128_FP8_PAIR, partial(lower, lower_impl=lower_impl), d=frozenset({128}))
+
+
+def _sm100_d128_fp8_accumulation_spec() -> EngineSpec:
+    """The D128 FP8 row's accumulation body: D64, windowed graphs, and its grouped GQA launch."""
+    from .kernels.sm100.d128_fp8_accumulation.host import lower
+
+    lower_impl = partial(lower_dsl_bwd_fp8, api_type=_SM100_D128_FP8)
+    return explicit_engine(_sm100_d128_fp8_spec(), _sm100_q.D128_FP8_ACCUMULATION, partial(lower, lower_impl=lower_impl))
 
 
 def _sm100_d192_half_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
@@ -2430,9 +2467,12 @@ def _sm100_d192_spec() -> EngineSpec:
 
 
 def _sm100_d192_fp8_spec() -> EngineSpec:
+    from .kernels.sm100.fp8_pair.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_sm100_d192_fp8",
+        name=_sm100_q.D192_FP8,
         capabilities=Capabilities(
+            implementation=_sm100_q.D192_FP8,
             sm_lo=100,
             sm_hi=_RUBIN[1],
             d=frozenset({128, 192}),
@@ -2447,7 +2487,7 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
         ),
-        lower=partial(lower_dsl_bwd_fp8, api_type=_SM100_D192_FP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_fp8, api_type=_SM100_D192_FP8)),
     )
 
 
@@ -2458,9 +2498,13 @@ def _d512_fp8_environment_mismatch(facts, version):
 
 
 def _d512_fp8_spec() -> EngineSpec:
+    from .kernels.sm100.d512_fp8 import contract
+    from .kernels.sm100.d512_fp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_d512_fp8",
+        name=contract.NAME,
         capabilities=Capabilities(
+            implementation=contract.NAME,
             sm_lo=100,
             sm_hi=107,
             d=frozenset({512}),
@@ -2476,7 +2520,7 @@ def _d512_fp8_spec() -> EngineSpec:
             compact_bshd=True,
             layouts=frozenset({"bshd"}),
         ),
-        lower=partial(lower_dsl_bwd_fp8, api_type=_D512_FP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_fp8, api_type=_D512_FP8)),
     )
 
 
@@ -2492,9 +2536,13 @@ def _d512_mxfp8_mismatch(facts, version):
 
 
 def _d512_mxfp8_spec() -> EngineSpec:
+    from .kernels.sm100.d512_mxfp8 import contract
+    from .kernels.sm100.d512_mxfp8.host import lower
+
     return EngineSpec(
-        name="sdpa_bwd_d512_mxfp8",
+        name=contract.NAME,
         capabilities=Capabilities(
+            implementation=contract.NAME,
             sm_lo=100,
             sm_hi=107,
             d=frozenset({512}),
@@ -2516,7 +2564,7 @@ def _d512_mxfp8_spec() -> EngineSpec:
                 window_right=frozenset({band.RIGHT_CAUSAL}),
             ),
         ),
-        lower=partial(lower_dsl_bwd_mxfp8, api_type=_D512_MXFP8),
+        lower=partial(lower, lower_impl=partial(lower_dsl_bwd_mxfp8, api_type=_D512_MXFP8)),
     )
 
 
@@ -2604,6 +2652,8 @@ ENGINE_SPECS = (
     _sm100_d512_role_split_spec(),
     _sm100_d512_two_by_two_spec(),
     _sm100_mxfp8_spec(),
+    _sm100_mxfp8_pair_spec(),
+    _sm100_d256_mxfp8_spec(),
     _sm100_d192_spec(),
     _sm100_d192_fp8_spec(),
     _sm107_spec(),
@@ -2618,6 +2668,8 @@ ENGINE_SPECS = (
     _sm100_d128_pair_spec(),
     _sm107_d192_spec(),
     _sm100_d128_fp8_spec(),
+    _sm100_d128_fp8_pair_spec(),
+    _sm100_d128_fp8_accumulation_spec(),
     _d512_fp8_spec(),
     _d512_mxfp8_spec(),
     _sm120_fp8_spec(),
