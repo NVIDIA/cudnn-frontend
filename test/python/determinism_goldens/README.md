@@ -7062,8 +7062,22 @@ the host pins the pick instead of relying on the timing.
 CI pipeline 82134950 ran the same two autotune tests at source `f080e1fe`
 (identical kernel and host code) on SM80, SM90 and SM100 with cuDNN 9.28.1
 and CuTe DSL 4.8.0: **12 of 12 cases passed, no skips**. SM107 was not
-run. No performance was measured: the sweep is develop's, and the hooks act
-only on a hint-cache miss.
+run.
+
+Performance was measured on the same GB300 against a develop worktree
+(`9bdf9a8a`) with the same compiled binding: cuTile GDN and KDA forward plus
+backward, bf16, 16 heads, K = V = 128, median of 40 iterations after warmup,
+each mode in a fresh plan and launch-hint cache. The timed sweep is develop's
+and costs the same: GDN 0.968 ms on develop and 0.985 ms here on the ragged
+six-sequence batch, 2.160 and 2.158 ms at 2 x 4096 tokens; KDA 1.243 and
+1.247 ms, 3.340 and 3.344 ms. A host pin of the recorded winners runs the
+same kernels at the same time (GDN 0.987 and 2.174 ms, KDA 1.270 and
+3.338 ms) and cuts the first-call warmup from 24 s to 4 s because nothing is
+timed. A pin of the first candidate, the table-miss fallback, costs GDN 6%
+on the ragged batch and 28% at 2 x 4096 (2.775 ms), KDA 1% and 4%, which
+is why a host records a table before pinning. The per-call host overhead on
+the cache-hit path is unchanged: 200 us per GDN forward and 242 us per KDA
+forward on a 64-token shape, develop and this tree alike.
 
 End to end, the Megatron-Bridge recipe
 `qwen35_text_9b_pretrain_8gpu_gb200_bf16_deterministic_config` (Qwen3.5-9B,
