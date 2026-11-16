@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from contextlib import contextmanager, nullcontext
 from enum import Enum
@@ -11,7 +12,8 @@ from typing import Iterator, Optional, Sequence, Tuple
 from cuda.bindings import driver as cuda
 
 from cudnn.api_base import ceil_div
-from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
+from cudnn.frost import buffers
+from cudnn.tensor_adapter import get_data_ptr, get_device, get_shape, get_strides, is_jax_array, is_torch_tensor
 
 
 class GroupedGemmBackend(str, Enum):
@@ -179,6 +181,48 @@ def _jax_wrapper_workspace(nbytes: int, device, current_stream: cuda.CUstream):
         # Free is enqueued even when validation/launch raises; no host wait or GC
         # finalizer, and no mutable "latest workspace" on the cached plan.
         _ck(*cuda.cuMemFreeAsync(ptr, current_stream))
+
+
+def validate_workspace_aliases(workspace_ptr, workspace_bytes, **operands):
+    """Check the carved byte range, allowing disjoint views of one allocation.
+
+    Pointer-table contents are not read: callers own the non-aliasing and lifetime
+    contract for pointed-to allocations, just as they own pointer validity.
+    """
+    workspace_end = workspace_ptr + workspace_bytes
+    for name, tensor in operands.items():
+        if tensor is None:
+            continue
+        if is_torch_tensor(tensor):
+            nbytes = tensor.nbytes
+            if not nbytes:
+                continue
+            begin = tensor.data_ptr()
+            if tensor.is_contiguous():
+                if workspace_ptr < begin + nbytes and begin < workspace_end:
+                    raise ValueError(f"workspace must not overlap {name}")
+                continue
+            itemsize, shape, strides = tensor.element_size(), tensor.shape, tensor.stride()
+        elif is_jax_array(tensor):
+            # JAX does not accept DLPack's stream=-1 sentinel. Read the same
+            # host metadata used by the tensor adapter; never export/sync here.
+            if not tensor.size:
+                continue
+            begin, itemsize = get_data_ptr(tensor), tensor.dtype.itemsize
+            shape, strides = tensor.shape, get_strides(tensor)
+        else:
+            begin, shape, strides, dtype, _ = buffers.probe(tensor)
+            if 0 in shape:
+                continue
+            itemsize = buffers.DTYPE_ITEMSIZE[dtype]
+        if strides is None:
+            end = begin + math.prod(shape) * itemsize
+        else:
+            offsets = [(extent - 1) * stride * itemsize for extent, stride in zip(shape, strides)]
+            end = begin + sum(max(offset, 0) for offset in offsets) + itemsize
+            begin += sum(min(offset, 0) for offset in offsets)
+        if workspace_ptr < end and begin < workspace_end:
+            raise ValueError(f"workspace must not overlap {name}")
 
 
 def wrapper_operand_meta(tensor):
