@@ -260,6 +260,15 @@ def test_sm107_decode_body_matches_the_sm100_body():
         assert a_src.count(specialized) == 1, f"the declared SM100-only live-column delta changed:\n{specialized}"
         a_src = a_src.replace(specialized, shared)
     a = [ln for ln in a_src.splitlines() if ln.strip()]
+    # The 18-warp SM107 tile uses four-column epilogue groups to keep wide
+    # output addresses below its register cap. Pin this exact local delta.
+    b_src = "\n".join(b)
+    epilogue_groups = "    O_GROUPS = 4 if N_Q == 64 else 2\n    O_HALF = COLS // O_GROUPS"
+    assert b_src.count(epilogue_groups) == 1
+    assert b_src.count("    for h in cutlass.range_constexpr(O_GROUPS):") == 1
+    b_src = b_src.replace(epilogue_groups, "    O_HALF = COLS // 2")
+    b_src = b_src.replace("    for h in cutlass.range_constexpr(O_GROUPS):", "    for h in cutlass.range_constexpr(2):")
+    b = b_src.splitlines()
     b = [ln for ln in b if ln.strip() not in ("desc_version=DESC_VERSION,",)]
     b = [ln.replace(", spin=SPIN_RING_WAITS)", ")") for ln in b]
     b = [
@@ -2721,6 +2730,59 @@ def test_decode_kernel_four_column_groups(H, KH, facts, splits):
     torch.testing.assert_close(lse[~dead], ref_lse[~dead], atol=5e-3, rtol=0)
     assert dead[3].all() and torch.isneginf(lse[3]).all() and (o[3] == 0).all(), "the keyless batch: LSE := -inf, O := 0 exactly"
     assert not dead[:3].any() and not dead[4:].any()
+
+
+@_gpu
+@pytest.mark.gpu_exclusive
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_decode_64_column_tile_wide_output_replays(dtype):
+    """The spill-free 64-column epilogue retains 64-bit physical O offsets."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, SQ, SKV = 4, 32, 2, 4, 129
+    batch_stride = 2**31 - 65536
+    required = ((B - 1) * batch_stride + SQ * H * D) * 2
+    if torch.cuda.mem_get_info()[0] < required + 2**30:
+        pytest.skip("wide output stride storage unavailable")
+    torch.manual_seed(1741)
+    q = torch.randn(B, SQ, H, D, device="cuda", dtype=dtype)
+    k = torch.randn(B, SKV, KH, D, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    o = torch.empty_strided((B, SQ, H, D), (batch_stride, H * D, D, 1), device="cuda", dtype=dtype)
+    lse = torch.empty(B, H, SQ, device="cuda")
+    seq_kv = torch.tensor([129, 65, 1, 0], device="cuda", dtype=torch.int32)
+    qv, kv, vv, ov = (t.transpose(1, 2) for t in (q, k, v, o))
+    api = SdpaFwdDslSm100(sample_q=qv, sample_k=kv, sample_v=vv, sample_o=ov, sample_lse=lse, seq_kv_lens_present=True, pack_gqa=True, split_kv=1)
+    assert api.check_support()
+    api.compile()
+    assert api.kernel_template == DECODE and api._k_mod.N_Q == 64 and api._k_mod.HEADS_PER_TILE == 16
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+
+    def execute():
+        api.execute(qv, kv, vv, ov, lse_tensor=lse, seq_kv_lens=seq_kv, workspace=ws)
+
+    execute()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            execute()
+        for lengths in ([129, 65, 1, 0], [0, 1, 127, 129]):
+            seq_kv.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+            v.mul_(0.75)
+            o.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref(q, k, v, lengths, None, 1 / math.sqrt(D))
+            torch.testing.assert_close(o.float(), ref_o, atol=2e-2, rtol=0)
+            live = ~torch.isinf(ref_lse)
+            torch.testing.assert_close(lse[live], ref_lse[live], atol=5e-3, rtol=0)
+            assert torch.isneginf(lse[~live]).all()
+            for b, length in enumerate(lengths):
+                if length == 0:
+                    assert (o[b] == 0).all()
+    finally:
+        graph.reset()
 
 
 @_gpu
