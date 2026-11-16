@@ -17,6 +17,44 @@ from cudnn.engines.engine_ids import is_python_engine
 pytestmark = pytest.mark.L0
 
 
+@pytest.mark.parametrize("cc", [(9, 0), (10, 0), (10, 3), (12, 0)])
+@pytest.mark.parametrize("version", [92400, 92600])
+@pytest.mark.parametrize("scale", [-0.125, 0.125, "tensor"])
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+def test_scale_guard_composes_with_existing_forward_guards(monkeypatch, cc, version, scale, dtype):
+    from cudnn.sdpa.fwd.backend_guard import backend_engine_guard
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    monkeypatch.setattr(cudnn, "backend_version", lambda: version)
+    facts = SdpaGraphFacts(
+        b=3,
+        h_q=4,
+        h_kv=2,
+        s_q=129,
+        s_kv=257,
+        d_qk=64,
+        d_v=256,
+        dtype=dtype,
+        device_cc=cc,
+        padded=True,
+        thd=True,
+        scale=0.125 if scale == "tensor" else scale,
+        dynamic_scale=scale == "tensor",
+    )
+    expected = {10, 18} if cc[0] == 10 else {9} if cc == (9, 0) and version < 92500 else {11} if cc == (12, 0) and version < 92600 else set()
+    if scale != 0.125:
+        expected |= {2, 9} if cc == (9, 0) else {3, 10} if cc[0] == 10 else set()
+    actual = backend_engine_guard(None, facts)
+    assert set(actual) == expected
+    # Preserve the existing diagnostic when two guards exclude the same engine.
+    if cc[0] == 10:
+        assert "#2401" in actual[10]
+    elif cc == (9, 0) and version < 92500:
+        assert "zero-length KV" in actual[9]
+    elif cc == (12, 0) and version < 92600:
+        assert "zero-length Q" in actual[11]
+
+
 @pytest.fixture(autouse=True)
 def native_only(monkeypatch):
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0")
