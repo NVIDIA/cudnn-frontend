@@ -97,7 +97,8 @@ def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen):
     # execution. The query-tail case has >1 GiB per half input: cloning both
     # together and making whole-input FP32 temporaries exhausts 16-GiB CI.
     original_o = operands[0].cpu()
-    old_o, old_do, old_raw = *operands, raw
+    old_o, old_do = operands
+    old_raw = raw
     operands[0] = old_o.clone()
     assert operands[0].data_ptr() != old_o.data_ptr()
     _assert_fresh_bytes(launch(), expected, "fresh O binding")
