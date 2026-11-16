@@ -18,7 +18,7 @@ jax = pytest.importorskip("jax", minversion="0.9.1")
 import jax.numpy as jnp
 import numpy as np
 
-from cudnn.jax import kimi_delta_attention as kda
+from cudnn.linear_attention.jax_api import kimi_delta_attention as kda
 from cudnn.ops import kimi_delta_attention_forward_jax as fwd, kimi_delta_attention_backward_jax as bwd
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
@@ -254,7 +254,7 @@ class RejectTorch:
 sys.meta_path.insert(0, RejectTorch())
 import jax
 import jax.numpy as jnp
-from cudnn.jax import kimi_delta_attention as kda
+from cudnn.linear_attention.jax_api import kimi_delta_attention as kda
 jax.config.update("jax_enable_x64", True)
 q = jnp.ones((80, 1, 64), jnp.bfloat16) * 0.05
 b = jnp.ones((80, 1), jnp.float32) * 0.5
@@ -389,22 +389,11 @@ def test_shape_inference():
 
 
 def test_explicit_entries_moved_to_cudnn_ops():
-    import cudnn.jax
     import cudnn.ops
 
     assert cudnn.ops.kimi_delta_attention_forward_jax is fwd
     assert cudnn.ops.kimi_delta_attention_backward_jax is bwd
-    for name in ("kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):
-        assert name not in cudnn.jax.__all__
-        assert not hasattr(cudnn.jax, name)
-
-
-def test_helper_types_not_exported():
-    import cudnn.jax
-
-    for name in ("KdaResidual", "KdaGradients"):
-        assert name not in cudnn.jax.__all__
-        assert not hasattr(cudnn.jax, name)
+    assert not hasattr(cudnn, "jax")
 
 
 def test_arrays_on_another_gpu_run_there_and_split_arrays_are_rejected():
@@ -530,3 +519,43 @@ def test_half_sm_heads_forward_and_gradients(ragged, checkpoint):
     expected_grads = jax.jit(jax.grad(partial(loss, ref=True)))(args)
     for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
         assert_close(got, want, 0.06)
+
+
+@pytest.mark.parametrize("waves", [1, 2], ids=["one_wave", "two_waves"])
+def test_chain_route_forward_and_gradients(monkeypatch, waves):
+    """A batch-invariant sequence above 8192 tokens takes the chain hosts, forward and backward, in one head wave and in two."""
+    from cudnn.linear_attention import jax_api
+    from cudnn.linear_attention.frost import kda_engine, kda_jax
+
+    plans = []
+    make_launcher = kda_jax.make_launcher
+    monkeypatch.setattr(kda_jax, "make_launcher", lambda plan, names: plans.append(plan) or make_launcher(plan, names))
+    monkeypatch.setattr(kda_engine, "_forward_head_divisor", lambda *args: waves)
+    monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args: waves)
+    monkeypatch.setattr(kda_engine, "_KDA_STATE_WAVE_BYTES", 0)
+    jax_api.build_call.cache_clear()
+    options = dict(batch_invariant=True)
+    try:
+        bounds = (0, 16385)
+        args, cu = inputs(hq=2, hk=2, hv=2, bounds=bounds)
+        actual = jax.jit(partial(run, **options))(args, cu)
+        for got, want in zip(actual, reference(args, bounds, **options)):
+            assert_close(got, want, 0.02)
+        assert [(plan.chain, plan.state_head_divisor) for plan in plans] == [(True, waves)]
+
+        del plans[:]
+        bounds = (0, 8193)
+        args, cu = inputs(hq=2, hk=2, hv=2, bounds=bounds)
+
+        def loss(args, reference_mode=False):
+            o, state = reference(args, bounds, **options) if reference_mode else run(args, cu, **options)
+            return o.astype(jnp.float32).sum() + state.astype(jnp.float32).sum()
+
+        actual_grads = jax.jit(jax.grad(loss))(args)
+        expected_grads = jax.jit(jax.grad(partial(loss, reference_mode=True)))(args)
+        for got, want in zip(jax.tree.leaves(actual_grads), jax.tree.leaves(expected_grads)):
+            assert_close(got, want, 0.06)
+        assert all(plan.chain for plan in plans)
+        assert [plan.checkpoint_head_divisor for plan in plans if hasattr(plan, "checkpoint_head_divisor")] == [waves]
+    finally:
+        jax_api.build_call.cache_clear()

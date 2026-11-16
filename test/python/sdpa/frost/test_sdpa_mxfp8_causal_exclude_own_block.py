@@ -299,8 +299,8 @@ def test_rows_never_read_their_own_block(in_key, block):
         (True, False, 2, 8, 2, 1024),
         (True, False, 1, 16, 2, 2048),
         (True, False, 1, 32, 4, 1024),
-        # The heuristics offer split-KV only for a launch grid small against the SM count (B200: 4 splits at
-        # one head, 2 at two). Early rows have no key in the later splits, which the combine must drop.
+        # Request two splits explicitly on every GPU. Early rows have no key
+        # in the later split, which the combine must drop.
         (False, True, 1, 1, 1, 1024),
         (False, True, 1, 1, 1, 2048),
         (False, True, 1, 2, 2, 2048),

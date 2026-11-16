@@ -1614,6 +1614,7 @@ def _run_thd(
     o_fill=0.0,
     stats_layout="token",
     with_lse_ref=False,
+    reference_fn=None,
 ):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
     (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF.
@@ -1855,7 +1856,7 @@ def _run_thd(
         )
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
-        ob = _ref(qd, kd, vd, scale=scale, return_stats=with_lse_ref, **ref_kw)
+        ob = (reference_fn or _ref)(qd, kd, vd, scale=scale, return_stats=with_lse_ref, **ref_kw)
         if with_lse_ref:
             ob, lse_b = ob
             lse_ref[cu_q[b] : cu_q[b + 1]] = lse_b.squeeze(0).T
@@ -1931,7 +1932,51 @@ def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
     monkeypatch.setenv("FROST_THD_CLUSTERS", "4")
     scale = 1.0 / math.sqrt(d_qk)
     lens = [1024, 768, 512, 256]
-    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, in_key, torch.float16, scale=scale, causal=True, d_qk=d_qk, d_v=d_v)
+
+    def rounded_probability_reference(q, k, v, *, scale, return_stats, is_causal, bottom_right, swa_window):
+        from sdpa.fp8_ref import compute_ref
+
+        assert is_causal and not bottom_right and swa_window is None and not return_stats
+        # The SM100 D512 body rounds its unnormalized P to the input FP8 type
+        # before PV. The full-precision P reference can exceed the unchanged
+        # output tolerance even for a causal row with only three live keys.
+        # The shared oracle uses 128-key blocks and a four-bit rescale threshold;
+        # reciprocal scale factors leave its effective P scale at one.
+        import cudnn
+
+        output, _, _ = compute_ref(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            scale,
+            1.0,
+            1.0,
+            1.0,
+            16.0,
+            1.0 / 16,
+            _FP8[in_key],
+            torch.float16,
+            right_bound=0,
+            diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+            rescale_threshold=4.0,
+            dtype=torch.float64,
+            quantize_o=False,
+        )
+        return output.transpose(1, 2)
+
+    o_out, o_ref, amax, _ = _run_thd(
+        lens,
+        lens,
+        8,
+        8,
+        in_key,
+        torch.float16,
+        scale=scale,
+        causal=True,
+        d_qk=d_qk,
+        d_v=d_v,
+        reference_fn=rounded_probability_reference if d_qk == d_v == 512 and _ARCH == "sm100" else None,
+    )
     _check(o_out, o_ref, torch.float16, in_key)
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 

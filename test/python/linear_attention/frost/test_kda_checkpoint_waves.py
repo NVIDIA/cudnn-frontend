@@ -13,8 +13,7 @@ import cudnn
 from cudnn.linear_attention.frost import kda_engine
 from determinism_utils import assert_bitwise, snapshot
 from linear_attention.determinism import pack, sequences
-from linear_attention.frost.test_kda_piece_capacity import _prepared
-from linear_attention.test_la import frost_la_unavailable
+from linear_attention.test_la import frost_la_unavailable, prepared_kda_graph as _prepared
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 

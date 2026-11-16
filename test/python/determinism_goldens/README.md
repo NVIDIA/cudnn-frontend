@@ -4,6 +4,62 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### D256 nonpaged split physical origins (2026-11-16)
+
+`sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed
+forward owners 20519 and 20570, FP16/BF16, token/head Stats and splits 2/5.
+It retains the independent FP64 reference and changed-pointer/pitch/length
+CUDA Graph checks, and adds byte comparisons with fresh allocations,
+concurrent work, reordered/duplicated/removed sequences, changed neighbors,
+and a separate B=1 graph carrying the same first sequence. This is forward
+binding coverage; the backward algorithm and its status are unchanged.
+
+On SM100, SM103 and SM107, actual Torch 2.11.0+cu130, cuDNN 9.24.0.43,
+CuTe DSL 4.8 and CUDA 13.4 compiler qualification completed at source
+`50535efb4` (production unchanged from `171bcd81a`). Imports and the matching
+native binding were checked on each target. Each target passed 366 native
+binder checks, two independent-origin reference/rebind/capture cases and 16
+compact split controls without failures or skips.
+
+| Target | SM count | New suite, recording | Separate-process strict check | Runtime fingerprint |
+|---|---|---|---|---|
+| SM100 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `b6cd858eb78e109b` |
+| SM103 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `104472d5f9694663` |
+| SM107 | 216 | 11 passed, 0 skipped | 11 passed, 0 skipped | `d42d57b738f5eead` |
+
+The selected SM107 CI entry also exposes these same checks through
+`test_sdpa_fp8_sm107.py::TestD256HalfSplitOrigins`, preserving their parameter
+marks without duplicating the test bodies. After integrating the mixed-KV
+owner fix, source `7849117b6` passed 11 recording checks and 11 independent
+strict checks through this entry on the 216-SM runtime above. All eight golden
+files were byte-identical to the existing records. Its integrated owner and
+graph-analyzer checks passed all 701 cases on native SM107.
+
+The new suite contains three host extension-gate checks and eight GPU cases.
+Each GPU case completes the reference, replay and batch checks before recording.
+Twenty-four new golden files were inspected and added; no existing golden was
+replaced. The four token-Stats hashes per SM103/SM107 target are byte-identical
+to the earlier successful run before the HN-only fixture correction.
+These results cover B=1/4, splits 2/5, and the stated origin/stride variations;
+they do not change the engines' public behavior notes.
+
+Reproduce from `test/python`, using a fresh recording directory and then a
+separate process for the strict comparison:
+
+```bash
+suite=sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py
+CUDNN_DETERMINISM_RECORD=/tmp/new-d256-origin-goldens pytest "$suite" -m L0 -q
+CUDNN_DETERMINISM_GOLDENS=/tmp/new-d256-origin-goldens pytest "$suite" -m L0 -q
+```
+
+The pre-fix B300 detector produced NaN output for both dtypes when independent
+physical offsets were not forwarded. The historical SM107 strict expected
+failures stopped at the missing-metadata assertion; bypassing only that assertion
+exposed the numerical error. The old native extension also fails all six new
+nonpaged D256 frame cases while passing the six paged controls. Intermediate
+new-fixture failures exposed omitted total-Q capacity and undersized B=1 HN
+storage, both corrected in tests without another production change.
+
 ### Fixed SM107 quantized backward implementations (2026-11-15)
 
 Per-tensor FP8 engine 20605 and MXFP8 engine 20606 retain their records,
@@ -531,7 +587,7 @@ pytest core/test_determinism_utils.py
 | `TestDSADeterministicDKV` | `sparse_attention_backward_wrapper` dKV layouts (`deterministic_dkv_mode`, SM100/SM103) | output, max logits, LSE (H128 D576: reference inputs) | dQ, dKV, dSink |
 | `TestDSAIndexerForward` | `indexer_forward_wrapper` | dense scores | — |
 | `TestDSAIndexerBackward` | `indexer_backward_wrapper`, `dense_indexer_backward_wrapper` | — | dIndexerQ, dWeights, dIndexerK, mutated score buffers |
-| `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | Unsupported for FP8/MXFP8 inputs |
+| `TestDSAIndexerFP8` | `indexer_forward_wrapper` | FP32 scores; SM90 FP32 LSE | — (no backward API for FP8/MXFP8/NVFP4 inputs) |
 | `moe/frost/test_shared_expert_decode_determinism.py` | `SharedExpertDecode` (the shared-expert decode kernel pair, `Geometry(HIDDEN, INTERMEDIATE)`) | BF16 output `y`, the inter-launch BF16 `act` and FP32 `gate_part` scratch rows | — (inference-only step kernels; no backward) |
 | `attention_gate/frost/test_gate_quant_decode_determinism.py` | `AttentionGateQuantDecode` (the attention gate + quantize decode step, rows 1 .. 160) | FP8 E4M3 output `out` | — (inference-only step kernel; no backward) |
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
@@ -787,14 +843,13 @@ Reproduce the in-repository checks from `test/python` with recording disabled:
 
 ```bash
 export CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8
-python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s -k 'not warm_stress'
-python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s -k warm_stress
+python -m pytest linear_attention/test_la.py -q -s -k 'shared_stage_reuse or changed_length_replay or batch_invariance_long_ragged or piece_capacity'
 python -m pytest linear_attention/frost/test_kda_determinism.py -q -s
 python -m pytest linear_attention/test_la.py -q -s -k 'kda and (long_fwd_batch_invariant_bitwise or long_bwd_batch_invariant_bitwise or long_odd_chunk_count_batch_invariant_bitwise or summary_chain_batch_invariant_length_rule_bitwise or summary_bwd_chain_batch_invariant_length_rule_bitwise or long_zero_length_sequences_pass_through or context_parallel_context_geometry or steep_summary_matches_reference or steep_fp16_inverse_range_without_normalization or steep_cuda_graph_gate_transitions or steep_channel_decay_initial_state or steep_narrow_gate_ragged_tail)'
 for tool in memcheck synccheck racecheck; do
   compute-sanitizer --tool "$tool" --error-exitcode 99 --report-api-errors no \
-    python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s \
-    -k 'shared_stage_reuse or piece_prologue'
+    python -m pytest linear_attention/test_la.py -q -s \
+    -k 'shared_stage_reuse'
 done
 ```
 
@@ -3347,6 +3402,35 @@ including their own saved golden. Each device skips the other precision group.
 The [API-by-dtype results](#api-and-datatype-results) keep these gaps separate
 from measured results. FP8/MXFP8 backward is not
 supported by these DSA attention/indexer APIs and has no positive test cases.
+
+### DSA NVFP4 indexer: 17 cases
+
+`deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py` runs the
+17 cases of the table above for SM100/SM103/SM107 NVFP4 as well (parameter ID
+`sm100-sm103-sm107-nvfp4`). Q/K are packed E2M1 with non-negative E4M3 scales,
+one per 16 values, drawn with mantissa bits in [2^-2, 2^3] and quantized once
+from CPU-seeded inputs. Their bytes travel as `uint8` and are viewed as
+`float4_e2m1fn_x2` only for the launch, so input mutation checks compare raw
+payload and scale bytes. The reference decodes the stored E2M1 codes and scales
+independently of the quantizer and computes in FP64; replay and batch
+comparisons remain byte-exact. `test_scale_change` doubles the Q E4M3 scales.
+
+| GPU | Runtime | Result |
+| --- | --- | --- |
+| SM100 B200, 148 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver 590.47, cuDNN `92700`, CuTe DSL `4.8.1` | 16 passed, 1 skipped |
+| SM103 B300, 72 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver 595.84.01, cuDNN `92700`, CuTe DSL `4.8.0` | 16 passed, 1 skipped |
+| SM107 Rubin, 216 SMs | Torch `2.13.0+cu130`, CUDA `13.0`, driver 620.62, cuDNN `92700`, CuTe DSL `4.8.0` | 16 passed, 1 skipped |
+
+The skip on each GPU is `test_golden`: it passed replay and the FP64 reference,
+then found no committed record for that runtime (MXFP8 has none for these
+runtimes either). No NVFP4 golden is committed yet; until one is recorded on a
+runtime that CI runs, NVFP4 byte stability is checked within a process only
+(replay, batch, boundary, ragged and neighbor cases). Command, from
+`test/python`:
+
+```bash
+python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_fp8_determinism.py -q -rs
+```
 
 ### Block-sparse attention blk64: 30 cases
 

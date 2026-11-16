@@ -20,7 +20,7 @@ if requirement_error:
 import cutlass
 import cutlass.cute as cute
 
-from cudnn.jax import call, neg_inf_init, zeros_init
+from cudnn._jax import call, neg_inf_init, zeros_init
 from cudnn.tensor_adapter import get_compute_capability
 from .score_recompute.indexer_score_unified_sm100 import IndexerScoreUnifiedSm100
 from .sparse_attention_forward.dsa_fwd_sm100_head64 import SparseAttentionForwardSm100Head64

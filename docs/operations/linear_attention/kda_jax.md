@@ -1,6 +1,6 @@
 # Kimi Delta Attention in JAX
 
-`cudnn.jax.kimi_delta_attention` returns `(output, final_state_or_None)` and
+`cudnn.linear_attention.jax_api.kimi_delta_attention` returns `(output, final_state_or_None)` and
 supports `jax.jit` and first-order reverse-mode differentiation. It uses the
 existing Frost KDA kernels, including their backward, checkpoint recompute,
 split scheduler, gate gradients, and grouped-head reductions.
@@ -55,7 +55,7 @@ SM100; broader version/architecture qualification is still required.
 ```python
 import jax
 import jax.numpy as jnp
-from cudnn.jax import kimi_delta_attention as kda
+from cudnn.linear_attention.jax_api import kimi_delta_attention as kda
 
 q = jnp.full((32, 1, 64), 0.05, jnp.bfloat16)
 k, v = q, jnp.ones_like(q)

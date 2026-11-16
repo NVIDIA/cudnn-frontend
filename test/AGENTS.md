@@ -84,9 +84,15 @@ knob; updating architecture-local body tests alone misses these consumers.
 When a fixture changes an unsplit record into a split record, select its
 implementation after computing the final knobs. Small-head SM100 paged THD
 split uses single-Q even when the ranked unsplit candidate used multi-Q.
+SM107 D128 THD split also uses shared single-Q with mixed half-Q/FP8-KV;
+its native multi-Q owner must decline the packed-split record before lowering.
+Check mixed-storage ownership separately from uniform-dtype controls.
 `test_paged_thd_split_capture_lengths_and_stats` and
 `test_native_paged_thd_capture_and_rebind` cover that transition, including
 default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
+The architecture CI selector may omit a newly added standalone test file.
+Mirror SM107 numerical regressions into `test_sdpa_fp8_sm107.py`, its existing
+selected entry, by reusing the same checks and preserving their parameter marks.
 Owner migrations must also update shared fixtures at non-exact head widths.
 An exact-width owner map can pass the new contract suite while scalar-tail,
 THD-interior and D512-origin fixtures still select a delegated row. Resolve the
@@ -307,6 +313,12 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+Numerical tests of an explicit split-KV leg must construct that supported plan
+with `create_execution_plan`; a smaller GPU may correctly offer only unsplit
+candidates. Keep heuristics-offering tests separate. The MXFP8 own-block
+`test_packed_and_split_legs` exercises this on both server SM100 and P2021,
+preserving independent O/LSE and bitwise own-block isolation checks.
+
 A partially migrated backward row can remain legal for one mask and delegate
 another. Band-model tests must distinguish declaration rejection from ownership
 transfer while sampling both the retained row and its explicit owners; do not
@@ -381,6 +393,12 @@ check that changing either the delta or a shared barrier still fails the test.
   ```
 
 ### Conventions for new tests
+
+- **Test launch bounds against each actual scheduler.** A `B`/`H` limit for
+  grid.y/z does not apply to a flat grid.x scheduler. Exercise 65535 and 65536
+  independently for batch and heads, in graph admission and standalone checks;
+  retain legal flat-grid controls and inspect auxiliary launches too.
+  `sdpa/frost/test_sdpa_bwd_launch_grid.py` covers half backward on SM80/SM120.
 
 - Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
   for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
@@ -673,6 +691,13 @@ backend fallback cannot hide a missing kernel repair. The SM100 selected entry
 `test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
 FP8 D128 cases and checks both prepared and standalone graph execution.
 Default-provider passes alone cannot qualify an advertised native path.
+
+Split batch-invariance fixtures must reserve total-Q capacity for inserted or
+duplicated sequences, not only the initial batch's live sum. Keep a required
+`max_total_seq_len_q` bound instead of dropping it to grow the test. A B=1
+head-major Stats control that retains the original head stride still needs
+storage for `H * head_stride`, including the last head's padding. The D256
+split-origin determinism suite checks these contracts with fixed public records.
 
 ### CUDA Graph test lifetimes
 
@@ -1623,3 +1648,16 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+### Backend workspace capacity
+
+A non-null pointer does not establish sufficient workspace capacity. Test the
+observed byte extent at every mapping/ordered/index transport, including the
+native ordered fast path, Python-only producers, deserialization and effective
+shape overrides. Warm the same plan with a valid buffer before replacing it
+with a short view. Keep that view inside a fully sized owned backing for the
+RED control; assert rejection before either FE scratch initialization or output
+writes. Exact capacity, larger carriers of a different element width, and raw
+integer pointers with unknown capacity are positive controls. See
+`core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.

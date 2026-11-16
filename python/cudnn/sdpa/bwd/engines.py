@@ -30,6 +30,7 @@ import cudnn
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.bwd.kernels.sm100.d256_f16_2x2.contract import sm100_head_pair_envelope as _sm100_d256_envelope
 
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
 # importing them here would drag the CuTe DSL into every support check.
@@ -492,6 +493,8 @@ def legal_implementations(capabilities: Capabilities, facts: "ga.SdpaGraphFacts"
 def _declared_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any) -> Optional[str]:
     if facts.invalid:
         return facts.invalid
+    if facts.mixed_qkv_ragged:
+        return "nonpaged FROST SDPA requires Q, K, and V to be all dense or all ragged"
     if not facts.is_backward:
         return "this engine serves sdpa_backward() graphs only"
     if requested is not None:
@@ -2043,6 +2046,17 @@ def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
     return "D256 backward serves exact (256, 256) and (192, 128) head dimensions"
 
 
+def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """The native pairs, plus dense head pairs below (256, 256) that compute on its geometry (``_sm100_d256_envelope``)."""
+    if _native_d256_head_mismatch(facts, version) is None:
+        return None
+    if not _sm100_d256_envelope(facts.d_qk, facts.d_v):
+        return "D256 backward serves (192, 128), and D_V in {192, 256} with D_V <= D_QK <= 256 and D_QK a multiple of 8"
+    if facts.thd:
+        return "the D256 head-pair envelope is dense BSHD only; THD serves the exact (256, 256) and (192, 128) pairs"
+    return None
+
+
 def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     if _d192_accumulation_serves(facts):
         return None
@@ -2069,7 +2083,9 @@ def _sm100_d256_spec() -> EngineSpec:
     no-zero-fill contract are the Rubin row's.
 
     Packed THD accepts independent per-port physical origins and both packed Stats layouts, with declared token capacities.
-    Exact ``d_qk == d_v == 256``, plus dense and THD ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry.
+    Exact ``d_qk == d_v == 256``, plus dense and THD ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry,
+    plus dense BSHD pairs with ``d_v`` in {192, 256} and ``d_v <= d_qk <= 256`` (``d_qk`` a multiple of 8) on the (256, 256)
+    geometry (``_sm100_d256_envelope``).
     Tensor maps retain each operand's actual width; delta and GQA fold use the value width. Any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
     sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
     by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening,
@@ -2084,9 +2100,9 @@ def _sm100_d256_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=100,
             sm_hi=106,
-            d=frozenset({128, 192, 256}),
+            d=frozenset({128, *range(192, 257, 8)}),
             dqk_ge_dv=True,
-            declaration_check=_native_d256_head_mismatch,
+            declaration_check=_sm100_d256_head_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
