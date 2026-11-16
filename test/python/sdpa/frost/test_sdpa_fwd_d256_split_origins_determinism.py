@@ -104,7 +104,7 @@ def test_origins_reference_replay_batch_and_golden(dtype, stats, splits):
     # keyless rows, empty work and retained captures before recording anything.
     # Batch insertion in the callback needs capacity beyond the original sum
     # of live Q lengths; the separate origin suite covers bounded total hints.
-    check_origins(256, dtype, stats, False, False, splits, engine_name=engine, cga=2, extra_checks=extra)
+    check_origins(256, dtype, stats, True, False, splits, engine_name=engine, cga=2, extra_checks=extra, total_capacity_hints=True)
     assert_golden(f"sdpa-d256-thd-split{splits}-origins-{dtype}-{stats}", record["inputs"], record["outputs"])
 
 
@@ -131,6 +131,8 @@ def _check_single_sequence(graph, nodes, values, origins, nq, stats_layout, expe
         seq_len_q=decl["ql"],
         seq_len_kv=decl["kl"],
         stats_use_log2=stats_layout == "head",
+        max_total_seq_len_q=256,
+        max_total_seq_len_kv=256,
     )
     bound["o"] = torch.empty_like(values["o"][:1])
     stats = values["stats"][:, :256] if stats_layout == "head" else values["stats"][:256]

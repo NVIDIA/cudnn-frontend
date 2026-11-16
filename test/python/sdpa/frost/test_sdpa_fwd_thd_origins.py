@@ -56,6 +56,7 @@ def test_independent_thd_origins_rebind_and_capture(
     batch_override=None,
     extra_checks=None,
     origin_element_unit=None,
+    total_capacity_hints=False,
 ):
     import cudnn
     import torch
@@ -207,6 +208,8 @@ def test_independent_thd_origins_rebind_and_capture(
         if name in ("q", "k", "v"):
             nodes[name].set_ragged_offset(nodes["ro_" + name]).set_ragged_offset_multiplier(multiplier)
     extra = dict(max_total_seq_len_q=sum(q_lengths), max_total_seq_len_kv=sum(kv_lengths)) if total_hints else {}
+    if total_hints and total_capacity_hints:
+        extra.update(max_total_seq_len_q=capacity, max_total_seq_len_kv=capacity)
     extra.update({name: nodes[name] for name in scale_values})
     if mxfp8:
         extra.update({"descale_" + name: nodes["sf_" + name] for name in ("q", "k", "v")})
