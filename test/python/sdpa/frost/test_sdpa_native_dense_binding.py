@@ -443,7 +443,6 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
     if cc in ((10, 0), (10, 3)):
-        from types import SimpleNamespace
         from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
 
         physical_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=d_v))
