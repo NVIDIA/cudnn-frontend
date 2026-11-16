@@ -108,11 +108,7 @@ def _check_dim_stride(node, port: str, t: Any) -> None:
 def _causal_alignment_error(params: dict) -> Optional[str]:
     """Reject contradictory legacy and band mask spellings before normalization."""
     if params.get("use_causal_mask") and getattr(params.get("diagonal_alignment"), "name", None) == "BOTTOM_RIGHT":
-        return (
-            "use_causal_mask=True requires diagonal_alignment=TOP_LEFT; "
-            "use use_causal_mask_bottom_right=True or diagonal_band_right_bound=0 with "
-            "diagonal_alignment=BOTTOM_RIGHT for bottom-right causal masking"
-        )
+        return "use_causal_mask=True requires diagonal_alignment=TOP_LEFT; " "use use_causal_mask_bottom_right=True for bottom-right causal masking"
     return None
 
 

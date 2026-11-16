@@ -31,6 +31,14 @@ _CASES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_device(monkeypatch):
+    from cudnn.sdpa import graph_analyzer as ga
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    monkeypatch.setattr(ga, "_device_sm_count", lambda: 148)
+
+
 def _graph(api, dtype, *, compiled=False, **mask):
     graph_type = cudnn._pybind_module.backend_graph if compiled else cudnn.pygraph
     g = graph_type(io_data_type=dtype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, sm_version=100)

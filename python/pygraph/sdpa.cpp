@@ -25,8 +25,7 @@ validate_causal_alignment(bool use_causal_mask, cudnn_frontend::DiagonalAlignmen
     if (use_causal_mask && diagonal_alignment == cudnn_frontend::DiagonalAlignment_t::BOTTOM_RIGHT) {
         throw std::runtime_error(
             "use_causal_mask=True requires diagonal_alignment=TOP_LEFT; "
-            "use use_causal_mask_bottom_right=True or diagonal_band_right_bound=0 with "
-            "diagonal_alignment=BOTTOM_RIGHT for bottom-right causal masking");
+            "use use_causal_mask_bottom_right=True for bottom-right causal masking");
     }
 }
 }  // namespace
