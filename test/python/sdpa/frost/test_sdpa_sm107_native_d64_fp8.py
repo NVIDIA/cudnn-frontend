@@ -114,7 +114,8 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
             am.set_output(True).set_dim(amax.shape).set_stride(amax.stride()).set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
-        name = "sdpa_fwd_sm107_d128_fp8_multi_q" if d == 64 else "sdpa_fwd_prefill_sm107_fp8"
+        # The same explicit body owns the narrow logical widths in the D64 tile.
+        name = "sdpa_fwd_sm107_d128_fp8_multi_q"
         engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[name]
         knobs = {
             getattr(cudnn.knob_type, name): value

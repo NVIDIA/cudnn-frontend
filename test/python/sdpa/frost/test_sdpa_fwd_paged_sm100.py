@@ -242,14 +242,26 @@ def _run_graph(
             if d == d_v and d in (32, 64, 128):
                 # Explicit layout fixtures request the single-Q or multi-Q body directly.
                 explicit_name = "sdpa_fwd_sm100_d128_single_q" if explicit_knobs.cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+        if arch == "sm107":
+            from cudnn.sdpa.graph_analyzer import analyze
+            from cudnn.sdpa.fwd.kernels.sm107.half_flavor_contract import padded_shape
+
+            # Pin the body for the covering tile while retaining logical widths
+            # in the graph and numerical reference (including scalar-tail cases).
+            facts = analyze(g)
+            physical_shape = padded_shape(facts)
+            if physical_shape in ((32, 32), (64, 64), (128, 128)):
+                explicit_name = "sdpa_fwd_sm107_d128_multi_q"
+            elif physical_shape == (192, 128):
+                explicit_name = "sdpa_fwd_sm107_d128_multi_q" if facts.has_paged_kv else "sdpa_fwd_sm107_d192_multi_q"
         if arch == "sm107" and (d, d_v) == (256, 256):
             explicit_name = "sdpa_fwd_sm107_d256_swap_ab" if explicit_knobs.tile_m in (16, 32, 64) else "sdpa_fwd_sm107_d256_lookahead"
-        if arch == "sm107" and (d, d_v) in ((512, 512), (576, 512)):
+        if arch == "sm107" and physical_shape in ((512, 512), (576, 512)):
             from dataclasses import replace
 
             explicit_name = "sdpa_fwd_sm107_d512_2x2"
             explicit_knobs = replace(explicit_knobs, tile_m=64, cga=2 if d == 576 else 4)
-        g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
+        g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs.to_public())
     plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:
         assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
