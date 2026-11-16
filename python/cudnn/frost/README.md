@@ -1119,7 +1119,13 @@ Contract:
   Where those two values are computed is part of the caller's rendering: a
   helper that computed them would emit its lane mask where it is traced, which
   can be behind a dependent-launch wait the kernel placed in front of the
-  reduction.
+  reduction. Measured on the add + RMSNorm + quantize decode kernel
+  (`norm/frost/kernel/add_norm_quant_decode_f16.py`), which takes its row
+  total from `block_reduce(..., kind="sum", order="ascending")`: with its own
+  two statements every form renders the cubin it rendered with the reduction
+  spelled inline (`sm_100a`, `sm_103a`, `sm_107a`, `sm_120a`); with them at
+  the call site 16 of its 45 `sm_100a` forms render another image, with the
+  same output bytes.
 - **Every thread, full warps, no warp-role branch.** A call emits one aligned
   thread-block barrier that all `32 * warps` threads issue once, and
   full-mask shuffles. The call sits under compile-time control flow only.

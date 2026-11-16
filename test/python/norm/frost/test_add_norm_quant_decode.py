@@ -834,10 +834,15 @@ def test_import_cudnn_does_not_import_the_kernel_or_torch():
 def test_kernel_takes_its_quantization_helpers_from_the_tile_library():
     """One definition per helper: the kernel module imports the static E4M3 store, the correctly rounded reciprocal and the NVFP4
     block-scale chain from ``cudnn.frost.tile_dsl.pointwise`` (their own cells are in
-    ``sdpa/frost/test_tile_dsl_quant_helpers.py``) and carries no inline PTX of its own.  Read from the source: no DSL import."""
+    ``sdpa/frost/test_tile_dsl_quant_helpers.py``) and carries no inline PTX of its own; its row reduction is
+    ``cudnn.frost.tile_dsl.rowwise.block_reduce`` (cells in ``sdpa/frost/test_tile_dsl_rowwise.py``), so the module holds no
+    thread-block barrier of its own, and every ``order="..."`` its text names is an order the tile library defines.  Read from
+    the source: no DSL import."""
     import ast
+    import re
 
-    tree = ast.parse((REPO / "python" / "cudnn" / "norm" / "frost" / "kernel" / "add_norm_quant_decode_f16.py").read_text())
+    source = (REPO / "python" / "cudnn" / "norm" / "frost" / "kernel" / "add_norm_quant_decode_f16.py").read_text()
+    tree = ast.parse(source)
     imported = {
         alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module == "cudnn.frost.tile_dsl.pointwise" for alias in node.names
     }
@@ -846,6 +851,25 @@ def test_kernel_takes_its_quantization_helpers_from_the_tile_library():
     assert defined == {"_bf16_words", "frost_add_rms_norm_quant", "launch"}, defined
     names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)} | {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert "inline_ptx" not in names, "the kernel spells an instruction inline instead of through the tile library"
+    reduction = {
+        alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module == "cudnn.frost.tile_dsl.rowwise" for alias in node.names
+    }
+    assert reduction == {"block_reduce"}, reduction
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "block_reduce"]
+    assert len(calls) == 1 and {kw.arg: getattr(kw.value, "value", None) for kw in calls[0].keywords} == {
+        "kind": "sum",
+        "order": "ascending",
+    }, "the row total is ONE ascending block sum"
+    assert "barrier" not in names, "the kernel spells the thread-block barrier of its reduction itself instead of through block_reduce"
+    library = ast.parse((REPO / "python" / "cudnn" / "frost" / "tile_dsl" / "rowwise.py").read_text())
+    orders = [
+        ast.literal_eval(node.value)
+        for node in library.body
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "SUM_ORDERS"
+    ]
+    assert len(orders) == 1 and "ascending" in orders[0], orders
+    named = set(re.findall(r'order="(\w+)"', source))
+    assert "ascending" in named and named <= set(orders[0]), f"the kernel module names a sum order the tile library does not define: {sorted(named)}"
 
 
 GOLDEN_CASES = ("add-bf16-e4m3-rows3", "store-e4m3-rows3", "none-e4m3-rows3", "add-nvfp4-rows3", "add-nvfp4-rows130", "add-bf16-nvfp4-ties-rows2")
