@@ -21,7 +21,7 @@ def _restore_stream(cudnn_handle):
         cudnn.set_stream(cudnn_handle, original)
 
 
-def _build(handle, needs_workspace):
+def _build(handle, needs_workspace, dtype=torch.bfloat16):
     if needs_workspace and (cudnn.backend_version() < 92600 or torch.cuda.get_device_capability()[0] < 9):
         pytest.skip("This backend ALiBi case requires Hopper+ and cuDNN 9.26+")
     graph = cudnn.pygraph(
@@ -35,10 +35,12 @@ def _build(handle, needs_workspace):
         # ALiBi slopes occupy FE scratch independently of the backend plan's
         # workspace choice, so this is not tied to a heuristic engine ranking.
         rng = torch.Generator(device="cuda").manual_seed(471)
-        values = [torch.randn((2, 32, 4, 128), generator=rng, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for _ in range(3)]
+        values = [torch.randn((2, 32, 4, 128), generator=rng, device="cuda", dtype=dtype).transpose(1, 2) for _ in range(3)]
         tensors = [graph.tensor_like(value) for value in values]
         output, _ = graph.sdpa(q=tensors[0], k=tensors[1], v=tensors[2], generate_stats=False, attn_scale=128**-0.5, use_alibi_mask=True, use_causal_mask=True)
-        output.set_output(True).set_dim(values[0].shape).set_stride(values[0].stride()).set_data_type(cudnn.data_type.BFLOAT16)
+        output.set_output(True).set_dim(values[0].shape).set_stride(values[0].stride()).set_data_type(
+            cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+        )
         result = torch.empty_like(values[0])
     else:
         # C=1 is rejected by the Hopper pointwise backend. A channels-last
@@ -100,10 +102,13 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
     graph, tensors, values = _build(cudnn_handle, True)
     # Exercise an actual effective-shape change rather than echoing the
     # declaration. This plan's FE ALiBi scratch remains required at B=1.
-    if overriding:
-        values = [value[:1] for value in values]
+    # Keep the full declared storage even when execution uses a smaller extent.
     overrides = (
-        dict(override_uids=[t.get_uid() for t in tensors], override_shapes=[list(t.shape) for t in values], override_strides=[list(t.stride()) for t in values])
+        dict(
+            override_uids=[t.get_uid() for t in tensors],
+            override_shapes=[list(t[:1].shape) for t in values],
+            override_strides=[list(t.stride()) for t in values],
+        )
         if overriding
         else {}
     )
@@ -113,7 +118,7 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
     cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
     _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
     torch.cuda.synchronize()
-    expected = values[-1].clone()
+    expected = (values[-1][:1] if overriding else values[-1]).clone()
     assert torch.isfinite(expected).all().item()
     for null_workspace in (None, 0, torch.empty(0, device="cuda", dtype=torch.uint8)):
         values[-1].fill_(123)
@@ -123,7 +128,7 @@ def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding,
         assert torch.all(values[-1] == 123).item()
         _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
         torch.cuda.synchronize()
-        torch.testing.assert_close(values[-1], expected, atol=0, rtol=0)
+        torch.testing.assert_close(values[-1][:1] if overriding else values[-1], expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index", "raw", "cpp_candidate"])
@@ -136,3 +141,124 @@ def test_zero_workspace_backend_accepts_null(entry, cudnn_handle):
         _call(graph, tensors, values, workspace, cudnn_handle, entry, {})
         torch.cuda.synchronize()
         torch.testing.assert_close(values[-1], torch.relu(values[0]), atol=0, rtol=0)
+
+
+class _PythonBuffer:
+    """A supported producer without the native exchange protocol."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.shape, self.dtype = tensor.shape, tensor.dtype
+
+    def data_ptr(self):
+        return self.tensor.data_ptr()
+
+    def stride(self):
+        return self.tensor.stride()
+
+
+@pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index"])
+@pytest.mark.parametrize("overriding", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("producer", ["native", "python"])
+def test_short_backend_workspace_rejects_before_any_write(entry, overriding, dtype, producer, cudnn_handle):
+    graph, tensors, values = _build(cudnn_handle, True, dtype)
+    _assert_short_workspace(graph, tensors, values, entry, overriding, producer, cudnn_handle)
+
+
+def _assert_short_workspace(graph, tensors, values, entry, overriding, producer, cudnn_handle):
+    # Keep the full declared storage even when execution uses a smaller extent.
+    overrides = (
+        dict(
+            override_uids=[t.get_uid() for t in tensors],
+            override_shapes=[list(t[:1].shape) for t in values],
+            override_strides=[list(t.stride()) for t in values],
+        )
+        if overriding
+        else {}
+    )
+    required = graph.get_workspace_size_plan_at_index(graph._plan_index, handle=cudnn_handle, **overrides)
+    assert required > 1
+    # The short view stays inside an owned allocation large enough for the plan:
+    # a RED run can expose the missing check without an invalid device access.
+    backing = torch.empty(required + 256, dtype=torch.uint8, device="cuda")
+    full = backing[:required]
+    wrap = _PythonBuffer if producer == "python" else lambda value: value
+    cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+    _call(graph, tensors, values, wrap(full), cudnn_handle, entry, overrides)
+    torch.cuda.synchronize()
+    expected = (values[-1][:1] if overriding else values[-1]).clone()
+    assert torch.isfinite(expected).all().item()
+    for length in (1, required - 1):
+        backing.fill_(165)
+        values[-1].fill_(123)
+        with pytest.raises(ValueError, match=f"requires a {required}-byte workspace but received a {length}-byte buffer"):
+            _call(graph, tensors, values, wrap(full[:length]), cudnn_handle, entry, overrides)
+        torch.cuda.synchronize()
+        assert torch.all(backing == 165).item(), "Rejected execution must not initialize FE scratch"
+        assert torch.all(values[-1] == 123).item(), "Rejected execution must not write the output"
+    # Exact capacity, a differently typed byte carrier, and an unknown-capacity
+    # integer address remain valid; capacity is in bytes, never element count.
+    for workspace in (wrap(full), wrap(backing[: (required + 3) // 4 * 4].view(torch.float32)), full.data_ptr()):
+        values[-1].fill_(float("nan"))
+        _call(graph, tensors, values, workspace, cudnn_handle, entry, overrides)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(values[-1][:1] if overriding else values[-1], expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index"])
+def test_deserialized_backend_checks_current_workspace_capacity(entry, cudnn_handle):
+    source, tensors, values = _build(cudnn_handle, True)
+    graph = cudnn.pygraph(handle=cudnn_handle)
+    graph.deserialize(source.serialize())
+    required = graph.get_workspace_size()
+    assert required > 1
+    backing = torch.empty(required + 256, device="cuda", dtype=torch.uint8)
+    cudnn.set_stream(cudnn_handle, torch.cuda.current_stream().cuda_stream)
+    _call(graph, tensors, values, backing[:required], cudnn_handle, entry, {})
+    torch.cuda.synchronize()
+    expected = values[-1].clone()
+    backing.fill_(165)
+    values[-1].fill_(123)
+    with pytest.raises(ValueError, match=f"requires a {required}-byte workspace but received a 1-byte buffer"):
+        _call(graph, tensors, values, backing[:1], cudnn_handle, entry, {})
+    torch.cuda.synchronize()
+    assert torch.all(backing == 165).item()
+    assert torch.all(values[-1] == 123).item()
+    _call(graph, tensors, values, backing[:required], cudnn_handle, entry, {})
+    torch.cuda.synchronize()
+    torch.testing.assert_close(values[-1], expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_conv_wgrad_checks_workspace_capacity(entry, dtype, cudnn_handle):
+    graph = cudnn.pygraph(handle=cudnn_handle, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    rng = torch.Generator(device="cuda").manual_seed(471)
+    values = [
+        torch.randn(4, channels, 32, 32, generator=rng, device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last) for channels in (32, 64)
+    ]
+    tensors = [graph.tensor_like(value) for value in values]
+    result = torch.empty((64, 32, 3, 3), device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last)
+    output = graph.conv_wgrad(image=tensors[0], loss=tensors[1], padding=[1, 1], stride=[1, 1], dilation=[1, 1])
+    output.set_output(True).set_dim(result.shape).set_stride(result.stride()).set_data_type(
+        cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    )
+    tensors.append(output)
+    values.append(result)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    errors = []
+    for index, cfg in enumerate(graph.plans):
+        if not is_backend_engine(cfg.engine_id):
+            continue
+        try:
+            graph.build_plan_at_index(index)
+        except (cudnn.cudnnGraphNotSupportedError, NotImplementedError) as exc:
+            errors.append(str(exc))
+            continue
+        if graph.get_workspace_size() > 1:
+            _assert_short_workspace(graph, tensors, values, entry, False, "native", cudnn_handle)
+            return
+    pytest.fail(f"No backend wgrad plan with scratch: {errors}")

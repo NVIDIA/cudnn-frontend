@@ -678,23 +678,135 @@ PyGraph::get_workspace_size_plan_at_index(int64_t index,
     return workspace;
 }
 
+namespace {
+
+PyGraph::MetadataBatchBounds
+metadata_batch_bounds(json const& structure) {
+    PyGraph::MetadataBatchBounds bounds;
+    auto nodes = structure.find("nodes");
+    if (nodes == structure.end() || nodes->empty()) {
+        auto saved = structure.find("frontend_metadata_batch_bounds");
+        return saved == structure.end() ? bounds : saved->get<PyGraph::MetadataBatchBounds>();
+    }
+    // Older structural encodings may embed tensor objects in ports. Keep the
+    // conservative bound when the flat UID schema cannot establish ownership.
+    if (!structure.contains("tensors") || !structure.at("tensors").is_array()) return {};
+    std::unordered_map<int64_t, json const*> tensors;
+    for (auto const& tensor : structure.at("tensors")) {
+        if (!tensor.contains("uid") || !tensor.at("uid").is_number_integer()) return {};
+        tensors.emplace(tensor.at("uid").get<int64_t>(), &tensor);
+    }
+    std::unordered_set<int64_t> other_uses;
+    for (auto const& node : *nodes) {
+        auto const& inputs  = node.at("inputs");
+        auto const& outputs = node.at("outputs");
+        if (!inputs.is_object() || !outputs.is_object()) return {};
+        for (auto const* ports : {&inputs, &outputs})
+            for (auto const& ref : *ports)
+                if (!ref.is_number_integer()) return {};
+        auto tag      = node.at("tag").get<std::string>();
+        auto q_ref    = inputs.find("Q");
+        int64_t q_uid = q_ref == inputs.end() ? -1 : q_ref->get<int64_t>();
+        auto q        = tensors.find(q_uid);
+        // Dense SDPA may retain the declared batch despite enabled overrides
+        // (#1570). The smaller-prefix contract is qualified for unified half
+        // forward only. Quantized/backward plans retain the declared floor
+        // until their runtime-batch storage behavior is independently checked.
+        bool half =
+            q != tensors.end() && (q->second->at("data_type") == "HALF" || q->second->at("data_type") == "BFLOAT16");
+        bool packed = tag == "SDPA" && node.value("implementation", "AUTO") == "UNIFIED" && half &&
+                      q->second->contains("ragged_offset_uid") && !q->second->at("ragged_offset_uid").is_null();
+        std::unordered_set<int64_t> metadata;
+        auto add = [&](int64_t uid, int64_t extra) {
+            auto tensor = tensors.find(uid);
+            if (tensor == tensors.end()) return;
+            auto dtype = tensor->second->at("data_type").get<std::string>();
+            if (dtype != "INT32" && dtype != "INT64") return;
+            auto const& shape = tensor->second->at("dim");
+            if (shape.empty()) return;
+            auto batch = q->second->at("dim").at(0).get<int64_t>();
+            bounds[uid].push_back({q_uid, batch, extra});
+            metadata.insert(uid);
+        };
+        if (packed) {
+            for (auto const& port : inputs.items()) {
+                if (port.key() == "CU_SEQ_LEN_Q" || port.key() == "CU_SEQ_LEN_KV") {
+                    add(port.value().get<int64_t>(), 1);
+                } else if (port.key() == "SEQ_LEN_Q" || port.key() == "SEQ_LEN_KV" || port.key() == "Page_table_K" ||
+                           port.key() == "Page_table_V") {
+                    add(port.value().get<int64_t>(), 0);
+                }
+            }
+            for (auto const* ports : {&inputs, &outputs}) {
+                for (auto const& ref : *ports) {
+                    auto tensor = tensors.find(ref.get<int64_t>());
+                    if (tensor == tensors.end()) continue;
+                    auto offset = tensor->second->find("ragged_offset_uid");
+                    if (offset != tensor->second->end() && !offset->is_null()) add(offset->get<int64_t>(), 1);
+                }
+            }
+        }
+        for (auto const* ports : {&inputs, &outputs})
+            for (auto const& ref : *ports) {
+                auto uid = ref.get<int64_t>();
+                if (!metadata.count(uid)) other_uses.insert(uid);
+                auto tensor = tensors.find(uid);
+                if (tensor != tensors.end()) {
+                    auto offset = tensor->second->find("ragged_offset_uid");
+                    if (offset != tensor->second->end() && !offset->is_null()) {
+                        auto offset_uid = offset->get<int64_t>();
+                        if (!metadata.count(offset_uid)) other_uses.insert(offset_uid);
+                    }
+                }
+            }
+    }
+    // A tensor can also be an ordinary operand elsewhere in a fused graph.
+    // Its metadata use must not erase that other operation's storage bound.
+    for (auto uid : other_uses) bounds.erase(uid);
+    for (auto& [uid, rules] : bounds) {
+        CUDNN_FRONTEND_UNUSED(uid);
+        std::sort(rules.begin(), rules.end());
+        rules.erase(std::unique(rules.begin(), rules.end()), rules.end());
+    }
+    return bounds;
+}
+
+}  // namespace
+
+PyGraph::MetadataBatchBounds
+PyGraph::get_metadata_batch_bounds() const {
+    if (!graph->context.get_override_shape_enabled()) return {};
+    json structure;
+    graph->serialize(structure);
+    return structure.at("nodes").empty() ? restored_metadata_batch_bounds : metadata_batch_bounds(structure);
+}
+
 std::vector<uint8_t>
 PyGraph::serialize() const {
     std::vector<uint8_t> data;
     auto status = graph->serialize(data);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
+    auto bounds = get_metadata_batch_bounds();
+    if (!bounds.empty()) {
+        auto saved                              = json::from_ubjson(data);
+        saved["frontend_metadata_batch_bounds"] = std::move(bounds);
+        data                                    = json::to_ubjson(saved);
+    }
     return data;
 }
 
 void
 PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyobj, bool const enforce_precompiled) {
     if (py::isinstance<py::str>(pyobj)) {
-        json j = json::parse(py::cast<std::string>(pyobj));
+        json j      = json::parse(py::cast<std::string>(pyobj));
+        auto bounds = j.value("context", json::object()).value("is_override_shape_enabled", false)
+                          ? metadata_batch_bounds(j)
+                          : MetadataBatchBounds{};
 
         auto status = graph->deserialize(j, enforce_precompiled);
 
         throw_if(status.is_bad(), status.get_code(), status.get_message());
-
+        restored_metadata_batch_bounds = std::move(bounds);
     } else {
         std::vector<uint8_t> data;
         if (py::isinstance<py::bytes>(pyobj)) {
@@ -705,6 +817,12 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
             data = py::cast<std::vector<uint8_t>>(pyobj);
         }
 
+        // Validate the additional binding facts before publishing a new plan.
+        // A malformed blob still goes through Graph's existing diagnostic path.
+        auto saved = json::from_ubjson(data, true, false);
+        bool overriding =
+            saved.is_object() && saved.value("context", json::object()).value("is_override_shape_enabled", false);
+        auto bounds = overriding ? metadata_batch_bounds(saved) : MetadataBatchBounds{};
         if (!handle_.has_value() && this->handle == nullptr && this->device_properties != nullptr) {
             // Handle-less path: use the device properties set at construction.
             auto status = graph->deserialize(data, enforce_precompiled);
@@ -716,6 +834,12 @@ PyGraph::deserialize(std::optional<std::intptr_t> handle_, py::object const& pyo
             auto status = graph->deserialize(handle, data, enforce_precompiled);
             throw_if(status.is_bad(), status.get_code(), status.get_message());
         }
+        // A loaded backend plan retains its override contract, even though
+        // Graph's plan-only restore does not reconstruct the node context.
+        // Read the source flag rather than inheriting the destination graph's
+        // constructor; fixed graphs must keep their declared capacity floor.
+        graph->set_override_shape_enabled(overriding);
+        restored_metadata_batch_bounds = std::move(bounds);
     }
 }
 
@@ -772,7 +896,8 @@ PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
                  std::optional<std::intptr_t> exec_handle,
                  py::object override_uids,
                  py::object override_shapes,
-                 py::object override_strides) {
+                 py::object override_strides,
+                 std::optional<int64_t> workspace_bytes) {
     std::unordered_map<int64_t, void*> var_pack_;
     var_pack_.reserve(var_pack.size());
     for (auto const& [uid, device_pointer] : var_pack) {
@@ -793,6 +918,9 @@ PyGraph::execute(std::unordered_map<int64_t, std::intptr_t> var_pack,
 
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
 
+    check_workspace_capacity(
+        workspace, workspace_bytes, handle_, -1, override_uids_vec, override_shapes_vec, override_strides_vec);
+
     cudnn_frontend::error_t status = {error_code_t::OK, ""};
     if (override_uids_vec.empty()) {
         status = graph->execute(handle_, var_pack_, workspace_ptr);
@@ -811,17 +939,53 @@ PyGraph::prepare_variant_pack_template() {
 }
 
 void
+PyGraph::check_workspace_capacity(std::intptr_t workspace,
+                                  std::optional<int64_t> workspace_bytes,
+                                  cudnnHandle_t exec_handle,
+                                  int64_t plan_index,
+                                  const std::vector<int64_t>& override_uids,
+                                  const std::vector<std::vector<int64_t>>& override_shapes,
+                                  const std::vector<std::vector<int64_t>>& override_strides) {
+    // Preserve the existing null-workspace diagnostic in the common C++ path.
+    // Integer pointers expose no allocation bound and remain caller-sized.
+    if (!workspace || !workspace_bytes) return;
+    if (*workspace_bytes < 0) throw py::value_error("workspace byte capacity must be nonnegative");
+    int64_t required = 0;
+    error_t status;
+#if (CUDNN_VERSION >= 92300)
+    if (!override_uids.empty() && cudnn_frontend::detail::get_backend_version() >= 92300) {
+        status =
+            plan_index < 0
+                ? graph->get_workspace_size(exec_handle, required, override_uids, override_shapes, override_strides)
+                : graph->get_workspace_size_plan_at_index(
+                      exec_handle, plan_index, required, override_uids, override_shapes, override_strides);
+    } else
+#endif
+    {
+        status = plan_index < 0 ? graph->get_workspace_size(required)
+                                : graph->get_workspace_size_plan_at_index(plan_index, required);
+    }
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+    if (*workspace_bytes < required)
+        throw py::value_error(("Plan requires a " + std::to_string(required) + "-byte workspace but received a " +
+                               std::to_string(*workspace_bytes) + "-byte buffer.")
+                                  .c_str());
+}
+
+void
 PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
                                int64_t n_user,
                                std::intptr_t workspace,
                                std::intptr_t exec_handle,
-                               int64_t plan_index) {
+                               int64_t plan_index,
+                               std::optional<int64_t> workspace_bytes) {
     static_assert(sizeof(std::intptr_t) == sizeof(void*), "intptr_t and void* must be the same size");
     throw_if(n_user < 0, error_code_t::INVALID_VALUE, "n_user must be non-negative");
     throw_if(n_user > 0 && user_ptrs_array == 0, error_code_t::INVALID_VALUE, "user_ptrs_array is null");
     // user_ptrs_array points to a contiguous intptr_t[] of device pointers — zero copy
     void** ptrs     = reinterpret_cast<void**>(user_ptrs_array);
     cudnnHandle_t h = exec_handle ? static_cast<cudnnHandle_t>((void*)exec_handle) : handle;
+    check_workspace_capacity(workspace, workspace_bytes, h, plan_index);
     // Address the plan the python walk built, which stops being the graph's own
     // candidate once the walk has skipped an entry. -1 defers to the candidate.
     auto status = plan_index < 0 ? graph->execute(h, ptrs, (int)n_user, (void*)workspace)
@@ -830,11 +994,17 @@ PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
 }
 
 void
-PyGraph::execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index) {
+PyGraph::execute_ordered_pack(py::handle pack,
+                              std::intptr_t workspace,
+                              std::intptr_t exec_handle,
+                              int64_t plan_index,
+                              std::optional<int64_t> workspace_bytes) {
     const auto frame      = read_native_execution_bindings(pack);
     const auto& overrides = frame.overrides;
     auto h                = exec_handle ? reinterpret_cast<cudnnHandle_t>(exec_handle) : handle;
     auto ws               = reinterpret_cast<void*>(workspace);
+    check_workspace_capacity(
+        workspace, workspace_bytes, h, plan_index, overrides.uids, overrides.shapes, overrides.strides);
     error_t status;
     if (plan_index >= 0) {
         status = graph->execute_plan_at_index(h,
@@ -874,7 +1044,11 @@ PyGraph::execute_ordered(py::handle schema,
         schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
     if (!py::cast<py::list>(read[1]).empty() || read[2].is_none()) return read;
     const auto extent = py::cast<py::tuple>(read[2]);
-    execute_ordered_pack(read[0], py::cast<std::intptr_t>(extent[0]), exec_handle, plan_index);
+    execute_ordered_pack(read[0],
+                         py::cast<std::intptr_t>(extent[0]),
+                         exec_handle,
+                         plan_index,
+                         py::cast<std::optional<int64_t>>(extent[1]));
     return py::none();
 }
 
@@ -885,7 +1059,8 @@ PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pa
                                std::optional<std::intptr_t> exec_handle,
                                py::object override_uids,
                                py::object override_shapes,
-                               py::object override_strides) {
+                               py::object override_strides,
+                               std::optional<int64_t> workspace_bytes) {
     std::unordered_map<int64_t, void*> var_pack_;
     for (auto const& [uid, device_pointer] : var_pack) {
         var_pack_.emplace(uid, (void*)device_pointer);
@@ -904,6 +1079,9 @@ PyGraph::execute_plan_at_index(std::unordered_map<int64_t, std::intptr_t> var_pa
     auto workspace_ptr = (void*)workspace;
 
     cudnnHandle_t handle_ = exec_handle.has_value() ? static_cast<cudnnHandle_t>((void*)(exec_handle.value())) : handle;
+
+    check_workspace_capacity(
+        workspace, workspace_bytes, handle_, index, override_uids_vec, override_shapes_vec, override_strides_vec);
 
     cudnn_frontend::error_t status = {error_code_t::OK, ""};
     if (override_uids_vec.empty()) {
@@ -1491,22 +1669,50 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("handle"),
              py::arg("override_uids")    = py::none(),
              py::arg("override_shapes")  = py::none(),
-             py::arg("override_strides") = py::none())
+             py::arg("override_strides") = py::none(),
+             py::arg("workspace_bytes")  = std::nullopt)
         .def("_prepare_variant_pack_template", &PyGraph::prepare_variant_pack_template)
         .def("_get_variant_pack_uids_sorted", &PyGraph::get_variant_pack_uids_sorted)
+        .def("_get_buffer_bounds",
+             [](PyGraph& self) {
+                 py::list bounds;
+                 auto metadata = self.get_metadata_batch_bounds();
+                 for (auto uid : self.graph->get_variant_pack_uids_sorted()) {
+                     graph::Tensor_attributes tensor;
+                     auto status = self.graph->query_tensor_attributes_of_uid(uid, tensor);
+                     throw_if(status.is_bad(), status.get_code(), status.get_message());
+                     // Dense affine ranges are descriptor facts. Ragged offsets and
+                     // reordered/vectorized layouts require their operation's storage
+                     // contract; their logical envelope is not an allocation size.
+                     const bool affine = !tensor.get_ragged_offset() &&
+                                         tensor.get_reordering_type() == TensorReordering_t::NONE &&
+                                         tensor.get_vector_count() == 1;
+                     bounds.append(py::make_tuple(
+                         uid,
+                         tensor.get_dim(),
+                         tensor.get_stride(),
+                         tensor.get_data_type(),
+                         affine ? cudnn_frontend::detail::get_element_size_in_bits(tensor.get_data_type()) : 0,
+                         self.graph->context.get_override_shape_enabled(),
+                         metadata[uid]));
+                 }
+                 return bounds;
+             })
         .def("_execute_with_raw_ptrs",
              &PyGraph::execute_with_raw_ptrs,
              py::arg("user_ptrs_array"),
              py::arg("n_user"),
              py::arg("workspace"),
              py::arg("handle"),
-             py::arg("plan_index") = -1)
+             py::arg("plan_index")      = -1,
+             py::arg("workspace_bytes") = std::nullopt)
         .def("_execute_ordered_pack",
              &PyGraph::execute_ordered_pack,
              py::arg("pack"),
              py::arg("workspace"),
              py::arg("handle"),
-             py::arg("plan_index") = -1)
+             py::arg("plan_index")      = -1,
+             py::arg("workspace_bytes") = std::nullopt)
         .def("_execute_ordered",
              &PyGraph::execute_ordered,
              py::arg("schema"),
@@ -1547,7 +1753,8 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("handle"),
              py::arg("override_uids")    = py::none(),
              py::arg("override_shapes")  = py::none(),
-             py::arg("override_strides") = py::none())
+             py::arg("override_strides") = py::none(),
+             py::arg("workspace_bytes")  = std::nullopt)
         .def("__repr__", [](PyGraph const& pygraph) {
             std::stringstream ss;
             json j = pygraph.graph;

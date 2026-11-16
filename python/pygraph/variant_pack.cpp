@@ -16,6 +16,7 @@
 #include "variant_pack.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
@@ -292,6 +294,56 @@ in_axis_order_of(std::vector<int64_t> &shape, std::vector<int64_t> &stride, cons
 // declaration does not change between executes, so python builds this once per
 // graph and the pack compares a caller's buffer against it in one crossing
 // (VariantPackNative::describe_from) rather than two per operand per call.
+// A backend descriptor's statically addressable range. Ragged/reordered
+// storage has an operation-specific contract and uses required_bytes == -1.
+struct BackendBufferBound {
+    int64_t uid            = -1;
+    int64_t required_bytes = -1;
+    int64_t element_bits   = 0;
+    bool overridable       = false;
+    std::vector<int64_t> shape;
+    std::vector<int64_t> stride;
+    std::vector<std::array<int64_t, 3>> metadata_batches;
+};
+
+int64_t
+checked_span_bytes(const std::vector<int64_t> &shape,
+                   const std::vector<int64_t> &stride,
+                   int64_t bits,
+                   bool forward_only                   = false,
+                   std::optional<int64_t> batch_extent = std::nullopt) {
+    if (bits <= 0) return -1;
+    if (!stride.empty() && shape.size() != stride.size())
+        throw py::value_error("buffer bound shape and stride ranks must agree");
+    for (auto dim : shape)
+        if (dim < 0) throw py::value_error("buffer bound extents must be nonnegative");
+    for (auto step : stride)
+        if (step < 0 && !forward_only) throw py::value_error("buffer bound strides must be nonnegative");
+    if (batch_extent && (shape.empty() || *batch_extent < 0))
+        throw py::value_error("batch metadata requires a nonnegative leading extent");
+    auto extent = [&](size_t i) { return i == 0 && batch_extent ? *batch_extent : shape[i]; };
+    for (size_t i = 0; i < shape.size(); ++i)
+        if (extent(i) == 0) return 0;
+    const auto limit = std::numeric_limits<int64_t>::max();
+    int64_t span     = 1;
+    if (stride.empty()) {
+        for (size_t i = 0; i < shape.size(); ++i) {
+            auto dim = extent(i);
+            if (dim > limit / span) throw py::value_error("buffer bound element span overflows int64");
+            span *= dim;
+        }
+    } else {
+        for (size_t i = 0; i < shape.size(); ++i) {
+            const auto step = forward_only ? std::max<int64_t>(stride[i], 0) : stride[i];
+            if (step && extent(i) - 1 > (limit - span) / step)
+                throw py::value_error("buffer bound element span overflows int64");
+            span += (extent(i) - 1) * step;
+        }
+    }
+    if (span > (limit - 7) / bits) throw py::value_error("buffer bound bit span overflows int64");
+    return (span * bits + 7) / 8;
+}
+
 class DeclaredLayout {
    public:
     struct Slot {
@@ -304,7 +356,7 @@ class DeclaredLayout {
         bool preserve_extent = false;
     };
 
-    explicit DeclaredLayout(size_t n) : slots_(n) {}
+    explicit DeclaredLayout(size_t n) : slots_(n), bounds_(std::make_shared<std::vector<BackendBufferBound>>(n)) {}
 
     void
     set(size_t index,
@@ -332,6 +384,34 @@ class DeclaredLayout {
         slot.preserve_extent = preserve_extent;
     }
 
+    void
+    set_backend_bound(size_t index,
+                      int64_t uid,
+                      const std::vector<int64_t> &shape,
+                      const std::vector<int64_t> &stride,
+                      int64_t element_bits,
+                      bool overridable,
+                      std::vector<std::array<int64_t, 3>> metadata_batches) {
+        // Packs and ordered schemas retain the snapshot they observed. A later
+        // metadata update must not mutate an in-flight execution's contract.
+        if (!bounds_.unique()) bounds_ = std::make_shared<std::vector<BackendBufferBound>>(*bounds_);
+        auto &bound            = bounds_->at(index);
+        bound.uid              = uid;
+        bound.required_bytes   = checked_span_bytes(shape, stride, element_bits);
+        bound.element_bits     = element_bits;
+        bound.overridable      = overridable;
+        bound.shape            = shape;
+        bound.stride           = stride;
+        bound.metadata_batches = std::move(metadata_batches);
+        if (!bound.metadata_batches.empty() && shape.empty())
+            throw py::value_error("batch metadata requires a leading axis");
+    }
+
+    std::shared_ptr<const std::vector<BackendBufferBound>>
+    backend_bounds() const {
+        return bounds_;
+    }
+
     // A slot whose declaration has a dtype but no storage geometry (no dims, or an
     // fp4 extent no slot geometry spells): overrides still speak its dtype.
     void
@@ -353,6 +433,7 @@ class DeclaredLayout {
 
    private:
     std::vector<Slot> slots_;
+    std::shared_ptr<std::vector<BackendBufferBound>> bounds_;
 };
 
 // A pack's operand, exposed to a kernel. It implements the same exchange protocol
@@ -782,14 +863,12 @@ class VariantPackNative {
             operand.stride.clear();
         }
         operand.filled = true;
-        {
-            // A zero-element producer spans nothing: the affine formula assumes a nonempty index domain.
-            const int64_t elems    = numel_of(operand.shape) == 0 ? 0
-                                     : operand.stride.empty()     ? numel_of(operand.shape)
-                                                                  : span_of(operand.shape, operand.stride);
-            const int64_t bytes    = (static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes + 7) / 8;
-            operand.observed_bytes = elems * bytes;
-        }
+        // Capacity is the forward byte range from data + byte_offset. A
+        // reversed view may reference storage before that pointer; a positive
+        // backend layout cannot borrow those preceding bytes. Checked arithmetic
+        // also prevents overflow from turning a known span into "unknown".
+        operand.observed_bytes =
+            checked_span_bytes(operand.shape, operand.stride, static_cast<int64_t>(t.dtype.bits) * t.dtype.lanes, true);
         operand.observed_device_type = static_cast<int32_t>(t.device.device_type);
         operand.observed_device_id   = t.device.device_id;
         pointers_[index]             = operand.data;
@@ -969,6 +1048,7 @@ class VariantPackNative {
     // graph (a bare address). Returns the indices whose extents were re-described.
     std::vector<size_t>
     describe_from(const DeclaredLayout &declared, const std::vector<size_t> &skip) {
+        backend_bounds_ = declared.backend_bounds();
         std::vector<size_t> described;
         const auto &slots = declared.slots();
         for (size_t i = 0; i < operands_.size() && i < slots.size(); i++) {
@@ -1163,6 +1243,73 @@ class VariantPackNative {
         return operands_.size();
     }
 
+    void
+    set_backend_overrides(std::vector<int64_t> uids,
+                          std::vector<std::vector<int64_t>> shapes,
+                          std::vector<std::vector<int64_t>> strides) {
+        if (uids.size() != shapes.size() || uids.size() != strides.size())
+            throw py::value_error("Override uids, shapes and strides must name the same tensors");
+        backend_overrides_ = {std::move(uids), std::move(shapes), std::move(strides)};
+    }
+
+    const BindingOverrides &
+    backend_overrides() const {
+        return ordered_geometry ? ordered_geometry->overrides : backend_overrides_;
+    }
+
+    void
+    validate_backend_capacity() const {
+        if (!backend_bounds_) return;
+        const auto &overrides = backend_overrides();
+        for (size_t i = 0; i < operands_.size(); ++i) {
+            const auto &operand = operands_[i];
+            const auto &bound   = backend_bounds_->at(i);
+            if (!operand.filled || operand.observed_bytes < 0 || bound.required_bytes < 0) continue;
+            auto required = bound.required_bytes;
+            for (size_t j = 0; j < overrides.uids.size(); ++j)
+                if (bound.overridable && overrides.uids[j] == bound.uid) {
+                    // An enabled override does not prove a plan uses a smaller
+                    // allocation: SDPA can retain declared strides/batches (#1570).
+                    // Preserve that storage envelope except for packed SDPA's
+                    // batch metadata, which follows the runtime query batch.
+                    auto const &strides = overrides.strides[j];
+                    auto effective      = checked_span_bytes(overrides.shapes[j], strides, bound.element_bits);
+                    if (!bound.metadata_batches.empty()) {
+                        required = 0;
+                        for (auto const &rule : bound.metadata_batches) {
+                            auto batch = rule[1];
+                            for (size_t k = 0; k < overrides.uids.size(); ++k)
+                                if (overrides.uids[k] == rule[0]) {
+                                    if (overrides.shapes[k].size() != 4)
+                                        throw py::value_error("SDPA metadata requires a rank-4 query override");
+                                    batch = overrides.shapes[k][0];
+                                    break;
+                                }
+                            auto limit = std::numeric_limits<int64_t>::max();
+                            if (batch < 0 || rule[2] < 0 || batch > limit - rule[2])
+                                throw py::value_error("SDPA metadata batch extent overflows int64");
+                            auto rows = batch + rule[2];
+                            // A short metadata override cannot hide the rows the
+                            // operation reads, even when it also changes stride.
+                            required = std::max(
+                                required,
+                                checked_span_bytes(bound.shape, bound.stride, bound.element_bits, false, rows));
+                            required = std::max(
+                                required,
+                                checked_span_bytes(overrides.shapes[j], strides, bound.element_bits, false, rows));
+                        }
+                    }
+                    required = std::max(required, effective);
+                    break;
+                }
+            if (operand.observed_bytes < required)
+                throw py::value_error(("tensor uid " + std::to_string(bound.uid) + " requires a " +
+                                       std::to_string(required) + "-byte buffer but received " +
+                                       std::to_string(operand.observed_bytes) + " bytes")
+                                          .c_str());
+        }
+    }
+
     // Every requested operand in one crossing, for an engine binding a whole node.
     std::vector<OperandBuffer *>
     operands(const std::vector<size_t> &indices, int32_t device_id) const {
@@ -1184,6 +1331,8 @@ class VariantPackNative {
    private:
     std::vector<Operand> operands_;
     std::vector<void *> pointers_;
+    std::shared_ptr<const std::vector<BackendBufferBound>> backend_bounds_;
+    BindingOverrides backend_overrides_;
 };
 
 std::vector<NativeOperandView>
@@ -1256,8 +1405,8 @@ native_pack_from_facts(const py::dict &facts,
 NativeExecutionBindings
 read_native_execution_bindings(py::handle object) {
     const auto &pack = py::cast<const VariantPackNative &>(object);
-    if (!pack.ordered_geometry) throw py::value_error("Expected an ordered execution pack");
-    return {pack.pointers(), pack.size(), pack.ordered_geometry->overrides};
+    pack.validate_backend_capacity();
+    return {pack.pointers(), pack.size(), pack.backend_overrides()};
 }
 
 // A operand over memory that is not a caller operand: the regions a plan carves
@@ -1700,6 +1849,15 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
              py::arg("dtype_bits")      = 0,
              py::arg("dtype_lanes")     = 1,
              py::arg("preserve_extent") = false)
+        .def("set_backend_bound",
+             &DeclaredLayout::set_backend_bound,
+             py::arg("index"),
+             py::arg("uid"),
+             py::arg("shape"),
+             py::arg("stride"),
+             py::arg("element_bits"),
+             py::arg("overridable"),
+             py::arg("metadata_batches") = std::vector<std::array<int64_t, 3>>{})
         .def("set_dtype",
              &DeclaredLayout::set_dtype,
              py::arg("index"),
@@ -1744,6 +1902,8 @@ its parts.
         .def("read_operand", &VariantPackNative::read_operand)
         .def("read_from", &VariantPackNative::read_from)
         .def("first_unfilled", &VariantPackNative::first_unfilled)
+        .def("_validate_backend_capacity", &VariantPackNative::validate_backend_capacity)
+        .def("_set_backend_overrides", &VariantPackNative::set_backend_overrides)
         .def("set_operand",
              &VariantPackNative::set_operand,
              py::arg("index"),

@@ -1623,3 +1623,51 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+### Backend workspace capacity
+
+A non-null pointer does not establish sufficient workspace capacity. Test the
+observed byte extent at every mapping/ordered/index transport, including the
+native ordered fast path, Python-only producers, deserialization and effective
+shape overrides. Warm the same plan with a valid buffer before replacing it
+with a short view. Keep that view inside a fully sized owned backing for the
+RED control; assert rejection before either FE scratch initialization or output
+writes. Exact capacity, larger carriers of a different element width, and raw
+integer pointers with unknown capacity are positive controls. See
+`core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+
+### Backend operand capacity and observed ranges
+
+`core/graph/test_execute_buffer_capacity.py` checks input/output bounds across
+SDPA forward/backward, matmul, FP16/BF16, mapping/ordered/index transports,
+overrides and deserialization. Keep short views inside fully sized owned
+allocations for the RED control, and check rejection before output or scratch
+writes. Flat bytes, wider typed carriers and raw pointers are positive controls.
+The host-only `test_buffer_capacity_contract.py` covers FP8/FP4/INT4, packed
+BOOLEAN versus BYTE_BOOLEAN, stride holes, DLPack-only producers, negative
+strides and cached metadata before backend lowering. A negative producer stride
+can reference preceding storage; it must not turn a known forward extent into
+the unknown-capacity sentinel. Capacity uses the loaded backend descriptor's
+logical element width, not a framework dtype's itemsize. Ragged/reordered/vector
+layouts need their operation's physical-storage contract, not a dense logical
+volume substituted for that contract. Keep the backend override spelling for
+these layouts: the existing `sdpa/graph/test_sdpa_thd.py` exercises logical
+shape and physical stride ranks that differ. A fixed-shape graph ignores runtime
+overrides, so smaller override metadata cannot weaken its capacity bound. Test
+both construction modes and reload into a fresh container before checking it.
+Enabling overrides does not prove a kernel uses smaller storage: SDPA can retain
+the declared batch and strides (#1570), while matmul honors them. Preserve the
+declared capacity envelope, cover larger overrides too, and check a tail canary
+after valid calls; comparing only the requested output region misses this bug.
+Unified FP16/BF16 packed forward SDPA's batch metadata is a separate contract: cumulative lengths and
+ragged offsets need at least the runtime query batch plus one entry; lengths
+and page tables need the runtime batch. A cached declaration may reserve many
+more batches. Test both legitimate smaller bindings and metadata overrides
+that understate the required rows, including changed strides and shared query
+dependencies. Preserve these facts and the source graph's override flag across
+load and reserialization; `core/graph/test_sdpa_metadata_capacity.py` covers
+that boundary with numerical output and changed-input CUDA Graph replay.
+Do not extend this shrink permission to quantized or backward plans from port
+names alone; qualify their runtime-batch storage behavior first.

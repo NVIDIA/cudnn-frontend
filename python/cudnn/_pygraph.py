@@ -120,8 +120,11 @@ def _is_dense(dim, stride) -> bool:
 
 
 def _observed_span(data) -> Optional[int]:
-    """Element span of a caller's buffer as the CALLER describes it (``1 + sum((size-1)*stride)``,
-    numel when compact); None for a bare address or a producer without shape/stride."""
+    """Addressable forward element span from the producer's data pointer.
+
+    Negative strides reference preceding storage, not additional bytes after
+    this pointer. None means no observable geometry, never a negative span.
+    """
     if data is None or type(data) is int:
         return None
     try:
@@ -136,7 +139,7 @@ def _observed_span(data) -> Optional[int]:
         n *= int(extent)
     if n == 0:
         return 0
-    return 1 + sum((int(size) - 1) * int(stride) for size, stride in zip(shape, strides))
+    return 1 + sum((int(size) - 1) * max(int(stride), 0) for size, stride in zip(shape, strides))
 
 
 def _producer_itemsize(data, declared_data_type) -> int:
@@ -346,6 +349,7 @@ class pygraph:
         # Backend operand order + the reusable pointer array handed to execute.
         # Both are properties of the frozen graph, so they outlive any one call.
         self._sorted_uids: Optional[List[int]] = None
+        self._binding_backend_owner = None  # an IR-only layout cannot survive later backend lowering
         self._declared_layout_native = None  # DeclaredLayout for _sorted_uids; see _declared_layout
         self._slot_of_uid = None  # uid -> slot of that order, built with the layout
         self._ordered_binding_schema = None  # native, bounded metadata cache; never retains caller buffers
@@ -2163,10 +2167,14 @@ class pygraph:
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
             if tensor_uids is not None:
                 pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index)
+                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
             uid_to_data = self._uid_to_data(tensor_dict)
-            var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, **kwargs)
+            pack = self._normalize(uid_to_data, workspace, *args, backend=True, **kwargs)
+            if pack is not None:
+                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
+            var_pack, _ = self._native_var_pack(uid_to_data, None)
+            ws_ptr, ws_bytes = self._workspace_extent(workspace)
+            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         return self._execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, index=index, **kwargs)
 
@@ -2191,9 +2199,16 @@ class pygraph:
             tensor_dict: Dict mapping tensors (by Tensor, name, or uid) to data.
                          Must include both input and output tensors.
                          With ``tensor_uids``, a tuple/list of buffers instead.
-                         No additional preparation call is required.
-            workspace: Workspace buffer (python engines receive it via the
-                       ExecutionContext; plans that need one require it)
+                         No additional preparation call is required. Observable
+                         buffers must cover the backend's declared affine byte range
+                         and any larger enabled override; flat byte carriers
+                         remain supported.
+                         Ragged/reordered storage follows its operation's contract.
+                         Integer pointers remain caller-sized.
+            workspace: Caller-owned contiguous scratch buffer. Its observed byte
+                       capacity must cover the selected plan's requirement for
+                       this call's shapes. Integer addresses have unknown capacity
+                       and remain the caller's responsibility.
             handle: cuDNN handle; kernels launch on its stream (classic
                     ``set_stream`` semantics, both python engines and backend)
             override_uids/shapes/strides: runtime geometry for the backend or a
@@ -2328,7 +2343,7 @@ class pygraph:
 
         if context is not None:
             raise ValueError("the backend's plans take no context (get_context_size() is 0); pass context= only to a python plan that reports one")
-        variant_pack = None if ordered or overriding else self._normalize(uid_to_data, workspace)
+        variant_pack = None if ordered else self._normalize(uid_to_data, workspace, override_uids, override_shapes, override_strides, backend=True)
 
         # Backend path. Address the plan the WALK built, not the backend's own
         # selection: they differ once the walk has skipped an entry.
@@ -2355,7 +2370,11 @@ class pygraph:
                 return
             variant_pack = self._finish_ordered(schema, result, workspace, override_uids)
             self._lowered_graph._execute_ordered_pack(
-                variant_pack.native, variant_pack.workspace, to_backend_handle(handle) or 0, -1 if cpp_index is None else cpp_index
+                variant_pack.native,
+                variant_pack.workspace,
+                to_backend_handle(handle) or 0,
+                -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
@@ -2365,20 +2384,23 @@ class pygraph:
         # dict build here, one map copy in pybind, and one hash lookup per
         # operand there.
         if variant_pack is not None:
-            self._lowered_graph._execute_with_raw_ptrs(
-                variant_pack.address,
-                len(variant_pack),
+            self._lowered_graph._execute_ordered_pack(
+                variant_pack.native,
                 variant_pack.workspace,
                 to_backend_handle(handle) or 0,
                 -1 if cpp_index is None else cpp_index,
+                variant_pack.workspace_bytes,
             )
             return
 
-        var_pack, ws_ptr = self._native_var_pack(uid_to_data, workspace)
+        var_pack, _ = self._native_var_pack(uid_to_data, None)
+        ws_ptr, ws_bytes = self._workspace_extent(workspace)
         if cpp_index is not None:
-            self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+            self._lowered_graph._execute_plan_at_index(
+                var_pack, ws_ptr, cpp_index, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes
+            )
             return
-        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides)
+        self._lowered_graph._execute(var_pack, ws_ptr, to_backend_handle(handle), override_uids, override_shapes, override_strides, ws_bytes)
 
     def _variant_pack_uids(self) -> Optional[List[int]]:
         """The graph's caller-filled variant_pack, ASCENDING by uid.
@@ -2394,10 +2416,17 @@ class pygraph:
         construction — has no C++ side, so its variant_pack come from the IR. The
         two never have to agree: each side indexes the layout it was given.
         """
+        lowered = self._lowered_graph
+        if self._binding_backend_owner is not lowered:
+            self._sorted_uids = None
+            self._declared_layout_native = None
+            self._slot_of_uid = None
+            self._ordered_binding_schema = None
+            self._ordered_binding_uids = None
+            self._binding_backend_owner = lowered
         order = self._sorted_uids
         if order is not None:
             return order
-        lowered = self._lowered_graph
         if lowered is not None:
             try:
                 # The order lives in the variant-pack template, which C++ builds
@@ -2425,6 +2454,8 @@ class pygraph:
         return order
 
     def _prepare_ordered_binding_schema(self):
+        if self._binding_backend_owner is not self._lowered_graph:
+            self._variant_pack_uids()  # invalidates a schema created before backend lowering
         if self._ordered_binding_schema is None:
             order = self._variant_pack_uids()
             if order is not None:
@@ -2441,9 +2472,17 @@ class pygraph:
             if type(data) is int:
                 from_graph.append(i)
             ptr, tensor = self._describe(data, order[i])
-            span = _observed_span(data)
-            if span is not None:
-                span *= _producer_itemsize(data, tensor.data_type)
+            width = storage_slot_bytes(tensor.data_type) if tensor.data_type is not None else None
+            if type(data) is not int and width is not None:
+                # _describe already decoded the producer's metadata, including
+                # DLPack-only/cuda-array-interface producers without .stride().
+                # Do not discard that observation or probe the producer twice.
+                span = 0 if 0 in tensor.dim else 1 + sum((size - 1) * max(step, 0) for size, step in zip(tensor.dim, tensor.stride))
+                span *= width
+            else:
+                span = _observed_span(data)
+                if span is not None:
+                    span *= _producer_itemsize(data, tensor.data_type)
             dev = getattr(data, "device", None)
             dev_type, dev_id = (-1, -1)
             if dev is not None and getattr(dev, "type", None) is not None:
@@ -2469,6 +2508,14 @@ class pygraph:
             raise ValueError(f"the workspace buffer must be contiguous; got dim {tuple(workspace_tensor.dim)} stride {tuple(workspace_tensor.stride)}")
         return workspace_ptr, _byte_size(workspace_tensor)
 
+    def _workspace_extent(self, workspace):
+        if workspace is None:
+            return 0, 0
+        extent = _pybind_module.read_buffer_extent(workspace)
+        # A byte count is a byte range only for dense storage. Fallback also
+        # preserves the unknown extent of a caller-sized integer pointer.
+        return self._workspace_extent_fallback(workspace) if extent is None else extent
+
     def _normalize_ordered(self, buffers, tensor_uids, workspace, override_uids=None, override_shapes=None, override_strides=None):
         schema = self._prepare_ordered_binding_schema()
         if schema is None:
@@ -2486,7 +2533,7 @@ class pygraph:
         overridden = tuple(self._slot_of_uid[uid] for uid in override_uids) if override_uids else ()
         return VariantPack(self._ordered_binding_uids, native, extent[0], extent[1], tuple(described), overridden)
 
-    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None):
+    def _normalize(self, uid_to_data: Dict[int, Any], workspace: Any, override_uids=None, override_shapes=None, override_strides=None, *, backend=False):
         """Turn the caller's variant pack into :class:`VariantPack`, once.
 
         This is the ONLY place a caller's object is inspected. Everything below
@@ -2503,6 +2550,16 @@ class pygraph:
         is the difference between one answer and two, since the backend
         re-describes the tensor from the overrides either way.
         """
+        supplied = sum(value is not None for value in (override_uids, override_shapes, override_strides))
+        if supplied not in (0, 3):
+            raise ValueError("Override uids, shapes and strides must be supplied together")
+        if supplied and not (len(override_uids) == len(override_shapes) == len(override_strides)):
+            raise ValueError(
+                f"override_uids, override_shapes and override_strides must name the same tensors: got "
+                f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
+            )
+        if override_uids and len(set(override_uids)) != len(override_uids):
+            raise ValueError("Duplicate override uid")
         order = self._variant_pack_uids()
         if order is None:
             return None
@@ -2538,13 +2595,6 @@ class pygraph:
         # crossing per pack: this is on every execute's critical path.
         from_graph.extend(native.describe_from(self._declared_layout(order), from_graph))
         if override_uids:
-            # The backend refuses a partial override; a short list must not
-            # quietly mean "keep the rest" here.
-            if len(override_shapes or ()) != len(override_uids) or len(override_strides or ()) != len(override_uids):
-                raise ValueError(
-                    f"override_uids, override_shapes and override_strides must name the same tensors: got "
-                    f"{len(override_uids)}, {len(override_shapes or ())} and {len(override_strides or ())} entries"
-                )
             # One crossing for every override: the native side turns each element geometry into
             # storage-slot geometry (fp4 packing), re-expresses it in the buffer's own axis order and
             # applies it with the declared dtype (see VariantPackNative::override_many).
@@ -2554,19 +2604,17 @@ class pygraph:
                 indices = [slot_of[uid] for uid in override_uids]
             except KeyError as exc:
                 raise ValueError(f"override_uids names tensor uid {exc.args[0]}, which is not an operand of this graph") from None
-            native.override_many(layout, indices, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
+            if backend:
+                # Backend overrides keep their operation-specific spelling. A
+                # ragged logical shape can have a different rank from its
+                # physical stride; Python-engine re-description is not its ABI.
+                native._set_backend_overrides(override_uids, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
+            else:
+                native.override_many(layout, indices, [list(s) for s in override_shapes], [list(s) if s else [] for s in override_strides])
         # The workspace has no uid, so it is not an operand — but an engine has
         # to bounds-check its carves, and reading its size here is the same read
         # every other buffer gets rather than a second probe further down.
-        workspace_ptr, workspace_bytes = 0, 0
-        if workspace is not None:
-            extent = _pybind_module.read_buffer_extent(workspace)
-            if extent is None:  # a bare address, a non-dense buffer, or no vtable
-                # An engine carves the workspace by byte offset, so a byte
-                # COUNT is only a byte RANGE when the buffer is dense.
-                workspace_ptr, workspace_bytes = self._workspace_extent_fallback(workspace)
-            else:
-                workspace_ptr, workspace_bytes = extent
+        workspace_ptr, workspace_bytes = self._workspace_extent(workspace)
         return VariantPack(tuple(order), native, workspace_ptr, workspace_bytes, tuple(from_graph), tuple(indices) if override_uids else ())
 
     def _declared_layout(self, order: List[int]):
@@ -2578,8 +2626,21 @@ class pygraph:
         if layout is None:
             layout = _pybind_module.DeclaredLayout(len(order))
             self._slot_of_uid = {uid: i for i, uid in enumerate(order)}
+            # The loaded backend owns the executable descriptors, including a
+            # deserialized graph with no Python IR or with an older IR attached.
+            backend_bounds = {bound[0]: bound[1:] for bound in self._lowered_graph._get_buffer_bounds()} if self._lowered_graph is not None else {}
             for i, uid in enumerate(order):
                 declared = self._tensor_by_uid.get(uid)
+                bound = backend_bounds.get(uid)
+                if bound is not None:
+                    dims, strides, dtype, bits, overridable, *metadata = bound
+                    layout.set_backend_bound(i, uid, list(dims), list(strides), bits, overridable, metadata[0] if metadata else [])
+                    if declared is None:
+                        declared = describing_tensor(uid, tuple(dims), tuple(strides), dtype)
+                else:
+                    # Python-only plans retain the uid mapping, while their
+                    # operation-specific binders own capacity validation.
+                    layout.set_backend_bound(i, uid, [], [], 0, False)
                 if declared is None:
                     continue
                 storage = storage_geometry(declared.dim, declared.stride, declared.data_type) if declared.dim else None

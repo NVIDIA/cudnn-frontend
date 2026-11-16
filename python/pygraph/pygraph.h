@@ -55,6 +55,14 @@ class PyGraph {
     bool is_handle_owner                                                = false;
     std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties = nullptr;
 
+    // Metadata UID -> (query UID, declared batch, cumulative-prefix extra).
+    // These are graph facts, never observations of a caller's storage.
+    using MetadataBatchBounds = std::unordered_map<int64_t, std::vector<std::array<int64_t, 3>>>;
+    MetadataBatchBounds restored_metadata_batch_bounds;
+
+    MetadataBatchBounds
+    get_metadata_batch_bounds() const;
+
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
 
@@ -796,18 +804,20 @@ class PyGraph {
     execute(std::unordered_map<int64_t, int64_t> var_pack,
             int64_t workspace,
             std::optional<std::intptr_t>,
-            py::object override_uids    = py::none(),
-            py::object override_shapes  = py::none(),
-            py::object override_strides = py::none());
+            py::object override_uids               = py::none(),
+            py::object override_shapes             = py::none(),
+            py::object override_strides            = py::none(),
+            std::optional<int64_t> workspace_bytes = std::nullopt);
 
     void
     execute_plan_at_index(std::unordered_map<int64_t, int64_t> var_pack,
                           int64_t workspace,
                           int64_t index,
                           std::optional<std::intptr_t>,
-                          py::object override_uids    = py::none(),
-                          py::object override_shapes  = py::none(),
-                          py::object override_strides = py::none());
+                          py::object override_uids               = py::none(),
+                          py::object override_shapes             = py::none(),
+                          py::object override_strides            = py::none(),
+                          std::optional<int64_t> workspace_bytes = std::nullopt);
 
     // --- Variant pack template (called automatically by build_plans) ---
     void
@@ -818,6 +828,17 @@ class PyGraph {
         return graph->get_variant_pack_uids_sorted();
     }
 
+    // Observed byte capacity is per call; a bare pointer carries none. Check
+    // before graph->execute can initialize FE scratch or launch any kernels.
+    void
+    check_workspace_capacity(std::intptr_t workspace,
+                             std::optional<int64_t> workspace_bytes,
+                             cudnnHandle_t exec_handle,
+                             int64_t plan_index,
+                             const std::vector<int64_t>& override_uids                 = {},
+                             const std::vector<std::vector<int64_t>>& override_shapes  = {},
+                             const std::vector<std::vector<int64_t>>& override_strides = {});
+
     // Takes a pointer to a contiguous array of device pointers, ordered as
     // get_variant_pack_uids_sorted() reports — no nanobind container copy and no
     // per-operand uid->pointer hash lookup. ``plan_index`` selects the plan;
@@ -827,10 +848,15 @@ class PyGraph {
                           int64_t n_user,
                           std::intptr_t workspace,
                           std::intptr_t exec_handle,
-                          int64_t plan_index);
+                          int64_t plan_index,
+                          std::optional<int64_t> workspace_bytes = std::nullopt);
 
     void
-    execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index);
+    execute_ordered_pack(py::handle pack,
+                         std::intptr_t workspace,
+                         std::intptr_t exec_handle,
+                         int64_t plan_index,
+                         std::optional<int64_t> workspace_bytes = std::nullopt);
 
     py::object
     execute_ordered(py::handle schema,
