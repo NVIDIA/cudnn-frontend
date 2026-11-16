@@ -650,11 +650,6 @@ SDPA_attributes::verify_sdpa_support_surface_for_implementation(const detail::Co
                 return {error_code_t::GRAPH_NOT_SUPPORTED, "Dropout for unified SDPA node requires cuDNN 9.22.0"};
             }
 
-            if (dropout_probability.has_value() && generate_stats.value_or(false)) {
-                return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Dropout for unified SDPA node with generated stats is not supported"};
-            }
-
             // Unified engine in cuDNN < 9.15 can't meaningfully support max sequence length,
             // while versions >= 9.15 "support" it by ignoring it (unified engine doesn't need it).
             if (max_seq_len_kv.has_value() && effective_cudnn_ver < 91500) {
