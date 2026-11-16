@@ -1674,6 +1674,21 @@ scale can change sign after planning; cover its changed-value CUDA Graph replay.
 Backward comparisons must consume independent correct O/Stats, and cover both
 default and deterministic algorithms. `test_sdpa_nonpositive_scale_backend.py`
 exercises these boundaries and re-measures each guard's version bound.
+Include partial KV tiles and separate Q-only tails: a fallback that passes
+S64 can return all-NaN gradients at KV129 even with `TILE_N=1`. Deterministic
+mode is not a numerical-safety exemption. The adjacent
+`test_sdpa_nonpositive_scale_tails.py` uses an FP64 oracle, both output fills,
+both half dtypes, GQA, aligned/causal/positive controls, and a separate tail
+currency detector for legacy and current configurations. Explicit padding
+selects a separate path: verify variable device lengths and THD independently
+instead of extrapolating the unmasked tail exclusion. Never read device lengths
+back to decide plan admission. If no correct native plan remains, reject planning.
+`test_sdpa_nonpositive_scale_padding.py` checks these legal paths, including
+packed LSE on Hopper and changing the runtime tensor scale's sign.
+The backward oracle must use the O/Stats actually bound to the graph, including
+O's dtype rounding in `delta = rowsum(O * dO)`; using the unrounded precursor
+can produce false D256 failures. Keep independent forward O/Stats generation
+and the existing gradient tolerances.
 When composing guards at the shared entry, preserve the union of excluded
 engines and an existing diagnostic for overlapping engines. Its
 `test_scale_guard_composes_with_existing_forward_guards` checks negative and

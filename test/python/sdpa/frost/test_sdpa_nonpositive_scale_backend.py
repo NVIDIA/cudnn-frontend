@@ -64,17 +64,21 @@ def native_only(monkeypatch):
         pytest.skip("the nonpositive-scale regression is qualified from cuDNN 9.16")
 
 
-def _inputs(dtype, scale, causal):
+def _inputs(dtype, scale, causal, *, geometry=(1, 64, 64, 64, 2, 2), oracle_dtype=torch.float32):
+    b, sq, sk, d, h, hk = geometry
     gen = torch.Generator().manual_seed(1412)
-    q, k, v, do = [torch.randn(1, 64, 2, 64, generator=gen).to(device="cuda", dtype=dtype).transpose(1, 2) for _ in range(4)]
-    qr, kr, vr = [x.float().detach().requires_grad_(True) for x in (q, k, v)]
-    logits = (qr @ kr.transpose(-1, -2)) * scale
+    q, k, v, do = [
+        torch.randn(shape, generator=gen).to(device="cuda", dtype=dtype).transpose(1, 2)
+        for shape in ((b, sq, h, d), (b, sk, hk, d), (b, sk, hk, d), (b, sq, h, d))
+    ]
+    qr, kr, vr = [x.to(oracle_dtype).detach().requires_grad_(True) for x in (q, k, v)]
+    logits = (qr @ kr.repeat_interleave(h // hk, 1).transpose(-1, -2)) * scale
     if causal:
-        logits = logits.masked_fill(torch.ones(64, 64, device="cuda", dtype=torch.bool).triu(1), -float("inf"))
-    o = torch.softmax(logits, -1) @ vr
+        logits = logits.masked_fill(torch.ones(sq, sk, device="cuda", dtype=torch.bool).triu(1), -float("inf"))
+    o = torch.softmax(logits, -1) @ vr.repeat_interleave(h // hk, 1)
     stats = torch.logsumexp(logits.detach(), -1, keepdim=True)
-    o.backward(do.float())
-    return (q, k, v, do), o.detach(), stats, tuple(x.grad for x in (qr, kr, vr))
+    o.backward(do.to(oracle_dtype))
+    return (q, k, v, do), o.detach().float(), stats.float(), tuple(x.grad.float() for x in (qr, kr, vr))
 
 
 def _graph(data, ref, stats, scale, causal, wants_stats, backward, scale_tensor=None, handle=None, retained_inputs=None, deterministic=False):
@@ -158,9 +162,10 @@ def test_native_frost_sdpa_scale_sign_all_offered_plans(dtype, scale, causal, mo
 @pytest.mark.parametrize("backward", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-def test_native_frost_tensor_scale_changes_after_build_and_capture(cudnn_handle, backward, dtype, causal):
+@pytest.mark.parametrize("geometry", [(1, 64, 64, 64, 2, 2), (2, 129, 128, 128, 2, 2)], ids=["aligned", "q-tail"])
+def test_native_frost_tensor_scale_changes_after_build_and_capture(cudnn_handle, backward, dtype, causal, geometry):
     """The runtime scalar changes sign without rebuilding or synchronizing it to the host."""
-    data, ref, stats, grads = _inputs(dtype, 0.125, causal)
+    data, ref, stats, grads = _inputs(dtype, 0.125, causal, geometry=geometry)
     scale_tensor = torch.tensor([0.125], device="cuda", dtype=torch.float32).reshape(1, 1, 1, 1)
     retained_inputs = {}
     make = lambda: _graph(data, ref, stats, 0.125, causal, True, backward, scale_tensor, cudnn_handle, retained_inputs)  # noqa: E731
@@ -201,7 +206,7 @@ def test_native_frost_tensor_scale_changes_after_build_and_capture(cudnn_handle,
                 with torch.cuda.graph(captured, stream=stream):
                     selected.execute(pack, workspace, handle=cudnn_handle)
                 for value in (0.125, -0.125, 0.0):
-                    _, new_ref, new_stats, new_grads = _inputs(dtype, value, causal)
+                    _, new_ref, new_stats, new_grads = _inputs(dtype, value, causal, geometry=geometry)
                     scale_tensor.fill_(value)
                     if backward:
                         # Update the retained O/Stats inputs from the independent
@@ -319,10 +324,10 @@ def test_native_frost_scale_guard_preserves_other_domains_and_bounds(monkeypatch
         dict(device_cc=(12, 0)),
         dict(device_cc=None),
         dict(invalid="malformed"),
-        dict(device_cc=(9, 0), is_backward=True, deterministic=True),
     ):
         assert not guard.backend_engine_guard(replace(base, **change)), change
     assert not guard.backend_engine_guard(None)
+    assert set(guard.backend_engine_guard(replace(base, device_cc=(9, 0), is_backward=True, deterministic=True, s_kv=64))) == {6}
     monkeypatch.setattr(guard, "FORWARD_FIXED_IN", {**guard.FORWARD_FIXED_IN, 3: 92800, 10: 92801})
     assert set(guard.backend_engine_guard(base)) == {10}
     monkeypatch.setattr(cudnn, "backend_version", lambda: 92801)
@@ -342,8 +347,10 @@ def test_native_frost_scale_guard_composes_with_existing_exclusions(monkeypatch)
     excluded = forward_guard(None, wide_v)
     assert set(excluded) == {3, 10, 18}
     assert "#2401" in excluded[10] and "#1428" in excluded[3]
-    ragged = SdpaGraphFacts(dtype=cudnn.data_type.BFLOAT16, scale=0.0, device_cc=(9, 0), d_qk=256, d_v=128, thd=True, is_backward=True)
-    assert set(backward_guard(None, ragged)) == {6}
+    ragged = SdpaGraphFacts(dtype=cudnn.data_type.BFLOAT16, scale=0.0, device_cc=(9, 0), d_qk=256, d_v=128, thd=True, padded=True, is_backward=True)
+    excluded = backward_guard(None, ragged)
+    assert set(excluded) == {6}
+    assert "ragged tile mapping" in excluded[6]
 
 
 @pytest.mark.parametrize("version", [91600, 91801, 92400, 92500, 92501, 92600, 92700, 92800])
@@ -354,10 +361,10 @@ def test_native_frost_hopper_backward_scale_regression_boundary(monkeypatch, ver
     from cudnn.sdpa import nonpositive_scale_guard as guard
 
     monkeypatch.setattr(cudnn, "backend_version", lambda: version)
-    facts = SdpaGraphFacts(dtype=cudnn.data_type.HALF, scale=0.0, dynamic_scale=dynamic, device_cc=(9, 0), is_backward=True)
+    facts = SdpaGraphFacts(dtype=cudnn.data_type.HALF, scale=0.0, dynamic_scale=dynamic, device_cc=(9, 0), is_backward=True, s_q=64, s_kv=64)
     assert set(guard.backend_engine_guard(facts)) == ({6} if version >= 92600 else set())
     assert not guard.backend_engine_guard(replace(facts, causal=True))
-    assert not guard.backend_engine_guard(replace(facts, deterministic=True))
+    assert set(guard.backend_engine_guard(replace(facts, deterministic=True))) == ({6} if version >= 92600 else set())
     # The independent engine-7 bug remains guarded on both sides of engine 6's
     # introduction boundary, while its correct configurations stay available.
     check = guard.backend_plan_guard(None, facts)
