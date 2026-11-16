@@ -262,7 +262,10 @@ def test_paged_thd_origins_rebind_and_capture(
             knobs[cudnn.knob_type.TILE_N] = tile_n
         if sched_policy is not None:
             knobs[cudnn.knob_type.SCHED_POLICY] = sched_policy
-        if rubin:
+        if rubin and single_q:
+            engine = "sdpa_fwd_sm107_d256_lookahead"
+            knobs[cudnn.knob_type.WARP_SPEC_CFG] = 1
+        elif rubin:
             from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
             from cudnn.sdpa.fwd.heuristics import select_sm107_half_geometry
             from cudnn.sdpa.graph_analyzer import analyze
