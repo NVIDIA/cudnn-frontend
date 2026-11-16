@@ -1000,9 +1000,9 @@ engine's plan is not a blob: it is a deterministic function of the graph and its
   format cannot represent exactly (a `score_mod` callback, a framework object)
   refuses serialization; nothing is dropped. Buffers bound at build time
   (`_data_bindings`) are not carried; pass them to `execute()`.
-- **the plan**: engine id, engine name (checked on load) and public knobs. Ids
-  and knob values are append-only, so the recipe stays valid on any frontend
-  that still ships the engine.
+- **the plan**: engine id, engine name (checked on load) and public knobs. The
+  current frontend must still admit the saved graph/configuration; retaining
+  an engine id does not promise unchanged eligibility across releases.
 - **the kernels** (`include_kernels=True`, the default): the compiled-cache
   entries the plan's build used (`compiled_cache.record_entries()` around
   `build_plan`), each with the environment manifest it was compiled under.
@@ -1017,6 +1017,46 @@ record's key. A refused or missing kernel compiles as usual;
 b2 h8 s1024 d128): build 3.1 s; deserialize into another process with an
 empty cache 33 ms, with imports already done (a backend plan takes 23-30 ms).
 3 kernels seeded, zero compiles, O bitwise equal.
+
+A retired graph/configuration is a recipe cache miss, not a request to substitute
+another implementation silently. Deserialization raises and restores the empty
+destination graph; discard the saved recipe and reconstruct the graph with
+heuristics. Namespace persisted recipes by the frontend build/version as well
+as the target environment. For example, exact SM100/SM103 half D256 recipes
+using engine 20511 must be regenerated for the explicit 20519/20520 engines.
+Exact D512/V512 and D576/V512 half recipes likewise move from 20511 to the
+explicit role-split (20521) or 2x2 (20522) implementation. These new wide engines
+report physical cluster width through `TILE_CGA_M`: 4 for D512, 2 for D576.
+Their MMA group is fixed at two CTAs; the old 20511 pair encoding is not a
+valid D512 cluster assignment for the new engines. Regenerate the complete
+engine/knob recipe through heuristics instead of rewriting its engine id.
+Exact SM100/SM103 per-tensor FP8 D512/V512 recipes similarly move from 20513
+to the explicit role-split engine 20523, with physical `TILE_CGA_M=4` and
+a fixed two-CTA MMA group. Exact D256/V256 per-tensor FP8 recipes move to
+the single-Q engine 20524, with `TILE_CGA_M=1` and a one-CTA MMA group.
+Exact D192/V128 per-tensor FP8 recipes move to the multi-Q engine 20525,
+with matching physical-cluster/MMA widths of one or two CTAs.
+Exact D64/D128 per-tensor FP8 recipes move to multi-Q (20527), dual-KV
+(20528) or swap-AB (20529). The new swap-AB record exposes its physical
+`TILE_M=16` and NATURAL scheduler; `SWAP_AB` is no longer a knob on these
+three engines because the engine id already fixes the implementation.
+Regenerate the full recipe instead of changing an old id in place.
+Dense head envelopes keep their legacy owner.
+Exact SM120-family half D512/V512 and D576/V512 recipes move from 20505 to
+the explicit paired-warp engine 20526 with unchanged knobs; the padded head
+envelopes keep 20505. Exact SM120-family per-tensor FP8 and MXFP8 D512/V512
+recipes likewise move from 20507 and 20518 to 20533 and 20534. Exact
+SM120-family half D256/V256 recipes move from 20505 to 20537 (TILE_M 64 / 128)
+or 20538 (TILE_M 16 / 32) with unchanged knobs.
+Exact SM120-family per-tensor FP8 and MXFP8 general-tile recipes (both dims
+multiples of 32 up to 256) move from 20507 / 20518 to 20542 / 20543.
+Exact SM120-family half recipes on the other 16-wide head tiles (both dims
+multiples of 16 up to 256) move from 20505 to 20544 (TILE_M 64 / 128) or 20538
+(TILE_M 16 / 32) with unchanged knobs.
+SM80 recipes on 20508 move to the owner of their head dims with unchanged knobs:
+20546 (D_QK <= 192, D_V <= 128), 20547 (other dims up to 256) or 20548 (wider).
+The blob's `frontend_version` is provenance, not an automatic fallback switch;
+the compiled-kernel manifest protects binary reuse, not recipe eligibility.
 
 The kernels are native code: deserialize only blobs from a trusted source. The
 C++ `Graph::deserialize` does not read this format. Running a python-engine
@@ -1121,3 +1161,36 @@ defaulting to device 0 is how an SM100 suite silently skips in full.
   kernel's persistent schedule to save the launch on that path. The dense
   padded-Q `.item()` read in `sdpa/fwd/engines.py` runs at execute and breaks
   CUDA-graph capture; decide it at `check_support` or drop it.
+
+### Plan-specific Stats stride override note
+
+After selecting the final plan, query
+`graph.get_behavior_notes()` (or `get_behavior_notes_for_plan_at_index(i)`).
+`cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE` declares that the plan
+accepts legal execution-time Stats stride overrides, including changes to the
+head stride of packed HN Stats. It does not permit changing the packing, dtype,
+or storage capacity, or bypass the plan's ragged-offset and override bounds.
+
+The declaration covers admitted override-enabled FP16/BF16 THD plans
+with packed HN Stats through the prepared THD binder on qualified SM100/SM103
+devices, plus qualified SM107 and SM120 (cc 12.0) half THD plans.
+SM121 remains unqualified. The note follows the admitted graph/config and the
+prepared binder, including the new explicit implementation owners; it does not
+apply to every plan on those architectures.
+This includes the explicit D256 lookahead engine and eligible legacy
+half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
+quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
+not serve THD. Backend plans retain their existing notes and do not inherit this
+frontend declaration. `RUNTIME_COMPILATION` remains present on FROST plans.
+
+Callers should use the selected plan's note to choose direct HN execution or
+retain their existing NH fallback. Do not infer support from the engine name or
+from FROST membership. Selecting/deselecting behavior notes uses the same
+per-plan declaration, but integrations should not filter the candidate pool just
+to choose a Stats layout. Consumers of this new enum must require an FE release
+that supplies it.
+
+The note has frontend-only integer value **1000**, in the band starting at
+`FRONTEND_BEHAVIOR_NOTE_BASE`; existing values 0–5 are unchanged. It serializes
+as `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE`. Backend enum conversion rejects it;
+it is never passed as a `cudnnBackendBehaviorNote_t`.

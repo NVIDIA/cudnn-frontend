@@ -10,6 +10,8 @@ Four checks, run after the timed loop on the ids the loop produced:
    the reference block on the SAME operands and the same state, so an error cannot accumulate and a wiring error is told apart
    from rounding.  The band of a block is named in its provider row (``BANDS``) and is never widened here.  Every band is
    judged element by element and asks for finite values first: a NaN is a failure of the block that produced it, never a tie.
+   A run in which no block is a provider's (every judged block selected onto its reference row) has nothing to judge: the
+   line is then REPORTED, ``Checks.judged`` is 0, and a sample does not print ``PASS`` for it.
 3. **tokens** -- end to end: the reference stack runs the same inputs with its own state.  The largest distance between the
    logits of the two stacks must be finite and inside the logits band, which the family declares beforehand in bf16 units of
    the run's largest reference logit (``logits_band_units``); and the greedy token must equal the reference's at every step
@@ -17,16 +19,39 @@ Four checks, run after the timed loop on the ids the loop produced:
    counted and printed as near-ties; they are not failures and not hidden.  The band is declared, not taken from the run: a
    band that follows the run's own distance can never fail.  The check cannot be sharper than the two stacks are close: a
    chain of 8-bit and 4-bit quantisers turns a one-unit rounding difference into different codes, so the logits of two
-   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.
+   correct stacks differ by more than one rounding, and the block check above is what verifies each provider.  Where a
+   family can declare no band for a model -- none that passes two correct stacks and fails a wrong one -- it declares
+   ``None``: the line is then REPORTED, prints the distance and the count of equal tokens, and fails only on a logit that
+   is not finite.  A line that cannot fail on a finite value is not printed as PASS.
 4. **batch invariance** -- with more than one sequence, every block is run again on ONE sequence alone, on the same operands
    and state; the bytes of that sequence must be equal.  The sequence that runs alone rotates with the step (step ``t``:
    sequence ``t`` modulo the count), so every row of the batch is covered at no extra launch.  A gate for a block whose
    provider row lists the GPU class under ``batch_invariant``; a printed fact for the rest.
 
+A fifth check, asked for by the run (``run_checks(..., kernels=True)``; a sample's ``--check-kernels``), is not against the
+reference but against the plan: **kernels** -- every launch of the traced steps is held against the census entries of the
+blocks (``model_samples.census``: the form on the objects, attribution, count, order, launch record, copies).  It reads what
+the traced pass kept (``Session.traced``).  Where the profiler's records cannot be had it is neither PASS nor FAIL: the line
+says ``NOT OBSERVED`` with the reason, ``Checks.unobserved`` carries it, and a sample then ends in ``RAN``, never in ``PASS``.
+
 Bands: ``bf16_rounding`` / ``bf16_unit`` = every element finite and within one bf16 unit of the reference, the unit taken at
 the larger magnitude and not below 2**-8 of the tensor's largest value (a multiply that rounds its unscaled sum to bf16 and the
 scaled result again differs from the once-rounded reference by one unit on a share of its elements); ``gdn_step`` = see below;
-``same`` = the provider is the reference chain, nothing to compare.
+``gate_fp8`` = see below; ``same`` = the provider is the reference chain, nothing to compare.
+
+**What a provider block is compared with.**  The reference block of the same name -- unless the provider's kernel rounds at
+other points than the reference chain: then the block names its twin (``Block.twin``), a reference block written at the
+kernel's rounding points, and is compared with that.  The reference is matched to the kernel's documented arithmetic; a
+band is never widened to cover a chain that rounds elsewhere.  **A band is judged per output**: it names the outputs it
+applies to and what it needs of the twin; an output it does not name is compared by its dtype (bf16: within one bf16
+unit; anything else: bytes), and state a call updates is compared byte for byte unless the band has a rule for it.
+
+``gate_fp8``, the band of the attention gate + quantise entry, is that entry's documented numerics contract, not a share.
+Its kernel forms the gated value as the quotient ``attn / (1 + exp(-gate))`` in fp32, rounds it once to bf16 and once to an
+8-bit code.  The twin forms the same quotient in the reference's accumulation precision and keeps the two bf16 values
+around it.  The band: every byte is the code of one of those two bf16 values, and the code of the nearest one wherever the
+quotient is more than 2.5 fp32 units from their midpoint; every value finite.  Inside that margin the fp32 quotient may
+fall on the other side of the midpoint, which is the kernel's own arithmetic; the line prints how many bytes did.
 
 ``gdn_step``, the band of the fused linear-attention step, is judged twice.  Over the whole run: more than 99.9 % of the 8-bit
 output bytes equal, more than 99.9 % of the recurrent state's elements within 1e-4, none farther than two bf16 units (2**-6)
@@ -59,10 +84,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from . import census
 from .loop import Session
 from .sampling import margin
 
@@ -73,6 +99,10 @@ GDN_STATE_BAND = 1e-4
 GDN_STATE_SHARE = 0.999
 GDN_CELL_STATE = 0.999
 GDN_STATE_CAP = 2.0**-6
+#: the gate entry's contract: beyond this many fp32 units from the midpoint of the two bf16 values around the gated value, the
+#: byte is the code of the nearest one (``docs/operations/attention/gate_quant_decode.md``: measured over every operand
+#: pair at five scales, doubled).  Not a tolerance of this sample: it moves only with that page
+GATE_MARGIN_ULP32 = 2.5
 BANDS = {
     "same": "the provider is the reference chain",
     "bitwise": "byte-identical",
@@ -82,6 +112,11 @@ BANDS = {
         f"8-bit bytes: more than {GDN_EQUAL_BYTES:.1%} equal over the run and more than {GDN_CELL_BYTES:.0%} in every cell (layer, sequence, value head); "
         f"state: more than {GDN_STATE_SHARE:.1%} within {GDN_STATE_BAND:g} over the run and more than {GDN_CELL_STATE:.1%} in every cell, "
         "all of it finite and within two bf16 units; conv history equal; null slot untouched"
+    ),
+    "gate_fp8": (
+        "8-bit bytes against the gate at the kernel's rounding points: every byte the code of one of the two bf16 values around the gated value "
+        f"attn / (1 + exp(-gate)), and the code of the nearest one wherever that value is more than {GATE_MARGIN_ULP32:g} fp32 units from their midpoint; "
+        "every value finite"
     ),
 }
 
@@ -162,6 +197,9 @@ class BlockStats:
     within_cap: bool = True
     conv_equal: bool = True
     null_equal: bool = True
+    state_equal: bool = True  # of a band without a rule for state: what the call updated, byte for byte
+    outside: int = 0  # gate_fp8: bytes that are the code of neither bf16 value around the gated value
+    off_nearest: int = 0  # gate_fp8: bytes off the nearest value's code although the gated value is beyond the margin
     cells: Dict[int, _Cells] = field(default_factory=dict)
     cell_bytes: Dict[int, Tuple[float, str]] = field(default_factory=dict)  # layer -> (the smallest share of a cell, which cell)
     cell_state: Dict[int, Tuple[float, str]] = field(default_factory=dict)
@@ -184,8 +222,16 @@ class BlockStats:
                 f"rms ratio {self.state_rms:.1e} at the worst call (printed, not gated); conv history {'equal' if self.conv_equal else 'DIFFERS'}; "
                 f"null slot {'untouched' if self.null_equal else 'WRITTEN'}{loud}"
             )
+        if self.band == "gate_fp8":
+            other = self.total_bytes - self.equal_bytes - self.outside
+            return (
+                f"{self.equal_bytes / max(self.total_bytes, 1):.4%} of 8-bit bytes are the code of the nearest bf16 value; {other:,} of {self.total_bytes:,} "
+                f"the code of the other one around the gated value, {self.off_nearest:,} of them more than {GATE_MARGIN_ULP32:g} fp32 units from the "
+                f"midpoint; {self.outside:,} the code of neither{loud}"
+            )
         share = self.off_by_one / max(self.elements, 1)
-        return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{loud}"
+        state = "" if self.state_equal else "; STATE DIFFERS"
+        return f"largest distance {self.worst_units:.2f} bf16 units; {share:.1%} of elements differ by one unit{state}{loud}"
 
 
 def _smallest(counts: torch.Tensor, total: int, layer: int) -> Tuple[float, str]:
@@ -220,7 +266,7 @@ class BlockTap:
                 t.copy_(c)
 
     def __call__(self, name, layer, block, operands):
-        row, ref = self.plan.rows[name], self.reference[name]
+        row, ref = self.plan.rows[name], block.twin(self.reference[name])  # the reference block, or the block's own twin
         independent = type(ref) is not type(block)
         alone = self.plan.sequences > 1
         if not independent and not alone:
@@ -235,7 +281,7 @@ class BlockTap:
         if independent:
             self._load(holders, before)
             ref_out = ref(*operands)
-            self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer)
+            self._judge(stats, compared, _tensors(ref.compared(ref_out)), after, self._save(holders), layer, ref)
         if alone:
             s = self.step % self.plan.sequences
             self._load(holders, before)
@@ -251,7 +297,26 @@ class BlockTap:
         return out
 
     @staticmethod
-    def _judge(stats: BlockStats, out, ref, state, ref_state, layer: int = 0) -> None:
+    def _judge(stats: BlockStats, out, ref, state, ref_state, layer: int = 0, twin=None) -> None:
+        """One call of a provider block against its twin: ``out`` / ``ref`` are the compared outputs of the two, ``state`` /
+        ``ref_state`` what each left in the state the call updates, ``twin`` the block ``ref`` came from (a band reads from
+        it what it needs beyond the outputs).  The band of the row decides per output."""
+        if stats.band == "gate_fp8":  # output 0: the 8-bit codes, against the twin's bracket of the gated value
+            if getattr(twin, "bracket", None) is None:  # a table that names this band for a block whose twin is another chain
+                raise ValueError(
+                    "the band gate_fp8 is judged against the gate at the kernel's rounding points: the block's twin keeps no bracket of the gated value"
+                )
+            codes, nearest = out[0], ref[0]
+            other, margin = twin.bracket
+            same = codes == nearest
+            stats.equal_bytes += int(same.sum())
+            stats.total_bytes += codes.numel()
+            stats.outside += int((~same & (codes != other)).sum())
+            stats.off_nearest += int((~same & (margin > GATE_MARGIN_ULP32)).sum())
+            stats.finite = stats.finite and bool(((codes & 0x7F) != 0x7F).all())  # E4M3 has no infinity; these two codes are its NaN
+            stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)
+            stats.ok = stats.finite and stats.outside == 0 and stats.off_nearest == 0 and stats.state_equal
+            return
         if stats.band == "gdn_step":
             codes, ref_codes = out[0], ref[0]
             (recurrent, conv), (ref_recurrent, ref_conv) = state[0], ref_state[0]
@@ -308,28 +373,35 @@ class BlockTap:
             stats.off_by_one += int((units >= 0.5).sum())
             stats.worst_units = _largest(stats.worst_units, float(units.amax()))
             stats.ok = stats.ok and bool((units <= 1.0).all())  # element by element: False for a NaN
-        stats.ok = stats.ok and stats.finite
+        stats.state_equal = stats.state_equal and bytes_equal(state, ref_state)  # no rule of this band for state: byte for byte
+        stats.ok = stats.ok and stats.finite and stats.state_equal
 
 
-def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: float) -> Tuple[bool, str]:
+def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tensor, ref_ids: torch.Tensor, band_units: Optional[float]) -> Tuple[bool, str]:
     """The end-to-end check of a run's greedy tokens against the reference stack's: ``(held, the text of its line)``.
 
     ``band_units`` is the declared logits band in bf16 units of the largest reference logit of the run.  The check holds when
     every logit is finite, the largest distance between the two stacks' logits is inside the band, and the token equals the
-    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band."""
+    reference's at every step whose reference margin exceeds ``LOGITS_FACTOR`` times the band.
+
+    ``band_units=None`` is a model whose family declares no band: the line is then a reported one.  It holds when every
+    logit of both stacks is finite; the distance is printed and judged against nothing."""
     a, r = logits.float(), ref_logits.float()
     finite = bool(torch.isfinite(a).all()) and bool(torch.isfinite(r).all())
     top = float(r.abs().amax()) if finite else float("nan")
     unit = 2.0 ** (math.frexp(top)[1] - 8) if top > 0.0 else float("nan")  # False for a NaN
-    band = band_units * unit
     distance = float((a - r).abs().amax())
+    measured = f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit"
+    if band_units is None:
+        return finite, measured + "  [no band is declared for this model: reported, gated on finite logits]" + ("" if finite else "; NON-FINITE LOGITS")
+    band = band_units * unit
     decidable = margin(ref_logits) > LOGITS_FACTOR * band  # nowhere when the band is not a number
     wrong = int((decidable & ~(ids == ref_ids)).sum())
     count, near = int(decidable.sum()), int((~decidable).sum())
     held = finite and distance <= band and wrong == 0
     text = (
         f"{count - wrong} of {count} decidable greedy tokens equal to the reference; {near} near-ties (margin not above {LOGITS_FACTOR:g} x the band); "
-        f"largest logit distance {distance:.4g} = {distance / unit:.2f} bf16 units of the largest logit  [band: {band_units:g} units = {band:.4g}, declared]"
+        f"{measured}  [band: {band_units:g} units = {band:.4g}, declared]"
     )
     return held, text + ("" if finite else "; NON-FINITE LOGITS")
 
@@ -338,6 +410,9 @@ def token_check(logits: torch.Tensor, ref_logits: torch.Tensor, ids: torch.Tenso
 class Checks:
     lines: List[str]
     ok: bool
+    judged: int = 0  # provider blocks compared with the reference; 0: every block of the run was the reference chain itself
+    kernels: str = ""  # the kernel check, when it was asked for: PASS | FAIL | NOT OBSERVED
+    unobserved: str = ""  # why the kernels were not observed
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -347,10 +422,42 @@ def _verdict(ok: bool) -> str:
     return "PASS" if ok else "FAIL"
 
 
-def run_checks(session: Session, prompt_tokens: int) -> Checks:
-    """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded.  Leaves the session reset."""
+def kernel_check(session: Session) -> Tuple[str, str, List[str]]:
+    """The kernel check on what the session's traced pass kept: ``(PASS | FAIL | NOT OBSERVED, why not observed, lines)``.  A
+    session whose traced pass kept no launch records (it was not asked to) has observed nothing."""
+    traced = session.traced
+    if traced is None:
+        reason = "the traced pass kept no launch records"
+        return census.NOT_OBSERVED, reason, [f"  kernels           not observed: {reason}    {census.NOT_OBSERVED}"]
+    status, sentences = traced.judge()
+    lines = [f"  kernels           {traced.summary()}    {status}"]
+    lines += [f"    kernels: {sentence}" for sentence in sentences]
+    lines += [f"    {detail}" for detail in traced.details()]
+    return status, traced.unobserved if status == census.NOT_OBSERVED else "", lines
+
+
+def run_checks(session: Session, prompt_tokens: int, max_steps: Optional[int] = None, second_reference: bool = False, kernels: Optional[bool] = None) -> Checks:
+    """Replay, blocks, tokens and batch invariance for the run ``session`` has just recorded: its recorded steps, or the first
+    ``max_steps`` of them (a long run of a deep model is checked on its first steps).  Leaves the session reset.
+
+    ``kernels`` adds the kernel check on the traced pass the session made before this call (``Session.trace`` with launch
+    records): a failure fails the run; kernels that could not be observed are reported, and ``Checks.unobserved`` says why.
+    Left out, it is the session's own decision (``Session.check_kernels``): a session of a stack that declares a target
+    kernel set is checked without being asked, so no caller can print a verdict for such a run that never looked at its
+    kernels.  For such a session ``kernels=False`` is refused.
+
+    ``second_reference`` runs the reference stack once more with the other accumulation precision (IEEE fp32 where the
+    reference accumulates in fp64) and prints, beside the token check, how far that second reference is from the first and
+    on how many greedy tokens the two agree.  It is a scale, printed and not gated: on a trained checkpoint with 4-bit
+    activations two stacks that differ only in rounding end up tens of bf16 units apart (see the family's logits band)."""
+    if kernels is None:
+        kernels = session.check_kernels
+    elif not kernels and session.stack in getattr(session.model, "target_stacks", ()):
+        raise ValueError(f"stack {session.stack} declares a target kernel set: its kernel check cannot be switched off")
     main = session.record
     steps = min(main.count, main.inputs.shape[0])
+    if max_steps is not None:
+        steps = min(steps, max_steps)
     inputs, logits, ids = main.inputs[:steps].clone(), main.logits[:steps].clone(), main.outputs[:steps].clone()
     facts = session.plan.facts
     reference = Session(
@@ -362,6 +469,7 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
         reference_precision=session.reference_precision,
         capacity=session.capacity,
         share=session,
+        record_steps=steps,
     )
     reference.load()
 
@@ -379,23 +487,61 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
     reference.reset(fresh=True)
     for t in range(steps):
         reference._advance(inputs[t])
-    band_units = float(session.model.logits_band_units)  # declared by the family, in its configs.py
-    tokens_ok, tokens_text = token_check(logits, reference.record.logits[:steps], ids, reference.record.outputs[:steps], band_units)
+    band_units = session.model.logits_band_units  # declared by the family, in its configs.py; None: the token line is reported
+    band_units = None if band_units is None else float(band_units)
+    ref_logits, ref_ids = reference.record.logits[:steps], reference.record.outputs[:steps]
+    tokens_ok, tokens_text = token_check(logits, ref_logits, ids, ref_ids, band_units)
+    tokens_text = f"{int((ids == ref_ids).sum())} of {ids.numel()} greedy tokens equal to the reference stack's; " + tokens_text
+    if second_reference:
+        other = "ieee-fp32" if session.reference_precision == "fp64" else "fp64"
+        second = Session(
+            session.model,
+            session.text,
+            session.sequences,
+            stack="reference",
+            device=session.device,
+            reference_precision=other,
+            capacity=session.capacity,
+            share=session,
+            record_steps=steps,
+        )
+        matmul = torch.backends.cuda.matmul
+        kept = getattr(matmul, "fp32_precision", None)  # a session with IEEE fp32 accumulation sets it for the process
+        try:
+            second.load()
+            second.reset(fresh=True)
+            for t in range(steps):
+                second._advance(inputs[t])
+        finally:
+            if kept is not None:
+                matmul.fp32_precision = kept
+        _, scale_text = token_check(second.record.logits[:steps], ref_logits, second.record.outputs[:steps], ref_ids, band_units)
+        distance = scale_text.split("largest logit distance ", 1)[1].split("  [", 1)[0]
+        tokens_text += (
+            f"; for scale, the reference stack with {other} accumulation is {distance} from the one with {session.reference_precision} "
+            f"and agrees with it on {int((second.record.outputs[:steps] == ref_ids).sum())} of {ids.numel()} greedy tokens (printed, not gated)"
+        )
 
     judged = {n: s for n, s in tap.stats.items() if s.band != "same"}
     blocks_ok = all(s.ok for s in judged.values())
     lines = [
-        f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {steps} steps: {prompt_tokens} prompt + {steps - prompt_tokens} decode)"
+        f"checks ({session.sequences} sequence{'s' if session.sequences > 1 else ''}, {'the first ' if steps < main.count else ''}{steps} steps: "
+        f"{min(prompt_tokens, steps)} prompt + {max(steps - prompt_tokens, 0)} decode)"
     ]
     lines.append(f"  replay            ids and logits byte-identical on a second run from a fresh state    {_verdict(replay_ok)}")
     inside = sum(s.ok for s in judged.values())
-    lines.append(
-        f"  blocks            {inside} of {len(judged)} provider blocks inside their bands against the {session.reference_precision}-accumulated "
-        f"reference, teacher-forced    {_verdict(blocks_ok)}"
-    )
+    if judged:
+        lines.append(
+            f"  blocks            {inside} of {len(judged)} provider blocks inside their bands against the {session.reference_precision}-accumulated "
+            f"reference, teacher-forced    {_verdict(blocks_ok)}"
+        )
+    else:  # a line that compares nothing cannot fail: it is not printed as a pass
+        lines.append("  blocks            no provider block to judge: every block of this run is the reference chain itself    REPORTED")
     for name, s in judged.items():
-        lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {BANDS[s.band]}]  {_verdict(s.ok)}")
-    lines.append(f"  tokens            {tokens_text}    {_verdict(tokens_ok)}")
+        lines.append(f"    {name:<22} {s.calls:>4} calls  {s.line()}  [band: {s.band}]  {_verdict(s.ok)}")
+    for band in dict.fromkeys(s.band for s in judged.values()):  # each band's text once, on a line of its own
+        lines.append(f"    band {band}: {BANDS[band]}")
+    lines.append(f"  tokens            {tokens_text}    {'REPORTED' if band_units is None and tokens_ok else _verdict(tokens_ok)}")
     batch_ok = True
     if session.sequences > 1:
         cls = f"cc{facts.cc[0]}.{facts.cc[1]}"
@@ -410,10 +556,13 @@ def run_checks(session: Session, prompt_tokens: int) -> Checks:
         gate_text = "; ".join(gated) if gated else f"no block is gated on {facts.class_text}"
         rest = f"{len(tap.stats) - len(differs)} of {len(tap.stats)} blocks equal" + (f"; differs: {', '.join(differs)}" if differs else "")
         verdict = _verdict(batch_ok) if gated else "REPORTED"
-        lines.append(
-            f"  batch invariance  one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences}): {gate_text}; {rest}    {verdict}"
-        )
+        rotation = f"one sequence alone vs among {session.sequences} (step t: sequence t mod {session.sequences})"
+        lines.append(f"  batch invariance  {rotation}: {gate_text}; {rest}    {verdict}")
     else:
         lines.append("  batch invariance  not applicable at 1 sequence")
+    status, unobserved = "", ""
+    if kernels:
+        status, unobserved, kernel_lines = kernel_check(session)
+        lines += kernel_lines
     session.reset(fresh=True)
-    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok)
+    return Checks(lines, replay_ok and blocks_ok and tokens_ok and batch_ok and status != census.FAIL, len(judged), status, unobserved)

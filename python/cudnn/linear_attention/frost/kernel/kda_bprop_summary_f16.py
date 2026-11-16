@@ -1585,7 +1585,7 @@ def compute1_warp_group(
             if write_start == 0:
                 row_lo_addr = tmem_row << 16
                 dstate0_vw = 16 // (mDstate0.element_type.width // 8)
-                dstate0_dst = (mDstate0.iterator + mDstate0.layout((batch_idx, head_idx, value_dim, 0))).raw_ptr()
+                dstate0_dst = (mDstate0.iterator + mDstate0.layout((batch_idx, head_idx // cfg.state_head_divisor, value_dim, 0))).raw_ptr()
                 for i in cutlass.range_constexpr(cfg.d_k // 32):
                     dstate0_vec = nvvm.tcgen05_ld(
                         "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_acc_offset + i * 32), cutlass.Float32), num=32
@@ -1611,11 +1611,11 @@ def compute1_warp_group(
                                 pass_val = cutlass.Float32(0.0)
                             composed_val = mDcomposed[cutlass.Int32(0), head_idx, value_dim, kd]
                             pass_val = composed_val if batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2) else pass_val
-                            mDstate0[batch_idx, head_idx, value_dim, kd] = pass_val.to(mDstate0.element_type)
+                            mDstate0[batch_idx, head_idx // cfg.state_head_divisor, value_dim, kd] = pass_val.to(mDstate0.element_type)
                         elif cutlass.const_expr(cfg.use_dstate_in):
-                            mDstate0[batch_idx, head_idx, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd]
+                            mDstate0[batch_idx, head_idx // cfg.state_head_divisor, value_dim, kd] = mDstate_in[batch_idx, head_idx, value_dim, kd]
                         else:
-                            mDstate0[batch_idx, head_idx, value_dim, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
+                            mDstate0[batch_idx, head_idx // cfg.state_head_divisor, value_dim, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
         if num_compute_chunks > 0:
             bars.mb_dstate0_acc_stored.arrive()
         chunk_serial_base += num_compute_chunks
@@ -2176,6 +2176,7 @@ class KdaBpropSummaryCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
     dstate_table: bool = True
     has_composed_dstate: bool = False
     scheduler_stages: int = 8

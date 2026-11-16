@@ -2771,6 +2771,19 @@ class Graph : public ICudnn, public INode {
         return check_support();
     }
 
+    // cuDNN 9.11 removed Maxwell, Pascal and Volta (compute capability below 7.5), but its heuristics still return
+    // plans for them that build and only fail at execute (CUDNN_STATUS_EXECUTION_FAILED); decline them up front.
+    error_t
+    check_backend_supports_sm_(int32_t const sm_version) const {
+        RETURN_CUDNN_FRONTEND_ERROR_IF(sm_version > 0 && sm_version < 75 && detail::get_backend_version() >= 91100,
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "cuDNN " + std::to_string(detail::get_backend_version()) +
+                                           " supports compute capability 7.5 (Turing) and newer; the target is SM" +
+                                           std::to_string(sm_version) +
+                                           ". cuDNN 9.10 is the last release for Maxwell, Pascal and Volta.");
+        return {error_code_t::OK, ""};
+    }
+
     // overload for deviceless AoT compilation
     error_t
     check_support() {
@@ -2778,6 +2791,7 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(context.populate_sm_version_from_device());
         auto sm_version = context.get_sm_version();
+        CHECK_CUDNN_FRONTEND_ERROR(check_backend_supports_sm_(sm_version));
 
         // Check OSS RmsNorm+SiLU engine
         if (plans.has_oss_rms_norm_silu_engine()) {
@@ -4001,6 +4015,13 @@ Graph::get_knobs_for_engine(int64_t const engine, std::vector<Knob> &knobs) {
 inline error_t
 Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
     CUDNN_FE_LOG_BANNER("  CREATE EXECUTION PLANS  (HEURISTICS QUERY)  ");
+
+    // An unset target (-1, or 0) resolves from the current device; a deviceless AoT graph without a target stays
+    // unresolved and skips this gate.
+    if (context.get_sm_version() <= 0 && detail::get_backend_version() >= 91100) {
+        (void)context.populate_sm_version_from_device();
+    }
+    CHECK_CUDNN_FRONTEND_ERROR(check_backend_supports_sm_(context.get_sm_version()));
 
     // A node's preferred engine (INode::override_heuristics_query) goes FIRST and the heuristics' configs follow it:
     // the deterministic SDPA backward on Blackwell needs the part's own bprop engine, which no heuristics mode proposes

@@ -5,7 +5,7 @@
 2x2 tcgen05 datapath.
 
 The SM100 large-head-dim chain (``api_dsl.SdpaBwdDslSm100``) with stage 2 ALWAYS the cc 10.7 sibling of the 2x2 twin,
-``kernels/sm107/bprop_d512_f16_2x2.py`` at the 8-stage ring arm (``api_dsl_sm107_d512``).  Every capability the row claims
+``kernels/sm107/d512_f16_2x2/kernel.py`` at the 8-stage ring arm (``api_dsl_sm107_d512``).  Every capability the row claims
 gets an ACCEPT test through the graph API with the engine PINNED against the sm107 suite's fp64 oracle; every decline a
 REJECT probe on a REAL graph with a faked cc 10.7 device (host, runs anywhere).  Row-specific detectors: the fork is PINNED
 to the SM100 body -- its code diff is an allowlist of the deltas its docstring names, its module refuses the SM100 ring arm
@@ -62,8 +62,8 @@ _RUBIN_CC = (10, 7)
 _SM_RANGE = (107, 119)  # the row mirrors the other Rubin rows (engines._RUBIN)
 _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
-_FORK_FILE = "sm107/bprop_d512_f16_2x2.py"
-_SM100_FILE = "sm100/bprop_d512_f16_2x2.py"
+_FORK_FILE = "sm107/d512_f16_2x2/kernel.py"
+_SM100_FILE = "sm100/d512_f16_2x2/kernel.py"
 _TAG = "sdpa_bwd_sm107_stage2_2x2"
 _RUBIN_ARM = dict(stages_kv=8, cast_stages=2)  # + smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2, the kernel's RUBIN_ARM
 _MD5_RECORD = Path(__file__).resolve().parent / "renderings" / "md5_stage2_2x2_sm107a.txt"
@@ -161,7 +161,7 @@ def test_adapter_is_the_sm100_chain_over_the_cc107_twin(monkeypatch):
         rec = SdpaBwdDslSm107D512._stage2_record(None, fields)
         assert isinstance(rec, TemplateParams2x2) and (rec.stages_kv, rec.cast_stages, rec.smem_cap_bytes) == (8, 2, SM107_USABLE_DYN_SMEM_2X2)
         # The SM100 row: the 4x1 role split by default, the SM100-arm twin when the module constant is flipped.
-        assert api_dsl.SdpaBwdDslSm100._stage2_file(None) == (_SM100_FILE if twin else "sm100/bprop_d512_f16.py")
+        assert api_dsl.SdpaBwdDslSm100._stage2_file(None) == (_SM100_FILE if twin else "sm100/d512_f16_role_split/kernel.py")
         if not twin:
             base = api_dsl.SdpaBwdDslSm100._stage2_record(None, fields)
             assert type(base) is TemplateParams, "the 4x1 record is the BASE TemplateParams (its PTX md5 is pinned)"
@@ -264,7 +264,7 @@ def test_d512_half_graph_is_served_by_exactly_this_row_on_the_rubin_line(monkeyp
 
 def test_d256_half_graph_stays_the_d256_rows(monkeypatch):
     """The envelope floor is exclusive at 256: the Rubin d256 half row keeps that graph, this row declines it."""
-    assert _eligible(monkeypatch, d=256) == {"sdpa_bwd_sm107"}
+    assert _eligible(monkeypatch, d=256) == {"sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_d256_f16_2x2"}
     assert _decline_reason(monkeypatch, d=256) is not None
 
 
@@ -419,12 +419,18 @@ def test_fork_source_pins():
     assert sorted(inits) == sorted(
         ["ONE_LANE", "ONE_LANE", "CGA_M", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
     )
-    assert src.count("@cute.kernel") == 2 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
-    assert _code_only(src).count(".launch(") == 2, "plain launches (the THD clamp kernel + the main kernel); the DSL launcher sets the oversized-SMEM attribute"
+    assert src.count("@cute.kernel") == 3 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
+    assert (
+        _code_only(src).count(".launch(") == 3
+    ), "plain launches (the THD sequence-map or clamp kernel + the main kernel); the DSL launcher sets the oversized-SMEM attribute"
     for gone in ("is_exclusive", "tmem_load_max_reduction_tile", "ld.red", "cp_async_bulk_shared_cluster_shared_cta", "tcgen05_cp", "mma_ts("):
         assert gone not in _code_only(src), gone  # the prose names what is absent; the code must not
     assert "bars.mb_tmem_dealloc.arrive()" in src and "bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))" in src
-    assert "RUBIN_ARM = dict(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)" in code
+    from cudnn.sdpa.bwd.kernels.sm107.d512_f16_2x2.config import RUBIN_ARM
+    from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
+
+    assert RUBIN_ARM == dict(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
+    assert "from cudnn.sdpa.bwd.kernels.sm107.d512_f16_2x2.config import RUBIN_ARM" in code
     assert 'raise ValueError(f"bprop_d512_f16_2x2_sm107: {msg}")' in code
 
 
@@ -440,7 +446,7 @@ _FORK_REQUIRE_CONDITIONS = (
     r"^    CFG\.SMEM_CAP_BYTES == SM107_USABLE_DYN_SMEM_2X2 and smem_bytes_2x2\(CFG\) == 320 \* 1024,$",
 )
 _FORK_ADDED = (
-    r"^RUBIN_ARM = dict\(",
+    r"^from cudnn\.sdpa\.bwd\.kernels\.sm107\.d512_f16_2x2\.config import RUBIN_ARM$",
     r"^PARAMS: TemplateParams = globals\(\)\.get\(\s*, TemplateParams2x2\(\*\*RUBIN_ARM\)\)$",  # the string literal is blanked
     r"^    SM107_USABLE_DYN_SMEM_2X2,$",
     r"^    TCGEN05_V0_ADDR_LIMIT_2X2,$",
@@ -761,7 +767,7 @@ def _direct_capture(Adapter, tensors, *, b, hq, hkv, sq, skv, dt, akw):
 
     def spy(path, params, tag="template"):
         if "stage2" in tag:
-            served.append(path.rsplit("/", 1)[-1])
+            served.append(path.rsplit("/kernels/", 1)[-1])
         return original(path, params, tag)
 
     with patch.object(api_dsl, "load_template", spy):
@@ -851,7 +857,7 @@ def test_fork_is_bitwise_the_sm100_body_at_rubin_params(monkeypatch, case, watch
     base, served_base = _direct_capture(api_dsl.SdpaBwdDslSm100, tensors, **geom)
     monkeypatch.setattr(api_dsl, "STAGE2_2X2", False)
     fork, served_fork = _direct_capture(SdpaBwdDslSm107D512, tensors, **geom)
-    assert served_base == ["bprop_d512_f16_2x2.py"] and served_fork == ["bprop_d512_f16_2x2.py"], (served_base, served_fork)
+    assert served_base == ["sm100/d512_f16_2x2/kernel.py"] and served_fork == [_FORK_FILE], (served_base, served_fork)
     for name, x, y in zip(("dQ", "dK", "dV", "S_ws", "dS_ws"), base, fork):
         assert torch.isfinite(y.view(torch.bfloat16 if dt == torch.bfloat16 else torch.float16).float()).all() or name.endswith("_ws"), name
         assert torch.equal(x, y), f"{name}: the fork is NOT bitwise the SM100 body at Rubin params ({(x != y).sum().item()} of {x.numel()} differ)"

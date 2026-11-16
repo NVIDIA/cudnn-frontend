@@ -12,8 +12,21 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import check_ref_dsa_sparse
 
 pytestmark = [pytest.mark.L0, pytest.mark.gpu_exclusive, pytest.mark.xdist_group(name="gpu_exclusive")]
 ALLOWED_INF = {"max_logits": -torch.inf, "lse": torch.inf, "lse_indexer": torch.inf}
-SHAPES = [(64, 512, 64), (64, 576, 64), (128, 512, 128)]
-SHAPE_IDS = ["h64-d512-k64", "h64-d576-k64", "h128-d512-k128"]
+SHAPES = {"h64-d512-k64": (64, 512, 64), "h64-d576-k64": (64, 576, 64), "h128-d512-k128": (128, 512, 128)}
+# SM100 H96 forward runs the H64 kernel on heads [0, 64) and [32, 96), and H128 D576 on [0, 64) and
+# [64, 128); this suite pins them forward only.
+FPROP_ONLY_SHAPES = {"h96-d576-k64": (96, 576, 64), "h128-d576-k64": (128, 576, 64)}
+
+
+def layout_cases():
+    """Return (backward, dtype, heads, dim, topk) cases with IDs ``<layout>-<dtype>-<direction>``."""
+    return [
+        pytest.param(backward, dtype, *shape, id=f"{layout}-{dtype_id}-{'bprop' if backward else 'fprop'}")
+        for layout, shape in {**SHAPES, **FPROP_ONLY_SHAPES}.items()
+        for dtype, dtype_id in ((torch.bfloat16, "bf16"), (torch.float16, "fp16"))
+        for backward in (False, True)
+        if not (backward and layout in FPROP_ONLY_SHAPES)
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -308,17 +321,13 @@ def dkv_route(inputs, dkv_mode):
 
 
 class TestDSA:
-    @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-    @pytest.mark.parametrize("heads,dim,topk", SHAPES, ids=SHAPE_IDS)
+    @pytest.mark.parametrize("backward,dtype,heads,dim,topk", layout_cases())
     def test_replay(self, backward, dtype, heads, dim, topk):
         inputs = pack(sequences(heads=heads, dim=dim, topk=topk, dtype=dtype))
         actual = assert_replays(lambda: run(inputs, backward), allowed_inf=ALLOWED_INF)
         check_reference(inputs, actual, backward)
 
-    @pytest.mark.parametrize("backward", [False, True], ids=["fprop", "bprop"])
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-    @pytest.mark.parametrize("heads,dim,topk", SHAPES, ids=SHAPE_IDS)
+    @pytest.mark.parametrize("backward,dtype,heads,dim,topk", layout_cases())
     def test_batch_invariance(self, backward, dtype, heads, dim, topk):
         if backward and dtype == torch.bfloat16 and (heads, dim, topk) == (128, 512, 128):
             pytest.skip("skip until fix: DSA H128 BF16 dKV changes with batch layout (PR #2266)")

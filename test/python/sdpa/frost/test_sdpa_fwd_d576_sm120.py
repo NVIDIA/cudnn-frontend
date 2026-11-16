@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from frost_test_utils import requires_blackwell_geforce, requires_dsl
+from frost_test_utils import requires_blackwell_geforce, requires_dsl, sm120_half_owner
 from sdpa.frost import test_sdpa_fwd_dsl_sm120 as dense
 from sdpa.frost import test_sdpa_fwd_paged_sm120 as paged
 from sdpa.frost import test_sdpa_prepared_sm120 as prepared
@@ -107,30 +107,35 @@ def test_d576_thd(dtype, stats_layout):
 
 def test_d576_admission():
     from cudnn.sdpa.fwd.config_sm120 import D576_FLAVOR, pick_flavor, smem_bytes
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, _sm120_spec, mismatch
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, mismatch
     from cudnn.sdpa.graph_analyzer import analyze
 
     g, _, _, _, _, _ = paged._case(torch.float16, 2, 16, True, False, dims=(576, 512), tile_m=64, tile_n=32, sq=1, explicit_plan=True)
-    facts, caps = analyze(g), _sm120_spec().capabilities
+    facts, rows = analyze(g), {s.name: s.capabilities for s in ENGINE_SPECS}
+
+    def caps(dims):
+        return rows[sm120_half_owner(*dims)]
+
     for dims in ((576, 512), (520, 264), (568, 504)):
         assert pick_flavor(*dims, False) == D576_FLAVOR
         assert pick_flavor(*dims, True) is None
         assert smem_bytes(*dims, 64, 32) == 98328
         for splits in (1, 3):
-            assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=splits)) is None
+            assert mismatch(caps(dims), replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32, split_kv=splits)) is None
     for dims in ((584, 512), (576, 520), (576, 256), (516, 512)):
-        assert mismatch(caps, replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
+        assert mismatch(caps(dims), replace(facts, d_qk=dims[0], d_v=dims[1]), SdpaFwdKnobs(tile_m=64, tile_n=32)) is not None
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("thd,splits", [(False, 1), (False, 3), (True, 1)], ids=["dense", "dense_split", "thd"])
-def test_d576_dense_thd_determinism(dtype, thd, splits):
+def test_d576_dense_thd_determinism(dtype, thd, splits, *, dims=(576, 512), num_q_heads=6, num_kv_heads=1, neighbor_repeats=64):
     import cudnn
     from cudnn.engines.manifest import engines_for
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs, engine_name
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 
-    h, hk, sq, sk, dq, dv = 6, 1, 17, 67, 576, 512
+    h, hk, sq, sk = num_q_heads, num_kv_heads, 17, 67
+    dq, dv = dims
     rng = torch.Generator().manual_seed(576512)
     records = [tuple((torch.randn(shape, generator=rng) * 0.25).to(dtype) for shape in ((h, sq, dq), (hk, sk, dq), (hk, sk, dv))) for _ in range(3)]
     sink_cpu = torch.linspace(-1, 1, h)
@@ -195,7 +200,7 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
         vp[o], vp[lse] = buffers["o"], buffers["lse"]
         g.validate()
         g.build_operation_graph()
-        selected = next(engine for engine in engines_for(g) if engine.name == engine_name(arch="sm120"))
+        selected = next(engine for engine in engines_for(g) if engine.name == sm120_half_owner(dq, dv))
         g.create_execution_plan(selected.engine_id, SdpaFwdKnobs(tile_m=64, tile_n=32, sched_policy=0, split_kv=splits, pack_gqa=not thd))
         g.select_plan(0)
         g.check_support()
@@ -223,7 +228,7 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
     ref_o = (scores - ref_lse[..., None]).exp() @ vv.double().repeat_interleave(h // hk, 0)
     torch.testing.assert_close(expected["o"][0].cpu().double(), ref_o, atol=0.003, rtol=0.02)
     torch.testing.assert_close(expected["lse"][0].cpu().double(), ref_lse, atol=0.0006, rtol=0)
-    for order in ([1, 0, 0, 2], [1, 2] * 64 + [0]):
+    for order in ([1, 0, 0, 2], [1, 2] * neighbor_repeats + [0]):
         buffers, launch = prepare(order)
         replay_inputs = {name: buffers[name].clone() for name in ("q", "k", "v")} if thd else None
         launch()
@@ -264,4 +269,13 @@ def test_d576_dense_thd_determinism(dtype, thd, splits):
         finally:
             torch.cuda.synchronize()
             captured.reset()
-    assert_golden(f"sdpa-sm120-d576v512-{'thd' if thd else 'dense'}-split{splits}-{dtype}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+    suffix = f"-h{h}kv{hk}" if (h, hk) != (6, 1) else ""
+    assert_golden(f"sdpa-sm120-d{dq}v{dv}-{'thd' if thd else 'dense'}-split{splits}-{dtype}{suffix}", {"q": qq, "k": kk, "v": vv, "sink": sink_cpu}, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dims", [(512, 512), (576, 512)])
+@pytest.mark.parametrize("group", [96, 128])
+@pytest.mark.parametrize("splits", [1, 3])
+def test_sm120_wide_subgroup_dense_determinism(dtype, dims, group, splits):
+    test_d576_dense_thd_determinism(dtype, False, splits, dims=dims, num_q_heads=2 * group, num_kv_heads=2, neighbor_repeats=16)

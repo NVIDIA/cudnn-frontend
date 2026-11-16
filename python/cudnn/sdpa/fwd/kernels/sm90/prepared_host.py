@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Pointer-only host for the SM90 D512 tile; operands come from the shared binder."""
+"""Pointer-only host for the native-width SM90 tiles; operands come from the shared binder."""
 
 from typing import Optional, Tuple
 
@@ -38,6 +38,11 @@ def host(
     thd_max_sq: cutlass.Int32,
     thd_origin_ptrs,
     thd_origin_caps,
+    block_table_ptr: Optional[cute.Pointer],
+    block_table_v_ptr: Optional[cute.Pointer],
+    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
+    table_v_strides: Optional[Tuple[cutlass.Int64, cutlass.Int64]],
+    n_pages: cutlass.Int32,
     kernel: cutlass.Constexpr,
     d_qk: cutlass.Constexpr[int],
     d_v: cutlass.Constexpr[int],
@@ -66,8 +71,10 @@ def host(
         return cute.make_tensor(ptr, cute.make_layout((batches, heads, tokens, dim), stride=(bs, hs, ss, 1)))
 
     q = bhsd(q_ptr, kernel.h_q, caps[0], d_qk, q_strides, batch)
-    k = bhsd(k_ptr, kernel.h_kv, caps[1], d_qk, k_strides, batch)
-    v = bhsd(v_ptr, kernel.h_kv, caps[2], d_v, v_strides, batch)
+    kv_rows = kernel.page_size if kernel.page_size else caps[1]
+    kv_batch = n_pages if kernel.page_size else batch
+    k = bhsd(k_ptr, kernel.h_kv, kv_rows, d_qk, k_strides, kv_batch)
+    v = bhsd(v_ptr, kernel.h_kv, kernel.page_size if kernel.page_size else caps[2], d_v, v_strides, kv_batch)
     o = bhsd(o_ptr, kernel.h_q, caps[3], d_v, o_strides, batch * kernel.split_kv)
     lse = None
     if cutlass.const_expr(lse_ptr is not None):
@@ -92,7 +99,13 @@ def host(
         for port in cutlass.range_constexpr(5):
             if cutlass.const_expr(kernel.thd_origins[port] is not None):
                 offsets[port] = cute.make_tensor(thd_origin_ptrs[port], cute.make_layout((kernel.b + 1,), stride=(1,)))
-    kernel(q, k, v, o, lse, sinks, q_lens, kv_lens, scale_softmax, thd_max_sq, thd_q_lens, thd_kv_lens, thd_lens_form, *offsets, stream)
+    if cutlass.const_expr(kernel.page_size > 0):
+        table_shape = (kernel.b, (kernel.s_kv + kernel.page_size - 1) // kernel.page_size)
+        table = cute.make_tensor(block_table_ptr, cute.make_layout(table_shape, stride=table_strides))
+        table_v = cute.make_tensor(block_table_v_ptr, cute.make_layout(table_shape, stride=table_v_strides))
+        kernel(q, k, v, o, lse, sinks, q_lens, kv_lens, scale_softmax, thd_max_sq, thd_q_lens, thd_kv_lens, thd_lens_form, *offsets, stream, table, table_v)
+    else:
+        kernel(q, k, v, o, lse, sinks, q_lens, kv_lens, scale_softmax, thd_max_sq, thd_q_lens, thd_kv_lens, thd_lens_form, *offsets, stream)
 
 
 def compile_host(kernel, dtype, d_qk, d_v, has_lse, lse_head_major, cache_key, target):
@@ -133,6 +146,13 @@ def compile_host(kernel, dtype, d_qk, d_v, has_lse, lse_head_major, cache_key, t
             else None
         ),
         (cutlass.Int64(0),) * 5 if kernel.thd_origins is not None else None,
+        ptr(cutlass.Int32, 4) if kernel.page_size else None,
+        ptr(cutlass.Int32, 4) if kernel.page_size else None,
+        # Match the shared frame even when unused: K keeps (0, 0), while
+        # the independently introduced V-stride slot is None off paging.
+        (cutlass.Int64(0),) * 2,
+        (cutlass.Int64(0),) * 2 if kernel.page_size else None,
+        cutlass.Int32(0),
         kernel,
         d_qk,
         d_v,

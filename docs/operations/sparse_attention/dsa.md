@@ -26,7 +26,7 @@ operations.
 **Scope:** this module ships CuTe-DSL kernels for sparse-attention forward and
 backward, indexer scores/top-K, sparse/dense score recompute, and sparse/dense
 indexer backward. On SM90, sparse forward covers H16/H32/H64/H96/H128 Prefill;
-on SM100 it covers regular H64 and small-top-k H128 Prefill. It does not
+on SM100 it covers regular H64/H96/H128 and small-top-k H128 Prefill. It does not
 include a decode or split-KV forward mode.
 
 The module packages the following operations:
@@ -188,8 +188,16 @@ attention sink participates only in the output denominator, not in any stats.
   - SM90: `H in {16, 32, 64, 96, 128}`, `D_qk in {512, 576}`, and
     `indexer_topk in {0, 512, 1024, 2048}`
   - SM100 H64: `D_qk in {512, 576}`, `indexer_topk in {0, 512, 1024, 2048}`
+  - SM100 H96: as H64. It launches the H64 kernel twice, on heads `[0, 64)`
+    and `[32, 96)` of the same tensors, so it does the work of 128 heads;
+    both launches write identical bytes to heads `[32, 64)`.
   - SM100 H128 small-top-k Prefill: `D_qk=512`,
     `indexer_topk in {0, 512, 1024}`
+  - SM100 H128 otherwise (`D_qk=576`, or `D_qk=512` with `indexer_topk=2048`):
+    the H64 kernel runs twice, on the disjoint heads `[0, 64)` and `[64, 128)`,
+    and each head's bytes equal an H64 run on that window. For `D_qk=512`,
+    `indexer_topk=2048` therefore uses a different kernel than `{0, 512, 1024}`,
+    and results can differ in rounding between the two.
 - **Indexer prefix constraint** — `indexer_topk <= K`. When `topk_length` is
   present, a meaningful `lse_indexer` additionally requires
   `topk_length >= indexer_topk` for that row. Shorter rows retain the SM100
@@ -1499,8 +1507,8 @@ the option is not available with ``deterministic=True``. Supported on SM100-clas
 `DSA.sparse_attention` composes the existing native forward and backward
 wrappers, without FlashMLA. It accepts contiguous BF16 `q[S_q,H,D]`,
 `kv[S_kv,D]`, INT32 `indices[S_q,K]`, optional FP32 `attn_sink[H]`, and
-optional INT32 `topk_length[S_q]`, on one SM100 device. Supported pairs are
-H16/H32/H64 with D512/D576 and H128 with D512; output V dimension is 512.
+optional INT32 `topk_length[S_q]`, on one SM100 device. Supported heads are
+H16/H32/H64/H96/H128, each with D512 or D576; output V dimension is 512.
 H16/H32 forward explicitly pads heads to 64 and slices the result. This cost
 belongs to the semantic adapter and is included when benchmarking the call.
 Physical K and sequence extents must be positive. K is padded to 128 for launch.
@@ -1535,3 +1543,41 @@ slots, then normalizes across the retained slots; all-masked rows return zeros.
 Targets are detached. Indexer training needs its own loss; discrete Top-K
 selection is not differentiated. This contract uses the existing native `out`
 return key, not the old unmerged bridge's `output` key.
+
+
+## Optional SM90 teacher-target output
+
+`sparse_attention_backward_wrapper(..., return_cli_target=True,
+cli_target_head_count=real_heads)` appends `cli_target` to the returned `TupleDict`.
+The default remains the original `dq`, `dkv`, `d_sink` result and preserves existing
+positional arguments. The new settings are keyword-only.
+
+This output is an FP32 contiguous tensor `[total_S_q, topk_max]`, in the input
+Top-K slot order. It contains the mean KV attention probability over real heads,
+reconstructed from the existing **KV-only natural-log LSE**, with any attention
+sink included in the softmax denominator by the existing preprocess. It is independent
+of `dout`. It is not the final normalized distillation target: consumers must
+normalize over their valid selected positions. Invalid slots, ignored suffixes
+and empty rows are zero. Duplicate indices retain the existing attention
+semantics; they are not deduplicated by this API.
+
+The initial implementation supports SM90 and one physical 64-head block, with
+`1 <= real_heads <= 64`. A caller padding smaller head counts must supply zero
+padded queries/upstream gradients and positive-infinity padded LSE values. It
+must use the matching real-head count. SM100-family and other architectures
+decline this optional output; their existing backward paths are unchanged.
+
+The wrapper allocates the output on the launch stream. Direct
+`SparseAttentionBackward` plans take `return_cli_target` and
+`cli_target_head_count` at construction, then require a matching preallocated
+`cli_target` keyword output in `execute()`. It must be contiguous FP32 on Q's
+device with the Top-K shape. Plans never allocate this output or change their
+output contract during execution. Inputs, outputs and workspace must not alias.
+Warm SM90 once before graph capture, as for ordinary sparse backward.
+
+CLI consumes probabilities already reconstructed by the backward kernel; it
+does not change sparse attention forward or the backward gradient equations.
+Target reference, gradient parity, empty-row/replay and plan-contract tests live
+in `test/python/deepseek_sparse_attention/cutedsl/test_DSA_cli_target.py`.
+GPU validation of this rebased revision is pending; downstream results on older
+source revisions are not evidence for this revision.

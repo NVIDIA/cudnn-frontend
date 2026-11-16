@@ -1622,10 +1622,10 @@ def _combine_decode_grid_kernel(
             # kernel's own sequence (no multiply ahead of the first add).
             alpha = cutlass.Float32(arith.select((m_c > neg_inf).ir_value(), cute.math.exp(m_c - m_safe_c, fastmath=True).ir_value(), zero.ir_value()))
             den_c = den_c * alpha
-            acc0 = acc0 * alpha
-            acc1 = acc1 * alpha
-            acc2 = acc2 * alpha
-            acc3 = acc3 * alpha
+            acc0 = cutlass.Float32(arith.select((alpha > zero).ir_value(), acc0.ir_value(), zero.ir_value())) * alpha
+            acc1 = cutlass.Float32(arith.select((alpha > zero).ir_value(), acc1.ir_value(), zero.ir_value())) * alpha
+            acc2 = cutlass.Float32(arith.select((alpha > zero).ir_value(), acc2.ir_value(), zero.ir_value())) * alpha
+            acc3 = cutlass.Float32(arith.select((alpha > zero).ir_value(), acc3.ir_value(), zero.ir_value())) * alpha
         m_c = m_new
         for j in cutlass.range_constexpr(DECODE_SPLITS_PER_CHAIN):
             lse_s = lse_v[j]
@@ -1633,6 +1633,9 @@ def _combine_decode_grid_kernel(
             live = (lse_s > neg_inf) & ((s_base + cutlass.Int32(j)) < n_splits)
             e = cute.math.exp(lse_s - m_safe_c, fastmath=True)
             w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+            # Finite LSE can still underflow. Keep the original range predicate
+            # independent of w's SELECT so the compiler can prefetch partial O.
+            live = live & (e > zero)
             v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
             v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
             v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
@@ -1691,9 +1694,13 @@ def _combine_decode_grid_kernel(
             a2 = cutlass.Float32((red_ptr + (off + cutlass.Int32(2))).load())
             a3 = cutlass.Float32((red_ptr + (off + cutlass.Int32(3))).load())
             den = den + f * den_cc
+            a0 = cutlass.Float32(arith.select((f > zero).ir_value(), a0.ir_value(), zero.ir_value()))
             acc0 = acc0 + f * a0
+            a1 = cutlass.Float32(arith.select((f > zero).ir_value(), a1.ir_value(), zero.ir_value()))
             acc1 = acc1 + f * a1
+            a2 = cutlass.Float32(arith.select((f > zero).ir_value(), a2.ir_value(), zero.ir_value()))
             acc2 = acc2 + f * a2
+            a3 = cutlass.Float32(arith.select((f > zero).ir_value(), a3.ir_value(), zero.ir_value()))
             acc3 = acc3 + f * a3
         inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
         inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
@@ -2161,6 +2168,7 @@ def _combine_lean_walk_kernel(
                     live = (lse_s > neg_inf) & (cutlass.Int32(s) < n_splits)
                     e = cute.math.exp(lse_s - m_safe, fastmath=True)
                     w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                    live = w > zero
                     v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
                     v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
                     v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
@@ -2190,6 +2198,7 @@ def _combine_lean_walk_kernel(
                             live = (lse_s > neg_inf) & in_range
                             e = cute.math.exp(lse_s - m_safe, fastmath=True)
                             w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                            live = w > zero
                             v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
                             v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
                             v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))

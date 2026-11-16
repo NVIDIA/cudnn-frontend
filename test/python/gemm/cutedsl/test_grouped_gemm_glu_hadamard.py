@@ -8,7 +8,8 @@ from typing import Dict
 import pytest
 import torch
 
-from test_utils import torch_fork_set_rng
+from determinism_utils import assert_replays
+from test_utils import bitwise_bits, torch_fork_set_rng
 from gemm.cutedsl.test_discrete_grouped_gemm_swiglu_utils import allocate_discrete_input_tensors
 from core.cutedsl.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES, compute_reference_amax
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors, grouped_gemm_swiglu_init
@@ -797,3 +798,407 @@ def test_grouped_gemm_glu_hadamard_wrapper_canonical_matches_legacy(request, ab_
         assert canonical["d_tensor"].ndim == 2
         for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor"):
             assert_same(name, canonical[name], legacy[name])
+
+
+# =============================================================================
+# SReLU epilogue options: saved-C regeneration, tanh_clamp_scale, rht_sign_mask
+# =============================================================================
+#
+# These pin four contracts that a tolerance comparison against an FP32 reference cannot see:
+#
+# 1. D is evaluated from C *as stored in c_dtype*, so a consumer that recomputes the activation
+#    from the saved C (the dSReLU backward, activation recomputation) reproduces D bit for bit.
+# 2. Amax is the amax of D as stored in d_dtype, and PostRhtAmax is the amax of the transformed
+#    values after rounding to BF16 -- the values the downstream NVFP4 quantizer actually sees.
+# 3. tanh_clamp_scale and rht_sign_mask are trace-time constants: both must reach the kernel
+#    and both must be part of the wrapper's cache key.
+# 4. All of the above hold on both post-RHT paths (shared-memory FWHT and TMEM).
+#
+# The references below are therefore computed from the kernel's own stored C / D rather than
+# from the dequantized inputs; test_grouped_gemm_glu_hadamard_wrapper_fp4 and friends already
+# cover the GEMM itself.
+
+# Unequal expert sizes and one empty expert, so per-expert reductions cannot pass by symmetry.
+SRELU_OPTION_GROUP_M_LIST = [256, 0, 512, 256]
+
+# Arbitrary non-trivial pattern, the all-negated mask (must equal no mask: H(-x) = -H(x)) and a
+# single flipped element.
+RHT_SIGN_MASKS = [
+    pytest.param(0xA5C3, id="mask_a5c3"),
+    pytest.param(0xFFFF, id="mask_all"),
+    pytest.param(0x0001, id="mask_bit0"),
+]
+
+POST_RHT_AMAX_PATHS = [
+    pytest.param(False, id="smem_post_rht_amax"),
+    pytest.param(True, id="tmem_post_rht_amax"),
+]
+
+# Parameter order of grouped_gemm_glu_hadamard_wrapper_sm100 up to and including
+# current_stream, frozen. Public signatures are append-only (root AGENTS.md): a caller that
+# passes its stream positionally must keep binding it to current_stream.
+_WRAPPER_LEGACY_POSITIONAL_ORDER = [
+    "a_tensor",
+    "sfa_tensor",
+    "padded_offsets",
+    "alpha_tensor",
+    "prob_tensor",
+    "b_tensor",
+    "sfb_tensor",
+    "b_ptrs",
+    "sfb_ptrs",
+    "n",
+    "b_dtype",
+    "b_major",
+    "bias_tensor",
+    "acc_dtype",
+    "c_dtype",
+    "d_dtype",
+    "cd_major",
+    "mma_tiler_mn",
+    "cluster_shape_mn",
+    "sf_vec_size",
+    "vector_f32",
+    "m_aligned",
+    "act_func",
+    "situ_beta1",
+    "situ_beta2",
+    "use_dynamic_sched",
+    "use_tmem_post_rht_amax",
+    "current_stream",
+]
+
+
+def _build_srelu_option_case(request, *, c_dtype=torch.bfloat16, d_dtype=torch.bfloat16, vector_f32=False, small_alpha=False):
+    cfg = _make_cfg(request, ab_dtype=torch.float4_e2m1fn_x2, sf_dtype=torch.float8_e8m0fnu, sf_vec_size=16)
+    cfg["c_dtype"], cfg["d_dtype"], cfg["vector_f32"] = c_dtype, d_dtype, vector_f32
+    if request.config.getoption("--grouped-gemm-group-m", default=None) is None and cfg["l"] == len(SRELU_OPTION_GROUP_M_LIST):
+        cfg["group_m_list"] = list(SRELU_OPTION_GROUP_M_LIST)
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+    # The allocator draws alpha from {-2, ..., 1}: an expert can land on 0 (C == 0 everywhere)
+    # and relu(C)^2 overflows FP16 at |alpha| >= 1. Pin alpha so every expert is live, and for
+    # the unclamped cases keep D finite in both output dtypes (small_alpha) while C still needs
+    # rounding to c_dtype (a power-of-two scale does not make the accumulator representable).
+    magnitudes = (0.0625, 0.125, 0.03125) if small_alpha else (1.0, 2.0, 0.5)
+    alpha = [magnitudes[i % 3] * (-1.0 if i % 2 else 1.0) for i in range(cfg["l"])]
+    inputs["alpha_tensor"].copy_(torch.tensor(alpha, dtype=torch.float32, device=inputs["alpha_tensor"].device))
+    return inputs, cfg
+
+
+def _run_srelu_option_case(case, **wrapper_kwargs):
+    """Run the wrapper over an already-built case, so repeated calls share identical inputs."""
+    from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
+
+    inputs, cfg = case
+    wrapper_kwargs.setdefault("act_func", "srelu")
+    outputs = grouped_gemm_glu_hadamard_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        acc_dtype=cfg["acc_dtype"],
+        c_dtype=cfg["c_dtype"],
+        d_dtype=cfg["d_dtype"],
+        cd_major=cfg["cd_major"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=cfg["vector_f32"],
+        m_aligned=cfg["m_aligned"],
+        **wrapper_kwargs,
+    )
+    torch.cuda.synchronize()
+    return outputs
+
+
+def _stored_cd_prob(inputs, outputs):
+    """The stored C and D (valid rows, on CPU, in their own dtypes) and the FP32 prob column."""
+    valid_m = inputs["valid_m"]
+    c = outputs["c_tensor"][:valid_m, :, 0].cpu()
+    d = outputs["d_tensor"][:valid_m, :, 0].cpu()
+    prob = inputs["prob_tensor"][:valid_m, :, 0].float().cpu()
+    return c, d, prob
+
+
+def _assert_same_bytes(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype, f"{label}: shape or dtype differs"
+    a, b = bitwise_bits(actual.reshape(-1)), bitwise_bits(expected.reshape(-1))
+    count = torch.count_nonzero(a != b).item()
+    assert count == 0, f"{label}: {count}/{a.numel()} bytes differ"
+
+
+def _expert_slices(inputs):
+    start = 0
+    for expert, group_m in enumerate(inputs["aligned_group_m_list"]):
+        yield expert, slice(start, start + group_m), group_m
+        start += group_m
+
+
+def _assert_amax_is_stored_d_amax(inputs, outputs, d: torch.Tensor) -> None:
+    amax = outputs["amax_tensor"].reshape(-1).cpu()
+    for expert, rows, group_m in _expert_slices(inputs):
+        if group_m == 0:
+            continue
+        want = d[rows].float().abs().max().item()
+        assert amax[expert].item() == want, f"expert {expert}: amax {amax[expert].item()} != amax of stored D {want}"
+
+
+def _post_rht_amax_ref(inputs, d: torch.Tensor, rht_sign_mask: int = 0) -> Dict[int, float]:
+    """Per-expert amax of the randomized Hadamard transform of the stored D, rounded to BF16.
+
+    Bit ``i`` of ``rht_sign_mask`` negates element ``i`` of each 16-token block before the
+    normalized 16-point transform. Computed in FP64, where the transform of BF16/FP16 inputs
+    is exact, then rounded to BF16 as the consumer's BF16 transform output is.
+    """
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard.hadamard_utils import HADAMARD_SIZE, hadamard_matrix
+
+    hadamard = hadamard_matrix(HADAMARD_SIZE, dtype=torch.float64, device=d.device)
+    signs = torch.tensor([-1.0 if (rht_sign_mask >> i) & 1 else 1.0 for i in range(HADAMARD_SIZE)], dtype=torch.float64)
+    ref = {}
+    for expert, rows, group_m in _expert_slices(inputs):
+        if group_m == 0:
+            continue
+        blocks = d[rows].double().T.reshape(d.shape[1], group_m // HADAMARD_SIZE, HADAMARD_SIZE) * signs
+        transformed = (blocks @ hadamard) * (HADAMARD_SIZE**-0.5)
+        ref[expert] = transformed.to(torch.bfloat16).float().abs().max().item()
+    return ref
+
+
+def _assert_post_rht_amax(inputs, outputs, d: torch.Tensor, rht_sign_mask: int = 0) -> None:
+    post_rht_amax = outputs["post_rht_amax_tensor"].reshape(-1).cpu()
+    for expert, want in _post_rht_amax_ref(inputs, d, rht_sign_mask).items():
+        got = post_rht_amax[expert].item()
+        assert got == want, f"expert {expert}: post-RHT amax {got} != reference {want} (rht_sign_mask={rht_sign_mask:#06x})"
+
+
+@pytest.mark.L0
+def test_grouped_gemm_glu_hadamard_wrapper_keeps_legacy_positional_order():
+    """New wrapper options are appended after current_stream, never inserted before it."""
+    import inspect
+
+    from cudnn import grouped_gemm_glu_hadamard_wrapper_sm100
+
+    params = list(inspect.signature(grouped_gemm_glu_hadamard_wrapper_sm100).parameters)
+    assert params[: len(_WRAPPER_LEGACY_POSITIONAL_ORDER)] == _WRAPPER_LEGACY_POSITIONAL_ORDER
+    assert {"tanh_clamp_scale", "rht_sign_mask"} <= set(params[len(_WRAPPER_LEGACY_POSITIONAL_ORDER) :])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar_f32", "vector_f32"])
+@pytest.mark.parametrize("use_tmem_post_rht_amax", POST_RHT_AMAX_PATHS)
+@pytest.mark.parametrize("cd_dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_grouped_gemm_glu_hadamard_srelu_saved_c_regeneration(request, cd_dtype, use_tmem_post_rht_amax, vector_f32):
+    """D is bit-identical to the activation recomputed from the saved C, in FP32 arithmetic."""
+    case = _build_srelu_option_case(request, c_dtype=cd_dtype, d_dtype=cd_dtype, vector_f32=vector_f32, small_alpha=True)
+    inputs, _ = case
+    outputs = _run_srelu_option_case(case, use_tmem_post_rht_amax=use_tmem_post_rht_amax)
+    c, d, prob = _stored_cd_prob(inputs, outputs)
+
+    assert bool(torch.isfinite(d.float()).all()), "D overflowed; the regeneration check would compare infinities"
+    assert torch.count_nonzero(d).item() > d.numel() // 8, "D is mostly zero; the regeneration check would be vacuous"
+
+    c_relu = torch.relu(c.float())
+    regenerated = ((c_relu * c_relu) * prob).to(cd_dtype)
+    _assert_same_bytes(d, regenerated, "D vs activation regenerated from saved C")
+
+    _assert_amax_is_stored_d_amax(inputs, outputs, d)
+    _assert_post_rht_amax(inputs, outputs, d)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("vector_f32", [False, True], ids=["scalar_f32", "vector_f32"])
+@pytest.mark.parametrize("use_tmem_post_rht_amax", POST_RHT_AMAX_PATHS)
+@pytest.mark.parametrize("tanh_clamp_scale", [16.0, 32.0], ids=["clamp16", "clamp32"])
+def test_grouped_gemm_glu_hadamard_srelu_tanh_clamp_scale(request, tanh_clamp_scale, use_tmem_post_rht_amax, vector_f32):
+    """The clamped epilogue computes (s * tanh(relu(C) / s))^2 * prob from the saved C."""
+    case = _build_srelu_option_case(request, vector_f32=vector_f32)
+    inputs, cfg = case
+    outputs = _run_srelu_option_case(case, tanh_clamp_scale=tanh_clamp_scale, use_tmem_post_rht_amax=use_tmem_post_rht_amax)
+    c, d, prob = _stored_cd_prob(inputs, outputs)
+
+    # The inputs must reach both the near-linear region and deep saturation of the clamp.
+    c_relu = torch.relu(c.double())
+    assert bool((c_relu > 4 * tanh_clamp_scale).any()) and bool(((c_relu > 0) & (c_relu < tanh_clamp_scale / 4)).any())
+
+    # The kernel uses the approximate tanh, so this is a tolerance check, not a bitwise one.
+    d_ref = (tanh_clamp_scale * torch.tanh(c_relu / tanh_clamp_scale)) ** 2 * prob.double()
+    torch.testing.assert_close(d.float(), d_ref.to(cfg["d_dtype"]).float(), atol=1e-1, rtol=1e-2)
+
+    # t is capped at 1 before use, so the output bound holds exactly, not within a tolerance.
+    bound = (tanh_clamp_scale * tanh_clamp_scale) * prob.abs()
+    assert bool((d.float().abs() <= bound).all()), "D exceeds s^2 * |prob|"
+
+    _assert_amax_is_stored_d_amax(inputs, outputs, d)
+    _assert_post_rht_amax(inputs, outputs, d)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_srelu_tanh_clamp_scale_cache_key(request):
+    """tanh_clamp_scale is a trace-time constant, so it must select its own compiled kernel.
+
+    A cache key that omitted it would silently serve the first scale's kernel to every later
+    one. Interleave three settings over identical inputs and require each to keep its own
+    behaviour, and None to stay bit-identical to omitting the argument.
+    """
+    case = _build_srelu_option_case(request)
+    inputs, _ = case
+
+    def stored_d(**kwargs):
+        return _stored_cd_prob(inputs, _run_srelu_option_case(case, **kwargs))[1]
+
+    prob_abs = inputs["prob_tensor"][: inputs["valid_m"], :, 0].float().abs().cpu()
+    omitted = stored_d()
+    d16 = stored_d(tanh_clamp_scale=16.0)
+    d32 = stored_d(tanh_clamp_scale=32.0)
+    explicit_none = stored_d(tanh_clamp_scale=None)
+    d16_again = stored_d(tanh_clamp_scale=16.0)
+
+    assert bool((d16.float().abs() <= 16.0 * 16.0 * prob_abs).all())
+    assert bool((d32.float().abs() <= 32.0 * 32.0 * prob_abs).all())
+    assert bool((d32.float().abs() > 16.0 * 16.0 * prob_abs).any()), "the 32.0 call was served the 16.0 kernel"
+    assert bool((omitted.float().abs() > 32.0 * 32.0 * prob_abs).any()), "the unclamped call was served a clamped kernel"
+    _assert_same_bytes(explicit_none, omitted, "tanh_clamp_scale=None vs argument omitted")
+    _assert_same_bytes(d16_again, d16, "tanh_clamp_scale=16.0 repeated after other scales")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("use_tmem_post_rht_amax", POST_RHT_AMAX_PATHS)
+@pytest.mark.parametrize("rht_sign_mask", RHT_SIGN_MASKS)
+def test_grouped_gemm_glu_hadamard_srelu_rht_sign_mask(request, rht_sign_mask, use_tmem_post_rht_amax):
+    """rht_sign_mask changes only PostRhtAmax, to the amax of the sign-randomized transform.
+
+    Runs with the soft clamp: unclamped relu(C)^2 on this data has isolated outliers that
+    dominate their 16-token block, and a block dominated by one element has the same
+    transform amax under every sign pattern, which would make the mask unobservable.
+    """
+    case = _build_srelu_option_case(request)
+    inputs, _ = case
+    common = dict(tanh_clamp_scale=16.0, use_tmem_post_rht_amax=use_tmem_post_rht_amax)
+    unmasked = _run_srelu_option_case(case, **common)
+    masked = _run_srelu_option_case(case, rht_sign_mask=rht_sign_mask, **common)
+    _, d, _ = _stored_cd_prob(inputs, masked)
+
+    for name in ("c_tensor", "d_tensor", "amax_tensor"):
+        _assert_same_bytes(masked[name], unmasked[name], f"{name} with vs without rht_sign_mask")
+
+    _assert_post_rht_amax(inputs, unmasked, d)
+    _assert_post_rht_amax(inputs, masked, d, rht_sign_mask)
+
+    live = [expert for expert, _, group_m in _expert_slices(inputs) if group_m]
+    masked_amax = masked["post_rht_amax_tensor"].reshape(-1).cpu()[live]
+    unmasked_amax = unmasked["post_rht_amax_tensor"].reshape(-1).cpu()[live]
+    if rht_sign_mask == 0xFFFF:
+        # Negating every input negates every output: the amax cannot move.
+        assert torch.equal(masked_amax, unmasked_amax)
+    else:
+        assert not torch.equal(masked_amax, unmasked_amax), "rht_sign_mask did not reach the kernel (or was dropped from the cache key)"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("use_tmem_post_rht_amax", POST_RHT_AMAX_PATHS)
+def test_grouped_gemm_glu_hadamard_srelu_options_replay(request, use_tmem_post_rht_amax):
+    """Every returned output keeps identical bytes across repeated calls with fixed inputs.
+
+    This is run-to-run repeatability under scheduling pressure only. It does not establish
+    batch invariance: Amax and PostRhtAmax are whole-expert reductions.
+    """
+    case = _build_srelu_option_case(request)
+
+    def run():
+        outputs = _run_srelu_option_case(case, tanh_clamp_scale=16.0, rht_sign_mask=0xA5C3, use_tmem_post_rht_amax=use_tmem_post_rht_amax)
+        return {name: outputs[name] for name in ("c_tensor", "d_tensor", "amax_tensor", "post_rht_amax_tensor")}
+
+    assert_replays(run)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        pytest.param({"act_func": "swiglu", "tanh_clamp_scale": 16.0}, "tanh_clamp_scale is only supported with act_func='srelu'", id="clamp_with_glu"),
+        pytest.param({"tanh_clamp_scale": 0.0}, "tanh_clamp_scale must be finite and positive", id="clamp_zero"),
+        pytest.param({"tanh_clamp_scale": -16.0}, "tanh_clamp_scale must be finite and positive", id="clamp_negative"),
+        pytest.param({"tanh_clamp_scale": float("inf")}, "tanh_clamp_scale must be finite and positive", id="clamp_inf"),
+        pytest.param({"tanh_clamp_scale": float("nan")}, "tanh_clamp_scale must be finite and positive", id="clamp_nan"),
+        pytest.param({"rht_sign_mask": -1}, "rht_sign_mask must be a 16-bit integer", id="mask_negative"),
+        pytest.param({"rht_sign_mask": 1 << 16}, "rht_sign_mask must be a 16-bit integer", id="mask_too_wide"),
+        pytest.param({"rht_sign_mask": 1.5}, "rht_sign_mask must be a 16-bit integer", id="mask_not_int"),
+    ],
+)
+def test_grouped_gemm_glu_hadamard_srelu_options_reject_invalid(request, kwargs, match):
+    case = _build_srelu_option_case(request)
+    with pytest.raises(ValueError, match=match):
+        _run_srelu_option_case(case, **kwargs)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("invalid_mask", [1.5, 1.0, "1"], ids=["mask_1.5", "mask_1.0", "mask_str"])
+def test_grouped_gemm_glu_hadamard_srelu_rejects_invalid_rht_sign_mask_on_warm_cache(request, invalid_mask):
+    """An invalid mask is rejected even when a valid call has already cached the kernel it would map to.
+
+    The wrapper normalizes the mask with int() for its cache key, so 1.5, 1.0 and "1" all land on
+    the entry a valid rht_sign_mask=1 call creates. Rejection must not depend on prior calls.
+    """
+    case = _build_srelu_option_case(request)
+    common = dict(tanh_clamp_scale=16.0)
+    _run_srelu_option_case(case, rht_sign_mask=1, **common)
+    with pytest.raises(ValueError, match="rht_sign_mask must be a 16-bit integer"):
+        _run_srelu_option_case(case, rht_sign_mask=invalid_mask, **common)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_grouped_gemm_glu_hadamard_rejects_rht_sign_mask_with_sample_hadamard(request):
+    """A caller-supplied Hadamard tensor already carries its signs; a mask on top is ambiguous."""
+    from cudnn import GroupedGemmGluHadamardSm100
+    from cudnn.gemm.cutedsl.grouped.glu_hadamard.hadamard_utils import HADAMARD_SIZE, hadamard_matrix
+
+    cfg = _make_cfg(request, ab_dtype=torch.float4_e2m1fn_x2, sf_dtype=torch.float8_e8m0fnu, sf_vec_size=16)
+    inputs = allocate_grouped_gemm_input_tensors(
+        n=cfg["n"],
+        k=cfg["k"],
+        l=cfg["l"],
+        group_m_list=cfg["group_m_list"],
+        ab_dtype=cfg["ab_dtype"],
+        sf_dtype=cfg["sf_dtype"],
+        sf_vec_size=cfg["sf_vec_size"],
+        m_aligned=cfg["m_aligned"],
+        b_major=cfg["b_major"],
+    )
+    outputs = _allocate_outputs(inputs, cfg)
+    with pytest.raises(ValueError, match="rht_sign_mask cannot be combined with sample_hadamard"):
+        GroupedGemmGluHadamardSm100(
+            sample_a=inputs["a_tensor"],
+            sample_b=inputs["b_tensor"],
+            sample_c=outputs["c_tensor"],
+            sample_d=outputs["d_tensor"],
+            sample_sfa=inputs["sfa_tensor"],
+            sample_sfb=inputs["sfb_tensor"],
+            sample_padded_offsets=inputs["padded_offsets_tensor"],
+            sample_alpha=inputs["alpha_tensor"],
+            sample_prob=inputs["prob_tensor"],
+            sample_amax=outputs["amax_tensor"],
+            sample_post_rht_amax=outputs["post_rht_amax_tensor"],
+            sample_hadamard=hadamard_matrix(HADAMARD_SIZE, dtype=torch.bfloat16, device=inputs["a_tensor"].device),
+            rht_sign_mask=0xA5C3,
+        )

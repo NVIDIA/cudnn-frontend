@@ -388,7 +388,7 @@ def prefix_sum(t):
     t = t.flatten()
     return torch.cat((torch.zeros(1, dtype=t.dtype, device=t.device), torch.cumsum(t, dim=0)))
 
-def convert_packed_to_uniform(packed_tensor, seq_len, s_max, fill_value=0):
+def convert_packed_to_uniform(packed_tensor, seq_len, s_max, fill_value=0, origins=None):
     assert packed_tensor.dim() == 3
     t, h, d = packed_tensor.size()
     seq_len = seq_len.flatten()
@@ -398,13 +398,15 @@ def convert_packed_to_uniform(packed_tensor, seq_len, s_max, fill_value=0):
 
     t_idx = 0
     for bi, s in enumerate(seq_len):
+        if origins is not None:
+            t_idx = origins[bi]
         uniform_tensor[bi, 0:s, :, :] = packed_tensor[t_idx : t_idx + s, :, :]
         t_idx += s
 
     uniform_tensor = torch.einsum("bshd->bhsd", uniform_tensor)
     return uniform_tensor
 
-def convert_uniform_to_packed(uniform_tensor, seq_len, max_t):
+def convert_uniform_to_packed(uniform_tensor, seq_len, max_t, origins=None):
     assert uniform_tensor.dim() == 4
     uniform_tensor = torch.einsum("bhsd->bshd", uniform_tensor)
     b, s, h, d = uniform_tensor.size()
@@ -414,10 +416,23 @@ def convert_uniform_to_packed(uniform_tensor, seq_len, max_t):
 
     t_idx = 0
     for bi, s_len in enumerate(seq_len):
+        if origins is not None:
+            t_idx = origins[bi]
         packed_tensor[t_idx : t_idx + s_len, :, :] = uniform_tensor[bi, 0:s_len, :, :]
         t_idx += s_len
 
     return packed_tensor
+
+def ragged_live_rows(seq_len, capacity, origins=None, *, device=None):
+    """Rows containing logical tokens; interior storage gaps are not live tokens."""
+    live = torch.zeros(capacity, dtype=torch.bool, device=device)
+    start = 0
+    for index, length in enumerate(seq_len):
+        if origins is not None:
+            start = origins[index]
+        live[start : start + length] = True
+        start += length
+    return live
 
 def create_container_and_page_table(tensor, block_size, seq_lens=None, layout="hnd"):
     """Carve the dense (B, H, S, D) ``tensor`` into K/V page pools plus an INT32 block table.

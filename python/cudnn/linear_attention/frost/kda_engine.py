@@ -14,7 +14,7 @@ from operator import itemgetter
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
-from cudnn.frost.device import build_device, current_device, multiprocessor_count
+from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
 from .common.piece_chain import chain_min_tokens
@@ -23,6 +23,51 @@ from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_ga
 
 # the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
 PREP_TILE_FRACTION = 0.475
+_KDA_STATE_WAVE_BYTES = 1024**3
+_KDA_CHECKPOINT_WAVE_BYTES = 5 * 1024**3
+_KDA_LARGE_WAVE_BYTES = 16 * 1024**3
+
+
+def _checkpoint_head_divisor(heads: int, checkpoint_bytes: int, num_pieces: int, num_sm: int) -> int:
+    """Limit private state/checkpoint storage with five bounded codegen variants.
+
+    Each wave retains a complete recurrence per head. Avoid further splitting
+    a wave below half the SM count: a few long sequences need their head-level
+    parallelism. Eight or more waves require at least four tasks per SM
+    per wave to amortize repeated scheduling and ragged tails. The storage
+    budget is a preference, not an allocation limit. Sixteen waves are reserved
+    for arenas whose conservative capacity still exceeds 16 GiB after eight
+    waves; ordinary shapes retain their existing launch count.
+    """
+    selected = 1
+    for divisor in (2, 4, 8, 16):
+        if checkpoint_bytes <= selected * _KDA_CHECKPOINT_WAVE_BYTES:
+            break
+        if divisor == 16 and checkpoint_bytes <= 8 * _KDA_LARGE_WAVE_BYTES:
+            break
+        minimum_tasks = 4 * num_sm if divisor >= 8 else max(1, num_sm // 2)
+        if heads % divisor == 0 and num_pieces * heads // divisor >= minimum_tasks:
+            selected = divisor
+    return selected
+
+
+def _forward_head_divisor(heads: int, state_bytes: int, num_pieces: int, num_sm: int, live_state_bytes: int | None = None) -> int:
+    """Retain the latency policy unless a dense shape needs a smaller state arena.
+
+    ``state_bytes`` retains the previous three-state cost for the usual one/two
+    wave choice. Exact H/X reuse reduces the live cost without adding launches.
+    Above 16 GiB of live states per wave, allow four/eight waves only when each
+    retains four planned tasks per SM. This is a shape-only preference, not a
+    cap on all workspace, transport, or caller-owned storage.
+    """
+    selected = min(2, _checkpoint_head_divisor(heads, state_bytes, num_pieces, num_sm))
+    live_state_bytes = state_bytes if live_state_bytes is None else live_state_bytes
+    for divisor in (4, 8):
+        if live_state_bytes <= selected * _KDA_LARGE_WAVE_BYTES:
+            break
+        if heads % divisor == 0 and num_pieces * heads // divisor >= 4 * num_sm:
+            selected = divisor
+    return selected
 
 
 def build_kda(graph):
@@ -138,7 +183,7 @@ class CompiledKda:
         from cuda.bindings.driver import CUstream
 
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, is_dv_split, piece_capacity, piece_table_layout
         from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
@@ -184,7 +229,7 @@ class CompiledKda:
         self.composed_fold = None
         self.n_heads_out = HO
         self.num_seqs = B
-        self.pieces, self.unit_chunks = choose_pieces(
+        self.pieces, self.unit_chunks, self.length_rule = choose_kda_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
@@ -194,6 +239,7 @@ class CompiledKda:
             batch_invariant=self.batch_invariant,
             expand_num=1,
             min_tokens=chain_min_tokens(reverse=False),
+            enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
         self.chain = self.pieces > 0
         self.dv_split = (
@@ -213,7 +259,6 @@ class CompiledKda:
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
-        self.length_rule = self.chain and self.batch_invariant
 
         from .common.host import get_dtype
         from .common.steep_decay import STEEP_OFF, steep_mode_for
@@ -222,7 +267,13 @@ class CompiledKda:
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
+            state_bytes = self.num_pieces * HO * (2 * V * K + K * K) * 4
+            live_state_bytes = self.num_pieces * HO * (V * K + K * K) * 4
+            self.state_head_divisor = _forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm, live_state_bytes)
+            state_heads = HO // self.state_head_divisor
+            if self.state_head_divisor > 1:
+                regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
             off_scheduler = layout.add(24)
@@ -233,8 +284,11 @@ class CompiledKda:
                 ("scheduler_all", off_scheduler, "int32", (6,)),
                 ("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
+            # The state chain reads each lane-owned H vector before replacing
+            # it with X. H has no later consumer; M remains a separate arena.
+            off_state_hx = layout.add(self.num_pieces * state_heads * V * K * 4)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
                 ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
@@ -242,9 +296,9 @@ class CompiledKda:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
-                ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
+                ("state_h", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)),
+                ("state_m", layout.add(self.num_pieces * state_heads * K * K * 4), "float32", (self.num_pieces, state_heads, K, K)),
+                ("state_x", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)),
             ]
             from .kernel import kda_summary_f16 as summary_module
 
@@ -431,8 +485,9 @@ class CompiledKda:
 
     def run_chain(self, q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream) -> None:
         """Chain prologue, fused H and M summaries, fp32 state chain seeded with initial_state, prefill over the pieces seeded
-        with X, all four launched from one compiled host (kernel/kda_chain_forward_f16.py); the checkpoint series keeps its
-        unsplit layout."""
+        with X, launched from one compiled host (kernel/kda_chain_forward_f16.py). Independent-head waves reuse
+        private H/M/X storage after each prefill completes; caller seeds, final states and checkpoint series keep their
+        unsplit layouts and arithmetic. The immutable piece geometry is shared by all waves."""
         state_h = region["state_h"]
         buffers = dict(
             q=q,
@@ -465,6 +520,7 @@ class CompiledKda:
             final_state=final_state,
             final_indices=state_indices,
             checkpoints=state_checkpoints if self.has_state_checkpoints and self.checkpoint else None,
+            state_wave_counts=region.get("state_wave_counts"),
         )
         checkpoint = self.checkpoint if self.has_state_checkpoints else 0
         if self.chain_launch is None:
@@ -485,6 +541,7 @@ class CompiledKda:
                 checkpoint_every_n_tokens=checkpoint,
                 scale=self.scale,
                 chain_rows=self.chain_rows_per_cta(state_h.shape[2], state_h.shape[3], self.num_seqs, self.n_heads_out, self.num_sm),
+                state_head_divisor=self.state_head_divisor,
                 device=self.device,
                 num_sm=self.num_sm,
                 stream=stream,
@@ -513,7 +570,7 @@ class CompiledKdaBwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, chain_min_tokens, choose_kda_pieces, piece_capacity, piece_table_layout
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -570,7 +627,7 @@ class CompiledKdaBwd:
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
-        self.pieces, self.unit_chunks = choose_pieces(
+        self.pieces, self.unit_chunks, self.length_rule = choose_kda_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
@@ -581,10 +638,10 @@ class CompiledKdaBwd:
             reverse=True,
             expand_num=1,
             min_tokens=chain_min_tokens(reverse=True),
+            enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
         self.chain = self.pieces > 0
-        self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
         self.has_context = bool(node.params.get("input_context", False))
         self.context = (
@@ -655,11 +712,36 @@ class CompiledKdaBwd:
         regions.append(("work_count", layout.add(4), "int32", (1,)))
         if "following_state_grad" in node.inputs:
             regions.append(("composed_dstate", layout.add(HO * V * K * 4, align=16), "float32", (1, HO, V, K)))
+        self.checkpoint_head_divisor = 1
+        self.state_head_divisor = 1
+        checkpoint_bytes = 0
         if self.needs_recompute:
             self.state_checkpoints_rows = max(total // self.b_t + self.num_pieces, 1)
-            regions.append(
-                ("state_checkpoints", layout.add(self.state_checkpoints_rows * HO * K * V * 2), self.io_name, (self.state_checkpoints_rows, HO, V, K))
-            )
+            # Bound the internal dense series by reusing it across independent
+            # heads. Caller checkpoints and coarse seeds retain their ABI.
+            if self.chain and not self.coarse_checkpoints:
+                checkpoint_bytes = self.state_checkpoints_rows * HO * K * V * 2
+                state_bytes = self.num_pieces * HO * max(V, K) * K * 4
+                capacity_bytes = max(checkpoint_bytes, 4 * state_bytes) if not self.has_context else checkpoint_bytes
+                self.checkpoint_head_divisor = _checkpoint_head_divisor(HO, capacity_bytes, self.num_pieces, self.num_sm)
+                if not self.has_context and state_bytes > _KDA_STATE_WAVE_BYTES:
+                    self.state_head_divisor = self.checkpoint_head_divisor
+            checkpoint_heads = HO // self.checkpoint_head_divisor
+            checkpoint_bytes = self.state_checkpoints_rows * checkpoint_heads * K * V * 2
+        if self.state_head_divisor > 1:
+            # Main/summary counts alias the last row-base entries. Keep those
+            # immutable: a wave has its own two counters.
+            regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
+        # H/G and M are dead after the two state chains. The dense checkpoint
+        # series is produced only after that point, so it reuses their arena.
+        # X and dX remain live through recompute/backward and stay disjoint.
+        state_heads = HO // self.state_head_divisor
+        reuse_phase_arena = self.chain and not self.has_state_checkpoints
+        phase_m_bytes = self.num_pieces * state_heads * K * K * 4 if reuse_phase_arena and not self.has_piece_transitions else 0
+        phase_hg_bytes = self.num_pieces * state_heads * V * K * 4 if reuse_phase_arena else 0
+        phase_offset = layout.add(max(checkpoint_bytes, phase_m_bytes + phase_hg_bytes))
+        if self.needs_recompute:
+            regions.append(("state_checkpoints", phase_offset, self.io_name, (self.state_checkpoints_rows, checkpoint_heads, V, K)))
         self.recompute_tensormap_bytes = tensormap_workspace_bytes(recompute_module, self.num_pieces)
         if self.needs_recompute and not self.chain:
             regions.append(("recompute_tensormaps", layout.add(self.recompute_tensormap_bytes, align=128), "int64", (self.recompute_tensormap_bytes // 8,)))
@@ -695,9 +777,9 @@ class CompiledKdaBwd:
         if self.safe_gate and self.has_dt_bias:
             regions.append(("gate_part_dt", layout.add(self.gate_bwd_blocks * HO * K * 4), "float32", (self.gate_bwd_blocks * HO * K,)))
         if self.chain:
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
-            state_shape = (self.num_pieces, HO, V, K)
+            state_shape = (self.num_pieces, state_heads, V, K)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
                 ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
@@ -705,15 +787,29 @@ class CompiledKdaBwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_dx_end", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
+                ("state_dx_end", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", state_shape),
             ]
             if not self.has_piece_transitions:
-                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+                regions.append(
+                    (
+                        "state_m",
+                        phase_offset if reuse_phase_arena else layout.add(self.num_pieces * state_heads * K * K * 4),
+                        "float32",
+                        (self.num_pieces, state_heads, K, K),
+                    )
+                )
             if not self.has_piece_tables:
-                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(
+                    (
+                        "state_g",
+                        phase_offset + phase_m_bytes if reuse_phase_arena else layout.add(self.num_pieces * state_heads * V * K * 4),
+                        "float32",
+                        state_shape,
+                    )
+                )
             if not self.has_state_checkpoints:
-                regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
-                regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(("state_h", phase_offset + phase_m_bytes, "float32", state_shape))
+                regions.append(("state_x", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", state_shape))
         self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, self.num_pieces)
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
         d_final = node.inputs.get("d_final_state")
@@ -931,7 +1027,10 @@ class CompiledKdaBwd:
     ) -> None:
         """Chain prologue, H and M summaries (M alone when the series is passed back), forward chain X, G summary, reverse
         chain seeded with d_final_state, dense series (the forward's or the seeded recompute), bprop over the pieces: one
-        compiled launch."""
+        compiled host call. Independent-head waves reuse private states and
+        checkpoints only after their consumers finish. Caller context and
+        checkpoint layouts stay full-head; recurrence and reduction order are
+        unchanged. The build fixes the wave topology and workspace layout."""
         series = not (self.has_state_checkpoints and not self.coarse_checkpoints)
         coarse = self.coarse_checkpoints
         buffers = dict(
@@ -949,6 +1048,7 @@ class CompiledKdaBwd:
             summary_rows=region["summary_rows"],
             main_count=region["main_count"],
             summary_count=region["summary_count"],
+            state_wave_counts=region.get("state_wave_counts"),
             work_items=region["work_items"],
             work_items_summary=region["work_items_summary"],
             series_items=region.get("work_items_recompute"),
@@ -998,6 +1098,8 @@ class CompiledKdaBwd:
             scale=self.scale,
             has_piece_transitions=self.has_piece_transitions,
             has_piece_state_grads=self.has_piece_tables,
+            checkpoint_head_divisor=self.checkpoint_head_divisor,
+            state_head_divisor=self.state_head_divisor,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(
@@ -1068,7 +1170,7 @@ class CompiledKdaSummary:
     def __init__(self, node, recompute_module):
         """Resolve graph attributes and select the forward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
+        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
         from .common.split_k import WORK_ITEM_FIELDS
 
@@ -1122,7 +1224,7 @@ class CompiledKdaSummary:
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         from .kernel import kda_summary_f16 as summary_module
 
         self.fused_summary = summary_module
@@ -1137,7 +1239,7 @@ class CompiledKdaSummary:
                 ("scheduler_m", off_scheduler + 8, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (6,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -1419,7 +1521,7 @@ class CompiledKdaSummaryBwd:
     def __init__(self, node, summary_module):
         """Resolve graph attributes and select the backward-summary schedule."""
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
+        from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout, run_state_chain
         from .kernel.kda_chain_prologue_f16 import run_chain_prologue
         from .common.split_k import WORK_ITEM_FIELDS
 
@@ -1499,7 +1601,7 @@ class CompiledKdaSummaryBwd:
         self.context_size = self.context.size if self.has_context else 0
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         self.has_piece_tables = self.has_context and self.context.has_tables
         layout = WorkspaceLayout()
         regions = []
@@ -1525,7 +1627,7 @@ class CompiledKdaSummaryBwd:
                 ("scheduler_m", off_scheduler + 8, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (6,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),

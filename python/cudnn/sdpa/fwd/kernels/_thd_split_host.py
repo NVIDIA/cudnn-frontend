@@ -124,7 +124,7 @@ def host_independent_kv(
         stats_log2,
         stream,
         sinks_ptr=sinks_ptr if cutlass.const_expr(has_sink) else None,
-        prefetch_group=(2 if splits <= 2 else 4 if splits <= 4 else 8 if splits <= 8 else 0),
+        prefetch_group=(2 if splits <= 2 else 4 if splits <= 4 else 8 if splits <= 8 else 16 if splits <= 16 else 0),
         cu_q_ptr=meta_ptr + cutlass.Int64(b) if cutlass.const_expr(thd_origin_ptrs is not None) else None,
         origin_ptrs=thd_origin_ptrs,
         origin_specs=thd_origin_specs,

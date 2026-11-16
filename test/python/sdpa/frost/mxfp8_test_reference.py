@@ -49,8 +49,12 @@ def _ref(
     seq_lens_q=None,
     seq_lens_kv=None,
     return_stats=False,
+    exclude_own_block=0,
 ):
-    """fp32 reference matching the kernel's mask + sink semantics (BHSD; GQA-aware)."""
+    """fp32 reference matching the kernel's mask + sink semantics (BHSD; GQA-aware).
+
+    ``exclude_own_block`` = B > 0 (sdpa_mxfp8(causal_exclude_own_block=B)) also masks the query's own aligned
+    B-key block: keys j >= B * floor(i / B) (rows 0 .. B-1 keep no key: O = 0, Stats = -inf)."""
     b, h_q, s_q, _ = qd.shape
     _, h_kv, s_kv, _ = vd.shape
     dev = qd.device
@@ -71,6 +75,8 @@ def _ref(
     if is_causal:
         lim = i + diag
         masked = masked | (j > lim + right_bound)
+    if exclude_own_block:
+        masked = masked | (j >= (i // exclude_own_block) * exclude_own_block + diag)
     if swa_window is not None:
         swa_base = i + diag
         masked = masked | (j < swa_base - swa_window)
@@ -109,7 +115,7 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     [h, n_tiles, SF_SMEM] uint8) where n_tiles = ceil(s/128): the quantizer's
     F8_128x4 atom padding rounds the S extent up to a multiple of 128, i.e.
     exactly the kernel's per-sequence-TILE-padded SF layout."""
-    from sdpa.mxfp8_quant import quantize_to_mxfp8
+    from sdpa.mxfp8_quant import pack_thd_columnwise_sf, quantize_to_mxfp8
 
     if s == 0:
         # Zero-length sequence: no tokens, no SF tiles.
@@ -123,7 +129,6 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
         # contract keeps every sequence tile contiguous, so transpose
         # [ceil(D/128), H, tile, 512] into [H, tile, ceil(D/128), 512] before
         # sequences are concatenated in cu_seqlens order.
-        planes = _cdiv(d, 128)
-        sf = swz_s.view(torch.uint8).reshape(planes, h, n_tiles, 512).permute(1, 2, 0, 3).contiguous().reshape(h, n_tiles, -1)
+        sf = pack_thd_columnwise_sf(swz_s, h, s, d)
         return data_s, dq_s.reshape(1, h, s, d), sf
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)

@@ -39,6 +39,23 @@ def _check_invariance(graph, nodes, values, state, workspace, overrides, flat, s
         for name, tensor in values.items():
             tensor.copy_(saved[name])
 
+    def repack_scales(order):
+        # MXFP8 data origins can move independently; scales remain packed in
+        # logical sequence order. Copy existing tile bytes, never requantize.
+        for name, lengths in (("q", ql), ("k", kl), ("v", kl)):
+            key = "sf_" + name
+            if key not in values:
+                continue
+            starts = [0]
+            for length in lengths:
+                starts.append(starts[-1] + (length + 127) // 128)
+            values[key].zero_()
+            dst = 0
+            for index in order:
+                count = starts[index + 1] - starts[index]
+                values[key][:, dst : dst + count].copy_(saved[key][:, starts[index] : starts[index + 1]])
+                dst += count
+
     def run():
         values["o"].fill_(-17)
         values["stats"].fill_(-29)
@@ -60,6 +77,7 @@ def _check_invariance(graph, nodes, values, state, workspace, overrides, flat, s
             values[name].copy_(saved[name][permutation])
         for name in ("q", "k", "v", "o", "stats"):
             values["ro_" + name][:-1].copy_(saved["ro_" + name][:-1][permutation])
+        repack_scales((2, 0, 3, 1))
         run()
         for name in full:
             assert torch.equal(bits(values[name]), full[name]), name
@@ -70,17 +88,20 @@ def _check_invariance(graph, nodes, values, state, workspace, overrides, flat, s
         values["kl"][2] = kl[0]
         for name in ("q", "k", "v"):
             values["ro_" + name][2].copy_(values["ro_" + name][0])
+        repack_scales((0, 1, 0, 3))
         run()
         for name in expected:
             assert torch.equal(bits(live(name, 2)), expected[name]), name
         restore()
         values["ql"][1:] = 0
         values["kl"][1:] = 0
+        repack_scales((0,))
         run()
         restore()
         for name in ("q", "k", "v"):
             length = ql[2] if name == "q" else kl[2]
-            flat(values[name])[origins[name][2] : origins[name][2] + length].mul_(0.5)
+            live_input = flat(values[name])[origins[name][2] : origins[name][2] + length]
+            live_input.copy_(live_input.float() * 0.5)
         run()
     finally:
         restore()

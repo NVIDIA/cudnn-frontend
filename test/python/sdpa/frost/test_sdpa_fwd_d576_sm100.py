@@ -311,7 +311,9 @@ def test_native_d576_register_split_sass(tmp_path, arch, monkeypatch, thd, split
     result = run_sass_probe(tmp_path, probe_src=probe, arch=arch, params={"thd": thd, "splits": splits}, tag="native_d576", timeout=180)
     assert result.expect["SMEM_TOTAL"] == 224120
     assert result.stats["ALLOC_192"] == result.stats["ALLOC_208"] == 1
-    assert result.stats["DEALLOC_40"] == 4
+    # All four service warps release at one common instruction before role dispatch.
+    # TestServiceRegisterRelease checks the emitted PTX guard's lane participation.
+    assert result.stats["DEALLOC_40"] == 1
     assert_no_new_spills(result.stats, {"LDL": 0, "STL": 0})
 
 

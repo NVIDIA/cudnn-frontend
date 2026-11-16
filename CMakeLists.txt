@@ -10,6 +10,7 @@ option(CUDNN_FRONTEND_BUILD_SAMPLES "Defines if samples are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_TESTS "Defines if unittests are built or not." ON)
 option(CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS "Defines if python bindings are built or not." OFF)
 option(CUDNN_FRONTEND_ENABLE_RTTI "Build in-tree targets with RTTI. Off by default so the headers stay compilable for consumers that disable it." OFF)
+option(CUDNN_FRONTEND_BUILD_AOT_SM120 "Build libcudnn_frontend_aot_sm120.so (ahead-of-time sm_120a attention kernels; needs the CuTeDSL wheel)." OFF)
 
 if(MSVC OR MSYS OR MINGW)
     add_compile_options(/W4 /WX)
@@ -55,6 +56,10 @@ target_include_directories(
 
 target_compile_features(cudnn_frontend INTERFACE cxx_std_17)
 
+# Optional C++ AOT loader; linking cudnn_frontend alone adds no dynamic-loader dependency.
+add_library(cudnn_frontend_aot_loader INTERFACE)
+target_link_libraries(cudnn_frontend_aot_loader INTERFACE cudnn_frontend ${CMAKE_DL_LIBS})
+
 # Make PCH for targets to link against
 add_library(_cudnn_frontend_pch INTERFACE)
 target_precompile_headers(_cudnn_frontend_pch INTERFACE ${PROJECT_SOURCE_DIR}/include/cudnn_frontend.h)
@@ -71,6 +76,10 @@ if (CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS)
     add_subdirectory(python)
 endif()
 
+if (CUDNN_FRONTEND_BUILD_AOT_SM120)
+    add_subdirectory(aot)
+endif()
+
 # Introduce variables:
 # * CMAKE_INSTALL_LIBDIR
 # * CMAKE_INSTALL_BINDIR
@@ -82,7 +91,7 @@ include(CMakePackageConfigHelpers)
 
 # Install the components
 install(
-    TARGETS cudnn_frontend
+    TARGETS cudnn_frontend cudnn_frontend_aot_loader
     EXPORT cudnn_frontend_targets FILE_SET HEADERS
 )
 

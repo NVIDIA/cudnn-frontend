@@ -1,0 +1,125 @@
+{
+  "inputs": {
+    "descale_k": {
+      "dtype": "torch.float32",
+      "sha256": "d388666e2351caf97e32db79dd5efdff3de2d4073eff49ef61edc7d7fd6a6250",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "descale_q": {
+      "dtype": "torch.float32",
+      "sha256": "030a1a64b337c633d995221728d15e8b0d086cc0dcf4557205111b089b04464d",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "descale_s": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "descale_v": {
+      "dtype": "torch.float32",
+      "sha256": "2f0d6f3d65a7e28c4223e4389106e46f1e9010a2bd724d35f9794cb8a86d7c68",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "k": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "066bae692d731412f4e7df711697d95de8b13c38e1048464e3bac6d724987d6f",
+      "shape": [
+        147,
+        2,
+        128
+      ]
+    },
+    "q": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "35ca2606e878add7136863f1b796f68abdaf76f7ac96efeb9fe3b6fa86186172",
+      "shape": [
+        129,
+        8,
+        128
+      ]
+    },
+    "scale_o": {
+      "dtype": "torch.float32",
+      "sha256": "ffcd594324296033e35bb6b3ea4a3d6e9b3b4db169f4e1968861c5746a9bf958",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "scale_s": {
+      "dtype": "torch.float32",
+      "sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+      "shape": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.float8_e5m2",
+      "sha256": "4e908b40e4003083a13d8aee0020ceb6bca29a35c3e548a370ef370b98940cc9",
+      "shape": [
+        147,
+        2,
+        128
+      ]
+    }
+  },
+  "outputs": {
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "c067d37e50fcbfdf2d09ed3ea0eb31a673831a37f1ca98c5391e4677a427ee7a",
+      "shape": [
+        129,
+        8,
+        128
+      ]
+    },
+    "stats": {
+      "dtype": "torch.float32",
+      "sha256": "d404589232cde6a094407d1b1d82ce1b33ad6a8c41aff34c359c8e5e898f7ca9",
+      "shape": [
+        129,
+        8
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13050,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "sm": [
+      12,
+      0
+    ],
+    "sm_count": 170,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

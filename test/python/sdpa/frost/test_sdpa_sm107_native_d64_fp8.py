@@ -49,7 +49,7 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
 
     def record(path, params, *args, **kwargs):
         module = load(path, params, *args, **kwargs)
-        if path.endswith("/sm107/prefill_d128_fp8.py"):
+        if path.endswith("/sm107/d128_fp8_multi_q/kernel.py"):
             loaded.append(module)
         return module
 
@@ -114,7 +114,8 @@ def test_native_d64_fp8_rebind_replay(in_key, out_dtype, mode, d, packed, splits
             am.set_output(True).set_dim(amax.shape).set_stride(amax.stride()).set_data_type(cudnn.data_type.FLOAT)
         graph.validate()
         graph.build_operation_graph()
-        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()["sdpa_fwd_prefill_sm107_fp8"]
+        name = "sdpa_fwd_sm107_d128_fp8_multi_q" if d == 64 else "sdpa_fwd_prefill_sm107_fp8"
+        engine = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[name]
         knobs = {
             getattr(cudnn.knob_type, name): value
             for name, value in dict(TILE_M=128, TILE_N=tile_n, TILE_CGA_M=cga, PACK_GQA=int(packed), SPLIT_KV=splits, SCHED_POLICY=scheduler).items()

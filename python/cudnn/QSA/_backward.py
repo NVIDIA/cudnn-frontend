@@ -32,7 +32,6 @@ from .kernels.bprop_sm100 import (
     DP_SYNC,
     DP_TT,
     DP_U_MAX,
-    DQ_PARTS_DEFAULT,
     F32,
     GQ,
     I32,
@@ -108,13 +107,11 @@ class LaunchPlan:
         max_seq_len: Optional[int] = None,
         arch: int = 100,
         gq: int = GQ,
-        dq_parts: int = DQ_PARTS_DEFAULT,
         rubin: bool = False,
         deterministic: bool = False,
     ):
         T = int(seq_len)
         assert hkv in (1, 2), f"{hkv} KV heads"
-        assert dq_parts in (1, 3), f"{dq_parts} dS parts"
         assert gq == GQ or (gq == 6 and hkv == 1), f"{gq} query heads per KV head with {hkv} KV heads"
         assert 1 <= T <= max_packed_len(hkv, gq), f"sequence length {T} outside [1, {max_packed_len(hkv, gq)}]"
         assert not rubin or arch == 107, f"the SM107 kernels on SM{arch}"
@@ -126,7 +123,6 @@ class LaunchPlan:
         self.deterministic = bool(deterministic)
         self.hkv = hkv
         self.gq = gq
-        self.dq_parts = dq_parts
         self.arch = int(arch)
         self.seq_len = T
         self.seq_mode = seq_mode
@@ -248,7 +244,6 @@ def plan_for(
     seq_mode: int,
     num_seqs: int = 1,
     gq: int = GQ,
-    dq_parts: int = DQ_PARTS_DEFAULT,
     max_seq_len: Optional[int] = None,
     deterministic: bool = False,
 ) -> LaunchPlan:
@@ -262,7 +257,6 @@ def plan_for(
         int(gq),
         bool(deterministic),
         None if max_seq_len is None else int(max_seq_len),
-        int(dq_parts),
     )
     with _PLANS_LOCK:
         plan = _PLANS.pop(key, None)
@@ -284,7 +278,6 @@ def plan_for(
                 max_seq_len,
                 arch=arch,
                 gq=gq,
-                dq_parts=dq_parts,
                 rubin=rubin,
                 deterministic=deterministic,
             )
@@ -301,7 +294,7 @@ def _fake(dtype, shape, sym, align=16):
 
 
 @lru_cache(maxsize=None)
-def _compile_args(hkv: int, gq: int, parts: int, rubin: bool, det: int) -> dict:
+def _compile_args(hkv: int, gq: int, rubin: bool, det: int) -> dict:
     """Storage-free kernel signatures, reused across plans. The shared cache owns the CUDA objects."""
     HQ = gq * hkv
     query_host, key_host, dense_host = _sparse_query_host, _sparse_key_host, _dpair_host
@@ -427,11 +420,10 @@ def _compile_args(hkv: int, gq: int, parts: int, rubin: bool, det: int) -> dict:
             F32(1),
             hkv,
             gq,
-            parts,
             stream,
         ),
-        "dense": lambda: (dense_host, *dense_fakes, 0, hkv, gq, parts, det, stream),
-        "dense_pdl": lambda: (dense_host, *dense_fakes, 1, hkv, gq, parts, det, stream),
+        "dense": lambda: (dense_host, *dense_fakes, 0, hkv, gq, det, stream),
+        "dense_pdl": lambda: (dense_host, *dense_fakes, 1, hkv, gq, det, stream),
         "fin": lambda: (_fin_host, *fin_fakes, 0, hkv, gq, stream),
         "fin_sparse": lambda: (_fin_host, *fin_fakes, 1, hkv, gq, stream),
     }
@@ -471,7 +463,6 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     config = {
         "hkv": plan.hkv,
         "gq": plan.gq,
-        "parts": plan.dq_parts,
         "arch": plan.arch,
         "sources": SOURCE_DIGESTS,
         "sm107": _SM107_SOURCE_DIGEST if plan.rubin else None,
@@ -479,7 +470,7 @@ def compile_kernels(plan: LaunchPlan) -> dict:
     key = template_key(globals(), config, "compile_kernels")
     # only the dense pair kernel has an ordered form
     dense_key = template_key(globals(), {**config, "deterministic": True}, "compile_kernels") if plan.deterministic else key
-    args = _compile_args(plan.hkv, plan.gq, plan.dq_parts, plan.rubin, int(plan.deterministic))
+    args = _compile_args(plan.hkv, plan.gq, plan.rubin, int(plan.deterministic))
     options = f"--enable-tvm-ffi --gpu-arch=sm_{plan.arch}a"
     return {
         name: compile_cached(*args[name], cache_key=dense_key if name.startswith("dense") else key, symbol=f"qsa_backward_{name}", options=options)
@@ -675,9 +666,7 @@ def dsl_cuda_major():
     return CUDA_VERSION.major
 
 
-def backward(
-    grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch, dq_parts=DQ_PARTS_DEFAULT, deterministic=False
-):
+def backward(grad_out, q, k, v, out_fp32, lse, sel_blocks, lo, hi, tok_base, block_first, block_last, scale, arch, deterministic=False):
     """``cudnn.ops.qsa_backward`` on SM100 / SM103 / SM107: the compacted selection through the launch sequence above."""
     from cudnn.api_base import TupleDict, WorkspaceCarver
     from . import _metadata
@@ -691,9 +680,7 @@ def backward(
     stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     ids, counts = _metadata.compact(sel_blocks, lo, hi, block_first, block_last, arch, stream)
     # the sequences come from tok_base on the device. There are at most as many as blocks.
-    plan = plan_for(
-        total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, dq_parts=dq_parts, deterministic=deterministic
-    )
+    plan = plan_for(total, q.device, hkv, SEQ_ORIGIN, num_seqs=min(total, block_first.shape[0]), gq=q.shape[1] // hkv, deterministic=deterministic)
     fns = compile_kernels(plan)
     workspace = torch.empty(plan.workspace_bytes(), dtype=torch.uint8, device=q.device)
     scratch = plan.carve(WorkspaceCarver(workspace, plan.workspace_bytes(), "qsa_backward"))

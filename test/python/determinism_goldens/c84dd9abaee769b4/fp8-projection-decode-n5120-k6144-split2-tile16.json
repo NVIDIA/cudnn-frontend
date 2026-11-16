@@ -1,0 +1,52 @@
+{
+  "inputs": {
+    "activation": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "ecdbc79fdbd75e2d30bee08de476bb3d31974e5a7c05ae81db326b6ec162f9ae",
+      "shape": [
+        12,
+        6144
+      ]
+    },
+    "scale": {
+      "dtype": "torch.float32",
+      "sha256": "08268f4f4e98892062eface288de13ec94ea556de57de53501dc6c84c1c4fe4d",
+      "shape": [
+        1
+      ]
+    },
+    "weight": {
+      "dtype": "torch.float8_e4m3fn",
+      "sha256": "e1b2c0b196df98f379c1180073332692e39f66a0962f2192abf58252c46c527d",
+      "shape": [
+        5120,
+        6144
+      ]
+    }
+  },
+  "outputs": {
+    "out": {
+      "dtype": "torch.bfloat16",
+      "sha256": "1c07f72abfd986f561a7843206246acf4214c03de7df736232f295e290016d8b",
+      "shape": [
+        12,
+        5120
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13010,
+    "cudnn": 92700,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA Graphics Device",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.13.0+cu130",
+    "tvm_ffi": "0.1.13.post3"
+  },
+  "schema": 1
+}

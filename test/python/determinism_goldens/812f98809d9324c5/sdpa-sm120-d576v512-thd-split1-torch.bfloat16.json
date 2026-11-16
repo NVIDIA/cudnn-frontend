@@ -1,0 +1,74 @@
+{
+  "inputs": {
+    "k": {
+      "dtype": "torch.bfloat16",
+      "sha256": "7473c3fe0967efa3493b80803e8ace0a3ac822ae77db4a6d5c369caaedb85264",
+      "shape": [
+        1,
+        67,
+        576
+      ]
+    },
+    "q": {
+      "dtype": "torch.bfloat16",
+      "sha256": "42a13ff990fad9d68a180fb0d91961de2e81c7a4ca0d776941b7d3283ad5bc28",
+      "shape": [
+        6,
+        17,
+        576
+      ]
+    },
+    "sink": {
+      "dtype": "torch.float32",
+      "sha256": "b50a3ceb85de22577adbc935e0e0728b0e7aa4fd6d35d79533041d6f8aa29100",
+      "shape": [
+        6
+      ]
+    },
+    "v": {
+      "dtype": "torch.bfloat16",
+      "sha256": "48fe3992b36834af70026ce062ea174794f6032586965ad8a9ea59fc6ccee3f5",
+      "shape": [
+        1,
+        67,
+        512
+      ]
+    }
+  },
+  "outputs": {
+    "lse": {
+      "dtype": "torch.float32",
+      "sha256": "c7640ee2f4e78ad5900b5bc94646fe29bed8b766cb1e6654e25176114747a4be",
+      "shape": [
+        1,
+        6,
+        17
+      ]
+    },
+    "o": {
+      "dtype": "torch.bfloat16",
+      "sha256": "cdcb196f08c4495aa636a66205f57e72320d4e0d871335e3202afdba7136c2fa",
+      "shape": [
+        1,
+        6,
+        17,
+        512
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13020,
+    "cudnn": 92400,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "sm": [
+      12,
+      0
+    ],
+    "sm_count": 188,
+    "torch": "2.14.0+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

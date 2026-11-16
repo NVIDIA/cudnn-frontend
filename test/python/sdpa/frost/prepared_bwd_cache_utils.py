@@ -47,11 +47,16 @@ from cudnn.frost import compiled_cache
 tests, package, arch, route, dtype, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
-if route.endswith("_2x2"):
-    # The SM100 d512 chain's 2x2 stage-2 twin: a module constant read when the plan compiles, flipped before anything builds.
+if arch == "sm100":
     from cudnn.sdpa.bwd import api_dsl
-    api_dsl.STAGE2_2X2 = True
-    route = route[: -len("_2x2")]
+    import test_sdpa_bwd_dsl_sm100 as dense_helper
+    import test_sdpa_bwd_thd_sm100 as thd_helper
+    twin = route.endswith("_2x2")
+    owner = "sdpa_bwd_sm100_d512_2x2" if twin else "sdpa_bwd_sm100_d512_role_split"
+    dense_helper._ENGINE = thd_helper._ENGINE = owner
+    api_dsl.STAGE2_2X2 = not twin
+    if twin:
+        route = route[: -len("_2x2")]
 if reload == "1":
     def forbidden(*a, **kw):
         raise AssertionError("prepared backward plan invoked JIT in the second process")
@@ -74,7 +79,7 @@ if arch == "sm120" and route.startswith("aux_"):
         return original(g, *args, **kwargs)
     with patch.object(cudnn.pygraph, "execute", record):
         grads = helper._run_bwd_graph(q, k, v, o, do, stats, scale=d**-0.5, is_causal=True, bias_gpu=bias, dbias_gpu=dbias, sink_gpu=sink)
-    assert grads[-1] == "sdpa_bwd_sm120"
+    assert grads[-1] == "sdpa_bwd_sm120_f16_fused"
     g, (vp, ws) = calls[-1]
     outputs = [*grads[:4], dbias]
     expected = [dq, dk, dv, aux.dsink, aux.dbias]

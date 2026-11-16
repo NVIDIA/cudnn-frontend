@@ -85,8 +85,10 @@ $$
 For **SReLU** (`act_func="srelu"`), the kernel does not split `N` into gate/up halves:
 
 $$
-D = \mathrm{prob} \cdot \mathrm{ReLU}(C)^2
+D = \mathrm{prob} \cdot \mathrm{ReLU}(\hat C)^2, \qquad \hat C = \mathrm{round}_{c\_dtype}(C)
 $$
+
+The activation is evaluated, in FP32, from `C` as it is stored in the returned `c_tensor`, so a consumer that recomputes it from the saved `C` (the dSReLU backward, activation recomputation) reproduces a BF16/FP16 `D` bit for bit. Earlier releases evaluated it from the unrounded FP32 accumulator; `D` now differs from those wherever rounding `C` to `c_dtype` changes the value (for `c_dtype=bfloat16`, up to about one part in $2^{7}$ of `D`). `swiglu` and `geglu` are unchanged.
 
 When requested, the RHT output applies a fixed 16-wide orthonormal Hadamard transform to bf16-rounded `D`. Rowwise RHT transforms feature blocks. Colwise RHT transforms token blocks and writes NVFP4 data in per-expert transposed order.
 

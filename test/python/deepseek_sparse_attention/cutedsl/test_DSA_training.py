@@ -64,7 +64,10 @@ def assert_numerics(actual, expected, tol=0.035):
         (32, 512, False, True),
         (64, 512, True, False),
         (64, 576, True, True),
+        (96, 512, True, True),
+        (96, 576, False, True),
         (128, 512, True, True),
+        (128, 576, True, True),
     ],
 )
 def test_native_training_and_original_score_slots(heads, dim, sink, lengths):
@@ -144,8 +147,8 @@ def test_stream_and_changed_input_graph_replay():
 
 
 def test_unsupported_shape_and_device_scale_fail_before_launch():
-    q, kv, idx, a, lens = inputs(128, 576)
-    with pytest.raises(NotImplementedError, match="H128 D512"):
+    q, kv, idx, a, lens = inputs(48, 576)
+    with pytest.raises(NotImplementedError, match="H16/H32/H64/H96/H128"):
         DSA.sparse_attention(q, kv, idx, a)
     q, kv, idx, a, lens = inputs()
     with pytest.raises(TypeError, match="host real"):

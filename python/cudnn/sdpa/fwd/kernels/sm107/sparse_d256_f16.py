@@ -6,7 +6,7 @@
 HEADER FIRST: this module carries its pipeline tables (warp map, barrier table with the issuing-lane ledger, SMEM table with
 swizzle + why, TMEM map, the one-helper invariant, the degenerate-input matrix) ahead of the body, so a reader checks the
 body against them instead of reconstructing the pipeline from the code.  The body is built from the SM100 swap-AB decode
-tile (``sm100/decode_d256_f16.py``: the MMA descriptors, the softmax orientation, the epilogue) plus the ``tma_gather4``
+tile (``sm100/d256_f16_swap_ab/kernel.py``: the MMA descriptors, the softmax orientation, the epilogue) plus the ``tma_gather4``
 loader; the config twin is ``config_sm107.make_cfg_d256_sparse``.
 
 WHAT IT COMPUTES.  For query row ``r`` of sequence ``b`` at position ``p`` with ``n_vis = min(p + 1, L_b)`` visible tokens

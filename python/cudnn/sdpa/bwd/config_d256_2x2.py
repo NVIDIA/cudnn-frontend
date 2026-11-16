@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 """Kernel configuration for the FROST d=256 bf16/fp16 SDPA-backward body on the **2x2 datapath**
-(``kernels/bprop_d256_2x2_f16.py``: ``tcgen05.mma.cta_group::2`` with the collective M = 128, 64 kv rows per CTA
+(``kernels/sm100/d256_f16_2x2/kernel.py``: ``tcgen05.mma.cta_group::2`` with the collective M = 128, 64 kv rows per CTA
 per sub-block).
 
 One body, two PROFILES, selected by the appended :class:`cudnn.sdpa.bwd.config_sm107.TemplateParams` field

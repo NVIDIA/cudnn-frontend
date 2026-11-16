@@ -669,6 +669,9 @@ class BlockSparseAttnBackwardSm90Blk64:
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         scale: cutlass.Float32,
+        # Paired-KV dK/dV only: per-KV64-block arrival counts (batch, heads, blocks); a block nobody arrived at
+        # has an unwritten accumulator and converts to zeros.
+        arrivals: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -722,6 +725,7 @@ class BlockSparseAttnBackwardSm90Blk64:
             self.gmem_tiled_copy_dQ,
             tile_sched_params,
             TileScheduler,
+            arrivals,
         ).launch(
             grid=grid_dim,
             block=[self.postprocess_num_threads, 1, 1],
@@ -743,6 +747,7 @@ class BlockSparseAttnBackwardSm90Blk64:
         gmem_tiled_copy_dQ: cute.TiledCopy,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        arrivals: Optional[cute.Tensor] = None,
     ):
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -784,7 +789,13 @@ class BlockSparseAttnBackwardSm90Blk64:
             g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_slice(tidx)
             tdQgdQaccum = g2s_thr_copy_dQaccum.partition_S(gdQaccum)
             tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum_flat)
-            cute.copy(g2s_tiled_copy_dQaccum, tdQgdQaccum, tdQsdQaccumg2s)
+            if const_expr(arrivals is not None):
+                # Paired-KV dK/dV without a zeroed workspace: a block no task arrived at was never written.
+                zero_tile = arrivals[batch_idx, head_idx, m_block] == 0
+                if not zero_tile:
+                    cute.copy(g2s_tiled_copy_dQaccum, tdQgdQaccum, tdQsdQaccumg2s)
+            else:
+                cute.copy(g2s_tiled_copy_dQaccum, tdQgdQaccum, tdQsdQaccumg2s)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
@@ -822,6 +833,9 @@ class BlockSparseAttnBackwardSm90Blk64:
             tdQrdQ = cute.make_rmem_tensor_like(tdQsdQ, self.dtype)
             # The subsequent gmem predicate guards tail rows; sdQ is a full tile.
             cute.autovec_copy(tdQsdQ, tdQrdQ)
+            if const_expr(arrivals is not None):
+                if zero_tile:
+                    tdQrdQ.fill(0.0)
 
             # Step 5: Copy dQ from register to gmem
             tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
@@ -902,10 +916,10 @@ class BlockSparseAttnBackwardSm90Blk64:
             stream,
         )
 
-        self._postprocess_call(mdQaccum, mdQ_bshd, softmax_scale, stream)
+        self._postprocess_call(mdQaccum, mdQ_bshd, softmax_scale, stream=stream)
         if const_expr(not self.direct_kv):
-            self._postprocess_call(mdKaccum, mdK_bshd, softmax_scale, stream)
-            self._postprocess_call(mdVaccum, mdV_bshd, Float32(1.0), stream)
+            self._postprocess_call(mdKaccum, mdK_bshd, softmax_scale, stream=stream)
+            self._postprocess_call(mdVaccum, mdV_bshd, Float32(1.0), stream=stream)
 
     @cute.jit
     def _bwd_call(

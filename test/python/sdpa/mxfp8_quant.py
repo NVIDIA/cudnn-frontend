@@ -38,7 +38,7 @@ Semantics are replicated from the TE sources (verified against the checkout at
   (``swizzle_row_scaling_kernel`` / ``swizzle_col_scaling_kernel``, the target
   of ``tex.swizzle_scales_for_gemm_``), cross-checked against the consumer side
   in this repo (``python/cudnn/sdpa/fwd/api_dsl.py`` ``_reshape_sf`` +
-  ``kernels/sm100/prefill_d128_mxfp8.py`` SF_SMEM_SIZE_*): the scale matrix
+  ``kernels/sm100/d128_mxfp8_multi_q/kernel.py`` SF_SMEM_SIZE_*): the scale matrix
   ``[R, C]`` (R = rows of the GEMM operand as consumed, C = number of
   32-element blocks along the contraction dim) is tiled into 128x4 "atoms" of
   512 bytes, atoms ordered row-major, and inside an atom byte
@@ -62,6 +62,7 @@ __all__ = [
     "swizzle_sf_rowwise",
     "swizzle_sf_columnwise",
     "quantize_to_mxfp8",
+    "pack_thd_columnwise_sf",
 ]
 
 # fmt: off
@@ -179,6 +180,17 @@ def swizzle_sf_columnwise(sf: torch.Tensor) -> torch.Tensor:
     ``[..., M//32, K]`` (bytes are what the kernel consumes)."""
     out = _swizzle_128x4(sf.transpose(-1, -2).contiguous())
     return out.reshape(sf.shape)
+
+
+def pack_thd_columnwise_sf(swizzled, heads, tokens, head_dim):
+    """Reorder one sequence's V scale bytes into [head, tile, plane*512].
+
+    The quantizer stores complete D planes across all heads/tiles. THD
+    consumers instead keep the planes of each 128-token tile contiguous.
+    This is a byte permutation; neither payload nor scales are requantized.
+    """
+    planes, tiles = ceil_div(head_dim, 128), ceil_div(tokens, 128)
+    return swizzled.view(torch.uint8).reshape(planes, heads, tiles, 512).permute(1, 2, 0, 3).contiguous().reshape(heads, tiles, planes * 512)
 
 
 def quantize_to_mxfp8(

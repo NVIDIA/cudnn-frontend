@@ -260,6 +260,10 @@ class ExecConfig:
     # SF_V addressing rather than contiguous-pool luck).  The MXFP8 harness reads paged_pool_layout ("nhd") and
     # sink_token_value above as the f16 harness does.
     paged_distinct_v_table: bool = False
+    # Per-port B+1 physical row offsets, independent of logical sequence lengths.
+    # Missing ports retain compact prefixes. Serialized with --repro; these are
+    # storage rows, before each port's token stride and offset multiplier.
+    ragged_origin_rows: dict[str, list[int]] = None
 
     @property
     def is_train(self):
@@ -289,18 +293,30 @@ class ExecConfig:
         if self.shape_stats is None and all(x is not None for x in [self.batches, self.h_q, self.s_q]):
             self.shape_stats = (self.batches, self.h_q, self.s_q, 1)
 
+        assert not self.ragged_origin_rows or self.is_ragged, "physical origins require ragged storage"
+        assert not (self.is_paged and any(name in (self.ragged_origin_rows or {}) for name in ("k", "v"))), "paged pools have no ragged K/V origins"
+
         # Packed token capacities: default to the minimal packed capacity of
         # the drawn seq_lens (sum rounded up to 64). Explicit totals (e.g. a
         # slack-capacity fuzz) must cover the packed payload.
         if self.is_ragged:
             seq_len_q = self.seq_len_q or [self.s_q] * (self.batches or 1)
             seq_len_kv = self.seq_len_kv or [self.s_kv] * (self.batches or 1)
+            origins = self.ragged_origin_rows or {}
+            assert set(origins) <= {"q", "k", "v", "o", "stats"}, "unknown ragged origin port"
+            for name, rows in origins.items():
+                lengths = seq_len_kv if name in ("k", "v") else seq_len_q
+                assert len(rows) == len(lengths) + 1, f"{name}: physical origins need B+1 entries"
+                assert all(type(row) is int and row >= 0 for row in rows), f"{name}: invalid physical origin"
+                assert all(start + length <= end for start, end, length in zip(rows, rows[1:], lengths)), f"{name}: overlapping physical sequences"
+            minimum_q = max([sum(seq_len_q)] + [rows[-1] for name, rows in origins.items() if name in ("q", "o", "stats")])
+            minimum_kv = max([sum(seq_len_kv)] + [rows[-1] for name, rows in origins.items() if name in ("k", "v")])
             if self.total_q is None:
-                self.total_q = packed_token_capacity(seq_len_q)
+                self.total_q = packed_token_capacity([minimum_q])
             if self.total_kv is None:
-                self.total_kv = packed_token_capacity(seq_len_kv)
-            assert self.total_q >= sum(seq_len_q), f"total_q={self.total_q} < sum(seq_len_q)"
-            assert self.total_kv >= sum(seq_len_kv), f"total_kv={self.total_kv} < sum(seq_len_kv)"
+                self.total_kv = packed_token_capacity([minimum_kv])
+            assert self.total_q >= minimum_q, f"total_q={self.total_q} < required physical rows {minimum_q}"
+            assert self.total_kv >= minimum_kv, f"total_kv={self.total_kv} < required physical rows {minimum_kv}"
 
         # Compute strides if not provided (packed for ragged, default BHSD otherwise).
         # with_ragged_token_gap (default True): per-tensor token-stride gaps,

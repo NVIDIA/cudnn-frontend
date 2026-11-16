@@ -4,11 +4,14 @@
 """End-to-end tests for the FROST SM90 DSL SDPA-forward engine against a torch reference.
 
 SM90 serves native D64/D128/D256/D512 f16/bf16 prefill; this file retains the D512
-forward suite. The end-to-end half runs through test_sdpa_fwd_dsl_sm100.py: its runners, fp32
-references and tolerances are arch-neutral apart from a module-level ``_ARCH`` fed to
-``engine_name(arch=...)``, so the ``sm100`` fixture repins that one string and SM90 runs the same
-graphs and assertions at its own head dim (test/AGENTS.md). The rest is what only SM90 has -- the
-row's envelope floor, the options its adapter declines, and its own template, THD arm and wrapper.
+forward suite. At exact (128, 128) a 128 x 128 tile names the dedicated D128 template (#378),
+whose numerics and graph route are test_sdpa_fwd_d128_sm90.py's. The end-to-end half runs
+through test_sdpa_fwd_dsl_sm100.py: its runners, fp32 references and tolerances are
+arch-neutral apart from a module-level ``_ARCH`` fed to
+``half_engine_names(arch)``, so the ``sm100`` fixture selects the Hopper owners and SM90 runs the same
+graphs and assertions at its own head dim (test/AGENTS.md). The rest is what only SM90 has: the
+row's envelope floors, the options its adapter declines, the adapter's flavor pick, and its own
+templates, THD arm and wrapper.
 """
 
 import math
@@ -20,7 +23,7 @@ from test_utils import torch_fork_set_rng
 
 import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
-from frost_test_utils import _SM, _is_plan_for, requires_dsl
+from frost_test_utils import _SM, _is_plan_for, requires_dsl, half_engine_names
 
 import test_sdpa_fwd_dsl_sm100 as _sm100  # module scope: the mask table below is read at collection
 from test_sdpa_fwd_dsl_sm100 import _bhsd
@@ -38,7 +41,7 @@ pytestmark = [
 
 _D = 512
 _SCALE = 1.0 / math.sqrt(_D)
-_ROW = "sdpa_fwd_prefill_sm90"
+_ROW = "sdpa_fwd_sm90_f16_three_wg"
 _SHAPE = (1, 2, 64, _D)
 
 
@@ -50,20 +53,20 @@ def sm100(monkeypatch):
     return _sm100
 
 
-def _api(s_kv=_SHAPE[2], dtype=torch.float16, **kw):
-    """A dense SM90 adapter; the decline tests below stop at check_support."""
+def _api(s_kv=_SHAPE[2], dtype=torch.float16, d=_D, **kw):
+    """A dense SM90 adapter at head dim ``d``; the decline tests below stop at check_support."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    b, h, s_q, d = _SHAPE
+    b, h, s_q, _ = _SHAPE
     q, k, v, o = (_bhsd(b, h, s, d, dtype) for s in (s_q, s_kv, s_kv, s_q))
     return SdpaFwdDslSm90(q, k, v, o, **kw)
 
 
-def _offered_id():
-    """The row's public engine id, as the manifest assigns it (family base + slot)."""
+def _offered_ids():
     from cudnn.engines import manifest
 
-    return next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_ROW]
+    family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
+    return {name: family.offered_ids()[name] for name in half_engine_names("sm90")}
 
 
 def _facts(gated=False, **kw):
@@ -405,14 +408,15 @@ def test_sm90_thd_execute_does_not_sync():
 
 @torch_fork_set_rng(seed=0)
 def test_sm90_graph_loads_its_own_template(sm100, monkeypatch):
-    """The suite's one routing proof: SM120 ships a prefill_d512_f16.py too, so the directory is the evidence."""
+    """The D512 graph's routing proof (D128's is test_sdpa_fwd_d128_sm90.py's): SM120 ships a prefill_d512_f16.py
+    too, so the directory is the evidence."""
     from cudnn.sdpa.fwd import api_dsl
 
     loaded, load = [], api_dsl._load_kernel_template
     monkeypatch.setattr(api_dsl, "_load_kernel_template", lambda filename, *a, **kw: loaded.append(filename) or load(filename, *a, **kw))
     q, k, v = (sm100._bhsd(1, 2, 96, _D, torch.float16) for _ in range(3))
     sm100._run_dsl_graph(q, k, v, scale=_SCALE, dtype=torch.float16, sdpa_kwargs={})
-    assert loaded == ["sm90/prefill_d512_f16.py"], loaded
+    assert loaded == ["sm90/f16_three_wg/kernel.py"], loaded
 
 
 @torch_fork_set_rng(seed=0)
@@ -426,6 +430,111 @@ def test_dsl_sm90_wrapper_matches_the_reference(sm100):
     o_ref, lse_ref = sm100._ref_sdpa_full(q, k, v, scale=_SCALE, is_causal=True, sinks=sinks.flatten(), return_stats=True)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=2e-2, rtol=2e-2)
+
+
+# --- The adapter's kernel flavor (issue #378) -------
+#
+# check_support picks its template once, first (config_sm90.pick_flavor over the flavors that have a
+# file in api_dsl._SM90_KERNEL_FILES and own any pinned tile, given the declared features), then reads
+# that flavor's tile for the tile, band and PackGQA checks; compile() loads the flavor's file under a
+# per-flavor tag. Exact (128, 128) declarations D128 serves take D128; everything else takes D512.
+
+
+class _TemplateNamed(Exception):
+    """Raised by the loader spy: the adapter named its template, and the test stops there (no JIT)."""
+
+
+def _spy_template_loads(monkeypatch, *, load=False):
+    """Record the (file, tag) of each template load. By default stop there, before anything is traced; with ``load``
+    hand it to the real loader, a module load with nothing traced (check_support's causal route no longer loads one: it
+    reads the declared shape and the CTA count alone)."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    loads, real = [], api_dsl._load_kernel_template
+
+    def spy(filename, params, tag="template", part=None):
+        loads.append((filename, tag))
+        if load:
+            return real(filename, params, tag, part=part)
+        raise _TemplateNamed(filename)
+
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", spy)
+    return loads
+
+
+def _api_at(d, h_q=8, h_kv=8, s=96, b=2, stats=False, **kw):
+    """A dense SM90 adapter at head dims ``d`` (an int for D_QK == D_V, else a pair), optionally with Stats."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    d_qk, d_v = (d, d) if isinstance(d, int) else d
+    q, k, v, o = (_bhsd(b, h, s, dim, torch.float16) for h, dim in ((h_q, d_qk), (h_kv, d_qk), (h_kv, d_v), (h_q, d_v)))
+    lse = torch.empty(b, h_q, s, dtype=torch.float32, device="cuda") if stats else None
+    return SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, **kw)
+
+
+_D128_FILE, _D512_FILE = ("sm90/d128_f16_multi_q/kernel.py", "sdpa_fwd_sm90_d128"), ("sm90/f16_three_wg/kernel.py", "sdpa_fwd_sm90_d512")
+_FLAVOR_CASES = [
+    # What D128 serves, each taking it.
+    pytest.param(128, {}, _D128_FILE, id="d128-dense"),
+    pytest.param(128, dict(is_causal=True), _D128_FILE, id="d128-causal"),
+    pytest.param(128, dict(is_causal=True, causal_bottom_right=True), _D128_FILE, id="d128-causal_br"),
+    pytest.param(128, dict(stats=True, stats_log2=True), _D128_FILE, id="d128-stats_log2"),
+    pytest.param(128, dict(h_kv=2), _D128_FILE, id="d128-gqa"),
+    pytest.param(128, dict(scale_softmax=-0.5), _D128_FILE, id="d128-negative_scale"),
+    pytest.param(128, dict(sched_policy=SCHED_LPT_L2), _D128_FILE, id="d128-lpt_l2"),
+    pytest.param(128, dict(tile_m=128, tile_n=128), _D128_FILE, id="d128-own_tile"),
+    # Vacuous bounds name no feature: a left bound at or beyond S_q + S_kv masks nothing.
+    pytest.param(128, dict(is_causal=True, window_size_left=10**6), _D128_FILE, id="d128-vacuous_window"),
+    # What D128 does not serve (config_sm90.D128_NOT_SERVED), each staying on D512.
+    pytest.param(128, dict(has_sink=True), _D512_FILE, id="d128-sink"),
+    pytest.param(128, dict(is_causal=True, window_size_left=16), _D512_FILE, id="d128-swa"),
+    pytest.param(128, dict(is_causal=True, window_size_right=8), _D512_FILE, id="d128-right_band"),
+    pytest.param(128, dict(seq_q_lens_present=True, seq_kv_lens_present=True), _D512_FILE, id="d128-lengths"),
+    pytest.param(128, dict(b=1, thd=True), _D512_FILE, id="d128-thd"),
+    pytest.param(128, dict(pack_gqa=True), _D512_FILE, id="d128-pack_gqa"),
+    pytest.param(128, dict(split_kv=2), _D512_FILE, id="d128-split"),
+    # A pinned tile names its flavor: the D512 body's 64/64 keeps a (128, 128) declaration on D512.
+    pytest.param(128, dict(tile_m=64, tile_n=64), _D512_FILE, id="d128-d512_tile"),
+    # Other head dims never take D128.
+    pytest.param(512, {}, _D512_FILE, id="d512"),
+    pytest.param((96, 128), {}, _D512_FILE, id="d96x128"),
+    pytest.param((128, 96), {}, _D512_FILE, id="d128x96"),
+]
+
+
+@pytest.mark.parametrize("d, declared, expected", _FLAVOR_CASES)
+def test_sm90_adapter_picks_d128_for_what_it_serves(monkeypatch, d, declared, expected):
+    """The flavor is decided once, in check_support, and compile() loads exactly that file under its tag. check_support
+    loads no template, causal D128 plans included: the causal route the shipped switches run on them
+    (api_dsl.D128_PERSISTENT_CAUSAL_WALK 2, D128_CAUSAL_WALK_ROUTE on) reads the declared shape and the CTA count
+    alone."""
+    checked = _spy_template_loads(monkeypatch, load=True)
+    api = _api_at(d, **declared)
+    assert api.check_support() and api.flavor == ((128, 128) if expected == _D128_FILE else (512, 512))
+    assert checked == [], checked
+    loads = _spy_template_loads(monkeypatch)
+    with pytest.raises(_TemplateNamed):
+        api.compile()
+    assert loads == [expected], loads
+
+
+def test_sm90_adapter_tile_and_pack_gqa_messages_name_the_chosen_flavor(monkeypatch):
+    """A pinned 128/128 tile names the D128 template: on a (128, 128) declaration D128 does not serve it
+    is refused with the reason; at head dims D128 does not cover, and with a mixed tile, it meets D512's
+    tile refusal; D512's PackGQA refusal keeps its message."""
+    _spy_template_loads(monkeypatch)
+    with pytest.raises(NotImplementedError, match="does not support tiles other than 64/64$"):
+        _api_at(512, tile_m=128, tile_n=128).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve attention sinks$"):
+        _api_at(128, tile_m=128, tile_n=128, has_sink=True).check_support()
+    with pytest.raises(NotImplementedError, match="does not serve split-KV$"):
+        _api_at(128, tile_m=128, tile_n=128, split_kv=2).check_support()
+    with pytest.raises(NotImplementedError, match="does not support tiles other than 64/64$"):
+        _api_at(128, tile_m=128, tile_n=64).check_support()
+    with pytest.raises(NotImplementedError, match="SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64$"):
+        _api_at(512, h_q=3, h_kv=1, pack_gqa=True).check_support()
+    with pytest.raises(NotImplementedError, match="SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64$"):
+        _api_at(128, h_q=3, h_kv=1, pack_gqa=True).check_support()
 
 
 # --- The row's head-dim envelope, floored above the template's -------
@@ -490,16 +599,16 @@ def test_sm90_template_params_are_validated(over, why):
     [
         pytest.param(dict(device_cc=(8, 9)), id="sm89"),
         pytest.param(dict(device_cc=(10, 0)), id="sm100"),
-        pytest.param(dict(has_paged_kv=True, page_size=128, padded=True), id="paged"),
+        pytest.param(dict(has_paged_kv=True, page_size=128, padded=True, thd=True), id="paged-thd"),
     ],
 )
 def test_sm90_row_declines_what_it_never_claimed(declared):
-    """sm_lo == sm_hi == 90, and paged KV is declined by the ROW as well as by the adapter: a row
-    that admitted what its adapter refuses would rank a plan that cannot build, and no graph can
-    reach these through the end-to-end cases. The served (9, 0) control is the gate test's."""
+    """SM90 is exact cc9.0. Paged KV serves dense Q; THD paging remains declined."""
     from cudnn.sdpa.fwd import engines
 
     assert engines.mismatch(_caps(_ROW), _facts(**declared)) is not None
+    if declared.get("has_paged_kv"):
+        assert engines.mismatch(_caps(_ROW), _facts(**(declared | {"thd": False}))) is None
 
 
 # --- Options the base adapter accepts and SM90 declines -------
@@ -548,7 +657,7 @@ def test_sm90_declines_pv_bf16():
 @pytest.mark.parametrize(
     ("declared", "why"),
     [
-        pytest.param(dict(paged_page_size=128, paged_max_seq_len_kv=256), "does not support paged KV", id="paged"),
+        pytest.param(dict(paged_page_size=128, paged_max_seq_len_kv=256), "paged KV requires device KV lengths", id="paged-without-kv-lengths"),
         pytest.param(dict(pertensor_fp8=True), "does not support FP8 or PV BF16 inputs", id="fp8"),
         pytest.param(dict(dtype=torch.float32), "Q/K/V/O other than FP16/BF16", id="qkv-dtype"),
         pytest.param(dict(dtype_o=torch.bfloat16), "an output dtype different from Q", id="o-dtype"),
@@ -570,6 +679,23 @@ def test_sm90_declines_what_it_cannot_lower(declared, why):
     packed by a ratio its work decoder does not carry."""
     with pytest.raises(NotImplementedError, match=why):
         _api(**declared).check_support()
+
+
+@pytest.mark.parametrize(
+    ("declared", "why", "flavor"),
+    [
+        pytest.param(dict(tile_m=128, tile_n=128, split_kv=2), "does not serve split-KV", (512, 512), id="split-kv"),
+        pytest.param(dict(cga=2), "CGA other than 1", (128, 128), id="cga"),
+    ],
+)
+def test_sm90_d128_declines_the_knobs_it_cannot_honor(declared, why, flavor):
+    """The knob half of the declines above at (128, 128): a split pinned on the 128 x 128 tile is refused with the D128
+    template's reason (with no tile pinned the D512 body serves the split), and a CGA pin is refused on the flavor
+    chosen first, D128 here, so neither is quietly dropped."""
+    api = _api(d=128, **declared)
+    with pytest.raises(NotImplementedError, match=why):
+        api.check_support()
+    assert api.flavor == flavor, api.flavor
 
 
 def test_sm90_binds_only_the_layouts_it_can_address():
@@ -610,10 +736,11 @@ def test_sm90_declines_a_too_old_dsl(monkeypatch):
 
 @pytest.mark.parametrize("declared", [dict(causal_bottom_right=True), dict(window_size_left=16)], ids=["bottom-right", "sliding-window"])
 def test_sm90_pending_s_q_above_s_kv_is_ranked_by_the_row_and_declined_at_build(declared):
-    """A known row/adapter disagreement, pinned on BOTH sides: ``mismatch`` has no unpadded
-    S_q > S_kv rule, so the row ranks the graph and the adapter declines it at build. This goes
-    RED when the row learns the rule or the feature lands -- convert it to a one-sided assertion
-    (or a positive case) then."""
+    """A known row/adapter disagreement on D512, pinned on BOTH sides: ``mismatch`` has no unpadded
+    S_q > S_kv rule there, so the row ranks the graph and the adapter declines it at build. This goes
+    RED when the row learns the rule or the feature lands; convert it to a one-sided assertion (or a
+    positive case) then. At (128, 128) the row declines the bottom-right case on the 128 x 128 tile
+    (the next test)."""
     from cudnn.sdpa.fwd import engines
 
     facts = _facts(s_q=_SHAPE[2], s_kv=32, causal=True, bottom_right="causal_bottom_right" in declared, window_left=declared.get("window_size_left"))
@@ -622,46 +749,68 @@ def test_sm90_pending_s_q_above_s_kv_is_ranked_by_the_row_and_declined_at_build(
         _api(s_kv=32, is_causal=True, **declared).check_support()
 
 
+def test_sm90_d128_pending_s_q_above_s_kv_is_declined_by_the_row_and_at_build():
+    """At (128, 128) the row declines unpadded bottom-right S_q > S_kv on the 128 x 128 tile with the adapter's own
+    message, and the adapter declines it at build on D128, so neither side ranks or builds that plan. (A sliding window
+    keeps the 64 x 64 tile: the 128 x 128 tile declines it.)"""
+    from cudnn.sdpa.fwd import engines
+
+    why = "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    facts = _facts(d_qk=128, d_v=128, s_q=_SHAPE[2], s_kv=32, causal=True, bottom_right=True)
+    assert engines.mismatch(_caps("sdpa_fwd_sm90_d128_multi_q"), facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128)) == why
+    with pytest.raises(NotImplementedError, match=why):
+        _api(s_kv=32, d=128, is_causal=True, causal_bottom_right=True).check_support()
+
+
 # --- Registration and the plans offered for the row -------
 
 
-def test_sm90_is_a_default_row_at_its_shipped_id(monkeypatch):
-    """A shipped slot is fixed forever: an autotune record is ``(engine_id, knobs)`` and downstream
-    caches persist the integer, so the id is pinned here rather than spelled at each use. The row is
-    offered without the env flag; ``placement._place_sm90_f16`` ranks it against the backend."""
+def test_sm90_fixed_bodies_have_stable_default_ids(monkeypatch):
     from cudnn.engines import manifest
 
     family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
-    slot = family.slots[_ROW]
-    assert not slot.opt_in and family.engine_id + slot.slot == 20517
-    assert _offered_id() == 20517 and manifest.engine_for_id(20517).name == _ROW
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    assert family.offered_ids().get(_ROW) == 20517
+    expected = dict(zip(half_engine_names("sm90"), (20539, 20540, 20541)))
+    assert all(family.offered_ids().get(name) == value for name, value in expected.items())
+    assert "sdpa_fwd_prefill_sm90" not in family.slots and manifest.engine_for_id(20517) is None
 
 
 def test_sm90_every_candidate_is_valid():
     """Every knob set the heuristics offer for the SM90 row is admissible on that row, deduplicated,
-    bounded, and carries its fixed geometry. THD narrows to NATURAL / unpacked: the adapter declines
-    THD under LPT or PackGQA, so offering either would rank a plan that cannot build."""
+    bounded, and carries a tile its template runs: 64 x 64 everywhere and, on an exact (128, 128)
+    graph the dedicated D128 template serves, its 128 x 128 sets first, unsplit and unpacked. THD
+    narrows to NATURAL / unpacked: the adapter declines THD under LPT or PackGQA, so offering either
+    would rank a plan that cannot build."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 
     shape = dict(h_kv=2, s_q=1024, s_kv=8192, device_sm_count=132)
     dense, thd = _facts(causal=True, **shape), _facts(thd=True, padded=True, **shape)
-    for facts, policies, packs in ((dense, {SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}, {False, True}), (thd, {SCHED_NATURAL}, {False})):
-        plans = recommend("A", facts, {_ROW: _offered_id()})
+    d128 = _facts(d_qk=128, d_v=128, causal=True, **shape)
+    all_policies = {SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}
+    for facts, tiles, policies, packs in (
+        (dense, {(64, 64)}, all_policies, {False, True}),
+        (thd, {(64, 64)}, {SCHED_NATURAL}, {False}),
+        (d128, {(128, 128), (64, 64)}, all_policies, {False, True}),
+    ):
+        plans = recommend("A", facts, _offered_ids())
         assert plans and len(plans) <= _MAX_SETS_PER_ENGINE and len({p.knobs for p in plans}) == len(plans), plans
-        for knobs in (p.knobs for p in plans):
-            assert engines.mismatch(_caps(_ROW), facts, knobs) is None, knobs
-            assert (knobs.tile_m, knobs.tile_n, knobs.cga) == (64, 64, 1), knobs
+        assert ((plans[0].knobs.tile_m, plans[0].knobs.tile_n) == (128, 128)) is ((128, 128) in tiles), plans[0]
+        for plan in plans:
+            knobs = plan.knobs
+            owner = "sdpa_fwd_sm90_d128_multi_q" if knobs.tile_m == 128 else _ROW
+            assert engines.mismatch(_caps(owner), facts, knobs) is None, knobs
+            assert (knobs.tile_m, knobs.tile_n) in tiles and knobs.cga == 1, knobs
             assert 1 <= knobs.split_kv <= 65535 and (not facts.thd or knobs.split_kv == 1), knobs
+            if (knobs.tile_m, knobs.tile_n) == (128, 128):
+                assert knobs.split_kv == 1 and knobs.pack_gqa is False, knobs
             assert knobs.sched_policy in policies and knobs.pack_gqa in packs, knobs
 
 
 def test_sm90_pack_gqa_uses_its_64_row_cta():
-    """An SM90 grid tile is one 64-row CTA whatever the head dims. Through the SM100 cluster chain
-    the row answered 128 -- 256 at d192x128 -- so S_q = 96 led packed. Order only: both legs stay
-    listed either way."""
+    """An SM90 grid tile is one 64-row CTA whatever the head dims (the D128 template's 128 x 128
+    tile is never offered packed). Through the SM100 cluster chain the row answered 128 -- 256 at
+    d192x128 -- so S_q = 96 led packed. Order only: both legs stay listed either way."""
     from cudnn.sdpa.fwd.heuristics import _pack_gqa_tile_q, recommend
 
     caps = _caps(_ROW)
@@ -671,9 +820,10 @@ def test_sm90_pack_gqa_uses_its_64_row_cta():
 
     for d_qk, d_v in ((512, 512), (264, 504), (192, 128)):
         assert _pack_gqa_tile_q(caps, sm90(d_qk=d_qk, d_v=d_v), 64, 1) == 64, (d_qk, d_v)
+    assert {p.knobs.pack_gqa for p in recommend("A", sm90(d_qk=128, d_v=128), _offered_ids()) if p.knobs.tile_m == 128} == {False}
 
     def leads_packed(s_q):
-        plans = recommend("A", sm90(s_q=s_q), {_ROW: _offered_id()})
+        plans = recommend("A", sm90(s_q=s_q), _offered_ids())
         assert {p.knobs.pack_gqa for p in plans} == {True, False}, plans
         return plans[0].knobs.pack_gqa
 

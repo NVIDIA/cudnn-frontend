@@ -23,6 +23,7 @@ _ARCHES = (
     "sm107_thd",
     "sm120",
     "sm100_d128",
+    "sm100_d128_pair",
     "sm100_d128_thd",
     "sm100_d128_grouped_thd",
 )
@@ -32,15 +33,18 @@ _WORKSPACE = 0x700000000000
 
 def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0, workspace_bytes=4096):
     family = "sm100" if arch.startswith("sm100_d128") else arch.split("_thd")[0]
-    # the d128 family's pointer hosts live in ONE module (kernels/sm100/prepared_d128_host.py), one traced entry per route
+    # Read the selected implementation's actual pointer entry, including the isolated recompute body.
     d128_entry = {
         "sm100_d128": "host_recompute",
+        "sm100_d128_pair": "host_pair",
         "sm100_d128_accum": "host_accum",
         "sm100_d128_thd": "host_thd",
         "sm100_d128_grouped_dense": "host_grouped_dense",
         "sm100_d128_grouped_thd": "host_grouped_thd",
     }.get(arch)
-    filename = "prepared_d128_host.py" if d128_entry else "prepared_host.py"
+    filename = {"sm100_d128": "d128_f16_recompute/prepared_host.py", "sm100_d128_pair": "d128_f16_pair/prepared_host.py"}.get(
+        arch, "d128_f16_accum/prepared_host.py" if d128_entry else "prepared_host.py"
+    )
     path = Path(prep.__file__).parent / "kernels" / family / filename
     entry = d128_entry or ("host_f16_thd" if arch == "sm107_thd" else "host_f16" if family == "sm107" else "host")
     host = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == entry)

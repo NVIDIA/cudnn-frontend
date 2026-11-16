@@ -67,9 +67,14 @@ _CTA_GROUP = nvvm.CTAGroup.CTA_2 if cta_group == 2 else nvvm.CTAGroup.CTA_1
 # The scheduler warp of cluster rank 0 publishes each claimed tile into every
 # cluster CTA's broadcast slot through mapa and arrives on that CTA's barrier,
 # a cluster-scope release by a thread of another CTA. The waits on the
-# broadcast ring must acquire at cluster scope too, or the slot read (and
-# the producer's reuse of the slot) is not ordered against the peer's access.
-_SCHED_BCAST_SCOPE = nvvm.MBarrierScope.CLUSTER if cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1 else None
+# broadcast ring poll that barrier at cluster scope with relaxed ordering and
+# then acquire through a fence restricted to shared::cluster memory. That
+# orders the slot read (and the producer's reuse of the slot) after the peer's
+# access just like an acquire-ordered cluster-scope wait, without the L1
+# invalidation such a wait costs on every poll.
+_SCHED_BCAST_CLUSTER = cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1
+_SCHED_BCAST_SCOPE = nvvm.MBarrierScope.CLUSTER if _SCHED_BCAST_CLUSTER else None
+_SCHED_BCAST_ORDER = nvvm.MemOrder.RELAXED if _SCHED_BCAST_CLUSTER else None
 _OPERAND_BARRIER_SCOPE = nvvm.MBarrierScope.CLUSTER if cta_group == 2 else None
 _gather_chunks_per_row = cta_tile_mnk[2] * (ab_dtype.width // 8) // 16
 _gather_rows_per_round = 128 // _gather_chunks_per_row
@@ -457,8 +462,11 @@ def _kernel(
                     bcast_full_phase,
                     time_limit=10_000_000,
                     scope=_SCHED_BCAST_SCOPE,
+                    order=_SCHED_BCAST_ORDER,
                 ):
                     pass
+                if cutlass.const_expr(_SCHED_BCAST_CLUSTER):
+                    nvvm.fence_sync_restrict(nvvm.MemOrder.ACQUIRE)
                 linear_idx = (sched_bcast_slot.subview(bcast_stage)).load()
                 # Finish every lane's slot reads before the elected release.
                 nvvm.bar_warp_sync(0xFFFFFFFF)

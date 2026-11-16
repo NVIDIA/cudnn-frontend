@@ -130,8 +130,8 @@ To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
 `has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
 `deterministic_bwd`, iteration counts), and run `--config <name>`. Supported
-forward variants are `(H, d_qk)` in `{(64, 512), (64, 576), (128, 512)}` with
-`indexer_topk` in `{0, 512, 1024}` (`2048` for H64 too); backward accepts any
+SM100 forward variants are H64, H96 and H128 with `d_qk` in `{512, 576}` and
+`indexer_topk` in `{0, 512, 1024, 2048}`; backward accepts any
 head count with `d_qk` in `{512, 576}` and a deterministic mode on SM90/SM100 for
 H16/H32/H64/H96/H128. A QSA preset (`kind="qsa"`, `num_kv_heads`,
 `block_size=4`, `head_dim_qk = head_dim_vo = 256`) is served for 24/2, 12/1
