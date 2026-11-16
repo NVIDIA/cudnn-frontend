@@ -72,7 +72,7 @@ The experimental API catalog includes:
 - [RMSNorm + RHT + Amax](/operations/Normalizations/rmsnorm_rht_amax)
 - [Ahead-of-time attention for SM120 (C/C++ API)](/operations/Attention/aot_sm120_attention)
 - [SDPA Backward, d = 128, dense and THD MHA/GQA/MQA (SM100 / SM103)](/operations/Attention/sdpa_bwd_sm100_d128)
-- [SDPA MXFP8 Backward, d = 128, MHA/GQA/MQA, any S (SM103, opt-in)](/operations/Attention/sdpa_bwd_sm103_d128_mxfp8)
+- [SDPA MXFP8 Backward, d = 128, MHA/GQA/MQA, any S (SM100 / SM103, opt-in)](/operations/Attention/sdpa_bwd_sm100_d128_mxfp8)
 - [SDPA Backward (SM120)](/operations/Attention/sdpa_bwd_sm120)
 - [SDPA Backward, d = 256 and d in (256, 512] (SM107 / Rubin; SM100 / SM103 via the 2x2-datapath body)](/operations/Attention/sdpa_bwd_sm107)
 - [Compact GQA Backward (SM107)](/operations/Attention/compact_gqa_backward)

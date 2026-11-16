@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``sdpa_bwd_sm103_d128_mxfp8``: the SM103 D=128 block-scale MXFP8 backward (a CuTeDSL chain).
+"""``sdpa_bwd_sm100_d128_mxfp8``: the SM100 / SM103 D=128 block-scale MXFP8 backward (a CuTeDSL chain).
 
 ACCEPT tests run the row end to end through the graph API (``sdpa_mxfp8_backward`` over BHSD-compact tensors, the
 row pinned by plan name) against the repo's MXFP8 backward reference (``sdpa.mxfp8_ref``), and compare its error
@@ -21,26 +21,27 @@ import torch
 
 import cudnn
 
-_ENGINE = "sdpa_bwd_sm103_d128_mxfp8"
+_ENGINE = "sdpa_bwd_sm100_d128_mxfp8"
 _D = 128
 _BLOCK = 32
 _TOL_COS = 0.9995
 
-requires_sm103 = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3), reason=f"{_ENGINE} targets compute capability 10.3"
+requires_sm100_family = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason=f"{_ENGINE} targets compute capability 10.0 / 10.3",
 )
 
 
 def _dsl_below_floor() -> bool:
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
-    from cudnn.sdpa.bwd.kernels.sm100._geometry_sm103 import CUTEDSL_FLOOR
+    from cudnn.sdpa.bwd.kernels.sm100._geometry_d128_mxfp8 import CUTEDSL_FLOOR
 
     installed, version = cutedsl_state()
     return not installed or cutedsl_too_old(version, floor=CUTEDSL_FLOOR)
 
 
 requires_dsl = pytest.mark.skipif(_dsl_below_floor(), reason=f"{_ENGINE} needs nvidia-cutlass-dsl at the row's floor (Rule 7)")
-pytestmark = [requires_sm103, requires_dsl]
+pytestmark = [requires_sm100_family, requires_dsl]
 
 
 @pytest.fixture(autouse=True)
@@ -338,7 +339,7 @@ def test_large_batch_plans():
     """B = 8: the throughput plan (no deterministic request) keeps the dK/dV walk unsplit, the batch-invariant plan
     splits it per batch element; both are correct."""
     from cudnn.frost.occupancy import max_active_clusters
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
     for det in (False, True):
         _run(b=8, hq=4, hkv=2, s=1024, use_deterministic_algorithm=det)
@@ -450,7 +451,7 @@ def test_repeat_and_graph_replay(s, causal, amax):
 
 
 # One golden per distinct numerical path of the chain (skills/determinism_tests): (B, H_q, H_kv, S, causal, amax,
-# use_deterministic_algorithm). On B300 the first plans the walk-split dK/dV (two CTAs per key block, fp32 partials
+# use_deterministic_algorithm). On B200 and B300 the first plans the walk-split dK/dV (two CTAs per key block, fp32 partials
 # added in a fixed order) and the second the unsplit walk -- the plan's only rounding-relevant choice.
 _GOLDEN_CELLS = {
     "dense-s1024-split": (1, 8, 2, 1024, False, False, True),
@@ -489,7 +490,7 @@ def test_golden(cell):
         "o": run.inp["o"], "dO_f16": run.inp["dO"], "stats": run.inp["stats"], "sf_q": Q["sf_row"], "sf_q_T": Q["sf_col"],
         "sf_k": K["sf_row"], "sf_k_T": K["sf_col"], "sf_v": V["sf_row"], "sf_dO": DO["sf_row"], "sf_dO_T": DO["sf_col"],
     }  # fmt: skip
-    assert_golden(f"sdpa-bwd-mxfp8-sm103-d128-{cell}", inputs, got)
+    assert_golden(f"sdpa-bwd-mxfp8-sm100-d128-{cell}", inputs, got)
 
 
 @pytest.mark.L0
@@ -512,7 +513,7 @@ def test_batch_invariance_where_the_default_plan_differs(s, causal):
     over the whole batch), while B = 1 splits it. Under use_deterministic_algorithm the split is decided per batch
     element, so every element of the B = 8 problem is bitwise the B = 1 problem on its data (aligned, tail, causal)."""
     from cudnn.frost.occupancy import max_active_clusters
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
     b, hq, hkv = 8, 4, 2
     g = G.geometry(s, b, hq, hkv, 1 / math.sqrt(_D), False, causal)
@@ -739,7 +740,7 @@ def test_first_build_inside_graph_capture(monkeypatch, tmp_path):
     b, hq, hkv, s = 1, 8, 2, 768
     inp = _inputs(b, hq, hkv, s, seed=17, causal=True)
     g, t, outs = _planned_graph(b, hq, hkv, s, inp, use_causal_mask=True)
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
     ws = torch.empty(G.workspace_bytes(G.geometry(s, b, hq, hkv, inp["scale"], False, True)) + 16, device="cuda", dtype=torch.uint8)
     dq = torch.full((b, hq, s, _D), float("nan"), device="cuda", dtype=torch.bfloat16)
@@ -801,7 +802,7 @@ def test_dq_shared_memory_releases_warm_stress():
     B = 1, 88 / 8 heads, S = 2048: 704 unit pairs on at most 74 two-CTA clusters, so every cluster refills both stages
     about nine times per launch."""
     from cudnn.frost.occupancy import max_active_clusters
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
     from warm_stress import StressCase, assert_warm_stress, stress_validation
 
     b, hq, hkv, s = 1, 88, 8, 2048
@@ -812,7 +813,7 @@ def test_dq_shared_memory_releases_warm_stress():
     dq, dk, dv = run.outputs
     assert_warm_stress(
         StressCase(
-            "SM103 D128 MXFP8 backward: persistent dQ scheduler slots and Q / dO staging",
+            "SM100 / SM103 D128 MXFP8 backward: persistent dQ scheduler slots and Q / dO staging",
             lambda: run.g.execute(run.pack, run.ws),
             {"dQ": dq, "dK": dk, "dV": dv},
             thread_blocks=2 * p.dq_clusters,

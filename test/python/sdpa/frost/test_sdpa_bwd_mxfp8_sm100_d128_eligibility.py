@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``sdpa_bwd_sm103_d128_mxfp8`` without an SM103: the row's graph declaration bounds and its launch plan.
+"""``sdpa_bwd_sm100_d128_mxfp8`` without a B200 / B300: the row's graph declaration bounds and its launch plan.
 
 The device is faked (compute capability, SM count, DSL version), so these run on any CUDA machine: the row's admission
 is its ``mismatch()`` on the analyzed graph, and the launch plan is host arithmetic over cluster capacities.
@@ -14,16 +14,16 @@ import math
 import pytest
 
 import cudnn
-import test_sdpa_bwd_mxfp8_sm103_d128 as row
+import test_sdpa_bwd_mxfp8_sm100_d128 as row
 
 pytestmark = pytest.mark.L0
 
-# B300: 74 two-CTA and 33 four-CTA clusters of a one-CTA-per-SM kernel (cudnn.frost.occupancy on cc 10.3)
-_B300_CLUSTERS = {2: 74, 4: 33}
+# B200 and B300 (148 SMs each): 74 two-CTA and 33 four-CTA clusters of a one-CTA-per-SM kernel (cudnn.frost.occupancy)
+_SM100_CLUSTERS = {2: 74, 4: 33}
 
 
 @pytest.fixture(autouse=True)
-def _sm103(monkeypatch):
+def _fake_device(monkeypatch):
     from cudnn.sdpa import graph_analyzer as ga
     from cudnn.sdpa.bwd import engines
 
@@ -124,12 +124,21 @@ def test_declines_strided_stats():
     assert reason is not None and "stats must be contiguous" in reason, reason
 
 
-@pytest.mark.parametrize("cc", [(10, 0), (12, 0), (10, 7)])
+@pytest.mark.parametrize("cc", [(12, 0), (10, 7), (9, 0)])
 def test_declines_other_devices(monkeypatch, cc):
     from cudnn.sdpa import graph_analyzer as ga
 
     monkeypatch.setattr(ga, "_device_cc", lambda: cc)
     assert _decline_reason() is not None
+
+
+def test_admits_b200(monkeypatch):
+    """cc 10.0 (B200) runs the same chain compiled for sm_100a."""
+    from cudnn.sdpa import graph_analyzer as ga
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 0))
+    assert _decline_reason() is None
+    assert _decline_reason(use_causal_mask=True, s=1000) is None
 
 
 @pytest.mark.parametrize("version", ["4.7.0", "4.8.0"])
@@ -148,16 +157,16 @@ def test_declines_below_the_dsl_floor(monkeypatch, version):
 
 
 def _plan(s, b, hq, hkv, causal=False, batch_invariant=True, **kw):
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
     g = G.geometry(s, b, hq, hkv, 1 / math.sqrt(128), False, causal)
-    return G.plan(g, _B300_CLUSTERS.__getitem__, batch_invariant=batch_invariant, **kw)
+    return G.plan(g, _SM100_CLUSTERS.__getitem__, batch_invariant=batch_invariant, **kw)
 
 
 @pytest.mark.parametrize(
     "shape,batch_invariant,expected",
     [
-        # (S, B, Hq, Hkv, causal) -> (walk split, cluster, dK/dV grid, dQ clusters), with B300's cluster capacities
+        # (S, B, Hq, Hkv, causal) -> (walk split, cluster, dK/dV grid, dQ clusters), with the B200 / B300 cluster capacities
         ((1024, 1, 88, 8, False), True, (2, 4, 128, 74)),
         ((1024, 8, 88, 8, False), True, (2, 4, 128, 74)),
         ((1024, 8, 88, 8, False), False, (1, 4, 128, 74)),
@@ -185,9 +194,9 @@ def test_deterministic_plan_is_per_batch_element():
 
 
 def test_forced_split_must_be_built():
-    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+    from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
     g = G.geometry(1152, 1, 8, 8, 1 / math.sqrt(128), False, True)  # causal MHA, 9 query blocks (odd): no walk split
     assert not g.has_split
     with pytest.raises(ValueError):
-        G.plan(g, _B300_CLUSTERS.__getitem__, split=2)
+        G.plan(g, _SM100_CLUSTERS.__getitem__, split=2)

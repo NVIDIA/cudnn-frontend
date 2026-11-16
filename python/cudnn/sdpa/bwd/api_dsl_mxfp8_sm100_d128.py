@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM103 D128 MXFP8 backward adapter for the prep -> dK/dV -> persistent dQ chain.
+"""SM100 / SM103 D128 MXFP8 backward adapter for the prep -> dK/dV -> persistent dQ chain.
 
 The geometry module owns launch planning; the kernel module owns computation.
 The prepared binder validates current operands and binds caller-owned workspace.
@@ -14,9 +14,9 @@ import math
 import torch
 
 from .api_dsl_mxfp8_sm100 import _ATTRIBUTES, _ROLES, SdpaBwdDslSm100Mxfp8
-from .kernels.sm100._geometry_sm103 import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
+from .kernels.sm100._geometry_d128_mxfp8 import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
 
-ROW = "sdpa_bwd_sm103_d128_mxfp8"
+ROW = "sdpa_bwd_sm100_d128_mxfp8"
 _AMAX_ROLES = ("amax_dq", "amax_dk", "amax_dv")
 _AMAX_ATTRIBUTES = ("amax_dQ", "amax_dK", "amax_dV")
 
@@ -26,8 +26,8 @@ def _bhsd_compact(desc) -> bool:
     return tuple(int(x) for x in desc.stride) == (h * s * d, s * d, d, 1)
 
 
-class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
-    """D = 128 block-scale MXFP8 backward on SM103 (see the module docstring)."""
+class SdpaBwdDslSm100D128Mxfp8(SdpaBwdDslSm100Mxfp8):
+    """D = 128 block-scale MXFP8 backward on SM100 / SM103 (see the module docstring)."""
 
     def __init__(self, *args, amax_requested=(), **kwargs) -> None:
         # names among amax_dQ / amax_dK / amax_dV the graph made real outputs (the sibling rows' spelling)
@@ -44,7 +44,9 @@ class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
         self._runtime_error_if(not installed, f"{ROW} requires nvidia-cutlass-dsl>={floor}, which is not installed")
         self._runtime_error_if(cutedsl_too_old(version, floor=CUTEDSL_FLOOR), f"{ROW} requires nvidia-cutlass-dsl>={floor}; found {version[1]}")
         dev = int(self.q_desc.device.index or 0)
-        self._value_error_if(compute_capability(dev) != (10, 3), f"{ROW}: the kernels target compute capability 10.3; got {compute_capability(dev)}")
+        self._value_error_if(
+            compute_capability(dev) not in ((10, 0), (10, 3)), f"{ROW}: the kernels target compute capability 10.0 or 10.3; got {compute_capability(dev)}"
+        )
         self._value_error_if(
             (self.head_dim_qk, self.head_dim_v) != (128, 128),
             f"{ROW}: (d_qk, d_v) must be (128, 128); got ({self.head_dim_qk}, {self.head_dim_v})",
@@ -88,7 +90,7 @@ class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
         return True
 
     def _geometry(self):
-        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
         return G.geometry(
             int(self.s_q_max),
@@ -103,7 +105,7 @@ class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
     def scratch_workspace_bytes(self) -> int:
         """Per-row delta / -LSE / -delta / LSE-copy rows, the dQ unit counter, and 16 bytes for amax outputs the graph
         leaves virtual (the kernels write all three when any is requested)."""
-        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
+        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
 
         return G.workspace_bytes(self._geometry()) + 16
 
@@ -132,8 +134,9 @@ class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
         from types import SimpleNamespace
 
         from cudnn.frost.compiled_cache import dsl_compile_lock, positional_entry
-        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as G
-        from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_mxfp8_sm103 as kernels
+        from cudnn.frost.device import compute_capability
+        from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as G
+        from cudnn.sdpa.bwd.kernels.sm100 import bprop_d128_mxfp8 as kernels
 
         from .prepared import BwdLaunchSpec
 
@@ -150,7 +153,8 @@ class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
         # compile it needs, both at plan time; execute is the positional entry alone
         with torch.cuda.device(device), dsl_compile_lock():
             plan = G.plan(g, lambda cluster: kernels.cluster_capacity(device, cluster), batch_invariant=bool(self.deterministic))
-            entry = kernels.compile_chain(g, plan.split, plan.kv_cluster)
+            major, minor = compute_capability(device)
+            entry = kernels.compile_chain(g, plan.split, plan.kv_cluster, major * 10 + minor)
         chain = positional_entry(entry)
         if chain is None:
             raise NotImplementedError(f"{ROW} requires a positional tvm-ffi entry")
@@ -188,4 +192,4 @@ class SdpaBwdDslSm103D128Mxfp8(SdpaBwdDslSm100Mxfp8):
         return self.compile().plan
 
 
-__all__ = ["SdpaBwdDslSm103D128Mxfp8", "ROW"]
+__all__ = ["SdpaBwdDslSm100D128Mxfp8", "ROW"]

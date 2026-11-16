@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare SM103 D128 MXFP8 backward engines on the same quantized inputs.
+"""Compare SM100 / SM103 D128 MXFP8 backward engines on the same quantized inputs.
 
-    CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 python benchmark/attention_training/benchmark_mxfp8_bwd_sm103_d128.py \\
+    CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 python benchmark/attention_training/benchmark_mxfp8_bwd_sm100_d128.py \\
         --s 2048 4096 8192 16384 --b 1 --hq 88 --hkv 8 --check --check-tol 0.01
 
 Engines are pinned by plan name. The SM100 engine uses a BSHD copy; other
@@ -204,7 +204,7 @@ def main():
     ap.add_argument("--hq", type=int, default=88)
     ap.add_argument("--hkv", type=int, default=8)
     ap.add_argument("--scale", type=float, default=None, help="attn_scale (default 1/sqrt(128))")
-    ap.add_argument("--engines", nargs="+", default=["backend", "sdpa_bwd_sm103_d128_mxfp8", "sdpa_bwd_sm100_mxfp8"])
+    ap.add_argument("--engines", nargs="+", default=["backend", "sdpa_bwd_sm100_d128_mxfp8", "sdpa_bwd_sm100_mxfp8"])
     ap.add_argument("--reps", type=int, default=7, help="timed cold calls per engine (median)")
     ap.add_argument("--amax", action="store_true", help="request amax_dQ / dK / dV (engines that cannot are reported as skipped)")
     ap.add_argument("--deterministic", action="store_true", help="request use_deterministic_algorithm (batch-invariant plans)")

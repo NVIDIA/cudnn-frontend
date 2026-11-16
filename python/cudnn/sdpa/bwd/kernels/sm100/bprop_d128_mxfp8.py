@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM103 D128 MXFP8 backward kernels, launched by ``chain_host`` with PDL.
+"""SM100 / SM103 D128 MXFP8 backward kernels, launched by ``chain_host`` with PDL.
 
 The chain prepares delta/LSE, computes dK/dV with a KV-stationary query walk,
 and computes dQ with persistent two-CTA clusters. Each output tile has one
 writer and a fixed reduction order. Layouts and launch planning live in
-``_geometry_sm103``; addresses, workspace and grid sizes are runtime arguments.
+``_geometry_d128_mxfp8``; addresses, workspace and grid sizes are runtime arguments.
 """
 
 from cuda.bindings import driver
@@ -24,7 +24,7 @@ from cudnn.frost.tile_dsl.consume import consume_then_arrive, consume_then_arriv
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16
 from cudnn.frost.tile_dsl.tma import st_global
 from cudnn.frost.tile_dsl.tmem import tmem_alloc
-from cudnn.sdpa.bwd.kernels.sm100 import _geometry_sm103 as geo_mod
+from cudnn.sdpa.bwd.kernels.sm100 import _geometry_d128_mxfp8 as geo_mod
 
 # PTX helpers retain the required rounding, predication and instruction scheduling.
 # Shared-helper substitutions preserved output bytes but regressed some B300
@@ -1863,11 +1863,11 @@ def chain_host(q: Int64, k: Int64, v: Int64, o: Int64, do: Int64, stats: Int64, 
 # ptxas -O2: at -O3 ptxas allocates this PTX into 96 registers (the cap with 18 warps per CTA) with ~200 bytes of
 # spills in the dK/dV softmax and MMA loops and runs more than 10 % slower; -O2 compiles every kernel of the chain
 # without spills (measured on B300).
-CHAIN_OPTIONS = "--enable-tvm-ffi --gpu-arch sm_103a --ptxas-options=-O2"
+CHAIN_OPTIONS = "--enable-tvm-ffi --gpu-arch sm_{sm}a --ptxas-options=-O2"  # sm: 100 or 103, the device the plan targets
 CHAIN_ABI = 1  # part of the cache key: bump when chain_host's arguments change
 
 
-def compile_chain(g, ks: int, cl: int):
+def compile_chain(g, ks: int, cl: int, sm: int = 103):
     """The chain compiled from declarations only (addresses, workspace and grids are runtime arguments)."""
     from cudnn.frost.compiled_cache import compile_cached
 
@@ -1879,9 +1879,9 @@ def compile_chain(g, ks: int, cl: int):
         int(ks),
         int(cl),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options=CHAIN_OPTIONS,
-        cache_key=repr(("sdpa_bwd_sm103_d128_mxfp8", CHAIN_ABI, g, int(ks), int(cl))),
-        symbol="frost_sdpa_bwd_sm103_d128_mxfp8",
+        options=CHAIN_OPTIONS.format(sm=int(sm)),
+        cache_key=repr(("sdpa_bwd_sm100_d128_mxfp8", CHAIN_ABI, g, int(ks), int(cl))),
+        symbol="frost_sdpa_bwd_sm100_d128_mxfp8",
     )
 
 

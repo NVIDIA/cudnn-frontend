@@ -37,7 +37,7 @@ _SM120 = "SdpaBwdDslSm120"
 _SM80 = "SdpaBwdDslSm80"
 _SM100 = "SdpaBwdDslSm100"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
-_SM103_D128_MXFP8 = "SdpaBwdDslSm103D128Mxfp8"
+_SM100_D128_MXFP8 = "SdpaBwdDslSm100D128Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
@@ -131,10 +131,10 @@ def _mxfp8_adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
         return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
-    if name == _SM103_D128_MXFP8:
-        from cudnn.sdpa.bwd import api_dsl_mxfp8_sm103_d128
+    if name == _SM100_D128_MXFP8:
+        from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100_d128
 
-        return api_dsl_mxfp8_sm103_d128.SdpaBwdDslSm103D128Mxfp8
+        return api_dsl_mxfp8_sm100_d128.SdpaBwdDslSm100D128Mxfp8
     from cudnn.sdpa.bwd import api_dsl_sm107
 
     return getattr(api_dsl_sm107, name)
@@ -1373,41 +1373,41 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
     )
 
 
-def _sm103_d128_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
-    from cudnn.sdpa.bwd.kernels.sm100._geometry_sm103 import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
+def _sm100_d128_mxfp8_declaration_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    from cudnn.sdpa.bwd.kernels.sm100._geometry_d128_mxfp8 import CUTEDSL_FLOOR, MAX_ROWS, MAX_SCALE, padded_rows
 
     if cutedsl_too_old(version, floor=CUTEDSL_FLOOR):
         want = ".".join(str(v) for v in CUTEDSL_FLOOR)
-        return f"the sm103 d128 MXFP8 backward requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
+        return f"the sm100 d128 MXFP8 backward requires nvidia-cutlass-dsl >= {want}; found {version[1]}"
     if (facts.d_qk, facts.d_v) != (128, 128):
-        return f"the sm103 d128 MXFP8 backward serves (D_QK, D_V) = (128, 128); graph has ({facts.d_qk}, {facts.d_v})"
+        return f"the sm100 d128 MXFP8 backward serves (D_QK, D_V) = (128, 128); graph has ({facts.d_qk}, {facts.d_v})"
     if facts.s_q != facts.s_kv:
-        return f"the sm103 d128 MXFP8 backward serves S_q == S_kv only; graph has S_q={facts.s_q}, S_kv={facts.s_kv}"
+        return f"the sm100 d128 MXFP8 backward serves S_q == S_kv only; graph has S_q={facts.s_q}, S_kv={facts.s_kv}"
     if facts.scale is None:
-        return "the sm103 d128 MXFP8 backward needs a plan-time attn_scale; the graph's scale is not modeled"
+        return "the sm100 d128 MXFP8 backward needs a plan-time attn_scale; the graph's scale is not modeled"
     if not (math.isfinite(facts.scale) and 0 < facts.scale <= MAX_SCALE):
-        return f"the sm103 d128 MXFP8 backward serves a finite attn_scale in (0, 2^12]; graph has {facts.scale!r}"
+        return f"the sm100 d128 MXFP8 backward serves a finite attn_scale in (0, 2^12]; graph has {facts.scale!r}"
     if padded_rows(facts.b, facts.h_q, facts.s_q) > MAX_ROWS:
-        return "the sm103 d128 MXFP8 backward indexes rows in int32: B * H_q * S (S rounded up to 256) must stay below 2^31"
+        return "the sm100 d128 MXFP8 backward indexes rows in int32: B * H_q * S (S rounded up to 256) must stay below 2^31"
     for name, dim, stride in facts.port_layouts:
         if name in ("q", "k", "v", "o", "dO", "dQ", "dK", "dV", "q_T", "k_T", "dO_T", "dO_f16"):
             b, h, s, d = (int(x) for x in dim)
             if tuple(int(x) for x in stride) != (h * s * d, s * d, d, 1):
-                return f"the sm103 d128 MXFP8 backward needs {name} BHSD-compact (stride (H*S*D, S*D, D, 1)); got stride {tuple(stride)}"
+                return f"the sm100 d128 MXFP8 backward needs {name} BHSD-compact (stride (H*S*D, S*D, D, 1)); got stride {tuple(stride)}"
     return None
 
 
-def _sm103_d128_mxfp8_spec() -> EngineSpec:
-    """Opt-in SM103 D128 MXFP8 backward for compact BHSD self-attention.
+def _sm100_d128_mxfp8_spec() -> EngineSpec:
+    """Opt-in SM100 / SM103 D128 MXFP8 backward for compact BHSD self-attention.
 
     Dense and causal graphs share the three-kernel chain. Deterministic mode
     chooses the dK/dV walk split per batch element to preserve batch invariance.
     """
     return EngineSpec(
-        name="sdpa_bwd_sm103_d128_mxfp8",
+        name="sdpa_bwd_sm100_d128_mxfp8",
         capabilities=Capabilities(
-            sm_lo=103,
-            sm_hi=103,  # measured on cc 10.3 (B300) only
+            sm_lo=100,
+            sm_hi=103,  # measured on cc 10.0 (B200) and cc 10.3 (B300)
             d=frozenset({128}),
             dtypes=frozenset({cudnn.data_type.FP8_E4M3}),
             out_dtypes=frozenset({cudnn.data_type.BFLOAT16}),
@@ -1419,10 +1419,10 @@ def _sm103_d128_mxfp8_spec() -> EngineSpec:
             deterministic=True,
             decode=False,
             layouts=frozenset({"dense_flex"}),
-            declaration_check=_sm103_d128_mxfp8_declaration_mismatch,
+            declaration_check=_sm100_d128_mxfp8_declaration_mismatch,
             band=band.BandSupport.from_legacy_flags(causal=True, bottom_right=True),
         ),
-        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM103_D128_MXFP8),
+        lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM100_D128_MXFP8),
     )
 
 
@@ -2427,7 +2427,7 @@ ENGINE_SPECS = (
     _sm120_spec(),
     _sm80_spec(),
     _sm100_spec(),
-    _sm103_d128_mxfp8_spec(),  # BHSD-compact D=128 on cc 10.3; ahead of the MXFP8 kernel pair (BSHD) where both admit
+    _sm100_d128_mxfp8_spec(),  # BHSD-compact D=128 on cc 10.0 / 10.3; ahead of the MXFP8 kernel pair (BSHD) where both admit
     _sm100_mxfp8_spec(),
     _sm100_d192_spec(),
     _sm100_d192_fp8_spec(),

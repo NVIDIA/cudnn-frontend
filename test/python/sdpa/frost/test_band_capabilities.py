@@ -130,7 +130,7 @@ def legal_facts(kind: str, caps, **overrides) -> ga.SdpaGraphFacts:
 def _pinned_geometry(kind: str, caps) -> dict:
     """Sequence lengths a row's declaration check requires of every graph, or ``{}``.
 
-    A row serving S_q == S_kv only (``sdpa_bwd_sm103_d128_mxfp8``) accepts the matrix's baseline but declines every
+    A row serving S_q == S_kv only (``sdpa_bwd_sm100_d128_mxfp8``) accepts the matrix's baseline but declines every
     unequal pair, so its samples keep the baseline lengths."""
     base = _values(kind, caps, *_dims(kind, caps))
     if declaration_reason(kind, caps, ga.SdpaGraphFacts(**base)) is not None:

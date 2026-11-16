@@ -95,7 +95,7 @@ arbitrary user callbacks.
 | `pygraph.sdpa`, FROST D64/D128 split THD setup (CGA1, fixed packing and split count) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | Unverified by this suite |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
-| `pygraph.sdpa_mxfp8_backward`, FROST `sdpa_bwd_sm103_d128_mxfp8` (opt-in; D128, BHSD-compact, S_q == S_kv, unmasked or causal, either anchor) | bprop | E4M3 payloads and E8M0 block scales; BF16 `o_f16` / `dO_f16` / gradients; optional FP32 amax | Unsupported | SM103: Supported with `use_deterministic_algorithm`, Replay only without it (tested configurations); SM100 Unsupported | Unsupported |
+| `pygraph.sdpa_mxfp8_backward`, FROST `sdpa_bwd_sm100_d128_mxfp8` (opt-in; D128, BHSD-compact, S_q == S_kv, unmasked or causal, either anchor) | bprop | E4M3 payloads and E8M0 block scales; BF16 `o_f16` / `dO_f16` / gradients; optional FP32 amax | Unsupported | Supported with `use_deterministic_algorithm`, Replay only without it (SM100 and SM103, tested configurations) | Unsupported |
 
 The D64/D128 per-tensor FP8 paging checks preserve quantized payloads and
 scales across reordered, duplicated and changed-neighbor batches. O and Stats
@@ -461,9 +461,9 @@ and synccheck coverage, including separate multi-tile THD cases. This evidence
 does not establish SM121 or cross-runtime bit identity, independent physical
 THD origins for quantized inputs, or backward behavior.
 
-## SM103 D128 MXFP8 backward
+## SM100 / SM103 D128 MXFP8 backward
 
-The opt-in `sdpa_bwd_sm103_d128_mxfp8` row runs three CuTeDSL kernels: prep,
+The opt-in `sdpa_bwd_sm100_d128_mxfp8` row runs three CuTeDSL kernels: prep,
 a key-stationary dK/dV kernel and a persistent dQ kernel. Every output tile has
 one writer, and there are no gradient atomics. When two CTAs split a key
 block's query walk, their FP32 partials are added in a fixed order through
@@ -474,7 +474,7 @@ Under `use_deterministic_algorithm` it is decided per batch element, so results
 are batch invariant. Without the request it is decided over the whole batch,
 which is faster at large B but is Replay only.
 
-`test_sdpa_bwd_mxfp8_sm103_d128.py` compares raw bytes across:
+`test_sdpa_bwd_mxfp8_sm100_d128.py` compares raw bytes across:
 
 - eager calls and CUDA-graph replays into poisoned outputs, for aligned,
   tail and causal shapes, including the amax outputs;
@@ -485,8 +485,8 @@ which is faster at large B but is Replay only.
 
 Payloads and scale bytes are fixed across batch comparisons. amax is a
 whole-batch maximum, so it is compared bitwise across replays, not across batch
-changes. Measured on B300 (cc 10.3) only. Other GPUs are not served, and
-cross-runtime bit identity is unverified.
+changes. Measured on B200 (cc 10.0) and B300 (cc 10.3). The four golden cases write the same
+bytes on both; other cross-runtime bit identity is unverified. Other GPUs are not served.
 
 ## SM120 packed backward
 

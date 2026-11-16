@@ -33,11 +33,11 @@ pytest core/test_determinism_utils.py
 | `gemm/frost/projection_decode/test_fp8_projection_decode_determinism.py` | `Fp8ProjectionDecode` (the FP8 split-K projection for decode rows, `ProjectionGeometry(OUT_FEATURES, IN_FEATURES)` at a fixed `split_k`) | BF16 output `out` (the entry's only result) | — (inference-only step kernel; no backward) |
 | `test_gdn_decode_fused.py` / `test_gdn_verify_fused.py` (the `rank_geometry` cells) | `GdnDecodeFused`, `GdnVerifyFused` (the fused GDN decode / MTP-verify step kernels, per-rank `Geometry`) | FP8 output, BF16 output, SSM state slots, conv-state pool, reader tickets | — (inference-only step kernels; no backward) |
 | `test_custom_reduction_determinism.py` | `pygraph.custom_reduction`: finite Torch-rule argmax/argmin and direct ADD body | INT32 index projection for FP16/BF16/FP32 values; FP32 sum output | — (no custom-reduction backward entry point) |
-| `sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py` | `sdpa_mxfp8_backward` on the `sdpa_bwd_sm103_d128_mxfp8` row (SM103, D128) | — (backward only) | BF16 dQ, dK, dV; FP32 amax_dQ / dK / dV when requested |
+| `sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py` | `sdpa_mxfp8_backward` on the `sdpa_bwd_sm100_d128_mxfp8` row (SM100 / SM103, D128) | — (backward only) | BF16 dQ, dK, dV; FP32 amax_dQ / dK / dV when requested |
 
-### SM103 D128 MXFP8 backward — qualification, 2026-11-13 (UTC)
+### SM100 / SM103 D128 MXFP8 backward — qualification, 2026-11-13 (UTC)
 
-`sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py` covers the cc 10.3-only CuTeDSL
+`sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py` covers the cc 10.0 / 10.3 CuTeDSL
 chain (prep, dK/dV, persistent dQ) behind `sdpa_mxfp8_backward`. The only atomics
 are the dQ kernel's work counter and the amax maximum. The counter decides which
 cluster computes a unit, not the order the unit sums in, and a maximum is exact in
@@ -77,15 +77,24 @@ recorded for them.
 Qualification on 2026-11-14: B300 SXM6 AC (148 SMs), driver 615.71.10, Torch
 2.11.0+cu130, cuDNN 9.28.0, CuTe DSL 4.8.1 (compiling with CUDA 13.4). The row
 module passes **55 tests** at L0 + L1 with zero skips, the four goldens included. The
-GPU-free eligibility module passes **42**. The warm stress has 0 mismatches in 3000
+GPU-free eligibility module passes **43**. The warm stress has 0 mismatches in 3000
 warm and 3000 poisoned launches; its unsafe control fails 200 / 200 on the same GPU.
 From `test/python`:
 
 ```bash
 CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
   python -m pytest -q -m "L0 or L1" \
-  sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128.py sdpa/frost/test_sdpa_bwd_mxfp8_sm103_d128_eligibility.py
+  sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128.py sdpa/frost/test_sdpa_bwd_mxfp8_sm100_d128_eligibility.py
 ```
+
+B200 qualification on 2026-11-16 (UTC): B200 (148 SMs), driver 615.71.10, otherwise the
+runtime above. The four cells were recorded into a new directory under
+`CUDNN_DETERMINISM_RECORD`, passed a strict `CUDNN_DETERMINISM_GOLDENS` check in a fresh
+process, and were copied to `ea37b1c6cd40d408/`. Their input and output hashes equal the
+B300 records: the `sm_100a` and `sm_103a` builds write the same bytes for these cells. The
+command above passes the row module (55 tests, the goldens included) and the eligibility
+module (43) with zero skips. The warm stress has 0 mismatches in 3000 warm and 3000
+poisoned launches; its unsafe control fails 200 / 200.
 
 Compute Sanitizer has not run on this row: the 12.9 sanitizer (2025.2.1) reports the B300 as
 an unsupported device, and a CUDA 13 build was not available on the test node.

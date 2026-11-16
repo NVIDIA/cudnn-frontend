@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Plan-time geometry of ``sdpa_bwd_sm103_d128_mxfp8``: every constant the kernels specialize on, the shared-memory
+"""Plan-time geometry of ``sdpa_bwd_sm100_d128_mxfp8``: every constant the kernels specialize on, the shared-memory
 struct layouts, and the tcgen05 descriptor constants, computed on the host in Python (no device readback)."""
 
 import math
@@ -294,7 +294,7 @@ def plan(g: Geometry, clusters_of, batch_invariant: bool = True, split: int = 0)
     if split == 0:
         split = 2 if (g.has_split and 2 * t1_decide <= 4 * clusters_of(4)) else 1
     if split == 2 and not g.has_split:
-        raise ValueError("sdpa_bwd_sm103_d128_mxfp8: the walk-split dK/dV variant is not built for this problem")
+        raise ValueError("sdpa_bwd_sm100_d128_mxfp8: the walk-split dK/dV variant is not built for this problem")
     cl = 4 if split == 2 else g.kv_cl1
     tasks = g.b * t1_per_batch * split
     cap = clusters_of(cl) * cl
