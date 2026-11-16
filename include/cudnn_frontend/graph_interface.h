@@ -78,6 +78,7 @@ class Graph : public ICudnn, public INode {
     struct RuntimeWorkspaceCache {
         struct Entry {
             std::weak_ptr<ExecutionPlan_v8> plan;
+            bool valid                          = false;
             cudnnBackendDescriptor_t descriptor = nullptr;
             cudnnHandle_t handle                = nullptr;
             std::vector<int64_t> uids;
@@ -87,7 +88,6 @@ class Graph : public ICudnn, public INode {
         } entry;
         std::mutex mutex;
     };
-    std::shared_ptr<RuntimeWorkspaceCache> runtime_workspace_cache = std::make_shared<RuntimeWorkspaceCache>();
 
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
@@ -1523,7 +1523,10 @@ class Graph : public ICudnn, public INode {
         auto &cache      = *runtime_workspace_cache;
         std::lock_guard<std::mutex> lock(cache.mutex);
         auto const &entry = cache.entry;
-        if (entry.plan.lock() == plan && entry.descriptor == plan->get_raw_desc() && entry.handle == handle &&
+        // Compare ownership without acquiring a temporary strong reference.
+        // The retained weak control block also distinguishes address reuse.
+        bool const same_plan = !entry.plan.owner_before(plan) && !plan.owner_before(entry.plan);
+        if (entry.valid && same_plan && entry.descriptor == plan->get_raw_desc() && entry.handle == handle &&
             entry.uids == override_uids && entry.shapes == override_shapes && entry.strides == override_strides) {
             // FE-owned scratch can change independently of the backend plan.
             cudnn_workspace_size = entry.backend_bytes + fe_workspace_size;
@@ -1569,15 +1572,16 @@ class Graph : public ICudnn, public INode {
         // Reuse the key's vector capacity when geometry changes on every call.
         // Invalidate first: a failed key copy must never expose a partial hit.
         // Backend-query failures above leave the preceding entry untouched.
-        auto &next = cache.entry;
-        next.plan.reset();
-        next.uids            = override_uids;
-        next.shapes          = override_shapes;
-        next.strides         = override_strides;
-        next.descriptor      = plan->get_raw_desc();
-        next.handle          = handle;
-        next.backend_bytes   = cudnn_ws;
-        next.plan            = plan;
+        auto &next         = cache.entry;
+        next.valid         = false;
+        next.uids          = override_uids;
+        next.shapes        = override_shapes;
+        next.strides       = override_strides;
+        next.descriptor    = plan->get_raw_desc();
+        next.handle        = handle;
+        next.backend_bytes = cudnn_ws;
+        if (!same_plan) next.plan = plan;
+        next.valid           = true;
         cudnn_workspace_size = cudnn_ws + fe_workspace_size;
         CUDNN_FE_LOG_LABEL_ENDL("INFO: get_workspace_size() is " << cudnn_workspace_size
                                                                  << " (runtime override shape)");
@@ -3551,6 +3555,10 @@ class Graph : public ICudnn, public INode {
                "CUDNN_FRONTEND_SKIP_JSON_LIB";
 #endif
     }
+
+   private:
+    // Keep this cold metadata after the existing execution fields.
+    std::shared_ptr<RuntimeWorkspaceCache> runtime_workspace_cache = std::make_shared<RuntimeWorkspaceCache>();
 };
 
 inline error_t
