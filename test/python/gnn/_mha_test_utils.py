@@ -153,6 +153,14 @@ def _reference_mha_simple(
     concat_heads: bool,
     norm_by_dim: bool,
 ):
+    output_dtype = value_features.dtype
+    # Keep additions, dot products, softmax, and aggregation in FP64. Casting
+    # only the final logits cannot recover precision lost in the reductions.
+    key_features, query_features, value_features = (features.double() for features in (key_features, query_features, value_features))
+    edge_features = None if edge_features is None else edge_features.double()
+    score_bias = None if score_bias is None else score_bias.double()
+    score_weight = None if score_weight is None else score_weight.double()
+    dropout_mask = None if dropout_mask is None else dropout_mask.double()
     offsets = graph.offsets.cpu().tolist()
     dim_node = key_features.shape[1]
     dim_head = dim_node // num_heads
@@ -161,7 +169,7 @@ def _reference_mha_simple(
     head_outputs = []
     for head in range(num_heads):
         per_dst = []
-        per_edge = torch.zeros(graph.num_edges, device=key_features.device, dtype=torch.float32)
+        per_edge = torch.zeros(graph.num_edges, device=key_features.device, dtype=torch.float64)
         feature_slice = slice(head * dim_head, (head + 1) * dim_head)
         for dst in range(graph.num_dst_nodes):
             begin, end = offsets[dst], offsets[dst + 1]
@@ -175,7 +183,7 @@ def _reference_mha_simple(
                 edge = edge_features[edge_rows, feature_slice]
                 key = key + edge
                 value = value + edge
-            logits = (key * query).sum(dim=-1).float()
+            logits = (key * query).sum(dim=-1)
             if score_weight is not None:
                 logits = logits * score_weight[head, csc_rows]
             if norm_by_dim:
@@ -190,4 +198,4 @@ def _reference_mha_simple(
         head_outputs.append(torch.stack(per_dst))
     attention = torch.stack(attention_rows)
     output = torch.cat(head_outputs, dim=1) if concat_heads else torch.stack(head_outputs).mean(dim=0)
-    return output, attention
+    return output.to(output_dtype), attention.float()
