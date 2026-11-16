@@ -1819,10 +1819,11 @@ FP64 reference is the numerical arm and the byte comparisons are the
 repeatability and batch-invariance arms. SM100/103 and SM107 are outside this
 row's range.
 
-Measured at source revision a78f6ce4 on an SM90 validation host (cc 9.0,
-132 SMs) with Torch 2.12.1+cu130, CUDA 13.0 and `nvidia-cutlass-dsl` 4.8.0a0:
-the file passed 41 collected cases with no skips in 34.3 s from a cold
-compiled-plan cache (30 compiled entries). At the same revision,
+Measured at source revision 8c1ddeb66 on an SM90 validation host (cc 9.0,
+132 SMs) with Torch 2.12.1+cu130, CUDA 13.0 and `nvidia-cutlass-dsl` 4.8.0:
+the file passed 43 collected cases with no skips in 46.4 s from a cold
+compiled-plan cache (34 compiled entries). At revision a78f6ce4 (identical
+kernel and chain),
 compute-sanitizer racecheck on `_case(torch.bfloat16, 64, True, 1, 3, 1, 65, 257)`
 and `_case(torch.float16, 128, True, 1, 3, 1, 65, 257)` reported zero hazards;
 every shared-memory writer and every ring reader arrives its mbarrier directly,
