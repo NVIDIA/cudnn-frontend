@@ -64,6 +64,21 @@ def is_last_resort(cfg: PlanConfig) -> bool:
     return cfg.engine_id == LAST_RESORT_ENGINE_ID
 
 
+LEAD, TRAIL, LAST = "lead", "trail", "last"
+"""Per-proposal verdicts for :func:`order`: ahead of the backend's block, after it, or after the LAST_RESORT marker."""
+
+
+def order(ours: List[PlanConfig], verdict: Callable[[PlanConfig], str]) -> List[PlanConfig]:
+    """A family hook's list from its proposals and one verdict per proposal: the ``lead`` proposals, the backend's
+    block, the ``trail`` proposals, then (if any) the :data:`LAST_RESORT` marker and the ``last`` proposals. Each group
+    keeps the proposals' order."""
+    groups: Dict[str, List[PlanConfig]] = {LEAD: [], TRAIL: [], LAST: []}
+    for p in ours:
+        groups[verdict(p)].append(p)
+    out = groups[LEAD] + [BACKEND] + groups[TRAIL]
+    return out + [LAST_RESORT] + groups[LAST] if groups[LAST] else out
+
+
 def _split_last_resort(proposals: List[PlanConfig]) -> Tuple[List[PlanConfig], List[PlanConfig]]:
     """(proposals before the LAST_RESORT marker, proposals after it); no marker: (all, [])."""
     for i, p in enumerate(proposals):
