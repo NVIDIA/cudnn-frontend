@@ -24,12 +24,14 @@ except ImportError:
     pytest.skip("torch.nn.attention.varlen with varlen_attn_out required", allow_module_level=True)
 
 from cudnn.torch import sdpa_provider  # noqa: E402
+from sdpa.torch._provider_test_utils import assert_public_rejection, cudnn_rejection_reasons  # noqa: E402
 
 if not sdpa_provider._has_backend_arg(torch.ops.torch_attn._varlen_attn.default):
     pytest.skip("this torch's varlen ops take no backend argument", allow_module_level=True)
 
 FLASH = [SDPBackend.FLASH_ATTENTION]
 CUDNN = [SDPBackend.CUDNN_ATTENTION]
+_OUT_SELECTS_BACKEND = sdpa_provider._has_backend_arg(torch.ops.torch_attn._varlen_attn_out.default)
 
 
 @pytest.fixture
@@ -63,6 +65,12 @@ def _attn(backends, **kwargs):
 
 @pytest.mark.L0
 def test_selected_cudnn_is_served(overrides):
+    q, k, v, cu, mx = _inputs()
+    reasons = cudnn_rejection_reasons(q, k, v, cu, cu, mx, [-1, 0])
+    if reasons:
+        with sdpa_kernel(CUDNN):
+            assert_public_rejection(reasons, lambda: varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0)))
+        return
     _, served = _attn(CUDNN)
     assert served == {"fwd": 1, "bwd": 1}
 
@@ -81,11 +89,22 @@ def test_selected_flash_is_passed_to_torch(overrides):
 def test_out_variant_honors_the_selection(overrides, backends, expected):
     q, k, v, cu, mx = _inputs()
     with torch.no_grad():
-        out = torch.empty_like(q)
+        out = torch.full_like(q, float("nan"))
         before = dict(sdpa_provider.calls)
         with sdpa_kernel(backends):
+            if not _OUT_SELECTS_BACKEND and backends == CUDNN:
+                with pytest.raises(RuntimeError, match="only supports.*FLASH_ATTENTION"):
+                    varlen_attn_out(out, q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
+                assert not _calls_since(before)
+                assert torch.isnan(out).all(), "rejected out call wrote the output"
+                return
+            reasons = cudnn_rejection_reasons(q, k, v, cu, cu, mx, [-1, 0]) if backends == CUDNN else []
+            if reasons:
+                assert_public_rejection(reasons, lambda: varlen_attn_out(out, q, k, v, cu, cu, mx, mx, window_size=(-1, 0)))
+                assert torch.isnan(out).all(), "rejected out call wrote the output"
+                return
             varlen_attn_out(out, q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
-        assert _calls_since(before) == expected
+        assert _calls_since(before) == (expected if _OUT_SELECTS_BACKEND else {})
         with sdpa_kernel(backends):
             ref = varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0))
     torch.testing.assert_close(out, ref, rtol=0, atol=2e-2)
@@ -99,6 +118,15 @@ def test_selected_cudnn_config_the_python_path_declines_runs_torchs_cudnn(overri
     seqused_k = (cu[1:] - cu[:-1]).to(torch.int32)
     before = dict(sdpa_provider.calls)
     with torch.no_grad(), sdpa_kernel(CUDNN), caplog.at_level(logging.INFO, logger="torch.nn.attention.varlen"):
-        varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, 0), seqused_k=seqused_k)
+        # A full window is admitted by both old and new Torch KV-cache selectors.
+        reasons = cudnn_rejection_reasons(q, k, v, cu, cu, mx, [-1, -1], seqused_k=seqused_k)
+
+        def public_call():
+            return varlen_attn(q, k, v, cu, cu, mx, mx, window_size=(-1, -1), seqused_k=seqused_k)
+
+        if reasons:
+            assert_public_rejection(reasons, public_call)
+            return
+        public_call()
     assert _calls_since(before) == {"fwd_torch": 1}
     assert "Using cuDNN backend for varlen_attn" in caplog.text
