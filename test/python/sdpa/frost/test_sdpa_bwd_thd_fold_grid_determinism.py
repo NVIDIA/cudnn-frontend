@@ -260,3 +260,53 @@ def test_thd_fold_complete_grid_product_keeps_last_live_owner(dtype, batch, head
         check(2)
     finally:
         captured.reset()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("partial", ["fp32", "io"], ids=["fp32-partials", "half-partials"])
+def test_thd_fold_runtime_bound_reuses_both_launch_paths(dtype, partial, monkeypatch):
+    """One compiled callable crosses the physical grid cap without recompiling.
+
+    The live sequence stays short; a larger runtime maximum is a legal bound,
+    not a new packed extent. Each launch must preserve the holes and use the
+    current input values, including after CUDA graph capture.
+    """
+    import cutlass.cute as cute
+
+    parts, outputs, meta, origins, refs, indices, _, _, group = _fixture(1, 2, 35, 64, 128, dtype, partial)
+    fn = _compile(parts, outputs, meta, origins, 1, 35, group)
+
+    def no_recompile(*args, **kwargs):
+        raise AssertionError("a runtime maximum must not compile another fold")
+
+    monkeypatch.setattr(cute, "compile", no_recompile)
+    # 128 / 8 vectors per token, 256 threads per block, 65535 physical blocks.
+    last_single_pass = 65535 * 256 // (128 // 8)
+    for maximum in (35, last_single_pass, last_single_pass + 1, 35):
+
+        def launch():
+            fn(*parts, *outputs, meta, origins, torch.cuda.current_stream().cuda_stream, max_skv_override=maximum)
+
+        launch()
+        for out, ref in zip(outputs, refs):
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(captured):
+                launch()
+            for part in parts:
+                part.neg_()
+            for out in outputs:
+                out.fill_(123.0)
+            captured.replay()
+            for out, ref, positions in zip(outputs, refs, indices):
+                expected = ref.clone()
+                expected[0, positions] = -ref[0, positions]
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            for part in parts:
+                part.neg_()
+            captured.replay()
+            for out, ref in zip(outputs, refs):
+                torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        finally:
+            captured.reset()
