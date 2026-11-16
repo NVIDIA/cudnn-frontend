@@ -8,6 +8,10 @@ chunking. A persistent attention stage does not imply a persistent gradient
 GEMM: D512 half stage 3 uses `batch * head_chunk` in grid.z even for THD.
 Cover each individual extent below its limit but their product above it,
 retain valid chunked large-head controls, and execute the complete chain.
+Layout-only admission fixtures must still provide real `SdpaGraphFacts`
+geometry matching their tensor declarations. A `SimpleNamespace` with only
+strides can fail before reaching the layout assertion when launch checks are
+composed; the dense-port contract covers both half dtypes on SM100/SM103.
 `test_sdpa_bwd_d512_half_grid.py` also checks graph/standalone parity and
 changed-input capture replay across that boundary.
 For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
