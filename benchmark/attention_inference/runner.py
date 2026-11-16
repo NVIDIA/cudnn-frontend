@@ -23,7 +23,7 @@ import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from .config_types import BenchmarkResult, InferenceBenchmarkConfig, ModelPreset, attn_mask
 
@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 # The backends whose generation phase reads a paged KV cache, and so sweep ``config.page_sizes``; the cudnn graph paths and fa4
 # attend over dense K / V and take one case per shape at ``config.page_size``.
 PAGED_BACKENDS = ("flashinfer", "flashinfer_fa2", "flashinfer_cudnn", "flash_mla", "b12x")
-CUDNN_LEGS = ("cudnn", "cudnn_oss", "cudnn_auto")
+CUDNN_LEGS = ("cudnn", "cudnn_oss", "cudnn_auto", "cudnn_oss_each")
 # FlashInfer with a pinned attention backend: like the cudnn legs they sweep config.kv_layouts in both phases (a paged prefill
 # reads the paged wrapper).
 FI_PINNED_LEGS = ("flashinfer_fa2", "flashinfer_cudnn")
@@ -183,7 +183,7 @@ class InferenceBenchmarkRunner:
                                         "kv_min_fill": fill,
                                     }
 
-    def run_single(self, case: Dict[str, Any], cc: tuple) -> BenchmarkResult:
+    def run_single(self, case: Dict[str, Any], cc: tuple) -> Union[BenchmarkResult, List[BenchmarkResult]]:
         config: InferenceBenchmarkConfig = case["config"]
         model: ModelPreset = case["model"]
         base = dict(
@@ -270,21 +270,27 @@ class InferenceBenchmarkRunner:
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
-            line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT,")), None)
-            if proc.returncode != 0 or line is None:
+            lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT,")]
+            if proc.returncode != 0 or not lines:
                 tail = "\n".join((proc.stderr or proc.stdout).splitlines()[-12:])
                 return BenchmarkResult(**base, time_ms=float("inf"), tflops=0.0, gbps=0.0, sol_pct=None, success=False, error_message=tail[-1500:])
-            _, ms, tflops, gbps, sol, gpu, detail = line.split(",", 6)
-            return BenchmarkResult(
-                **base,
-                time_ms=float(ms),
-                tflops=float(tflops),
-                gbps=float(gbps),
-                sol_pct=float(sol) if sol else None,
-                success=True,
-                gpu_name=gpu,
-                backend_detail=detail,
-            )
+            results = []
+            # cudnn_oss_each prints one RESULT per FROST plan; every other leg prints one.
+            for line in lines if case["backend"] == "cudnn_oss_each" else lines[:1]:
+                _, ms, tflops, gbps, sol, gpu, detail = line.split(",", 6)
+                results.append(
+                    BenchmarkResult(
+                        **base,
+                        time_ms=float(ms),
+                        tflops=float(tflops),
+                        gbps=float(gbps),
+                        sol_pct=float(sol) if sol else None,
+                        success=True,
+                        gpu_name=gpu,
+                        backend_detail=detail,
+                    )
+                )
+            return results if case["backend"] == "cudnn_oss_each" else results[0]
         except subprocess.TimeoutExpired:
             return BenchmarkResult(**base, time_ms=float("inf"), tflops=0.0, gbps=0.0, sol_pct=None, success=False, error_message="timeout")
 
@@ -314,14 +320,15 @@ class InferenceBenchmarkRunner:
                 f"[{i}/{len(cases)}] {m.name} | {case['phase']} | b={case['batch_size']} "
                 f"q={case['q_tokens']} kv={case['kv_len']} | {case['backend']} | {case['data_type']}{kvd}{pg}"
             )
-            r = self.run_single(case, cc)
-            results.append(r)
-            if r.success:
-                sol = f", {r.sol_pct:.0f}% mem-SOL" if r.sol_pct else ""
-                metric = f"{r.tflops:.0f} TFLOPS" if r.phase == "context" else f"{r.gbps:.0f} GB/s{sol}"
-                logger.info(f"  -> {r.time_ms:.3f} ms ({metric}) [{r.backend_detail}]")
-            else:
-                logger.warning(f"  -> FAILED: {((r.error_message or '').strip().splitlines() or ['(no error message)'])[-1][:140]}")
+            out = self.run_single(case, cc)
+            for r in out if isinstance(out, list) else [out]:
+                results.append(r)
+                if r.success:
+                    sol = f", {r.sol_pct:.0f}% mem-SOL" if r.sol_pct else ""
+                    metric = f"{r.tflops:.0f} TFLOPS" if r.phase == "context" else f"{r.gbps:.0f} GB/s{sol}"
+                    logger.info(f"  -> {r.time_ms:.3f} ms ({metric}) [{r.backend_detail}]")
+                else:
+                    logger.warning(f"  -> FAILED: {((r.error_message or '').strip().splitlines() or ['(no error message)'])[-1][:140]}")
         return results
 
     def results_to_dataframe(self, results):

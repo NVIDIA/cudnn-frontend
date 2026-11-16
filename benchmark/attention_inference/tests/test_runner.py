@@ -140,6 +140,17 @@ class PageSizeTest(unittest.TestCase):
         ):
             self.assertIsNone(self.runner.run_single(fi, cc=(10, 0)).cudnn_total_q)
 
+    def test_each_leg_returns_one_result_per_plan(self):
+        from benchmark.attention_inference.configs.serving_prefill import CONFIG as SP
+
+        each, auto = (next(iter(self.runner.expand_config(replace(SP, backends=[leg])))) for leg in ("cudnn_oss_each", "cudnn_auto"))
+        stdout = "RESULT,1,2,3,,dev,cudnn_oss_each rank=0 plan=a\nRESULT,0.5,2,3,,dev,cudnn_oss_each rank=1 plan=b\n"
+        with patch("benchmark.attention_inference.runner.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=stdout)):
+            results = self.runner.run_single(each, cc=(10, 0))
+            single = self.runner.run_single(auto, cc=(10, 0))
+        self.assertEqual([(r.time_ms, r.backend_detail) for r in results], [(1.0, "cudnn_oss_each rank=0 plan=a"), (0.5, "cudnn_oss_each rank=1 plan=b")])
+        self.assertEqual(single.time_ms, 1.0)  # every other leg keeps one result
+
     def test_b12x_sliding_window_generation_is_dense(self):
         swa = replace(QWEN35.models[0], sliding_window_size=128)
         cases = list(self.runner.expand_config(replace(QWEN35, models=[swa], backends=["b12x"], context_seqlens=[], context_chunked_shapes=[])))

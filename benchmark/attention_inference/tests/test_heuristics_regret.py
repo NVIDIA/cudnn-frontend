@@ -126,3 +126,22 @@ def test_baseline_pairs_within_compatible_schemas(tmp_path):
     )
     assert "matched cases: 2" in out.stdout and "1 with a new default plan" in out.stdout, out.stdout
     assert out.returncode == 1
+
+
+def test_each_leg_reports_the_frost_order_without_failing(tmp_path):
+    each = lambda rank, ms, q=1024, plan="frost[TILE_M=128]": dict(  # noqa: E731
+        backend="cudnn_oss_each", q_tokens=q, kv_len=q, time_ms=ms, backend_detail=f"cudnn_oss_each rank={rank} plan={plan}"
+    )
+    _write(
+        tmp_path / "r.csv",
+        [each(0, "1.2", plan="first[A]"), each(1, "1.0", plan="fast[B]"), each(2, "1.1"), each(0, "0.5", q=2048)],
+    )
+    run = lambda *extra: subprocess.run([sys.executable, "-m", "benchmark.heuristics_regret", str(tmp_path), *extra], capture_output=True, text=True)
+    out = run()
+    assert out.returncode == 0, out.stderr
+    assert "cases with 2+ timed plans: 1; first-plan regret geomean 1.200" in out.stdout  # the one-plan case is not ranked
+    assert "best of the first 3: regret geomean 1.000" in out.stdout
+    assert "inversions beyond 1.05x: 2 in 1 cases" in out.stdout
+    assert "| 1.20 | fast[B] (1) 1.0000 | first[A] 1.2000 |" in out.stdout
+    assert run("--top_k", "1").stdout.count("best of the first 1: regret geomean 1.200") == 1
+    assert run("--fail").returncode == 0

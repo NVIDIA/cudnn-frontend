@@ -14,6 +14,10 @@ spread is run-to-run noise, reported as the noise floor the threshold has to cle
 
     python -m benchmark.heuristics_regret <results dir or CSV> [...] [--threshold 1.05] [--top 30] [--fail]
 
+``cudnn_oss_each`` rows (one per FROST plan the heuristics proposed, ranked in proposal order) add the order among FROST plans: the
+first plan against the fastest, the best of the first ``--top_k`` against the fastest, and inversions (a plan ranked ahead of one that is
+faster by more than ``--threshold``). It is reported alone and does not change ``--fail``.
+
 ``--baseline <an earlier run's dir or CSV> [...]`` adds the run-to-run view: each case's ``cudnn_auto`` time against the
 same case there (matched on the configuration columns both runs record). A case slower by more than ``--regress`` is
 listed under "plan changed" when its default plan differs between the runs (a dispatch change) and under "same plan"
@@ -25,6 +29,7 @@ import csv
 import glob
 import math
 import os
+import re
 import sys
 from collections import defaultdict
 
@@ -173,6 +178,54 @@ def _report_baseline(paths, baseline, regress, top):
     return bool(changed or lost)
 
 
+def _load_each(paths):
+    """{case: [(rank, ms, plan)]} from cudnn_oss_each rows; a row's rank is its position in the heuristics' FROST proposal."""
+    cases = defaultdict(list)
+    for f in _csvs(paths):
+        with open(f, newline="") as fh:
+            for row in csv.DictReader(fh):
+                detail = row.get("backend_detail") or ""
+                rank = re.search(r"rank=(\d+)", detail)
+                if row.get("backend") != "cudnn_oss_each" or rank is None:
+                    continue
+                key = (os.path.relpath(f),) + tuple(sorted((k, v) for k, v in row.items() if k and k not in NON_KEY))
+                try:
+                    t = float(row["time_ms"]) if row.get("success") == "True" and row.get("skipped") != "True" else None
+                except (TypeError, ValueError):
+                    t = None
+                if t and t > 0:
+                    cases[key].append((int(rank.group(1)), t, _plan(detail)))
+    return cases
+
+
+def _report_each(paths, threshold, top, k):
+    rows = []
+    for key, plans in _load_each(paths).items():
+        timed = sorted(plans)
+        if len(timed) < 2:
+            continue
+        best = min(t for _, t, _ in timed)
+        inversions = sum(1 for i in range(len(timed)) for j in range(i + 1, len(timed)) if timed[i][1] > timed[j][1] * threshold)
+        rows.append((timed[0][1] / best, min(t for _, t, _ in timed[:k]) / best, inversions, key, timed))
+    if not rows:
+        return
+    g = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs))
+    first, topk = [r[0] for r in rows], [r[1] for r in rows]
+    print("## FROST order (cudnn_oss_each: every proposed FROST plan, timed alone)\n")
+    print(
+        f"- cases with 2+ timed plans: {len(rows)}; first-plan regret geomean {g(first):.3f}, worst {max(first):.3f}, > {threshold:.2f}: {sum(r > threshold for r in first)}"
+    )
+    print(f"- best of the first {k}: regret geomean {g(topk):.3f}, worst {max(topk):.3f}, > {threshold:.2f}: {sum(r > threshold for r in topk)}")
+    print(f"- inversions beyond {threshold:.2f}x: {sum(r[2] for r in rows)} in {sum(1 for r in rows if r[2])} cases\n")
+    worst = [r for r in sorted(rows, key=lambda r: -r[0]) if r[0] > threshold][:top]
+    if worst:
+        print("| first-plan regret | fastest plan (rank) | first plan | case |\n|---|---|---|---|")
+        for r0, _, _, key, timed in worst:
+            rank, t, plan = min(timed, key=lambda x: x[1])
+            print(f"| {r0:.2f} | {plan} ({rank}) {t:.4f} | {timed[0][2]} {timed[0][1]:.4f} | {_label(key)} |")
+        print()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+")
@@ -181,9 +234,11 @@ def main():
     ap.add_argument("--fail", action="store_true", help="exit 1 when any misrank or coverage loss is found (or, with --baseline, a slower new default plan)")
     ap.add_argument("--baseline", nargs="+", default=None, help="an earlier run's results dir or CSV: report cudnn_auto cases slower than there")
     ap.add_argument("--regress", type=float, default=1.2, help="--baseline: now/baseline ratio reported as slower")
+    ap.add_argument("--top_k", type=int, default=3, help="cudnn_oss_each: how many leading FROST plans an autotuner would time")
     a = ap.parse_args()
 
     regressed = _report_baseline(a.paths, a.baseline, a.regress, a.top) if a.baseline else False
+    _report_each(a.paths, a.threshold, a.top, a.top_k)
 
     cases = _load(a.paths)
     regrets, misranks, losses, same_plan = [], [], [], []
