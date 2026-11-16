@@ -46,6 +46,7 @@ def test_budget_chunks_also_fit_launch(b, h, group, bpe, batch_chunking, expecte
 
 def _api(monkeypatch, kind, *, b, h, hk, thd=False, dtype=torch.bfloat16, d=256, dv=256):
     from cudnn.frost import buffers, device
+    from cudnn.api_base import TensorDesc
     from test_sdpa_bwd_dsl_sm107 import _adapter, _adapter_desc
     from test_sdpa_bwd_mxfp8_sm107 import _mxfp8_adapter
 
@@ -77,6 +78,7 @@ def _api(monkeypatch, kind, *, b, h, hk, thd=False, dtype=torch.bfloat16, d=256,
                 dim = 1 if name == "stats" else d if name in ("q", "k", "dq", "dk") else dv
                 dt = torch.float32 if name == "stats" else dtype if name in ("dq", "dk", "dv") else input_dtype
                 samples["sample_" + name] = _adapter_desc((b, hk if kv else h, 3 if kv else 2, dim), dt, name)
+            samples["sample_stats"] = TensorDesc(torch.float32, (b, h, 2, 1), (h * 2, 2, 1, 1), (3, 2, 1, 0), torch.device("cuda", 0))
             api = cls(**samples, thd=thd, max_total_seq_len_q=2 if thd else None, max_total_seq_len_kv=3 if thd else None)
     facts = SdpaGraphFacts(
         is_backward=True,
@@ -114,6 +116,30 @@ def test_sm107_dense_twin_preserves_shared_chunk_bounds(monkeypatch, dtype, b, h
         assert reason is None, reason
         assert api.check_support()
         assert api._b_chunk * api._qh_chunk <= 65535
+
+
+@pytest.mark.parametrize("kind", ["sm100-half", "sm103-half"])
+@pytest.mark.parametrize("d,dv", [(200, 192), (248, 192), (256, 192), (256, 256), (192, 128)])
+@pytest.mark.parametrize("mode", ["dense-legal", "thd-legal", "dense-bad-grid", "thd-bad-grid"])
+def test_sm100_head_envelope_and_grid_compose(monkeypatch, kind, d, dv, mode):
+    thd = mode.startswith("thd")
+    bad_grid = mode.endswith("bad-grid")
+    b = 65536 if thd and bad_grid else 1
+    h = 65536 if not thd and bad_grid else 2
+    native = (d, dv) in ((256, 256), (192, 128))
+    accepted = not bad_grid and (not thd or native)
+    api, facts, spec = _api(monkeypatch, kind, b=b, h=h, hk=1, thd=thd, dtype=torch.float16, d=d, dv=dv)
+    reason = engines.mismatch(spec.capabilities, facts)
+    assert (reason is None) == accepted, reason
+    if accepted:
+        assert api.check_support()
+    else:
+        # Both checks matter: a valid head pair must still meet launch bounds,
+        # and valid launch dimensions must not widen the packed head envelope.
+        with pytest.raises(ValueError):
+            api.check_support()
+        if not thd or native:
+            assert "grid" in reason, reason
 
 
 @pytest.mark.parametrize("kind,dtype", [route for route in _ROUTES if route.values[0] != "mx"])
@@ -251,7 +277,7 @@ def test_sm100_thd_full_chain_grid_reference(monkeypatch, dtype, hkv):
 def test_sm100_dense_batch_chunks_preserve_whole_group(monkeypatch, dtype):
     import test_sdpa_bwd_d256_sm100 as helper
     from cudnn.sdpa.bwd import chunk_grid
-    from test_sdpa_bwd_thd_sm107 import _grad_failure
+    import test_sdpa_bwd_thd_sm107 as thd_helper
     from determinism_utils import assert_bitwise, snapshot
 
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
@@ -296,7 +322,7 @@ def test_sm100_dense_batch_chunks_preserve_whole_group(monkeypatch, dtype):
             # Bound oracle temporaries while checking every batch and element.
             for start in range(0, 4, 2):
                 got = output[start : start + 2]
-                error = _grad_failure("dense chunk", got, (ref * sign).expand_as(got), dtype)
+                error = thd_helper._grad_failure("dense chunk", got, (ref * sign).expand_as(got), dtype)
                 assert error is None, error
 
     graph.execute(vp, workspace)

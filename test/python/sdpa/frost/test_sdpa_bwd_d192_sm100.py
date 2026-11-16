@@ -93,6 +93,27 @@ def test_rectangular_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, cau
     check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, budget)
 
 
+@requires_pre_rubin_blackwell
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize(
+    "d,dv,sq,sk,hk,causal,br,left,deterministic",
+    [
+        (192, 192, 256, 512, 4, False, False, None, False),
+        (192, 192, 257, 385, 2, True, True, None, False),
+        (192, 192, 257, 513, 1, True, False, 128, False),
+        (192, 192, 512, 512, 2, True, False, None, True),
+        (256, 192, 256, 512, 4, False, False, None, False),
+        (256, 192, 257, 385, 1, True, False, None, True),
+        (224, 192, 257, 385, 2, True, True, None, False),
+        (200, 192, 256, 512, 4, False, False, 128, False),
+    ],
+    ids=["d192-dense", "d192-gqa-br", "d192-mqa-window", "d192-det", "d256x192-dense", "d256x192-mqa-det", "d224x192-gqa-br", "d200x192-window"],
+)
+def test_head_pair_envelope_replay_and_rebind(monkeypatch, dt, d, dv, sq, sk, hk, causal, br, left, deterministic):
+    """Dense head pairs under (256, 256) with D_V in {192, 256} run the (256, 256) body over real-width tensor maps."""
+    check_backward_replay_and_rebind(monkeypatch, dt, sq, sk, hk, causal, br, left, None, d=d, dv=dv, deterministic=deterministic)
+
+
 def check_backward_replay_and_rebind(
     monkeypatch, dt, sq, sk, hk, causal, br, left, budget, *, d=192, dv=128, deterministic=False, api_type=None, engine=_ENGINE, scale=None, batch_pitch=False
 ):
@@ -108,8 +129,11 @@ def check_backward_replay_and_rebind(
     compiled_hosts = []
     original_host = prepared_host.compile_host_f16
 
+    native_d192 = (d, dv) == (192, 128)
+    geometry = (d, dv) if native_d192 or (d, dv) == (256, 256) else (256, 256)
+
     def record_host(main, mm_dk, mm_dq, *args, **kwargs):
-        assert (mm_dk is None) == (d == 192), "D192 must omit the separate dK GEMM; D256 must retain it"
+        assert (mm_dk is None) == native_d192, "D192x128 must omit the separate dK GEMM; D256 and its envelope must retain it"
         compiled_hosts.append(main)
         return original_host(main, mm_dk, mm_dq, *args, **kwargs)
 
@@ -120,11 +144,13 @@ def check_backward_replay_and_rebind(
 
     def record_compile(api, main, mm_dk, mm_dq):
         compiled_geometry.append((main.CFG.TILE_K, main.CFG.TILE_O))
-        assert compiled_geometry[-1] == (d, dv), "the actual compiled body must use native geometry"
-        assert bool(main.CFG.FUSE_DK) == (d == 192)
+        assert compiled_geometry[-1] == geometry, "native pairs compile their own geometry; envelope pairs the (256, 256) body"
+        assert bool(main.CFG.FUSE_DK) == native_d192
         for stage3 in (mm_dk, mm_dq):
-            assert stage3.PARAMS.cgrp_tile_mn == ((128, 192) if d == 192 else (256, 256))
-            assert stage3.cta_group == (1 if d == 192 else 2)
+            if stage3 is None:
+                continue
+            assert stage3.PARAMS.cgrp_tile_mn == ((128, 192) if native_d192 else (256, 256))
+            assert stage3.cta_group == (1 if native_d192 else 2)
         return original_compile(api, main, mm_dk, mm_dq)
 
     monkeypatch.setattr(api_type, "_compile_plan", record_compile)
@@ -232,7 +258,21 @@ def check_backward_replay_and_rebind(
 
 @pytest.mark.parametrize(
     "d,dv,thd,served",
-    [(192, 128, False, True), (192, 128, True, True), (128, 128, False, False), (192, 192, False, False), (256, 128, False, False), (256, 256, False, True)],
+    [
+        (192, 128, False, True),
+        (192, 128, True, True),
+        (128, 128, False, False),
+        (192, 192, False, True),
+        (192, 192, True, False),
+        (256, 192, False, True),
+        (224, 192, False, True),
+        (160, 160, False, False),
+        (256, 160, False, False),
+        (192, 136, False, False),
+        (256, 128, False, False),
+        (264, 264, False, False),
+        (256, 256, False, True),
+    ],
 )
 def test_exact_head_pair_admission(monkeypatch, d, dv, thd, served):
     from test_sdpa_bwd_d256_sm100 import _decline_reason

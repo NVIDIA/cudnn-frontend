@@ -1101,6 +1101,9 @@ Backward (d512 stage 2):
   `test_sdpa_bwd_d256_chunk_grid.py` pair impossible whole-group declarations
   with legal large-batch controls, then check actual THD head chunks and
   dense whole-group batch chunks against an independent reference and replay.
+  When composing head-envelope and launch predicates, retain valid expanded
+  dense pairs as controls; `test_sm100_head_envelope_and_grid_compose` detects
+  either a lost envelope or a successful head check bypassing grid validation.
 
 - **A head subgroup is legal only when the final reduction covers all global
   per-query-head partials.** The dense BF16 SM100 d256 chain can divide one GQA
