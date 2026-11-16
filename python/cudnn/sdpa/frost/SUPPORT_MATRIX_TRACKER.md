@@ -8,6 +8,8 @@
 > current support changes to the relevant new architecture section as it is
 > refactored. Do not append development logs here. A pending new section means
 > its documentation has not yet migrated, not that the feature is unsupported.
+> Current SM107 mixed-KV THD split ownership is described in
+> [the SM107 feature combinations](support/sm107.md#feature-combinations).
 
 **SM90 fixed implementation ownership — 2026-11-14**
 
