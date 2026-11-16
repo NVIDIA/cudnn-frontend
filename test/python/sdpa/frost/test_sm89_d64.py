@@ -615,8 +615,8 @@ def test_sm89_mask_families_match_explicit_boolean_masks(label, kwargs, mask_fn)
 @requires_ada
 @pytest.mark.L1
 def test_sm89_row_claims_exactly_its_measured_band():
-    """`diagonal_band_right_bound` is accepted and IGNORED by this kernel, so the
-    row must not advertise right-band widening.  Pinning the negative here keeps
+    """Right-band widening (`diagonal_band_right_bound`) is not yet qualified for
+    this row, so the row must not advertise it.  Pinning the negative here keeps
     the row and the support matrix from drifting apart in the permissive
     direction."""
     caps = _spec().capabilities
