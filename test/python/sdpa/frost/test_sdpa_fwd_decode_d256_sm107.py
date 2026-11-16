@@ -1465,7 +1465,7 @@ def test_decode_graph_qwen_24_2_packs_twelve_rows_into_the_tile():
     plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[700, 130, 5, 1024], page=16, dtype=torch.bfloat16, capture=cap)
     _assert_decode_tile_plan(plan, G=12, units=4 * 2, kv_tiles=8, grid=(4, 24, 1))
     mod = cap["module"]
-    assert "sm107" in mod.__name__ and mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__name__
+    assert mod.TEMPLATE_NAME == DECODE and mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py"), mod.__file__
     assert (mod.HEADS_PER_TILE, mod.Q_BOX_TOKENS, mod.Q_BOX_ROWS, mod.N_Q - mod.Q_BOX_ROWS, mod.N_Q, mod.CFG.SPLIT_KV) == (
         12,
         1,
@@ -1905,9 +1905,8 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
     requires paged KV' gate declined): ACCEPT -- a decode-shaped graph packs the whole group (24/2
     -> 12 rows) and splits (the fp32 partials + the shared combine), the 16-row MTP step packs 8:1;
     the 24/2 MTP step packs on the 32-column tile in two token units and splits; REJECT -- a packed
-    graph past the route (24/2 at S_q = 5: a third token unit) and a split past the route (33 MHA
-    rows) are typed declines naming the decode tile, because the d256 prefill kernel wires neither
-    (never a silent unpacked / unsplit run)."""
+    graph past the route (24/2 at S_q = 5 under the 32-column cap) is a typed decline.
+    An unpacked split past the decode route (33 MHA rows) uses native prefill with its split intact."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     def api(*, s_q, H, KH, pack, split=1, seq_lens=True, **extra):
@@ -1947,8 +1946,8 @@ def test_decode_adapter_dense_pack_and_split_follow_the_tile():
         api(s_q=11, H=24, KH=2, pack=True)  # 132 packed rows (a third token unit of the 64-column tile): no Rubin d256 kernel packs them
     with pytest.raises(NotImplementedError, match="d256 decode tile"):
         api(s_q=5, H=24, KH=2, pack=True, decode_q_tile_max=32)  # 60 packed rows under the cap: a third unit of the 32-column tile
-    with pytest.raises(NotImplementedError, match="d256 decode tile"):
-        api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 33 MHA rows: the prefill kernel, no dense split
+    a = api(s_q=33, H=4, KH=4, pack=False, split=2, seq_lens=False)
+    assert a._decode_q_tile() == 0 and a.split_kv == 2 and a._fp32_partial_split()
     with pytest.raises(ValueError, match="unpadded dense graphs only"):
         api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=True)  # a PADDED dense split: the shared structural rule
 
@@ -2869,6 +2868,13 @@ def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
     from test_sdpa_fwd_paged_sm100 import _run_graph
 
+    def check_body(graph, _vp, _workspace):
+        import inspect
+
+        api = inspect.getclosurevars(graph._compiled_plans[graph._plan_index]._compiled.default_stream).nonlocals["api"]
+        assert api.kernel_template == DECODE
+        assert api._k_mod.__file__.endswith("/sm107/d256_f16_swap_ab/kernel.py")
+
     _run_graph(
         2,
         8,
@@ -2886,7 +2892,8 @@ def test_paged_decode_independent_pool_layouts(hnd, dtype, split, pack):
         replay=True,
         arch="sm107",
         pack_gqa=pack,
-        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=pack, split_kv=split),
+        extra_checks=check_body,
+        explicit_knobs=SdpaFwdKnobs(sched_policy=0, tile_m=16, tile_n=128, cga=1, pack_gqa=pack, split_kv=split),
     )
 
 
