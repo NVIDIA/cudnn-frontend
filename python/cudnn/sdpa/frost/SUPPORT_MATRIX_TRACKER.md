@@ -1,5 +1,7 @@
 # FROST SDPA — legacy support tracker
 
+Current nonpaged D256 split physical-origin support is documented in [SM100/SM103](support/sm100.md) and [SM107](support/sm107.md).
+
 > **Historical reference; migration in progress.** Current support documentation
 > starts at [support/README.md](support/README.md), with a
 > [completed SM90 example](support/sm90.md) and a [template](support/TEMPLATE.md).
