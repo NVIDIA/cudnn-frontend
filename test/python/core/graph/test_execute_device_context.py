@@ -24,9 +24,12 @@ def _current():
 
 @pytest.fixture(params=["backend", "frost"])
 def attention(request, monkeypatch):
-    if cudnn.backend_version() < 92400 or torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("the representative decode graph requires Hopper+ and cuDNN 9.24+")
+    cc = torch.cuda.get_device_capability()
+    if cudnn.backend_version() < 92400 or cc[0] < 8:
+        pytest.skip("the representative decode graph requires Ampere+ and cuDNN 9.24+")
     if request.param == "frost":
+        if cc[0] == 8 and cc != (8, 0):
+            pytest.skip("the SM80 FROST implementation serves cc 8.0 only")
         from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
 
         installed, version = cutedsl_state()
