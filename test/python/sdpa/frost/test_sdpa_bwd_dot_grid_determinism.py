@@ -43,6 +43,15 @@ def _compile_dense(operands, delta, dq_accum=None, dq_sem=None, scales=()):
     return cute.compile(dot_do_o_host, *args, fake(dq_accum), fake(dq_sem), 128, dim, dim, 64, False, dq_sem is not None, stream, options=options)
 
 
+def _assert_fresh_bytes(outputs, expected, label):
+    # The shared byte comparator counts differences through an Int64
+    # reduction. Compare these full snapshots on the host while both the
+    # old dO and its replacement are live on the GPU.
+    actual = {name: value.cpu() for name, value in snapshot(outputs).items()}
+    reference = {name: value.cpu() for name, value in expected.items()}
+    assert_bitwise(actual, reference, label)
+
+
 def _inputs(batch, heads, seqlen, dtype):
     # Exactly representable values with distinct batch/head/row coordinates.
     # The closed-form FP64 oracle covers every output, including large grids.
@@ -84,13 +93,22 @@ def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen):
 
     expected = assert_replays(launch)
     check()
-    # Rebind fresh O/dO and output storage while retaining the old buffers.
-    old = operands, raw
-    operands = [value.clone() for value in operands]
+    # Rebind one input at a time, keeping its old allocation alive through
+    # execution. The query-tail case has >1 GiB per half input: cloning both
+    # together and making whole-input FP32 temporaries exhausts 16-GiB CI.
+    original_o = operands[0].cpu()
+    old_o, old_do, old_raw = *operands, raw
+    operands[0] = old_o.clone()
+    assert operands[0].data_ptr() != old_o.data_ptr()
+    _assert_fresh_bytes(launch(), expected, "fresh O binding")
+    check()
+    assert torch.equal(old_o.cpu().view(torch.uint8), original_o.view(torch.uint8))
+    del old_o
+    operands[1] = old_do.clone()
     raw = raw.clone()
     delta = raw[16:-16].view(batch, heads, rounded)
-    assert all(a.data_ptr() != b.data_ptr() for a, b in zip(operands, old[0]))
-    assert_bitwise(snapshot(launch()), expected, "fresh bindings")
+    assert operands[1].data_ptr() != old_do.data_ptr() and raw.data_ptr() != old_raw.data_ptr()
+    _assert_fresh_bytes(launch(), expected, "fresh dO/output bindings")
     check()
 
     # A different batch order, duplicated sequence and singleton execution all
@@ -110,15 +128,20 @@ def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen):
         launch()
     try:
         for multiplier in (-1.0, 0.5):
-            operands[1].copy_((old[0][1].float() * multiplier).to(dtype))
+            # Keep old dO live so a capture with stale pointers cannot pass.
+            source, target = old_do.flatten(), operands[1].flatten()
+            for start in range(0, source.numel(), 2**20):
+                part = source[start : start + 2**20].float().mul_(multiplier).to(dtype)
+                target[start : start + 2**20].copy_(part)
             delta.fill_(float("nan"))
             graph.replay()
             check(multiplier)
     finally:
         graph.reset()
     # Inputs are read-only: compare the original O and the changed dO in full.
-    assert torch.equal(operands[0].view(torch.uint8), old[0][0].view(torch.uint8))
-    assert torch.equal(operands[1].float(), old[0][1].float() * 0.5)
+    assert torch.equal(operands[0].cpu().view(torch.uint8), original_o.view(torch.uint8))
+    for start in range(0, source.numel(), 2**20):
+        assert torch.equal(target[start : start + 2**20].float(), source[start : start + 2**20].float() * 0.5)
     if (batch, heads) == (2, 3):
         inputs = {"o": operands[0], "do": operands[1], **{f"descale_{i}": value for i, value in enumerate(scales)}}
         assert_golden(f"sdpa_bwd_shared_delta_dense_{str(dtype).split('.')[-1]}", inputs, {"delta": delta})
@@ -152,7 +175,6 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
         value[0].index_copy_(0, pos, live.cuda().to(dtype)[:, :, None].expand(total, heads, 64))
         inputs.append(value)
         positions.append(pos)
-    original = [value.clone() for value in inputs]
     meta = torch.zeros(4 * batch + 4, dtype=torch.int32, device="cuda")
     meta[batch : 2 * batch + 1] = prefix.cuda()
     origins = offsets.cuda()
@@ -163,6 +185,7 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
     values = [*inputs, delta, meta, origins]
     types = [scalar, scalar, cutlass.Float32, cutlass.Int32, cutlass.Int64]
     fake = [make_fake_tensor(t, tuple(v.shape), tuple(v.stride()), assumed_align=16) for t, v in zip(types, values)]
+    del values  # Do not retain old input allocations after staged rebinding.
     arch = f"sm_{_SM}" + ("a" if _SM >= 90 else "")
 
     @cute.jit
@@ -189,8 +212,16 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
 
     expected = assert_replays(launch)
     check()
-    inputs = [value.clone() for value in inputs]
-    assert_bitwise(snapshot(launch()), expected, "THD fresh storage")
+    original_o = inputs[0].cpu()
+    old_o, old_do = inputs
+    inputs[0] = old_o.clone()
+    assert inputs[0].data_ptr() != old_o.data_ptr()
+    _assert_fresh_bytes(launch(), expected, "THD fresh O storage")
+    assert torch.equal(old_o.cpu().view(torch.uint8), original_o.view(torch.uint8))
+    del old_o
+    inputs[1] = old_do.clone()
+    assert inputs[1].data_ptr() != old_do.data_ptr()
+    _assert_fresh_bytes(launch(), expected, "THD fresh dO storage")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch()
@@ -201,9 +232,13 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
         check(-1)
     finally:
         graph.reset()
-    assert torch.equal(inputs[0].view(torch.uint8), original[0].view(torch.uint8))
-    # Poisoned gaps stay poisoned; compare exact live dO bytes separately.
-    assert torch.equal(inputs[1][0, positions[1]], -original[1][0, positions[1]])
+    assert torch.equal(inputs[0].cpu().view(torch.uint8), original_o.view(torch.uint8))
+    # Poisoned gaps stay poisoned; compare every live dO byte in bounded
+    # gathers instead of allocating two full-size gathered inputs at once.
+    rows_per_chunk = max(1, 2**20 // (heads * 64))
+    for start in range(0, positions[1].numel(), rows_per_chunk):
+        pos = positions[1][start : start + rows_per_chunk]
+        assert torch.equal(inputs[1][0, pos], -old_do[0, pos])
     if (batch, heads) == (3, 2):
         assert_golden(
             f"sdpa_bwd_shared_delta_thd_{str(dtype).split('.')[-1]}",
@@ -223,5 +258,9 @@ def test_flat_delta_initializes_accumulator_and_relay():
     fn(*operands, delta, accum, relay, torch.cuda.current_stream().cuda_stream)
     torch.testing.assert_close(delta[:, :, :2], reference, rtol=0, atol=0)
     assert torch.count_nonzero(delta[:, :, 2:]) == 0
-    assert torch.count_nonzero(accum) == 0
+    # count_nonzero can materialize an Int64 tensor as large as the input.
+    # Check every scratch element without a multi-GiB reduction temporary.
+    flat_accum = accum.flatten()
+    for start in range(0, flat_accum.numel(), 2**20):
+        assert torch.count_nonzero(flat_accum[start : start + 2**20]) == 0
     assert torch.count_nonzero(relay) == 0
