@@ -197,9 +197,10 @@ attention sink participates only in the output denominator, not in any stats.
     channels, their block scales and, at `D_qk = 576`, the 64 channels only K
     reads. Pass the `torch.uint8` tensor of the rows, shape
     `(total_S_kv, record_bytes)`, and name the format with `kv_format`. A
-    cache with padded rows is passed as that view of its buffer, so
-    `stride(0)` is the row pitch. A format is never inferred from the row
-    width: `mxfp8_528` and `fp8_528` share one.
+    cache with padded rows is passed as that view of its buffer: the row
+    pitch, `stride(0)`, is a multiple of 16 bytes and at least
+    `record_bytes`. A format is never inferred from the row width:
+    `mxfp8_528` and `fp8_528` share one.
 
   | `kv_format` | `D_qk` | Bytes per token | Row layout (byte offsets) | Value of channel `c` | Served |
   |---|---|---|---|---|---|
@@ -220,9 +221,10 @@ attention sink participates only in the output denominator, not in any stats.
   INT32, with an optional `extra_topk_length` `(total_S_q,)` clamped to
   `[0, extra_K]`, index `extra_kv` as `topk_idxs` and `topk_length` index
   `kv`. Each query attends to both sets of slots under one softmax and one
-  sink. Each pool is stored in its own form: `extra_kv_format` and
-  `descale_extra_kv` describe `extra_kv` as `kv_format` and `descale_kv`
-  describe `kv`. `indexer_topk > 0` is not served with a second pool. For
+  sink, and `max_logits` and `lse` cover the slots of both pools. Each pool
+  is stored in its own form: `extra_kv_format` and `descale_extra_kv`
+  describe `extra_kv` as `kv_format` and `descale_kv` describe `kv`.
+  `indexer_topk > 0` is not served with a second pool. For
   DeepSeek-V4.1, `kv` is the window cache and `extra_kv` the compressed
   cache:
 

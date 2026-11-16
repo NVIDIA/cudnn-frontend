@@ -7,7 +7,8 @@ A packed cache keeps each token's K = V row in one run of bytes: the quantized
 channels, their block scales and, at ``D_qk = 576``, the 64 channels only K
 reads. It is passed as the ``torch.uint8`` tensor of those rows, shape
 ``(S_kv, record_bytes)``, together with the name of its format; a cache with
-padded rows is passed as that view of its buffer (``stride(0)`` is the pitch).
+padded rows is passed as that view of its buffer. The row pitch,
+``stride(0)``, is a multiple of 16 bytes and at least ``record_bytes``.
 Without a format name the pool is a typed ``(S_kv, D_qk)`` tensor: Q's
 dtype, or ``float8_e4m3fn`` with a per-tensor descale.
 
@@ -49,7 +50,6 @@ Byte offsets are within one row; V reads channels ``[0, 512)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ class KvFormat:
     record_bytes: int
 
 
-KV_FORMATS: Dict[str, KvFormat] = {
+KV_FORMATS: dict[str, KvFormat] = {
     fmt.name: fmt
     for fmt in (
         KvFormat("mxfp8_528", head_dim_qk=512, record_bytes=528),

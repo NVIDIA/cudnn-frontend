@@ -31,6 +31,9 @@ _SUPPORTED_VARIANTS = {
 _SM90_SUPPORTED_HEADS = (16, 32, 64, 96, 128)
 _SM90_SUPPORTED_HEAD_DIMS = (512, 576)
 
+# execute() operands that pair with an optional declaration: each is given exactly when its sample_ counterpart was.
+_POOL_OPERANDS = ("extra_kv", "extra_topk_idxs", "extra_topk_length", "descale_kv", "descale_extra_kv")
+
 
 class SparseAttentionForward(APIBase):
     """Sparse prefill forward for the supported Hopper and Blackwell shapes.
@@ -56,14 +59,14 @@ class SparseAttentionForward(APIBase):
     def __init__(
         self,
         sample_q: torch.Tensor,  # (total_S_q, H, D_qk) FP16/BF16
-        sample_kv: torch.Tensor,  # (total_S_kv, D_qk) FP16/BF16, K=V latent
+        sample_kv: torch.Tensor,  # (total_S_kv, D_qk) of Q's dtype or float8_e4m3fn, or packed uint8 rows; K=V latent
         sample_topk_idxs: torch.Tensor,  # (total_S_q, logical_K) INT32
         sample_attn_sink: Optional[torch.Tensor] = None,  # (H,) FP32
         sample_topk_length: Optional[torch.Tensor] = None,  # (total_S_q,) INT32
         softmax_scale: Optional[float] = None,
         indexer_topk: int = 0,
         *,
-        kv_format: Optional[str] = None,  # packed cache format of sample_kv; None: a (total_S_kv, D_qk) pool of Q's dtype
+        kv_format: Optional[str] = None,  # packed cache format of sample_kv; None: a typed (total_S_kv, D_qk) pool
         sample_extra_kv: Optional[torch.Tensor] = None,  # second pool, indexed by sample_extra_topk_idxs
         extra_kv_format: Optional[str] = None,  # packed cache format of sample_extra_kv
         sample_extra_topk_idxs: Optional[torch.Tensor] = None,  # (total_S_q, extra_K) INT32 token ids in sample_extra_kv
@@ -82,6 +85,11 @@ class SparseAttentionForward(APIBase):
         self.descale_extra_kv_desc = self._make_tensor_desc(sample_descale_extra_kv, name="sample_descale_extra_kv")
         self.kv_format = kv_format
         self.extra_kv_format = extra_kv_format
+        # Which of _POOL_OPERANDS this plan declares, in that order.
+        self._declared_pool_operands = tuple(
+            desc is not None
+            for desc in (self.extra_kv_desc, self.extra_topk_idxs_desc, self.extra_topk_length_desc, self.descale_kv_desc, self.descale_extra_kv_desc)
+        )
         self.topk_idxs_desc = self._make_tensor_desc(sample_topk_idxs, name="sample_topk_idxs")
         self.attn_sink_desc = self._make_tensor_desc(sample_attn_sink, name="sample_attn_sink")
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
@@ -105,15 +113,12 @@ class SparseAttentionForward(APIBase):
         total_s_q, num_heads, head_dim = self.q_desc.shape
         total_s_kv, kv_head_dim = self.kv_desc.shape
         topk_s_q, logical_topk = self.topk_idxs_desc.shape
-        del total_s_kv
+        del total_s_kv, kv_head_dim
 
         self._check_dtype(self.q_desc, [torch.float16, torch.bfloat16], name="Q")
         kv_fmt = self._check_kv_storage(self.kv_desc, self.kv_format, self.descale_kv_desc, name="KV", format_arg="kv_format", descale_arg="descale_kv")
         self._check_dtype(self.topk_idxs_desc, torch.int32, name="topk_idxs")
-        if kv_fmt is None:
-            self._value_error_if(kv_head_dim != head_dim, f"KV head dimension ({kv_head_dim}) must match Q ({head_dim})")
-        else:
-            self._check_packed_kv_width(self.kv_desc, kv_fmt, head_dim, name="KV")
+        self._check_pool_width(self.kv_desc, kv_fmt, head_dim, name="KV", rows="total_S_kv")
         self._value_error_if(topk_s_q != total_s_q, f"topk_idxs first dimension ({topk_s_q}) must match Q ({total_s_q})")
         self._check_extra_kv(total_s_q, head_dim)
 
@@ -191,7 +196,7 @@ class SparseAttentionForward(APIBase):
             f"SparseAttentionForward does not serve kv_format={self.kv_format!r} on {arch}; pass a (total_S_kv, D_qk) pool of Q's dtype",
         )
         self._not_implemented_error_if(
-            kv_fmt is None and self.kv_desc.dtype == torch.float8_e4m3fn,
+            self.kv_desc.dtype == torch.float8_e4m3fn,
             f"SparseAttentionForward does not serve a per-tensor-scaled FP8 KV pool (descale_kv) on {arch}; pass a (total_S_kv, D_qk) pool of Q's dtype",
         )
         self._not_implemented_error_if(
@@ -230,12 +235,24 @@ class SparseAttentionForward(APIBase):
         self._value_error_if(descale_desc is not None, f"{descale_arg} does not apply to a {fmt.name} cache, which carries its own scales")
         return fmt
 
-    def _check_packed_kv_width(self, desc, fmt: KvFormat, head_dim: int, *, name: str) -> None:
-        """Check that a packed pool holds whole rows of its format, whose channel count is Q's ``D_qk``."""
+    def _check_pool_width(self, desc, fmt: Optional[KvFormat], head_dim: int, *, name: str, rows: str) -> None:
+        """Check a pool against Q's ``D_qk``: its channels when typed, whole rows of its format when packed.
+
+        A packed pool's row pitch, ``stride(0)``, is a multiple of 16 bytes and at least one row: rows may be padded
+        apart but never overlap.
+        """
+        if fmt is None:
+            self._value_error_if(desc.shape[1] != head_dim, f"{name} head dimension ({desc.shape[1]}) must match Q ({head_dim})")
+            return
         self._value_error_if(
             desc.shape[1] != fmt.record_bytes or desc.stride[1] != 1,
-            f"{name} in format {fmt.name} must be the (total_S_kv, {fmt.record_bytes}) byte rows of the cache, each row's bytes "
+            f"{name} in format {fmt.name} must be the ({rows}, {fmt.record_bytes}) byte rows of the cache, each row's bytes "
             f"contiguous; got shape {desc.shape} with stride {desc.stride}",
+        )
+        pitch = desc.stride[0]
+        self._value_error_if(
+            desc.shape[0] > 1 and (pitch < fmt.record_bytes or pitch % 16 != 0),
+            f"{name} row pitch stride(0) must be a multiple of 16 bytes and at least {fmt.record_bytes}, got {pitch}",
         )
         self._value_error_if(fmt.head_dim_qk != head_dim, f"{fmt.name} rows hold D_qk={fmt.head_dim_qk} channels, but Q has D_qk={head_dim}")
 
@@ -255,14 +272,14 @@ class SparseAttentionForward(APIBase):
             ]
             self._value_error_if(bool(given), f"{', '.join(given)} describe a second KV pool, but extra_kv is not given")
             return
-        self._value_error_if(desc.ndim != 2, f"extra_kv must be 2-D (total_S_extra_kv, D_qk), got {desc.shape}")
+        self._value_error_if(
+            desc.ndim != 2,
+            f"extra_kv must be 2-D: (total_S_extra_kv, D_qk) channels, or the (total_S_extra_kv, record_bytes) rows of a packed cache; got {desc.shape}",
+        )
         fmt = self._check_kv_storage(
             desc, self.extra_kv_format, self.descale_extra_kv_desc, name="extra_kv", format_arg="extra_kv_format", descale_arg="descale_extra_kv"
         )
-        if fmt is None:
-            self._value_error_if(desc.shape[1] != head_dim, f"extra_kv head dimension ({desc.shape[1]}) must match Q ({head_dim})")
-        else:
-            self._check_packed_kv_width(desc, fmt, head_dim, name="extra_kv")
+        self._check_pool_width(desc, fmt, head_dim, name="extra_kv", rows="total_S_extra_kv")
 
         self._value_error_if(idxs_desc is None, "extra_kv needs extra_topk_idxs, its own (total_S_q, extra_K) INT32 token ids")
         self._value_error_if(idxs_desc.ndim != 2, f"extra_topk_idxs must be 2-D (total_S_q, extra_K), got {idxs_desc.shape}")
@@ -329,15 +346,10 @@ class SparseAttentionForward(APIBase):
         """
         if self._compiled_kernel is None:
             raise ValueError("SparseAttentionForward kernel not compiled")
-        for name, given, declared in (
-            ("extra_kv", extra_kv, self.extra_kv_desc),
-            ("extra_topk_idxs", extra_topk_idxs, self.extra_topk_idxs_desc),
-            ("extra_topk_length", extra_topk_length, self.extra_topk_length_desc),
-            ("descale_kv", descale_kv, self.descale_kv_desc),
-            ("descale_extra_kv", descale_extra_kv, self.descale_extra_kv_desc),
-        ):
-            if (given is not None) != (declared is not None):
-                raise ValueError(f"{name} must be given exactly when the plan was declared with sample_{name}")
+        given = (extra_kv is not None, extra_topk_idxs is not None, extra_topk_length is not None, descale_kv is not None, descale_extra_kv is not None)
+        if given != self._declared_pool_operands:
+            name = next(name for name, g, d in zip(_POOL_OPERANDS, given, self._declared_pool_operands) if g != d)
+            raise ValueError(f"{name} must be given exactly when the plan was declared with sample_{name}")
         scale = self.softmax_scale if softmax_scale is None else float(softmax_scale)
         if self._device_major == 9:
             from . import _interface_sm90 as _iface_sm90
@@ -391,6 +403,11 @@ class SparseAttentionForward(APIBase):
 _cache_of_sparse_attention_forward_objects: dict = {}
 
 
+def _key_dtype(value) -> object:
+    """An optional operand's part of the wrapper's object-cache key: ``None``, its dtype, or the type of a non-tensor."""
+    return None if value is None else getattr(value, "dtype", type(value))
+
+
 def sparse_attention_forward_wrapper(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -423,13 +440,12 @@ def sparse_attention_forward_wrapper(
     FP8 ``kv``; ``extra_kv``, ``extra_kv_format``, ``extra_topk_idxs``,
     ``extra_topk_length`` and ``descale_extra_kv`` declare a second pool with
     its own token ids, as on ``SparseAttentionForward``. No architecture
-    serves these yet, and the wrapper never copies them.
+    serves these yet.
     """
 
     scale = 1.0 / math.sqrt(q.shape[-1]) if softmax_scale is None else float(softmax_scale)
     capability = torch.cuda.get_device_capability(q.device) if q.is_cuda else None
-    staged = kv_format is None and extra_kv is None and descale_kv is None
-    if capability is not None and capability[0] == 9 and staged:
+    if capability is not None and capability[0] == 9:
         dsl_error = sm90_dsa_cutedsl_requirement_error()
         if dsl_error is not None:
             raise RuntimeError(dsl_error)
@@ -453,13 +469,14 @@ def sparse_attention_forward_wrapper(
         topk_length is not None,
         int(indexer_topk),
         None if capability is None else tuple(capability),
-        kv_format,
-        None if extra_kv is None else extra_kv.dtype,
-        extra_kv_format,
-        None if extra_topk_idxs is None else extra_topk_idxs.dtype,
+        # repr() and _key_dtype() keep a malformed argument hashable, so check_support() reports it.
+        repr(kv_format),
+        _key_dtype(extra_kv),
+        repr(extra_kv_format),
+        _key_dtype(extra_topk_idxs),
         extra_topk_length is not None,
-        None if descale_kv is None else descale_kv.dtype,
-        None if descale_extra_kv is None else descale_extra_kv.dtype,
+        _key_dtype(descale_kv),
+        _key_dtype(descale_extra_kv),
     )
     obj = _cache_of_sparse_attention_forward_objects.get(key)
     if obj is None:

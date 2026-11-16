@@ -842,7 +842,7 @@ def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.sparse_attention_forward._kv_formats import KV_FORMATS
     except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
     queries = {d: torch.empty((1, 64, d), dtype=torch.bfloat16, device=device) for d in (512, 576)}
@@ -874,6 +874,14 @@ def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
         DSA.SparseAttentionForward(q, rows, topk, kv_format="mxfp8").check_support()
     with pytest.raises(ValueError, match="each row's bytes contiguous"):
         DSA.SparseAttentionForward(q, torch.empty((528, 2), dtype=torch.uint8, device=device).t(), topk, kv_format="mxfp8_528").check_support()
+    for pool, pitch in (
+        (torch.empty((528,), dtype=torch.uint8, device=device).expand(2, 528), 0),  # rows overlap
+        (torch.empty((2, 529), dtype=torch.uint8, device=device)[:, :528], 529),  # rows not 16-byte apart
+    ):
+        with pytest.raises(ValueError, match=f"KV row pitch stride\\(0\\) must be a multiple of 16 bytes and at least 528, got {pitch}"):
+            DSA.SparseAttentionForward(q, pool, topk, kv_format="mxfp8_528").check_support()
+    with pytest.raises(ValueError, match="unknown kv_format \\['mxfp8_528'\\]"):
+        DSA.sparse_attention_forward_wrapper(q, rows, topk, kv_format=["mxfp8_528"])
     with pytest.raises(ValueError, match="KV must have same dtype as Q; a packed torch.uint8 cache also needs kv_format"):
         DSA.SparseAttentionForward(q, rows, topk).check_support()
 
@@ -930,7 +938,7 @@ def test_DSA_sparse_attention_forward_packed_kv_declarations(monkeypatch):
         DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=kv_fp8, sample_extra_topk_idxs=extra_idxs, sample_descale_extra_kv=descale).check_support()
     with pytest.raises(ValueError, match="unknown extra_kv_format 'nvfp4'"):
         DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "extra_kv_format": "nvfp4"}).check_support()
-    with pytest.raises(ValueError, match="extra_kv in format nvfp4_288 must be the \\(total_S_kv, 288\\) byte rows"):
+    with pytest.raises(ValueError, match="extra_kv in format nvfp4_288 must be the \\(total_S_extra_kv, 288\\) byte rows"):
         DSA.SparseAttentionForward(q, kv, topk, **{**packed_extra, "sample_extra_kv": extra[:, :-1]}).check_support()
     with pytest.raises(ValueError, match="extra_kv must have same dtype as Q; a packed torch.uint8 cache also needs extra_kv_format"):
         DSA.SparseAttentionForward(q, kv, topk, sample_extra_kv=extra, sample_extra_topk_idxs=extra_idxs).check_support()
@@ -1011,6 +1019,7 @@ _MODEL_CALLS = (
     # DeepSeek-V4-Flash and V4-Pro: a 512-channel K = V record, a 128-token window and a per-head sink. Compressed layers
     # attend to indexer-selected entries (CSA: top-512 / top-1024) or to every causal compressed block (HCA).
     _ModelCall("deepseek-v4-flash", "window", 64, 512, _Pool("bf16", 128), sink=True, served=True),
+    _ModelCall("deepseek-v4-flash", "window", 64, 512, _Pool("fp8", 128), sink=True),
     _ModelCall("deepseek-v4-flash", "csa", 64, 512, _Pool("bf16", 640), indexer_topk=512, sink=True, served=True),
     _ModelCall("deepseek-v4-flash", "csa", 64, 512, _Pool("bf16", 128), _Pool("bf16", 512), sink=True),
     _ModelCall("deepseek-v4-flash", "csa", 64, 512, _Pool("fp8", 128), _Pool("fp8", 512), sink=True),
@@ -1021,7 +1030,9 @@ _MODEL_CALLS = (
     # DeepSeek-V4.1-Flash: as V4-Flash, with window-only layers and compressed layers (ratio 1 or 2) whose indexer picks
     # 512 entries. Its window cache is mxfp8_528 or per-tensor FP8, and its compressed cache nvfp4_288.
     _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("mxfp8_528", 128), sink=True),
+    _ModelCall("deepseek-v4.1-flash", "window", 64, 512, _Pool("fp8", 128), sink=True),
     _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("bf16", 640), indexer_topk=512, sink=True, served=True),
+    _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("bf16", 128), _Pool("bf16", 512), sink=True),
     _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("mxfp8_528", 128), _Pool("nvfp4_288", 512), sink=True),
     _ModelCall("deepseek-v4.1-flash", "compressed", 64, 512, _Pool("fp8", 128), _Pool("nvfp4_288", 512), sink=True),
 )
@@ -1053,7 +1064,7 @@ def test_DSA_sparse_attention_forward_model_calls(call):
     try:
         from cudnn import DSA
     except ImportError:
-        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+        return pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
     total_s_q = 2
