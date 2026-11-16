@@ -19,7 +19,26 @@ def _facts(**overrides):
     return replace(facts, **overrides)
 
 
-@pytest.mark.parametrize("version,excluded", [(92301, False), (92400, True), (92500, True), (92501, False), (92700, False)])
+@pytest.mark.parametrize(
+    "version,excluded",
+    [
+        (90000, True),
+        (91002, True),
+        (91600, True),
+        (91801, True),
+        (91901, True),
+        (92000, True),
+        (92101, True),
+        (92200, True),
+        (92301, True),
+        (92302, True),
+        (92400, True),
+        (92401, True),
+        (92500, True),
+        (92501, False),
+        (92700, False),
+    ],
+)
 @pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
 def test_ragged_backward_guard_version_bounds(monkeypatch, version, excluded, dtype):
     monkeypatch.setattr(cudnn, "backend_version", lambda: version)
@@ -49,8 +68,9 @@ def test_ragged_backward_guard_version_bounds(monkeypatch, version, excluded, dt
         dict(invalid="bad graph"),
     ],
 )
-def test_ragged_backward_guard_preserves_other_domains(monkeypatch, overrides):
-    monkeypatch.setattr(cudnn, "backend_version", lambda: 92400)
+@pytest.mark.parametrize("version", [91801, 92400])
+def test_ragged_backward_guard_preserves_other_domains(monkeypatch, overrides, version):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: version)
     assert guard.backend_engine_guard(None, _facts(**overrides)) == {}
 
 
@@ -82,8 +102,9 @@ def _graph(dtype=cudnn.data_type.BFLOAT16):
 
 
 @pytest.mark.parametrize("knobs", [{}, {cudnn.knob_type.STREAM_K: 1}])
-def test_ragged_backward_explicit_replay_declines_before_lowering(monkeypatch, knobs):
-    monkeypatch.setattr(cudnn, "backend_version", lambda: 92400)
+@pytest.mark.parametrize("version", [91600, 91801, 92302, 92400, 92500])
+def test_ragged_backward_explicit_replay_declines_before_lowering(monkeypatch, knobs, version):
+    monkeypatch.setattr(cudnn, "backend_version", lambda: version)
     monkeypatch.setattr(graph_analyzer, "_device_cc", lambda: (9, 0))
     g = _graph()
     facts = graph_analyzer.analyze(g)
@@ -97,8 +118,8 @@ def test_ragged_backward_explicit_replay_declines_before_lowering(monkeypatch, k
 def test_ragged_backward_default_has_no_unsafe_plan(mode):
     import torch
 
-    if torch.cuda.get_device_capability() != (9, 0) or not 92400 <= cudnn.backend_version() < 92501:
-        pytest.skip("requires native SM90 with the affected cuDNN 9.24/9.25.0 backend")
+    if torch.cuda.get_device_capability() != (9, 0) or cudnn.backend_version() >= guard.RAGGED_TILE_MAPPING_FIXED_IN:
+        pytest.skip("requires native SM90 with an affected backend before cuDNN 9.25.1")
     g = _graph()
     try:
         g.create_execution_plans([mode, cudnn.heur_mode.FALLBACK])
@@ -125,8 +146,8 @@ def test_ragged_backward_fix_version_detector(monkeypatch, request, cudnn_handle
     from sdpa.fp16 import exec_sdpa
     from sdpa.random_config import ExecConfig
 
-    if torch.cuda.get_device_capability() != (9, 0) or cudnn.backend_version() < 92400:
-        pytest.skip("requires native SM90 and cuDNN >= 9.24")
+    if torch.cuda.get_device_capability() != (9, 0) or cudnn.backend_version() < 91000:
+        pytest.skip("requires native SM90 and the numerical harness's cuDNN 9.10+ baseline")
     affected = cudnn.backend_version() < guard.RAGGED_TILE_MAPPING_FIXED_IN
     monkeypatch.setattr(guard, "RAGGED_TILE_MAPPING_FIXED_IN", 0)
     original_plans = cudnn.pygraph.create_execution_plans

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Version-bounded exclusions for measured backend backward correctness defects."""
 
-RAGGED_TILE_MAPPING_SINCE = 92400
 RAGGED_TILE_MAPPING_FIXED_IN = 92501
 
 
@@ -18,13 +17,15 @@ def backend_engine_guard(graph, facts):
         return {}
     if not (192 < facts.d_qk <= 256 and 64 < facts.d_v <= 128):
         return {}
-    if not RAGGED_TILE_MAPPING_SINCE <= cudnn.backend_version() < RAGGED_TILE_MAPPING_FIXED_IN:
+    if cudnn.backend_version() >= RAGGED_TILE_MAPPING_FIXED_IN:
         return {}
     # The old SM90 ragged scheduler omits half of the KV tiles when Q/K use
     # the 256-wide implementation and V uses its 128-wide implementation.
     # Dq <= 192, Dv <= 64, and dense/padded layouts use unaffected mappings.
-    # Actual 9.24.0.43 / 9.25.0.15 reproduce wrong gradients; the same inputs
-    # pass on 9.25.1.1 / 9.27.0.42. No hidden layout conversion is attempted.
+    # This defect also reproduces on 9.16 and 9.18 through 9.23, before its original
+    # 9.24 detector. There is no known safe earlier release: exclude the engine
+    # until the 9.25.1 fix, without a speculative lower version bound.
+    # No hidden layout conversion is attempted.
     return {
         6: f"cuDNN {cudnn.backend_version_string()} engine 6 returns incorrect gradients for SM90 THD SDPA backward "
         "with 192 < d_qk <= 256 and 64 < d_v <= 128; the ragged tile mapping is fixed in cuDNN 9.25.1"
