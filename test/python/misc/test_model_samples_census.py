@@ -3762,6 +3762,16 @@ def test_the_norms_twin_and_its_band_on_stated_tensors():
     wrong = nibbles(codes4)
     wrong[0, 1] ^= 0x8  # the other sign
     assert judged((pack(wrong), scales4, residual), mlp).outside == 1
+    # a code of the OTHER bf16 value: the kernel's own arithmetic inside the margin, a failure beyond it
+    apart4 = other.clone()
+    apart4[1, 1], apart4[1, 3] = 5.5, 5.5  # stated so that the two values of these elements have different codes (6 and 4; 6 and 6)
+    took = nibbles(codes4)
+    took[1, 1] = 7  # the code of 5.5 under a block scale of 1, where the nearest value is 4: an element far from its midpoint
+    stats = judged((pack(took), scales4, residual), stated(("codes", "scales", "residual"), four, (codes4, scales4, residual), (nearest, apart4, margin)))
+    assert not stats.ok and (stats.off_nearest, stats.outside) == (1, 0), "4-bit codes: the other value's code beyond the margin"
+    near_tie = margin.clone()
+    near_tie[1, 1] = 4.0
+    assert judged((pack(took), scales4, residual), stated(("codes", "scales", "residual"), four, (codes4, scales4, residual), (nearest, apart4, near_tie))).ok
     # the block maximum is an element inside the margin: the kernel's maximum is one of two values, and so is its block scale
     top, top_other, top_margin = nearest.clone(), other.clone(), margin.clone()
     top[1, 3], top_other[1, 3], top_margin[1, 3] = 6.375, 6.40625, 5.0  # neighbours whose scales 34.0 (a tie: to the even 32) and 34.2 round apart
