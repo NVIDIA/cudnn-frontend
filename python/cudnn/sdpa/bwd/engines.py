@@ -57,6 +57,7 @@ _SM100_D128_FP8 = "SdpaBwdDslSm100D128Fp8"
 _SM100_D192 = "SdpaBwdDslSm100D192"
 _SM100_D192_FP8 = "SdpaBwdDslSm100D192Fp8"
 _D512_FP8 = "SdpaBwdDslD512Fp8"
+_SM100_D256_FP8 = "SdpaBwdDslSm100D256Fp8"
 _D512_MXFP8 = "SdpaBwdDslD512Mxfp8"
 _SM120_FP8 = "SdpaBwdDslSm120Fp8"
 _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
@@ -152,6 +153,10 @@ def _fp8_adapter(name: str):
         from cudnn.sdpa.bwd.api_dsl_sm120_fp8 import SdpaBwdDslSm120Fp8
 
         return SdpaBwdDslSm120Fp8
+    if name == _SM100_D256_FP8:
+        from cudnn.sdpa.bwd.kernels.sm100.d256_fp8.host import SdpaBwdDslSm100D256Fp8
+
+        return SdpaBwdDslSm100D256Fp8
     if name == _D512_FP8:
         from cudnn.sdpa.bwd.api_dsl_d512_fp8 import SdpaBwdDslD512Fp8
 
@@ -2540,6 +2545,32 @@ def _sm100_d192_fp8_spec() -> EngineSpec:
     )
 
 
+def _sm100_d256_fp8_spec() -> EngineSpec:
+    from .kernels.sm100.d256_fp8 import contract
+
+    return EngineSpec(
+        name=contract.NAME,
+        capabilities=Capabilities(
+            implementation=contract.NAME,
+            sm_lo=100,
+            sm_hi=103,
+            d=frozenset({256}),
+            declaration_check=contract.graph_error,
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            is_fp8=True,
+            out_dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            amax_dgrad=True,
+            causal=True,
+            swa=True,
+            gqa=True,
+            deterministic=True,
+            compact_bshd=True,
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd_fp8, api_type=_SM100_D256_FP8),
+    )
+
+
 def _d512_fp8_environment_mismatch(facts, version):
     from .d512_fp8_contract import environment_error
 
@@ -2722,6 +2753,7 @@ ENGINE_SPECS = (
     _sm100_d128_fp8_pair_spec(),
     _sm100_d128_fp8_accumulation_spec(),
     _d512_fp8_spec(),
+    _sm100_d256_fp8_spec(),
     _d512_mxfp8_spec(),
     _sm120_fp8_spec(),
     _sm120_mxfp8_spec(),
