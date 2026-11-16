@@ -828,6 +828,14 @@ PyGraph::check_workspace_capacity(std::intptr_t workspace,
     if (*workspace_bytes < 0) throw py::value_error("workspace byte capacity must be nonnegative");
     int64_t required = 0;
     error_t status;
+#if (CUDNN_VERSION < 92300)
+    // The override-aware workspace query needs the cuDNN 9.23 headers. A build against older
+    // headers sizes the workspace from the plan alone and does not read these arguments.
+    CUDNN_FRONTEND_UNUSED(exec_handle);
+    CUDNN_FRONTEND_UNUSED(override_uids);
+    CUDNN_FRONTEND_UNUSED(override_shapes);
+    CUDNN_FRONTEND_UNUSED(override_strides);
+#endif
 #if (CUDNN_VERSION >= 92300)
     if (!override_uids.empty() && cudnn_frontend::detail::get_backend_version() >= 92300) {
         status =
