@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sdpa import fp16, fp8
+from sdpa.frost.frost_test_utils import requires_bwd_engine_row, requires_dsl, select_engine
 from sdpa.random_config import ExecConfig
 
 
@@ -176,3 +177,55 @@ def test_fp8_training_declared_totals(monkeypatch, dtype, declare, request, cudn
         fp8.exec_sdpa_fp8(cfg, request, cudnn_handle)
     finally:
         cudnn.set_stream(handle=cudnn_handle, stream=stream)
+
+
+@pytest.mark.L0
+@requires_dsl
+@requires_bwd_engine_row("sdpa_bwd_sm107_fp8")
+@pytest.mark.parametrize("widths", [(256, 256), (192, 128)], ids=["d256-v256", "d192-v128"])
+@pytest.mark.parametrize("multiplier", [False, True], ids=["element-offsets", "scaled-offsets"])
+def test_fp8_ragged_sm107_existing_route(monkeypatch, request, cudnn_handle, widths, multiplier):
+    from cudnn.frost.buffers import _cutedsl_has_sm107
+
+    if not _cutedsl_has_sm107():
+        pytest.skip("the installed CuTe DSL compiler does not support SM107")
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    cfg = _config(torch.float8_e4m3fn, widths, multiplier)
+    cfg.declare_total_seq_len = True
+    original_builder = fp8.generate_graph_bwd
+    original_plans = cudnn.pygraph.create_execution_plans
+    original_note = fp8.note_frost_routing
+    observed = []
+
+    def builder(*args, **kwargs):
+        graph = original_builder(*args, **kwargs)
+        for name, expected in [("max_total_seq_len_q", cfg.total_q), ("max_total_seq_len_kv", cfg.total_kv)]:
+            assert graph.nodes[0].params[name] == expected
+        for role in ("q", "k", "dQ", "dK", "v", "o", "dO", "dV"):
+            width = widths[0] if role in ("q", "k", "dQ", "dK") else widths[1]
+            assert graph._tensor_by_uid[int(getattr(fp8.GraphBwdUid, role))].ragged_offset_multiplier == (width if multiplier else 1)
+        assert graph._tensor_by_uid[int(fp8.GraphBwdUid.stats)].ragged_offset_multiplier == 1
+        return graph
+
+    def plans(graph, *args, **kwargs):
+        result = original_plans(graph, *args, **kwargs)
+        if len(graph.nodes) == 1 and graph.nodes[0].node_type.name == "SDPA_FP8_BWD":
+            select_engine(graph, "sdpa_bwd_sm107_fp8")
+        return result
+
+    def note(graph, *args, **kwargs):
+        if kwargs.get("label") == "fp8-bwd":
+            assert graph.selected_engine.name == "sdpa_bwd_sm107_fp8"
+            observed.append(graph.get_engine_and_knobs_at_index(graph._plan_index))
+        return original_note(graph, *args, **kwargs)
+
+    monkeypatch.setattr(fp8, "generate_graph_bwd", builder)
+    monkeypatch.setattr(cudnn.pygraph, "create_execution_plans", plans)
+    monkeypatch.setattr(fp8, "note_frost_routing", note)
+    stream = cudnn.get_stream(cudnn_handle)
+    try:
+        fp8.exec_sdpa_fp8(cfg, request, cudnn_handle)
+    finally:
+        cudnn.set_stream(handle=cudnn_handle, stream=stream)
+    assert len(observed) == 1
+    request.node.user_properties.append(("backward_record", str(observed[0])))

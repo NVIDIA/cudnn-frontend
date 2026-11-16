@@ -26,6 +26,14 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 _E4M3, _BF16_OUT = 0, 2
 
 
+class TestRaggedBackwardMetadata:
+    """Keep the shared backward metadata regression in the SM107 CI selection."""
+
+    from sdpa.graph.test_ragged_offset_multiplier import test_fp8_ragged_sm107_existing_route as _ragged
+
+    test_offset_units_and_declared_totals = staticmethod(_ragged)
+
+
 class TestServiceRegisterRelease:
     from service_register_release_checks import test_sm107_service_register_release as _release
 
