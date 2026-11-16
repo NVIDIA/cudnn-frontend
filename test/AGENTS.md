@@ -78,9 +78,15 @@ knob; updating architecture-local body tests alone misses these consumers.
 When a fixture changes an unsplit record into a split record, select its
 implementation after computing the final knobs. Small-head SM100 paged THD
 split uses single-Q even when the ranked unsplit candidate used multi-Q.
+SM107 D128 THD split also uses shared single-Q with mixed half-Q/FP8-KV;
+its native multi-Q owner must decline the packed-split record before lowering.
+Check mixed-storage ownership separately from uniform-dtype controls.
 `test_paged_thd_split_capture_lengths_and_stats` and
 `test_native_paged_thd_capture_and_rebind` cover that transition, including
 default cluster, packed heads, Stats layouts, fresh bindings and retained replay.
+The architecture CI selector may omit a newly added standalone test file.
+Mirror SM107 numerical regressions into `test_sdpa_fp8_sm107.py`, its existing
+selected entry, by reusing the same checks and preserving their parameter marks.
 Owner migrations must also update shared fixtures at non-exact head widths.
 An exact-width owner map can pass the new contract suite while scalar-tail,
 THD-interior and D512-origin fixtures still select a delegated row. Resolve the
@@ -301,6 +307,12 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+Numerical tests of an explicit split-KV leg must construct that supported plan
+with `create_execution_plan`; a smaller GPU may correctly offer only unsplit
+candidates. Keep heuristics-offering tests separate. The MXFP8 own-block
+`test_packed_and_split_legs` exercises this on both server SM100 and P2021,
+preserving independent O/LSE and bitwise own-block isolation checks.
+
 A partially migrated backward row can remain legal for one mask and delegate
 another. Band-model tests must distinguish declaration rejection from ownership
 transfer while sampling both the retained row and its explicit owners; do not
@@ -375,6 +387,12 @@ check that changing either the delta or a shared barrier still fails the test.
   ```
 
 ### Conventions for new tests
+
+- **Test launch bounds against each actual scheduler.** A `B`/`H` limit for
+  grid.y/z does not apply to a flat grid.x scheduler. Exercise 65535 and 65536
+  independently for batch and heads, in graph admission and standalone checks;
+  retain legal flat-grid controls and inspect auxiliary launches too.
+  `sdpa/frost/test_sdpa_bwd_launch_grid.py` covers half backward on SM80/SM120.
 
 - Synthetic LayerNorm/RMSNorm nodes must keep the full saved-statistics shape:
   for X=(N,D) normalized over D, mean/inv_var are (N,1), including backward
@@ -478,6 +496,15 @@ check that changing either the delta or a shared barrier still fails the test.
 - **Poison caller workspace, including physical padding.** A TMA descriptor can expose aligned scratch rows beyond the logical sequence. Initialize workspace bytes to both zero and `0xff`, poison outputs, and compare eager and captured results against the same reference. Numerically masked rows still need defined intermediates: `0 * NaN` remains NaN. A clean initcheck result is insufficient when the caller initialized those stale bytes itself (`test_delta_workspace_padding_does_not_feed_dkdv`).
 - **A harness mirror of an engine's admission rule includes the engine's DSL target gate.** `sdpa/mxfp8.py::block_scaled_o_draw` admits a block-scaled O draw where the FROST MXFP8 row would serve it, and an admitted draw the row then declines FAILS the test (the `sf_o` output has no backend lowering), so the mirror must agree with the row on every gate. When the cc 10.7 row became a default candidate (PR #1478) the mirror asked the manifest but not `cutedsl_arch_requirement_error`: on a cc 10.7 host with the public CuTe DSL 4.7.0 (no `sm_107a`) the row declines through that gate while the mirror admitted the draw, so every flag-less d128 block-scaled draw of `test_sdpa_mxfp8_fwd_L0` would have failed where develop ran the backend on the folded draw (verified host-side with the target modelled absent). Model the target on both sides: `sdpa/test_mxfp8_block_scaled_fold.py::test_cc107_default_admission_needs_the_sm_107a_dsl_target` pins the fold with `buffers._cutedsl_has_sm107` patched absent and present.
 - **A version-bounded backend workaround ships with the detector that re-measures it.** A constant such as `sdpa/fwd/backend_guard.py::SQ1_MXFP8_PLANNING_CRASH_FIXED_IN` is a measurement, and nothing in an ordinary test run would ever notice the backend getting fixed (the guard keeps it from being asked). `sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0` runs the trigger matrix one interpreter per contract with the guard disabled in the child (the constant set to 0 there; a crash is the child's rc 139, never the runner's) plus a control contract the backend is known to plan, and fails with the version to record once the installed backend plans the matrix cleanly -- or, above a recorded version, once it crashes again. Spawn the children with the test module's own directory and `test/python` on their `sys.path`; they inherit neither pytest's path setup nor its fixtures.
+
+  Retain the original cold input and workspace initialization when adding
+  warmed/replay controls (the SM120 empty-query detector uses `0xff`). A zero
+  query mask with reserved physical rows, or an empty request after a positive
+  launch, does not qualify a cold compact empty sequence.
+  `TestSM120EmptyQueryCompatibility` keeps its raw cold-engine detector in a
+  child, checks lengths and physical origins changed together during replay,
+  and updates both the bound V page pool and the dense reference when changing
+  paged inputs. An arbitrary child failure is not the expected kernel crash.
 - Native binder migrations must also run the existing prepared-launch tests. An invalid override can violate both a fixed split shape and Q/O agreement: preserve the primary declared-shape diagnostic, not just rejection. `test_sdpa_prepared_thd.py::test_split_prepared_strided_output_rebind_and_capture` checks this after numerical and replay validation.
 When an attention oracle is FP64 with tolerances, it is not an exact-byte
 `StressCase.reference`. Validate both cold launches used by the helper against
@@ -667,6 +694,13 @@ backend fallback cannot hide a missing kernel repair. The SM100 selected entry
 `test_sdpa_fwd_fp8_sm100.py::TestD128Fp8PhysicalOrigins` reuses those shared
 FP8 D128 cases and checks both prepared and standalone graph execution.
 Default-provider passes alone cannot qualify an advertised native path.
+
+Split batch-invariance fixtures must reserve total-Q capacity for inserted or
+duplicated sequences, not only the initial batch's live sum. Keep a required
+`max_total_seq_len_q` bound instead of dropping it to grow the test. A B=1
+head-major Stats control that retains the original head stride still needs
+storage for `H * head_stride`, including the last head's padding. The D256
+split-origin determinism suite checks these contracts with fixed public records.
 
 ### CUDA Graph test lifetimes
 
@@ -1617,3 +1651,16 @@ fallback must match each caller's verdict shape. A three-field caller cannot
 unpack the helper's two-field rejection: it masks the actual graph diagnostic.
 Let that caller propagate the original exception, and exercise the rejection
 path as well as the normal callback (the SM90 D128 packed-plan test is an example).
+
+
+### Backend workspace capacity
+
+A non-null pointer does not establish sufficient workspace capacity. Test the
+observed byte extent at every mapping/ordered/index transport, including the
+native ordered fast path, Python-only producers, deserialization and effective
+shape overrides. Warm the same plan with a valid buffer before replacing it
+with a short view. Keep that view inside a fully sized owned backing for the
+RED control; assert rejection before either FE scratch initialization or output
+writes. Exact capacity, larger carriers of a different element width, and raw
+integer pointers with unknown capacity are positive controls. See
+`core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.

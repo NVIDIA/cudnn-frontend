@@ -24,11 +24,10 @@ class IndexerScoreUnifiedSm100Mxfp4(IndexerScoreUnifiedSm100Mxfp8):
     format_name = "MXFP4"
     mma_inst_k = 64
 
-    @staticmethod
-    def _qk_tensor(t: cute.Tensor) -> cute.Tensor:
+    def _qk_tensor(self, t: cute.Tensor) -> cute.Tensor:
         """Q or K as this kernel reads it: launched as packed ``Uint8`` bytes, read as two E2M1 values per byte."""
         if t.element_type is not cutlass.Uint8:
-            raise TypeError(f"SM100 unified indexer MXFP4 expects Q/K launched as Uint8 bytes, got {t.element_type}")
+            raise TypeError(f"SM100 unified indexer {self.format_name} expects Q/K launched as Uint8 bytes, got {t.element_type}")
         return cute.recast_tensor(t, cutlass.Float4E2M1FN)
 
     def _make_data_tiled_mma(self, blockscaled_tiled_mma_qk, cta_group):

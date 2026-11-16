@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """JAX-native (XLA custom call) entry point for grouped GEMM GLU + Hadamard + quant,
-built on :func:`cudnn.jax.call`.
+built on :func:`cudnn._jax.call`.
 
 ``grouped_gemm_glu_hadamard_quant_jax_forward`` is the canonical forward with dense
 weights for packed FP4 inputs. Its NVFP4 outputs are packed too: uint8 arrays with

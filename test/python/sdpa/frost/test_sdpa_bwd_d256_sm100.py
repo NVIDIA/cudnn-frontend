@@ -3,7 +3,7 @@
 
 """``sdpa_bwd_sm100_d256``: the SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 SDPA backward on the 2x2 tcgen05 datapath.
 
-The Rubin half chain (``api_dsl_sm107``) over the shared 2x2-datapath body ``kernels/bprop_d256_2x2_f16.py`` at
+The Rubin half chain (``api_dsl_sm107``) over the shared 2x2-datapath body ``kernels/sm100/d256_f16_2x2/kernel.py`` at
 ``datapath_2x2_profile = 1``.  Every capability the row claims gets an ACCEPT test through the graph API with the engine
 PINNED (the bf16 d256 graph has a native backend competitor, cuDNN engine 5 on B200 / 9.26) against the sm107 suite's fp64
 oracle, every decline a REJECT probe on a REAL graph with a faked cc 10.0 device.  The 2x2-specific detectors: the
@@ -61,7 +61,7 @@ _SM100_CC = (10, 0)
 _SM_RANGE = (100, 106)  # the SM100 MXFP8 row's range; 107+ is the native Rubin row's
 _DTYPES = (torch.bfloat16, torch.float16)
 _DTYPE_IDS = ("bf16", "fp16")
-_KERNEL_FILE = "bprop_d256_2x2_f16.py"
+_KERNEL_FILE = "sm100/d256_f16_2x2/kernel.py"
 _TAG = "sdpa_bwd_sm100_d256_main"
 
 
@@ -120,8 +120,8 @@ def test_capabilities_match_what_is_implemented():
     """The row claims exactly what the accept tests run; every deferral is pinned False with its reject test."""
     c = _spec().capabilities
     assert (c.sm_lo, c.sm_hi) == _SM_RANGE, "SM100 / SM103 (cc 10.0-10.6); the native Rubin row owns 107+"
-    assert c.d == frozenset({128, 192, 256}) and not c.d_envelope and c.dqk_ge_dv
-    assert c.declaration_check is not None, "only the exact D256 and D192x128 head pairs are qualified"
+    assert c.d == frozenset({128, *range(192, 257, 8)}) and not c.d_envelope and c.dqk_ge_dv
+    assert c.declaration_check is not None, "only D256, D192x128 and the dense D_V in {192, 256} envelope pairs are qualified"
     assert c.dtypes == frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
     assert not c.is_fp8 and not c.is_mxfp8 and c.out_dtypes == frozenset()
     assert c.causal and c.bottom_right and c.swa and c.gqa
@@ -968,7 +968,7 @@ def test_adapter_backstop_admits_the_served_matrix_and_sizes_its_workspace_at_bu
         (dict(window_size_left=0), "window_left > 0"),
         (dict(seq_kv_lens_present=True), "padding masks"),
         (dict(thd=True), "THD"),
-        (dict(d=512), "d_qk = d_v = 256"),
+        (dict(d=512), "head dims must be"),
     ],
     ids=["fp32", "gqa-ratio", "decode", "right-band", "swa-zero", "padded", "thd", "d512"],
 )
@@ -1120,7 +1120,7 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
     MASKS = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=640)}
     params = TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=profile, **MASKS[mask])
-    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), params, tag=f"sass_2x2_{arch}_p{profile}_" + mask)
+    mod = load_template(_sm100_kernel_path("sm100/d256_f16_2x2/kernel.py"), params, tag=f"sass_2x2_{arch}_p{profile}_" + mask)
     print("SASS SOFTMAX_REGS", mod.CFG.SOFTMAX_REGS)
     print("SASS OTHER_REGS", mod.CFG.OTHER_REGS)
     slot_cols = mod.LAYOUT.S_COLS  # one S / dP accumulator slot = 64 TMEM columns (the 2x2 D atom); dV is a separate base
@@ -1209,7 +1209,7 @@ _NATURAL_PROBE = textwrap.dedent(r"""
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
     MASKS = {"dense": {}, "causal": dict(window_right=0)}
     for mask, kw in MASKS.items():
-        mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, **kw), tag="natural_2x2_" + mask)
+        mod = load_template(_sm100_kernel_path("sm100/d256_f16_2x2/kernel.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, **kw), tag="natural_2x2_" + mask)
         assert mod.MMA_LOOKAHEAD is False, "profile 1 ships the NATURAL MMA order (config_d256_2x2.MMA_LOOKAHEAD = 0)"
         mod.compile(b=1, qh=2, kh=1, sq=256, skv=512)
         print("NATURAL_OK", mask)
@@ -1248,7 +1248,7 @@ _ARM_NUMERICS_PROBE = textwrap.dedent(r"""
     lookahead = bool(int(sys.argv[1]))
     b, qh, kh, sq, skv, d = 2, 4, 2, 512, 768, 256
     dt = torch.bfloat16
-    mod = load_template(_sm100_kernel_path("bprop_d256_2x2_f16.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, window_right=0), tag="arm_numerics")
+    mod = load_template(_sm100_kernel_path("sm100/d256_f16_2x2/kernel.py"), TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=1, window_right=0), tag="arm_numerics")
     mod.MMA_LOOKAHEAD = lookahead
     fn = mod.compile(b=b, qh=qh, kh=kh, sq=sq, skv=skv)
     gen = torch.Generator(device="cpu").manual_seed(3)
@@ -1395,7 +1395,7 @@ _RUBIN_PROFILE_PROBE = textwrap.dedent(r"""
     from cudnn.sdpa.bwd.config_sm107 import TemplateParams
 
     mod = load_template(
-        _sm100_kernel_path("bprop_d256_2x2_f16.py"),
+        _sm100_kernel_path("sm100/d256_f16_2x2/kernel.py"),
         TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=2),
         tag="rubin_profile_trace",
     )

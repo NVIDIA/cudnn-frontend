@@ -237,7 +237,7 @@ def indexer_forward_wrapper(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
@@ -246,10 +246,14 @@ def indexer_forward_wrapper(
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
     With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
-    The block-scaled SM100 precisions take BF16 W and blockscaled-packed E8M0
-    ``q_scale`` / ``k_scale``, one scale per 32 head_dim values (``head_dim // 32``
-    per row): ``'mxfp8'`` (E4M3 Q/K) or ``'mxfp4'`` (``float4_e2m1fn_x2`` Q/K with
-    last dim ``head_dim // 2``, still ``head_dim // 32`` scales per row).
+    The block-scaled SM100 precisions take BF16 W and blockscaled-packed
+    ``q_scale`` / ``k_scale``: ``'mxfp8'`` (E4M3 Q/K) and ``'mxfp4'``
+    (``float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``) with one E8M0
+    scale per 32 head_dim values (``head_dim // 32`` per row), and ``'nvfp4'``
+    (``float4_e2m1fn_x2`` Q/K) with one non-negative E4M3 scale per 16
+    (``head_dim // 16`` per row); fold the product of NVFP4's per-tensor global
+    decode scales (which multiply the block-scaled values back to real values:
+    ``1 / g`` for an encoding global scale ``g``) into ``sm_scale``. ``sf_vec_size=None`` selects the format's scale vector size.
     SM90 offers ``'fp8'`` with per-token scales instead.
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
@@ -381,7 +385,7 @@ def indexer_forward_top_k_wrapper(
     k_scale: Optional[torch.Tensor] = None,
     cu_seqlens_q_scale_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_scale_padded: Optional[torch.Tensor] = None,
-    sf_vec_size: int = 32,
+    sf_vec_size: Optional[int] = None,
     return_lse: bool = False,
     lse_out: Optional[torch.Tensor] = None,
     return_softmax: Optional[bool] = None,
@@ -399,8 +403,8 @@ def indexer_forward_top_k_wrapper(
     """Combined indexer score generation and Top-K selection API.
 
     With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32;
-    ``'mxfp8'`` and ``'mxfp4'`` take block-scaled Q/K and BF16 W as in
-    :func:`indexer_forward_wrapper`.
+    ``'mxfp8'``, ``'mxfp4'`` and ``'nvfp4'`` take block-scaled Q/K and BF16 W as
+    in :func:`indexer_forward_wrapper`.
     Returns ``{'indices', 'logits', 'softmax'}`` by default, plus ``'lse'``
     when requested. Set ``return_softmax=False`` to return only indices and
     logits. Unlike :func:`indexer_forward_wrapper`, this path never
@@ -409,7 +413,7 @@ def indexer_forward_top_k_wrapper(
     On SM90, the validated path is contiguous packed THD with ``ratio=4``,
     ``head_dim=128``, one KV head, and 64 query heads. It accepts BF16 Q/K
     with BF16 or FP32 W, or E4M3 FP8 Q/K with contiguous FP32 per-token/head
-    ``q_scale``/``k_scale`` and BF16 W. SM90 declines BSHD, MXFP8/MXFP4,
+    ``q_scale``/``k_scale`` and BF16 W. SM90 declines BSHD, MXFP8/MXFP4/NVFP4,
     paged K, explicit microbatching, non-default tuning, and other SM9x
     capabilities. Those restrictions do not change the SM100+ path.
 
@@ -461,8 +465,8 @@ def indexer_forward_top_k_wrapper(
             raise NotImplementedError("SM90 packed THD compressed indexer forward does not support microbatch_rows > 0")
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
             raise NotImplementedError("SM90 uses per-token FP8 scales and does not accept block-scale padded prefixes")
-        if sf_vec_size != 32:
-            raise NotImplementedError("sf_vec_size is a block-scaled SM100 option and must remain 32 on SM90")
+        if sf_vec_size not in (None, 32):
+            raise NotImplementedError("sf_vec_size is a block-scaled SM100 option; SM90 takes only its default (None) or 32")
         if block_table is not None or kv_lens is not None:
             raise NotImplementedError("paged K is not supported by the initial SM90 compressed indexer path")
         from ._compressed_top_k_sm90 import indexer_fwd_compress_topk_sm90

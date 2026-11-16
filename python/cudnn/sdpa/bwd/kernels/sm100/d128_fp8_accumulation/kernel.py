@@ -21,7 +21,7 @@ from cudnn.frost.tile_dsl.pointwise import abs_max_tree, ffma2, fmax_f32, fmul2,
 from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_commit, tma_store_tile, tma_store_wait
 
-from cudnn.sdpa.bwd.config_sm100_d128_accum_fp8 import make_bar_layout, make_config
+from cudnn.sdpa.bwd.kernels.sm100.d128_fp8_accumulation.config import make_bar_layout, make_config
 
 _PARAMS = globals().get("FROST_TEMPLATE_PARAMS", 128)
 HEAD_DIM, WINDOW = (_PARAMS, 0) if isinstance(_PARAMS, int) else (int(_PARAMS[0]), int(_PARAMS[1]))

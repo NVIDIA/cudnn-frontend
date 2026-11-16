@@ -324,7 +324,7 @@ def arrive_on_leader_release(mb, leader_cta_id, cta_group: int):
     SASS (``USYNCS.ARRIVE.TRANS64.RED.ACT0``), so this form is FREE, and the ordering instruction on the path is the
     caller's ``fence_proxy`` (``MEMBAR.ALL.CTA`` + ``FENCE.VIEW.ASYNC.S``) -- keep the fence; 0 stale reads without it is
     margin on that shape, not a licence (PTX memory model).  First consumer:
-    ``sdpa/bwd/kernels/sm107/bprop_d256_mxfp8.py`` (``mb_p_ready``).  Lane ledger: same as :func:`arrive_on_leader` (one
+    ``sdpa/bwd/kernels/sm107/d256_mxfp8/kernel.py`` (``mb_p_ready``).  Lane ledger: same as :func:`arrive_on_leader` (one
     arrive per calling lane -- nothing here elects)."""
     if cutlass.const_expr(cta_group == 1):
         nvvm.mbarrier_arrive(mb)

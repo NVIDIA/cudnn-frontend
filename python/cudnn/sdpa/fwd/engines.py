@@ -1900,6 +1900,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     """
     if facts.invalid:
         return facts.invalid
+    if facts.mixed_qkv_ragged:
+        return "nonpaged FROST SDPA requires Q, K, and V to be all dense or all ragged"
     if facts.is_backward:
         return "this engine serves sdpa() forward graphs only"
     if knobs is not None and not isinstance(knobs, SdpaFwdKnobs):
@@ -2217,6 +2219,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
         ):
             return "nonpaged D192 split physical origins require the matching native cuDNN Frontend extension"
+        if (
+            packed_split
+            and not facts.has_paged_kv
+            and (facts.d_qk, facts.d_v) == (256, 256)
+            and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d256_split_physical_origins", False)
+        ):
+            return "nonpaged D256 split physical origins require the matching native cuDNN Frontend extension"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -4958,7 +4967,7 @@ def supports_stats_stride_override(spec: EngineSpec, facts: "ga.SdpaGraphFacts",
     if facts.is_fp8 or facts.is_mxfp8 or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
         return False
     # Public notes require hardware qualification, not only a shared binder.
-    if spec.capabilities.sm_lo != 100 or facts.device_cc not in ((10, 0), (10, 3)):
+    if (spec.capabilities.sm_lo, facts.device_cc) not in ((100, (10, 0)), (100, (10, 3)), (107, (10, 7)), (120, (12, 0))):
         return False
     stats = facts.stats_t
     if stats is None or stats.ragged_offset is None:
@@ -5272,7 +5281,11 @@ def lower_dsl_prefill(
             and facts.epilogue_gate_t is None
             and lowering_row_name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107")
             and facts.device_cc in ((10, 0), (10, 3), (10, 7))
-            and ((facts.d_qk, facts.d_v) == (192, 128) or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split))
+            and (
+                (facts.d_qk, facts.d_v) == (192, 128)
+                or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split)
+                or ((facts.d_qk, facts.d_v) == (256, 256) and api.packed_thd_split and api.cga in (None, 2))
+            )
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and not facts.has_paged_kv
         )

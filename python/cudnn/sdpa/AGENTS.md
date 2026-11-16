@@ -831,7 +831,7 @@ load/MMA/result-store/release order and retain the refilling warm stress.
 
 Kernels on this atom: forward `fwd/kernels/sm100/d512_f16_2x2/kernel.py` + `fwd/kernels/sm107/d512_f16_2x2/kernel.py`
 (`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/d512_f16_2x2/kernel.py` (`config_sm100.CfgBwdD512x2`,
-`TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
+`TemplateParams2x2`), backward d256 `bwd/kernels/sm100/d256_f16_2x2/kernel.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
 `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
 
@@ -999,7 +999,7 @@ Backward (d512 stage 2):
 - **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
   CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
   rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
-  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  (`bwd/kernels/sm107/d512_f16_2x2/kernel.py`, parent `sm100/`) differs from its
   parent in a handful of code lines (the ring-arm default record, the
   hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
   fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
@@ -1932,9 +1932,17 @@ partition, legal-tuple ranking, identities and
 `test_sm80_selector_is_the_adapters_d64_rule`.
 
 Moving a body into its implementation directory changes what a relative import
-resolves against (`from . import _bprop_mxfp8_masks` in `sm100/d256_mxfp8/`
-looked in the new package). An AST comparison of the moved file passes, and
+resolves against (after #2617 moved the D256 MXFP8 bodies into
+`sm100/d256_mxfp8/`, their `from . import _bprop_mxfp8_masks` looked in the new
+package instead of `sm100/`). An AST comparison of the moved file passes, and
 host suites never import template bodies, so import every moved module
 (`importlib.import_module`) before the GPU run. After delegating a row, diff
 failing test ids across every file under `test/python/sdpa` against the parent:
 row-name pins in band, admission and GPU suites do not match a `*bwd*` glob.
+
+After moving a body, search both its retired path and its basename across
+`docs`, `python` and `test` (for example, `git grep -n retired_kernel.py --
+docs python test`). Operation pages may spell the filename differently from
+loader constants, so a loader-only replacement can miss a current reference.
+Update current documentation; preserve frozen historical tracker entries and
+existing diagnostic labels.

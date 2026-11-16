@@ -431,7 +431,7 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     stats.set_uid(101).set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
-    # Manifest slot 15 is the distinct Rubin half engine.
+    # Legacy rows below are replaced by the explicit body owners where split.
     engine_id = 20505 if cc[0] == 12 else (20515 if cc == (10, 7) else _SM100_ID)
     if cc[0] == 12:
         from cudnn.engines.manifest import MANIFEST
@@ -443,7 +443,6 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
     if cc in ((10, 0), (10, 3)):
-        from types import SimpleNamespace
         from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
 
         physical_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=d_v))
@@ -465,6 +464,20 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
         elif physical_shape == (512, 512):
             # Preserve this native-binder fixture's original role-split ABI.
             engine_id, tile_m, cga = 20521, 128, 4
+    elif cc == (10, 7):
+        from cudnn.sdpa.fwd.kernels.sm107.half_flavor_contract import padded_shape
+
+        physical_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=d_v))
+        # These callers exercise native multi-Q / role-split prefill, including
+        # split-KV. Keep the same host ABI after the legacy Rubin row delegates.
+        engine_id, cga = {
+            (32, 32): (20559, 1),
+            (64, 64): (20559, 2),
+            (128, 128): (20559, 2),
+            (192, 128): (20556, 2),
+            (256, 256): (20557, 2),
+            (512, 512): (20554, 4),
+        }[physical_shape]
     graph.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, tile_n=tile_n, cga=cga, pack_gqa=cc != (10, 7), split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared

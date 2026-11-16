@@ -30,6 +30,7 @@ import cudnn
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import band
 from cudnn.sdpa import graph_analyzer as ga
+from cudnn.sdpa.bwd.kernels.sm100.d256_f16_2x2.contract import sm100_head_pair_envelope as _sm100_d256_envelope
 
 # Lowering dependencies, resolved at build time — see the note in fwd/engines.py:
 # importing them here would drag the CuTe DSL into every support check.
@@ -40,6 +41,9 @@ _SM100_D512_ROLE_SPLIT = "SdpaBwdDslSm100D512RoleSplit"
 _SM100_D512_TWO_BY_TWO = "SdpaBwdDslSm100D512TwoByTwo"
 _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
+_SM107_D256_NATIVE = "SdpaBwdDslSm107D256FourByOne"
+_SM107_D256_2X2 = "SdpaBwdDslSm107D256TwoByTwo"
+_SM107_D192_2X2 = "SdpaBwdDslSm107D192TwoByTwo"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
 _SM100_D256 = "SdpaBwdDslSm100D256"
@@ -59,6 +63,22 @@ _SM120_MXFP8 = "SdpaBwdDslSm120Mxfp8"
 
 
 def _adapter(name: str):
+    if name == _SM107_FP8:
+        from .kernels.sm107.d256_fp8.host import SdpaBwdDslSm107Fp8
+
+        return SdpaBwdDslSm107Fp8
+    if name == _SM107_MXFP8:
+        from .kernels.sm107.d256_mxfp8.host import SdpaBwdDslSm107Mxfp8
+
+        return SdpaBwdDslSm107Mxfp8
+    if name == _SM107_D256_NATIVE:
+        from .kernels.sm107.d256_f16_4x1.host import SdpaBwdDslSm107D256FourByOne
+
+        return SdpaBwdDslSm107D256FourByOne
+    if name in (_SM107_D256_2X2, _SM107_D192_2X2):
+        from .kernels.sm100.d256_f16_2x2 import host
+
+        return getattr(host, name)
     if name == _SM100_D128_ACCUMULATION:
         from cudnn.sdpa.bwd.kernels.sm100.d128_f16_accum.host import SdpaBwdDslSm100D128Accumulation
 
@@ -105,27 +125,29 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_mxfp8_sm100
 
         return api_dsl_mxfp8_sm100.SdpaBwdDslSm100Mxfp8
-    if name in (_SM107, _SM107_FP8, _SM107_MXFP8):
-        # The Rubin d=256 chains (half + per-tensor FP8 + block-scale MXFP8) share one module.
+    if name == _SM107:
+        # Compatibility for the historical half adapter; fixed graph owners live beside their bodies.
         from cudnn.sdpa.bwd import api_dsl_sm107
 
         return getattr(api_dsl_sm107, name)
     if name == _SM100_D256:
         # The SM100 d=256 half row: the Rubin half chain's adapter over the 2x2-datapath body.
-        from cudnn.sdpa.bwd import api_dsl_sm100_d256
+        from .kernels.sm100.d256_f16_2x2.host_sm100 import SdpaBwdDslSm100D256
 
-        return api_dsl_sm100_d256.SdpaBwdDslSm100D256
+        return SdpaBwdDslSm100D256
     if name == _SM107_D512:
         # The cc 10.7 d512 half row: the SM100 large-head-dim chain's adapter over the cc 10.7 2x2-datapath stage 2.
-        from cudnn.sdpa.bwd import api_dsl_sm107_d512
+        from .kernels.sm107.d512_f16_2x2.host import SdpaBwdDslSm107D512
 
-        return api_dsl_sm107_d512.SdpaBwdDslSm107D512
+        return SdpaBwdDslSm107D512
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
 
 
 def _fp8_adapter(name: str):
+    if name == _SM107_FP8:
+        return _adapter(name)
     if name == _SM120_FP8:
         from cudnn.sdpa.bwd.api_dsl_sm120_fp8 import SdpaBwdDslSm120Fp8
 
@@ -148,6 +170,8 @@ def _fp8_adapter(name: str):
 
 
 def _mxfp8_adapter(name: str):
+    if name == _SM107_MXFP8:
+        return _adapter(name)
     if name == _SM120_MXFP8:
         from cudnn.sdpa.bwd.api_dsl_sm120_mxfp8 import SdpaBwdDslSm120Mxfp8
 
@@ -176,6 +200,7 @@ from cudnn.sdpa.bwd.config_sm120 import (
     SEQ_Q_TILES as _SM120_Q_TILES,
     SUPPORTED_HEAD_DIMS as _SM120_HEAD_DIMS,
 )
+from cudnn.sdpa.bwd.kernels.sm107 import d256_half_contract as _sm107_d256_half
 from cudnn.sdpa.bwd.kernels.sm100 import d512_half_contract as _sm100_d512_half
 from cudnn.sdpa.bwd.kernels.sm120 import half_contract as _sm120_half
 from cudnn.sdpa.bwd.kernels.sm80 import half_contract as _sm80_half
@@ -468,6 +493,8 @@ def legal_implementations(capabilities: Capabilities, facts: "ga.SdpaGraphFacts"
 def _declared_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any) -> Optional[str]:
     if facts.invalid:
         return facts.invalid
+    if facts.mixed_qkv_ragged:
+        return "nonpaged FROST SDPA requires Q, K, and V to be all dense or all ragged"
     if not facts.is_backward:
         return "this engine serves sdpa_backward() graphs only"
     if requested is not None:
@@ -1661,6 +1688,8 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107",
         capabilities=Capabilities(
+            select_implementation=_sm107_d256_half.select_implementation,
+            delegated=frozenset({_sm107_d256_half.NATIVE, _sm107_d256_half.TWO_BY_TWO}),
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -1684,6 +1713,20 @@ def _sm107_spec() -> EngineSpec:
             layouts=frozenset({"bshd"}),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM107),
+    )
+
+
+def _sm107_d256_native_spec() -> EngineSpec:
+    return explicit_engine(_sm107_spec(), _sm107_d256_half.NATIVE, partial(lower_dsl_bwd, api_type=_SM107_D256_NATIVE))
+
+
+def _sm107_d256_two_by_two_spec() -> EngineSpec:
+    return explicit_engine(
+        _sm107_spec(),
+        _sm107_d256_half.TWO_BY_TWO,
+        partial(lower_dsl_bwd, api_type=_SM107_D256_2X2),
+        thd=False,
+        thd_declared_totals=False,
     )
 
 
@@ -1845,6 +1888,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_fp8",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -1875,7 +1919,7 @@ def _sm107_fp8_spec() -> EngineSpec:
 
 def _sm107_mxfp8_spec() -> EngineSpec:
     """SM107 (Rubin) d=256 block-scale MXFP8 backward row (``sdpa_mxfp8_backward``;
-    ``api_dsl_sm107.SdpaBwdDslSm107Mxfp8``, kernel ``sm107/bprop_d256_mxfp8.py``).
+    ``api_dsl_sm107.SdpaBwdDslSm107Mxfp8``, kernel ``sm107/d256_mxfp8/kernel.py``).
 
     ONE kernel plus scale-factor plumbing (no separate SF-repack or dequant kernels): the per-tensor
     fp8 body's pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every
@@ -1946,6 +1990,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_mxfp8",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_mxfp8",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -2001,6 +2046,17 @@ def _native_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[
     return "D256 backward serves exact (256, 256) and (192, 128) head dimensions"
 
 
+def _sm100_d256_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    """The native pairs, plus dense head pairs below (256, 256) that compute on its geometry (``_sm100_d256_envelope``)."""
+    if _native_d256_head_mismatch(facts, version) is None:
+        return None
+    if not _sm100_d256_envelope(facts.d_qk, facts.d_v):
+        return "D256 backward serves (192, 128), and D_V in {192, 256} with D_V <= D_QK <= 256 and D_QK a multiple of 8"
+    if facts.thd:
+        return "the D256 head-pair envelope is dense BSHD only; THD serves the exact (256, 256) and (192, 128) pairs"
+    return None
+
+
 def _sm100_d192_head_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     if _d192_accumulation_serves(facts):
         return None
@@ -2020,14 +2076,16 @@ def _sm100_d256_spec() -> EngineSpec:
 
     The Rubin half chain (``_sm107_spec``: dot -> main kernel with dV in TMEM and a kv-major dS workspace -> the two
     ``bprop_matmul_blackwell`` GEMMs at the (256, 256) tile -> the GQA fold) over the **2x2-datapath** main kernel
-    ``kernels/bprop_d256_2x2_f16.py`` at profile 1: ``tcgen05.mma.cta_group::2`` with the collective M = 128 (64 kv rows per
+    ``kernels/sm100/d256_f16_2x2/kernel.py`` at profile 1: ``tcgen05.mma.cta_group::2`` with the collective M = 128 (64 kv rows per
     CTA, a 128-row kv block per cga2 pair), every operand an SMEM SS operand, 512 non-exclusive TMEM columns and 210 KiB
     of SMEM -- the footprint that lets a bf16 d=256 backward exist on SM100 at all (the 4x1 body needs Rubin's 576
     columns / 327 KiB).  The kv WRITE PAIR stays 256 rows (``STAGE3_GRAN_ROWS``), so the stage-3 renderings and the
     no-zero-fill contract are the Rubin row's.
 
     Packed THD accepts independent per-port physical origins and both packed Stats layouts, with declared token capacities.
-    Exact ``d_qk == d_v == 256``, plus dense and THD ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry.
+    Exact ``d_qk == d_v == 256``, plus dense and THD ``(d_qk, d_v) == (192, 128)`` through native 192/128 stage-2 geometry,
+    plus dense BSHD pairs with ``d_v`` in {192, 256} and ``d_v <= d_qk <= 256`` (``d_qk`` a multiple of 8) on the (256, 256)
+    geometry (``_sm100_d256_envelope``).
     Tensor maps retain each operand's actual width; delta and GQA fold use the value width. Any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
     sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
     by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening,
@@ -2038,12 +2096,13 @@ def _sm100_d256_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100_d256",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm100_d256",
             zero_scale=True,
             sm_lo=100,
             sm_hi=106,
-            d=frozenset({128, 192, 256}),
+            d=frozenset({128, *range(192, 257, 8)}),
             dqk_ge_dv=True,
-            declaration_check=_native_d256_head_mismatch,
+            declaration_check=_sm100_d256_head_mismatch,
             d_envelope=False,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             gqa=True,
@@ -2070,6 +2129,7 @@ def _sm107_d192_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_d192",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_d192",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -2089,7 +2149,7 @@ def _sm107_d192_spec() -> EngineSpec:
             decode=False,  # prefill body: a 128-row q tile per iteration
             layouts=frozenset({"bshd"}),
         ),
-        lower=partial(lower_dsl_bwd, api_type=_SM107),
+        lower=partial(lower_dsl_bwd, api_type=_SM107_D192_2X2),
     )
 
 
@@ -2098,7 +2158,7 @@ def _sm107_d512_spec() -> EngineSpec:
 
     The SM100 large-head-dim chain (``_sm100_spec``: dot -> stage-2 S / dS workspaces -> the three ``bprop_matmul_blackwell``
     GEMMs at the (512, 512) tile -> the GQA fold) with stage 2 ALWAYS the **2x2-datapath** body
-    ``kernels/sm107/bprop_d512_f16_2x2.py`` at the cc 10.7 ring arm: two independent ``tcgen05.mma.cta_group::2`` pairs per
+    ``kernels/sm107/d512_f16_2x2/kernel.py`` at the cc 10.7 ring arm: two independent ``tcgen05.mma.cta_group::2`` pairs per
     (4,1,1) cluster, 64 q rows per CTA, both BMMs as SMEM SS operands, an 8-stage K / V chunk ring (SM100: 4) and two cast
     stages (SM100: 1) filling 320 of the line's 325 KiB usable SMEM, 256 TMEM columns, descriptor version 0 at zero margin.
     Its own row rather than a widened ``sdpa_bwd_sm100`` because Capabilities cannot vary per cc inside one row: the 4x1 role
@@ -2119,6 +2179,7 @@ def _sm107_d512_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_d512",
         capabilities=Capabilities(
+            implementation="sdpa_bwd_sm107_d512",
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
@@ -2645,6 +2706,8 @@ ENGINE_SPECS = (
     _sm100_d192_spec(),
     _sm100_d192_fp8_spec(),
     _sm107_spec(),
+    _sm107_d256_native_spec(),
+    _sm107_d256_two_by_two_spec(),
     _sm107_fp8_spec(),
     _sm107_mxfp8_spec(),
     _sm100_d256_spec(),

@@ -1368,7 +1368,7 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
 @cutlass.cute.jit
 def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
-    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/d256_fp8/kernel.py``, the gated block's
     gradient amax pass and gate backward).
 
     Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into

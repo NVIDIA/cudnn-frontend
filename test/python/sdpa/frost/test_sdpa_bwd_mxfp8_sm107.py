@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Rubin (SM 10.7) MXFP8 d=256 SDPA backward: the KERNEL BODY ``sdpa/bwd/kernels/sm107/bprop_d256_mxfp8.py`` (static +
+"""The Rubin (SM 10.7) MXFP8 d=256 SDPA backward: the KERNEL BODY ``sdpa/bwd/kernels/sm107/d256_mxfp8/kernel.py`` (static +
 sm_107a SASS pins) and the ENGINE ROW ``sdpa_bwd_sm107_mxfp8`` (registration, the row's ``mismatch()`` on real graphs, the Rubin
 accept matrix against ``sdpa.mxfp8_ref.compute_ref_backward``, ``quantize_ds=False`` for the bf16-dS chain and ``True`` for the
 block-scaled one).
@@ -110,8 +110,8 @@ def _mock_target_for_cross_arch_contracts(monkeypatch):
         monkeypatch.setattr(prepared_sm107, "_sm", lambda api: 107)
 
 
-_KERNEL_FILE = "sm107/bprop_d256_mxfp8.py"
-_FP8_FILE = "sm107/bprop_d256_fp8.py"
+_KERNEL_FILE = "sm107/d256_mxfp8/kernel.py"
+_FP8_FILE = "sm107/d256_fp8/kernel.py"
 _TAG = "sdpa_bwd_sm107_main_mxfp8"
 _ENGINE = "sdpa_bwd_sm107_mxfp8"
 _FAMILY_NAME = "frost_sdpa_bwd"
@@ -709,7 +709,7 @@ _SASS_PROBE = textwrap.dedent(r"""
         "pb_dense_fmul": dict(ds_sf_policy=DS_SF_P_B, scaled_fp8_pack=False),
         "pb_causal_fused": dict(ds_sf_policy=DS_SF_P_B, scaled_fp8_pack=True, window_right=0),
     }
-    mod = load_template(_sm100_kernel_path("sm107/bprop_d256_mxfp8.py"), TemplateParams(dtype_qkv=DTYPE_E4M3, **ARMS[arm]), tag="sdpa_bwd_sm107_main_mxfp8")
+    mod = load_template(_sm100_kernel_path("sm107/d256_mxfp8/kernel.py"), TemplateParams(dtype_qkv=DTYPE_E4M3, **ARMS[arm]), tag="sdpa_bwd_sm107_main_mxfp8")
     p_packs = (mod._SMX_CHUNK // mod._P_PACK) * 8  # scaled cvts per lane per iteration on the P path (8 per 16-pack)
     dk_packs = (mod._SMX_CHUNK // mod._DS_PACK) * 8 * int(mod._IS_P_B)  # the same 16-pack shape for the ds_dk payload
     dq_cvts = mod._SMX_CHUNK * int(mod._IS_P_B)  # ds_dq: one LONE scaled cvt per element (its column's byte), fp32_to_fp8x4_scaled_pairs
@@ -1346,7 +1346,7 @@ def test_reject_missing_sm107a_dsl_target_before_compile(monkeypatch, dsl_versio
     dist = "nvidia-cutlass-dsl" if dsl_version == "4.7.0" else "nvidia-cutlass-dsl-internal"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, (dist, dsl_version)))
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
-    for engine in (_ENGINE, "sdpa_bwd_sm107", "sdpa_bwd_sm107_fp8"):
+    for engine in (_ENGINE, "sdpa_bwd_sm107_d256_f16_4x1", "sdpa_bwd_sm107_fp8"):
         reason = _decline_reason(monkeypatch, engine=engine)
         assert reason is not None and "sm_107a" in reason and dsl_version in reason, (engine, reason)
     assert _decline_reason(monkeypatch, engine="sdpa_bwd_sm100_d256_mxfp8", cc=(10, 0)) is None
@@ -1822,6 +1822,7 @@ def _run_mxfp8(
     k_mult=1.0,
     repeat_outputs=0,
     frost_forward=False,
+    record=None,
 ):
     """Quantize bf16-rounded unit-normal operands (rowwise + columnwise, the producer's F8_128x4 SF), compute the forward in torch over
     the DEQUANTIZED operands under the graph's mask (natural-log LSE = the graph's Stats, O -> o_f16), build the graph, PIN the engine,
@@ -1912,8 +1913,12 @@ def _run_mxfp8(
         o_f16 = out.contiguous()  # [B, H, S_q, D]
 
     g, t, (dq_t, dk_t, dv_t, *_amax) = _mxfp8_graph(b, hq, hkv, sq, skv, causal=causal, bottom_right=bottom_right, left_bound=window, scale=scale)
-    g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, _ENGINE)
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        select_engine(g, _ENGINE)
+    else:
+        g.create_execution_plan(*record)
+        g.select_plan(0)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

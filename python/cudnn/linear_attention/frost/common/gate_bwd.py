@@ -25,13 +25,10 @@ a partial pass over token stripes (the same pass rewrites dGate -> dg_raw),
 then a sum kernel that folds the stripe partials.
 """
 
-import functools
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
-from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.tile_dsl.pointwise import (
     f16x2_to_f32,
@@ -47,9 +44,6 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, st_global_v4
-
-from .host import get_dtype
-from cudnn.frost.device import current_device
 
 USE_PDL = True
 
@@ -469,95 +463,6 @@ def channel_gate_bwd_launch(
         )
 
 
-@functools.cache
-def gate_bwd_cache(key):
-    return {}
-
-
-def scalar_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, *, stream):
-    """Scalar-gate backward: rewrite d_gate [total, HO] (gate dtype) in place from
-    transformed-space to raw-logit space and fill d_a_log/d_dt_bias (HO,).
-    part_a/part_dt are (scalar_gate_blocks(total) * HO,) fp32 workspace carves.
-    a_log/dt_bias may be None (unit amplitude / zero bias); the matching
-    d_*/part_* are then None and that gradient is not produced."""
-    n_tokens, h_o = (int(dim) for dim in d_gate.shape)
-    n_blocks = scalar_gate_blocks(n_tokens)
-    head_tiles = -(-h_o // SCALAR_HEAD_TILE)
-    slice_len = (n_tokens + n_blocks - 1) // n_blocks
-    cache = gate_bwd_cache(
-        (
-            "gdn",
-            str(g_raw.dtype),
-            str(a_log.dtype) if a_log is not None else "none",
-            str(dt_bias.dtype) if dt_bias is not None else "none",
-            d_a_log is not None,
-            d_dt_bias is not None,
-            part_a is not None,
-            part_dt is not None,
-            current_device(),
-        )
-    )
-    cu_stream = cuda.CUstream(int(stream))
-    tensors = (d_gate, g_raw, a_log, dt_bias, part_a, part_dt, d_a_log, d_dt_bias)
-    if "compiled" not in cache:
-        traced = [from_dlpack(t, assumed_align=4) for t in tensors[:2]]
-        traced = [tr.mark_layout_dynamic(leading_dim=1) for tr in traced]
-        traced += [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None for t in tensors[2:]]
-        cache["compiled"] = cute.compile(
-            scalar_gate_bwd_launch,
-            *traced,
-            cutlass.Int32(n_tokens),
-            cutlass.Int32(h_o),
-            cutlass.Int32(slice_len),
-            cutlass.Int32(n_blocks),
-            cutlass.Int32(head_tiles),
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    cache["compiled"](*tensors, n_tokens, h_o, slice_len, n_blocks, head_tiles, cu_stream)
-
-
-def channel_gate_bwd(d_gate, g_raw, a_log, dt_bias, d_a_log, d_dt_bias, part_a, part_dt, gate_lower_bound, *, stream):
-    """Per-channel-gate backward: rewrite d_gate [total, HO, d_k] (gate dtype) in
-    place and fill d_a_log/d_dt_bias at their parameter shapes ((HO,) params
-    get the channel axis folded in the sum kernel).  a_log/dt_bias may be None
-    (unit amplitude / zero bias); the matching d_*/part_* are then None and
-    that gradient is not produced."""
-    n_tokens, h_o, d_k = (int(dim) for dim in d_gate.shape)
-    g_vector_bytes = 4 * (get_dtype(g_raw.dtype).width // 8)
-    slice_len = (n_tokens + GATE_BWD_BLOCKS - 1) // GATE_BWD_BLOCKS
-    cache = gate_bwd_cache(
-        (
-            "channel",
-            str(g_raw.dtype),
-            str(a_log.dtype) if a_log is not None else "none",
-            str(dt_bias.dtype) if dt_bias is not None else "none",
-            d_a_log is not None,
-            d_dt_bias is not None,
-            part_a is not None,
-            part_dt is not None,
-            d_k,
-            current_device(),
-        )
-    )
-    cu_stream = cuda.CUstream(int(stream))
-    tensors = (d_gate, g_raw, a_log, dt_bias, part_a, part_dt, d_a_log, d_dt_bias)
-    args = (n_tokens, h_o, slice_len)
-    if "compiled" not in cache:
-        traced = [from_dlpack(t, assumed_align=g_vector_bytes).mark_layout_dynamic(leading_dim=2) for t in (d_gate, g_raw)]
-        traced += [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=len(t.shape) - 1) if t is not None else None for t in tensors[2:]]
-        cache["compiled"] = cute.compile(
-            channel_gate_bwd_launch,
-            d_k,
-            *traced,
-            *(cutlass.Int32(a) for a in args),
-            cutlass.Float32(gate_lower_bound),
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    cache["compiled"](*tensors, *args, float(gate_lower_bound), cu_stream)
-
-
 @cute.jit
 def exit_slot_table_body(b_t: cutlass.Constexpr[int], tidx, n_threads: cutlass.Constexpr[int], n_batch: cutlass.Int32, mCu, mSlots):
     """Every thread of one CTA fills the exit-slot table ``mSlots`` [slots, 2]: row ``slot(b, c)`` holds (first token
@@ -595,6 +500,7 @@ def exit_base_table_body(
     mCuPieces,
     mMainRows,
     mExitBase,
+    slot_base=None,
 ):
     """Every thread of one CTA fills ``mExitBase`` [pieces]: the exit slot of piece ``p``'s first chunk,
     ``cu[b] // b_t + 2 b`` plus the piece's chunk offset from the start of its sequence ``b``; ``mMainRows``
@@ -611,7 +517,10 @@ def exit_base_table_body(
             else:
                 hi = mid - cutlass.Int32(1)
         start = cutlass.Int32(mCu[lo])
-        mExitBase[p] = start // cutlass.Int32(b_t) + cutlass.Int32(2) * lo + (cutlass.Int32(mCuPieces[p]) - start) // cutlass.Int32(b_t)
+        base = start // cutlass.Int32(b_t) + cutlass.Int32(2) * lo + (cutlass.Int32(mCuPieces[p]) - start) // cutlass.Int32(b_t)
+        if cutlass.const_expr(slot_base is not None):
+            base = base + slot_base
+        mExitBase[p] = base
         p = p + cutlass.Int32(n_threads)
 
 
@@ -1010,101 +919,6 @@ def mamba2_gate_bwd_launch(
             frost_mamba2_skip_bwd_sum(mSkipPart, mDD, h_o, n_slots * cutlass.Int32(4), skip_channels).launch(
                 grid=(h_o, 1, 1), block=(MAMBA2_SKIP_SUM_GROUPS * skip_channels, 1, 1), stream=stream, use_pdl=USE_PDL
             )
-
-
-def mamba2_zgate_bwd(do_out, z, y_pre, do_pre, dz, *, stream) -> None:
-    """z-gate backward over ``[total, HO, d_v]`` io-dtype tensors with a stride-1 innermost dim and free outer strides:
-    writes ``do_pre`` (the bprop's dO) and ``dz``."""
-    io_dtype = get_dtype(z.dtype)
-    total, h_o, d_v = (int(dim) for dim in z.shape)
-    vector_width = 16 // (io_dtype.width // 8)
-    num_vectors = total * (d_v // vector_width)
-    n_blocks = max(1, min(-(-num_vectors // MAMBA2_ZGATE_THREADS), max(1, 4096 // h_o)))
-    cu_stream = cuda.CUstream(int(stream))
-    tensors = (do_out, z, y_pre, do_pre, dz)
-    cache = gate_bwd_cache(("mamba2_zgate", str(z.dtype), d_v, current_device()))
-    if "compiled" not in cache:
-        traced = [from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=2) for t in tensors]
-        cache["compiled"] = cute.compile(
-            mamba2_zgate_bwd_launch,
-            *traced,
-            cutlass.Int32(num_vectors),
-            d_v,
-            io_dtype,
-            cutlass.Int32(h_o),
-            cutlass.Int32(n_blocks),
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    cache["compiled"](*tensors, num_vectors, h_o, n_blocks, cu_stream)
-
-
-def mamba2_gate_bwd(
-    dot_q,
-    dot_k,
-    exit_dots,
-    g,
-    a,
-    dt_bias,
-    slots,
-    dg,
-    da,
-    d_dt_bias,
-    part_a,
-    part_dt,
-    *,
-    b_t,
-    dt_softplus,
-    dt_min,
-    dt_max,
-    stream,
-    skip_bwd_part=None,
-    dd=None,
-) -> None:
-    """dt-gate backward: ``dg`` [total, HO] (gate dtype) from the bprop's row dots and exit dots, ``dA`` (HO,) and,
-    with ``dt_bias``, ``d_dt_bias`` (HO,); with ``skip_bwd_part`` (the bprop's four per-warp dD partial rows per slot, flat
-    over ``(4 * slots, HO[, d_v])``), ``dd`` (HO,) or (HO, d_v) in D's dtype.  ``slots`` is the int32 [slots, 2]
-    exit-slot table the backward's prologue wrote (:func:`exit_slot_table_body`); ``part_a`` / ``part_dt`` are
-    ``(slots * HO,)`` fp32 workspace carves."""
-    n_slots, h_o = (int(dim) for dim in exit_dots.shape)
-    skip_channels = int(dd.shape[1]) if dd is not None and len(dd.shape) == 2 else 1
-    cu_stream = cuda.CUstream(int(stream))
-    tensors = (dot_q, dot_k, exit_dots, g, a, dt_bias, slots, dg, part_a, part_dt, skip_bwd_part, da, d_dt_bias, dd)
-    cache = gate_bwd_cache(
-        (
-            "mamba2_gate",
-            str(g.dtype),
-            str(a.dtype),
-            str(dt_bias.dtype) if dt_bias is not None else "none",
-            d_dt_bias is not None,
-            str(dd.dtype) if dd is not None else "none",
-            skip_channels,
-            int(b_t),
-            bool(dt_softplus),
-            current_device(),
-        )
-    )
-    if "compiled" not in cache:
-        traced = [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=1) for t in tensors[:4]]
-        traced += [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None for t in tensors[4:6]]
-        traced.append(from_dlpack(slots, assumed_align=8).mark_layout_dynamic(leading_dim=1))
-        traced.append(from_dlpack(dg, assumed_align=4).mark_layout_dynamic(leading_dim=1))
-        traced += [from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None for t in tensors[8:13]]
-        traced.append(from_dlpack(dd, assumed_align=4).mark_layout_dynamic(leading_dim=len(dd.shape) - 1) if dd is not None else None)
-        cache["compiled"] = cute.compile(
-            mamba2_gate_bwd_launch,
-            *traced,
-            cutlass.Int32(h_o),
-            cutlass.Int32(n_slots),
-            cutlass.Float32(float(dt_min)),
-            cutlass.Float32(float(dt_max)),
-            int(b_t),
-            bool(dt_softplus),
-            skip_channels,
-            cu_stream,
-            options="--enable-tvm-ffi",
-        )
-    cache["compiled"](*tensors, h_o, n_slots, float(dt_min), float(dt_max), cu_stream)
 
 
 frost_scalar_gate_bwd_partial.set_name_prefix("cudnn", remove_cutlass_symbol=False)

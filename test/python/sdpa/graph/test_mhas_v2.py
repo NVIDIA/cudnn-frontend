@@ -36,6 +36,17 @@ from sdpa.blocked import fetch_blocked_tests
 from sdpa.helpers import print_section_begin, print_section_end
 from sdpa.softmax_knobs import served_softmax_knob_sets, knob_set_for_case, knob_set_label, is_default_knob_set
 import frost_routing
+from sdpa.graph import test_sdpa_sm90_zero_kv_compat as _sm90_zero_kv_compat
+
+
+@pytest.mark.L0
+class TestSM90ZeroKVCompatibility:
+    """Keep the versioned compatibility checks in the maintained graph CI entry."""
+
+    test_default_zero_kv_and_changed_length_capture = staticmethod(_sm90_zero_kv_compat.test_default_zero_kv_and_changed_length_capture)
+    test_zero_kv_layouts_use_safe_default = staticmethod(_sm90_zero_kv_compat.test_zero_kv_layouts_use_safe_default)
+    test_zero_kv_backend_fix_boundary_is_current = staticmethod(_sm90_zero_kv_compat.test_zero_kv_backend_fix_boundary_is_current)
+
 
 # fmt: off
 
@@ -5855,3 +5866,12 @@ def test_sdpa_reference_matmul(contraction, dtype):
                 grads = torch.autograd.grad(actual, (a, b), weights)
                 for grad, expected_grad in zip(grads, expected_grads):
                     torch.testing.assert_close(grad.cpu().double(), expected_grad, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+class TestSM120EmptyQueryCompatibility:
+    from sdpa.graph import test_sdpa_sm120_empty_q_compat as _compat
+    test_backend_boundary = staticmethod(_compat.test_sm120_empty_query_backend_fix_boundary)
+    test_cold_packed_empty = staticmethod(_compat.test_sm120_cold_packed_empty_query)
+    test_default_and_capture = staticmethod(_compat.test_sm120_empty_query_default_and_changed_capture)
+    test_length_transports = staticmethod(_compat.test_sm120_empty_query_length_transports)

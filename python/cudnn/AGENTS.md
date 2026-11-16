@@ -457,7 +457,7 @@ DSL satisfies your kernel.**
   and say so in the PR body if it raises the floor of a user-facing op:
   `cutlass.experimental.*` (primitives, `cuda.tensor_map`; everything under
   `cudnn/frost/tile_dsl` inherits it) → 4.7.0.
-  `cudnn.jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
+  `cudnn._jax` (JAX bridge fixes for optional tensors and aliasing) → 4.7.1;
   the JAX dependency group and runtime guard enforce this higher floor.
   Native im2col tensor-map creation used by `conv/cutedsl/conv3d_postops`
   (`cutlass.experimental.cuda.create_tensor_map_im2col`) → 4.9.
@@ -804,6 +804,10 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+  The common graph execution boundary must restore the caller's original
+  context on success and failure, including an empty worker context. The
+  backend and FROST cases in `core/graph/test_execute_device_context.py`
+  check mapping/ordered/indexed execution, default streams and captured replay.
 - **A guard that keeps the backend's planner away from a graph covers EVERY
   path that creates a backend plan, not only the heuristics query.** The cc 10.7
   single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
@@ -823,6 +827,18 @@ treatment at the caller boundary.**
   (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
   the first guard. A version-bounded guard also needs the detector that
   re-measures its bound (test/AGENTS.md).
+  The first version where a defect was measured is not its introduction
+  boundary. A lower bound needs evidence of an unaffected earlier release;
+  otherwise exclude the known-bad engine until the verified fixed version.
+  Exercise earlier supported versions in both default-planning and explicit
+  replay tests, and do not version-skip their numerical detector. The SM90
+  ragged-backward cases in `test_sdpa_bwd_backend_guard.py` cover this boundary.
+- **Provider support is not graph invalidity.** A layout a FROST engine cannot
+  run may still be valid for the backend. Preserve its graph facts and let the
+  provider's matcher decline it; returning an empty `invalid` fact record can
+  bypass backend correctness guards. Detector: the mixed dense/ragged Q/K/V
+  checks and native old/fixed-backend gradient controls in
+  `test_sdpa_bwd_backend_guard.py`.
 - **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
   `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
   `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
@@ -1022,6 +1038,20 @@ binding. The Hq16 sparse-attention teacher kernel reserves padding after Q
 for its P operand. Its public forward/backward reference and byte-golden
 tests in `simplified_sparse_attention/cutedsl/` cover this layout.
 
+Exact workspace reuse requires both an ownership proof and compiler-visible
+load-before-store ordering. If one lane consumes a vector before replacing it,
+keep the aliased load/store in one inline PTX block. Retain loaded values in
+named PTX temporaries until every input operand is consumed: write-only output
+registers may overlap registers holding a later store's inputs. This does not
+make partial overlaps or cross-lane readers safe. KDA's
+`test_state_chain_summary_alias_capture` compares disjoint and exactly aliased
+FP32 H/X for square/rectangular states, both walk directions and changed-input
+capture replay; the unmodified separate-storage implementation is a negative
+control for that alias contract.
+Run that control from a parent source/test tree and verify the nested kernel
+module path: the linear-attention test conftest overlays its sibling source
+tree, so checking only `cudnn.__file__` does not identify the tested kernel.
+
 When sharing a kernel with JAX, match scratch flag storage to its native ABI.
 A kernel that stores byte-valued flags needs a `uint8` buffer; JAX's Boolean
 CuTe tensor can reject that store during lowering. The long-key cases in
@@ -1151,6 +1181,23 @@ accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`)
 **Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
 `TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
 (the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
+
+**A wgmma accumulator read that no `wgmma.wait_group` dominates serializes
+every wgmma of the kernel.** ptxas keeps `wgmma.mma_async` groups pipelined
+only when every read of their accumulator registers sits behind a wait on
+every path. One path without it is enough: ptxas injects the wait itself
+(remark C7517), reports C7514 (`wgmma.mma_async instructions are serialized`)
+and puts a `WARPGROUP.DEPBAR` behind every HGMMA of the function, not only in
+front of that read. The SM90 blk128 BSA forward issued its last
+`wait_group(0)` under `if has_blocks:` and rescaled O behind the branch; its
+variable-count and split kernels then ran 16 DEPBARs per list step where the
+source has 2 waits. Results are bit-identical either way, so numerics tests
+cannot see it; issuing the wait unconditionally (a wait with nothing pending
+is a no-op) removed both remarks and 26 % of the SM cycles. **Detector:**
+compile with `CUTE_DSL_COMPILER_OPT="remarks{ptx}"` and search the log for
+`C7514` / `C7517` (a pipelined kernel has neither), or compare the
+`WARPGROUP.DEPBAR` count of the SASS with the kernel's own `wait_group` calls.
+No test pins this yet.
 
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged
