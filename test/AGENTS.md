@@ -1671,3 +1671,11 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+When a shared SDPA harness offers a declared-total switch, inspect the actual
+backward node before planning as well as checking numerical outputs. Native
+backends may produce identical results without the totals, hiding a dropped
+executor keyword while a FROST THD row needs those values to plan.
+`test_fp8_training_declared_totals` exercises both switch states through the
+real executor and checks its backward metadata before backward planning can
+turn missing coverage into an unsupported skip.

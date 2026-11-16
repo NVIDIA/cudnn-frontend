@@ -153,3 +153,26 @@ def test_half_cumulative_forward_offset_units(dtype, gapped, multiplier, request
         fp16.exec_sdpa(cfg, request, cudnn_handle)
     finally:
         cudnn.set_stream(handle=cudnn_handle, stream=stream)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2], ids=["e4m3", "e5m2"])
+@pytest.mark.parametrize("declare", [False, True], ids=["implicit-totals", "declared-totals"])
+def test_fp8_training_declared_totals(monkeypatch, dtype, declare, request, cudnn_handle):
+    cfg = _config(dtype, (64, 64), False)
+    cfg.declare_total_seq_len = declare
+    original = fp8.generate_graph_bwd
+
+    def checked_backward(*args, **kwargs):
+        graph = original(*args, **kwargs)
+        assert len(graph.nodes) == 1
+        for key, capacity in (("max_total_seq_len_q", cfg.total_q), ("max_total_seq_len_kv", cfg.total_kv)):
+            assert graph.nodes[0].params.get(key) == (capacity if declare else None), key
+        return graph
+
+    monkeypatch.setattr(fp8, "generate_graph_bwd", checked_backward)
+    stream = cudnn.get_stream(cudnn_handle)
+    try:
+        fp8.exec_sdpa_fp8(cfg, request, cudnn_handle)
+    finally:
+        cudnn.set_stream(handle=cudnn_handle, stream=stream)
