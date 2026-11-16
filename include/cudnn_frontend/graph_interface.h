@@ -3562,6 +3562,11 @@ class Graph : public ICudnn, public INode {
                 continue;
             }
             auto const &declared = it->second;
+            // The declared geometry is already accepted by this plan. Avoid
+            // repeating the changed-layout checks for an unchanged override.
+            if (shapes[k] == declared.dim && strides[k] == declared.stride) {
+                continue;
+            }
             // Stats callers may omit the trailing singleton dimension. Its
             // stride never contributes to an address; preserve that established
             // contract while refusing changes to the actual storage layout.

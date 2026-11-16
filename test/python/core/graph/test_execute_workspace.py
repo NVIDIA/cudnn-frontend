@@ -94,16 +94,23 @@ def _call(graph, tensors, values, workspace, handle, entry, overrides):
         raise AssertionError(entry)
 
 
+def _smaller_geometry(graph, values):
+    # Hopper engine 9 honors KV sequence lengths but ignores batch changes.
+    # Keep an actual shape change in the capacity tests on both engine families.
+    if torch.cuda.get_device_capability() == (9, 0) and graph.get_plan_name_at_index(graph._plan_index).startswith("eng9_"):
+        return [values[0], values[1][:, :, :16], values[2][:, :, :16], values[3]]
+    return [value[:1] for value in values]
+
+
 @pytest.mark.parametrize("entry", ["mapping", "ordered", "mapping_at_index", "ordered_at_index", "raw", "cpp_candidate"])
 @pytest.mark.parametrize("overriding", [False, True])
 def test_required_backend_workspace_rejects_null_and_recovers(entry, overriding, cudnn_handle):
     if overriding and (entry == "raw" or cudnn.backend_version() < 92600):
         pytest.skip("Raw transport has no overrides; this override graph needs cuDNN 9.26+")
     graph, tensors, values = _build(cudnn_handle, True)
-    # Exercise an actual effective-shape change rather than echoing the
-    # declaration. This plan's FE ALiBi scratch remains required at B=1.
+    # The smaller geometry still requires this plan's FE ALiBi scratch.
     if overriding:
-        values = [value[:1] for value in values]
+        values = _smaller_geometry(graph, values)
     overrides = (
         dict(override_uids=[t.get_uid() for t in tensors], override_shapes=[list(t.shape) for t in values], override_strides=[list(t.stride()) for t in values])
         if overriding
@@ -165,7 +172,7 @@ def test_short_backend_workspace_rejects_before_any_write(entry, overriding, dty
 
 def _assert_short_workspace(graph, tensors, values, entry, overriding, producer, cudnn_handle):
     if overriding:
-        values = [value[:1] for value in values]
+        values = _smaller_geometry(graph, values)
     overrides = (
         dict(override_uids=[t.get_uid() for t in tensors], override_shapes=[list(t.shape) for t in values], override_strides=[list(t.stride()) for t in values])
         if overriding

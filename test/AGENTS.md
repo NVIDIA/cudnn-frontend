@@ -52,6 +52,14 @@ capture stream used by Torch. A Python-engine path may follow Torch's current st
 stays on its configured stream. An empty capture followed by NaN-filled outputs is a harness failure, not
 evidence of a backend replay defect. Check the captured graph and changed-input replay before attributing it.
 
+For native SDPA execute-time shape overrides, keep physical allocations large enough
+for the declaration and compare active O and Stats against an independent reference.
+Record inactive writes separately: the declared-storage contract does not promise
+that unused output rows stay untouched. Split Q-only and KV-only length changes,
+causal and non-causal controls, and declared tile boundaries before generalizing a
+backend failure. A workspace-capacity test must use a shape the selected engine
+honors so an earlier geometry rejection cannot hide the intended capacity check.
+
 Scope sync-debug mode to the execute call inside the CUDA-graph context.
 Torch's capture entry may synchronize before capture begins; guarding that
 entry tests Torch's setup rather than the executor. Restore the previous mode
