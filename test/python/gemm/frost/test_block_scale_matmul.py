@@ -174,7 +174,7 @@ def test_block_scale_matmul_rejects_virtual_quantizer_outputs():
 
     with pytest.raises(
         NotImplementedError,
-        match=re.escape("call cudnn.ops.nvfp4_block_scale_quantize explicitly"),
+        match=re.escape("call cudnn.ops.nvfp4_block_scale_quantize_forward explicitly"),
     ):
         analyze_with_binding(g)
 
@@ -191,7 +191,7 @@ def test_explicit_nvfp4_quantizer_output_composes_with_frost_matmul(k):
     torch.manual_seed(20260901)
     x = torch.randn((1, m, k), device="cuda", dtype=torch.bfloat16)
     one = torch.ones((1, 1, 1), device="cuda", dtype=torch.float32)
-    packed, activation_scales = cudnn.ops.nvfp4_block_scale_quantize(x, one)
+    packed, activation_scales = cudnn.ops.nvfp4_block_scale_quantize_forward(x, one)
 
     # E2M1 code 2 is +1.0, so 0x22 represents two +1.0 values.
     weight_bytes = torch.full((1, n, k // 2), 0x22, device="cuda", dtype=torch.uint8)
@@ -201,7 +201,7 @@ def test_explicit_nvfp4_quantizer_output_composes_with_frost_matmul(k):
     output = torch.empty((1, m, n), device="cuda", dtype=torch.float16)
 
     compiled(_vp_bs(compiled, packed, weight, output, activation_scales, weight_scales))
-    restored = cudnn.ops.nvfp4_block_scale_dequantize(packed, activation_scales, one)
+    restored = cudnn.ops.nvfp4_block_scale_dequantize_forward(packed, activation_scales, one)
     torch.cuda.synchronize()
 
     expected_column = restored.float().sum(dim=-1, keepdim=True)

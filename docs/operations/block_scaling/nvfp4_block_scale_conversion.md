@@ -1,7 +1,7 @@
 # NVFP4 block-scale conversion
 
-`cudnn.ops.nvfp4_block_scale_quantize` and
-`cudnn.ops.nvfp4_block_scale_dequantize` are explicit conversion operations for
+`cudnn.ops.nvfp4_block_scale_quantize_forward` and
+`cudnn.ops.nvfp4_block_scale_dequantize_forward` are explicit conversion operations for
 the NVFP4 tensor representation consumed by block-scaled GEMMs. They are
 experimental frontend-only APIs and require CuTeDSL >= 4.7.0.
 
@@ -35,7 +35,7 @@ in a `torch.uint8` carrier; that carrier remains valid for explicit storage and
 the standalone dequantizer, but is not accepted directly by the current FROST
 GEMM launch boundary.
 
-## High-level use
+## Use
 
 ```python
 import torch
@@ -44,28 +44,21 @@ import cudnn
 x = torch.randn((1, 16384, 2048), device="cuda", dtype=torch.bfloat16)
 encode = torch.tensor([[[309.4100647]]], device="cuda", dtype=torch.float32)
 
-packed, block_scales = cudnn.ops.nvfp4_block_scale_quantize(x, encode)
+packed, block_scales = cudnn.ops.nvfp4_block_scale_quantize_forward(x, encode)
 
 # With native PyTorch FP4 support, `packed` and `block_scales` can now be passed
 # as materialized inputs to an existing FROST block-scale GEMM graph. Mark its
 # scale descriptor as `cudnn.tensor_reordering.F8_128x4`.
 
 decode = encode.reciprocal()
-restored = cudnn.ops.nvfp4_block_scale_dequantize(packed, block_scales, decode)
+restored = cudnn.ops.nvfp4_block_scale_dequantize_forward(packed, block_scales, decode)
 ```
 
-The high-level quantizer allocates its two outputs and returns a `TupleDict`, so
+The quantizer allocates its two outputs and returns a `TupleDict`, so
 both tuple unpacking and named access (`result["packed_tensor"]`,
 `result["scale_tensor"]`) are supported. The dequantizer returns its BF16
-tensor directly.
-
-## Explicit plan lifecycle
-
-`Nvfp4BlockScaleQuantizer` and `Nvfp4BlockScaleDequantizer` accept sample input
-and preallocated output tensors. Call `check_support()`, `compile()`, then
-`execute(...)`. The compiled `K` is fixed, while `M` is symbolic and may change
-between executions as long as it remains divisible by 128. `execute()` never
-allocates, converts, or copies its tensor arguments.
+tensor directly. Each op compiles once per device and `K`; `M` is symbolic,
+so later calls with a different `M` reuse the compiled kernel.
 
 Both kernels in this package were authored for cuDNN Frontend from the public
 NVFP4 arithmetic and `F8_128x4` layout contract; they do not embed code copied
