@@ -135,7 +135,9 @@ def _check_single_sequence(graph, nodes, values, origins, nq, stats_layout, expe
         max_total_seq_len_kv=256,
     )
     bound["o"] = torch.empty_like(values["o"][:1])
-    stats = values["stats"][:, :256] if stats_layout == "head" else values["stats"][:256]
+    # HN binding requires H * declared head stride, including the last head's
+    # padding. Keep that storage extent when reducing only the batch count.
+    stats = values["stats"] if stats_layout == "head" else values["stats"][:256]
     bound["stats"] = torch.empty_strided(stats.shape, stats.stride(), dtype=stats.dtype, device=stats.device)
     decl["o"].set_output(True).set_dim(bound["o"].shape).set_stride(bound["o"].stride()).set_ragged_offset(decl["ro_o"]).set_ragged_offset_multiplier(
         nodes["o"].get_ragged_offset_multiplier()
