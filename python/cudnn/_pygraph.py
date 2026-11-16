@@ -1122,6 +1122,19 @@ class pygraph:
         facts = self._facts_for(analyzer)
         return {} if facts is None else dict(guard(self, facts))
 
+    def _backend_plan_guard(self):
+        """An active config predicate, or None; shared by discovery and record replay."""
+        from .engines import manifest
+
+        family = manifest.family_for(self) if self._nodes else None
+        if family is None:
+            return None
+        factory, analyzer = manifest.resolve_backend_plan_guard(family), manifest.resolve_analyzer(family)
+        if factory is None or analyzer is None:
+            return None
+        facts = self._facts_for(analyzer)
+        return None if facts is None else factory(self, facts)
+
     def build_operation_graph(self) -> None:
         """Validate the graph; lower to C++ when no python engines are registered.
 
@@ -1463,6 +1476,17 @@ class pygraph:
         entries = [e for e in entries if int(e.engine_id) not in excluded]
         if dropped and not entries:
             self._backend_declined = cudnn_graph_not_supported(excluded[dropped[0]])
+        plan_guard = self._backend_plan_guard()
+        if plan_guard is not None:
+            retained = []
+            for entry in entries:
+                reason = plan_guard(int(entry.engine_id), entry.knobs)
+                if reason is None:
+                    retained.append(entry)
+                else:
+                    _LOG.info("backend plan %d %s is not offered for this graph: %s", entry.engine_id, entry.knobs, reason)
+                    self._backend_declined = cudnn_graph_not_supported(reason)
+            entries = retained
         import cudnn
 
         asked_oss = any(h == cudnn.heur_mode.OPENSOURCE for h in (self._backend_heuristics or []))
@@ -1470,7 +1494,9 @@ class pygraph:
         # withheld whenever the guard dropped one.
         if dropped and asked_oss:
             _LOG.info("the OPENSOURCE delegating entry is withheld: its fallback list holds excluded engines %s", dropped)
-        if not dropped and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
+        if plan_guard is not None and asked_oss:
+            _LOG.info("the OPENSOURCE delegating entry is withheld: its configs cannot be checked by the active backend plan guard")
+        if not dropped and plan_guard is None and (asked_oss or (not entries and self._lowered_graph.get_engine_count())):
             # OSS candidates are registered in the backend's CANDIDATE space and
             # never surface as plans, so they cannot be enumerated: one
             # delegating entry, built and run by C++ itself. FIRST, because
@@ -1795,6 +1821,10 @@ class pygraph:
         address it BY INDEX — which is why this returns one."""
         self._refuse_guarded_backend()  # a backend record replayed onto a guarded graph: a decline, not a crash
         reason = self._backend_engine_exclusions().get(int(engine_id))
+        if reason is not None:
+            raise cudnn_graph_not_supported(reason)
+        plan_guard = self._backend_plan_guard()
+        reason = None if plan_guard is None else plan_guard(int(engine_id), knobs or {})
         if reason is not None:
             raise cudnn_graph_not_supported(reason)
         self._lower_backend_graph()  # heuristics would only add plans nobody asked for

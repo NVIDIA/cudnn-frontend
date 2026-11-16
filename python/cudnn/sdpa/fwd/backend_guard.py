@@ -119,11 +119,16 @@ SM90_ZERO_KV_WRONG_O_FIXED_IN = 92500
 
 def backend_engine_guard(graph, facts) -> Dict[int, str]:
     """Backend engines (global ids) that must not run ``graph`` (its SDPA facts), each with the reason."""
+    from cudnn.sdpa.nonpositive_scale_guard import backend_engine_guard as scale_guard
+
     excluded = _wide_v_engine_guard(graph, facts)
     for engine, reason in _zero_kv_engine_guard(graph, facts).items():
         excluded.setdefault(engine, reason)
     for engine, reason in _sm120_empty_q_engine_guard(graph, facts).items():
         excluded.setdefault(engine, reason)
+    if facts is not None and not facts.is_backward:
+        for engine, reason in scale_guard(facts).items():
+            excluded.setdefault(engine, reason)
     return excluded
 
 

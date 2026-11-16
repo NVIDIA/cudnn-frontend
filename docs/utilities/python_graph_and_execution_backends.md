@@ -982,3 +982,24 @@ The note has frontend-only integer value **1000**, in the band starting at
 `FRONTEND_BEHAVIOR_NOTE_BASE`; existing values 0–5 are unchanged. It serializes
 as `SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE`. Backend enum conversion rejects it;
 it is never passed as a `cudnnBackendBehaviorNote_t`.
+
+
+### Native SDPA nonpositive scales
+
+For half-precision SDPA, native engines and configurations with known incorrect
+zero/negative `attn_scale` results are excluded during planning and explicit
+`(engine_id, knobs)` replay. Correct native fallback configurations remain
+available where supported. If no correct backend or FROST plan remains,
+planning fails. In particular, unmasked
+backward with partial KV tiles cannot use the affected engine-7
+fallback, including deterministic mode; Hopper engine 6 has a matching tail
+exclusion. Aligned KV, causal and explicit-padding controls retain their independently validated
+configurations. A tensor-valued scale can change after planning, so the same guards
+apply even when its initial value is positive; FE does not read it on the host.
+The guards cover measured forward and backward defects and retain per-engine
+fix-version detectors. They do not change the FROST support domains.
+
+Opaque serialized native execution plans do not restore sufficient graph facts
+for these checks. Discard and rebuild affected native plan caches when deploying
+the guard. Replaying an engine/knob record onto a newly declared graph does run
+the checks.

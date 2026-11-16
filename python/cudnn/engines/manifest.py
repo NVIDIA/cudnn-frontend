@@ -130,6 +130,12 @@ class EngineFamily:
     # typed decline; the backend's other engines stay. None: no engine is excluded. Same contract as
     # backend_guard: a documented backend defect on a measured domain, never placement policy.
     backend_engine_guard: Optional[Tuple[str, str]] = None
+    # Factory ``guard(graph, facts) -> predicate | None``. An active predicate
+    # accepts (backend engine id, public knobs) and returns a decline reason or
+    # None. Use for measured config-specific defects when excluding the whole
+    # engine would discard its correct configurations. Opaque native delegates
+    # are withheld while active because their configs cannot be checked.
+    backend_plan_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -417,6 +423,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         heuristics=("cudnn.sdpa.bwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
         backend_engine_guard=("cudnn.sdpa.bwd.backend_guard", "backend_engine_guard"),
+        backend_plan_guard=("cudnn.sdpa.nonpositive_scale_guard", "backend_plan_guard"),
     ),
     EngineFamily(
         FROST_CONV_ID_BASE,
@@ -533,6 +540,11 @@ def resolve_backend_engine_guard(family: EngineFamily):
     """The family's backend-engine guard, or None (see EngineFamily.backend_engine_guard)."""
 
     return _resolve(family, family.backend_engine_guard, "backend_engine_guard")
+
+
+def resolve_backend_plan_guard(family: EngineFamily):
+    """The family's config-guard factory, or None (see EngineFamily.backend_plan_guard)."""
+    return _resolve(family, family.backend_plan_guard, "backend_plan_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):
