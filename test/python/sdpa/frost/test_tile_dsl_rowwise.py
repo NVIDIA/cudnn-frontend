@@ -143,6 +143,7 @@ def wrong_trees(order: str, warps: int) -> dict:
 
 
 SUM_CELLS = [("ascending", (1, 4, 8, 20, 24, 32))]
+SUM_CELLS += [("descending", (1, 2, 4, 8, 16, 32))]
 SUM_ROWS = 384
 
 
@@ -165,6 +166,7 @@ _REFUSED = [
     (dict(kind="max", order=None, index_limit=128), "index_limit belongs to"),
 ]
 _REFUSED_WARPS = [0, 33, -4, True, 4.0, "4", None]
+_REFUSED += [(dict(kind="sum", order="descending", warps=w), "power-of-two warp count") for w in (3, 20, 24)]
 
 
 def test_api_refuses_a_missing_or_wrong_order():
@@ -354,6 +356,13 @@ def expected_pins(arch: str) -> dict:
             "min_xorsign": {"min.xorsign.abs.f32": 1},
         }
     )
+    want.update(
+        {
+            "sum_descending_w1": _sum_pin("16,8,4,2,1", 0),
+            "sum_descending_w4": _sum_pin("16,8,4,2,1,2,1", 0),
+            "sum_descending_w32": _sum_pin("16,8,4,2,1,16,8,4,2,1", 0),
+        }
+    )
     return want
 
 
@@ -370,6 +379,8 @@ def test_rendering_of_every_primitive(tmp_path, arch):
 
     * a sum: the shuffle offsets IN PROGRAM ORDER -- 1, 2, 4, 8, 16 twice for ``"ascending"`` -- one addition per shuffle, one
       barrier, one slot store, one slot load; the ``"ascending"`` load sits behind a lane guard below 32 warps;
+    * ``"descending"``: the offsets 16, 8, 4, 2, 1 then ``warps / 2 .. 1`` (``5 + log2(warps)`` shuffles), and its slot load
+      behind the barrier with no compare or branch in front of it (every lane loads);
     * a maximum: on a compute-capability-10.x target two single-instruction warp maxima and no shuffle; on any other target,
       and on EVERY target when the shuffle arm is forced, ten shuffles with ten ``max.f32`` and no single-instruction maximum;
       with an index two integer warp minima and two slot words; in every maximum the constant ``-inf`` (``0fFF800000``) once

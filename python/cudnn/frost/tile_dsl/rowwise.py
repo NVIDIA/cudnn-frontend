@@ -17,6 +17,10 @@ some elements.  ``order`` therefore has no default for ``kind="sum"``:
   lane 0 of each warp stores the warp's sum to the warp's slot; the barrier; lanes ``0 .. warps - 1`` of every warp load slot
   ``lane``, the other lanes hold ``+0``; the same five steps.  Defined for every warp count 1 .. 32.  Below 32 warps the padding
   lanes add ``+0``, so a total of ``-0`` (every addend ``-0``) is returned as ``+0``; a sum of squares has no such case.
+* ``"descending"``: inside each warp the offsets 16, 8, 4, 2, 1; the same publish and barrier; then EVERY lane loads slot
+  ``lane mod warps`` (no padding, no zero is added) and adds over the offsets ``warps / 2 .. 1``.  ``5 + log2(warps)`` shuffles.
+  Defined for a POWER-OF-TWO warp count only: for any other count no second level with this association exists, and the call is
+  refused at trace time rather than given an invented one.
 
 Every order leaves the same bits in every thread of the block.  ``"max"`` and ``"max_index"`` are exact in any order and take
 ``order=None``.
@@ -35,6 +39,7 @@ WHAT A CALL EMITS.  No mbarrier, no cluster operation, no loop with a run-time t
 
 Lanes address the slots at a 4-byte stride (one word per lane in an access phase: never a multiple of the 128-byte bank cycle);
 no descriptor reads them, so there is no swizzle.
+Under ``"descending"`` the reader is EVERY lane, at word ``lane mod warps``.
 
 CALLER OBLIGATIONS.
 
@@ -62,7 +67,7 @@ from .pointwise import fmax_f32
 
 WARP = 32
 BUTTERFLY_STEPS = 5  # the offsets 1, 2, 4, 8, 16: the 32 lanes of a warp
-SUM_ORDERS = ("ascending",)
+SUM_ORDERS = ("ascending", "descending")
 KINDS = ("sum", "max", "max_index")
 
 
@@ -116,6 +121,19 @@ def _block_sum_ascending(value, lane, warp, slots, warps: cutlass.Constexpr[int]
         total = slots[lane]
     for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
         total = total + cute.arch.shuffle_sync_bfly(total, offset=1 << step)
+    return total
+
+
+@cute.jit
+def _block_sum_descending(value, lane, warp, slots, warps: cutlass.Constexpr[int], levels: cutlass.Constexpr[int]):
+    for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
+        value = value + cute.arch.shuffle_sync_bfly(value, offset=(WARP // 2) >> step)
+    if lane == 0:
+        slots[warp] = value
+    cute.arch.barrier()
+    total = slots[lane & (warps - 1)]  # every lane loads: no padding lane, no zero addend
+    for step in cutlass.range_constexpr(levels):
+        total = total + cute.arch.shuffle_sync_bfly(total, offset=(warps // 2) >> step)
     return total
 
 
@@ -186,7 +204,8 @@ def block_reduce(value, lane, warp, slots, warps, *, kind, order, index_limit=No
     Plain Python at trace time: every refusal below is a ``ValueError`` raised before any operation is emitted -- an unknown
     ``kind`` or ``order``, an ``order`` given to a maximum, ``warps`` that is not an int in 1 .. 32, a missing or non-int
     ``index_limit``, an ``index_limit`` given to another kind, a slot tensor that is not fp32 or is statically smaller than the
-    call needs."""
+    call needs.
+    ``order="descending"`` with a warp count that is not a power of two is refused the same way."""
     if kind not in KINDS:
         raise ValueError(f"block_reduce: kind must be one of {KINDS}, got {kind!r}")
     _check_warps(warps, "block_reduce")
@@ -195,6 +214,8 @@ def block_reduce(value, lane, warp, slots, warps, *, kind, order, index_limit=No
     if kind == "sum":
         if order not in SUM_ORDERS:
             raise ValueError(f"block_reduce: a sum needs order in {SUM_ORDERS} (the order changes the result's bits), got {order!r}")
+        if order == "descending" and warps & (warps - 1):
+            raise ValueError(f"block_reduce: order='descending' is defined for a power-of-two warp count, got {warps}")
     elif order is not None:
         raise ValueError(f"block_reduce: kind={kind!r} is exact in any order; pass order=None, got {order!r}")
     if kind == "max_index" and (isinstance(index_limit, bool) or not isinstance(index_limit, int) or not 1 <= index_limit <= 2**31 - 1):
@@ -202,6 +223,8 @@ def block_reduce(value, lane, warp, slots, warps, *, kind, order, index_limit=No
     _check_slots(slots.element_type, cute.size(slots), kind, warps)
 
     if kind == "sum":
+        if order == "descending":
+            return _block_sum_descending(value, lane, warp, slots, warps, warps.bit_length() - 1)
         return _block_sum_ascending(value, lane, warp, slots, warps)
     redux = _target_has_redux_f32()
     if kind == "max":

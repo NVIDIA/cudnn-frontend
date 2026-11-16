@@ -298,6 +298,11 @@ RENDERS += [
     ("ex2", "render", ("ex2",), False),
     ("min_xorsign", "render", ("min_xorsign",), False),
 ]
+RENDERS += [
+    ("sum_descending_w1", "sum", (1, "descending", False), False),
+    ("sum_descending_w4", "sum", (4, "descending", False), False),
+    ("sum_descending_w32", "sum", (32, "descending", False), False),
+]
 
 # PTX statements the rendering cell counts: exact opcode tokens, and the two families counted by prefix.
 PTX_EXACT = (

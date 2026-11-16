@@ -1105,6 +1105,12 @@ Contract:
   `"ascending"` pairs the lanes of a warp with the shuffle offsets 1, 2, 4, 8,
   16, and the warp sums the same way with `+0` in the lanes past the warp
   count; it is defined for every warp count.
+- **`"descending"`** pairs the lanes with the offsets 16, 8, 4, 2, 1; behind
+  the barrier every lane loads the sum of warp `lane mod warps` and adds over
+  the offsets `warps / 2 .. 1` (`5 + log2(warps)` shuffles, no zero is
+  added). It serves a kernel whose bytes follow a reference that reduces in
+  that order, and exists for a power-of-two warp count only: any other count
+  is refused at trace time.
 - **An entry names its order.** A kernel that documents a byte contract states
   the order in its module text and at the call; moving a landed kernel to the
   other order is a numerical change with new goldens, never a refactor.
