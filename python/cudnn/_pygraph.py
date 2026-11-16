@@ -2161,15 +2161,25 @@ class pygraph:
     def execute_plan_at_index(self, tensor_dict, workspace=None, index: int = 0, handle=None, *args, tensor_uids=None, **kwargs) -> None:
         """Execute one ranked plan without changing the graph's selected plan."""
         if not self._planning_done:  # e.g. a deserialized graph: C++ owns the list
-            if tensor_uids is not None:
-                pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
-                return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
-            uid_to_data = self._uid_to_data(tensor_dict)
-            var_pack, _ = self._native_var_pack(uid_to_data, None)
-            ws_ptr, ws_bytes = self._workspace_extent(workspace)
-            return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
+            h = handle if handle is not None else self._handle
+            if isinstance(h, Handle):
+                stream, device = self._resolve_stream(h), h.device.ordinal
+                if not execution_context_matches(stream, device):
+                    # Same contract as _execute(): run in the handle's context, then restore the caller's.
+                    with execution_context(stream, device):
+                        return self._execute_native_plan_at_index(tensor_dict, workspace, index, handle, *args, tensor_uids=tensor_uids, **kwargs)
+            return self._execute_native_plan_at_index(tensor_dict, workspace, index, handle, *args, tensor_uids=tensor_uids, **kwargs)
         self._reject_if_barred(self._check_plan_index(index))
         return self._execute(tensor_dict, workspace, handle, *args, tensor_uids=tensor_uids, index=index, **kwargs)
+
+    def _execute_native_plan_at_index(self, tensor_dict, workspace, index, handle, *args, tensor_uids=None, **kwargs):
+        if tensor_uids is not None:
+            pack = self._normalize_ordered(tensor_dict, tensor_uids, workspace, *args, **kwargs)
+            return self._lowered_graph._execute_ordered_pack(pack.native, pack.workspace, to_backend_handle(handle) or 0, index, pack.workspace_bytes)
+        uid_to_data = self._uid_to_data(tensor_dict)
+        var_pack, _ = self._native_var_pack(uid_to_data, None)
+        ws_ptr, ws_bytes = self._workspace_extent(workspace)
+        return self._lowered_graph._execute_plan_at_index(var_pack, ws_ptr, index, to_backend_handle(handle), *args, workspace_bytes=ws_bytes, **kwargs)
 
     def execute(
         self,
