@@ -396,9 +396,11 @@ class GdnHopperCudaEngine(BaseEngine):
             raise NotImplementedError(f"{ENGINE}: state_checkpoints are not produced")
         if facts.wants_transition:
             raise NotImplementedError(f"{ENGINE}: the transition output is not produced")
-        # Context-parallel ports.
-        if facts.has_composed_summaries or facts.has_composed_state or facts.output_context or facts.input_context:
-            raise NotImplementedError(f"{ENGINE}: context-parallel ports (composed summaries/state, context) are unsupported")
+        # Context-parallel ports, and the forward context a FROST backward consumes.
+        if facts.has_composed_summaries or facts.has_composed_state:
+            raise NotImplementedError(f"{ENGINE}: context-parallel ports (composed summaries/state) are unsupported")
+        if facts.output_context or facts.input_context:
+            raise NotImplementedError(f"{ENGINE}: a forward context (output_context / input_context) is not produced or read")
 
         # --- attributes. The kernels take a log-space gate, a post-sigmoid beta and q/k as given.
         if facts.safe_gate or facts.has_a_log or facts.has_dt_bias or facts.gate_lower_bound is not None:

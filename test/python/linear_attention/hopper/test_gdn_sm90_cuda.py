@@ -451,6 +451,15 @@ def test_out_of_scope_graphs_are_declined(kwargs):
         gated_delta_net(*tensors, cu, plan_name=ENGINE, **kwargs)
 
 
+@requires_hopper
+@pytest.mark.L0
+def test_a_forward_context_is_declined_by_name():
+    """``output_context`` (the forward context a FROST backward reads) is declined with a reason that names it."""
+    tensors, cu, _ = make_case([256], 4, "bounded")
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="forward context .*output_context"):
+        gated_delta_net(*tensors, cu, plan_name=ENGINE, output_context=True)
+
+
 # ----------------------------------------------------------------------------- CUDA graphs
 @requires_hopper
 @pytest.mark.parametrize("lengths, heads", [([2048], 12), ([1024] * 4, 32)], ids=["2048x12", "4x1024x32"])

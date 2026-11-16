@@ -322,7 +322,9 @@ a row alone and inside a batch under the entry's own picks.
   `batch_invariant=True`, and its bytes are the same with or without it: the
   forward runs one unsplit chain per (sequence, head), and the backward's
   per-(sequence, head) arithmetic does not depend on the batch. Other SM90 GDN
-  configurations run on `gdn_cutile` and are unverified.
+  configurations that `gdn_cutile` accepts run there and are unverified; the
+  rest (for example `output_context`, `state_checkpoints`, `state_indices`)
+  have no SM90 engine.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served
