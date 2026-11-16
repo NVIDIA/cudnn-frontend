@@ -333,12 +333,17 @@ def test_trail_only_rows_rank_behind_the_backend(monkeypatch):
     tag = lambda p: "backend" if is_backend_block(p) else "last_resort" if is_last_resort(p) else "frost"
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    specs = {s.name: s for s in bwd_engines.ENGINE_SPECS}
     for name in heuristics.TRAIL_ONLY_ROWS:
-        assert not family.slots[name].opt_in, name
-        eid = _OFFERED[name]
-        monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
-        # d256: no study timed these head dims, so no placement_table entry lifts the row
-        assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], name
+        # A delegating row never runs itself: its default-offered explicit owners are what trails.
+        owners = sorted(specs[name].capabilities.delegated) or [name]
+        offered = [n for n in owners if not family.slots[n].opt_in]
+        assert offered, name
+        for owner in offered:
+            eid = _OFFERED[owner]
+            monkeypatch.setattr(heuristics, "recommend", lambda kind, facts, offered, eid=eid: [PlanConfig(eid, None)])
+            # d256: no study timed these head dims, so no placement_table entry lifts the row
+            assert [tag(p) for p in heuristics.propose("A", _facts(d_qk=256, d_v=256), _OFFERED)] == ["backend", "last_resort", "frost"], owner
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert [tag(p) for p in heuristics.propose("A", _facts(), _OFFERED)] == ["frost"]
 

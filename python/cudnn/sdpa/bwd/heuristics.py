@@ -114,7 +114,7 @@ def _leads(spec: EngineSpec, facts) -> bool:
     return name not in TRAIL_ONLY_ROWS
 
 
-TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512"})
+TRAIL_ONLY_ROWS = frozenset({"sdpa_bwd_sm80", "sdpa_bwd_sm120", "sdpa_bwd_sm107", "sdpa_bwd_sm107_d512", "sdpa_bwd_sm100_mxfp8"})
 """Default-offered rows with no hand-written lead shard: ranked after the backend's block, so they serve a graph only when the
 backend declines it (a correctness fallback, not a performance claim) -- except where a measured ``placement_table`` entry
 leads the graph's class (:func:`_measured_lead`)."""
