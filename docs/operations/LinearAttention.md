@@ -34,6 +34,15 @@ Requires an SM100 / SM103 / SM107 GPU (Blackwell data center) and the CuTe DSL r
 
 `T` is the total token count of the packed batch, `N` the number of sequences.
 
+### GDN on Hopper (SM90)
+
+On SM90, `GDN` and `GDN_BWD` run on `gdn_hopper_cuda`, a CUDA engine compiled with NVRTC from the SM90 KDA kernels in their scalar-gate build. It is the default there; `plan_name="gdn_hopper_cuda"` pins it.
+
+- It serves packed THD BF16 `q` / `k` / `v` with equal head counts and `K` = `V` = 128, a log-space FP32 gate, a post-sigmoid FP32 `beta`, and an optional FP32 or BF16 state.
+- The forward runs one chain per (sequence, head), so `batch_invariant` is served with the same kernels.
+- It declines `use_qk_l2norm_in_kernel`, `safe_gate`, `use_beta_sigmoid_in_kernel`, the linear gate domain, `allow_neg_eigval`, `state_checkpoints`, `state_indices`, `overwrite_initial_state`, `output_context` and the summary / context-parallel ports. Those GDN graphs run on the cuTile engine.
+- The other variants have no SM90 engine in this table.
+
 ## Layout
 
 All operands use the packed THD layout, where the tokens of every sequence are concatenated with `cu_seqlens` (`[N + 1]`) giving the sequence boundaries. For example, a dense batch of `N` equal-length sequences is `cu_seqlens = [0, T, 2T, ...]`.
@@ -47,7 +56,7 @@ Operands may be strided views, as the engines build their TMA descriptors from t
 - **Checkpoint conventions.** By default row `j` of a sequence of `L` tokens is the state before block `j` (after `j * n` tokens): row 0 is the incoming state, the sequence end is excluded, `ceil(L / n)` rows per sequence and `T // n + N` rows of capacity. With `checkpoint_after_block=True` row `j` is the state after block `j` (after `(j + 1) * n` tokens): the incoming state is never stored, an aligned sequence end is stored and equals `final_state`, `floor(L / n)` rows per sequence (none for a sequence shorter than `n`) and `T // n` rows of capacity. A backward node given after-block rows does not seed from them; it recomputes the series as it does without checkpoints.
 - **batch_invariant.** Each sequence's results are bitwise independent of the batch composition (whole-sequence scheduling; split-K load balancing is disabled).
 - **Clamps and guards.** Mamba-2's `dt` clamp zeroes the gate gradient where active. GDN-2's `beta_guard` is recomputed, not differentiated, in the backward.
-- **Engines.** The FROST engines are the only engines for these nodes and are pure pass-through: `check_support` verifies the kernel-native dtypes and head dims listed above and declines everything else. A plan can be pinned by name through `plan_name` (for example `gdn_frost`, `mamba2_frost`, `mamba2_summary_frost`).
+- **Engines.** The FROST engines are the only engines for these nodes and are pure pass-through: `check_support` verifies the kernel-native dtypes and head dims listed above and declines everything else. A plan can be pinned by name through `plan_name` (for example `gdn_frost`, `mamba2_frost`, `mamba2_summary_frost`). On SM90, GDN runs on `gdn_hopper_cuda` instead (GDN on Hopper, above).
 
 ## Example
 
