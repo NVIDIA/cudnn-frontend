@@ -699,7 +699,7 @@ def _checked_run(sequences, step_defect=None, multiply_defect=None, band="declar
             return out
 
     class Multiply(torch_ref.Linear):
-        def __call__(self, qx, weight):
+        def __call__(self, qx, weight, site=""):  # the in-projection is handed its call site; a multiply over a copy ignores it
             product = super().__call__(qx, weight)
             return product if multiply_defect is None else multiply_defect(product, weight)
 
