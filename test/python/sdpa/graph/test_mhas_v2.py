@@ -5866,3 +5866,12 @@ def test_sdpa_reference_matmul(contraction, dtype):
                 grads = torch.autograd.grad(actual, (a, b), weights)
                 for grad, expected_grad in zip(grads, expected_grads):
                     torch.testing.assert_close(grad.cpu().double(), expected_grad, atol=0, rtol=0)
+
+
+@pytest.mark.L0
+class TestSM120EmptyQueryCompatibility:
+    from sdpa.graph import test_sdpa_sm120_empty_q_compat as _compat
+    test_backend_boundary = staticmethod(_compat.test_sm120_empty_query_backend_fix_boundary)
+    test_cold_packed_empty = staticmethod(_compat.test_sm120_cold_packed_empty_query)
+    test_default_and_capture = staticmethod(_compat.test_sm120_empty_query_default_and_changed_capture)
+    test_length_transports = staticmethod(_compat.test_sm120_empty_query_length_transports)

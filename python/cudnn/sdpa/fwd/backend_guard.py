@@ -122,6 +122,8 @@ def backend_engine_guard(graph, facts) -> Dict[int, str]:
     excluded = _wide_v_engine_guard(graph, facts)
     for engine, reason in _zero_kv_engine_guard(graph, facts).items():
         excluded.setdefault(engine, reason)
+    for engine, reason in _sm120_empty_q_engine_guard(graph, facts).items():
+        excluded.setdefault(engine, reason)
     return excluded
 
 
@@ -137,6 +139,33 @@ def _zero_kv_engine_guard(graph, facts) -> Dict[int, str]:
     return {
         9: f"cuDNN {cudnn.backend_version_string()} engine 9 leaves O and Stats unwritten for zero-length KV in padded Hopper SDPA forward "
         f"(dense, ragged or paged; reproduced in 9.23.2.1 and 9.24.0.43, fixed in 9.25.0.15); the backend's other engines serve this graph"
+    }
+
+
+# Real 9.23.2.1 / 9.24.0.43 / 9.25.0.15 / 9.25.1.1 execute engine 11
+# with an illegal instruction on a cold compact THD request containing an
+# empty query sequence and 0xff-initialized caller workspace. Reserved-span
+# and warmed controls may pass; retain the original cold request in the
+# detector. The observed failure is
+# independent of the attention mask, sink, head precision and stride gaps.
+# The same engine/knobs pass on 9.26.0.51 and 9.27.0.42. Query lengths can
+# change in retained device buffers, so the declaration must be safe before
+# launch; do not read lengths back or add an execute-time repair kernel.
+SM120_EMPTY_Q_CRASH_FIXED_IN = 92600
+
+
+def _sm120_empty_q_engine_guard(graph, facts) -> Dict[int, str]:
+    import cudnn
+
+    if facts is None or facts.invalid is not None or facts.is_backward:
+        return {}
+    if facts.device_cc != (12, 0) or not facts.thd or not facts.padded or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        return {}
+    if cudnn.backend_version() >= SM120_EMPTY_Q_CRASH_FIXED_IN:
+        return {}
+    return {
+        11: f"cuDNN {cudnn.backend_version_string()} engine 11 crashes with zero-length Q in SM120 THD SDPA forward "
+        f"(reproduced through 9.25.1.1, fixed in 9.26.0.51); other backend and FROST engines remain available"
     }
 
 
