@@ -787,14 +787,13 @@ Reproduce the in-repository checks from `test/python` with recording disabled:
 
 ```bash
 export CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8
-python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s -k 'not warm_stress'
-python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s -k warm_stress
+python -m pytest linear_attention/test_la.py -q -s -k 'shared_stage_reuse or changed_length_replay or batch_invariance_long_ragged or piece_capacity'
 python -m pytest linear_attention/frost/test_kda_determinism.py -q -s
 python -m pytest linear_attention/test_la.py -q -s -k 'kda and (long_fwd_batch_invariant_bitwise or long_bwd_batch_invariant_bitwise or long_odd_chunk_count_batch_invariant_bitwise or summary_chain_batch_invariant_length_rule_bitwise or summary_bwd_chain_batch_invariant_length_rule_bitwise or long_zero_length_sequences_pass_through or context_parallel_context_geometry or steep_summary_matches_reference or steep_fp16_inverse_range_without_normalization or steep_cuda_graph_gate_transitions or steep_channel_decay_initial_state or steep_narrow_gate_ragged_tail)'
 for tool in memcheck synccheck racecheck; do
   compute-sanitizer --tool "$tool" --error-exitcode 99 --report-api-errors no \
-    python -m pytest linear_attention/frost/test_kda_piece_capacity.py -q -s \
-    -k 'shared_stage_reuse or piece_prologue'
+    python -m pytest linear_attention/test_la.py -q -s \
+    -k 'shared_stage_reuse'
 done
 ```
 
