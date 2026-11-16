@@ -88,8 +88,8 @@ def test_fp4_needs_the_packed_dtype():
 
 
 def test_default_engines_enabled_follows_the_manifest(monkeypatch):
-    """The default admission follows the manifest, not the raw flag: the cc 10.7 and SM120 rows are default candidates
-    (offered with the flag deleted), the SM100 row still answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES.  A CuTe DSL at
+    """The default admission follows the manifest, not the raw flag: the cc 10.7 and SM120 rows and the SM100 MXFP8 owners
+    (default since 2026-11-16, behind the backend) are offered with the flag deleted, and the flag changes nothing.  A CuTe DSL at
     the FROST floor and the sm_107a target are modelled as present (test/AGENTS.md: SM107 metadata tests run on every
     lane; the public 4.7.0 wheel lacks the target)."""
     from cudnn.frost import buffers
@@ -100,7 +100,7 @@ def test_default_engines_enabled_follows_the_manifest(monkeypatch):
     assert _draw(32, sm=107, engines_enabled=None) == 32
     assert _draw(32, sm=120, engines_enabled=None) == 32
     assert _draw(32, sm=121, engines_enabled=None) == 32
-    assert _draw(32, sm=100, engines_enabled=None) == 0
+    assert _draw(32, sm=100, engines_enabled=None) == 32
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert _draw(32, sm=100, engines_enabled=None) == 32
 
