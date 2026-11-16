@@ -195,12 +195,6 @@ def flash_attn_bwd_sm90(
             raise ValueError("CLI target output requires one 64-head block and 1..64 real heads")
         if cli_target.shape != topk_idxs.shape or cli_target.dtype != torch.float32 or cli_target.device != q.device or not cli_target.is_contiguous():
             raise ValueError("cli_target must be contiguous FP32 on Q's device with Top-K shape")
-        # Empty rows and unused suffix slots are never written by the main kernel.
-        memset_zero_async(
-            cli_target.data_ptr(),
-            cli_target.numel() * cli_target.element_size(),
-            int(current_stream),
-        )
     elif cli_target_head_count:
         raise ValueError("cli_target_head_count requires a preallocated cli_target")
 
@@ -240,6 +234,10 @@ def flash_attn_bwd_sm90(
     dpsum = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     lse_log2 = carver.take(seqlen_q_rounded * num_head, torch.float32).view(1, seqlen_q_rounded, num_head)
     dkv_accum = carver.take(num_dkv_shards * physical_plane_elems, torch.float32).view(1, num_dkv_shards, physical_plane_elems)
+    # Validate workspace/indexing and carve every scratch view before modifying
+    # caller outputs. Empty rows and unused target slots are not written below.
+    if cli_target is not None:
+        memset_zero_async(cli_target.data_ptr(), cli_target.numel() * cli_target.element_size(), int(current_stream))
     # Deterministic planes include trailing packed relay masks. The mask
     # builder and main kernel share them only through the caller workspace.
     memset_zero_async(dkv_accum.data_ptr(), dkv_accum.numel() * dkv_accum.element_size(), int(current_stream))

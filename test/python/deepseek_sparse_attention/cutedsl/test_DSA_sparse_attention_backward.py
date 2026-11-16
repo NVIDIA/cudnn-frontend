@@ -2587,9 +2587,15 @@ def test_DSA_sparse_attention_backward_deterministic_dkv_mode_public_contract():
     plan = inspect.signature(DSA.SparseAttentionBackward).parameters
     assert wrapper["deterministic_dkv_mode"].default == "records"
     assert plan["deterministic_dkv_mode"].default == "records"
-    # The new option follows every positional parameter of the existing signatures.
-    assert list(wrapper)[-1] == "deterministic_dkv_mode"
-    assert list(plan)[-1] == "deterministic_dkv_mode"
+    for parameters in (wrapper, plan):
+        positional = [
+            name for name, parameter in parameters.items() if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        assert positional[-1] == "deterministic_dkv_mode"
+        assert parameters["return_cli_target"].kind == inspect.Parameter.KEYWORD_ONLY
+        assert parameters["return_cli_target"].default is False
+        assert parameters["cli_target_head_count"].kind == inspect.Parameter.KEYWORD_ONLY
+        assert parameters["cli_target_head_count"].default is None
 
 
 @pytest.mark.L0

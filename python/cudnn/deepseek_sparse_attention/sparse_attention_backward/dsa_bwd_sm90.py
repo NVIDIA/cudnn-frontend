@@ -1158,9 +1158,7 @@ class FlashAttentionDSABackwardSm90:
         sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sCliTarget = None
         if const_expr(self.emit_cli_target):
-            sCliTarget = storage.sCliTarget.get_tensor(
-                cute.make_layout((4, self.tile_n), stride=(self.tile_n, 1))
-            )
+            sCliTarget = storage.sCliTarget.get_tensor(cute.make_layout((4, self.tile_n), stride=(self.tile_n, 1)))
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sLSE = storage.sLSE.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
         sdPsum = storage.sdPsum.get_tensor(cute.make_layout((self.tile_m,), stride=(1,)))
