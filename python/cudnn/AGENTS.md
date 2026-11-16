@@ -804,6 +804,10 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+  The common graph execution boundary must restore the caller's original
+  context on success and failure, including an empty worker context. The
+  backend and FROST cases in `core/graph/test_execute_device_context.py`
+  check mapping/ordered/indexed execution, default streams and captured replay.
 - **A guard that keeps the backend's planner away from a graph covers EVERY
   path that creates a backend plan, not only the heuristics query.** The cc 10.7
   single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
