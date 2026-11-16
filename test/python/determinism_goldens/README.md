@@ -4,6 +4,24 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### D256 nonpaged split physical origins (2026-11-16)
+
+`sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py` exercises fixed
+forward owners 20519 and 20570, FP16/BF16, token/head Stats and splits 2/5.
+It retains the independent FP64 reference and changed-pointer/pitch/length
+CUDA Graph checks, and adds byte comparisons with fresh allocations,
+concurrent work, reordered/duplicated/removed sequences, changed neighbors,
+and a separate B=1 graph carrying the same first sequence. This is forward
+binding coverage; the backward algorithm and its status are unchanged.
+
+New execution and golden qualification are pending on SM100, SM103 and
+SM107. The pre-fix B300 cuDNN 9.24 / Torch 2.11 detector produced NaN output
+for both dtypes when independent physical offsets were not forwarded.
+The existing SM107 strict expected failures stopped at the missing-metadata
+assertion; removing that assertion for diagnosis exposed the numerical error.
+No prior golden is replaced, and no repeatability or batch-invariance status
+is upgraded before the new suite completes.
+
 ### Fixed SM107 quantized backward implementations (2026-11-15)
 
 Per-tensor FP8 engine 20605 and MXFP8 engine 20606 retain their records,
