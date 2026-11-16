@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 90, reason
 
 @pytest.fixture(autouse=True)
 def native(monkeypatch):
-    monkeypatch.setattr(paging, "sm120_half_owner", lambda dq, dv: sm90_half_owner(dq, dv, paged=True))
+    monkeypatch.setattr(paging, "sm120_half_owner", lambda dq, dv, tile_m=None: sm90_half_owner(dq, dv, paged=True))
     with torch.cuda.stream(torch.cuda.Stream()):
         yield
 
