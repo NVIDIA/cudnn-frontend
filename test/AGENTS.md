@@ -1665,3 +1665,11 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+A runtime workspace-requirement cache must retain finalized-plan identity and
+full UID/shape/stride geometry, never buffer capacity or stream bindings. Warm
+it before changing the handle, replacing/deserializing the plan, and rebinding
+a short workspace. Reject before either FE scratch initialization or output
+writes, on both mapping and ordered transports. The backend API trace in
+`core/graph/test_execute_workspace.py::test_runtime_workspace_query_reuses_only_finalized_plan_geometry`
+checks that repeated queries disappear while key changes still reach cuDNN.
