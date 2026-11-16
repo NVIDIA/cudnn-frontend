@@ -1,0 +1,210 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+"""Row kernels: one thread block per row, and the reduction of one value over that block.
+
+A row kernel launches one thread block per row.  Every thread owns a few elements of the row, reduces them to one value in
+registers, and the block then needs ONE result in every thread: the row's sum of squares, its maximum magnitude, its maximum
+with the position of that maximum.  :func:`block_reduce` is that step -- warp shuffles, one shared-memory word per warp, one
+thread-block barrier, a second warp level -- with the things that decide a kernel's bytes and its safety stated as arguments
+instead of being re-derived in every kernel.
+
+THE ORDER OF A SUM IS PART OF THE BYTES.  fp32 addition is not associative, so two reductions of the same 640 partial sums that
+pair the lanes in another order return totals that differ in the last bit on some rows, and a normalized row then differs in
+some elements.  ``order`` therefore has no default for ``kind="sum"``:
+
+* ``"ascending"``: inside each warp five butterfly steps with the offsets 1, 2, 4, 8, 16 (``v = v + shuffle(v, lane ^ offset)``);
+  lane 0 of each warp stores the warp's sum to the warp's slot; the barrier; lanes ``0 .. warps - 1`` of every warp load slot
+  ``lane``, the other lanes hold ``+0``; the same five steps.  Defined for every warp count 1 .. 32.  Below 32 warps the padding
+  lanes add ``+0``, so a total of ``-0`` (every addend ``-0``) is returned as ``+0``; a sum of squares has no such case.
+
+Every order leaves the same bits in every thread of the block.  ``"max"`` and ``"max_index"`` are exact in any order and take
+``order=None``.
+
+WHAT A CALL EMITS.  No mbarrier, no cluster operation, no loop with a run-time trip count.
+
+    barrier                        kind                participants     issuing lanes              guard
+    the thread-block barrier       named barrier 0,    32 x warps       every thread, once:        the CALLER: every thread of the
+    of this reduction              the aligned form    (the launch's    SUM = 32 x warps           block reaches the call, under
+                                                       thread count)    == participants            compile-time control flow only
+
+    buffer        dtype x words                     writer                        reader                               refilled in a launch
+    warp slots    fp32 x slot_words(kind, warps)    lane 0 of warp w: word w      behind the barrier: lanes            no: one store phase, one
+                                                    (and warps + w for the        0 .. warps-1 of every warp,          load phase -> nothing
+                                                    index), before the barrier    word = lane                          releases it
+
+Lanes address the slots at a 4-byte stride (one word per lane in an access phase: never a multiple of the 128-byte bank cycle);
+no descriptor reads them, so there is no swizzle.
+
+CALLER OBLIGATIONS.
+
+* ``lane`` and ``warp`` are the CALLER's ``thread index % 32`` and ``thread index // 32``.  Where those two values are computed
+  is part of the caller's rendering (computed inside a helper, the same expression can be emitted behind a dependent-launch wait
+  that the caller placed in front of the call); a kernel that keeps a compiled form byte for byte keeps its own two statements.
+* The block is ``warps`` FULL warps and every thread reaches the call exactly once, never from a warp-role branch: the shuffles
+  use the full-warp mask and the barrier is the aligned thread-block form.
+* ONE slot array per call, from the kernel's one shared-memory allocator.  A second reduction takes its own array: two calls on
+  one array would refill a buffer behind a barrier while loads of the first fill can still be pending, which is the hazard
+  ``tile_dsl.consume`` exists for.
+* No value is a NaN.  A ``"max"`` or ``"max_index"`` value is any other fp32 value, of either sign: the lanes past the warp count
+  hold ``-inf``, the identity of a maximum, so the result is the block's maximum at every warp count (a kernel's maximum of
+  magnitudes is the usual case and never sees the identity).  The warp maximum is ``redux.sync.max.f32`` where the compile
+  target is known to assemble it (compute capability 10.x) and five butterfly steps of ``max.f32`` everywhere else.  On inputs
+  without a NaN the two arms return the same maximum -- bit for bit, except the sign of a zero maximum that zeros of both signs
+  hold, which a maximum of magnitudes never has -- and, with an index, the same index; neither is the ``.NaN`` form, and what
+  they return for a NaN operand is not part of the contract.
+"""
+
+import cutlass
+import cutlass.cute as cute
+
+from .pointwise import fmax_f32
+
+WARP = 32
+BUTTERFLY_STEPS = 5  # the offsets 1, 2, 4, 8, 16: the 32 lanes of a warp
+SUM_ORDERS = ("ascending",)
+KINDS = ("sum", "max", "max_index")
+
+
+def _arch_has_redux_f32(arch) -> bool:
+    """Whether ``redux.sync.max.f32`` is known to assemble for the DSL architecture ``arch``: compute capability 10.x.  A POSITIVE
+    list -- a target nobody named (older, newer, or of another line) takes the shuffle arm, which assembles everywhere."""
+    return int(arch.major) == 10
+
+
+def _target_has_redux_f32() -> bool:
+    """:func:`_arch_has_redux_f32` of the target the DSL is compiling for.  Read once per :func:`block_reduce` call, in plain
+    Python at trace time, and handed to the traced bodies as a compile-time argument."""
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    return _arch_has_redux_f32(CuTeDSL._get_dsl().get_arch_enum())
+
+
+def _check_warps(warps, who: str) -> None:
+    if isinstance(warps, bool) or not isinstance(warps, int) or not 1 <= warps <= WARP:
+        raise ValueError(f"{who}: warps must be an int in 1 .. {WARP} (the block's full warps), got {warps!r}")
+
+
+def slot_words(kind: str, warps: int) -> int:
+    """The fp32 shared-memory words ONE :func:`block_reduce` call of ``kind`` needs at ``warps`` warps: ``warps`` for ``"sum"`` and
+    ``"max"``, ``2 * warps`` for ``"max_index"`` (the warp maxima, then the bits of their indices).  Plain arithmetic: usable where
+    a kernel sizes its allocation and in a config module without the DSL's tracing."""
+    if kind not in KINDS:
+        raise ValueError(f"slot_words: kind must be one of {KINDS}, got {kind!r}")
+    _check_warps(warps, "slot_words")
+    return 2 * warps if kind == "max_index" else warps
+
+
+def _check_slots(element_type, words, kind: str, warps: int) -> None:
+    """The slot tensor of one call: fp32, and -- where its size is a compile-time fact -- at least ``slot_words(kind, warps)``
+    words.  A smaller array is a shared-memory write past its end that no test of the result need notice."""
+    if element_type != cutlass.Float32:
+        raise ValueError(f"block_reduce: slots must be an fp32 shared-memory tensor, got element type {element_type}")
+    if isinstance(words, int) and not isinstance(words, bool) and words < slot_words(kind, warps):
+        raise ValueError(f"block_reduce: kind={kind!r} at {warps} warps needs {slot_words(kind, warps)} slot words, the tensor holds {words}")
+
+
+@cute.jit
+def _block_sum_ascending(value, lane, warp, slots, warps: cutlass.Constexpr[int]):
+    for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
+        value = value + cute.arch.shuffle_sync_bfly(value, offset=1 << step)
+    if lane == 0:
+        slots[warp] = value
+    cute.arch.barrier()
+    total = cutlass.Float32(0)
+    if lane < warps:
+        total = slots[lane]
+    for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
+        total = total + cute.arch.shuffle_sync_bfly(total, offset=1 << step)
+    return total
+
+
+@cute.jit
+def _warp_max(value, redux: cutlass.Constexpr[bool]):
+    """The fp32 maximum over the 32 lanes of the warp, in every lane: one ``redux.sync.max.f32`` under ``redux``, else five
+    butterfly steps of ``max.f32``."""
+    if cutlass.const_expr(redux):
+        value = cute.arch.warp_redux_sync(value, "fmax")
+    else:
+        for step in cutlass.range_constexpr(BUTTERFLY_STEPS):
+            value = fmax_f32(value, cute.arch.shuffle_sync_bfly(value, offset=1 << step))
+    return value
+
+
+@cute.jit
+def _block_max(value, lane, warp, slots, warps: cutlass.Constexpr[int], redux: cutlass.Constexpr[bool]):
+    value = _warp_max(value, redux)
+    if lane == 0:
+        slots[warp] = value
+    cute.arch.barrier()
+    total = cutlass.Uint32(0xFF800000).bitcast(cutlass.Float32)  # -inf: the identity of a maximum, for values of either sign
+    if lane < warps:
+        total = slots[lane]
+    return _warp_max(total, redux)
+
+
+@cute.jit
+def _block_max_index(value, index, lane, warp, slots, warps: cutlass.Constexpr[int], index_limit: cutlass.Constexpr[int], redux: cutlass.Constexpr[bool]):
+    warp_top = _warp_max(value, redux)
+    candidate = cutlass.Int32(index_limit)
+    if value == warp_top:
+        candidate = index
+    warp_first = cute.arch.warp_redux_sync(candidate, "min")
+    if lane == 0:
+        slots[warp] = warp_top
+        slots[warps + warp] = warp_first.bitcast(cutlass.Float32)  # the index travels as its 32 bits
+    cute.arch.barrier()
+    slot_top = cutlass.Uint32(0xFF800000).bitcast(cutlass.Float32)  # -inf: the identity of the value maximum
+    slot_first = cutlass.Int32(index_limit)
+    if lane < warps:
+        slot_top = slots[lane]
+        slot_first = slots[warps + lane].bitcast(cutlass.Int32)
+    top = _warp_max(slot_top, redux)
+    winner = cutlass.Int32(index_limit)
+    if slot_top == top:
+        winner = slot_first
+    return top, cute.arch.warp_redux_sync(winner, "min")
+
+
+def block_reduce(value, lane, warp, slots, warps, *, kind, order, index_limit=None):
+    """Reduce one value per thread over the whole thread block; the result is returned in EVERY thread.
+
+    ``value``        ``"sum"``: the thread's partial sum (``Float32``).  ``"max"``: the thread's maximum (``Float32``, of
+                     either sign; usually a maximum of magnitudes).  ``"max_index"``: a pair ``(Float32, Int32)`` -- the
+                     thread's best value and its index, an index in ``[0, index_limit)``.  No value is a NaN.
+    ``lane, warp``   the caller's ``thread index % 32`` and ``thread index // 32`` (traced ``Int32``), see the module text.
+    ``slots``        an fp32 shared-memory tensor of at least ``slot_words(kind, warps)`` words, used by THIS call only.
+    ``warps``        a Python int, the block's full warps, 1 .. 32.
+    ``kind``         keyword-only, required: ``"sum"``, ``"max"`` or ``"max_index"``.
+    ``order``        keyword-only, required: one of ``SUM_ORDERS`` for a sum (it changes bytes); ``None`` for the two maxima.
+    ``index_limit``  ``"max_index"`` only, required there: a Python int above every index (at most ``2**31 - 1``).
+
+    Returns a ``Float32`` -- or ``(Float32, Int32)`` for ``"max_index"``: the block's maximum and the LOWEST index that holds
+    it.  When a maximum is a zero and zeros of both signs hold it, the sign of the returned zero is not part of the contract
+    (with an index: the index is the lowest of them).
+
+    Plain Python at trace time: every refusal below is a ``ValueError`` raised before any operation is emitted -- an unknown
+    ``kind`` or ``order``, an ``order`` given to a maximum, ``warps`` that is not an int in 1 .. 32, a missing or non-int
+    ``index_limit``, an ``index_limit`` given to another kind, a slot tensor that is not fp32 or is statically smaller than the
+    call needs."""
+    if kind not in KINDS:
+        raise ValueError(f"block_reduce: kind must be one of {KINDS}, got {kind!r}")
+    _check_warps(warps, "block_reduce")
+    if kind != "max_index" and index_limit is not None:
+        raise ValueError(f"block_reduce: index_limit belongs to kind='max_index', got it with kind={kind!r}")
+    if kind == "sum":
+        if order not in SUM_ORDERS:
+            raise ValueError(f"block_reduce: a sum needs order in {SUM_ORDERS} (the order changes the result's bits), got {order!r}")
+    elif order is not None:
+        raise ValueError(f"block_reduce: kind={kind!r} is exact in any order; pass order=None, got {order!r}")
+    if kind == "max_index" and (isinstance(index_limit, bool) or not isinstance(index_limit, int) or not 1 <= index_limit <= 2**31 - 1):
+        raise ValueError(f"block_reduce: kind='max_index' needs index_limit, an int in 1 .. 2**31 - 1 above every index, got {index_limit!r}")
+    _check_slots(slots.element_type, cute.size(slots), kind, warps)
+
+    if kind == "sum":
+        return _block_sum_ascending(value, lane, warp, slots, warps)
+    redux = _target_has_redux_f32()
+    if kind == "max":
+        return _block_max(value, lane, warp, slots, warps, redux)
+    best, index = value
+    return _block_max_index(best, index, lane, warp, slots, warps, index_limit, redux)
