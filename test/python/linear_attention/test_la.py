@@ -3445,7 +3445,7 @@ def test_determinism_cutile_autotune_host_hooks(backend, variant, tune_cache):
         with pytest.raises(RuntimeError, match="the host could not record"):
             run(Picking(0), record_hint=Mock(side_effect=RuntimeError("the host could not record")))
     assert recorded, f"{variant}: no timed winner was recorded"
-    assert all(config == vars(common.launch_hint_configs((1,), (common.DEFAULT_NWW,))[0]) for config in recorded.values()), recorded
+    assert all(config == vars(common.launch_hint_configs((1,))[0]) for config in recorded.values()), recorded
 
     # pin every launch to its second candidate: the search must not run, and the bytes are candidate 1's
     searched = Mock(side_effect=RuntimeError("the timed search ran under a host pick"))

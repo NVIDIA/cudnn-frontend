@@ -72,10 +72,6 @@ def opt(t, bufs, dtype_name: str = "float32"):
 # two processes that time their candidates can write different bytes. The cache is per device.
 launch_hint_cache: dict = {}
 
-# The first candidate of every sweep. cuTile's own default is None (auto, compiler-chosen), so the tuning-failure
-# fallback launches this value explicitly rather than the unhinted kernel.
-DEFAULT_NWW = 4
-
 # Host hooks on the pick. A host that needs the same bytes on every rank and in every run (a training framework's
 # autotune policy) sets ``select_hints(kernel, cache_key, configs)``: it returns one of ``configs`` and the timed search
 # is skipped, or None to let the search run. ``record_hint(kernel, cache_key, config)`` is told each timed winner, so
@@ -92,8 +88,8 @@ def kernel_name(kernel):
     return getattr(getattr(kernel, "_pyfunc", None), "__name__", repr(kernel))
 
 
-def launch_hint_configs(occ_choices, nww_choices=(DEFAULT_NWW, 8)):
-    """occupancy x num_worker_warps grid; deduped, default (occ_choices[0], DEFAULT_NWW) first."""
+def launch_hint_configs(occ_choices, nww_choices=(4, 8)):
+    """occupancy x num_worker_warps grid; deduped, (occ_choices[0], nww_choices[0]) first."""
     seen = set()
     cfgs = []
     for occ in occ_choices:
@@ -106,7 +102,7 @@ def launch_hint_configs(occ_choices, nww_choices=(DEFAULT_NWW, 8)):
     return cfgs
 
 
-def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(DEFAULT_NWW, 8), timeout=30, stream=None):
+def autotuned_launch(kernel, cache_key, grid, args, occ_choices=(1, 2, 3, 4), nww_choices=(4, 8), timeout=30, stream=None):
     """Launch ``kernel`` with the best launch hints for ``cache_key``.
 
     Tune-once/cache/launch over launch hints only (grid, args and signature are
@@ -346,7 +342,7 @@ def l2norm_fwd(x, eps: float = 1e-6, out=None, rstd_out=None, stream=None):
             grid,
             (x, y, rstd, float(eps), T, D, BD, BT),
             occ_choices=L2NORM_TUNE_OCC,
-            nww_choices=(DEFAULT_NWW,),
+            nww_choices=(4,),
             stream=stream,
         )
     else:
@@ -383,7 +379,7 @@ def l2norm_bwd(
             grid,
             (y, rstd_flat, dy, dy2_arg, dx, float(eps), T, D, BD, BT, int(dy2 is not None)),
             occ_choices=L2NORM_TUNE_OCC,
-            nww_choices=(DEFAULT_NWW,),
+            nww_choices=(4,),
             stream=stream,
         )
     else:
