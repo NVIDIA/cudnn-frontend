@@ -459,6 +459,32 @@ def piece_table_body(
 # ---- state chain ----------------------------------------------------------------------------------
 
 
+@cute.jit
+def load_summary_store_state(h_addr, x_addr, state_values, width: cutlass.Constexpr[int]):
+    """Read a row owner's H vector before replacing it with the incoming state.
+
+    Exact H/X aliasing is safe because the same lane owns both vectors and no
+    other lane reads H. Keep load and store in one assembly block: independent
+    inline loads/stores do not describe this alias to the compiler. Named PTX
+    temporaries retain H until all input operands have been consumed, so output
+    register allocation cannot clobber the state values before the store.
+    """
+    if cutlass.const_expr(width == 2):
+        return nvvm.inline_ptx(
+            "{ .reg .f32 h0, h1; ld.global.v2.f32 {h0, h1}, [$2]; " "st.global.v2.f32 [$3], {$4, $5}; mov.f32 $0, h0; mov.f32 $1, h1; }",
+            write_only_types=[cutlass.Float32] * 2,
+            read_only_args=[h_addr, x_addr, state_values[0], state_values[1]],
+        )
+    else:
+        return nvvm.inline_ptx(
+            "{ .reg .f32 h0, h1, h2, h3; ld.global.v4.f32 {h0, h1, h2, h3}, [$4]; "
+            "st.global.v4.f32 [$5], {$6, $7, $8, $9}; "
+            "mov.f32 $0, h0; mov.f32 $1, h1; mov.f32 $2, h2; mov.f32 $3, h3; }",
+            write_only_types=[cutlass.Float32] * 4,
+            read_only_args=[h_addr, x_addr, state_values[0], state_values[1], state_values[2], state_values[3]],
+        )
+
+
 @cute.kernel
 def frost_state_chain(
     heads_out: cutlass.Int32,
@@ -482,6 +508,8 @@ def frost_state_chain(
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
     mComposed: cute.Tensor | None,
+    head_divisor: cutlass.Constexpr[int] = 1,
+    head_phase: cutlass.Int32 = 0,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
@@ -491,7 +519,13 @@ def frost_state_chain(
     ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``; without it the fixed grid ``seq * pieces + j``.  ``emit_states``
     stores every slot's entry state into ``X``.  A one-slot walk copies the seed into ``X`` when there is no tail or summary
     and otherwise yields ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is
-    walked."""
+    walked. ``head_divisor`` partitions independent heads; this launch handles
+    ``h = state_h * head_divisor + head_phase``. Internal H/M/X buffers have
+    ``HO // head_divisor`` heads, while caller seed/composed/tail/summary ports
+    retain all HO heads. Row tables always retain the original HO stride.
+    Divisor one and phase zero preserve the ordinary full-head launch.
+    Internal FP32 H and X may be exactly the same view: each lane reads its H
+    vector before writing X. Partial overlaps and aliasing M are not supported."""
     K = cutlass.const_expr(dim_k)
     V = cutlass.const_expr(dim_v)
     HO = heads_out
@@ -518,7 +552,8 @@ def frost_state_chain(
     col0 = lane * cutlass.Int32(cols_per_lane)
     bid = cute.arch.block_idx()
     seq = cutlass.Int32(bid[0])
-    h = cutlass.Int32(bid[1])
+    state_h = cutlass.Int32(bid[1])
+    h = state_h * head_divisor + head_phase
     seed_seq = seq
     if cutlass.const_expr(mSeedIndices is not None):
         seed_seq = cutlass.Int32(mSeedIndices[seq])
@@ -601,7 +636,7 @@ def frost_state_chain(
                 seed_x_row = row0 + seed_row
                 seed_x_offset = (
                     cutlass.Int64(seq_base) * cutlass.Int64(mX.stride[0])
-                    + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
+                    + cutlass.Int64(state_h) * cutlass.Int64(mX.stride[1])
                     + cutlass.Int64(seed_x_row) * cutlass.Int64(mX.stride[2])
                     + cutlass.Int64(col0)
                 )
@@ -687,8 +722,8 @@ def frost_state_chain(
             m_chunk = chunk_id % cutlass.Int32(K // 4)
             m_dst_words.append(m_row * K + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
             m_src_elems.append(cutlass.Int64(m_row) * cutlass.Int64(K) + cutlass.Int64(m_chunk) * cutlass.Int64(4))
-        m_slot_elems = cutlass.Int64(HO) * cutlass.Int64(K * K)
-        m_head_elems = cutlass.Int64(h) * cutlass.Int64(K * K)
+        m_slot_elems = cutlass.Int64(HO // head_divisor) * cutlass.Int64(K * K)
+        m_head_elems = cutlass.Int64(state_h) * cutlass.Int64(K * K)
         x_row_addrs = []
         h_row_addrs = []
         x_slot_bytes = cutlass.Int64(0)
@@ -701,13 +736,13 @@ def frost_state_chain(
                 row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
                 h_row_addrs.append(
                     mH.iterator.toint()
-                    + (cutlass.Int64(h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
+                    + (cutlass.Int64(state_h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
                     * cutlass.Int64(mH.element_type.width // 8)
                 )
                 if cutlass.const_expr(emit_states):
                     x_row_addrs.append(
                         mX.iterator.toint()
-                        + (cutlass.Int64(h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
+                        + (cutlass.Int64(state_h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
                         * cutlass.Int64(mX.element_type.width // 8)
                     )
         first_step = cutlass.Int32(0) if cutlass.const_expr(not reverse) else count - cutlass.Int32(1)
@@ -728,16 +763,19 @@ def frost_state_chain(
                 x_slot_off = cutlass.Int64(slot) * x_slot_bytes
                 h_slot_off = cutlass.Int64(slot) * h_slot_bytes
                 for rr in cutlass.range_constexpr(walk_own_rows):
+                    h_addr = h_row_addrs[rr] + h_slot_off
                     if cutlass.const_expr(emit_states):
                         x_addr = x_row_addrs[rr] + x_slot_off
                         x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                         if cutlass.const_expr(cols_per_lane == 2):
-                            st_global_v2(x_addr, x_vals, cutlass.Float32)
+                            h_vals = list(load_summary_store_state(h_addr, x_addr, x_vals, 2))
                         else:
+                            h_vals = []
                             for q in cutlass.range_constexpr(cols_per_lane // 4):
-                                st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
-                    h_addr = h_row_addrs[rr] + h_slot_off
-                    if cutlass.const_expr(cols_per_lane == 2):
+                                h_vals += list(
+                                    load_summary_store_state(h_addr + cutlass.Int64(16 * q), x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], 4)
+                                )
+                    elif cutlass.const_expr(cols_per_lane == 2):
                         h_vals = list(ld_global_v2(h_addr, cutlass.Float32))
                     else:
                         h_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(h_addr + cutlass.Int64(16 * q), cutlass.Float32)]
@@ -990,6 +1028,8 @@ def launch_state_chain(
     mSeedIndices: cute.Tensor | None,
     mComposed: cute.Tensor | None,
     stream: cuda.CUstream,
+    head_divisor: cutlass.Constexpr[int] = 1,
+    head_phase: cutlass.Int32 = 0,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
     frost_state_chain(
@@ -1014,7 +1054,9 @@ def launch_state_chain(
         mMainRows,
         mSeedIndices,
         mComposed,
-    ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+        head_divisor,
+        head_phase,
+    ).launch(grid=(num_seqs, heads_out // head_divisor, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 state_chain_cache = {}
@@ -1178,7 +1220,13 @@ def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail,
     not built), the piece table's ``main_rows`` int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in
     sequence order, with capacity covering its filled slots; otherwise ``capacity = num_seqs * compiled.pieces``),
     ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
-    ``has_composed`` (the context-parallel boundary sequence's entry state)."""
+    ``has_composed`` (the context-parallel boundary sequence's entry state).
+    H and X may be exactly the same FP32 view; this destroys H as each lane
+    replaces its summary with the incoming state. Partial overlaps and aliasing
+    M or the public seed/tail/product buffers are unsupported. The caller owns
+    all buffers and keeps them live through completion on ``stream``; concurrent
+    launches must not share writable storage. This prepared launch neither
+    allocates nor compiles and may be captured in a CUDA Graph."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
     compiled.compiled(
         int(compiled.heads_out),

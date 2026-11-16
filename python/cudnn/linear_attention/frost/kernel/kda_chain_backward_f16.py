@@ -34,6 +34,7 @@ from cutlass.cute.runtime import from_dlpack
 from cudnn.frost.buffers import DeviceView
 
 from ..common.host import get_dtype
+from ..common.head_wave import head_wave_items, state_wave_items, write_wave_items
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import kda_bprop_f16, kda_bprop_summary_f16, kda_chain_prologue_f16, kda_recompute_f16, kda_summary_f16
 
@@ -49,6 +50,8 @@ def chain_backward_host(
     series: cutlass.Constexpr[bool],
     has_piece_transitions: cutlass.Constexpr[bool],
     has_piece_state_grads: cutlass.Constexpr[bool],
+    checkpoint_head_divisor: cutlass.Constexpr[int],
+    state_head_divisor: cutlass.Constexpr[int],
     summary_cfg: cutlass.Constexpr,
     transition_cfg: cutlass.Constexpr,
     bwd_summary_cfg: cutlass.Constexpr,
@@ -82,6 +85,7 @@ def chain_backward_host(
     summary_rows: cute.Tensor,
     main_count: cute.Tensor,
     summary_count: cute.Tensor,
+    state_wave_counts: Optional[cute.Tensor],
     work_items: cute.Tensor,
     work_items_summary: cute.Tensor,
     series_items: Optional[cute.Tensor],
@@ -167,56 +171,31 @@ def chain_backward_host(
         dgate,
         stream,
     )
-    if cutlass.const_expr(fused_h_m):
-        kda_summary_f16.host(
-            summary_cfg,
-            k,
-            v,
-            gate,
-            a_log,
-            dt_bias,
-            beta,
-            cu_pieces_main,
-            None,
-            None,
-            state_h_summary,
-            state_m_main,
-            work_items_summary,
-            summary_count,
-            scheduler_recompute,
-            summary_words,
-            stream,
-        )
-        launch_state_chain(
-            heads_out,
-            dim_v,
-            dim_k,
-            chain_rows,
-            pieces,
-            False,
-            False,
-            has_seed,
-            False,
-            False,
-            True,
-            num_seqs,
-            state_h_chain,
-            state_m_chain,
-            state_x_chain,
-            seed,
-            None,
-            None,
-            main_rows,
-            None,
-            composed,
-            stream,
-        )
-    else:
-        if cutlass.const_expr(not has_piece_transitions):
-            kda_recompute_f16.host(
-                transition_cfg,
+    for state_phase in cutlass.range(state_head_divisor):
+        active_main_count = main_count
+        active_summary_count = summary_count
+        if cutlass.const_expr(state_head_divisor > 1):
+            active_main_count = cute.make_tensor(state_wave_counts.iterator, cute.make_layout((1,)))
+            active_summary_count = cute.make_tensor(state_wave_counts.iterator + 1, cute.make_layout((1,)))
+            state_wave_items(
+                state_head_divisor,
+                b_t,
+                state_phase,
+                heads_out,
+                cu_pieces,
+                main_rows,
+                summary_rows,
+                work_items,
+                work_items_summary,
+                active_main_count,
+                active_summary_count,
+                scheduler_all,
+            ).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream, use_pdl=True)
+        if cutlass.const_expr(fused_h_m):
+            kda_summary_f16.host(
+                summary_cfg,
                 k,
-                k,
+                v,
                 gate,
                 a_log,
                 dt_bias,
@@ -224,106 +203,175 @@ def chain_backward_host(
                 cu_pieces_main,
                 None,
                 None,
+                state_h_summary,
                 state_m_main,
-                None,
                 work_items_summary,
-                summary_count,
-                scheduler_m,
-                recompute_m_words,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
+                active_summary_count,
+                scheduler_recompute,
+                summary_words,
                 stream,
             )
-    if cutlass.const_expr(not has_piece_state_grads):
-        kda_bprop_summary_f16.host(
-            bwd_summary_cfg,
-            q_ratio,
-            k_ratio,
-            a_log,
-            dt_bias,
-            beta,
-            cu_pieces_main,
-            state_g,
+            launch_state_chain(
+                heads_out,
+                dim_v,
+                dim_k,
+                chain_rows,
+                pieces,
+                False,
+                False,
+                has_seed,
+                False,
+                False,
+                True,
+                num_seqs,
+                state_h_chain,
+                state_m_chain,
+                state_x_chain,
+                seed,
+                None,
+                None,
+                main_rows,
+                None,
+                composed,
+                stream,
+                head_divisor=state_head_divisor,
+                head_phase=state_phase,
+            )
+        else:
+            if cutlass.const_expr(not has_piece_transitions):
+                kda_recompute_f16.host(
+                    transition_cfg,
+                    k,
+                    k,
+                    gate,
+                    a_log,
+                    dt_bias,
+                    beta,
+                    cu_pieces_main,
+                    None,
+                    None,
+                    state_m_main,
+                    None,
+                    work_items_summary,
+                    active_summary_count,
+                    scheduler_m,
+                    recompute_m_words,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    stream,
+                )
+        if cutlass.const_expr(not has_piece_state_grads):
+            kda_bprop_summary_f16.host(
+                bwd_summary_cfg,
+                q_ratio,
+                k_ratio,
+                a_log,
+                dt_bias,
+                beta,
+                cu_pieces_main,
+                state_g,
+                None,
+                None,
+                work_items_summary,
+                active_summary_count,
+                scheduler_summary,
+                bprop_summary_words,
+                dstate_scratch,
+                scale,
+                stream,
+            )
+        launch_state_chain(
+            heads_out,
+            dim_v,
+            dim_k,
+            chain_rows,
+            pieces,
+            True,
+            True,
+            has_dseed,
+            False,
+            False,
+            True,
+            num_seqs,
+            state_g_chain,
+            state_m_chain,
+            state_dx_end_chain,
+            dseed,
             None,
             None,
-            work_items_summary,
-            summary_count,
-            scheduler_summary,
-            bprop_summary_words,
-            dstate_scratch,
-            scale,
+            main_rows,
+            None,
+            dcomposed,
             stream,
+            head_divisor=state_head_divisor,
+            head_phase=state_phase,
         )
-    launch_state_chain(
-        heads_out,
-        dim_v,
-        dim_k,
-        chain_rows,
-        pieces,
-        True,
-        True,
-        has_dseed,
-        False,
-        False,
-        True,
-        num_seqs,
-        state_g_chain,
-        state_m_chain,
-        state_dx_end_chain,
-        dseed,
-        None,
-        None,
-        main_rows,
-        None,
-        dcomposed,
-        stream,
-    )
-    if cutlass.const_expr(series):
-        kda_recompute_f16.host(
-            series_cfg,
-            k,
-            v,
-            gate,
-            a_log,
-            dt_bias,
-            beta,
-            cu_pieces_main,
-            state_x_series,
-            None,
-            None,
-            seed_checkpoints,
-            recompute_items,
-            recompute_count,
-            scheduler_series,
-            series_words,
-            checkpoint_every_n,
-            seed_every_n,
-            stream,
-        )
-    kda_bprop_f16.host(
-        bprop_cfg,
-        q_ratio,
-        k_ratio,
-        v_ratio,
-        a_log,
-        dt_bias,
-        beta,
-        gate_main,
-        checkpoints,
-        dgate,
-        dbeta,
-        cu_pieces_main,
-        dstate0,
-        state_dx_end,
-        None,
-        work_items,
-        main_count,
-        scheduler_bwd,
-        bprop_words,
-        dstate_scratch,
-        scale,
-        stream,
-    )
+        for phase in cutlass.range(checkpoint_head_divisor // state_head_divisor):
+            wave_items = work_items
+            wave_count = active_main_count
+            if cutlass.const_expr(checkpoint_head_divisor > 1 and state_head_divisor == 1):
+                # All summary consumers have completed before this table is reused.
+                head_wave_items(
+                    checkpoint_head_divisor,
+                    b_t,
+                    phase,
+                    heads_out,
+                    cu_pieces,
+                    main_rows,
+                    main_count,
+                    work_items_summary,
+                    summary_count,
+                    scheduler_series,
+                    scheduler_bwd,
+                ).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream, use_pdl=True)
+                wave_items = work_items_summary
+                wave_count = summary_count
+            if cutlass.const_expr(series):
+                kda_recompute_f16.host(
+                    series_cfg,
+                    k,
+                    v,
+                    gate,
+                    a_log,
+                    dt_bias,
+                    beta,
+                    cu_pieces_main,
+                    state_x_series,
+                    None,
+                    None,
+                    seed_checkpoints,
+                    wave_items if cutlass.const_expr(checkpoint_head_divisor > 1 and state_head_divisor == 1) else recompute_items,
+                    wave_count if cutlass.const_expr(checkpoint_head_divisor > 1) else recompute_count,
+                    scheduler_series,
+                    series_words,
+                    checkpoint_every_n,
+                    seed_every_n,
+                    stream,
+                )
+            kda_bprop_f16.host(
+                bprop_cfg,
+                q_ratio,
+                k_ratio,
+                v_ratio,
+                a_log,
+                dt_bias,
+                beta,
+                gate_main,
+                checkpoints,
+                dgate,
+                dbeta,
+                cu_pieces_main,
+                dstate0,
+                state_dx_end,
+                None,
+                wave_items,
+                wave_count,
+                scheduler_bwd,
+                bprop_words,
+                dstate_scratch,
+                scale,
+                stream,
+            )
 
 
 def build_configs(io_dtype, state_dtype, transition_dtype, gate_dtype, *, fused_h_m, series, coarse, use_dstate0, **flags):
@@ -377,6 +425,7 @@ def build_chain_backward(
     summary_rows,
     main_count,
     summary_count,
+    state_wave_counts,
     work_items,
     work_items_summary,
     series_items,
@@ -434,11 +483,20 @@ def build_chain_backward(
     stream,
     has_piece_transitions=False,
     has_piece_state_grads=False,
+    checkpoint_head_divisor=1,
+    state_head_divisor=1,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
     kernel compiles as it does there.  ``has_piece_transitions`` / ``has_piece_state_grads``: the transition arm and the leaf summary are skipped,
-    their buffers the backward summary's intermediates."""
+    their buffers the backward summary's intermediates. The plan-selected
+    checkpoint divisor is one of 1/2/4/8/16 and divides ``heads_out``; private
+    checkpoint views have ``heads_out // checkpoint_head_divisor`` heads.
+    The state divisor is either one or the checkpoint divisor. Compact state
+    waves require fused H/M summaries, no external piece context, and two
+    separate wave counters; caller states and checkpoints keep all heads.
+    These divisors are bounded compile-key axes, while head and piece extents
+    remain runtime data. Replays need distinct writable storage per stream."""
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -488,6 +546,8 @@ def build_chain_backward(
         int(chain_rows),
         bool(has_piece_transitions),
         bool(has_piece_state_grads),
+        int(checkpoint_head_divisor),
+        int(state_head_divisor),
     )
     if key not in chain_backward_cache:
         summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = build_configs(
@@ -509,6 +569,14 @@ def build_chain_backward(
             d_k=DK,
             d_v=DV,
         )
+        if checkpoint_head_divisor > 1:
+            assert series and not coarse
+            series_cfg.checkpoint_head_divisor = checkpoint_head_divisor
+            bprop_cfg.checkpoint_head_divisor = checkpoint_head_divisor
+        if state_head_divisor > 1:
+            assert state_head_divisor == checkpoint_head_divisor and fused_h_m and not has_piece_state_grads
+            for cfg in (summary_cfg, bwd_summary_cfg, series_cfg, bprop_cfg):
+                cfg.state_head_divisor = state_head_divisor
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
@@ -526,6 +594,8 @@ def build_chain_backward(
             bool(series),
             bool(has_piece_transitions),
             bool(has_piece_state_grads),
+            int(checkpoint_head_divisor),
+            int(state_head_divisor),
             summary_cfg,
             transition_cfg,
             bwd_summary_cfg,
@@ -559,6 +629,7 @@ def build_chain_backward(
             from_dlpack(summary_rows, assumed_align=16).mark_layout_dynamic(),
             from_dlpack(main_count, assumed_align=4).mark_layout_dynamic(),
             from_dlpack(summary_count, assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(state_wave_counts, assumed_align=4).mark_layout_dynamic() if state_wave_counts is not None else None,
             work_items_placeholder,
             work_items_summary_placeholder,
             series_items_placeholder,
@@ -630,6 +701,7 @@ def run_chain_backward(
     summary_rows,
     main_count,
     summary_count,
+    state_wave_counts,
     work_items,
     work_items_summary,
     series_items,
@@ -678,9 +750,16 @@ def run_chain_backward(
     stream,
     has_piece_transitions=False,
     has_piece_state_grads=False,
+    checkpoint_head_divisor=1,
+    state_head_divisor=1,
 ) -> None:
-    """Replay the chain backward: one crossing into the DSL for its seven launches (the passes the summary's intermediates replace compiled out).  The
-    plan validated the contract at build, so nothing here raises."""
+    """Replay the prepared chain backward in one DSL call on the supplied stream.
+
+    The bounded head-wave topology is fixed at build; each wave completes its
+    consumers before the next overwrites the shared phase arena. External
+    contexts/checkpoints retain full-head layouts. No allocation, compilation or
+    device-to-host metadata read occurs here; the plan validates the bindings.
+    """
     compiled(
         int(pieces),
         int(heads_out),
@@ -705,6 +784,7 @@ def run_chain_backward(
         summary_rows,
         main_count,
         summary_count,
+        state_wave_counts,
         work_items,
         work_items_summary,
         series_items,

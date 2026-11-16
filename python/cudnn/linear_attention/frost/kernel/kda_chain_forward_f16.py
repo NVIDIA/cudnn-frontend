@@ -15,14 +15,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One compiled launch for the KDA chain forward: chain prologue, fused summary, fp32 state chain and prefill issued from a
-single host, the way ``split_k.run_table`` launches plan, scan and walk.  Every kernel, its host and the tensor placeholder
-each host was compiled with are the standalone modules' own; this host only sequences the four launches, so the kernels'
-SASS is unchanged and the Python side crosses into the DSL once per call instead of four times.  A buffer that two hosts read
-through different placeholder types is passed twice, once per type: H, M and X (the summary's and prefill's torch views, the
-state chain's ``(1, HO, V, K)`` device views) and ``cu_pieces`` (the prologue marks it at its element alignment, the summary
-and prefill at 8 bytes).  Compiled at ``--opt-level 2``, the level of every KDA module (the chain prologue and the state chain
-take it standalone too, through ``opt_level``), so every nested kernel is the standalone one."""
+"""One compiled KDA forward host: prologue, H/M summary, FP32 chain and prefill.
+
+The prologue constructs immutable piece metadata once. Bounded independent-head
+waves reuse private H/M/X storage; each wave regenerates its queues and owns two
+counts separate from the row tables. The next queue launch waits for completion
+of the preceding prefill before reusing storage. Caller seeds, final states and
+checkpoints retain their full-head layout and per-head arithmetic is unchanged.
+
+Buffers consumed through different placeholder types are passed twice: H/M/X as
+summary/prefill views and state-chain device views, and the piece prefixes with
+the alignments required by their consumers. Compile keys include the bounded
+head divisor; head count, piece count, addresses and stream remain runtime data.
+"""
 
 from typing import Optional
 
@@ -36,6 +41,7 @@ from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
 from ..common.host import get_dtype
+from ..common.head_wave import state_wave_items
 from ..common.piece_chain import dtype_name, launch_state_chain
 from . import kda_chain_prologue_f16, kda_prefill_f16, kda_summary_f16
 
@@ -74,6 +80,7 @@ CHAIN_FORWARD_BUFFERS = (
     "final_state",
     "final_indices",
     "checkpoints",
+    "state_wave_counts",
 )
 
 chain_forward_cache = {}
@@ -90,6 +97,7 @@ def chain_forward_host(
     dim_k: cutlass.Constexpr[int],
     chain_rows: cutlass.Constexpr[int],
     has_seed: cutlass.Constexpr[bool],
+    state_head_divisor: cutlass.Constexpr[int],
     pieces: cutlass.Int32,
     heads_out: cutlass.Int32,
     num_seqs: cutlass.Int32,
@@ -129,6 +137,7 @@ def chain_forward_host(
     final_state: Optional[cute.Tensor],
     final_indices: Optional[cute.Tensor],
     checkpoints: Optional[cute.Tensor],
+    state_wave_counts: Optional[cute.Tensor],
     stream: cuda.CUstream,
 ) -> None:
     kda_chain_prologue_f16.chain_prologue(
@@ -170,73 +179,95 @@ def chain_forward_host(
         None,
         stream,
     )
-    kda_summary_f16.host(
-        summary_cfg,
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_pieces_main,
-        None,
-        None,
-        state_h_summary,
-        state_m_summary,
-        work_items_summary,
-        summary_count,
-        scheduler_summary,
-        summary_words,
-        stream,
-    )
-    launch_state_chain(
-        heads_out,
-        dim_v,
-        dim_k,
-        chain_rows,
-        pieces,
-        False,
-        False,
-        has_seed,
-        False,
-        False,
-        True,
-        num_seqs,
-        state_h_chain,
-        state_m_chain,
-        state_x_chain,
-        seed,
-        None,
-        None,
-        main_rows,
-        seed_indices,
-        composed,
-        stream,
-    )
-    kda_prefill_f16.host(
-        prefill_cfg,
-        q,
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        beta,
-        cu_pieces_main,
-        state_x_prefill,
-        None,
-        o,
-        final_state,
-        None,
-        final_indices,
-        work_items,
-        main_count,
-        scheduler_prefill,
-        prefill_words,
-        checkpoint_every_n,
-        scale,
-        stream,
-    )
+    for state_phase in cutlass.range(state_head_divisor):
+        active_main_count = main_count
+        active_summary_count = summary_count
+        if cutlass.const_expr(state_head_divisor > 1):
+            active_main_count = cute.make_tensor(state_wave_counts.iterator, cute.make_layout((1,)))
+            active_summary_count = cute.make_tensor(state_wave_counts.iterator + 1, cute.make_layout((1,)))
+            state_wave_items(
+                state_head_divisor,
+                b_t,
+                state_phase,
+                heads_out,
+                cu_pieces,
+                main_rows,
+                summary_rows,
+                work_items,
+                work_items_summary,
+                active_main_count,
+                active_summary_count,
+                scheduler_all,
+            ).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream, use_pdl=True)
+        kda_summary_f16.host(
+            summary_cfg,
+            k,
+            v,
+            gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_pieces_main,
+            None,
+            None,
+            state_h_summary,
+            state_m_summary,
+            work_items_summary,
+            active_summary_count,
+            scheduler_summary,
+            summary_words,
+            stream,
+        )
+        launch_state_chain(
+            heads_out,
+            dim_v,
+            dim_k,
+            chain_rows,
+            pieces,
+            False,
+            False,
+            has_seed,
+            False,
+            False,
+            True,
+            num_seqs,
+            state_h_chain,
+            state_m_chain,
+            state_x_chain,
+            seed,
+            None,
+            None,
+            main_rows,
+            seed_indices,
+            composed,
+            stream,
+            head_divisor=state_head_divisor,
+            head_phase=state_phase,
+        )
+        kda_prefill_f16.host(
+            prefill_cfg,
+            q,
+            k,
+            v,
+            gate,
+            a_log,
+            dt_bias,
+            beta,
+            cu_pieces_main,
+            state_x_prefill,
+            None,
+            o,
+            final_state,
+            None,
+            final_indices,
+            work_items,
+            active_main_count,
+            scheduler_prefill,
+            prefill_words,
+            checkpoint_every_n,
+            scale,
+            stream,
+        )
 
 
 def build_configs(io_dtype, state_dtype, gate_dtype, *, store_final_state, enable_checkpoints, checkpoint_dtype=None, **flags):
@@ -304,11 +335,16 @@ def build_chain_forward(
     device,
     num_sm,
     stream,
+    state_head_divisor=1,
+    state_wave_counts=None,
 ):
-    """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, checkpoint and final-state presence,
-    seed dtype, chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``, ``heads_out`` and
-    ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every kernel
-    compiles as it does there."""
+    """Compile a forward chain for static dtypes, dimensions, gates, output presence and head divisor.
+
+    Piece/head/sequence counts and buffer addresses are runtime data. A divisor
+    greater than one requires compact H/M/X views and two caller-owned wave
+    counters; public states and checkpoints retain the original head count.
+    The prepared host launches on the supplied stream without allocating.
+    """
     _HQ, DK = q.shape[1], q.shape[2]
     k.shape[1]
     _HV, DV = v.shape[1], v.shape[2]
@@ -353,6 +389,7 @@ def build_chain_forward(
         seed_indices is not None,
         final_indices is not None,
         int(chain_rows),
+        int(state_head_divisor),
     )
     if key not in chain_forward_cache:
         summary_cfg, prefill_cfg = build_configs(
@@ -373,6 +410,9 @@ def build_chain_forward(
             d_v=DV,
         )
 
+        summary_cfg.state_head_divisor = state_head_divisor
+        prefill_cfg.state_head_divisor = state_head_divisor
+
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         work_items_summary_placeholder = from_dlpack(work_items_summary, assumed_align=16)
@@ -388,6 +428,7 @@ def build_chain_forward(
             DK,
             int(chain_rows),
             has_seed,
+            int(state_head_divisor),
             cutlass.Int32(int(pieces)),
             cutlass.Int32(int(heads_out)),
             cutlass.Int32(int(num_seqs)),
@@ -431,6 +472,7 @@ def build_chain_forward(
             from_dlpack(final_state, assumed_align=16).mark_layout_dynamic(leading_dim=3) if final_state is not None else None,
             from_dlpack(final_indices, assumed_align=4).mark_layout_dynamic() if final_indices is not None else None,
             from_dlpack(checkpoints, assumed_align=16).mark_layout_dynamic(leading_dim=3) if checkpoints is not None else None,
+            from_dlpack(state_wave_counts, assumed_align=4).mark_layout_dynamic() if state_wave_counts is not None else None,
             cuda.CUstream(int(stream)),
             cache_key=repr((__name__, key)),
             symbol="frost_la_kda_chain_forward_f16",
@@ -478,6 +520,7 @@ def run_chain_forward(
     checkpoint_every_n_tokens,
     scale,
     stream,
+    state_wave_counts=None,
 ) -> None:
     """Launch the compiled chain with the current buffers and stream."""
     buffers = locals()
