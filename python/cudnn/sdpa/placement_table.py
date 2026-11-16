@@ -265,11 +265,13 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # develop (1.11x, the 32-tile d256 boundary the cc 10.0 grid also measured as mixed). Only these studies answer for
     # cc 10.3 -- a new cc 10.0 study does not, until a transfer check names it here. Entries keyed (10, 3) themselves (a
     # study run on cc 10.3, e.g. the d256 backward below) answer first and need no transfer.
+    # sm100_d256_decode_v4_924_20261116 replaces v3 after its own check (B300 SXM6 AC 1100 W, cuDNN 9.24.0.43; 80 cost-stratified
+    # train cells): regret 1.002, worst 1.038; the 15 verdicts that differ from v3 run 0.861 of v3's choice, worst 1.032.
     (10, 3): (
         (10, 0),
         frozenset(
             {
-                "sm100_d256_decode_v3_20261028",
+                "sm100_d256_decode_v4_924_20261116",
                 "sm100_d576_decode_v2_20261028",
                 "sm100_d512_paged_decode_b100_20261030",
                 "sm100_d512_paged_context_20261030",
@@ -341,13 +343,20 @@ def lookup(row: str, facts) -> Optional[bool]:
 # ---------------------------------------------------------------------------------------------------------------- generated
 # benchmark/placement_gen/gen.py --emit; one block per study, keys sorted. Do not edit by hand.
 TABLE: Dict[Tuple, Entry] = {
-    # study sm100_d256_decode_v3_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 200 on-tile + 200 off-tile grid + 48 off-tile dense at 34-60 tiles)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.001, "sm100_d256_decode_v3_20261028"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry(
-        "ge", 5.044, "sm100_d256_decode_v3_20261028", "tiles"
+    # study sm100_d256_decode_v4_924_20261116 (full-power B200, cuDNN 9.24.0.43; v3's frozen 448-cell grid re-timed with the backend's
+    # split-KV reduction kernel counted, see benchmark/placement_gen/README.md)
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", False): Entry(
+        "ge", 23.507, "sm100_d256_decode_v4_924_20261116"
     ),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry("ge", 26.002, "sm100_d256_decode_v3_20261028"),
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry("ge", 24.532, "sm100_d256_decode_v3_20261028"),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "dense", "none", False, "gqa", True): Entry(
+        "ge", 4.5, "sm100_d256_decode_v4_924_20261116", "tiles"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", False): Entry(
+        "always", None, "sm100_d256_decode_v4_924_20261116"
+    ),
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (256, 256), "q1", "paged", "none", False, "gqa", True): Entry(
+        "always", None, "sm100_d256_decode_v4_924_20261116"
+    ),
     # study sm100_d576_decode_v2_20261028 (full-power B200, cuDNN 9.28.0.38; frozen 128-case grid on the tile + the same grid off it)
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "mtp", "paged", "causal_br", False, "gqa", False): Entry(
         "always", None, "sm100_d576_decode_v2_20261028"
