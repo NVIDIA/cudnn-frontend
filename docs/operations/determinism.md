@@ -555,8 +555,8 @@ across repeated executions with a poisoned workspace on causal and unmasked MHA
 and GQA graphs at D64 and D128, including grids beyond one CTA wave, and across
 CUDA Graph replays for causal GQA at D128. Batch invariance: the same bytes are
 compared across reordered and duplicated batches and against the sequence
-declared alone, for BF16 and FP16 at both D64 and D128 (causal GQA and
-unmasked MHA cells).
+declared alone, in four cells: BF16 D128 causal GQA, FP16 D64 unmasked MHA,
+BF16 D64 causal MHA and FP16 D128 unmasked GQA.
 
 ## Split-combine zero-weight qualification
 
