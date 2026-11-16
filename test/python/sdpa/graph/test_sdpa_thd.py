@@ -1119,7 +1119,7 @@ def test_sdpa_thd_large_batch(cudnn_handle):
 
 
 @pytest.mark.L0
-def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle):
+def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle, request):
     """Ragged-offset Stats must be written for every q head at s_q=1 with GQA.
 
     Regression guard for the report that only the first head of each kv group
@@ -1131,6 +1131,8 @@ def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle):
         pytest.skip("THD layout requires cuDNN 9.10.0 or higher")
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("SDPA with THD layout requires SM80 or higher")
+    if cudnn_version < "9.27.0":
+        request.applymarker(pytest.mark.xfail(strict=True, reason="#1083: only the first q head of each kv group is written before cuDNN 9.27.0"))
 
     b, h_q, h_kv, s_q, s_kv, d = 1, 8, 2, 1, 300, 128
     dtype = torch.bfloat16

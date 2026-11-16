@@ -48,7 +48,25 @@ def test_native_narrow_graph_admission(thd, cga, split, packed, monkeypatch):
     assert engines.mismatch(caps, facts, dataclasses.replace(knobs, tile_n=128)) is None
 
 
-@pytest.mark.parametrize("change", ["dense_cga1", "ragged_split", "dense_paged", "paged_split", "bias", "kv_mask", "sm100"])
+@pytest.mark.parametrize("cga,split", [(1, 1), (2, 1), (1, 2), (2, 2)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_native_narrow_dense_paged_admission(cga, split, packed, monkeypatch):
+    """Dense-query paging admits the narrow tile at CGA1 and CGA2 (#2375)."""
+    from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
+
+    from cudnn.frost import buffers
+    from cudnn.sdpa.fwd import engines
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    caps = _caps("sdpa_fwd_sm107_d128_multi_q")
+    facts = _f16_facts(h_q=16, h_kv=4, has_paged_kv=True, page_size=16, padded=True)
+    knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=split, pack_gqa=packed, tile_m=128, tile_n=64, sched_policy=0)
+    assert engines.effective_tile_ns(caps, facts, knobs) == frozenset({64, 128})
+    assert engines.mismatch(caps, facts, knobs) is None
+    assert engines.mismatch(caps, facts, dataclasses.replace(knobs, tile_n=128)) is None
+
+
+@pytest.mark.parametrize("change", ["dense_cga1", "ragged_split", "paged_split", "bias", "kv_mask", "sm100"])
 def test_native_narrow_keeps_other_body_domains(change, monkeypatch):
     from test_sdpa_fwd_dsl_sm107 import _caps, _f16_facts
 
@@ -64,8 +82,6 @@ def test_native_narrow_keeps_other_body_domains(change, monkeypatch):
     elif change == "ragged_split":
         facts = dataclasses.replace(facts, thd=True)
         knobs = dataclasses.replace(knobs, cga=1, split_kv=2)
-    elif change == "dense_paged":
-        facts = dataclasses.replace(facts, has_paged_kv=True)
     elif change == "paged_split":
         facts = dataclasses.replace(facts, thd=True, has_paged_kv=True)
         knobs = dataclasses.replace(knobs, cga=1, split_kv=2)
