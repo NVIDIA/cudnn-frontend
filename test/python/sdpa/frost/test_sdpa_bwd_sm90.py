@@ -213,7 +213,11 @@ def test_multiwave_grid_matches_fp64_and_repeats(dt, d, causal, b, hq, hkv, sq, 
 
 
 @requires_hopper
-@pytest.mark.parametrize("dt,d,causal,hq,hkv", [(torch.bfloat16, 128, True, 4, 2), (torch.float16, 64, False, 4, 4)], ids=["d128-causal-gqa", "d64-dense-mha"])
+@pytest.mark.parametrize(
+    "dt,d,causal,hq,hkv",
+    [(torch.bfloat16, 128, True, 4, 2), (torch.float16, 64, False, 4, 4), (torch.bfloat16, 64, True, 4, 4), (torch.float16, 128, False, 4, 2)],
+    ids=["bf16-d128-causal-gqa", "fp16-d64-dense-mha", "bf16-d64-causal-mha", "fp16-d128-dense-gqa"],
+)
 def test_batch_invariance(dt, d, causal, hq, hkv):
     b, sq, sk = 3, 320, 257
     case = _case(dt, d, causal, b, hq, hkv, sq, sk)

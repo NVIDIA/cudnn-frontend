@@ -1811,7 +1811,8 @@ compared as bytes for causal GQA at D128 under both the deterministic and the
 default request; a replay with a changed dO is then checked against a fresh
 FP64 reference. Batch invariance: reordered, duplicated and uniform batches,
 and the sequence declared alone through a one-batch graph, are compared as
-bytes for causal GQA at D128 and unmasked MHA at D64. Adjacent cases pin the
+bytes for BF16 and FP16 at both D64 and D128 (causal GQA and unmasked MHA
+cells). Adjacent cases pin the
 three launches without allocation or synchronization, the declines by name
 and the batch / query-head grid limits. No runtime golden is recorded: the
 FP64 reference is the numerical arm and the byte comparisons are the
