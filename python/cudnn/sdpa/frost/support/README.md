@@ -25,6 +25,17 @@ For a pending section, consult the registered [forward](../../fwd/engines.py) an
 [legacy tracker](../SUPPORT_MATRIX_TRACKER.md) remains a historical reference;
 its claims may be stale or conflict with later entries.
 
+## Dense and ragged layout combinations
+
+For nonpaged FROST attention, Q, K and V must all use dense declarations or all
+carry ragged offsets. Mixing ragged queries with dense K/V, or dense queries with
+ragged K/V, is declined by both forward and backward FROST engines. Paged K/V is
+a separate contract: supported rows may combine ragged queries with page pools.
+The shared graph analyzer preserves mixed-layout facts because backend support
+is independent; version-specific backend correctness guards still apply.
+Detector: `test_mixed_ragged_layout_is_provider_support_not_invalid` in
+`test_sdpa_bwd_backend_guard.py`.
+
 ## Reading a support page
 
 - **Supported** means an engine serves the stated graph domain, subject to all
