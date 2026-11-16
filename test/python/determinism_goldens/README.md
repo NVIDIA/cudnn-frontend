@@ -14,13 +14,43 @@ concurrent work, reordered/duplicated/removed sequences, changed neighbors,
 and a separate B=1 graph carrying the same first sequence. This is forward
 binding coverage; the backward algorithm and its status are unchanged.
 
-New execution and golden qualification are pending on SM100, SM103 and
-SM107. The pre-fix B300 cuDNN 9.24 / Torch 2.11 detector produced NaN output
-for both dtypes when independent physical offsets were not forwarded.
-The existing SM107 strict expected failures stopped at the missing-metadata
-assertion; removing that assertion for diagnosis exposed the numerical error.
-No prior golden is replaced, and no repeatability or batch-invariance status
-is upgraded before the new suite completes.
+On SM100, SM103 and SM107, actual Torch 2.11.0+cu130, cuDNN 9.24.0.43,
+CuTe DSL 4.8 and CUDA 13.4 compiler qualification completed at source
+`50535efb4` (production unchanged from `171bcd81a`). Imports and the matching
+native binding were checked on each target. Each target passed 366 native
+binder checks, two independent-origin reference/rebind/capture cases and 16
+compact split controls without failures or skips.
+
+| Target | SM count | New suite, recording | Separate-process strict check | Runtime fingerprint |
+|---|---|---|---|---|
+| SM100 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `b6cd858eb78e109b` |
+| SM103 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `104472d5f9694663` |
+| SM107 | 216 | 11 passed, 0 skipped | 11 passed, 0 skipped | `d42d57b738f5eead` |
+
+The new suite contains three host extension-gate checks and eight GPU cases.
+Each GPU case completes the reference, replay and batch checks before recording.
+Twenty-four new golden files were inspected and added; no existing golden was
+replaced. The four token-Stats hashes per SM103/SM107 target are byte-identical
+to the earlier successful run before the HN-only fixture correction.
+These results cover B=1/4, splits 2/5, and the stated origin/stride variations;
+they do not change the engines' public behavior notes.
+
+Reproduce from `test/python`, using a fresh recording directory and then a
+separate process for the strict comparison:
+
+```bash
+suite=sdpa/frost/test_sdpa_fwd_d256_split_origins_determinism.py
+CUDNN_DETERMINISM_RECORD=/tmp/new-d256-origin-goldens pytest "$suite" -m L0 -q
+CUDNN_DETERMINISM_GOLDENS=/tmp/new-d256-origin-goldens pytest "$suite" -m L0 -q
+```
+
+The pre-fix B300 detector produced NaN output for both dtypes when independent
+physical offsets were not forwarded. The historical SM107 strict expected
+failures stopped at the missing-metadata assertion; bypassing only that assertion
+exposed the numerical error. The old native extension also fails all six new
+nonpaged D256 frame cases while passing the six paged controls. Intermediate
+new-fixture failures exposed omitted total-Q capacity and undersized B=1 HN
+storage, both corrected in tests without another production change.
 
 ### Fixed SM107 quantized backward implementations (2026-11-15)
 

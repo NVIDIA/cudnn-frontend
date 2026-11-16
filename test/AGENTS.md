@@ -680,6 +680,13 @@ backend fallback cannot hide a missing kernel repair. The SM100 selected entry
 FP8 D128 cases and checks both prepared and standalone graph execution.
 Default-provider passes alone cannot qualify an advertised native path.
 
+Split batch-invariance fixtures must reserve total-Q capacity for inserted or
+duplicated sequences, not only the initial batch's live sum. Keep a required
+`max_total_seq_len_q` bound instead of dropping it to grow the test. A B=1
+head-major Stats control that retains the original head stride still needs
+storage for `H * head_stride`, including the last head's padding. The D256
+split-origin determinism suite checks these contracts with fixed public records.
+
 ### CUDA Graph test lifetimes
 
 Apply `torch.cuda.set_sync_debug_mode("error")` around the execute body,
