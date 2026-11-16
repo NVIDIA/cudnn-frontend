@@ -14,10 +14,11 @@ out on a checkpoint from local disk, with the checkpoint's own tokenizer and cha
 stack `fe-cublas`, which is a reference path: it holds every quantised weight as a bf16 copy and issues every launch from
 Python. The second stack, `native`, is defined by a kernel set instead: the target kernel set of the model's decode step,
 checked in as a recorded kernel census, per block the kernel and the form it is called in. It is built block by block;
-today three cuDNN Frontend entries are on their target forms -- the fused linear-attention step, the residual add +
-RMSNorm + quantise in its five forms, the attention gate + quantise: 193 of the 484 launches of a step of the 64-layer
-model, 48 the target's own compiled kernels + 145 cuDNN Frontend entries with byte-equal results (194 = 49 + 145 with
-PyTorch's gather; the 1 declared stand-in has no block yet). Every other block is still on its fallback row, printed as `not yet`. Kernels on the stored 8-bit and 4-bit formats,
+today four cuDNN Frontend entries are on their target forms -- the fused linear-attention step, the residual add +
+RMSNorm + quantise in its five forms, the 8-bit in-projection on the stored weights (on compute capability 10.0, where
+the target launches that kernel), the attention gate + quantise: 257 of the 484 launches of a step of the 64-layer
+model, 48 the target's own compiled kernels + 209 cuDNN Frontend entries with byte-equal results (258 = 49 + 209 with
+PyTorch's gather; the 1 declared stand-in has no block yet). Every other block is still on its fallback row, printed as `not yet`. The other kernels on the stored 8-bit and 4-bit formats,
 FlashInfer where the target has it, and a captured decode step (a step recorded once and replayed without Python between
 its launches) follow in that stack. The destination is a runnable performance reference. Until a sample reaches it, its
 README says what the sample measures and what it does not, and no README here carries a performance table: numbers are
@@ -97,7 +98,7 @@ and for a default run it imports nothing beyond cuDNN Frontend, PyTorch and the 
 | module | what it holds |
 |---|---|
 | `text_io.py` | text in, token ids; token ids, streamed text out: a synthetic byte-level tokenizer for the seeded run; a checkpoint's own tokenizer and chat template (messages, tool schemas, template options) from local disk |
-| `weights.py` | the three storage formats (bf16; 8-bit E4M3 with a scale; packed 4-bit with block scales and a global scale, the NVFP4 of a checkpoint's name), the merge rule, dequantisation; the two containers that carry what a kernel on the stored formats writes to a block that is not one yet (block scales in the kernel's 128 x 4 layout; bf16 rows the consumer quantises itself); seeded checkpoints built in memory; a checkpoint on local disk, described from its shard headers and read tensor by tensor without pickle |
+| `weights.py` | the three storage formats (bf16; 8-bit E4M3 with a scale; packed 4-bit with block scales and a global scale, the NVFP4 of a checkpoint's name), the merge rule, dequantisation; the two containers that carry what a kernel on the stored formats writes to a block that is not one yet (block scales in the kernel's 128 x 4 layout; bf16 rows the consumer quantises itself); the stored form of a weight kept beside its bf16 copy where a block of the plan multiplies on it; seeded checkpoints built in memory; a checkpoint on local disk, described from its shard headers and read tensor by tensor without pickle |
 | `state.py` | the key/value cache of the attention layers; the recurrent-state and conv-history pool of the linear-attention layers, by slot id |
 | `blocks.py` | provider rows as data (GPU classes, ranges, stack, the layer widths an entry serves where it serves some only, the form an entry is called in -- per call site, where a step calls it in several), the plan for (GPU class, sequences, tokens per sequence, stack), the served-by table, the memory sentence, typed declines |
 | `census.py` | the kernel census of a decode step: what a block declares to launch (its census entries), the reader of the profiler's exported trace, canonical ids of the kernel families, the kernel table, and the kernel check that holds every launch of the traced steps against the plan (`--check-kernels`); the reader of a family's census of a target kernel set (`kernel_census.json`), the identity of every block call against it, the three numbers and the census line |

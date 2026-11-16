@@ -64,7 +64,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    is judged by its dtype, and state a call updates byte for byte. An adapter launches its entry and nothing else:
    what a consumer on a fallback row needs beyond the kernel's bytes -- a gather out of the kernel's scale layout, a
    quantisation the target does with a launch of its own -- is launched by that consumer, when it reads its operand
-   (`weights.dequantize`). A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
+   (`weights.dequantize`). An adapter that multiplies on the stored format of its weight says so (`stored_weights`):
+   the load of the session then keeps that format beside the bf16 copy for the block, as the loader had it, and the
+   memory sentence counts it; the copy stays, because the reference block and every fallback row read it. A row that is a reference chain or a multiply over a dequantised copy carries a `fallback` reason and is
    counted as a fallback. A provider row that no test of this repository runs is printed as `unverified in CI`. Every band
    asks for finite values and is judged element by element. A band that is a share over a run is also held per unit of
    failure of the kernel (the fused step: one value head of one sequence). A band is declared before the run, never taken
@@ -121,7 +123,10 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     form at each site); the family's wiring names the site of every call (`sites()`), and the step hands that name to
     the block. The adapter holds one entry instance per form and serves a call with the instance of its site; which
     form serves which call is never its choice. Every item of the check then holds per call site, and a call is found
-    by its place in the wiring, not by its block and layer: a block can be called twice in a layer.
+    by its place in the wiring, not by its block and layer: a block can be called twice in a layer. A site name
+    belongs to one block (an adapter finds the sites of its row in the wiring by name), and what differs between the
+    sites of a row may be the operand's shape as well as the kernel's form: an entry that is one weight shape per
+    instance has the shape of each site in its row.
 16. **A target kernel set is data, and a statement about it is three numbers.** A family's `kernel_census.json` holds the
     target kernel set of its decode step: per block call the kernel, the form the target calls it in, and per GPU class,
     SM count and row count the recorded launch shape. How a block stands to the target (`target`, `stand-in`, `not yet`,
@@ -355,3 +360,31 @@ Each of these passed every test and every GPU run of the first version; a host t
   the row.
 - A sentence counted once per occurrence, not once per step, read "and 7 more of the 4 traced steps" as soon as a
   block could fail twice in a step.
+
+## What building the projection row taught
+
+- The class of a row is where the target launches the kernel, not where the entry runs. The FP8 projection entry
+  serves compute capability 10.x; the target launches it for the in-projections on 10.0 and a library multiply on the
+  other classes, so the row claims 10.0 and up to 32 rows, and everywhere else the block prints its fallback reason.
+- A row states the kernel whole. This entry picks its own form when none is passed, and the pick may move with the
+  entry; the row names the split, the weight tile, the ring depth, the tensor-memory columns and their release and
+  both launch knobs, the adapter passes the form as one object, and it refuses a row that leaves one of them out.
+- One block, one form, two weight shapes. The in-projection's weight has another shape in each kind of layer and the
+  entry is one shape per instance, so the shape is a field of the row per call site, as a form is for the norm block.
+  Here a launch record does tell the sites apart (one thread block per 128 weight rows), and the census records both.
+- A site name belongs to one block. The first draft named the in-projection's sites by the layer's kind, which the
+  norm block's sites already are; the norm's adapter, which finds the sites of its row in the wiring by name, would
+  have built a form no call of a two-layer model is made in. A host test that pins the forms a run builds holds it.
+- A kernel on the stored format needs the stored format. The loader had the merged 8-bit codes in hand and freed them
+  after the copy; it now keeps them for the blocks that say they multiply on them, asked by the plan of the session
+  and of the sessions that follow on its weights. The copy stays for the reference, so the memory sentence grows, and
+  the allocator's slack with it: the first checkpoint run took 0.4 GiB more than a sentence that had added the
+  stored bytes alone. Measure the sentence against a run whenever what a stack holds changes.
+- With a second exactly judged row behind it, a launch behind a layer's input norm fails the check: it now sits
+  between two rows that are judged one by one. The same launch behind the in-projection fails in a linear-attention
+  layer (the fused step follows) and is counted as the reference chain's in an attention layer. What the check
+  cannot see shrank by those places and no further.
+- A chain of dependent launches is a statement about three kernels. The norm releases at its wait, the in-projection
+  starts on that release and waits before it reads the norm's codes, the fused step starts on the in-projection's
+  release and waits before it reads the projection's rows. Each row says in a comment what the launch before it must
+  not write and what the launch after it must wait for; replay and the block check on the device are what hold it.

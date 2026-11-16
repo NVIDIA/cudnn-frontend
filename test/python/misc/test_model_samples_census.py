@@ -1695,6 +1695,9 @@ def test_the_last_line_of_a_run_that_checks_its_kernels(monkeypatch, capsys, tmp
     (line,) = _kernel_lines(lines)
     assert line.endswith("    PASS") and "2 on exact rows, in the wiring order" in line, line
     assert any(line.startswith("kernels, planned (decided before the load") for line in lines) and "[00] seeded weights" in lines[-2]
+    # the norm block and the in-projection are called at named sites in every stack; here no entry serves them, so there is no
+    # instance to count and no such line
+    assert not any("as the call log of a traced step has it" in line for line in lines)
 
     code, lines = _sample_run(monkeypatch, capsys, ["--check-kernels", "--sequences", "2"], step_launches=[(SYMBOL, ((96, 2, 1), (256, 1, 1), 74848))])
     assert code == 1 and lines[-1] == "[00] FAIL", lines[-3:]
@@ -1978,7 +1981,10 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert row["add_norm_quantize"].split("cudnn.AddNormQuantDecode")[1].split() == norm.split()
     assert table[14:20] == [f"  add_norm_quantize at {site}:{census.form_text(fields)}" for site, fields in configs.NORM_FORMS], "the form of every call site"
     assert table[16] == "  add_norm_quantize at linear_attention: [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT e4m3_static]"
-    assert table[-3].startswith("  per step: 8 launches on 4 exact rows") and table[-2:] == [f"  {line}" for line in claim.coverage()]
+    multiply = f"{PROJECTION_FORM}] + one of 2 forms, by call site fp8_projection 2 name and launch shape, as the entry states them target"
+    assert row["projection.fp8.in"].split("cudnn.Fp8ProjectionDecode")[1].split() == multiply.split()
+    assert table[20:22] == [f"  projection.fp8.in at {site}:{census.form_text(fields)}" for site, fields in configs.PROJECTION_SITES], "and the weight's shape"
+    assert table[-3].startswith("  per step: 10 launches on 5 exact rows") and table[-2:] == [f"  {line}" for line in claim.coverage()]
     assert "identity" not in census.table(_plan(options={"device": "cpu"})[0]).splitlines()[1], "a stack without a target has no such column"
 
     # fe-entries: the same rows today, so the same identities
@@ -1993,7 +1999,7 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     step = differs.identities[3]
     assert step.text() == "not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" and step.launch is None
     assert differs.numbers()["not_the_target"] == {"linear_attention.step": 1} and "; not the target: linear_attention.step 1; " in differs.coverage()[1]
-    assert 3 not in differs.recorded and len(differs.recorded) == 7, "no recorded launch shape is held against a call that is not the target's"
+    assert 3 not in differs.recorded and len(differs.recorded) == 9, "no recorded launch shape is held against a call that is not the target's"
     # compute capability 12.x: the gate and the norm entry do not serve there, the blocks stay on their reference chains, and the census has no section
     plan12, model, _ = _target_plan(2, cc=(12, 0), sms=170)
     assert plan12.rows["attention.gate_quantize"].key == "torch_ref.gate_quantize" and plan12.rows["linear_attention.step"].form == (
@@ -2001,6 +2007,7 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         ("PDL_RELEASE", True),
     )
     assert plan12.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and plan12.rows["add_norm_quantize"].site_form("mlp") == ()
+    assert plan12.rows["projection.fp8.in"].key == "cublas.bf16_dequantized" and plan12.rows["projection.fp8.in"].site_form("full_attention.qkv") == ()
     claim12 = target.claim(plan12, model, installed=RECORDED)
     assert not claim12.known and claim12.coverage() == [
         "kernel identity: not stated for this run (no recorded section for cc 12.0 / 170 SMs: recorded is cc 10.0 / 148 SMs)"
@@ -2014,7 +2021,7 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     there = census.Target(data).claim(plan12, model, installed=RECORDED)
     gate = there.identities[there.blocks.index("attention.gate_quantize")]
     assert there.known and gate.text() == "not yet (reference chain)" and (there.numbers()["target_code"], there.numbers()["target_port"]) == (2, 0)
-    assert there.numbers()["not_yet"]["add_norm_quantize"] == 5
+    assert there.numbers()["not_yet"]["add_norm_quantize"] == 5 and there.numbers()["not_yet"]["projection.fp8.in"] == 2
 
 
 def test_every_reason_a_class_is_not_claimed():
@@ -2949,7 +2956,7 @@ def test_a_count_of_target_launches_in_the_readmes_carries_its_split():
         r"\b\d+ launches of every one of the \d+ traced steps on target kernels",
         r"\bthe \d+ (?:remaining )?target launch(?:es)?\b",
     )
-    split = re.compile(r"\d+ (?:of )?the target's own compiled kernels? \+ \d+ (?:of a )?cuDNN Frontend entr(?:y|ies)|=\s*49 \+ 145\b")
+    split = re.compile(r"\d+ (?:of )?the target's own compiled kernels? \+ \d+ (?:of a )?cuDNN Frontend entr(?:y|ies)|=\s*49 \+ 209\b")
     found = 0
     for name in ("README.md", "AGENTS.md", "qwen_dense/README.md"):
         text = " ".join((MODELS / name).read_text().split())
@@ -2960,8 +2967,8 @@ def test_a_count_of_target_launches_in_the_readmes_carries_its_split():
                 assert split.search(after), f"{name}: {after[:120]!r} gives a count of target launches without its split"
     assert found >= 5, "the patterns still find the counts of the READMEs"
     area = " ".join((MODELS / "README.md").read_text().split())
-    assert "193 of the 484 launches of a step of the 64-layer model, 48 the target's own compiled kernels + 145 cuDNN Frontend entries" in area
-    assert "194 of the 484" not in area, "the three entries are 193 launches; the 194th is PyTorch's gather"
+    assert "257 of the 484 launches of a step of the 64-layer model, 48 the target's own compiled kernels + 209 cuDNN Frontend entries" in area
+    assert "258 of the 484" not in area, "the four entries are 257 launches; the 258th is PyTorch's gather"
     for wrong in ("counts 3 of 20.", "(65 of the 484 launches of a step of the 64-layer model)"):  # the two sentences the review found
         assert not split.search(wrong + " " * 10), "the rule sees a count without its split"
 
@@ -4517,7 +4524,7 @@ def test_the_projection_entrys_adapter_over_a_stand_in_entry(monkeypatch):
 
     # a call: the stored codes of both operands as they are, one scale element, an output of the call's own
     codes = torch.arange(48 * 64, dtype=torch.uint8).reshape(48, 64) % 100
-    weight = Dequantized(codes.to(torch.bfloat16), 0.03125, stored=ScaledTensor(codes, 0.03125))
+    weight = Dequantized(codes.to(torch.bfloat16), 0.013, stored=ScaledTensor(codes, 0.013))
     qx = ScaledTensor((torch.arange(2 * 64, dtype=torch.uint8).reshape(2, 64) % 90), 0.017857142857142856)
     del calls[:]
     out = block(qx, weight, "linear_attention.qkvz")
@@ -4530,18 +4537,25 @@ def test_the_projection_entrys_adapter_over_a_stand_in_entry(monkeypatch):
     w, a, scale, o = seen[-1]
     assert o is out, "what the adapter returns is the tensor its entry wrote: it launches nothing else"
     assert w.dtype == a.dtype == torch.float8_e4m3fn and w.data_ptr() == codes.data_ptr() and a.data_ptr() == qx.codes.data_ptr(), "views, no copy"
-    product = torch.tensor([0.017857142857142856], dtype=torch.float32) * torch.tensor([0.03125], dtype=torch.float32)
+    product = torch.tensor([0.017857142857142856], dtype=torch.float32) * torch.tensor([0.013], dtype=torch.float32)
     assert scale.dtype == torch.float32 and scale.shape == (1,) and torch.equal(scale, product), "the fp32 product of the two scales"
+    assert not torch.equal(
+        product, torch.tensor([0.017857142857142856 * 0.013], dtype=torch.float32)
+    ), "which these two values tell from a rounded fp64 product"
     block(qx, weight, "linear_attention.qkvz")
     assert seen[-1][2] is scale, "one element per pair of values, built once: never inside a later step"
+    halved = Dequantized(codes.to(torch.bfloat16), 0.5, stored=ScaledTensor(codes, 0.5))
+    block(qx, halved, "linear_attention.qkvz")
+    assert seen[-1][2] is not scale and torch.equal(seen[-1][2], torch.tensor([0.017857142857142856], dtype=torch.float32) * 0.5), "another weight scale"
+    assert seen[-1][0].data_ptr() == codes.data_ptr(), "and still that weight's own codes"
     assert block.serving() == ("cudnn.Fp8ProjectionDecode #1", row.site_form("linear_attention.qkvz")), "read from the instance that was called"
     block(qx, weight, "full_attention.qkv")
     assert block.serving() == ("cudnn.Fp8ProjectionDecode #2", row.site_form("full_attention.qkv"))
 
     # what it cannot serve is named
     with pytest.raises(ValueError, match=r"the weight of this call has no stored 8-bit codes: the weights of this session were loaded for another plan"):
-        block(qx, Dequantized(codes.to(torch.bfloat16), 0.03125), "linear_attention.qkvz")
-    per_row = ScaledTensor(codes, torch.full((48,), 0.03125))
+        block(qx, Dequantized(codes.to(torch.bfloat16), 0.013), "linear_attention.qkvz")
+    per_row = ScaledTensor(codes, torch.full((48,), 0.013))
     with pytest.raises(ValueError, match=r"the weight of this call has one scale per weight row"):
         block(qx, Dequantized(codes.to(torch.bfloat16), per_row.scale, stored=per_row), "linear_attention.qkvz")
     with pytest.raises(ValueError, match=r"^cudnn.Fp8ProjectionDecode multiplies static 8-bit codes; this block is handed Unquantized$"):
