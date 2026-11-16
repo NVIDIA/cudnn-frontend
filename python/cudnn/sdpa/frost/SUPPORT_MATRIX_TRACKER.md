@@ -584,7 +584,7 @@ Dense and THD execute through the shared prepared pointer binder; graph shape/st
 overrides remain unsupported. The scheduler keeps its declared batch and dense
 extents; THD workspace retains 128-byte tensor-map alignment. No plan-owned dummy
 tensors or tensor-launch fallback.
-Backward: `sdpa_bwd_sm90` (manifest slot 18, opt-in: offered with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`)
+Backward: `sdpa_bwd_sm90` (manifest slot 34, opt-in: offered with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`)
 serves dense compact-BSHD **D64 / D128** half graphs (MHA, or GQA / MQA with an
 integral head ratio; unmasked or top-left causal; positive sequence lengths; FP32 contiguous Stats) through
 one key-owner kernel with an ordered dQ relay: a CTA claims a 128-row key tile from its head's ticket, Q / dO
