@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the SM100 block-scaled (MXFP8/MXFP4) scale-layout and UMMA descriptor contract."""
+"""Tests for the SM100 block-scaled (MXFP8/MXFP4/NVFP4) scale-layout and UMMA descriptor contract."""
 
 from types import SimpleNamespace
 
