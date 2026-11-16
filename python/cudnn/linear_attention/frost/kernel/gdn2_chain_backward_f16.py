@@ -154,6 +154,7 @@ def chain_backward_host(
     reduce_dk: Optional[cute.Tensor] = None,
     reduce_dv_src: Optional[cute.Tensor] = None,
     reduce_dv: Optional[cute.Tensor] = None,
+    m_count: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         if cutlass.const_expr(fold_seed is not None):
@@ -256,6 +257,8 @@ def chain_backward_host(
         seed_every_n=seed_every_n,
         seed_row_base=seed_row_base,
         tail_enable=tail_enable,
+        m_count=m_count,
+        summary_skip=0 if cutlass.const_expr(fused_h_m) else -1,
     )
     if cutlass.const_expr(fused_h_m):
         gdn2_summary_f16.host(
@@ -321,7 +324,7 @@ def chain_backward_host(
                 state_m_main,
                 None,
                 work_items_summary,
-                summary_count,
+                m_count if cutlass.const_expr(m_count is not None) else summary_count,
                 scheduler_m,
                 recompute_m_words,
                 cutlass.Int32(0),
@@ -568,6 +571,7 @@ def build_chain_backward(
     has_piece_state_grads=False,
     lead_buffers=(None,) * 4,
     post_buffers=(None,) * 14,
+    m_count=None,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan; ``pieces``, ``heads_out``
     and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone modules' builds so every
@@ -632,6 +636,7 @@ def build_chain_backward(
         bool(has_piece_state_grads),
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in (*lead_buffers, *post_buffers)),
         fold_rows,
+        m_count is not None,
     )
     if key not in chain_backward_cache:
         flags = dict(
@@ -824,6 +829,7 @@ def build_chain_backward(
             *fold_placeholders,
             float(gate_lower_bound),
             *post_placeholders,
+            from_dlpack(m_count, assumed_align=4).mark_layout_dynamic() if m_count is not None else None,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_backward_cache[key]
@@ -904,6 +910,7 @@ def run_chain_backward(
     has_piece_state_grads=False,
     lead_buffers=(None,) * 4,
     post_buffers=(None,) * 14,
+    m_count=None,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its seven launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
@@ -982,6 +989,7 @@ def run_chain_backward(
         tail_enable,
         *lead_buffers,
         *post_buffers,
+        m_count,
     )
 
 

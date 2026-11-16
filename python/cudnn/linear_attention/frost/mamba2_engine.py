@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from operator import itemgetter
 
-from cudnn import behavior_note
+import cudnn
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -39,8 +39,6 @@ def build_mamba2(graph):
 
 def mamba2_support_gates(engine: str, facts) -> None:
     """The Mamba-2 kernel family's dtype/attribute gates."""
-    import cudnn
-
     checkpoint = facts.checkpoint_every_n_tokens
     checkpoint_dtypes = (cudnn.data_type.FLOAT, facts.io_dtype)
     if not facts.is_bwd:
@@ -105,7 +103,7 @@ class Mamba2FrostEngine(BaseEngine):
     """FROST chunked-kernel backend for single-node MAMBA2 graphs (THD layout) on SM100 / SM103 / SM107."""
 
     name = "mamba2_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)
@@ -134,7 +132,7 @@ class CompiledMamba2:
     summaries and an fp32 state chain seeding every piece)."""
 
     def __init__(self, node, kernel_module):
-        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
+        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_capacity, piece_table_layout, ragged_pieces
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
         from .common.tail import GATE_WORDS, choose_tail
         from cuda.bindings.driver import CUstream
@@ -190,6 +188,9 @@ class CompiledMamba2:
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
         self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=total)
         if not self.chain and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -215,7 +216,7 @@ class CompiledMamba2:
 
         regions = []
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
             self.ideal = None
@@ -226,7 +227,7 @@ class CompiledMamba2:
                 ("scheduler_all", off_scheduler, "int32", (4,)),
                 ("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -253,8 +254,9 @@ class CompiledMamba2:
                 self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
-            if self.tail is not None:
-                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+            if self.tail is not None or self.ragged_pieces:
+                off_gate = layout.add(4 * GATE_WORDS, align=16)
+                regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
             if self.split:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
@@ -286,6 +288,32 @@ class CompiledMamba2:
                 self.chain_rows = 4 * CHAIN_THREADS // K
                 tail_words = tensormap_workspace_bytes(kernel_module, self.tail_pieces_total) // 8
                 regions.append(("tail_tensormaps", layout.add(tail_words * 8, align=128), "int64", (tail_words,)))
+            if self.ragged_pieces:
+                slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=total, batch_invariant=True)
+                ragged_tiles = slots * HO
+                off_ragged_scheduler = layout.add(16)
+                regions += [
+                    ("ragged_scheduler_prefill", off_ragged_scheduler, "int32", (2,)),
+                    ("ragged_scheduler_summary", off_ragged_scheduler + 8, "int32", (2,)),
+                    ("ragged_scheduler_all", off_ragged_scheduler, "int32", (4,)),
+                    ("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)),
+                ]
+                table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+                off_ragged_table = layout.add(table.nbytes, align=256)
+                regions += [
+                    ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                    ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                    ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                    ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                    ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                    ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                    ("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                    ("ragged_transition", layout.add(slots * HO * 4), "float32", (slots, HO)),
+                    ("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ]
+                self.chain_rows = 4 * CHAIN_THREADS // K
+                ragged_words = tensormap_workspace_bytes(kernel_module, slots) // 8
+                regions.append(("ragged_tensormaps", layout.add(ragged_words * 8, align=128), "int64", (ragged_words,)))
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
         self.workspace_size = layout.size
@@ -350,6 +378,13 @@ class CompiledMamba2:
             indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
             self.tail_buffers = itemgetter(*indices)
             self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {"words": "ragged_tensormaps", "seed": "initial_state"}
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (int(self.ragged_pieces), int(self.num_seqs), 0, 0)
 
     def run(self, views, workspace, stream) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
@@ -412,13 +447,23 @@ class CompiledMamba2:
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
             item_limit_word=region.get("gate"),
-            tail_scalars=self.tail_scalars if self.tail is not None else (),
-            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
+            tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 4 if self.ragged_pieces else (),
+            tail_buffers=(
+                self.tail_buffers((*views, *region.values(), None))
+                if self.tail is not None
+                else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+            ),
+            ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+            ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+            ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
             fold_buffers=fold_buffers,
         )
         if self.warmup_launch is None:
             self.warmup_launch = self.build_warmup_forward(
                 **buffers,
+                ragged_pieces=self.ragged_pieces,
+                ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                ragged_chain_rows=self.chain_rows if self.ragged_pieces else 0,
                 tail=self.tail,
                 tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                 split=self.split,
@@ -522,7 +567,7 @@ class CompiledMamba2Bwd:
 
     def __init__(self, node, bwd_module, prefill_module, recompute_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
+        from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_capacity, piece_table_layout, ragged_pieces
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
         from .common.tail import GATE_WORDS, choose_tail
         from .kernel.mamba2_chain_backward_f16 import build_chain_backward, run_chain_backward
@@ -596,6 +641,9 @@ class CompiledMamba2Bwd:
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
         self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=total)
         if not self.chain and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -620,7 +668,7 @@ class CompiledMamba2Bwd:
         layout = WorkspaceLayout()
         regions = []
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             off_scheduler = layout.add(32)
             regions += [
                 ("scheduler_summary_fwd", off_scheduler, "int32", (2,)),
@@ -629,7 +677,7 @@ class CompiledMamba2Bwd:
                 ("scheduler_regenerate", off_scheduler + 24, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (8,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -705,8 +753,9 @@ class CompiledMamba2Bwd:
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         if not self.chain:
             regions.append(("work_count", layout.add(4), "int32", (1,)))
-            if self.tail is not None:
-                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+            if self.tail is not None or self.ragged_pieces:
+                off_gate = layout.add(4 * GATE_WORDS, align=16)
+                regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
         if self.split:
             self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
             regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
@@ -751,6 +800,45 @@ class CompiledMamba2Bwd:
             if not self.reuse_series:
                 tail_recompute_words = tensormap_workspace_bytes(prefill_module, self.tail_pieces_total) // 8
                 regions.append(("tail_recompute_tensormaps", layout.add(tail_recompute_words * 8, align=128), "int64", (tail_recompute_words,)))
+        if self.ragged_pieces:
+            slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=total, batch_invariant=True)
+            ragged_tiles = slots * HO
+            off_ragged_scheduler = layout.add(32)
+            regions += [
+                ("ragged_scheduler_summary_fwd", off_ragged_scheduler, "int32", (2,)),
+                ("ragged_scheduler_summary_bwd", off_ragged_scheduler + 8, "int32", (2,)),
+                ("ragged_scheduler_bwd", off_ragged_scheduler + 16, "int32", (2,)),
+                ("ragged_scheduler_regenerate", off_ragged_scheduler + 24, "int32", (2,)),
+                ("ragged_scheduler_all", off_ragged_scheduler, "int32", (8,)),
+            ]
+            table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+            off_ragged_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                ("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)),
+                ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("ragged_state_g", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ("ragged_state_dx", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ("ragged_transition", layout.add(slots * HO * 4), "float32", (slots, HO)),
+                ("ragged_exit_base", layout.add(slots * 4), "int32", (slots,)),
+            ]
+            if not self.reuse_series and not self.coarse_checkpoints:
+                regions += [
+                    ("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                    ("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ]
+            if self.coarse_checkpoints:
+                regions.append(("ragged_seed_row_base", layout.add(4), "int32", (1,)))
+            self.chain_rows = 4 * CHAIN_THREADS // K
+            ragged_words = tensormap_workspace_bytes(bwd_module, slots) // 8
+            regions.append(("ragged_tensormaps", layout.add(ragged_words * 8, align=128), "int64", (ragged_words,)))
+            if not self.reuse_series:
+                ragged_recompute_words = tensormap_workspace_bytes(prefill_module, slots) // 8
+                regions.append(("ragged_recompute_tensormaps", layout.add(ragged_recompute_words * 8, align=128), "int64", (ragged_recompute_words,)))
         self.workspace_size = layout.size
         self.carve_names = [name for name, off, dt, shape in regions]
         self.carve = carve_plan(self.plan_name, [(off, dt, shape) for name, off, dt, shape in regions])
@@ -799,6 +887,19 @@ class CompiledMamba2Bwd:
             indices = [positions.get(aliases.get(name, "tail_" + name), absent) for name in self.tail_buffer_names]
             self.tail_buffers = itemgetter(*indices)
             self.tail_scalars = (int(self.tail.pieces), int(self.tail.num_seqs), int(self.tail.batch_base), int(self.tail.first_head_lo))
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_bprop": "ragged_scheduler_bwd",
+                "prefill_words": "ragged_recompute_tensormaps",
+                "bprop_words": "ragged_tensormaps",
+                "seed": "initial_state",
+                "dfs": "d_final_state",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (int(self.ragged_pieces), int(self.num_seqs), 0, 0)
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
@@ -912,7 +1013,12 @@ class CompiledMamba2Bwd:
                 skip_bwd_part,
                 region,
                 stream,
-                self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
+                (
+                    self.tail_buffers((*views, *region.values(), None))
+                    if self.tail is not None
+                    else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+                ),
+                self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
                 post_buffers,
                 fold_buffers,
             )
@@ -1050,6 +1156,7 @@ class CompiledMamba2Bwd:
         region,
         stream,
         tail_buffers,
+        ragged_buffers,
         post_buffers,
         fold_buffers,
     ) -> None:
@@ -1095,14 +1202,20 @@ class CompiledMamba2Bwd:
                 seed_span_tokens=self.recompute_span_tokens if coarse else 0,
                 seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
                 item_limit_word=region.get("gate"),
-                tail_scalars=self.tail_scalars if self.tail is not None else (),
+                tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 4 if self.ragged_pieces else (),
                 tail_buffers=tail_buffers,
+                ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+                ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+                ragged_buffers=ragged_buffers,
                 post_buffers=post_buffers,
                 fold_buffers=fold_buffers,
             )
             if self.regenerate_launch is None:
                 self.regenerate_launch = self.build_regenerate_backward(
                     **buffers,
+                    ragged_pieces=self.ragged_pieces,
+                    ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                    ragged_chain_rows=self.chain_rows if self.ragged_pieces else 0,
                     tail=self.tail,
                     tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                     split=self.split,
@@ -1149,14 +1262,20 @@ class CompiledMamba2Bwd:
             workspace=region["tensormaps"],
             exit_slots=region["gate_slots"],
             item_limit_word=region.get("gate"),
-            tail_scalars=self.tail_scalars if self.tail is not None else (),
+            tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 4 if self.ragged_pieces else (),
             tail_buffers=tail_buffers,
+            ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+            ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+            ragged_buffers=ragged_buffers,
             post_buffers=post_buffers,
             fold_buffers=fold_buffers,
         )
         if self.warmup_launch is None:
             self.warmup_launch = self.build_warmup_backward(
                 **buffers,
+                ragged_pieces=self.ragged_pieces,
+                ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                ragged_chain_rows=self.chain_rows if self.ragged_pieces else 0,
                 tail=self.tail,
                 tail_chain_rows=self.chain_rows if self.tail is not None else 0,
                 split=self.split,
@@ -1195,7 +1314,7 @@ class CompiledMamba2Summary:
 
     def __init__(self, node, kernel_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import CHAIN_THREADS, choose_pieces, piece_table_layout
+        from .common.piece_chain import CHAIN_THREADS, choose_pieces, piece_capacity, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS
         from .common.tail import GATE_WORDS, choose_tail
         from .kernel import mamba2_prefill_f16
@@ -1255,7 +1374,7 @@ class CompiledMamba2Summary:
         regions = []
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=node.inputs["k"].dim[0], batch_invariant=self.batch_invariant)
             self.n_tiles = self.num_pieces * HO
             self.tensormap_words = tensormap_workspace_bytes(mamba2_prefill_f16, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
@@ -1265,7 +1384,7 @@ class CompiledMamba2Summary:
         if self.tail is not None:
             regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
         if self.chain:
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -1448,7 +1567,7 @@ class CompiledMamba2SummaryBwd:
 
     def __init__(self, node, kernel_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import CHAIN_THREADS, choose_pieces, piece_table_layout
+        from .common.piece_chain import CHAIN_THREADS, choose_pieces, piece_capacity, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS
         from .common.tail import GATE_WORDS, choose_tail
         from .kernel import mamba2_prefill_f16
@@ -1509,7 +1628,7 @@ class CompiledMamba2SummaryBwd:
         regions = []
         self.tensormap_words = tensormap_workspace_bytes(kernel_module, B) // 8
         if self.chain:
-            self.num_pieces = B * self.pieces
+            self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=node.inputs["q"].dim[0], batch_invariant=self.batch_invariant)
             self.n_tiles = self.num_pieces * HO
             self.tensormap_words = tensormap_workspace_bytes(mamba2_prefill_f16, self.num_pieces) // 8
         regions.append(("tensormaps", layout.add(self.tensormap_words * 8, align=128), "int64", (self.tensormap_words,)))
@@ -1519,7 +1638,7 @@ class CompiledMamba2SummaryBwd:
         if self.tail is not None:
             regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
         if self.chain:
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -1682,7 +1801,7 @@ class Mamba2SummaryFrostEngine(BaseEngine):
     """FROST summary backend for single-node MAMBA2_SUMMARY and MAMBA2_SUMMARY_BWD graphs (THD layout)."""
 
     name = "mamba2_summary_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)

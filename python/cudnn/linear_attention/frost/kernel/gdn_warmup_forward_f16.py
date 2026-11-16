@@ -172,6 +172,42 @@ def warmup_forward_host(
     tail_work_count: Optional[cute.Tensor] = None,
     tail_scheduler: Optional[cute.Tensor] = None,
     tail_workspace: Optional[cute.Tensor] = None,
+    ragged_unit_chunks: cutlass.Constexpr[int] = 0,
+    ragged_chain_rows: cutlass.Constexpr[int] = 0,
+    ragged_tinv_cfg: cutlass.Constexpr = None,
+    ragged_summary_cfg: cutlass.Constexpr = None,
+    ragged_prefill_cfg: cutlass.Constexpr = None,
+    ragged_pieces: cutlass.Int32 = 0,
+    ragged_num_seqs: cutlass.Int32 = 0,
+    ragged_batch_base: cutlass.Int32 = 0,
+    ragged_first_head_lo: cutlass.Int32 = 0,
+    ragged_item_limit: cutlass.Int32 = 0,
+    ragged_item_base: cutlass.Int32 = 0,
+    ragged_cu_pieces: Optional[cute.Tensor] = None,
+    ragged_main_rows: Optional[cute.Tensor] = None,
+    ragged_summary_rows: Optional[cute.Tensor] = None,
+    ragged_summary_count: Optional[cute.Tensor] = None,
+    ragged_work_items_summary: Optional[cute.Tensor] = None,
+    ragged_scheduler_all: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary: Optional[cute.Tensor] = None,
+    ragged_tinv_words: Optional[cute.Tensor] = None,
+    ragged_tinv_rows: Optional[cute.Tensor] = None,
+    ragged_tinv_row_count: Optional[cute.Tensor] = None,
+    ragged_summary_words: Optional[cute.Tensor] = None,
+    ragged_tinv: Optional[cute.Tensor] = None,
+    ragged_state_h_summary: Optional[cute.Tensor] = None,
+    ragged_state_m_summary: Optional[cute.Tensor] = None,
+    ragged_state_h_chain: Optional[cute.Tensor] = None,
+    ragged_state_m_chain: Optional[cute.Tensor] = None,
+    ragged_state_x_chain: Optional[cute.Tensor] = None,
+    ragged_seed: Optional[cute.Tensor] = None,
+    ragged_state_x_prefill: Optional[cute.Tensor] = None,
+    ragged_work_items: Optional[cute.Tensor] = None,
+    ragged_work_count: Optional[cute.Tensor] = None,
+    ragged_scheduler: Optional[cute.Tensor] = None,
+    ragged_workspace: Optional[cute.Tensor] = None,
+    ragged_gate_pieces: cutlass.Constexpr[int] = 0,
+    ragged_enable: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         launch_state_chain(
@@ -253,6 +289,8 @@ def warmup_forward_host(
             stream,
             item_limit_word,
             gate_sms=gate_sms,
+            gate_chain_pieces=ragged_gate_pieces,
+            gate_tail=tail_prefill_cfg is not None,
         )
         gate_sms = 0
     gdn_prefill_f16.prologue(
@@ -284,6 +322,8 @@ def warmup_forward_host(
         item_limit_word=item_limit_word,
         tail_enable=tail_enable,
         gate_sms=gate_sms,
+        gate_chain_pieces=ragged_gate_pieces,
+        gate_tail=tail_prefill_cfg is not None,
     )
     gdn_prefill_f16.host(
         prefill_cfg,
@@ -432,6 +472,69 @@ def warmup_forward_host(
             None,
             item_limit_word,
         )
+    if cutlass.const_expr(ragged_summary_cfg is not None):
+        gdn_chain_forward_f16.chain_forward_host(
+            ragged_unit_chunks,
+            b_t,
+            expand_num,
+            True,
+            ragged_tinv_cfg,
+            ragged_summary_cfg,
+            ragged_prefill_cfg,
+            ragged_prefill_cfg.d_v,
+            ragged_prefill_cfg.d_k,
+            ragged_chain_rows,
+            ragged_seed is not None,
+            True,
+            ragged_pieces,
+            n_heads_out,
+            ragged_num_seqs,
+            checkpoint_every_n,
+            scale,
+            ragged_batch_base,
+            ragged_first_head_lo,
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            a_log,
+            dt_bias,
+            o,
+            cu_seqlens,
+            ragged_cu_pieces,
+            ragged_main_rows,
+            ragged_summary_rows,
+            ragged_work_count,
+            ragged_summary_count,
+            ragged_work_items,
+            ragged_work_items_summary,
+            ragged_scheduler_all,
+            ragged_scheduler_summary,
+            ragged_scheduler,
+            ragged_tinv_words,
+            ragged_tinv_rows,
+            ragged_tinv_row_count,
+            ragged_summary_words,
+            ragged_workspace,
+            ragged_tinv,
+            ragged_state_h_summary,
+            ragged_state_m_summary,
+            ragged_state_h_chain,
+            ragged_state_m_chain,
+            ragged_state_x_chain,
+            ragged_seed,
+            None,
+            seed_indices,
+            ragged_state_x_prefill,
+            state_out,
+            final_indices,
+            checkpoints,
+            stream,
+            k_slots,
+            v_slots,
+            ragged_enable,
+        )
 
 
 def build_warmup_forward(
@@ -481,6 +584,12 @@ def build_warmup_forward(
     tail_buffers=(),
     lead_buffers=(None,) * 8,
     l2norm_skip_k=False,
+    ragged_pieces=0,
+    ragged_unit_chunks=0,
+    ragged_chain_rows=0,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags, the split-K geometry, the d_v split, state and checkpoint
     presence, device) the warmup or uncut forward launch over the buffers of one plan.  The placeholders repeat the marks
@@ -556,6 +665,16 @@ def build_warmup_forward(
         l2norm_k_slots,
         l2norm_k_expand_num,
         bool(l2norm_skip_k),
+        (
+            (
+                int(ragged_pieces),
+                int(ragged_unit_chunks),
+                int(ragged_chain_rows),
+                *(str(buffer.dtype) if buffer is not None else None for buffer in ragged_buffers),
+            )
+            if ragged_pieces
+            else None
+        ),
     )
     if key not in warmup_forward_cache:
         prefill_cfg = gdn_prefill_f16.build_cfg(
@@ -697,6 +816,76 @@ def build_warmup_forward(
                 from_dlpack(buffers["scheduler"], assumed_align=4).mark_layout_dynamic(),
                 from_dlpack(buffers["workspace"], assumed_align=128).mark_layout_dynamic(),
             ]
+        ragged_constexprs = ()
+        ragged_placeholders = ()
+        if ragged_pieces:
+            if tail is None:
+                tail_constexprs = (0, 0, None, None, None)
+                tail_placeholders = [*(cutlass.Int32(0) for _ in range(6)), *([None] * len(TAIL_BUFFERS))]
+            buffers = dict(zip(TAIL_BUFFERS, ragged_buffers))
+            ragged_flags = dict(
+                store_final_state=state_out is not None,
+                enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+                checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
+                checkpoint_after_block=bool(checkpoint_after_block),
+                log_gate=log_gate,
+                safe_gate=safe_gate,
+                beta_sigmoid=use_beta_sigmoid,
+                allow_neg_eigval=allow_neg_eigval,
+                d_k=DK,
+                expand_num=expand_num,
+                k_slots=k_slots,
+                v_slots=v_slots,
+                beta_slots=beta_slots,
+            )
+            HO = gate.shape[1]
+            seed_name = dtype_name(state_in.dtype) if state_in is not None else "float32"
+            ragged_tinv_cfg, ragged_summary_cfg, ragged_prefill_cfg = gdn_chain_forward_f16.build_configs(
+                io_dtype, get_dtype(buffers["state_h_summary"].dtype), get_dtype(buffers["state_x_prefill"].dtype), num_sm=num_sm, d_v=DV, **ragged_flags
+            )
+            ragged_items_summary = from_dlpack(buffers["work_items_summary"], assumed_align=16)
+            ragged_items_summary.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_states = {}
+            for name in ("state_h_summary", "state_m_summary", "state_x_prefill"):
+                ragged_states[name] = from_dlpack(buffers[name], assumed_align=16)
+                ragged_states[name].mark_layout_dynamic().mark_compact_shape_dynamic(mode=3, stride_order=(0, 1, 2, 3), divisibility=DK)
+            ragged_views = [
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                ragged_items_summary,
+                from_dlpack(buffers["scheduler_all"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["tinv_words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["tinv_rows"], assumed_align=16).mark_layout_dynamic(leading_dim=1),
+                from_dlpack(buffers["tinv_row_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["tinv"], assumed_align=128).mark_layout_dynamic(leading_dim=3),
+                ragged_states["state_h_summary"],
+                ragged_states["state_m_summary"],
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                (
+                    from_dlpack(DeviceView(256, (1, HO, DV, DK), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3)
+                    if state_in is not None
+                    else None
+                ),
+                ragged_states["state_x_prefill"],
+            ]
+            ragged_items = from_dlpack(buffers["work_items"], assumed_align=16)
+            ragged_items.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_constexprs = (int(ragged_unit_chunks), int(ragged_chain_rows), ragged_tinv_cfg, ragged_summary_cfg, ragged_prefill_cfg)
+            ragged_placeholders = [
+                *(cutlass.Int32(int(value)) for value in ragged_scalars),
+                *ragged_views,
+                ragged_items,
+                from_dlpack(buffers["work_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["workspace"], assumed_align=128).mark_layout_dynamic(),
+            ]
+            ragged_placeholders += [int(ragged_pieces), from_dlpack(ragged_enable, assumed_align=4).mark_layout_dynamic()]
         fold_placeholders = [None] * 4
         if fold_update is not None:
             fold_placeholders = [
@@ -782,6 +971,8 @@ def build_warmup_forward(
             from_dlpack(l2norm_inv_k, assumed_align=16).mark_layout_dynamic(leading_dim=1) if l2norm_inv_k is not None else None,
             *tail_constexprs,
             *tail_placeholders,
+            *ragged_constexprs,
+            *ragged_placeholders,
             cache_key=repr((__name__, key)),
             symbol="frost_la_gdn_warmup_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
@@ -825,6 +1016,9 @@ def run_warmup_forward(
     tail_scalars=(),
     tail_buffers=(),
     lead_buffers=(None,) * 8,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue and prefill launches.  The
     plan validated the contract at build, so nothing here raises."""
@@ -874,6 +1068,7 @@ def run_warmup_forward(
         *lead_buffers,
         *tail_scalars,
         *tail_buffers,
+        *((*ragged_scalars, *ragged_buffers, ragged_enable) if ragged_buffers else ()),
     )
 
 

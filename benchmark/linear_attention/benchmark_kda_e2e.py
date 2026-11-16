@@ -148,8 +148,8 @@ def run_case(args, case_name, seq_lengths, heads, checkpoint):
     bwd_graph, _ = next(reversed(bprop_cache.values()))
     fwd_plan = fwd_graph._compiled_plans[fwd_graph._plan_index].compiled
     bwd_plan = bwd_graph._compiled_plans[bwd_graph._plan_index].compiled
-    row["forward_schedule"] = "chain" if fwd_plan.chain else "uncut"
-    row["backward_schedule"] = "chain" if bwd_plan.chain else "uncut"
+    row["forward_schedule"] = "chain" if fwd_plan.chain else "device" if fwd_plan.ragged_pieces else "uncut"
+    row["backward_schedule"] = "chain" if bwd_plan.chain else "device" if bwd_plan.ragged_pieces else "uncut"
     row["forward_pieces"] = int(fwd_plan.pieces)
     row["backward_pieces"] = int(bwd_plan.pieces)
     row["forward_workspace_bytes"] = fwd_graph.get_workspace_size()
@@ -228,13 +228,8 @@ def main():
             _, unit_chunks = auto_choose_pieces(**kwargs)
             return args.force_pieces, unit_chunks
 
-        def choose_kda_pieces_override(**kwargs):
-            kwargs.pop("enable_ragged_fallback")
-            _, unit_chunks = auto_choose_pieces(**kwargs)
-            return args.force_pieces, unit_chunks, bool(args.force_pieces and args.batch_invariant)
-
         piece_chain.choose_pieces = choose_pieces_override
-        piece_chain.choose_kda_pieces = choose_kda_pieces_override
+        piece_chain.ragged_pieces = lambda **kwargs: 0
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_stream(stream)

@@ -111,14 +111,17 @@ Every variant, except Mamba-2, applies the q/k L2 normalization; pass `--no_qk_l
 
 The decay gates are all ones (alpha = 1, log gate 0) for every variant and backend, so the measured schedule does not depend on the input draw; kda and gdn2 feed the raw safe-gate logit of that gate, whose in-kernel `lower_bound * sigmoid` transform reproduces alpha = 1 exactly in fp32. The write strengths (beta, and w for GDN-2) stay random.  Mamba-2 feeds a raw dt of -30 (A = -1, zero dt_bias): softplus makes dt vanish, so its decay exp(A dt) is 1 in fp32 as well.
 
-### SM100 packed-ragged KDA schedule
+### Packed-ragged KDA schedule
 
 `benchmark_kda_e2e.py --ragged-suite` exercises packed batches whose declared
-`B * H` tile count can hide a long-sequence tail. On compute capability 10.0,
-the automatic KDA selector may reuse the existing device-side length-rule
-piece table when the ordinary selector would otherwise leave the batch uncut.
-Sequences of at most 8192 tokens remain one piece; longer sequences use at
-most four pieces. Other architectures preserve the previous selector.
+`B * H` tile count can hide a long-sequence tail. A KDA plan the ordinary
+selector leaves uncut carries the device-side length-rule piece table as a
+second launch group, and the gate of its first kernel takes that group when
+the sequences it would cut fill at most half the SMs with their tiles and the
+cut halves the longest item (`forward_schedule` / `backward_schedule` read
+`device`). Sequences of at most 16384 tokens remain one piece; longer
+sequences use three or more pieces, up to the count that keeps one sequence's
+heads in one wave (no group above a third of the SMs in heads).
 
 The schedule changes plan selection only. It does not change the public KDA
 API, arithmetic, checkpoint format, or the `batch_invariant=True` contract.

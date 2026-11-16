@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 
-from .piece_chain import choose_pieces
+from .piece_chain import choose_pieces, piece_capacity
 
 
 class Context:
@@ -33,7 +33,8 @@ class Context:
 def backward_context(
     owner,
     *,
-    full,
+    normalized_rows,
+    chunk_factors,
     total,
     num_householder,
     h_q,
@@ -50,8 +51,8 @@ def backward_context(
     tinv_rows=None,
 ):
     """The backward summary's context over ``total`` k rows of one local sequence: the normalized q / k rows and inverse
-    norms (``full`` families, where the backward normalizes the same rows), and for a chained summary the chunk factors
-    (``full``) and the per-piece transitions and state gradients."""
+    norms (``normalized_rows``, where the backward normalizes the same rows), and for a chained summary the chunk factors
+    (``chunk_factors``) and the per-piece transitions and state gradients."""
     expand_num = max(1, int(num_householder))
     q_rows = int(total) // expand_num
     pieces, unit_chunks = choose_pieces(
@@ -66,7 +67,7 @@ def backward_context(
         expand_num=expand_num,
         reverse=True,
     )
-    has_rows = bool(full and use_qk_l2norm and (expand_num == 1 or int(d_v) == 64))
+    has_rows = bool(normalized_rows and use_qk_l2norm and (expand_num == 1 or int(d_v) == 64))
     has_tables = pieces > 0
     layout = WorkspaceLayout()
     regions = []
@@ -75,7 +76,7 @@ def backward_context(
         regions.append(("k_n", layout.add(total * h_k * d_k * 2), io_name, (total, h_k, d_k)))
         regions.append(("inv_q", layout.add(q_rows * h_q * 4), "float32", (q_rows, h_q)))
         regions.append(("inv_k", layout.add(total * h_k * 4), "float32", (total, h_k)))
-    if full and has_tables:
+    if chunk_factors and has_tables:
         rows = tinv_rows(q_rows, pieces, expand_num, b_t)
         regions.append(("tinv", layout.add(rows * h_o * b_t * b_t * 2), io_name, (rows, h_o, b_t, b_t)))
     if has_tables:
@@ -96,6 +97,8 @@ def forward_context(owner, *, total, h_k, d_k, io_name, use_qk_l2norm):
 def forward_apply_context(
     owner,
     *,
+    normalized_rows,
+    chunk_factors,
     total,
     num_householder,
     num_seqs,
@@ -110,7 +113,7 @@ def forward_apply_context(
     cadence_tokens,
     batch_invariant,
     use_qk_l2norm,
-    tinv_rows,
+    tinv_rows=None,
 ):
     """The forward's context over ``total`` k rows of ``num_seqs`` sequences, for the backward of the same tokens."""
     expand_num = max(1, int(num_householder))
@@ -125,7 +128,7 @@ def forward_apply_context(
         batch_invariant=bool(batch_invariant),
         expand_num=expand_num,
     )
-    has_rows = bool(use_qk_l2norm and (expand_num == 1 or int(d_v) == 64))
+    has_rows = bool(normalized_rows and use_qk_l2norm and (expand_num == 1 or int(d_v) == 64))
     has_tables = pieces > 0
     layout = WorkspaceLayout()
     regions = []
@@ -134,7 +137,10 @@ def forward_apply_context(
         regions.append(("k_n", layout.add(total * h_k * d_k * 2), io_name, (total, h_k, d_k)))
         regions.append(("inv_q", layout.add(q_rows * h_q * 4), "float32", (q_rows, h_q)))
         regions.append(("inv_k", layout.add(total * h_k * 4), "float32", (total, h_k)))
-    if has_tables:
-        rows = tinv_rows(q_rows, int(num_seqs) * pieces, expand_num, b_t)
+    slots = piece_capacity(num_seqs=num_seqs, pieces=pieces, total_tokens=q_rows, batch_invariant=batch_invariant)
+    if chunk_factors and has_tables:
+        rows = tinv_rows(q_rows, slots, expand_num, b_t)
         regions.append(("tinv", layout.add(rows * h_o * b_t * b_t * 2), io_name, (rows, h_o, b_t, b_t)))
+    if has_tables:
+        regions.append(("state_m", layout.add(slots * h_o * d_k * d_k * 4), "float32", (slots, h_o, d_k, d_k)))
     return Context(owner, layout, regions, pieces, unit_chunks, has_rows, has_tables)

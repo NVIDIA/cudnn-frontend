@@ -3974,6 +3974,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -4021,6 +4022,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={
@@ -4111,6 +4113,7 @@ _STRUCTURED_OPS = {
             "gate_lower_bound",
             "batch_invariant",
             "overwrite_initial_state",
+            "output_context",
         ),
         outputs=("O", "final_state", "state_checkpoints", "composed_initial_state"),
         maybe={
@@ -4160,6 +4163,7 @@ _STRUCTURED_OPS = {
             "batch_invariant",
             "overwrite_initial_state",
             "input_context",
+            "context_from_forward",
         ),
         outputs=("dQ", "dK", "dV", "dG", "dBeta", "dW", "d_initial_state", "d_a_log", "d_dt_bias"),
         maybe={

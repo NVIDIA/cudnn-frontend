@@ -11,16 +11,16 @@ import math
 from operator import itemgetter
 
 
-from cudnn import behavior_note
+import cudnn
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
-from cudnn.frost.device import build_device, compute_capability, current_device, multiprocessor_count
+from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
-from .common.context import backward_context
+from .common.context import backward_context, forward_apply_context
 from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
-# the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles (GB200 fit; Rubin retune pending)
+# the d_v split takes the prep path up to this fraction of the SM count in (sequence, head) tiles
 PREP_TILE_FRACTION = 0.475
 _KDA_STATE_WAVE_BYTES = 1024**3
 _KDA_CHECKPOINT_WAVE_BYTES = 5 * 1024**3
@@ -94,14 +94,12 @@ class KdaFrostEngine(BaseEngine):
     forward and KDA_BWD (with a forward checkpoint recompute when ``state_checkpoints`` is absent)."""
 
     name = "kda_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
-        import cudnn
-
         facts = graph._facts_for(analyze)
         frost_la_gate("KdaFrostEngine", facts, "KDA")
-        if facts.is_bwd and facts.input_context:
+        if facts.is_bwd and facts.input_context and not facts.context_from_forward:
             context_gate("KdaFrostEngine", facts, b_t=16)
         if facts.d_qk not in (64, 128):
             raise NotImplementedError(f"KdaFrostEngine: q/k head dim must be 64 or 128, got {facts.d_qk}")
@@ -187,13 +185,14 @@ class CompiledKda:
         from .common.piece_chain import (
             DV_SPLIT_TILES,
             chain_rows_per_cta,
-            choose_kda_pieces,
+            choose_pieces,
             is_dv_split,
             piece_capacity,
             piece_table_layout,
+            ragged_pieces,
         )
         from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
-        from .kernel.kda_uncut_forward_f16 import TAIL_BUFFERS, build_uncut_forward, run_uncut_forward
+        from .kernel.kda_uncut_forward_f16 import RAGGED_BUFFERS, TAIL_BUFFERS, build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
         from .common.tail import GATE_WORDS, choose_tail
 
@@ -202,6 +201,7 @@ class CompiledKda:
         self.chain_rows_per_cta = chain_rows_per_cta
         self.uncut_launch = None
         self.tail_buffer_names = TAIL_BUFFERS
+        self.ragged_buffer_names = RAGGED_BUFFERS
         self.build_uncut_forward = build_uncut_forward
         self.run_uncut_forward = run_uncut_forward
         self.build_chain_forward = build_chain_forward
@@ -236,7 +236,7 @@ class CompiledKda:
         self.num_sm = multiprocessor_count(self.device)
         self.n_heads_out = HO
         self.num_seqs = B
-        self.pieces, self.unit_chunks, self.length_rule = choose_kda_pieces(
+        self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
@@ -245,9 +245,9 @@ class CompiledKda:
             cadence_tokens=self.checkpoint if self.has_state_checkpoints else 0,
             batch_invariant=self.batch_invariant,
             expand_num=1,
-            enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
         self.chain = self.pieces > 0
+        self.length_rule = self.chain and self.batch_invariant
         self.dv_split = (
             not self.chain
             and not self.batch_invariant
@@ -265,6 +265,9 @@ class CompiledKda:
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.prep = self.dv_split and B * HO <= int(PREP_TILE_FRACTION * self.num_sm)
         self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=total)
         if not self.chain and not self.dv_split and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -280,6 +283,32 @@ class CompiledKda:
                 self.tail = None
         self.tail_prep = self.tail is not None and self.tail.dv_split and self.tail.tiles <= int(PREP_TILE_FRACTION * self.num_sm)
         self.io_name = "float16" if q.get_data_type().name == "HALF" else "bfloat16"
+        self.output_context = bool(node.params.get("output_context", False))
+        self.has_context = False
+        self.context_size = 0
+        if self.output_context:
+            self.context = forward_apply_context(
+                self.plan_name,
+                normalized_rows=False,
+                chunk_factors=False,
+                total=total,
+                num_householder=1,
+                num_seqs=B,
+                h_q=q.dim[1],
+                h_k=node.inputs["k"].dim[1],
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=self.checkpoint if self.has_state_checkpoints else 0,
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+            )
+            self.context_size = self.context.size
+            self.has_context = self.context_size > 0
+        self.output_piece_transitions = self.output_context and self.context.has_tables
 
         from .common.host import get_dtype
         from .common.steep_decay import STEEP_OFF, steep_mode_for
@@ -318,9 +347,10 @@ class CompiledKda:
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
                 ("state_h", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)),
-                ("state_m", layout.add(self.num_pieces * state_heads * K * K * 4), "float32", (self.num_pieces, state_heads, K, K)),
-                ("state_x", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)),
             ]
+            if not self.output_piece_transitions:
+                regions.append(("state_m", layout.add(self.num_pieces * state_heads * K * K * 4), "float32", (self.num_pieces, state_heads, K, K)))
+            regions.append(("state_x", off_state_hx, "float32", (self.num_pieces, state_heads, V, K)))
             from .kernel import kda_summary_f16 as summary_module
 
             self.fused_tensormap_bytes = tensormap_workspace_bytes(summary_module, self.num_pieces)
@@ -332,8 +362,9 @@ class CompiledKda:
             self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
-            if self.tail is not None:
-                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+            if self.tail is not None or self.ragged_pieces:
+                off_gate = layout.add(4 * GATE_WORDS, align=16)
+                regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
             if self.prep:
                 from .kernel import kda_prep_f16 as prep_module
                 from .kernel.gdn_tinv_f16 import tinv_rows
@@ -409,6 +440,35 @@ class CompiledKda:
             regions.append(("tail_fused_tensormaps", layout.add(tail_fused_bytes, align=128), "int64", (tail_fused_bytes // 8,)))
             tail_bytes = tensormap_workspace_bytes(kernel_module, self.tail_pieces_total)
             regions.append(("tail_tensormaps", layout.add(tail_bytes, align=128), "int64", (tail_bytes // 8,)))
+        if self.ragged_pieces:
+            from .kernel import kda_summary_f16 as ragged_summary_module
+
+            slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=total, batch_invariant=True)
+            off_ragged_scheduler = layout.add(24)
+            regions += [
+                ("ragged_scheduler_prefill", off_ragged_scheduler, "int32", (2,)),
+                ("ragged_scheduler_h", off_ragged_scheduler + 8, "int32", (2,)),
+                ("ragged_scheduler_m", off_ragged_scheduler + 16, "int32", (2,)),
+                ("ragged_scheduler_all", off_ragged_scheduler, "int32", (6,)),
+                ("ragged_work_items", layout.add(slots * HO * WORK_ITEM_FIELDS * 4), "int32", (slots * HO, WORK_ITEM_FIELDS)),
+            ]
+            table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+            off_ragged_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ("ragged_state_m", layout.add(slots * HO * K * K * 4), "float32", (slots, HO, K, K)),
+                ("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+            ]
+            ragged_fused_bytes = tensormap_workspace_bytes(ragged_summary_module, slots)
+            regions.append(("ragged_fused_tensormaps", layout.add(ragged_fused_bytes, align=128), "int64", (ragged_fused_bytes // 8,)))
+            ragged_bytes = tensormap_workspace_bytes(kernel_module, slots)
+            regions.append(("ragged_tensormaps", layout.add(ragged_bytes, align=128), "int64", (ragged_bytes // 8,)))
         seed = node.inputs.get("initial_state")
         if (
             self.steep_mode != STEEP_OFF
@@ -420,7 +480,8 @@ class CompiledKda:
         ):
             # The final state may overwrite the seeds (the graph contract, not this call's pointers: buffers can alias
             # after warmup), so the prefill seeds from a copy its exact twin can reread (common/state_snapshot.py).
-            seed_name, seed_bytes = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2)}.get(seed.get_data_type().name, ("float32", 4))
+            seed_names = {"BFLOAT16": ("bfloat16", 2), "HALF": ("float16", 2), "FP8_E4M3": ("float8_e4m3fn", 1), "FP8_E5M2": ("float8_e5m2", 1)}
+            seed_name, seed_bytes = seed_names.get(seed.get_data_type().name, ("float32", 4))
             regions.append(("state_snapshot", layout.add(B * HO * V * K * seed_bytes, align=128), seed_name, (B, HO, V, K)))
         self.workspace_size = layout.size
         self.workspace_regions = tuple(regions)
@@ -450,6 +511,8 @@ class CompiledKda:
         self.index_composed = pos.get("composed_initial_state")
         if self.chain:
             positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            if self.has_context:
+                positions |= {"context_" + name: len(names) + len(self.carve_names) + i for i, name in enumerate(self.context.names)}
             aliases = {
                 "gate": "g",
                 "o": "O",
@@ -462,7 +525,9 @@ class CompiledKda:
                 "prefill_words": "tensormaps",
                 "scheduler_summary": "scheduler_h",
             }
-            absent = len(names) + len(self.carve_names)
+            if self.output_piece_transitions:
+                aliases |= {"state_m": "context_state_m"}
+            absent = len(names) + len(self.carve_names) + (len(self.context.names) if self.has_context else 0)
             if not self.safe_gate:
                 positions.pop("a_log", None)
                 positions.pop("dt_bias", None)
@@ -510,6 +575,26 @@ class CompiledKda:
                 self.tail_ctas if self.tail.dv_split else 0,
                 self.tail_item_base if self.tail.dv_split else 0,
             )
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "cu_pieces_main": "ragged_cu_pieces",
+                "scheduler_summary": "ragged_scheduler_h",
+                "summary_words": "ragged_fused_tensormaps",
+                "state_h_summary": "ragged_state_h",
+                "state_m_summary": "ragged_state_m",
+                "state_h_chain": "ragged_state_h",
+                "state_m_chain": "ragged_state_m",
+                "state_x_chain": "ragged_state_x",
+                "state_x_prefill": "ragged_state_x",
+                "seed": "initial_state",
+                "work_count": "ragged_main_count",
+                "scheduler": "ragged_scheduler_prefill",
+                "workspace": "ragged_tensormaps",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.ragged_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
 
     def host_config(self):
         """The jit host of the plan's scheme and its constexpr arguments by parameter name, built from the node's tensors for a
@@ -574,7 +659,7 @@ class CompiledKda:
             prep_cfg=prep_cfg,
         )
 
-    def run(self, views, workspace, stream) -> None:
+    def run(self, views, workspace, stream, context=None) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
         fold_buffers = (None,) * 4
         if self.index_preceding_state_update is not None:
@@ -585,7 +670,8 @@ class CompiledKda:
                 composed,
             )
         if self.chain and self.chain_launch is not None:
-            buffers = self.chain_buffers((*views, *workspace.carve(self.carve), None))
+            context_views = context.carve(self.context.carve) if self.has_context else ()
+            buffers = self.chain_buffers((*views, *workspace.carve(self.carve), *context_views, None))
             self.chain_launch(*self.chain_scalars, *buffers, self.stream_type(int(stream or 0)), None, *fold_buffers)
             return
         q = views[self.index_q]
@@ -604,6 +690,9 @@ class CompiledKda:
         stream = stream if stream is not None else 0
 
         region = dict(zip(self.carve_names, workspace.carve(self.carve)))
+        context_region = self.context.regions(context) if self.has_context else {}
+        if self.output_piece_transitions:
+            region["state_m"] = context_region["state_m"]
         if self.chain:
             self.run_chain(
                 q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream, fold_buffers
@@ -640,14 +729,23 @@ class CompiledKda:
             prep_row_count=region.get("prep_row_count"),
             state_snapshot=region.get("state_snapshot"),
             item_limit_word=region.get("gate"),
-            tail_scalars=self.tail_scalars if self.tail is not None else (),
-            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
+            tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 6 if self.ragged_pieces else (),
+            tail_buffers=(
+                self.tail_buffers((*views, *region.values(), None))
+                if self.tail is not None
+                else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+            ),
             fold_buffers=fold_buffers,
+            ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+            ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
         )
         tail = self.tail
         if self.uncut_launch is None:
             self.uncut_launch = self.build_uncut_forward(
                 **buffers,
+                ragged_pieces=self.ragged_pieces,
+                ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                ragged_chain_rows=self.chain_rows_per_cta(v.shape[2], q.shape[2], self.num_seqs, self.n_heads_out, self.num_sm) if self.ragged_pieces else 0,
                 tail=tail,
                 tail_chain_rows=(
                     self.chain_rows_per_cta(v.shape[2], q.shape[2], tail.num_seqs, self.n_heads_out, self.num_sm)
@@ -763,7 +861,7 @@ class CompiledKdaBwd:
         """Resolve graph attributes and select the backward scheduling family."""
         from .common.gate_bwd import GATE_BWD_BLOCKS
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, choose_kda_pieces, piece_capacity, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout, ragged_pieces
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import TAIL_BUFFERS, build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -817,7 +915,7 @@ class CompiledKdaBwd:
         self.batch_invariant = bool(node.params.get("batch_invariant", False))
         self.overwrite_initial_state = bool(node.params.get("overwrite_initial_state", False))
         self.num_seqs = B
-        self.pieces, self.unit_chunks, self.length_rule = choose_kda_pieces(
+        self.pieces, self.unit_chunks = choose_pieces(
             num_seqs=B,
             heads_out=HO,
             num_sm=self.num_sm,
@@ -827,16 +925,49 @@ class CompiledKdaBwd:
             batch_invariant=self.batch_invariant,
             reverse=True,
             expand_num=1,
-            enable_ragged_fallback=compute_capability(self.device) == (10, 0),
         )
+        final_state_grad = "d_final_state" in node.inputs or "following_state_grad" in node.inputs
         self.chain = self.pieces > 0
+        self.length_rule = self.chain and self.batch_invariant
+        self.ragged_pieces = 0
+        if (
+            not self.chain
+            and not self.batch_invariant
+            and not self.overwrite_initial_state
+            and "preceding_state_update" not in node.inputs
+            and "composed_initial_state" not in node.inputs
+        ):
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=total)
         self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant) if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
         self.has_context = bool(node.params.get("input_context", False))
-        self.context = (
-            backward_context(
+        self.context_from_forward = self.has_context and bool(node.params.get("context_from_forward", False))
+        self.context = None
+        if self.context_from_forward:
+            self.context = forward_apply_context(
                 self.plan_name,
-                full=False,
+                normalized_rows=False,
+                chunk_factors=False,
+                total=total,
+                num_householder=1,
+                num_seqs=B,
+                h_q=HQ,
+                h_k=HK,
+                h_o=HO,
+                d_k=K,
+                d_v=V,
+                b_t=self.b_t,
+                io_name=self.io_name,
+                num_sm=self.num_sm,
+                cadence_tokens=int(node.params.get("checkpoint_every_n_tokens", 0) or 0),
+                batch_invariant=self.batch_invariant,
+                use_qk_l2norm=self.use_qk_l2norm,
+            )
+        elif self.has_context:
+            self.context = backward_context(
+                self.plan_name,
+                normalized_rows=False,
+                chunk_factors=False,
                 total=total,
                 num_householder=1,
                 h_q=HQ,
@@ -851,15 +982,16 @@ class CompiledKdaBwd:
                 batch_invariant=self.batch_invariant,
                 use_qk_l2norm=self.use_qk_l2norm,
             )
-            if self.has_context
-            else None
-        )
         self.context_size = self.context.size if self.has_context else 0
         same_cut = (
-            self.has_context and self.context.has_tables and B == 1 and (self.pieces, self.unit_chunks) == (self.context.pieces, self.context.unit_chunks)
+            self.has_context
+            and self.context.has_tables
+            and (B == 1 or self.context_from_forward)
+            and (self.pieces, self.unit_chunks) == (self.context.pieces, self.context.unit_chunks)
         )
-        self.has_piece_tables = same_cut and self.chain
-        self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
+        self.has_piece_tables = same_cut and self.chain and not self.context_from_forward
+        self.has_piece_transitions = same_cut and self.chain and not self.fused_h_m and not (self.context_from_forward and final_state_grad)
+        self.has_m_count = self.chain and not self.fused_h_m and not self.has_piece_transitions and not final_state_grad
 
         from .common.host import get_dtype
         from .common.steep_decay import STEEP_OFF, steep_mode_for
@@ -913,8 +1045,9 @@ class CompiledKdaBwd:
         self.work_item_rows = self.n_tiles
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
-        if self.tail is not None:
-            regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+        if self.tail is not None or self.ragged_pieces:
+            off_gate = layout.add(4 * GATE_WORDS, align=16)
+            regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
         if "following_state_grad" in node.inputs:
             regions.append(("composed_dstate", layout.add(HO * V * K * 4, align=16), "float32", (1, HO, V, K)))
         self.checkpoint_head_divisor = 1
@@ -1003,6 +1136,8 @@ class CompiledKdaBwd:
                         (self.num_pieces, state_heads, K, K),
                     )
                 )
+            if self.has_m_count:
+                regions.append(("m_count", layout.add(4), "int32", (1,)))
             if not self.has_piece_tables:
                 regions.append(
                     (
@@ -1072,6 +1207,62 @@ class CompiledKdaBwd:
                 regions.append(("tail_state_x", layout.add(self.tail_pieces_total * HO * V * K * 4), "float32", tail_state_shape))
             tail_bwd_bytes = tensormap_workspace_bytes(bwd_module, self.tail_pieces_total)
             regions.append(("tail_bwd_tensormaps", layout.add(tail_bwd_bytes, align=128), "int64", (tail_bwd_bytes // 8,)))
+        if self.ragged_pieces:
+            from .kernel import kda_bprop_summary_f16 as ragged_summary_module
+            from .kernel import kda_summary_f16 as ragged_fused_module
+
+            slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=total, batch_invariant=True)
+            ragged_tiles = slots * HO
+            ragged_state_shape = (slots, HO, V, K)
+            off_ragged_scheduler = layout.add(40)
+            regions += [
+                ("ragged_scheduler_recompute", off_ragged_scheduler, "int32", (2,)),
+                ("ragged_scheduler_bwd", off_ragged_scheduler + 8, "int32", (2,)),
+                ("ragged_scheduler_summary", off_ragged_scheduler + 16, "int32", (2,)),
+                ("ragged_scheduler_m", off_ragged_scheduler + 24, "int32", (2,)),
+                ("ragged_scheduler_series", off_ragged_scheduler + 32, "int32", (2,)),
+                ("ragged_scheduler_all", off_ragged_scheduler, "int32", (10,)),
+                ("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)),
+            ]
+            ragged_summary_bytes = tensormap_workspace_bytes(ragged_summary_module, slots)
+            regions.append(("ragged_summary_tensormaps", layout.add(ragged_summary_bytes, align=128), "int64", (ragged_summary_bytes // 8,)))
+            if not self.has_state_checkpoints:
+                ragged_fused_bytes = tensormap_workspace_bytes(ragged_fused_module, slots)
+                regions.append(("ragged_fused_tensormaps", layout.add(ragged_fused_bytes, align=128), "int64", (ragged_fused_bytes // 8,)))
+            ragged_recompute_bytes = tensormap_workspace_bytes(recompute_module, slots)
+            regions.append(("ragged_recompute_tensormaps_m", layout.add(ragged_recompute_bytes, align=128), "int64", (ragged_recompute_bytes // 8,)))
+            if self.needs_recompute:
+                regions.append(("ragged_recompute_tensormaps_series", layout.add(ragged_recompute_bytes, align=128), "int64", (ragged_recompute_bytes // 8,)))
+            if self.coarse_checkpoints:
+                ragged_recompute_item_rows = max((total // self.recompute_span_tokens + 2 * slots) * HO, 1)
+                regions.append(
+                    (
+                        "ragged_work_items_recompute",
+                        layout.add(ragged_recompute_item_rows * WORK_ITEM_FIELDS * 4),
+                        "int32",
+                        (ragged_recompute_item_rows, WORK_ITEM_FIELDS),
+                    )
+                )
+                regions.append(("ragged_work_count_recompute", layout.add(4), "int32", (1,)))
+                regions.append(("ragged_seed_row_base", layout.add(4), "int32", (1,)))
+            table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+            off_ragged_table = layout.add(table.nbytes, align=256)
+            regions += [
+                ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("ragged_state_m", layout.add(slots * HO * K * K * 4), "float32", (slots, HO, K, K)),
+                ("ragged_state_g", layout.add(slots * HO * V * K * 4), "float32", ragged_state_shape),
+                ("ragged_state_dx_end", layout.add(slots * HO * V * K * 4), "float32", ragged_state_shape),
+            ]
+            if not self.has_state_checkpoints:
+                regions.append(("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", ragged_state_shape))
+                regions.append(("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", ragged_state_shape))
+            ragged_bwd_bytes = tensormap_workspace_bytes(bwd_module, slots)
+            regions.append(("ragged_bwd_tensormaps", layout.add(ragged_bwd_bytes, align=128), "int64", (ragged_bwd_bytes // 8,)))
         self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, self.num_pieces)
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
         d_final = node.inputs.get("d_final_state")
@@ -1148,6 +1339,43 @@ class CompiledKdaBwd:
                 int(self.recompute_span_tokens if coarse else 0) // self.b_t,
                 int(self.tail.batch_base),
                 int(self.tail.first_head_lo),
+            )
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            coarse = self.coarse_checkpoints
+            aliases = {
+                "cu_pieces_main": "ragged_cu_pieces",
+                "series_items": "ragged_work_items_recompute",
+                "series_count": "ragged_work_count_recompute",
+                "recompute_items": ("ragged_work_items_recompute" if coarse else "ragged_work_items") if self.needs_recompute else None,
+                "recompute_count": ("ragged_work_count_recompute" if coarse else "ragged_main_count") if self.needs_recompute else None,
+                "summary_words": "ragged_fused_tensormaps",
+                "recompute_m_words": "ragged_recompute_tensormaps_m",
+                "series_words": "ragged_recompute_tensormaps_series",
+                "bprop_summary_words": "ragged_summary_tensormaps",
+                "bprop_words": "ragged_bwd_tensormaps",
+                "state_h_summary": "ragged_state_h",
+                "state_m_main": "ragged_state_m",
+                "state_h_chain": "ragged_state_h",
+                "state_m_chain": "ragged_state_m",
+                "state_x_chain": "ragged_state_x",
+                "seed": "initial_state",
+                "state_x_series": "ragged_state_x",
+                "state_g_chain": "ragged_state_g",
+                "state_dx_end_chain": "ragged_state_dx_end",
+                "dseed": "d_final_state",
+                "dcomposed": "composed_dstate",
+                "dstate0": "d_initial_state",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (
+                int(self.ragged_pieces),
+                int(self.num_seqs),
+                int(self.recompute_span_tokens if coarse else 0) // self.b_t,
+                0,
+                0,
             )
 
     def host_config(self):
@@ -1338,10 +1566,17 @@ class CompiledKdaBwd:
                 dstate_scratch=region["dstate_scratch"],
                 dstate_snapshot=region.get("dstate_snapshot"),
                 item_limit_word=region.get("gate"),
-                tail_scalars=self.tail_scalars if self.tail is not None else (),
-                tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
+                tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 5 if self.ragged_pieces else (),
+                tail_buffers=(
+                    self.tail_buffers((*views, *region.values(), None))
+                    if self.tail is not None
+                    else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+                ),
                 post_buffers=post_buffers,
                 fold_buffers=fold_buffers,
+                ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+                ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+                ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
             )
             schedule = dict(
                 b_t=self.b_t,
@@ -1360,6 +1595,11 @@ class CompiledKdaBwd:
                 self.uncut_launch = self.build_uncut_backward(
                     **buffers,
                     **schedule,
+                    ragged_pieces=self.ragged_pieces,
+                    ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                    ragged_chain_rows=(
+                        self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm) if self.ragged_pieces else 0
+                    ),
                     tail=tail,
                     tail_chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, tail.num_seqs, self.n_heads_out, self.num_sm) if tail is not None else 0,
                     use_initial_state=state0 is not None or composed is not None,
@@ -1464,6 +1704,7 @@ class CompiledKdaBwd:
             dstate0=dstate0,
             post_buffers=post_buffers,
             fold_buffers=fold_buffers,
+            m_count=region.get("m_count"),
         )
         schedule = dict(
             pieces=self.pieces,
@@ -1522,7 +1763,7 @@ class KdaSummaryFrostEngine(BaseEngine):
     and KDA_SUMMARY_BWD (d_initial_state through the bprop summary kernel) graphs."""
 
     name = "kda_summary_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)
@@ -1949,7 +2190,8 @@ class CompiledKdaSummaryBwd:
         if self.has_context:
             self.context = backward_context(
                 self.plan_name,
-                full=False,
+                normalized_rows=False,
+                chunk_factors=False,
                 total=total,
                 num_householder=1,
                 h_q=q.dim[1],

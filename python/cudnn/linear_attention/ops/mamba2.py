@@ -88,6 +88,7 @@ def make_fprop_cache_key(
     checkpoint_dtype=None,
     composed_rows=None,
     checkpoint_after_block=False,
+    state_indices_dtype=None,
 ):
     return (
         "fprop",
@@ -120,6 +121,7 @@ def make_fprop_cache_key(
         checkpoint_dtype,
         composed_rows,
         bool(checkpoint_after_block),
+        state_indices_dtype,
     )
 
 
@@ -402,6 +404,7 @@ def run_mamba2_fwd(
         checkpoint_dtype,
         composed_rows or None,
         checkpoint_after_block=bool(checkpoint_after_block),
+        state_indices_dtype=state_indices.dtype if state_indices is not None else None,
     )
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(

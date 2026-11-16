@@ -342,8 +342,9 @@ are close.
 - The linear-attention nodes (GDN, KDA, GDN-2, GDP, Mamba-2 and their summary
   nodes) are python-engine-only ops: they have no cuDNN backend lowering, so
   routing them to the backend entry raises `cudnnGraphNotSupportedError` at
-  lowering. Their engines, attributes and state semantics are in
-  `docs/operations/LinearAttention.md`.
+  lowering. Their engines, attributes and state semantics are in Linear
+  Attention ([docs](/operations/LinearAttention),
+  [GitHub](https://github.com/NVIDIA/cudnn-frontend/blob/develop/docs/operations/LinearAttention.md)).
 
 ### The manifest: classify, then let the engine decide
 

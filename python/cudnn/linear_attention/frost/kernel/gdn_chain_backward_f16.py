@@ -21,7 +21,7 @@ recompute when the forward's series is passed back) and the seeded series recomp
 of the bprop summary and the bprop), which runs the G summary, the reverse state chain and the bprop.  The series recompute moves
 ahead of the G summary (it depends only on the forward chain); the reverse chain is the one GDN kernel compiled at 2
 while GDN's standalone level is 3 (same instruction count, one runtime division per CTA folded differently).  The bprop module is a constexpr argument: GDP at d_v = 64
-runs the gdp_bprop_v64_f16 fork, whose host takes no T-pass tiles.  Every kernel, its host and the tensor placeholder each host
+runs the gdp_bprop_v64_f16 fork.  Every kernel, its host and the tensor placeholder each host
 was compiled with are the standalone modules' own; a buffer two hosts read through different placeholder types is passed
 twice, once per type (H, M and X: the summary's and recompute's mode-3 compact views against the state chain's ``(1, HO, V,
 K)`` device views)."""
@@ -174,6 +174,7 @@ def chain_backward_head_host(
     reduce_dv: Optional[cute.Tensor] = None,
     gather_dq_src: Optional[cute.Tensor] = None,
     gather_dq: Optional[cute.Tensor] = None,
+    m_count: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         if cutlass.const_expr(fold_seed is not None):
@@ -311,6 +312,8 @@ def chain_backward_head_host(
         seed_every_n=seed_every_n,
         seed_row_base=seed_row_base,
         tail_enable=tail_enable,
+        m_count=m_count,
+        summary_skip=0 if cutlass.const_expr(fused_h_m) else -1,
     )
     if cutlass.const_expr(not has_chunk_factors):
         gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
@@ -376,7 +379,7 @@ def chain_backward_head_host(
                 None,
                 tinv,
                 work_items_summary,
-                summary_count,
+                m_count if cutlass.const_expr(m_count is not None) else summary_count,
                 scheduler_m,
                 cutlass.Int32(0),
                 cutlass.Int32(0),
@@ -409,7 +412,6 @@ def chain_backward_head_host(
     if cutlass.const_expr(bprop_cfg is not None):
         chain_backward_tail_host(
             bprop,
-            compact_qdo,
             has_piece_state_grads,
             bwd_summary_cfg,
             bprop_cfg,
@@ -541,7 +543,6 @@ def chain_backward_head_host(
 @cute.jit
 def chain_backward_tail_host(
     bprop: cutlass.Constexpr,
-    compact_qdo: cutlass.Constexpr[bool],
     has_piece_state_grads: cutlass.Constexpr[bool],
     summary_cfg: cutlass.Constexpr,
     bprop_cfg: cutlass.Constexpr,
@@ -650,65 +651,35 @@ def chain_backward_tail_host(
         mTailEnable=tail_enable,
         first_head_lo=first_head_lo,
     )
-    if cutlass.const_expr(compact_qdo):
-        bprop.host(
-            bprop_cfg,
-            q,
-            k,
-            v,
-            gate,
-            a_log,
-            dt_bias,
-            beta,
-            dgate,
-            dbeta,
-            do,
-            dq,
-            dk,
-            dv,
-            cu_pieces,
-            dstate0,
-            state_dx_end,
-            None,
-            inv_q,
-            inv_k,
-            work_items,
-            main_count,
-            scheduler_bwd,
-            scale,
-            bprop_words,
-            stream,
-        )
-    else:
-        bprop.host(
-            bprop_cfg,
-            q,
-            k,
-            v,
-            gate,
-            a_log,
-            dt_bias,
-            beta,
-            dgate,
-            dbeta,
-            do,
-            dq,
-            dk,
-            dv,
-            cu_pieces,
-            dstate0,
-            state_dx_end,
-            None,
-            inv_q,
-            inv_k,
-            tinv,
-            work_items,
-            main_count,
-            scheduler_bwd,
-            scale,
-            bprop_words,
-            stream,
-        )
+    bprop.host(
+        bprop_cfg,
+        q,
+        k,
+        v,
+        gate,
+        a_log,
+        dt_bias,
+        beta,
+        dgate,
+        dbeta,
+        do,
+        dq,
+        dk,
+        dv,
+        cu_pieces,
+        dstate0,
+        state_dx_end,
+        None,
+        inv_q,
+        inv_k,
+        tinv,
+        work_items,
+        main_count,
+        scheduler_bwd,
+        scale,
+        bprop_words,
+        stream,
+    )
 
 
 def build_configs(
@@ -721,7 +692,6 @@ def build_configs(
     fused_h_m,
     series,
     coarse,
-    compact_qdo,
     use_dstate0,
     fused_l2norm,
     num_sm,
@@ -735,6 +705,7 @@ def build_configs(
     k_slots,
     v_slots,
     beta_slots,
+    skip_first_m=False,
 ):
     tinv_cfg = gdn_tinv_f16.build_cfg(
         io_dtype,
@@ -763,6 +734,7 @@ def build_configs(
             expand_num=expand_num,
             k_slots=k_slots,
             v_slots=v_slots,
+            skip_first_m=skip_first_m,
         )
     else:
         transition_cfg = gdn_recompute_f16.build_cfg(
@@ -826,7 +798,7 @@ def build_configs(
         d_k=d_k,
         d_v=d_v,
         expand_num=expand_num,
-        **({} if compact_qdo else dict(tinv_source="gmem")),
+        tinv_source="gmem",
         k_slots=k_slots,
         v_slots=v_slots,
         beta_slots=beta_slots,
@@ -923,11 +895,12 @@ def build_chain_backward(
     lead_buffers=(None,) * 12,
     gate_blocks=0,
     post_buffers=(None,) * 16,
+    m_count=None,
 ):
     """Compile (cached per static config) the chain backward launch over the buffers of one plan;
     ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments.  The placeholders repeat the marks of the standalone
     modules' builds so every kernel compiles as it does there.  ``has_chunk_factors`` / ``has_piece_transitions`` / ``has_piece_state_grads``: the T pass,
-    the transition arm and the leaf summary are skipped, their buffers the backward summary's intermediates."""
+    the transition arm and the leaf summary are skipped, their buffers the context's."""
     DK = q.shape[2]
     DV = v.shape[-1]
     HO = gate.shape[1]
@@ -1003,6 +976,7 @@ def build_chain_backward(
         len(l2norm_k.shape) if l2norm_k is not None else 0,
         l2norm_k_slots,
         l2norm_k_expand_num,
+        m_count is not None,
     )
     if key not in chain_backward_cache:
         tinv_cfg, summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = build_configs(
@@ -1014,7 +988,6 @@ def build_chain_backward(
             fused_h_m=fused_h_m,
             series=series,
             coarse=coarse,
-            compact_qdo=compact_qdo,
             use_dstate0=dstate0 is not None,
             fused_l2norm=inv_q is not None,
             num_sm=num_sm,
@@ -1028,6 +1001,7 @@ def build_chain_backward(
             k_slots=k_slots,
             v_slots=v_slots,
             beta_slots=beta_slots,
+            skip_first_m=not has_seed and composed is None,
         )
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
@@ -1187,6 +1161,7 @@ def build_chain_backward(
             *l2norm_placeholders,
             cutlass.Int32(int(gate_blocks)),
             *post_placeholders,
+            from_dlpack(m_count, assumed_align=4).mark_layout_dynamic() if m_count is not None else None,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return chain_backward_cache[key]
@@ -1271,6 +1246,7 @@ def run_chain_backward(
     lead_buffers=(None,) * 12,
     gate_blocks=0,
     post_buffers=(None,) * 16,
+    m_count=None,
 ) -> None:
     """Replay the chain backward: one crossing into the DSL for its launches (the passes the summary's intermediates replace compiled out).  The
     plan validated the contract at build, so nothing here raises."""
@@ -1350,6 +1326,7 @@ def run_chain_backward(
         *lead_buffers,
         int(gate_blocks),
         *post_buffers,
+        m_count,
     )
 
 

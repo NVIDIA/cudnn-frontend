@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from operator import itemgetter
 
-from cudnn import behavior_note
+import cudnn
 from cudnn.engines.base import BaseEngine, CompiledPlan
 
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
@@ -46,8 +46,6 @@ def build_gdn(graph):
 
 def gdn_support_gates(engine: str, facts) -> None:
     """The GDN kernel family's dtype/attribute gates, shared with the GDP engine."""
-    import cudnn
-
     if facts.is_bwd and facts.input_context and not facts.context_from_forward:
         context_gate(engine, facts, b_t=64, expand_num=facts.num_householder)
     checkpoint = facts.checkpoint_every_n_tokens
@@ -110,7 +108,7 @@ class GdnFrostEngine(BaseEngine):
     declining elsewhere so ranking falls back to ``GdnCuTileEngine``."""
 
     name = "gdn_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)
@@ -141,7 +139,9 @@ class CompiledGdn:
             chain_rows_per_cta,
             choose_pieces,
             is_dv_split,
+            piece_capacity,
             piece_table_layout,
+            ragged_pieces,
         )
         from cuda.bindings.driver import CUstream
 
@@ -230,6 +230,9 @@ class CompiledGdn:
         self.split = not self.chain and not self.dv_split and not self.batch_invariant and not self.overwrite_initial_state
         self.tiles_per_head = DV_SPLIT_TILES if self.dv_split else 1
         self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
         if not self.chain and not self.dv_split and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -244,7 +247,7 @@ class CompiledGdn:
             if self.tail is not None and self.tail.batch_base == 0 and ("preceding_state_update" in node.inputs or "composed_initial_state" in node.inputs):
                 self.tail = None
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B
         self.tinv_pass = self.chain
         self.output_context = bool(node.params.get("output_context", False))
         if self.output_context:
@@ -252,6 +255,8 @@ class CompiledGdn:
 
             self.context = forward_apply_context(
                 self.plan_name,
+                normalized_rows=True,
+                chunk_factors=True,
                 total=total,
                 num_householder=self.num_householder,
                 num_seqs=B,
@@ -272,6 +277,7 @@ class CompiledGdn:
             self.has_context = self.context_size > 0
         self.output_normalized_rows = self.output_context and self.context.has_rows
         self.output_chunk_factors = self.output_context and self.context.has_tables
+        self.output_piece_transitions = self.output_context and self.context.has_tables
 
         layout = WorkspaceLayout()
         from .common.host import tensormap_workspace_bytes
@@ -295,7 +301,7 @@ class CompiledGdn:
 
             self.fused_tensormap_words = tensormap_workspace_bytes(summary_module, self.num_pieces, self.num_householder) // 8
             regions.append(("fused_tensormaps", layout.add(self.fused_tensormap_words * 8), "int64", (self.fused_tensormap_words,)))
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -305,9 +311,10 @@ class CompiledGdn:
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
                 ("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
-                ("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)),
-                ("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)),
             ]
+            if not self.output_piece_transitions:
+                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+            regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", (self.num_pieces, HO, V, K)))
         else:
             self.tensormap_words = tensormap_workspace_bytes(kernel_module, B, self.num_householder) // 8
             regions.append(("tensormaps", layout.add(self.tensormap_words * 8), "int64", (self.tensormap_words,)))
@@ -321,8 +328,9 @@ class CompiledGdn:
                 self.work_item_rows = self.n_tiles
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
-            if self.tail is not None:
-                regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+            if self.tail is not None or self.ragged_pieces:
+                off_gate = layout.add(4 * GATE_WORDS, align=16)
+                regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
             if self.split:
                 self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
@@ -376,6 +384,43 @@ class CompiledGdn:
             regions.append(("tail_tinv_tensormaps", layout.add(tail_tinv_words * 8, align=128), "int64", (tail_tinv_words,)))
             regions.append(("tail_tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
             regions.append(("tail_tinv_row_count", layout.add(4), "int32", (1,)))
+        if self.ragged_pieces:
+            from .kernel import gdn_summary_f16 as ragged_summary_module
+            from .kernel import gdn_tinv_f16 as ragged_tinv_module
+
+            slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=self.q_rows, batch_invariant=True)
+            ragged_tiles = slots * HO
+            ragged_words = tensormap_workspace_bytes(kernel_module, slots, self.num_householder) // 8
+            ragged_fused_words = tensormap_workspace_bytes(ragged_summary_module, slots, self.num_householder) // 8
+            off_ragged_scheduler = layout.add(24)
+            regions += [
+                ("ragged_scheduler_prefill", off_ragged_scheduler, "int32", (2,)),
+                ("ragged_scheduler_h", off_ragged_scheduler + 8, "int32", (2,)),
+                ("ragged_scheduler_m", off_ragged_scheduler + 16, "int32", (2,)),
+                ("ragged_scheduler_all", off_ragged_scheduler, "int32", (6,)),
+                ("ragged_tensormaps", layout.add(ragged_words * 8), "int64", (ragged_words,)),
+                ("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)),
+                ("ragged_fused_tensormaps", layout.add(ragged_fused_words * 8), "int64", (ragged_fused_words,)),
+            ]
+            table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+            off_ragged_table = layout.add(table.nbytes)
+            regions += [
+                ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+                ("ragged_state_m", layout.add(slots * HO * K * K * 4), "float32", (slots, HO, K, K)),
+                ("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", (slots, HO, V, K)),
+            ]
+            rows = ragged_tinv_module.tinv_rows(self.q_rows, slots, self.expand_num, self.b_t)
+            regions.append(("ragged_tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+            ragged_tinv_words = tensormap_workspace_bytes(ragged_tinv_module, slots, self.num_householder) // 8
+            regions.append(("ragged_tinv_tensormaps", layout.add(ragged_tinv_words * 8, align=128), "int64", (ragged_tinv_words,)))
+            regions.append(("ragged_tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+            regions.append(("ragged_tinv_row_count", layout.add(4), "int32", (1,)))
         if self.tinv_pass:
             from .kernel import gdn_tinv_f16 as tinv_module
 
@@ -438,6 +483,8 @@ class CompiledGdn:
                 aliases |= {"q": "context_q_n", "k": "context_k_n"}
             if self.output_chunk_factors:
                 aliases |= {"tinv": "context_tinv"}
+            if self.output_piece_transitions:
+                aliases |= {"state_m": "context_state_m"}
             absent = len(names) + len(self.carve_names) + (len(self.context.names) if self.has_context else 0)
             if not self.safe_gate:
                 positions.pop("a_log", None)
@@ -480,6 +527,34 @@ class CompiledGdn:
                 self.tail_ctas if self.tail.dv_split else 0,
                 self.tail_item_base if self.tail.dv_split else 0,
             )
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "scheduler_summary": "ragged_scheduler_h",
+                "tinv_words": "ragged_tinv_tensormaps",
+                "summary_words": "ragged_fused_tensormaps",
+                "state_h_summary": "ragged_state_h",
+                "state_m_summary": "ragged_state_m",
+                "state_h_chain": "ragged_state_h",
+                "state_m_chain": "ragged_state_m",
+                "state_x_chain": "ragged_state_x",
+                "state_x_prefill": "ragged_state_x",
+                "seed": "initial_state",
+                "work_count": "ragged_main_count",
+                "scheduler": "ragged_scheduler_prefill",
+                "workspace": "ragged_tensormaps",
+            }
+            absent = len(names) + len(self.carve_names)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (
+                int(self.ragged_pieces),
+                int(self.num_seqs),
+                0,
+                0,
+                0,
+                0,
+            )
 
     def run(self, views, workspace, stream, context=None) -> None:
         composed = views[self.index_composed] if self.index_composed is not None else None
@@ -521,6 +596,8 @@ class CompiledGdn:
             q, k = rows["q_n"], (context_region["k_n"] if self.has_k_normalized else rows["k_n"])
         if self.output_chunk_factors:
             region["tinv"] = context_region["tinv"]
+        if self.output_piece_transitions:
+            region["state_m"] = context_region["state_m"]
         if self.chain:
             self.run_chain(
                 q, k, v, g, beta, cu, state0, composed, o, final_state, state_checkpoints, a_log, dt_bias, state_indices, region, stream, lead_buffers
@@ -550,14 +627,24 @@ class CompiledGdn:
             scheduler=region["scheduler"],
             workspace=region["tensormaps"],
             item_limit_word=region.get("gate"),
-            tail_scalars=self.tail_scalars if self.tail is not None else (),
-            tail_buffers=self.tail_buffers((*views, *region.values(), None)) if self.tail is not None else (),
+            tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 6 if self.ragged_pieces else (),
+            tail_buffers=(
+                self.tail_buffers((*views, *region.values(), None))
+                if self.tail is not None
+                else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+            ),
             lead_buffers=lead_buffers,
+            ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+            ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+            ragged_buffers=self.ragged_buffers((*views, *region.values(), None)) if self.ragged_pieces else (),
         )
         if self.warmup_launch is None:
             tail = self.tail
             self.warmup_launch = self.build_warmup_forward(
                 **buffers,
+                ragged_pieces=self.ragged_pieces,
+                ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                ragged_chain_rows=self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm) if self.ragged_pieces else 0,
                 l2norm_skip_k=self.has_k_normalized,
                 tail=tail,
                 tail_chain_rows=(
@@ -671,7 +758,7 @@ class CompiledGdnBwd:
     expanded pack."""
 
     def __init__(self, node, bwd_module, recompute_module):
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout, ragged_pieces
         from .kernel.gdn_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.gdn_warmup_backward_f16 import TAIL_BUFFERS, build_warmup_backward, run_warmup_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
@@ -743,8 +830,12 @@ class CompiledGdnBwd:
             expand_num=self.expand_num,
             reverse=True,
         )
+        final_state_grad = "d_final_state" in node.inputs or "following_state_grad" in node.inputs
         self.chain = self.pieces > 0
         self.tail = None
+        self.ragged_pieces = 0
+        if not self.chain and not self.batch_invariant and "preceding_state_update" not in node.inputs and "composed_initial_state" not in node.inputs:
+            self.ragged_pieces = ragged_pieces(heads_out=HO, num_sm=self.num_sm, total_tokens=self.q_rows)
         if not self.chain and not self.batch_invariant:
             self.tail = choose_tail(
                 num_seqs=B,
@@ -759,7 +850,7 @@ class CompiledGdnBwd:
                 self.tail = None
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=self.q_rows, batch_invariant=self.batch_invariant) if self.chain else B
         self.fused_h_m = self.chain and not self.has_state_checkpoints
         self.pack_bwd_needed = self.num_householder > 1 and not self.compact_qdo
         self.summary_q_step = self.num_householder if self.pack_bwd_needed and self.use_qk_l2norm else 1
@@ -772,6 +863,8 @@ class CompiledGdnBwd:
 
             self.context = forward_apply_context(
                 self.plan_name,
+                normalized_rows=True,
+                chunk_factors=True,
                 total=total,
                 num_householder=self.num_householder,
                 num_seqs=B,
@@ -793,7 +886,8 @@ class CompiledGdnBwd:
 
             self.context = backward_context(
                 self.plan_name,
-                full=True,
+                normalized_rows=True,
+                chunk_factors=True,
                 total=total,
                 num_householder=self.num_householder,
                 h_q=HQ,
@@ -819,7 +913,8 @@ class CompiledGdnBwd:
         self.has_normalized_rows = self.has_context and self.context.has_rows
         self.has_chunk_factors = same_cut and self.chain
         self.has_piece_tables = same_cut and self.chain and not self.context_from_forward
-        self.has_piece_transitions = self.has_piece_tables and not self.fused_h_m
+        self.has_piece_transitions = same_cut and self.chain and not self.fused_h_m and not (self.context_from_forward and final_state_grad)
+        self.has_m_count = self.chain and not self.fused_h_m and not self.has_piece_transitions and not final_state_grad
 
         layout = WorkspaceLayout()
         regions = []
@@ -909,14 +1004,15 @@ class CompiledGdnBwd:
             self.work_item_rows = self.n_tiles
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
-        if self.tail is not None:
-            regions.append(("gate", layout.add(4 * GATE_WORDS, align=16), "int32", (GATE_WORDS,)))
+        if self.tail is not None or self.ragged_pieces:
+            off_gate = layout.add(4 * GATE_WORDS, align=16)
+            regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
         if self.split:
             self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
             regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         if self.chain:
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes)
             state_shape = (self.num_pieces, HO, V, K)
             regions += [
@@ -930,6 +1026,8 @@ class CompiledGdnBwd:
             ]
             if not self.has_piece_transitions:
                 regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+            if self.has_m_count:
+                regions.append(("m_count", layout.add(4), "int32", (1,)))
             if not self.has_piece_tables:
                 regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
             if not self.has_state_checkpoints:
@@ -1004,6 +1102,64 @@ class CompiledGdnBwd:
                 regions.append(("tail_tinv_tensormaps", layout.add(words * 8, align=128), "int64", (words,)))
                 regions.append(("tail_tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
                 regions.append(("tail_tinv_row_count", layout.add(4), "int32", (1,)))
+        if self.ragged_pieces:
+            from .kernel import gdn_bprop_summary_f16 as ragged_summary_module
+            from .kernel import gdn_tinv_f16 as ragged_tinv_module
+
+            slots = piece_capacity(num_seqs=B, pieces=self.ragged_pieces, total_tokens=self.q_rows, batch_invariant=True)
+            ragged_tiles = slots * HO
+            off_ragged_scheduler = layout.add(40)
+            regions += [
+                ("ragged_scheduler_recompute", off_ragged_scheduler, "int32", (2,)),
+                ("ragged_scheduler_bwd", off_ragged_scheduler + 8, "int32", (2,)),
+                ("ragged_scheduler_summary", off_ragged_scheduler + 16, "int32", (2,)),
+                ("ragged_scheduler_m", off_ragged_scheduler + 24, "int32", (2,)),
+                ("ragged_scheduler_series", off_ragged_scheduler + 32, "int32", (2,)),
+                ("ragged_scheduler_all", off_ragged_scheduler, "int32", (10,)),
+            ]
+            words = tensormap_workspace_bytes(ragged_summary_module, slots, self.num_householder) // 8
+            regions.append(("ragged_summary_tensormaps", layout.add(words * 8), "int64", (words,)))
+            words = tensormap_workspace_bytes(bwd_module, slots, self.num_householder) // 8
+            regions.append(("ragged_tensormaps", layout.add(words * 8), "int64", (words,)))
+            words = tensormap_workspace_bytes(recompute_module, slots, self.num_householder) // 8
+            regions.append(("ragged_recompute_tensormaps_m", layout.add(words * 8), "int64", (words,)))
+            if self.needs_recompute:
+                regions.append(("ragged_recompute_tensormaps_series", layout.add(words * 8), "int64", (words,)))
+            if not self.has_state_checkpoints:
+                from .kernel import gdn_summary_f16 as ragged_fused_module
+
+                words = tensormap_workspace_bytes(ragged_fused_module, slots, self.num_householder) // 8
+                regions.append(("ragged_fused_tensormaps", layout.add(words * 8), "int64", (words,)))
+            if self.coarse_checkpoints:
+                rows = max((total // self.recompute_span_tokens + 2 * slots) * HO, 1)
+                regions.append(("ragged_work_items_recompute", layout.add(rows * WORK_ITEM_FIELDS * 4), "int32", (rows, WORK_ITEM_FIELDS)))
+                regions.append(("ragged_work_count_recompute", layout.add(4), "int32", (1,)))
+                regions.append(("ragged_seed_row_base", layout.add(4), "int32", (1,)))
+            regions.append(("ragged_work_items", layout.add(ragged_tiles * WORK_ITEM_FIELDS * 4), "int32", (ragged_tiles, WORK_ITEM_FIELDS)))
+            table = piece_table_layout(B, self.ragged_pieces, HO, capacity=slots)
+            off_ragged_table = layout.add(table.nbytes)
+            state_shape = (slots, HO, V, K)
+            regions += [
+                ("ragged_main_rows", off_ragged_table + table.main_rows, "int32", (B + 1,)),
+                ("ragged_summary_rows", off_ragged_table + table.summary_rows, "int32", (B + 1,)),
+                ("ragged_cu_pieces", off_ragged_table + table.cu_pieces, "int32", (slots + 1,)),
+                ("ragged_main_count", off_ragged_table + table.main_count, "int32", (1,)),
+                ("ragged_summary_count", off_ragged_table + table.summary_count, "int32", (1,)),
+                ("ragged_work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
+                ("ragged_state_m", layout.add(slots * HO * K * K * 4), "float32", (slots, HO, K, K)),
+                ("ragged_state_g", layout.add(slots * HO * V * K * 4), "float32", state_shape),
+                ("ragged_state_dx_end", layout.add(slots * HO * V * K * 4), "float32", state_shape),
+            ]
+            if not self.has_state_checkpoints:
+                regions.append(("ragged_state_h", layout.add(slots * HO * V * K * 4), "float32", state_shape))
+                regions.append(("ragged_state_x", layout.add(slots * HO * V * K * 4), "float32", state_shape))
+            if not self.tinv_pass:
+                rows = ragged_tinv_module.tinv_rows(self.q_rows, slots, self.expand_num, self.b_t)
+                regions.append(("ragged_tinv", layout.add(rows * HO * self.b_t * self.b_t * 2), self.io_name, (rows, HO, self.b_t, self.b_t)))
+                words = tensormap_workspace_bytes(ragged_tinv_module, slots, self.num_householder) // 8
+                regions.append(("ragged_tinv_tensormaps", layout.add(words * 8, align=128), "int64", (words,)))
+                regions.append(("ragged_tinv_rows", layout.add(rows * 16), "int32", (rows, 4)))
+                regions.append(("ragged_tinv_row_count", layout.add(4), "int32", (1,)))
         self.recompute_orders = self.needs_recompute and not self.coarse_checkpoints
         self.bwd_orders = not self.recompute_orders
         self.workspace_size = layout.size
@@ -1076,6 +1232,45 @@ class CompiledGdnBwd:
                 int(self.recompute_span_tokens if coarse else 0) // self.b_t,
                 int(self.tail.batch_base),
                 int(self.tail.first_head_lo),
+            )
+        if self.ragged_pieces:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            if self.has_context:
+                positions |= {"context_" + name: len(names) + len(self.carve_names) + i for i, name in enumerate(self.context.names)}
+            coarse = self.coarse_checkpoints
+            rows = "context_" if self.has_normalized_rows else ""
+            aliases = {
+                "series_items": "ragged_work_items_recompute",
+                "series_count": "ragged_work_count_recompute",
+                "recompute_items": ("ragged_work_items_recompute" if coarse else "ragged_work_items") if self.needs_recompute else None,
+                "recompute_count": ("ragged_work_count_recompute" if coarse else "ragged_main_count") if self.needs_recompute else None,
+                "tinv_words": "ragged_tinv_tensormaps",
+                "summary_words": "ragged_fused_tensormaps",
+                "recompute_m_words": "ragged_recompute_tensormaps_m",
+                "series_words": "ragged_recompute_tensormaps_series",
+                "bprop_summary_words": "ragged_summary_tensormaps",
+                "bprop_words": "ragged_tensormaps",
+                "summary_q": "q" if self.pack_expands_q or not self.use_qk_l2norm else rows + "q_n",
+                "summary_do": "dO",
+                "tinv": "tinv" if self.tinv_pass else "ragged_tinv",
+                "state_h_summary": "ragged_state_h",
+                "state_m_main": "ragged_state_m",
+                "state_h_chain": "ragged_state_h",
+                "state_m_chain": "ragged_state_m",
+                "state_x_chain": "ragged_state_x",
+                "seed": "initial_state",
+                "state_x_series": "ragged_state_x",
+                "dseed": "d_final_state",
+            }
+            absent = len(names) + len(self.carve_names) + (len(self.context.names) if self.has_context else 0)
+            indices = [positions.get(aliases.get(name, "ragged_" + name), absent) for name in self.tail_buffer_names]
+            self.ragged_buffers = itemgetter(*indices)
+            self.ragged_scalars = (
+                int(self.ragged_pieces),
+                int(self.num_seqs),
+                int(self.recompute_span_tokens if coarse else 0) // self.b_t,
+                0,
+                0,
             )
 
     def run(self, views, workspace, stream, context=None) -> None:
@@ -1232,8 +1427,15 @@ class CompiledGdnBwd:
                 inv_k=inv_k,
                 scheduler_bwd=scheduler_bwd,
                 item_limit_word=region.get("gate"),
-                tail_scalars=self.tail_scalars if self.tail is not None else (),
-                tail_buffers=self.tail_buffers((*views, *region.values(), *context_region.values(), None)) if self.tail is not None else (),
+                tail_scalars=self.tail_scalars if self.tail is not None else (0,) * 5 if self.ragged_pieces else (),
+                tail_buffers=(
+                    self.tail_buffers((*views, *region.values(), *context_region.values(), None))
+                    if self.tail is not None
+                    else (None,) * len(self.tail_buffer_names) if self.ragged_pieces else ()
+                ),
+                ragged_enable=region.get("ragged_enable") if self.ragged_pieces else None,
+                ragged_scalars=self.ragged_scalars if self.ragged_pieces else (),
+                ragged_buffers=self.ragged_buffers((*views, *region.values(), *context_region.values(), None)) if self.ragged_pieces else (),
                 lead_buffers=lead_buffers,
                 gate_blocks=self.gate_bwd_blocks,
                 post_buffers=post_buffers,
@@ -1247,6 +1449,11 @@ class CompiledGdnBwd:
                 self.warmup_launch = self.build_warmup_backward(
                     bprop_module=self.bwd,
                     **buffers,
+                    ragged_pieces=self.ragged_pieces,
+                    ragged_unit_chunks=self.unit_chunks if self.ragged_pieces else 0,
+                    ragged_chain_rows=(
+                        self.chain_rows_per_cta(self.dim_v, self.dim_k, self.num_seqs, self.n_heads_out, self.num_sm) if self.ragged_pieces else 0
+                    ),
                     **seeds,
                     scale=self.scale,
                     use_initial_state=state0 is not None or composed is not None,
@@ -1360,7 +1567,7 @@ class CompiledGdnBwd:
             series_words=region.get("recompute_tensormaps_series"),
             bprop_summary_words=region["summary_tensormaps"],
             bprop_words=region["tensormaps"],
-            checkpoints=region["state_checkpoints"] if series else state_checkpoints,
+            checkpoints=state_checkpoints if (self.has_state_checkpoints and not coarse) else region["state_checkpoints"],
             seed_checkpoints=state_checkpoints if coarse else None,
             dq=dq_out,
             dk=dk_out,
@@ -1385,6 +1592,7 @@ class CompiledGdnBwd:
             lead_buffers=lead_buffers,
             gate_blocks=self.gate_bwd_blocks,
             post_buffers=post_buffers,
+            m_count=region.get("m_count"),
         )
         schedule = dict(
             pieces=self.pieces,
@@ -1445,7 +1653,7 @@ class GdnSummaryFrostEngine(BaseEngine):
     and GDN_SUMMARY_BWD (d_initial_state through the bprop summary kernel) graphs."""
 
     name = "gdn_summary_frost"
-    behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
+    behavior_notes = (cudnn.behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph) -> None:
         facts = graph._facts_for(analyze)
@@ -1474,7 +1682,7 @@ class CompiledGdnSummary:
 
     def __init__(self, node, recompute_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_capacity, piece_table_layout
         from .kernel.gdn_chain_forward_f16 import build_chain_summary, run_chain_summary
         from .kernel.gdn_warmup_forward_f16 import SUMMARY_TAIL_BUFFERS, build_warmup_summary, run_warmup_summary
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
@@ -1556,7 +1764,11 @@ class CompiledGdnSummary:
                 expand_num=self.num_householder,
             )
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = (
+            piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total // self.num_householder, batch_invariant=self.batch_invariant)
+            if self.chain
+            else B
+        )
         from .kernel import gdn_summary_f16 as summary_module
 
         layout = WorkspaceLayout()
@@ -1568,7 +1780,7 @@ class CompiledGdnSummary:
                 ("scheduler_m", off_scheduler + 8, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (6,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
@@ -1834,7 +2046,7 @@ class CompiledGdnSummaryBwd:
 
     def __init__(self, node, summary_module):
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_capacity, piece_table_layout
         from .kernel.gdn_chain_backward_f16 import build_chain_summary_backward, run_chain_summary_backward
         from .kernel.gdn_warmup_backward_f16 import SUMMARY_TAIL_BUFFERS, build_warmup_summary_backward, run_warmup_summary_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
@@ -1899,7 +2111,8 @@ class CompiledGdnSummaryBwd:
 
             self.context = backward_context(
                 self.plan_name,
-                full=True,
+                normalized_rows=True,
+                chunk_factors=True,
                 total=total,
                 num_householder=self.num_householder,
                 h_q=HQ,
@@ -1930,7 +2143,11 @@ class CompiledGdnSummaryBwd:
             )
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state
         self.length_rule = self.chain and self.batch_invariant
-        self.num_pieces = B * self.pieces if self.chain else B
+        self.num_pieces = (
+            piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total // self.num_householder, batch_invariant=self.batch_invariant)
+            if self.chain
+            else B
+        )
         self.has_normalized_rows = self.has_context and self.context.has_rows
         self.has_chunk_factors = self.has_context and self.context.has_tables
         self.has_piece_tables = self.has_context and self.context.has_tables
@@ -1945,7 +2162,7 @@ class CompiledGdnSummaryBwd:
                 ("scheduler_m", off_scheduler + 8, "int32", (2,)),
                 ("scheduler_all", off_scheduler, "int32", (6,)),
             ]
-            table = piece_table_layout(B, self.pieces, HO)
+            table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes, align=256)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),

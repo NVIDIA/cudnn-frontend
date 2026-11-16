@@ -130,6 +130,8 @@ def frost_kda_regenerate_prologue(
     seed_span_chunks: cutlass.Int32,
     mItemLimit: Optional[cute.Tensor] = None,
     gate_sms: cutlass.Constexpr[int] = 0,
+    gate_chain_pieces: cutlass.Constexpr[int] = 0,
+    gate_tail: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Four-CTA prologue of the regenerate path, the recompute's and the bprop's prologues in one launch: block 0 the
     recompute's item phase (the interval items under ``coarse``, the uncut table under ``recompute_orders``), block 1
@@ -145,7 +147,7 @@ def frost_kda_regenerate_prologue(
     n_items = n_heads_out * n_batch
     if cutlass.const_expr(mItemLimit is not None):
         if cutlass.const_expr(gate_sms > 0):
-            gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+            gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit, gate_chain_pieces, gate_tail)
         n_items = cutlass.Int32(mItemLimit[1])
     if bidx == cutlass.Int32(0):
         if cutlass.const_expr(coarse):
@@ -360,6 +362,58 @@ def uncut_backward_host(
     tail_dcomposed: Optional[cute.Tensor] = None,
     tail_dstate0: Optional[cute.Tensor] = None,
     tail_seed_row_base: Optional[cute.Tensor] = None,
+    ragged_unit_chunks: cutlass.Constexpr[int] = 0,
+    ragged_chain_rows: cutlass.Constexpr[int] = 0,
+    ragged_summary_cfg: cutlass.Constexpr = None,
+    ragged_transition_cfg: cutlass.Constexpr = None,
+    ragged_bwd_summary_cfg: cutlass.Constexpr = None,
+    ragged_series_cfg: cutlass.Constexpr = None,
+    ragged_bprop_cfg: cutlass.Constexpr = None,
+    ragged_pieces: cutlass.Int32 = 0,
+    ragged_num_seqs: cutlass.Int32 = 0,
+    ragged_series_span_chunks: cutlass.Int32 = 0,
+    ragged_batch_base: cutlass.Int32 = 0,
+    ragged_first_head_lo: cutlass.Int32 = 0,
+    ragged_cu_pieces: Optional[cute.Tensor] = None,
+    ragged_cu_pieces_main: Optional[cute.Tensor] = None,
+    ragged_main_rows: Optional[cute.Tensor] = None,
+    ragged_summary_rows: Optional[cute.Tensor] = None,
+    ragged_main_count: Optional[cute.Tensor] = None,
+    ragged_summary_count: Optional[cute.Tensor] = None,
+    ragged_work_items: Optional[cute.Tensor] = None,
+    ragged_work_items_summary: Optional[cute.Tensor] = None,
+    ragged_series_items: Optional[cute.Tensor] = None,
+    ragged_series_count: Optional[cute.Tensor] = None,
+    ragged_recompute_items: Optional[cute.Tensor] = None,
+    ragged_recompute_count: Optional[cute.Tensor] = None,
+    ragged_scheduler_all: Optional[cute.Tensor] = None,
+    ragged_scheduler_recompute: Optional[cute.Tensor] = None,
+    ragged_scheduler_m: Optional[cute.Tensor] = None,
+    ragged_scheduler_series: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary: Optional[cute.Tensor] = None,
+    ragged_scheduler_bwd: Optional[cute.Tensor] = None,
+    ragged_summary_words: Optional[cute.Tensor] = None,
+    ragged_recompute_m_words: Optional[cute.Tensor] = None,
+    ragged_series_words: Optional[cute.Tensor] = None,
+    ragged_bprop_summary_words: Optional[cute.Tensor] = None,
+    ragged_bprop_words: Optional[cute.Tensor] = None,
+    ragged_state_h_summary: Optional[cute.Tensor] = None,
+    ragged_state_m_main: Optional[cute.Tensor] = None,
+    ragged_state_h_chain: Optional[cute.Tensor] = None,
+    ragged_state_m_chain: Optional[cute.Tensor] = None,
+    ragged_state_x_chain: Optional[cute.Tensor] = None,
+    ragged_seed: Optional[cute.Tensor] = None,
+    ragged_state_x_series: Optional[cute.Tensor] = None,
+    ragged_state_g: Optional[cute.Tensor] = None,
+    ragged_state_g_chain: Optional[cute.Tensor] = None,
+    ragged_state_dx_end_chain: Optional[cute.Tensor] = None,
+    ragged_state_dx_end: Optional[cute.Tensor] = None,
+    ragged_dseed: Optional[cute.Tensor] = None,
+    ragged_dcomposed: Optional[cute.Tensor] = None,
+    ragged_dstate0: Optional[cute.Tensor] = None,
+    ragged_seed_row_base: Optional[cute.Tensor] = None,
+    ragged_gate_pieces: cutlass.Constexpr[int] = 0,
+    ragged_enable: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         if cutlass.const_expr(fold_seed is not None):
@@ -448,6 +502,8 @@ def uncut_backward_host(
             seed_span_chunks,
             item_limit_word,
             gate_sms,
+            ragged_gate_pieces,
+            tail_bprop_cfg is not None,
         ).launch(grid=(4, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
         kda_recompute_f16.host(
             recompute_cfg,
@@ -493,6 +549,8 @@ def uncut_backward_host(
             stream,
             item_limit_word=item_limit_word,
             gate_sms=gate_sms,
+            gate_chain_pieces=ragged_gate_pieces,
+            gate_tail=tail_bprop_cfg is not None,
         )
     kda_bprop_f16.host(
         bprop_cfg,
@@ -606,6 +664,95 @@ def uncut_backward_host(
             tail_seed_row_base,
             stream,
             item_limit_word,
+        )
+    if cutlass.const_expr(ragged_bprop_cfg is not None):
+        kda_chain_backward_f16.chain_backward_host(
+            ragged_unit_chunks,
+            b_t,
+            True,
+            ragged_summary_cfg is not None,
+            ragged_series_cfg is not None,
+            False,
+            False,
+            ragged_summary_cfg,
+            ragged_transition_cfg,
+            ragged_bwd_summary_cfg,
+            ragged_series_cfg,
+            ragged_bprop_cfg,
+            ragged_bprop_cfg.d_v,
+            ragged_bprop_cfg.d_k,
+            ragged_chain_rows,
+            ragged_seed is not None,
+            ragged_dseed is not None,
+            True,
+            ragged_pieces,
+            heads_out,
+            ragged_num_seqs,
+            ragged_series_span_chunks,
+            checkpoint_every_n,
+            seed_every_n,
+            scale,
+            ragged_batch_base,
+            ragged_first_head_lo,
+            q,
+            k,
+            v,
+            do,
+            gate,
+            gate_main,
+            beta,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            ragged_cu_pieces,
+            ragged_cu_pieces_main,
+            ragged_main_rows,
+            ragged_summary_rows,
+            ragged_main_count,
+            ragged_summary_count,
+            ragged_work_items,
+            ragged_work_items_summary,
+            ragged_series_items,
+            ragged_series_count,
+            ragged_recompute_items,
+            ragged_recompute_count,
+            ragged_scheduler_all,
+            ragged_scheduler_recompute,
+            ragged_scheduler_m,
+            ragged_scheduler_series,
+            ragged_scheduler_summary,
+            ragged_scheduler_bwd,
+            ragged_summary_words,
+            ragged_recompute_m_words,
+            ragged_series_words,
+            ragged_bprop_summary_words,
+            ragged_bprop_words,
+            dstate_scratch,
+            checkpoints,
+            seed_checkpoints,
+            dq,
+            dk,
+            dv,
+            dgate,
+            dbeta,
+            ragged_state_h_summary,
+            ragged_state_m_main,
+            ragged_state_h_chain,
+            ragged_state_m_chain,
+            ragged_state_x_chain,
+            ragged_seed,
+            None,
+            ragged_state_x_series,
+            ragged_state_g,
+            ragged_state_g_chain,
+            ragged_state_dx_end_chain,
+            ragged_state_dx_end,
+            ragged_dseed,
+            ragged_dcomposed,
+            ragged_dstate0,
+            ragged_seed_row_base,
+            stream,
+            ragged_enable,
         )
     if cutlass.const_expr(gate_bwd_dgate is not None):
         gate_tokens = cutlass.Int32(gate_bwd_dgate.shape[0])
@@ -774,6 +921,12 @@ def build_uncut_backward(
     tail_buffers=(),
     post_buffers=(None,) * 14,
     fold_buffers=(None,) * 4,
+    ragged_pieces=0,
+    ragged_unit_chunks=0,
+    ragged_chain_rows=0,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ):
     """Compile (cached per static config) the uncut backward launch over the buffers of one plan.  The placeholders
     repeat the marks of the standalone builds so every kernel compiles as it does there; the recompute or the bprop
@@ -828,6 +981,16 @@ def build_uncut_backward(
         ),
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in post_buffers),
         (int(fold_rows), tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers)),
+        (
+            (
+                int(ragged_pieces),
+                int(ragged_unit_chunks),
+                int(ragged_chain_rows),
+                *(str(buffer.dtype) if buffer is not None else None for buffer in ragged_buffers),
+            )
+            if ragged_pieces
+            else None
+        ),
     )
     if key not in uncut_backward_cache:
         recompute_cfg, bprop_cfg = build_configs(
@@ -956,6 +1119,107 @@ def build_uncut_backward(
                 from_dlpack(buffers["dstate0"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["dstate0"] is not None else None,
                 from_dlpack(buffers["seed_row_base"], assumed_align=4).mark_layout_dynamic() if buffers["seed_row_base"] is not None else None,
             ]
+        ragged_constexprs = ()
+        ragged_placeholders = ()
+        if ragged_pieces:
+            if tail is None:
+                tail_constexprs = (0, 0, None, None, None, None, None)
+                tail_placeholders = [*(cutlass.Int32(0) for _ in range(5)), *([None] * len(TAIL_BUFFERS))]
+            buffers = dict(zip(TAIL_BUFFERS, ragged_buffers))
+            HO = gate.shape[1]
+            ragged_cfgs = kda_chain_backward_f16.build_configs(
+                io_dtype,
+                get_dtype(buffers["state_x_series"].dtype) if buffers["state_x_series"] is not None else cutlass.Float32,
+                get_dtype(buffers["state_m_main"].dtype),
+                gate_dtype,
+                fused_h_m=buffers["state_h_summary"] is not None,
+                series=buffers["recompute_items"] is not None,
+                coarse=coarse,
+                use_dstate0=buffers["dstate0"] is not None,
+                l2norm=use_qk_l2norm,
+                safe_gate=safe_gate,
+                gate_scale_log2=gate_scale_log2,
+                log_gate=log_gate,
+                beta_sigmoid=use_beta_sigmoid,
+                allow_neg_eigval=allow_neg_eigval,
+                max_active_clusters=num_sm,
+                d_k=DK,
+                d_v=DV,
+            )
+            ragged_summary_cfg, ragged_transition_cfg, ragged_series_cfg, ragged_bwd_summary_cfg, ragged_bprop_cfg = ragged_cfgs
+            ragged_constexprs = (
+                int(ragged_unit_chunks),
+                int(ragged_chain_rows),
+                ragged_summary_cfg,
+                ragged_transition_cfg,
+                ragged_bwd_summary_cfg,
+                ragged_series_cfg,
+                ragged_bprop_cfg,
+            )
+            ragged_items = {}
+            for name in ("work_items", "work_items_summary", "series_items"):
+                ragged_items[name] = None
+                if buffers[name] is not None:
+                    ragged_items[name] = from_dlpack(buffers[name], assumed_align=16)
+                    ragged_items[name].mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            chain_states = [
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3) for _ in range(5)
+            ]
+            ragged_placeholders = [
+                *(cutlass.Int32(int(value)) for value in ragged_scalars),
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["cu_pieces_main"], assumed_align=8).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["main_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                ragged_items["work_items"],
+                ragged_items["work_items_summary"],
+                ragged_items["series_items"],
+                from_dlpack(buffers["series_count"], assumed_align=4).mark_layout_dynamic() if buffers["series_count"] is not None else None,
+                (ragged_items["series_items"] if coarse else ragged_items["work_items"]) if buffers["recompute_items"] is not None else None,
+                from_dlpack(buffers["recompute_count"], assumed_align=4).mark_layout_dynamic() if buffers["recompute_count"] is not None else None,
+                *(
+                    from_dlpack(buffers[name], assumed_align=4).mark_layout_dynamic()
+                    for name in ("scheduler_all", "scheduler_recompute", "scheduler_m", "scheduler_series", "scheduler_summary", "scheduler_bwd")
+                ),
+                *(
+                    from_dlpack(buffers[name], assumed_align=128).mark_layout_dynamic() if buffers[name] is not None else None
+                    for name in ("summary_words", "recompute_m_words", "series_words", "bprop_summary_words", "bprop_words")
+                ),
+                (
+                    from_dlpack(buffers["state_h_summary"], assumed_align=16).mark_layout_dynamic(leading_dim=3)
+                    if buffers["state_h_summary"] is not None
+                    else None
+                ),
+                from_dlpack(buffers["state_m_main"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                chain_states[0] if buffers["state_h_chain"] is not None else None,
+                from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                chain_states[1] if buffers["state_x_chain"] is not None else None,
+                (
+                    from_dlpack(DeviceView(256, (1, HO, DV, DK), dtype_name(buffers["seed"].dtype), int(device)), assumed_align=4).mark_layout_dynamic(
+                        leading_dim=3
+                    )
+                    if buffers["seed"] is not None
+                    else None
+                ),
+                from_dlpack(buffers["state_x_series"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["state_x_series"] is not None else None,
+                from_dlpack(buffers["state_g"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                chain_states[2],
+                chain_states[3],
+                from_dlpack(buffers["state_dx_end"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                (
+                    from_dlpack(DeviceView(256, (1, HO, DV, DK), dtype_name(buffers["dseed"].dtype), int(device)), assumed_align=4).mark_layout_dynamic(
+                        leading_dim=3
+                    )
+                    if buffers["dseed"] is not None
+                    else None
+                ),
+                chain_states[4] if buffers["dcomposed"] is not None else None,
+                from_dlpack(buffers["dstate0"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["dstate0"] is not None else None,
+                from_dlpack(buffers["seed_row_base"], assumed_align=4).mark_layout_dynamic() if buffers["seed_row_base"] is not None else None,
+            ]
+            ragged_placeholders += [int(ragged_pieces), from_dlpack(ragged_enable, assumed_align=4).mark_layout_dynamic()]
         gate_align = 4 * (gate_dtype.width // 8)
         post_placeholders = [
             from_dlpack(buffer, assumed_align=gate_align).mark_layout_dynamic(leading_dim=2) if buffer is not None else None for buffer in post_buffers[:2]
@@ -1037,6 +1301,8 @@ def build_uncut_backward(
             *fold_placeholders,
             *tail_constexprs,
             *tail_placeholders,
+            *ragged_constexprs,
+            *ragged_placeholders,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return uncut_backward_cache[key]
@@ -1093,6 +1359,9 @@ def run_uncut_backward(
     tail_buffers=(),
     post_buffers=(None,) * 14,
     fold_buffers=(None,) * 4,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ) -> None:
     """Replay the uncut backward: one crossing into the DSL.  The plan validated the contract at build, so nothing here
     raises."""
@@ -1142,6 +1411,7 @@ def run_uncut_backward(
         *fold_buffers,
         *tail_scalars,
         *tail_buffers,
+        *((*ragged_scalars, *ragged_buffers, ragged_enable) if ragged_buffers else ()),
     )
 
 

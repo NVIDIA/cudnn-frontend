@@ -68,6 +68,8 @@ TAIL_BUFFERS = (
     "prep_row_count",
 )
 
+RAGGED_BUFFERS = TAIL_BUFFERS[:20]
+
 uncut_forward_cache = {}
 
 
@@ -162,6 +164,32 @@ def uncut_forward_host(
     tail_prep_words: Optional[cute.Tensor] = None,
     tail_prep_rows: Optional[cute.Tensor] = None,
     tail_prep_row_count: Optional[cute.Tensor] = None,
+    ragged_unit_chunks: cutlass.Constexpr[int] = 0,
+    ragged_chain_rows: cutlass.Constexpr[int] = 0,
+    ragged_pieces: cutlass.Constexpr[int] = 0,
+    ragged_summary_cfg: cutlass.Constexpr = None,
+    ragged_prefill_cfg: cutlass.Constexpr = None,
+    ragged_enable: Optional[cute.Tensor] = None,
+    ragged_cu_pieces: Optional[cute.Tensor] = None,
+    ragged_cu_pieces_main: Optional[cute.Tensor] = None,
+    ragged_main_rows: Optional[cute.Tensor] = None,
+    ragged_summary_rows: Optional[cute.Tensor] = None,
+    ragged_summary_count: Optional[cute.Tensor] = None,
+    ragged_work_items_summary: Optional[cute.Tensor] = None,
+    ragged_scheduler_all: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary: Optional[cute.Tensor] = None,
+    ragged_summary_words: Optional[cute.Tensor] = None,
+    ragged_state_h_summary: Optional[cute.Tensor] = None,
+    ragged_state_m_summary: Optional[cute.Tensor] = None,
+    ragged_state_h_chain: Optional[cute.Tensor] = None,
+    ragged_state_m_chain: Optional[cute.Tensor] = None,
+    ragged_state_x_chain: Optional[cute.Tensor] = None,
+    ragged_seed: Optional[cute.Tensor] = None,
+    ragged_state_x_prefill: Optional[cute.Tensor] = None,
+    ragged_work_items: Optional[cute.Tensor] = None,
+    ragged_work_count: Optional[cute.Tensor] = None,
+    ragged_scheduler: Optional[cute.Tensor] = None,
+    ragged_workspace: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         launch_state_chain(
@@ -232,6 +260,8 @@ def uncut_forward_host(
             item_limit_word=item_limit_word,
             tail_enable=tail_enable,
             gate_sms=gate_sms,
+            gate_chain_pieces=ragged_pieces,
+            gate_tail=tail_prefill_cfg is not None,
         )
         gdn2_prep_f16.host(
             prep_cfg,
@@ -279,6 +309,8 @@ def uncut_forward_host(
             item_limit_word=item_limit_word,
             tail_enable=tail_enable,
             gate_sms=gate_sms,
+            gate_chain_pieces=ragged_pieces,
+            gate_tail=tail_prefill_cfg is not None,
         )
     prefill_host = gdn2_prep_prefill_f16.host if cutlass.const_expr(prep) else gdn2_prefill_f16.host
     prefill_host(
@@ -412,6 +444,64 @@ def uncut_forward_host(
             None,
             item_limit_word,
         )
+    if cutlass.const_expr(ragged_summary_cfg is not None):
+        gdn2_chain_forward_f16.chain_forward_host(
+            ragged_unit_chunks,
+            b_t,
+            True,
+            ragged_summary_cfg,
+            ragged_prefill_cfg,
+            ragged_prefill_cfg.d_v,
+            ragged_prefill_cfg.d_k,
+            ragged_chain_rows,
+            ragged_seed is not None,
+            True,
+            cutlass.Int32(ragged_pieces),
+            cutlass.Int32(gate.shape[1]),
+            cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(1),
+            checkpoint_every_n,
+            scale,
+            cutlass.Int32(0),
+            cutlass.Int32(0),
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            beta_prefill,
+            w,
+            a_log,
+            dt_bias,
+            o,
+            cu_seqlens,
+            ragged_cu_pieces,
+            ragged_cu_pieces_main,
+            ragged_main_rows,
+            ragged_summary_rows,
+            ragged_work_count,
+            ragged_summary_count,
+            ragged_work_items,
+            ragged_work_items_summary,
+            ragged_scheduler_all,
+            ragged_scheduler_summary,
+            ragged_scheduler,
+            ragged_summary_words,
+            ragged_workspace,
+            ragged_state_h_summary,
+            ragged_state_m_summary,
+            ragged_state_h_chain,
+            ragged_state_m_chain,
+            ragged_state_x_chain,
+            ragged_seed,
+            None,
+            seed_indices,
+            ragged_state_x_prefill,
+            state_out,
+            final_indices,
+            checkpoints,
+            stream,
+            ragged_enable,
+        )
 
 
 def build_uncut_forward(
@@ -469,6 +559,11 @@ def build_uncut_forward(
     tail_scalars=(),
     tail_buffers=(),
     lead_buffers=(None,) * 4,
+    ragged_pieces=0,
+    ragged_unit_chunks=0,
+    ragged_chain_rows=0,
+    ragged_enable=None,
+    ragged_buffers=(),
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, the d_v split, state and checkpoint
     presence, device) the uncut forward launch over the buffers of one plan.  The placeholders repeat the marks of the
@@ -523,6 +618,7 @@ def build_uncut_forward(
         (int(tail.unit_chunks), int(tail_chain_rows), bool(tail.dv_split), bool(tail_prep)) if tail is not None else None,
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in lead_buffers),
         fold_rows,
+        (int(ragged_pieces), int(ragged_unit_chunks), int(ragged_chain_rows)),
     )
     if key not in uncut_forward_cache:
         prefill_module = gdn2_prep_prefill_f16 if prep else gdn2_prefill_f16
@@ -665,6 +761,74 @@ def build_uncut_forward(
                 from_dlpack(buffers["workspace"], assumed_align=128).mark_layout_dynamic(),
                 *tail_prep_placeholders,
             ]
+        ragged_placeholders = ()
+        if ragged_pieces:
+            if tail is None:
+                tail_constexprs = (0, 0, None, None, None)
+                tail_placeholders = [*(cutlass.Int32(0) for _ in range(6)), *([None] * 28)]
+            buffers = dict(zip(RAGGED_BUFFERS, ragged_buffers))
+            HO = gate.shape[1]
+            seed_name = dtype_name(state_in.dtype) if state_in is not None else "float32"
+            ragged_flags = dict(
+                l2norm=use_qk_l2norm,
+                safe_gate=safe_gate,
+                gate_scale_log2=float(gate_lower_bound) * gdn2_prefill_f16.LOG2_E,
+                log_gate=log_gate,
+                beta_sigmoid=use_beta_sigmoid,
+                allow_neg_eigval=allow_neg_eigval,
+                beta_guard=beta_guard,
+                max_active_clusters=num_sm,
+                d_k=DK,
+            )
+            ragged_summary_cfg = gdn2_summary_f16.build_cfg(io_dtype, gate_dtype, use_initial_state=False, d_v=DV, **ragged_flags)
+            ragged_prefill_cfg = gdn2_prefill_f16.build_cfg(
+                io_dtype,
+                get_dtype(buffers["state_x_prefill"].dtype),
+                gate_dtype,
+                use_initial_state=True,
+                d_v=DV,
+                store_final_state=state_out is not None,
+                enable_checkpoints=int(checkpoint_every_n_tokens) > 0,
+                checkpoint_dtype=get_dtype(checkpoints.dtype) if int(checkpoint_every_n_tokens) > 0 else None,
+                checkpoint_after_block=bool(checkpoint_after_block),
+                **ragged_flags,
+            )
+            ragged_items_summary = from_dlpack(buffers["work_items_summary"], assumed_align=16)
+            ragged_items_summary.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_items = from_dlpack(buffers["work_items"], assumed_align=16)
+            ragged_items.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_placeholders = [
+                int(ragged_unit_chunks),
+                int(ragged_chain_rows),
+                int(ragged_pieces),
+                ragged_summary_cfg,
+                ragged_prefill_cfg,
+                from_dlpack(ragged_enable, assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["cu_pieces_main"], assumed_align=8).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                ragged_items_summary,
+                from_dlpack(buffers["scheduler_all"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["state_h_summary"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["state_m_summary"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, (1, HO, DK, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(DeviceView(256, (1, HO, DV, DK), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                (
+                    from_dlpack(DeviceView(256, (1, HO, DV, DK), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3)
+                    if state_in is not None
+                    else None
+                ),
+                from_dlpack(buffers["state_x_prefill"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                ragged_items,
+                from_dlpack(buffers["work_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["workspace"], assumed_align=128).mark_layout_dynamic(),
+            ]
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
         fold_placeholders = [None] * 4
@@ -727,6 +891,7 @@ def build_uncut_forward(
             *fold_placeholders,
             *tail_constexprs,
             *tail_placeholders,
+            *ragged_placeholders,
             cache_key=repr((__name__, key)),
             symbol="frost_la_gdn2_uncut_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
@@ -777,6 +942,8 @@ def run_uncut_forward(
     tail_scalars=(),
     tail_buffers=(),
     lead_buffers=(None,) * 4,
+    ragged_enable=None,
+    ragged_buffers=(),
 ) -> None:
     """Replay the uncut forward: one crossing into the DSL for the prologue and prefill launches.  The plan validated the
     contract at build, so nothing here raises."""
@@ -822,6 +989,7 @@ def run_uncut_forward(
         *lead_buffers,
         *tail_scalars,
         *tail_buffers,
+        *((ragged_enable, *ragged_buffers) if ragged_buffers else ()),
     )
 
 

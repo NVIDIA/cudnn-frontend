@@ -5,7 +5,7 @@
 Chunked Gated Delta Net 2 (GDN-2) piece-chain prologue for SM100 / SM103 / SM107 (Cutlass primitives): the one launch that
 builds every table the chain's kernels read, so each consumer keeps its body and skips its own prologue.
 
-Phases (two blocks: both build the piece table, block 0 the work-item tables, block 1 the descriptor arrays):
+Phases (one block owns the piece table and builds the work-item tables followed by the descriptor arrays):
   piece table        : the flat piece slots of every sequence from cu_seqlens
   work-item tables   : the LPT order of the main and summary work-item tables, the scheduler rings, the
                        checkpoint-seeded series items where the backward reads a coarse series
@@ -30,7 +30,7 @@ import cutlass.experimental.primitives as nvvm
 
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
-from ..common.piece_chain import piece_table_body
+from ..common.piece_chain import CHAIN_MIN_PIECES, piece_table_body
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, expanded_cu_seqlen, gen_interval_items, order_body
 from . import gdn2_bprop_f16, gdn2_bprop_summary_f16, gdn2_prefill_f16, gdn2_recompute_f16, gdn2_summary_f16
 
@@ -104,57 +104,71 @@ def frost_gdn2_chain_prologue(
     seed_every_n: cutlass.Int32 = 0,
     seed_row_base: Optional[cute.Tensor] = None,
     tail_enable: Optional[cute.Tensor] = None,
+    m_count: Optional[cute.Tensor] = None,
+    summary_skip: cutlass.Constexpr[int] = 0,
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     widx = tidx // cutlass.Int32(32)
-    bidx = cutlass.Int32(cute.arch.block_idx()[0])
     n_heads_out = cutlass.Int32(heads_out)
     head_floor = None
     if cutlass.const_expr(tail):
         head_floor = first_head_lo
 
-    # ---- piece table -----------------------------------------------------------------
-    piece_table_body(
-        ORDER_THREADS,
-        pieces,
-        unit_chunks,
-        b_t,
-        1,
-        length_rule,
-        heads_out,
-        tidx,
-        num_seqs,
-        cu_seqlens,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-    )
-    if tidx == cutlass.Int32(0):
-        main_count[0] = cutlass.Int32(main_rows[num_seqs]) - first_head_lo * (cutlass.Int32(main_rows[1]) // n_heads_out)
-        summary_count[0] = cutlass.Int32(summary_rows[num_seqs]) - first_head_lo * (cutlass.Int32(summary_rows[1]) // n_heads_out)
-    nvvm.barrier_cta_sync()
-    n_pieces = num_seqs * cutlass.Int32(pieces)
+    enabled = True
     if cutlass.const_expr(tail_enable is not None):
-        n_pieces = n_pieces if cutlass.Int32(tail_enable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
+        enabled = cutlass.Int32(tail_enable[0]) != cutlass.Int32(0)
+    if enabled:
+        # ---- piece table -----------------------------------------------------------------
+        piece_table_body(
+            ORDER_THREADS,
+            pieces,
+            unit_chunks,
+            b_t,
+            1,
+            length_rule,
+            heads_out,
+            tidx,
+            num_seqs,
+            cu_seqlens,
+            cu_pieces,
+            main_rows,
+            summary_rows,
+            summary_skip,
+            CHAIN_MIN_PIECES if cutlass.const_expr(tail and length_rule) else 2,
+        )
         if tidx == cutlass.Int32(0):
-            if cutlass.Int32(tail_enable[0]) == cutlass.Int32(0):
-                main_count[0] = cutlass.Int32(0)
-                summary_count[0] = cutlass.Int32(0)
+            main_count[0] = cutlass.Int32(main_rows[num_seqs]) - first_head_lo * (cutlass.Int32(main_rows[1]) // n_heads_out)
+            summary_count[0] = cutlass.Int32(summary_rows[num_seqs]) - first_head_lo * (cutlass.Int32(summary_rows[1]) // n_heads_out)
         nvvm.barrier_cta_sync()
-    n_items = n_heads_out * n_pieces
-    if cutlass.const_expr(tail and seed_row_base is not None):
-        if bidx == cutlass.Int32(1) and tidx == cutlass.Int32(0):
-            seed_rows = cutlass.Int32(0)
-            seed_b = cutlass.Int32(0)
-            while seed_b < batch_base:
-                seed_len = expanded_cu_seqlen(1, cu_full, seed_b + 1) - expanded_cu_seqlen(1, cu_full, seed_b)
-                seed_rows = seed_rows + (seed_len + seed_every_n - cutlass.Int32(1)) // seed_every_n
-                seed_b = seed_b + cutlass.Int32(1)
-            seed_row_base[0] = seed_rows
+        if cutlass.const_expr(m_count is not None):
+            # ---- M item count ------------------------------------------------------------
+            sMiddle = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
+            if tidx == cutlass.Int32(0):
+                sMiddle[0] = cutlass.Int32(0)
+            nvvm.barrier_cta_sync()
+            middle_b = tidx
+            while middle_b < num_seqs:
+                if cutlass.Int32(main_rows[middle_b + 1]) - cutlass.Int32(main_rows[middle_b]) > cutlass.Int32(2) * n_heads_out:
+                    sMiddle[0] = cutlass.Int32(1)
+                middle_b = middle_b + cutlass.Int32(ORDER_THREADS)
+            nvvm.barrier_cta_sync()
+            if tidx == cutlass.Int32(0):
+                m_count[0] = cutlass.Int32(summary_count[0]) if sMiddle[0] != cutlass.Int32(0) else cutlass.Int32(0)
+            nvvm.barrier_cta_sync()
+        n_pieces = cutlass.Int32(cu_pieces.shape[0]) - cutlass.Int32(1)
+        n_items = n_heads_out * n_pieces
+        if cutlass.const_expr(tail and seed_row_base is not None):
+            if tidx == cutlass.Int32(0):
+                seed_rows = cutlass.Int32(0)
+                seed_b = cutlass.Int32(0)
+                while seed_b < batch_base:
+                    seed_len = expanded_cu_seqlen(1, cu_full, seed_b + 1) - expanded_cu_seqlen(1, cu_full, seed_b)
+                    seed_rows = seed_rows + (seed_len + seed_every_n - cutlass.Int32(1)) // seed_every_n
+                    seed_b = seed_b + cutlass.Int32(1)
+                seed_row_base[0] = seed_rows
 
-    if bidx == cutlass.Int32(0):
         # ---- work-item tables --------------------------------------------------------
         sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
         sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
@@ -203,6 +217,7 @@ def frost_gdn2_chain_prologue(
                 mRowBase=summary_rows,
                 mSlotRows=main_rows,
                 first_head_lo=head_floor,
+                first_slot=int(summary_skip < 0),
             )
         if cutlass.const_expr(series_items is not None):
             gen_interval_items(
@@ -219,7 +234,6 @@ def frost_gdn2_chain_prologue(
                 first_head_lo=head_floor,
                 first_head_slots=cutlass.Int32(main_rows[1]) // n_heads_out if cutlass.const_expr(tail) else None,
             )
-    else:
         # ---- descriptor arrays -------------------------------------------------------
         checkpoint_row_base = None
         if cutlass.const_expr(tail and checkpoints is not None):
@@ -376,6 +390,18 @@ def frost_gdn2_chain_prologue(
                 beta,
                 n_pieces,
             )
+    else:
+        if tidx == cutlass.Int32(0):
+            main_count[0] = cutlass.Int32(0)
+            summary_count[0] = cutlass.Int32(0)
+            if cutlass.const_expr(m_count is not None):
+                m_count[0] = cutlass.Int32(0)
+            if cutlass.const_expr(series_items is not None):
+                series_count[0] = cutlass.Int32(0)
+            si = cutlass.Int32(0)
+            while si < scheduler.shape[0]:
+                scheduler[si] = cutlass.Int32(0)
+                si = si + cutlass.Int32(1)
 
 
 @cute.jit
@@ -431,6 +457,8 @@ def chain_prologue(
     seed_every_n=None,
     seed_row_base=None,
     tail_enable=None,
+    m_count=None,
+    summary_skip: cutlass.Constexpr[int] = 0,
 ) -> None:
     swizzle_128b = tma.TensorMapSwizzle.s128b
     head_floor = cutlass.Int32(0)
@@ -612,4 +640,6 @@ def chain_prologue(
         seed_n,
         seed_row_base,
         tail_enable,
-    ).launch(grid=(2, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+        m_count,
+        summary_skip,
+    ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)

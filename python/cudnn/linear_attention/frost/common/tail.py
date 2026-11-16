@@ -6,7 +6,8 @@ standalone chain or d_v-split launch) and its device-side admission.  The first 
 count runs :func:`gate_body` in the CTA that reads it: the sequence lengths of ``cu_seqlens`` in, two int32 words out::
 
     gate[0] tail_enable   1 = the prefix runs the first prefix_tiles tiles and the tail launch the rest, 0 = the prefix runs the whole batch
-    gate[1] item limit    the prefix prologue's item count: prefix_tiles when the tail runs, n_tiles when it does not"""
+    gate[1] item limit    the prefix prologue's item count: prefix_tiles when the tail runs, n_tiles when it does not, 0 when the chain runs
+    gate[2] chain_enable  1 = the length-rule chain group runs the whole batch (a plan with ``chain_pieces``), 0 = it runs nothing"""
 
 import math
 from typing import NamedTuple
@@ -22,9 +23,10 @@ from .piece_chain import (
     CHAIN_MIN_UNITS_PER_PIECE,
     CHAIN_PIECE_TOKENS,
     DV_SPLIT_TILES,
+    piece_count,
 )
 
-GATE_WORDS = 2
+GATE_WORDS = 3
 TAIL_RAGGED_PCT = 125
 TAIL_MAX_WAVES = 4
 
@@ -76,33 +78,66 @@ def choose_tail(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_token
 
 
 @cute.jit
-def gate_body(n_threads: cutlass.Constexpr[int], tidx, heads_out, num_sms: cutlass.Constexpr[int], mCuSeqlens: cute.Tensor, mGate: cute.Tensor):
+def gate_body(
+    n_threads: cutlass.Constexpr[int],
+    tidx,
+    heads_out,
+    num_sms: cutlass.Constexpr[int],
+    mCuSeqlens: cute.Tensor,
+    mGate: cute.Tensor,
+    chain_pieces: cutlass.Constexpr[int] = 0,
+    tail: cutlass.Constexpr[bool] = True,
+):
     """The gate of a prefix launch over its ``cu_seqlens`` and the int32 ``[GATE_WORDS]`` words, called by every thread of one
     CTA of ``n_threads`` threads before that CTA reads word 1 (CTA barriers inside; the words are written when it returns):
     ``n_tiles`` every (sequence, head) tile of the batch at ``heads_out`` heads (a prefix launch runs one tile per head),
-    ``prefix_tiles`` its full waves of ``num_sms`` tiles."""
+    ``prefix_tiles`` its full waves of ``num_sms`` tiles (``n_tiles`` without ``tail``).  ``chain_pieces``: the chain runs when
+    the sequences the length rule cuts at that many slots fill at most half the SMs with their tiles and the cut halves the
+    longest item."""
     num_seqs = cutlass.Int32(mCuSeqlens.shape[0]) - cutlass.Int32(1)
     n_tiles = num_seqs * heads_out
-    prefix_tiles = (n_tiles // cutlass.Int32(num_sms)) * cutlass.Int32(num_sms)
+    prefix_tiles = (n_tiles // cutlass.Int32(num_sms)) * cutlass.Int32(num_sms) if cutlass.const_expr(tail) else n_tiles
     sLongest = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
     sShortest = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    sCutItem = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    sCutSeqs = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
     if tidx == cutlass.Int32(0):
         sLongest[0] = cutlass.Int32(0)
         sShortest[0] = cutlass.Int32(0x7FFFFFFF)
+        sCutItem[0] = cutlass.Int32(0)
+        sCutSeqs[0] = cutlass.Int32(0)
     nvvm.barrier_cta_sync()
     longest = cutlass.Int32(0)
     shortest = cutlass.Int32(0x7FFFFFFF)
+    cut_item = cutlass.Int32(0)
+    cut_seqs = cutlass.Int32(0)
     b = tidx
     while b < num_seqs:
         n = cutlass.Int32(mCuSeqlens[b + cutlass.Int32(1)]) - cutlass.Int32(mCuSeqlens[b])
         longest = n if n > longest else longest
         shortest = n if (n > cutlass.Int32(0)) and (n < shortest) else shortest
+        if cutlass.const_expr(chain_pieces > 0):
+            count = piece_count(cutlass.Int32(chain_pieces), 1, 1, True, n, cutlass.Int32(1), CHAIN_MIN_PIECES)
+            item = (n + count - cutlass.Int32(1)) // count
+            cut_item = item if item > cut_item else cut_item
+            cut_seqs = cut_seqs + (cutlass.Int32(1) if count > cutlass.Int32(1) else cutlass.Int32(0))
         b = b + cutlass.Int32(n_threads)
     nvvm.atomicrmw("max", sLongest.data_ptr(0), longest, space=nvvm.SharedSpace.shared_cta)
     nvvm.atomicrmw("min", sShortest.data_ptr(0), shortest, space=nvvm.SharedSpace.shared_cta)
+    if cutlass.const_expr(chain_pieces > 0):
+        nvvm.atomicrmw("max", sCutItem.data_ptr(0), cut_item, space=nvvm.SharedSpace.shared_cta)
+        nvvm.atomicrmw("add", sCutSeqs.data_ptr(0), cut_seqs, space=nvvm.SharedSpace.shared_cta)
     nvvm.barrier_cta_sync()
     if tidx == cutlass.Int32(0):
         ragged = sLongest[0] * cutlass.Int32(100) > sShortest[0] * cutlass.Int32(TAIL_RAGGED_PCT)
-        mGate[0] = cutlass.Int32(0) if ragged else cutlass.Int32(1)
-        mGate[1] = n_tiles if ragged else prefix_tiles
+        tail_enable = cutlass.Int32(0) if ragged else cutlass.Int32(1)
+        items = n_tiles if ragged else prefix_tiles
+        if cutlass.const_expr(chain_pieces > 0):
+            cut_tiles = sCutSeqs[0] * heads_out * cutlass.Int32(2)
+            chain = (cut_tiles > cutlass.Int32(0)) and (cut_tiles <= cutlass.Int32(num_sms)) and (sCutItem[0] * cutlass.Int32(2) <= sLongest[0])
+            tail_enable = cutlass.Int32(0) if chain else tail_enable
+            items = cutlass.Int32(0) if chain else items
+            mGate[2] = cutlass.Int32(1) if chain else cutlass.Int32(0)
+        mGate[0] = tail_enable
+        mGate[1] = items
     nvvm.barrier_cta_sync()

@@ -30,7 +30,7 @@ import cutlass.experimental.primitives as nvvm
 
 from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
-from ..common.piece_chain import piece_table_body
+from ..common.piece_chain import CHAIN_MIN_PIECES, piece_table_body
 from ..common.split_k import ORDER_CAPACITY, ORDER_ELEMENTS, ORDER_THREADS, expanded_cu_seqlen, gen_interval_items, order_body
 from . import kda_bprop_f16, kda_bprop_summary_f16, kda_prefill_f16, kda_recompute_f16, kda_summary_f16
 
@@ -96,6 +96,8 @@ def frost_kda_chain_prologue(
     seed_every_n: cutlass.Int32 = 0,
     seed_row_base: Optional[cute.Tensor] = None,
     tail_enable: Optional[cute.Tensor] = None,
+    m_count: Optional[cute.Tensor] = None,
+    summary_skip: cutlass.Constexpr[int] = 0,
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
@@ -106,72 +108,63 @@ def frost_kda_chain_prologue(
     if cutlass.const_expr(tail):
         head_floor = first_head_lo
 
-    # ---- piece table -----------------------------------------------------------------
-    piece_table_body(
-        ORDER_THREADS,
-        pieces,
-        unit_chunks,
-        b_t,
-        1,
-        length_rule,
-        heads_out,
-        tidx,
-        num_seqs,
-        cu_seqlens,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-    )
-    if tidx == cutlass.Int32(0):
-        main_count[0] = cutlass.Int32(main_rows[num_seqs]) - first_head_lo * (cutlass.Int32(main_rows[1]) // n_heads_out)
-        summary_count[0] = cutlass.Int32(summary_rows[num_seqs]) - first_head_lo * (cutlass.Int32(summary_rows[1]) // n_heads_out)
-    nvvm.barrier_cta_sync()
-    n_pieces = cutlass.Int32(cu_pieces.shape[0]) - cutlass.Int32(1)
+    enabled = True
     if cutlass.const_expr(tail_enable is not None):
-        n_pieces = n_pieces if cutlass.Int32(tail_enable[0]) != cutlass.Int32(0) else cutlass.Int32(0)
+        enabled = cutlass.Int32(tail_enable[0]) != cutlass.Int32(0)
+    if enabled:
+        # ---- piece table -----------------------------------------------------------------
+        piece_table_body(
+            ORDER_THREADS,
+            pieces,
+            unit_chunks,
+            b_t,
+            1,
+            length_rule,
+            heads_out,
+            tidx,
+            num_seqs,
+            cu_seqlens,
+            cu_pieces,
+            main_rows,
+            summary_rows,
+            summary_skip,
+            CHAIN_MIN_PIECES if cutlass.const_expr(tail and length_rule) else 2,
+        )
         if tidx == cutlass.Int32(0):
-            if cutlass.Int32(tail_enable[0]) == cutlass.Int32(0):
-                main_count[0] = cutlass.Int32(0)
-                summary_count[0] = cutlass.Int32(0)
+            main_count[0] = cutlass.Int32(main_rows[num_seqs]) - first_head_lo * (cutlass.Int32(main_rows[1]) // n_heads_out)
+            summary_count[0] = cutlass.Int32(summary_rows[num_seqs]) - first_head_lo * (cutlass.Int32(summary_rows[1]) // n_heads_out)
         nvvm.barrier_cta_sync()
-    n_items = n_heads_out * n_pieces
-    if cutlass.const_expr(tail and seed_row_base is not None):
-        if tidx == cutlass.Int32(0):
-            seed_rows = cutlass.Int32(0)
-            seed_b = cutlass.Int32(0)
-            while seed_b < batch_base:
-                seed_len = expanded_cu_seqlen(1, cu_full, seed_b + 1) - expanded_cu_seqlen(1, cu_full, seed_b)
-                seed_rows = seed_rows + (seed_len + seed_every_n - cutlass.Int32(1)) // seed_every_n
-                seed_b = seed_b + cutlass.Int32(1)
-            seed_row_base[0] = seed_rows
+        if cutlass.const_expr(m_count is not None):
+            # ---- M item count ------------------------------------------------------------
+            sMiddle = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
+            if tidx == cutlass.Int32(0):
+                sMiddle[0] = cutlass.Int32(0)
+            nvvm.barrier_cta_sync()
+            middle_b = tidx
+            while middle_b < num_seqs:
+                if cutlass.Int32(main_rows[middle_b + 1]) - cutlass.Int32(main_rows[middle_b]) > cutlass.Int32(2) * n_heads_out:
+                    sMiddle[0] = cutlass.Int32(1)
+                middle_b = middle_b + cutlass.Int32(ORDER_THREADS)
+            nvvm.barrier_cta_sync()
+            if tidx == cutlass.Int32(0):
+                m_count[0] = cutlass.Int32(summary_count[0]) if sMiddle[0] != cutlass.Int32(0) else cutlass.Int32(0)
+            nvvm.barrier_cta_sync()
+        n_pieces = cutlass.Int32(cu_pieces.shape[0]) - cutlass.Int32(1)
+        n_items = n_heads_out * n_pieces
+        if cutlass.const_expr(tail and seed_row_base is not None):
+            if tidx == cutlass.Int32(0):
+                seed_rows = cutlass.Int32(0)
+                seed_b = cutlass.Int32(0)
+                while seed_b < batch_base:
+                    seed_len = expanded_cu_seqlen(1, cu_full, seed_b + 1) - expanded_cu_seqlen(1, cu_full, seed_b)
+                    seed_rows = seed_rows + (seed_len + seed_every_n - cutlass.Int32(1)) // seed_every_n
+                    seed_b = seed_b + cutlass.Int32(1)
+                seed_row_base[0] = seed_rows
 
-    # ---- work-item tables --------------------------------------------------------
-    sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-    sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
-    sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
-    order_body(
-        False,
-        b_t,
-        ORDER_THREADS,
-        ORDER_ELEMENTS,
-        tidx,
-        n_heads_out,
-        n_items,
-        cu_pieces,
-        None,
-        main_count,
-        work_items,
-        scheduler,
-        sKey,
-        sIdx,
-        sSpread,
-        num_ctas=num_ctas,
-        chain=True,
-        mRowBase=main_rows,
-        first_head_lo=head_floor,
-    )
-    if cutlass.const_expr(work_items_summary is not None):
-        nvvm.barrier_cta_sync()
+        # ---- work-item tables --------------------------------------------------------
+        sKey = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sIdx = cutlass.Array(cutlass.Int32, ORDER_CAPACITY, space=cutlass.AddressSpace.smem, alignment=16)
+        sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
         order_body(
             False,
             b_t,
@@ -182,127 +175,163 @@ def frost_kda_chain_prologue(
             n_items,
             cu_pieces,
             None,
-            summary_count,
-            work_items_summary,
-            None,
+            main_count,
+            work_items,
+            scheduler,
             sKey,
             sIdx,
             sSpread,
             num_ctas=num_ctas,
             chain=True,
-            mRowBase=summary_rows,
-            mSlotRows=main_rows,
+            mRowBase=main_rows,
             first_head_lo=head_floor,
         )
-    if cutlass.const_expr(series_items is not None):
-        gen_interval_items(
-            b_t,
-            ORDER_THREADS,
-            tidx,
-            n_heads_out,
-            n_items,
-            series_span_chunks,
-            cu_pieces,
-            series_count,
-            series_items,
-            None,
-            first_head_lo=head_floor,
-            first_head_slots=cutlass.Int32(main_rows[1]) // n_heads_out if cutlass.const_expr(tail) else None,
-        )
-    # ---- descriptor arrays -------------------------------------------------------
-    checkpoint_row_base = None
-    if cutlass.const_expr(tail and checkpoints is not None):
-        checkpoint_row_base = cutlass.Int32(0)
-        seq_b = cutlass.Int32(0)
-        while seq_b < batch_base:
-            seq_len = expanded_cu_seqlen(1, cu_full, seq_b + 1) - expanded_cu_seqlen(1, cu_full, seq_b)
-            if cutlass.const_expr(checkpoint_after_block):
-                checkpoint_row_base = checkpoint_row_base + seq_len // checkpoint_every_n
-            else:
-                checkpoint_row_base = checkpoint_row_base + (seq_len + checkpoint_every_n - cutlass.Int32(1)) // checkpoint_every_n
-            seq_b = seq_b + cutlass.Int32(1)
-    if cutlass.const_expr(summary_words is not None):
-        kda_summary_f16.build_descs_body(widx, base_k, base_v, base_gate, summary_words, cu_pieces, k, v, gate, n_pieces)
-    if cutlass.const_expr(recompute_h_words is not None):
-        kda_recompute_f16.build_descs_body(
-            widx, base_k, base_v, base_gate, base_k, recompute_h_words, cu_pieces, k, v, gate, None, n_pieces, cutlass.Int32(0)
-        )
-    if cutlass.const_expr(recompute_m_words is not None):
-        kda_recompute_f16.build_descs_body(
-            widx - cutlass.Int32(4), base_k, base_k, base_gate, base_k, recompute_m_words, cu_pieces, k, k, gate, None, n_pieces, cutlass.Int32(0)
-        )
-    if cutlass.const_expr(series_words is not None):
-        kda_recompute_f16.build_descs_body(
-            widx - cutlass.Int32(8),
-            base_k,
-            base_v,
-            base_gate,
-            base_checkpoint,
-            series_words,
-            cu_pieces,
-            k,
-            v,
-            gate,
-            checkpoints,
-            n_pieces,
-            checkpoint_every_n,
-            checkpoint_row_base=checkpoint_row_base,
-        )
-    if cutlass.const_expr(prefill_words is not None):
-        kda_prefill_f16.build_descs_body(
-            widx - cutlass.Int32(12),
-            base_q,
-            base_k,
-            base_v,
-            base_gate,
-            base_o,
-            base_checkpoint,
-            prefill_words,
-            cu_pieces,
-            q,
-            k,
-            v,
-            gate,
-            o,
-            checkpoints,
-            n_pieces,
-            checkpoint_every_n,
-            checkpoint_after_block=checkpoint_after_block,
-            checkpoint_row_base=checkpoint_row_base,
-        )
-    if cutlass.const_expr(bprop_words is not None):
-        kda_bprop_f16.build_descs_body(
-            widx - cutlass.Int32(12),
-            base_q,
-            base_k,
-            base_v,
-            base_gate,
-            base_do,
-            base_dq,
-            base_dk,
-            base_dv,
-            base_dgate,
-            base_checkpoint,
-            bprop_words,
-            cu_pieces,
-            q,
-            k,
-            v,
-            gate,
-            do_,
-            dq,
-            dk,
-            dv,
-            dgate,
-            checkpoints,
-            n_pieces,
-            checkpoint_every_n,
-            checkpoint_row_base=checkpoint_row_base,
-        )
-    if cutlass.const_expr(bprop_summary_words is not None):
-        kda_bprop_summary_f16.build_descs_body(
-            widx - cutlass.Int32(22), base_q, base_k, base_gate, base_do, bprop_summary_words, cu_pieces, q, k, gate, do_, n_pieces
-        )
+        if cutlass.const_expr(work_items_summary is not None):
+            nvvm.barrier_cta_sync()
+            order_body(
+                False,
+                b_t,
+                ORDER_THREADS,
+                ORDER_ELEMENTS,
+                tidx,
+                n_heads_out,
+                n_items,
+                cu_pieces,
+                None,
+                summary_count,
+                work_items_summary,
+                None,
+                sKey,
+                sIdx,
+                sSpread,
+                num_ctas=num_ctas,
+                chain=True,
+                mRowBase=summary_rows,
+                mSlotRows=main_rows,
+                first_head_lo=head_floor,
+                first_slot=int(summary_skip < 0),
+            )
+        if cutlass.const_expr(series_items is not None):
+            gen_interval_items(
+                b_t,
+                ORDER_THREADS,
+                tidx,
+                n_heads_out,
+                n_items,
+                series_span_chunks,
+                cu_pieces,
+                series_count,
+                series_items,
+                None,
+                first_head_lo=head_floor,
+                first_head_slots=cutlass.Int32(main_rows[1]) // n_heads_out if cutlass.const_expr(tail) else None,
+            )
+        # ---- descriptor arrays -------------------------------------------------------
+        checkpoint_row_base = None
+        if cutlass.const_expr(tail and checkpoints is not None):
+            checkpoint_row_base = cutlass.Int32(0)
+            seq_b = cutlass.Int32(0)
+            while seq_b < batch_base:
+                seq_len = expanded_cu_seqlen(1, cu_full, seq_b + 1) - expanded_cu_seqlen(1, cu_full, seq_b)
+                if cutlass.const_expr(checkpoint_after_block):
+                    checkpoint_row_base = checkpoint_row_base + seq_len // checkpoint_every_n
+                else:
+                    checkpoint_row_base = checkpoint_row_base + (seq_len + checkpoint_every_n - cutlass.Int32(1)) // checkpoint_every_n
+                seq_b = seq_b + cutlass.Int32(1)
+        if cutlass.const_expr(summary_words is not None):
+            kda_summary_f16.build_descs_body(widx, base_k, base_v, base_gate, summary_words, cu_pieces, k, v, gate, n_pieces)
+        if cutlass.const_expr(recompute_h_words is not None):
+            kda_recompute_f16.build_descs_body(
+                widx, base_k, base_v, base_gate, base_k, recompute_h_words, cu_pieces, k, v, gate, None, n_pieces, cutlass.Int32(0)
+            )
+        if cutlass.const_expr(recompute_m_words is not None):
+            kda_recompute_f16.build_descs_body(
+                widx - cutlass.Int32(4), base_k, base_k, base_gate, base_k, recompute_m_words, cu_pieces, k, k, gate, None, n_pieces, cutlass.Int32(0)
+            )
+        if cutlass.const_expr(series_words is not None):
+            kda_recompute_f16.build_descs_body(
+                widx - cutlass.Int32(8),
+                base_k,
+                base_v,
+                base_gate,
+                base_checkpoint,
+                series_words,
+                cu_pieces,
+                k,
+                v,
+                gate,
+                checkpoints,
+                n_pieces,
+                checkpoint_every_n,
+                checkpoint_row_base=checkpoint_row_base,
+            )
+        if cutlass.const_expr(prefill_words is not None):
+            kda_prefill_f16.build_descs_body(
+                widx - cutlass.Int32(12),
+                base_q,
+                base_k,
+                base_v,
+                base_gate,
+                base_o,
+                base_checkpoint,
+                prefill_words,
+                cu_pieces,
+                q,
+                k,
+                v,
+                gate,
+                o,
+                checkpoints,
+                n_pieces,
+                checkpoint_every_n,
+                checkpoint_after_block=checkpoint_after_block,
+                checkpoint_row_base=checkpoint_row_base,
+            )
+        if cutlass.const_expr(bprop_words is not None):
+            kda_bprop_f16.build_descs_body(
+                widx - cutlass.Int32(12),
+                base_q,
+                base_k,
+                base_v,
+                base_gate,
+                base_do,
+                base_dq,
+                base_dk,
+                base_dv,
+                base_dgate,
+                base_checkpoint,
+                bprop_words,
+                cu_pieces,
+                q,
+                k,
+                v,
+                gate,
+                do_,
+                dq,
+                dk,
+                dv,
+                dgate,
+                checkpoints,
+                n_pieces,
+                checkpoint_every_n,
+                checkpoint_row_base=checkpoint_row_base,
+            )
+        if cutlass.const_expr(bprop_summary_words is not None):
+            kda_bprop_summary_f16.build_descs_body(
+                widx - cutlass.Int32(22), base_q, base_k, base_gate, base_do, bprop_summary_words, cu_pieces, q, k, gate, do_, n_pieces
+            )
+    else:
+        if tidx == cutlass.Int32(0):
+            main_count[0] = cutlass.Int32(0)
+            summary_count[0] = cutlass.Int32(0)
+            if cutlass.const_expr(m_count is not None):
+                m_count[0] = cutlass.Int32(0)
+            if cutlass.const_expr(series_items is not None):
+                series_count[0] = cutlass.Int32(0)
+            si = cutlass.Int32(0)
+            while si < scheduler.shape[0]:
+                scheduler[si] = cutlass.Int32(0)
+                si = si + cutlass.Int32(1)
 
 
 @cute.jit
@@ -354,6 +383,8 @@ def chain_prologue(
     seed_every_n=None,
     seed_row_base=None,
     tail_enable=None,
+    m_count=None,
+    summary_skip: cutlass.Constexpr[int] = 0,
 ) -> None:
     swizzle_128b = tma.TensorMapSwizzle.s128b
     head_floor = cutlass.Int32(0)
@@ -503,4 +534,6 @@ def chain_prologue(
         seed_n,
         seed_row_base,
         tail_enable,
+        m_count,
+        summary_skip,
     ).launch(grid=(1, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)

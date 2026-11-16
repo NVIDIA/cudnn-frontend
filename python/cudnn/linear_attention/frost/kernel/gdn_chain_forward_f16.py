@@ -275,6 +275,7 @@ def chain_forward_host(
         cu_full=cu_full,
         batch_base=batch_base,
         tail_enable=tail_enable,
+        summary_skip=1,
     )
     gdn_tinv_f16.host(tinv_cfg, False, k, tinv_words, gate, a_log, dt_bias, beta, cu_pieces, tinv, tinv_rows, tinv_row_count, stream)
     gdn_summary_f16.host(
@@ -369,6 +370,7 @@ def build_configs(
     k_slots,
     v_slots,
     beta_slots,
+    skip_first_m=False,
 ):
     tinv_cfg = gdn_tinv_f16.build_cfg(
         io_dtype,
@@ -394,6 +396,7 @@ def build_configs(
         expand_num=expand_num,
         k_slots=k_slots,
         v_slots=v_slots,
+        skip_first_m=skip_first_m,
     )
     prefill_cfg = gdn_prefill_f16.build_cfg(
         io_dtype,
@@ -563,6 +566,7 @@ def build_chain_forward(
             k_slots=k_slots,
             v_slots=v_slots,
             beta_slots=beta_slots,
+            skip_first_m=not has_seed and composed is None,
         )
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)

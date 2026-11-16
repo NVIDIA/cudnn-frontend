@@ -237,6 +237,7 @@ def chain_forward_host(
         cu_full=cu_full,
         batch_base=batch_base,
         tail_enable=tail_enable,
+        summary_skip=1,
     )
     gdn2_summary_f16.host(
         summary_cfg,

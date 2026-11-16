@@ -111,6 +111,7 @@ def make_fprop_cache_key(
     state_pool_rows=None,
     composed_rows=None,
     checkpoint_after_block=False,
+    state_indices_dtype=None,
 ):
     """Return the complete plan-cache identity for a KDA forward graph."""
     return (
@@ -150,6 +151,7 @@ def make_fprop_cache_key(
         state_pool_rows,
         composed_rows,
         bool(checkpoint_after_block),
+        state_indices_dtype,
     )
 
 
@@ -269,6 +271,7 @@ def build_fprop_graph(
     state_pool_rows=None,
     composed_rows=None,
     checkpoint_after_block=False,
+    output_context=False,
 ):
     """Build a single-node KDA forward graph and its tensor placeholders."""
     graph = cudnn.pygraph()
@@ -323,6 +326,7 @@ def build_fprop_graph(
         overwrite_initial_state=overwrite_initial_state or None,
         checkpoint_every_n_tokens=checkpoint,
         checkpoint_after_block=checkpoint_after_block or None,
+        output_context=output_context or None,
         name="kda",
     )
     if state_checkpoints_t is not None:
@@ -380,7 +384,8 @@ def run_kda_fwd(
     preceding_state_update: Optional[torch.Tensor] = None,
     preceding_transition: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    output_context: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal KDA forward over a cached single-node KDA pygraph in THD layout.
 
     Returns ``(o, final_state, state_checkpoints)``; ``final_state`` / ``state_checkpoints`` are zero-size
@@ -393,7 +398,8 @@ def run_kda_fwd(
     the device into the one-row ``composed_initial_state`` (fp32 ``[1, HO, V, K]``, the fourth output) that the first
     local sequence starts from; the caller's ``initial_state`` row 0, when given, is the state beyond the farthest rank
     and the other rows stay the other sequences' starts (zero without one).  Zero-size without summaries, as with an
-    empty ``P = 0`` pair.
+    empty ``P = 0`` pair.  ``output_context`` adds a fifth value, the uint8 context this forward leaves for the backward of
+    the same tokens (zero-size without it, or when the plan keeps nothing).
     """
     total, H, K = q.shape
     HK = k.shape[1]
@@ -519,7 +525,8 @@ def run_kda_fwd(
         state_pool_rows,
         composed_rows=composed_rows or None,
         checkpoint_after_block=bool(checkpoint_after_block),
-    )
+        state_indices_dtype=state_indices.dtype if state_indices is not None else None,
+    ) + (bool(output_context),)
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(
             total,
@@ -552,6 +559,7 @@ def run_kda_fwd(
             state_pool_rows=state_pool_rows,
             composed_rows=composed_rows or None,
             checkpoint_after_block=bool(checkpoint_after_block),
+            output_context=bool(output_context),
         )
         select_plan(fprop_cache[cache_key][0], plan_name)
 
@@ -593,8 +601,9 @@ def run_kda_fwd(
         state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=checkpoint_dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     workspace, handle = make_execution_resources(graph, device)
-    execute_graph(graph, variant_pack, workspace, handle)
-    return o, final_state, state_checkpoints, composed
+    context_out = torch.empty(graph.get_context_size() if output_context else 0, dtype=torch.uint8, device=device)
+    execute_graph(graph, variant_pack, workspace, handle, context_out if context_out.numel() else None)
+    return o, final_state, state_checkpoints, composed, context_out
 
 
 @torch.library.custom_op("cudnn::kimi_delta_attention_fwd", mutates_args=())
@@ -623,7 +632,8 @@ def kda_fwd(
     preceding_state_update: Optional[torch.Tensor] = None,
     preceding_transition: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    output_context: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Functional KDA forward: :func:`run_kda_fwd` with fresh outputs; the autograd formula registers below."""
     return run_kda_fwd(
         q=q,
@@ -650,6 +660,7 @@ def kda_fwd(
         preceding_state_update=preceding_state_update,
         preceding_transition=preceding_transition,
         checkpoint_after_block=checkpoint_after_block,
+        output_context=output_context,
     )
 
 
@@ -683,7 +694,7 @@ def kda_fwd_overwrite_state(
     table addresses a state pool.  The engine runs the chain or the uncut schedule and
     never the split-K cut, so the state a sequence reads at its first chunk is the one it writes at its last.  Inference
     only: a mutating op registers no autograd formula.  Returns ``(o, state_checkpoints)``."""
-    o, _, state_checkpoints, _ = run_kda_fwd(
+    o, _, state_checkpoints, _, _ = run_kda_fwd(
         q=q,
         k=k,
         v=v,
@@ -738,6 +749,7 @@ def kda_fwd_fake(
     preceding_state_update=None,
     preceding_transition=None,
     checkpoint_after_block=False,
+    output_context=False,
 ):
     """Return FakeTensor-compatible output metadata for KDA forward."""
     total, H, K = q.shape
@@ -775,7 +787,8 @@ def kda_fwd_fake(
         )
     else:
         state_checkpoints = q.new_empty(0)
-    return o, final, state_checkpoints, composed
+    context_out = q.new_empty(torch.library.get_ctx().new_dynamic_size() if output_context else 0, dtype=torch.uint8)
+    return o, final, state_checkpoints, composed, context_out
 
 
 @kda_fwd_overwrite_state.register_fake
@@ -805,7 +818,7 @@ def kda_fwd_overwrite_state_fake(
     checkpoint_after_block=False,
 ):
     """Return fake outputs for the in-place KDA forward custom op."""
-    o, _, state_checkpoints, _ = kda_fwd_fake(
+    o, _, state_checkpoints, _, _ = kda_fwd_fake(
         q=q,
         k=k,
         v=v,
@@ -868,6 +881,7 @@ def build_bprop_graph(
     has_composed_state=False,
     input_context=False,
     checkpoint_after_block=False,
+    context_from_forward=False,
 ):
     """Build a single-node KDA backward graph and its tensor placeholders."""
     graph = cudnn.pygraph()
@@ -927,6 +941,7 @@ def build_bprop_graph(
         gate_lower_bound=gate_lower_bound,
         gate_domain=None if gate_domain == "log" else gate_domain,
         input_context=input_context or None,
+        context_from_forward=context_from_forward or None,
         name="kda_bwd",
     )
     return graph, dict(
@@ -989,6 +1004,7 @@ def kda_bwd(
     composed_initial_state: Optional[torch.Tensor] = None,
     context: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
+    context_from_forward: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal KDA backward over a cached single-node KDA_BWD pygraph in THD layout.
 
@@ -1000,8 +1016,10 @@ def kda_bwd(
     row, when given, is the gradient beyond the farthest rank; every other sequence starts from its ``d_final_state``
     row, or zero).  ``composed_initial_state`` (fp32 ``[1, HO, V, K]``, the forward's fourth output) is the first local
     sequence's initial state under context parallelism, beside the caller's optional ``initial_state``.
-    ``context`` is the backward summary's context over the same tokens (``output_context``); a zero-size tensor is
-    none.  Returns ``(dq, dk, dv, dg, dbeta, d_initial_state, d_a_log, d_dt_bias)``.
+    ``context`` is the backward summary's context over the same tokens (``output_context``), or with
+    ``context_from_forward`` the one the forward of the same tokens left (its ``output_context``, prepared at the
+    forward's ``checkpoint_every_n_tokens`` and ``batch_invariant``, which this call must be given); a zero-size tensor
+    is none.  Returns ``(dq, dk, dv, dg, dbeta, d_initial_state, d_a_log, d_dt_bias)``.
     """
     total, H, K = q.shape
     if 0 in dO.stride():
@@ -1111,7 +1129,7 @@ def kda_bwd(
         composed_rows=composed_rows or None,
         composed_state=composed_state is not None,
         checkpoint_after_block=bool(checkpoint_after_block),
-    ) + (has_context,)
+    ) + (has_context, has_context and bool(context_from_forward))
     if cache_key not in bprop_cache:
         bprop_cache[cache_key] = build_bprop_graph(
             total,
@@ -1144,6 +1162,7 @@ def kda_bwd(
             has_composed_state=composed_state is not None,
             input_context=has_context,
             checkpoint_after_block=bool(checkpoint_after_block),
+            context_from_forward=has_context and bool(context_from_forward),
         )
         select_plan(bprop_cache[cache_key][0], plan_name)
 
@@ -1229,6 +1248,7 @@ def kda_bwd_fake(
     composed_initial_state=None,
     context=None,
     checkpoint_after_block=False,
+    context_from_forward=False,
 ):
     """Return FakeTensor-compatible output metadata for KDA backward."""
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
@@ -1281,6 +1301,7 @@ def kda_setup_context(ctx, inputs, output):
         preceding_state_update,
         preceding_transition,
         checkpoint_after_block,
+        output_context,
     ) = inputs
     saved = [q, k, v, g, beta, cu_seqlens]
     ctx.checkpoint_reuse = (
@@ -1299,6 +1320,9 @@ def kda_setup_context(ctx, inputs, output):
         saved.append(a_log)
     if ctx.has_dt_bias:
         saved.append(dt_bias)
+    ctx.context_from_forward = output[4].numel() > 0 and checkpoint_every_n_tokens == ctx.checkpoint_every_n_tokens
+    if ctx.context_from_forward:
+        saved.append(output[4])
     ctx.save_for_backward(*saved)
     # under context parallelism the backward starts from the composed state, and the caller's initial_state (the
     # state beyond the farthest preceding rank) gets no gradient
@@ -1315,10 +1339,10 @@ def kda_setup_context(ctx, inputs, output):
     ctx.gate_lower_bound = gate_lower_bound
     ctx.gate_domain = str(gate_domain)
     ctx.set_materialize_grads(False)
-    ctx.mark_non_differentiable(output[2], output[3])
+    ctx.mark_non_differentiable(output[2], output[3], output[4])
 
 
-def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
+def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state, d_context):
     """Apply the registered first-order KDA backward formula."""
     # Non-reentrant activation checkpointing allows one saved-tensor unpack.
     saved_tensors = ctx.saved_tensors
@@ -1331,6 +1355,7 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
         gate_params = list(saved_tensors[6:])
     a_log = gate_params.pop(0) if ctx.has_a_log else None
     dt_bias = gate_params.pop(0) if ctx.has_dt_bias else None
+    context = gate_params.pop(0) if ctx.context_from_forward else None
     initial_state = ctx.initial_state
 
     if dO is None:
@@ -1360,6 +1385,8 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
         a_log=a_log,
         dt_bias=dt_bias,
         plan_name=ctx.plan_name,
+        context=context,
+        context_from_forward=ctx.context_from_forward,
     )
     return (
         dq,
@@ -1380,6 +1407,7 @@ def kda_backward(ctx, dO, dFinal, dstate_checkpoints, d_composed_initial_state):
         None,
         d_a_log if ctx.has_a_log else None,
         d_dt_bias if ctx.has_dt_bias else None,
+        None,
         None,
         None,
         None,
@@ -1428,6 +1456,7 @@ def kimi_delta_attention(
     preceding_state_update: Optional[torch.Tensor] = None,
     preceding_transition: Optional[torch.Tensor] = None,
     checkpoint_after_block: bool = False,
+    output_context: bool = False,
 ):
     """Kimi Delta Attention (KDA) linear attention.
 
@@ -1543,6 +1572,11 @@ def kimi_delta_attention(
             gets no gradient.
         preceding_transition: the matching ``transition`` outputs, fp32
             ``[P, HO, K, K]``.
+        output_context: also return, as the last value, the uint8 context this forward leaves
+            for the backward of the same tokens: the piece transitions of a chained forward
+            (zero-size when the plan keeps none).  Autograd gives it to the backward, which then
+            does not recompute them; ``torch.ops.cudnn.kimi_delta_attention_bwd`` takes it as
+            ``context`` with ``context_from_forward=True``.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``, or
@@ -1553,6 +1587,7 @@ def kimi_delta_attention(
         ``initial_state`` to ``torch.ops.cudnn.kimi_delta_attention_bwd``).
         ``final_state`` is empty unless ``output_final_state=True``; under
         ``overwrite_initial_state`` or ``state_indices`` it is the caller's buffer.
+        ``output_context`` appends the context.
     """
     if q.dim() != 3:
         raise ValueError("expected THD [total_tokens, heads, dim] tensors")
@@ -1565,6 +1600,8 @@ def kimi_delta_attention(
             raise ValueError("kimi_delta_attention: overwrite_initial_state requires initial_state")
         if preceding_state_update is not None or preceding_transition is not None:
             raise ValueError("kimi_delta_attention: preceding summaries cannot combine with overwrite_initial_state or state_indices")
+        if output_context:
+            raise ValueError("kimi_delta_attention: output_context cannot combine with overwrite_initial_state or state_indices (inference only)")
         o, state_checkpoints = torch.ops.cudnn.kimi_delta_attention_fwd_overwrite_state(
             q,
             k,
@@ -1592,7 +1629,7 @@ def kimi_delta_attention(
         )
         final_state = initial_state if (output_final_state or overwrite_initial_state) else initial_state.new_empty(0)
     else:
-        o, final_state, state_checkpoints, composed_initial_state = torch.ops.cudnn.kimi_delta_attention_fwd(
+        o, final_state, state_checkpoints, composed_initial_state, context_out = torch.ops.cudnn.kimi_delta_attention_fwd(
             q,
             k,
             v,
@@ -1617,9 +1654,14 @@ def kimi_delta_attention(
             preceding_state_update=preceding_state_update,
             preceding_transition=preceding_transition,
             checkpoint_after_block=bool(checkpoint_after_block),
+            output_context=bool(output_context),
         )
         if preceding_state_update is not None:
+            if output_context:
+                return o, final_state, state_checkpoints, composed_initial_state, context_out
             return o, final_state, state_checkpoints, composed_initial_state
+        if output_context:
+            return (o, final_state, state_checkpoints, context_out) if checkpoint_every_n_tokens > 0 else (o, final_state, context_out)
     if checkpoint_every_n_tokens > 0:
         return o, final_state, state_checkpoints
     return o, final_state

@@ -150,6 +150,7 @@ def chain_backward_host(
     fold_transition: Optional[cute.Tensor] = None,
     fold_seed: Optional[cute.Tensor] = None,
     fold_composed: Optional[cute.Tensor] = None,
+    m_count: Optional[cute.Tensor] = None,
     checkpoint_head_divisor: cutlass.Constexpr[int] = 1,
     state_head_divisor: cutlass.Constexpr[int] = 1,
     state_wave_counts: Optional[cute.Tensor] = None,
@@ -248,6 +249,8 @@ def chain_backward_host(
         seed_every_n=seed_every_n,
         seed_row_base=seed_row_base,
         tail_enable=tail_enable,
+        m_count=m_count,
+        summary_skip=0 if cutlass.const_expr(fused_h_m) else -1,
     )
     for state_phase in cutlass.range(state_head_divisor):
         active_main_count = main_count
@@ -333,7 +336,7 @@ def chain_backward_host(
                     state_m_main,
                     None,
                     work_items_summary,
-                    active_summary_count,
+                    m_count if cutlass.const_expr(m_count is not None) else active_summary_count,
                     scheduler_m,
                     recompute_m_words,
                     cutlass.Int32(0),
@@ -633,6 +636,7 @@ def build_chain_backward(
     has_piece_state_grads=False,
     post_buffers=(None,) * 14,
     fold_buffers=(None,) * 4,
+    m_count=None,
     checkpoint_head_divisor=1,
     state_head_divisor=1,
     state_wave_counts=None,
@@ -703,6 +707,7 @@ def build_chain_backward(
         bool(has_piece_state_grads),
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in post_buffers),
         (int(fold_rows), tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers)),
+        m_count is not None,
         int(checkpoint_head_divisor),
         int(state_head_divisor),
     )
@@ -866,6 +871,7 @@ def build_chain_backward(
             *post_placeholders,
             fold_rows,
             *fold_placeholders,
+            from_dlpack(m_count, assumed_align=4).mark_layout_dynamic() if m_count is not None else None,
             int(checkpoint_head_divisor),
             int(state_head_divisor),
             from_dlpack(state_wave_counts, assumed_align=4).mark_layout_dynamic() if state_wave_counts is not None else None,
@@ -945,6 +951,7 @@ def run_chain_backward(
     has_piece_state_grads=False,
     post_buffers=(None,) * 14,
     fold_buffers=(None,) * 4,
+    m_count=None,
     checkpoint_head_divisor=1,
     state_head_divisor=1,
     state_wave_counts=None,
@@ -1027,6 +1034,7 @@ def run_chain_backward(
         tail_enable,
         *post_buffers,
         *fold_buffers,
+        m_count,
         state_wave_counts,
     )
 

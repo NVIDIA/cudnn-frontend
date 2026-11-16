@@ -106,6 +106,7 @@ def make_fprop_cache_key(
     state_pool_rows=None,
     composed_rows=None,
     checkpoint_after_block=False,
+    state_indices_dtype=None,
 ):
     return (
         "fprop",
@@ -143,6 +144,7 @@ def make_fprop_cache_key(
         state_pool_rows,
         composed_rows,
         bool(checkpoint_after_block),
+        state_indices_dtype,
     )
 
 
@@ -509,6 +511,7 @@ def run_gdn_fwd(
         state_pool_rows,
         composed_rows or None,
         checkpoint_after_block=bool(checkpoint_after_block),
+        state_indices_dtype=state_indices.dtype if state_indices is not None else None,
     ) + (has_context, bool(output_context))
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(

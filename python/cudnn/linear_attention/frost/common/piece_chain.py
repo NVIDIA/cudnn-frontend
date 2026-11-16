@@ -66,14 +66,6 @@ CHAIN_MIN_UNITS_PER_PIECE = 4
 CHAIN_MIN_MEAN_TOKENS = 2048
 DV_SPLIT_TILES = 2
 
-# A packed KDA shape can have enough nominal (sequence, head) tiles to suppress
-# the ordinary chain while nearly all tokens belong to one sequence.  Keep the
-# device-side length rule available for a bounded number of nominal waves; the
-# piece table reads the actual cu_seqlens and leaves sequences of at most this
-# many tokens uncut.
-KDA_RAGGED_MAX_TILE_WAVES = 4
-KDA_RAGGED_MAX_PIECES = 4
-
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
 CHAIN_ROW_GROUPS = 2
@@ -141,63 +133,13 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
     return 0, unit_chunks
 
 
-def choose_kda_pieces(
-    *,
-    num_seqs,
-    heads_out,
-    num_sm,
-    total_tokens,
-    b_t,
-    cadence_tokens,
-    batch_invariant,
-    expand_num,
-    enable_ragged_fallback,
-    reverse=False,
-    compose_tail=False,
-):
-    """Return ``(pieces, unit_chunks, length_rule)`` for a KDA main plan.
-
-    The ordinary shape-only rule assumes all declared sequences contribute
-    equally.  That is pessimistic for an oversubscribed packed batch containing
-    one long sequence and many short or empty ones: ``num_seqs * heads_out``
-    can exceed the SM count while the long sequence remains the critical path.
-
-    On the measured SM100 route, keep a bounded length-rule chain in that gap.
-    Its device-built piece table reads ``cu_seqlens`` and cuts only sequences
-    longer than :data:`LENGTH_RULE_PIECE_TOKENS`; no device value reaches the
-    host and balanced short sequences stay single-piece.  The fallback caps the
-    schedule at :data:`KDA_RAGGED_MAX_PIECES`: on SM100, four pieces were faster
-    than eight for the 64K skewed case while using less workspace.  The caller
-    controls ``enable_ragged_fallback`` so unmeasured architectures preserve
-    the prior choice exactly.
-    """
-    pieces, unit_chunks = choose_pieces(
-        num_seqs=num_seqs,
-        heads_out=heads_out,
-        num_sm=num_sm,
-        total_tokens=total_tokens,
-        b_t=b_t,
-        cadence_tokens=cadence_tokens,
-        batch_invariant=batch_invariant,
-        expand_num=expand_num,
-        reverse=reverse,
-        compose_tail=compose_tail,
-    )
-    if pieces or batch_invariant or not enable_ragged_fallback:
-        return pieces, unit_chunks, bool(pieces and batch_invariant)
-
-    num_seqs = max(1, int(num_seqs))
-    heads_out = max(1, int(heads_out))
-    num_sm = max(1, int(num_sm))
-    total_tokens = int(total_tokens)
-    nominal_tiles = num_seqs * heads_out
-    length_pieces = min(-(-total_tokens // LENGTH_RULE_PIECE_TOKENS), KDA_RAGGED_MAX_PIECES)
-
-    if not (num_sm <= nominal_tiles <= KDA_RAGGED_MAX_TILE_WAVES * num_sm):
-        return 0, unit_chunks, False
-    if length_pieces < 2:
-        return 0, unit_chunks, False
-    return length_pieces, unit_chunks, True
+def ragged_pieces(*, heads_out, num_sm, total_tokens):
+    """Slot cap of the length-rule chain group a main plan without pieces carries for the gate of its first kernel to take
+    (``common/tail.py``), 0 for no group: the slots that keep one sequence's ``heads_out`` tiles in one wave, at most
+    ``CHAIN_MAX_PIECES`` and what the batch's tokens fill at ``LENGTH_RULE_PIECE_TOKENS`` each.  The group cuts a sequence at
+    ``CHAIN_MIN_PIECES`` slots or more, so a plan whose wave holds fewer of one sequence carries none."""
+    pieces = min(int(num_sm) // max(1, int(heads_out)), CHAIN_MAX_PIECES, -(-int(total_tokens) // LENGTH_RULE_PIECE_TOKENS))
+    return pieces if pieces >= CHAIN_MIN_PIECES else 0
 
 
 def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
@@ -271,12 +213,15 @@ def piece_count(
     length_rule: cutlass.Constexpr[bool],
     length,
     span_chunks,
+    min_slots: cutlass.Constexpr[int] = 2,
 ):
     """Slots a sequence of ``length`` real tokens takes: ``ceil(chunks / span_chunks)`` (the length rule:
-    ``clamp(ceil(length / LENGTH_RULE_PIECE_TOKENS), 1, pieces)``), at least one."""
+    ``clamp(ceil(length / LENGTH_RULE_PIECE_TOKENS), 1, pieces)``, one below ``min_slots``), at least one."""
     if cutlass.const_expr(length_rule):
         count = (length + cutlass.Int32(LENGTH_RULE_PIECE_TOKENS - 1)) // cutlass.Int32(LENGTH_RULE_PIECE_TOKENS)
         count = count if count < cutlass.Int32(pieces) else cutlass.Int32(pieces)
+        if cutlass.const_expr(min_slots > 2):
+            count = count if count >= cutlass.Int32(min_slots) else cutlass.Int32(1)
     else:
         chunks = (length * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
         count = (chunks + span_chunks - cutlass.Int32(1)) // span_chunks
@@ -292,12 +237,13 @@ def piece_span(
     length_rule: cutlass.Constexpr[bool],
     length,
     span_chunks,
+    min_slots: cutlass.Constexpr[int] = 2,
 ):
     """``(span_tokens, last)`` of a sequence of ``length`` real tokens taking ``piece_count`` slots: the piece span in
     real tokens (Int64, the sequence's chunks spread evenly over its slots and rounded up to units) and the index of its
     last filled slot (0 when empty)."""
     chunks = (length * cutlass.Int32(expand_num) + cutlass.Int32(b_t - 1)) // cutlass.Int32(b_t)
-    count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks)
+    count = piece_count(pieces, b_t, expand_num, length_rule, length, span_chunks, min_slots)
     own_span = (chunks + count - cutlass.Int32(1)) // count
     own_span = own_span if own_span > cutlass.Int32(1) else cutlass.Int32(1)
     span_units = (own_span + cutlass.Int32(unit_chunks - 1)) // cutlass.Int32(unit_chunks)
@@ -323,6 +269,8 @@ def piece_table_body(
     mCuPieces: cute.Tensor,
     mMainRows: cute.Tensor,
     mSummaryRows: cute.Tensor,
+    summary_skip: cutlass.Constexpr[int] = 0,
+    min_slots: cutlass.Constexpr[int] = 2,
 ):
     """Piece table of one CTA (every thread calls; CTA barriers inside).  The wave is ``num_seqs * pieces`` slots and every
     slot spans ``span = ceil(total_chunks / wave)`` chunks (units rounded up); thread ``b`` owns sequence ``b``, taking
@@ -331,7 +279,8 @@ def piece_table_body(
     ``wave - (num_seqs - 1)`` slots, which cannot overflow.  Slots are flat in sequence order: sequence ``b``'s first slot
     is ``main_rows[b] // heads_out`` and ``cu_pieces[slot + j] = cu[b] + min(j * span_b, len_b)``; ``main_rows`` /
     ``summary_rows`` are the per-sequence row bases of the main table (one row per filled slot and head, slot 0 of an
-    empty sequence included) and of the summary table (sequences with two or more filled slots).  The entries from the
+    empty sequence included) and of the summary table (sequences with two or more filled slots, without the last /
+    first one under ``summary_skip`` 1 / -1).  The entries from the
     batch end to the last element of ``cu_pieces`` all hold the batch end, so the table stays monotone over its capacity
     for the consumers that size the slots from its shape.  The length rule permits a capacity smaller than the wave
     without changing any sequence's split.  Deterministic, no host sync."""
@@ -393,10 +342,13 @@ def piece_table_body(
             start = cutlass.Int32(mCu[b_read])
             end = cutlass.Int32(mCu[b_read + 1])
         length = end - start
-        span_tokens, last = piece_span(pieces, unit_chunks, b_t, expand_num, length_rule, length, span_chunks)
+        span_tokens, last = piece_span(pieces, unit_chunks, b_t, expand_num, length_rule, length, span_chunks, min_slots)
         rows = (last + cutlass.Int32(1)) * cutlass.Int32(heads_out)
         rows_main = rows if valid else cutlass.Int32(0)
         rows_summary = rows if (valid and last > cutlass.Int32(0)) else cutlass.Int32(0)
+        # ---- summary skip -------------------------------------------------------------------------
+        if cutlass.const_expr(summary_skip != 0):
+            rows_summary = rows_summary - cutlass.Int32(heads_out) if rows_summary > cutlass.Int32(0) else cutlass.Int32(0)
 
         # ---- row bases: warp scan, then the warp totals -----------------------------------
         incl_main = rows_main
@@ -531,6 +483,8 @@ def frost_state_chain(
     P = pieces
     product_rows = cutlass.const_expr(K * rows // V if emit_summary else 0)
     walk_state = cutlass.const_expr(has_seed or has_tail or not emit_summary)
+    zero_entry = cutlass.const_expr(not has_seed and mComposed is None)
+    walk_last = cutlass.const_expr(has_tail or emit_summary)
     cols_per_lane = cutlass.const_expr(K // CHAIN_LANES)
     k_slice = cutlass.const_expr(K // CHAIN_K_WARPS)
     tiles = cutlass.const_expr(k_slice // CHAIN_K_TILE)
@@ -763,6 +717,7 @@ def frost_state_chain(
                             * cutlass.Int64(mX.element_type.width // 8)
                         )
             first_step = cutlass.Int32(0) if cutlass.const_expr(not reverse) else count - cutlass.Int32(1)
+            steps = count if cutlass.const_expr(walk_last) else count - cutlass.Int32(1)
             first_buf_words = cutlass.Int32(0)
             first_slot_elems = cutlass.Int64(seq_base + first_step) * m_slot_elems + m_head_elems
             for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
@@ -773,7 +728,7 @@ def frost_state_chain(
 
             # ---- walk ---------------------------------------------------------------------------------
             i = cutlass.Int32(0)
-            while i < count:
+            while i < steps:
                 step = i if cutlass.const_expr(not reverse) else count - cutlass.Int32(1) - i
                 slot = seq_base + step
                 if cutlass.const_expr(walk_state):
@@ -798,7 +753,7 @@ def frost_state_chain(
                             h_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(h_addr + cutlass.Int64(16 * q), cutlass.Float32)]
                         for c in cutlass.range_constexpr(cols_per_lane):
                             piece_h[rr * cols_per_lane + c] = h_vals[c]
-                if i + cutlass.Int32(1) < count:
+                if i + cutlass.Int32(1) < steps:
                     next_step = step + cutlass.Int32(1) if cutlass.const_expr(not reverse) else step - cutlass.Int32(1)
                     next_buf_words = ((i + cutlass.Int32(1)) % cutlass.Int32(CHAIN_M_BUFFERS)) * cutlass.Int32(m_words)
                     next_slot_elems = cutlass.Int64(seq_base + next_step) * m_slot_elems + m_head_elems
@@ -934,6 +889,9 @@ def frost_state_chain(
                                 part = list(ld_shared_v2(part_ptr, cutlass.Float32))
                             else:
                                 part = [x for q in range(cols_per_lane // 4) for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)]
+                            if cutlass.const_expr(zero_entry):
+                                for c in cutlass.range_constexpr(cols_per_lane):
+                                    part[c] = part[c] if i > cutlass.Int32(0) else cutlass.Float32(0.0)
                             for c in cutlass.range_constexpr(0, cols_per_lane, 2):
                                 total[c], total[c + 1] = fadd2(total[c], total[c + 1], part[c], part[c + 1])
                         for c in cutlass.range_constexpr(cols_per_lane):
@@ -966,6 +924,19 @@ def frost_state_chain(
                                 st_shared_v4(product_ptr + 4 * q, total[4 * q : 4 * q + 4], cutlass.Float32)
                 nvvm.barrier_cta_sync()
                 i = i + cutlass.Int32(1)
+
+            # ---- the last slot's entry state ----------------------------------------------------------
+            if cutlass.const_expr(walk_state and emit_states and not walk_last):
+                last_step = steps if cutlass.const_expr(not reverse) else cutlass.Int32(0)
+                last_slot_off = cutlass.Int64(seq_base + last_step) * x_slot_bytes
+                for rr in cutlass.range_constexpr(walk_own_rows):
+                    x_addr = x_row_addrs[rr] + last_slot_off
+                    x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
+                    if cutlass.const_expr(cols_per_lane == 2):
+                        st_global_v2(x_addr, x_vals, cutlass.Float32)
+                    else:
+                        for q in cutlass.range_constexpr(cols_per_lane // 4):
+                            st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
 
             # ---- epilogue -----------------------------------------------------------------------------
             if cutlass.const_expr(has_tail):
@@ -1410,6 +1381,8 @@ def frost_scalar_state_chain(
                     seed_addr = mSeed.iterator.toint() + seed_offset * cutlass.Int64(mSeed.element_type.width // 8)
                     if cutlass.const_expr(mSeed.element_type == cutlass.Float32):
                         seed_vals = list(ld_global_v4(seed_addr, cutlass.Float32))
+                    elif cutlass.const_expr(mSeed.element_type.width == 8):
+                        seed_vals = [mSeed[seed_seq, h, r, c + cutlass.Int32(e)].to(cutlass.Float32) for e in range(4)]
                     else:
                         seed_words = list(ld_global_v2(seed_addr, cutlass.Int32))
                         seed_vals = [x for word in seed_words for x in f16x2_to_f32(word, dtype=mSeed.element_type)]

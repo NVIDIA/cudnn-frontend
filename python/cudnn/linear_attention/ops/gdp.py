@@ -82,6 +82,7 @@ def make_fprop_cache_key(
     beta_shape=None,
     composed_rows=None,
     checkpoint_after_block=False,
+    state_indices_dtype=None,
 ):
     return (
         "gdp_fprop",
@@ -119,6 +120,7 @@ def make_fprop_cache_key(
         beta_shape,
         composed_rows,
         bool(checkpoint_after_block),
+        state_indices_dtype,
     )
 
 
@@ -543,6 +545,7 @@ def run_gdp_fwd(
         tuple(beta.shape),
         composed_rows=composed_rows or None,
         checkpoint_after_block=bool(checkpoint_after_block),
+        state_indices_dtype=state_indices.dtype if state_indices is not None else None,
     ) + (family_slots(k, n, 3), family_slots(v, n, 3), family_slots(beta, n, 2), has_context, bool(output_context))
     if cache_key not in fprop_cache:
         fprop_cache[cache_key] = build_fprop_graph(

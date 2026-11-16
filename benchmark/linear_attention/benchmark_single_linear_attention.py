@@ -423,7 +423,7 @@ def run_benchmark(
         raise RuntimeError(f"Benchmark failed with return code {result.returncode}.\n" f"stderr: {result.stderr}\n" f"stdout: {result.stdout}")
 
     # Parse CSV output
-    # Format: case_tag,backend,variant,batch_size,seqlen,num_q_heads,num_kv_heads,head_dim,fwd_time,bwd_time,fwd_tflops,bwd_tflops,max_diff,num_iters,fwd_bw,bwd_bw
+    # Format: case_tag,backend,variant,batch_size,seqlen,num_q_heads,num_kv_heads,head_dim,fwd_time,bwd_time,fwd_tflops,bwd_tflops,max_diff,num_iters,fwd_bw,bwd_bw,checkpoint_chunks,batch_invariant
     output_line = result.stdout.strip().split("\n")[-1]
     parts = output_line.split(",")
 
@@ -592,8 +592,6 @@ else:
     if args.batch_invariant:
         if args.la_backend != "cudnn":
             raise ValueError(f"--batch_invariant is a cudnn backend mode; {args.la_backend} has no batch-invariance control")
-        if args.store_on:
-            raise ValueError("--batch_invariant and --store_on are separate legs: each names its own backend tag in the results CSV")
 
     if args.store_on:
         if args.la_backend in ("flash_kda", "flash_qla", "mamba_ssm"):
@@ -723,6 +721,7 @@ else:
                     checkpoint_every_n_tokens=ckpt_tokens,
                     checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
+                    output_context=True,
                     **safe_gate_kwargs,
                 )
             elif args.variant == "mamba2":
@@ -759,6 +758,7 @@ else:
                     checkpoint_dtype=torch.float32 if args.fp32_checkpoints else None,
                     batch_invariant=args.batch_invariant,
                     beta_guard=False,
+                    output_context=True,
                     **safe_gate_kwargs,
                 )
             return out[0], out[1]
@@ -1507,15 +1507,9 @@ else:
     fwd_sol_str = f", {fwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and fwd_tflops > 0 else ""
     bwd_sol_str = f", {bwd_tflops / _peak_mma_tflops * 100:.1f}% SOL" if _peak_mma_tflops and bwd_tflops > 0 else ""
 
-    backend_tag = args.la_backend
-    if args.la_backend == "cudnn":
-        if args.store_on:
-            backend_tag = "cudnn_state_on"
-        elif args.batch_invariant:
-            backend_tag = "cudnn_batch_invariant"
     if args.format_output:
         print(
-            f"{args.case_tag},{backend_tag},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{fwd_bw:.2f},{bwd_bw:.2f}"
+            f"{args.case_tag},{args.la_backend},{args.variant},{args.batch_size},{args.seqlen},{args.num_q_heads},{args.num_kv_heads},{head_dim_qk},{fwd_median_time:.3f},{bwd_median_time:.3f},{fwd_tflops:.0f},{bwd_tflops:.0f},{(np.max(np.array(forward_diffs[5:])) if len(forward_diffs) > 5 else (np.max(np.array(forward_diffs)) if len(forward_diffs) > 0 else 0.0)):.6f},{num_iters},{fwd_bw:.2f},{bwd_bw:.2f},{args.checkpoint_chunk_mult if args.store_on else 0},{int(args.batch_invariant)}"
         )
     else:
         if run_fwd and run_bwd:

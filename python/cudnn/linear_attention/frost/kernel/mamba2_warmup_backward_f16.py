@@ -203,6 +203,41 @@ def warmup_backward_host(
     tail_dfs: Optional[cute.Tensor] = None,
     tail_exit_base: Optional[cute.Tensor] = None,
     tail_seed_row_base: Optional[cute.Tensor] = None,
+    ragged_unit_chunks: cutlass.Constexpr[int] = 0,
+    ragged_chain_rows: cutlass.Constexpr[int] = 0,
+    ragged_recompute_summary_cfg: cutlass.Constexpr = None,
+    ragged_recompute_series_cfg: cutlass.Constexpr = None,
+    ragged_bprop_summary_cfg: cutlass.Constexpr = None,
+    ragged_bprop_cfg: cutlass.Constexpr = None,
+    ragged_pieces: cutlass.Int32 = 0,
+    ragged_num_seqs: cutlass.Int32 = 0,
+    ragged_batch_base: cutlass.Int32 = 0,
+    ragged_first_head_lo: cutlass.Int32 = 0,
+    ragged_cu_pieces: Optional[cute.Tensor] = None,
+    ragged_main_rows: Optional[cute.Tensor] = None,
+    ragged_summary_rows: Optional[cute.Tensor] = None,
+    ragged_main_count: Optional[cute.Tensor] = None,
+    ragged_summary_count: Optional[cute.Tensor] = None,
+    ragged_work_items: Optional[cute.Tensor] = None,
+    ragged_work_items_summary: Optional[cute.Tensor] = None,
+    ragged_scheduler_all: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary_fwd: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary_bwd: Optional[cute.Tensor] = None,
+    ragged_scheduler_bprop: Optional[cute.Tensor] = None,
+    ragged_scheduler_regenerate: Optional[cute.Tensor] = None,
+    ragged_prefill_words: Optional[cute.Tensor] = None,
+    ragged_bprop_words: Optional[cute.Tensor] = None,
+    ragged_state_h: Optional[cute.Tensor] = None,
+    ragged_transition: Optional[cute.Tensor] = None,
+    ragged_state_x: Optional[cute.Tensor] = None,
+    ragged_state_g: Optional[cute.Tensor] = None,
+    ragged_state_dx: Optional[cute.Tensor] = None,
+    ragged_seed: Optional[cute.Tensor] = None,
+    ragged_dfs: Optional[cute.Tensor] = None,
+    ragged_exit_base: Optional[cute.Tensor] = None,
+    ragged_seed_row_base: Optional[cute.Tensor] = None,
+    ragged_gate_pieces: cutlass.Constexpr[int] = 0,
+    ragged_enable: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         if cutlass.const_expr(fold_seed is not None):
@@ -272,6 +307,8 @@ def warmup_backward_host(
             stream,
             item_limit_word,
             gate_sms=gate_sms,
+            gate_chain_pieces=ragged_gate_pieces,
+            gate_tail=tail_bprop_cfg is not None,
         )
         gate_sms = 0
     mamba2_bprop_f16.prologue(
@@ -296,6 +333,8 @@ def warmup_backward_host(
         stream,
         item_limit_word=item_limit_word,
         gate_sms=gate_sms,
+        gate_chain_pieces=ragged_gate_pieces,
+        gate_tail=tail_bprop_cfg is not None,
     )
     mamba2_bprop_f16.host(
         bprop_cfg,
@@ -402,6 +441,79 @@ def warmup_backward_host(
             stream,
             item_limit_word,
         )
+    if cutlass.const_expr(ragged_bprop_cfg is not None):
+        mamba2_chain_backward_f16.chain_backward_host(
+            ragged_unit_chunks,
+            b_t,
+            True,
+            ragged_recompute_series_cfg is not None,
+            False,
+            ragged_recompute_summary_cfg,
+            ragged_recompute_series_cfg,
+            ragged_bprop_summary_cfg,
+            ragged_bprop_cfg,
+            ragged_bprop_cfg.d_v,
+            ragged_bprop_cfg.d_k,
+            ragged_chain_rows,
+            ragged_seed is not None,
+            ragged_dfs is not None,
+            True,
+            ragged_pieces,
+            n_heads_out,
+            ragged_num_seqs,
+            dt_min,
+            dt_max,
+            cutlass.Int32(0),
+            ragged_batch_base,
+            ragged_first_head_lo,
+            q,
+            k,
+            v,
+            do,
+            gate,
+            a,
+            dt_bias,
+            d,
+            dq,
+            dk,
+            dv,
+            cu_seqlens,
+            ragged_cu_pieces,
+            ragged_main_rows,
+            ragged_summary_rows,
+            ragged_main_count,
+            ragged_summary_count,
+            ragged_work_items,
+            ragged_work_items_summary,
+            ragged_scheduler_all,
+            ragged_scheduler_summary_fwd,
+            ragged_scheduler_summary_bwd,
+            ragged_scheduler_bprop,
+            ragged_scheduler_regenerate,
+            ragged_prefill_words,
+            ragged_bprop_words,
+            checkpoints,
+            ragged_state_h,
+            ragged_transition,
+            ragged_state_x,
+            None,
+            ragged_state_g,
+            ragged_state_dx,
+            ragged_seed,
+            None,
+            ragged_dfs,
+            dcomposed,
+            dstate0,
+            exit_dots,
+            dot_q,
+            dot_k,
+            skip_bwd_part,
+            exit_slots,
+            ragged_exit_base,
+            ragged_seed_row_base,
+            stream,
+            ragged_enable,
+        )
     if cutlass.const_expr(reduce_dq is not None):
         dq_words = cutlass.Int64(reduce_dq.shape[0]) * cutlass.Int64(reduce_dq.shape[1]) * cutlass.Int64(bprop_cfg.d_k // 2)
         head_reduce.launch(
@@ -506,6 +618,12 @@ def build_warmup_backward(
     tail_buffers=(),
     post_buffers=(None,) * 18,
     fold_buffers=(None,) * 4,
+    ragged_pieces=0,
+    ragged_unit_chunks=0,
+    ragged_chain_rows=0,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ):
     """Compile (cached per static config) the warmup or uncut backward launch over the buffers of one plan."""
     _HQ, DK = q.shape[1], q.shape[2]
@@ -556,6 +674,16 @@ def build_warmup_backward(
         ),
         tuple((str(buffer.dtype), len(buffer.shape)) if buffer is not None else None for buffer in post_buffers),
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers),
+        (
+            (
+                int(ragged_pieces),
+                int(ragged_unit_chunks),
+                int(ragged_chain_rows),
+                *(str(buffer.dtype) if buffer is not None else None for buffer in ragged_buffers),
+            )
+            if ragged_pieces
+            else None
+        ),
     )
     if key not in warmup_backward_cache:
         bprop_cfg = mamba2_bprop_f16.build_cfg(
@@ -659,6 +787,59 @@ def build_warmup_backward(
                 from_dlpack(buffers["exit_base"], assumed_align=4).mark_layout_dynamic(),
                 from_dlpack(buffers["seed_row_base"], assumed_align=4).mark_layout_dynamic() if buffers["seed_row_base"] is not None else None,
             ]
+        ragged_constexprs = ()
+        ragged_placeholders = ()
+        if ragged_pieces:
+            if tail is None:
+                tail_constexprs = (0, 0, None, None, None, None)
+                tail_placeholders = [*(cutlass.Int32(0) for _ in range(4)), *([None] * len(TAIL_BUFFERS))]
+            buffers = dict(zip(TAIL_BUFFERS, ragged_buffers))
+            ragged_cfgs = mamba2_chain_backward_f16.build_configs(
+                io_dtype,
+                regenerate=False,
+                coarse=False,
+                seed_dtype=cutlass.Float32,
+                use_dstate0=dstate0 is not None,
+                dt_softplus=dt_softplus,
+                has_d=d is not None,
+                d_per_channel=d is not None and len(d.shape) == 2,
+                skip_bwd_partials=skip_bwd_part is not None,
+                max_active_clusters=num_sm,
+                d_k=DK,
+                d_v=DV,
+            )
+            ragged_items = from_dlpack(buffers["work_items"], assumed_align=16)
+            ragged_items.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_items_summary = from_dlpack(buffers["work_items_summary"], assumed_align=16)
+            ragged_items_summary.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_constexprs = (int(ragged_unit_chunks), int(ragged_chain_rows), *ragged_cfgs)
+            ragged_placeholders = [
+                *(cutlass.Int32(int(value)) for value in ragged_scalars),
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["main_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                ragged_items,
+                ragged_items_summary,
+                from_dlpack(buffers["scheduler_all"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary_fwd"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary_bwd"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_bprop"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_regenerate"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["prefill_words"], assumed_align=128).mark_layout_dynamic() if buffers["prefill_words"] is not None else None,
+                from_dlpack(buffers["bprop_words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["state_h"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["state_h"] is not None else None,
+                from_dlpack(buffers["transition"], assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                from_dlpack(buffers["state_x"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["state_x"] is not None else None,
+                from_dlpack(buffers["state_g"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["state_dx"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["seed"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["seed"] is not None else None,
+                from_dlpack(buffers["dfs"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["dfs"] is not None else None,
+                from_dlpack(buffers["exit_base"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["seed_row_base"], assumed_align=4).mark_layout_dynamic() if buffers["seed_row_base"] is not None else None,
+            ]
+            ragged_placeholders += [int(ragged_pieces), from_dlpack(ragged_enable, assumed_align=4).mark_layout_dynamic()]
         gate_skip_channels = int(post_buffers[13].shape[1]) if post_buffers[13] is not None and len(post_buffers[13].shape) == 2 else 1
         post_placeholders = [
             from_dlpack(buffer, assumed_align=16).mark_layout_dynamic(leading_dim=2) if buffer is not None else None for buffer in post_buffers[:4]
@@ -743,6 +924,8 @@ def build_warmup_backward(
             *post_placeholders,
             *tail_constexprs,
             *tail_placeholders,
+            *ragged_constexprs,
+            *ragged_placeholders,
             options="--enable-tvm-ffi --opt-level 2",
         )
     compiled = warmup_backward_cache[key]
@@ -789,6 +972,9 @@ def run_warmup_backward(
     tail_buffers=(),
     post_buffers=(None,) * 18,
     fold_buffers=(None,) * 4,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ) -> None:
     """Replay the warmup or uncut backward: one crossing into the DSL for the table, prologue and bprop launches."""
     compiled(
@@ -842,6 +1028,7 @@ def run_warmup_backward(
         *post_buffers,
         *tail_scalars,
         *tail_buffers,
+        *((*ragged_scalars, *ragged_buffers, ragged_enable) if ragged_buffers else ()),
     )
 
 
@@ -884,6 +1071,8 @@ def frost_mamba2_regenerate_prologue(
     mSeriesCount: Optional[cute.Tensor],
     mItemLimit: Optional[cute.Tensor] = None,
     gate_sms: cutlass.Constexpr[int] = 0,
+    gate_chain_pieces: cutlass.Constexpr[int] = 0,
+    gate_tail: cutlass.Constexpr[bool] = True,
 ) -> None:
     """Three-CTA prologue of the regenerate path: block 0 LPT-orders the work-item table both kernels consume (under
     ``coarse`` the bprop's alone; the recompute then runs over checkpoint-seeded interval items of ``seed_span_chunks``)
@@ -908,7 +1097,7 @@ def frost_mamba2_regenerate_prologue(
         n_items = n_heads_out * n_batch
         if cutlass.const_expr(mItemLimit is not None):
             if cutlass.const_expr(gate_sms > 0):
-                gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit)
+                gate_body(ORDER_THREADS, tidx, n_heads_out, gate_sms, cu_seqlens, mItemLimit, gate_chain_pieces, gate_tail)
             n_items = cutlass.Int32(mItemLimit[1])
         order_body(
             order_gen,
@@ -1095,6 +1284,41 @@ def regenerate_backward_host(
     tail_dfs: Optional[cute.Tensor] = None,
     tail_exit_base: Optional[cute.Tensor] = None,
     tail_seed_row_base: Optional[cute.Tensor] = None,
+    ragged_unit_chunks: cutlass.Constexpr[int] = 0,
+    ragged_chain_rows: cutlass.Constexpr[int] = 0,
+    ragged_recompute_summary_cfg: cutlass.Constexpr = None,
+    ragged_recompute_series_cfg: cutlass.Constexpr = None,
+    ragged_bprop_summary_cfg: cutlass.Constexpr = None,
+    ragged_bprop_cfg: cutlass.Constexpr = None,
+    ragged_pieces: cutlass.Int32 = 0,
+    ragged_num_seqs: cutlass.Int32 = 0,
+    ragged_batch_base: cutlass.Int32 = 0,
+    ragged_first_head_lo: cutlass.Int32 = 0,
+    ragged_cu_pieces: Optional[cute.Tensor] = None,
+    ragged_main_rows: Optional[cute.Tensor] = None,
+    ragged_summary_rows: Optional[cute.Tensor] = None,
+    ragged_main_count: Optional[cute.Tensor] = None,
+    ragged_summary_count: Optional[cute.Tensor] = None,
+    ragged_work_items: Optional[cute.Tensor] = None,
+    ragged_work_items_summary: Optional[cute.Tensor] = None,
+    ragged_scheduler_all: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary_fwd: Optional[cute.Tensor] = None,
+    ragged_scheduler_summary_bwd: Optional[cute.Tensor] = None,
+    ragged_scheduler_bprop: Optional[cute.Tensor] = None,
+    ragged_scheduler_regenerate: Optional[cute.Tensor] = None,
+    ragged_prefill_words: Optional[cute.Tensor] = None,
+    ragged_bprop_words: Optional[cute.Tensor] = None,
+    ragged_state_h: Optional[cute.Tensor] = None,
+    ragged_transition: Optional[cute.Tensor] = None,
+    ragged_state_x: Optional[cute.Tensor] = None,
+    ragged_state_g: Optional[cute.Tensor] = None,
+    ragged_state_dx: Optional[cute.Tensor] = None,
+    ragged_seed: Optional[cute.Tensor] = None,
+    ragged_dfs: Optional[cute.Tensor] = None,
+    ragged_exit_base: Optional[cute.Tensor] = None,
+    ragged_seed_row_base: Optional[cute.Tensor] = None,
+    ragged_gate_pieces: cutlass.Constexpr[int] = 0,
+    ragged_enable: Optional[cute.Tensor] = None,
 ) -> None:
     """The backward without a saved series: the split-K table (warmup only), one prologue for both kernels, the
     recompute writing the chunk-cadence series (under ``coarse`` over interval items seeded from ``seed_checkpoints``,
@@ -1167,6 +1391,8 @@ def regenerate_backward_host(
             stream,
             item_limit_word,
             gate_sms=gate_sms,
+            gate_chain_pieces=ragged_gate_pieces,
+            gate_tail=tail_bprop_cfg is not None,
         )
         gate_sms = 0
     recompute_base_k, recompute_base_v, recompute_base_checkpoint = mamba2_recompute_f16.base_descriptors(io_dtype, b_t, k, v, series)
@@ -1211,6 +1437,8 @@ def regenerate_backward_host(
         series_count,
         item_limit_word,
         gate_sms,
+        ragged_gate_pieces,
+        tail_bprop_cfg is not None,
     ).launch(grid=(3, 1, 1), block=(ORDER_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
     mamba2_recompute_f16.host(
         recompute_cfg,
@@ -1344,6 +1572,79 @@ def regenerate_backward_host(
             stream,
             item_limit_word,
         )
+    if cutlass.const_expr(ragged_bprop_cfg is not None):
+        mamba2_chain_backward_f16.chain_backward_host(
+            ragged_unit_chunks,
+            b_t,
+            True,
+            ragged_recompute_series_cfg is not None,
+            coarse,
+            ragged_recompute_summary_cfg,
+            ragged_recompute_series_cfg,
+            ragged_bprop_summary_cfg,
+            ragged_bprop_cfg,
+            ragged_bprop_cfg.d_v,
+            ragged_bprop_cfg.d_k,
+            ragged_chain_rows,
+            ragged_seed is not None,
+            ragged_dfs is not None,
+            True,
+            ragged_pieces,
+            n_heads_out,
+            ragged_num_seqs,
+            dt_min,
+            dt_max,
+            seed_every_n_tokens,
+            ragged_batch_base,
+            ragged_first_head_lo,
+            q,
+            k,
+            v,
+            do,
+            gate,
+            a,
+            dt_bias,
+            d,
+            dq,
+            dk,
+            dv,
+            cu_seqlens,
+            ragged_cu_pieces,
+            ragged_main_rows,
+            ragged_summary_rows,
+            ragged_main_count,
+            ragged_summary_count,
+            ragged_work_items,
+            ragged_work_items_summary,
+            ragged_scheduler_all,
+            ragged_scheduler_summary_fwd,
+            ragged_scheduler_summary_bwd,
+            ragged_scheduler_bprop,
+            ragged_scheduler_regenerate,
+            ragged_prefill_words,
+            ragged_bprop_words,
+            series,
+            ragged_state_h,
+            ragged_transition,
+            ragged_state_x,
+            seed_checkpoints,
+            ragged_state_g,
+            ragged_state_dx,
+            ragged_seed,
+            None,
+            ragged_dfs,
+            dcomposed,
+            dstate0,
+            exit_dots,
+            dot_q,
+            dot_k,
+            skip_bwd_part,
+            exit_slots,
+            ragged_exit_base,
+            ragged_seed_row_base,
+            stream,
+            ragged_enable,
+        )
     if cutlass.const_expr(reduce_dq is not None):
         dq_words = cutlass.Int64(reduce_dq.shape[0]) * cutlass.Int64(reduce_dq.shape[1]) * cutlass.Int64(bprop_cfg.d_k // 2)
         head_reduce.launch(
@@ -1457,6 +1758,12 @@ def build_regenerate_backward(
     tail_buffers=(),
     post_buffers=(None,) * 18,
     fold_buffers=(None,) * 4,
+    ragged_pieces=0,
+    ragged_unit_chunks=0,
+    ragged_chain_rows=0,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ):
     """Compile (cached per static config) the regenerate backward launch (table, one prologue, recompute, bprop) over
     the buffers of one plan; ``seed_checkpoints`` (io or fp32 rows ``seed_every_n_tokens`` apart) makes the recompute run
@@ -1515,6 +1822,16 @@ def build_regenerate_backward(
         ),
         tuple((str(buffer.dtype), len(buffer.shape)) if buffer is not None else None for buffer in post_buffers),
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in fold_buffers),
+        (
+            (
+                int(ragged_pieces),
+                int(ragged_unit_chunks),
+                int(ragged_chain_rows),
+                *(str(buffer.dtype) if buffer is not None else None for buffer in ragged_buffers),
+            )
+            if ragged_pieces
+            else None
+        ),
     )
     if key not in regenerate_backward_cache:
         recompute_cfg = mamba2_recompute_f16.build_cfg(
@@ -1643,6 +1960,59 @@ def build_regenerate_backward(
                 from_dlpack(buffers["exit_base"], assumed_align=4).mark_layout_dynamic(),
                 from_dlpack(buffers["seed_row_base"], assumed_align=4).mark_layout_dynamic() if buffers["seed_row_base"] is not None else None,
             ]
+        ragged_constexprs = ()
+        ragged_placeholders = ()
+        if ragged_pieces:
+            if tail is None:
+                tail_constexprs = (0, 0, None, None, None, None)
+                tail_placeholders = [*(cutlass.Int32(0) for _ in range(4)), *([None] * len(TAIL_BUFFERS))]
+            buffers = dict(zip(TAIL_BUFFERS, ragged_buffers))
+            ragged_cfgs = mamba2_chain_backward_f16.build_configs(
+                io_dtype,
+                regenerate=True,
+                coarse=coarse,
+                seed_dtype=get_dtype(seed_checkpoints.dtype) if coarse else cutlass.Float32,
+                use_dstate0=dstate0 is not None,
+                dt_softplus=dt_softplus,
+                has_d=d is not None,
+                d_per_channel=d is not None and len(d.shape) == 2,
+                skip_bwd_partials=skip_bwd_part is not None,
+                max_active_clusters=num_sm,
+                d_k=DK,
+                d_v=DV,
+            )
+            ragged_items = from_dlpack(buffers["work_items"], assumed_align=16)
+            ragged_items.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_items_summary = from_dlpack(buffers["work_items_summary"], assumed_align=16)
+            ragged_items_summary.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
+            ragged_constexprs = (int(ragged_unit_chunks), int(ragged_chain_rows), *ragged_cfgs)
+            ragged_placeholders = [
+                *(cutlass.Int32(int(value)) for value in ragged_scalars),
+                from_dlpack(buffers["cu_pieces"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["main_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_rows"], assumed_align=16).mark_layout_dynamic(),
+                from_dlpack(buffers["main_count"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["summary_count"], assumed_align=4).mark_layout_dynamic(),
+                ragged_items,
+                ragged_items_summary,
+                from_dlpack(buffers["scheduler_all"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary_fwd"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_summary_bwd"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_bprop"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["scheduler_regenerate"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["prefill_words"], assumed_align=128).mark_layout_dynamic() if buffers["prefill_words"] is not None else None,
+                from_dlpack(buffers["bprop_words"], assumed_align=128).mark_layout_dynamic(),
+                from_dlpack(buffers["state_h"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["state_h"] is not None else None,
+                from_dlpack(buffers["transition"], assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                from_dlpack(buffers["state_x"], assumed_align=16).mark_layout_dynamic(leading_dim=3) if buffers["state_x"] is not None else None,
+                from_dlpack(buffers["state_g"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["state_dx"], assumed_align=16).mark_layout_dynamic(leading_dim=3),
+                from_dlpack(buffers["seed"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["seed"] is not None else None,
+                from_dlpack(buffers["dfs"], assumed_align=4).mark_layout_dynamic(leading_dim=3) if buffers["dfs"] is not None else None,
+                from_dlpack(buffers["exit_base"], assumed_align=4).mark_layout_dynamic(),
+                from_dlpack(buffers["seed_row_base"], assumed_align=4).mark_layout_dynamic() if buffers["seed_row_base"] is not None else None,
+            ]
+            ragged_placeholders += [int(ragged_pieces), from_dlpack(ragged_enable, assumed_align=4).mark_layout_dynamic()]
         gate_skip_channels = int(post_buffers[13].shape[1]) if post_buffers[13] is not None and len(post_buffers[13].shape) == 2 else 1
         post_placeholders = [
             from_dlpack(buffer, assumed_align=16).mark_layout_dynamic(leading_dim=2) if buffer is not None else None for buffer in post_buffers[:4]
@@ -1738,6 +2108,8 @@ def build_regenerate_backward(
             *post_placeholders,
             *tail_constexprs,
             *tail_placeholders,
+            *ragged_constexprs,
+            *ragged_placeholders,
             options="--enable-tvm-ffi --opt-level 2",
         )
     return regenerate_backward_cache[key], facts
@@ -1792,6 +2164,9 @@ def run_regenerate_backward(
     tail_buffers=(),
     post_buffers=(None,) * 18,
     fold_buffers=(None,) * 4,
+    ragged_enable=None,
+    ragged_scalars=(),
+    ragged_buffers=(),
 ) -> None:
     """Replay the regenerate backward: one crossing into the DSL for the table, prologue, recompute and bprop launches."""
     compiled(
@@ -1854,6 +2229,7 @@ def run_regenerate_backward(
         *post_buffers,
         *tail_scalars,
         *tail_buffers,
+        *((*ragged_scalars, *ragged_buffers, ragged_enable) if ragged_buffers else ()),
     )
 
 

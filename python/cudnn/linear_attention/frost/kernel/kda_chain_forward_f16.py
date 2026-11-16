@@ -236,6 +236,7 @@ def chain_forward_host(
         cu_full=cu_full,
         batch_base=batch_base,
         tail_enable=tail_enable,
+        summary_skip=1,
     )
     for state_phase in cutlass.range(state_head_divisor):
         active_main_count = main_count

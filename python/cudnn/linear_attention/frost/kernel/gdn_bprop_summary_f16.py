@@ -76,6 +76,7 @@ from dataclasses import dataclass
 from typing import NamedTuple, Optional, Type, Tuple
 
 import cuda.bindings.driver as cuda
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 import cutlass
 import cutlass.cute as cute
@@ -214,7 +215,9 @@ def make_bars(cfg) -> GdnBpropSummaryBars:
         mb_a_done=MBarrier(alloc(cfg.smem_a_stages), try_wait=True, stages=cfg.smem_a_stages, init_count=MMA_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_tmem_done=MBarrier(alloc(1), try_wait=True, stages=1, init_count=ALL_COMPUTE, producer=Producer.THREAD),
         mb_scheduler_ready=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=ONE_LANE, producer=Producer.THREAD),
-        mb_scheduler_done=MBarrier(alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15, producer=Producer.THREAD),
+        mb_scheduler_done=MBarrier(
+            alloc(cfg.scheduler_stages), try_wait=True, stages=cfg.scheduler_stages, init_count=15 * cfg.threads_per_warp, producer=Producer.THREAD
+        ),
     )
 
 
@@ -233,12 +236,11 @@ def scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, n
 
 
 @cute.jit
-def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one):
+def scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz):
     """Consumer side: read the TMA-LDG warp's published next tile."""
     bars.mb_scheduler_ready[scheduler_state.idx].wait(scheduler_state.phase)
     next_tile = sScheduler[scheduler_state.idx]
-    if elect_one:
-        bars.mb_scheduler_done[scheduler_state.idx].arrive()
+    consume_then_arrive(bars.mb_scheduler_done[scheduler_state.idx], next_tile, rz)
     return next_tile, advance(scheduler_state, cfg.scheduler_stages)
 
 
@@ -250,6 +252,7 @@ def tmastg_warp(
     num_ctas,
     sScheduler,
     bars,
+    rz,
 ):
     """Scheduler-only shell for warp 15; it arrives on ``mb_scheduler_done``
     so that barrier's 15-warp population holds."""
@@ -261,7 +264,7 @@ def tmastg_warp(
     tile_idx = cutlass.Int32(bidx)
 
     while tile_idx < total_tiles:
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
 
 @cute.jit
@@ -283,6 +286,7 @@ def gate_warp(
     sTokCumprod,
     sScheduler,
     bars,
+    rz,
 ):
     """Gate load warp role (warp 14): per-chunk Gate G->S loads and, under expand_num > 1, the chunk's block-token tables
     (readout slot, cumsum and cumprod at the slot); the stage recycle waits on the consumers' done barrier."""
@@ -402,7 +406,7 @@ def gate_warp(
                 gate_store_idx = gate_store_index.idx
                 bars.mb_gate_done[gate_store_idx].wait(gate_store_index.phase)
                 gate_store_index = advance(gate_store_index, cfg.smem_gate_stages)
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
 
 @cute.jit
@@ -424,6 +428,7 @@ def tcgen05_mma_warp(
     sA_trans,
     sScheduler,
     bars,
+    rz,
 ):
     """MMA issuer role (warp 12): every tcgen05 GEMM of the reverse dstate recurrence.  Per work item the first chunk's QK
     GEMM is issued before the chunk loop; per chunk the order is dV inter, dstate Q-term, dU intra, QK of the next chunk,
@@ -810,7 +815,7 @@ def tcgen05_mma_warp(
                         bars.mb_q_mma_done[q_last].arrive(cta_group=1)
                         bars.mb_do_mma_done[do_last].arrive(cta_group=1)
 
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
     bars.mb_du_total_acc_done[0].wait(du_total_done_index.phase)
     bars.mb_tmem_done[0].wait(0)
@@ -1019,6 +1024,7 @@ def compute0_warp_group(
     sA,
     sScheduler,
     bars,
+    rz,
 ):
     """Compute warp-group 0 role (warps 0-3): stages each chunk's dO' into the shared input columns and builds its
     attention matrix."""
@@ -1223,7 +1229,7 @@ def compute0_warp_group(
                 do_last = do_index.idx ^ cutlass.Int32(1)
                 for _ in cutlass.range(pad_post):
                     bars.mb_do_cg0_done[do_last].arrive()
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
     for _ in range(cfg.smem_a_stages):
         bars.mb_a_done[a_index.idx].wait(a_index.phase)
         a_index = advance(a_index, cfg.smem_a_stages)
@@ -1247,6 +1253,7 @@ def compute1_warp_group(
     sCumprod,
     sScheduler,
     bars,
+    rz,
 ):
     """Compute warp-group 1 role (warps 4-7): persistent scheduler loop
     running each chunk's dV decay rescale and the dU / dY' stagings."""
@@ -1377,7 +1384,7 @@ def compute1_warp_group(
             # ---- Gate stage release --------------------------------------------------
             bars.mb_gate_done[gate_idx].arrive()
 
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -1398,6 +1405,7 @@ def compute2_warp_group(
     sCumprod,
     sScheduler,
     bars,
+    rz,
 ):
     """Compute warp-group 2 role (warps 8-11): d_final_state seeding, the per-chunk f16 pack of the dstate accumulator into
     the input columns with its rescale by the next chunk's total decay, and the d_initial_state store + zero-chunk passthrough."""
@@ -1579,7 +1587,7 @@ def compute2_warp_group(
                             if dstate_row_valid:
                                 gDstate0[dstate_gmem_row, i * ldtm_width + kk] = cutlass.Float32(0.0).to(mDstate0_out.element_type)
 
-        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one)
+        tile_idx, scheduler_state = scheduler_next_tile(cfg, bars, sScheduler, scheduler_state, elect_one, rz)
 
     bars.mb_tmem_done[0].arrive()
 
@@ -1878,6 +1886,7 @@ def host(
         scheduler_counter,
         tensormap_workspace,
         cutlass.Int32(num_descs),
+        cutlass.Int32(0),
     ).launch(
         grid=grid_shape,
         block=(cfg.threads_per_cta, 1, 1),
@@ -1911,9 +1920,11 @@ def frost_gdn_bprop_summary(
     mScheduler: cute.Tensor,
     tensormap_workspace: cute.Tensor,
     n_desc: cutlass.Int32,
+    rz_arg: cutlass.Int32,
 ):
     """Main GDN bprop state-summary chunked kernel (warp-specialized
     persistent body)."""
+    rz = release_zero(rz_arg)
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
@@ -2170,6 +2181,7 @@ def frost_gdn_bprop_summary(
             sA=sA,
             sScheduler=sScheduler,
             bars=bars,
+            rz=rz,
         )
 
     if warp_idx >= cfg.compute_group_1_warp_ids[0] and warp_idx <= cfg.compute_group_1_warp_ids[-1]:
@@ -2188,6 +2200,7 @@ def frost_gdn_bprop_summary(
             sCumprod=sCumprod,
             sScheduler=sScheduler,
             bars=bars,
+            rz=rz,
         )
 
     if warp_idx >= cfg.compute_group_2_warp_ids[0] and warp_idx <= cfg.compute_group_2_warp_ids[-1]:
@@ -2206,6 +2219,7 @@ def frost_gdn_bprop_summary(
             sCumprod=sCumprod,
             sScheduler=sScheduler,
             bars=bars,
+            rz=rz,
         )
 
     elif warp_idx == cfg.tcgen05_mma_warp_id:
@@ -2227,6 +2241,7 @@ def frost_gdn_bprop_summary(
             sA_trans=sA_trans,
             sScheduler=sScheduler,
             bars=bars,
+            rz=rz,
         )
 
     elif warp_idx == cfg.tma_qkv_warp_id:
@@ -2272,6 +2287,7 @@ def frost_gdn_bprop_summary(
             sTokCumprod=sTokCumprod,
             sScheduler=sScheduler,
             bars=bars,
+            rz=rz,
         )
     if warp_idx == cfg.epilogue_warp_id:
         tmastg_warp(
@@ -2281,6 +2297,7 @@ def frost_gdn_bprop_summary(
             num_ctas,
             sScheduler=sScheduler,
             bars=bars,
+            rz=rz,
         )
 
 
