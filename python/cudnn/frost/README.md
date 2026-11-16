@@ -365,7 +365,7 @@ python/cudnn/
         sm80/f16_two_subgroup/kernel.py  one directory per explicit engine body
         sm100/d512_f16_role_split/kernel.py       stage 2 of the large-head-dim chain
         sm100/d256_mxfp8/dq.py        ported MXFP8 kernel classes (+ dkdv,
-                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
+                                      masks, common, sf_repack)
         sm107/d256_f16_4x1/kernel.py       Rubin d256 bf16/fp16 main kernel (dV in
                                       TMEM, dS to a kv-major GMEM workspace)
         sm107/d256_fp8/kernel.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
@@ -1135,8 +1135,7 @@ Contract:
     pipeline shape go in the implementation directory name and the engine name.
     Contracts and helpers shared by several implementations of one arch stay at
     the arch level (`kernels/sm100/small_half_contract.py`); a module shared
-    across arch lines stays at `kernels/` level. Backward kernels are migrating
-    to this layout and are still flat files in some arch packages.
+    across arch lines stays at `kernels/` level.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.

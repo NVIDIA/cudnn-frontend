@@ -561,7 +561,7 @@ def test_workspace_accounts_for_repack_buffers():
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
-    from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
+    from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
 
     l = b * hq
     # 4 rowwise-A + 5 rowwise/columnwise-B + 2 columnwise-B buffers (see _sf_plan)

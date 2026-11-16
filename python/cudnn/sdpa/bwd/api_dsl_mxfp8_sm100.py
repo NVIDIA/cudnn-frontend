@@ -22,7 +22,7 @@ and seven F8_128x4 scale tensors. The gradients ``dQ/dK/dV`` are half precision
 
 Scale-factor layout: the kernels read scale factors through TMA in a 2-CTA
 slot layout the upstream quantizer emits, not cuDNN's canonical F8_128x4 --
-see ``kernels/sm100/bprop_sf_repack_mxfp8.py`` for the layouts and why a TMA
+see ``kernels/sm100/d256_mxfp8/sf_repack.py`` for the layouts and why a TMA
 descriptor cannot address the shifted copy. The seven graph SF tensors are
 therefore repacked (eleven small launches, one per kernel operand form) into
 workspace ahead of the two kernels. This is a documented, deliberate exception
@@ -146,7 +146,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         producer's 2-D swizzle with the D tile outside the head plane (see the
         repack module).
         """
-        from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import SF_LAYOUT_SFA, SF_LAYOUT_SFB
 
         b, hq, hk, sq, sk, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, self.head_dim_qk
         lq, lk = b * hq, b * hk
@@ -281,7 +281,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
     def _kernel_workspace_bytes(self) -> int:
         import cutlass
 
-        from cudnn.sdpa.bwd.kernels.sm100._bprop_mxfp8_common import get_workspace_size
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.common import get_workspace_size
 
         return int(get_workspace_size(self.s_q_max, self.head_dim_qk, self.h_q, self.batch_size, cutlass.Float32))
 
@@ -296,7 +296,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         kernels size but do not use) plus the eleven repacked scale-factor
         buffers. A pure function of the plan geometry; all of it is carved
         from the caller's buffer at execute. The kernel pair needs the delta rows only."""
-        from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import repack_geometry
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8.sf_repack import repack_geometry
 
         if self._pair_route():
             from cudnn.sdpa.bwd.kernels.sm100.prepared_d192_fp8_host import workspace_layout
@@ -323,7 +323,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         return q_geom, kv_geom, lse_geom
 
     def _mask_types(self):
-        from cudnn.sdpa.bwd.kernels.sm100 import _bprop_mxfp8_masks as masks
+        from cudnn.sdpa.bwd.kernels.sm100.d256_mxfp8 import masks
 
         # Upstream's selection, kept verbatim: the residual mask is needed only
         # for a Q-side tail. A KV-side tail (S_kv not a multiple of 128) is
@@ -429,7 +429,7 @@ class SdpaBwdDslSm100Mxfp8(SdpaBwdDsl):
         from .prepared import BwdLaunchSpec, Operand
         from .kernels.sm100.d256_mxfp8.dkdv import BlackwellFmhaBackwardDKDV256
         from .kernels.sm100.d256_mxfp8.dq import BlackwellFmhaBackwardDQ256
-        from .kernels.sm100.bprop_sf_repack_mxfp8 import Mxfp8SfRepackSm100
+        from .kernels.sm100.d256_mxfp8.sf_repack import Mxfp8SfRepackSm100
         from .kernels.sm100.prepared_mxfp8_host import compile_host
 
         out_dt = cutlass.BFloat16 if self.out_dtype == torch.bfloat16 else cutlass.Float16
