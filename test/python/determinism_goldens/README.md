@@ -7026,19 +7026,38 @@ sequences. From `test/python`:
 python -m pytest linear_attention/test_la.py -k "autotune or determinism" -rA
 ```
 
-Source `20493fe8` ran on one GB300 (cc 10.3, 152 SMs) with cuDNN backend
+The two stream-contention tests, `test_determinism_two_streams` (forward,
+every variant) and `test_bwd_same_graph_two_streams` (backward, KDA and
+mamba2, fp16 and bf16), were FROST-only and now run on the cuTile engine as
+well: two instances on two side streams, each repeat compared bitwise with
+its own single-stream baseline, with the serial baselines warming the hint
+cache so the concurrent repeats never tune. The first run of the backward
+case on cuTile KDA found a stream defect: `chunk_kda_grad` launched its five
+gradient casts without a stream, so they ran on the legacy default stream
+while the rest of the backward ran on the caller's, and on a non-blocking
+torch stream the first backward after another stream had tuned returned
+`dq` and `dk` as zeros (GB300 job 1990036; a probe that logged every launch
+saw stream 0 beside the side stream, and a device sync after every launch
+made the zeros disappear). The casts now take the caller's stream; develop
+has the same defect. GDN's backward does not.
+
+Source `2a254355` ran on one GB300 (cc 10.3, 152 SMs) with cuDNN backend
 9.26.0, cuDNN frontend 1.33.0 from the checkout, CuTe DSL 4.8.0, CUDA 13.4
-and driver API 13040, Torch 2.14.0a0 (NGC 26.09):
-**49 passed, 84 skipped, 0 failed.** The passes are `test_determinism_fwd`,
+and driver API 13040, Torch 2.14.0a0 (NGC 26.09), selecting
+`-k "autotune or determinism or two_streams"`:
+**57 passed, 89 skipped, 0 failed.** The passes are `test_determinism_fwd`,
 `_bwd`, `_multi_tile_fwd` and `_multi_tile_bwd` (7 each), `_bwd_all_grads`
-(11), `_two_streams` (5), `test_beta_guard_bwd_determinism` (1) over the FROST
-variants and cuTile GDN and KDA, plus the two autotune tests for GDN and KDA
-(2 each). The skips are the `hopper` and `hopper_cuda` rows and cuTile's
-gdn2, gdp and mamba2 rows, which have no plan on this GPU;
-`test_multi_graph_stress` is not selected. Forcing each candidate on this
-GPU showed that occupancy never moves a bit and that `num_worker_warps=8`
-moves the bits of the kkt solve, dqkwg and prepare_wy_repr_bwd kernels,
-which is why the host pins the pick instead of relying on the timing.
+(11), `test_determinism_two_streams` (7: five FROST variants, cuTile GDN and
+KDA), `test_bwd_same_graph_two_streams` (6: FROST KDA and mamba2, cuTile KDA,
+two dtypes each), `test_beta_guard_bwd_determinism` (1), plus the two
+autotune tests for GDN and KDA (2 each). The skips are the `hopper` and
+`hopper_cuda` rows and cuTile's gdn2, gdp and mamba2 rows, which have no
+plan on this GPU; `test_multi_graph_stress` is not selected. After the cast
+fix the launch log of the two-stream backward shows every cuTile launch and
+memset on the caller's stream. Forcing each candidate on this GPU showed
+that occupancy never moves a bit and that `num_worker_warps=8` moves the
+bits of the kkt solve, dqkwg and prepare_wy_repr_bwd kernels, which is why
+the host pins the pick instead of relying on the timing.
 
 CI pipeline 82134950 ran the same two autotune tests at source `f080e1fe`
 (identical kernel and host code) on SM80, SM90 and SM100 with cuDNN 9.28.1
@@ -7046,8 +7065,21 @@ and CuTe DSL 4.8.0: **12 of 12 cases passed, no skips**. SM107 was not
 run. No performance was measured: the sweep is develop's, and the hooks act
 only on a hint-cache miss.
 
+End to end, the Megatron-Bridge recipe
+`qwen35_text_9b_pretrain_8gpu_gb200_bf16_deterministic_config` (Qwen3.5-9B,
+Megatron-Core deterministic mode, `gdn_kernel_backend=transformer_engine`,
+2 nodes x 4 GB300, mock data, 20 steps) ran three times with this tree's
+`python/cudnn` mounted over the container's cudnn 1.29.0 package, on the
+nemo 26.10.rc5 image: **the three arms are identical on every logged step
+(loss, grad norm, num zeros), 3.66 s per iteration**. On this GPU and head
+dim 128 cuDNN serves the FROST GDN engine, which this revision does not
+change, so this run is a regression check of the tree in the training
+container, not a cuTile exercise; TE forwards no plan name, so the cuTile
+engine cannot be selected from the recipe on GB300.
+
 QSA is not changed by this revision; its deterministic backward is develop's
-(#2417). For the record on the same GB300 and source `20493fe8`, the QSA
+(#2417). For the record on the same GB300 and source `20493fe8` (the cuTile
+cast fix touches no QSA file), the QSA
 L0/L1 determinism and replay selection, goldens deselected, gives
 **75 passed, 9 skipped, 0 failed**. The skips are the batch-invariance
 cases waived under PR #2266 (batch layout changes the saved FP32 output or the
