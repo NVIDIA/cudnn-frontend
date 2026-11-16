@@ -47,11 +47,22 @@ GATE_SYMBOL = (
 )
 GATE_SHAPE = ((3, 1, 1), (256, 1, 1), 0)
 GATHER_SHAPE = ((40, 1, 1), (128, 1, 1), 0)
+NORM_SHAPE = ((1, 1, 1), (640, 1, 1), 80)  # of the add + norm + quantise entry at 1 row: one thread block per row
+#: the symbol of that entry's kernel in two of its forms, as a traced run reported them: the form's text follows the kernel's name
+NORM_SYMBOL = (
+    "cudnn_kernel_frost_add_rms_norm_quant_h5120_add_nvfp4_wait_release_eps358637bd_tensorptrbf16gmemalign16o1_tensorptrbf16_gmem_align16_o_1_"
+    "tensorptrbf16gmemalign16o1_tensorptrf32_gmem_o_1_0"
+)
+NORM_SYMBOL_FIRST = (
+    "cudnn_kernel_frost_add_rms_norm_quant_h5120_store_bf16_e4m3_static_wait_release_eps358637bd_tensorptrbf16gmemalign16o1_tensorptrbf16_gmem_align16_o_1_"
+    "tensorptrbf16gmemalign16o1_tensorpt_0"
+)
 RECORDED = {"torch": "2.14.0+cu130", "nvidia-cutlass-dsl": "4.8.0"}  # installed versions equal to the census's recorded ones
 CENSUS = "target census plain / cc 10.0 / 148 SMs (recorded 2026-11-12)"
-#: what the census line says was compared when the gather, the fused step and the gate of the two-layer model held: three numbers
-COMPARED_3 = (
-    "3 launches of a step compared by launch shape (2 the target's own compiled kernels + 1 cuDNN Frontend entry with byte-equal results "
+#: what the census line says was compared when the gather, the fused step, the gate and the five norms of the two-layer model
+#: held: three numbers
+COMPARED_8 = (
+    "8 launches of a step compared by launch shape (2 the target's own compiled kernels + 6 cuDNN Frontend entries with byte-equal results "
     "+ 0 declared stand-ins)"
 )
 COMPARED_2 = (
@@ -142,6 +153,7 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
 
     assert kernel(SYMBOL) == "gdn_decode_fused" and kernel(SYMBOL.replace("PDLFalsePDL_RELEASEFalse", "PDLTruePDL_RELEASETrue")) == "gdn_decode_fused"
     assert kernel(TARGET_SYMBOL) == "gdn_decode_fused" and kernel(GATE_SYMBOL) == "gate_quant", "each entry's kernel has an id of its own"
+    assert kernel(NORM_SYMBOL) == kernel(NORM_SYMBOL_FIRST) == "add_norm_quant", "one id for every form of the norm entry's kernel"
     assert kernel("cudnn_kernel_frost_gdn_verify_fused_CfgTPR4K_RESIDENTTrue_0") == "cudnn_fe", "a cuDNN Frontend kernel no pattern names is no family's member"
     assert kernel(GATHER) == "embedding_gather" and kernel(GATHER.replace("SmallIndex", "LargeIndex")) == "embedding_gather"
     assert census.FAMILY_OF["embedding_gather"] == "pytorch", "the gather is a PyTorch kernel with an id of its own"
@@ -165,8 +177,9 @@ def test_canonical_ids_of_the_kernel_families_a_sample_launches():
 
     named = [kernel_id for kernel_id, _ in census.FAMILIES]
     judged = {kernel.id for adapter in factories().values() for kernel in adapter.kernels if kernel.relation == "exact"}
-    assert judged == {"gdn_decode_fused", "gate_quant", "embedding_gather"} and judged <= set(named), "every exactly judged kernel has a pattern of its own"
-    assert named.index("gdn_decode_fused") < named.index("cudnn_fe") and named.index("gate_quant") < named.index("cudnn_fe"), "in front of the catch-all"
+    assert judged == {"gdn_decode_fused", "gate_quant", "add_norm_quant", "embedding_gather"} and judged <= set(named), "a pattern of its own each"
+    for kernel_id in ("gdn_decode_fused", "gate_quant", "add_norm_quant"):
+        assert named.index(kernel_id) < named.index("cudnn_fe"), f"{kernel_id}: in front of the catch-all"
     with pytest.raises(ValueError, match="an exact kernel states its launches per call"):
         census.Kernel("k", "PyTorch", "exact")
     with pytest.raises(ValueError, match="only an exact kernel states"):
@@ -801,7 +814,26 @@ def _tiny_session(sequences, stack="reference"):
     return session, text
 
 
-def _stand_ins(monkeypatch, step_launches=None, declares=None, profiler="records", serves=None, gate_shape=GATE_SHAPE, gate_defect=False):
+def _norm_symbol(form):
+    """The symbol a stand-in instance of the norm entry states for a form: the form's text behind the kernel's name, as the
+    entry writes it."""
+    mode = "add" if form["ADD"] else ("store" if form.get("STORE_RESIDUAL") else "none")
+    outputs = "_".join(part for part in ("bf16" if form["BF16_OUT"] else None, form["QUANT"]) if part)
+    return f"cudnn_kernel_frost_add_rms_norm_quant_h64_{mode}_{outputs}_wait_release_eps358637bd_0"
+
+
+def _stand_ins(
+    monkeypatch,
+    step_launches=None,
+    declares=None,
+    profiler="records",
+    serves=None,
+    gate_shape=GATE_SHAPE,
+    gate_defect=False,
+    norm_defect="",
+    norm_serves=None,
+    norm_shape=None,
+):
     """The provider factories of a device that exists only as a log: every provider of the provider rows is a stand-in that
     runs the reference's arithmetic and writes the launches a real provider of its row would make into the log; a stand-in
     profiler (it replaces ``loop.trace_steps``) hands the log over as the launch records of a traced pass.
@@ -811,12 +843,20 @@ def _stand_ins(monkeypatch, step_launches=None, declares=None, profiler="records
     one entry instance, which states the form of the row).  ``profiler``: ``"records"``, or the reason it cannot run -- or a
     list of these, one per traced pass, the last one for every further pass.  The stand-in of the gate entry runs the
     kernel's fp32 chain, states and launches ``gate_shape`` and is compared with the gate's real twin; ``gate_defect``
-    makes it write one wrong byte per call."""
+    makes it write one wrong byte per call.
+
+    The stand-in of the norm entry runs that kernel's fp32 chain in the form of the call's site -- one instance per form,
+    the residual stream updated in place, the 4-bit block scales as the kernel forms them and in its 128 x 4 layout, the
+    bf16 rows handed over unquantised where the form writes no codes -- states and launches one thread block per row (or
+    ``norm_shape``) and is compared with the norm's real twin.  ``norm_serves(site)`` replaces what it says served a call; ``norm_defect`` makes
+    it ``"extra"`` (launch one more kernel in front of its own), ``"missing"`` (not launch at the output head), ``"chain"`` (launch a
+    chain of PyTorch kernels in place of its own), or write per call a wrong ``"code"``, block ``"scale"``, ``"bf16"``
+    element or ``"residual"`` element."""
     from model_samples import loop
     from model_samples.census import Facts, Kernel, Launch
     from model_samples.providers import factories, torch_ref
     from model_samples.timing import Trace
-    from model_samples.weights import ScaledTensor, quantize_fp8
+    from model_samples.weights import BLOCK, ScaledTensor, TiledBlockScaledTensor, Unquantized, _e2m1, _e4m3_values, quantize_fp8, tile_scale_index
 
     log = []
     passes = [profiler] if isinstance(profiler, str) else list(profiler)
@@ -880,9 +920,87 @@ def _stand_ins(monkeypatch, step_launches=None, declares=None, profiler="records
                 codes[0, 0] = 0x7E  # the largest code: of no bf16 value near a gated value of this model
             return ScaledTensor(codes, float(quant.scale))
 
+    class Norm(torch_ref.AddNormQuantize):
+        """The stand-in of the norm entry: the kernel's own chain in fp32 -- the sum, the normalised value rounded once to
+        bf16, the codes of that bf16 value -- in the form of the call's site, one launch per call, and the real twin."""
+
+        provider = "cuDNN FE"
+        kernels = (Kernel("add_norm_quant", "cuDNN FE", "exact", launches=1, shape="entry"),)
+        state_args = (1,)
+        _twin = None
+        _site = ""
+
+        def _form(self, site):
+            return dict(self.row.site_form(site))
+
+        def launch_facts(self, rows, site=""):
+            return Facts((_norm_symbol(self._form(site)),), self._form(site), norm_shape or ((rows, 1, 1), (640, 1, 1), 80))
+
+        def serving(self):  # what the stand-in's own entry instance of the last call's form states
+            if norm_serves is not None:
+                return norm_serves(self._site)
+            place = [site for site, _ in self.row.sites].index(self._site) + 1
+            return f"cudnn.AddNormQuantDecode #{place}", tuple(self.row.site_form(self._site))
+
+        def twin(self, reference):
+            if self._twin is None:
+                self._twin = torch_ref.AddNormQuantizeBracket(reference.row, self.model, self.facts, self.options)
+                self._twin.forms = {site: self._form(site) for site, _ in self.row.sites}
+            return self._twin
+
+        def compared(self, out):
+            q, normed, residual = out
+            return (None if isinstance(q, Unquantized) else q, normed, residual)
+
+        def __call__(self, branch, residual, weight, quant, site=""):
+            form, rows = self._form(site), branch.shape[0]
+            self._site = site
+            if norm_defect == "chain":
+                launch(ELEMENTWISE)
+                launch(ELEMENTWISE)
+            else:
+                if norm_defect == "extra":
+                    launch(ELEMENTWISE)  # in front of its own kernel: after the launch of the block before it
+                if not (norm_defect == "missing" and site == "output_head"):
+                    launch(_norm_symbol(form), norm_shape or ((rows, 1, 1), (640, 1, 1), 80))
+            if residual is None:
+                v, residual = branch.float(), branch.clone()
+            else:
+                v = residual.float() + branch.float()
+                residual.copy_(v.to(torch.bfloat16))  # in place, as the kernel updates the stream
+            y = ((v * torch.rsqrt(v.square().mean(-1, keepdim=True) + self.eps)) * (1.0 + weight.float())).to(torch.bfloat16)
+            if norm_defect == "bf16":
+                y[0, 0] = y[0, 0].float() * 1.5 + 1.0
+            if norm_defect == "residual":
+                residual[0, 0] = residual[0, 0].float() + 1.0
+            if form["QUANT"] == "e4m3_static":
+                q = quantize_fp8(y, quant.scale)
+                if norm_defect == "code":
+                    q.codes[0, 0] = 0x7E  # the largest code: of no bf16 value near a normed value of this model
+            elif form["QUANT"] == "nvfp4":
+                scales = torch_ref.nvfp4_block_scales(y.float().abs().unflatten(-1, (-1, BLOCK)).amax(-1), quant.scale)
+                if norm_defect == "scale":
+                    scales[0, 0] += 8  # one binade up: of no block maximum the bracket admits
+                # the encode scale as the reference quantiser forms it (the reciprocal of block scale x scale, in fp32), the sign
+                # kept on a zero: inside the bracket of the entry's two approximate reciprocals, and on an exact tie the
+                # reference's choice -- so the token line of the tiny geometry (rows 64 wide, where one 4-bit code moves a
+                # logit by several units) is held to the family's band as it is with the reference chain
+                step = _e4m3_values(scales).repeat_interleave(BLOCK, dim=-1) * torch.tensor(float(quant.scale), dtype=torch.float32)
+                encode = torch.where(step != 0, 1.0 / torch.where(step != 0, step, torch.ones_like(step)), torch.zeros_like(step))
+                nibbles = _e2m1(y.float() * encode, signed_zero=True)
+                if norm_defect == "code":
+                    nibbles[0, 0] = nibbles[0, 0] ^ 0x8  # the other sign: outside every bracket of a non-zero value
+                tiled = torch.zeros((128, y.shape[-1] // BLOCK), dtype=torch.uint8)
+                tiled.view(-1)[tile_scale_index(rows, y.shape[-1] // BLOCK, "cpu")] = scales
+                q = TiledBlockScaledTensor(nibbles[..., 0::2] | (nibbles[..., 1::2] << 4), tiled, float(quant.scale))
+            else:  # the form ends at the bf16 rows: the consumer quantises
+                q = None if quant is None else Unquantized(y, quant.fmt, float(quant.scale))
+            return q, (y if form["BF16_OUT"] else None), residual
+
     stand_ins = {
         "fe.gdn_decode_fused": Step,
         "fe.attention_gate_quant_decode": Gate,
+        "fe.add_norm_quant_decode": Norm,
         "cublas.bf16_dequantized": logging(torch_ref.Linear, ELEMENTWISE, NVJET, SPLIT_K, ELEMENTWISE),
         "cublas.bf16_dequantized+torch_ref.silu_mul_quantize": logging(torch_ref.GateUp, ELEMENTWISE, NVJET, ELEMENTWISE),
         "torch.index_select": logging(torch_ref.Embedding, GATHER, shape=GATHER_SHAPE),
@@ -1424,7 +1542,12 @@ def test_the_census_file_of_the_target_kernel_set():
     plan, model, _ = _target_plan()
     exact = {name: [kernel.id for kernel in block.kernels if kernel.relation == "exact"] for name, block in plan.items()}
     served = {name: ids[0] for name, ids in exact.items() if ids}
-    assert served == {"embedding": "embedding_gather", "linear_attention.step": "gdn_decode_fused", "attention.gate_quantize": "gate_quant"}
+    assert served == {
+        "embedding": "embedding_gather",
+        "add_norm_quantize": "add_norm_quant",
+        "linear_attention.step": "gdn_decode_fused",
+        "attention.gate_quantize": "gate_quant",
+    }
     for block, kernel_id in served.items():
         meta = target.data["kernels"][kernel_id]
         same = "a change of a form the kernel census names updates kernel_census.json in the same commit"
@@ -1432,6 +1555,21 @@ def test_the_census_file_of_the_target_kernel_set():
             "form", {}
         ), f"{block}: the form of its native row in configs.py and of {kernel_id} in the census differ; {same}"
         assert meta["entry"] == plan[block].entry, block
+    # a kernel the target calls in several forms: the census names the form of every call, the row the form of every call site,
+    # and for every call of the 64-layer model the two are the same form
+    full_plan, full, _ = _target_plan(64)
+    parts = sections["cc10.0/sm148"]["rows"]["1"]
+    calls = target.sequence(parts, full.geometry.layer_kinds)
+    by_call = [(site, facts) for (block, _, facts), site in zip(calls, full.sites()) if block == "add_norm_quantize"]
+    assert len(by_call) == 129 and all(site for site, _ in by_call)
+    for site, facts in by_call:
+        wanted = {**target.data["kernels"]["add_norm_quant"]["form"], **facts["form"]}
+        assert dict(full_plan.rows["add_norm_quantize"].site_form(site)) == wanted, f"add_norm_quantize at {site}: configs.py and the census differ; {same}"
+    assert parts[census.FIRST_LAYER] == {"add_norm_quantize": {"form": {"ADD": False, "STORE_RESIDUAL": True}}}, "the first norm of a step starts the stream"
+    assert by_call[0][1]["form"] == {"ADD": False, "STORE_RESIDUAL": True, "BF16_OUT": True, "QUANT": "e4m3_static"} and by_call[1][1]["form"]["ADD"] is True
+    assert (
+        by_call[0][1]["launch"] == by_call[1][1]["launch"] == [[1, 1, 1], [640, 1, 1], 80]
+    ), "one launch shape for every form: the form is not in a launch record"
     assert configs.TARGET_STACKS == QwenDense.target_stacks == ("native", "fe-entries")
     # which kernels a stack of this repository calls an entry for is said per kernel, and held here: the three numbers count
     # the complete stack, and a reader of the file must be able to tell what exists today
@@ -1443,18 +1581,24 @@ def test_the_census_file_of_the_target_kernel_set():
         assert ("tie_out" in meta) == ("differences" in meta) == ported, f"{kernel_id}: a port a stack calls says where its byte equality is recorded"
         if ported:
             assert isinstance(meta["tie_out"], str) and "is not a test of this repository" in meta["tie_out"] and meta["differences"], kernel_id
-            for path in ("docs/operations/attention/gate_quant_decode.md", "test/python/attention_gate/frost"):
+            holds = {
+                "gate_quant": ("docs/operations/attention/gate_quant_decode.md", "test/python/attention_gate/frost"),
+                "add_norm_quant": ("docs/operations/normalizations/add_norm_quant_decode.md", "test/python/norm/frost"),
+            }[kernel_id]
+            for path in holds:
                 assert path in meta["tie_out"] and (MODELS.parents[1] / path).exists(), f"{kernel_id}: what the repository holds for the entry"
+    assert "on compute capability 10.0 -- no differing byte" in kernels["add_norm_quant"]["tie_out"], "the class the comparison was made on"
+    assert len(kernels["add_norm_quant"]["differences"]) == 5, "what differs from the target kernel besides its results, as the entry lists it"
     assert [kernel_id for kernel_id, meta in kernels.items() if meta.get("kind") == "port" and meta["entry"] is None] == [
-        "add_norm_quant",
         "fp8_projection",
         "swiglu_fp4",
-    ], "the ports no stack calls yet: 257 of the 273 launches"
+    ], "the ports no stack calls yet: 128 of the 273 launches"
     readme = " ".join((MODELS / "qwen_dense" / "README.md").read_text().split())
     for sentence in (
-        "These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 16 today, the gate entry's.",
+        "These are the numbers of the complete stack, not of today's. Of the 273, this stack launches 145 today: the norm entry's 129 and the gate entry's 16.",
         'And "byte-equal" is the entry\'s own record, not something this sample measures',
         "for the gate entry it was made on compute capability 10.3, and none is recorded for 10.0",
+        "for the norm entry it was made on compute capability 10.0",
     ):
         assert sentence in readme, sentence
     about = " ".join(target.data["about"])
@@ -1471,8 +1615,9 @@ def test_the_census_file_of_the_target_kernel_set():
 
 def test_the_identity_of_every_block_call_and_the_three_numbers():
     """How every block call of the ``native`` plan stands to the target, decided against the census from the row's kernel and
-    form: 65 of the 484 launches of a step of the 64-layer model are target kernels, 49 the target's own compiled kernels
-    and 16 cuDNN Frontend entries with byte-equal results; every other block is ``not yet``.  Always three numbers."""
+    form: 194 of the 484 launches of a step of the 64-layer model are target kernels, 49 the target's own compiled kernels
+    and 145 cuDNN Frontend entries with byte-equal results (the norm entry's 129, in five forms, and the gate entry's 16);
+    every other block is ``not yet``.  Always three numbers."""
     from model_samples import census
     from model_samples.qwen_dense import QwenDense, configs
 
@@ -1480,9 +1625,8 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     claim = target.claim(plan, model, installed=RECORDED)
     numbers = claim.numbers()
     assert (numbers["launches"], numbers["code"], numbers["port"], numbers["stand_ins"]) == (484, 210, 273, 1)
-    assert (numbers["target_code"], numbers["target_port"]) == (49, 16) and numbers["not_the_target"] == {}
+    assert (numbers["target_code"], numbers["target_port"]) == (49, 145) and numbers["not_the_target"] == {}
     assert numbers["not_yet"] == {
-        "add_norm_quantize": 129,
         "projection.fp8.in": 64,
         "projection.fp8.out": 64,
         "mlp.gate_up": 64,
@@ -1491,38 +1635,46 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
         "attention.core": 16,
         "output_head": 1,
     }
-    assert sum(numbers["not_yet"].values()) + 49 + 16 + 1 == 484 and numbers["stand_ins_not_yet"] == ["output_head.quantize"]
+    assert sum(numbers["not_yet"].values()) + 49 + 145 + 1 == 484 and numbers["stand_ins_not_yet"] == ["output_head.quantize"]
     whole, reached = claim.coverage()
     assert whole == (
         WHOLE + "484 launches per step = 210 the target's own compiled kernels + 273 cuDNN Frontend entries with byte-equal results + 1 declared stand-in"
     ), "the three numbers of the complete stack, said to be that: the 273 are not all launched by a stack today"
     assert reached == (
-        "kernel identity, as planned: 65 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 16 cuDNN Frontend entries "
-        "with byte-equal results); not yet: add_norm_quantize 129, projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, "
+        "kernel identity, as planned: 194 of 484 launches of a step are target kernels (49 the target's own compiled kernels + 145 cuDNN Frontend entries "
+        "with byte-equal results); not yet: projection.fp8.in 64, projection.fp8.out 64, mlp.gate_up 64, mlp.down 64, "
         "attention.prepare 16, attention.core 16, output_head 1; 1 declared stand-in (not yet: output_head.quantize)"
     )
     readme = (MODELS / "qwen_dense" / "README.md").read_text()
     assert whole in readme and reached in readme, "the two lines of the family README are the lines a run prints"
     assert configs.readme_table(QwenDense().calls_text(), "native") in readme, "regenerate the native table of the README from configs.readme_table()"
     assert configs.readme_table(QwenDense().calls_text(), "fe-entries") == configs.readme_table(QwenDense().calls_text(), "native"), "the same rows today"
+    shapes = {"embedding": GATHER_SHAPE, "add_norm_quantize": NORM_SHAPE, "linear_attention.step": SHAPE, "attention.gate_quantize": GATE_SHAPE}
     assert claim.recorded == {
-        index: {"embedding": GATHER_SHAPE, "linear_attention.step": SHAPE, "attention.gate_quantize": GATE_SHAPE}[block]
-        for index, (block, _) in enumerate(model.wiring())
-        if block in ("embedding", "linear_attention.step", "attention.gate_quantize")
-    }, "the recorded launch shape of every target launch: 65 of them, as tuples"
-    assert len(claim.recorded) == 65
+        index: shapes[block] for index, (block, _) in enumerate(model.wiring()) if block in shapes
+    }, "the recorded launch shape of every target launch: 194 of them, as tuples"
+    assert len(claim.recorded) == 194
+    assert configs.readme_sites(QwenDense(), "native") in readme, "regenerate the call-site table of the README from configs.readme_sites()"
+    from collections import Counter
+
+    forms = Counter(site for site in model.sites() if site)
+    assert forms == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}, "five forms: 1 / 47 / 16 / 64 / 1"
 
     plan, model, _ = _target_plan(2)
     claim = target.claim(plan, model, installed=RECORDED)
     assert claim.coverage()[1].startswith(
-        "kernel identity, as planned: 3 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 1 cuDNN Frontend entry "
-        "with byte-equal results); not yet: add_norm_quantize 5, "
+        "kernel identity, as planned: 8 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 6 cuDNN Frontend entries "
+        "with byte-equal results); not yet: projection.fp8.in 2, "
     )
     kinds = {block: (identity.relation, identity.kind) for block, identity in zip(claim.blocks, claim.identities)}
-    for block in ("linear_attention.step", "attention.gate_quantize"):  # the class their target forms ran on: a run of 2 or more sequences gates them
+    for block in (
+        "add_norm_quantize",
+        "linear_attention.step",
+        "attention.gate_quantize",
+    ):  # the class their target forms ran on: 2 or more sequences gate them
         assert plan.rows[block].batch_invariant == ("cc10.0",), f"{block}: batch invariance of its native row is a gate on compute capability 10.0"
     assert kinds["embedding"] == kinds["linear_attention.step"] == ("target", "code") and kinds["attention.gate_quantize"] == ("target", "port")
-    assert kinds["token_choice"] == ("host", "") and kinds["mlp.down"] == ("not yet", "code") and kinds["add_norm_quantize"] == ("not yet", "port")
+    assert kinds["token_choice"] == ("host", "") and kinds["mlp.down"] == ("not yet", "code") and kinds["add_norm_quantize"] == ("target", "port")
     table = census.table(plan, claim).splitlines()
     assert table[1].split()[-1] == "identity" and table[0].startswith("kernels, planned (decided before the load from the family's configs.py; stack native,")
     row = {line.split()[0]: line for line in table[2:14]}
@@ -1535,7 +1687,11 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     assert row["attention.gate_quantize"].split("cudnn.AttentionGateQuantDecode")[1].split() == gate.split()
     assert row["mlp.down"].rstrip().endswith("by family                                        not yet (bf16 copy of 4-bit weights)")
     assert row["token_choice"].rstrip().endswith("host path, not compared                          --")
-    assert table[-3].startswith("  per step: 3 launches on 3 exact rows") and table[-2:] == [f"  {line}" for line in claim.coverage()]
+    norm = "[PDL True, PDL_RELEASE True] + one of 6 forms, by call site add_norm_quant 5 name and launch shape, as the entry states them target"
+    assert row["add_norm_quantize"].split("cudnn.AddNormQuantDecode")[1].split() == norm.split()
+    assert table[14:20] == [f"  add_norm_quantize at {site}:{census.form_text(fields)}" for site, fields in configs.NORM_FORMS], "the form of every call site"
+    assert table[16] == "  add_norm_quantize at linear_attention: [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT e4m3_static]"
+    assert table[-3].startswith("  per step: 8 launches on 4 exact rows") and table[-2:] == [f"  {line}" for line in claim.coverage()]
     assert "identity" not in census.table(_plan(options={"device": "cpu"})[0]).splitlines()[1], "a stack without a target has no such column"
 
     # fe-entries: the same rows today, so the same identities
@@ -1550,13 +1706,14 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     step = differs.identities[3]
     assert step.text() == "not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" and step.launch is None
     assert differs.numbers()["not_the_target"] == {"linear_attention.step": 1} and "; not the target: linear_attention.step 1; " in differs.coverage()[1]
-    assert 3 not in differs.recorded and len(differs.recorded) == 2, "no recorded launch shape is held against a call that is not the target's"
-    # compute capability 12.x: the gate entry does not serve there, the block stays on its reference chain, and the census has no section
+    assert 3 not in differs.recorded and len(differs.recorded) == 7, "no recorded launch shape is held against a call that is not the target's"
+    # compute capability 12.x: the gate and the norm entry do not serve there, the blocks stay on their reference chains, and the census has no section
     plan12, model, _ = _target_plan(2, cc=(12, 0), sms=170)
     assert plan12.rows["attention.gate_quantize"].key == "torch_ref.gate_quantize" and plan12.rows["linear_attention.step"].form == (
         ("PDL", True),
         ("PDL_RELEASE", True),
     )
+    assert plan12.rows["add_norm_quantize"].key == "torch_ref.add_norm_quantize" and plan12.rows["add_norm_quantize"].site_form("mlp") == ()
     claim12 = target.claim(plan12, model, installed=RECORDED)
     assert not claim12.known and claim12.coverage() == [
         "kernel identity: not stated for this run (no recorded section for cc 12.0 / 170 SMs: recorded is cc 10.0 / 148 SMs)"
@@ -1570,6 +1727,7 @@ def test_the_identity_of_every_block_call_and_the_three_numbers():
     there = census.Target(data).claim(plan12, model, installed=RECORDED)
     gate = there.identities[there.blocks.index("attention.gate_quantize")]
     assert there.known and gate.text() == "not yet (reference chain)" and (there.numbers()["target_code"], there.numbers()["target_port"]) == (2, 0)
+    assert there.numbers()["not_yet"]["add_norm_quantize"] == 5
 
 
 def test_every_reason_a_class_is_not_claimed():
@@ -1582,8 +1740,8 @@ def test_every_reason_a_class_is_not_claimed():
     claim = target.claim(plan, model, installed=RECORDED)
     fallback, absent = "fallback rows present", "the plan has no block for output_head.quantize"
     assert claim.reasons == [fallback, absent] and claim.name == CENSUS and (claim.basis, claim.claimed, claim.rows) == ("recorded", False, 1)
-    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); {COMPARED_3}: each in the recorded one"
-    assert claim.compared() == (3, COMPARED_3, 0), "what item 7 compares: a count of target launches is three numbers here too"
+    assert claim.line(census.PASS) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); {COMPARED_8}: each in the recorded one"
+    assert claim.compared() == (8, COMPARED_8, 0), "what item 7 compares: a count of target launches is three numbers here too"
     assert claim.line(census.NOT_OBSERVED) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent}); the launch shapes of its target launches were not observed"
     assert claim.line(census.FAIL) == f"{CENSUS}: NOT CLAIMED ({fallback}; {absent})", "a failed check says nothing about the recorded shapes"
     selected, model, _ = _target_plan(overrides={"linear_attention.step": "fe.gdn_decode_fused", "mlp.down": "torch_ref.linear"})
@@ -2308,19 +2466,36 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
     planned = lines.index(next(line for line in lines if line.startswith("kernels, planned (decided before the load")))
     assert lines[planned + 1].split()[-1] == "identity" and "stack native" in lines[planned]
-    assert lines[planned + 15].strip().startswith(WHOLE + "20 launches per step = 9 ")
-    reached = "kernel identity, as planned: 3 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 1 cuDNN Frontend entry with "
-    assert lines[planned + 16].strip().startswith(reached + "byte-equal results); not yet: add_norm_quantize 5, ")
+    assert lines[planned + 14] == "  add_norm_quantize at linear_attention.first: [ADD False, STORE_RESIDUAL True, BF16_OUT True, QUANT e4m3_static]"
+    assert lines[planned + 21].strip().startswith(WHOLE + "20 launches per step = 9 ")
+    reached = "kernel identity, as planned: 8 of 20 launches of a step are target kernels (2 the target's own compiled kernels + 6 cuDNN Frontend entries with "
+    assert lines[planned + 22].strip().startswith(reached + "byte-equal results); not yet: projection.fp8.in 2, ")
     (kernels,) = _kernel_lines(lines)
-    assert kernels.endswith("    PASS") and "3 on exact rows, in the wiring order" in kernels
+    assert kernels.endswith("    PASS") and "8 on exact rows, in the wiring order" in kernels
     not_claimed = f"    {CENSUS}: NOT CLAIMED (fallback rows present; the plan has no block for output_head.quantize)"
-    assert not_claimed + f"; {COMPARED_3}: each in the recorded one" in lines
+    assert not_claimed + f"; {COMPARED_8}: each in the recorded one" in lines
     gate = next(line for line in lines if line.strip().startswith("attention.gate_quantize ") and "calls" in line)
     assert gate.endswith("[band: gate_fp8]  PASS") and "0 the code of neither" in gate, gate
-    assert any(line.startswith("  blocks            7 of 7 provider blocks inside their bands") and line.endswith("PASS") for line in lines)
+    norm = next(line for line in lines if line.strip().startswith("add_norm_quantize ") and "calls" in line)
+    assert norm.endswith("[band: add_norm_quant]  PASS") and "residual stream equal" in norm and norm.split("; ")[-1].startswith("0 outside"), norm
+    assert any(line.startswith("  blocks            8 of 8 provider blocks inside their bands") and line.endswith("PASS") for line in lines)
+    served = next(line.strip() for line in lines if line.strip().startswith("add_norm_quantize, as the call log of a traced step has it (5 calls): "))
+    assert [part.split(" x ")[0] for part in served.split(": ", 1)[1].split("; ")] == ["1", "2", "1", "1"], "per form, in the order of its first call"
+    assert "2 x cudnn.AddNormQuantDecode #5 [PDL True, PDL_RELEASE True, ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4]" in served
     written = json.loads(target.read_text())
     (run,) = written["runs"]
-    assert written["stack"] == "native" and run["target"]["not_claimed"][0] == "fallback rows present" and run["target"]["numbers"]["target_port"] == 1
+    assert written["stack"] == "native" and run["target"]["not_claimed"][0] == "fallback rows present" and run["target"]["numbers"]["target_port"] == 6
+    norms = [site for site in run["sites"] if site["block"] == "add_norm_quantize"]
+    assert [site["site"] for site in norms] == ["linear_attention.first", "mlp", "full_attention", "mlp", "output_head"]
+    assert all(site["identity"] == "target" and site["served"] == site["form"] and site["instance"].startswith("cudnn.AddNormQuantDecode #") for site in norms)
+    assert norms[1]["form"]["QUANT"] == "nvfp4" and norms[4]["form"] == {
+        "PDL": True,
+        "PDL_RELEASE": True,
+        "ADD": True,
+        "STORE_RESIDUAL": False,
+        "BF16_OUT": True,
+        "QUANT": None,
+    }
     assert [site["identity"] for site in run["sites"] if site["block"] in ("embedding", "attention.gate_quantize", "mlp.down")] == [
         "target",
         "not yet (bf16 copy of 4-bit weights)",
@@ -2349,7 +2524,7 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert code == 0 and lines[-1] == "[00] PASS", lines[-4:]
     assert (
         f"    {CENSUS}: NOT CLAIMED (not the target set: linear_attention.step selected by --provider; fallback rows present; the plan has no block for "
-        "output_head.quantize); 2 launches of a step compared by launch shape (1 the target's own compiled kernel + 1 cuDNN Frontend entry with "
+        "output_head.quantize); 7 launches of a step compared by launch shape (1 the target's own compiled kernel + 6 cuDNN Frontend entries with "
         "byte-equal results + 0 declared stand-ins): each in the recorded one"
     ) in lines
     assert any("not the target (the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True])" in line for line in lines)
@@ -2368,6 +2543,7 @@ def test_a_run_of_the_native_stack_through_its_last_line(monkeypatch, capsys, tm
     assert f"    {CENSUS}: NOT CLAIMED (fallback rows present; {unstated})" in lines
     invariance = next(line for line in lines if line.startswith("  batch invariance  "))
     assert "linear_attention.step equal (gated)" in invariance and "attention.gate_quantize equal (gated)" in invariance and invariance.endswith("PASS")
+    assert "add_norm_quantize equal (gated)" in invariance, "a sequence alone writes the bytes it writes among two: the norm row gates it on this class"
 
     # the default stack is untouched by all of this: no kernel line without the flag
     code, lines = _sample_run(monkeypatch, capsys, ["--sequences", "1"])
@@ -2417,7 +2593,7 @@ def test_the_target_stacks_always_check_their_kernels(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert (
         "kernels, planned (decided before the load from model_samples/qwen_dense/configs.py; stack native" in out
-        and "kernel identity, as planned: 3 of 20" in out
+        and "kernel identity, as planned: 8 of 20" in out
     )
 
 
@@ -2428,7 +2604,7 @@ def test_a_dry_plan_of_the_native_stack_imports_nothing_new():
     code = f"""
 import sys
 import cudnn, torch
-cudnn.GdnDecodeFused, cudnn.AttentionGateQuantDecode
+cudnn.GdnDecodeFused, cudnn.AttentionGateQuantDecode, cudnn.AddNormQuantDecode
 import importlib.metadata
 before = set(sys.modules)
 sys.path.insert(0, {str(MODELS)!r})
@@ -2441,11 +2617,11 @@ claim = model.target().claim(planned, model)
 table = census.table(planned, claim)
 added = sorted({{name.split(".")[0] for name in set(sys.modules) - before}})
 print("ADDED", [name for name in added if name not in sys.stdlib_module_names and name not in ("model_samples", "cudnn")])
-print("TABLE", "gate_quant" in table, "3 of 20" in table, claim.reasons[0])
+print("TABLE", "gate_quant" in table, "add_norm_quant" in table, "8 of 20" in table, claim.reasons[0])
 """
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "ADDED []" in done.stdout and "TABLE True True fallback rows present" in done.stdout, done.stdout + done.stderr
+    assert "ADDED []" in done.stdout and "TABLE True True True fallback rows present" in done.stdout, done.stdout + done.stderr
 
 
 # ----------------------------------------------------------------------------------------------- what the review of the stack found
@@ -2460,7 +2636,7 @@ def test_a_count_of_target_launches_in_the_readmes_carries_its_split():
         r"\b\d+ launches of every one of the \d+ traced steps on target kernels",
         r"\bthe \d+ (?:remaining )?target launch(?:es)?\b",
     )
-    split = re.compile(r"\d+ (?:of )?the target's own compiled kernels? \+ \d+ (?:of a )?cuDNN Frontend entr(?:y|ies)|=\s*49 \+ 16\b")
+    split = re.compile(r"\d+ (?:of )?the target's own compiled kernels? \+ \d+ (?:of a )?cuDNN Frontend entr(?:y|ies)|=\s*49 \+ 145\b")
     found = 0
     for name in ("README.md", "AGENTS.md", "qwen_dense/README.md"):
         text = " ".join((MODELS / name).read_text().split())
@@ -2471,8 +2647,8 @@ def test_a_count_of_target_launches_in_the_readmes_carries_its_split():
                 assert split.search(after), f"{name}: {after[:120]!r} gives a count of target launches without its split"
     assert found >= 5, "the patterns still find the counts of the READMEs"
     area = " ".join((MODELS / "README.md").read_text().split())
-    assert "64 of the 484 launches of a step of the 64-layer model, 48 of the target's own compiled kernels + 16 of a cuDNN Frontend entry" in area
-    assert "65 of the 484" not in area, "the two entries are 64 launches; the 65th is PyTorch's gather"
+    assert "193 of the 484 launches of a step of the 64-layer model, 48 the target's own compiled kernels + 145 cuDNN Frontend entries" in area
+    assert "194 of the 484" not in area, "the three entries are 193 launches; the 194th is PyTorch's gather"
     for wrong in ("counts 3 of 20.", "(65 of the 484 launches of a step of the 64-layer model)"):  # the two sentences the review found
         assert not split.search(wrong + " " * 10), "the rule sees a count without its split"
 
@@ -2499,7 +2675,7 @@ def test_a_section_holds_for_the_layer_widths_it_was_recorded_with():
     reduced = QwenDense.reduced(2).geometry
     assert all(getattr(reduced, name) == getattr(full, name) for name in widths) and reduced.vocab != full.vocab, "the reduced model keeps the widths"
     plan, model, _ = _target_plan(2)
-    assert target.claim(plan, model, installed=RECORDED).known and len(target.claim(plan, model, installed=RECORDED).recorded) == 3
+    assert target.claim(plan, model, installed=RECORDED).known and len(target.claim(plan, model, installed=RECORDED).recorded) == 8
 
     stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)  # stated facts: no entry is built for these widths
     other = QwenDense(replace(reduced, hidden=4096, la_key_heads=8, la_value_heads=32, attn_heads=16), ("other widths",))
@@ -2580,7 +2756,7 @@ def test_the_checks_of_a_target_stack_look_at_its_kernels_unasked(monkeypatch):
     assert f"linear_attention.step (layer 0) launched {SYMBOL!r}; cudnn.GdnDecodeFused names {TARGET_SYMBOL!r} for this run" in sentence
     held = tie_out.run_checks(run(), prompt_tokens=3)
     assert held.ok and held.kernels == census.PASS and _line(held, "kernels ").endswith("    PASS"), held.text()
-    assert any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_3 in line for line in held.lines), "and the census line with what was compared"
+    assert any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_8 in line for line in held.lines), "and the census line with what was compared"
     with pytest.raises(ValueError, match=r"^stack native declares a target kernel set: its kernel check cannot be switched off$"):
         tie_out.run_checks(run(), prompt_tokens=3, kernels=False)
 
@@ -2612,7 +2788,7 @@ def test_equal_says_what_was_compared_and_a_file_that_records_less_is_refused():
     for claimed in (True, False):  # a misspelt key is a fact the reader does not know: never "nothing recorded"
         misspelt = _small_census(claimed=claimed)
         step_facts(misspelt)["lauch"] = step_facts(misspelt).pop("launch")
-        assert refused(misspelt) == "linear_attention.step states lauch; an entry states launch and at"
+        assert refused(misspelt) == "linear_attention.step states lauch; an entry states launch and at and form"
     for bad in (
         [[96, 1], [256, 1, 1], 42112],
         [[96, 1, 1], [256, 1, 1]],
@@ -2663,8 +2839,9 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     adapter makes that first use while the run is planned, on scratch operands of the run's row count: a decline is then a
     ``NotImplementedError`` -- a SKIP before the load, in the entry's own words -- where the installation does not meet a
     requirement the adapter can name (the part's target by cuDNN Frontend's public probe; on compute capability 10.7 the
-    CUDA 13 flavour of the CuTe DSL for the gate entry), and a ``ValueError`` -- an ERROR -- for any other decline: those
-    are the adapter's own operands, and a faulty adapter must not read as an unsupported GPU."""
+    CUDA 13 flavour of the CuTe DSL for the gate entry and for the norm entry), and a ``ValueError`` -- an ERROR -- for any
+    other decline: those are the adapter's own operands, and a faulty adapter must not read as an unsupported GPU.  The
+    norm entry is built once per form the run calls; its build takes no operand."""
     from types import SimpleNamespace
 
     import cudnn
@@ -2727,13 +2904,41 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
         def launch_shape_for(self, rows):
             return ((96, rows, 1), (256, 1, 1), 42112)
 
+    class Norm:
+        decline = ""
+
+        def __init__(self, device, hidden, eps, *, add, bf16, quant, store_residual=False, pdl=None, pdl_release=None):
+            self.form = (add, store_residual, bf16, quant)
+
+        def compile(self, rows=None):
+            calls.append(("norm compile", self.form))
+            if self.decline:
+                raise NotImplementedError(self.decline)
+
+        def __call__(self, x, residual, weight, scale, out=None, codes=None, scales=None):
+            calls.append(("norm launch", self.form, tuple(x.shape)))
+            return out, codes, scales
+
+        def kernel_symbols_for(self, rows):
+            return (NORM_SYMBOL,)
+
+        def form_for(self, rows):
+            return dict(zip(("ADD", "STORE_RESIDUAL", "BF16_OUT", "QUANT"), self.form), PDL=True, PDL_RELEASE=True)
+
+        def launch_shape_for(self, rows):
+            return ((rows, 1, 1), (640, 1, 1), 80)
+
     monkeypatch.setattr(cudnn, "AttentionGateQuantDecode", Gate, raising=False)
     monkeypatch.setattr(cudnn, "GdnDecodeFused", Step, raising=False)
+    monkeypatch.setattr(cudnn, "AddNormQuantDecode", Norm, raising=False)
     monkeypatch.setattr(fe, "_ENTRIES", {})
     monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
     monkeypatch.setattr(fe, "_outside_pool", lambda device, launch: (launch(), 0)[1])
     model = QwenDense.reduced(2)
     options = {"device": "cpu", "check_kernels": True}
+    # the forms of the norm entry the two-layer model calls, in the order its row names their sites: (add, store, bf16, quant)
+    norm_forms = [(False, True, True, "e4m3_static"), (True, False, False, "e4m3_static"), (True, False, False, "nvfp4"), (True, False, True, None)]
+    norm_builds = [("norm compile", form) for form in norm_forms]
     assert fe.EntryBlock.first_use_devices == ("cuda",), "a kernel is built for a CUDA device only"
 
     def resolved(cc=(10, 0), sequences=4, total=180 * GIB):
@@ -2755,9 +2960,13 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     table = resolved()
     assert calls == [] and not table.first_used, "resolving the table builds nothing: the first use is a step of its own, after the memory sentence"
     table.first_use()
-    assert calls == [("step compile", 4, (4, 10240)), ("gate compile", (4, 6144), "cpu", (4, 6144))], "the first use of each entry, at the run's row count"
+    assert calls == [
+        *norm_builds,  # one build per form the run calls, none for a form of the row no call of this model is made in
+        ("step compile", 4, (4, 10240)),
+        ("gate compile", (4, 6144), "cpu", (4, 6144)),
+    ], "the first use of each entry, at the run's row count"
     table.first_use()
-    assert len(calls) == 2 and table.first_used, "made once per plan"
+    assert len(calls) == 6 and table.first_used, "made once per plan"
     del calls[:]
     table["linear_attention.step"].compile(4, 1)
     table["attention.gate_quantize"].compile(4, 1)
@@ -2767,6 +2976,11 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
         "gate compile",
         "gate launch",
     ], "after the load: the build again (the entry finds its kernel), one launch"
+    del calls[:]
+    table["add_norm_quantize"].compile(4, 1)
+    assert calls == [
+        event for form in norm_forms for event in (("norm compile", form), ("norm launch", form, (4, 5120)))
+    ], "the same for every form of the norm entry"
 
     # (1) compute capability 10.7 with the CUDA 12 flavour of the CuTe DSL: the gate entry's own sentence, as a SKIP of the plan
     monkeypatch.setattr(Gate, "decline", flavour)
@@ -2784,6 +2998,27 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=12, minor=9))
     with pytest.raises(ValueError, match=r"^cudnn.AttentionGateQuantDecode declined the operands this adapter built for its first use: "):
         planned(cc=(10, 3))  # either flavour serves 10.0 and 10.3: there the flavour explains nothing
+    # (2b) the norm entry asks the same of the installation on compute capability 10.7, and is asked first: its own sentence is the
+    # SKIP; with the CUDA 13.4 flavour, or on another class, the same decline is the adapter's -- an ERROR
+    norm_flavour = "the add + RMSNorm + quantize decode step on compute capability 10.7 requires a CuTe DSL whose compiler is CUDA 13.4 or later"
+    monkeypatch.setattr(Norm, "decline", norm_flavour)
+    for compiler, cc, outcome in (
+        ((12, 9), (10, 7), NotImplementedError),
+        ((13, 0), (10, 7), NotImplementedError),
+        ((13, 4), (10, 7), ValueError),
+        ((12, 9), (10, 0), ValueError),
+    ):
+        monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=compiler[0], minor=compiler[1]))
+        with pytest.raises(outcome) as declined:
+            planned(cc=cc)
+        own = (
+            norm_flavour
+            if outcome is NotImplementedError
+            else f"cudnn.AddNormQuantDecode declined the operands this adapter built for its first use: {norm_flavour}"
+        )
+        assert str(declined.value) == own, (compiler, cc)
+    monkeypatch.setattr(Norm, "decline", "")
+    monkeypatch.setattr(dsl_version, "CUDA_VERSION", SimpleNamespace(major=12, minor=9))
     # (3) a CuTe DSL without the part's target (cuDNN Frontend's public probe): the fused step's decline is a SKIP too
     monkeypatch.setattr(Gate, "decline", "")
     monkeypatch.setattr(Step, "decline", "SM107 requires a CuTe DSL build supporting sm_107a; found 4.8.0 without that target")
@@ -2804,8 +3039,15 @@ def test_the_first_use_of_an_entry_is_part_of_the_plan(monkeypatch):
     monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: False)
     with pytest.raises(RuntimeError, match=r"^cudnn.GdnDecodeFused declines this installation at its first launch: the fused step needs"):
         table["linear_attention.step"].compile(4, 1)
-    row = configs.PROVIDERS["attention.gate_quantize"][0]
-    assert row.classes == ("cc10.x",), "the row claims every compute capability 10.x: what the entry needs there beyond the class is asked at plan time"
+    monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
+    monkeypatch.setattr(Norm, "decline", "the add + RMSNorm + quantize decode step serves at most 1024 rows per call; got 4")
+    with pytest.raises(RuntimeError, match=r"^cudnn.AddNormQuantDecode declined the operands this adapter built for its first launch: the add \+ RMSNorm"):
+        table["add_norm_quantize"].compile(4, 1)
+    for block in ("attention.gate_quantize", "add_norm_quantize"):
+        row = configs.PROVIDERS[block][0]
+        assert row.classes == (
+            "cc10.x",
+        ), f"{block}: the row claims every compute capability 10.x; what the entry needs there beyond the class is asked at plan time"
 
 
 def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(monkeypatch, capsys):
@@ -2853,6 +3095,9 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     class Gate(Entry):
         name = "cudnn.AttentionGateQuantDecode"
 
+    class Norm(Entry):
+        name = "cudnn.AddNormQuantDecode"
+
     def scratch(block, sequences, tokens):  # in place of the adapters' scratch operands: what would be allocated, and when
         events.append(("scratch", block.entry, sequences * tokens))
         return block._build(block.options["device"]), ()
@@ -2869,6 +3114,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
     gpu = {"total": 180 * GIB, "free": 1 * GIB}  # a real device, as it reports itself
     monkeypatch.setattr(cudnn, "GdnDecodeFused", Step, raising=False)
     monkeypatch.setattr(cudnn, "AttentionGateQuantDecode", Gate, raising=False)
+    monkeypatch.setattr(cudnn, "AddNormQuantDecode", Norm, raising=False)
     monkeypatch.setattr(fe, "_ENTRIES", {})
     monkeypatch.setattr(fe, "_FIRST_LAUNCH", {})
     monkeypatch.setattr(fe.GdnDecodeFusedBlock, "_scratch", scratch)
@@ -2888,9 +3134,14 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         later = [Session(model, text, sequences=count, stack=stack, device="cuda:0", share=first) for count in counts[1:]]
         return first, first.plan_table(later)
 
+    def norm_builds(stack):
+        """The norm entry's first use in a stack that has its row: one build per form the two-layer model calls (four), in
+        front of the other entries' -- and no scratch operand: its build takes none."""
+        return [] if stack == "fe-cublas" else [("build", "cudnn.AddNormQuantDecode")] * 4
+
     def first_uses(stack, *counts):
         entries = ("cudnn.GdnDecodeFused",) if stack == "fe-cublas" else ("cudnn.GdnDecodeFused", "cudnn.AttentionGateQuantDecode")
-        return [event for rows in counts for entry in entries for event in (("scratch", entry, rows), ("build", entry))]
+        return [event for rows in counts for event in (*norm_builds(stack), *(e for entry in entries for e in (("scratch", entry, rows), ("build", entry))))]
 
     target = "SM100 requires a CuTe DSL build supporting sm_100a; found 4.8.0 without that target"
     assert configs.PROVIDER_STACKS == ("fe-cublas", "native", "fe-entries")
@@ -2933,6 +3184,7 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
             run(stack, 1, 4)
         assert str(skipped.value) == target and events == [
             ("memory sentence", stack),
+            *norm_builds(stack),
             ("scratch", "cudnn.GdnDecodeFused", 1),
             ("build", "cudnn.GdnDecodeFused"),
         ]
@@ -2942,6 +3194,780 @@ def test_a_run_that_does_not_fit_is_declined_before_an_entry_builds_anything(mon
         del events[:]
         with pytest.raises(NotImplementedError) as skipped:
             Session(model, text, sequences=1, stack=stack, device="cuda:0").load()
-        assert str(skipped.value) == target and events == [("scratch", "cudnn.GdnDecodeFused", 1), ("build", "cudnn.GdnDecodeFused")], stack
+        assert str(skipped.value) == target and events == [
+            *norm_builds(stack),
+            ("scratch", "cudnn.GdnDecodeFused", 1),
+            ("build", "cudnn.GdnDecodeFused"),
+        ], stack
         monkeypatch.setattr(Step, "decline", "")
         monkeypatch.setattr(cudnn.frost, "cutedsl_runtime_available", lambda cc=None: True)
+
+
+# ----------------------------------------------------------------------------------------------- an entry that a step calls in several forms
+def test_the_call_sites_of_a_decode_step_and_the_forms_a_row_names_for_them(monkeypatch):
+    """The norm block is called at several sites of a step, and a kernel that serves it is called in another form at each.
+    ``sites()`` names the site of every call of the wiring -- what the normed rows feed, and whether a residual stream
+    exists yet -- ``step`` hands the same name to the block as its last operand, and a provider row names the form of
+    each site: six forms, of which the 64-layer model calls five, 1 / 47 / 16 / 64 / 1 times a step."""
+    from collections import Counter
+    from types import SimpleNamespace
+
+    from model_samples import census
+    from model_samples.qwen_dense import QwenDense, configs
+
+    full = QwenDense()
+    wiring, sites = full.wiring(), full.sites()
+    assert len(sites) == len(wiring) == 484 and census.call_sites(full) == sites
+    named = [(block, layer, site) for (block, layer), site in zip(wiring, sites) if site]
+    assert len(named) == 129 and all(block == "add_norm_quantize" for block, _, _ in named), "only the norm block is called in several forms"
+    assert Counter(site for _, _, site in named) == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}
+    assert named[:3] == [("add_norm_quantize", 0, "linear_attention.first"), ("add_norm_quantize", 0, "mlp"), ("add_norm_quantize", 1, "linear_attention")]
+    assert named[6:8] == [("add_norm_quantize", 3, "full_attention"), ("add_norm_quantize", 3, "mlp")] and named[-1] == ("add_norm_quantize", 64, "output_head")
+    assert [site for site in QwenDense.reduced(1).sites() if site] == [
+        "full_attention.first",
+        "mlp",
+        "output_head",
+    ], "a model that starts with an attention layer"
+    from model_samples.qwen_dense import model as family
+
+    assert {site.removesuffix(family.FIRST) for _, _, site in named} == set(family.NORM_SITES) and family.FIRST == ".first"
+    assert [site for site in QwenDense.reduced(2).sites() if site] == ["linear_attention.first", "mlp", "full_attention", "mlp", "output_head"]
+    bare = SimpleNamespace(wiring=lambda: (("embedding", -1), ("token_choice", -1)))
+    assert census.call_sites(bare) == ("", ""), "a model that names no call sites: every block in one form"
+    with pytest.raises(ValueError, match="^the model names 1 call sites for the 2 calls of its wiring$"):
+        census.call_sites(SimpleNamespace(wiring=bare.wiring, sites=lambda: ("",)))
+
+    # what the step hands the block is the site of that call: seen on a step of the reference stack
+    session, _ = _tiny_session(1)
+    seen = []
+
+    def tap(name, layer, block, operands):
+        seen.append((name, layer, operands[4] if name == "add_norm_quantize" else ""))
+        return block(*operands)
+
+    session.tap = tap
+    session._advance(torch.zeros(1, dtype=torch.int32))
+    assert seen == [(block, layer, site) for (block, layer), site in zip(session.model.wiring(), session.model.sites())]
+    assert [site for _, _, site in seen if site] == ["linear_attention.first", "mlp", "full_attention", "mlp", "output_head"]
+
+    # the row: the launch form every call has, and per call site the residual mode and the outputs
+    row = configs.PROVIDERS["add_norm_quantize"][0]
+    assert row.key == "fe.add_norm_quant_decode" and row.form == (("PDL", True), ("PDL_RELEASE", True)) and row.sites == configs.NORM_FORMS
+    assert row.classes == ("cc10.x",) and row.rows == (1, 1024) and row.sequences == (1, 1024) and row.band == "add_norm_quant"
+    assert set(row.stacks) == {"native", "fe-entries"} and row.batch_invariant == ("cc10.0",) and not row.fallback and row.ci
+    assert configs.PROVIDERS["add_norm_quantize"][1].key == "torch_ref.add_norm_quantize", "the reference chain stays the row of every other class and stack"
+    assert {site for site, _ in row.sites} >= {site for _, _, site in named} and len(row.sites) == len({fields for _, fields in row.sites}) == 6
+    for site, fields in row.sites:
+        assert [name for name, _ in fields] == ["ADD", "STORE_RESIDUAL", "BF16_OUT", "QUANT"], f"{site}: the entry has no default for these"
+        assert dict(fields)["ADD"] != dict(fields)["STORE_RESIDUAL"] and dict(fields)["STORE_RESIDUAL"] == site.endswith(".first"), site
+    assert row.site_form("mlp") == (("PDL", True), ("PDL_RELEASE", True), ("ADD", True), ("STORE_RESIDUAL", False), ("BF16_OUT", False), ("QUANT", "nvfp4"))
+    assert dict(row.site_form("output_head"))["QUANT"] is None and dict(row.site_form("linear_attention"))["BF16_OUT"] is True
+    with pytest.raises(
+        ValueError, match=r"^provider row fe.add_norm_quant_decode: no form for the call site 'mlp.gate'; the row names linear_attention.first, "
+    ):
+        row.site_form("mlp.gate")
+    with pytest.raises(ValueError, match=r"no form for the call site ''"):
+        row.site_form()
+    plain = configs.PROVIDERS["linear_attention.step"][1]
+    assert plain.sites == () and plain.site_form() == plain.site_form("any site") == plain.form, "a row that names no sites is called in its one form"
+    assert configs.readme_sites(full, "native").splitlines()[2:] == [
+        "| residual add + RMSNorm + quantise | `linear_attention.first` | 1 | [ADD False, STORE_RESIDUAL True, BF16_OUT True, QUANT e4m3_static] |",
+        "| residual add + RMSNorm + quantise | `full_attention.first` | 0 | [ADD False, STORE_RESIDUAL True, BF16_OUT False, QUANT e4m3_static] |",
+        "| residual add + RMSNorm + quantise | `linear_attention` | 47 | [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT e4m3_static] |",
+        "| residual add + RMSNorm + quantise | `full_attention` | 16 | [ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT e4m3_static] |",
+        "| residual add + RMSNorm + quantise | `mlp` | 64 | [ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4] |",
+        "| residual add + RMSNorm + quantise | `output_head` | 1 | [ADD True, STORE_RESIDUAL False, BF16_OUT True, QUANT None] |",
+    ]
+
+
+def test_a_call_served_in_the_form_of_another_call_site_fails_the_form_check():
+    """Item 0 per call site, on the plan of the 64-layer model with the real adapter on stated device facts.  Every call of
+    the norm block carries the form of ITS site and the facts of the entry instance of that form; the forms cannot be told
+    apart by a launch record (one launch shape, one kernel id).  A call log in which one call was served by the instance
+    of a neighbouring form fails with a sentence that names the call, its site and both forms -- also where it is the
+    other norm call of the same layer."""
+    from collections import Counter
+    from dataclasses import replace
+
+    from model_samples import census
+
+    plan, model, _ = _target_plan(64)
+    sites = census.expected(plan, model)
+    norms = [(index, site) for index, site in enumerate(sites) if site.block == "add_norm_quantize"]
+    assert Counter(site.site for _, site in norms) == {"linear_attention.first": 1, "linear_attention": 47, "full_attention": 16, "mlp": 64, "output_head": 1}
+    row = plan.rows["add_norm_quantize"]
+    for _, site in norms:
+        assert site.form == row.site_form(site.site) and site.wrong == "" and tuple(site.facts.shape) == NORM_SHAPE, site.site
+        assert all(site.facts.form[name] == value for name, value in site.form) and site.facts.form["HIDDEN"] == 5120, "the entry instance of that form"
+        assert site.row == f"add_norm_quantize at {site.site}" and site.name == f"add_norm_quantize (layer {site.layer})"
+    assert len({site.form for _, site in norms}) == 5 and len({tuple(site.facts.shape) for _, site in norms}) == 1, "five forms, one launch shape"
+    assert [site.site for site in sites if site.block != "add_norm_quantize"] == [""] * 355 and sites[3].row == "linear_attention.step"
+    assert census.check_forms(sites) == []
+    clean = [census.Call(site.block, site.layer, 1, "an entry instance", site.form) for site in sites]
+    assert census.check_forms(sites, [clean, clean]) == [], "every call served in the form of its site"
+
+    at = {(site.layer, site.site): index for index, site in norms}
+    mlp5, input5, input3 = at[(5, "mlp")], at[(5, "linear_attention")], at[(3, "full_attention")]
+    eight_bit = "[PDL True, PDL_RELEASE True, ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT e4m3_static]"
+    four_bit = "[PDL True, PDL_RELEASE True, ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4]"
+    wrong = list(clean)
+    wrong[mlp5] = census.Call("add_norm_quantize", 5, 1, "cudnn.AddNormQuantDecode #3", sites[input3].form)  # the form of an attention layer's input norm
+    sentence = (
+        f"add_norm_quantize (layer 5), the call at mlp: the adapter served the call with the form {eight_bit} (cudnn.AddNormQuantDecode #3); "
+        f"the row says {four_bit}"
+    )
+    assert census.check_forms(sites, [wrong, wrong]) == [sentence], "one sentence per kind of difference"
+    swapped = list(clean)  # the two norm calls of one layer, each served in the other's form: both are named, neither hides the other
+    swapped[mlp5], swapped[input5] = clean[input5], clean[mlp5]
+    found = census.check_forms(sites, [swapped])
+    assert len(found) == 2 and found[0].startswith("add_norm_quantize (layer 5), the call at linear_attention: the adapter served the call with the form")
+    assert found[1].startswith("add_norm_quantize (layer 5), the call at mlp: ") and found[1].endswith(f"the row says {four_bit}")
+    unserved = list(clean)
+    unserved[mlp5] = census.Call("add_norm_quantize", 5, 1, "", ())
+    assert census.check_forms(sites, [unserved]) == [
+        f"add_norm_quantize (layer 5), the call at mlp: the adapter served the call with the form [] (no entry instance); the row says {four_bit}"
+    ]
+    # a row whose form is not the entry's at one site: named with the site, once
+    other = [replace(site, form=(("PDL", False), *site.form[1:])) if site.site == "mlp" else site for site in sites]
+    assert census.check_forms(other) == ["add_norm_quantize at mlp: the row's form says PDL False, cudnn.AddNormQuantDecode states PDL True for this run"]
+    # a call site the row has no form for: a wrong table, said on the site
+    lacking = replace(row, sites=tuple(entry for entry in row.sites if entry[0] != "output_head"))
+    plan.rows["add_norm_quantize"] = lacking
+    missing = [site for site in census.expected(plan, model) if site.site == "output_head"]
+    assert (
+        len(missing) == 1
+        and missing[0].facts is None
+        and missing[0].wrong.startswith("provider row fe.add_norm_quant_decode: no form for the call site 'output_head'")
+    )
+    assert census.check_forms(missing)[0].startswith("add_norm_quantize at output_head: cudnn.AddNormQuantDecode states no launch for this run (provider row")
+
+
+def test_the_norm_entrys_adapter_over_a_stand_in_entry(monkeypatch):
+    """``fe.add_norm_quant_decode`` over a stand-in entry.  One adapter, one entry instance per form: the form of a call's
+    site reaches the constructor as the entry's own arguments, a call is served by the instance of its site and by no
+    other, and the call log reads the instance that was called.  The residual stream is the kernel's to update in place;
+    everything else it writes goes into buffers of this call's own.  A consumer on a fallback row gets the kernel's bytes
+    as they are -- the block scales in the kernel's layout, the bf16 rows unquantised where the form writes no codes --
+    and nothing but the entry is launched.  A call whose operands do not fit the form of its site, a form the adapter
+    cannot pass, and an entry that declines the width or the row count are wrong tables: ``ValueError``."""
+    from dataclasses import replace
+
+    import cudnn
+
+    from model_samples import census
+    from model_samples.blocks import DeviceFacts, plan
+    from model_samples.providers import Quant, fe, torch_ref
+    from model_samples.qwen_dense import QwenDense, configs
+    from model_samples.weights import ScaledTensor, TiledBlockScaledTensor, Unquantized
+
+    built = []
+
+    class Entry:
+        limit = 1024
+
+        def __init__(self, device, hidden, eps, *, add, bf16, quant, store_residual=False, pdl=None, pdl_release=None):
+            if hidden != 5120:
+                raise NotImplementedError(f"this stand-in serves hidden 5120; got hidden {hidden}")
+            self.arguments = dict(hidden=hidden, eps=eps, add=add, bf16=bf16, quant=quant, store_residual=store_residual, pdl=pdl, pdl_release=pdl_release)
+            self.calls = []
+            built.append(self)
+
+        def compile(self, rows=None):
+            self.calls.append(("compile", rows))
+
+        def __call__(self, x, residual, weight, scale, out=None, codes=None, scales=None):
+            self.calls.append(("launch", tuple(x.shape), residual, scale, out, codes, scales))
+            mark = len(self.calls)
+            if self.arguments["add"]:
+                residual.copy_((residual.float() + x.float()).to(torch.bfloat16))  # in place, as the kernel does
+            elif self.arguments["store_residual"]:
+                residual.copy_(x)
+            for written in (out, codes, scales):
+                if written is not None:
+                    written.view(torch.uint8).fill_(mark)
+            return out, codes, scales
+
+        def kernel_symbols_for(self, rows):
+            return (_norm_symbol(self.form_for(rows)).replace("h64", "h5120"),)
+
+        def form_for(self, rows):
+            a = self.arguments
+            return dict(
+                HIDDEN=a["hidden"], EPS=a["eps"], ADD=a["add"], STORE_RESIDUAL=a["store_residual"], BF16_OUT=a["bf16"], QUANT=a["quant"], PDL=bool(a["pdl"]),
+                PDL_RELEASE=bool(a["pdl"]) if a["pdl_release"] is None else a["pdl_release"],
+            )  # fmt: skip
+
+        def launch_shape_for(self, rows):
+            if rows > self.limit:
+                raise NotImplementedError(f"this stand-in serves at most {self.limit} rows per call; got {rows}")
+            return ((rows, 1, 1), (640, 1, 1), 80)
+
+    monkeypatch.setattr(cudnn, "AddNormQuantDecode", Entry, raising=False)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    model = QwenDense.reduced(2)
+    row = configs.PROVIDERS["add_norm_quantize"][0]
+    stated = DeviceFacts((10, 0), "stated device", 148, 0, 0)
+    options = {"device": "cpu", "check_kernels": True}
+    block = fe.AddNormQuantDecodeBlock(row, model, stated, options)
+    block.check_support(1, 1)
+    assert built == [] and block.serving() == ("cudnn.AddNormQuantDecode", ()), "on stated facts nothing is built; before a call nothing has served"
+    assert block.kernels == (census.Kernel("add_norm_quant", "cuDNN FE", "exact", launches=1, shape="entry"),) and block.state_args == (1,)
+    assert block._sites() == ("linear_attention.first", "full_attention", "mlp", "output_head"), "the forms the two-layer model calls, in the row's order"
+    facts = block.launch_facts(1, "mlp")
+    assert len(built) == 1 and built[0].arguments == dict(
+        hidden=5120, eps=1e-6, add=True, bf16=False, quant="nvfp4", store_residual=False, pdl=True, pdl_release=True
+    ), "the form of the call site, as the entry's own arguments"
+    assert (
+        facts.shape == NORM_SHAPE
+        and facts.form["QUANT"] == "nvfp4"
+        and facts.symbols == ("cudnn_kernel_frost_add_rms_norm_quant_h5120_add_nvfp4_wait_release_eps358637bd_0",)
+    )
+    assert block.launch_facts(4, "mlp").shape == ((4, 1, 1), (640, 1, 1), 80) and len(built) == 1, "one instance per form, whatever the row count"
+
+    x = torch.ones((2, 5120), dtype=torch.bfloat16)
+    weight = torch.zeros(5120, dtype=torch.bfloat16)
+    eight, four = Quant("fp8", 0.0625), Quant("nvfp4", 0.03125)
+    # the first call of a step: no residual stream yet -- the form stores the operand, into a tensor of this call's own
+    q1, normed1, residual = block(x, None, weight, eight, "linear_attention.first")
+    first = built[1]
+    assert (
+        first.arguments["add"] is False
+        and first.arguments["store_residual"] is True
+        and first.arguments["bf16"] is True
+        and first.arguments["quant"] == "e4m3_static"
+    )
+    _, shape, stored, scale1, out1, codes1, scales1 = first.calls[-1]
+    assert shape == (2, 5120) and stored is residual and residual is not x and torch.equal(residual, x) and scales1 is None
+    assert isinstance(q1, ScaledTensor) and q1.scale == 0.0625 and q1.codes.dtype == torch.uint8 and q1.codes.data_ptr() == codes1.data_ptr()
+    assert codes1.dtype == torch.float8_e4m3fn and tuple(codes1.shape) == (2, 5120) and normed1 is out1 and out1.dtype == torch.bfloat16
+    assert scale1.dtype == torch.float32 and scale1.tolist() == [0.0625], "8-bit codes: the consumer's static scale, as it is"
+    assert block.serving() == ("cudnn.AddNormQuantDecode #2", row.site_form("linear_attention.first")), "the instance that was called, and what it states"
+    # the norm in front of an MLP: the residual stream is updated in place; 4-bit codes with their block scales in the kernel's layout
+    q2, normed2, same = block(x, residual, weight, four, "mlp")
+    _, _, updated, scale2, out2, codes2, scales2 = built[0].calls[-1]
+    assert same is residual and updated is residual and bool((residual == 2.0).all()), "in place: the stream is the kernel's to update"
+    assert normed2 is None and out2 is None and isinstance(q2, TiledBlockScaledTensor) and q2.scale == 0.03125
+    assert q2.codes is codes2 and codes2.dtype == torch.uint8 and tuple(codes2.shape) == (2, 2560)
+    assert tuple(scales2.shape) == (128, 320) and scales2.dtype == torch.float8_e4m3fn and q2.tiled_scales.data_ptr() == scales2.data_ptr()
+    assert scale2.tolist() == [32.0] and scale2.dtype == torch.float32, "4-bit codes: the global scale a consumer divides by, the fp32 reciprocal"
+    assert block.serving() == ("cudnn.AddNormQuantDecode #1", row.site_form("mlp"))
+    q3, _, _ = block(x, residual, weight, four, "mlp")
+    assert (
+        built[0].calls[-1][3] is scale2 and q3.codes is not q2.codes and int(q2.codes[0, 0]) != int(q3.codes[0, 0])
+    ), "one scale tensor per value; buffers of its own per call"
+    assert tuple(block.compared((q2, None, residual))[0].tensors()[1].shape) == (2, 320), "compared row by row: the block scales gathered out of the layout"
+    # the final norm: the form ends at the bf16 rows; the 4-bit operand of the consumer is handed over unquantised
+    q4, normed4, _ = block(x, residual, weight, four, "output_head")
+    head = built[2]
+    assert head.arguments["bf16"] is True and head.arguments["quant"] is None and head.calls[-1][3] is None and head.calls[-1][5] is None
+    assert isinstance(q4, Unquantized) and q4.data is normed4 and (q4.fmt, q4.scale) == ("nvfp4", 0.03125)
+    assert block.compared((q4, normed4, residual)) == (None, normed4, residual), "what the consumer quantises is not the kernel's output"
+    assert block(x, residual, weight, None, "output_head")[0] is None, "no quantised operand asked for: none handed over"
+    assert block.serving() == ("cudnn.AddNormQuantDecode #3", row.site_form("output_head")) and len(built) == 3, "three forms called so far: three instances"
+    assert (
+        fe.AddNormQuantDecodeBlock(row, model, stated, options).launch_facts(1, "mlp") == facts and len(built) == 3
+    ), "one entry per form, shared by every session"
+    block.compile(4, 1)
+    assert len(built) == 4, "at load: every form the model calls (the fourth is the attention layer's input norm)"
+    assert [call[:2] for call in built[3].calls] == [("compile", None), ("launch", (4, 5120))] and built[3].arguments["quant"] == "e4m3_static"
+    assert [call[0] for call in built[0].calls[-2:]] == ["compile", "launch"] and built[0].calls[-1][1] == (
+        4,
+        5120,
+    ), "compiled and launched once per form at load"
+    reference = torch_ref.AddNormQuantize(configs.PROVIDERS["add_norm_quantize"][1], model, stated, options)
+    twin = block.twin(reference)
+    assert type(twin) is torch_ref.AddNormQuantizeBracket and block.twin(reference) is twin and reference.twin(reference) is reference
+    assert twin.forms == {site: dict(row.site_form(site)) for site, _ in row.sites}, "the twin writes what the form of each call site writes"
+    for name in ("norm/frost/add_norm_quant_decode.py", "norm/frost/kernel/add_norm_quant_decode_config.py", "norm/frost/kernel/add_norm_quant_decode_f16.py"):
+        assert name in fe.SOURCE_FILES and (Path(cudnn.__file__).parent / name).is_file(), f"the source hash of a run covers {name}"
+
+    # a call whose operands are not what the form of its site takes: the table or the wiring is wrong, and the adapter decides nothing
+    for arguments, sentence in (
+        ((x, None, weight, four, "mlp"), "its form at mlp is ADD True, STORE_RESIDUAL False; the step has no residual stream yet there"),
+        (
+            (x, residual, weight, eight, "linear_attention.first"),
+            "its form at linear_attention.first is ADD False, STORE_RESIDUAL True; the step has a residual stream there",
+        ),
+        ((x, residual, weight, eight, "mlp"), "its form at mlp writes nvfp4 codes; the step asks for a fp8 operand there"),
+        ((x, residual, weight, None, "mlp"), "its form at mlp writes nvfp4 codes; the step asks for no quantised operand there"),
+        ((x, residual, weight, four, "full_attention"), "its form at full_attention writes e4m3_static codes; the step asks for a nvfp4 operand there"),
+    ):
+        with pytest.raises(ValueError) as wrong:
+            block(*arguments)
+        assert str(wrong.value) == f"provider row fe.add_norm_quant_decode: {sentence}", sentence
+    with pytest.raises(ValueError, match="cudnn.AddNormQuantDecode writes static 8-bit or 4-bit codes; this block is asked for 'int8'"):
+        block(x, residual, weight, Quant("int8", 1.0), "mlp")
+    with pytest.raises(ValueError, match=r"^provider row fe.add_norm_quant_decode: no form for the call site 'mlp.gate'"):
+        block(x, residual, weight, four, "mlp.gate")
+    named = replace(row, form=(("PDL", True), ("THREADS", 640)))
+    with pytest.raises(
+        ValueError, match=r"its form at linear_attention.first names THREADS; this adapter passes ADD, BF16_OUT, QUANT, STORE_RESIDUAL, PDL, PDL_RELEASE"
+    ):
+        fe.AddNormQuantDecodeBlock(named, model, stated, options).check_support(1, 1)
+    short = replace(row, sites=(("mlp", (("ADD", True), ("BF16_OUT", False))),))
+    with pytest.raises(ValueError, match=r"its form at mlp does not name QUANT; .* which has no default for ADD, BF16_OUT, QUANT$"):
+        fe.AddNormQuantDecodeBlock(short, model, stated, options).check_support(1, 1)
+
+    # on a real device the adapter asks the instance of every form the run calls for the launch of its row count
+    real = DeviceFacts((10, 0), "stated device", 148, 180 * GIB, 80 * GIB)
+    fe.AddNormQuantDecodeBlock(row, model, real, options).check_support(4, 1)
+    monkeypatch.setattr(Entry, "limit", 3)
+    declined = (
+        r"^the provider table is wrong: the row of fe.add_norm_quant_decode claims this run \(4 rows on compute capability 10.0\), and "
+        r"cudnn.AddNormQuantDecode declines it: this stand-in serves at most 3 rows per call; got 4$"
+    )
+    with pytest.raises(ValueError, match=declined):
+        fe.AddNormQuantDecodeBlock(row, model, real, options).check_support(4, 1)
+    with pytest.raises(ValueError, match=declined):  # through the plan: a ValueError, which a sample prints as an ERROR
+        plan(dict(model.provider_table), model.regimes, real, 4, 1, "native", model=model, options=options)
+    monkeypatch.setattr(fe, "_ENTRIES", {})
+    narrow = QwenDense.reduced(2)
+    narrow.geometry = replace(narrow.geometry, hidden=4096)
+    with pytest.raises(ValueError) as wrong:
+        fe.AddNormQuantDecodeBlock(row, narrow, real, options).check_support(1, 1)
+    assert str(wrong.value) == (
+        "the provider table is wrong: cudnn.AddNormQuantDecode declines the geometry or the form of the row of fe.add_norm_quant_decode at "
+        "linear_attention.first: this stand-in serves hidden 5120; got hidden 4096"
+    )
+
+    class Older:  # an installed package without the entry, and one whose entry states no launch facts
+        __version__ = "1.32.3"
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    monkeypatch.setattr(fe.AddNormQuantDecodeBlock, "_cudnn", lambda self: Older())
+    with pytest.raises(NotImplementedError, match=r"needs nvidia-cudnn-frontend with the add \+ RMSNorm \+ quantise decode step \(>= 1.33.0\); this is 1.32.3"):
+        fe.AddNormQuantDecodeBlock(row, model, stated, options).check_support(1, 1)
+    monkeypatch.undo()
+    monkeypatch.setattr(cudnn, "AddNormQuantDecode", type("NoFacts", (), {}), raising=False)
+    with pytest.raises(NotImplementedError, match=r"the kernel check needs the launch facts of cudnn.AddNormQuantDecode \(kernel_symbols_for"):
+        fe.AddNormQuantDecodeBlock(row, model, stated, options).check_support(1, 1)
+
+
+def test_a_census_names_the_form_of_every_call_of_a_kernel_with_several_forms():
+    """The target calls the norm kernel in another form at each call site, and the census says which: per entry of a section
+    the fields of that call (``form``), and what differs at a block's first call in the model's first layer
+    (``first_layer``).  A block call is the target's only where the row's form at ITS site is the census's form of THAT
+    call; a row that differs at one site is ``not the target`` there and nowhere else, and the reason is said once."""
+    import copy
+
+    from model_samples import census
+    from model_samples.qwen_dense import QwenDense
+
+    target = QwenDense.target()
+    parts = target.data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"]
+    kinds = QwenDense().geometry.layer_kinds
+    calls = [facts for block, _, facts in target.sequence(parts, kinds) if block == "add_norm_quantize"]
+    first, later = calls[0]["form"], calls[2]["form"]
+    assert first == {"ADD": False, "STORE_RESIDUAL": True, "BF16_OUT": True, "QUANT": "e4m3_static"}, "the first layer's facts, merged field by field"
+    assert later == {"ADD": True, "STORE_RESIDUAL": False, "BF16_OUT": True, "QUANT": "e4m3_static"} and calls[-1]["form"]["QUANT"] is None
+    assert parts["linear_attention_layer"][0][2]["form"]["ADD"] is True, "the file's own entry is left as it is"
+    assert target.sequence(parts, kinds) == target.sequence(parts, kinds) and target.numbers(parts, kinds) == (484, 210, 273, 1)
+    attention_first = [facts["form"] for block, _, facts in target.sequence(parts, QwenDense.reduced(1).geometry.layer_kinds) if block == "add_norm_quantize"]
+    assert attention_first[0] == {"ADD": False, "STORE_RESIDUAL": True, "BF16_OUT": False, "QUANT": "e4m3_static"}, "whatever kind the first layer is"
+    plan1, model1, _ = _target_plan(1)
+    assert target.claim(plan1, model1, installed=RECORDED).of("add_norm_quantize") == "target", "and the row has that form at that site"
+
+    plan, model, _ = _target_plan(64)
+
+    def changed(change):
+        data = copy.deepcopy(target.data)
+        change(data["configurations"]["plain"]["cc10.0/sm148"]["rows"]["1"])
+        return census.Target(data)
+
+    def with_normed_rows(rows):  # the census says the norm in front of an MLP also writes its bf16 rows
+        for kind in ("linear_attention_layer", "attention_layer"):
+            rows[kind][-3][2]["form"]["BF16_OUT"] = True
+
+    claim = changed(with_normed_rows).claim(plan, model, installed=RECORDED)
+    numbers = claim.numbers()
+    row_form = "[PDL True, PDL_RELEASE True, ADD True, STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4]"
+    reason = f"the row's form at mlp is {row_form}, the target's {row_form.replace('BF16_OUT False', 'BF16_OUT True')}"
+    assert numbers["not_the_target"] == {"add_norm_quantize": 64} and (numbers["target_code"], numbers["target_port"]) == (49, 81)
+    assert claim.reasons == [f"not the target set: add_norm_quantize ({reason})", "fallback rows present", "the plan has no block for output_head.quantize"][
+        1:2
+    ] + [
+        f"not the target set: add_norm_quantize ({reason})",
+        "the plan has no block for output_head.quantize",
+    ], "said once for its 64 calls"
+    assert (
+        claim.of("add_norm_quantize") == f"target; not the target ({reason})" and len(claim.recorded) == 194 - 64
+    ), "no recorded shape is held against those calls"
+    unmerged = changed(lambda rows: rows.pop(census.FIRST_LAYER)).claim(plan, model, installed=RECORDED)
+    assert unmerged.numbers()["not_the_target"] == {"add_norm_quantize": 1} and unmerged.identities[1].reason.startswith(
+        "the row's form at linear_attention.first is [PDL True, PDL_RELEASE True, ADD False, STORE_RESIDUAL True, "
+    ), "without it the census would say that the first norm of a step adds to a residual"
+
+    with pytest.raises(ValueError, match="^kernel_census.json: first_layer names attention.core, which the first layer of this model does not call$"):
+        changed(lambda rows: rows[census.FIRST_LAYER].update({"attention.core": {"form": {}}})).claim(plan, model, installed=RECORDED)
+    for change, sentence in (
+        (lambda rows: rows["epilogue"][0][2].update(form=["BF16_OUT"]), "1 rows, epilogue: the form of add_norm_quantize is not an object of form fields"),
+        (
+            lambda rows: rows.update({census.FIRST_LAYER: [["add_norm_quantize", {}]]}),
+            "1 rows: first_layer is not an object of block: facts (launch and at and form)",
+        ),
+        (
+            lambda rows: rows[census.FIRST_LAYER]["add_norm_quantize"].update(forms={}),
+            "1 rows: first_layer is not an object of block: facts (launch and at and form)",
+        ),
+        (lambda rows: rows[census.FIRST_LAYER]["add_norm_quantize"].update(form="first"), "first_layer: the form of add_norm_quantize is not an object"),
+    ):
+        with pytest.raises(ValueError) as refused:
+            changed(change)
+        assert str(refused.value).startswith("kernel_census.json: plain / cc10.0/sm148, ") and sentence in str(refused.value), sentence
+
+
+def test_the_norms_twin_and_its_band_on_stated_tensors():
+    """The norm at the kernel's rounding points, and the band its entry is judged with: the entry's documented contract, per
+    output.  The kernel's chain in fp32 -- the sum, the normalised value rounded once to bf16, the codes of that bf16 value
+    -- is inside the band in every form.  Each rule of the band is held on a bracket stated here: a normed element outside
+    the two bf16 values, one on the other value beyond the margin, a NaN, an 8-bit code of neither value, 8-bit codes that
+    are not those of the rows the same call wrote, a block scale of no admitted maximum, a 4-bit code outside the bracket
+    of the two reciprocals, and a residual stream that differs: each fails the block."""
+    from types import SimpleNamespace
+
+    from model_samples import tie_out
+    from model_samples.blocks import DeviceFacts
+    from model_samples.providers import Quant, torch_ref
+    from model_samples.qwen_dense import configs
+    from model_samples.weights import BLOCK, BlockScaledTensor, _e2m1, _e4m3_values, quantize_fp8
+
+    assert (
+        tie_out.NORM_MARGIN_ULP32 == 20.0
+    ), "the bound of the entry's page (docs/operations/normalizations/add_norm_quant_decode.md): it moves only with that page"
+    page = " ".join((MODELS.parents[1] / "docs" / "operations" / "normalizations" / "add_norm_quant_decode.md").read_text().split())
+    assert "the kernel's fp32 value is within `20 x 2^-24` relative of it" in page and "the codes are those of quantizing `out` itself" in page
+    assert torch_ref.NVFP4_ENCODE_BOUND == 5 * 2.0**-23 and torch_ref.FP4_SIXTH_BITS == 0x3E2AAAAB
+    bf16 = torch.bfloat16
+
+    def judged(out, twin):
+        stats = tie_out.BlockStats("add_norm_quant")
+        tie_out.BlockTap._judge(stats, tuple(out), tuple(twin.reference), [], [], 0, twin)
+        return stats
+
+    # ---- the rules, on a bracket stated here: per element the nearest bf16 value, the other one, the distance from their midpoint
+    nearest = torch.tensor([[1.0, -2.0, 0.5, 3.0] * 8, [0.25, 4.0, -1.5, 6.0] * 8]).to(bf16)  # two rows of two blocks of 16
+    other = torch.tensor([[1.0078125, -2.015625, 0.50390625, 3.015625] * 8, [0.251953125, 4.03125, -1.5078125, 6.03125] * 8]).to(bf16)  # one unit away
+    margin = torch.full((2, 32), 1000.0, dtype=torch.float64)
+    margin[0, 5], margin[1, 3] = 3.0, 20.0  # two elements inside the margin: the kernel may write either value there
+    residual = torch.ones((2, 32), dtype=bf16)
+
+    def stated(names, quant, reference, bracket=None):
+        return SimpleNamespace(bracket=bracket or (nearest, other, margin), outputs=names, quant=quant, reference=reference)
+
+    final = stated(("normed", "residual"), None, (nearest, residual))
+    stats = judged((nearest, residual), final)
+    assert stats.ok and (stats.elements, stats.other_value, stats.outside, stats.off_nearest, stats.total_bytes) == (64, 0, 0, 0, 0)
+    assert stats.line().startswith("residual stream equal; 64 normed elements, 0 of them the other bf16 value") and stats.line().endswith("; 0 outside")
+    inside = nearest.clone()
+    inside[0, 5], inside[1, 3] = other[0, 5], other[1, 3]
+    stats = judged((inside, residual), final)
+    assert stats.ok and stats.other_value == 2, "inside the margin the fp32 value may lie on the other side of the midpoint: the kernel's own arithmetic"
+    beyond = nearest.clone()
+    beyond[0, 6] = other[0, 6]  # the other value where the normalised value is far from the midpoint
+    stats = judged((beyond, residual), final)
+    assert (
+        not stats.ok
+        and (stats.off_nearest, stats.outside, stats.other_value) == (1, 0, 1)
+        and "; 1 off the nearest value more than 20 fp32 units" in stats.line()
+    )
+    apart = nearest.clone()
+    apart[1, 3] = 6.0625  # two units away: neither value of the bracket, margin or not
+    stats = judged((apart, residual), final)
+    assert not stats.ok and stats.outside == 1 and stats.line().endswith("; 1 outside")
+    signed = nearest.clone()
+    signed[0, 0] = -1.0
+    assert judged((signed, residual), final).outside == 1, "compared as bit patterns: the sign is part of the value"
+    with_nan = nearest.clone()
+    with_nan[0, 0] = float("nan")
+    stats = judged((with_nan, residual), final)
+    assert not stats.ok and not stats.finite and stats.line().endswith("NON-FINITE VALUES")
+    stats = judged((nearest, residual + 1), final)
+    assert not stats.ok and not stats.state_equal and stats.line().startswith("residual stream DIFFERS; "), "the stream the call updated in place"
+    with pytest.raises(
+        ValueError, match="the band add_norm_quant is judged against the norm at the kernel's rounding points: the block's twin keeps no bracket"
+    ):
+        judged((nearest, residual), SimpleNamespace(reference=(nearest, residual)))
+    stats = judged((nearest,), final)
+    assert not stats.ok and stats.outside == 1, "a call that wrote other outputs than its form names: nothing is compared, and it does not hold"
+
+    # 8-bit codes.  A bf16 value has more digits than an 8-bit code, so two neighbouring bf16 values mostly share their code;
+    # 1.0625 and 1.0703125 do not (the first is the tie between the codes of 1.0 and 1.125 and goes to the even one).  The
+    # bracket holds that pair twice: once inside the margin, once far from the midpoint
+    eight = Quant("fp8", 1.0)
+    near8, other8 = nearest.clone(), other.clone()
+    for at in ((0, 5), (0, 6)):
+        near8[at], other8[at] = 1.0625, 1.0703125
+    bracket8 = (near8, other8, margin)
+    of_nearest, of_other = quantize_fp8(near8, eight.scale).codes, quantize_fp8(other8, eight.scale).codes
+    assert (of_nearest != of_other).nonzero().tolist() == [[0, 5], [0, 6]] and (int(of_nearest[0, 5]), int(of_other[0, 5])) == (0x38, 0x39)
+    alone = stated(("codes", "residual"), eight, (of_nearest, residual), bracket8)
+    stats = judged((of_nearest, residual), alone)
+    assert stats.ok and (stats.total_bytes, stats.equal_bytes, stats.elements) == (64, 64, 0)
+    either = of_nearest.clone()
+    either[0, 5] = of_other[0, 5]
+    stats = judged((either, residual), alone)
+    assert stats.ok and stats.total_bytes - stats.equal_bytes == 1, "codes alone: inside the margin either value's code"
+    wrong = of_nearest.clone()
+    wrong[0, 6] = of_other[0, 6]
+    stats = judged((wrong, residual), alone)
+    assert not stats.ok and (stats.off_nearest, stats.outside) == (1, 0), "the other value's code beyond the margin"
+    wrong = of_nearest.clone()
+    wrong[0, 0] = 0x7E
+    stats = judged((wrong, residual), alone)
+    assert not stats.ok and stats.outside == 1, "the code of neither value"
+    wrong[0, 0] = 0x7F  # E4M3 has no infinity: this code is its NaN
+    assert not judged((wrong, residual), alone).finite
+    both = stated(("codes", "normed", "residual"), eight, (of_nearest, near8, residual), bracket8)
+    assert judged((of_nearest, near8, residual), both).ok
+    took_other = near8.clone()
+    took_other[0, 5] = other8[0, 5]  # the kernel's fp32 value fell on the other side, inside the margin
+    assert judged((quantize_fp8(took_other, eight.scale).codes, took_other, residual), both).ok, "the codes are those of the bf16 rows the same call wrote"
+    stats = judged((of_nearest, took_other, residual), both)
+    assert (
+        not stats.ok and stats.not_of_out == 1 and "; 1 8-bit codes not those of the normed rows of their call" in stats.line()
+    ), "not the codes of other rows"
+
+    four = Quant("nvfp4", 0.03125)  # the kernel's global scale is 32
+    assert float(torch_ref.nvfp4_global_scale(four.scale, "cpu")) == 32.0 and float(torch_ref.nvfp4_global_scale(1 / 3, "cpu")) == 3.0
+
+    def nibbles(packed):
+        return torch.stack((packed & 0xF, packed >> 4), dim=-1).flatten(-2)
+
+    def pack(codes):
+        return codes[..., 0::2] | (codes[..., 1::2] << 4)
+
+    def kernel4(y, scale):  # the kernel's 4-bit chain on bf16 rows: its block scale, then the codes through the fp32 quotient
+        scales = torch_ref.nvfp4_block_scales(y.float().abs().unflatten(-1, (-1, BLOCK)).amax(-1), scale)
+        step = _e4m3_values(scales).repeat_interleave(BLOCK, dim=-1)
+        encode = torch.where(
+            step != 0, torch_ref.nvfp4_global_scale(scale, "cpu") / torch.where(step != 0, step, torch.ones_like(step)), torch.zeros_like(step)
+        )
+        return pack(_e2m1(y.float() * encode, signed_zero=True)), scales
+
+    codes4, scales4 = kernel4(nearest, four.scale)
+    assert scales4.tolist() == [[0x58, 0x58], [0x60, 0x60]], "e4m3(32 x (3 x fp32(1/6))) = 16 and e4m3(32 x (6 x fp32(1/6))) = 32, by their bytes"
+    mlp = stated(("codes", "scales", "residual"), four, (codes4, scales4, residual))
+    stats = judged((codes4, scales4, residual), mlp)
+    assert stats.ok and (stats.total_bytes, stats.equal_bytes) == (64 + 4, 64 + 4), "the codes one nibble per element, and the block scales"
+    wrong = scales4.clone()
+    wrong[0, 1] += 1
+    stats = judged((codes4, wrong, residual), mlp)
+    assert not stats.ok and stats.outside >= 1, "a block scale of no maximum the bracket admits (and the codes are then judged under it)"
+    wrong = nibbles(codes4)
+    wrong[1, 0] = 7  # the code of 6 x the block scale, where the value is the block's smallest
+    stats = judged((pack(wrong), scales4, residual), mlp)
+    assert not stats.ok and stats.outside == 1, "a code outside the bracket of the two reciprocals"
+    wrong = nibbles(codes4)
+    wrong[0, 1] ^= 0x8  # the other sign
+    assert judged((pack(wrong), scales4, residual), mlp).outside == 1
+    # the block maximum is an element inside the margin: the kernel's maximum is one of two values, and so is its block scale
+    top, top_other, top_margin = nearest.clone(), other.clone(), margin.clone()
+    top[1, 3], top_other[1, 3], top_margin[1, 3] = 6.375, 6.40625, 5.0  # neighbours whose scales 34.0 (a tie: to the even 32) and 34.2 round apart
+    edge = SimpleNamespace(bracket=(top, top_other, top_margin), outputs=("codes", "scales", "residual"), quant=four, reference=None)
+    low, high = kernel4(top, four.scale), kernel4(torch.where(top_margin <= 20.0, top_other, top), four.scale)
+    assert low[1][1, 0] != high[1][1, 0], "two admitted block scales"
+    for written in (low, high):
+        edge.reference = (*written, residual)
+        assert judged((*written, residual), edge).ok, "either: the codes are judged under the block scale the kernel stored"
+    firm = top_margin.clone()
+    firm[1, 3] = 1000.0  # the same rows with that element far from its midpoint: only the nearest value's maximum is admitted
+    edge.bracket = (top, top_other, firm)
+    assert judged((*low, residual), edge).ok and not judged((*high, residual), edge).ok
+
+    # ---- the 4-bit models at the kernel's points
+    assert torch_ref.nvfp4_block_scales(torch.tensor([6.0, 3.0, 0.0, 448.0 * 6 / 32, 1e9]), four.scale).tolist() == [0x60, 0x58, 0x00, 0x7E, 0x7E]
+    y = torch.tensor([[6.0, -6.0, 0.0, -0.0, 1.25, 1.3, -0.25, 0.26, 3.5, 5.0, 2.5, 1.75, 0.75, 9.0, -9.0, 0.1]]).to(bf16)
+    low, high = torch_ref.nvfp4_code_bracket(y, torch.tensor([[0x38]], dtype=torch.uint8), 1.0)  # a block scale of 1 at a global scale of 1
+    assert low.tolist() == [[7, 15, 0, 8, 2, 3, 8, 1, 5, 6, 4, 3, 1, 7, 15, 0]], "below an exact tie; a zero keeps its sign; saturation at 6"
+    assert high.tolist() == [[7, 15, 0, 8, 3, 3, 9, 1, 6, 7, 5, 4, 2, 7, 15, 0]], "above it: two adjacent codes on a tie, one code everywhere else"
+    zero_low, zero_high = torch_ref.nvfp4_code_bracket(y, torch.tensor([[0x00]], dtype=torch.uint8), 1.0)
+    assert (
+        zero_low.tolist() == zero_high.tolist() == [[0, 8, 0, 8, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 8, 0]]
+    ), "under a zero block scale: the codes of the signed zero"
+
+    # ---- the twin's arithmetic against the kernel's chain written out in fp32, in every form the row names
+    generator = torch.Generator().manual_seed(11)
+    x = (3 * torch.randn((3, 5120), generator=generator)).to(bf16)
+    stream = (10 * torch.randn((3, 5120), generator=generator)).to(bf16)
+    weight = (0.3 * torch.randn(5120, generator=generator)).to(bf16)
+    x[0, :64], stream[0, :64] = 0.0, 0.0  # an all-zero block
+    stream[1, 64:128] = -x[1, 64:128]  # a stretch whose sum cancels
+    weight[200:216] = -1.0  # 1 + w = 0: a block of zero outputs
+    eps32 = float(torch.tensor(1e-6, dtype=torch.float32))
+    new_residual, near, far, distance = torch_ref.norm_bracket(x, stream, weight, 1e-6)
+    assert torch.equal(new_residual, (stream.float() + x.float()).to(bf16)), "the residual: one fp32 addition, one rounding"
+    v = stream.double() + x.double()
+    exact = v * (1.0 + weight.double()) / torch.sqrt(v.square().mean(-1, keepdim=True) + eps32)
+    assert bool(((near.double() - exact).abs() <= (far.double() - exact).abs()).all()), "nearest is the nearer of the two"
+    assert bool(((near.double() - exact) * (far.double() - exact) <= 0).all()), "and the two are on either side of the value (or on it)"
+    assert torch.equal(near, torch_ref.rms_norm(stream.float() + x.float(), weight, 1e-6, torch.float64)), "on these rows the chain's fp64 norm rounds to it"
+    started = torch_ref.norm_bracket(x, None, weight, 1e-6)
+    assert started[0] is x and not torch.equal(started[1], near), "the first call of a step: the branch is the stream, and the norm is of the branch alone"
+
+    def kernel_chain(branch, residual, site_form, quant):  # what the entry computes: fp32 throughout, one rounding to bf16
+        v32 = branch.float() if residual is None else residual.float() + branch.float()
+        y = ((v32 * torch.rsqrt(v32.square().mean(-1, keepdim=True) + 1e-6)) * (1.0 + weight.float())).to(bf16)
+        out = []
+        if site_form["QUANT"] == "e4m3_static":
+            out.append(quantize_fp8(y, quant.scale).codes)
+        elif site_form["QUANT"] == "nvfp4":
+            out += list(kernel4(y, quant.scale))
+        return (*out, *([y] if site_form["BF16_OUT"] else []), branch if residual is None else v32.to(bf16)), y
+
+    row = configs.PROVIDERS["add_norm_quantize"][0]
+    twin = torch_ref.AddNormQuantizeBracket(configs.PROVIDERS["add_norm_quantize"][1], SimpleNamespace(norm_eps=1e-6), DeviceFacts((0, 0), "cpu"), {})
+    twin.forms = {site: dict(row.site_form(site)) for site, _ in row.sites}
+    names = {
+        "linear_attention.first": ("codes", "normed", "residual"),
+        "full_attention.first": ("codes", "residual"),
+        "linear_attention": ("codes", "normed", "residual"),
+        "full_attention": ("codes", "residual"),
+        "mlp": ("codes", "scales", "residual"),
+        "output_head": ("normed", "residual"),
+    }
+    others = 0
+    for site, _ in row.sites:
+        quant = four if site in ("mlp", "output_head") else Quant("fp8", 0.02)
+        operands = (x, None if site.endswith(".first") else stream, weight, quant, site)
+        out, y = kernel_chain(*operands[:2], twin.forms[site], quant)
+        reference = twin(*operands)
+        assert twin.outputs == names[site], f"{site}: what the form of the site writes"
+        assert (reference[0] is None) == (site == "output_head") and (reference[1] is None) == (twin.forms[site]["BF16_OUT"] is False), site
+        if site == "mlp":
+            assert isinstance(reference[0], BlockScaledTensor) and reference[0].scale == four.scale
+        stats = tie_out.BlockStats("add_norm_quant")
+        tie_out.BlockTap._judge(stats, out, tie_out._tensors(reference), [], [], 0, twin)
+        assert stats.ok and stats.outside == 0 and stats.off_nearest == 0 and stats.not_of_out == 0 and stats.state_equal and stats.finite, (site, stats.line())
+        others += int((y != twin.bracket[0]).sum())
+        assert int((y != twin.bracket[0]).sum()) <= 0.001 * y.numel(), f"{site}: an fp32 chain leaves the nearest bf16 of the fp64 value on few elements"
+        if "scales" in names[site]:
+            assert stats.total_bytes == 3 * 5120 + 3 * 320 and stats.equal_bytes >= 0.999 * stats.total_bytes
+        # one changed byte of each output of the form fails the call
+        for index, name in enumerate(names[site]):
+            changed = [t.clone() for t in out]
+            flat = changed[index].view(torch.uint8).view(-1)
+            flat[7] = flat[7] ^ (0x40 if name == "normed" else 0x44)
+            defect = tie_out.BlockStats("add_norm_quant")
+            tie_out.BlockTap._judge(defect, changed, tie_out._tensors(reference), [], [], 0, twin)
+            assert not defect.ok, f"{site}: one changed byte of {name}"
+    assert bool((distance > 0).all()) and float(distance.min()) < 1e6, "the margins of these rows are finite: no element is a bf16 value by construction"
+
+
+def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
+    """The norm row of the ``native`` stack through a real session on the CPU, on the stand-in of its entry.  Clean, the run
+    holds: five calls of a step on four forms, each served by the instance of its site, the residual stream in place, the
+    consumers on fallback rows reading the kernel's bytes as they are.  Then the negative controls, each of which must
+    fail the kernel check with its own sentence -- a call served in the form of another site (only the call log shows
+    it), a chain of other kernels under the row's name, a launch more in front of its kernel, a launch less, a launch in
+    another shape than the census recorded -- or fail the block in its band while the kernel check holds: a wrong code, a
+    wrong block scale, a wrong normed element, a wrong element of the residual stream."""
+    from model_samples import census, tie_out
+    from model_samples.qwen_dense import configs
+
+    row = configs.PROVIDERS["add_norm_quantize"][0]
+
+    def run(sequences=2, **stand_in):
+        session = _recorded_run(monkeypatch, sequences=sequences, stack="native", **stand_in)[0]
+        session.trace(4)
+        return session, tie_out.run_checks(session, prompt_tokens=3)
+
+    def sentences(checks):
+        return [line.strip() for line in checks.lines if line.strip().startswith("kernels: ")]
+
+    def norm_line(checks):
+        return next(line for line in checks.lines if line.strip().startswith("add_norm_quantize ") and "calls" in line)
+
+    session, checks = run()
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
+    assert "8 on exact rows, in the wiring order" in _line(checks, "kernels ") and norm_line(checks).endswith("[band: add_norm_quant]  PASS")
+    assert "add_norm_quantize equal (gated)" in _line(checks, "batch invariance"), "each sequence alone writes the bytes it writes among two"
+    log = session.traced.call_log[0]
+    assert log[1] == census.Call("add_norm_quantize", 0, 2, "cudnn.AddNormQuantDecode #1", row.site_form("linear_attention.first"))
+    assert [(call.layer, call.instance[-2:], dict(call.form)["QUANT"]) for call in log if call.block == "add_norm_quantize"] == [
+        (0, "#1", "e4m3_static"),
+        (0, "#5", "nvfp4"),
+        (1, "#4", "e4m3_static"),
+        (1, "#5", "nvfp4"),
+        (2, "#6", None),
+    ], "the instance of the call's own site, call by call"
+    counted = _line(checks, "add_norm_quantize, as the call log of a traced step has it (5 calls): ")
+    assert counted.count(" x cudnn.AddNormQuantDecode #") == 4 and "2 x cudnn.AddNormQuantDecode #5 " in counted, "four forms, the MLP's twice"
+    stated = [line.strip() for line in checks.lines if line.strip().startswith("add_norm_quantize at ")]
+    assert [line.split(":")[0] for line in stated] == [
+        f"add_norm_quantize at {site}" for site in ("linear_attention.first", "mlp", "full_attention", "output_head")
+    ]
+    assert "2 launches per step (2 calls x 1 per call); the entry states grid (2, 1, 1), block (640, 1, 1), shared memory 80 B and the kernel " in stated[1]
+
+    # (1) the calls in front of an MLP served by the instance of another form: the launch records are clean (one kernel id, one launch shape)
+    def neighbour(site):
+        served = "full_attention" if site == "mlp" else site
+        return f"cudnn.AddNormQuantDecode #{[name for name, _ in row.sites].index(served) + 1}", tuple(row.site_form(served))
+
+    _, checks = run(norm_serves=neighbour)
+    assert not checks.ok and checks.kernels == census.FAIL, checks.text()
+    assert sentences(checks) == [
+        "kernels: form: add_norm_quantize (layer 0), the call at mlp: the adapter served the call with the form [PDL True, PDL_RELEASE True, ADD True, "
+        "STORE_RESIDUAL False, BF16_OUT False, QUANT e4m3_static] (cudnn.AddNormQuantDecode #4); the row says [PDL True, PDL_RELEASE True, ADD True, "
+        "STORE_RESIDUAL False, BF16_OUT False, QUANT nvfp4]"
+    ], "one sentence for the kind of difference, whichever layer"
+    for other in ("replay", "blocks", "tokens", "batch invariance"):
+        assert _line(checks, other).endswith("PASS"), checks.text()
+
+    # (2) a fallback under the row's name: the block launches a chain of PyTorch kernels, the row declares the entry's kernel
+    _, checks = run(norm_defect="chain")
+    missing = "did not launch add_norm_quant: the step has 0 launch(es) of add_norm_quant, the plan 5 = 5 call(s) x 1 per call"
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks) == [f"kernels: step 0 (and 3 more of the 4 traced steps): add_norm_quantize (layer {layer}) {missing}" for layer in (0, 1, 2)]
+    ), checks.text()
+    assert norm_line(checks).endswith("PASS"), "its bytes are the kernel's: only the kernel check sees it"
+
+    # (3) one launch more: in front of the first norm of a step nothing is declared (the gather before it is judged one by one too)
+    _, checks = run(norm_defect="extra")
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"kernels: step 0 (and 3 more of the 4 traced steps): launched {ELEMENTWISE[:93] + '...'!r} between embedding and add_norm_quantize (layer 0): "
+            "a kernel of the fallback family pytorch, which no row there declares; nothing may sit between two exact rows"
+        ]
+    ), checks.text()
+
+    # (4) one launch less: the final norm does not launch
+    _, checks = run(norm_defect="missing")
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            "kernels: step 0 (and 3 more of the 4 traced steps): add_norm_quantize (layer 2) did not launch add_norm_quant: the step has 4 launch(es) of "
+            "add_norm_quant, the plan 5 = 5 call(s) x 1 per call"
+        ]
+    ), checks.text()
+
+    # (5) at one sequence the census holds the run: a launch in another shape than the recorded one, although the entry states that shape too
+    _, checks = run(sequences=1, norm_shape=((1, 1, 1), (320, 1, 1), 80))
+    assert not checks.ok and checks.kernels == census.FAIL
+    assert sentences(checks) == [
+        f"kernels: step 0 (and 3 more of the 4 traced steps): add_norm_quantize (layer {layer}) launched add_norm_quant with grid (1, 1, 1), "
+        f"block (320, 1, 1), shared memory 80 B; the {CENSUS} has grid (1, 1, 1), block (640, 1, 1), shared memory 80 B"
+        for layer in (0, 1, 2)
+    ], checks.text()
+    _, checks = run(sequences=1)
+    assert checks.ok and any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_8 in line for line in checks.lines), "held to the recorded shape, and said"
+
+    # (6) wrong bytes: the block fails in its band, the kernel check holds
+    for defect, said in (
+        ("code", lambda line: not line.split("; ")[-1].startswith("0 outside")),
+        ("scale", lambda line: not line.split("; ")[-1].startswith("0 outside")),
+        ("bf16", lambda line: not line.split("; ")[-1].startswith("0 outside")),
+        ("residual", lambda line: line.split("calls", 1)[1].strip().startswith("residual stream DIFFERS")),
+    ):
+        _, checks = run(norm_defect=defect)
+        line = norm_line(checks)
+        assert not checks.ok and checks.kernels == census.PASS and line.endswith("[band: add_norm_quant]  FAIL") and said(line), (defect, line)
+        assert _line(checks, "blocks").endswith("FAIL") and "7 of 8 provider blocks inside their bands" in _line(checks, "blocks"), defect
