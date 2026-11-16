@@ -3509,11 +3509,12 @@ def test_multi_graph_stress(backend, variant):
         assert_stress_stable(backend, variant, STRESS_SHAPES)
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_determinism_two_streams(backend, variant):
     """Two concurrent instances on separate streams; every repeat matches its
-    own single-stream baseline bitwise."""
+    own single-stream baseline bitwise. The serial baselines also warm the
+    cuTile launch-hint cache, so the concurrent repeats never tune."""
     case_a = make_case(variant, torch.bfloat16, seq_lens=[497, 16, 1, 480, 0, 253], seed=SEED)
     case_b = make_case(variant, torch.bfloat16, B=2, T=512, seed=SEED + 1)
     launch_a = lambda: run_fwd(backend, case_a, output_final_state=True)  # noqa: E731
@@ -3522,7 +3523,7 @@ def test_determinism_two_streams(backend, variant):
     # order the side streams behind the input generation (default stream)
     torch.cuda.synchronize()
 
-    with torch.cuda.stream(s1):
+    with waive_unsupported(backend, variant), torch.cuda.stream(s1):
         base_a = launch_a()
     torch.cuda.synchronize()
     with torch.cuda.stream(s2):
@@ -3539,7 +3540,7 @@ def test_determinism_two_streams(backend, variant):
                 assert torch.equal(bits(x), bits(y)), f"stream {label} output {i} differs on concurrent run {r}"
 
 
-@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("backend", ["frost", "cutile"], indirect=True)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize("variant", ["kda", "mamba2"])
 def test_bwd_same_graph_two_streams(backend, variant, dtype):
