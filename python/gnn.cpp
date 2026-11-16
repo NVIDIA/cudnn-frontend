@@ -72,9 +72,14 @@ throw_if_gnn_failed(cudnnStatus_t status, char const *operation) {
 
 void
 ensure_cuda_runtime_context() {
-    // AggSimple's NVRTC path currently requires a CUDA context to already be
-    // current on the calling thread. cudaFree(nullptr) initializes the CUDA
-    // Runtime's primary context without allocating or freeing device memory.
+    // Driver launches use the context current on this thread. Reuse it when
+    // present: cudaFree is not allowed during CUDA Graph capture, even for null.
+    if (detail::has_current_context()) return;
+    // A cold worker thread (for example, a PyTorch autograd worker) may have no
+    // current context. GNN operators in cudnn that use NVRTC need one before
+    // their driver launch;
+    // cudaFree(nullptr) initializes the Runtime's primary context without
+    // allocating or freeing device memory.
     auto const status = detail::cuda_free(nullptr);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("Failed to initialize the CUDA Runtime context: ") +
