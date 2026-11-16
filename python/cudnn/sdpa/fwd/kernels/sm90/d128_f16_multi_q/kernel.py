@@ -477,6 +477,9 @@ class SM90FusedMultiHeadAttentionForward:
         # named ones start at 1: id 1 + w orders compute warpgroup w's four O-staging warps
         # before its TMA store.
         self.bar_o_stage_base = 1
+        # The two compute warpgroups share V; both join this subset barrier
+        # after clearing disjoint parts of its runtime tail and before PV.
+        self.bar_v_tail = 3
 
         self.threads_per_cta = len(self.REG_BUDGETS) * cute.arch.THREADS_PER_WARPGROUP
 
@@ -840,11 +843,39 @@ class SM90FusedMultiHeadAttentionForward:
             rescale_output(output, alpha)
         if not v_ready:
             bars.mb_tma_v_full[stage].wait(kv_full_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths and is_first_kv_tile):
+            self.sanitize_v_tail(basic_params, stage)
         mma_pv(tile, probability_words, is_first_kv_tile, ab_dtype=self.storage_dtype, k_steps=self.KV_TILE // 16)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
             bars.mb_tma_v_empty[stage].arrive()
         return advance(kv_full_state, self.KV_STAGES)
+
+    @cute.jit
+    def sanitize_v_tail(self, basic_params, stage):
+        """Clear unread V rows after TMA completes, before either compute group uses PV.
+
+        P=0 cannot suppress NaN padding. Both compute warpgroups clear disjoint
+        16-byte chunks of the shared 128x128 V tile, then fence and rendezvous.
+        Only the first reverse-walk tile can overlap the runtime KV tail.
+        """
+        work = basic_params.work
+        row_lo = work.kv_len - (work.kv_right - 1) * self.KV_TILE
+        if row_lo < self.KV_TILE:
+            region = basic_params.sV[stage].base
+            tid = cute.arch.thread_idx()[0] - cute.arch.THREADS_PER_WARPGROUP
+            participants = 2 * cute.arch.THREADS_PER_WARPGROUP
+            zero = cutlass.Vector.from_elements(tuple(self.storage_dtype(0.0) for _ in range(8)), self.storage_dtype)
+            for step in cutlass.range_constexpr(self.tile_elems // (8 * participants)):
+                index = step * participants + tid
+                row = (index // 8) % self.KV_TILE
+                if row >= row_lo:
+                    # SW128 permutes chunks within a row; clearing whole rows
+                    # needs no XOR. Each 64-column slab has KV_TILE * 64 elements.
+                    offset = (index // (self.KV_TILE * 8)) * self.KV_TILE * 64 + row * 64 + (index % 8) * 8
+                    (region.data_ptr() + offset).store(zero, alignment=16)
+            prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+            warpgroup_barrier_sync(self.bar_v_tail, participants)
 
     @cute.jit
     def pack_probability_words(self, s_regs: cutlass.Array, p_words: cutlass.Array):
@@ -948,6 +979,9 @@ class SM90FusedMultiHeadAttentionForward:
         rescale_output(output, softmax_params.alpha.load(0, 2))
         # V(t-1) was issued before K(t), so this wait almost always passes at once.
         bars.mb_tma_v_full[v_stage].wait(v_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths):
+            if kv_step == 1:
+                self.sanitize_v_tail(basic_params, v_stage)
         # Every PV accumulates: O starts at zero (compute_warp_group), so PV(0) needs no first form.
         mma_pv(pv_tile, probability_words, False, ab_dtype=self.storage_dtype, k_steps=self.KV_TILE // 16, wg_wait=-1)
         # QK(t) has retired (groups complete in commit order); PV(t-1) may still run.
@@ -976,6 +1010,9 @@ class SM90FusedMultiHeadAttentionForward:
         probability_words = p_words.load(0, self.qk_row_slots).bitcast(cutlass.Uint32)
         rescale_output(pv_tile.o_regs, softmax_params.alpha.load(0, 2))
         bars.mb_tma_v_full[stage].wait(v_state.phase)
+        if cutlass.const_expr(self.dense_kv_lengths):
+            if basic_params.work.iterations == 1:
+                self.sanitize_v_tail(basic_params, stage)
         mma_pv(pv_tile, probability_words, False, ab_dtype=self.storage_dtype, k_steps=self.KV_TILE // 16)
         prims.bar_warp_sync(cute.arch.FULL_MASK)
         if prims.elect_sync():
@@ -1106,7 +1143,7 @@ class SM90FusedMultiHeadAttentionForward:
             if work.iterations > 0:
                 # Stable references for this unit; mutable contents keep their owners. Keep
                 # the context inside this arm, away from control-flow joins.
-                basic_params = SimpleNamespace(bars=bars, local_tid=local_tid, work=work, row_base=row_base)
+                basic_params = SimpleNamespace(bars=bars, local_tid=local_tid, work=work, row_base=row_base, sV=sV)
                 mma_params = SimpleNamespace(o_regs=output, q_desc=q_desc, k_desc=k_desc, v_desc=v_desc)
                 # Reverse KV traversal: first tile, right boundary, interior, left boundary.
                 # FULL waits start at phase 0.

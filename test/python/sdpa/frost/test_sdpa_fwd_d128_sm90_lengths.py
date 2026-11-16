@@ -40,6 +40,7 @@ def test_d128_runtime_lengths_replay(dtype, mask, lengths):
     # A whole declared Q tile must still mask a partial *runtime* Q tile.
     sq, skv = 256, 385
     q, k, v = _inputs(4, 4, 2, sq, skv, dtype)
+    originals = tuple(t.clone() for t in (q, k, v))
     q_lens = torch.full((4,), sq, dtype=torch.int32, device="cuda") if lengths in ("q", "both") else None
     kv_lens = torch.full((4,), skv, dtype=torch.int32, device="cuda") if lengths in ("kv", "both") else None
     api, o, stats = _plan(
@@ -81,7 +82,15 @@ def test_d128_runtime_lengths_replay(dtype, mask, lengths):
                 kv_lens.copy_(torch.tensor(kv_values, dtype=torch.int32, device="cuda"))
             else:
                 kv_values = [skv] * 4
+            for tensor, original in zip((q, k, v), originals):
+                tensor.copy_(original)
             v.add_(0.125)
+            # Padding is unread storage and may contain NaNs. Masking P alone
+            # does not prevent a zero probability times a padded NaN V value.
+            for batch, (qlen, klen) in enumerate(zip(q_values, kv_values)):
+                q[batch, :, qlen:] = float("nan")
+                k[batch, :, klen:] = float("nan")
+                v[batch, :, klen:] = float("nan")
             o.fill_(float("nan"))
             stats.fill_(float("nan"))
             captured.replay()
@@ -104,10 +113,15 @@ def test_d128_lengths_without_stats_on_partial_q_tail(dtype, scale):
     q_values, kv_values = [sq, 129, 0, 65], [skv, 0, skv, 31]
     q_lens = torch.tensor(q_values, dtype=torch.int32, device="cuda")
     kv_lens = torch.tensor(kv_values, dtype=torch.int32, device="cuda")
+    for batch, (qlen, klen) in enumerate(zip(q_values, kv_values)):
+        q[batch, :, qlen:] = float("nan")
+        k[batch, :, klen:] = float("nan")
+        v[batch, :, klen:] = float("nan")
     api, o, stats = _plan(
         q,
         k,
         v,
+        variant="v1",
         is_causal=True,
         causal_bottom_right=True,
         scale_softmax=scale,
@@ -118,3 +132,41 @@ def test_d128_lengths_without_stats_on_partial_q_tail(dtype, scale):
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
     expected, _ = _reference(q, k, v, q_values, kv_values, "br", scale)
     torch.testing.assert_close(o, expected, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@torch_fork_set_rng(seed=1733)
+def test_d128_v_tail_rendezvous_repeated_replay(dtype):
+    """Both Q warpgroups must see the cleared V tail before PV, through ring refills."""
+    q_values = [0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 512, 257, 129]
+    kv_values = [0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 383, 384, 385, 65, 129]
+    q, k, v = _inputs(16, 8, 2, 512, 385, dtype)
+    q_lens = torch.tensor(q_values, dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor(kv_values, dtype=torch.int32, device="cuda")
+    for batch, (qlen, klen) in enumerate(zip(q_values, kv_values)):
+        q[batch, :, qlen:] = float("nan")
+        k[batch, :, klen:] = float("nan")
+        v[batch, :, klen:] = float("nan")
+    api, o, stats = _plan(q, k, v, stats=True, seq_q_lens_present=True, seq_kv_lens_present=True)
+
+    def execute():
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=stats, seq_q_lens=q_lens, seq_kv_lens=kv_lens)
+
+    execute()
+    expected_o, expected_stats = _reference(q, k, v, q_values, kv_values, "none")
+    torch.testing.assert_close(o, expected_o, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats, expected_stats, atol=2e-2, rtol=2e-2)
+    first_o, first_stats = o.clone(), stats.clone()
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(captured):
+            execute()
+        for _ in range(8):
+            o.fill_(float("nan"))
+            stats.fill_(float("nan"))
+            for _ in range(16):
+                captured.replay()
+            torch.testing.assert_close(o, first_o, atol=0, rtol=0)
+            torch.testing.assert_close(stats, first_stats, atol=0, rtol=0)
+    finally:
+        captured.reset()
