@@ -3122,10 +3122,14 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         # Exercise the public default without pinning a particular split count.
         g.build_plans()
     else:
-        if arch == "sm100" and d in (128, 192):
+        if d in (128, 192):
             # The explicit single-CTA split request belongs to single-Q,
             # even when the ranked unsplit candidate used multi-Q.
-            engine = 20532
+            engine = 20569 if arch == "sm107" else 20532
+        elif arch == "sm107" and d == 256:
+            # Rubin's nonpaged THD split uses the shared two-CTA lookahead,
+            # rather than the native body used by its unsplit candidate.
+            engine = 20570
         g.create_execution_plan(
             engine,
             {
