@@ -131,6 +131,10 @@ they do show: the form of each site against the entry instance's own form, the i
 traced steps (the call log), and the kernel's symbol, which carries the form's text. A run prints which instance served
 how many calls of a step: 1, 47, 16, 64 and 1 on the 64-layer model.
 
+The entry serves one hidden width, the published model's 5120, and the row says so (`widths` in `configs.py`). A
+checkpoint of the family with another hidden width is not this row's: its norm block stays on the reference chain in
+both stacks, on every GPU class, and its run states no kernel identity (below).
+
 Two consumers of this block are still on fallback rows, and what they need beyond the kernel's bytes is launched by
 them, never inside the norm's call. The 4-bit operand keeps its block scales in the layout the kernel writes (128 x 4),
 and the multiply over a copy gathers them when it dequantises. And where the form ends at the bf16 rows, the output

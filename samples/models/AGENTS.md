@@ -48,7 +48,9 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
    flags leave no provider block to judge (`[NN] RAN (no provider block was judged)`, the blocks line `REPORTED`):
    `PASS` is kept for a run in which provider blocks were compared with the reference and held.
 7. **Provider selection is data.** A family's `configs.py` holds ordered `ProviderRow`s per block; the first row whose GPU
-   classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. To add a provider: add its
+   classes, sequence range, tokens-per-sequence range and stack contain the run serves the block. An entry that serves
+   some layer widths only has them in its row (`widths`: fields of the model's geometry); a model of the family with
+   another width is then the next row's, and the run says that no kernel identity is stated for it -- never `ERROR`. To add a provider: add its
    key to `providers.KEYS` with its factory, add its row above the rows it should win against (and below a row of the
    same key that an existing command selects with `--provider`), name its tie-out band, and regenerate the family
    README's tables (`configs.readme_table`); a host test keeps them in agreement. A third-party
@@ -107,7 +109,8 @@ processors, tool-call parsing of the output, automatic choice of a stack or a ro
     the kernel check (`--check-kernels`) compares them with the entry's answer on the objects. A row of an entry that
     states its launch names at least one field: with none the entry runs on its own pick and nothing is compared, so
     the check fails it. The call log of a traced step is an observation: after each call the adapter says which entry
-    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. The
+    instance it called and what that instance states for the row's fields (`serving()`), never a copy of the row. A
+    traced pass keeps one such log per traced step, and a step without its log fails the check. The
     check then holds the profiler's record of every launch of the traced steps against the plan. Where those records
     cannot be had the run ends in `RAN <stack> stack (kernels not observed: <reason>)`, never in `PASS`; a failed check
     stays `FAIL`. A new adapter comes with its census entries, and a chain that gains an operator whose kernel no
@@ -320,8 +323,10 @@ Each of these passed every test and every GPU run of the first version; a host t
 - One block, several forms. The target calls the add + RMSNorm + quantise kernel in five forms in a step, and a launch
   record cannot tell them apart: one kernel id, one grid, one block, one shared memory. So the form of a call is data
   at three places that a host test holds to each other -- the row (per call site), the wiring (the site of every
-  call), the census (the form of every call) -- and it is observed in one: the call log, which says which entry
-  instance served the call. A wrong form shows there and nowhere else.
+  call), the census (the form of every call) -- and it is observed in the call log, which says which entry
+  instance served the call. A wrong form shows there and, for this entry, in the kernel's symbol, which carries the
+  form's text; never in a launch shape. A check that reads the log must also fail without it: a traced pass with
+  launch records and no call log passed until a host test asked.
 - A block that is called twice in a layer is not found by its block and layer. The first version of the census dump
   looked a call up that way and reported, for a layer's input norm, the form of the layer's second norm call. A call
   is the one at its place in the wiring.
@@ -340,7 +345,13 @@ Each of these passed every test and every GPU run of the first version; a host t
   are and let the consumer convert when it reads them.
 - Attribution by family cannot see everything. A launch more in front of the first norm of a step fails the check,
   because the gather before it is judged one by one; the same launch in front of a norm that follows a fallback row
-  is counted as that row's. The check is exact where two exactly judged rows meet, and it gets sharper with every
-  row that leaves its fallback.
+  is counted as that row's, and a launch behind the norm's kernel is counted as the consumer's at every call site
+  while that consumer is a fallback row. The check is exact where two exactly judged rows meet, and it gets sharper
+  with every row that leaves its fallback. Until then "the adapter launches nothing but its entry" is held on the
+  adapter itself: a host test finds, in what the adapter returns, the very tensors its entry wrote.
+- A row says what its entry serves, also in the model's widths. The norm entry serves one hidden width. The first
+  version of its row did not say so, and a checkpoint of the family with another width ended in "the provider table
+  is wrong" where the README promised a run on the reference chain. The table was wrong: the width is a condition of
+  the row.
 - A sentence counted once per occurrence, not once per step, read "and 7 more of the 4 traced steps" as soon as a
   block could fail twice in a step.
