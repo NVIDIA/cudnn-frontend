@@ -121,6 +121,13 @@ def test_sm80_backward_rows_decline_the_envelopes_that_cannot_fit():
 def test_thor_rides_the_sm100_rows():
     thor = (11, 0)
     assert thor in fwd_engines._THD_ORIGIN_CCS
+    from cudnn.sdpa.fwd.config_sm100 import supports_scalar_kv_tail_split
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    assert supports_scalar_kv_tail_split((128, 128), device_cc=thor, fp8=False, pertensor=False)
+    tail = _fwd_facts(device_cc=thor, h_kv=2, s_q=64, s_kv=257)
+    knobs = SdpaFwdKnobs(split_kv=4, tile_m=128, tile_n=128, cga=2, pack_gqa=False)
+    assert fwd_engines.mismatch(_row(fwd_engines.ENGINE_SPECS, "sdpa_fwd_prefill_sm100"), tail, knobs) is None
     assert _served(_family(fwd_engines.ENGINE_SPECS, 100), fwd_engines.mismatch, _fwd_facts(device_cc=thor))
     rubin_fwd = _family(fwd_engines.ENGINE_SPECS, 107) + [
         _row(fwd_engines.ENGINE_SPECS, n) for n in ("sdpa_fwd_prefill_sm107_mxfp8", "sdpa_fwd_prefill_sm107_fp8")
