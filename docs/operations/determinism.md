@@ -180,6 +180,10 @@ checks cover empty actual Q/KV lengths; split partial Stats use natural logs
 regardless of the final Stats base. `SWAP_AB=0` and an unset knob keep the
 prefill body, whose output bytes need not equal this body's. This is forward
 only and adds no backward implementation.
+The SM100/SM103 dense body also preserves O, Stats and Amax bytes under
+retained replay with output batch strides or address products beyond 32 bits.
+These wide-address checks cover both FP8 input types and all four scalar
+output types; batch invariance retains the fixed-plan scope described above.
 
 SM100 D64 per-tensor FP8 paging also offers an explicit `SWAP_AB=1`
 implementation. Each token unit computes eight packed query columns using a
