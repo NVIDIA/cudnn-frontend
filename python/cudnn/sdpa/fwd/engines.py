@@ -2213,7 +2213,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "attn_scale_prefolded is not admitted on the half THD packed split / D128 packing / D192 single-Q legs"
         if (
             packed_split
-            and facts.device_cc in ((10, 0), (10, 3))
+            and facts.device_cc in _THD_ORIGIN_CCS
             and not facts.has_paged_kv
             and (facts.d_qk, facts.d_v) == (128, 128)
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d128_split_physical_origins", False)
@@ -2221,7 +2221,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "nonpaged D128 split physical origins require the matching native cuDNN Frontend extension"
         if (
             packed_split
-            and facts.device_cc in ((10, 0), (10, 3), (10, 7))
+            and facts.device_cc in (*_THD_ORIGIN_CCS, (10, 7))
             and not facts.has_paged_kv
             and (facts.d_qk, facts.d_v) == (192, 128)
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
@@ -5276,7 +5276,7 @@ def lower_dsl_prefill(
             and not getattr(api, "thd_decode_leg", False)
             and facts.epilogue_gate_t is None
             and lowering_row_name == "sdpa_fwd_prefill_sm100"
-            and facts.device_cc in ((10, 0), (10, 3))
+            and facts.device_cc in _THD_ORIGIN_CCS
             and (facts.d_qk, facts.d_v) == (64, 64)
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and (facts.has_paged_kv or api.pack_gqa)
@@ -5292,7 +5292,7 @@ def lower_dsl_prefill(
             facts.thd
             and facts.epilogue_gate_t is None
             and lowering_row_name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107")
-            and facts.device_cc in ((10, 0), (10, 3), (10, 7))
+            and facts.device_cc in (*_THD_ORIGIN_CCS, (10, 7))
             and (
                 (facts.d_qk, facts.d_v) == (192, 128)
                 or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split)
