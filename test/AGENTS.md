@@ -57,6 +57,14 @@ Torch's capture entry may synchronize before capture begins; guarding that
 entry tests Torch's setup rather than the executor. Restore the previous mode
 before leaving capture, including on exceptions.
 
+A shared auxiliary kernel needs both direct boundary tests and caller checks.
+THD fold inputs can be FP32 or half partials, independently of the output
+precision. Preserve each output's physical origin when testing batch
+reordering, and test the full output allocation to detect writes into gaps.
+`test_sdpa_bwd_thd_fold_grid_determinism.py` covers these contracts at B/Hkv
+65535 and 65536. Its compile test retains a runtime max length: specializing
+batch must not accidentally specialize callers' runtime length arguments.
+
 Moving a kernel requires checking dynamic fixture paths as well as full-path
 imports. The D256 implementation contract's `test_dynamic_kernel_fixture_paths_exist`
 checks the actual paged-kernel and service-register-release case providers;

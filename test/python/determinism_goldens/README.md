@@ -7353,3 +7353,68 @@ comes from the frozen implementation revisions; subsequent parent integration
 preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
+
+
+## Shared THD backward fold grid boundaries (2026-11-16)
+
+The direct `dkv_reduce_thd_origins_host` regression covers FP16 and BF16 outputs
+from FP32 or matching half partials, MHA and GQA=3, and Dk/Dv=64/128 and 128/64.
+It checks batch and KV-head counts 65535/65536, a live second block, empty
+sequences, independent physical output origins, and the complete output
+allocations including gap canaries. An independent FP64 sum of exactly
+representable values checks every live gradient. Eight repeats include concurrent
+GPU work. Fresh storage, singleton/reordered/duplicated sequences, changed
+neighbors, and changed-input CUDA Graph replay preserve the expected bytes.
+All input partials and metadata are checked for unintended mutation.
+
+The base reducer at `b837a4eae4f4` produces **24 failed / 16 passed** on A100
+with small golden cases deselected: all failures are `CUDA_LAUNCH_INVALID_CONFIG`
+above grid.y/z limits; the legal edge controls pass. The fix retains ordinary
+three-dimensional grids and each row's reduction order. Only overflowing batch
+or head dimensions use a flat grid. The maximum sequence length stays a runtime
+host argument. D128 single/two-CTA callers pass their existing compile-time
+batch fact without first converting it into a runtime scalar.
+
+Qualification uses Torch 2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 and
+CUDA compiler 13.4, with the isolated source import verified:
+
+| Device | Direct helper | Other checks |
+| --- | --- | --- |
+| A100 / SM80 | 48 passed | None |
+| L40S / SM89 | 48 passed | 15 host/cross-compilation checks passed |
+| P2021 / SM100 | 48 passed | 2 existing D128 single/two-CTA numerical comparisons and 9 D512 THD graph/standalone cases passed |
+
+The SM100 command also deselects 14 existing L1 cases; these are not coverage.
+The two D128 cases compare both native half partials and FP32 accumulation
+against the existing reference. The D512 checks include independent origins,
+rebinding, changed-input replay and deterministic repeatability at ordinary
+shapes. The 15 non-native checks comprise one launch-bound test and half/FP32
+partial cross-compilation for SM80/89/90/100/103/107/120, retaining a runtime
+maximum length. They do not establish numerical behavior on absent GPUs.
+
+Twenty-four new small golden records (eight per measured GPU) were recorded
+only after the reference and replay checks, inspected, and checked with recording
+disabled. No previous golden was replaced. The eight output pairs match across
+these three measured runtimes; this is not a cross-runtime compatibility promise.
+
+Reproduction, after installing this checkout and verifying `cudnn.__file__`:
+
+```bash
+cd test/python
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" pytest -o addopts= -m L0 \
+  sdpa/frost/test_sdpa_bwd_thd_fold_grid_determinism.py \
+  sdpa/frost/test_sdpa_bwd_thd_fold_grid_contract.py
+# On SM100, additionally run the caller integration cases:
+pytest -o addopts= -m L0 \
+  sdpa/frost/test_sdpa_bwd_d128_dkv_accum_sm100.py::test_dkv_accum_fp32_dq_bitwise_vs_default_on_one_kv_block_and_dk_dv_recorded \
+  sdpa/frost/test_sdpa_bwd_thd_origins_sm100.py::test_origins_rebind_and_replay \
+  sdpa/frost/test_sdpa_bwd_thd_origins_sm100.py::test_graph_deterministic_origins_repeat_bitwise \
+  sdpa/frost/test_sdpa_bwd_thd_origins_sm100.py::test_graph_independent_origins_2x2
+```
+
+This helper has no forward or FP8-output contract. Forward kernels and the
+other backward reducers are not changed. SM90/103/107/120 native execution,
+complete attention chains at B/H=65536, and metadata addressing at billion-entry
+batch sizes remain unverified. No FROST capability or full-API determinism row
+is widened by this helper qualification. Other main/auxiliary launch chains
+and the native backend remain within the open #1573 audit.

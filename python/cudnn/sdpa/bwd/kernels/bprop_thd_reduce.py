@@ -17,6 +17,15 @@ REDUCE_THREADS = 256
 REDUCE_VECTOR = 8
 
 
+def _reduce_launch_grid(blocks, batch: int, heads: int):
+    """Retain ordinary grids and flatten only overflowing y/z dimensions."""
+    if batch <= 65535 and heads <= 65535:
+        return (blocks, batch, heads), False
+    if batch * heads > 2**31 - 1:
+        raise ValueError("THD backward fold exceeds the flat grid.x limit")
+    return (blocks * batch * heads, 1, 1), True
+
+
 @cute.jit
 def _reduce_thd_port(
     part,
@@ -68,15 +77,22 @@ def dkv_reduce_thd_origins_kernel(
     D: cutlass.Constexpr[int],
     group: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
+    flat_grid: cutlass.Constexpr[bool] = False,
+    flat_blocks: cutlass.Int64 = 0,
 ):
     """Each live 16-byte output vector has one owner; both sums are FP32."""
     block, batch, kv_head = cute.arch.block_idx()
+    if cutlass.const_expr(flat_grid):
+        owner = block // flat_blocks
+        block = block % flat_blocks
+        batch = owner % n_batch
+        kv_head = owner // n_batch
     tid = cute.arch.thread_idx()[0]
     local_vec = cutlass.Int64(block) * REDUCE_THREADS + cutlass.Int64(tid)
     local_pos = local_vec * REDUCE_VECTOR
     data = cutlass.make_array_view(meta)
     length = cutlass.Int64(data[batch])
-    start = cutlass.Int64(data[2 * n_batch + 1 + batch])
+    start = cutlass.Int64(data[2 * cutlass.Int64(n_batch) + 1 + cutlass.Int64(batch)])
     # Compact dK and dV partials have their own feature widths. Reusing dK's
     # row/column decode for dV would cross rows and miss the final live tokens.
     _reduce_thd_port(dk_part, dk, origins, local_pos, batch, kv_head, start, length, dk_origin, D, group, io_dtype)
@@ -94,7 +110,7 @@ def dkv_reduce_thd_origins_host(
     dv,
     meta,
     origins,
-    n_batch,
+    n_batch: cutlass.Constexpr[int],
     max_skv,
     dk_origin: cutlass.Constexpr[int],
     dv_origin: cutlass.Constexpr[int],
@@ -112,6 +128,7 @@ def dkv_reduce_thd_origins_host(
     """
     width = cutlass.const_expr(max(D, dv.shape[3]))
     blocks = cute.math.max((cutlass.Int64(max_skv) * (width // REDUCE_VECTOR) + REDUCE_THREADS - 1) // REDUCE_THREADS, cutlass.Int64(1))
-    dkv_reduce_thd_origins_kernel(dk_part, dv_part, dk, dv, meta, origins, n_batch, dk_origin, dv_origin, D, group, io_dtype).launch(
-        grid=(blocks, n_batch, dk.shape[2]), block=(REDUCE_THREADS, 1, 1), stream=stream
+    grid, flat_grid = _reduce_launch_grid(blocks, n_batch, dk.shape[2])
+    dkv_reduce_thd_origins_kernel(dk_part, dv_part, dk, dv, meta, origins, n_batch, dk_origin, dv_origin, D, group, io_dtype, flat_grid, blocks).launch(
+        grid=grid, block=(REDUCE_THREADS, 1, 1), stream=stream
     )
