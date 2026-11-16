@@ -301,6 +301,12 @@ into the baseline tree when a new regression must run against old production cod
 
 ### Native flavor routing assertions
 
+Numerical tests of an explicit split-KV leg must construct that supported plan
+with `create_execution_plan`; a smaller GPU may correctly offer only unsplit
+candidates. Keep heuristics-offering tests separate. The MXFP8 own-block
+`test_packed_and_split_legs` exercises this on both server SM100 and P2021,
+preserving independent O/LSE and bitwise own-block isolation checks.
+
 A partially migrated backward row can remain legal for one mask and delegate
 another. Band-model tests must distinguish declaration rejection from ownership
 transfer while sampling both the retained row and its explicit owners; do not
