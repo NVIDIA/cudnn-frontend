@@ -78,7 +78,9 @@ def graph_mismatch(facts, version):
 
         return wide_mismatch(facts, version)
     if not facts.thd:
-        return None
+        from .launch_grid import yz_grid_mismatch
+
+        return yz_grid_mismatch(facts.b, facts.h_q)
     if facts.device_cc not in ((12, 0), (12, 1)):
         return "SM120 THD backward requires cc 12.0 or 12.1"
     for enabled, label in (
