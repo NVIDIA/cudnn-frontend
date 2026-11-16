@@ -1663,7 +1663,6 @@ class CompiledKdaBwd:
         checkpoints only after their consumers finish. Caller context and
         checkpoint layouts stay full-head; recurrence and reduction order are
         unchanged. The build fixes the wave topology and workspace layout."""
-        series = not (self.has_state_checkpoints and not self.coarse_checkpoints)
         coarse = self.coarse_checkpoints
         buffers = dict(
             q=q,
@@ -1724,7 +1723,7 @@ class CompiledKdaBwd:
             num_seqs=self.num_seqs,
             b_t=self.b_t,
             fused_h_m=self.fused_h_m,
-            series=series,
+            series=self.needs_recompute,
             coarse=coarse,
             series_span_tokens=self.recompute_span_tokens if coarse else 0,
             seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,

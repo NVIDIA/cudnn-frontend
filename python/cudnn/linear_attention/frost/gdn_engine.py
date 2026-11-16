@@ -1532,7 +1532,6 @@ class CompiledGdnBwd:
         """Chain prologue, T pass, H and M summaries (M alone when the series is passed back), forward chain X, G summary,
         reverse chain seeded with d_final_state, dense series (the forward's or the seeded recompute), bprop over the
         pieces."""
-        series = not (self.has_state_checkpoints and not self.coarse_checkpoints)
         coarse = self.coarse_checkpoints
         buffers = dict(
             q=q,
@@ -1601,7 +1600,7 @@ class CompiledGdnBwd:
             b_t=self.b_t,
             compact_qdo=self.compact_qdo,
             fused_h_m=self.fused_h_m,
-            series=series,
+            series=self.needs_recompute,
             coarse=coarse,
             series_span_tokens=self.recompute_span_tokens if coarse else 0,
             seed_every_n_tokens=self.checkpoint_cadence if coarse else 0,
