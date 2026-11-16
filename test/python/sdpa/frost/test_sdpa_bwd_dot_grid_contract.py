@@ -18,6 +18,12 @@ def test_flat_grid_limit_is_checked_before_launch():
     assert _dot_launch_grid(1, 1, 2**31 - 1) == ((2**31 - 1, 1, 1), 1)
     with pytest.raises(ValueError, match=r"grid.x limit"):
         _dot_launch_grid(1, 65536, 65536)
+    assert _dot_launch_grid(1023, 32, 65536) == ((2145386496, 1, 1), 1023)
+    for q_blocks in (1024, 2049):
+        # The sibling THD fold missed this complete product. Delta already
+        # checks all three factors, including work beyond uint32.
+        with pytest.raises(ValueError, match=r"grid.x limit"):
+            _dot_launch_grid(q_blocks, 32, 65536)
 
 
 @pytest.mark.parametrize("arch", ["sm_80", "sm_89", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a"])
@@ -40,7 +46,15 @@ def test_flat_delta_compiles_for_other_architectures(arch, scaled):
     scale = make_fake_tensor(cutlass.Float32, (1,), (1,), assumed_align=16)
     stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     options = f"--enable-tvm-ffi --gpu-arch {arch}"
-    if scaled:
-        cute.compile(dot_do_o_scaled_host, o, o, delta, scale, scale, 128, 64, 64, stream, options=options)
-    else:
-        cute.compile(dot_do_o_host, o, o, delta, None, None, 128, 64, 64, 64, False, False, stream, options=options)
+    try:
+        if scaled:
+            cute.compile(dot_do_o_scaled_host, o, o, delta, scale, scale, 128, 64, 64, stream, options=options)
+        else:
+            cute.compile(dot_do_o_host, o, o, delta, None, None, 128, 64, 64, 64, False, False, stream, options=options)
+    except Exception as exc:
+        # An architecture enum can exist before the bundled compiler supports
+        # the target. Only its explicit capability diagnostic is a skip.
+        message = str(exc)
+        if "Unsupported GPU architecture" in message and arch in message and "CUDA toolkit version" in message:
+            pytest.skip(f"Installed DSL compiler cannot target {arch}: {message}")
+        raise
