@@ -203,6 +203,15 @@ observer detector passed without changing its assertions.
 
 ### Explicit SM100 D512 half backward owners (2026-11-15)
 
+The L0 `sdpa/frost/test_sdpa_bwd_d512_half_grid.py` boundary suite also
+exercises the final GEMM's batch/head product. Both half dtypes and fixed
+bodies compare all three gradients with an independent reference, replay
+retained captures with changed upstream gradients, and remove empty sequence
+neighbors while preserving packed input bytes. MQA crosses head-chunk
+boundaries. The modeled SM103/SM107 admission checks are not native execution
+qualification, and these bounded cases do not broaden the general batch
+invariance status below. The device arithmetic and existing goldens are unchanged.
+
 The role-split and 2x2 bodies moved without executable AST changes. Fixed
 hosts name the body, parameter record and artifact independently; both retain
 the shared native binder's overlap checks. The legacy graph record declines,

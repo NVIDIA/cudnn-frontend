@@ -1301,10 +1301,15 @@ def _sm80_f16_two_subgroup_spec() -> EngineSpec:
     return explicit_engine(_sm80_spec(), _sm80_half.TWO_SUBGROUP, partial(lower, lower_impl=partial(lower_dsl_bwd, api_type=_SM80)))
 
 
+def _d512_half_launch_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
+    return _sm100_d512_half.launch_error(facts.b)
+
+
 def _sm100_dense_layout_mismatch(facts: "ga.SdpaGraphFacts", version) -> Optional[str]:
     """Use the standalone native TMA admission for each dense data port."""
-    if facts.thd:
-        return None
+    error = _d512_half_launch_mismatch(facts, version)
+    if error or facts.thd:
+        return error
     from types import SimpleNamespace
     from .prepared_sm100 import native_io_layout
 
@@ -2166,6 +2171,7 @@ def _sm107_d512_spec() -> EngineSpec:
         name="sdpa_bwd_sm107_d512",
         capabilities=Capabilities(
             implementation="sdpa_bwd_sm107_d512",
+            declaration_check=_d512_half_launch_mismatch,
             zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],

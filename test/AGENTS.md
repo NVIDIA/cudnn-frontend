@@ -2,6 +2,14 @@
 
 For new numerical APIs and kernel paths, use the
 [determinism skill](../skills/determinism_tests/SKILL.md) to add/run L0 tests and update API support.
+
+For a multi-kernel SDPA chain, check every launch's grid after head/batch
+chunking. A persistent attention stage does not imply a persistent gradient
+GEMM: D512 half stage 3 uses `batch * head_chunk` in grid.z even for THD.
+Cover each individual extent below its limit but their product above it,
+retain valid chunked large-head controls, and execute the complete chain.
+`test_sdpa_bwd_d512_half_grid.py` also checks graph/standalone parity and
+changed-input capture replay across that boundary.
 For kernel determinism changes, follow the [root rules](../AGENTS.md#kernel-determinism-and-batch-invariance)
 and the [coverage table](python/determinism_goldens/README.md).
 The shared comparator checks bytes, tensor names, shapes, and dtypes. Clone each
