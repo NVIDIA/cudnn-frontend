@@ -3401,11 +3401,11 @@ def chunk_kda_grad(
     if use_beta_sigmoid_in_kernel:
         db = fused_beta_sigmoid_bwd(beta_raw, db, scale=2.0 if allow_neg_eigval else 1.0, out=db, stream=stream)
     return (
-        cast(bufs, "dq_cast", dq, q),
-        cast(bufs, "dk_cast", dk, k),
-        cast(bufs, "dv_cast", dv, v),
-        cast(bufs, "dg_cast", dg, g),
-        cast(bufs, "db_cast", db, beta_raw),
+        cast(bufs, "dq_cast", dq, q, stream=stream),
+        cast(bufs, "dk_cast", dk, k, stream=stream),
+        cast(bufs, "dv_cast", dv, v, stream=stream),
+        cast(bufs, "dg_cast", dg, g, stream=stream),
+        cast(bufs, "db_cast", db, beta_raw, stream=stream),
         dh0,
         dA,
         dbias,
