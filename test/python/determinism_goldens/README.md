@@ -27,6 +27,14 @@ compact split controls without failures or skips.
 | SM103 | 148 | 11 passed, 0 skipped | 11 passed, 0 skipped | `104472d5f9694663` |
 | SM107 | 216 | 11 passed, 0 skipped | 11 passed, 0 skipped | `d42d57b738f5eead` |
 
+The selected SM107 CI entry also exposes these same checks through
+`test_sdpa_fp8_sm107.py::TestD256HalfSplitOrigins`, preserving their parameter
+marks without duplicating the test bodies. After integrating the mixed-KV
+owner fix, source `7849117b6` passed 11 recording checks and 11 independent
+strict checks through this entry on the 216-SM runtime above. All eight golden
+files were byte-identical to the existing records. Its integrated owner and
+graph-analyzer checks passed all 701 cases on native SM107.
+
 The new suite contains three host extension-gate checks and eight GPU cases.
 Each GPU case completes the reference, replay and batch checks before recording.
 Twenty-four new golden files were inspected and added; no existing golden was
