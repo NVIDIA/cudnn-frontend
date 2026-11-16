@@ -45,7 +45,7 @@ def _kv_tail_engines(facts, version):
         return ()
     if facts.device_cc == (9, 0):
         engines = (6, 7)
-    elif facts.device_cc in ((8, 0), (8, 9), (10, 0), (10, 3)):
+    elif facts.device_cc in ((8, 0), (8, 9), (10, 0), (10, 3), (10, 7), (12, 0)):
         engines = (7,)
     else:
         return ()
@@ -63,9 +63,9 @@ def backend_engine_guard(facts):
         return {}
     if facts.device_cc == (9, 0):
         engines = (6,) if facts.is_backward and not facts.causal and not facts.padded else (() if facts.is_backward else (2, 9))
-    elif facts.device_cc in ((10, 0), (10, 3)):
+    elif facts.device_cc in ((10, 0), (10, 3), (10, 7)):
         engines = (5,) if facts.is_backward else (3, 10)
-    elif facts.is_backward and facts.device_cc in ((8, 0), (8, 9)):
+    elif facts.is_backward and facts.device_cc in ((8, 0), (8, 9), (12, 0)):
         engines = ()
     else:
         return {}

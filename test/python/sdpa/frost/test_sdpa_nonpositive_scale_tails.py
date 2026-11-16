@@ -73,6 +73,18 @@ def test_backward_tail_plans_match_independent_oracle(geometry, dtype, scale, ca
     else:
         records = [g.get_engine_and_knobs_at_index(i) for i, plan in enumerate(g.plans) if not is_python_engine(plan.engine_id)]
     if not records:
+        if geometry[3] == 256 and torch.cuda.get_device_capability() == (10, 7):
+            # Some native versions do not serve SM107 D256 even at positive
+            # scale. Establish that independently of this correctness guard.
+            control, _, _ = _graph(data, ref, stats, 0.125, causal, True, True, deterministic=deterministic)
+            try:
+                control.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            except cudnn.cudnnGraphNotSupportedError:
+                control_records = []
+            else:
+                control_records = [p for p in control.plans if not is_python_engine(p.engine_id)]
+            if not control_records:
+                pytest.skip("installed native SM107 backward offers no D256 plan even for the positive-scale control")
         # A diagnosed nonpositive-scale domain may have no correct native
         # fallback. Verify the explicit-record refusal too, rather than skip.
         blackwell_d256 = torch.cuda.get_device_capability()[0] == 10 and geometry[3] == 256
@@ -111,7 +123,7 @@ def test_forward_partial_tile_control(dtype, scale, causal, wants_stats):
         _check_outputs(outputs, [ref, stats] if wants_stats else [ref], dtype)
 
 
-@pytest.mark.parametrize("cc", [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3)])
+@pytest.mark.parametrize("cc", [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7), (12, 0)])
 @pytest.mark.parametrize("version", [91600, 92400, 92800])
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -150,13 +162,14 @@ def test_partial_or_variable_kv_guard_contract(monkeypatch, cc, version, dynamic
     assert set(guard.backend_engine_guard(facts)) == ordinary
 
 
+@pytest.mark.parametrize("cc", [(10, 0), (10, 7), (12, 0)])
 @pytest.mark.parametrize("scale", [0.0, -0.125, "tensor"])
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("cfg", [2, 26], ids=["current", "legacy"])
-def test_partial_kv_public_record_declines_before_lowering(monkeypatch, scale, deterministic, cfg):
+def test_partial_kv_public_record_declines_before_lowering(monkeypatch, cc, scale, deterministic, cfg):
     from cudnn.sdpa import graph_analyzer
 
-    monkeypatch.setattr(graph_analyzer, "_device_cc", lambda: (10, 0))
+    monkeypatch.setattr(graph_analyzer, "_device_cc", lambda: cc)
     value = 0.125 if scale == "tensor" else scale
     data, ref, stats, _ = _inputs(torch.float16, value, False, geometry=(2, 129, 129, 128, 2, 2))
     tensor = torch.tensor([value], device="cuda", dtype=torch.float32).reshape(1, 1, 1, 1) if scale == "tensor" else None
@@ -172,7 +185,7 @@ def test_partial_kv_backend_guard_currency(monkeypatch):
     from frost_routing import measured
 
     cc = torch.cuda.get_device_capability()
-    if cc not in ((8, 0), (8, 9), (9, 0), (10, 0), (10, 3)):
+    if cc not in ((8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (10, 7), (12, 0)):
         pytest.skip("no measured partial-KV native exclusion on this architecture")
     targets = (6, 7) if cc == (9, 0) else (7,)
     bounds = dict(guard.BACKWARD_KV_TAIL_FIXED_IN)

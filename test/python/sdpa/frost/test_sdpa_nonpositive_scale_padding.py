@@ -104,6 +104,16 @@ def test_explicit_padding_keeps_correct_native_paths(dtype, scale, causal, deter
     else:
         records = [g.get_engine_and_knobs_at_index(i) for i, p in enumerate(g.plans) if not is_python_engine(p.engine_id)]
     if not records:
+        if ragged and deterministic and cc == (10, 7):
+            control, _, _ = _graph(data, o, stats, 0.125, causal, deterministic, lengths, ragged)
+            try:
+                control.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            except cudnn.cudnnGraphNotSupportedError:
+                control_records = []
+            else:
+                control_records = [p for p in control.plans if not is_python_engine(p.engine_id)]
+            if not control_records:
+                pytest.skip("installed native SM107 deterministic THD backward offers no positive-scale control plan")
         # Blackwell's packed path uses engine 5, independently unsafe even with
         # causal/padding masks. Do not count a native support gap as a skip.
         assert ragged and cc[0] == 10 and (tensor_scale is not None or value <= 0)

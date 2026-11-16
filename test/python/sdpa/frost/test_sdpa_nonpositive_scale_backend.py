@@ -236,6 +236,7 @@ def test_native_frost_scale_guard_currency(monkeypatch):
         (9, 0): {False: (2, 9), True: (6, 7)},
         (10, 0): {False: (3, 10), True: (5, 7)},
         (10, 3): {False: (3, 10), True: (5, 7)},
+        (10, 7): {False: (3, 10), True: (5, 7)},
     }
     if cc not in targets:
         pytest.skip("no nonpositive-scale exclusion on this architecture")
