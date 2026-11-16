@@ -51,22 +51,25 @@ def test_backward_replay_batch_capture_and_golden(itype, otype):
             torch.testing.assert_close(changed[n][1:].float(), -got[n][1:].float(), rtol=0, atol=0)
         assert_bitwise({n: changed[n] for n in AMAX}, {n: got[n] for n in AMAX}, "sign flip preserves global amax")
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            run.launch()
-        selected.inputs["dO"].view(torch.uint8).bitwise_xor_(128)
-        eager = execute(run)
-        for n in GRADS:
-            torch.testing.assert_close(eager[n].float(), -changed[n].float(), rtol=0, atol=0)
-        for x in run.outputs.values():
-            x.fill_(float("nan"))
-        run.workspace.fill_(255)
-        captured.replay()
-        assert_bitwise(snapshot(run.outputs), eager, "changed-input retained CUDA Graph")
-        torch.cuda.set_sync_debug_mode("error")
         try:
-            run.launch()
+            with torch.cuda.graph(captured):
+                run.launch()
+            selected.inputs["dO"].view(torch.uint8).bitwise_xor_(128)
+            eager = execute(run)
+            for n in GRADS:
+                torch.testing.assert_close(eager[n].float(), -changed[n].float(), rtol=0, atol=0)
+            for x in run.outputs.values():
+                x.fill_(float("nan"))
+            run.workspace.fill_(255)
+            captured.replay()
+            assert_bitwise(snapshot(run.outputs), eager, "changed-input retained CUDA Graph")
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                run.launch()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
         finally:
-            torch.cuda.set_sync_debug_mode("default")
+            captured.reset()
     assert_bitwise(snapshot_inputs(case), before, "source inputs/scales preserved")
     assert_golden(f"sdpa_sm100_d256_fp8_bwd_{itype}_{otype}", before, baseline)
 

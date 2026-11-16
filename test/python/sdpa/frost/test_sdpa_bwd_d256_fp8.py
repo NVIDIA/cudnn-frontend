@@ -5,8 +5,8 @@
 import pytest
 import torch
 
-from d256_fp8_bwd_helpers import AMAX, check, execute, graph_plan, make_case, snapshot_inputs, standalone
-from determinism_utils import assert_bitwise, snapshot
+from d256_fp8_bwd_helpers import check, execute, graph_plan, make_case, snapshot_inputs, standalone
+from determinism_utils import assert_bitwise
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
 pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
