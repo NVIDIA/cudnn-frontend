@@ -5,6 +5,8 @@
 # The parts the SM80 rows serve: the A100 the kernels were written for, and the GA10x / AD10x parts that run the same
 # sm_80 binaries under a smaller per-CTA shared-memory budget (the opt-in limits, bytes).
 SM80_ROW_PARTS = ((8, 0), (8, 6), (8, 9))
+# The parts the SM80 backward row serves itself; cc 8.9 backward has its own rows (``sdpa_bwd_sm89``).
+SM80_BACKWARD_PARTS = ((8, 0), (8, 6))
 SMEM_OPTIN_BYTES = {(8, 0): 166912, (8, 6): 101376, (8, 9): 101376}
 
 
@@ -13,11 +15,12 @@ def smem_budget_bytes(device_cc):
     return None if device_cc is None else SMEM_OPTIN_BYTES.get(tuple(device_cc))
 
 
-def part_mismatch(device_cc, what):
-    if device_cc is not None and tuple(device_cc) in SM80_ROW_PARTS:
+def part_mismatch(device_cc, what, parts=SM80_ROW_PARTS):
+    if device_cc is not None and tuple(device_cc) in parts:
         return None
     major, minor = device_cc
-    return f"{what} requires SM80, SM86 or SM89; found SM{major}{minor}"
+    names = [f"SM{a}{b}" for a, b in parts]
+    return f"{what} requires {', '.join(names[:-1])} or {names[-1]}; found SM{major}{minor}"
 
 
 def data_layout_mismatch(name, shape, stride, *, thd=False):
@@ -95,7 +98,7 @@ def graph_mismatch(facts, _version=None):
         )
         if reason is not None:
             return reason
-        budget = smem_budget_bytes(facts.device_cc)
+        budget = smem_budget_bytes(facts.device_cc) if facts.device_cc is not None and tuple(facts.device_cc) in SM80_BACKWARD_PARTS else None
         if budget is not None:
             from cudnn.sdpa.bwd.config_sm80 import backward_smem_mismatch
 

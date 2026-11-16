@@ -1256,7 +1256,7 @@ def _sm80_spec() -> EngineSpec:
             zero_scale=True,
             sm_lo=80,
             sm_hi=80,
-            sm_extra=frozenset({86, 89}),
+            sm_extra=frozenset({86}),  # cc 8.9 backward has its own rows (_sm89_spec)
             d=frozenset({256}),
             d_envelope=True,  # flavor envelopes; masked native loads
             d_pad_multiple=8,
@@ -1318,6 +1318,7 @@ def _sm89_spec(*, d64=False) -> EngineSpec:
             implementation=name,
             select_implementation=_sm89_implementation,
             delegated=frozenset(),
+            sm_extra=frozenset(),
         ),
         lower=partial(lower_dsl_bwd, api_type=_SM89),
         policy="sdpa_bwd_sm89",

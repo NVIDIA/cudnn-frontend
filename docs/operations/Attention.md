@@ -67,7 +67,8 @@ FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_
 | Arch | Fprop | Bprop | Deterministic bprop⁶ | Padded | Ragged (THD) | Head dim |
 |-----------|-------------|-------------|-------------|-------------|-------------|------|
 | Ampere A100 (cc 8.0) | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 256 (d_qk = 192, d_vo = 128) |
-| Ampere / Ada GA10x, AD10x (cc 8.6, 8.9)⁷ | Yes | d &lt;= 128 | d &lt;= 128 | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop d &lt;= 128 |
+| Ampere GA10x (cc 8.6)⁷ | Yes | d &lt;= 128 | d &lt;= 128 | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop d &lt;= 128 |
+| Ada AD10x (cc 8.9)⁷ | Yes | Yes | Yes | Fprop, bprop | Fprop, bprop | Fprop as cc 8.0; bprop as cc 8.0 (`sdpa_bwd_sm89`) |
 | Hopper (cc 9.0) | Yes | No | No | Fprop (d &gt; 64) | Fprop (d &gt; 64) | d &lt;= 512 |
 | Blackwell B200 / B300 (cc 10.0, 10.3)⁸ | Yes | Yes | Yes | Fprop | Fprop; bprop d &gt;= 128 (deterministic: d_qk &gt;= 192) | Fprop d &lt;= 512 (d_qk = 576, d_vo = 512); bprop d &lt;= 512 (d_qk = 192, d_vo = 128) |
 | Thor (SM110, cc 11.0)⁹ | Yes | Yes | Yes | Fprop | As cc 10.0 / 10.3 | As cc 10.0 / 10.3 |
@@ -76,7 +77,7 @@ FROST serves `sdpa` / `sdpa_backward` through python engines (`sdpa_fwd_prefill_
 
 ⁶ `use_deterministic_algorithm=True`: the rows listed produce bitwise identical gradients across runs. FROST fprop plans are bitwise repeatable; FROST bprop plans without the flag are not (atomic dQ accumulation).
 
-⁷ cc 8.6 / 8.9 run the SM80 kernels under their smaller per-CTA shared-memory budget: the d = 256 prefill runs its 32-key tile, the d = 128 backward runs single-buffered Q / dO without the dQ staging tile, and the (192, 128) and 256 backward envelopes decline. The rows rank after the backend plans.
+⁷ cc 8.6 / 8.9 run the SM80 kernels under their smaller per-CTA shared-memory budget: the d = 256 prefill runs its 32-key tile. On cc 8.6 the d = 128 backward runs single-buffered Q / dO without the dQ staging tile and the (192, 128) and 256 backward envelopes decline; on cc 8.9 backward is served by the `sdpa_bwd_sm89` rows (32x32 tiles above d = 128). The rows rank after the backend plans.
 
 ⁸ The cc 10.x FROST bprop rows take BSHD-physical Q / K / V / O / dO / dQ / dK / dV (BHSD-physical only through the d = 512 row) and do not serve `use_padding_mask` with dense inputs. The ragged (192, 128) rows (`sdpa_bwd_sm100_d192`, `sdpa_bwd_sm107_d192`) are opt-in (`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`).
 

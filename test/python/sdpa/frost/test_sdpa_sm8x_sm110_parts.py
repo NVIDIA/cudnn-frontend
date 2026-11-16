@@ -45,6 +45,8 @@ def _served(rows, mismatch, facts):
 def test_part_table():
     assert native_sm80.part_mismatch((8, 0), "x") is None and native_sm80.part_mismatch((8, 6), "x") is None and native_sm80.part_mismatch((8, 9), "x") is None
     assert "found SM87" in native_sm80.part_mismatch((8, 7), "x") and "found SM90" in native_sm80.part_mismatch((9, 0), "x")
+    assert native_sm80.part_mismatch((8, 6), "x", native_sm80.SM80_BACKWARD_PARTS) is None
+    assert "requires SM80 or SM86; found SM89" in native_sm80.part_mismatch((8, 9), "x", native_sm80.SM80_BACKWARD_PARTS)
     assert native_sm80.smem_budget_bytes((8, 0)) == A100 and native_sm80.smem_budget_bytes((8, 6)) == GA10X and native_sm80.smem_budget_bytes((9, 0)) is None
 
 
@@ -86,25 +88,34 @@ def test_backward_smem_model_and_levers():
 
 def test_sm80_rows_admit_the_named_parts_only():
     fwd, bwd = _family(fwd_engines.ENGINE_SPECS, 80), _family(bwd_engines.ENGINE_SPECS, 80)
-    assert fwd and bwd and all(c.sm_extra == frozenset({86, 89}) for c in fwd + bwd)
+    assert fwd and bwd and all(c.sm_extra == frozenset({86, 89}) for c in fwd) and all(c.sm_extra == frozenset({86}) for c in bwd)
     for cc in ((8, 0), (8, 6), (8, 9)):
         assert _served(fwd, fwd_engines.mismatch, _fwd_facts(device_cc=cc)), cc
+    for cc in ((8, 0), (8, 6)):
         assert _served(bwd, bwd_engines.mismatch, _bwd_facts(device_cc=cc)), cc
     assert "SM80-80 or SM86 or SM89" in fwd_engines.mismatch(_row(fwd_engines.ENGINE_SPECS, "sdpa_fwd_prefill_sm80"), _fwd_facts(device_cc=(8, 7)))
-    assert "SM80-80 or SM86 or SM89" in bwd_engines.mismatch(_row(bwd_engines.ENGINE_SPECS, "sdpa_bwd_sm80"), _bwd_facts(device_cc=(9, 0)))
+    assert "SM80-80 or SM86" in bwd_engines.mismatch(_row(bwd_engines.ENGINE_SPECS, "sdpa_bwd_sm80"), _bwd_facts(device_cc=(9, 0)))
     assert all("SM8" in fwd_engines.mismatch(c, _fwd_facts(device_cc=(8, 7))) for c in fwd)
     assert all("SM8" in bwd_engines.mismatch(c, _bwd_facts(device_cc=(9, 0))) for c in bwd)
+    assert all("SM8" in bwd_engines.mismatch(c, _bwd_facts(device_cc=(8, 9))) for c in bwd)
+    ada = [_row(bwd_engines.ENGINE_SPECS, n) for n in ("sdpa_bwd_sm89", "sdpa_bwd_sm89_f16_d64")]
+    assert all(c.sm_extra == frozenset() for c in ada)
+    assert _served(ada, bwd_engines.mismatch, _bwd_facts(device_cc=(8, 9)))
+    assert all("SM89" in bwd_engines.mismatch(c, _bwd_facts(device_cc=(8, 6))) for c in ada)
 
 
 def test_sm80_backward_rows_decline_the_envelopes_that_cannot_fit():
     bwd = _family(bwd_engines.ENGINE_SPECS, 80)
-    for cc in ((8, 6), (8, 9)):
-        assert _served(bwd, bwd_engines.mismatch, _bwd_facts(device_cc=cc, d_qk=64, d_v=64))
-        assert _served(bwd, bwd_engines.mismatch, _bwd_facts(device_cc=cc))
-        for d_qk, d_v in ((192, 128), (256, 256)):
-            reasons = [bwd_engines.mismatch(c, _bwd_facts(device_cc=cc, d_qk=d_qk, d_v=d_v)) for c in bwd]
-            assert all(reasons) and any("shared memory" in r for r in reasons), reasons
+    cc = (8, 6)
+    assert _served(bwd, bwd_engines.mismatch, _bwd_facts(device_cc=cc, d_qk=64, d_v=64))
+    assert _served(bwd, bwd_engines.mismatch, _bwd_facts(device_cc=cc))
+    for d_qk, d_v in ((192, 128), (256, 256)):
+        reasons = [bwd_engines.mismatch(c, _bwd_facts(device_cc=cc, d_qk=d_qk, d_v=d_v)) for c in bwd]
+        assert all(reasons) and any("shared memory" in r for r in reasons), reasons
     assert _served(bwd, bwd_engines.mismatch, _bwd_facts(device_cc=(8, 0), d_qk=256, d_v=256))
+    ada = _row(bwd_engines.ENGINE_SPECS, "sdpa_bwd_sm89")
+    for d_qk, d_v in ((128, 128), (192, 128), (256, 256)):
+        assert bwd_engines.mismatch(ada, _bwd_facts(device_cc=(8, 9), d_qk=d_qk, d_v=d_v)) is None, (d_qk, d_v)
 
 
 def test_thor_rides_the_sm100_rows():

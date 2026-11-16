@@ -1457,7 +1457,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         from cudnn.sdpa.native_sm80 import smem_budget_bytes
 
         budget = smem_budget_bytes(self._device_cc)
-        if budget is not None and not self._use_d64:
+        if budget is not None and not self._use_d64 and "qo_stages" not in dict(getattr(self, "_native_template_overrides", ())):
             from cudnn.sdpa.bwd.config_sm80 import default_levers, levers_within_budget, pipeline_smem_bytes
 
             levers = levers_within_budget(self.flavor_d_qk, self.flavor_d_v, budget, has_rope=self._has_rope)
@@ -1480,9 +1480,9 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
         return True
 
     def _check_native_device(self, capability, device):
-        from cudnn.sdpa.native_sm80 import part_mismatch
+        from cudnn.sdpa.native_sm80 import SM80_BACKWARD_PARTS, part_mismatch
 
-        reason = part_mismatch(capability, "SdpaBwdDslSm80")
+        reason = part_mismatch(capability, "SdpaBwdDslSm80", SM80_BACKWARD_PARTS)
         self._value_error_if(reason is not None, f"{reason} on {device}")
 
     _native_flavor_dims = _SM80_BWD_FLAVOR_DIMS
