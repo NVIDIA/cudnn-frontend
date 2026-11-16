@@ -866,6 +866,11 @@ def _extract_facts(rec: dict) -> SdpaGraphFacts:
     binding_rejects_conflicts = not (is_backward and not is_fp8_bwd and not is_mxfp8_bwd)
     use_causal = bool(rec.get("use_causal_mask", False))
     use_causal_br = bool(rec.get("use_causal_mask_bottom_right", False))
+    from cudnn._sdpa_validate import _causal_alignment_error
+
+    alignment_error = _causal_alignment_error(rec)
+    if alignment_error is not None:
+        return _invalid(alignment_error)
     # Left window (== length; window offset is length-1). The op family uses several
     # spellings for the same knob: sdpa / sdpa_backward → sliding_window_length or
     # diagonal_band_left_bound; sdpa_mxfp8 → diagonal_band_left_bound; sdpa_fp8 →
