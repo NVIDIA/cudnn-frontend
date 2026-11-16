@@ -20,7 +20,10 @@ def _facts(**kwargs):
     )
 
 
-@pytest.mark.parametrize("version,excluded", [(92301, False), (92400, True), (92401, True), (92500, False), (92501, False), (93000, False)])
+@pytest.mark.parametrize(
+    "version,excluded",
+    [(92100, True), (92300, True), (92301, True), (92302, True), (92400, True), (92401, True), (92500, False), (92501, False), (93000, False)],
+)
 def test_zero_kv_guard_version_boundary(monkeypatch, version, excluded):
     monkeypatch.setattr(cudnn, "backend_version", lambda: version)
     actual = backend_engine_guard(None, _facts())

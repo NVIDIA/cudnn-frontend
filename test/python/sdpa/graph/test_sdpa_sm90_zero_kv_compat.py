@@ -71,8 +71,6 @@ def _check(values, lengths):
 def test_default_zero_kv_and_changed_length_capture(dtype, dims, stats, cudnn_handle, monkeypatch):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Hopper backend compatibility")
-    if cudnn.backend_version() < 92400:
-        pytest.skip("qualification starts with cuDNN 9.24")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     original_stream = torch.cuda.current_stream()
     stream = torch.cuda.Stream()
@@ -121,8 +119,8 @@ def test_zero_kv_layouts_use_safe_default(layout, dtype, stats, cudnn_handle, re
     from sdpa import fp16
     from sdpa.random_config import ExecConfig
 
-    if torch.cuda.get_device_capability() != (9, 0) or cudnn.backend_version() < 92400:
-        pytest.skip("Hopper compatibility from cuDNN 9.24")
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Hopper backend compatibility")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     cfg = ExecConfig(
         data_type=dtype,
@@ -170,11 +168,11 @@ def test_zero_kv_layouts_use_safe_default(layout, dtype, stats, cudnn_handle, re
 def test_zero_kv_backend_fix_boundary_is_current(dtype, stats, cudnn_handle, monkeypatch):
     from cudnn.sdpa.fwd import backend_guard
 
-    if torch.cuda.get_device_capability() != (9, 0) or cudnn.backend_version() < 92400:
-        pytest.skip("Hopper compatibility from cuDNN 9.24")
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Hopper backend compatibility")
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     # Execute the actual installed backend with just this guard lifted. A
-    # future corrected 9.24 build must fail this detector, prompting a more
+    # corrected older build must fail this detector, prompting a more
     # precise boundary instead of silently keeping the compatibility fallback.
     monkeypatch.setattr(backend_guard, "SM90_ZERO_KV_WRONG_O_FIXED_IN", 0)
     cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
