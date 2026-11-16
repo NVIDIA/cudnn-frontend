@@ -1157,7 +1157,8 @@ def dense_indexer_score_recompute_wrapper(
     (``torch.float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``), both with
     one E8M0 scale per 32 head_dim values (``head_dim // 32`` per row, for
     MXFP4 too), or ``"nvfp4"`` (packed E2M1 Q/K as for MXFP4, one non-negative
-    E4M3 scale per 16 head_dim values; its per-tensor global scales are folded
+    E4M3 scale per 16 head_dim values; fold the product of its per-tensor global
+    decode scales, which multiply the block-scaled values back to real values,
     into ``sm_scale``). Block-scaled precisions take packed
     ``q_scale`` / ``k_scale`` (and, for THD, ``cu_seqlens_*_scale_padded``).
 

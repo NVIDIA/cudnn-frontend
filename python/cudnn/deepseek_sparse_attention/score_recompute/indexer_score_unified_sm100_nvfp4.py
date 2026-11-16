@@ -9,8 +9,9 @@ The kernel runs the MXFP4 producer, scale path and unified indexer epilogue on
 tcgen05 ``kind::mxf4nvf4`` with 16-value scale blocks, whose MMA reads K=64
 values and four E4M3 scales (one TMEM column) per row.  A row's eight scales
 span two TMEM columns of its scale field, and each MMA along K reads its own.
-Per-tensor global scales are not applied: callers fold them into
-``softmax_scale``.
+Per-tensor global scales are not applied: callers fold the product of the Q
+and K global decode scales (the factors that multiply the block-scaled values
+back to real values) into ``softmax_scale``.
 """
 
 from __future__ import annotations

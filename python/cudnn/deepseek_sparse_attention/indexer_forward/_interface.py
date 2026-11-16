@@ -174,7 +174,8 @@ def indexer_fwd(
             block-scaled kernels differ only in the MMA (``kind::mxf4`` for MXFP4,
             ``kind::mxf4nvf4`` for NVFP4) and the scale format.
         q_scale: blockscaled-packed Q scales: E8M0 (MXFP8 / MXFP4) or non-negative
-            E4M3 (NVFP4, whose per-tensor global scales are folded into ``sm_scale``).
+            E4M3 (NVFP4; fold the product of its per-tensor global decode scales,
+            which multiply the block-scaled values back to real values, into ``sm_scale``).
         k_scale: blockscaled-packed K scales (same dtype as ``q_scale``).
         cu_seqlens_q_scale_padded: required THD prefix of the Q scale storage.
             Values are consumed as provided; each Q span must cover its logical

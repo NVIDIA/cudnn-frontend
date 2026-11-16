@@ -14,6 +14,10 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
+# Block-scaled indexer precisions whose Q/K are packed E2M1, two values per byte (the library table's formats with
+# ``elems_per_storage > 1``; ``test_DSA_mxfp8_scale_utils`` checks the two agree).
+PACKED_FP4_PRECISIONS = ("mxfp4", "nvfp4")
+
 
 def _require_sm90():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
@@ -31,8 +35,11 @@ def _require_sm100_family():
         pytest.skip("SM100 or SM103 GPU required")
 
 
-def _require_mxfp4_indexer(format_name: str = "MXFP4"):
-    """Skip unless the GPU, torch build and CuTe DSL support the packed-FP4 (``format_name``: MXFP4 or NVFP4) indexer."""
+def _require_fp4_indexer(precision: str):
+    """Skip unless the GPU, torch build and CuTe DSL support the packed-FP4 ``precision`` ("mxfp4" or "nvfp4") indexer."""
+    if precision not in PACKED_FP4_PRECISIONS:
+        raise ValueError(f"{precision!r} is not a packed-FP4 indexer precision {PACKED_FP4_PRECISIONS}")
+    format_name = precision.upper()
     _require_sm100()
     if getattr(torch, "float4_e2m1fn_x2", None) is None:
         pytest.skip(f"{format_name} indexer requires torch.float4_e2m1fn_x2")
@@ -55,8 +62,8 @@ def _require_mxfp4_indexer(format_name: str = "MXFP4"):
 
 def _require_sm100_indexer(precision: str):
     """Skip unless this GPU / torch build runs the SM100-family ``precision`` ("bf16", "mxfp8", "mxfp4" or "nvfp4") indexer."""
-    if precision in ("mxfp4", "nvfp4"):
-        _require_mxfp4_indexer(precision.upper())
+    if precision in PACKED_FP4_PRECISIONS:
+        _require_fp4_indexer(precision)
         return
     from cudnn.tensor_adapter import has_tcgen05
 
@@ -268,6 +275,17 @@ def quantize_e2m1(
     return packed, dequantized
 
 
+def dequantize_e2m1(packed: torch.Tensor, scale: torch.Tensor, sf_vec_size: int) -> torch.Tensor:
+    """FP32 value of packed E2M1 bytes (``float4_e2m1fn_x2`` or their ``uint8`` view, element ``2i`` in the low nibble
+    of byte ``i``) times their logical block ``scale``: the stored codes decoded directly, independent of
+    :func:`quantize_e2m1`."""
+    raw = packed.view(torch.uint8)
+    codes = torch.stack((raw & 0xF, raw >> 4), dim=-1).flatten(-2)
+    magnitudes = torch.tensor(_E2M1_MAGNITUDES, device=raw.device)[(codes & 0x7).long()]
+    values = torch.where((codes & 0x8) != 0, -magnitudes, magnitudes)
+    return values * expand_mxfp8_scale(scale, values.shape[-1], sf_vec_size)
+
+
 def make_random_mxfp4(
     shape: Tuple[int, ...],
     *,
@@ -280,10 +298,23 @@ def make_random_mxfp4(
     of every stored code (the reference input) and the logical ``(..., head_dim // 32)`` scales.
     """
     scale = make_random_mxfp8_scale((*shape[:-1], shape[-1] // 32), device=device, seed=seed, exponent_min=-2, exponent_max=3)
+    return _make_random_e2m1(shape, scale, 32, device=device, seed=seed)
+
+
+def _make_random_e2m1(
+    shape: Tuple[int, ...],
+    scale: torch.Tensor,
+    sf_vec_size: int,
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Standard-normal values of ``shape`` times their block ``scale``, quantized to packed E2M1 with that scale:
+    ``(packed, dequantized, scale)``. ``seed + 1`` seeds the values (``seed`` is the scale generator's)."""
     generator = torch.Generator(device=device)
     generator.manual_seed(seed + 1)
     values = torch.randn(shape, device=device, generator=generator)
-    packed, dequantized = quantize_e2m1(values * expand_mxfp8_scale(scale, shape[-1]), scale)
+    packed, dequantized = quantize_e2m1(values * expand_mxfp8_scale(scale, shape[-1], sf_vec_size), scale, sf_vec_size)
     return packed, dequantized, scale
 
 
@@ -311,11 +342,7 @@ def make_random_nvfp4(
     ``float8_e4m3fn``. No per-tensor global scale: the reference is the E2M1 code times its block scale.
     """
     scale = make_random_nvfp4_scale((*shape[:-1], shape[-1] // 16), device=device, seed=seed)
-    generator = torch.Generator(device=device)
-    generator.manual_seed(seed + 1)
-    values = torch.randn(shape, device=device, generator=generator)
-    packed, dequantized = quantize_e2m1(values * expand_mxfp8_scale(scale, shape[-1], 16), scale, sf_vec_size=16)
-    return packed, dequantized, scale
+    return _make_random_e2m1(shape, scale, 16, device=device, seed=seed)
 
 
 def make_random_mxfp8(

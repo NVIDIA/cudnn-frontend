@@ -130,7 +130,7 @@ def _use_cand_2d(precision: str, pbf: int) -> bool:
     batch base ``batch_idx*pbf`` is computed in 64-bit by CuTe's crd2idx, so
     ``bs*pbf`` may exceed 2^31 with no overflow (verified at ``bs*pbf=2.2e9`` by the
     opt-in ``test_indexer_fwd_dsl_compress_cand_2d_high_offset_64bit``).  bf16 BSHD only:
-    the block-scaled (MXFP8/MXFP4) epilogue and varlen use the 1D store.
+    the block-scaled (MXFP8 / MXFP4 / NVFP4) epilogue and varlen use the 1D store.
     """
     return precision == "bf16" and pbf < (1 << 31)
 
@@ -161,7 +161,8 @@ def compress_topk_cand_buffer_size(
     match the launch contract, ``return_lse=True`` with an explicit
     ``microbatch_rows > 0`` raises here too (microbatch + LSE is unsupported).
 
-    Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``)
+    Pass the launch's ``precision``: block-scaled precisions (``"mxfp8"``, ``"mxfp4"``,
+    ``"nvfp4"``)
     always run a single launch, so this returns the full buffer and an explicit
     ``microbatch_rows > 0`` raises, as at launch.
 
@@ -308,7 +309,7 @@ def indexer_fwd_compress_topk(
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` [BF16; E4M3 with
             precision="mxfp8"; packed ``float4_e2m1fn_x2`` with last dim
-            ``head_dim // 2`` with precision="mxfp4"]
+            ``head_dim // 2`` with precision="mxfp4" or "nvfp4"]
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` [same dtype rules as q]
         w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16 or FP32 for BF16 Q/K;
             BF16 for block-scaled Q/K.
@@ -939,7 +940,7 @@ def _run_compress_gemm_varlen(
     k_scale=None,
     cu_seqlens_q_scale_padded=None,
     cu_seqlens_k_scale_padded=None,
-    sf_vec_size=32,
+    sf_vec_size=None,
     want_lse=False,
     lse_out=None,
     page_size=0,
@@ -955,7 +956,7 @@ def _run_compress_gemm_varlen(
     ``page_size > 0`` reads K from a page pool through ``block_table`` / ``kv_lens``
     (BF16 only); ``cu_seqlens_k`` is then ``None``.
 
-    A block-scaled ``precision`` (``'mxfp8'`` or ``'mxfp4'``) runs the blockscaled
+    A block-scaled ``precision`` (``'mxfp8'``, ``'mxfp4'`` or ``'nvfp4'``) runs the blockscaled
     logits GEMM on the format's Q/K and packed scales (see ``indexer_fwd_compress_topk``).
     THD concatenates per-sequence padded scale regions along ``MN`` and keeps
     only KV heads in ``L``. The user-provided Q/K scale prefixes are consumed
@@ -1210,7 +1211,7 @@ def _indexer_fwd_compress_topk_thd(
     block_table: Optional[torch.Tensor] = None,
     kv_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, ...]:
-    """THD/varlen compressed-logits top-k, supporting BF16, MXFP8, and MXFP4.
+    """THD/varlen compressed-logits top-k, supporting BF16, MXFP8, MXFP4 and NVFP4.
 
     ``block_table`` ((bs, max_pages) int32) + ``kv_lens`` ((bs,) int32) read K from a
     page pool ``(num_pages, page_size, 1, head_dim)`` (BF16, local ids); ``cu_seqlens_k``

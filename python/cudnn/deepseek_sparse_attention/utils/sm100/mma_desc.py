@@ -209,7 +209,9 @@ def make_blockscaled_instr_desc(
     scales one MMA reads per row (``scale_vec::NX``; by default 2 with
     ``packed_fp4``, else 1): a ``2X`` MMA reads a pair of scales, so its ids
     must be 0 or 2; a ``4X`` MMA (``.kind::mxf4nvf4``, packed FP4 only) reads
-    all four bytes of a scale column, so its ids must be 0.
+    all four bytes of a scale column, so its ids must be 0. UE4M3 scales
+    (``scale_format``) exist only in the ``4X`` form; the ``1X`` and ``2X``
+    kinds take UE8M0.
     """
     a_fmt = int(to_blockscaled_UMMA_format(a_type, packed_fp4))
     b_fmt = int(to_blockscaled_UMMA_format(b_type, packed_fp4))
@@ -224,6 +226,8 @@ def make_blockscaled_instr_desc(
         raise ValueError("Blockscaled scale factor IDs must be in [0, 3]")
     if scale_vec not in (1, 2, 4) or (scale_vec > 1) != packed_fp4:
         raise ValueError(f"scale_vec must be 1 for kind::mxf8f6f4 and 2 or 4 for packed FP4, got {scale_vec} with packed_fp4={packed_fp4}")
+    if scale_format == ScaleFormat.UE4M3 and scale_vec != 4:
+        raise ValueError(f"UE4M3 scales need scale_vec::4X (kind::mxf4nvf4 with 16-value blocks), got scale_vec={scale_vec}")
     if a_sf_id % scale_vec or b_sf_id % scale_vec:
         valid_ids = " or ".join(str(i) for i in range(0, 4, scale_vec))
         raise ValueError(f"scale_vec::{scale_vec}X scale factor IDs must be {valid_ids}")
@@ -264,13 +268,10 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
 
 
 def blockscaled_scale_vec(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp) -> int:
-    """Scales one block-scaled MMA reads per row: one E8M0 (``kind::mxf8f6f4``, K=32), two E8M0
-    (``kind::mxf4``, K=64) or four (``kind::mxf4nvf4`` with 16-value blocks, K=64)."""
-    if isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4NVF4Op):
-        return 4
-    if isinstance(op, cute.nvgpu.tcgen05.mma.MmaMXF4Op):
-        return 2
-    return 1
+    """Scales one block-scaled MMA reads per row, its K over the scale vector size: one E8M0
+    (``kind::mxf8f6f4``, K=32 in 32-value blocks), two E8M0 (``kind::mxf4``, K=64 in 32-value blocks) or four
+    E4M3 (``kind::mxf4nvf4``, K=64 in 16-value blocks)."""
+    return op.shape_mnk[2] // op.sf_vec_size
 
 
 def blockscaled_mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.BlockScaledMmaOp, sf_id: int):

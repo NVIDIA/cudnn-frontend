@@ -856,7 +856,7 @@ compressed column 0.
     `pack_q_scale_bshd`/`pack_k_scale_bshd` for BSHD, and
     `pack_q_scale_thd`/`pack_k_scale_thd` into a caller-provided `out` with
     prefixes from `make_scale_cu_seqlens_padded` for THD.
-    `sf_vec_size` is fixed at 32, and THD inputs take the same
+    `sf_vec_size` must be 32 (its default), and THD inputs take the same
     `cu_seqlens_q_scale_padded`/`cu_seqlens_k_scale_padded` scale-prefix
     contract. Its kernel differs from the MXFP8 one only in the MMA:
     tcgen05 `kind::mxf4`, K = 64 per MMA. Requires a PyTorch build with
@@ -868,11 +868,15 @@ compressed column 0.
     `D // 16` (8) per row, packed by the same packers (they move any one-byte
     scale) and with the same THD scale-prefix contract. `sf_vec_size` must be
     16, its default. The per-tensor FP32 global scales of NVFP4 are not
-    inputs: fold their product into `sm_scale`, since a score is
+    inputs: fold the product of the Q and K global decode scales into
+    `sm_scale`, since a score is
     `sm_scale * sum_h relu(q_h . k) * w_h` and the ReLU commutes with a
-    positive scale. `sm_scale` is a launch argument, so a new global scale per
-    step compiles nothing. Its kernel differs from the MXFP4 one only in the
-    scales: tcgen05 `kind::mxf4nvf4` with 16-value blocks (`scale_vec::4X`),
+    positive scale. A decode scale multiplies an E2M1 value times its E4M3
+    block scale back to the real value: for a global scale stored as the
+    encoding factor `g = 448 * 6 / amax`, fold `1 / g`. `sm_scale` is a launch
+    argument, so a new global scale per step compiles nothing. Its kernel
+    differs from the MXFP4 one only in the scales: tcgen05 `kind::mxf4nvf4`
+    with 16-value blocks (`scale_vec::4X`),
     K = 64 per MMA, reading four E4M3 scales per row per MMA. Requires a
     PyTorch build with `torch.float4_e2m1fn_x2`; otherwise
     `precision="nvfp4"` raises `NotImplementedError`.
@@ -882,7 +886,7 @@ compressed column 0.
         q_fp4, k_fp4, w, top_k=2048, ratio=4, precision="nvfp4",
         q_scale=pack_q_scale_bshd(q_scale_e4m3, qhead_per_kv_head=64),
         k_scale=pack_k_scale_bshd(k_scale_e4m3),
-        sm_scale=sm_scale * q_global_scale * k_global_scale,
+        sm_scale=sm_scale * q_decode_scale * k_decode_scale,
     )
     ```
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports

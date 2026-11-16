@@ -17,7 +17,7 @@ from test_utils import torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
     _require_sm100_indexer,
-    _require_mxfp4_indexer,
+    _require_fp4_indexer,
     _require_sm90,
     _require_sm100 as _require_sm100_family,
     dsa_init,
@@ -967,15 +967,18 @@ def test_DSA_indexer_forward_wrapper_fp4_scale_group_routing(precision):
     device = "cuda"
     h_q, d, s_q, s_k, ratio = 64, 128, 128, 128, 4
     groups = d // vec
-    # Both rows of scales strictly increase, so every (Q group, K group) pair has a distinct scale product: a scale read
-    # from the wrong group moves the score, and data read from the wrong group is zero and zeroes it.  The E4M3 scales
-    # carry mantissa bits (1.25, 1.5, 1.75 x 2^e), which an exponent-only read would drop.
+    # Every (Q group, K group) pair has a distinct scale product: the K scales span less than the ratio between
+    # consecutive Q scales, so each Q group's products lie in their own range.  A scale read from the wrong group moves
+    # the score, and data read from the wrong group is zero and zeroes it.  The E4M3 scales carry mantissa bits
+    # (1.25, 1.5, 1.75 x 2^e), which an exponent-only read would drop.
     if precision == "mxfp4":
         q_values = torch.ldexp(torch.ones(groups, device=device), torch.tensor([-6.0, -2.0, 2.0, 6.0], device=device))
         k_values = torch.ldexp(torch.ones(groups, device=device), torch.tensor([-1.0, 0.0, 1.0, 2.0], device=device))
     else:
-        q_values = torch.tensor([0.1875, 0.25, 0.625, 1.0, 1.5, 2.5, 3.5, 6.0], device=device)
-        k_values = torch.tensor([0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0], device=device)
+        q_values = 1.5 * torch.ldexp(torch.ones(groups, device=device), 2.0 * torch.arange(-3.0, groups - 3.0, device=device))
+        k_values = torch.tensor([1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5], device=device)
+    products = (q_values[:, None] * k_values[None, :]).flatten()
+    assert products.unique().numel() == products.numel(), "every (Q group, K group) scale product must be distinct"
     q_scale_logical = q_values.expand(1, s_q, h_q, groups).contiguous().to(fmt.scale_dtype)
     k_scale_logical = k_values.expand(1, s_k, 1, groups).contiguous().to(fmt.scale_dtype)
     assert torch.equal(q_scale_logical[0, 0, 0].float(), q_values) and torch.equal(k_scale_logical[0, 0, 0].float(), k_values)
@@ -1197,9 +1200,11 @@ def test_DSA_indexer_forward_wrapper_sm90_rejects_block_scaled_precisions(monkey
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("precision", ["mxfp4", "nvfp4"])
 @pytest.mark.parametrize("gate", ["dsl_floor", "dsl_target", "arch_map"])
-def test_require_mxfp4_indexer_skips_on_an_unsupported_dsl(monkeypatch, gate):
-    """``_require_mxfp4_indexer`` skips, not errors, below the CuTe DSL floor, on a DSL without the GPU target, or off the DSA arch map."""
+def test_require_fp4_indexer_skips_on_an_unsupported_dsl(monkeypatch, gate, precision):
+    """``_require_fp4_indexer`` skips, not errors, below the CuTe DSL floor, on a DSL without the GPU target, or off
+    the DSA arch map; it refuses a precision that is not packed FP4."""
     if getattr(torch, "float4_e2m1fn_x2", None) is None:
         pytest.skip("requires torch.float4_e2m1fn_x2")
     from cudnn.frost import buffers
@@ -1224,7 +1229,9 @@ def test_require_mxfp4_indexer_skips_on_an_unsupported_dsl(monkeypatch, gate):
         monkeypatch.setattr(compiler, "gpu_arch_flag", unmapped_gpu)
         expected = "Unsupported GPU compute capability"
     with pytest.raises(pytest.skip.Exception, match=expected):
-        _require_mxfp4_indexer()
+        _require_fp4_indexer(precision)
+    with pytest.raises(ValueError, match="not a packed-FP4 indexer precision"):
+        _require_fp4_indexer("mxfp8")
 
 
 @pytest.mark.L0

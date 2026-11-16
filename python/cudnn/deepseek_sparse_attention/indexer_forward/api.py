@@ -251,8 +251,9 @@ def indexer_forward_wrapper(
     (``float4_e2m1fn_x2`` Q/K with last dim ``head_dim // 2``) with one E8M0
     scale per 32 head_dim values (``head_dim // 32`` per row), and ``'nvfp4'``
     (``float4_e2m1fn_x2`` Q/K) with one non-negative E4M3 scale per 16
-    (``head_dim // 16`` per row); fold NVFP4's per-tensor global scales into
-    ``sm_scale``. ``sf_vec_size=None`` selects the format's scale vector size.
+    (``head_dim // 16`` per row); fold the product of NVFP4's per-tensor global
+    decode scales (which multiply the block-scaled values back to real values:
+    ``1 / g`` for an encoding global scale ``g``) into ``sm_scale``. ``sf_vec_size=None`` selects the format's scale vector size.
     SM90 offers ``'fp8'`` with per-token scales instead.
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
@@ -465,7 +466,7 @@ def indexer_forward_top_k_wrapper(
         if cu_seqlens_q_scale_padded is not None or cu_seqlens_k_scale_padded is not None:
             raise NotImplementedError("SM90 uses per-token FP8 scales and does not accept block-scale padded prefixes")
         if sf_vec_size not in (None, 32):
-            raise NotImplementedError("sf_vec_size is a block-scaled SM100 option and must remain 32 on SM90")
+            raise NotImplementedError("sf_vec_size is a block-scaled SM100 option; SM90 takes only its default (None) or 32")
         if block_table is not None or kv_lens is not None:
             raise NotImplementedError("paged K is not supported by the initial SM90 compressed indexer path")
         from ._compressed_top_k_sm90 import indexer_fwd_compress_topk_sm90

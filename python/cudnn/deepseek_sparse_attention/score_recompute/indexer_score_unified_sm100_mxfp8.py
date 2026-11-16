@@ -512,8 +512,13 @@ class IndexerScoreUnifiedSm100Mxfp8(BlockScaledScoreSm100Mixin, IndexerScoreSm10
             blockscaled_tiled_mma_qk, (self.n_block_size, self.m_block_size, self.head_dim_padded), self.sf_vec_size, q_scale_smem_layout
         )
         # Each scale field must fit the TMEM columns reserved for it (see __init__).
-        assert tcgen05.find_tmem_tensor_col_offset(cute.make_tensor(sf_tmem_ptr, tCtKSFA_layout)) <= self.tmem_sfa_cols
-        assert tcgen05.find_tmem_tensor_col_offset(cute.make_tensor(sf_tmem_ptr, tCtQSFB_layout)) <= self.tmem_sfb_cols
+        sfa_cols = tcgen05.find_tmem_tensor_col_offset(cute.make_tensor(sf_tmem_ptr, tCtKSFA_layout))
+        sfb_cols = tcgen05.find_tmem_tensor_col_offset(cute.make_tensor(sf_tmem_ptr, tCtQSFB_layout))
+        if const_expr(sfa_cols > self.tmem_sfa_cols or sfb_cols > self.tmem_sfb_cols):
+            raise ValueError(
+                f"{self.format_name} scale fields need {sfa_cols} (K) / {sfb_cols} (Q) TMEM columns, "
+                f"but {self.tmem_sfa_cols} / {self.tmem_sfb_cols} are reserved"
+            )
         tCtQSFB = cute.make_tensor(sf_tmem_ptr + tmem_sf_offset_scale * self.tmem_q_sfb_offset, tCtQSFB_layout)
         tiled_copy_s2t_qsfb, tCsQSFB_compact_s2t, tCtQSFB_compact_s2t = self._s2t_copy_and_partition(sQScale, tCtQSFB)
 

@@ -9,6 +9,7 @@ import torch
 from test_utils import torch_fork_set_rng
 
 from deepseek_sparse_attention.cutedsl.dsa_utils import (
+    PACKED_FP4_PRECISIONS,
     _require_sm100_indexer,
     dsa_init,
     indexer_scale_format,
@@ -656,7 +657,7 @@ def _with_precisions(precisions, cases):
         pytest.param(precision, *case.values, marks=case.marks, id=f"{case.id}-{precision}")
         for case in cases
         for precision in precisions
-        if not (case.values[0] == "attention" and precision in ("mxfp4", "nvfp4"))
+        if not (case.values[0] == "attention" and precision in PACKED_FP4_PRECISIONS)
     ]
 
 
@@ -890,7 +891,7 @@ def test_DSA_dense_score_recompute_wrapper_block_scaled_rejects_mismatched_input
         score(q, k, aux, sf_vec_size=48 - sf_vec_size, **common)
     with pytest.raises(ValueError, match="q_scale packed shape"):
         score(q, k, aux, **{**common, "q_scale": k_scale})
-    if precision not in ("mxfp4", "nvfp4"):
+    if precision not in PACKED_FP4_PRECISIONS:
         return
 
     # Unpacked E4M3 Q/K under a packed-FP4 precision are named as a dtype error, not as a doubled head_dim.
