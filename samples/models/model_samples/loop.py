@@ -148,11 +148,12 @@ class Session:
             )
         return self.plan
 
-    def stored_weights(self) -> tuple:
+    def stored_weights(self, own: bool = False) -> tuple:
         """The blocks whose weights this session's load keeps on their stored format beside the bf16 copy: every block that
         a provider multiplying on the stored format serves (``Block.stored_weights``) in this session's plan or in the
-        plan of a session that will run on its weights (``plan_table(later)``)."""
-        plans = [self.resolve(), *(session.resolve() for session in self._followers)]
+        plan of a session that will run on its weights (``plan_table(later)``).  ``own``: the blocks of this session's
+        plan alone -- the weights its own steps read on the stored format."""
+        plans = [self.resolve(), *(session.resolve() for session in (() if own else self._followers))]
         return tuple(dict.fromkeys(name for plan in plans for name, block in plan.items() if getattr(block, "stored_weights", False)))
 
     def claim(self) -> Optional[census.Claim]:
@@ -331,5 +332,9 @@ class Session:
 
     def report(self) -> Report:
         if hasattr(self.model, "bytes_per_step") and self.state is not None:
-            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position)
+            # a block of this session's plan that multiplies on the stored format reads its weight there, not as a copy
+            # (asked of a family's model only where the plan has such a block)
+            stored = self.stored_weights(own=True)
+            read = {"stored": stored} if stored else {}
+            self._report.bytes = self.model.bytes_per_step(self.sequences, self.state.position, **read)
         return self._report

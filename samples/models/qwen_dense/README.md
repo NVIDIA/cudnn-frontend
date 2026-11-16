@@ -325,7 +325,9 @@ this area.
 The prompt goes through the decode step, one step per token (the `first token` line says so), and a step issues 484 block
 calls from Python: on the run above about twelve thousand kernel launches and a thousand small copies per step, with the
 GPU busy for about a quarter of the period. That is what this stack is: it reads 51.6 GB per step where the model in its
-stored formats needs 17.9 GB, and it is bound by the launch path, not by the GPU. The timings a run prints are orientation
+stored formats needs 17.9 GB, and it is bound by the launch path, not by the GPU. The stack `native` on compute
+capability 10.0 reads the in-projections on their stored codes, 5.2 GB where the copies are 10.4 GB: 46.4 GB per step,
+and its `bytes per step` line says so. The timings a run prints are orientation
 values of that run and no more; no rate of this stack is a number to quote.
 
 The checks of a run with a checkpoint cover the first 16 steps of every prompt: replay, every provider block

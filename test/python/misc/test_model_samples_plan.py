@@ -936,6 +936,11 @@ def test_the_traced_pass_is_read_from_kernel_activity_records():
     assert "note                  GPU busy 83% of the period: the GPU work of this stack bounds this step, not the launch path; no floor" in report.text()
     assert "rate                  10.3 tokens per second per sequence = 4 tokens / 0.390 s of the decode loop" in text
     assert "bytes per step        model 17.92 GB (weights 17.61 in their stored formats, state and cache 0.31); this stack moves 51.56 GB (2.88x)" in text
+    assert "this stack moves 51.56 GB (2.88x): bf16 copies of the weights (arithmetic, not a measurement)" in text, "every weight read as a copy"
+    kept = Report("qwen_dense", reduced=False)  # a stack with a block that multiplies on the stored format: those weights are read there
+    kept.bytes = {"weights": 17_610_000_000, "copies": 46_050_000_000, "stored": 5_200_000_000, "state": 310_000_000}
+    moves = "this stack moves 46.36 GB (2.59x): bf16 copies of the weights, and 5.20 GB of weights in their stored format (arithmetic, not a measurement)"
+    assert moves in kept.text()
     assert "first token           prefill route: decode step, 58 tokens x one step; not a time to first token of record" in text
     report.trace, report.trace_missing = None, "the profiler recorded no kernel activity on this GPU"
     assert "traced pass           not available: the profiler recorded no kernel activity on this GPU" in report.text()
@@ -1004,6 +1009,7 @@ def test_the_published_model_states_its_bytes_and_its_memory_need(monkeypatch):
     assert 51.2e9 < step["copies"] < 51.3e9 and 2.90 < step["copies"] / step["weights"] < 2.92, "the bf16 copies: 2 bytes per weight element"
     assert 0.30e9 < step["state"] < 0.36e9, "48 recurrent states read and written, 16 key/value caches read"
     assert model.bytes_per_step(4, 343)["state"] == 4 * step["state"] and model.bytes_per_step(4, 343)["copies"] - step["copies"] == 3 * 2 * 5120
+    assert step["stored"] == 0 and set(step) == {"weights", "copies", "stored", "state"}, "no weight of this stack is read on its stored format"
     need = model.memory_bytes(sequences=1, capacity=343)
     copies = model.copy_bytes()
     assert 50.0 * GIB < copies < 50.2 * GIB, "the bf16 copies incl. the embedding table"

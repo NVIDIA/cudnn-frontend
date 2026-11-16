@@ -414,21 +414,25 @@ class QwenDense:
         held = self.copy_bytes() + self.stored_bytes(stored)
         return held + self.state_bytes(sequences, capacity) + max(2 * GIB, held // 8)
 
-    def bytes_per_step(self, sequences: int, positions: int) -> Dict[str, int]:
+    def bytes_per_step(self, sequences: int, positions: int, stored: Sequence[str] = ()) -> Dict[str, int]:
         """What one decode step of ``sequences`` sequences reads and writes, in bytes: arithmetic on the tensor list, not a
         measurement.
 
         * ``weights``: every weight the step reads in full, in its stored format (8-bit: 1 byte per element; 4-bit: 0.5 byte
           per element plus one block-scale byte per 16; bf16: 2), and one row of the embedding table per sequence;
-        * ``copies``: the same weights as the stacks of this family hold them so far, bf16 at 2 bytes per element;
+        * ``copies``: the same weights as a stack of this family reads them: a bf16 copy at 2 bytes per element -- but the
+          weights of the blocks ``stored`` (the blocks of the stack's plan whose provider multiplies on the stored format:
+          ``STORED_WEIGHTS``) on that format, as the loader kept them beside the copy;
+        * ``stored``: the part of ``copies`` that is read on a stored format (``stored_bytes``); 0 for a stack whose every
+          multiply reads a copy;
         * ``state``: the recurrent state and the conv history of every linear-attention layer, read and written, and the
           cached keys and values of every attention layer up to ``positions`` positions, read."""
         g = self.geometry
-        stored = copies = 0
+        on_disk = copies = 0
         for spec in self.tensor_specs():
             if spec.fmt == "scalar" or spec.name == "embed_tokens.weight":
                 continue
-            stored += spec.stored_bytes
+            on_disk += spec.stored_bytes
             copies += 2 * spec.numel
         embedding = 2 * sequences * g.hidden
         state = 0
@@ -437,7 +441,9 @@ class QwenDense:
                 state += 2 * sequences * (g.la_value_heads * g.la_head_dim**2 * 4 + (g.la_conv_width - 1) * g.qkv_channels * 2)
             else:
                 state += 2 * sequences * g.attn_kv_heads * positions * g.attn_head_dim * 2
-        return {"weights": stored + embedding, "copies": copies + embedding, "state": state}
+        # a block that multiplies on the stored format reads 1 byte per element of its merged 8-bit weight where its copy has 2
+        kept = self.stored_bytes(stored)
+        return {"weights": on_disk + embedding, "copies": copies - kept + embedding, "stored": kept, "state": state}
 
     def state_shapes(self) -> Dict[str, tuple]:
         g = self.geometry

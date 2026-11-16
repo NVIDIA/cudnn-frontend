@@ -46,7 +46,8 @@ step facts above are taken from those same records.  The kernel check of a sampl
 
 **Bytes per step** is arithmetic on the model's tensor list, not a measurement: the bytes of the weights a step reads in
 their stored formats plus the state it reads and writes ("model"), against the same with the weights as the running stack
-holds them ("this stack moves").
+reads them ("this stack moves"): bf16 copies, and the stored format for the weights a block of the stack multiplies on
+there.
 
 These are host-side timings and counts for orientation only: no clock is locked, and nothing here is a measurement of
 record.  A run on a reduced model prefixes its times with "reduced model" and prints no rate.
@@ -322,9 +323,12 @@ class Report:
             weights, state = self.bytes["weights"], self.bytes["state"]
             model, moved = weights + state, self.bytes["copies"] + state
             stored = f"weights {weights / gb:.2f} in their stored formats, state and cache {state / gb:.2f}"
+            # what a block of this stack multiplies on the stored format is read there, and its bf16 copy is not read by a step
+            kept = self.bytes.get("stored", 0)
+            reads = "bf16 copies of the weights" + (f", and {kept / gb:.2f} GB of weights in their stored format" if kept else "")
             lines.append(
                 f"bytes per step        {prefix}model {model / gb:.2f} GB ({stored}); "
-                f"this stack moves {moved / gb:.2f} GB ({moved / model:.2f}x): bf16 copies of the weights (arithmetic, not a measurement)"
+                f"this stack moves {moved / gb:.2f} GB ({moved / model:.2f}x): {reads} (arithmetic, not a measurement)"
             )
         # what bounds a step is said from this run's traced pass, not as a constant: the same loop is bound by its launches
         # on one stack and GPU and by its GPU work on another

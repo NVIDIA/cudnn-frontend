@@ -4647,12 +4647,26 @@ def test_the_loader_keeps_the_stored_weight_a_plan_multiplies_on(monkeypatch):
     assert full.stored_bytes() == 0 and full.stored_bytes(("projection.fp8.in",)) == 48 * 16384 * 5120 + 16 * 14336 * 5120 == 5_200_936_960
     extra = full.memory_bytes(1, 64, ("projection.fp8.in",)) - full.memory_bytes(1, 64)
     assert extra == full.stored_bytes(("projection.fp8.in",)) * 9 // 8, "one byte per element, and the allocator's slack on what is held"
+    # what a step reads: the stored in-projections at one byte per element where their copies have two; every other figure as it was
+    copied, read = full.bytes_per_step(1, 58), full.bytes_per_step(1, 58, stored=("projection.fp8.in",))
+    assert copied["stored"] == 0 and read["stored"] == 5_200_936_960 == copied["copies"] - read["copies"], "the copies of these weights are not read by a step"
+    assert (read["weights"], read["state"]) == (copied["weights"], copied["state"]) and full.bytes_per_step(1, 58, stored=()) == copied
+    said = f"reads the in-projections on their stored codes, {read['stored'] / 1e9:.1f} GB where the copies are {2 * read['stored'] / 1e9:.1f} GB: "
+    said += f"{(read['copies'] + read['state']) / 1e9:.1f} GB per step"
+    assert said in " ".join((MODELS / "qwen_dense" / "README.md").read_text().split()), said
 
     # through sessions: the stand-in of the entry asks for the stored weights, and the load of the session keeps them
     session = _recorded_run(monkeypatch, sequences=1, stack="native")[0]
     assert session.stored_weights() == ("projection.fp8.in",) and all(layer.in_proj.stored is not None for layer in session.weights.layers)
+    # ... and the report's bytes of a step count them as they are read: on the stored format, not as copies
+    moved = session.report().bytes
+    assert moved == session.model.bytes_per_step(1, session.state.position, stored=("projection.fp8.in",)) and moved["stored"] > 0
+    assert moved["copies"] == session.model.bytes_per_step(1, session.state.position)["copies"] - moved["stored"]
+    assert "): bf16 copies of the weights, and 0.00 GB of weights in their stored format (arithmetic, not a measurement)" in session.report().text()
     session = _recorded_run(monkeypatch, sequences=1, stack="fe-cublas")[0]
     assert session.stored_weights() == () and all(layer.in_proj.stored is None for layer in session.weights.layers), "a stack without such a block keeps none"
+    assert session.report().bytes == session.model.bytes_per_step(1, session.state.position) and session.report().bytes["stored"] == 0
+    assert "): bf16 copies of the weights (arithmetic, not a measurement)" in session.report().text(), "every multiply of this stack reads a copy"
     # a session whose own plan has no such block keeps them for the session that will run on its weights
     build = _stand_ins(monkeypatch)
     tiny = _tiny_model()
@@ -4671,6 +4685,9 @@ def test_the_loader_keeps_the_stored_weight_a_plan_multiplies_on(monkeypatch):
     assert later.weights is first.weights and all(layer.in_proj.stored is not None for layer in later.weights.layers)
     ids = later.prefill([text.encode("ab0")])
     assert later.read(ids) and later.plan["projection.fp8.in"].serving()[0] == "cudnn.Fp8ProjectionDecode #2"
+    first.read(first.prefill([text.encode("ab0")]))
+    assert first.stored_weights(own=True) == () and first.report().bytes["stored"] == 0, "its own steps read the copies, whatever its load keeps for the next"
+    assert later.stored_weights(own=True) == ("projection.fp8.in",) and later.report().bytes["stored"] == tiny.stored_bytes(("projection.fp8.in",)) > 0
 
 
 def test_the_projection_row_on_other_classes_and_row_counts():
