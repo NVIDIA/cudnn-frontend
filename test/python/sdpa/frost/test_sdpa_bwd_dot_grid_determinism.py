@@ -37,10 +37,11 @@ def _compile_dense(operands, delta, dq_accum=None, dq_sem=None, scales=()):
     options = f"--enable-tvm-ffi --gpu-arch {arch}"
     stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     dim = operands[0].shape[-1]
+    chunk = min(dim, 64)
     args = [fake(value) for value in (*operands, delta)]
     if scales:
-        return cute.compile(dot_do_o_scaled_host, *args, *[fake(value) for value in scales], 128, dim, 64, stream, options=options)
-    return cute.compile(dot_do_o_host, *args, fake(dq_accum), fake(dq_sem), 128, dim, dim, 64, False, dq_sem is not None, stream, options=options)
+        return cute.compile(dot_do_o_scaled_host, *args, *[fake(value) for value in scales], 128, dim, chunk, stream, options=options)
+    return cute.compile(dot_do_o_host, *args, fake(dq_accum), fake(dq_sem), 128, dim, dim, chunk, False, dq_sem is not None, stream, options=options)
 
 
 def _assert_fresh_bytes(outputs, expected, label):
@@ -52,28 +53,32 @@ def _assert_fresh_bytes(outputs, expected, label):
     assert_bitwise(actual, reference, label)
 
 
-def _inputs(batch, heads, seqlen, dtype):
+def _inputs(batch, heads, seqlen, dtype, head_dim=64):
     # Exactly representable values with distinct batch/head/row coordinates.
     # The closed-form FP64 oracle covers every output, including large grids.
     amplitude = (torch.arange(batch * heads, dtype=torch.float64).reshape(batch, heads) % 13 - 6) / 8 + 1
     upstream = (torch.arange(seqlen, dtype=torch.float64) % 3 + 1) / 4
-    shape = (batch, seqlen, heads, 64)
+    shape = (batch, seqlen, heads, head_dim)
     o = amplitude.to(device="cuda", dtype=dtype)[:, None, :, None].expand(shape).contiguous()
     do = upstream.to(device="cuda", dtype=dtype)[None, :, None, None].expand(shape).contiguous()
-    reference = (64 * amplitude[:, :, None] * upstream[None, None, :]).float().cuda()
+    reference = (head_dim * amplitude[:, :, None] * upstream[None, None, :]).float().cuda()
     return [o, do], reference
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn], ids=["fp16", "bf16", "fp8"])
 @pytest.mark.parametrize(
-    "batch,heads,seqlen",
-    [(2, 3, 2), (65535, 2, 2), (65536, 2, 2), (2, 65535, 2), (2, 65536, 2), (1, 65536, 129)],
+    "batch,heads,seqlen,head_dim",
+    # Grid dimensions are independent of the contraction width. Keep every
+    # batch/head/query boundary while reducing live storage for four workers
+    # sharing a 16-GiB GPU. Only the large live query tail needs D32;
+    # both sides of the batch/head boundary and the goldens retain D64.
+    [(2, 3, 2, 64), (65535, 2, 2, 64), (65536, 2, 2, 64), (2, 65535, 2, 64), (2, 65536, 2, 64), (1, 65536, 129, 32)],
     ids=["small", "batch-edge", "batch-over", "heads-edge", "heads-over", "query-tail"],
 )
-def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen):
+def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen, head_dim):
     if dtype == torch.float8_e4m3fn and _SM < 89:
         pytest.skip("Native FP8 conversion requires SM89 or newer")
-    operands, reference = _inputs(batch, heads, seqlen, dtype)
+    operands, reference = _inputs(batch, heads, seqlen, dtype, head_dim)
     rounded = (seqlen + 127) // 128 * 128
     raw = torch.full((batch * heads * rounded + 32,), 12345.0, device="cuda")
     delta = raw[16:-16].view(batch, heads, rounded)
@@ -94,8 +99,8 @@ def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen):
     expected = assert_replays(launch)
     check()
     # Rebind one input at a time, keeping its old allocation alive through
-    # execution. The query-tail case has >1 GiB per half input: cloning both
-    # together and making whole-input FP32 temporaries exhausts 16-GiB CI.
+    # execution. Even D32 query-tail inputs exceed 0.5 GiB each: cloning both
+    # together and making whole-input FP32 temporaries exhausts parallel CI.
     original_o = operands[0].cpu()
     old_o, old_do = operands
     old_raw = raw
@@ -150,9 +155,11 @@ def test_dense_delta_grid_replay_and_isolation(dtype, batch, heads, seqlen):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @pytest.mark.parametrize(
-    "batch,heads", [(3, 2), (65535, 2), (65536, 2), (3, 65535), (3, 65536)], ids=["small", "batch-edge", "batch-over", "heads-edge", "heads-over"]
+    "batch,heads,head_dim",
+    [(3, 2, 64), (65535, 2, 64), (65536, 2, 64), (3, 65535, 32), (3, 65536, 32)],
+    ids=["small", "batch-edge", "batch-over", "heads-edge", "heads-over"],
 )
-def test_thd_origins_delta_grid(dtype, batch, heads):
+def test_thd_origins_delta_grid(dtype, batch, heads, head_dim):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
@@ -166,14 +173,14 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
     row = torch.arange(total) - prefix[owners]
     amp = ((owners[:, None] + torch.arange(heads)[None, :]) % 13 - 6).double() / 8 + 1
     upstream = (row.double() % 3 + 1) / 4
-    reference = (64 * amp * upstream[:, None]).T.float().cuda()
+    reference = (head_dim * amp * upstream[:, None]).T.float().cuda()
     offsets = torch.stack([prefix[:-1].long() + (torch.arange(batch) + 1) * gap for gap in (1, 2)])
     inputs, positions = [], []
     for port, gap in enumerate((1, 2)):
-        value = torch.full((1, total + (batch + 1) * gap, heads, 64), float("nan"), device="cuda", dtype=dtype)
+        value = torch.full((1, total + (batch + 1) * gap, heads, head_dim), float("nan"), device="cuda", dtype=dtype)
         pos = (offsets[port, owners] + row).cuda()
         live = amp if port == 0 else upstream[:, None].expand(total, heads)
-        value[0].index_copy_(0, pos, live.cuda().to(dtype)[:, :, None].expand(total, heads, 64))
+        value[0].index_copy_(0, pos, live.cuda().to(dtype)[:, :, None].expand(total, heads, head_dim))
         inputs.append(value)
         positions.append(pos)
     meta = torch.zeros(4 * batch + 4, dtype=torch.int32, device="cuda")
@@ -193,6 +200,7 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
     def host(o: cute.Tensor, do: cute.Tensor, out: cute.Tensor, metadata: cute.Tensor, offsets: cute.Tensor, stream):
         # Production callers supply these immutable declaration facts from
         # their compiled plan, rather than changing them at each launch.
+        # D32 storage uses the helper's existing padded-D64 load mask.
         dot_do_o_thd_origins_host(o, do, out, metadata, offsets, offsets.shape[1], 129, (0, 1), 64, stream)
 
     fn = cute.compile(
@@ -236,7 +244,7 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
     assert torch.equal(inputs[0].cpu().view(torch.uint8), original_o.view(torch.uint8))
     # Poisoned gaps stay poisoned; compare every live dO byte in bounded
     # gathers instead of allocating two full-size gathered inputs at once.
-    rows_per_chunk = max(1, 2**20 // (heads * 64))
+    rows_per_chunk = max(1, 2**20 // (heads * head_dim))
     for start in range(0, positions[1].numel(), rows_per_chunk):
         pos = positions[1][start : start + rows_per_chunk]
         assert torch.equal(inputs[1][0, pos], -old_do[0, pos])
@@ -248,13 +256,14 @@ def test_thd_origins_delta_grid(dtype, batch, heads):
         )
 
 
-def test_flat_delta_initializes_accumulator_and_relay():
-    operands, reference = _inputs(1, 65536, 2, torch.bfloat16)
-    delta = torch.empty((1, 65536, 128), device="cuda")
+@pytest.mark.parametrize("heads,head_dim", [(3, 64), (65536, 32)], ids=["small-wide", "heads-over"])
+def test_flat_delta_initializes_accumulator_and_relay(heads, head_dim):
+    operands, reference = _inputs(1, heads, 2, torch.bfloat16, head_dim)
+    delta = torch.empty((1, heads, 128), device="cuda")
     # These optional regions belong to the same preprocess launch. A grid fix
     # that only changes the delta store can leave stale dQ or relay counters.
-    accum = torch.full((1, 128, 65536, 64), 5.0, device="cuda")
-    relay = torch.full((1, 65536, 1), 7, device="cuda", dtype=torch.int32)
+    accum = torch.full((1, 128, heads, head_dim), 5.0, device="cuda")
+    relay = torch.full((1, heads, 1), 7, device="cuda", dtype=torch.int32)
     fn = _compile_dense(operands, delta, accum, relay)
     fn(*operands, delta, accum, relay, torch.cuda.current_stream().cuda_stream)
     torch.testing.assert_close(delta[:, :, :2], reference, rtol=0, atol=0)

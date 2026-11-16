@@ -7413,3 +7413,31 @@ pytest sdpa/frost/test_sdpa_bwd_dot_large_index.py -m L1
 Native SM103/107/120 execution at the new boundary and full SDPA-chain
 qualification at that boundary are pending. Existing API support rows retain
 their prior limits; the SM100 integration controls above cover regular shapes.
+
+### Parallel-memory follow-up (2026-11-16)
+
+The large live query-tail and THD head-boundary fixtures now use D32 storage;
+batch/head/query extents, complete comparisons, retained old dO, eight repeats,
+and changed-input capture are preserved. Ordinary dense grid boundaries and
+THD batch boundaries still use D64. The large accumulator uses D32 with an
+additional D64 small control. The L1 address-span detector and production
+helpers are unchanged; small golden inputs and outputs are unchanged.
+
+With the same runtime listed above and a 2-GiB Torch allocator limit per
+worker, the final L40S suite passes all 30 cases. On SM100, four workers run
+the native suite, five existing stride controls and the host/compiler suite:
+49 pass and one SM80-FP8 compile case skips. Reserving unrelated memory leaves
+16 GiB for the entire process group, including contexts/compiler allocations;
+the sampled group peak is 9.14 GiB. Four additional synchronized THD rebind
+runs hold their largest live inputs together and all pass, with a sampled
+group peak of 9.35 GiB. Both runs stay below 1.880 GiB allocated / 1.917 GiB
+reserved per worker. Sampling is not an exact instantaneous peak measurement.
+
+The pre-follow-up D64 query-tail fixture fails its initial input allocation
+under the same 2-GiB cap. Original-helper RED controls must run in separate
+processes: retained failed-test tracebacks otherwise exhaust that cap and
+mask later launch failures. Ten isolated L40S controls against the exact
+original helper produce seven invalid-launch failures (FP16/BF16/FP8 dense,
+half THD and accumulator initialization) and three legal-boundary passes,
+without OOM. These bounded SM100/L40S results do not establish
+native SM120 qualification or change the API support status above.
