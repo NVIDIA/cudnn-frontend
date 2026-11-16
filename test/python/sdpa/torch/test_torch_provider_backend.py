@@ -9,8 +9,6 @@ cuDNN and the cuDNN python path supports it; everything else must reach torch's
 own op body: flash when flash was selected, torch's C++ cuDNN path otherwise.
 """
 
-import logging
-
 import pytest
 import torch
 
@@ -41,12 +39,12 @@ def overrides():
     handle.remove()
 
 
-def _inputs(lens=(128, 256), H=4, D=64):
+def _inputs(lens=(128, 256), H=4, D=64, dtype=torch.bfloat16):
     torch.manual_seed(0)
     lens_t = torch.tensor(lens, device="cuda")
     cu = torch.nn.functional.pad(lens_t.cumsum(0), (1, 0)).to(torch.int32)
     T, mx = int(cu[-1]), int(lens_t.max())
-    q, k, v = (torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda", requires_grad=True) for _ in range(3))
+    q, k, v = (torch.randn(T, H, D, dtype=dtype, device="cuda", requires_grad=True) for _ in range(3))
     return q, k, v, cu, mx
 
 
@@ -111,13 +109,22 @@ def test_out_variant_honors_the_selection(overrides, backends, expected):
 
 
 @pytest.mark.L0
-def test_selected_cudnn_config_the_python_path_declines_runs_torchs_cudnn(overrides, caplog):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_selected_cudnn_config_the_python_path_declines_runs_torchs_cudnn(overrides, monkeypatch, dtype):
     # The cuDNN python path does not serve seqused_k; torch's C++ cuDNN path
     # does. The call must stay on cuDNN rather than drop to flash.
-    q, k, v, cu, mx = _inputs()
+    q, k, v, cu, mx = _inputs(dtype=dtype)
     seqused_k = (cu[1:] - cu[:-1]).to(torch.int32)
+    native = torch.ops.aten._cudnn_attention_forward
+    native_calls = []
+
+    def record_native(*args, **kwargs):
+        native_calls.append(kwargs)
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(torch.ops.aten, "_cudnn_attention_forward", record_native)
     before = dict(sdpa_provider.calls)
-    with torch.no_grad(), sdpa_kernel(CUDNN), caplog.at_level(logging.INFO, logger="torch.nn.attention.varlen"):
+    with torch.no_grad(), sdpa_kernel(CUDNN):
         # A full window is admitted by both old and new Torch KV-cache selectors.
         reasons = cudnn_rejection_reasons(q, k, v, cu, cu, mx, [-1, -1], seqused_k=seqused_k)
 
@@ -126,7 +133,14 @@ def test_selected_cudnn_config_the_python_path_declines_runs_torchs_cudnn(overri
 
         if reasons:
             assert_public_rejection(reasons, public_call)
+            assert not native_calls, "a rejected call reached the native cuDNN operator"
             return
-        public_call()
+        actual = public_call()
     assert _calls_since(before) == {"fwd_torch": 1}
-    assert "Using cuDNN backend for varlen_attn" in caplog.text
+    assert len(native_calls) == 1, "fallback did not execute Torch's cuDNN operator exactly once"
+    torch.testing.assert_close(native_calls[0]["seqused_k"], seqused_k, rtol=0, atol=0)
+    assert torch.isfinite(actual).all()
+    overrides.remove()
+    with torch.no_grad(), sdpa_kernel(CUDNN):
+        expected = public_call()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
