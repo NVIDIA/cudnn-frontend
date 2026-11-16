@@ -58,12 +58,17 @@ CALLER OBLIGATIONS.
   without a NaN the two arms return the same maximum -- bit for bit, except the sign of a zero maximum that zeros of both signs
   hold, which a maximum of magnitudes never has -- and, with an index, the same index; neither is the ``.NaN`` form, and what
   they return for a NaN operand is not part of the contract.
+
+The row helpers at the end of the module -- one 128-bit load of eight 16-bit values, the two eight-element stores, the per-row
+FP8 scale -- are plain compositions of ``tile_dsl.pointwise`` and ``tile_dsl.tma`` helpers with the element-to-byte order stated
+once.
 """
 
 import cutlass
 import cutlass.cute as cute
 
-from .pointwise import fmax_f32
+from .pointwise import div_rn_f32, f16x2_to_f32, fmax_f32, fp32_to_fp16, fp32_to_fp8x2, min_xorsign_abs_f32, opaque_f32_bits, pack_fp8x2_pairs, rcp_div_rn
+from .tma import ld_global_v4, st_global_v2, st_global_v4
 
 WARP = 32
 BUTTERFLY_STEPS = 5  # the offsets 1, 2, 4, 8, 16: the 32 lanes of a warp
@@ -231,3 +236,79 @@ def block_reduce(value, lane, warp, slots, warps, *, kind, order, index_limit=No
         return _block_max(value, lane, warp, slots, warps, redux)
     best, index = value
     return _block_max_index(best, index, lane, warp, slots, warps, index_limit, redux)
+
+
+# ---------------------------------------------------------------------------
+# Row helpers: eight 16-bit elements per thread, as one vector.  ``addr`` is the byte address of the vector's first element
+# (``(tensor.iterator + element).toint()``); the vector is 16 bytes for the 16-bit forms and 8 bytes for the E4M3 codes, and
+# the caller keeps it aligned to its own size.  Element ``j`` of a list is the element at the j-th position of the vector, in
+# memory order, in every helper.
+# ---------------------------------------------------------------------------
+ROW_VEC = 8  # elements per thread per vector
+E4M3_MAX_BITS = 0x43E00000  # fp32(448): the largest E4M3 magnitude
+FP8_ROW_SCALE_FLOOR_BITS = 0x36924925  # fp32(1 / (448 * 512)): the floor of a per-row scale
+
+
+def _check_vec(values, who: str) -> None:
+    if not isinstance(values, (list, tuple)) or len(values) != ROW_VEC:
+        raise ValueError(f"{who}: values must be a list or tuple of {ROW_VEC} Float32 values, got {values!r}")
+
+
+def row_load8(addr, *, dtype):
+    """ONE 128-bit global load of eight 16-bit values at ``addr``, widened exactly to fp32: a list of eight ``Float32`` whose
+    element ``j`` is the value at ``addr + 2 j`` bytes.
+
+    ``dtype`` is keyword-only and REQUIRED: ``BFloat16`` (a bit move) or ``Float16`` (a convert).  It decides the decoded values
+    -- the fp16 pattern of 1.0 read as bf16 is 0.0078125 -- and the conversion helpers of ``tile_dsl.pointwise`` default to
+    ``Float16``, so no default here would be right for both kinds of row.  Any other ``dtype`` is a ``ValueError`` raised before
+    any operation is emitted."""
+    if dtype not in (cutlass.BFloat16, cutlass.Float16):
+        raise ValueError(f"row_load8: dtype must be cutlass.BFloat16 or cutlass.Float16, got {dtype!r}")
+    words = ld_global_v4(addr, cutlass.Int32)
+    out = []
+    for pair in range(ROW_VEC // 2):
+        lo, hi = f16x2_to_f32(words[pair], dtype=dtype)
+        out.extend((lo, hi))
+    return out
+
+
+def row_store8_bf16(addr, values) -> None:
+    """ONE 128-bit global store of eight fp32 values rounded to bf16 (nearest-even): ``values[j]`` goes to ``addr + 2 j`` bytes."""
+    _check_vec(values, "row_store8_bf16")
+    words = [fp32_to_fp16(values[2 * pair], values[2 * pair + 1], dtype=cutlass.BFloat16) for pair in range(ROW_VEC // 2)]
+    st_global_v4(addr, words, cutlass.Int32)
+
+
+def row_store8_e4m3(addr, values, inv, *, clamp) -> None:
+    """ONE 64-bit global store of the eight E4M3 codes of ``values[j] * inv``: the code of ``values[j]`` is the BYTE at
+    ``addr + j``.
+
+    Per element one fp32 multiply by ``inv`` (the reciprocal of the dequantization scale, e.g. from
+    :func:`fp8_dynamic_row_scale`), then under ``clamp`` one ``min.xorsign.abs.f32`` against 448
+    (:func:`~cudnn.frost.tile_dsl.pointwise.min_xorsign_abs_f32`), then the saturating nearest-even convert.  The convert
+    saturates by itself, so ``clamp`` changes no code of a finite or infinite product: it is the instruction a kernel carries
+    when its instruction stream follows a reference that clamps.  ``clamp`` is keyword-only, required, a Python bool."""
+    _check_vec(values, "row_store8_e4m3")
+    if not isinstance(clamp, bool):
+        raise ValueError(f"row_store8_e4m3: clamp must be a Python bool, got {clamp!r}")
+    limit = opaque_f32_bits(E4M3_MAX_BITS) if clamp else None
+    pairs = []
+    for pair in range(ROW_VEC // 2):
+        lo = values[2 * pair] * inv
+        hi = values[2 * pair + 1] * inv
+        if clamp:
+            lo = min_xorsign_abs_f32(lo, limit)
+            hi = min_xorsign_abs_f32(hi, limit)
+        pairs.append(fp32_to_fp8x2(lo, hi))
+    st_global_v2(addr, [pack_fp8x2_pairs(pairs[0], pairs[1]), pack_fp8x2_pairs(pairs[2], pairs[3])], cutlass.Int32)
+
+
+def fp8_dynamic_row_scale(amax):
+    """``(scale, inv)`` of one row quantized to E4M3 with its own scale: ``scale = max(div.rn(amax, 448), fp32(1 / (448 * 512)))``
+    and ``inv = div.rn(1, scale)`` -- two IEEE divisions and one exact maximum, so both are functions of ``amax`` alone on every
+    target.  ``amax`` is the row's non-negative maximum magnitude (``block_reduce(..., kind="max")``); a zero row gives the
+    floor.  The row's codes are ``e4m3(x * inv)`` (:func:`row_store8_e4m3`) and ``scale`` is what the consumer multiplies by.
+
+    NOT :func:`~cudnn.frost.tile_dsl.pointwise.e4m3_scale_from_amax` (the block scale of NVFP4: another rule, another floor)."""
+    scale = fmax_f32(div_rn_f32(amax, opaque_f32_bits(E4M3_MAX_BITS)), opaque_f32_bits(FP8_ROW_SCALE_FLOOR_BITS))
+    return scale, rcp_div_rn(scale)

@@ -24,6 +24,10 @@ reference that is named here, or a bound that is the instruction's own specifica
   - ``min_xorsign_abs_f32`` against its definition; the three approximate instructions inside the bound of their
     specification (``ex2.approx.f32`` from the correctly rounded result, as its specification states it), each beside the
     instruction it is not.
+
+The row helpers of the module have their cells at the end: on the host the load's required ``dtype``; on the device the per-row
+FP8 scale against two IEEE divisions on the host, the E4M3 store's bytes in element order against the host cast, the 16-bit
+load / store round trip on all 65,536 patterns.
 """
 
 import importlib
@@ -343,6 +347,15 @@ def expected_pins(arch: str) -> dict:
     want = {}
     want.update(
         {
+            "row_scale": {"div.rn.f32": 2, "max.f32": 1, "0x43E00000": 1, "0x36924925": 1},
+            "store_e4m3_clamp": {"mul.f32": 8, "min.xorsign.abs.f32": 8, "cvt.rn.satfinite.e4m3x2.f32": 4, "st.global.v2": 1, "0x43E00000": 1},
+            "store_e4m3": {"mul.f32": 8, "cvt.rn.satfinite.e4m3x2.f32": 4, "st.global.v2": 1},
+            "load8_bf16": {"ld.global.v4": 1},
+            "roundtrip": {"ld.global.v4": 1, "cvt.rn.bf16x2.f32": 4, "st.global.v4": 1},
+        }
+    )
+    want.update(
+        {
             "sum_ascending_w4": _sum_pin(_ASC10, 2),
             "sum_ascending_w20": _sum_pin(_ASC10, 2),
             "sum_ascending_w32": _sum_pin(_ASC10, 0),  # every lane is below 32 warps: the load needs no guard
@@ -386,6 +399,7 @@ def test_rendering_of_every_primitive(tmp_path, arch):
       with an index two integer warp minima and two slot words; in every maximum the constant ``-inf`` (``0fFF800000``) once
       -- the identity the lanes past the warp count hold -- and in no other rendering;
     * each one-instruction helper: exactly one statement of its instruction and none of the instruction it is not;
+    * the row helpers: their statements.
 
     Every count that is not named is ZERO.  With a disassembler that decodes the target also: one barrier instruction per
     reduction, no spill, and the hardware function behind each approximate instruction.  A target the installed compiler
@@ -427,6 +441,7 @@ def test_rendering_of_every_primitive(tmp_path, arch):
         assert sass[tag]["bar_sync"] == want[tag].get("bar.sync", 0), (tag, sass[tag])
     assert sass["div_full"]["mufu_rcp"] == 1 and sass["rsqrt"]["mufu_rsq"] == 1 and sass["ex2"]["mufu_ex2"] == 1, sass
     assert sass["min_xorsign"]["fmnmx_xorsign"] == 1, sass["min_xorsign"]
+    assert sass["store_e4m3_clamp"]["fmnmx_xorsign"] == 8 and sass["store_e4m3"]["fmnmx_xorsign"] == 0, (sass["store_e4m3_clamp"], sass["store_e4m3"])
 
 
 # ---------------------------------------------------------------------------
@@ -787,3 +802,143 @@ def test_one_instruction_helpers():
         f"{int(in_range.sum())} operands with a normal result, worst {worst:.3f} units in the last place from the correctly rounded 2^x ({worst_from_exact:.3f} from the exact value), {same_as_flushed} bitwise the .ftz form, {int(underflow.sum())} subnormal results not flushed",
     )
     assert bool((got[torch.isfinite(x) & (x < -151.0)] <= 2.0 * spacing).all()) and bool((got[torch.isfinite(x) & (x < -151.0)] >= 0).all())
+
+
+# ---------------------------------------------------------------------------
+# The row helpers: one host cell (the load's required dtype), then the device cells
+# ---------------------------------------------------------------------------
+
+E4M3 = torch.float8_e4m3fn
+ROW_SCALE_FLOOR_BITS = 0x36924925  # fp32(1 / (448 * 512))
+
+
+def test_row_load8_needs_its_dtype():
+    """``row_load8`` decodes sixteen bytes as eight bf16 or as eight fp16 values, and the two readings of one word differ (the
+    fp16 pattern of 1.0 read as bf16 is 0.0078125), so ``dtype`` is keyword-only and has NO default -- the conversion helpers of
+    ``tile_dsl.pointwise`` default to fp16, and a default of either kind here would decode the other kind's rows without an
+    error.  A call without it is a ``TypeError``; a ``dtype`` that is not ``BFloat16`` or ``Float16`` is a ``ValueError`` raised
+    in plain Python before any operation is emitted (the address here is ``None``: nothing reads it)."""
+    import inspect
+
+    import cutlass
+
+    rw = _rowwise()
+    dtype = inspect.signature(rw.row_load8).parameters["dtype"]
+    assert dtype.kind is inspect.Parameter.KEYWORD_ONLY and dtype.default is inspect.Parameter.empty, dtype
+    with pytest.raises(TypeError, match="dtype"):
+        rw.row_load8(None)
+    with pytest.raises(TypeError):
+        rw.row_load8(None, cutlass.BFloat16)
+    for wrong in (None, cutlass.Float32, cutlass.Int16, "bf16"):
+        with pytest.raises(ValueError, match="dtype must be cutlass.BFloat16 or cutlass.Float16"):
+            rw.row_load8(None, dtype=wrong)
+    assert float(torch.tensor([0x3C00], dtype=torch.int16).view(torch.bfloat16).float()[0]) == 0.0078125  # fp16 1.0 read as bf16
+
+
+def _f32(bits: int) -> float:
+    return float(torch.tensor([bits], dtype=torch.int64).to(torch.int32).view(torch.float32)[0])
+
+
+@requires_blackwell
+def test_fp8_dynamic_row_scale_is_its_two_divisions():
+    """``fp8_dynamic_row_scale(amax)`` against the host: ``scale = max(amax / 448, fp32(1 / (448 * 512)))`` and ``inv = 1 /
+    scale``, two IEEE fp32 divisions and an exact maximum, bit for bit -- on every non-negative finite bf16 maximum, a dense
+    draw, and the edges: zero (the floor), the last value under the floor's own ``448 x floor``, that value, the first above
+    it, the largest finite bf16 magnitude, fp32 subnormals."""
+    probe = _probe()
+    gen = torch.Generator(device="cpu").manual_seed(37)
+    floor = torch.tensor(_f32(ROW_SCALE_FLOOR_BITS), dtype=torch.float32)
+    assert ROW_SCALE_FLOOR_BITS == int(_bits(torch.tensor([1.0 / (448.0 * 512.0)], dtype=torch.float32))[0])
+    assert probe.rowwise.FP8_ROW_SCALE_FLOOR_BITS == ROW_SCALE_FLOOR_BITS and _f32(probe.rowwise.E4M3_MAX_BITS) == E4M3_MAX
+    knee = torch.tensor(E4M3_MAX, dtype=torch.float32) * floor
+    around = [knee]
+    for _ in range(4):
+        around.append(torch.nextafter(around[-1], torch.tensor(float("inf"))))
+    below = [knee]
+    for _ in range(4):
+        below.append(torch.nextafter(below[-1], torch.tensor(0.0)))
+    edges = torch.stack(
+        around + below[1:] + [torch.tensor(0.0), torch.tensor(_f32(0x7F7F0000)), torch.tensor(1e-45), torch.tensor(1e-40), torch.tensor(E4M3_MAX)]
+    )
+    grid = (torch.arange(0x7F80, dtype=torch.int32) << 16).view(torch.float32)
+    drawn = torch.exp2(torch.empty(1 << 16).uniform_(-30.0, 30.0, generator=gen)).to(torch.float32)
+    amax = torch.cat([edges, grid, drawn]).contiguous()
+    scale, inv = (t.cpu() for t in probe.run_scale(amax.to(_device())))
+    want_scale = torch.maximum(amax / torch.tensor(E4M3_MAX, dtype=torch.float32), floor)
+    want_inv = torch.ones((), dtype=torch.float32) / want_scale
+    bad = _bits(scale) != _bits(want_scale)
+    assert not bool(bad.any()), f"{int(bad.sum())} scales differ from max(amax / 448, floor) (first amax bits {hex(int(_bits(amax)[bad][0]) & 0xFFFFFFFF)})"
+    bad = _bits(inv) != _bits(want_inv)
+    assert not bool(bad.any()), f"{int(bad.sum())} reciprocals differ from 1 / scale (first amax bits {hex(int(_bits(amax)[bad][0]) & 0xFFFFFFFF)})"
+    assert int((_bits(scale) == ROW_SCALE_FLOOR_BITS).sum()) > 100 and int((_bits(scale) != ROW_SCALE_FLOOR_BITS).sum()) > 100  # both sides of the floor
+    assert int(_bits(scale)[edges.numel() - 5]) == ROW_SCALE_FLOOR_BITS  # a zero row takes the floor
+
+
+def e4m3_vectors(gen):
+    """``(x [n, 8], inv [n])`` for the E4M3 store cell: vectors of eight DISTINCT values; vectors with elements above 448 and
+    below -448; zeros of both signs; infinities; every positive code value and the midpoint to the next code (ties) with
+    ``inv = 1``; and random vectors with random multipliers."""
+    distinct = torch.tensor([[0.5, -1.25, 3.0, -7.5, 20.0, -96.0, 224.0, -448.0], [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]])
+    saturating = torch.tensor(
+        [[449.0, -449.0, 1000.0, -1.0e6, 447.0, -447.0, 3.0e38, -3.0e38], [0.0, -0.0, 480.0, -480.0, 2.0**-10, -(2.0**-10), 1.5 * 2.0**-9, 464.0]]
+    )
+    infinite = torch.tensor([[float("inf"), -float("inf"), 1.0, -1.0, 0.0, -0.0, 448.0, -448.0]])
+    codes = torch.arange(0, 0x7F, dtype=torch.uint8).view(E4M3).to(torch.float32)
+    mid = ((codes[:-1].double() + codes[1:].double()) / 2.0).to(torch.float32)
+    pts = torch.cat([codes, mid, -codes, -mid])
+    pts = torch.cat([pts, torch.zeros((-pts.numel()) % 8)]).view(-1, 8)
+    fixed = torch.cat([distinct, saturating, infinite, pts])
+    drawn = _wide(gen, (4096, 8))
+    x = torch.cat([fixed, drawn]).contiguous()
+    inv = torch.cat([torch.ones(fixed.shape[0]), torch.exp2(torch.empty(4096).uniform_(-6.0, 10.0, generator=gen))]).to(torch.float32).contiguous()
+    return x, inv
+
+
+@requires_blackwell
+def test_row_store8_e4m3_byte_order_and_clamp():
+    """``row_store8_e4m3`` with and without ``clamp``: the eight stored bytes of every vector, in ELEMENT order (``values[j]`` ->
+    byte ``j``), equal the host's E4M3 cast (nearest-even, saturating) of the fp32 product ``values[j] * inv`` -- vectors of
+    eight distinct values (a permuted store fails), elements beyond +-448 (the saturated codes), zeros of both signs, both
+    infinities, every code value and every tie between two codes, random vectors with random multipliers.  The clamp changes no
+    byte.  The sentinel bytes in front of the first vector and behind the last are untouched."""
+    probe = _probe()
+    gen = torch.Generator(device="cpu").manual_seed(38)
+    x, inv = e4m3_vectors(gen)
+    want = (x * inv[:, None]).to(E4M3).view(torch.uint8)
+    assert want[0].unique().numel() == 8 and want[1].unique().numel() == 8  # eight different bytes: the order is observable
+    assert {0x7E, 0xFE} <= set(want[2].tolist()) and {0x00, 0x80} <= set(want[3].tolist()) and want[4, :2].tolist() == [0x7E, 0xFE]
+    for clamp in (True, False):
+        codes = probe.run_store_e4m3(x.to(_device()), inv.to(_device()), clamp=clamp).cpu()
+        got = codes[probe.PAD : -probe.PAD].view(-1, 8)
+        bad = got != want
+        assert not bool(
+            bad.any()
+        ), f"clamp={clamp}: {int(bad.any(dim=1).sum())} vectors differ from the cast of the product (first vector {int(bad.any(dim=1).nonzero()[0])})"
+        assert bool((codes[: probe.PAD] == 0xA5).all()) and bool((codes[-probe.PAD :] == 0xA5).all()), f"clamp={clamp}: a byte outside the vectors was written"
+
+
+@requires_blackwell
+def test_row_load8_and_store8_bf16_round_trip():
+    """All 65,536 16-bit patterns as one ramp of 8,192 vectors:
+
+    * ``row_load8`` (bf16) -> ``row_store8_bf16`` returns every pattern that is not a NaN bit for bit at its own position (the
+      ramp is distinct, so a permuted element order fails); the 254 NaN patterns are counted apart (a NaN stays a NaN);
+    * ``row_load8`` alone widens exactly: bf16 to the fp32 with those upper 16 bits, fp16 to the host's fp32 conversion."""
+    probe = _probe()
+    dev = _device()
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    src = patterns.view(torch.bfloat16).contiguous()
+    not_nan = ~torch.isnan(src.float())
+    assert int(not_nan.sum()) == 65536 - 254
+    back = probe.run_roundtrip(src.to(dev)).cpu()
+    bad = (back.view(torch.int16) != patterns) & not_nan
+    assert not bool(bad.any()), f"{int(bad.sum())} bf16 patterns do not survive the load / store round trip (first {hex(int(patterns[bad][0]) & 0xFFFF)})"
+    assert bool(torch.isnan(back.float()[~not_nan]).all())
+    widened = probe.run_load8(src.to(dev)).cpu()
+    bad = (_bits(widened) != (torch.arange(65536, dtype=torch.int32) << 16)) & not_nan
+    assert not bool(bad.any()), f"{int(bad.sum())} bf16 patterns are not widened exactly"
+    half = patterns.view(torch.float16).contiguous()
+    not_nan = ~torch.isnan(half.float())
+    widened = probe.run_load8(half.to(dev)).cpu()
+    bad = (_bits(widened) != _bits(half.float())) & not_nan
+    assert not bool(bad.any()), f"{int(bad.sum())} fp16 patterns are not widened exactly"

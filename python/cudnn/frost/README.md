@@ -1151,6 +1151,19 @@ Contract:
   numerical change renders every form for every target before and after, with
   one explicit `PYTHONHASHSEED`, and compares the cubin md5.
 
+The module also holds the row helpers of an eight-element-per-thread kernel,
+each a composition of `tile_dsl.pointwise` and `tile_dsl.tma` helpers with the
+element-to-byte order stated once: `row_load8(addr, dtype=)` (one 128-bit load
+of eight 16-bit values, widened exactly; element `j` is the value at
+`addr + 2 j` bytes; `dtype` is required, `BFloat16` or `Float16`: it decides
+the decoded values), `row_store8_bf16(addr, values)` (nearest-even, one 128-bit
+store), `row_store8_e4m3(addr, values, inv, clamp=)` (the E4M3 codes of
+`values[j] * inv`, the code of `values[j]` in the byte at `addr + j`; `clamp`
+adds one `min.xorsign.abs.f32` against 448 per element and changes no code)
+and `fp8_dynamic_row_scale(amax)` (`scale = max(div.rn(amax, 448),
+fp32(1 / (448 * 512)))` and `inv = div.rn(1, scale)`: the per-row FP8 scale
+and its reciprocal, two IEEE divisions).
+
 
 ## Adding coverage, cheapest first
 

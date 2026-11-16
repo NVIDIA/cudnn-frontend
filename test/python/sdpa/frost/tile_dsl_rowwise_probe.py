@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Probe kernels for ``cudnn.frost.tile_dsl.rowwise`` (``block_reduce``) and for the four one-instruction
+"""Probe kernels for ``cudnn.frost.tile_dsl.rowwise`` (``block_reduce`` and the row helpers) and for the four one-instruction
 helpers of ``cudnn.frost.tile_dsl.pointwise`` (``div_full_f32``, ``rsqrt_approx_ftz_f32``, ``ex2_approx_f32``,
 ``min_xorsign_abs_f32``).  Not a test module; imported by ``test_tile_dsl_rowwise.py`` AFTER its DSL and device gates (this
 module imports the CuTe DSL at top level).
@@ -28,6 +28,11 @@ stride; never refilled inside a launch, so nothing releases it.
 ELEMENT-WISE PROBES (one thread per element, ``THREADS`` per thread block, no shared state): ``frost_rowwise_pointwise_probe``
 (the four helpers, each beside the instruction it is NOT) and ``frost_rowwise_render_probe`` (one helper per rendering).
 
+ROW-HELPER PROBES (one thread per element or per eight-element vector, no shared state): ``frost_rowwise_scale_probe``
+(``fp8_dynamic_row_scale``), ``frost_rowwise_store_e4m3_probe`` (``row_store8_e4m3``; the code tensor carries ``PAD`` bytes in
+front), ``frost_rowwise_load8_probe`` (``row_load8`` widened out to fp32), ``frost_rowwise_roundtrip_probe`` (``row_load8`` ->
+``row_store8_bf16``).
+
 Run as ``__main__`` (``<arch> <dump dir> [nvdisasm candidates...]``, ``CUTE_DSL_DUMP_DIR`` and ``CUTE_DSL_KEEP=ptx,cubin`` set by
 the caller) it trace-compiles one rendering per entry of ``RENDERS`` for ``<arch>`` and prints the PTX counts the rendering cell
 pins.
@@ -46,6 +51,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.frost.tile_dsl import rowwise
 from cudnn.frost.tile_dsl.pointwise import div_full_f32, div_rn_f32, ex2_approx_f32, min_xorsign_abs_f32, rsqrt_approx_ftz_f32
 from cudnn.frost.tile_dsl.rowwise import WARP, block_reduce, slot_words
+from cudnn.frost.tile_dsl.rowwise import fp8_dynamic_row_scale, row_load8, row_store8_bf16, row_store8_e4m3
 
 THREADS = 256  # the element-wise probes
 POINTWISE_ROWS = ("div_full", "div_rn", "rsqrt_ftz", "rsqrt_plain", "ex2", "ex2_ftz", "min_xorsign")
@@ -281,10 +287,137 @@ def run_pointwise(a, b):
 
 
 # ---------------------------------------------------------------------------
+# Row-helper probes and their runners
+# ---------------------------------------------------------------------------
+
+VEC = 8  # elements per thread of the row helpers
+PAD = 8  # sentinel bytes in front of (and behind) the E4M3 code vectors
+BF16, F16 = cutlass.BFloat16, cutlass.Float16
+
+
+@cute.kernel
+def frost_rowwise_scale_probe(amax: cute.Tensor, scale: cute.Tensor, inv: cute.Tensor, n: cutlass.Int32):
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    i = bid * THREADS + tid
+    if i < n:
+        s, r = fp8_dynamic_row_scale(amax[i])
+        scale[i] = s
+        inv[i] = r
+
+
+frost_rowwise_scale_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
+def frost_rowwise_store_e4m3_probe(x: cute.Tensor, inv: cute.Tensor, codes: cute.Tensor, clamp: cutlass.Constexpr[bool], n: cutlass.Int32):
+    """Vector ``i`` = the eight fp32 values ``x[8 i .. 8 i + 7]`` and the multiplier ``inv[i]``; its codes go to the eight bytes at
+    ``PAD + 8 i`` of ``codes``."""
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    i = bid * THREADS + tid
+    if i < n:
+        vals = [x[VEC * i + j] for j in range(VEC)]
+        row_store8_e4m3((codes.iterator + (PAD + VEC * i)).toint(), vals, inv[i], clamp=clamp)
+
+
+frost_rowwise_store_e4m3_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
+def frost_rowwise_load8_probe(src: cute.Tensor, out: cute.Tensor, dtype: cutlass.Constexpr, n: cutlass.Int32):
+    """Vector ``i`` of 16-bit ``src`` widened by ``row_load8`` and written out element by element as fp32."""
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    i = bid * THREADS + tid
+    if i < n:
+        vals = row_load8((src.iterator + VEC * i).toint(), dtype=dtype)
+        for j in cutlass.range_constexpr(VEC):
+            out[VEC * i + j] = vals[j]
+
+
+frost_rowwise_load8_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.kernel
+def frost_rowwise_roundtrip_probe(src: cute.Tensor, dst: cute.Tensor, n: cutlass.Int32):
+    """Vector ``i`` of bf16 ``src`` through ``row_load8`` -> ``row_store8_bf16`` into ``dst``."""
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    i = bid * THREADS + tid
+    if i < n:
+        vals = row_load8((src.iterator + VEC * i).toint(), dtype=BF16)
+        row_store8_bf16((dst.iterator + VEC * i).toint(), vals)
+
+
+frost_rowwise_roundtrip_probe.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _launch_scale(amax: cute.Tensor, scale: cute.Tensor, inv: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+    frost_rowwise_scale_probe(amax, scale, inv, n).launch(grid=((n + THREADS - 1) // THREADS, 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+
+@cute.jit
+def _launch_store_e4m3(x: cute.Tensor, inv: cute.Tensor, codes: cute.Tensor, clamp: cutlass.Constexpr[bool], n: cutlass.Int32, stream: cuda.CUstream):
+    frost_rowwise_store_e4m3_probe(x, inv, codes, clamp, n).launch(grid=((n + THREADS - 1) // THREADS, 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+
+@cute.jit
+def _launch_load8(src: cute.Tensor, out: cute.Tensor, dtype: cutlass.Constexpr, n: cutlass.Int32, stream: cuda.CUstream):
+    frost_rowwise_load8_probe(src, out, dtype, n).launch(grid=((n + THREADS - 1) // THREADS, 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+
+@cute.jit
+def _launch_roundtrip(src: cute.Tensor, dst: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
+    frost_rowwise_roundtrip_probe(src, dst, n).launch(grid=((n + THREADS - 1) // THREADS, 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+
+def run_scale(amax):
+    """``(scale, inv)`` of ``fp8_dynamic_row_scale`` for a contiguous 1-D fp32 CUDA tensor (>= 2 elements)."""
+    scale = torch.full_like(amax, float("nan"))
+    inv = torch.full_like(amax, float("nan"))
+    _run("scale", _launch_scale, (amax, scale, inv), (), amax.numel())
+    return scale, inv
+
+
+def run_store_e4m3(x, inv, *, clamp, sentinel=0xA5):
+    """The code tensor (uint8, ``PAD + 8 n + PAD`` bytes, pre-filled with ``sentinel``) after ``row_store8_e4m3`` of ``n`` vectors:
+    ``x`` is ``[n, 8]`` fp32, ``inv`` ``[n]`` fp32."""
+    n = x.shape[0]
+    codes = torch.full((PAD + VEC * n + PAD,), sentinel, dtype=torch.uint8, device=x.device)
+    _run("store_e4m3", _launch_store_e4m3, (x.reshape(-1), inv, codes), (clamp,), n)
+    return codes
+
+
+def run_load8(src):
+    """``row_load8`` of every eight-element vector of a contiguous 1-D bf16 or fp16 CUDA tensor, as fp32 of the same length."""
+    out = torch.full((src.numel(),), float("nan"), dtype=torch.float32, device=src.device)
+    dtype = BF16 if src.dtype == torch.bfloat16 else F16
+    _run("load8", _launch_load8, (src, out), (dtype,), src.numel() // VEC)
+    return out
+
+
+def run_roundtrip(src):
+    """A bf16 tensor of ``src``'s shape (1-D, contiguous, CUDA, a multiple of eight elements) written by ``row_store8_bf16`` from
+    what ``row_load8`` read."""
+    dst = torch.zeros_like(src)
+    _run("roundtrip", _launch_roundtrip, (src, dst), (), src.numel() // VEC)
+    return dst
+
+
+# ---------------------------------------------------------------------------
 # Renderings: (tag, kind, compile-time arguments, shuffle arm forced).  The test module pins one dict of counts per tag.
 # ---------------------------------------------------------------------------
 
 RENDERS = []
+RENDERS += [
+    ("row_scale", "scale", (), False),
+    ("store_e4m3_clamp", "store_e4m3", (True,), False),
+    ("store_e4m3", "store_e4m3", (False,), False),
+    ("load8_bf16", "load8", (BF16,), False),
+    ("roundtrip", "roundtrip", (), False),
+]
 RENDERS += [
     ("sum_ascending_w4", "sum", (4, "ascending", False), False),
     ("sum_ascending_w20", "sum", (20, "ascending", False), False),
@@ -378,6 +511,14 @@ if __name__ == "__main__":
             return _launch_max_index, [fake(), fake(cutlass.Int32), fake(), fake(cutlass.Int32), *const, cutlass.Int32(1)]
         if kind == "render":
             return _launch_render, [fake(), fake(), *const]
+        if kind == "scale":
+            return _launch_scale, [fake(), fake(), fake(), cutlass.Int32(1)]
+        if kind == "store_e4m3":
+            return _launch_store_e4m3, [fake(), fake(), fake(cutlass.Uint8), *const, cutlass.Int32(1)]
+        if kind == "load8":
+            return _launch_load8, [fake(const[0]), fake(), *const, cutlass.Int32(1)]
+        if kind == "roundtrip":
+            return _launch_roundtrip, [fake(cutlass.BFloat16), fake(cutlass.BFloat16), cutlass.Int32(1)]
         raise ValueError(kind)
 
     for tag, kind, const, shuffle in RENDERS:
