@@ -3788,6 +3788,15 @@ def test_the_norms_twin_and_its_band_on_stated_tensors():
 
     # ---- the 4-bit models at the kernel's points
     assert torch_ref.nvfp4_block_scales(torch.tensor([6.0, 3.0, 0.0, 448.0 * 6 / 32, 1e9]), four.scale).tolist() == [0x60, 0x58, 0x00, 0x7E, 0x7E]
+    # the order of the kernel's two multiplications is part of the byte: at a global scale of 3 these block maxima sit on a rounding
+    # tie of the block scale, which a division by 6, or the product regrouped, breaks the other way
+    ties, third = torch.tensor([0.048828125, 0.09765625, 0.1953125]), 1.0 / 3.0
+    sixth = torch.tensor(torch_ref.FP4_SIXTH_BITS, dtype=torch.int32).view(torch.float32)
+    three = torch_ref.nvfp4_global_scale(third, "cpu")
+    assert float(three) == 3.0 and torch_ref.nvfp4_block_scales(ties, third).tolist() == [13, 21, 29], "e4m3(global x (largest x fp32(1/6)))"
+    from model_samples.weights import _e4m3
+
+    assert _e4m3(three * (ties / 6.0)).tolist() == _e4m3((three * ties) * sixth).tolist() == [12, 20, 28], "neither of these is the kernel's byte"
     y = torch.tensor([[6.0, -6.0, 0.0, -0.0, 1.25, 1.3, -0.25, 0.26, 3.5, 5.0, 2.5, 1.75, 0.75, 9.0, -9.0, 0.1]]).to(bf16)
     low, high = torch_ref.nvfp4_code_bracket(y, torch.tensor([[0x38]], dtype=torch.uint8), 1.0)  # a block scale of 1 at a global scale of 1
     assert low.tolist() == [[7, 15, 0, 8, 2, 3, 8, 1, 5, 6, 4, 3, 1, 7, 15, 0]], "below an exact tie; a zero keeps its sign; saturation at 6"
