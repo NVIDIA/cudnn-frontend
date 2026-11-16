@@ -136,6 +136,9 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
+| `grouped_gemm_srelu_wrapper_sm100` / `GroupedGemmSreluSm100`, BF16 backend | fprop | BF16 A/B, C and D; FP32 prob; FP32 accumulate | Unsupported | Supported (SM103, tested configurations); SM100 unverified | Unsupported |
+| `grouped_gemm_dsrelu_wrapper_sm100` / `GroupedGemmDsreluSm100`, BF16 backend (`deterministic=True`) | bprop | BF16 A/B/C, dZ (`d_row`) and `d_srelu`; FP32 prob and dprob | Unsupported | Supported (SM103, tested configurations, dprob included); SM100 unverified | Unsupported |
+| `grouped_gemm_dsrelu_wrapper_sm100` / `GroupedGemmDsreluSm100`, BF16 backend (default atomic dprob) | bprop | BF16 A/B/C, dZ (`d_row`) and `d_srelu`; FP32 prob and dprob | Unsupported | Not guaranteed (atomic dprob; dZ and `d_srelu` are single writes) | Unsupported |
 
 Exact D256 FP16/BF16 on SM100/SM103 has separate lookahead and swap-AB
 engine entries. The public engine/knob record fixes the main body and Q tile;
@@ -271,6 +274,25 @@ a row alone and inside a batch under the entry's own picks.
   saved C for BF16 and FP16 C/D. The clamped path's approximate `tanh` is not
   bitwise equal to a host `tanh`. Other activations and SM107 are not covered
   by this row.
+
+- `grouped_gemm_srelu_wrapper_sm100` and `grouped_gemm_dsrelu_wrapper_sm100`
+  BF16 backend (and their classes): the forward needs no deterministic mode,
+  since C and D are single writes per element. In the backward, dZ and
+  `d_srelu` are single writes in both modes, but `dprob` is bit-exact run to
+  run only with `deterministic=True`: one FP32 slot per (row, N tile), folded
+  in increasing tile order by a second kernel. The wrapper's default
+  `deterministic=None` follows `torch.use_deterministic_algorithms`;
+  `GroupedGemmDsreluSm100` defaults to `False`, never reads torch's flag, and
+  with `deterministic=True` takes a zeroed `sample_dprob_workspace`. Otherwise
+  the N tiles reach `dprob` through FP32 atomics in completion order. The L0
+  suites check repeated deterministic backward calls, CUDA-graph replay against
+  eager calls and static against dynamic scheduling.
+  `test_grouped_gemm_srelu_bf16_determinism.py` and
+  `test_grouped_gemm_dsrelu_bf16_determinism.py` check replay, batch
+  invariance and goldens, and warm-stress the shared-memory stages the kernels
+  refill (the tile-info ring, and the backward's C stage). They pass on SM103
+  (GB300) with the committed goldens; SM100 is unverified. The BF16 backend
+  runs only on SM100 and SM103.
 
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
