@@ -26,6 +26,12 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
     using output_names = SDPA_fp8_backward_attributes::output_names;
 
    private:
+    error_t
+    collect_sdpa_override_operands_node(SDPAOverrideOperands& operands) const override final {
+        collect_sdpa_override_operands(attributes, operands);
+        return {error_code_t::OK, ""};
+    }
+
     mutable bool is_deterministic_algorithm_supported_on_blackwell = false;  // Will be edited in pre_validate_node()
     // MXFP8 with d_qk == d_v == 256 on Blackwell and Rubin. This shape has NO cuDNN
     // backend plan; it is served only by the frontend-only FROST engines

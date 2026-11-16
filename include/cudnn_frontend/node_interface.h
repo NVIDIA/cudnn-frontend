@@ -34,6 +34,34 @@ namespace graph {
 // uid -> (byte alignment, element bytes) that execute() enforces on the caller's pointer and override strides.
 using AlignedOperands = std::unordered_map<Tensor_attributes::uid_t, std::pair<int64_t, int64_t>>;
 
+// Native SDPA overrides select a subextent of declared storage; they cannot repack it.
+// Snapshots are collected once at lowering, never by walking the graph during execute.
+struct SDPAOverrideGeometry {
+    std::vector<int64_t> dim;
+    std::vector<int64_t> stride;
+    bool ragged_batch = false;
+};
+using SDPAOverrideOperands = std::unordered_map<Tensor_attributes::uid_t, SDPAOverrideGeometry>;
+
+template <typename Attributes>
+inline void
+collect_sdpa_override_operands(Attributes const& attributes, SDPAOverrideOperands& operands) {
+    auto collect = [&](auto const& ports) {
+        for (auto const& [port, tensor] : ports) {
+            CUDNN_FRONTEND_UNUSED(port);
+            if (tensor && !tensor->get_is_virtual() && !tensor->get_is_pass_by_value()) {
+                operands[tensor->get_uid()] = {
+                    tensor->get_dim(), tensor->get_stride(), tensor->get_ragged_offset() != nullptr};
+                if (auto const& offset = tensor->get_ragged_offset(); offset && !offset->get_is_virtual()) {
+                    operands[offset->get_uid()] = {offset->get_dim(), offset->get_stride()};
+                }
+            }
+        }
+    };
+    collect(attributes.inputs);
+    collect(attributes.outputs);
+}
+
 // First dimension (extent > 1, stride != 1) whose byte stride is not a multiple of `alignment`, or -1.
 inline int64_t
 misaligned_stride_dimension(std::vector<int64_t> const& dim,
@@ -172,6 +200,11 @@ class INode {
     collect_tensors_in_workspace_node(
         std::unordered_map<Tensor_attributes::uid_t, std::tuple<int64_t, int64_t, std::vector<float>>>&,
         int64_t&) const {
+        return {error_code_t::OK, ""};
+    }
+
+    virtual error_t
+    collect_sdpa_override_operands_node(SDPAOverrideOperands&) const {
         return {error_code_t::OK, ""};
     }
 
@@ -397,6 +430,15 @@ class INode {
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_node(tensor_to_pass_by_value));
         for (auto const& sub_node : sub_nodes) {
             CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_sdpa_override_operands_subtree(SDPAOverrideOperands& operands) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_sdpa_override_operands_node(operands));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_sdpa_override_operands_subtree(operands));
         }
         return {error_code_t::OK, ""};
     }

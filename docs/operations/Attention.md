@@ -1426,9 +1426,14 @@ g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
   declared buffer this run uses; it neither shrinks the allocation nor re-packs
   the layout, and the strides describe the declared storage. Allocating only the
   run's extent leaves the kernel addressing past the buffer. `override_strides`
-  that differ from the declared strides are accepted but not used: the kernel
-  reads and writes with the declared strides
-  ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)).
+  that differ from the declared strides are rejected for native SDPA before
+  execution, as are dimensions larger than the declaration. Build a new plan
+  for a larger envelope or a different layout. This prevents silent use of the
+  old layout reported in [#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570).
+  Hopper engine 9 also rejects batch changes because it uses the declared
+  batch grid. Other engines retain supported smaller-batch overrides.
+  This check also applies to Stats and backward operands, and to runtime
+  workspace queries. FROST plans retain their own override contract.
 - **The plan is chosen at build time.** `override_*` does not re-run the
   heuristic and does not reselect an engine, so grouping lengths into buckets is
   the caller's policy rather than something this feature does. Two graphs
@@ -1441,7 +1446,18 @@ g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
   argument; capturing a graph populated with a fixed variant pack is a separate
   contract.
 
+Native plans serialized by this frontend preserve the geometry check, including
+plan-only payloads. Older execution-plan caches without this metadata can still
+execute without overrides. Rebuild those caches before passing runtime overrides;
+the frontend cannot determine their original SDPA layout reliably. This also
+applies to old opaque caches of other operations. Newly built and newly serialized
+non-SDPA plans retain their existing override behavior.
+
 ### Boundaries
+
+The following historical backend observations preceded the frontend geometry
+checks above. Changed strides and oversized dimensions now fail in the frontend;
+the remaining observations are not a portable supported-shape guarantee.
 
 Measured on an L20 (SM89), cuDNN 9.26, FP16, `B=1 H=4 D=64`, plan
 `eng8_k24=1_k27=0_k38=0_k40=3_k41=1` for prefill and
