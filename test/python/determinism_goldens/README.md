@@ -4,6 +4,180 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Fixed SM107 quantized backward implementations (2026-11-15)
+
+Per-tensor FP8 engine 20605 and MXFP8 engine 20606 retain their records,
+domains and diagnostic numerical policies. Their bodies, fixed hosts,
+contracts and configuration helpers now live in `sm107/d256_fp8` and
+`sm107/d256_mxfp8`. The 59 moved device definitions have identical ASTs;
+the shared parser, workspace and prepared binding chain are preserved.
+
+On native SM107 with CUDA 13.4 compilation, CuTe DSL 4.8, cuDNN 9.30 and
+Torch 2.14.1+cu130, frozen source `916d60187` produced the following L0
+results. Every frozen source hash and the actual import path were checked.
+
+| Suite under `test/python/sdpa/frost/` | Result |
+|---|---|
+| `test_sdpa_bwd_sm107_quant_implementations.py` | 8 passed |
+| `test_sdpa_bwd_fp8_sm107.py` | 247 passed, 8 skipped, 1 stale classic-admission fixture failed |
+| `test_sdpa_bwd_mxfp8_sm107.py` | 163 passed, 29 skipped |
+| `test_sdpa_bwd_thd_fp8_sm107.py` | 152 passed |
+| `test_sdpa_bwd_thd_mxfp8_sm107.py` | 148 passed |
+
+The 37 skips were 30 unavailable nvdisasm checks, six unavailable historical
+reference dumps and one superseded bring-up placeholder. The admission
+failure was reproduced with the identical assertion on frozen parent
+`42508c7e4` in the same environment. Disabling opt-in no longer removes
+default Python engines, so that test did not reach the classic C++ path it
+intended to exercise. Source `ae13f0299` explicitly withholds Python
+candidates in that test; the native admission test and the existing eight
+head/architecture boundary cases then all passed. The original C++ admission
+assertion remains. This correction changes no production behavior or tolerance.
+
+The eight new cases cover causal D256, S=257, MHA 4/4 and GQA 4/2 with
+BF16 gradients. Both default and diagnostic dS policies are exercised for
+each family. They check reference gradients, requested FP8 gradient/dP amax,
+actual body/profile identity, exported-record rebuild, fresh port bindings,
+input preservation and four poisoned CUDA Graph replays after changing dO.
+All eight passed new golden recording and separate-process strict checking
+under runtime key `22fb9766a4ab5fdc`; no existing golden was replaced.
+
+The strict/control job's final summary command used an unavailable bare
+`python` executable after all pytest processes had finished. Its preserved
+XML confirmed eight strict passes and matching parent/candidate admission
+failures; the summary was recovered without rerunning those GPU tests.
+
+These results qualify the tested fixed-plan repeatability and rebinding
+cases. General batch invariance, other GPU architectures, absent SASS checks
+and cross-runtime byte identity remain unverified. Deterministic-mode
+declarations are unchanged.
+
+### Fixed D256 and D192 half backward implementations (2026-11-15)
+
+The SM107 native D256 and shared SM100/SM107 two-by-two bodies now have
+explicit implementation directories and hosts. Engine 20632 fixes the native
+SM107 body; opt-in 20633 fixes the dense Rubin interleaved profile. SM100
+20607 and SM107 D192/V128 20610 keep their records and shared body. Legacy
+20604 delegates and requires replanning. The 57 moved device definitions
+retain identical ASTs; workspace and reduction order are unchanged.
+
+On CUDA 13.4 compilation, CuTe DSL 4.8, cuDNN 9.30 and Torch 2.14.1+cu130,
+frozen source `42508c7e4` passed the following `-m L0` selections. All source
+hashes and the actual import path were checked before execution.
+
+| Native GPU | Suites under `test/python/sdpa/frost/` | Result |
+|---|---|---|
+| SM107 | `test_sdpa_bwd_dsl_sm107.py`, `test_sdpa_bwd_thd_sm107.py`, `test_sdpa_bwd_d192_sm107.py`, `test_sdpa_bwd_sm107_d256_implementations.py`, `test_sdpa_bwd_sm107_d256_contract.py` | 490 passed, 88 skipped |
+| SM100 B200 | `test_sdpa_bwd_d256_sm100.py`, `test_sdpa_bwd_d192_sm100.py`, `test_sdpa_bwd_thd_d256_sm100.py`, `test_sdpa_bwd_thd_d192_sm100.py`, `test_sdpa_bwd_config_d256_2x2.py` | 405 passed, 26 skipped |
+
+The SM107 skips were 34 fingerprints pinned to DSL 4.7, six unavailable
+historical reference dumps, 46 unavailable nvdisasm checks and two documented
+graph-padding declines. The SM100 skips were 26 nvdisasm checks. The 12 new
+native record tests exercised FP16/BF16, dense GQA and causal MHA/GQA, actual
+body/profile identity, public-record rebuild despite legacy half switches,
+fresh bindings and changed-input CUDA Graph replay.
+
+`test_sdpa_bwd_d256_implementation_determinism.py` at source `d96a3583e`
+adds 20 bounded cases: 12 on SM107 (20632, 20633 and D192/V128 20610), eight
+on SM100 (D256/D256 and D192/V128 20607). Every case uses FP16 or BF16,
+causal S=257 and MHA 4/4 or GQA 4/2. It checks all gradients against an
+FP64 reference, finite results, unmodified inputs, fresh poisoned buffers,
+eight executions with concurrent work, batch size one versus three, reordered
+and duplicated sequences, and changed neighbor gradients. An initial test
+incorrectly bound FP64 oracle Stats; the corrected test binds FP32 Stats
+without changing production or tolerance.
+
+All 20 cases passed through new golden recording, then all passed in a
+separate process with recording disabled and strict checking enabled. The
+new records use runtime keys `c8aefc970ef3af15` (SM100) and `22fb9766a4ab5fdc` (SM107);
+no existing golden was replaced. Other-architecture parameter cases are
+explicitly skipped in each lane. These are tested-configuration results:
+general batch invariance, SM103 and the existing L1 stress cases are not
+newly qualified. Existing graph deterministic-mode declarations are unchanged.
+
+An additional CPU-only differential run selected L0 cases across every
+`test/python/sdpa` file, excluding PTX/SASS/render/compile/cubin test names.
+It used no CUDA device and `--noconftest` to inspect host consumers across
+the tree. Candidate/parent passed 11,479/11,470 cases and had identical
+14,779 call/setup failure IDs and 16 collection-error IDs; no candidate-only
+failure was introduced. The 65 differing traces contained the same
+CUDA-unavailable error messages, with changed source lines or relocated
+adapter paths. The additional nine passes are the new fixed-owner host
+contracts; 32 additional native cases were skipped without a GPU. This
+differential audit is not a green full-suite runtime result.
+
+### Fixed SM107 D512 backward implementation (2026-11-15)
+
+Engine 20608 retains its public record, the D264–D512 aligned envelope,
+workspace and reduction order. Its body, host, contract and fixed ring
+configuration now live together in `sm107/d512_f16_2x2`; the old adapter
+module re-exports the same class. All 31 moved device function/class ASTs
+are unchanged. The graph still declines deterministic mode and packed THD.
+
+On native cc 10.7 with cuDNN 9.30, CuTe DSL 4.8, CUDA 13.4 compilation and
+Torch 2.14.1+cu130, frozen source `8abfcd5b8` passed the following selections.
+The exact import path, compiler target and all frozen source hashes were
+checked before pytest. Run these files from `test/python` with `-m L0`:
+
+| Suite in `sdpa/frost/` | Result |
+|---|---|
+| `test_sdpa_bwd_d512_sm107.py` | 104 passed; 2 SASS checks skipped because nvdisasm was unavailable |
+| `test_sdpa_bwd_sm107_d512_implementation.py` | 6 passed: FP16/BF16, D384 GQA and D512 MHA/GQA, public record rebuild, fresh bindings and changed-input CUDA Graph replay |
+| `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_explicit_engines.py`, `test_sdpa_bwd_heuristics.py` | 269 host-contract checks passed on the GPU worker |
+
+After integrating the D128 pair parent, source `ecbdf5e8b` added
+`test_sdpa_bwd_sm107_d512_determinism.py`. Its four FP16/BF16 cases use
+D384 GQA (4/2 heads) and D512 MHA (4/4), causal S=257. Each checks all three
+gradients against a separate reference, finite results, unmodified inputs,
+fresh poisoned storage and eight replays with concurrent work. It compares
+the same sequence alone, in a batch of three, reordered and duplicated,
+and after changing only a neighbor's upstream gradient.
+
+All four cases passed before recording new goldens. A separate process then
+passed all four again with `CUDNN_DETERMINISM_RECORD` unset and
+`CUDNN_DETERMINISM_GOLDENS` pointing at the new records. The reviewed files
+are under runtime key `22fb9766a4ab5fdc`; no existing golden was replaced.
+The production implementation is identical between these two snapshots.
+
+These checks establish repeatability and batch isolation for the tested
+configurations, not general batch invariance across the engine's domain.
+Other GPU targets, the two SASS checks and the existing L1 time-slicing
+stress were not qualified by these runs. The existing L0 delayed-empty
+observer detector passed without changing its assertions.
+
+### Explicit SM100 D512 half backward owners (2026-11-15)
+
+The role-split and 2x2 bodies moved without executable AST changes. Fixed
+hosts name the body, parameter record and artifact independently; both retain
+the shared native binder's overlap checks. The legacy graph record declines,
+and the ordinary default remains role split. No numerical golden changed.
+
+On SM100, cuDNN 9.30, CuTe DSL 4.8 and CUDA 13.4 compilation, a frozen source
+snapshot passed the following selections. The loaded source was checked in
+each process. Run from `test/python` with `-m L0`; paths below are under
+`sdpa/frost/`. Counts include host contracts and must not be presented as
+counts of native numerical cases.
+
+| Selection | Result |
+|---|---|
+| `test_sdpa_bwd_config_sm100_2x2.py`; `test_sdpa_bwd_d512_explicit_engines.py`; `test_sdpa_bwd_heuristics.py`; `test_sdpa_bwd_explicit_engines.py` | 659 passed, including four native public-record rebuild/refusal checks |
+| `test_sdpa_bwd_dsl_sm100.py`: `test_dense`, `test_causal_dtypes`, `test_head_dim_band`, `test_gqa_mqa`, `test_deterministic_request_is_bitwise_across_launches`, `test_prepared_sm100_rebind_stream_and_replay`, both `test_prepared_backward_artifact_reloads_in_fresh_process` variants, `test_stage2_2x2_is_bitwise_the_role_split` | 62 passed |
+| `test_sdpa_bwd_thd_sm100.py`: `test_graph_thd_self_attention`, `test_graph_thd_cross_attention`, `test_graph_thd_stats_packings`, `test_graph_thd_zero_length_sequence`, `test_graph_thd_gqa`, `test_graph_thd_causal`, `test_graph_thd_causal_bottom_right`; `test_sdpa_bwd_thd_origins_sm100.py` | 45 passed |
+| `test_band_capabilities.py`; `test_sdpa_graph_analyzer.py`; `test_sdpa_bwd_native_layouts_sm100.py` | 692 passed, 8 skipped because only one CUDA device was allocated |
+| `test_sdpa_bwd_dsl_sm100.py`: `test_stage2_2x2_debug_clk_dump_accounts_the_waits`, `test_stage2_4x1_debug_clk_dump_accounts_the_waits`, `test_stage2_2x2_waits_for_delayed_empty_observer`, `test_stage2_2x2_sass_pins` | 8 passed; the SASS checks include cross-target compilation, not SM107 execution |
+
+The two pytest summaries were **766 passed, 74 deselected** and
+**700 passed, 8 skipped**. The deselections retain the suites' L1 cases.
+Both public owner records rebuild the same body with opposite legacy-switch
+values and compare all three gradient outputs as raw bits. Existing dense
+and packed suites retain independent references, poisoned storage, fresh
+bindings, capture/replay, GQA and physical-origin checks. Standalone fixed
+hosts had separately passed 16 dense/replay and D384/Stats-packing cases.
+
+This establishes repeatability for the tested records. General batch
+invariance, SM103 execution and multi-device execution remain unverified by
+this run; existing support claims elsewhere keep their original scope.
+
 ### Forward SDPA body retirement (2026-11-15)
 
 The retirement candidate redirects standalone and retained envelope routes
@@ -633,6 +807,723 @@ startup logs are retained separately from the successful qualification.
 Compatibility, docstring, compile-cache, CUDA Graph and fence audits pass.
 Changed-file pre-commit and syntax checks pass; Fern validation has zero
 errors (the unauthenticated redirect check is skipped).
+
+### KDA independent-head workspace reuse — B300, 2026-11-14
+
+This follow-up starts from `03ed4530337c3e9bd01565b493d99d66a1c6924d`,
+the compact-piece change described above. It targets the KDA layer's complete
+input/output/gradient/transport/workspace peak. The earlier complete KDA+CSA
+table is a different measurement and is not used for the below-20-GB claim.
+The published change is rebased onto develop
+`3fa2cfb38f6b278e1ab2de2eb26c40f2bfa3f560`, whose linear-attention sources
+are byte-identical to that measured baseline.
+
+A large backward plan partitions independent heads into two or four waves.
+Each wave keeps the original sequence pieces, BT16 recurrence and checkpoint
+cadence. Internal state/checkpoint head coordinates are compact; caller states,
+CP summaries, gradients and saved contexts retain their original layouts.
+Grouped-head and gate-parameter reductions keep their order after all waves.
+No dtype, precision default, numerical threshold or golden is changed.
+
+The H/G region is shared across their non-overlapping lifetimes. Once both
+state chains finish, the combined H/G+M arena holds the checkpoint series.
+X/dX remain disjoint and live until backward consumes them. Document-dense
+ranks can partition all owned states as well as checkpoints. This second mode
+is disabled with an external context. Caller/coarse checkpoints retain their
+full-head ABI. The original row tables remain immutable: wave counts use a
+separate two-element buffer because the original counts alias terminal row
+entries. Every regenerated queue row has exactly one writer. The main queues place
+pieces with at least 512 tokens (BT16) before shorter pieces, reducing the tail
+of the persistent schedule. A CTA prefix scan assigns disjoint destinations
+from the two ends of the queue. Partial rounds participate with zero counts;
+two blocking CTA barriers publish and retire the eight warp counts. Queue
+ordering changes no task identity, chunk bounds or floating-point operation.
+
+The shape-only policy has a 5 GiB checkpoint/state capacity preference and
+an occupancy guard. It is not a universal memory limit for every head size,
+external state or unbounded document count. The added compile-key combinations
+are (checkpoint divisor, state divisor) = (1,1), (2,1), (4,1), (2,2), (4,4).
+The compile-count detector requires exactly four new artifacts across three
+ragged capacities for the four nontrivial combinations. Warm prepared execution
+retains the existing stream/capture contract and adds no allocation or length
+readback.
+
+Qualification on B300, driver 580.173.02, Torch 2.12.1+cu130 and cuDNN 9.20.0:
+
+- **60 new non-stress tests pass**: 48 BF16/FP16 log/safe-gate cases across
+  equal/GQA/GVA heads, both divisors and both storage modes; two policy/cache
+  tests; two rectangular K/V cases, two external-context geometries, two
+  non-invariant chain cases, two queue identity/partition cases and two
+  standalone default state-chain ABI cases with CPU FP64 references.
+  They compare all input/state/parameter gradients, canaries, poisoned native
+  graph replay and changed input/length data at stable addresses.
+- **71 existing tests pass**, including 28 determinism/golden/reference cases,
+  the compact-piece regressions, and four GDN/GDN2 long-sequence checks
+  of the shared chain default. The standalone default tests also pass on the
+  unchanged parent. Existing numerical tolerances and goldens are unchanged.
+- **16 equal-head cases pass in each additional compiler lane**:
+  CuTeDSL 4.8.0 with CUDA compiler 12.9/13.4, and 4.8.1 with compiler 12.9.
+  The main 60-case lane uses 4.8.1/compiler 13.4. CUDA 13 dependencies use
+  `nvidia-cutlass-dsl[cu13]`. All four lanes use the final v7 kernel sources,
+  including long-first queue scheduling; the extra lanes explicitly force both
+  divisors. CUDA 12 compiler testing does not qualify a fully CUDA 12 framework
+  deployment.
+- **6,000 warm/poisoned native graph executions pass** (3,000 of each), with
+  the unsafe control failing 200/200. The deliberately two-CTA grid forces
+  scheduler wrapping; it is not full-occupancy stress evidence.
+- **Memcheck, Synccheck and Racecheck each pass three cases** (one full-state
+  wave and both direct queue-partition divisors),
+  including changed-metadata capture replay, with zero errors/hazards. No
+  kernel or API-error filtering is used. This sanitizer lane sets
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`: the ordinary expandable
+  allocator reports a recoverable `cuMemCreate` permission failure under
+  instrumentation. An independent Torch-only program reproduces the two API
+  errors with expandable allocation and reports zero with regular allocation.
+  Numerical/performance runs retain their original allocator settings.
+- Actual generated code covers 13 queue/chain prerequisite waits and retains
+  100 scheduler release dependencies in 20 summary/recompute bodies across
+  five rendered hosts. PTX data-flow checks and SASS mask/address/arrival
+  checks pass. Backward's existing SMEM handoffs are unchanged; this review's
+  new ownership edges are the inter-kernel queues, phase-arena reuse and
+  generic shared-memory prefix counts. The three emitted queue kernels retain
+  shared stores → `barrier.sync` → shared loads → `barrier.sync` before reuse.
+  A follow-up SASS operand audit additionally verifies that all eight words
+  from the two `LDS.128` instructions are consumed before the retirement
+  barrier, including the eighth count used only in the total. The consumption
+  precedes the valid-row branch, so tail lanes are covered. Barrier placement
+  alone would not prove this obligation; no extra fence was added to the
+  unchanged numerical kernels.
+
+The 2026-11-14 line-by-line review adds **six boundary tests**, all passing on
+the same B300 / DSL 4.8.1 / compiler 13.4 environment in 306.15 s (51 deselected,
+no failures or skips). The seven production files are unchanged from the
+original qualification; the earlier test totals above are retained evidence,
+not a new rerun of those suites.
+
+- Four runtime-head tests compare all backward outputs with the unsplit D=1
+  reference for 16 shape/configuration pairs, including 6 and 12 heads. Both
+  storage modes and divisors are covered. Each case retains exactly two
+  compiled launch objects (D=1 and its wave configuration) as head count changes;
+  all comparisons are byte-identical and workspace canaries remain intact.
+- Two independent-stream tests use separate preallocated workspaces, explicit
+  handles/streams and captured graphs sharing compiled code. Each stream runs
+  64 poisoned replays per storage mode: 256 replays total. Both streams are
+  submitted before waiting, with comparisons every eight replays. All gradient
+  bytes match the D=1 reference, input ports remain unchanged, and all canaries
+  pass. This covers concurrent submissions; it does not claim a measured
+  percentage of hardware overlap or permit shared workspace across streams.
+
+Run only these additions with:
+
+```bash
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -x -rs -k 'runtime_heads or independent_streams'
+```
+
+Reproduce the new checks from `test/python`:
+
+```bash
+export CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -rs -k 'not warm_stress'
+python -m pytest linear_attention/frost/test_kda_wave_boundaries.py -q -rs
+python -m pytest linear_attention/frost/test_kda_wave_queues.py -q -rs
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -s -k warm_stress
+for tool in memcheck synccheck racecheck; do
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+    compute-sanitizer --tool "$tool" --error-exitcode 99 \
+    python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py \
+    linear_attention/frost/test_kda_wave_queues.py -q -rs \
+    -k 'test_wave_queue_identity or (all-states and equal and bf16-log-d64 and 2)'
+done
+```
+
+The first non-invariant fixture failed its routing assertion because its
+oversubscribed SM103 shape selected the uncut path. Reducing its nominal
+sequence/head grid selects the ordinary chain and both cases pass; no production
+routing or numerical threshold was changed. Earlier failed/interrupted runs
+are retained separately and are not counted as passes.
+
+The additional memory/replay measurements are B300-only. No new H20, B200 or
+SM107 result is claimed, and Hopper code is unchanged.
+
+Final real CP8 measurements use eight B300 devices, 1,048,576 total tokens,
+131,072 tokens per rank, H32/K128/V128, BF16 Q/K/V/dO and FP32 gates, beta,
+their gradients and CP merge. `batch_invariant=True` in both arms. Each case
+runs the parent and candidate in separate fresh processes, three warmups and
+31 measured iterations per arm. Time is the median of the per-iteration
+maximum-rank forward+backward time; memory is the maximum over ranks and
+measured iterations. The region includes KDA and boundary communication;
+one-time CPU planning/JIT, validation and hashing are excluded. This is eager
+execution, not a CUDA Graph performance measurement.
+
+All inputs, outputs, gradients, CP transport tensors and workspace contribute
+to the allocated peak. Peak counters are reset before releasing the preceding
+iteration's gradients, so the iteration transition is included. The reference
+already includes #2574's compact-piece optimization. Both arms use the same
+existing cuLA integration snapshot, including its pre-existing worktree changes;
+no pristine cuLA commit or new cuLA change is claimed. The CP harness is separate
+from this repository; the native regression commands above are self-contained.
+
+| Global THD token lengths | Allocated GiB, before → after | Reserved GiB, before → after | F+B ms, before → after | Change |
+| --- | ---: | ---: | ---: | ---: |
+| 2,048 × 512 | 22.998 → 17.271 | 23.596 → 17.869 | 13.520 → 13.562 | +0.31% |
+| 1,024 × (480, 544) | 22.998 → 17.271 | 23.596 → 17.869 | 13.610 → 13.550 | -0.44% |
+| 2,047 × 256 + 524,544 | 25.754 → 17.372 | 26.850 → 18.467 | 29.551 → 29.639 | +0.30% |
+| 1,536 × 64, then 512 × 1,856 | 36.953 → 17.256 | 42.158 → 17.270 | 22.071 → 22.813 | +3.36% |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 28.990 → 18.108 | 29.850 → 18.969 | 18.002 → 18.381 | +2.11% |
+| 4,096 × 256 | 25.749 → 17.366 | 26.848 → 18.465 | 14.851 → 15.109 | +1.74% |
+| 8,192 × 128 | 31.252 → 18.619 | 33.352 → 20.719 | 17.500 → 17.902 | +2.29% |
+| one 1M, weak gate | 20.285 → 16.215 | 21.219 → 17.148 | 29.511 → 29.766 | +0.86% |
+
+The maximum allocated footprint is **19.992 decimal GB**
+(18.619 GiB), below 20,000,000,000 bytes for all eight measured cases.
+The maximum allocator reservation is **22.247 decimal GB**
+(20.719 GiB), which is **not below 20 GB**. These Torch counters do
+not include driver/context allocations or every NCCL allocation. The claim is
+about the live KDA tensor/workspace footprint, not a process-wide reservation
+ceiling, a whole-model footprint or a universal limit for arbitrary THD layouts.
+
+The sensitive middle-skew case also passes a second round with candidate-first
+order: 17.955 → 18.352 ms
+(+2.21%). The largest measured latency regression across
+the table and this repeat is **3.36%**. Full-tensor SHA256 records match
+for all six inputs and O/dQ/dK/dV/dG/dBeta on all eight ranks, in every paired
+case and the reversed-order repeat. Hashing is outside the timed region.
+The weak-gate control uses one 1M document with gates scaled by 0.01.
+
+The expanded low-document matrix on the same unchanged production code exposes
+a performance exception: global **256 × 4K** at real CP8 takes
+12.663 → 13.557 ms (**+7.06%**), reproduced with candidate-first arm order at
+12.656 → 13.563 ms (**+7.16%**). All output and input-gradient byte hashes still
+match on every rank. Disabling head waves diagnostically recovers latency to
+12.659 ms, but raises candidate allocated memory from 16.285 to 20.309 GiB.
+This is not a production fix. The initial eight-case table remains valid, but
+the <=5% criterion is **not met over the expanded coverage**; PR #2577 remains
+Draft pending a scheduling-policy improvement. The full 13-case matrix and
+Nsight Systems attribution are retained in the PR description.
+
+Compatibility, docstring, compile-cache, CUDA Graph and fence audits pass.
+Changed-file pre-commit and syntax checks pass; Fern reports zero errors and
+one warning because unauthenticated redirect checking is unavailable.
+
+
+### H96 KDA workspace qualification — B300 CP8, 2026-11-14
+
+This follow-up retains the preceding baseline/candidate production sources and
+measurement method, increasing equal Q/K/V heads from 32 to **96 per rank**.
+Global THD length is 1,048,576, local length 131,072, K=V=128, BF16 Q/K/V/dO,
+FP32 gates/beta/CP merge, and batch invariance enabled. Every arm is a fresh
+process with three warmups and 31 measured forward+backward iterations, including
+CP boundary communication. Arm order alternates across the ten cases. This is
+KDA only; input construction, planning/JIT and full-tensor hashing are outside
+the timed region.
+
+| Global THD lengths | F+B ms, before → after | Change | Allocated GiB, before → after | Candidate reserved GiB |
+| --- | ---: | ---: | ---: | ---: |
+| 256 × 4,096 | 37.116 → 39.419 | +6.21% | 61.746 → 42.797 | 42.801 |
+| one 1M | 81.786 → 84.159 | +2.90% | 60.832 → 42.609 | 45.406 |
+| 20 × 1,024 + 2 × 514,048 | 90.681 → 94.813 | +4.56% | 61.409 → 42.678 | 45.406 |
+| 2,048 × 512 | 39.621 → 40.103 | +1.22% | 68.967 → 43.198 | 44.986 |
+| 1,024 × (480, 544) | 39.803 → 40.006 | +0.51% | 68.967 → 43.198 | 44.986 |
+| 2,047 × 256 + 524,544 | 80.328 → 83.474 | +3.92% | 77.238 → 44.155 | 47.434 |
+| 1,536 × 64; 512 × 1,856 | 63.007 → 64.648 | +2.60% | 110.828 → 51.764 | 51.801 |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 51.539 → 52.565 | +1.99% | 86.941 → 45.261 | 56.895 |
+| 4,096 × 256 | 43.442 → 43.956 | +1.18% | 77.221 → 44.138 | 47.428 |
+| 8,192 × 128 | 50.920 → 51.918 | +1.96% | 93.725 → 46.018 | 52.312 |
+
+All ten pairs have identical full-tensor hashes for the six inputs and
+O/dQ/dK/dV/dG/dBeta on every rank, with finite outputs/gradients. All seven
+loaded production-module hashes match the qualified source manifests.
+Allocated memory decreases **29.96–53.29%**. Nine cases stay within 5% latency
+regression in this round; **256 × 4K regresses 6.21%**. This exception retains
+the PR's Draft status rather than widening the acceptance threshold.
+
+Both cases with at least 4.5% first-round regression were repeated in reverse
+arm order (candidate first), again with three warmups and 31 samples:
+
+| Global THD lengths | F+B ms, baseline → candidate | Change | Byte equality |
+| --- | ---: | ---: | --- |
+| 256 × 4,096 | 37.122 → 39.374 | +6.07% | all ranks, outputs and input gradients |
+| 20 × 1,024 + 2 × 514,048 | 90.712 → 94.801 | +4.51% | all ranks, outputs and input gradients |
+
+The memory peaks are unchanged. The first case remains above the 5% target;
+this H96 follow-up also leaves the earlier H32 7.06% / 7.16% exception unresolved.
+
+The candidate uses four checkpoint waves throughout. Document-dense ranks also
+use four state waves; long-document ranks retain full-head states. Mixed
+layouts can therefore select (4,4) and (4,1) on different ranks. The table
+reports the median of per-iteration maximum-rank F+B and the memory maximum
+across ranks/iterations, not an average that hides imbalance.
+
+H96 inputs, outputs and gradients alone occupy approximately **36.094 GiB /
+38.755 decimal GB per rank**, before transport or workspace. The H32 below-20-GB
+result does not extend to this H96 configuration. Candidate allocated peaks
+range from 42.609 to 51.764 GiB; the largest reservation is 56.895 GiB.
+These are Torch counters, not process-wide VRAM caps. No new H20/SM90, SM100
+or SM107 result is implied.
+
+The native test follow-up uses BF16/log-gate **D64**, with FP32 gates and
+initial/final states; the CP8 performance matrix above uses **K=V=128**.
+The same runtime as the preceding qualification is retained: Torch 2.12.1+cu130,
+cuDNN 9.20.0, CuTeDSL 4.8.1/compiler 13.4 and driver 580.173.02. Run from
+`test/python` with an explicit handle bound to each capture stream:
+
+```bash
+CUDNN_TEST_NO_ISOLATION=1 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+python -m pytest linear_attention/frost/test_kda_checkpoint_waves.py -q -x -rs -k 'runtime_heads or (independent_streams and h96)'
+```
+
+**6 passed, 53 deselected, 2 warnings in 315.64 s**, with no failures or skips.
+The warnings are Torch's `torch.jit.script` deprecation. Four runtime-head
+cases now cover 20 shape/configuration pairs, including H96 for both divisors
+and both storage modes, while reusing the same two compiled launch objects
+per case. Two H96 independent-stream cases run 64 poisoned CUDA Graph replays
+per stream and storage mode: **256 total**, comparing every eight replays.
+All backward outputs match the unsplit D=1 path byte for byte; input immutability
+and workspace canaries pass. Concurrent submission does not measure hardware
+overlap or permit sharing a workspace across streams.
+
+All seven loaded production-module hashes and the executed test-source hash
+were checked against the local source. This follow-up changes tests and
+documentation only; production kernels remain byte-identical to `a19c476d`.
+No numerical tolerance or golden changed. Earlier sanitizer and warm-stress
+results remain retained evidence, not H96 reruns. Compatibility audit: passed
+for the added head-count/storage-mode checks. Docstring audit: passed for the
+unchanged production surface.
+
+### Additional H96 workspace reduction — B300 CP8, 2026-11-14
+
+This follow-up compares against the preceding qualified memory-optimized
+parent `e74a4ced` (production `a19c476d`). It retains the H96-per-rank,
+K=V=128, real CP8, 1M global THD configuration and all-resident measurement
+method above (warmed eager F+B; CUDA Graph is tested separately). Forward reuses private FP32 H/M/X in at most two head waves.
+Backward may use eight waves only when the memory trigger is met and each
+wave has at least four planned piece/head tasks per SM; few long documents
+retain more head parallelism. This shape-only estimate is neither an
+occupancy guarantee nor a hard memory cap.
+
+| Global THD lengths | F+B ms, parent → new | Change | Allocated GiB, parent → new | New reserved GiB |
+| --- | ---: | ---: | ---: | ---: |
+| 256 × 4,096 | 39.419 → 39.369 | -0.13% | 42.797 → 42.797 | 42.801 |
+| one 1M | 84.159 → 84.114 | -0.05% | 42.609 → 42.609 | 45.406 |
+| 20 × 1,024 + 2 × 514,048 | 94.813 → 94.791 | -0.02% | 42.678 → 42.678 | 45.406 |
+| 2,048 × 512 | 40.103 → 40.791 | +1.72% | 43.198 → 39.700 | 41.488 |
+| 1,024 × (480, 544) | 40.006 → 40.702 | +1.74% | 43.198 → 39.700 | 41.488 |
+| 2,047 × 256 + 524,544 | 83.474 → 83.471 | -0.00% | 44.155 → 42.609 | 45.406 |
+| 1,536 × 64; 512 × 1,856 | 64.648 → 66.416 | +2.73% | 51.764 → 42.107 | 49.818 |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 52.565 → 53.782 | +2.31% | 45.261 → 40.743 | 46.572 |
+| 4,096 × 256 | 43.956 → 44.813 | +1.95% | 44.138 → 40.171 | 41.820 |
+| 8,192 × 128 | 51.918 → 53.363 | +2.78% | 46.018 → 41.114 | 49.195 |
+
+All ten cases preserve the six input hashes and full O/dQ/dK/dV/dG/dBeta
+hashes on all eight ranks. Every output/gradient is finite, and the ten
+loaded production-module hashes match the measured snapshot. The allocated
+range becomes **39.700–42.797 GiB**, versus **42.609–51.764 GiB** for the
+parent; maximum additional latency is **2.78%** in this matrix. The worst
+skewed case saves **9.657 GiB / 18.66%**. The unchanged all-resident tensors
+alone still require about **36.094 GiB** before transport or workspace.
+Reservations are Torch allocator high-water marks, not a cuDNN-owned pool
+or a process-wide memory cap.
+
+An unguarded eight-wave prototype was rejected: one long document, mixed22
+and the 2,048-document long-tail case regressed 11.48%, 8.98% and 12.25%
+relative to the parent. The final policy protects these long-document ranks.
+Against the *original unoptimized* baseline, the selected implementation
+still has +6.07% at 256 × 4K and +5.41% at the first skewed case. Thus this
+follow-up does not meet the original all-case 5% PR acceptance criterion;
+the prior H32 exception is not resolved or rerun.
+
+The final source additionally moves kernel-name registration into the shared
+queue module, with a prefix regression, so forward import order does not
+depend on a backward caller. All function/class ASTs remain identical to
+the ten-case measured implementation after that naming-only correction.
+No arithmetic, dtype, reduction order, public tensor layout, numerical
+tolerance or golden changed. Runtime head/piece extents remain symbolic;
+the new compile axis is the bounded divisor.
+
+Final-source native runs use the same Torch 2.12.1+cu130, cuDNN 9.20.0,
+CuTeDSL 4.8.1/compiler 13.4 runtime as above. Commands from `test/python`:
+
+```bash
+python -m pytest -q -x -rs linear_attention/frost/test_kda_forward_waves.py \
+  core/frost/test_frost_kernel_name_prefix.py -k 'forward or kda_head_wave'
+python -m pytest -q -x -rs linear_attention/frost/test_kda_checkpoint_waves.py \
+  -k '(bitwise_and_capture and (equal-8 or gqa-8 or gva-8)) or capacity_policy or (runtime_heads and 8)'
+```
+
+With `CUDNN_TEST_NO_ISOLATION=1` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`, the
+forward/prefix selection reports **18 passed, 4 deselected, 2 warnings in
+413.10 s**; backward reports **27 passed, 58 deselected, 2 warnings in
+449.21 s**, with no failures or skips. Warnings are the existing Torch JIT
+deprecation. Forward covers BF16/FP16, log/safe gates, equal/grouped heads,
+rectangular states, empty/ragged sequences, poisoned capture replay,
+changed prefixes and public checkpoints plus all autograd gradients.
+Runtime-head checks reuse the same two compiled launch objects across head
+counts, including H96. Backward covers eight-wave checkpoint-only and
+owned-state modes, safe/log gates, FP16/BF16, equal/grouped heads, changed
+prefixes and H96 runtime-head reuse.
+
+The forward warm stress completes 3,000 warm and 3,000 SMEM-poisoned launches
+with zero wrong bytes; its unsafe control fails 200/200. The target forces
+**two total CTAs** to exercise repeated work, below the control's three CTAs
+per SM. This is a limited race-rate check, not proof of safety for arbitrary
+scheduling. Input immutability and workspace canaries also pass.
+
+The first backward selection aborted because a newly expanded fixture forced
+eight waves on only four heads. The fixture now sizes equal/grouped/safe-gate
+operands consistently using `max(4, divisor)`; production selection already
+requires divisibility. Its exit-134 log is retained and not counted as a pass.
+The corrected run uses a fresh compiled-cache directory. Superseded V1/V2
+incomplete native runs likewise are not counted.
+
+Compute Sanitizer 13.4 runs the BF16/log D64 forward two-wave capture case
+and the backward eight-wave owned-state capture case, including changed
+prefixes. Each tool reports **2 passed**, no skips: Memcheck **0 errors**
+(79.33 s), Synccheck **0 errors** (86.60 s), Racecheck **0 hazards, 0 errors,
+0 warnings** (1818.23 s). No kernel/API filtering is used. The instrumentation
+lane uses `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` for the
+previously isolated allocator/tool incompatibility; ordinary measurements
+retain their original allocator settings. These are D64 checks, not a
+sanitized CP8 1M run.
+
+Fresh-process paired repeats use the final production source, three warmups
+and 31 timed iterations per arm. Arm order is parent→candidate for mixed22
+and uniform8192, candidate→parent for skew2048. These are timing-only repeats:
+finite, geometry and all loaded source hashes are checked; full-tensor byte
+parity is supplied by the ten-case matrix and native tests above.
+
+| Layout | F+B ms, parent → final | Change | Allocated GiB, parent → final |
+| --- | ---: | ---: | ---: |
+| low-mixed22 | 94.637 → 94.812 | +0.18% | 42.678 → 42.678 |
+| skew2048 | 64.607 → 66.318 | +2.65% | 51.764 → 42.107 |
+| uniform8192 | 51.921 → 53.371 | +2.79% | 46.018 → 41.114 |
+
+The memory peaks are unchanged from the primary matrix.
+
+The final forward fixture additionally changes V and G in place alongside
+the THD prefixes, verifying that replay rebuilds both H and M from current
+values. The complete forward/prefix selection was rerun: **18 passed,
+4 deselected, 2 warnings in 177.69 s**, no failures or skips. It again completes
+3,000 warm and 3,000 poisoned launches with zero wrong bytes and an unsafe
+control of 200/200; the same two-CTA coverage limitation applies. Production
+source is unchanged by this additional test. All eight changed source/test
+files were matched against the final remote snapshot.
+
+Changed-file pre-commit and Python compilation checks pass. Fern reports
+zero errors and one warning because the unauthenticated redirects check is
+skipped. No public API or dependency requirement changed.
+
+No new H20/SM90, SM100, SM107, CSA or full-model result is implied. Earlier
+independent-stream two/four-wave backward evidence remains retained, not an
+eight-wave or forward concurrency rerun. Compile-cache and CUDA Graph audits:
+passed for the exercised runtime-head, prefix and replay configurations;
+other architectures remain unverified for this addition.
+
+### H96 exact state reuse and dense-THD workspace — SM100 CP4, 2026-11-15
+
+This experiment branches from `a1de8974`. The budget is now **workspace only**:
+external Q/K/V/G/Beta/dO, output and input gradients are excluded. Earlier
+all-resident H96 figures above must not be interpreted as workspace figures.
+The target is decimal 20 GB (18.626 GiB).
+
+Forward H and X use exactly the same FP32 region. A row-owning lane loads its
+H vector before storing X, in one inline PTX block with named temporary
+registers. M remains separate; no other lane reads that H vector. This saves
+one of three forward state arrays for square K/V without extra launches.
+Normal shapes retain one/two forward waves. Above 16 GiB of live state per
+wave, four/eight waves are allowed only with at least four planned tasks per
+SM. Backward can additionally use sixteen waves above a conservative 128 GiB
+full-arena estimate, with the same task guard. These are bounded shape
+policies, not occupancy guarantees or a universal workspace cap.
+
+Per-head recurrence, arithmetic order, chunking, FP32 states and CP merge,
+public tensor layouts, coarse checkpoints and numerical tolerances are
+unchanged. No golden is updated. The existing compile-key divisor domain is
+bounded; token counts, sequence prefixes, pointer values and runtime head
+counts do not become new specialization axes.
+
+#### Measurement
+
+The specified four-GPU environment runs real CP4, global 1,048,576 tokens,
+262,144 tokens per rank, H96 per rank, K=V=128, BF16 Q/K/V/dO, FP32 gates and
+states, and `batch_invariant=True`. The same cuLA working-package snapshot
+is used by both arms. It includes pre-existing contiguous CP summary and
+backward context-range fixes; no cuLA source is changed in this branch.
+
+Each case starts in a fresh process: three warmups and fifteen eager F+B
+iterations, including CP boundary communication when needed. Latency is the
+median of the per-iteration slowest rank. Planning, compilation, random input
+creation and hashing are excluded. Full input and O/dQ/dK/dV/dG/dBeta hashes
+are compared per rank. Source-module hashes and loaded runtime are recorded.
+
+Native workspace is the exact requested per-graph buffer size. A separate,
+untimed audit samples active internal allocations at every cuDNN execution,
+subtracting deduplicated external I/O storage live at that phase; it includes
+summary/context and Torch-owned CP transport. This is an execution-boundary
+sample, not an allocation-event trace or a whole-device/NCCL allocation cap.
+Allocator reservations are reported separately. CUDA Graph is checked for
+correctness, not used for these performance measurements.
+
+All memory values below are decimal GB. Layouts are in packed document order;
+`n × length` denotes n documents. Every row has full per-rank byte parity.
+
+| Global THD layout | Native workspace GB, parent → candidate | Sampled internal GB, parent → candidate | F+B ms, parent → candidate | Latency change |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 1,048,576 | 13.117 → 13.117 | 13.388 → 13.388 | 174.246 → 174.570 | +0.19% |
+| 20 × 1,024 + 2 × 514,048 | 13.331 → 13.331 | 13.401 → 13.401 | 209.410 → 209.891 | +0.23% |
+| 256 × 4,096 | 7.701 → 7.701 | 7.752 → 7.752 | 80.165 → 80.124 | -0.05% |
+| 2,048 × 512 | 7.530 → 7.530 | 7.581 → 7.581 | 82.711 → 82.714 | +0.00% |
+| 1,024 × (480, 544) | 7.530 → 7.530 | 7.581 → 7.581 | 82.651 → 82.676 | +0.03% |
+| 2,047 × 256 + 524,544 | 13.117 → 13.117 | 13.388 → 13.388 | 172.667 → 173.322 | +0.38% |
+| 1,536 × 64; 512 × 1,856 | 15.652 → 10.440 | 15.715 → 10.503 | 106.016 → 106.027 | +0.01% |
+| 256 × 1,856; 1,536 × 64; 256 × 1,856 | 8.643 → 8.270 | 8.712 → 8.333 | 92.881 → 92.802 | -0.08% |
+| 4,096 × 256 | 9.975 → 8.542 | 10.025 → 8.593 | 91.462 → 91.444 | -0.02% |
+| 8,192 × 128 | 19.648 → 13.105 | 19.699 → 13.155 | 109.656 → 109.629 | -0.02% |
+| 16,384 × 64 | 38.993 → 14.616 | 39.044 → 14.666 | 151.345 → 151.547 | +0.13% |
+| 32,768 × 32 | 77.684 → 13.037 | 77.735 → 13.087 | 234.933 → 237.908 | +1.27% |
+
+All twelve layouts are below 20 GB: the maximum native workspace is
+**14.616 GB**, and maximum sampled internal storage is **14.666 GB**.
+The largest measured latency regression is **1.27%**, on 32,768 documents.
+The parent already meets the workspace target for ten of twelve layouts;
+the two dense extremes are reduced from 39.044/77.735 GB sampled internal
+storage to 14.666/13.087 GB. Some forward savings do not lower the overall
+maximum because backward was already the larger phase.
+
+Measurement provenance: V2 measured all twelve layouts. Final V3 adds only
+the guarded backward-sixteen-wave selection; one-document, skew2048 and
+32,768-document rows were rerun on V3. The other nine rows retain their V2
+measurements. Captured geometry replay through both selectors confirms
+identical decisions for those nine; constructor/allocation/execution ASTs
+outside the two policy helpers and constant are identical, and the state-chain
+source has the same SHA256. They are not presented as exact-V3 reruns.
+
+The comparison is against the already-optimized parent `a1de8974`, not the
+original pre-wave baseline in the earlier B300 report. Earlier performance
+exceptions in that report are not resolved by this comparison.
+
+#### Native and safety validation
+
+Runtime: Torch 2.14.1+cu130, CUDA 13.0, cuDNN 9.24.0, CuTeDSL 4.8.1 with
+CUDA 13.4 compiler. Both arms use the same extension rebuilt from the parent
+source in an isolated venv. Commands run from `test/python`, with
+`CUDNN_TEST_NO_ISOLATION=1` and `CUBLAS_WORKSPACE_CONFIG=:4096:8`.
+
+```bash
+python -m pytest -q -x -rs linear_attention/frost/test_kda_state_reuse.py \
+  linear_attention/frost/test_kda_forward_waves.py \
+  linear_attention/frost/test_kda_wave_boundaries.py -k 'not warm_stress'
+python -m pytest -q -x -rs linear_attention/frost/test_kda_checkpoint_waves.py \
+  -k '(bitwise_and_capture and (equal-16 or gqa-16 or gva-16)) or capacity_policy or (runtime_heads and 16)'
+```
+
+- V1: **35 passed, 6 deselected in 482.99 s**. Warm stress completed
+  3,000 warm and 3,000 poisoned launches with zero wrong bytes; the unsafe
+  control failed 200/200. The tested shape has only two total CTAs, below
+  the control's three CTAs/SM, so this is limited schedule coverage rather
+  than a universal race-free guarantee.
+- V2: **41 passed, 1 deselected in 764.14 s**, no skips or failures. The
+  deselected warm-stress case ran in V1 with identical state-chain source.
+  Includes forward four/eight-wave coverage, cache reuse and independent
+  FP64 state-chain references.
+- V3 backward sixteen-wave selection: **27 passed, 84 deselected in
+  569.96 s**, no skips or failures. The 24 parity/capture combinations cover
+  two storage modes, three head patterns and four dtype/gate cases; two
+  additional runtime-head checks include H96, plus the policy boundary test.
+- V3 forward policy: **1 passed, 16 deselected in 2.39 s**.
+
+These selections overlap; their counts are not a count of unique tests.
+Compile-cache audit: passed for the exercised forward/backward head waves;
+runtime head changes reuse the same two baseline/wave compiled objects.
+CUDA Graph audit: passed for the exercised preallocated native calls,
+poisoned workspaces, changed-input replay and prefix changes. This is not a
+whole distributed CP4 captured-graph pool benchmark. No C++ port is involved.
+
+Standalone alias coverage includes K/V64/128 square and rectangular states,
+forward/reverse, one/three pieces, tail and transition product, changed values
+at stable addresses, graph replay and a trailing canary. Shared chain entry
+checks also compare with an independent FP64 recurrence. Forward wave tests
+cover grouped heads, log/safe gates, FP16/BF16, public checkpoints and all
+autograd gradients; backward sixteen-wave tests cover grouped heads,
+checkpoint-only/owned-state paths, changed lengths and H96 runtime reuse.
+
+Compute Sanitizer 13.4.92, scoped to the sixteen standalone alias/capture
+cases: Memcheck **16 passed, 1 deselected, 0 errors (15.22 s)**;
+Synccheck **16 passed, 1 deselected, 0 errors (11.78 s)**; Racecheck
+**16 passed, 1 deselected, 0 hazards, 0 errors, 0 warnings (133.80 s)**.
+No device kernel filter or memory/race/synchronization suppression is used.
+These are small native tests, not a sanitized distributed CP4 1M run.
+
+This is a **qualified, not unfiltered, sanitizer pass**. Unfiltered memcheck
+on the candidate reports 41 `cuGetProcAddress_v2` / error-1 API queries;
+the unchanged parent independently reports the same 41 queries while both
+of its default-chain FP64-reference tests pass. The newer tool's default
+extended mode additionally prints 41 driver diagnostics: requested API
+versions 13010–13041 exceed driver version 13000. The saved parent XML
+attributes all 41 explicit errors to `cuda.bindings._internal.driver`.
+Neither unfiltered run reports a device memory violation, but both exit 99
+and are retained as failures, not counted as clean tool passes.
+
+The qualified runs retain explicit API error checking and suppress only
+`kind=Api`, `api=cuGetProcAddress_v2`, `result=1`; all other explicit API
+results and device checks remain enabled. A parent control with this exact
+suppression reports **2 passed, 6 deselected, 0 errors (3.37 s)**.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` is used only in this
+instrumentation lane. Original logs, the failed narrower stack-filter
+attempt, XML and the final suppression are retained in the experiment
+artifacts. No CUDA library, driver or production dependency is changed.
+
+```xml
+<ComputeSanitizerOutput>
+  <record>
+    <kind>Api</kind>
+    <what><api>cuGetProcAddress_v2</api><result>1</result></what>
+  </record>
+</ComputeSanitizerOutput>
+```
+
+The invocation is `compute-sanitizer --tool <memcheck|synccheck|racecheck>
+--report-api-errors explicit --suppressions <file.xml> --error-exitcode 99`,
+followed by `python -m pytest -q -x -rs
+linear_attention/frost/test_kda_state_reuse.py -k summary_alias`.
+The API-reporting modes and XML suppression semantics follow the
+[Compute Sanitizer documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#error-suppression).
+Racecheck detects shared-memory hazards; it does not prove global alias
+ownership. H/X safety additionally relies on the documented single-lane
+ownership, same-block load-before-store PTX and exact-view contract.
+
+The negative control runs the new alias test from an isolated parent source
+and test tree, verifying the loaded state-chain path and SHA256 before each
+case. With caches disabled, the unchanged parent fails the first case
+(`1-False-64-64`): **177,678/196,608 tail bytes differ**, pytest exit 1,
+**1 failed, 1 deselected in 1.57 s**, stopped at first failure. Saved PTX
+shows the parent's store before its load, while the candidate PTX has the
+single load-before-store block. This validates the detector for the newly
+supported alias contract; it is not a failure of the parent's supported
+separate-storage contract.
+
+Earlier attempts launched parent/mutant controls from the candidate test tree;
+its conftest overlaid candidate kernel sources despite the parent top-level
+`cudnn.__file__`. Those controls are invalid and excluded. Native candidate
+suites and parent API controls use matching source/test trees. The CP4
+benchmark is a standalone harness with per-module hashes, unaffected by this
+pytest overlay. The corrected control's wrapper also expected a `state`
+mismatch specifically, so it exits 1 on the actual `tail` mismatch; the saved
+pytest traceback and source check, not that wrapper status, establish the
+expected negative result.
+
+The initial pilot used an older cuLA snapshot and failed the contiguous-summary
+contract before producing a measurement. Its log is retained and excluded.
+An initial extension import lacked its runtime library path; subsequent
+imports and all reported tests use the corrected launch environment. No
+partial or failed run is counted as a pass.
+
+Changed-file pre-commit and Python compilation checks pass. All four
+production/test hashes match the measured V3 snapshot. Fern reports zero
+errors and one warning for the skipped unauthenticated redirects check.
+
+Other GPUs, independent-stream concurrency for this new alias, safe-gate
+CP4 1M performance, and full-model/CSA measurements are unverified here.
+Existing earlier-architecture evidence is retained, not represented as a
+rerun of this change.
+
+### PR integration and strict review — B200, 2026-11-15
+
+Integration commit `2be2c82d31eb33fa611a867e095a01699b03adc9` merges upstream
+`develop` through `b24979cd4640385b7b6791664c975388ac167250`. All linear-attention
+implementation and test files remain byte-identical to `edeea242` after the
+merge. The native extension was rebuilt from the merged tree. The subsequent
+review changes three internal docstrings and adds zero-initial-state alias
+coverage; stripping docstrings gives identical production Python ASTs. The
+performance tables above are retained measurements, not post-merge reruns.
+
+The full production diff against current upstream was reviewed, including
+compact/full-head indices, rectangular state arenas, empty/one-piece paths,
+summary coverage of every multi-piece slot, caller context/checkpoint ownership,
+all queue writers and counters, phase-arena lifetimes, PDL prerequisites,
+TMA/TMEM completion, reduction order and compile-key bounds. No new confirmed
+race, bounds or numerical defect was found. `run_state_chain`,
+`build_chain_backward` and `CompiledKdaBwd.run_chain` now document destructive
+exact H/X reuse, compact versus public head layouts, and independent writable
+storage for concurrent streams.
+
+The alias load/store executes in one side-effectful inline PTX block with
+named temporaries. The CuTeDSL 4.8.0 and 4.8.1 wrappers were independently read
+from their released wheels and have identical `inline_ptx` implementations;
+the NVVM op documents side-effectful lowering. Same-lane ownership handles the
+H/X edge, blocking CTA barriers publish and retire queue shared counts, and
+`griddepcontrol.wait` handles inter-kernel consumers and next-wave reuse. The
+[PTX dependency instruction](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-griddepcontrol)
+orders prerequisite completion and memory visibility. Existing numerical
+kernel async-proxy/TMA/TMEM protocols are unchanged; no speculative global
+fence was added. Earlier sanitizer and generated-code evidence above is
+retained with its stated qualifications, not counted as new runs.
+
+Merged-source native tests use Torch 2.14.1+cu130, cuDNN 9.24.0 and the same
+B200 environment as the CP4 experiment. Each compiler lane uses its own empty
+compiler/artifact caches and separate process; loaded nested module paths and
+SHA256 values are verified, not just the top-level package path.
+
+| Selection | DSL / actual compiler | Result |
+|---|---|---|
+| State alias, forward waves, boundaries, queues, forward warm/poison stress | 4.8.1 / CUDA 13.4 | 44 passed, 903.64 s |
+| Backward bitwise/capture, policy, cache, H96 runtime and independent streams | 4.8.1 / CUDA 13.4 | 104 passed, 7 deselected, 1691.33 s |
+| Alias, default FP64-reference chains, forward waves, sixteen-wave backward and policies | 4.8.0 / CUDA 12.9 | 35 passed, 118 deselected, 533.68 s |
+| Same selection | 4.8.0 / CUDA 13.4 | 35 passed, 118 deselected, 535.16 s |
+| Same selection | 4.8.1 / CUDA 12.9 | 35 passed, 118 deselected, 522.68 s |
+| Final alias file, including zero initial state | 4.8.0 / CUDA 12.9 | 33 passed, 18.75 s |
+| Same final alias file | 4.8.0 / CUDA 13.4 | 33 passed, 19.55 s |
+| Same final alias file | 4.8.1 / CUDA 12.9 | 33 passed, 19.11 s |
+| Same final alias file | 4.8.1 / CUDA 13.4 | 33 passed, 19.12 s |
+
+The final alias file contains 32 capture/byte-parity cases (four rectangular
+or square K/V pairs, both directions, one/three pieces, caller seed or implicit
+zero seed) plus one policy test. The explicit zero-seed cases exercise the
+constant FP32 operand in the load-before-store PTX. Existing seeded case
+behavior is unchanged. These selections overlap; their totals are not unique
+coverage counts. No numerical tolerance or golden changed. The cu12 lanes
+qualify that DSL compiler on the CUDA 13 framework, not a complete CUDA 12
+framework/backend deployment. No new SM103/SM107 or Hopper result is claimed.
+
+From `test/python`, the main native selections are:
+
+```bash
+python -m pytest -q -x -rs linear_attention/frost/test_kda_state_reuse.py \
+  linear_attention/frost/test_kda_forward_waves.py \
+  linear_attention/frost/test_kda_wave_boundaries.py \
+  linear_attention/frost/test_kda_wave_queues.py
+python -m pytest -q -x -rs linear_attention/frost/test_kda_checkpoint_waves.py \
+  -k '16 or capacity_policy or compile_count or independent_streams'
+```
+
+The second selector also matches `bf16`/`fp16` IDs, so it exercises the full
+backward dtype/head-pattern parity matrix across divisors 2/4/8/16, not just
+sixteen waves. Extra compiler lanes select:
+
+```text
+summary_alias or arena_policy or capacity_policy or default_state_chain
+or (forward_waves_bitwise_and_capture and 8)
+or (checkpoint_waves_bitwise_and_capture and equal-16)
+```
+
+The `8` selection also includes forward rectangular `k128`/`v128` IDs at other
+divisors. The final zero-seed qualification runs the complete
+`test_kda_state_reuse.py` in all four compiler lanes. Tests use matching source
+and test trees, `CUDNN_TEST_NO_ISOLATION=1` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`; the exact loaded compiler paths and source
+hashes are retained in the qualification manifests.
+
+The fresh forward stress again reports 0/3,000 warm and 0/3,000 poisoned
+failures, with the unsafe control failing 200/200. The target still has only
+two CTAs, so this is limited scheduling coverage. Compatibility, docstring,
+compile-cache, CUDA Graph and fence audits pass for the exercised scope.
+Changed-file pre-commit/syntax checks pass. Fern reports zero errors and one
+warning (unauthenticated redirect validation); the repository's pinned CLI
+was used after checking that no project-local executable override was present.
+
+This refresh updates the existing Draft PR. The original-baseline >5%
+performance exceptions above remain open; the CP4 incremental comparison
+against `a1de8974` does not resolve them. Old upstream CI on `a19c476` does
+not validate the refreshed head.
 
 ## SM100 D128 per-tensor FP8 decode — qualification, 2026-11-12 (UTC)
 

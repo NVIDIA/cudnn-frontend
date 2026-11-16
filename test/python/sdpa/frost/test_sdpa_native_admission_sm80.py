@@ -82,7 +82,11 @@ def _facts(direction, descs, *, thd=False):
 
 def _mismatch(direction, facts):
     if direction == "bwd":
-        return backward.mismatch(backward._sm80_spec().capabilities, facts)
+        # The row delegates every body: check the explicit engine its selector names for this graph.
+        selected = backward._sm80_spec().capabilities.select_implementation(facts)
+        owner = selected if isinstance(selected, str) else selected[0]
+        spec = next(s for s in backward.ENGINE_SPECS if s.name == owner)
+        return backward.mismatch(spec.capabilities, facts)
     from cudnn.sdpa.fwd.kernels.sm80 import half_flavor_contract as half
 
     owner = half.implementation_for(facts.d_qk, facts.d_v)

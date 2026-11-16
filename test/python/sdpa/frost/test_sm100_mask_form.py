@@ -51,7 +51,7 @@ _KERNELS = {
     ("mxfp8", (512, 512)): ("d512_mxfp8_slice_recompute/kernel.py", 3),
     ("mxfp8_swa", (512, 512)): ("d512_mxfp8_retained_p/kernel.py", 3),  # exact top-left SWA of one KV tile, unsplit
     ("decode", (128, 128)): ("d128_f16_single_q/kernel.py", 2),  # the key-sharded softmax arm of the d64 quadrant tile (``QUAD``) is the second site
-    ("bwd", (512, 512)): ("bprop_d512_f16.py", 1),
+    ("bwd", (512, 512)): ("d512_f16_role_split/kernel.py", 1),
 }
 _KERNEL_IDS = [f"{k}-d{f[0]}" if f[0] == f[1] else f"{k}-d{f[0]}x{f[1]}" for k, f in _KERNELS]
 

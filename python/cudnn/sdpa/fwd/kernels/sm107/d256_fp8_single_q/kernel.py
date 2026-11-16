@@ -95,7 +95,7 @@ if PARAMS.paged_kv:
 # buffer at or above 256 KiB wraps to offset 0 and the MMA multiplies whatever
 # sits at the bottom of SMEM.
 #
-# DERIVED from the layout, as the f16 sibling does (prefill_d256_f16.py), not a
+# DERIVED from the layout, as the f16 sibling does (d256_f16_lookahead/kernel.py), not a
 # literal: STAGES_KV moves the last V stage.  Declaration order in _kernel is
 # sQO_raw | sK_raw[STAGES_KV] | sV_raw[STAGES_KV], and the Q∪O alias is
 # byte-sized for max(Q@BPE, O@BPE_O) -- a BF16/FP16 O doubles it.  With an
@@ -451,7 +451,7 @@ def _kernel(
     # FROST's quantized ABI: the four 1-element fp32 scales arrive as DEVICE
     # TENSORS and the amax of O is an OUTPUT.  The pre-upstream contract pre-folded the scales on
     # the host and produced no amax -- that gap is what this closes.  Template:
-    # the shipped sm107/prefill_d128_fp8.py sibling (same lineage).
+    # the shipped sm107/d128_fp8_multi_q/kernel.py sibling (same lineage).
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -2301,7 +2301,7 @@ def _host(
     # FROST's quantized ABI: the four 1-element fp32 scales arrive as DEVICE
     # TENSORS and the amax of O is an OUTPUT.  The pre-upstream contract pre-folded the scales on
     # the host and produced no amax -- that gap is what this closes.  Template:
-    # the shipped sm107/prefill_d128_fp8.py sibling (same lineage).
+    # the shipped sm107/d128_fp8_multi_q/kernel.py sibling (same lineage).
     descale_q_t: cute.Tensor,
     descale_k_t: cute.Tensor,
     descale_v_t: cute.Tensor,
@@ -2315,7 +2315,7 @@ def _host(
     seq_q_lens_addr: cutlass.Int64 = 0,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
-    # sm107/prefill_d128_fp8.py sibling does.
+    # sm107/d128_fp8_multi_q/kernel.py sibling does.
     # THD device metadata build: the CALLER's Q/KV length tensors, (B,) lengths
     # or (B+1,) cu prefix sums per side via thd_lens_form.  Consumed only by the
     # setup kernel, which writes the metadata buffer device-side.

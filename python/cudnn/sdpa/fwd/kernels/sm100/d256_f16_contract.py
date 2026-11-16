@@ -10,6 +10,7 @@ chooses a geometry; support and build consume that same immutable choice.
 from dataclasses import dataclass, replace
 
 from cudnn import data_type
+from .half_flavor_contract import padded_shape
 from .d256_f16_lookahead import contract as lookahead
 from .d256_f16_swap_ab import contract as swap_ab
 
@@ -22,7 +23,7 @@ IMPLEMENTATIONS = frozenset({LOOKAHEAD, SWAP_AB})
 def in_pilot_domain(facts):
     return (
         facts.device_cc in ((10, 0), (10, 3))
-        and (facts.d_qk, facts.d_v) == (256, 256)
+        and padded_shape(facts) == (256, 256)
         and not (facts.invalid or facts.is_backward)
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
         and not (facts.is_fp8 or facts.is_mxfp8)
@@ -81,7 +82,7 @@ def explicit_geometry(implementation, knobs, *, facts=None):
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"unknown D256 implementation: {implementation}")
     default = 16 if implementation == SWAP_AB else 128
-    if implementation == SWAP_AB and facts is not None and (facts.d_qk, facts.d_v) == (128, 128):
+    if implementation == SWAP_AB and facts is not None and padded_shape(facts) == (128, 128):
         return D256Geometry(implementation, default if knobs is None or knobs.tile_m is None else knobs.tile_m, head_dim=128, live_columns=8, early_q=True)
     return D256Geometry(implementation, default if knobs is None or knobs.tile_m is None else knobs.tile_m)
 
@@ -92,9 +93,9 @@ def mismatch(implementation, facts, knobs):
         return f"requires SM100/SM103; current device is {facts.device_cc}"
     from .small_half_contract import in_domain as in_small_domain
 
-    small_swap = implementation == SWAP_AB and (facts.d_qk, facts.d_v) == (128, 128) and in_small_domain(facts) and facts.uniform_dtype
+    small_swap = implementation == SWAP_AB and padded_shape(facts) == (128, 128) and in_small_domain(facts) and facts.uniform_dtype
     if not (in_pilot_domain(facts) or small_swap):
-        return "this implementation serves exact D_qk=D_v=256 half graphs on SM100/SM103"
+        return "this implementation serves the D256 half envelope on SM100/SM103"
     if facts.has_epilogue_gate or facts.attn_scale_prefolded:
         return "the SM100 D256 half implementations do not carry a gate or pre-folded scale"
     geometry = explicit_geometry(implementation, knobs, facts=facts)

@@ -52,7 +52,8 @@ def _compiler_targets_available(monkeypatch):
 
 # Explicit engines that one mask band names: they decline every other band by ownership, not by a capability flag
 # (their flags equal their sibling's, which this matrix samples); test_sdpa_fwd_d512_mxfp8_implementation_contract pins the band.
-_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p"})
+# The SM80 D64 body likewise serves only the plain aligned corner its selector names; test_sdpa_bwd_explicit_engines pins it.
+_BAND_OWNED = frozenset({"sdpa_fwd_sm100_d512_mxfp8_retained_p", "sdpa_bwd_sm80_f16_d64"})
 
 
 def _rows():
@@ -98,11 +99,15 @@ def _dims(kind: str, caps):
     # first pair the row accepts unmasked, so a head-dim rule never stands in
     # for a band decision.
     dims = sorted(caps.d)
+    if caps.implementation == "sdpa_bwd_sm100_d128_accumulation":
+        # D64 serves this owner's sliding-window domain; D128 is unwindowed.
+        return (64, 64)
     pairs = ([(128, 128)] if 128 in dims else []) + [(d, d) for d in reversed(dims)] + [(a, b) for a in reversed(dims) for b in dims if a != b]
     for pair in pairs:
         if _probe(kind)(caps, ga.SdpaGraphFacts(**_values(kind, caps, *pair))) is None:
             return pair
-    return pairs[0]
+    # A row that delegated every body it would select keeps only its policy, as above; its explicit engines are sampled.
+    return None if caps.delegated else pairs[0]
 
 
 def declaration_reason(kind: str, caps, facts) -> Optional[str]:
@@ -133,7 +138,12 @@ def declaration_reason(kind: str, caps, facts) -> Optional[str]:
         return check(facts)
     from cudnn.frost.buffers import cutedsl_state
 
-    return check(facts, cutedsl_state()[1])
+    reason = check(facts, cutedsl_state()[1])
+    if reason is None and caps.delegated and bwd_engines._declared_mismatch(caps, facts, None) is None:
+        # A partially migrated row can transfer only some masks to another
+        # owner. Keep testing its bands, while recognizing that transfer.
+        return bwd_engines.mismatch(caps, facts)
+    return reason
 
 
 def probe_matches(kind: str, caps, facts, expected) -> bool:
@@ -229,6 +239,9 @@ def _values(kind: str, caps, d_qk: int, d_v: int) -> dict:
     if getattr(caps, "implementation", "") == "sdpa_fwd_sm107_shared_d256_lookahead":
         # Its nonpaged domain is THD split, not the native dense lookahead.
         values.update(thd=True, padded=True)
+    if getattr(caps, "implementation", "") == "sdpa_bwd_sm100_d128_accumulation_2cta":
+        # Two-CTA accumulation owns grouped attention; MHA has no such body.
+        values["h_kv"] = 2
     return values
 
 
@@ -345,7 +358,7 @@ def test_a_window_coupling_is_declared_and_decided_after_the_anchor():
     ):
         with pytest.raises(ValueError):
             band.BandSupport(right=right, left=left, window_right=window_right)
-    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8")
+    kind, caps = next((kind, spec.capabilities) for kind, spec in _rows() if spec.name == "sdpa_bwd_sm100_mxfp8_pair")
     assert caps.band.window_right == frozenset({band.RIGHT_CAUSAL}) and caps.swa and caps.causal
     assert caps.band.as_dict()["window_right"] == [band.RIGHT_CAUSAL]
     reason = band.window_right_reason(caps.band.window_right)

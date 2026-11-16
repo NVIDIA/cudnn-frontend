@@ -721,7 +721,7 @@ def exp2_emul_pair(x_lo, x_hi):
     shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Four sm100
     prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
     ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
-    d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
+    d128 MXFP8 kernel (``sm100/d128_mxfp8_multi_q/kernel.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
     dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
     +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
     H=128/128), and the d128 bf16 / fp16 kernel on its dense-band builds only (``_E2E_DENSE_BAND``:
@@ -772,7 +772,7 @@ def exp2_mixed(vec, emul_pairs, N: int):
     so an all-MUFU chunk stays IR-identical to the unsplit kernel.  Trace-time helper (plain
     Python over traced values), like :func:`row_max_reduction`.  Which pairs to emulate is a
     ptxas-schedule property of the CONSUMING kernel -- tune it there, per kernel, by A/B
-    (``sm100/prefill_d128_mxfp8.py`` documents its sweep)."""
+    (``sm100/d128_mxfp8_multi_q/kernel.py`` documents its sweep)."""
     assert N % 2 == 0, f"exp2_mixed: N={N} must be even"
     if not emul_pairs:
         return cute.math.exp2(vec, fastmath=True)
@@ -1368,7 +1368,7 @@ def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
 @cutlass.cute.jit
 def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
-    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/d256_fp8/kernel.py``, the gated block's
     gradient amax pass and gate backward).
 
     Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into

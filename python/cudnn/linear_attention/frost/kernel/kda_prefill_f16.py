@@ -1760,7 +1760,7 @@ def compute1_warp_group(
                         seed_row = cutlass.Int32(mSeedIndices[batch_idx])
                     if cutlass.const_expr(cfg.state_table):
                         seed_vw = 16 // (mState_init.element_type.width // 8)
-                        seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, value_dim + v_offset, 0))).raw_ptr()
+                        seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o // cfg.state_head_divisor, value_dim + v_offset, 0))).raw_ptr()
                     if cutlass.const_expr(cfg.has_composed):
                         is_boundary = batch_idx == cutlass.Int32(0)
                         composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, value_dim + v_offset, 0))).raw_ptr()
@@ -2356,16 +2356,16 @@ def compute1_warp_group(
                             key_dim = key_block_start + col
                             if cutlass.const_expr(cfg.has_composed):
                                 if cutlass.const_expr(cfg.state_table):
-                                    pass_val = mState_init[seed_row, head_o, value_dim + v_offset, key_dim].to(cutlass.Float32)
+                                    pass_val = mState_init[seed_row, head_o // cfg.state_head_divisor, value_dim + v_offset, key_dim].to(cutlass.Float32)
                                 else:
                                     pass_val = cutlass.Float32(0.0)
                                 composed_val = mComposed[cutlass.Int32(0), head_o, value_dim + v_offset, key_dim]
                                 pass_val = composed_val if batch_idx == cutlass.Int32(0) else pass_val
                                 mState_out[final_row, head_o, value_dim + v_offset, key_dim] = pass_val.to(mState_out.element_type)
                             elif cutlass.const_expr(cfg.use_initial_state):
-                                mState_out[final_row, head_o, value_dim + v_offset, key_dim] = mState_init[seed_row, head_o, value_dim + v_offset, key_dim].to(
-                                    mState_out.element_type
-                                )
+                                mState_out[final_row, head_o, value_dim + v_offset, key_dim] = mState_init[
+                                    seed_row, head_o // cfg.state_head_divisor, value_dim + v_offset, key_dim
+                                ].to(mState_out.element_type)
                             else:
                                 mState_out[final_row, head_o, value_dim + v_offset, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
         cum_chunk_base += num_chunks_tile
@@ -3006,7 +3006,9 @@ class KdaPrefillCfg:
     """Kernel cfg (fixed BT=16 schedule constants; derived TMEM column offsets
     and SMEM buffer cosizes are stamped by ``build_cfg``; per-stage sizes are
     inlined at the use sites).  Passed ``cfg``-first (a ``cutlass.Constexpr``)
-    into ``host`` / ``kernel`` and every warp body."""
+    into ``host`` / ``kernel`` and every warp body. ``state_head_divisor`` only
+    compacts the internal seed-state head axis for a chain wave; input/output
+    tensors, composed states and caller final states retain their full heads."""
 
     io_dtype: Type[cutlass.Numeric]
     state_dtype: Type[cutlass.Numeric]
@@ -3100,6 +3102,7 @@ class KdaPrefillCfg:
     steep_norm_cosize: int = 0
     steep_tile_cosize: int = 0
     steep_corr_cosize: int = 0
+    state_head_divisor: int = 1
 
 
 def build_cfg(

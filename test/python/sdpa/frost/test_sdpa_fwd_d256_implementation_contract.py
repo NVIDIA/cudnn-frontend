@@ -40,13 +40,11 @@ def test_exact_d256_transfers_ownership_but_keeps_both_implementations_legal(cc)
     assert "owned by" in engines.mismatch(SPECS["sdpa_fwd_prefill_sm100"].capabilities, f)
     for name in (LOOKAHEAD, SWAP_AB):
         assert engines.mismatch(SPECS[name].capabilities, f) is None
-    # Keep these controls on retained envelopes as exact widths migrate to
-    # their own implementations in subsequent batches.
-    for dq, dv in ((112, 112), (160, 128), (248, 248)):
+    for dq, dv, admitted in ((112, 112, False), (160, 128, False), (248, 248, True)):
         other = facts(device_cc=cc, d_qk=dq, d_v=dv)
-        assert engines.mismatch(SPECS["sdpa_fwd_prefill_sm100"].capabilities, other) is None
-        assert engines.mismatch(SPECS[LOOKAHEAD].capabilities, other) is not None
-        assert engines.mismatch(SPECS[SWAP_AB].capabilities, other) is not None
+        assert "owned by" in engines.mismatch(SPECS["sdpa_fwd_prefill_sm100"].capabilities, other)
+        for name in (LOOKAHEAD, SWAP_AB):
+            assert (engines.mismatch(SPECS[name].capabilities, other) is None) == admitted
 
 
 @pytest.mark.parametrize("name, tile, cga", [(LOOKAHEAD, 128, 2), (SWAP_AB, 16, 1), (SWAP_AB, 32, 1)])

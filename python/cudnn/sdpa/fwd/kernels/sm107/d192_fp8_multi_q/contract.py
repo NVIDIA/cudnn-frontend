@@ -6,6 +6,7 @@
 from dataclasses import dataclass, replace
 
 from cudnn import data_type
+from ..fp8_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm107_d192_fp8_multi_q"
 TEMPLATE_NAME = "prefill_d192_d128_fp8"
@@ -16,7 +17,7 @@ LEGACY_ROW = "sdpa_fwd_prefill_sm107_fp8"
 def in_domain(facts):
     return (
         facts.device_cc in ((10, 7),)
-        and (facts.d_qk, facts.d_v) == (192, 128)
+        and padded_shape(facts) == (192, 128)
         and not (facts.invalid or facts.is_backward)
         and facts.is_fp8
         and not facts.is_mxfp8
@@ -59,7 +60,7 @@ def mismatch(facts, knobs):
     if facts.device_cc not in ((10, 7),):
         return f"requires SM107; current device is {facts.device_cc}"
     if not in_domain(facts):
-        return "requires exact D192/V128 per-tensor FP8 on SM107"
+        return "requires a D192/V128 per-tensor FP8 envelope on SM107"
     if knobs is not None:
         if knobs.cga not in (None, 1, 2):
             return "FP8 D192/V128 multi-Q requires TILE_CGA_M=1 or 2 (physical launch cluster)"

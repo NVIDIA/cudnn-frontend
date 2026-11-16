@@ -78,12 +78,14 @@ def test_note_excludes_ineligible_graphs(changes):
     assert NOTE not in _notes("sdpa_fwd_sm100_d128_multi_q", _facts(**changes))
 
 
-@pytest.mark.parametrize("name,cc", [("sdpa_fwd_prefill_sm107", (10, 7)), ("sdpa_fwd_prefill_sm120", (12, 0))])
+@pytest.mark.parametrize("name,cc", [("sdpa_fwd_sm120_f16_general", (12, 1))])
 def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, monkeypatch):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    assert NOTE not in _notes(name, _facts(device_cc=cc))
+    facts = _facts(device_cc=cc)
+    assert engines.mismatch(SPECS[name].capabilities, facts) is None
+    assert NOTE not in _notes(name, facts)
 
 
 @pytest.mark.parametrize(
@@ -100,7 +102,7 @@ def test_unqualified_architectures_do_not_advertise_the_shared_binder(name, cc, 
         ("sdpa_fwd_sm107_d512_2x2", 512, 512, 64, 4, 1, 0),
     ],
 )
-def test_admitted_sm107_half_owners_do_not_inherit_sm100_notes(name, dq, dv, tile, cluster, splits, warp, monkeypatch):
+def test_admitted_sm107_half_owners_declare_qualified_notes(name, dq, dv, tile, cluster, splits, warp, monkeypatch):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
@@ -109,7 +111,7 @@ def test_admitted_sm107_half_owners_do_not_inherit_sm100_notes(name, dq, dv, til
     # A retired/ineligible row would also return RTC alone. Require a legal
     # selected record so this tests the public note's qualification boundary.
     assert engines.mismatch(SPECS[name].capabilities, f, knobs) is None
-    assert _notes(name, f, knobs.to_public()) == (cudnn.behavior_note.RUNTIME_COMPILATION,)
+    assert _notes(name, f, knobs.to_public()) == (cudnn.behavior_note.RUNTIME_COMPILATION, NOTE)
 
 
 def test_new_swap_ab_does_not_inherit_lookahead_notes():
@@ -149,3 +151,48 @@ def test_wide_half_notes_follow_selected_plan(name, dq, tile, cluster, cc):
     assert NOTE not in _notes(name, f, replace(good, cga=1))
     assert NOTE not in _notes(name, _facts(packing="NH", d_qk=dq, d_v=512, device_cc=cc), good)
     assert NOTE not in _notes(name, _facts(d_qk=dq, d_v=512, device_cc=cc, shape_overrides=False), good)
+
+
+# The native lifecycle suite uses these same explicit public plan records.
+QUALIFIED_OVERRIDE_CASES = [
+    (107, "sm107_d128_multi_q", 64, 64, 128, 128, 1, 1, 0, 0, False),
+    (107, "sm107_d128_multi_q", 128, 128, 128, 128, 2, 1, 0, 0, False),
+    (107, "sm107_d192_multi_q", 192, 128, 128, 128, 2, 1, 0, 0, False),
+    (107, "sm107_d256_lookahead", 256, 256, 128, 128, 2, 1, 0, 0, False),
+    (107, "sm107_d256_lookahead", 128, 128, 128, 128, 1, 1, 0, 1, False),
+    (107, "sm107_shared_single_q", 128, 128, 128, 128, 1, 2, 1, 0, True),
+    (107, "sm107_shared_single_q", 192, 128, 128, 128, 1, 1, 0, 0, False),
+    (107, "sm107_shared_d256_lookahead", 256, 256, 128, 128, 2, 2, 0, 0, False),
+    (107, "sm107_d512_role_split", 512, 512, 128, 128, 4, 1, 0, 0, False),
+    (107, "sm107_d512_2x2", 512, 512, 64, 128, 4, 1, 0, 0, False),
+    (120, "sm120_f16_general", 64, 64, 64, 64, 1, 1, 0, 0, False),
+    (120, "sm120_f16_general", 128, 128, 64, 64, 1, 1, 0, 0, False),
+    (120, "sm120_f16_general", 192, 128, 64, 64, 1, 1, 0, 0, False),
+    (120, "sm120_d256_all_compute", 256, 256, 64, 64, 1, 1, 0, 0, False),
+    (120, "sm120_d512_paired", 512, 512, 64, 32, 1, 1, 0, 0, False),
+    (120, "sm120_d512_paired", 576, 512, 64, 32, 1, 1, 0, 0, False),
+]
+
+
+@pytest.mark.parametrize("case", QUALIFIED_OVERRIDE_CASES, ids=lambda c: f"sm{c[0]}-{c[1]}-d{c[2]}-split{c[7]}-warp{c[9]}")
+def test_qualified_override_owner_notes(case, monkeypatch):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    arch, owner, dq, dv, tile_m, tile_n, cga, split, pack, warp, paged = case
+    knobs = engines.SdpaFwdKnobs(tile_m=tile_m, tile_n=tile_n, cga=cga, split_kv=split, pack_gqa=bool(pack), warp_spec_cfg=warp)
+    changes = dict(
+        d_qk=dq,
+        d_v=dv,
+        device_cc=(arch // 10, arch % 10),
+        device_sm_count=208 if arch == 107 else 170,
+        max_total_seq_len_q=32,
+        has_paged_kv=paged,
+        page_size=16 if paged else 0,
+    )
+    name = "sdpa_fwd_" + owner
+    f = _facts(**changes)
+    assert engines.mismatch(SPECS[name].capabilities, f, knobs) is None
+    assert NOTE in _notes(name, f, knobs.to_public())
+    for excluded in (dict(packing="NH"), dict(packing="padded"), dict(shape_overrides=False), dict(wants_stats=False, stats_t=None)):
+        assert NOTE not in _notes(name, _facts(**changes, **excluded), knobs)

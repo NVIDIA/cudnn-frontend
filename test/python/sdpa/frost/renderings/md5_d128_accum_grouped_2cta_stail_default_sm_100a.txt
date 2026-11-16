@@ -1,5 +1,5 @@
-# sm_100a PTX md5 PER KERNEL of the d128 grouped THD cta_group::2 chain's DEFAULT rendering (prepared_d128_host.compile_host_grouped_2cta with
-# every typed field unset: the pair body of bprop_d128_f16.py under warp_roles 16w, mask_form fsel, dkv_accum bf16_partials,
+# sm_100a PTX md5 PER KERNEL of the d128 grouped THD cta_group::2 chain's DEFAULT rendering (d128_f16_accum_2cta.prepared_host.compile_host_grouped_2cta with
+# every typed field unset: the pair body of d128_f16_accum_2cta/kernel.py under warp_roles 16w, mask_form fsel, dkv_accum bf16_partials,
 # stats_form tma_ring = THE default since the day-4 decision (the loader-fed SMEM stats ring; the delta-and-stats launch replaces the compact
 # delta launch), no probe, no stamps; host trace-compile, no device; the probe geometry B, H, HK = 2, 8, 2 is in
 # test_sdpa_bwd_d128_2cta_stail_sm100.py; the main kernel renders 306ad223fb86f8b8efa86449f6d14ba6 at B, H, HK = 4, 32, 4).

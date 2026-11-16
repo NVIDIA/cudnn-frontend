@@ -25,7 +25,8 @@ def _check_native_origins(dtype_name, width, request, cudnn_handle, *, mxfp8=Fal
     cfg = _physical_origin_cfg(dtype_name, width)
     if engine is None:
         row = "sdpa_fwd_prefill_sm120_mxfp8" if mxfp8 else "sdpa_fwd_prefill_sm120_fp8" if cfg.data_type.itemsize == 1 else "sdpa_fwd_prefill_sm120"
-        engine = sm120_owner(row, width, width)
+        # Name the prefill implementation; an unspecified TILE_M returns both half owners.
+        engine = sm120_owner(row, width, width, tile_m=128)
     cfg.plan_pin = {"engine": engine, "knobs": {"PACK_GQA": 0, "SPLIT_KV": 1}}
     if engine in ("sdpa_fwd_sm100_d512_2x2", "sdpa_fwd_sm107_d512_2x2"):
         cfg.plan_pin["knobs"]["TILE_M"] = 64

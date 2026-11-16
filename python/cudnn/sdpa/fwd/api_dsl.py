@@ -675,16 +675,16 @@ def _pick_flavor(d_qk: int, d_v: int, candidates: Optional[tuple[tuple[int, int]
 
 
 # The exp2 MUFU / FMA split of the sm100 softmax (``TemplateParams.exp2_fma_split``, the ``_E2E_*`` block of
-# sm100/d128_mxfp8_multi_q/kernel.py, prefill_d128_fp8.py and prefill_d192_d128_f16.py) is claimed per KERNEL and per
-# ARCH.  It trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's MUFU rate -- MEASURED
-# 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
+# sm100/d128_mxfp8_multi_q/kernel.py, d128_fp8_{multi_q,dual_kv}/kernel.py and d192_f16_multi_q/kernel.py) is claimed
+# per KERNEL and per ARCH.  It trades MUFU.EX2 pipe-time for FMA pipe-time, so its sign follows the part's MUFU rate --
+# MEASURED 16 elements/clk/SM on cc 10.0 (B200) and 32 on cc 10.7 (Rubin: the same split is -9..-10 %, an emulated exp2
 # costs 1.99x the MUFU time it frees); cc 10.3 (GB300) DOCUMENTS the same doubled exp2 throughput, and a B300 A/B
-# (below) confirms it: the split stays off there.  Positive gate on the measured cc, never a negative gate on
-# 10.3: the engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.  Precisely: with
-# the gate OFF the four kernels trace the all-MUFU exp2 spelling (``_E2E_ENABLED`` False, ``cute.math.exp2`` at
-# every softmax site), and the d128 MXFP8 kernel ADDITIONALLY carries its arch-independent Amax_O FMNMX fold
-# (``fmax_f32``, not behind this gate -- MEASURED +0.5..+1.8 % on B200, unmeasured on GB300), so a cc 10.3 build of
-# that kernel is develop's exp burst plus the fold, not develop's kernel byte for byte.
+# (below) confirms it: the split stays off there.  Positive gate on the measured cc, never a negative gate on 10.3: the
+# engine rows are cc RANGES and an unmeasured part gets the develop (all-MUFU) kernel.  Precisely: with the gate OFF the
+# four kernels trace the all-MUFU exp2 spelling (``_E2E_ENABLED`` False, ``cute.math.exp2`` at every softmax site), and
+# the d128 MXFP8 kernel ADDITIONALLY carries its arch-independent Amax_O FMNMX fold (``fmax_f32``, not behind this gate
+# -- MEASURED +0.5..+1.8 % on B200, unmeasured on GB300), so a cc 10.3 build of that kernel is develop's exp burst plus
+# the fold, not develop's kernel byte for byte.
 #
 # Per kernel, keyed by (quantization kind, flavor) -- the spelling ``_load_sm100_kernel_module`` selects the
 # kernel file by.  ON = MEASURED wins on B200 (A/B/A x3, CUPTI medians, 2026-09-22): ("mxfp8", (128, 128))

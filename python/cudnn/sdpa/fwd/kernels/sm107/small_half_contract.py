@@ -9,6 +9,7 @@ from cudnn.sdpa import band
 from ... import config_sm107 as config
 from .d128_f16_multi_q import contract as ordinary
 from .small_f16_batch_pair import contract as pair
+from .half_flavor_contract import padded_shape
 
 LEGACY_ROW = "sdpa_fwd_prefill_sm107"
 MULTI_Q = ordinary.NAME
@@ -23,8 +24,8 @@ def in_domain(facts):
         facts.device_cc == (10, 7)
         and not (facts.invalid or facts.is_backward or facts.is_fp8 or facts.is_mxfp8)
         and facts.dtype in (data_type.HALF, data_type.BFLOAT16)
-        and (facts.d_qk, facts.d_v) in ((32, 32), (64, 64), (128, 128), (192, 128))
-        and (facts.uniform_dtype or (mixed and facts.d_qk in (64, 128)))
+        and padded_shape(facts) in ((32, 32), (64, 64), (128, 128), (192, 128))
+        and (facts.uniform_dtype or (mixed and (facts.d_qk, facts.d_v) in ((64, 64), (128, 128))))
     )
 
 

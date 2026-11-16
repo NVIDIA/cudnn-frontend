@@ -28,6 +28,11 @@ pytestmark = [pytest.mark.L0, requires_dsl, requires_pre_rubin_blackwell]
         ("d64_f16_quadrant", 32, 8, 1, 1, True, True),
         ("d64_f16_quadrant", 64, 8, 1, 3, True, True),
         ("d64_f16_quadrant", 64, 32, 1, 1, False, False),
+        ("d128_f16_multi_q", (40, 56), 129, 1, 1, False, False),
+        ("d128_f16_multi_q", (80, 112), 129, 2, 3, True, True),
+        ("d128_f16_single_q", (40, 56), 33, 1, 3, False, False),
+        ("d128_f16_single_q", (80, 112), 17, 1, 3, True, True),
+        ("d64_f16_quadrant", (40, 56), 8, 1, 3, True, True),
     ],
 )
 def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, folder, d, sq, cga, split, packed, causal):
@@ -38,7 +43,8 @@ def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, folder, d,
 
     monkeypatch.setattr(heuristics, "select_sm100_small_half_geometry", lambda *a, **kw: pytest.fail("fixed record reentered small-head selection"))
     torch.manual_seed(19231)
-    b, h, hk, sk, dq, dv = 2, 8, 2, 512, d, d
+    b, h, hk, sk = 2, 8, 2, 512
+    dq, dv = (d, d) if isinstance(d, int) else d
     owner = {"d128_f16_multi_q": 20535, "d128_f16_single_q": 20532, "d64_f16_quadrant": 20536}[folder]
     owner_name = {20535: "sdpa_fwd_sm100_d128_multi_q", 20532: "sdpa_fwd_sm100_d128_single_q", 20536: "sdpa_fwd_sm100_d64_quadrant"}[owner]
     tensors = {
@@ -71,7 +77,7 @@ def test_public_record_rebuild_rebind_and_capture(monkeypatch, dtype, folder, d,
         metadata = compiled.implementation_config
         assert (metadata["query_tile"], metadata["cluster_m"], metadata["cta_group"], metadata["split_kv"]) == (128, cga, cga, split)
         assert seen and seen[-1].CFG.TILES_Q == (2 if owner == 20535 else 1)
-        assert seen[-1].CFG.TILE_K == (32 if owner == 20535 and d == 32 and cga == 1 else max(d, 64))
+        assert seen[-1].CFG.TILE_K == (32 if owner == 20535 and d == 32 and cga == 1 else 64 if max(dq, dv) <= 64 else 128)
         workspace = torch.empty(max(1, graph.get_workspace_size()), device="cuda", dtype=torch.uint8)
         return graph, nodes, workspace
 

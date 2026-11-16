@@ -57,6 +57,68 @@ def test_logical_d32_uses_the_existing_d64_thd_envelope():
     assert g.implementation == small.MULTI_Q and g.d_flavor == 64
 
 
+@pytest.mark.parametrize(
+    "owner,physical,dims,changes,knobs",
+    [
+        (small.MULTI_Q, 32, (24, 16), {}, dict(cga=1)),
+        (small.MULTI_Q, 128, (80, 112), {}, dict(cga=2)),
+        (small.BATCH_PAIR, 64, (48, 40), dict(b=4, has_bias=True, bias_dim=(1, 32, 128, 256), s_kv=256), dict(cga=1)),
+        (mid.D192, 192, (176, 112), {}, dict(cga=2)),
+        (mid.LOOKAHEAD, 256, (224, 208), {}, dict(cga=2)),
+        (mid.SWAP_AB, 256, (224, 208), dict(s_q=3), dict(cga=1, tile_m=16)),
+        (SINGLE_Q, 128, (112, 96), {}, dict(cga=1)),
+    ],
+)
+def test_envelope_record_preserves_physical_host_geometry(monkeypatch, owner, physical, dims, changes, knobs):
+    from cudnn.sdpa.fwd.config_common import TemplateParams
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == owner)
+    native = facts(physical, **changes)
+    envelope = replace(native, d_qk=dims[0], d_v=dims[1])
+    k = engines.SdpaFwdKnobs(tile_n=128, **knobs)
+    assert engines.mismatch(spec.capabilities, envelope, k) is None
+    legacy = next(s for s in engines.ENGINE_SPECS if s.name == small.LEGACY_ROW)
+    assert "owned by" in engines.mismatch(legacy.capabilities, envelope, k)
+    seen = []
+    monkeypatch.setitem(spec.lower.keywords, "lower_impl", lambda *a, **kw: seen.append((a, kw["selected_kernel"])))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fixed envelope record consulted main-body selection")
+
+    monkeypatch.setattr(heuristics, "select_sm107_half_geometry", forbidden)
+    for f in (native, envelope):
+        spec.lower(spec, f, engines.SdpaFwdKnobs.from_public(k.to_public()))
+    (native_args, expected), (args, got) = seen
+    assert args[1] == envelope  # Logical load/store bounds are not replaced by physical widths.
+    assert args[2] == native_args[2]
+    assert got == expected
+    assert got.configure_params(TemplateParams()) == expected.configure_params(TemplateParams())
+
+
+@pytest.mark.parametrize("dims", [(24, 16), (48, 40), (112, 96), (176, 112), (224, 208)])
+def test_half_envelope_does_not_expand_mixed_kv(dims):
+    f = replace(facts(128), d_qk=dims[0], d_v=dims[1], uniform_dtype=False, kv_dtype=cudnn.data_type.FP8_E4M3)
+    owners = [s for s in engines.ENGINE_SPECS if s.capabilities.implementation in small.IMPLEMENTATIONS | mid.IMPLEMENTATIONS | {SINGLE_Q, SHARED_LOOKAHEAD}]
+    assert all(engines.mismatch(s.capabilities, f) for s in owners)
+
+
+@pytest.mark.parametrize(
+    "owner,dims,knobs",
+    [
+        (small.MULTI_Q, (24, 16), dict(cga=1)),
+        (mid.LOOKAHEAD, (112, 96), dict(cga=1, warp_spec_cfg=1)),
+        (SHARED_LOOKAHEAD, (224, 208), dict(cga=2, split_kv=3)),
+    ],
+)
+def test_envelope_transfer_keeps_existing_thd_declines(owner, dims, knobs):
+    f = replace(facts(128, thd=True), d_qk=dims[0], d_v=dims[1])
+    k = engines.SdpaFwdKnobs(tile_n=128, **knobs)
+    policy = engines.sm100_legacy_policy_spec(small.LEGACY_ROW)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == owner)
+    assert engines.mismatch(policy.capabilities, f, k) is not None
+    assert engines.mismatch(spec.capabilities, f, k) is not None
+
+
 def test_omitted_d128_tile_width_keeps_legacy_default():
     g = heuristics.select_sm107_half_geometry(facts(128), engines.SdpaFwdKnobs())
     assert (g.implementation, g.tile_n, g.cga) == (small.MULTI_Q, 128, 2)

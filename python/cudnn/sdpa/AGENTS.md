@@ -204,6 +204,14 @@ of the dense-only `seq_q_lens_present` flag: bind against the compiled spec,
 validate ordinary B or cumulative B+1 storage, and reject uncompiled operands.
 A graph-only test misses a direct-API operand silently dropped by that flag.
 
+When narrowing a backward owner's legacy mask flags with `dataclasses.replace`,
+pass `band=None` to recompute its normalized band declaration. Otherwise the
+copied `BandSupport` still advertises the parent's masks. The band matrix must
+sample each owner's actual non-mask domain (for example grouped heads for the
+two-CTA backward body and D64 for the one-CTA body's sliding window).
+`test_every_row_carries_a_normalized_band_support` and
+`test_unmasked_baseline_is_accepted_by_every_row` detect these mismatches.
+
 **Rule S2 — A change to FROST SDPA graph eligibility updates the affected
 architecture section under [frost/support/](frost/support/README.md) in the same commit.**
 
@@ -273,7 +281,7 @@ ordered after that read.**
   half that stores alpha must also be the one that owns key 0 — the
   original ownership is forced, only the ordering was missing.
 - The same kernel family can hide the split behind a different role name.
-  `sm100/prefill_d256_mxfp8.py` has no `mb_softmax_max`: its
+  `sm100/d256_mxfp8_single_q/kernel.py` has no `mb_softmax_max`: its
   `FUSED_CORR_SPLIT_P` schedule (mxfp8 + strict top-left causal) gives
   keys 64–127 to the *correction* warpgroup (`_fused_p1_step`), and half 0
   stored P into cols 96–111 with nothing ordering it after that
@@ -821,9 +829,9 @@ load/MMA/result-store/release order and retain the refilling warm stress.
 
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
-Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
-(`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/bprop_d512_f16_2x2.py` (`config_sm100.CfgBwdD512x2`,
-`TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
+Kernels on this atom: forward `fwd/kernels/sm100/d512_f16_2x2/kernel.py` + `fwd/kernels/sm107/d512_f16_2x2/kernel.py`
+(`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/d512_f16_2x2/kernel.py` (`config_sm100.CfgBwdD512x2`,
+`TemplateParams2x2`), backward d256 `bwd/kernels/sm100/d256_f16_2x2/kernel.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
 its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
 `test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
 
@@ -991,7 +999,7 @@ Backward (d512 stage 2):
 - **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
   CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
   rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
-  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  (`bwd/kernels/sm107/d512_f16_2x2/kernel.py`, parent `sm100/`) differs from its
   parent in a handful of code lines (the ring-arm default record, the
   hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
   fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
@@ -1621,7 +1629,8 @@ heuristics made before it, and the public knob record's round trip through
 with its margin and its process's node class, clock and control pair -- never a
 default flip from one cell. The per-rendering constants were re-measured on the
 new renderings: see the module constants' comments in
-`fwd/kernels/sm107/prefill_d128_f16.py` for the A/B/A each carries.
+`fwd/kernels/sm107/d128_f16_multi_q/kernel.py` and `fwd/kernels/sm107/small_f16_batch_pair/kernel.py`
+for the A/B/A each carries.
 
 ## Single-CTA packed split scheduler
 
@@ -1908,3 +1917,32 @@ Compare canonical compiled geometry when old public knobs were ignored.
 `test_explicit_d256_body_does_not_reselect_for_query_extent` exports the public
 engine/knob record into a fresh graph, checks the actual body/tile/CGA and
 replays changed inputs under CUDA Graph capture.
+
+Backward rows delegate by selected body, not by exact head pair: their head
+dims are a set plus an envelope, so exact pairs would leave every padded width
+on the row. The row declares `select_implementation` (the same function its
+lowering dispatches on) and `delegated`. Owners come from `explicit_engine`,
+which keeps the row's contract and its name as `policy`. Heuristics and
+`placement_table` read row-keyed decisions through `policy_name`. When one
+graph admits two bodies (a knob choice on the same facts), return a tuple of
+legal bodies, default first, so that each owner's explicit record stays
+valid. If a row restates an adapter's own body test on facts, test the two
+against each other. Detectors: `test_sdpa_bwd_explicit_engines.py` covers the
+partition, legal-tuple ranking, identities and
+`test_sm80_selector_is_the_adapters_d64_rule`.
+
+Moving a body into its implementation directory changes what a relative import
+resolves against (after #2617 moved the D256 MXFP8 bodies into
+`sm100/d256_mxfp8/`, their `from . import _bprop_mxfp8_masks` looked in the new
+package instead of `sm100/`). An AST comparison of the moved file passes, and
+host suites never import template bodies, so import every moved module
+(`importlib.import_module`) before the GPU run. After delegating a row, diff
+failing test ids across every file under `test/python/sdpa` against the parent:
+row-name pins in band, admission and GPU suites do not match a `*bwd*` glob.
+
+After moving a body, search both its retired path and its basename across
+`docs`, `python` and `test` (for example, `git grep -n retired_kernel.py --
+docs python test`). Operation pages may spell the filename differently from
+loader constants, so a loader-only replacement can miss a current reference.
+Update current documentation; preserve frozen historical tracker entries and
+existing diagnostic labels.

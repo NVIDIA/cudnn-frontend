@@ -325,6 +325,10 @@ def fp8_engine_names(arch="sm100") -> tuple[str, ...]:
     return (f"sdpa_fwd_prefill_{arch}_fp8",)
 
 
+# The SM80 backward row's bodies; a pin to the pair takes whichever the graph selects.
+SM80_BWD_OWNERS = ("sdpa_bwd_sm80_f16_d64", "sdpa_bwd_sm80_f16_two_subgroup")
+
+
 def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None, sched_policy=None):
     """Pin the ranked entry for engine ``name`` (or an explicit tuple of names; graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
@@ -755,8 +759,9 @@ def run_d512_delayed_observer(tmp_path, engine):
 
         def delayed(path, params, tag="template"):
             p = Path(path)
-            if p.name == "bprop_d512_f16_2x2.py":
-                assert p.parent.name == ("sm107" if engine == "sdpa_bwd_sm107_d512" else "sm100")
+            relative = p.relative_to(Path(api_dsl.__file__).parent / "kernels").as_posix()
+            expected = "sm107/d512_f16_2x2/kernel.py" if engine == "sdpa_bwd_sm107_d512" else "sm100/d512_f16_2x2/kernel.py"
+            if relative == expected:
                 source = p.read_text()
                 begin = source.index("def _ldg_kv_tile(")
                 end = source.index("\n@cute.jit\ndef _tmaldg_warp_group(", begin)

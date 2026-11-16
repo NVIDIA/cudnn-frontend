@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from cudnn import data_type
 from cudnn.sdpa.fwd.config_fp8_decode_common import TemplateParamsDecode
 from ..small_fp8_contract import in_domain
+from ..fp8_flavor_contract import padded_shape
 
 NAME = "sdpa_fwd_sm100_d128_fp8_swap_ab"
 TEMPLATE_NAME = "decode_d128_fp8"
@@ -47,7 +48,7 @@ class Geometry:
 
 def mismatch(facts, knobs):
     if not in_domain(facts):
-        return "swap-AB requires exact D64/D128 per-tensor FP8 on SM100/SM103"
+        return "swap-AB requires per-tensor FP8 covered by D64/D128 on SM100/SM103"
     if facts.thd or not (0 < facts.b <= 65535):
         return "swap-AB requires dense queries and batch in [1, 65535]"
     if facts.o_block_scale or facts.dtype_o not in (data_type.FP8_E4M3, data_type.FP8_E5M2, data_type.HALF, data_type.BFLOAT16):
@@ -64,7 +65,7 @@ def mismatch(facts, knobs):
     group = facts.h_q // facts.h_kv if knobs is not None and knobs.pack_gqa else 1
     if group > 8:
         return "swap-AB packs a whole group into eight live softmax columns"
-    if facts.d_qk == 64:
+    if padded_shape(facts) == (64, 64):
         if facts.device_cc != (10, 0) or not facts.has_paged_kv:
             return "D64 swap-AB requires SM100 paged KV"
         if not (0 < facts.s_q <= 4 * (8 // group)):

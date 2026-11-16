@@ -61,7 +61,7 @@ def test_registered_owner_and_public_record(cc, dtype, thd, cga, owner):
     "overrides",
     [
         {"device_cc": (10, 7)},
-        {"d_qk": 176, "d_v": 112},
+        {"d_qk": 177, "d_v": 112},
         {"is_fp8": True},
         {"is_mxfp8": True},
         {"uniform_dtype": False},
@@ -73,8 +73,13 @@ def test_other_implementation_domains_are_not_admitted(owner, overrides):
     assert engines.mismatch(SPECS[owner].capabilities, facts(thd=True, padded=True, **overrides)) is not None
 
 
-def test_dense_head_envelope_remains_legacy():
-    assert engines.mismatch(SPECS[multi.LEGACY_ROW].capabilities, facts(d_qk=176, d_v=112)) is None
+@pytest.mark.parametrize("thd,cga,owner", [(False, 1, multi.NAME), (False, 2, multi.NAME), (True, 1, single.NAME), (True, 2, multi.NAME)])
+def test_head_envelope_has_an_explicit_owner(thd, cga, owner):
+    f = facts(d_qk=176, d_v=112, thd=thd, padded=thd)
+    k = engines.SdpaFwdKnobs(cga=cga, tile_m=128, tile_n=128)
+    assert "owned by" in engines.mismatch(SPECS[multi.LEGACY_ROW].capabilities, f)
+    assert engines.mismatch(SPECS[owner].capabilities, f, k) is None
+    assert heuristics.select_sm100_d192_half_geometry(f, k).implementation == owner
 
 
 @pytest.mark.parametrize("mode", ["A", "FALLBACK"])
@@ -93,6 +98,17 @@ def test_single_q_retains_nonpaged_thd_split():
     f = facts(thd=True, padded=True)
     k = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2, sched_policy=1)
     assert engines.mismatch(SPECS[single.NAME].capabilities, f, k) is None
+
+
+def test_head_envelope_retains_the_previous_packed_split_boundary():
+    f = facts(d_qk=176, d_v=112, thd=True, padded=True)
+    k = engines.SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=3, sched_policy=0)
+    policy = engines.sm100_legacy_policy_spec()
+    assert not engines.thd_split_domain(policy.capabilities, f)
+    # The legacy row rejects its cluster domain first; the owner already fixes
+    # that geometry and reports the unsupported packed split directly.
+    assert engines.mismatch(policy.capabilities, f, k) is not None
+    assert "split_kv" in engines.mismatch(SPECS[single.NAME].capabilities, f, k)
     assert engines.mismatch(SPECS[multi.NAME].capabilities, f, k) is not None
 
 

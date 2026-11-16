@@ -431,36 +431,53 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     stats.set_uid(101).set_output(True).set_dim(lse.shape).set_stride(lse.stride()).set_data_type(cudnn.data_type.FLOAT)
     graph.validate()
     graph.build_operation_graph()
-    # Manifest slot 15 is the distinct Rubin half engine.
+    # Legacy rows below are replaced by the explicit body owners where split.
     engine_id = 20505 if cc[0] == 12 else (20515 if cc == (10, 7) else _SM100_ID)
     if cc[0] == 12:
         from cudnn.engines.manifest import MANIFEST
         from frost_test_utils import sm120_half_owner
 
         tile_m, tile_n, cga = 64, 32 if d > 256 else 64, 1
-        # Exact native tiles have explicit owners; padded envelopes keep 20505.
+        # Native tiles and their padded envelopes have explicit owners.
         engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[sm120_half_owner(d, d_v, tile_m)]
     else:
         tile_m, tile_n, cga = 128, 128, 2 if prefill or d == 256 else 1
     if cc in ((10, 0), (10, 3)):
-        if (d, d_v) == (192, 128):
+        from cudnn.sdpa.fwd.kernels.sm100.half_flavor_contract import padded_shape
+
+        physical_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=d_v))
+        if physical_shape == (192, 128):
             engine_id = 20531
-        elif d == d_v and d in (32, 64, 128):
+        elif physical_shape in ((32, 32), (64, 64), (128, 128)):
             # Preserve this fixture's native prefill/single-Q ABI. Short D64
             # packed rows use the separate quadrant body.
             engine_id = 20535 if prefill else 20532
-            if not prefill and d <= 64 and sq * (h // kh) <= 32:
+            if not prefill and physical_shape[0] <= 64 and sq * (h // kh) <= 32:
                 # The quadrant body admits 32 live rows in a physical M128 tile.
                 engine_id, tile_m = 20536, 128
-            elif not prefill and d == 128 and paged and sq * (h // kh) <= 8:
+            elif not prefill and physical_shape == (128, 128) and paged and sq * (h // kh) <= 8:
                 engine_id, tile_m = 20520, 16
-    if cc in ((10, 0), (10, 3)) and (d, d_v) == (256, 256):
-        # Pin the same body this fixture exercised before the row split.
-        # Its short packed Q rows used swap-AB even with the old CGA2 knob.
-        engine_id, tile_m, cga = (20519, 128, 2) if prefill else (20520, 16, 1)
-    if cc in ((10, 0), (10, 3)) and (d, d_v) == (512, 512):
-        # Preserve this native-binder fixture's original role-split ABI.
-        engine_id, tile_m, cga = 20521, 128, 4
+        elif physical_shape == (256, 256):
+            # Pin the same body this fixture exercised before the row split.
+            # Its short packed Q rows used swap-AB even with the old CGA2 knob.
+            engine_id, tile_m, cga = (20519, 128, 2) if prefill else (20520, 16, 1)
+        elif physical_shape == (512, 512):
+            # Preserve this native-binder fixture's original role-split ABI.
+            engine_id, tile_m, cga = 20521, 128, 4
+    elif cc == (10, 7):
+        from cudnn.sdpa.fwd.kernels.sm107.half_flavor_contract import padded_shape
+
+        physical_shape = padded_shape(SimpleNamespace(d_qk=d, d_v=d_v))
+        # These callers exercise native multi-Q / role-split prefill, including
+        # split-KV. Keep the same host ABI after the legacy Rubin row delegates.
+        engine_id, cga = {
+            (32, 32): (20559, 1),
+            (64, 64): (20559, 2),
+            (128, 128): (20559, 2),
+            (192, 128): (20556, 2),
+            (256, 256): (20557, 2),
+            (512, 512): (20554, 4),
+        }[physical_shape]
     graph.create_execution_plan(engine_id, SdpaFwdKnobs(sched_policy=0, tile_m=tile_m, tile_n=tile_n, cga=cga, pack_gqa=cc != (10, 7), split_kv=splits))
     graph.build_plan_at_index(0)
     launch = graph._compiled_plans[graph._plan_index]._prepared
@@ -637,6 +654,12 @@ def test_native_dense_graph_fresh_bindings_and_changed_replay(
     finally:
         capture.reset()
     del owners
+
+
+@pytest.mark.parametrize("d,d_v,sq,prefill", [(40, 56, 1, False), (80, 112, 1, False), (176, 112, 129, True), (224, 224, 4, False), (384, 320, 129, True)])
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+def test_native_dense_envelope_owners_rebind_and_replay(d, d_v, sq, prefill, dtype_name, monkeypatch, request):
+    test_native_dense_graph_fresh_bindings_and_changed_replay(False, d, sq, dtype_name, monkeypatch, request, d_v=d_v, prefill=prefill)
 
 
 def test_native_dense_unknown_storage_contract_is_preserved():

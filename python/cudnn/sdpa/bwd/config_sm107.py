@@ -6,14 +6,14 @@
 Three kernel BODIES share this module, one per dtype family, and each is its
 own pipeline rather than a dtype arm of the other:
 
-* ``kernels/sm107/bprop_d256_f16.py`` (bf16 / fp16): natural MMA order
+* ``kernels/sm107/d256_f16_4x1/kernel.py`` (bf16 / fp16): natural MMA order
   ``Q.K -> dO.V -> P.dO``, P written back INTO the S accumulator (no P ring, no
   ``s_acc_empty``), BMM1 K-split (the K back-half is UTCCP'd into the spare
   TMEM columns and the freed SMEM hosts the second ``dO_dv`` stage).
-* ``kernels/sm107/bprop_d256_fp8.py`` (per-tensor FP8 E4M3): lookahead MMA
+* ``kernels/sm107/d256_fp8/kernel.py`` (per-tensor FP8 E4M3): lookahead MMA
   order ``Q.K[i+1]`` ahead of ``S.dO[i]``, a 2-stage fp8 P ring in TMEM, three
   3-deep Q / dO rings.
-* ``kernels/sm107/bprop_d256_mxfp8.py`` (MXFP8: E4M3 payloads + E8M0 block scale
+* ``kernels/sm107/d256_mxfp8/kernel.py`` (MXFP8: E4M3 payloads + E8M0 block scale
   factors, ``FAMILY_MXFP8``): the fp8 body's pipeline -- the 2-stage e4m3 P ring
   in TMEM [512, 576), BMM2 = ``mma_ts`` -- with every UTCCP'd scale-factor atom
   ALIASED into the P-ring slot that is dead in the current q iteration (no
@@ -315,8 +315,8 @@ class TemplateParams(_BwdTemplateParams):
     body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
     served by all three bodies (packed ``[1, T, H, D]`` operands, a kv-blocked
     dS workspace, per-sequence lengths from the metadata buffer -- the module
-    docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py`` /
-    ``bprop_d256_mxfp8.py``; the MXFP8 body over packed per-sequence-tile-padded
+    docs of ``sm107/d256_f16_4x1/kernel.py`` / ``sm107/d256_fp8/kernel.py`` /
+    ``sm107/d256_mxfp8/kernel.py``; the MXFP8 body over packed per-sequence-tile-padded
     scale factors).
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also
@@ -360,7 +360,7 @@ class TemplateParams(_BwdTemplateParams):
     # under P-c), the dS ring depth and the payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
-    # --- the 2x2-datapath body (``kernels/bprop_d256_2x2_f16.py``, config ``bwd/config_d256_2x2``) ---------------
+    # --- the 2x2-datapath body (``kernels/sm100/d256_f16_2x2/kernel.py``, config ``bwd/config_d256_2x2``) ---------------
     # 0 = the shipped 4x1 bodies (this module's ``make_cfg_d256_bwd``; REJECTED != 0 there -- a 4x1 body never
     # reads it, so a non-zero value would be a claim it cannot honour); 1 = the SM100 profile (one 64-row sub-block per
     # CTA, the ``sdpa_bwd_sm100_d256`` row); 2 = the Rubin interleaved profile (two sub-blocks per CTA, the

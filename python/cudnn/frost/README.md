@@ -333,21 +333,20 @@ python/cudnn/
                                       explicit engine)
         sm80/wide_cooperative/        SM80 wide-head cooperative body (wide512 /
                                       mla576 envelopes; explicit engine)
-        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
-                                      the D512 body: one 64-row tile over
+        sm90/f16_three_wg/            the D512 body: one 64-row tile over
                                       three warpgroups, every D up to 512 on
                                       native 128/256/512-column storage
-        sm90/prefill_d64_f16.py       the D512 body's exact dense D64 subset
-        sm90/prefill_d128_f16.py      dedicated exact D128: 128-row tile, two
+        sm90/d64_f16_one_wg/          the D512 body's exact dense D64 subset
+        sm90/d128_f16_multi_q/        dedicated exact D128: 128-row tile, two
                                       64-row compute warpgroups
         sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
         sm100/d256_f16_lookahead/kernel.py
         sm100/d256_f16_swap_ab/kernel.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
-        sm100/prefill_d512_f16.py
+        sm100/d512_f16_role_split/kernel.py
         sm100/split_combine.py        the split-KV reduction pass
-        sm107/prefill_d128_fp8.py     Rubin siblings (dense K=64 MMA, desc v1)
-        sm107/decode_d256_f16.py      the d256 decode tile's Rubin sibling (same
+        sm107/d128_fp8_multi_q/kernel.py     Rubin siblings (dense K=64 MMA, desc v1)
+        sm107/d256_f16_swap_ab/kernel.py      the d256 decode tile's Rubin sibling (same
                                       swap-AB body; config_sm107.make_cfg_d256_decode)
         sm120/f16_general/            general SM120 template (d <= 256; explicit engine)
         sm120/d256_f16_all_compute/   d256 flavor (explicit engine)
@@ -363,15 +362,15 @@ python/cudnn/
     bwd/                        same shape, its own api_dsl.py / engines.py /
                                 config_sm*.py
       kernels/                  one package per ARCH LINE, like fwd/
-        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
-        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
-        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
-                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
-        sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
+        sm80/f16_two_subgroup/kernel.py  one directory per explicit engine body
+        sm100/d512_f16_role_split/kernel.py       stage 2 of the large-head-dim chain
+        sm100/d256_mxfp8/dq.py        ported MXFP8 kernel classes (+ dkdv,
+                                      masks, common, sf_repack)
+        sm107/d256_f16_4x1/kernel.py       Rubin d256 bf16/fp16 main kernel (dV in
                                       TMEM, dS to a kv-major GMEM workspace)
-        sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
+        sm107/d256_fp8/kernel.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
                                       the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
-        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/f16_fused/kernel.py     fused SM120 main kernel
         sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
                                       (dq2k, converts)
         bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
@@ -699,7 +698,7 @@ honors" is a `dataclasses.fields()` walk over the spec table.
 The engine-to-kernel mapping is many-to-many by design:
 
 - One engine serves several dtypes through one template: the d512 engine
-  lowers fp16 and bf16 graphs to `sm100/prefill_d512_f16.py` with different
+  lowers fp16 and bf16 graphs to `sm100/d512_f16_role_split/kernel.py` with different
   TemplateParams.
 - One engine can drive several kernels: `EngineSpec.lower` is a hook
   `(spec, facts, knobs) -> executor`. The default (`lower_dsl_prefill`)
@@ -864,7 +863,7 @@ Asserts:
   never a module-level `assert` (stripped under `python -O`, and an
   import-time crash is undebuggable from the frontend).
 - Hardware-invariant geometry checks in a template use a raising helper (see
-  `_require` in `sm100/prefill_d512_f16.py`) and must be unreachable for any
+  `_require` in `sm100/d512_f16_role_split/kernel.py`) and must be unreachable for any
   parameter set the engine's capabilities admit.
 - Never `assert api.check_support()` -- it raises on failure and the assert is
   stripped under `-O`; call it plainly.
@@ -1128,11 +1127,15 @@ Contract:
 9. **No module-level asserts on anything a user could trip.** Raise
    `ValueError` in validation functions; keep `assert` for programmer
    invariants inside tile_dsl at most.
-10. **Two directory levels under the pass, maximum**, and ARCH is the only
-    coverage axis allowed to be one of them (`kernels/sm107/prefill_d128_fp8.py`).
-    Every other axis -- phase, head dim, dtype family -- goes in the filename and
-    the engine name. A module shared across arch lines stays at `kernels/` level
-    rather than inside one arch package.
+10. **One directory per implementation, under its arch.** ARCH is the only
+    coverage axis that is a directory level of its own; each implementation then
+    gets one directory holding its body (`kernel.py`), its declaration contract
+    (`contract.py`), its fixed host (`host.py`) and, where needed, `config.py`
+    (`kernels/sm107/d128_fp8_multi_q/kernel.py`). Head dim, dtype family and the
+    pipeline shape go in the implementation directory name and the engine name.
+    Contracts and helpers shared by several implementations of one arch stay at
+    the arch level (`kernels/sm100/small_half_contract.py`); a module shared
+    across arch lines stays at `kernels/` level.
 11. **Identifiers are keyed by op geometry, not model names.**
     `make_cfg_d512`, not `make_cfg_dsv4`; model provenance goes in comments
     only.

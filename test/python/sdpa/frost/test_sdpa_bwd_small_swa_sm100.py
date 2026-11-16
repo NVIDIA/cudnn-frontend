@@ -87,11 +87,11 @@ def test_native_head_host_specializations(monkeypatch):
     import cutlass
 
     from cudnn.frost.template_loader import load_template
-    from cudnn.sdpa.bwd.kernels.sm100 import prepared_d128_host as wide
+    from cudnn.sdpa.bwd.kernels.sm100.d128_f16_recompute import prepared_host as wide
 
     narrow = load_template(wide.__file__, 64, tag="sdpa_bwd_d64_host")
-    body = load_template(str(Path(wide.__file__).with_name("bprop_d128_f16.py")), 64, tag="sdpa_bwd_d64")
-    assert body.CFG_RECOMPUTE.HEAD_DIM == 64 and body.CFG_RECOMPUTE.TILE_N == 128  # the recompute body's binding of the family module
+    body = load_template(str(Path(wide.__file__).with_name("kernel.py")), 64, tag="sdpa_bwd_d64")
+    assert body.CFG_RECOMPUTE.HEAD_DIM == 64 and body.CFG_RECOMPUTE.TILE_N == 128  # the fixed recompute body's width specialization
     assert body.CFG_RECOMPUTE.SLAB_ELEMS >= body.CFG_RECOMPUTE.AUX + body.CFG_RECOMPUTE.TILE_M * body.CFG_RECOMPUTE.TILE_N
     captured = []
 

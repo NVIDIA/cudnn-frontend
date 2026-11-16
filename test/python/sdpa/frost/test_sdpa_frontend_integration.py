@@ -14,7 +14,6 @@ import torch
 import cudnn
 from cudnn.engines import MANIFEST, is_backend_engine, is_python_engine
 
-from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import requires_pre_rubin_blackwell, requires_dsl, requires_sm80, _dsl_installed, _is_plan_for
 
 _FROST = "sdpa_fwd_sm100_d512_2x2"  # exact D512 half owner for the graphs below
@@ -175,10 +174,10 @@ def test_default_plan_runs_and_matches_torch():
 
 
 @_SM100_DSL
-@pytest.mark.parametrize("d,owner", [(56, engine_name()), (64, "sdpa_fwd_sm100_d128_multi_q")])
-def test_small_dims_select_exact_or_envelope_owner(d, owner):
-    """Exact small heads select a fixed body; non-exact heads retain the
-    legacy envelope entry. Both public graph plans execute against torch."""
+@pytest.mark.parametrize("d", [56, 64])
+def test_small_dims_select_exact_or_envelope_owner(d):
+    """Exact and envelope widths select the same fixed body and execute against torch."""
+    owner = "sdpa_fwd_sm100_d128_multi_q"
     q_gpu = torch.randn(B, S, H, d, device="cuda", dtype=torch.float16).transpose(1, 2)
     k_gpu = torch.randn(B, S, H, d, device="cuda", dtype=torch.float16).transpose(1, 2)
     v_gpu = torch.randn(B, S, H, d, device="cuda", dtype=torch.float16).transpose(1, 2)

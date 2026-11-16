@@ -247,7 +247,7 @@ def _validate_cfg_d256_decode_sm107(cfg: CfgD256Decode, flavor: str) -> None:
 
 
 def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIters]:
-    """Config for sm107/decode_d256_f16.py: the SM100 decode record (config_sm100.make_cfg_d256_decode,
+    """Config for sm107/d256_f16_swap_ab/kernel.py: the SM100 decode record (config_sm100.make_cfg_d256_decode,
     whose predicates are arch-neutral, built here over the Rubin width set _D256_DECODE_Q_TILES_SM107 --
     the SM100 pair plus the 64-column tile) re-validated against the Rubin SMEM carveout (standard or
     oversized) and the version-0 tcgen05 descriptor window.

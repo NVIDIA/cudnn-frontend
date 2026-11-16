@@ -424,7 +424,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
 
 
 def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]:
-    """Config for ``sm100/decode_d128_f16.py`` at ``d_flavor=64`` -- the d64
+    """Config for ``sm100/d128_f16_single_q/kernel.py`` at ``d_flavor=64`` -- the d64
     flavor at ``cta_mma=1``.  Backstop, like every ``make_cfg_*``."""
     if params.decode_quad:
         raise ValueError("single-Q configuration cannot select the quadrant implementation")

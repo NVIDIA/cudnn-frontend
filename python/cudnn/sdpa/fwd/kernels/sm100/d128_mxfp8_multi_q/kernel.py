@@ -61,7 +61,7 @@ from cudnn.sdpa.fwd.kernels.sm100.d128_mxfp8_multi_q.config import make_cfg_d64,
 # as a module global before this body runs; the default keeps direct import usable.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 # One pipeline, two head-dim geometries: d128 and the native d64 (gpt-oss class),
-# selected by TemplateParams.d_flavor exactly as in prefill_d128_f16.py.
+# selected by TemplateParams.d_flavor exactly as in d128_f16_multi_q/kernel.py.
 # The d128 flavor runs three K/V stages at cga1 (config_sm100.make_cfg_d128: the scale-factor staging still fits
 # next to the aliased Q/O slab; the per-tensor fp8 sibling keeps the default two).
 _MAKE_CFG = {64: make_cfg_d64, 128: lambda p: make_cfg_d128(p, cga1_kv_stages=3)}
@@ -69,7 +69,7 @@ if PARAMS.d_flavor not in _MAKE_CFG:
     raise ValueError(f"prefill_d128_mxfp8: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 if PARAMS.dual_kv_stream:
-    raise ValueError("sm100/prefill_d128_mxfp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/prefill_d128_fp8.py only")
+    raise ValueError("sm100/prefill_d128_mxfp8: dual_kv_stream (two KV streams over one Q tile) is served by sm100/d128_fp8_dual_kv/kernel.py only")
 # Lowering of the CLC scheduler's credit arrive (``tile_dsl.scheduler.read_tile_id_arrive``, every call site below): False =
 # the lane-compare BRANCH form, True = the single predicated arrive of PR #1169.  Both land the same arrives from the same
 # lanes (READ_TILE_ARRIVERS unchanged), so this is a per-SPECIALIZATION tuning constant, keyed on the compile-time mask bits

@@ -76,6 +76,7 @@ arbitrary user callbacks.
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
+| `DSA.sparse_attention_backward_wrapper(return_cli_target=True)` teacher output | bprop auxiliary | FP32 target; FP16/BF16 inputs | Unverified (tests added) | Unsupported | Unsupported |
 | `DSA.sparse_attention_forward_wrapper` | fprop | FP16, BF16 | Unverified | Supported | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | FP16 | Unverified | Replay only | Supported |
 | `DSA.sparse_attention_backward_wrapper` | bprop | BF16 | Unverified | Replay only | Replay only |
@@ -121,6 +122,10 @@ arbitrary user callbacks.
 | `pygraph.sdpa`, FROST single-sequence THD setup (dense D128 or paged D64/D128, unsplit) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | See native single-sequence limits below |
 | `pygraph.sdpa`, FROST D64/D128 split THD setup (CGA1, fixed packing and split count) | fprop | matching FP16/BF16 Q/K/V/O | Unverified | Supported (SM100, tested configurations); SM103 execution unverified | Unverified by this suite |
 | `pygraph.sdpa` / standalone FROST D64 packed THD prefill (CGA1/2, N128, unsplit, independent origins) | fprop | matching FP16/BF16 Q/K/V/O | Unsupported | Supported (tested configurations) | Unverified by this suite |
+| `pygraph.sdpa_backward`, explicit FROST SM100 D512 role-split and 2x2 owners | bprop | matching FP16/BF16 inputs and gradients | Unsupported for these engines | Unverified for general batch invariance; fixed-plan repeatability verified on SM100 in tested configurations; SM103 unverified | Unsupported for these engines |
+| `pygraph.sdpa_backward`, fixed D256 and D192/V128 half implementations (20607, 20610, 20632, 20633) | bprop | matching FP16/BF16 inputs and gradients | Unsupported for these engines | SM100: repeatability and batch isolation verified at causal S=257, MHA/GQA; general batch invariance and SM103 unverified | Repeatability and batch isolation verified at causal S=257, MHA/GQA for the three fixed owners; general batch invariance unverified; deterministic-mode declarations unchanged |
+| `pygraph.sdpa_backward`, FROST SM107 D512 fixed implementation (20608) | bprop | matching FP16/BF16 inputs and gradients | Unsupported for this engine | Unsupported for this engine | Repeatability and batch isolation verified for dense causal D384 GQA / D512 MHA in FP16/BF16; general batch invariance unverified; the graph does not advertise deterministic mode |
+| `pygraph.sdpa_fp8_backward` / `sdpa_mxfp8_backward`, fixed SM107 implementations (20605, 20606) | bprop | E4M3 inputs with tensor/block scales; BF16 gradients in these checks | Unsupported for these engines | Unsupported for these engines | Fixed-plan repeatability, record rebuild and changed-input capture verified at causal D256, S=257, MHA/GQA; general batch invariance unverified; deterministic-mode declarations unchanged |
 | `pygraph.sdpa_fp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and FP32 tensor scales; E4M3/FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8_backward`, FROST exact D512 dense pair | bprop | E4M3 payloads and canonical E8M0 block scales; FP16/BF16 gradients | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Supported (tested configurations) |
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
@@ -291,9 +296,25 @@ a row alone and inside a batch under the entry's own picks.
   KDA's packed workspace uses a shape-only bound on the number of piece slots;
   it preserves the per-sequence split rule and arithmetic. Compact-workspace
   output, gradient and CP-summary byte parity is additionally checked on SM103
-  for BF16/FP16, including changed-length CUDA Graph replay. This additional
-  workspace regression has not been rerun on SM100 or SM107; their earlier
-  determinism coverage remains recorded in the test report.
+  for BF16/FP16, including changed-length CUDA Graph replay. Large KDA backward
+  plans can also reuse checkpoint and owned-state storage across independent
+  head waves. This preserves each head's recurrence, FP32 state and reduction
+  order; BF16/FP16 grouped heads, rectangular states and external contexts have
+  additional SM103 byte-parity coverage. Runtime-head reuse of compiled code
+  and independent CUDA Graph replays on two streams with separate workspaces
+  are also checked against the unsplit backward path on SM103, including H96
+  with BF16/log gates and FP32 states (two/four-wave backward). Forward state
+  waves and eight-wave backward have additional SM103 byte-parity coverage
+  for grouped heads, rectangular forward states, public checkpoints and
+  changed-prefix graph replay. Exact FP32 forward H/X storage reuse has
+  additional SM100 byte-parity coverage, including rectangular states,
+  forward/reverse chains, changed-input graph replay and public checkpoints.
+  Four/eight-wave forward and sixteen-wave backward also have SM100 coverage
+  for grouped heads, log/safe gates and runtime-head reuse through H96.
+  Their automatic policy may retain more storage to protect parallelism;
+  it is not a hard workspace cap. The new H/X alias and sixteen-wave paths
+  have not been requalified on SM103 or SM107; earlier architecture coverage
+  remains recorded separately in the test report.
 - Fused GDN step entries (`GdnDecodeFused`, `GdnVerifyFused`): no determinism
   switch; every form the entry picks or a knob selects writes the one-CTA
   form's bytes, so the status holds under any knob and at every served

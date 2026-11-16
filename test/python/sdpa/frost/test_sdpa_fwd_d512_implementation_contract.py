@@ -66,10 +66,12 @@ def test_other_architectures_do_not_enter_the_new_rows(cc, name):
     assert "requires SM100/SM103" in engines.mismatch(SPECS[name].capabilities, facts(device_cc=cc))
 
 
-def test_envelope_keeps_its_existing_owner():
+def test_envelope_has_explicit_owners():
     f = facts(d_qk=504, d_v=504)
-    assert engines.mismatch(SPECS["sdpa_fwd_prefill_sm100"].capabilities, f) is None
-    assert all(engines.mismatch(SPECS[name].capabilities, f) is not None for name in (ROLE_SPLIT, TWO_BY_TWO))
+    assert "owned by" in engines.mismatch(SPECS["sdpa_fwd_prefill_sm100"].capabilities, f)
+    for name in (ROLE_SPLIT, TWO_BY_TWO):
+        assert engines.mismatch(SPECS[name].capabilities, f) is None
+        assert explicit_geometry(name, f).d_qk == 512
 
 
 @pytest.mark.parametrize("name", [ROLE_SPLIT, TWO_BY_TWO])

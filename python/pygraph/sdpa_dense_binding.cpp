@@ -21,9 +21,9 @@ namespace py = nanobind;
 namespace cudnn_frontend {
 namespace python_bindings {
 namespace {
-// A persistent SM90 D128 causal plan's work-item claim counter (prefill_d128_f16.py, TemplateParams.causal_claim): one
-// Int32 at the caller's workspace base, zeroed on the launch stream before every launch. The bytes the plan reserves
-// for it (api_dsl scratch_workspace_bytes, config_sm90.D128_CLAIM_WORKSPACE_BYTES).
+// A persistent SM90 D128 causal plan's work-item claim counter (sm90/d128_f16_multi_q/kernel.py,
+// TemplateParams.causal_claim): one Int32 at the caller's workspace base, zeroed on the launch stream before every
+// launch. The bytes the plan reserves for it (api_dsl scratch_workspace_bytes, config_sm90.D128_CLAIM_WORKSPACE_BYTES).
 constexpr int64_t kClaimWorkspaceBytes = 128;
 // cuMemsetD32Async, resolved once through the runtime as cudnn_frontend_shim.h resolves its driver entry points, so
 // the binder never links libcuda and never calls back into Python for the reset (an earlier counter did: cuda-python's
