@@ -36,6 +36,17 @@ from sdpa.blocked import fetch_blocked_tests
 from sdpa.helpers import print_section_begin, print_section_end
 from sdpa.softmax_knobs import served_softmax_knob_sets, knob_set_for_case, knob_set_label, is_default_knob_set
 import frost_routing
+from sdpa.graph import test_sdpa_sm90_zero_kv_compat as _sm90_zero_kv_compat
+
+
+@pytest.mark.L0
+class TestSM90ZeroKVCompatibility:
+    """Keep the versioned compatibility checks in the maintained graph CI entry."""
+
+    test_default_zero_kv_and_changed_length_capture = staticmethod(_sm90_zero_kv_compat.test_default_zero_kv_and_changed_length_capture)
+    test_zero_kv_layouts_use_safe_default = staticmethod(_sm90_zero_kv_compat.test_zero_kv_layouts_use_safe_default)
+    test_zero_kv_backend_fix_boundary_is_current = staticmethod(_sm90_zero_kv_compat.test_zero_kv_backend_fix_boundary_is_current)
+
 
 # fmt: off
 
