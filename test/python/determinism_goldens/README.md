@@ -7353,3 +7353,58 @@ comes from the frozen implementation revisions; subsequent parent integration
 preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
+
+## Shared backward delta grid boundaries (2026-11-16)
+
+`sdpa/frost/test_sdpa_bwd_dot_grid_determinism.py` directly exercises the shared
+backward delta helper. Its contract is FP32 `rowsum(O * dO)`, optionally scaled
+by the two device descales, plus any declared dQ accumulator/relay zeroing.
+It has no forward operation and does not produce final attention gradients.
+These results do not establish full-chain batch invariance or expand graph
+engine eligibility.
+
+The suite checks complete delta outputs against an independent FP64 formula,
+zero/sentinel tails, fresh bindings, eight executions with concurrent work,
+changed-input CUDA Graph replay, and a sequence alone, reordered and duplicated.
+Dense FP16/BF16/E4M3 cases include batch/head 65535 and 65536 and a live second
+query tile. Half THD cases include empty sequences, independent poisoned O/dO
+origins, compact output packing and a live second query tile. The optional
+accumulator and relay regions must both be cleared.
+
+Runtime: PyTorch 2.14.1+cu130, cuDNN 9.28.0.38, CuTe DSL 4.8.0 with CUDA 13.4
+compiler. Every process verified its isolated checkout import.
+
+| Device / scope | Passed | Skipped | Interpretation |
+|---|---:|---:|---|
+| A100 / SM80, native L0 suite | 23 | 6 | FP8 conversion unavailable on SM80; those cases are unverified here |
+| A100 / SM80, large-index L1 detector | 1 | 0 | Delta crosses the signed Int32 element boundary; owned prefix/tail canaries survive |
+| L40S / SM89, native L0 suite | 29 | 0 | Portable helper execution, not an SM89 SDPA engine claim |
+| Host contract and cross-compilation, run on L40S | 14 | 1 | SM80 FP8 conversion skipped; half/FP8 compiled for SM89/90/100/103/107/120; no native claim for those other targets |
+
+Before the fix, the original helper at `68853830a1b520f91dd77220acfe44b1579a9379`
+failed the initial 21-case L40S matrix **11 failed / 10 passed**, all failures
+being CUDA launch-configuration rejection above 65535. The same A100 FP16
+subset had **2 failed / 2 passed**. Keeping the flat launch while restoring
+only the Int32 delta multiplication makes the large-index detector fail on
+untouched live output rows; widening that multiplication passes. Its whole
+wrapped-address interval belongs to the test's prefix allocation. This L1
+case requires 28 GiB free and remains outside the smoke suite.
+
+Nine new small goldens were recorded only after the reference/replay checks,
+then compared with recording disabled. No previous golden was replaced.
+FP16/BF16 delta output hashes agree on both tested devices; FP8 includes its
+explicit descale product. The new records are in runtime directories
+`a29ca37b88513cb6` (A100) and `98a9396f557b5d7c` (L40S).
+
+Commands from `test/python`, with the stated GPU visible and source import
+verified:
+
+```bash
+CUDNN_DETERMINISM_GOLDENS="$PWD/determinism_goldens" \
+  pytest sdpa/frost/test_sdpa_bwd_dot_grid_determinism.py -m L0
+pytest sdpa/frost/test_sdpa_bwd_dot_grid_contract.py -m L0
+pytest sdpa/frost/test_sdpa_bwd_dot_large_index.py -m L1
+```
+
+Native SM100/103/107/120 execution at the new boundary and full SDPA-chain
+qualification are pending. Existing API support rows retain their prior limits.

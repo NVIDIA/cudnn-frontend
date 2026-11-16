@@ -727,6 +727,14 @@ K/V page-table strides; `test_fp8_paged_distinct_table_strides_prepared`
 checks both routes numerically with the tensor compiler forbidden, changed
 allocations and CUDA Graph replay.
 
+Audit auxiliary launches as well as the main kernel when fixing grid bounds.
+A persistent or chunked main pass can still launch a full-batch/head delta
+preprocess. Cover half and scaled FP8, packed and independent-origin THD,
+and every scratch initialization in that launch. The shared delta grid suite
+checks both sides of 65535; its large-index L1 sibling surrounds the output
+with owned storage so an Int32 offset wrap corrupts a canary, not another
+allocation. Compile-only target checks remain separate from native evidence.
+
 For descriptor stride products, inspect the traced multiplication intermediates,
 not just the final cast or Python annotation. MXFP8 V scales use a separate
 plane stride: `test_mxfp8_v_scale_plane_stride_multiplies_in_int64` checks the
