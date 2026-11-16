@@ -875,11 +875,12 @@ def _softmax_warp_group(
     oo = cutlass.make_array_view(o_tensor)
     D_V = cutlass.const_expr(o_tensor.shape[3])
     # Bound the epilogue's live inverse/dead/live lists together with its TMEM
-    # readback and wide output addresses. The 18-warp N_Q=64 tile needs four
-    # columns at a time to stay within its 96-register cap; smaller CTAs retain
-    # the eight-column groups. Arithmetic and output ownership stay identical.
+    # readback and wide output addresses. The dense 18-warp N_Q=64 tile needs
+    # four columns at a time to stay within its 96-register cap. Paged records
+    # stay spill-free with eight columns, as do smaller CTAs: keep their wider
+    # readback to avoid extra epilogue waits. Arithmetic and ownership match.
     # Each lane keeps only its own LSE and recomputes token/head at the store.
-    O_GROUPS = 4 if N_Q == 64 else 2
+    O_GROUPS = 4 if N_Q == 64 and not PAGED_KV else 2
     O_HALF = COLS // O_GROUPS
     my_lse = ZERO
     my_lse_live = lane < cutlass.Int32(0)  # False

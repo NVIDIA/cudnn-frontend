@@ -263,7 +263,7 @@ def test_sm107_decode_body_matches_the_sm100_body():
     # The 18-warp SM107 tile uses four-column epilogue groups to keep wide
     # output addresses below its register cap. Pin this exact local delta.
     b_src = "\n".join(b)
-    epilogue_groups = "    O_GROUPS = 4 if N_Q == 64 else 2\n    O_HALF = COLS // O_GROUPS"
+    epilogue_groups = "    O_GROUPS = 4 if N_Q == 64 and not PAGED_KV else 2\n    O_HALF = COLS // O_GROUPS"
     assert b_src.count(epilogue_groups) == 1
     assert b_src.count("    for h in cutlass.range_constexpr(O_GROUPS):") == 1
     b_src = b_src.replace(epilogue_groups, "    O_HALF = COLS // 2")
