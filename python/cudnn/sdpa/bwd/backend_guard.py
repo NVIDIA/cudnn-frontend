@@ -7,6 +7,16 @@ RAGGED_TILE_MAPPING_FIXED_IN = 92501
 
 def backend_engine_guard(graph, facts):
     """Keep the affected engine off a graph; preserve other backend candidates."""
+    from cudnn.sdpa.nonpositive_scale_guard import backend_engine_guard as scale_guard
+
+    excluded = _ragged_tile_mapping_guard(graph, facts)
+    if facts is not None and facts.is_backward:
+        for engine, reason in scale_guard(facts).items():
+            excluded.setdefault(engine, reason)
+    return excluded
+
+
+def _ragged_tile_mapping_guard(graph, facts):
     import cudnn
 
     if facts is None or facts.invalid is not None or not facts.is_backward:

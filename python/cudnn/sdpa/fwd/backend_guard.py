@@ -105,6 +105,16 @@ WIDE_V_WRONG_O_ENGINES = (10, 18)
 
 def backend_engine_guard(graph, facts) -> Dict[int, str]:
     """Backend engines (global ids) that must not run ``graph`` (its SDPA facts), each with the reason."""
+    from cudnn.sdpa.nonpositive_scale_guard import backend_engine_guard as scale_guard
+
+    excluded = _wide_v_engine_guard(graph, facts)
+    if facts is not None and not facts.is_backward:
+        for engine, reason in scale_guard(facts).items():
+            excluded.setdefault(engine, reason)
+    return excluded
+
+
+def _wide_v_engine_guard(graph, facts) -> Dict[int, str]:
     import cudnn
 
     if facts is None or facts.invalid is not None or facts.is_backward:

@@ -1642,3 +1642,13 @@ RED control; assert rejection before either FE scratch initialization or output
 writes. Exact capacity, larger carriers of a different element width, and raw
 integer pointers with unknown capacity are positive controls. See
 `core/graph/test_execute_workspace.py::test_short_backend_workspace_rejects_before_any_write`.
+
+
+For native SDPA correctness guards, execute each public `(engine_id, knobs)`
+record: two configurations of the same fallback engine can differ numerically.
+Retain a correct sibling config, test explicit replay before native lowering,
+and keep opaque delegates from bypassing an active config predicate. A tensor
+scale can change sign after planning; cover its changed-value CUDA Graph replay.
+Backward comparisons must consume independent correct O/Stats, and cover both
+default and deterministic algorithms. `test_sdpa_nonpositive_scale_backend.py`
+exercises these boundaries and re-measures each guard's version bound.
