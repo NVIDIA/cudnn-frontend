@@ -24,7 +24,6 @@ _ROUTES = [pytest.param(cc, dtype, dtype, id=f"sm{cc[0]}{cc[1]}-{dtype}") for cc
 
 
 def _declarations(monkeypatch, cc, dtype, grad, *, b=1, h=1, sq=2, sk=3, scale=None, causal=False, deterministic=False):
-    from cudnn import _pybind_module
     from cudnn.frost import buffers, device
     from cudnn.sdpa.bwd.api_dsl_sm100_d192 import SdpaBwdDslSm100D192
     from cudnn.sdpa.bwd.api_dsl_sm100_d192_fp8 import SdpaBwdDslSm100D192Fp8
@@ -34,7 +33,7 @@ def _declarations(monkeypatch, cc, dtype, grad, *, b=1, h=1, sq=2, sk=3, scale=N
         monkeypatch.setattr(module, "cutedsl_state", state)
         monkeypatch.setattr(module, "cutedsl_arch_requirement_error", lambda cc: None)
     monkeypatch.setattr(device, "compute_capability", lambda _: cc)
-    monkeypatch.setattr(_pybind_module, "_SdpaBwdBinder", SimpleNamespace(supports_zero_workspace=True))
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaBwdBinder", SimpleNamespace(supports_zero_workspace=True))
 
     samples, ports = {}, []
     for role in ("q", "k", "v", "o", "dO", "stats", "dQ", "dK", "dV"):
