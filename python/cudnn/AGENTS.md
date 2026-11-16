@@ -1166,6 +1166,23 @@ accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`)
 `TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
 (the SDPA pins in `sdpa/frost/test_sdpa_bwd_d256_sm100.py` are the pattern).
 
+**A wgmma accumulator read that no `wgmma.wait_group` dominates serializes
+every wgmma of the kernel.** ptxas keeps `wgmma.mma_async` groups pipelined
+only when every read of their accumulator registers sits behind a wait on
+every path. One path without it is enough: ptxas injects the wait itself
+(remark C7517), reports C7514 (`wgmma.mma_async instructions are serialized`)
+and puts a `WARPGROUP.DEPBAR` behind every HGMMA of the function, not only in
+front of that read. The SM90 blk128 BSA forward issued its last
+`wait_group(0)` under `if has_blocks:` and rescaled O behind the branch; its
+variable-count and split kernels then ran 16 DEPBARs per list step where the
+source has 2 waits. Results are bit-identical either way, so numerics tests
+cannot see it; issuing the wait unconditionally (a wait with nothing pending
+is a no-op) removed both remarks and 26 % of the SM cycles. **Detector:**
+compile with `CUTE_DSL_COMPILER_OPT="remarks{ptx}"` and search the log for
+`C7514` / `C7517` (a pipelined kernel has neither), or compare the
+`WARPGROUP.DEPBAR` count of the SASS with the kernel's own `wait_group` calls.
+No test pins this yet.
+
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged
 map it already acquired. Track the sequence/expert per consuming warp, reacquire
