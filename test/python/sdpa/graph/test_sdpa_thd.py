@@ -1131,8 +1131,6 @@ def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle, request):
         pytest.skip("THD layout requires cuDNN 9.10.0 or higher")
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("SDPA with THD layout requires SM80 or higher")
-    if cudnn_version < "9.27.0":
-        request.applymarker(pytest.mark.xfail(strict=True, reason="#1083: only the first q head of each kv group is written before cuDNN 9.27.0"))
 
     b, h_q, h_kv, s_q, s_kv, d = 1, 8, 2, 1, 300, 128
     dtype = torch.bfloat16
@@ -1195,6 +1193,8 @@ def test_sdpa_thd_seq1_gqa_ragged_stats(cudnn_handle, request):
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     graph.check_support()
     graph.build_plans()
+    if cudnn_version < "9.27.0" and graph.selected_engine is None:
+        request.applymarker(pytest.mark.xfail(strict=True, reason="#1083: the backend writes only the first q head of each kv group before cuDNN 9.27.0"))
 
     workspace = torch.empty(max(int(graph.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
     stream = torch.cuda.current_stream().cuda_stream
