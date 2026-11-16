@@ -239,10 +239,14 @@ def test_thd_fold_complete_grid_product_keeps_last_live_owner(dtype, batch, head
     launch()
     torch.cuda.synchronize()
     check(1)
-    before = snapshot(launch())
+    # Each complete-grid output can contain 134M elements. The shared byte
+    # comparator's Int64 reduction would add a multi-GiB GPU temporary while
+    # the inputs and replay snapshots are live; compare every byte on CPU.
+    before = {name: value.cpu() for name, value in snapshot(launch()).items()}
     for output in outputs:
         output.fill_(123.0)
-    assert_bitwise(snapshot(launch()), before, "complete-grid replay")
+    replay = {name: value.cpu() for name, value in snapshot(launch()).items()}
+    assert_bitwise(replay, before, "complete-grid replay")
     captured = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(captured):
