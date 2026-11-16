@@ -29,7 +29,7 @@ SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (4, 8, 16, 32, 64)
 SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4 = SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8
 # NVFP4 (E4M3 scales per 16 values) also keeps the 128-row tile and its 128-packed-row scale atom, so a group of
 # 4..64 heads packs ``128 // group`` tokens per tile.
-SUPPORTED_QHEAD_PER_KV_HEAD_NVFP4 = (4, 8, 16, 32, 64)
+SUPPORTED_QHEAD_PER_KV_HEAD_NVFP4 = SUPPORTED_QHEAD_PER_KV_HEAD_MXFP4
 # Head groups keyed by precision.
 _SUPPORTED_QHEAD_PER_KV_HEAD = {
     "bf16": SUPPORTED_QHEAD_PER_KV_HEAD_BF16,
