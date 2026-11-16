@@ -102,13 +102,44 @@ WIDE_V_WRONG_O_SINCE = 92301
 WIDE_V_WRONG_O_FIXED_IN: Optional[int] = None
 WIDE_V_WRONG_O_ENGINES = (10, 18)
 
+# Actual cuDNN 9.24.0.43 on Hopper leaves O / Stats unwritten for live query
+# rows whose per-batch KV length is zero (NaN when the output was poisoned).
+# Dense, ragged and paged graphs reproduce this with engine 9; engine 8 is
+# correct. The same defect is present in 9.23.2.1: 9.24 is the serving-stack
+# qualification target, not an introduction boundary. Without an established
+# unaffected earlier release, retain this exclusion below the verified fix.
+# 9.25.0.15 and 9.25.1.1 pass the
+# saved FP16/BF16 repros with and without Stats. This is a data-dependent
+# defect: a positive-length launch does not qualify the same graph for a
+# later empty-KV launch. Device lengths cannot be inspected while planning.
+# Keep the backend's other engines and FROST candidates, and do not add an
+# execute-time synchronization or output-repair kernel.
+SM90_ZERO_KV_WRONG_O_FIXED_IN = 92500
+
 
 def backend_engine_guard(graph, facts) -> Dict[int, str]:
     """Backend engines (global ids) that must not run ``graph`` (its SDPA facts), each with the reason."""
     excluded = _wide_v_engine_guard(graph, facts)
+    for engine, reason in _zero_kv_engine_guard(graph, facts).items():
+        excluded.setdefault(engine, reason)
     for engine, reason in _sm120_empty_q_engine_guard(graph, facts).items():
         excluded.setdefault(engine, reason)
     return excluded
+
+
+def _zero_kv_engine_guard(graph, facts) -> Dict[int, str]:
+    import cudnn
+
+    if facts is None or facts.invalid is not None or facts.is_backward:
+        return {}
+    if facts.device_cc != (9, 0) or not facts.padded or facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16):
+        return {}
+    if cudnn.backend_version() >= SM90_ZERO_KV_WRONG_O_FIXED_IN:
+        return {}
+    return {
+        9: f"cuDNN {cudnn.backend_version_string()} engine 9 leaves O and Stats unwritten for zero-length KV in padded Hopper SDPA forward "
+        f"(dense, ragged or paged; reproduced in 9.23.2.1 and 9.24.0.43, fixed in 9.25.0.15); the backend's other engines serve this graph"
+    }
 
 
 # Real 9.23.2.1 / 9.24.0.43 / 9.25.0.15 / 9.25.1.1 execute engine 11

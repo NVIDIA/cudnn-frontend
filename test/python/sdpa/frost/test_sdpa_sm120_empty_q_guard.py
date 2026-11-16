@@ -50,7 +50,8 @@ def test_sm120_empty_q_features_do_not_hide_runtime_lengths(monkeypatch, feature
 )
 def test_sm120_empty_q_preserves_other_domains(monkeypatch, changes):
     monkeypatch.setattr(cudnn, "backend_version", lambda: 92400)
-    assert backend_engine_guard(None, _facts(**changes)) == {}
+    expected = {9} if changes.get("device_cc") == (9, 0) else set()
+    assert set(backend_engine_guard(None, _facts(**changes))) == expected
 
 
 def test_sm120_empty_q_preserves_wide_v_guard(monkeypatch):
