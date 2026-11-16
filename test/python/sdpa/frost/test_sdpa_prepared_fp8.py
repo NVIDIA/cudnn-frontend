@@ -50,6 +50,7 @@ def _case(
     seq_lens=None,
     independent_o_offsets=False,
     record=None,
+    output_batch_stride=0,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -132,6 +133,10 @@ def _case(
             off_o = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=offset_type, name="off_o")
             o.set_ragged_offset(off_o)
             tensors["off_o"], vp[off_o] = off_o, torch.arange(b + 1, device="cuda", dtype=offset_dtype) * sq * hq * dv
+    if output_batch_stride:
+        assert not thd and not output_padding
+        out = torch.empty_strided((b, hq, sq, dv), (output_batch_stride, dv, hq * dv, 1), device="cuda", dtype=output_dtype)
+        o.set_stride(out.stride())
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
@@ -552,3 +557,66 @@ def test_fp8_output_pitch_requires_native_byte_alignment(output_dtype, padding, 
         captured.replay()
         _check(bufs, thd=False)
         assert torch.all(bufs["o_storage"][..., 128:] == 12)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("pack", [False, True])
+@pytest.mark.parametrize("b,batch_stride", [(2, 0), (4, 2**31 - 65536), (2, 2**32 + 65536)], ids=["compact", "wide_product", "wide_stride"])
+def test_decode_fp8_physical_output_strides_replay(dtype, output_dtype, pack, b, batch_stride):
+    """The actual swap-AB body addresses wide O pitches in elements for every scalar output type."""
+    import inspect
+
+    from determinism_utils import assert_bitwise, snapshot
+
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import NAME
+
+    family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
+    knobs = SdpaFwdKnobs(tile_m=16, tile_n=128, cga=1, pack_gqa=pack, split_kv=1, sched_policy=0)
+    g, vp, ws, bufs, _ = _case(
+        b=b,
+        sq=1,
+        skv=128,
+        dtype=dtype,
+        output_dtype=output_dtype,
+        output_batch_stride=batch_stride,
+        record=(family.offered_ids()[NAME], knobs.to_public()),
+    )
+    assert g.selected_engine.name == NAME
+    compiled = g._compiled_plans[g._plan_index]._compiled
+    assert compiled.kernel_template == "decode_d128_fp8"
+    api = inspect.getclosurevars(compiled.default_stream).nonlocals["api"]
+    assert api._k_mod.__file__.endswith("/sm100/d128_fp8_swap_ab/kernel.py")
+    bufs["o"].fill_(11)
+    g.execute(vp, ws)
+    _check(bufs, thd=False, b=b, sq=1, skv=128)
+    baseline = snapshot({name: bufs[name] for name in ("o", "lse", "amax_o")})
+    original_v = bufs["v"].clone()
+    with _cuda_graph() as capture:
+        with torch.cuda.graph(capture):
+            previous = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                g.execute(vp, ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(previous)
+        capture.replay()
+        assert_bitwise({name: bufs[name] for name in baseline}, baseline, "unchanged wide-output replay")
+        bufs["v"].copy_((-0.5 * bufs["v"].float()).to(dtype))
+        bufs["descale_v"].fill_(0.3)
+        bufs["scale_o"].fill_(1.7)
+        bufs["o"].fill_(11)
+        bufs["lse"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
+        capture.replay()
+        _check(bufs, thd=False, b=b, sq=1, skv=128)
+        bufs["v"].copy_(original_v)
+        bufs["descale_v"].fill_(0.7)
+        bufs["scale_o"].fill_(1.3)
+        bufs["o"].fill_(11)
+        bufs["lse"].fill_(float("nan"))
+        bufs["amax_o"].fill_(999)
+        capture.replay()
+        assert_bitwise({name: bufs[name] for name in baseline}, baseline, "restored wide-output replay")
