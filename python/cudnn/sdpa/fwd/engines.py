@@ -2219,6 +2219,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d192_split_physical_origins", False)
         ):
             return "nonpaged D192 split physical origins require the matching native cuDNN Frontend extension"
+        if (
+            packed_split
+            and not facts.has_paged_kv
+            and (facts.d_qk, facts.d_v) == (256, 256)
+            and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_nonpaged_d256_split_physical_origins", False)
+        ):
+            return "nonpaged D256 split physical origins require the matching native cuDNN Frontend extension"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
@@ -5274,7 +5281,11 @@ def lower_dsl_prefill(
             and facts.epilogue_gate_t is None
             and lowering_row_name in ("sdpa_fwd_prefill_sm100", "sdpa_fwd_prefill_sm107")
             and facts.device_cc in ((10, 0), (10, 3), (10, 7))
-            and ((facts.d_qk, facts.d_v) == (192, 128) or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split))
+            and (
+                (facts.d_qk, facts.d_v) == (192, 128)
+                or ((facts.d_qk, facts.d_v) == (64, 64) and api.packed_thd_split)
+                or ((facts.d_qk, facts.d_v) == (256, 256) and api.packed_thd_split and api.cga in (None, 2))
+            )
             and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
             and not facts.has_paged_kv
         )

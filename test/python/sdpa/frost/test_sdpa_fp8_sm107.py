@@ -41,6 +41,16 @@ class TestNativeHalfRegisterRelease:
 
 
 @requires_rubin
+class TestD256HalfSplitOrigins:
+    """Keep the shared half D256 origin regression in the selected SM107 CI entry."""
+
+    from sdpa.frost import test_sdpa_fwd_d256_split_origins_determinism as _origins
+
+    test_matching_extension = staticmethod(_origins.test_split_origins_require_matching_extension)
+    test_reference_replay_batch_and_golden = staticmethod(_origins.test_origins_reference_replay_batch_and_golden)
+
+
+@requires_rubin
 class TestD128Fp8PhysicalOrigins:
     """Exercise native data maps and independent Stats through the CI entry."""
 

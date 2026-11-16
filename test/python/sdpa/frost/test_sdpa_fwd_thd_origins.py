@@ -31,6 +31,8 @@ pytestmark = [requires_dsl]
     + [
         pytest.param(128, "bfloat16", "token", True, False, 2, marks=pytest.mark.L0, id="d128_split2_origins"),
         pytest.param(128, "float16", "head", True, False, 5, marks=pytest.mark.L0, id="d128_split5_origins"),
+        pytest.param(256, "bfloat16", "token", True, False, 2, marks=pytest.mark.L0, id="d256_split2_origins"),
+        pytest.param(256, "float16", "head", True, False, 5, marks=pytest.mark.L0, id="d256_split5_origins"),
         pytest.param((576, 512), "bfloat16", "token", True, False, 1, marks=pytest.mark.L0, id="d576_unpacked"),
         pytest.param((576, 512), "bfloat16", "head", True, True, 1, marks=pytest.mark.L0, id="d576_partial_pack"),
         pytest.param((576, 512), "float16", "token", False, True, 1, marks=pytest.mark.L1, id="d576_fp16_partial_pack"),
@@ -54,6 +56,7 @@ def test_independent_thd_origins_rebind_and_capture(
     batch_override=None,
     extra_checks=None,
     origin_element_unit=None,
+    total_capacity_hints=False,
 ):
     import cudnn
     import torch
@@ -205,6 +208,8 @@ def test_independent_thd_origins_rebind_and_capture(
         if name in ("q", "k", "v"):
             nodes[name].set_ragged_offset(nodes["ro_" + name]).set_ragged_offset_multiplier(multiplier)
     extra = dict(max_total_seq_len_q=sum(q_lengths), max_total_seq_len_kv=sum(kv_lengths)) if total_hints else {}
+    if total_hints and total_capacity_hints:
+        extra.update(max_total_seq_len_q=capacity, max_total_seq_len_kv=capacity)
     extra.update({name: nodes[name] for name in scale_values})
     if mxfp8:
         extra.update({"descale_" + name: nodes["sf_" + name] for name in ("q", "k", "v")})
@@ -238,7 +243,7 @@ def test_independent_thd_origins_rebind_and_capture(
 
         graph.create_execution_plan(family_for(graph).offered_ids()[engine_name], {cudnn.knob_type.PACK_GQA: int(pack_gqa)} if quantized else {})
         graph.select_plan(0)
-    elif cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk == 128 and splits > 1):
+    elif cga is not None or d_qk == 576 or kv_dtype_name is not None or (d_qk in (128, 256) and splits > 1):
         from cudnn.engines.manifest import family_for
 
         if engine_name == "sdpa_fwd_prefill_sm100" and d_qk == 576 and torch.cuda.get_device_capability() in ((10, 0), (10, 3)):

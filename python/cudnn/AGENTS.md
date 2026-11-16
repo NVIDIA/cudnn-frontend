@@ -1027,6 +1027,16 @@ Do not export these helpers through `cudnn`.
 
 ## CuTeDSL kernel bodies
 
+Array slices need wide coordinates for wide global strides. In CuTe DSL 4.8,
+`cutlass.Array` slicing (for example `a[batch, row, head, :]`) multiplies each
+coordinate by a stride cast to that coordinate's integer width. An Int64
+tensor layout alone does not prevent overflow: widen each dynamic sliced
+coordinate before forming its stride product. Full scalar indexing is a
+different path; do not infer a slicing guarantee from it. Detector:
+`TestNativeHalfStrides::test_physical_wide_stride` in the SM100/SM107 forward
+suites physically allocates a wide batch stride and checks output and replay,
+including D256 SwapAB decode at one query row.
+
 Widen operands before triangular workspace products, in both producer and
 consumer. Widening an already-overflowed offset cannot recover it. Derive tile
 decoder bounds from the input extent. `test_triangular_offsets.py` compiles the
