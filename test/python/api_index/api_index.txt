@@ -1376,8 +1376,11 @@ cudnn.moe_ep.MoeEpTrainingWgradOperands
 cudnn.moe_ep.MoeEpTuningConfig
 cudnn.moe_ep.MoeEpTuningConfig.dgrad_optimization
 cudnn.moe_ep.MoeEpTuningConfig.epi_flag_batch
+cudnn.moe_ep.MoeEpTuningConfig.fc2_bulk_store
 cudnn.moe_ep.MoeEpTuningConfig.group_hint
+cudnn.moe_ep.MoeEpTuningConfig.mixed_cga
 cudnn.moe_ep.MoeEpTuningConfig.reduce_topk_in_kernel
+cudnn.moe_ep.MoeEpTuningConfig.scheduling
 cudnn.moe_ep.MoeEpTuningConfig.token_back_mode
 cudnn.moe_ep.MoeEpTuningConfig.token_in_flag_batch
 cudnn.moe_ep.MoeFormat
