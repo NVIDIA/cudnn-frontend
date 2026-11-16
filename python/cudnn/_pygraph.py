@@ -2603,17 +2603,13 @@ class pygraph:
             self._slot_of_uid = {uid: i for i, uid in enumerate(order)}
             # The loaded backend owns the executable descriptors, including a
             # deserialized graph with no Python IR or with an older IR attached.
-            backend_bounds = (
-                {uid: (dims, strides, dtype, bits, overridable) for uid, dims, strides, dtype, bits, overridable in self._lowered_graph._get_buffer_bounds()}
-                if self._lowered_graph is not None
-                else {}
-            )
+            backend_bounds = {bound[0]: bound[1:] for bound in self._lowered_graph._get_buffer_bounds()} if self._lowered_graph is not None else {}
             for i, uid in enumerate(order):
                 declared = self._tensor_by_uid.get(uid)
                 bound = backend_bounds.get(uid)
                 if bound is not None:
-                    dims, strides, dtype, bits, overridable = bound
-                    layout.set_backend_bound(i, uid, list(dims), list(strides), bits, overridable)
+                    dims, strides, dtype, bits, overridable, *metadata = bound
+                    layout.set_backend_bound(i, uid, list(dims), list(strides), bits, overridable, metadata[0] if metadata else [])
                     if declared is None:
                         declared = describing_tensor(uid, tuple(dims), tuple(strides), dtype)
                 else:

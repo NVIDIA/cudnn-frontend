@@ -55,6 +55,14 @@ class PyGraph {
     bool is_handle_owner                                                = false;
     std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties = nullptr;
 
+    // Metadata UID -> (query UID, declared batch, cumulative-prefix extra).
+    // These are graph facts, never observations of a caller's storage.
+    using MetadataBatchBounds = std::unordered_map<int64_t, std::vector<std::array<int64_t, 3>>>;
+    MetadataBatchBounds restored_metadata_batch_bounds;
+
+    MetadataBatchBounds
+    get_metadata_batch_bounds() const;
+
     std::optional<PyCallback> callback_fn;
     std::optional<PyCallback> callback_fn_bprop;
 

@@ -1661,3 +1661,13 @@ Enabling overrides does not prove a kernel uses smaller storage: SDPA can retain
 the declared batch and strides (#1570), while matmul honors them. Preserve the
 declared capacity envelope, cover larger overrides too, and check a tail canary
 after valid calls; comparing only the requested output region misses this bug.
+Unified FP16/BF16 packed forward SDPA's batch metadata is a separate contract: cumulative lengths and
+ragged offsets need at least the runtime query batch plus one entry; lengths
+and page tables need the runtime batch. A cached declaration may reserve many
+more batches. Test both legitimate smaller bindings and metadata overrides
+that understate the required rows, including changed strides and shared query
+dependencies. Preserve these facts and the source graph's override flag across
+load and reserialization; `core/graph/test_sdpa_metadata_capacity.py` covers
+that boundary with numerical output and changed-input CUDA Graph replay.
+Do not extend this shrink permission to quantized or backward plans from port
+names alone; qualify their runtime-batch storage behavior first.

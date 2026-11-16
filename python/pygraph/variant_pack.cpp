@@ -16,6 +16,7 @@
 #include "variant_pack.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
@@ -299,13 +301,17 @@ struct BackendBufferBound {
     int64_t required_bytes = -1;
     int64_t element_bits   = 0;
     bool overridable       = false;
+    std::vector<int64_t> shape;
+    std::vector<int64_t> stride;
+    std::vector<std::array<int64_t, 3>> metadata_batches;
 };
 
 int64_t
 checked_span_bytes(const std::vector<int64_t> &shape,
                    const std::vector<int64_t> &stride,
                    int64_t bits,
-                   bool forward_only = false) {
+                   bool forward_only                   = false,
+                   std::optional<int64_t> batch_extent = std::nullopt) {
     if (bits <= 0) return -1;
     if (!stride.empty() && shape.size() != stride.size())
         throw py::value_error("buffer bound shape and stride ranks must agree");
@@ -313,20 +319,25 @@ checked_span_bytes(const std::vector<int64_t> &shape,
         if (dim < 0) throw py::value_error("buffer bound extents must be nonnegative");
     for (auto step : stride)
         if (step < 0 && !forward_only) throw py::value_error("buffer bound strides must be nonnegative");
-    if (std::find(shape.begin(), shape.end(), 0) != shape.end()) return 0;
+    if (batch_extent && (shape.empty() || *batch_extent < 0))
+        throw py::value_error("batch metadata requires a nonnegative leading extent");
+    auto extent = [&](size_t i) { return i == 0 && batch_extent ? *batch_extent : shape[i]; };
+    for (size_t i = 0; i < shape.size(); ++i)
+        if (extent(i) == 0) return 0;
     const auto limit = std::numeric_limits<int64_t>::max();
     int64_t span     = 1;
     if (stride.empty()) {
-        for (auto dim : shape) {
+        for (size_t i = 0; i < shape.size(); ++i) {
+            auto dim = extent(i);
             if (dim > limit / span) throw py::value_error("buffer bound element span overflows int64");
             span *= dim;
         }
     } else {
         for (size_t i = 0; i < shape.size(); ++i) {
             const auto step = forward_only ? std::max<int64_t>(stride[i], 0) : stride[i];
-            if (step && shape[i] - 1 > (limit - span) / step)
+            if (step && extent(i) - 1 > (limit - span) / step)
                 throw py::value_error("buffer bound element span overflows int64");
-            span += (shape[i] - 1) * step;
+            span += (extent(i) - 1) * step;
         }
     }
     if (span > (limit - 7) / bits) throw py::value_error("buffer bound bit span overflows int64");
@@ -379,11 +390,21 @@ class DeclaredLayout {
                       const std::vector<int64_t> &shape,
                       const std::vector<int64_t> &stride,
                       int64_t element_bits,
-                      bool overridable) {
+                      bool overridable,
+                      std::vector<std::array<int64_t, 3>> metadata_batches) {
         // Packs and ordered schemas retain the snapshot they observed. A later
         // metadata update must not mutate an in-flight execution's contract.
         if (!bounds_.unique()) bounds_ = std::make_shared<std::vector<BackendBufferBound>>(*bounds_);
-        bounds_->at(index) = {uid, checked_span_bytes(shape, stride, element_bits), element_bits, overridable};
+        auto &bound            = bounds_->at(index);
+        bound.uid              = uid;
+        bound.required_bytes   = checked_span_bytes(shape, stride, element_bits);
+        bound.element_bits     = element_bits;
+        bound.overridable      = overridable;
+        bound.shape            = shape;
+        bound.stride           = stride;
+        bound.metadata_batches = std::move(metadata_batches);
+        if (!bound.metadata_batches.empty() && shape.empty())
+            throw py::value_error("batch metadata requires a leading axis");
     }
 
     std::shared_ptr<const std::vector<BackendBufferBound>>
@@ -1249,10 +1270,36 @@ class VariantPackNative {
                 if (bound.overridable && overrides.uids[j] == bound.uid) {
                     // An enabled override does not prove a plan uses a smaller
                     // allocation: SDPA can retain declared strides/batches (#1570).
-                    // Preserve the declared storage envelope, and also cover an
-                    // override that addresses farther into the caller's buffer.
-                    required = std::max(
-                        required, checked_span_bytes(overrides.shapes[j], overrides.strides[j], bound.element_bits));
+                    // Preserve that storage envelope except for packed SDPA's
+                    // batch metadata, which follows the runtime query batch.
+                    auto const &strides = overrides.strides[j];
+                    auto effective      = checked_span_bytes(overrides.shapes[j], strides, bound.element_bits);
+                    if (!bound.metadata_batches.empty()) {
+                        required = 0;
+                        for (auto const &rule : bound.metadata_batches) {
+                            auto batch = rule[1];
+                            for (size_t k = 0; k < overrides.uids.size(); ++k)
+                                if (overrides.uids[k] == rule[0]) {
+                                    if (overrides.shapes[k].size() != 4)
+                                        throw py::value_error("SDPA metadata requires a rank-4 query override");
+                                    batch = overrides.shapes[k][0];
+                                    break;
+                                }
+                            auto limit = std::numeric_limits<int64_t>::max();
+                            if (batch < 0 || rule[2] < 0 || batch > limit - rule[2])
+                                throw py::value_error("SDPA metadata batch extent overflows int64");
+                            auto rows = batch + rule[2];
+                            // A short metadata override cannot hide the rows the
+                            // operation reads, even when it also changes stride.
+                            required = std::max(
+                                required,
+                                checked_span_bytes(bound.shape, bound.stride, bound.element_bits, false, rows));
+                            required = std::max(
+                                required,
+                                checked_span_bytes(overrides.shapes[j], strides, bound.element_bits, false, rows));
+                        }
+                    }
+                    required = std::max(required, effective);
                     break;
                 }
             if (operand.observed_bytes < required)
@@ -1802,7 +1849,15 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
              py::arg("dtype_bits")      = 0,
              py::arg("dtype_lanes")     = 1,
              py::arg("preserve_extent") = false)
-        .def("set_backend_bound", &DeclaredLayout::set_backend_bound)
+        .def("set_backend_bound",
+             &DeclaredLayout::set_backend_bound,
+             py::arg("index"),
+             py::arg("uid"),
+             py::arg("shape"),
+             py::arg("stride"),
+             py::arg("element_bits"),
+             py::arg("overridable"),
+             py::arg("metadata_batches") = std::vector<std::array<int64_t, 3>>{})
         .def("set_dtype",
              &DeclaredLayout::set_dtype,
              py::arg("index"),
