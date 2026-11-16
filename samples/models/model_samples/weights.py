@@ -15,6 +15,12 @@ bytes a kernel on the stored formats would see.  :func:`dequantize` returns the 
 an E4M3 code has a 4-bit significand and an E2M1 code times its E4M3 block scale at most 6 bits, so both are exact in bf16
 (8 bits), and a multiply over these copies applies the scales to its result.
 
+Two more containers carry what a kernel on the stored formats hands to a block that is not one yet.
+:class:`TiledBlockScaledTensor` is a 4-bit activation with its block scales in the 128 x 4 layout such a kernel writes
+(:func:`tile_scale_index`); :class:`Unquantized` is bf16 rows whose producer wrote no codes, with the quantisation the
+consumer's operand has.  :func:`dequantize` reads both, so the gather out of the layout and the quantisation are launched by
+the block that consumes the operand, never by the one that produced it.
+
 The quantisers follow the public arithmetic of the two formats (round to nearest even, saturating); they are not promised to
 make the midpoint choices of another quantiser.
 
@@ -103,6 +109,93 @@ class BlockScaledTensor:
         return (self.codes, self.block_scales)
 
 
+#: the 128 x 4 block-scale layout (cuDNN's ``F8_128x4`` order): rows and block-scale columns of one tile, rows of one line
+TILE_ROWS = 128
+TILE_COLUMNS = 4
+TILE_LINE_ROWS = 32
+_TILE_INDEX: dict = {}  # (rows, blocks, device) -> the index of ``tile_scale_index``: built once per process
+
+
+def tile_scale_index(rows: int, blocks: int, device) -> torch.Tensor:
+    """``[rows, blocks]`` int64: the byte of the block scale of ``(row, block)`` in a scale buffer in the 128 x 4 layout.  The
+    buffer holds ``ceil(rows / 128)`` bands of 128 rows, one after the other; a band holds ``ceil(blocks / 4)`` tiles of 128
+    rows x 4 scale columns (512 bytes each), one after the other; inside a tile the scale of ``(r, c)`` is byte
+    ``(r % 32) * 16 + (r // 32) * 4 + c``."""
+    key = (int(rows), int(blocks), str(device))
+    if key not in _TILE_INDEX:
+        row = torch.arange(rows, dtype=torch.int64).unsqueeze(1)
+        block = torch.arange(blocks, dtype=torch.int64).unsqueeze(0)
+        tile_bytes = TILE_ROWS * TILE_COLUMNS
+        band_bytes = (blocks + TILE_COLUMNS - 1) // TILE_COLUMNS * tile_bytes
+        local = row % TILE_ROWS
+        inside = (local % TILE_LINE_ROWS) * (tile_bytes // TILE_LINE_ROWS) + (local // TILE_LINE_ROWS) * TILE_COLUMNS + block % TILE_COLUMNS
+        _TILE_INDEX[key] = ((row // TILE_ROWS) * band_bytes + (block // TILE_COLUMNS) * tile_bytes + inside).to(device)
+    return _TILE_INDEX[key]
+
+
+@dataclass
+class TiledBlockScaledTensor:
+    """A 4-bit activation as a kernel on the stored formats writes it: packed E2M1 codes ``[rows, n / 2]`` (``uint8``, low
+    nibble first), the E4M3 block scales as code bytes in the 128 x 4 layout (:func:`tile_scale_index`; the buffer has
+    ``ceil(rows / 128) * 128`` rows of ``n / 16`` bytes, and only the bytes of the ``rows`` live rows are read) and the
+    global scale of :class:`BlockScaledTensor`.  A block that reads the row-major layout asks for it (``row_major``): one
+    gather, launched by the block that asks."""
+
+    codes: torch.Tensor
+    tiled_scales: torch.Tensor
+    scale: float
+
+    @property
+    def shape(self):
+        return (*self.codes.shape[:-1], self.codes.shape[-1] * 2)
+
+    def row_major(self) -> BlockScaledTensor:
+        rows, blocks = self.codes.shape[0], self.codes.shape[-1] * 2 // BLOCK
+        scales = self.tiled_scales.reshape(-1)[tile_scale_index(rows, blocks, self.codes.device)]
+        return BlockScaledTensor(self.codes, scales, self.scale)
+
+    def rows(self, start: int, stop: int) -> BlockScaledTensor:
+        return self.row_major().rows(start, stop)
+
+    def clone(self) -> BlockScaledTensor:
+        return self.row_major().clone()
+
+    def tensors(self):
+        return self.row_major().tensors()
+
+
+@dataclass
+class Unquantized:
+    """bf16 rows on their way to a block that reads a quantised operand, with the quantisation that operand has (``fmt``:
+    ``"fp8"`` or ``"nvfp4"``; ``scale``: its static scale).  The producer wrote no codes -- a kernel whose form at this call
+    site ends at the bf16 rows -- so the consumer quantises them itself: ``quantized()`` is what :func:`dequantize` and
+    every comparison read, and its launches are the consumer's."""
+
+    data: torch.Tensor
+    fmt: str
+    scale: float
+
+    @property
+    def shape(self):
+        return self.data.shape
+
+    def quantized(self):
+        if self.fmt == "fp8":
+            return quantize_fp8(self.data, self.scale)
+        if self.fmt == "nvfp4":
+            return quantize_nvfp4(self.data, self.scale)
+        raise ValueError(f"unknown quantisation format {self.fmt!r}")
+
+    def rows(self, start: int, stop: int) -> "Unquantized":
+        return Unquantized(self.data[start:stop], self.fmt, self.scale)
+
+    def clone(self) -> "Unquantized":
+        return Unquantized(self.data.clone(), self.fmt, self.scale)
+
+    def tensors(self):
+        return self.quantized().tensors()
+
+
 @dataclass
 class Dequantized:
     """A bf16 copy of code values (exact) and the scale a multiply applies to its result (a float or one scale per row)."""
@@ -120,14 +213,17 @@ def _e4m3_values(codes: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
     return codes.view(torch.float8_e4m3fn).to(dtype)
 
 
-def _e2m1(x: torch.Tensor) -> torch.Tensor:
-    """fp32 -> E2M1 code nibbles (``uint8`` in 0..15): saturating at +-6, round to nearest, ties to the even code."""
+def _e2m1(x: torch.Tensor, signed_zero: bool = False) -> torch.Tensor:
+    """fp32 -> E2M1 code nibbles (``uint8`` in 0..15): saturating at +-6, round to nearest, ties to the even code.  A value
+    that rounds to zero gets the code 0 whatever its sign; with ``signed_zero`` it keeps its sign (code 8 for a negative
+    one), as a kernel that carries the sign bit through writes it."""
     mag = x.abs()
     index = torch.zeros(x.shape, dtype=torch.uint8, device=x.device)
     for i in range(7):  # the code index = the midpoints below the magnitude; a tie goes up from an odd code, down from an even one
         mid = (E2M1_VALUES[i] + E2M1_VALUES[i + 1]) / 2
         index += (mag >= mid) if i % 2 else (mag > mid)
-    return index + 8 * (torch.signbit(x) & (index > 0)).to(torch.uint8)
+    negative = torch.signbit(x) if signed_zero else torch.signbit(x) & (index > 0)
+    return index + 8 * negative.to(torch.uint8)
 
 
 def _e2m1_values(nibbles: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
@@ -174,7 +270,13 @@ def quantize_nvfp4(x: torch.Tensor, scale: float, rows_per_chunk: int = 2048) ->
 
 def dequantize(t, rows_per_chunk: int = 2048) -> Dequantized:
     """The code values of a stored tensor as a bf16 copy, without the outer scale (exact: see the module docstring), and that
-    scale.  A plain tensor is returned as it is with scale 1."""
+    scale.  A plain tensor is returned as it is with scale 1.  An operand a kernel on the stored formats handed over is
+    brought to the stored form first, here, by the block that reads it: bf16 rows without codes are quantised
+    (:class:`Unquantized`), block scales in the 128 x 4 layout are gathered (:class:`TiledBlockScaledTensor`)."""
+    if isinstance(t, Unquantized):
+        t = t.quantized()
+    if isinstance(t, TiledBlockScaledTensor):
+        t = t.row_major()
     if isinstance(t, ScaledTensor):
         return Dequantized(_e4m3_values(t.codes, torch.bfloat16), t.scale)
     if isinstance(t, BlockScaledTensor):
