@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import cudnn
 from cudnn import _pybind_module
 
-from ._device import ensure_current_context
+from ._device import ensure_current_context, execution_context, execution_context_matches
 from ._handle import Handle, to_backend_handle
 from .datatypes import _buffer_dtype_to_cudnn, _dlpack_code_bits, _dlpack_lanes, _torch_to_cudnn_data_type
 from .engines.base import ExecutionContext, VariantPack
@@ -2227,7 +2227,29 @@ class pygraph:
         *,
         index=None,
         context=None,
+        _context_bound=False,
     ):
+        h = handle if handle is not None else self._handle
+        if not _context_bound and isinstance(h, Handle):
+            stream, device = self._resolve_stream(h), h.device.ordinal
+            if not execution_context_matches(stream, device):
+                # Backend plans and Python plans share the handle's device and
+                # stream contract. Only a foreign/cold context takes this path;
+                # ordinary same-context calls keep their existing launch path.
+                with execution_context(stream, device):
+                    return self._execute(
+                        tensor_dict,
+                        workspace,
+                        handle,
+                        override_uids,
+                        override_shapes,
+                        override_strides,
+                        tensor_uids,
+                        index=index,
+                        context=context,
+                        _context_bound=True,
+                    )
+            _context_bound = True
         # Keep the caller's choice local across binding and launch. Temporarily
         # selecting/restoring an index lets overlapping callers run each other's
         # plan and can corrupt the selection left for ordinary execute().
@@ -2258,7 +2280,8 @@ class pygraph:
             # A JIT engine launches through the driver, which reads the calling
             # thread's context stack; an autograd worker has none. The handle's
             # device decides when the stream names no context.
-            ensure_current_context(stream, h.device.ordinal if h is not None else None)
+            if not _context_bound:
+                ensure_current_context(stream, h.device.ordinal if h is not None else None)
             if index not in self._compiled_plans:
                 # compile with the CALLER's context (execute-supplied handle
                 # and its stream reach the JIT build)

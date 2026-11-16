@@ -269,7 +269,7 @@ def test_a_backend_graph_runs_on_a_cold_thread(drv):
 
         seen = _on_a_cold_thread(body)
         assert seen["before"] == 0, "the worker was already bound, so this no longer covers the cold path"
-        assert seen["after"] != 0
+        assert seen["after"] == 0, "graph.execute must restore the worker's originally empty context"
         torch.cuda.synchronize()
         expected = torch.relu(torch.relu(a.float() @ b.float()))
         assert (out.float() - expected).abs().max().item() < 1.0

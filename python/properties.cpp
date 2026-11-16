@@ -243,6 +243,41 @@ custom_reduction_identity_from_bits(cudnn_frontend::DataType_t data_type, uint64
 
 }  // namespace
 
+// The predicate lets ordinary execute calls avoid a Python context-manager
+// allocation while foreign/cold threads enter and restore the target context.
+std::optional<bool>
+try_execution_context_matches(std::optional<std::intptr_t> stream, int device) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    using GetCurrent              = CUresult(CUDAAPI*)(CUcontext*);
+    using StreamContext           = CUresult(CUDAAPI*)(CUstream, CUcontext*);
+    using ContextDevice           = CUresult(CUDAAPI*)(CUdevice*);
+    static const auto get_current = reinterpret_cast<GetCurrent>(detail::get_driver_entry_point("cuCtxGetCurrent"));
+    static const auto stream_context =
+        reinterpret_cast<StreamContext>(detail::get_driver_entry_point("cuStreamGetCtx"));
+    static const auto context_device =
+        reinterpret_cast<ContextDevice>(detail::get_driver_entry_point("cuCtxGetDevice"));
+    if (!get_current || !stream_context || !context_device) return std::nullopt;
+
+    CUcontext current = nullptr;
+    if (get_current(&current) != CUDA_SUCCESS) return std::nullopt;
+    if (current == nullptr) return false;
+    const auto raw_stream = stream.value_or(0);
+    if (raw_stream != 0 && raw_stream != reinterpret_cast<std::intptr_t>(CU_STREAM_LEGACY) &&
+        raw_stream != reinterpret_cast<std::intptr_t>(CU_STREAM_PER_THREAD)) {
+        CUcontext target = nullptr;
+        if (stream_context(reinterpret_cast<CUstream>(raw_stream), &target) != CUDA_SUCCESS) return std::nullopt;
+        return target == current;
+    }
+    CUdevice ordinal = 0;
+    if (context_device(&ordinal) != CUDA_SUCCESS) return std::nullopt;
+    return ordinal == device;
+#else
+    (void)stream;
+    (void)device;
+    return std::nullopt;
+#endif
+}
+
 // The graph's Python context policy, in one native crossing. Unlike the backend
 // shim's cold-thread repair, an explicit stream/device can replace a bound
 // context. No CUDA work happens at import; unavailable entry points leave the
@@ -688,6 +723,7 @@ init_properties(py::module_& m) {
           &try_ensure_current_context,
           py::arg("stream") = std::nullopt,
           py::arg("device") = std::nullopt);
+    m.def("_try_execution_context_matches", &try_execution_context_matches, py::arg("stream"), py::arg("device"));
 
     bind_enum<cudnn_frontend::NormFwdPhase_t>(m, "norm_forward_phase")
         .value("INFERENCE", cudnn_frontend::NormFwdPhase_t::INFERENCE)
