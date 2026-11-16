@@ -267,6 +267,7 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
     # study run on cc 10.3, e.g. the d256 backward below) answer first and need no transfer.
     # sm100_d256_decode_v4_924_20261116 replaces v3 after its own check (B300 SXM6 AC 1100 W, cuDNN 9.24.0.43; 80 cost-stratified
     # train cells): regret 1.002, worst 1.038; the 15 verdicts that differ from v3 run 0.861 of v3's choice, worst 1.032.
+    # sm100_d576_dense_decode_rt924_20261030 replaces its parent study after the same check (20 train cells): regret 1.000.
     (10, 3): (
         (10, 0),
         frozenset(
@@ -276,7 +277,7 @@ PART_TRANSFERS: Dict[Tuple[int, int], Tuple[Tuple[int, int], FrozenSet[str]]] = 
                 "sm100_d512_paged_decode_b100_20261030",
                 "sm100_d512_paged_context_20261030",
                 "sm100_d256_paged_context_20261030",
-                "sm100_d576_dense_decode_20261030",
+                "sm100_d576_dense_decode_rt924_20261030",
             }
         ),
     ),
@@ -424,11 +425,15 @@ TABLE: Dict[Tuple, Entry] = {
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (64, 64), "prefill_short_q", "paged", "causal_br", False, "gqa_split", True): Entry(
         "always", None, "sm100_paged_d64_d256_prefill_20261111"
     ),
-    # study sm100_d576_dense_decode_20261030 (cuDNN 9.29.0.17; dense K/V, h_q 8-128, b 1-128, S_kv 4k-128k: on the tile on B200,
-    # off it on B100 plus 18 cells at 384-768 query rows; off the tile KV cannot split, so the unsplit tile follows b * h_q)
-    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", False): Entry("ge", 26.09, "sm100_d576_dense_decode_20261030"),
+    # study sm100_d576_dense_decode_rt924_20261030: study sm100_d576_dense_decode_20261030's grid (dense K/V, h_q 8-128, b 1-128,
+    # S_kv 4k-128k; off the tile KV cannot split, so the unsplit tile follows b * h_q) with the backend re-timed on a full-power B200
+    # at cuDNN 9.24.0.43, its split-KV reduction counted; FROST times from the original study; fresh 24-cell holdout at develop
+    # 5304d19df: regret 1.000 vs the old entries' 1.031, no cell slower
+    ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", False): Entry(
+        "ge", 25.588, "sm100_d576_dense_decode_rt924_20261030"
+    ),
     ("sdpa_fwd_prefill_sm100", (10, 0), "bf16", (576, 512), "q1", "dense", "none", False, "gqa", True): Entry(
-        "ge", 8.293, "sm100_d576_dense_decode_20261030", "rows"
+        "ge", 8.293, "sm100_d576_dense_decode_rt924_20261030", "rows"
     ),
     # study sm107_paged_prefill_20261109 (208-SM Rubin, cuDNN 9.30.0.2; FlashInfer's paged cudnn path, recorded graph facts; bf16
     # D128 / D192x128 / D256 causal chunks and squares, MHA / GQA 4-8 / MQA, b 1-16, s_q 5-8192, page 16 / 64, HND / NHD; 953
