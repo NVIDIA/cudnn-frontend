@@ -24,6 +24,7 @@ from block_sparse_attention.cutedsl.bsa_utils import (
     import_bsa,
     make_fixed_metadata,
     make_variable_metadata,
+    no_host_sync,
     require_arch,
     supported_block_size,
 )
@@ -505,6 +506,298 @@ def test_sm90_blk128_partial_prologue(scale, variable):
     ro, rl, _ = blk128_reference(q, k, v, ids, counts, sizes, count, scale, "bhsd")
     torch.testing.assert_close(result["o_tensor"].double(), ro, atol=8e-3, rtol=8e-3)
     torch.testing.assert_close(result["lse_tensor"].double(), rl, atol=1e-4, rtol=1e-5)
+
+
+def _sm90_blk128_forward_with_flags(monkeypatch, call, *variants, built=None):
+    """Run ``call()`` once per dict of kernel-constructor flags in ``variants``, each on a freshly built SM90 blk128
+    forward kernel (empty compile cache), and return the cloned ``(O, LSE)`` of every run.  ``built`` (a list) receives
+    the keyword arguments each kernel was constructed with, the overriding flags included."""
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    fwd = importlib.import_module("cudnn.block_sparse_attention.csrc.fwd.sm90_blk128.bsa_fwd_sm90")
+    # The module's own kernel class, also when an earlier call of this helper left a subclass in its place.
+    base = next(cls for cls in fwd.BlockSparseAttnForwardSm90Blk128.__mro__ if cls.__module__ == fwd.__name__)
+    results = []
+    for flags in variants:
+        builds = []
+
+        class Kernel(base):
+            def __init__(self, *args, **kwargs):
+                builds.append({**kwargs, **flags})
+                super().__init__(*args, **{**kwargs, **flags})
+
+        monkeypatch.setattr(fwd, "BlockSparseAttnForwardSm90Blk128", Kernel)
+        monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+        result = call()
+        assert builds, "the forward did not build the SM90 blk128 kernel"
+        if built is not None:
+            built.extend(builds)
+        results.append((result["o_tensor"].clone(), result["lse_tensor"].clone()))
+    return results
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize(
+    "variable, count, splits, sizes_rank, kv_tail, scale",
+    [
+        pytest.param(True, 5, 1, 2, True, 0.137, id="variable-sizes_rank2-tail"),
+        pytest.param(True, 5, 1, 1, False, -0.125, id="variable-sizes_rank1-negative_scale"),
+        pytest.param(True, 5, 1, 0, True, 0.0, id="variable-tail_only-zero_scale"),
+        pytest.param(True, 5, 1, 0, False, 0.137, id="variable-full_blocks"),
+        pytest.param(True, 5, 3, 3, True, 0.137, id="variable-split3-sizes_rank3-tail"),
+        pytest.param(False, 5, 1, 2, True, 0.137, id="fixed-sizes_rank2-tail"),
+        pytest.param(False, 1, 1, 1, False, 0.137, id="fixed-single_block-one_stage"),
+        pytest.param(False, 4, 2, 0, False, -0.125, id="fixed-split2-full_blocks-negative_scale"),
+    ],
+)
+@torch_fork_set_rng(seed=128)
+def test_sm90_blk128_lean_consumer_loop_matches_plain_loop(monkeypatch, variable, count, splits, sizes_rank, kv_tail, scale):
+    """The lean consumer loop (full KV blocks skip the mask, partial ones compare one limit per thread; the O rescale
+    runs one step later, behind a warp vote) returns the O and LSE bits of the plain loop.  GQA problems with a
+    one-row last Q tile; variable counts walk lists of 0..5 blocks in every head; block sizes mix full, 127-, 96-,
+    64-, 3- and 1-token blocks, per batch and per head where the rank allows, and the physical KV tail."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    batch, heads, kv_heads, q_blocks, kv_blocks = 2, 4, 2, 6, 8
+    seqlen_q = (q_blocks - 1) * 128 + 1
+    tail = 37 if kv_tail else 128
+    seqlen_k = (kv_blocks - 1) * 128 + tail
+    q = torch.randn((batch, heads, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, seqlen_k, 96), device="cuda", dtype=torch.bfloat16)
+    # Distinct block ids per row (the prefix of a random permutation); the slots past a variable count hold a poison index.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :count].to(torch.int32).contiguous()
+    counts = None
+    if variable:
+        lengths = torch.arange(q_blocks, device="cuda", dtype=torch.int32)
+        counts = torch.stack([lengths.roll(i) for i in range(batch * heads)]).view(batch, heads, q_blocks).contiguous()
+        assert counts.min() == 0 and counts.max() == count
+        indices.masked_fill_(torch.arange(count, device="cuda") >= counts[..., None], 999999)
+    sizes = None
+    if sizes_rank:
+        pattern = torch.tensor([128, 1, 127, 128, 3, 96, 64, tail], device="cuda", dtype=torch.int32)
+        shape = {1: (kv_blocks,), 2: (batch, kv_blocks), 3: (batch, heads, kv_blocks)}[sizes_rank]
+        rows = pattern.expand(shape).reshape(-1, kv_blocks)
+        # Every row of the rank keeps the tail size last and rotates the other blocks.
+        sizes = torch.stack([torch.cat((row[:-1].roll(i), row[-1:])) for i, row in enumerate(rows)]).view(shape).contiguous()
+
+    def call():
+        return ops.block_sparse_attention_forward(
+            q,
+            k,
+            v,
+            indices,
+            count,
+            sizes,
+            q2k_block_nums=counts,
+            allow_empty_block_nums=variable,
+            sparse_block_size=128,
+            softmax_scale=scale,
+            kv_splits=splits,
+        )
+
+    (o_plain, lse_plain), (o_lean, lse_lean) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(lean_consumer_loop=False), {})
+    assert torch.isfinite(o_lean).all()
+    assert torch.equal(o_lean, o_plain) and torch.equal(lse_lean, lse_plain)
+    o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, counts, sizes, count, scale, "bhsd")
+    torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
+@torch_fork_set_rng(seed=129)
+def test_sm90_blk128_lean_consumer_loop_rescale_vote(monkeypatch, with_block_sizes):
+    """Both outcomes of the warp vote that guards the deferred O rescale, bitwise against the plain loop.  Every key of
+    KV block j has the logit 4 * j for a query row with q = 8 and -4 * j for one with q = -8, and the lists are
+    ascending, so a positive row raises its running max at every step (ratio < 1) and a zero or negative row never
+    does (ratio exactly 1.0).  Tile 0 never rescales, tile 1 rescales in every warp, tile 2 alternates warps of the two
+    kinds and tile 3 mixes both kinds of row inside every warp."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    q_blocks, kv_blocks = 4, 8
+    seqlen_q, seqlen_k = q_blocks * 128, kv_blocks * 128
+    row = torch.arange(128, device="cuda")
+    q = torch.zeros((1, 1, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    q[0, 0, 128:256, 0] = 8
+    q[0, 0, 256:384, 0] = torch.where(row % 32 < 16, -8, 8).to(q.dtype)
+    q[0, 0, 384:512, 0] = torch.where(row % 2 == 0, 8, -8).to(q.dtype)
+    k = torch.zeros((1, 1, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    k[0, 0, :, 0] = (torch.arange(seqlen_k, device="cuda") // 128).to(k.dtype) * 0.5
+    v = torch.randn((1, 1, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    indices = torch.arange(kv_blocks, device="cuda", dtype=torch.int32).expand(1, 1, q_blocks, kv_blocks).contiguous()
+    sizes = torch.tensor([128, 1, 128, 77, 128, 3, 128, 111], device="cuda", dtype=torch.int32) if with_block_sizes else None
+
+    # The rows of one compute warp are 16 consecutive query rows. A warp must rescale at a step when the block's logit
+    # exceeds the running max of one of its rows, and must skip the rescale when it does so for none of them.
+    block_logit = q[0, 0, :, 0].double()[:, None] * k[0, 0, ::128, 0].double()[None, :]
+    raised = (block_logit[:, 1:] > block_logit.cummax(dim=1).values[:, :-1]).view(q_blocks * 8, 16, kv_blocks - 1)
+    assert raised.any(1).any() and (~raised.any(1)).any(), "the problem must hold a rescaling warp-step and a skipping one"
+    assert (raised.any(1) & ~raised.all(1)).any(), "some warp must mix rescaled and unchanged rows"
+
+    def call():
+        return ops.block_sparse_attention_forward(q, k, v, indices, kv_blocks, sizes, sparse_block_size=128)
+
+    (o_plain, lse_plain), (o_lean, lse_lean) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(lean_consumer_loop=False), {})
+    assert torch.equal(o_lean, o_plain) and torch.equal(lse_lean, lse_plain)
+    o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, None, sizes, kv_blocks, None, "bhsd")
+    torch.testing.assert_close(o_lean.double(), o_ref, atol=8e-3, rtol=8e-3)
+    torch.testing.assert_close(lse_lean.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_blocks, layout", [pytest.param(11, "bhsd", id="small_sort"), pytest.param(4100, "bshd", id="large_sort")])
+@torch_fork_set_rng(seed=130)
+def test_sm90_blk128_tile_order_matches_identity_order(monkeypatch, q_blocks, layout):
+    """Longest-list-first CTA order (variable counts, kv_splits == 1): CTA x of a head runs the Q tile at rank x of the
+    head's stable descending list-length order, which the wrapper sorts on the device.  Which CTA computes a tile does
+    not change the tile's arithmetic, so O and LSE are the bits of the identity-order kernel.  The counts tie and
+    include empty lists, the last Q tile has one row and the heads are grouped.  A CUDA graph is then replayed after
+    the counts and the lists changed at the same addresses: the replay sorts the new counts, without a host
+    synchronization or a new compile.  4100 Q tiles take torch's sort for more than 4096 elements (no FP64 reference
+    at that size; the identity-order kernel is the reference)."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    small = q_blocks <= 4096
+    batch, heads, kv_heads, dim, value_dim = (2, 4, 2, 128, 96) if small else (1, 2, 1, 64, 64)
+    kv_blocks, width = 8, 5
+    seqlen_q, seqlen_k = (q_blocks - 1) * 128 + 1, (kv_blocks - 1) * 128 + 37
+    q = torch.randn((batch, heads, seqlen_q, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, seqlen_k, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, seqlen_k, value_dim), device="cuda", dtype=torch.bfloat16)
+    inputs = [q, k, v] if layout == "bhsd" else [t.transpose(1, 2).contiguous() for t in (q, k, v)]
+    # Every slot of a list holds a valid block id, so that any count up to the width is legal after the lists change.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    counts = torch.randint(0, width + 1, (batch, heads, q_blocks), device="cuda", dtype=torch.int32)
+    sizes = torch.tensor([128, 1, 127, 128, 3, 96, 64, 37], device="cuda", dtype=torch.int32)
+    tiles = torch.arange(q_blocks, device="cuda")
+    assert (counts == 0).any() and (torch.argsort(counts, dim=-1, descending=True, stable=True) != tiles).any()
+
+    def call():
+        return ops.block_sparse_attention_forward(
+            *inputs, indices, width, sizes, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128, layout=layout
+        )
+
+    built = []
+    (o_identity, lse_identity), (o_order, lse_order) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(has_tile_order=False), {}, built=built)
+    assert [flags["has_tile_order"] for flags in built] == [False, True], "the wrapper must ask for the tile order with variable counts"
+    assert torch.isfinite(o_order).all()
+    assert torch.equal(o_order, o_identity) and torch.equal(lse_order, lse_identity)
+
+    cache = interface._bsa_attn_fwd_sm90_blk128.compile_cache
+    compiled = dict(cache)
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            captured = call()
+        counts.copy_(counts.flip(-1))
+        indices.copy_(indices.flip(-2))
+        assert (torch.argsort(counts, dim=-1, descending=True, stable=True) != tiles).any()
+        captured["o_tensor"].fill_(float("nan"))
+        captured["lse_tensor"].fill_(float("nan"))
+        with no_host_sync():
+            graph.replay()
+            eager = call()
+        o_graph, lse_graph = captured["o_tensor"].clone(), captured["lse_tensor"].clone()
+    assert cache == compiled, "new counts must not compile another kernel"
+    assert torch.equal(o_graph, eager["o_tensor"]) and torch.equal(lse_graph, eager["lse_tensor"])
+    ((o_identity, lse_identity),) = _sm90_blk128_forward_with_flags(monkeypatch, call, dict(has_tile_order=False))
+    assert torch.equal(o_graph, o_identity) and torch.equal(lse_graph, lse_identity)
+    if small:
+        o_ref, lse_ref, _ = blk128_reference(q, k, v, indices, counts, sizes, width, None, "bhsd")
+        torch.testing.assert_close(o_graph.double(), o_ref, atol=8e-3, rtol=8e-3)
+        torch.testing.assert_close(lse_graph.double(), lse_ref, atol=1e-4, rtol=1e-5)
+
+
+def _longest_list_first(counts):
+    """Per (batch, head), the Q tiles by descending list length with equal lengths in their natural order, computed
+    on the host.  Every tile has its own sort key, so the reference does not rest on the stability of a sort."""
+    lengths = counts.long().cpu()
+    tiles = torch.arange(lengths.shape[-1])
+    return torch.argsort((lengths.max() - lengths) * lengths.shape[-1] + tiles, dim=-1)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("q_blocks", [pytest.param(11, id="small_sort"), pytest.param(4100, id="large_sort")])
+@torch_fork_set_rng(seed=131)
+def test_sm90_blk128_tile_order_is_longest_list_first(monkeypatch, q_blocks):
+    """The tile order that the wrapper hands to the kernel is, per (batch, head), the permutation of the Q tiles by
+    descending list length with equal lengths in their natural order.  O and LSE cannot show it (every permutation
+    of the CTAs gives the same bits), so the launch arguments are recorded.  Checked on an eager call, on a second
+    one after the counts changed at the same address, and on a CUDA graph replayed after another change: the order
+    tensor of the captured launch then holds the order of the counts the replay ran on.  11 and 4100 Q tiles take
+    torch's two sort paths (up to and beyond 4096 elements)."""
+    ops = import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    batch, heads, kv_heads, dim = (2, 4, 2, 128) if q_blocks <= 4096 else (1, 2, 1, 64)
+    kv_blocks, width = 8, 5
+    q = torch.randn((batch, heads, (q_blocks - 1) * 128 + 1, dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, kv_heads, kv_blocks * 128, dim), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn((batch, kv_heads, kv_blocks * 128, 64), device="cuda", dtype=torch.bfloat16)
+    # Every slot of a list holds a valid block id, so that any count up to the width is legal after the counts change.
+    indices = torch.argsort(torch.rand((batch, heads, q_blocks, kv_blocks), device="cuda"), dim=-1)[..., :width].to(torch.int32).contiguous()
+    counts = torch.randint(0, width + 1, (batch, heads, q_blocks), device="cuda", dtype=torch.int32)
+
+    def call():
+        return ops.block_sparse_attention_forward(q, k, v, indices, width, q2k_block_nums=counts, allow_empty_block_nums=True, sparse_block_size=128)
+
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    call()
+    cache = interface._bsa_attn_fwd_sm90_blk128.compile_cache
+    ((key, compiled),) = cache.items()
+    launches = []
+
+    def recorder(*args):
+        launches.append(args)
+        return compiled(*args)
+
+    cache[key] = recorder
+
+    def launched_order():
+        # Launch arguments: q, k, v, o, lse, lists, counts, sizes, order, then the scalars and the stream.
+        order = launches[-1][8]
+        assert tuple(order.shape) == (q_blocks, heads, batch) and not order.dtype.is_floating_point, (order.shape, order.dtype)
+        return order.permute(2, 1, 0).long().cpu()
+
+    call()
+    first = _longest_list_first(counts)
+    assert (first != torch.arange(q_blocks)).any(), "the natural order must not already be the longest-list-first order"
+    assert torch.equal(launched_order(), first)
+
+    counts.copy_(counts.flip(-1))
+    call()
+    second = _longest_list_first(counts)
+    assert not torch.equal(second, first)
+    assert torch.equal(launched_order(), second), "an eager call must order the counts it is given"
+
+    with cuda_graph() as graph:
+        with torch.cuda.graph(graph):
+            call()
+        counts.copy_(counts.roll(1, -1))
+        third = _longest_list_first(counts)
+        assert not torch.equal(third, second)
+        with no_host_sync():
+            graph.replay()
+        assert torch.equal(launched_order(), third), "a replay must order the counts it runs on"
+    assert len(launches) == 3 and list(cache) == [key], "three launches of the one compiled kernel"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("surplus", [pytest.param(2, id="more_lengths_than_q_tiles"), pytest.param(-1, id="fewer_lengths_than_q_tiles")])
+@torch_fork_set_rng(seed=132)
+def test_sm90_blk128_tile_order_rejects_lengths_off_the_q_grid(monkeypatch, surplus):
+    """The host entry ranks every list length it is given and the grid has one CTA per Q tile of q.  Lengths for more
+    Q tiles than q has would hand CTAs to tiles that do not exist and leave real tiles unwritten; lengths for fewer
+    would leave CTAs without a tile.  The public API rejects such metadata by its shape (test_BSA_api.py); the
+    private entry behind it raises before a kernel is built or launched."""
+    import_bsa(families=(9,), reason="the native SM90 blk128 kernels are under test")
+    interface = importlib.import_module("cudnn.block_sparse_attention._interface")
+    q_blocks, kv_blocks, width = 4, 8, 5
+    q = torch.randn((1, 2, q_blocks * 128, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, kv_blocks * 128, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indices = torch.arange(width, device="cuda", dtype=torch.int32).expand(1, 2, q_blocks + surplus, width).contiguous()
+    counts = torch.full((1, 2, q_blocks + surplus), width, device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(interface._bsa_attn_fwd_sm90_blk128, "compile_cache", {})
+    with pytest.raises(ValueError, match=f"one list length per Q tile: expected {q_blocks}, got {q_blocks + surplus}"):
+        interface.bsa_attn_fwd(q, k, v, indices, width, q2k_block_nums=counts, sparse_block_size=128)
+    assert not interface._bsa_attn_fwd_sm90_blk128.compile_cache, "the rejection must come before a kernel is built"
 
 
 # ---- SM100/SM110 blk64

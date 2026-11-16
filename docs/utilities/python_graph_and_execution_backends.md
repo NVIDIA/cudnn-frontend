@@ -1171,9 +1171,12 @@ accepts legal execution-time Stats stride overrides, including changes to the
 head stride of packed HN Stats. It does not permit changing the packing, dtype,
 or storage capacity, or bypass the plan's ragged-offset and override bounds.
 
-The initial declaration covers admitted override-enabled FP16/BF16 THD plans
+The declaration covers admitted override-enabled FP16/BF16 THD plans
 with packed HN Stats through the prepared THD binder on qualified SM100/SM103
-devices. SM107/SM120 do not advertise this note pending hardware qualification.
+devices, plus qualified SM107 and SM120 (cc 12.0) half THD plans.
+SM121 remains unqualified. The note follows the admitted graph/config and the
+prepared binder, including the new explicit implementation owners; it does not
+apply to every plan on those architectures.
 This includes the explicit D256 lookahead engine and eligible legacy
 half engines. Dense, token-major/padded Stats, no-Stats, override-disabled,
 quantized and ragged-Q dense-decode plans do not declare it. D256 swap-AB does
