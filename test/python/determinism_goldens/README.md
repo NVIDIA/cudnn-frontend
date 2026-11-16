@@ -7438,3 +7438,57 @@ comes from the frozen implementation revisions; subsequent parent integration
 preserved those device bodies and repeated the affected host checks. General
 batch invariance, unmeasured layouts and other GPU targets remain unverified
 by this refactor qualification.
+
+
+### SM100/SM103 FP8 swap-AB wide output addressing — 2026-11-16
+
+The D128 body now widens all coordinates before an Array row slice accumulates
+runtime stride products. Original compact output controls pass on B200 and
+B300; an output batch stride of `2**31 - 65536` elements at B4 leaves half the
+original output unwritten. The fix changes addressing only, with no arithmetic,
+barrier, capability or plan-selection change. This forward body adds no backward
+implementation.
+
+Native qualification used cuDNN 9.24.0.43, Torch 2.11.0+cu130, CuTeDSL 4.8.0
+with compiler/NVRTC 13.4, and verified checkout imports. Parent kernel source
+is `f1b7ee075`; final candidate adds the coordinate-width fix and maintained
+prepared-output regression. B200/SM100 and B300/SM103 both have 148 SMs in these
+runs. CUDA 12 compiler compatibility was not measured in this qualification.
+
+- B200: **74 passed, 0 skipped** for the 48 new output-layout cases and existing
+  dense/paged replay, batch, golden and warm-refill cases.
+- B300: **58 passed, 0 skipped** for the same 48 output-layout cases and existing
+  dense replay, batch, golden and warm-refill cases. Paged SwapAB is not claimed
+  on SM103.
+- Separate B200 D64/D128 paged, split, optional-output and route controls:
+  **60 passed, 0 skipped** with the identical kernel patch.
+
+The 48-case regression crosses E4M3/E5M2 input, FP16/BF16/E4M3/E5M2 output,
+packed/unpacked heads, compact storage, wide batch products and wide strides.
+It checks O, Stats and Amax against the independent reference, byte equality
+for unchanged replay, changed V/scales, and restored-input replay. Snapshots
+are cloned before mutation. Existing batch tests preserve quantized payloads
+through reordering, duplication and changed neighbors; whole-batch Amax retains
+its separate comparison rule. Warm-refill controls on both GPUs detect the
+unsafe ring; the candidate has zero mismatches in 256 warm plus 256 poisoned
+launches per stress case.
+
+For the exact old-stack environments, record the **unmodified parent** into a
+new private golden directory, then compare the candidate with recording unset.
+All 10 B200 and 4 B300 parent records pass strict candidate comparison; no
+committed baseline is replaced. The parent recording runs are separate from
+the candidate counts above.
+
+From `test/python`, run the maintained wide-output detector plus the affected
+existing CI entries:
+
+```bash
+pytest sdpa/frost/test_sdpa_prepared_fp8.py::test_decode_fp8_physical_output_strides_replay -m L0 -q
+CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
+  pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py -m L0 -q \
+  -k 'TestDenseFp8SwapAB and (test_replay_batch or test_golden or test_warm_refill)'
+# SM100 additionally:
+CUDNN_DETERMINISM_GOLDENS=/path/to/same-runtime-parent-goldens \
+  pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8DecodeDeterminism -m L0 -q
+pytest sdpa/frost/test_sdpa_fwd_fp8_sm100.py::TestNativeFp8Decode -m L0 -q
+```
