@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``sdpa_fwd_prefill_sm90`` reads the bound ragged offsets of a THD graph.
+"""``sdpa_fwd_sm90_f16_three_wg`` reads the bound ragged offsets of a THD graph.
 
 A ragged graph binds one ragged-offset tensor per port, and a padded THD layout -- TE's
 ``cu_seqlens_padded`` -- puts a sequence's rows somewhere other than ``prefix(lengths)``.
@@ -25,7 +25,6 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import _SM, requires_dsl
 from frost_test_utils import select_engine as _select_engine
 
@@ -166,7 +165,7 @@ def _run_padded_full(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch="sm90"))
+    _select_engine(g, "sdpa_fwd_sm90_f16_three_wg")
     g.check_support()
     g.build_plans()
     workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)

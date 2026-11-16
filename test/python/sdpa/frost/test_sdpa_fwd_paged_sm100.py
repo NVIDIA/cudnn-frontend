@@ -6,7 +6,7 @@
 The graph is cuDNN's own paged-cache contract — ``graph.sdpa(..., k=<page pool>,
 v=<page pool>, use_padding_mask=True, seq_len_q=, seq_len_kv=,
 paged_attention_k_table=, paged_attention_v_table=,
-paged_attention_max_seq_len_kv=)`` — served by ``sdpa_fwd_prefill_sm100``
+paged_attention_max_seq_len_kv=)`` — served by the SM100 half implementation owners
 through the d128 / d192x128 / d256 kernels' ``PAGED_KV`` specialization:
 block-table indirection on the K/V TMA loads, HND and NHD page layouts,
 per-batch lengths read on device, KV split + combine.  The K and V pools may
@@ -25,6 +25,9 @@ empty ranges, cga1, page sizes across the 128-row tile.
 
 import math
 import os
+
+from frost_test_utils import mxfp8_engine_name, mxfp8_engine_names
+from frost_test_utils import fp8_engine_names, half_engine_names
 
 import pytest
 
@@ -141,6 +144,8 @@ def _run_graph(
     replay=False,
     explicit_knobs=None,
     arch="sm100",
+    record=None,
+    extra_checks=None,
 ):
     """Build, pin the FROST engine, execute, compare every Q row against ``_ref_rows``.
 
@@ -212,18 +217,43 @@ def _run_graph(
         st.set_output(True).set_dim(stats_gpu.shape).set_stride(stats_gpu.stride()).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    if explicit_knobs is None:
+    if record is not None:
+        assert explicit_knobs is None, "provide a public record or native knobs, not both"
+        g.create_execution_plan(*record)
+    elif explicit_knobs is None:
         g.create_execution_plans([cudnn.heur_mode.A])
     else:
-        from cudnn.engines.manifest import family_for
+        from collections.abc import Mapping
 
-        g.create_execution_plan(family_for(g).offered_ids()[engine_name(arch=arch)], explicit_knobs)
-    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
+        from cudnn.engines.manifest import family_for
+        from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+        if isinstance(explicit_knobs, Mapping):
+            explicit_knobs = SdpaFwdKnobs.from_public(explicit_knobs)
+
+        explicit_name = engine_name(arch=arch)
+        if arch == "sm100":
+            explicit_name = {
+                (192, 128): "sdpa_fwd_sm100_d192_multi_q",
+                (256, 256): "sdpa_fwd_sm100_d256_lookahead",
+                (512, 512): "sdpa_fwd_sm100_d512_role_split",
+                (576, 512): "sdpa_fwd_sm100_d512_2x2",
+            }.get((d, d_v), explicit_name)
+            if d == d_v and d in (32, 64, 128):
+                # Explicit layout fixtures request the single-Q or multi-Q body directly.
+                explicit_name = "sdpa_fwd_sm100_d128_single_q" if explicit_knobs.cga == 1 else "sdpa_fwd_sm100_d128_multi_q"
+        if arch == "sm107" and (d, d_v) in ((512, 512), (576, 512)):
+            from dataclasses import replace
+
+            explicit_name = "sdpa_fwd_sm107_d512_2x2"
+            explicit_knobs = replace(explicit_knobs, tile_m=64, cga=2 if d == 576 else 4)
+        g.create_execution_plan(family_for(g).offered_ids()[explicit_name], explicit_knobs)
+    plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     if lead_split is not None:
         assert plan.knobs.split_kv == lead_split, f"expected the heuristics to lead with split_kv={lead_split}; got {plan.knobs}"
     if want_split is not None:
         names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
-        idx = next((i for i, n in enumerate(names) if n.startswith(engine_name(arch=arch)) and g.plans[i].knobs.split_kv == want_split), None)
+        idx = next((i for i, n in enumerate(names) if n.startswith(half_engine_names(arch)) and g.plans[i].knobs.split_kv == want_split), None)
         assert idx is not None, f"no {engine_name(arch=arch)} plan with split_kv={want_split}; knobs={[p.knobs for p in g.plans]}"
         g.select_plan(idx)
         plan = g.plans[idx]
@@ -300,6 +330,8 @@ def _run_graph(
         if stats:
             torch.testing.assert_close(stats_gpu.view(B, H, s_q), ref_lse, atol=5e-3, rtol=0)
         captured.reset()
+    if extra_checks is not None:
+        extra_checks(g, vp, ws)
     return plan
 
 
@@ -447,7 +479,6 @@ def test_paged_graph_prefill_shaped_s_q():
     prefill); all q rows attend the whole live KV (no causal mask)."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
 
     B, H, KH, P, max_pages, s_q = 2, 4, 4, 16, 8, 3
     dev, dtype = "cuda", torch.float16
@@ -478,7 +509,7 @@ def test_paged_graph_prefill_shaped_s_q():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    select_engine(g, half_engine_names())
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -618,8 +649,7 @@ def test_paged_graph_declines_off_contract():
     """Plan-time declines stay plan-time: no engine plan is offered, nothing compiles."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
-    from frost_test_utils import offers_engine
+    from frost_test_utils import half_engine_names, offers_engine
 
     def _build(P, d=D, H=8, KH=2, hnd=False, padding=True, sink=False, d_v=None):
         B, max_pages = 2, 8
@@ -663,7 +693,7 @@ def test_paged_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name())
+        return g is not None and any(offers_engine(g, name) for name in half_engine_names("sm100"))
 
     assert _offers(_build(16))
     # Lifted: paged KV + attention sink at s_q == 1 is offered (the decline
@@ -795,7 +825,7 @@ def _device_lead_split(B, H, KH, s_kv, *, s_q=1, causal_br=False, dtype=torch.fl
         device_cc=torch.cuda.get_device_capability(),
         device_sm_count=_sm_count(),
     )
-    plans = recommend("A", facts, {engine_name(): 0})
+    plans = recommend("A", facts, {name: i for i, name in enumerate(half_engine_names())})
     assert plans, "the f16 row must serve this graph"
     return plans[0].knobs.split_kv
 
@@ -849,7 +879,12 @@ def test_paged_graph_few_unit_long_kv_splits_to_the_latency_floor(H, KH, s_kv, b
 # and page sizes on both sides of the tile.  Mirrors test_sdpa_fwd_split_kv_sm100.
 
 
-_KERNEL_FILES = {128: "prefill_d128_f16.py", 192: "prefill_d192_d128_f16.py", 256: "prefill_d256_f16.py", 512: "prefill_d512_f16.py"}
+_KERNEL_FILES = {
+    128: "d128_f16_multi_q/kernel.py",
+    192: "d192_f16_multi_q/kernel.py",
+    256: "d256_f16_lookahead/kernel.py",
+    512: "d512_f16_role_split/kernel.py",
+}
 
 
 def _run_kernel(B, H, KH, P, max_pages, lens, hnd, splits, *, cta_mma=1, dtype=torch.float16, d=128, d_v=None, expect_pack_g=None):
@@ -1190,7 +1225,7 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    plan = select_engine(g, engine_name(arch=arch), pack_gqa=pack_gqa)
+    plan = select_engine(g, half_engine_names(arch), pack_gqa=pack_gqa)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -1284,7 +1319,6 @@ def test_paged_graph_batch_innermost_block_table():
     as views: the table strides are part of the compile key, not a contract."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
-    from cudnn.sdpa.fwd.engines import engine_name
 
     dev, dtype = "cuda", torch.float16
     B, H, KH, P, max_pages = 3, 8, 2, 32, 12
@@ -1318,7 +1352,7 @@ def test_paged_graph_batch_innermost_block_table():
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, engine_name())
+    select_engine(g, half_engine_names())
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -1535,6 +1569,7 @@ def _run_graph_fp8(
     amax=True,
     stats_log2=False,
     explicit_swap_ab=None,
+    record=None,
 ):
     """``causal``: None, "top_left" or "bottom_right" -- a causal upper bound (``right_bound=0``)
     with that diagonal alignment; ``window_left``: W adds the left sliding window (``left_bound=W``).
@@ -1546,7 +1581,7 @@ def _run_graph_fp8(
     import cudnn.sdpa  # noqa: F401 — registers the FROST engines
     from cudnn.sdpa.fwd.engines import engine_name
 
-    target_engine = engine_name(arch="sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100", fp8=True)
+    target_engine = fp8_engine_names(arch="sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100")
     dev = "cuda"
     scale = 1.0 / math.sqrt(d)
     d_v = d if d_v is None else d_v
@@ -1628,7 +1663,10 @@ def _run_graph_fp8(
         amx_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     g.validate()
     g.build_operation_graph()
-    g.create_execution_plans([cudnn.heur_mode.A])
+    if record is None:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    else:
+        g.create_execution_plan(*record)
     if pin:
         select_engine(g, target_engine)
     if want_split is not None:
@@ -1652,7 +1690,23 @@ def _run_graph_fp8(
             knobs = replace(knobs, cga=explicit_cga)
         if explicit_swap_ab is not None:
             knobs = replace(knobs, swap_ab=explicit_swap_ab)
-        g.create_execution_plan(selected.engine_id, knobs.to_public() if explicit_swap_ab is not None else knobs)
+        engine_id = selected.engine_id
+        if record is None:
+            from cudnn.engines.manifest import family_for
+            from cudnn.sdpa import graph_analyzer
+            from cudnn.sdpa.fwd.heuristics import select_sm100_small_fp8_geometry
+            from cudnn.sdpa.fwd.kernels.sm100.small_fp8_contract import in_domain
+            from cudnn.sdpa.fwd.kernels.sm100.d128_fp8_swap_ab.contract import Geometry as SwapAB
+
+            facts = graph_analyzer.analyze(g)
+            if in_domain(facts):
+                # Fixture arguments describe a legacy body choice. Resolve them once,
+                # then create/replay the canonical fixed implementation record.
+                knobs = replace(knobs, tile_m=128)
+                geometry = SwapAB(d_flavor=d) if explicit_swap_ab == 1 else select_sm100_small_fp8_geometry(facts, knobs)
+                knobs = geometry.canonical_knobs(knobs)
+                engine_id = family_for(g).offered_ids()[geometry.implementation]
+        g.create_execution_plan(engine_id, knobs.to_public())
         g.select_plan(len(g.plans) - 1)
     g.check_support()
     g.build_plans()
@@ -1849,7 +1903,7 @@ def _is_frost_fp8(g, index) -> bool:
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import _is_plan_for
 
-    return _is_plan_for(g.get_plan_name_at_index(index), engine_name(fp8=True))
+    return _is_plan_for(g.get_plan_name_at_index(index), fp8_engine_names())
 
 
 def _assert_frost_fp8_led_and_served(g):
@@ -1857,7 +1911,7 @@ def _assert_frost_fp8_led_and_served(g):
 
     names = _plan_names(g)
     assert _is_frost_fp8(g, 0), names
-    assert g.selected_engine is not None and g.selected_engine.name == engine_name(fp8=True), names
+    assert g.selected_engine is not None and g.selected_engine.name in fp8_engine_names(), names
 
 
 @pytest.mark.L0
@@ -1954,18 +2008,22 @@ def test_paged_graph_fp8_declines_off_contract():
     from cudnn.sdpa.fwd.engines import engine_name
     from frost_test_utils import offers_engine
 
-    def _offers(g):
-        return g is not None and offers_engine(g, engine_name(fp8=True))
+    def _offers(g, d=D):
+        owner = {
+            256: "sdpa_fwd_sm100_d256_fp8_single_q",
+            512: "sdpa_fwd_sm100_d512_fp8_role_split",
+        }.get(d, fp8_engine_names())
+        return g is not None and offers_engine(g, owner)
 
     assert _offers(_build_fp8_paged_graph(16))
     assert _offers(_build_fp8_paged_graph(128, hnd=True))
     assert not _offers(_build_fp8_paged_graph(48)), "page_size 48 neither divides nor is a multiple of the 128-row tile"
-    assert _offers(_build_fp8_paged_graph(16, d=256))
-    assert _offers(_build_fp8_paged_graph(16, d=512))
-    assert not _offers(_build_fp8_paged_graph(16, d=512, thd=True)), "paged D512 FP8 requires dense Q"
+    assert _offers(_build_fp8_paged_graph(16, d=256), d=256)
+    assert _offers(_build_fp8_paged_graph(16, d=512), d=512)
+    assert not _offers(_build_fp8_paged_graph(16, d=512, thd=True), d=512), "paged D512 FP8 requires dense Q"
     for d in (128, 256):
-        assert _offers(_build_fp8_paged_graph(16, d=d, thd=True))
-    assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True)), "THD requires an exact native FP8 width"
+        assert _offers(_build_fp8_paged_graph(16, d=d, thd=True), d=d)
+    assert not _offers(_build_fp8_paged_graph(16, d=64, thd=True), d=64), "THD requires an exact native FP8 width"
     # Masks ride the same row: a causal bound (either alignment) and a left window are
     # offered.  Bottom-right alignment is a property of the band's diagonal: with no band
     # at all it is inert (the analyzer records an unmasked graph, which is offered); with a
@@ -1979,7 +2037,7 @@ def test_paged_graph_fp8_declines_off_contract():
     assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(right_bound=0, left_bound=64)))
     assert _offers(_build_fp8_paged_graph(16, mask_kw=dict(diagonal_alignment=br)))
     g_br_window_only = _build_fp8_paged_graph(16, mask_kw=dict(left_bound=64, diagonal_alignment=br))
-    assert g_br_window_only is not None and not offers_engine(g_br_window_only, engine_name(fp8=True)), "bottom-right alignment requires a causal upper bound"
+    assert g_br_window_only is not None and not offers_engine(g_br_window_only, fp8_engine_names()), "bottom-right alignment requires a causal upper bound"
     # The f16/bf16 engine never sees an sdpa_fp8 graph: its row is a different quantization family.
     assert not offers_engine(_build_fp8_paged_graph(16), engine_name())
 
@@ -1991,13 +2049,13 @@ def test_paged_graph_fp8_declines_off_contract():
 # The SM100 d192x128 quantized files are listed because config_sm100._PAGED_KV_FLAVORS
 # names "d192" for the f16/bf16 kernel, so their config no longer refuses paged_kv.
 _PAGED_UNWIRED_KERNELS = [
-    ("sm100/prefill_d192_d128_fp8.py", 0, 1),
-    ("sm100/prefill_d512_f16_2x2.py", 2, 2),
-    ("sm107/prefill_d128_fp8.py", 0, 2),
-    ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
-    ("sm107/prefill_d256_f16.py", 2, 2),
-    ("sm107/prefill_d256_fp8.py", 0, 1),
-    ("sm107/prefill_d512_mxfp8.py", 0, 2),
+    ("sm100/d192_fp8_multi_q/kernel.py", 0, 1),
+    ("sm100/d512_f16_2x2/kernel.py", 2, 2),
+    ("sm107/d128_fp8_multi_q/kernel.py", 0, 2),
+    ("sm107/d192_mxfp8_multi_q/kernel.py", 0, 2),
+    ("sm107/d256_f16_lookahead/kernel.py", 2, 2),
+    ("sm107/d256_fp8_single_q/kernel.py", 0, 1),
+    ("sm107/d512_mxfp8_role_split/kernel.py", 0, 2),
 ]
 
 
@@ -2018,7 +2076,7 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
 
     path = os.path.join(os.path.dirname(os.path.abspath(api_dsl.__file__)), "kernels", *rel.split("/"))
     params = TemplateParams(dtype_qkv=dtype_qkv, dtype_o=2, seq_kv_lens_present=True, paged_kv=True, page_size=16, cta_mma=cta_mma)
-    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/prefill_d128_fp8.py" else "paged_kv is not wired"
+    expected_error = "native paged half prefill requires half inputs and d_flavor=128" if rel == "sm107/d128_fp8_multi_q/kernel.py" else "paged_kv is not wired"
     with pytest.raises(ValueError, match=expected_error):
         load_template(path, params, tag=f"paged_unwired_probe_{rel.replace('/', '_')}")
 
@@ -2602,7 +2660,7 @@ def _run_graph_mxfp8(B, H, KH, P, max_pages, lens, hnd, *, want_split=None, **bu
     from cudnn.sdpa.fwd.engines import engine_name
 
     g, vp, Ob, stats_gpu, amax, ref_in = _build_mxfp8(B, H, KH, P, max_pages, lens, hnd, **build_kw)
-    name = engine_name(mxfp8=True)
+    name = mxfp8_engine_name("sm100", build_kw.get("d_qk", 256), build_kw.get("d_v", 256))
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
@@ -2933,7 +2991,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         return g
 
     def _offers(g):
-        return g is not None and offers_engine(g, engine_name(mxfp8=True))
+        return g is not None and offers_engine(g, mxfp8_engine_names())
 
     assert _offers(_plans(128))
     assert not _offers(_plans(64)), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"
@@ -2955,7 +3013,7 @@ def test_paged_mxfp8_graph_declines_off_contract():
         (192, 128, 2, 3, 1),
         (256, 256, 2, 33, 1),
         (256, 256, 2, 3, 2),
-        (512, 512, 2, 3, 1),
+        (512, 512, 4, 3, 1),
     ],
 )
 def test_paged_independent_pool_layouts(k_hnd, v_hnd, kh, dtype, d, d_v, cga, s_q, split):

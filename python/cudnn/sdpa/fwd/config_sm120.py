@@ -12,9 +12,17 @@ from typing import Optional
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
 from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_ROWS
 
+
+def bias_decline(d_qk, d_v, *, thd=False, paged=False, split_kv=1, pack_gqa=False, tile_m=None, bottom_right=False):
+    """The bounded register-bias arm, shared by graph admission and standalone."""
+    if (d_qk, d_v) != (128, 128) or thd or paged or split_kv > 1 or pack_gqa or tile_m in DECODE_Q_TILES or bottom_right:
+        return "SM120 additive bias requires dense exact D128, unsplit, unpacked prefill"
+    return None
+
+
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64, 32)
-# Q tiles of the DECODE tile (sm120/decode_f16.py): 16 or 32 packed rows per CTA,
+# Q tiles of the DECODE tile (sm120/decode_f16_key_group/kernel.py): 16 or 32 packed rows per CTA,
 # the consumer warps spread over the KEY axis instead of the rows.
 DECODE_Q_TILES = (16, 32)
 HEAD_TILE_GRANULE = 16
@@ -118,7 +126,7 @@ def tile_domain(d_qk: int, d_v: int, fp8: bool) -> frozenset[tuple[int, int]]:
 
 
 def is_decode_tile(q_tile: int) -> bool:
-    """Whether a Q tile names the decode tile (sm120/decode_f16.py) rather than a prefill template."""
+    """Whether a Q tile names the decode tile (sm120/decode_f16_key_group/kernel.py) rather than a prefill template."""
     return q_tile in DECODE_Q_TILES
 
 
@@ -355,7 +363,7 @@ def validate_params(
     quantizing epilogue); the FP8 template passes its own — FP8 in, any of its
     four quantizing-store epilogues out. ``allow_right_band=False`` rejects a
     widened right band for templates that do not plumb one. ``decode_tile``
-    names the decode tile (sm120/decode_f16.py), which takes the
+    names the decode tile (sm120/decode_f16_key_group/kernel.py), which takes the
     ``DECODE_Q_TILES`` at its stage-width KV tile; every other template is
     built for the ``SEQ_Q_TILES``.
     """

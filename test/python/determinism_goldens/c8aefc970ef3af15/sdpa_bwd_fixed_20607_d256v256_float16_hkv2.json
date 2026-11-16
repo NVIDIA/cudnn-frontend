@@ -1,0 +1,111 @@
+{
+  "inputs": {
+    "do": {
+      "dtype": "torch.float16",
+      "sha256": "398d5255d533dd89215ad2e0378843c1d3123c8deb9c1fd0a122f2e55363cedd",
+      "shape": [
+        1,
+        4,
+        257,
+        256
+      ]
+    },
+    "k": {
+      "dtype": "torch.float16",
+      "sha256": "d0dfe04e7c663936fd346c84146a2bf2dd5024f9e61991344598a64a597475f9",
+      "shape": [
+        1,
+        2,
+        257,
+        256
+      ]
+    },
+    "o": {
+      "dtype": "torch.float16",
+      "sha256": "bd7d939b3a055eccd1c25e0d7d17603ceacbd45afabbd3c81a7e085082a0f0a5",
+      "shape": [
+        1,
+        4,
+        257,
+        256
+      ]
+    },
+    "q": {
+      "dtype": "torch.float16",
+      "sha256": "c044d0f17709bb53c7a606539b70c7dc19864380c5a1c652e3c6dc003ebee915",
+      "shape": [
+        1,
+        4,
+        257,
+        256
+      ]
+    },
+    "stats": {
+      "dtype": "torch.float32",
+      "sha256": "5cc2af4bfd1a5e9a3d5f1a3b953e73752e06f3f397b47a76d446961946480428",
+      "shape": [
+        1,
+        4,
+        257,
+        1
+      ]
+    },
+    "v": {
+      "dtype": "torch.float16",
+      "sha256": "0c61184a3446d5d392f43821d012975ec9f102f6f206410040afb001d5351cb2",
+      "shape": [
+        1,
+        2,
+        257,
+        256
+      ]
+    }
+  },
+  "outputs": {
+    "dk": {
+      "dtype": "torch.float16",
+      "sha256": "81e8b0aaa458316ca1714648c711a2c0adc388d0ee6c60b5fcbb5181ab8ece3a",
+      "shape": [
+        1,
+        2,
+        257,
+        256
+      ]
+    },
+    "dq": {
+      "dtype": "torch.float16",
+      "sha256": "60077c5b3e30d6d7b0bd2e629d4feaebab50ab167c5dc0cfb07e0ac8589e77f1",
+      "shape": [
+        1,
+        4,
+        257,
+        256
+      ]
+    },
+    "dv": {
+      "dtype": "torch.float16",
+      "sha256": "e900b58b710bd104eb9d21494adec7c1d8281ae1b6eec22374bbae74a9fe2728",
+      "shape": [
+        1,
+        2,
+        257,
+        256
+      ]
+    }
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "cuda_driver": 13040,
+    "cudnn": 93000,
+    "cutlass": "4.8.0",
+    "gpu": "NVIDIA B200",
+    "sm": [
+      10,
+      0
+    ],
+    "sm_count": 148,
+    "torch": "2.14.1+cu130",
+    "tvm_ffi": "0.1.14.post1"
+  },
+  "schema": 1
+}

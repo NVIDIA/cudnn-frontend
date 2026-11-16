@@ -43,9 +43,9 @@ def test_paged_pack_rebind(d, dv, g, m, n, dtype, graph_mode, splits, cudnn_hand
     seen = []
     original = api_dsl._sm80_load_kernel_module
 
-    def record(flavor, params):
+    def record(flavor, params, *args, **kwargs):
         seen.append(params.pack_g)
-        return original(flavor, params)
+        return original(flavor, params, *args, **kwargs)
 
     monkeypatch.setattr(api_dsl, "_sm80_load_kernel_module", record)
     knobs = {

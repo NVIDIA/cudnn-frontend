@@ -3,7 +3,7 @@
 
 """The small head-dim tiles of the Rubin (SM107) f16/bf16 forward row: ``TILE_K = TILE_O`` in {32, 64} as Cfg flavors of the d128 file.
 
-``sm107/prefill_d128_f16.py`` is one body with three head-dim geometries (``TemplateParams.d_flavor`` 32 / 64 / 128 ->
+``sm107/d128_f16_multi_q/kernel.py`` is one body with three head-dim geometries (``TemplateParams.d_flavor`` 32 / 64 / 128 ->
 ``config_sm107.make_cfg_d32`` / ``make_cfg_d64`` / ``make_cfg_d128``).  A graph's head dim lands on the SMALLEST width covering
 max(d_qk, d_v) -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, the natives on themselves -- and the TMA load zero-fills the columns
 past D (exact zero terms in QK^T and in P.V's padded V columns; the ``expect_tx`` count is the FULL box; the O store clips at
@@ -45,6 +45,7 @@ import torch
 from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 from small_tile_cells import CASES, TOL_O, case_inputs, check, check_degenerate_rows, run_graph
 from test_sdpa_fwd_decode_d256_sm107 import requires_sm107_dsl
+from test_sdpa_fwd_dsl_sm107 import _half_mismatch
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -53,7 +54,7 @@ _ROW = "sdpa_fwd_prefill_sm107"
 # the bitwise zero-fill pin).
 _SERVED = {8: 32, 16: 32, 24: 32, 32: 32, 40: 64, 48: 64, 56: 64, 64: 64}
 _DECLINED = (4, 12, 20, 36, 60)  # D % 8 != 0: the TMA 16-byte global-stride rule, a typed decline
-_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py"
+_KERNEL = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "d128_f16_multi_q" / "kernel.py"
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +81,7 @@ def _facts(**kw):
 def _caps():
     from cudnn.sdpa.fwd import engines
 
-    return {s.name: s.capabilities for s in engines.ENGINE_SPECS}[_ROW]
+    return engines.sm100_legacy_policy_spec(_ROW).capabilities
 
 
 def _rubin_pool():
@@ -102,7 +103,7 @@ def test_row_serves_every_small_head_dim_on_the_next_width():
     assert SM107_HEAD_DIM_TILE_WIDTHS == (32, 64, 128) and SM107_F16_SMALL_D_SHAPES <= caps.d_shapes
     for d, width in _SERVED.items():
         f = _facts(d_qk=d, d_v=d)
-        assert engines.mismatch(caps, f) is None, (d, engines.mismatch(caps, f))
+        assert _half_mismatch(f) is None, (d, _half_mismatch(f))
         assert engines._selected_d_shape(caps, f) == (width, width) == _pick_flavor(d, d, pool), d
         assert sm107_f16_tile_width(d, d) == width, d
     for d in (72, 96, 120, 128):
@@ -116,7 +117,7 @@ def test_row_serves_every_small_head_dim_on_the_next_width():
         assert engines._selected_d_shape(caps, _facts(d_qk=d, d_v=d)) == want == _pick_flavor(d, d, pool) and sm107_f16_tile_width(d, d) is None, d
     assert engines._selected_d_shape(caps, _facts(d_qk=192, d_v=128)) == (192, 128), "the d192xd128 native pair is untouched"
     for d in _DECLINED:
-        why = engines.mismatch(caps, _facts(d_qk=d, d_v=d))
+        why = _half_mismatch(_facts(d_qk=d, d_v=d))
         assert why is not None and "multiples of 8" in why, (d, why)
         assert sm107_f16_tile_width(d, d) is None, d
     # asymmetric heads ride the width covering BOTH extents
@@ -134,7 +135,7 @@ def test_row_serves_the_dense_leg_on_the_small_tiles():
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps()
-    spec = {s.name: s for s in engines.ENGINE_SPECS}[_ROW]
+    spec = engines.sm100_legacy_policy_spec(_ROW)
     accept = (
         dict(),
         dict(dtype=cudnn.data_type.BFLOAT16, dtype_o=cudnn.data_type.BFLOAT16),
@@ -149,11 +150,11 @@ def test_row_serves_the_dense_leg_on_the_small_tiles():
         dict(wants_stats=False),
     )
     for kw in accept:
-        assert engines.mismatch(caps, _facts(**kw)) is None, (kw, engines.mismatch(caps, _facts(**kw)))
+        assert _half_mismatch(_facts(**kw)) is None, (kw, _half_mismatch(_facts(**kw)))
         assert engines._selected_d_shape(caps, _facts(**kw)) == (32, 32), kw
-    assert engines.mismatch(caps, _facts(), SdpaFwdKnobs(cga=1)) is None
+    assert _half_mismatch(_facts(), SdpaFwdKnobs(cga=1)) is None
     f64 = _facts(d_qk=64, d_v=64)
-    assert engines.mismatch(caps, f64, SdpaFwdKnobs(cga=1)) is None and engines.mismatch(caps, f64, SdpaFwdKnobs(cga=2)) is None
+    assert _half_mismatch(f64, SdpaFwdKnobs(cga=1)) is None and _half_mismatch(f64, SdpaFwdKnobs(cga=2)) is None
     assert engines.effective_cgas(caps, _facts()) == frozenset({1}) and engines.effective_cgas(caps, f64) == frozenset({1, 2})
     # The d128 flavor carries two tiles behind TILE_CGA_M on cc 10.7: cga2 = the Rubin prefill pipeline, cga1 = the shared SM100
     # decode tile compiled for cc 10.7 (issue #1472); the small tiles do not change that domain.
@@ -200,7 +201,7 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
 
     caps = _caps()
-    spec = {s.name: s for s in engines.ENGINE_SPECS}[_ROW]
+    spec = engines.sm100_legacy_policy_spec(_ROW)
     assert caps.dense_only_d_shapes == frozenset({(32, 32)})
     assert dict(caps.native_legs_by_d_shape)[(64, 64)] == frozenset({"THD", "PackGQA", "split-KV", "paged KV"})
     assert sm107_small_tile_leg() is None and sm107_small_tile_leg(split_kv=1, pack_gqa=False) is None
@@ -216,7 +217,7 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
         knobs = SdpaFwdKnobs(**kkw) if kkw else None
         for d, width in want.items():
             f = _facts(d_qk=d, d_v=d, **fkw)
-            why = engines.mismatch(caps, f, knobs)
+            why = _half_mismatch(f, knobs)
             selected = engines._selected_d_shape(caps, f, knobs)
             as_leg = sm107_small_tile_leg(
                 thd=f.thd,
@@ -253,7 +254,7 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     assert heuristics._auto_sched_cga(spec, f24, split_kv=2, sched_policy=0) == (0, 1)
     assert heuristics._auto_sched_cga(spec, _facts(d_qk=24, d_v=24, has_score_max=True, has_score_sum_exp=True), split_kv=1, sched_policy=0) == (0, 2)
     # a cga nobody serves is still a typed decline naming the domain of the flavor it would land on
-    why = engines.mismatch(caps, f24, SdpaFwdKnobs(cga=3))
+    why = _half_mismatch(f24, SdpaFwdKnobs(cga=3))
     assert why is not None and "cga=3" in why and "[1, 2]" in why, why
 
 
@@ -268,7 +269,7 @@ def test_partial_pack_checks_the_selected_native_tile(d_qk, d_v, cga):
     facts = _facts(d_qk=d_qk, d_v=d_v, h_q=24, h_kv=2)
     knobs = engines.SdpaFwdKnobs(pack_gqa=True, cga=cga)
     assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
-    assert engines.mismatch(caps, facts, knobs) is None
+    assert _half_mismatch(facts, knobs) is None
 
 
 @requires_sm107_dsl
@@ -280,10 +281,10 @@ def test_native_d64_split_retains_thd_and_paged_boundaries(cga, packed):
     caps = _caps()
     knobs = engines.SdpaFwdKnobs(cga=cga, split_kv=8, pack_gqa=packed)
     facts = _facts(d_qk=64, d_v=64, h_q=24, h_kv=2, has_sink=True)
-    assert engines.mismatch(caps, facts, knobs) is None
+    assert _half_mismatch(facts, knobs) is None
     assert engines._selected_d_shape(caps, facts, knobs) == (64, 64)
     for changed in (dict(thd=True, padded=True), dict(has_paged_kv=True, page_size=16), dict(attn_scale_prefolded=True, thd=True, padded=True)):
-        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None
+        assert _half_mismatch(dataclasses.replace(facts, **changed), knobs) is not None
     params = cfg.TemplateParams(dtype_qkv=2, d_flavor=64, cta_mma=cga, split_kv=8, pack_gqa=packed, qh_per_kh=12)
     native, _ = cfg.make_cfg_d64(params)
     assert native.SPLIT_KV == 8 and native.TILE_K == native.TILE_O == 64
@@ -307,7 +308,7 @@ def test_one_constant_feeds_the_row_the_adapter_and_the_factory():
     for shape, domain in SM107_SMALL_D_CGAS.items():
         assert by_shape[shape] == domain, shape
         assert supported_cgas_for(shape, fp8=False, device_cc=(10, 7)) == tuple(sorted(domain)), shape
-        assert _SM107_KERNEL_FILES[shape] == _SM107_KERNEL_FILES[(128, 128)] == "sm107/prefill_d128_f16.py", shape
+        assert _SM107_KERNEL_FILES[shape] == _SM107_KERNEL_FILES[(128, 128)] == "sm107/d128_f16_multi_q/kernel.py", shape
     with pytest.raises(ValueError, match="outside the validated widths"):
         make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=2))
     for cta in (1, 2):

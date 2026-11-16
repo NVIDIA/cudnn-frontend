@@ -43,7 +43,7 @@ def _case(kind, gate, *, b=2):
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    select_engine(g, "sdpa_fwd_prefill_sm107", pack_gqa=False)
+    select_engine(g, "sdpa_fwd_sm107_d256_lookahead", pack_gqa=False)
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)

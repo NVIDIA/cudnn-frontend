@@ -405,6 +405,15 @@ class BaseEngine(ABC):
     # (The id_end / owned_id_range block this used to declare was for engines
     # registered at runtime, which no longer exist.)
 
+    def get_behavior_notes(self, graph: "pygraph", plan: PlanConfig) -> tuple:
+        """Notes for this graph/config, available before compilation and filtering.
+
+        Override for plan-dependent capabilities; never mutate the engine-wide
+        tuple. The answer must describe the artifact build_plan will produce,
+        without compiling, changing the plan, or influencing candidate ranking.
+        """
+        return self.behavior_notes
+
     def check_support(self, graph: "pygraph") -> None:
         """Raise to decline ``graph``.
 

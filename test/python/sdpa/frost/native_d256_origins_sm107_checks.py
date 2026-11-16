@@ -33,7 +33,7 @@ def test_native_d256_independent_origins(dtype_name, stats_layout, policy, total
         result = build(graph, *args, **kwargs)
         plan = graph._compiled_plans[graph._plan_index]
         module = plan._compiled.kernel_module
-        assert module.__file__.endswith("sm107/prefill_d256_f16.py")
+        assert module.__file__.endswith("sm107/d256_f16_lookahead/kernel.py")
         assert module.CFG.TILE_K == module.CFG.TILE_O == 256
         assert module.CFG.CTA_MMA == 2 and module.CFG.SPLIT_KV == 1
         spec = plan._prepared.spec
@@ -56,5 +56,5 @@ def test_native_d256_independent_origins(dtype_name, stats_layout, policy, total
     monkeypatch.setattr(cudnn.pygraph, "create_execution_plan", select_schedule)
     monkeypatch.setattr(cudnn.pygraph, "build_plans", verify_native_build)
     monkeypatch.setattr(cudnn.pygraph, "execute", execute_without_sync)
-    run(256, dtype_name, stats_layout, total_hints, False, 1, engine_name="sdpa_fwd_prefill_sm107", cga=2)
+    run(256, dtype_name, stats_layout, total_hints, False, 1, engine_name="sdpa_fwd_sm107_d256_lookahead", cga=2)
     assert checked

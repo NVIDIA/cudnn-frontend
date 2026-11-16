@@ -26,6 +26,7 @@ def _fixture(dtype="bfloat16", layout="NH", rank=4):
     s.paged, s.has_sink, s.lse_padded = False, False, False
     s.has_lse, s.lse_head_major = layout is not None, layout == "HN"
     s.lse_head_stride, s.lse_stride = (16 if layout == "HN" else 0), None
+    s.lse_stride_override = False
     s.device_index, s.lens_form = 0, 3
     s.total_q, s.total_kv, s.off_o_desc = 16, 512, 4096
     s.expect = dict.fromkeys(("q", "k", "v", "o"), dtype)

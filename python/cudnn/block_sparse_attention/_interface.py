@@ -114,9 +114,15 @@ def _sm100_blk128_bwd_auto_bucket_size_blocks(*, num_q_blocks: int, num_kv_block
     return 2048 if large_bucket_tasks >= min(num_sms, default_tasks) else default_bucket
 
 
+_CUTLASS_DSL_VERSIONS: dict[str, tuple[int, int, int]] = {}
+
+
 def _cutlass_dsl_version() -> tuple[int, int, int]:
     """Return the installed CUTLASS DSL version without adding a dependency."""
     version = getattr(cutlass, "__version__", None)
+    # The entry points gate on the version before every launch: parse a given version string once.
+    if isinstance(version, str) and version in _CUTLASS_DSL_VERSIONS:
+        return _CUTLASS_DSL_VERSIONS[version]
     try:
         parts = str(version).split(".")
         parsed = []
@@ -129,9 +135,11 @@ def _cutlass_dsl_version() -> tuple[int, int, int]:
             if not digits:
                 raise ValueError
             parsed.append(int(digits))
-        return tuple(parsed)
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Cannot parse CUTLASS DSL version {version!r}") from exc
+    if isinstance(version, str):
+        _CUTLASS_DSL_VERSIONS[version] = tuple(parsed)
+    return tuple(parsed)
 
 
 def _require_sage_fp8_cutedsl() -> None:
@@ -1175,6 +1183,17 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
     q, k, v = (q, k, v) if layout == "bhsd" else (q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     b, h, sq, d = q.shape
     dv = v.shape[-1]
+    variable = counts is not None
+    # Variable list lengths without KV splits: each head runs its Q tiles longest list first, so the grid's tail is
+    # short lists and lists nested in each other are walked together (P7 of the SM90 blk64 forward). The stable
+    # descending argsort per (b, h) keeps equal lengths in their natural order; it stays on the device (no host
+    # synchronization, CUDA-graph safe) and is issued here so its small kernels run while the host prepares the launch.
+    has_tile_order = variable and splits == 1
+    if has_tile_order and counts.shape[-1] != (sq + 127) // 128:
+        # The order ranks every length it is given and the grid has one CTA per Q tile of q: a length for a tile
+        # that q does not have would take the CTA of a real tile, whose output rows would then stay unwritten.
+        raise ValueError(f"q2k_block_nums must hold one list length per Q tile: expected {(sq + 127) // 128}, got {counts.shape[-1]}")
+    order = torch.argsort(counts, dim=-1, descending=True, stable=True) if has_tile_order else None
     if splits == 1:
         out = torch.empty((b, h, sq, dv) if layout == "bhsd" else (b, sq, h, dv), device=q.device, dtype=q.dtype)
         out_bh = out if layout == "bhsd" else out.transpose(1, 2)
@@ -1190,8 +1209,9 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
         indices.permute(3, 2, 1, 0),
         counts.permute(2, 1, 0) if counts is not None else indices,
         sizes if sizes is not None else indices,
+        # An unused tile-order slot aliases the index tensor, like the count and size slots; the kernel never reads it.
+        order.permute(2, 1, 0) if has_tile_order else indices,
     )
-    variable = counts is not None
     stages = 1 if not variable and (count + splits - 1) // splits <= 1 else 2
     has_kv_tail = k.shape[2] % 128 != 0
     scale_nonpositive = scale is not None and scale <= 0
@@ -1206,12 +1226,22 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
         splits,
         stages,
         has_kv_tail,
+        has_tile_order,
         *map(_sm90_blk128_tensor_key, args),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     if key not in _bsa_attn_fwd_sm90_blk128.compile_cache:
         kernel = BlockSparseAttnForwardSm90Blk128(
-            d, dv, h // k.shape[1], variable, sizes.ndim if sizes is not None else 0, splits, stages, scale_nonpositive, has_kv_tail
+            d,
+            dv,
+            h // k.shape[1],
+            variable,
+            sizes.ndim if sizes is not None else 0,
+            splits,
+            stages,
+            scale_nonpositive,
+            has_kv_tail,
+            has_tile_order=has_tile_order,
         )
         _bsa_attn_fwd_sm90_blk128.compile_cache[key] = cute.compile(
             kernel,
@@ -1222,7 +1252,8 @@ def _bsa_attn_fwd_sm90_blk128(q, k, v, indices, count, sizes=None, counts=None, 
             options="--enable-tvm-ffi",
         )
     with torch.cuda.nvtx.range("cudnn_bsa_sm90_blk128_fwd"):
-        _bsa_attn_fwd_sm90_blk128.compile_cache[key](*(t.detach() for t in args), d**-0.5 if scale is None else scale, count, stream)
+        # The launch records no autograd and DLPack export rejects tensors that require grad, so detach such views.
+        _bsa_attn_fwd_sm90_blk128.compile_cache[key](*(t.detach() if t.requires_grad else t for t in args), d**-0.5 if scale is None else scale, count, stream)
     if splits > 1:
         out, lse = _combine_blk64_kv_bucketed_partials(q, out_bh, lse, splits)
         if layout == "bshd":
@@ -1243,15 +1274,17 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
     bucket = 256 if bucket is None else bucket
     if bucket <= 0:
         raise ValueError("bucket_size_blocks must be positive")
-    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
-        indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
-    )
-    dq = torch.empty_like(q) if dq is None else dq
-    dk = torch.empty_like(k) if dk is None else dk
-    dv = torch.empty_like(v) if dv is None else dv
-    _validate_sm90_blk128_tma(dq=dq, dk=dk, dv=dv)
-    if sizes is not None and sizes.ndim == 1:
-        sizes = sizes[None, :].expand(b, -1)
+    if indices.shape[2] != (sq + 127) // 128:
+        # The CSR lists one Q128 row per row of this tensor. The kernel's compute warps look for a missing second Q64
+        # half only when ceil(sq / 64) is odd, so a row past the last Q128 block would leave them waiting for a Q stage
+        # that the loader warps skip (a hang); a missing row would silently drop its edges.
+        raise ValueError(f"q2k_block_index must list {(sq + 127) // 128} query blocks for seqlen_q={sq} and sparse_block_size=128, got {tuple(indices.shape)}")
+    # One Q group stores dK/dV directly and needs no FP32 dK/dV accumulators. Several groups reduce into them, so they
+    # must start at zero: that memset (1 GB, 0.3 ms on a 255k-token, 4-head problem) depends on nothing the CSR build
+    # produces and is the first device work of the call. The host side of the CSR build then runs under it instead of
+    # ahead of it with an idle GPU. The group count is the CSR builder's own formula (checked below).
+    num_q_groups = (indices.shape[2] + bucket - 1) // bucket
+    direct_kv = num_q_groups == 1
     workspace = _empty_bwd_workspace_with_zeroed_accum(
         batch_size=b,
         num_heads=h,
@@ -1263,11 +1296,24 @@ def _bsa_attn_bwd_sm90_blk128(do, q, k, v, o, lse, indices, count, sizes=None, c
         round_d_to=32,
         zero_dq_accum=False,
         device=q.device,
-        zero_kv_accum=offsets.shape[2] != 1,
+        zero_kv_accum=not direct_kv,
+        include_dkv_accum=not direct_kv,
     )
+    offsets, edges, _, _ = build_bucketed_k2q_csr_cutedsl(
+        indices, count, (sk + 127) // 128, bucket_size_blocks=bucket, q2k_block_nums=counts, parallel_offsets=True
+    )
+    if offsets.shape[2] != num_q_groups:
+        # Not an assert, which `python -O` removes: the workspace above was sized and zeroed for num_q_groups, and a
+        # multi-group kernel on a workspace without dK/dV accumulators would reduce out of bounds.
+        raise RuntimeError(f"the bucketed K2Q CSR has {offsets.shape[2]} Q groups, but the backward workspace was prepared for {num_q_groups}")
+    dq = torch.empty_like(q) if dq is None else dq
+    dk = torch.empty_like(k) if dk is None else dk
+    dv = torch.empty_like(v) if dv is None else dv
+    _validate_sm90_blk128_tma(dq=dq, dk=dk, dv=dv)
+    if sizes is not None and sizes.ndim == 1:
+        sizes = sizes[None, :].expand(b, -1)
     args = (do, o, q, k, v, lse, dq, dk, dv, offsets, edges, sizes, workspace)
     scale_nonpositive = scale is not None and scale <= 0
-    direct_kv = offsets.shape[2] == 1
     has_kv_tail = sk % 128 != 0
     key = (q.device.index, d, scale_nonpositive, direct_kv, has_kv_tail, *map(_sm90_blk128_tensor_key, args))
     shape = (sq, sk, d, (h, b))

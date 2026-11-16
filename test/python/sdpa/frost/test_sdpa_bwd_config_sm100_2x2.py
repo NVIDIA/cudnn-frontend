@@ -3,7 +3,7 @@
 
 """``cudnn.sdpa.bwd.config_sm100``: the 2x2-datapath stage-2 config (``CfgBwdD512x2``), host-only.
 
-The layout facts the fused kernel ``kernels/sm100/bprop_d512_f16_2x2.py`` and the adapter rely on are pinned as
+The layout facts the fused kernel ``kernels/sm100/d512_f16_2x2/kernel.py`` and the adapter rely on are pinned as
 VALUES, not just as "does not raise": the SMEM tally and slab offsets per arm (SM100 4-stage / SM107 8-stage ring),
 every tcgen05 descriptor root and the version-0 window rule, the 256-column TMEM carve, the expect_tx byte counts,
 the mbarrier arrival counts (P3) and the cluster q span.  The 4x1 role-split record is pinned UNCHANGED: the base
@@ -50,7 +50,7 @@ from cudnn.sdpa.bwd.config_sm100 import (
 pytestmark = [pytest.mark.L0]
 
 _KERNELS = Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "bwd" / "kernels" / "sm100"
-_KERNEL_2X2 = _KERNELS / "bprop_d512_f16_2x2.py"
+_KERNEL_2X2 = _KERNELS / "d512_f16_2x2/kernel.py"
 
 _SM107 = dict(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
 
@@ -89,17 +89,31 @@ def test_persistent_clusters_use_the_descriptor_or_build_device(descriptor, scop
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-def test_prepared_plan_device_matches_its_compile_target(explicit, monkeypatch):
+@pytest.mark.parametrize("owner", ["legacy", "role_split", "2x2", "sm107"])
+def test_prepared_plan_device_matches_its_compile_target(explicit, owner, monkeypatch):
     from types import SimpleNamespace
     import torch
     from cudnn.frost import device
     from cudnn.sdpa.bwd import prepared_sm100
+    from cudnn.sdpa.bwd.api_dsl import SdpaBwdDslSm100
+    from cudnn.sdpa.bwd.api_dsl_sm107_d512 import SdpaBwdDslSm107D512
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
     from cudnn.sdpa.bwd.kernels.sm100 import prepared_host
+    from cudnn.sdpa.bwd.prepared import execute
+    from cudnn.sdpa.fwd.prepared import BufferFacts
+
+    Adapter = {
+        "legacy": SdpaBwdDslSm100,
+        "role_split": SdpaBwdDslSm100D512RoleSplit,
+        "2x2": SdpaBwdDslSm100D512TwoByTwo,
+        "sm107": SdpaBwdDslSm107D512,
+    }[owner]
 
     descriptor = torch.device("cuda:1" if explicit else "cuda")
     desc = SimpleNamespace(shape=(1, 2, 128, 512), stride=(131072, 512, 1024, 1), dtype=torch.bfloat16, device=descriptor)
     stats = SimpleNamespace(shape=(1, 2, 128), stride=(256, 128, 1), dtype=torch.float32, device=descriptor)
-    api = SimpleNamespace(
+    attrs = dict(
         **{role + "_desc": stats if role == "stats" else desc for role in prepared_sm100.ROLES[:9]},
         batch_size=1,
         h_q=2,
@@ -115,11 +129,13 @@ def test_prepared_plan_device_matches_its_compile_target(explicit, monkeypatch):
         _dq_b_head_group=1,
         dtype=torch.bfloat16,
         scale_softmax=512**-0.5,
-        _NAME="sdpa_bwd_sm100",
         scratch_workspace_bytes=lambda: 132352,
     )
+    api = object.__new__(Adapter)
+    api.__dict__.update(attrs)
     target = 1 if explicit else 2
     queried = []
+    symbols, frames = [], []
 
     def cc(index):
         queried.append(index)
@@ -127,13 +143,34 @@ def test_prepared_plan_device_matches_its_compile_target(explicit, monkeypatch):
 
     monkeypatch.setattr(device, "compute_capability", cc)
     monkeypatch.setattr(device, "ambient_device", lambda: 0)
-    monkeypatch.setattr(prepared_host, "compile_host", lambda *a, **kw: lambda *frame: None)
+
+    def compile_host(*args, **kwargs):
+        symbols.append(kwargs["symbol"])
+        return lambda *frame: frames.append(frame)
+
+    monkeypatch.setattr(prepared_host, "compile_host", compile_host)
     monkeypatch.setattr(prepared_sm100, "positional_entry", lambda entry: entry)
     stage = SimpleNamespace(CFG=SimpleNamespace(TILE_M=128, CTA_MMA=2), _host=None, FROST_SOURCE_DIGEST="host-test")
     with device.build_device(2):
         spec = prepared_sm100.compile_plan(api, stage, stage, stage)
     assert queried == [target]
     assert spec.device_index == target
+    assert symbols == [f"frost_{Adapter._NAME}_prepared"]
+    # The artifact identifies its implementation; binding retains the shared
+    # chain's validation contract, including the native gradient-overlap guard.
+    facts = {
+        role: BufferFacts(0x100000000000 + i * 2**40, op.dtype, (2, target), op.span, op.shape, op.strides)
+        for i, (role, op) in enumerate(zip(spec.roles, spec.operands))
+        if op is not None
+    }
+    workspace = 0x700000000000
+    execute(spec, facts, workspace, 17)
+    for first, second in (("dq", "dk"), ("dq", "dv"), ("dk", "dv")):
+        bad = facts | {second: facts[second]._replace(ptr=facts[first].ptr)}
+        with pytest.raises(ValueError, match=first + " overlaps " + second):
+            execute(spec, bad, workspace, 17)
+    assert len(frames) == 1
+    assert spec.name == ("sdpa_bwd_sm107_d512" if owner == "sm107" else "sdpa_bwd_sm100")
 
 
 # --------------------------------------------------------------------------- the two arms' layouts, as values
@@ -338,7 +375,7 @@ def test_4x1_debug_clk_lever_is_a_sibling_record_default_off_and_wraps_every_wai
         make_cfg_d512(cfgmod.TemplateParamsDbg(debug_clk=1))
     with pytest.raises(ValueError, match=re.escape("debug_clk (0 / 1) and debug_dump_addr must be set together")):
         make_cfg_d512(cfgmod.TemplateParamsDbg(debug_dump_addr=4096))
-    src = (_KERNELS / "bprop_d512_f16.py").read_text()
+    src = (_KERNELS / "d512_f16_role_split/kernel.py").read_text()
     # No barrier of the kernel is waited directly any more: the only `.wait(` calls are _wait_c's two arms.
     assert re.findall(r"^\s+(?:bars|sched)\.[\w\[\]\.\s]*\.wait\(", src, flags=re.M) == []
     assert src.count("        mb.wait(phase)\n") == 2
@@ -421,10 +458,44 @@ def test_kernel_source_pins():
     assert "bars.mb_tmem_dealloc.arrive()" in src and "bars.mb_tmem_dealloc.arrive_on_peer(cta_id_x ^ cutlass.Int32(1))" in src
 
 
-def test_twin_is_default_off_and_names_the_sibling_file():
+def test_standalone_twin_is_default_off_and_names_the_owner_file():
     from cudnn.sdpa.bwd import api_dsl
 
     assert api_dsl.STAGE2_2X2 is False
-    assert api_dsl._SM100_STAGE2_FILE_2X2 == "sm100/bprop_d512_f16_2x2.py"
+    assert api_dsl._SM100_STAGE2_FILE_2X2 == "sm100/d512_f16_2x2/kernel.py"
     assert Path(api_dsl._sm100_kernel_path(api_dsl._SM100_STAGE2_FILE_2X2)).is_file()
-    assert api_dsl._SM100_STAGE2_FILE == "sm100/bprop_d512_f16.py"
+    assert api_dsl._SM100_STAGE2_FILE == "sm100/d512_f16_role_split/kernel.py"
+
+
+@pytest.mark.parametrize("twin", [False, True], ids=["role_split", "2x2"])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3), (10, 7), (11, 0)])
+@pytest.mark.parametrize("dtype", [DTYPE_BF16, DTYPE_FP16])
+@pytest.mark.parametrize("profile", ["dense", "causal", "thd", "thd_bottom_right"])
+def test_fixed_stage2_identity_ignores_legacy_switch(twin, cc, dtype, profile, monkeypatch):
+    """Each fixed host retains its path and exact parameter record across unrelated legacy callers."""
+    from cudnn.sdpa.bwd import api_dsl
+    from cudnn.sdpa.bwd.engines import _adapter
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_2x2.host import SdpaBwdDslSm100D512TwoByTwo
+    from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
+
+    Adapter = SdpaBwdDslSm100D512TwoByTwo if twin else SdpaBwdDslSm100D512RoleSplit
+    assert _adapter(Adapter.__name__) is Adapter
+    fixed, legacy = object.__new__(Adapter), object.__new__(api_dsl.SdpaBwdDslSm100)
+    fixed._device_cc = legacy._device_cc = lambda: cc
+    fields = dict(
+        dtype_qkv=dtype,
+        window_right=0 if profile in ("causal", "thd_bottom_right") else None,
+        window_left=127 if profile == "thd_bottom_right" else None,
+        bottom_right=profile == "thd_bottom_right",
+        thd_varlen=profile.startswith("thd"),
+    )
+    monkeypatch.setattr(api_dsl, "STAGE2_2X2", twin)
+    expected_file, expected_record = legacy._stage2_file(), legacy._stage2_record(fields)
+    assert fixed._NAME != legacy._NAME and fixed._STAGE2_TAG != legacy._STAGE2_TAG
+    expected_name = "sdpa_bwd_sm100_d512_2x2" if twin else "sdpa_bwd_sm100_d512_role_split"
+    assert (fixed._NAME, fixed._STAGE2_TAG) == (expected_name, expected_name + "_stage2")
+    for unrelated_switch in (False, True):
+        monkeypatch.setattr(api_dsl, "STAGE2_2X2", unrelated_switch)
+        assert fixed._stage2_file() == expected_file
+        assert fixed._stage2_record(fields) == expected_record
+        assert Path(api_dsl._sm100_kernel_path(fixed._stage2_file())).is_file()

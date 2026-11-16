@@ -74,6 +74,11 @@ class EngineSlot:
 
     slot: int
     opt_in: bool = False
+    # Python-only op attributes (spec ``python_only_attrs``) that ONLY this slot serves.  A graph that
+    # SETS one is offered the slot even while it is opt-in: the backend cannot lower such a graph and no
+    # sibling serves it, so withholding the slot leaves the graph with no plan at all rather than with
+    # the backend's.  Every other graph still sees the slot only under the opt-in flag.
+    unlocked_by: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -133,14 +138,31 @@ class EngineFamily:
     def owns(self, engine_id: int) -> bool:
         return self.engine_id <= engine_id < self.id_end
 
-    def offered_ids(self) -> Dict[str, int]:
+    def offered_ids(self, graph=None) -> Dict[str, int]:
         """``{engine name: engine id}`` for the engines on offer.
 
         Maturity only -- no arch range. Whether an engine suits a device is the
-        engine's own check_support().
+        engine's own check_support().  With ``graph``, an opt-in slot is also on
+        offer when the graph sets one of its ``unlocked_by`` attributes.
         """
         enabled = opt_in_engines_enabled()
-        return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in}
+        set_attrs = _set_params(graph) if graph is not None else frozenset()
+        return {name: self.engine_id + s.slot for name, s in self.slots.items() if enabled or not s.opt_in or not set_attrs.isdisjoint(s.unlocked_by)}
+
+
+def _set_params(graph) -> frozenset:
+    """Names of the op parameters the graph's nodes hold with a non-None value -- what
+    ``EngineSlot.unlocked_by`` is matched against.  Pure python IR, no engine import."""
+    return frozenset(name for node in graph.nodes for name, value in (getattr(node, "params", None) or {}).items() if _param_is_set(value))
+
+
+def _param_is_set(value) -> bool:
+    # An integer 0 is an attribute's off value (``causal_exclude_own_block=0`` is plain causal); a bool is never 0-valued here.
+    if value is None:
+        return False
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value != 0
+    return True
 
 
 # Node types that NAME a family -- not a list of what a family can serve.
@@ -280,13 +302,67 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7),
             "sdpa_fwd_prefill_sm80": EngineSlot(8),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
-            "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
+            # Opt-in, except for a graph setting causal_exclude_own_block: this slot is its only server
+            # (backend-unlowerable; the SM107/SM120 MXFP8 rows decline it), so that graph is offered it unasked.
+            "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True, unlocked_by=("causal_exclude_own_block",)),
             "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14),
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
-            "sdpa_fwd_prefill_sm90": EngineSlot(17),
+            # Slot 17 retired: SM90 recipes must replan onto the fixed bodies below; never reuse.
+            "sdpa_fwd_sm90_d64_one_wg": EngineSlot(39),
+            "sdpa_fwd_sm90_f16_three_wg": EngineSlot(40),
+            "sdpa_fwd_sm90_d128_multi_q": EngineSlot(41),
             "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18),
+            "sdpa_fwd_sm100_d256_lookahead": EngineSlot(19),
+            "sdpa_fwd_sm100_d256_swap_ab": EngineSlot(20),
+            "sdpa_fwd_sm100_d512_role_split": EngineSlot(21),
+            "sdpa_fwd_sm100_d512_2x2": EngineSlot(22),
+            "sdpa_fwd_sm107_d512_role_split": EngineSlot(54),
+            "sdpa_fwd_sm107_d512_2x2": EngineSlot(55),
+            "sdpa_fwd_sm107_d192_multi_q": EngineSlot(56),
+            "sdpa_fwd_sm107_d256_lookahead": EngineSlot(57),
+            "sdpa_fwd_sm107_d256_swap_ab": EngineSlot(58),
+            "sdpa_fwd_sm107_d128_multi_q": EngineSlot(59),
+            "sdpa_fwd_sm107_small_batch_pair": EngineSlot(60),
+            "sdpa_fwd_sm107_shared_single_q": EngineSlot(69),
+            "sdpa_fwd_sm107_shared_d256_lookahead": EngineSlot(70),
+            "sdpa_fwd_sm100_d512_fp8_role_split": EngineSlot(23),
+            "sdpa_fwd_sm100_d256_fp8_single_q": EngineSlot(24),
+            "sdpa_fwd_sm100_d256_mxfp8_single_q": EngineSlot(45, opt_in=True),
+            "sdpa_fwd_sm100_d128_mxfp8_multi_q": EngineSlot(50, opt_in=True, unlocked_by=("causal_exclude_own_block",)),
+            "sdpa_fwd_sm100_d192_mxfp8_multi_q": EngineSlot(51, opt_in=True),
+            "sdpa_fwd_sm100_d192_fp8_multi_q": EngineSlot(25),
+            "sdpa_fwd_sm120_d512_paired": EngineSlot(26),
+            "sdpa_fwd_sm100_d128_fp8_multi_q": EngineSlot(27),
+            "sdpa_fwd_sm100_d128_fp8_dual_kv": EngineSlot(28),
+            "sdpa_fwd_sm100_d128_fp8_swap_ab": EngineSlot(29),
+            "sdpa_fwd_sm100_d192_multi_q": EngineSlot(31),
+            "sdpa_fwd_sm100_d128_single_q": EngineSlot(32),
+            "sdpa_fwd_sm120_d512_fp8_paired": EngineSlot(33),
+            "sdpa_fwd_sm120_d512_mxfp8_paired": EngineSlot(34),
+            "sdpa_fwd_sm100_d128_multi_q": EngineSlot(35),
+            "sdpa_fwd_sm100_d64_quadrant": EngineSlot(36),
+            "sdpa_fwd_sm120_d256_all_compute": EngineSlot(37),
+            "sdpa_fwd_sm120_decode_key_group": EngineSlot(38),
+            "sdpa_fwd_sm120_fp8_general": EngineSlot(42),
+            "sdpa_fwd_sm120_mxfp8_general": EngineSlot(43),
+            "sdpa_fwd_sm120_f16_general": EngineSlot(44),
+            "sdpa_fwd_sm80_f16_k_prefetch": EngineSlot(46),
+            "sdpa_fwd_sm80_d256_kv_prefetch": EngineSlot(47),
+            "sdpa_fwd_sm80_wide_cooperative": EngineSlot(48),
+            "sdpa_fwd_sm107_d512_fp8_role_split": EngineSlot(49),
+            # Opt-in like the MXFP8 row they split; that row's causal_exclude_own_block unlock serves D128 only.
+            "sdpa_fwd_sm100_d512_mxfp8_slice_recompute": EngineSlot(52, opt_in=True),
+            "sdpa_fwd_sm100_d512_mxfp8_retained_p": EngineSlot(53, opt_in=True),
+            "sdpa_fwd_sm107_d192_fp8_multi_q": EngineSlot(61),
+            "sdpa_fwd_sm107_d256_fp8_single_q": EngineSlot(62),
+            "sdpa_fwd_sm107_d128_fp8_multi_q": EngineSlot(63),
+            "sdpa_fwd_sm107_d128_fp8_swap_ab": EngineSlot(64),
+            "sdpa_fwd_sm107_d128_mxfp8_multi_q": EngineSlot(65),
+            "sdpa_fwd_sm107_d192_mxfp8_multi_q": EngineSlot(66),
+            "sdpa_fwd_sm107_d256_mxfp8_single_q": EngineSlot(67),
+            "sdpa_fwd_sm107_d512_mxfp8_role_split": EngineSlot(68),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
@@ -318,6 +394,22 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_bwd_d512_mxfp8": EngineSlot(15, opt_in=True),
             "sdpa_bwd_sm120_fp8": EngineSlot(16, opt_in=True),
             "sdpa_bwd_sm120_mxfp8": EngineSlot(17, opt_in=True),
+            "sdpa_bwd_sm120_f16_fused": EngineSlot(18),
+            "sdpa_bwd_sm80_f16_d64": EngineSlot(19),
+            "sdpa_bwd_sm80_f16_two_subgroup": EngineSlot(20),
+            "sdpa_bwd_sm120_f16_two_subgroup": EngineSlot(21),
+            "sdpa_bwd_sm100_d128_fp8_pair": EngineSlot(22, opt_in=True),
+            "sdpa_bwd_sm100_d128_fp8_accumulation": EngineSlot(23, opt_in=True),
+            "sdpa_bwd_sm100_mxfp8_pair": EngineSlot(24, opt_in=True),
+            "sdpa_bwd_sm100_d256_mxfp8": EngineSlot(25, opt_in=True),
+            "sdpa_bwd_sm100_d512_role_split": EngineSlot(26),
+            "sdpa_bwd_sm100_d512_2x2": EngineSlot(27, opt_in=True),
+            "sdpa_bwd_sm100_d128_recompute": EngineSlot(28),
+            "sdpa_bwd_sm100_d128_pair": EngineSlot(29),
+            "sdpa_bwd_sm100_d128_accumulation": EngineSlot(30),
+            "sdpa_bwd_sm100_d128_accumulation_2cta": EngineSlot(31),
+            "sdpa_bwd_sm107_d256_f16_4x1": EngineSlot(32),
+            "sdpa_bwd_sm107_d256_f16_2x2": EngineSlot(33, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -484,23 +576,24 @@ def engines_for(graph):
     family = family_for(graph)
     if family is None:
         return []
-    ids = family.offered_ids()  # availability is a separate question from kind
+    ids = family.offered_ids(graph)  # availability is a separate question from kind
     return list(instantiate(family, ids)) if ids else []
 
 
-def engine_for_id(engine_id: int):
+def engine_for_id(engine_id: int, graph=None):
     """The engine that owns ``engine_id``, or None.
 
     An engine id is fully decodable from this table: the family owning the id
     block, then the slot within it. Nothing has to be registered first, which is
     what lets create_execution_plan() replay an autotune result on a fresh graph
     -- including an engine that is not a candidate for THAT graph, where the
-    replay is a deliberate pin rather than a routing decision.
+    replay is a deliberate pin rather than a routing decision.  ``graph`` (the
+    graph being pinned) lets a slot it unlocks be pinned without the opt-in.
     """
     for family in MANIFEST:
         if not family.owns(engine_id):
             continue
-        ids = family.offered_ids()
+        ids = family.offered_ids(graph)
         if engine_id not in ids.values():
             return None  # a real slot, but gated off in this process
         return next((e for e in instantiate(family, ids) if e.engine_id == engine_id), None)

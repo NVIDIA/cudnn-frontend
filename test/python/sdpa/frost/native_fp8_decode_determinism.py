@@ -135,7 +135,7 @@ def _runner(dtype, out_dtype, sq, h, d, dv, split, amax, stats, log2):
             )
             api.check_support()
             api.compile()
-            assert api._k_mod.__file__.endswith("sm100/decode_d128_fp8.py")
+            assert api._k_mod.__file__.endswith("sm100/d128_fp8_swap_ab/kernel.py")
             assert api._k_mod.STAGES == 5 and api._k_mod.COLS == 8
             assert api._amax_folded_out == (not amax)
             plans[b] = api

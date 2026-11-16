@@ -189,7 +189,7 @@ e4m3 -> bf16 upcast of Q / K walks compact elements.  The graph tier needs the
 ragged fp8 graph is a typed decline at eligibility (``thd_declared_totals``).
 
 MXFP8 (cuDNN ``sdpa_mxfp8_backward``):
-ONE kernel plus scale-factor plumbing (``sm107/bprop_d256_mxfp8.py``, the fp8 body's
+ONE kernel plus scale-factor plumbing (``sm107/d256_mxfp8/kernel.py``, the fp8 body's
 pipeline with the F8_128x4 E8M0 scale factors dequantizing INSIDE every block-scale MMA).
 The kernel consumes the ROWWISE payloads q / k / v / dO with their SF and the COLUMNWISE
 dO_T with its D-plane-major SF; q_T / k_T (and their SF) are stage-3 operands only.  P is
@@ -299,9 +299,9 @@ _SM107_D = 256
 _SM107_Q_PAD = 128
 _SM107_KV_PAD = 256  # also the stage-3 K-trim granularity (`causal_gran`) and the kernels' q write pair (`config_sm107.q_write_tiles`)
 _SM107_KERNEL_FILES = {
-    _cfg.FAMILY_F16: "sm107/bprop_d256_f16.py",
-    _cfg.FAMILY_FP8: "sm107/bprop_d256_fp8.py",
-    _cfg.FAMILY_MXFP8: "sm107/bprop_d256_mxfp8.py",
+    _cfg.FAMILY_F16: "sm107/d256_f16_4x1/kernel.py",
+    _cfg.FAMILY_FP8: "sm107/d256_fp8/kernel.py",
+    _cfg.FAMILY_MXFP8: "sm107/d256_mxfp8/kernel.py",
 }
 _SM107_TEMPLATE_TAGS = {
     _cfg.FAMILY_F16: "sdpa_bwd_sm107_main_f16",
@@ -310,7 +310,7 @@ _SM107_TEMPLATE_TAGS = {
 }
 # The 2x2-datapath body (kernels/ level: it serves the SM100 line AND the Rubin twin; frost/README rule 10) and the
 # template tag of its Rubin rendering.  The SM100 row's adapter (api_dsl_sm100_d256) names its own tag.
-_2X2_KERNEL_FILE = "bprop_d256_2x2_f16.py"
+_2X2_KERNEL_FILE = "sm100/d256_f16_2x2/kernel.py"
 _2X2_TEMPLATE_TAG_SM107 = "sdpa_bwd_sm107_main_2x2"
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
 # The stage-2 dS workspace budget EVERY sm107 row chunks against (``_sm107_chunks``): ONE constant for the half row, the
@@ -374,8 +374,8 @@ FP8_DS_DTYPE: int = DTYPE_E4M3
 # over P-c, both at a 4 GiB stage-2 budget (the main kernel 1.27x / 1.54x the bf16-dS body, both stage-3 GEMMs 1.8x faster and the two
 # dequant passes gone), every accept cell within the fp8 recipe, the dS payloads bit-exact against the oracle's 1x32 quantization.
 MXFP8_DS_SF_POLICY: int = _cfg.DS_SF_POLICY_DEFAULT
-# The Rubin 2x2-datapath twin of the half row's main kernel.  False = the shipped 4x1 body (``sm107/bprop_d256_f16.py``,
-# ``datapath_2x2_profile = 0``: its rendering stays byte-identical).  True = ``kernels/bprop_d256_2x2_f16.py`` at profile
+# The Rubin 2x2-datapath twin of the half row's main kernel.  False = the shipped 4x1 body (``sm107/d256_f16_4x1/kernel.py``,
+# ``datapath_2x2_profile = 0``: its rendering stays byte-identical).  True = ``kernels/sm100/d256_f16_2x2/kernel.py`` at profile
 # 2 (two 64-row sub-blocks per CTA, ``tcgen05.mma.cta_group::2`` M = 128, descriptor version 1) -- the body the SM100
 # ``sdpa_bwd_sm100_d256`` row runs at profile 1, so one fix lands once.  Read at CALL time (``_kernel_file`` /
 # ``_template_params``) like DQ_SINGLE_LAUNCH, and copied INTO the TemplateParams record so it reaches the template
@@ -616,7 +616,7 @@ def _stage3_trim_window(window: Optional[int], causal: bool, bottom_right: bool,
     """The sliding window the stage-3 K-trim may use: the graph's ``window_left``, or None -- the window dropped from the
     trim -- under PER-BATCH kv lengths with bottom-right causal.
 
-    The kernel anchors BOTH band edges on the per-batch diagonal (``seq_kv_lens[b] - S_q``: ``bprop_d256_f16._mask_p_chunk``,
+    The kernel anchors BOTH band edges on the per-batch diagonal (``seq_kv_lens[b] - S_q``: ``sm107/d256_f16_4x1/kernel.py::_mask_p_chunk``,
     ``_q_loop_bounds``), the GEMMs on the uniform one (``S_kv - S_q``: ``bprop_matmul_blackwell._causal_k_range``).  The CAUSAL
     edge survives the mismatch: it rounds outward from the uniform diagonal, which sits at or past every per-batch one
     (``len_b <= S_kv``), so the plain bottom-right range is a superset of every batch's band and whatever it reaches beyond
@@ -668,7 +668,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     # lengths are served (module doc) -- on all three rows.
     _PER_BATCH_KV_LENS = True
     # The body serves THD / varlen (packed [1, T, H, D] operands through packed-total-clamped runtime descriptors, a kv-blocked
-    # dS workspace, per-sequence lengths and the device claim counter from the metadata buffer -- ``sm107/bprop_d256_f16.py``
+    # dS workspace, per-sequence lengths and the device claim counter from the metadata buffer -- ``sm107/d256_f16_4x1/kernel.py``
     # "THD / varlen"; the fp8 and MXFP8 bodies carry the same leg -- the MXFP8 one over packed per-sequence-tile-padded scale factors).
     _THD_SUPPORTED = True
     _THD_ORIGINS_SUPPORTED = False
@@ -1005,7 +1005,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
     def _thd_map_slots(self, b: int) -> int:
         """How many 128-B tensor maps the THD main kernel writes inside the metadata buffer, for ``b`` sequences: the five
         packed-total-clamped input descriptors (Q, dO, dO_dv, K, V) + one clipped dV descriptor per sequence on the half and fp8
-        bodies (``sm107/bprop_d256_f16.py`` ``THD_MAP_SLOTS``).  A body with more clamped inputs (the MXFP8 one's five scale-factor
+        bodies (``sm107/d256_f16_4x1/kernel.py`` ``THD_MAP_SLOTS``).  A body with more clamped inputs (the MXFP8 one's five scale-factor
         maps) overrides; the scratch plan and the host's maps view must agree, so it is spelled once, here."""
         return 5 + (6 if self._thd_ro_spec else 1) * b
 
@@ -1959,7 +1959,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     def _thd_map_slots(self, b: int) -> int:
         """The MXFP8 THD main kernel writes TEN packed-total-clamped input maps (the five payload descriptors of the other bodies plus
         the five scale-factor maps Q-SF / K-SF / V-SF / dO-SF / dO_T-SF, their tile extent clamped to the live SF tile total) and one
-        clipped dV descriptor per sequence: ``10 + B`` slots (``sm107/bprop_d256_mxfp8.py`` ``THD_MAP_SLOTS``)."""
+        clipped dV descriptor per sequence: ``10 + B`` slots (``sm107/d256_mxfp8/kernel.py`` ``THD_MAP_SLOTS``)."""
         return 10 + b
 
     def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):

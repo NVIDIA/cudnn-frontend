@@ -33,7 +33,7 @@ import cudnn
 _SM80 = pytest.mark.skipif(_SM != 80, reason="needs an SM80 (A100) GPU, have " + ("none" if _SM is None else f"sm_{_SM}"))
 pytestmark = [pytest.mark.L0, _SM80, requires_dsl]
 
-_ENGINE = "sdpa_bwd_sm80"
+_ENGINE = "sdpa_bwd_sm80_f16_two_subgroup"  # THD runs the SM80 row's two-subgroup body
 _D = 128
 _TOL_COS = 0.999
 

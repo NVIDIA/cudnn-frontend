@@ -8,8 +8,7 @@ import pytest
 import torch
 
 import cudnn
-from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine
+from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell, select_engine, mxfp8_engine_name
 from sdpa.frost.test_sdpa_prepared_fp8 import _cuda_graph
 
 pytestmark = [requires_dsl, requires_pre_rubin_blackwell]
@@ -39,6 +38,7 @@ def _case(
     padded_stats=False,
     independent_o_offsets=False,
     sink=None,
+    record=None,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -157,13 +157,15 @@ def _case(
         tensors["amax_o"], vp[am] = am, buffers["amax_o"]
     g.validate()
     g.build_operation_graph()
-    if override or explicit_plan:
+    name = mxfp8_engine_name(arch, d, dv)
+    if record is not None:
+        g.create_execution_plan(*record)
+    elif override or explicit_plan:
         # Pin the executor under test. Unrelated backend heuristics can fail
         # before the physical-stride fixture reaches a FROST launch.
         from cudnn.engines import MANIFEST
         from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs
 
-        name = engine_name(arch=arch, mxfp8=True)
         family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
         caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
         cgas = dict(caps.cgas_by_d_shape).get((d, dv), caps.cgas)
@@ -177,7 +179,7 @@ def _case(
         g.create_execution_plan(family.offered_ids()[name], knobs)
     else:
         g.create_execution_plans([cudnn.heur_mode.A])
-    chosen = select_engine(g, engine_name(arch=arch, mxfp8=True), **({"pack_gqa": False} if arch == "sm120" else {}))
+    chosen = select_engine(g, name, **({"pack_gqa": False} if arch == "sm120" else {}))
     if (chosen.knobs.split_kv or 1) != split_kv:
         from dataclasses import replace
 

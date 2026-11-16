@@ -41,7 +41,7 @@ def test_dense_replay(cga, packed, split, tile_n, dtype, monkeypatch, head_dim=1
     def compile_native(api):
         original(api)
         assert api.flavor == (head_dim, head_dim)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
         assert api._k_mod.CFG.CTA_MMA == cga
         seen.append(True)
@@ -102,7 +102,7 @@ def test_page_boundaries(dims, page, sq, cga, split, packed, policy, empty, monk
         original(api)
         width = 64 if max(dims) <= 64 else 128
         assert api.flavor == (width, width)
-        assert api._k_mod.__file__.endswith("sm107/prefill_d128_f16.py")
+        assert api._k_mod.__file__.endswith("sm107/d128_f16_multi_q/kernel.py")
         assert api._k_mod.CFG.PAGED_KV and not api._k_mod.CFG.THD_VARLEN
 
     monkeypatch.setattr(SdpaFwdDslSm100, "compile", compile_native)

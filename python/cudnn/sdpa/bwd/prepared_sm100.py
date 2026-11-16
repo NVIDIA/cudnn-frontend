@@ -121,9 +121,11 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
     key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (stage2, mm_lo, mm_hi)), params, geometry, regions, sm))
     if origins:
         key = repr((key, "thd-origins", api._thd_origins, api._thd_origin_dtypes))
-    # The row's name is the spec's, the artifact symbol's (``frost_sdpa_bwd_sm100_prepared`` on the SM100 row, the cc 10.7 d512
-    # row's own on ``sdpa_bwd_sm107_d512``) and the launch spec's; the chain is the same for both.
+    # The implementation owns its artifact symbol. Fixed SM100 stage-2 owners
+    # retain the shared chain's native binding name: that contract includes
+    # gradient-overlap validation. Adjacent adapters keep their existing names.
     name = api._NAME
+    binding_name = getattr(api, "_BINDING_NAME", name)
     if origins:
         entry = compile_host(
             stage2._host_chain,
@@ -155,13 +157,13 @@ def compile_plan(api, stage2, mm_lo, mm_hi):
             offset,
             device_index,
             api.scale_softmax,
-            name,
+            binding_name,
             True,
             roles=ROLES[:11] + RAGGED_ROLES,
             attributes=ATTRIBUTES[:11] + RAGGED_ROLES,
             native_binding=True,
         )
-    return BwdLaunchSpec(owner, fn, tuple(operands), offset, device_index, api.scale_softmax, name, True, native_binding=True)
+    return BwdLaunchSpec(owner, fn, tuple(operands), offset, device_index, api.scale_softmax, binding_name, True, native_binding=True)
 
 
 def execute_standalone(api, tensors, workspace, current_stream, scale):

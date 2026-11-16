@@ -18,9 +18,16 @@ pytestmark = [pytest.mark.L0, requires_dsl, pytest.mark.skipif(_SM != 90, reason
 
 @pytest.fixture(autouse=True)
 def native(monkeypatch):
+    from cudnn.sdpa.fwd import api_dsl, heuristics
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     monkeypatch.setattr(shared, "_ARCH", "sm90")
+    # #378: with no tile pinned the direct adapter runs an exact (128, 128) dense declaration on the dedicated D128
+    # template. This file qualifies the D512 body's native D128/D256 storage, so its (128, 128) cases keep the D512
+    # body's 64 x 64 tile: the adapter picks among the D512 body alone.
+    monkeypatch.delitem(api_dsl._SM90_KERNEL_FILES, api_dsl._SM90_D128_FLAVOR)
+    # The graph route likewise offers no 128 x 128 set (the D128 template's tile), so every plan it ranks is 64 x 64.
+    monkeypatch.setattr(heuristics, "_sm90_d128_knob_sets", lambda spec, facts: [])
     original = SdpaFwdDslSm90.compile
 
     def compile_checked(api):

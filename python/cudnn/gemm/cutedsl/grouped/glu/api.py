@@ -1341,6 +1341,8 @@ def grouped_gemm_glu_wrapper_sm100(
             glu_clamp_min=glu_clamp_min,
             generate_c=generate_c,
             sf_vec_size=sf_vec_size,
+            situ_beta1=situ_beta1,
+            situ_beta2=situ_beta2,
         )
     # Hot-loop memo; see wrapper_operand_meta for the rationale. Everything
     # from here to api.execute() is derivation -- dtype resolution, GluCall construction,

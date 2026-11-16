@@ -1,4 +1,5 @@
 cudnn
+cudnn.AddNormQuantDecode
 cudnn.AlignedHCABackward
 cudnn.AttentionGateQuantDecode
 cudnn.BSA
@@ -158,6 +159,7 @@ cudnn.RmsNormRhtAmaxSm100
 cudnn.RmsNormSiluPadSm100
 cudnn.RopeQDQInplace
 cudnn.SharedExpertDecode
+cudnn.SwigluFp4Decode
 cudnn.TailRoPEForward
 cudnn.Tensor
 cudnn.Tensor.alignment_value
@@ -215,6 +217,7 @@ cudnn.behavior_note.REQUIRES_BIAS_INT8x32_REORDER
 cudnn.behavior_note.REQUIRES_FILTER_INT8x32_REORDER
 cudnn.behavior_note.RUNTIME_COMPILATION
 cudnn.behavior_note.SUPPORTS_CUDA_GRAPH_NATIVE_API
+cudnn.behavior_note.SUPPORTS_SDPA_STATS_STRIDE_OVERRIDE
 cudnn.behavior_note.name
 cudnn.behavior_note.value
 cudnn.block_sparse_attention
@@ -450,6 +453,7 @@ cudnn.engines.BaseEngine.build_plan
 cudnn.engines.BaseEngine.check_support
 cudnn.engines.BaseEngine.engine_id
 cudnn.engines.BaseEngine.execute
+cudnn.engines.BaseEngine.get_behavior_notes
 cudnn.engines.BaseEngine.get_workspace_size
 cudnn.engines.BaseEngine.knobs_from_public
 cudnn.engines.BaseEngine.knobs_to_public
@@ -762,6 +766,18 @@ cudnn.gemm.ProjectionForm.TOKEN_TILE
 cudnn.gemm.ProjectionGeometry
 cudnn.gemm.ProjectionGeometry.K_TILES
 cudnn.gemm.ProjectionGeometry.describe
+cudnn.gemm.SwigluFp4Decode
+cudnn.gemm.SwigluFp4Decode.cfg_for
+cudnn.gemm.SwigluFp4Decode.compile
+cudnn.gemm.SwigluFp4Decode.form_for
+cudnn.gemm.SwigluFp4Decode.kernel_symbols_for
+cudnn.gemm.SwigluFp4Decode.key
+cudnn.gemm.SwigluFp4Decode.launch_shape_for
+cudnn.gemm.SwigluGeometry
+cudnn.gemm.SwigluGeometry.K_BLOCKS
+cudnn.gemm.SwigluGeometry.WEIGHT_ROWS
+cudnn.gemm.SwigluGeometry.WEIGHT_TILES
+cudnn.gemm.SwigluGeometry.describe
 cudnn.gemm.cutedsl.dense.amax
 cudnn.gemm.cutedsl.dense.amax.GemmAmaxSm100
 cudnn.gemm.cutedsl.dense.amax.GemmAmaxSm100.check_support

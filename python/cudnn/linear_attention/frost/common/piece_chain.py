@@ -16,15 +16,16 @@ sequence fills slots in proportion to its length; their summaries ``H_j`` (state
 context-parallel backward fold only ``reverse`` since the backward summary's transition is ``M_buf^T`` as stored.
 ``emit_states`` stores every slot's entry state into ``X``; a fold that only needs ``tail`` turns it off and binds no ``X``.
 ``emit_summary`` also composes the running product ``summary_m`` so ``tail = seed @ summary_m + tail_zero_seed``.
-Layouts, fp32 unless stated: ``H``, ``X`` ``[num_seqs * pieces, HO, V, K]``; ``M`` ``[num_seqs * pieces, HO, K, K]``;
+Layouts, fp32 unless stated: ``H``, ``X`` ``[capacity, HO, V, K]``; ``M`` ``[capacity, HO, K, K]``;
 ``seed`` / ``tail`` ``[num_seqs, HO, V, K]`` (fp32 or bf16); ``summary_m`` ``[num_seqs, HO, K, K]``.  Slots are flat in
 sequence order: sequence ``b`` owns ``main_rows[b] // HO .. main_rows[b + 1] // HO``, its piece ``j`` being slot
 ``main_rows[b] // HO + j`` (the public summary chain without a piece table keeps the fixed grid ``b * pieces + j``).
 Empty pieces carry ``H = 0``, ``M = I`` and fall through exactly.  Piece table workspace (``piece_table_layout``):
 ``main_rows`` / ``summary_rows`` int32 ``[num_seqs + 1]`` (row bases of each sequence in the main and summary work-item
-tables, entry ``num_seqs`` the row count) and ``cu_pieces`` int32 ``[num_seqs * pieces + 1]`` in real tokens, the flat
+tables, entry ``num_seqs`` the row count) and ``cu_pieces`` int32 ``[capacity + 1]`` in real tokens, the flat
 slot starts followed by the batch end, each 16-byte aligned; the rows of a sequence's last filled piece carry
 ``final_dst`` and those of its first ``dstate_dst``, so the main kernels write ``final_state`` / ``d_initial_state`` in place.
+Capacity defaults to ``num_seqs * pieces``; length-rule KDA plans use the tighter shape-only ``piece_capacity`` bound.
 """
 
 import math
@@ -63,6 +64,14 @@ CHAIN_MAX_PIECES = 16
 LENGTH_RULE_PIECE_TOKENS = 8192
 CHAIN_MIN_UNITS_PER_PIECE = 4
 DV_SPLIT_TILES = 2
+
+# A packed KDA shape can have enough nominal (sequence, head) tiles to suppress
+# the ordinary chain while nearly all tokens belong to one sequence.  Keep the
+# device-side length rule available for a bounded number of nominal waves; the
+# piece table reads the actual cu_seqlens and leaves sequences of at most this
+# many tokens uncut.
+KDA_RAGGED_MAX_TILE_WAVES = 4
+KDA_RAGGED_MAX_PIECES = 4
 
 PIECE_TABLE_ALIGN = 256
 CHAIN_K_WARPS = 4
@@ -134,6 +143,67 @@ def choose_pieces(
     return 0, unit_chunks
 
 
+def choose_kda_pieces(
+    *,
+    num_seqs,
+    heads_out,
+    num_sm,
+    total_tokens,
+    b_t,
+    cadence_tokens,
+    batch_invariant,
+    expand_num,
+    enable_ragged_fallback,
+    reverse=False,
+    compose_tail=False,
+    min_tokens=0,
+):
+    """Return ``(pieces, unit_chunks, length_rule)`` for a KDA main plan.
+
+    The ordinary shape-only rule assumes all declared sequences contribute
+    equally.  That is pessimistic for an oversubscribed packed batch containing
+    one long sequence and many short or empty ones: ``num_seqs * heads_out``
+    can exceed the SM count while the long sequence remains the critical path.
+
+    On the measured SM100 route, keep a bounded length-rule chain in that gap.
+    Its device-built piece table reads ``cu_seqlens`` and cuts only sequences
+    longer than :data:`LENGTH_RULE_PIECE_TOKENS`; no device value reaches the
+    host and balanced short sequences stay single-piece.  The fallback caps the
+    schedule at :data:`KDA_RAGGED_MAX_PIECES`: on SM100, four pieces were faster
+    than eight for the 64K skewed case while using less workspace.  The caller
+    controls ``enable_ragged_fallback`` so unmeasured architectures preserve
+    the prior choice exactly.
+    """
+    pieces, unit_chunks = choose_pieces(
+        num_seqs=num_seqs,
+        heads_out=heads_out,
+        num_sm=num_sm,
+        total_tokens=total_tokens,
+        b_t=b_t,
+        cadence_tokens=cadence_tokens,
+        batch_invariant=batch_invariant,
+        expand_num=expand_num,
+        reverse=reverse,
+        compose_tail=compose_tail,
+        min_tokens=min_tokens,
+    )
+    if pieces or batch_invariant or not enable_ragged_fallback:
+        return pieces, unit_chunks, bool(pieces and batch_invariant)
+
+    num_seqs = max(1, int(num_seqs))
+    heads_out = max(1, int(heads_out))
+    num_sm = max(1, int(num_sm))
+    total_tokens = int(total_tokens)
+    nominal_tiles = num_seqs * heads_out
+    length_pieces = min(-(-total_tokens // LENGTH_RULE_PIECE_TOKENS), KDA_RAGGED_MAX_PIECES)
+
+    if not (num_sm <= nominal_tiles <= KDA_RAGGED_MAX_TILE_WAVES * num_sm):
+        return 0, unit_chunks, False
+    if length_pieces < 2:
+        return 0, unit_chunks, False
+    return length_pieces, unit_chunks, True
+
+
 def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand_num, unit_chunks):
     """Whether a plan without pieces and without ``batch_invariant`` runs the d_v split: every (sequence, head) tile as
     ``DV_SPLIT_TILES`` CTAs, each owning ``dim_v // DV_SPLIT_TILES`` value columns, at the tile counts where the slot budget
@@ -142,6 +212,20 @@ def is_dv_split(*, num_seqs, heads_out, dim_v, num_sm, total_tokens, b_t, expand
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
     )
     return budget == DV_SPLIT_TILES and int(dim_v) == 128
+
+
+def piece_capacity(*, num_seqs: int, pieces: int, total_tokens: int, batch_invariant: bool) -> int:
+    """Shape-only slot capacity; independent of the per-sequence split rule.
+
+    A length-rule sequence of length ``L`` uses at most ``max(1, ceil(L / 8192))`` slots, including an empty sequence's
+    identity slot.  This is at most ``1 + floor(L / 8192)``; summing over the batch bounds the capacity by
+    ``num_seqs + floor(total_tokens / 8192)`` as well as the original ``num_seqs * pieces``.  Chunk/cadence rounding
+    can only reduce the filled count.  No sequence lengths need to be read back from the device.
+    """
+    capacity = int(num_seqs) * int(pieces)
+    if batch_invariant:
+        capacity = min(capacity, int(num_seqs) + int(total_tokens) // LENGTH_RULE_PIECE_TOKENS)
+    return capacity
 
 
 # ---- piece table ----------------------------------------------------------------------------------
@@ -159,16 +243,18 @@ class PieceTableLayout(NamedTuple):
     nbytes: int
 
 
-def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTableLayout:
+def piece_table_layout(num_seqs: int, pieces: int, heads_out: int, *, capacity: int | None = None) -> PieceTableLayout:
     """``main_rows`` / ``summary_rows`` int32 ``[num_seqs + 1]`` (each sequence's first row; entry ``num_seqs``
     is the table's row count, the ``main_count`` / ``summary_count`` region) and ``cu_pieces`` int32
-    ``[num_seqs * pieces + 1]``, each 16-aligned; 256-aligned total.  ``item_rows`` is the work-item capacity."""
+    ``[capacity + 1]``, each 16-aligned; 256-aligned total.  ``item_rows`` is the work-item capacity.  The default
+    capacity is ``num_seqs * pieces``; length-rule callers may supply the tighter ``piece_capacity`` bound."""
     num_seqs = int(num_seqs)
+    capacity = num_seqs * int(pieces) if capacity is None else int(capacity)
     rows_bytes = -(-4 * (num_seqs + 1) // 16) * 16
     cu_pieces = 2 * rows_bytes
-    cu_bytes = -(-4 * (num_seqs * int(pieces) + 1) // 16) * 16
+    cu_bytes = -(-4 * (capacity + 1) // 16) * 16
     nbytes = -(-(cu_pieces + cu_bytes) // PIECE_TABLE_ALIGN) * PIECE_TABLE_ALIGN
-    return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, num_seqs * int(pieces) * int(heads_out), nbytes)
+    return PieceTableLayout(0, rows_bytes, cu_pieces, 4 * num_seqs, rows_bytes + 4 * num_seqs, capacity * int(heads_out), nbytes)
 
 
 @cute.jit
@@ -250,8 +336,9 @@ def piece_table_body(
     is ``main_rows[b] // heads_out`` and ``cu_pieces[slot + j] = cu[b] + min(j * span_b, len_b)``; ``main_rows`` /
     ``summary_rows`` are the per-sequence row bases of the main table (one row per filled slot and head, slot 0 of an
     empty sequence included) and of the summary table (sequences with two or more filled slots).  The entries from the
-    batch end to ``cu_pieces[num_seqs * pieces]`` all hold the batch end, so the table stays monotone over the whole wave
-    for the consumers that size the slots from its shape.  Deterministic, no host sync."""
+    batch end to the last element of ``cu_pieces`` all hold the batch end, so the table stays monotone over its capacity
+    for the consumers that size the slots from its shape.  The length rule permits a capacity smaller than the wave
+    without changing any sequence's split.  Deterministic, no host sync."""
     num_warps = cutlass.const_expr(n_threads // 32)
     sWarpMain = cutlass.Array(cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16)
     sWarpSummary = cutlass.Array(cutlass.Int32, num_warps, space=cutlass.AddressSpace.smem, alignment=16)
@@ -361,7 +448,7 @@ def piece_table_body(
     total_slots = running_main // cutlass.Int32(heads_out)
     batch_end = cutlass.Int32(mCu[num_seqs])
     tail = total_slots + tidx
-    while tail <= num_seqs * cutlass.Int32(pieces):
+    while tail < cutlass.Int32(mCuPieces.shape[0]):
         mCuPieces[tail] = batch_end
         tail = tail + cutlass.Int32(n_threads)
     if tidx == 0:
@@ -370,6 +457,32 @@ def piece_table_body(
 
 
 # ---- state chain ----------------------------------------------------------------------------------
+
+
+@cute.jit
+def load_summary_store_state(h_addr, x_addr, state_values, width: cutlass.Constexpr[int]):
+    """Read a row owner's H vector before replacing it with the incoming state.
+
+    Exact H/X aliasing is safe because the same lane owns both vectors and no
+    other lane reads H. Keep load and store in one assembly block: independent
+    inline loads/stores do not describe this alias to the compiler. Named PTX
+    temporaries retain H until all input operands have been consumed, so output
+    register allocation cannot clobber the state values before the store.
+    """
+    if cutlass.const_expr(width == 2):
+        return nvvm.inline_ptx(
+            "{ .reg .f32 h0, h1; ld.global.v2.f32 {h0, h1}, [$2]; " "st.global.v2.f32 [$3], {$4, $5}; mov.f32 $0, h0; mov.f32 $1, h1; }",
+            write_only_types=[cutlass.Float32] * 2,
+            read_only_args=[h_addr, x_addr, state_values[0], state_values[1]],
+        )
+    else:
+        return nvvm.inline_ptx(
+            "{ .reg .f32 h0, h1, h2, h3; ld.global.v4.f32 {h0, h1, h2, h3}, [$4]; "
+            "st.global.v4.f32 [$5], {$6, $7, $8, $9}; "
+            "mov.f32 $0, h0; mov.f32 $1, h1; mov.f32 $2, h2; mov.f32 $3, h3; }",
+            write_only_types=[cutlass.Float32] * 4,
+            read_only_args=[h_addr, x_addr, state_values[0], state_values[1], state_values[2], state_values[3]],
+        )
 
 
 @cute.kernel
@@ -395,6 +508,8 @@ def frost_state_chain(
     mMainRows: cute.Tensor | None,
     mSeedIndices: cute.Tensor | None,
     mComposed: cute.Tensor | None,
+    head_divisor: cutlass.Constexpr[int] = 1,
+    head_phase: cutlass.Int32 = 0,
 ):
     """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state and, under ``emit_summary``, the matching
     rows of the running M product.  Eight warps (two row groups times four k slices, lane ``l`` owning ``K / 32`` columns);
@@ -404,7 +519,13 @@ def frost_state_chain(
     ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``; without it the fixed grid ``seq * pieces + j``.  ``emit_states``
     stores every slot's entry state into ``X``.  A one-slot walk copies the seed into ``X`` when there is no tail or summary
     and otherwise yields ``tail = seed @ M_0 + H_0``.  With ``emit_summary`` and neither seed nor tail only the product is
-    walked."""
+    walked. ``head_divisor`` partitions independent heads; this launch handles
+    ``h = state_h * head_divisor + head_phase``. Internal H/M/X buffers have
+    ``HO // head_divisor`` heads, while caller seed/composed/tail/summary ports
+    retain all HO heads. Row tables always retain the original HO stride.
+    Divisor one and phase zero preserve the ordinary full-head launch.
+    Internal FP32 H and X may be exactly the same view: each lane reads its H
+    vector before writing X. Partial overlaps and aliasing M are not supported."""
     K = cutlass.const_expr(dim_k)
     V = cutlass.const_expr(dim_v)
     HO = heads_out
@@ -431,7 +552,8 @@ def frost_state_chain(
     col0 = lane * cutlass.Int32(cols_per_lane)
     bid = cute.arch.block_idx()
     seq = cutlass.Int32(bid[0])
-    h = cutlass.Int32(bid[1])
+    state_h = cutlass.Int32(bid[1])
+    h = state_h * head_divisor + head_phase
     seed_seq = seq
     if cutlass.const_expr(mSeedIndices is not None):
         seed_seq = cutlass.Int32(mSeedIndices[seq])
@@ -514,7 +636,7 @@ def frost_state_chain(
                 seed_x_row = row0 + seed_row
                 seed_x_offset = (
                     cutlass.Int64(seq_base) * cutlass.Int64(mX.stride[0])
-                    + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
+                    + cutlass.Int64(state_h) * cutlass.Int64(mX.stride[1])
                     + cutlass.Int64(seed_x_row) * cutlass.Int64(mX.stride[2])
                     + cutlass.Int64(col0)
                 )
@@ -600,8 +722,8 @@ def frost_state_chain(
             m_chunk = chunk_id % cutlass.Int32(K // 4)
             m_dst_words.append(m_row * K + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
             m_src_elems.append(cutlass.Int64(m_row) * cutlass.Int64(K) + cutlass.Int64(m_chunk) * cutlass.Int64(4))
-        m_slot_elems = cutlass.Int64(HO) * cutlass.Int64(K * K)
-        m_head_elems = cutlass.Int64(h) * cutlass.Int64(K * K)
+        m_slot_elems = cutlass.Int64(HO // head_divisor) * cutlass.Int64(K * K)
+        m_head_elems = cutlass.Int64(state_h) * cutlass.Int64(K * K)
         x_row_addrs = []
         h_row_addrs = []
         x_slot_bytes = cutlass.Int64(0)
@@ -614,13 +736,13 @@ def frost_state_chain(
                 row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
                 h_row_addrs.append(
                     mH.iterator.toint()
-                    + (cutlass.Int64(h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
+                    + (cutlass.Int64(state_h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
                     * cutlass.Int64(mH.element_type.width // 8)
                 )
                 if cutlass.const_expr(emit_states):
                     x_row_addrs.append(
                         mX.iterator.toint()
-                        + (cutlass.Int64(h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
+                        + (cutlass.Int64(state_h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
                         * cutlass.Int64(mX.element_type.width // 8)
                     )
         first_step = cutlass.Int32(0) if cutlass.const_expr(not reverse) else count - cutlass.Int32(1)
@@ -641,16 +763,19 @@ def frost_state_chain(
                 x_slot_off = cutlass.Int64(slot) * x_slot_bytes
                 h_slot_off = cutlass.Int64(slot) * h_slot_bytes
                 for rr in cutlass.range_constexpr(walk_own_rows):
+                    h_addr = h_row_addrs[rr] + h_slot_off
                     if cutlass.const_expr(emit_states):
                         x_addr = x_row_addrs[rr] + x_slot_off
                         x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                         if cutlass.const_expr(cols_per_lane == 2):
-                            st_global_v2(x_addr, x_vals, cutlass.Float32)
+                            h_vals = list(load_summary_store_state(h_addr, x_addr, x_vals, 2))
                         else:
+                            h_vals = []
                             for q in cutlass.range_constexpr(cols_per_lane // 4):
-                                st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
-                    h_addr = h_row_addrs[rr] + h_slot_off
-                    if cutlass.const_expr(cols_per_lane == 2):
+                                h_vals += list(
+                                    load_summary_store_state(h_addr + cutlass.Int64(16 * q), x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], 4)
+                                )
+                    elif cutlass.const_expr(cols_per_lane == 2):
                         h_vals = list(ld_global_v2(h_addr, cutlass.Float32))
                     else:
                         h_vals = [x for q in range(cols_per_lane // 4) for x in ld_global_v4(h_addr + cutlass.Int64(16 * q), cutlass.Float32)]
@@ -903,6 +1028,8 @@ def launch_state_chain(
     mSeedIndices: cute.Tensor | None,
     mComposed: cute.Tensor | None,
     stream: cuda.CUstream,
+    head_divisor: cutlass.Constexpr[int] = 1,
+    head_phase: cutlass.Int32 = 0,
 ) -> None:
     slices = cutlass.const_expr(dim_v // rows)
     frost_state_chain(
@@ -927,7 +1054,9 @@ def launch_state_chain(
         mMainRows,
         mSeedIndices,
         mComposed,
-    ).launch(grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
+        head_divisor,
+        head_phase,
+    ).launch(grid=(num_seqs, heads_out // head_divisor, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
 
 
 state_chain_cache = {}
@@ -1085,12 +1214,19 @@ def build_state_chain(
 
 
 def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail, summary_m, stream, main_rows=None, seed_indices=None, composed=None) -> None:
-    """Chain ``num_seqs`` sequences over ``compiled.pieces`` slots each: ``H`` / ``X`` fp32 ``[num_seqs * pieces, HO, V, K]``
-    (``H`` None for a product-only chain, ``X`` None without ``emit_states``), ``M`` fp32 ``[num_seqs * pieces, HO, K, K]``,
+    """Chain ``num_seqs`` sequences: ``H`` / ``X`` fp32 ``[capacity, HO, V, K]``
+    (``H`` None for a product-only chain, ``X`` None without ``emit_states``), ``M`` fp32 ``[capacity, HO, K, K]``,
     ``seed`` / ``tail`` ``[num_seqs, HO, V, K]`` and ``summary_m`` ``[num_seqs, HO, K, K]`` in their built dtypes (None when
     not built), the piece table's ``main_rows`` int32 ``[num_seqs + 1]`` when ``filled_only`` (the slots are then flat in
-    sequence order), ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
-    ``has_composed`` (the context-parallel boundary sequence's entry state)."""
+    sequence order, with capacity covering its filled slots; otherwise ``capacity = num_seqs * compiled.pieces``),
+    ``seed_indices`` int32 ``[num_seqs]`` when built with ``has_seed_indices``, ``composed`` fp32 ``[1, HO, V, K]`` when built with
+    ``has_composed`` (the context-parallel boundary sequence's entry state).
+    H and X may be exactly the same FP32 view; this destroys H as each lane
+    replaces its summary with the incoming state. Partial overlaps and aliasing
+    M or the public seed/tail/product buffers are unsupported. The caller owns
+    all buffers and keeps them live through completion on ``stream``; concurrent
+    launches must not share writable storage. This prepared launch neither
+    allocates nor compiles and may be captured in a CUDA Graph."""
     walk_state = compiled.has_seed or compiled.has_tail or not compiled.emit_summary
     compiled.compiled(
         int(compiled.heads_out),

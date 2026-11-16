@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SM100 large-head THD backward (``sdpa_bwd_sm100``, D in (256, 512]) with independent physical origins.
+"""SM100 large-head THD backward (explicit role-split/2x2 owners, D in (256, 512]) with independent physical origins.
 
 Every port is bound at its own per-sequence offsets with poisoned gaps between sequences (NaN inputs, sentinel
 outputs).  A chain that addressed a port at the compact length prefixes would read the poison or write the gap.
@@ -11,12 +11,14 @@ import pytest
 import torch
 
 import cudnn.sdpa.bwd.api_dsl as api_dsl
+from cudnn.sdpa.bwd.kernels.sm100.d512_f16_role_split.host import SdpaBwdDslSm100D512RoleSplit
 import test_sdpa_bwd_thd_d256_sm100 as thd
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 from test_sdpa_bwd_thd_sm100 import stage2_datapath  # noqa: F401  (fixture: pins and checks the stage-2 body)
 
 pytestmark = [requires_dsl, requires_pre_rubin_blackwell]
-_ENGINE = "sdpa_bwd_sm100"
+_ENGINE = "sdpa_bwd_sm100_d512_role_split"
+_ADAPTER = SdpaBwdDslSm100D512RoleSplit
 _LQ, _LK = (257, 93, 128), (383, 129, 267)
 
 
@@ -90,7 +92,7 @@ def test_origins_rebind_and_replay(monkeypatch, dt, token_major, surface):
     # The shared harness forces two GQA groups through reused scratch; this chain's chunk rule is a module function.
     monkeypatch.setattr(api_dsl.SdpaBwdDslSm100, "_ws_budget_bytes", None, raising=False)
     monkeypatch.setattr(api_dsl, "_sm100_head_chunk_thd", lambda *args, **kwargs: 4)
-    thd.check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, d=512, d_v=512, api_type=api_dsl.SdpaBwdDslSm100, engine=_ENGINE)
+    thd.check_origins_rebind_and_replay(monkeypatch, dt, token_major, surface, d=512, d_v=512, api_type=_ADAPTER, engine=_ENGINE)
 
 
 @pytest.mark.L0
@@ -102,7 +104,7 @@ def test_origin_ports_are_optional_per_port():
     for key in ("data", "starts", "live"):
         p[key]["dq"] = compact[key]["dq"]
     del p["offsets"]["dq"], p["spec"]["dq"]
-    api = thd.make_adapter(p, True, api_type=api_dsl.SdpaBwdDslSm100)
+    api = thd.make_adapter(p, True, api_type=_ADAPTER)
     p["ws"] = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     p["snapshots"] = thd.snapshots(p)
     thd.poison(p)
@@ -115,7 +117,7 @@ def test_origin_ports_are_optional_per_port():
 def test_compact_standalone_plan_is_unchanged_by_the_origin_contract():
     """No declared offsets: the packed-prefix artifact, its frame and its workspace carve are the pre-existing ones."""
     p = thd.make_payload(torch.bfloat16, True, _LQ, _LK, 0, False, hq=2, hkv=2, d=512, d_v=512, physical_origins=False)
-    api = thd.make_adapter(p, True, api_type=api_dsl.SdpaBwdDslSm100)
+    api = thd.make_adapter(p, True, api_type=_ADAPTER)
     assert api._thd_origins is None and len(api._prepared.operands) == 11
     p["ws"] = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
     p["snapshots"] = thd.snapshots(p)
@@ -164,7 +166,7 @@ def test_empty_final_origin_stats_guard(stage2_datapath, surface, token_major, a
         graph, execute = thd.make_graph(p, token_major, engine=_ENGINE)
         workspace_size = graph.get_workspace_size()
     else:
-        api = thd.make_adapter(p, token_major, api_type=api_dsl.SdpaBwdDslSm100)
+        api = thd.make_adapter(p, token_major, api_type=_ADAPTER)
         workspace_size = api.scratch_workspace_bytes()
 
         def execute(payload):

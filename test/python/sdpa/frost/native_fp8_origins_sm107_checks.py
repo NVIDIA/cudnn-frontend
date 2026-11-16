@@ -9,14 +9,14 @@ from sdpa.frost.test_sdpa_fwd_thd_origins import test_independent_thd_origins_re
 from sdpa.frost.test_sdpa_fwd_thd_origins_fp8_sm120 import _check_routes_and_invariance
 from sdpa.frost.test_sdpa_physical_origins_shared import _check_native_origins
 
-_ENGINE = "sdpa_fwd_prefill_sm107_fp8"
+_ENGINE = "sdpa_fwd_sm107_d128_fp8_multi_q"
 _DTYPES = ("float8_e4m3fn", "float8_e5m2")
 
 
 def _check_route(graph, nodes, values, state, workspace, overrides, flat, stats_layout):
     plan = graph._compiled_plans[graph._plan_index]
     module = plan._compiled.kernel_module
-    assert module.__file__.endswith("sm107/prefill_d128_fp8.py")
+    assert module.__file__.endswith("sm107/d128_fp8_multi_q/kernel.py")
     assert module.CFG.CTA_MMA == 2 and module.CFG.SPLIT_KV == 1
     assert plan._prepared.spec.origin_specs is not None
     assert plan._prepared.spec.native is not None
