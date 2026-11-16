@@ -323,7 +323,9 @@ def epilogue_warp(
                 checkpoint_stage = checkpoint_ready_index.idx
                 bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
                 checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
-                checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), write_start, head_o)
+                checkpoint_slice = tma_slice_runtime_desc(
+                    desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), write_start, head_o // cfg.checkpoint_head_divisor
+                )
                 tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
                 tma_store_commit()
                 tma_store_wait(0)
@@ -340,7 +342,9 @@ def epilogue_warp(
                         bars.mb_checkpoint_tmastg_ready[checkpoint_stage].wait(checkpoint_ready_index.phase)
                         checkpoint_ready_index = advance(checkpoint_ready_index, cfg.smem_checkpoint_stages)
                         checkpoint_entry = checkpoint_quotient
-                        checkpoint_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), checkpoint_entry, head_o)
+                        checkpoint_slice = tma_slice_runtime_desc(
+                            desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), checkpoint_entry, head_o // cfg.checkpoint_head_divisor
+                        )
                         tma_store_tile(sCheckpoint_tma[checkpoint_stage], checkpoint_slice, acquire=False)
                         tma_store_commit()
                         tma_store_wait(0)
@@ -1369,7 +1373,7 @@ def compute1_warp_group(
                 if seed_from_initial_state:
                     if cutlass.const_expr(cfg.state_table):
                         seed_vw = 16 // (mState_init.element_type.width // 8)
-                        seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o, state_gmem_row, 0))).raw_ptr()
+                        seed_src = (mState_init.iterator + mState_init.layout((batch_idx, head_o // cfg.state_head_divisor, state_gmem_row, 0))).raw_ptr()
                     if cutlass.const_expr(cfg.has_composed):
                         is_boundary = batch_idx == cutlass.Int32(0)
                         composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, state_gmem_row, 0))).raw_ptr()
@@ -1897,11 +1901,13 @@ def compute1_warp_group(
                             if cutlass.const_expr(cfg.has_composed):
                                 value = cutlass.Float32(0.0)
                                 if cutlass.const_expr(cfg.state_table):
-                                    value = mState_init[batch_idx, head_o, state_gmem_row, key_dim].to(cutlass.Float32)
+                                    value = mState_init[batch_idx, head_o // cfg.state_head_divisor, state_gmem_row, key_dim].to(cutlass.Float32)
                                 value = mComposed[cutlass.Int32(0), head_o, state_gmem_row, key_dim] if is_boundary else value
                                 mState_out[batch_idx, head_o, state_gmem_row, key_dim] = value.to(mState_out.element_type)
                             elif cutlass.const_expr(cfg.use_initial_state):
-                                mState_out[batch_idx, head_o, state_gmem_row, key_dim] = mState_init[batch_idx, head_o, state_gmem_row, key_dim]
+                                mState_out[batch_idx, head_o, state_gmem_row, key_dim] = mState_init[
+                                    batch_idx, head_o // cfg.state_head_divisor, state_gmem_row, key_dim
+                                ]
                             elif cutlass.const_expr(cfg.seed_identity):
                                 diag = cutlass.Float32(1.0) if state_gmem_row == key_dim else cutlass.Float32(0.0)
                                 mState_out[batch_idx, head_o, state_gmem_row, key_dim] = diag.to(mState_out.element_type)
@@ -2559,6 +2565,8 @@ class Gdn2RecomputeCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
+    checkpoint_head_divisor: int = 1
     log_gate: bool = True
     seed_identity: bool = False
     state_table: bool = True

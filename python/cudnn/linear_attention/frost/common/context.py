@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 
-from .piece_chain import choose_pieces, piece_capacity
+from . import piece_chain
 
 
 class Context:
@@ -55,7 +55,7 @@ def backward_context(
     (``chunk_factors``) and the per-piece transitions and state gradients."""
     expand_num = max(1, int(num_householder))
     q_rows = int(total) // expand_num
-    pieces, unit_chunks = choose_pieces(
+    pieces, unit_chunks = piece_chain.choose_pieces(
         num_seqs=1,
         heads_out=int(h_o),
         num_sm=int(num_sm),
@@ -118,7 +118,7 @@ def forward_apply_context(
     """The forward's context over ``total`` k rows of ``num_seqs`` sequences, for the backward of the same tokens."""
     expand_num = max(1, int(num_householder))
     q_rows = int(total) // expand_num
-    pieces, unit_chunks = choose_pieces(
+    pieces, unit_chunks = piece_chain.choose_pieces(
         num_seqs=int(num_seqs),
         heads_out=int(h_o),
         num_sm=int(num_sm),
@@ -137,7 +137,7 @@ def forward_apply_context(
         regions.append(("k_n", layout.add(total * h_k * d_k * 2), io_name, (total, h_k, d_k)))
         regions.append(("inv_q", layout.add(q_rows * h_q * 4), "float32", (q_rows, h_q)))
         regions.append(("inv_k", layout.add(total * h_k * 4), "float32", (total, h_k)))
-    slots = piece_capacity(num_seqs=num_seqs, pieces=pieces, total_tokens=q_rows, batch_invariant=batch_invariant)
+    slots = piece_chain.piece_capacity(num_seqs=num_seqs, pieces=pieces, total_tokens=q_rows, batch_invariant=batch_invariant)
     if chunk_factors and has_tables:
         rows = tinv_rows(q_rows, slots, expand_num, b_t)
         regions.append(("tinv", layout.add(rows * h_o * b_t * b_t * 2), io_name, (rows, h_o, b_t, b_t)))

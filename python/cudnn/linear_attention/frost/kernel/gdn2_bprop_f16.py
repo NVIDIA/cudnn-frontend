@@ -1703,7 +1703,7 @@ def tmaldg_warp(
                 state_index = advance(state_index, cfg.smem_state_stages)
                 if elect_one:
                     bars.mb_state_ready[state_idx].arrive(n_bytes=cfg.tma_state_bytes)
-                state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o)
+                state_slice = tma_slice_runtime_desc(desc_checkpoint_slot, cutlass.Int32(0), cutlass.Int32(0), chunk_idx, head_o // cfg.checkpoint_head_divisor)
                 tma_load_tile(sState_tma[state_idx], state_slice, bars.mb_state_ready[state_idx].smem_ptr, acquire=False)
 
             # ---- dO load -------------------------------------------------------------
@@ -2231,7 +2231,7 @@ def compute1_warp_group(
                 row_lo_addr = tmem_row << 16
                 if cutlass.const_expr(cfg.dstate_table):
                     seed_vw = 16 // (mDstate_in.element_type.width // 8)
-                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx, state_gmem_row, 0))).raw_ptr()
+                    dstate_src = (mDstate_in.iterator + mDstate_in.layout((batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, 0))).raw_ptr()
                 if cutlass.const_expr(cfg.has_composed_dstate):
                     is_boundary = batch_idx == cutlass.Int32(cu_seqlens.shape[0]) - cutlass.Int32(2)
                     composed_src = (mDcomposed.iterator + mDcomposed.layout((cutlass.Int32(0), head_idx, state_gmem_row, 0))).raw_ptr()
@@ -2693,13 +2693,13 @@ def compute1_warp_group(
                             if cutlass.const_expr(cfg.has_composed_dstate):
                                 value = cutlass.Float32(0.0)
                                 if cutlass.const_expr(cfg.dstate_table):
-                                    value = mDstate_in[batch_idx, head_idx, state_gmem_row, kd].to(cutlass.Float32)
+                                    value = mDstate_in[batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, kd].to(cutlass.Float32)
                                 value = mDcomposed[cutlass.Int32(0), head_idx, state_gmem_row, kd] if is_boundary else value
                                 mDstate0[dstate_dst, head_idx, state_gmem_row, kd] = value.to(mDstate0.element_type)
                             elif cutlass.const_expr(cfg.use_dstate_in):
-                                mDstate0[dstate_dst, head_idx, state_gmem_row, kd] = mDstate_in[batch_idx, head_idx, state_gmem_row, kd].to(
-                                    mDstate0.element_type
-                                )
+                                mDstate0[dstate_dst, head_idx, state_gmem_row, kd] = mDstate_in[
+                                    batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, kd
+                                ].to(mDstate0.element_type)
                             else:
                                 mDstate0[dstate_dst, head_idx, state_gmem_row, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
         if sk_nt > 0:
@@ -4548,6 +4548,8 @@ class Gdn2BpropCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
+    checkpoint_head_divisor: int = 1
     log_gate: bool = True
     dstate_table: bool = True
     has_composed_dstate: bool = False

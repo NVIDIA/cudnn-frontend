@@ -320,7 +320,9 @@ class CompiledKda:
             self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
             state_bytes = self.num_pieces * HO * (2 * V * K + K * K) * 4
             live_state_bytes = self.num_pieces * HO * (V * K + K * K) * 4
-            self.state_head_divisor = _forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm, live_state_bytes)
+            self.state_head_divisor = (
+                1 if self.output_piece_transitions else _forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm, live_state_bytes)
+            )
             state_heads = HO // self.state_head_divisor
             if self.state_head_divisor > 1:
                 regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
@@ -535,6 +537,7 @@ class CompiledKda:
                 positions.pop("state_checkpoints", None)
             indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
             self.chain_buffers = itemgetter(*indices)
+            self.index_state_wave_counts = positions.get("state_wave_counts", absent)
             self.chain_scalars = (
                 int(self.pieces),
                 int(self.n_heads_out),
@@ -625,6 +628,7 @@ class CompiledKda:
         )
         if self.chain:
             summary_cfg, prefill_cfg = kda_chain_forward_f16.build_configs(io_dtype, get_dtype("float32"), gate_dtype, **flags)
+            summary_cfg.state_head_divisor = prefill_cfg.state_head_divisor = self.state_head_divisor
             return kda_chain_forward_f16.chain_forward_host, dict(
                 unit_chunks=self.unit_chunks,
                 b_t=self.b_t,
@@ -636,6 +640,7 @@ class CompiledKda:
                 chain_rows=self.chain_rows_per_cta(dim_v, dim_k, self.num_seqs, self.n_heads_out, self.num_sm),
                 has_seed=self.index_initial_state is not None,
                 tail=False,
+                state_head_divisor=self.state_head_divisor,
             )
         state = node.inputs.get("initial_state", node.outputs.get("final_state"))
         prefill_cfg, prep_cfg = kda_uncut_forward_f16.build_configs(
@@ -671,8 +676,10 @@ class CompiledKda:
             )
         if self.chain and self.chain_launch is not None:
             context_views = context.carve(self.context.carve) if self.has_context else ()
-            buffers = self.chain_buffers((*views, *workspace.carve(self.carve), *context_views, None))
-            self.chain_launch(*self.chain_scalars, *buffers, self.stream_type(int(stream or 0)), None, *fold_buffers)
+            merged = (*views, *workspace.carve(self.carve), *context_views, None)
+            self.chain_launch(
+                *self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *fold_buffers, merged[self.index_state_wave_counts]
+            )
             return
         q = views[self.index_q]
         k = views[self.index_k]
@@ -1406,6 +1413,9 @@ class CompiledKdaBwd:
             summary_cfg, transition_cfg, series_cfg, bwd_summary_cfg, bprop_cfg = kda_chain_backward_f16.build_configs(
                 io_dtype, get_dtype("float32"), get_dtype("float32"), gate_dtype, fused_h_m=self.fused_h_m, series=self.needs_recompute, **flags
             )
+            series_cfg.checkpoint_head_divisor = bprop_cfg.checkpoint_head_divisor = self.checkpoint_head_divisor
+            for cfg in (summary_cfg, bwd_summary_cfg, series_cfg, bprop_cfg):
+                cfg.state_head_divisor = self.state_head_divisor
             return kda_chain_backward_f16.chain_backward_host, dict(
                 unit_chunks=self.unit_chunks,
                 b_t=self.b_t,
@@ -1426,6 +1436,8 @@ class CompiledKdaBwd:
                 has_dseed=self.index_d_final_state is not None,
                 tail=False,
                 gate_lower_bound=self.gate_lower_bound,
+                checkpoint_head_divisor=self.checkpoint_head_divisor,
+                state_head_divisor=self.state_head_divisor,
             )
         seeded = self.needs_recompute and not coarse
         state = node.inputs["initial_state"] if seeded and self.index_initial_state is not None else None

@@ -16,6 +16,7 @@ from cudnn.engines.base import BaseEngine, CompiledPlan
 from cudnn.frost.device import build_device, current_device, multiprocessor_count
 from cudnn.frost.workspace import WorkspaceLayout, carve_plan
 from ..graph_analyzer import analyze
+from . import kda_engine
 from .common.context import backward_context, forward_apply_context
 from .engine import FrostLaPlan, context_gate, frost_la_gate, summary_support_gates
 
@@ -273,6 +274,14 @@ class CompiledGdn2:
         regions = []
         if self.chain:
             self.num_pieces = piece_capacity(num_seqs=B, pieces=self.pieces, total_tokens=total, batch_invariant=self.batch_invariant)
+            state_bytes = self.num_pieces * HO * (2 * V * K + K * K) * 4
+            live_state_bytes = self.num_pieces * HO * (V * K + K * K) * 4
+            self.state_head_divisor = (
+                1 if self.output_piece_transitions else kda_engine._forward_head_divisor(HO, state_bytes, self.num_pieces, self.num_sm, live_state_bytes)
+            )
+            state_heads = HO // self.state_head_divisor
+            if self.state_head_divisor > 1:
+                regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
             self.n_tiles = self.num_pieces * HO
             self.work_item_rows = self.n_tiles
             self.tensormap_bytes = tensormap_workspace_bytes(kernel_module, self.num_pieces)
@@ -291,7 +300,8 @@ class CompiledGdn2:
             regions.append(("fused_tensormaps", layout.add(self.fused_tensormap_bytes, align=128), "int64", (self.fused_tensormap_bytes // 8,)))
             table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes)
-            state_shape = (self.num_pieces, HO, V, K)
+            state_shape = (self.num_pieces, state_heads, V, K)
+            off_state_hx = layout.add(self.num_pieces * state_heads * V * K * 4)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
                 ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
@@ -299,11 +309,11 @@ class CompiledGdn2:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
+                ("state_h", off_state_hx, "float32", state_shape),
             ]
             if not self.output_piece_transitions:
-                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
-            regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(("state_m", layout.add(self.num_pieces * state_heads * K * K * 4), "float32", (self.num_pieces, state_heads, K, K)))
+            regions.append(("state_x", off_state_hx, "float32", state_shape))
         else:
             regions.append(("scheduler", layout.add(8), "int32", (2,)))
             self.n_tiles = B * HO * self.tiles_per_head
@@ -483,6 +493,7 @@ class CompiledGdn2:
                 positions.pop("state_checkpoints", None)
             indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
             self.chain_buffers = itemgetter(*indices)
+            self.index_state_wave_counts = positions.get("state_wave_counts", absent)
             fold = "preceding_state_update" in pos
             lead = ("preceding_state_update", "preceding_transition", "initial_state", "composed_initial_state") if fold else (None,) * 4
             self.chain_lead = itemgetter(*(pos.get(name, absent) for name in lead))
@@ -554,7 +565,14 @@ class CompiledGdn2:
             carved = workspace.carve(self.carve)
             context_views = context.carve(self.context.carve) if self.has_context else ()
             merged = (*views, *carved, *context_views, None)
-            self.chain_launch(*self.chain_scalars, *self.chain_buffers(merged), self.stream_type(int(stream or 0)), None, *self.chain_lead(merged))
+            self.chain_launch(
+                *self.chain_scalars,
+                *self.chain_buffers(merged),
+                self.stream_type(int(stream or 0)),
+                None,
+                *self.chain_lead(merged),
+                merged[self.index_state_wave_counts],
+            )
             return
         k = views[self.index_k]
         v = views[self.index_v]
@@ -736,6 +754,7 @@ class CompiledGdn2:
             final_indices=state_indices,
             checkpoints=state_checkpoints if self.has_state_checkpoints else None,
             lead_buffers=lead_buffers,
+            state_wave_counts=region.get("state_wave_counts"),
         )
         checkpoint = self.checkpoint if self.has_state_checkpoints else 0
         if self.chain_launch is None:
@@ -758,6 +777,7 @@ class CompiledGdn2:
                 checkpoint_after_block=self.checkpoint_after_block,
                 scale=self.scale,
                 chain_rows=self.chain_rows_per_cta(state_h.shape[2], state_h.shape[3], self.num_seqs, self.n_heads_out, self.num_sm),
+                state_head_divisor=self.state_head_divisor,
                 device=self.device,
                 num_sm=self.num_sm,
                 stream=stream,
@@ -969,11 +989,29 @@ class CompiledGdn2Bwd:
             regions += [("gate", off_gate, "int32", (GATE_WORDS,)), ("ragged_enable", off_gate + 8, "int32", (1,))]
         self.bwd_tensormap_bytes = tensormap_workspace_bytes(bwd_module, self.num_pieces)
         regions.append(("bwd_tensormaps", layout.add(self.bwd_tensormap_bytes, align=128), "int64", (self.bwd_tensormap_bytes // 8,)))
+        self.checkpoint_head_divisor = 1
+        self.state_head_divisor = 1
+        checkpoint_bytes = 0
         if self.needs_recompute:
             self.state_checkpoints_rows = max(total // self.b_t + self.num_pieces, 1)
-            regions.append(
-                ("state_checkpoints", layout.add(self.state_checkpoints_rows * HO * K * V * 2), self.io_name, (self.state_checkpoints_rows, HO, V, K))
-            )
+            if self.chain and not self.coarse_checkpoints:
+                checkpoint_bytes = self.state_checkpoints_rows * HO * K * V * 2
+                state_bytes = self.num_pieces * HO * max(V, K) * K * 4
+                capacity_bytes = max(checkpoint_bytes, 4 * state_bytes) if not self.has_context else checkpoint_bytes
+                self.checkpoint_head_divisor = kda_engine._checkpoint_head_divisor(HO, capacity_bytes, self.num_pieces, self.num_sm)
+                if not self.has_context and state_bytes > kda_engine._KDA_STATE_WAVE_BYTES:
+                    self.state_head_divisor = self.checkpoint_head_divisor
+            checkpoint_heads = HO // self.checkpoint_head_divisor
+            checkpoint_bytes = self.state_checkpoints_rows * checkpoint_heads * K * V * 2
+        if self.state_head_divisor > 1:
+            regions.append(("state_wave_counts", layout.add(8), "int32", (2,)))
+        state_heads = HO // self.state_head_divisor
+        reuse_phase_arena = self.chain and not self.has_state_checkpoints
+        phase_m_bytes = self.num_pieces * state_heads * K * K * 4 if reuse_phase_arena and not self.has_piece_transitions else 0
+        phase_hg_bytes = self.num_pieces * state_heads * V * K * 4 if reuse_phase_arena else 0
+        phase_offset = layout.add(max(checkpoint_bytes, phase_m_bytes + phase_hg_bytes))
+        if self.needs_recompute:
+            regions.append(("state_checkpoints", phase_offset, self.io_name, (self.state_checkpoints_rows, checkpoint_heads, V, K)))
         self.recompute_tensormap_bytes = tensormap_workspace_bytes(recompute_module, self.num_pieces)
         if self.needs_recompute and not self.chain:
             regions.append(("recompute_tensormaps", layout.add(self.recompute_tensormap_bytes, align=128), "int64", (self.recompute_tensormap_bytes // 8,)))
@@ -1014,7 +1052,7 @@ class CompiledGdn2Bwd:
         if self.chain:
             table = piece_table_layout(B, self.pieces, HO, capacity=self.num_pieces)
             off_piece_table = layout.add(table.nbytes)
-            state_shape = (self.num_pieces, HO, V, K)
+            state_shape = (self.num_pieces, state_heads, V, K)
             regions += [
                 ("main_rows", off_piece_table + table.main_rows, "int32", (B + 1,)),
                 ("summary_rows", off_piece_table + table.summary_rows, "int32", (B + 1,)),
@@ -1022,17 +1060,31 @@ class CompiledGdn2Bwd:
                 ("main_count", off_piece_table + table.main_count, "int32", (1,)),
                 ("summary_count", off_piece_table + table.summary_count, "int32", (1,)),
                 ("work_items_summary", layout.add(table.item_rows * WORK_ITEM_FIELDS * 4), "int32", (table.item_rows, WORK_ITEM_FIELDS)),
-                ("state_dx_end", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape),
+                ("state_dx_end", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", state_shape),
             ]
             if not self.has_piece_transitions:
-                regions.append(("state_m", layout.add(self.num_pieces * HO * K * K * 4), "float32", (self.num_pieces, HO, K, K)))
+                regions.append(
+                    (
+                        "state_m",
+                        phase_offset if reuse_phase_arena else layout.add(self.num_pieces * state_heads * K * K * 4),
+                        "float32",
+                        (self.num_pieces, state_heads, K, K),
+                    )
+                )
             if self.has_m_count:
                 regions.append(("m_count", layout.add(4), "int32", (1,)))
             if not self.has_piece_tables:
-                regions.append(("state_g", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(
+                    (
+                        "state_g",
+                        phase_offset + phase_m_bytes if reuse_phase_arena else layout.add(self.num_pieces * state_heads * V * K * 4),
+                        "float32",
+                        state_shape,
+                    )
+                )
             if not self.has_state_checkpoints:
-                regions.append(("state_h", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
-                regions.append(("state_x", layout.add(self.num_pieces * HO * V * K * 4), "float32", state_shape))
+                regions.append(("state_h", phase_offset + phase_m_bytes, "float32", state_shape))
+                regions.append(("state_x", layout.add(self.num_pieces * state_heads * V * K * 4), "float32", state_shape))
         if self.tail is not None:
             from .kernel import gdn2_bprop_summary_f16 as tail_summary_module
             from .kernel import gdn2_summary_f16 as tail_fused_module
@@ -1527,6 +1579,7 @@ class CompiledGdn2Bwd:
             lead_buffers=lead_buffers,
             post_buffers=post_buffers,
             m_count=region.get("m_count"),
+            state_wave_counts=region.get("state_wave_counts"),
         )
         schedule = dict(
             pieces=self.pieces,
@@ -1545,6 +1598,8 @@ class CompiledGdn2Bwd:
             scale=self.scale,
             has_piece_transitions=self.has_piece_transitions,
             has_piece_state_grads=self.has_piece_tables,
+            checkpoint_head_divisor=self.checkpoint_head_divisor,
+            state_head_divisor=self.state_head_divisor,
         )
         if self.chain_launch is None:
             self.chain_launch = self.build_chain_backward(

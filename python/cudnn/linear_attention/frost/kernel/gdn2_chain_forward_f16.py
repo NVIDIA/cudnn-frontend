@@ -37,6 +37,7 @@ from cudnn.frost.buffers import DeviceView
 from cudnn.frost.compiled_cache import compile_cached
 
 from ..common.host import get_dtype
+from ..common.head_wave import state_wave_items
 from ..common.piece_chain import chain_rows_per_cta, dtype_name, launch_state_chain
 from . import gdn2_chain_prologue_f16, gdn2_prefill_f16, gdn2_summary_f16
 
@@ -144,6 +145,8 @@ def chain_forward_host(
     fold_transition: Optional[cute.Tensor] = None,
     fold_seed: Optional[cute.Tensor] = None,
     fold_composed: Optional[cute.Tensor] = None,
+    state_head_divisor: cutlass.Constexpr[int] = 1,
+    state_wave_counts: Optional[cute.Tensor] = None,
 ) -> None:
     if cutlass.const_expr(fold_update is not None):
         launch_state_chain(
@@ -239,77 +242,99 @@ def chain_forward_host(
         tail_enable=tail_enable,
         summary_skip=1,
     )
-    gdn2_summary_f16.host(
-        summary_cfg,
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        beta,
-        w,
-        cu_pieces_main,
-        None,
-        None,
-        state_h_summary,
-        state_m_summary,
-        work_items_summary,
-        summary_count,
-        scheduler_summary,
-        summary_words,
-        stream,
-    )
-    launch_state_chain(
-        heads_out,
-        dim_v,
-        dim_k,
-        chain_rows,
-        pieces,
-        False,
-        False,
-        has_seed,
-        False,
-        False,
-        True,
-        num_seqs,
-        state_h_chain,
-        state_m_chain,
-        state_x_chain,
-        seed,
-        None,
-        None,
-        main_rows,
-        seed_indices,
-        composed,
-        stream,
-        mTailEnable=tail_enable,
-        first_head_lo=first_head_lo,
-    )
-    gdn2_prefill_f16.host(
-        prefill_cfg,
-        q,
-        k,
-        v,
-        gate,
-        a_log,
-        dt_bias,
-        beta_prefill,
-        w,
-        cu_pieces_main,
-        state_x_prefill,
-        None,
-        o,
-        final_state,
-        None,
-        final_indices,
-        work_items,
-        main_count,
-        scheduler_prefill,
-        prefill_words,
-        checkpoint_every_n,
-        scale,
-        stream,
-    )
+    for state_phase in cutlass.range(state_head_divisor):
+        active_main_count = main_count
+        active_summary_count = summary_count
+        if cutlass.const_expr(state_head_divisor > 1):
+            active_main_count = cute.make_tensor(state_wave_counts.iterator, cute.make_layout((1,)))
+            active_summary_count = cute.make_tensor(state_wave_counts.iterator + 1, cute.make_layout((1,)))
+            state_wave_items(
+                state_head_divisor,
+                b_t,
+                state_phase,
+                heads_out,
+                cu_pieces,
+                main_rows,
+                summary_rows,
+                work_items,
+                work_items_summary,
+                active_main_count,
+                active_summary_count,
+                scheduler_all,
+            ).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream, use_pdl=True)
+        gdn2_summary_f16.host(
+            summary_cfg,
+            k,
+            v,
+            gate,
+            a_log,
+            dt_bias,
+            beta,
+            w,
+            cu_pieces_main,
+            None,
+            None,
+            state_h_summary,
+            state_m_summary,
+            work_items_summary,
+            active_summary_count,
+            scheduler_summary,
+            summary_words,
+            stream,
+        )
+        launch_state_chain(
+            heads_out,
+            dim_v,
+            dim_k,
+            chain_rows,
+            pieces,
+            False,
+            False,
+            has_seed,
+            False,
+            False,
+            True,
+            num_seqs,
+            state_h_chain,
+            state_m_chain,
+            state_x_chain,
+            seed,
+            None,
+            None,
+            main_rows,
+            seed_indices,
+            composed,
+            stream,
+            mTailEnable=tail_enable,
+            first_head_lo=first_head_lo,
+            head_divisor=state_head_divisor,
+            head_phase=state_phase,
+        )
+        gdn2_prefill_f16.host(
+            prefill_cfg,
+            q,
+            k,
+            v,
+            gate,
+            a_log,
+            dt_bias,
+            beta_prefill,
+            w,
+            cu_pieces_main,
+            state_x_prefill,
+            None,
+            o,
+            final_state,
+            None,
+            final_indices,
+            work_items,
+            active_main_count,
+            scheduler_prefill,
+            prefill_words,
+            checkpoint_every_n,
+            scale,
+            stream,
+        )
 
 
 def build_chain_forward(
@@ -368,6 +393,8 @@ def build_chain_forward(
     tail=False,
     tail_enable=None,
     lead_buffers=(None,) * 4,
+    state_head_divisor=1,
+    state_wave_counts=None,
 ):
     """Compile (cached per static config: dtypes, heads, dims, gate flags and bound, beta guard, checkpoint and final-state
     presence, seed dtype, chain rows, device) the chain forward launch over the buffers of one plan; ``pieces``,
@@ -426,6 +453,7 @@ def build_chain_forward(
         tail_enable is not None,
         tuple(str(buffer.dtype) if buffer is not None else None for buffer in lead_buffers),
         fold_rows,
+        int(state_head_divisor),
     )
     if key not in chain_forward_cache:
         summary_cfg = gdn2_summary_f16.build_cfg(
@@ -463,6 +491,7 @@ def build_chain_forward(
             d_v=DV,
             log_gate=log_gate,
         )
+        summary_cfg.state_head_divisor = prefill_cfg.state_head_divisor = state_head_divisor
 
         work_items_placeholder = from_dlpack(work_items, assumed_align=16)
         work_items_placeholder.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1), divisibility=1)
@@ -543,6 +572,8 @@ def build_chain_forward(
             from_dlpack(tail_enable, assumed_align=16).mark_layout_dynamic() if tail_enable is not None else None,
             fold_rows,
             *fold_placeholders,
+            int(state_head_divisor),
+            from_dlpack(state_wave_counts, assumed_align=4).mark_layout_dynamic() if state_wave_counts is not None else None,
             cache_key=repr((__name__, key)),
             symbol="frost_la_gdn2_chain_forward_f16",
             options="--enable-tvm-ffi --opt-level 2",
@@ -594,6 +625,7 @@ def run_chain_forward(
     first_head_lo=0,
     tail_enable=None,
     lead_buffers=(None,) * 4,
+    state_wave_counts=None,
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the four launches.  The plan validated the contract at build,
     so nothing here raises."""
@@ -610,6 +642,7 @@ def run_chain_forward(
         cuda.CUstream(int(stream)),
         tail_enable,
         *lead_buffers,
+        state_wave_counts,
     )
 
 

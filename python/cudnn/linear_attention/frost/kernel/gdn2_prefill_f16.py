@@ -1608,7 +1608,9 @@ def compute1_warp_group(
                         seed_row = cutlass.Int32(mSeedIndices[batch_idx])
                     if cutlass.const_expr(cfg.state_table):
                         seed_vw = 16 // (mState_init.element_type.width // 8)
-                        seed_src = (mState_init.iterator + mState_init.layout((seed_row, head_o, state_gmem_row + v_offset, 0))).raw_ptr()
+                        seed_src = (
+                            mState_init.iterator + mState_init.layout((seed_row, head_o // cfg.state_head_divisor, state_gmem_row + v_offset, 0))
+                        ).raw_ptr()
                     if cutlass.const_expr(cfg.has_composed):
                         is_boundary = batch_idx == cutlass.Int32(0)
                         composed_src = (mComposed.iterator + mComposed.layout((cutlass.Int32(0), head_o, state_gmem_row + v_offset, 0))).raw_ptr()
@@ -2308,12 +2310,12 @@ def compute1_warp_group(
                             if cutlass.const_expr(cfg.has_composed):
                                 value = cutlass.Float32(0.0)
                                 if cutlass.const_expr(cfg.state_table):
-                                    value = mState_init[seed_row, head_o, state_gmem_row + v_offset, key_dim].to(cutlass.Float32)
+                                    value = mState_init[seed_row, head_o // cfg.state_head_divisor, state_gmem_row + v_offset, key_dim].to(cutlass.Float32)
                                 value = mComposed[cutlass.Int32(0), head_o, state_gmem_row + v_offset, key_dim] if is_boundary else value
                                 mState_out[final_row, head_o, state_gmem_row + v_offset, key_dim] = value.to(mState_out.element_type)
                             elif cutlass.const_expr(cfg.use_initial_state):
                                 mState_out[final_row, head_o, state_gmem_row + v_offset, key_dim] = mState_init[
-                                    seed_row, head_o, state_gmem_row + v_offset, key_dim
+                                    seed_row, head_o // cfg.state_head_divisor, state_gmem_row + v_offset, key_dim
                                 ].to(mState_out.element_type)
                             else:
                                 mState_out[final_row, head_o, state_gmem_row + v_offset, key_dim] = cutlass.Float32(0.0).to(mState_out.element_type)
@@ -3076,6 +3078,7 @@ class Gdn2PrefillCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
     log_gate: bool = True
     tiles_per_head: int = 1
     state_table: bool = True

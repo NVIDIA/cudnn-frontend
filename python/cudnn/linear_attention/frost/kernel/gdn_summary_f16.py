@@ -794,7 +794,7 @@ def chain_warp_group(
         if cutlass.const_expr(cfg.skip_first_m and not is_h):
             skip_m = mWorkItems[tile_idx, WORK_ITEM_DSTATE_DST] >= cutlass.Int32(0)
             if skip_m:
-                for drain_idx in cutlass.range(n_local):  # noqa: B007
+                for _ in cutlass.range(n_local):
                     gate_idx = gate_index.idx
                     bars.mb_gate_ready[gate_idx].wait(gate_index.phase)
                     gate_index = advance(gate_index, cfg.smem_gate_stages)

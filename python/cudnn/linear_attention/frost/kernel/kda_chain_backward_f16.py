@@ -35,7 +35,7 @@ from cudnn.frost.buffers import DeviceView
 
 from ..common import gate_bwd, head_reduce
 from ..common.host import get_dtype
-from ..common.head_wave import head_wave_items, state_wave_items, write_wave_items
+from ..common.head_wave import head_wave_items, state_wave_items
 from ..common.piece_chain import chain_rows_per_cta, dtype_name, launch_state_chain
 from . import kda_bprop_f16, kda_bprop_summary_f16, kda_chain_prologue_f16, kda_recompute_f16, kda_summary_f16
 

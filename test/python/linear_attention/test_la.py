@@ -8486,3 +8486,32 @@ def test_piece_capacity_bounds_empty_and_threshold_lengths():
         assert needed <= bound <= len(batch) * pieces
         assert piece_capacity(num_seqs=len(batch), pieces=pieces, total_tokens=total, batch_invariant=False) == len(batch) * pieces
     assert piece_capacity(num_seqs=432, pieces=16, total_tokens=131072, batch_invariant=True) == 448
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("states", [False, True], ids=["checkpoint_waves", "state_waves"])
+@pytest.mark.parametrize("waves", [2, 4])
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+def test_head_waves_match_one_wave(monkeypatch, backend, variant, waves, states):
+    """A batch-invariant ragged batch in ``waves`` head waves (the forward's state waves; the backward's checkpoint waves alone
+    or with its state waves), each plan built and then replayed: o, final_state and every gradient are bitwise the one-wave run."""
+    from cudnn.linear_attention.frost import kda_engine
+
+    case = long_case(variant, [0, 17, 8193, 513], H=4, HK=4, HV=4)
+    state0, d_final, dO = bwd_inputs(case)
+    monkeypatch.setattr(kda_engine, "_KDA_STATE_WAVE_BYTES", 0 if states else 1 << 62)
+    results, asked = [], []
+    for divisor in (1, waves):
+        monkeypatch.setattr(kda_engine, "_forward_head_divisor", lambda *args, d=divisor: asked.append(("fwd", d)) or d)
+        monkeypatch.setattr(kda_engine, "_checkpoint_head_divisor", lambda *args, d=divisor: asked.append(("bwd", d)) or d)
+        clear_caches()
+        for _ in range(2):
+            results.append(long_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO))
+    assert {("fwd", waves), ("bwd", waves)} <= set(asked)
+    o, fs, grads, _, _ = results[0]
+    for o_run, fs_run, grads_run, _, _ in results[1:]:
+        assert_bitwise("o", o_run, o)
+        assert_bitwise("final_state", fs_run, fs)
+        for name, g in grads.items():
+            assert_bitwise(f"d{name}", grads_run[name], g)

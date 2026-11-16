@@ -1423,7 +1423,7 @@ def compute1_warp_group(
                 if write_start == 0:
                     row_lo_addr = tmem_row << 16
                     dstate0_vw = 16 // (mDstate0.element_type.width // 8)
-                    dstate0_dst = (mDstate0.iterator + mDstate0.layout((batch_idx, head_idx, state_gmem_row, 0))).raw_ptr()
+                    dstate0_dst = (mDstate0.iterator + mDstate0.layout((batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, 0))).raw_ptr()
                     for i in cutlass.range_constexpr(cfg.d_k // 32):
                         dstate0_vec = nvvm.tcgen05_ld(
                             "32x32b", nvvm.make_tmem_ptr(row_lo_addr + (tmem_col + cfg.tmem_dstate_acc_offset + i * 32), cutlass.Float32), num=32
@@ -1449,11 +1449,13 @@ def compute1_warp_group(
                                 if cutlass.const_expr(cfg.dstate_table):
                                     value = mDstate_in[batch_idx, head_idx, state_gmem_row, kd].to(cutlass.Float32)
                                 value = mDcomposed[cutlass.Int32(0), head_idx, state_gmem_row, kd] if is_boundary else value
-                                mDstate0[batch_idx, head_idx, state_gmem_row, kd] = value.to(mDstate0.element_type)
+                                mDstate0[batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, kd] = value.to(mDstate0.element_type)
                             elif cutlass.const_expr(cfg.use_dstate_in):
-                                mDstate0[batch_idx, head_idx, state_gmem_row, kd] = mDstate_in[batch_idx, head_idx, state_gmem_row, kd]
+                                mDstate0[batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, kd] = mDstate_in[
+                                    batch_idx, head_idx, state_gmem_row, kd
+                                ]
                             else:
-                                mDstate0[batch_idx, head_idx, state_gmem_row, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
+                                mDstate0[batch_idx, head_idx // cfg.state_head_divisor, state_gmem_row, kd] = cutlass.Float32(0.0).to(mDstate0.element_type)
         if sk_nt > 0:
             bars.mb_dstate0_acc_stored.arrive()
         gbase += sk_nt
@@ -2027,6 +2029,7 @@ class Gdn2BpropSummaryCfg:
     max_active_clusters: int
     d_k: int
     d_v: int
+    state_head_divisor: int = 1
     log_gate: bool = True
     dstate_table: bool = True
     has_composed_dstate: bool = False
