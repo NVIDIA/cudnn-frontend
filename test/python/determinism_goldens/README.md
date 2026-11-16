@@ -7379,6 +7379,8 @@ compiler. Every process verified its isolated checkout import.
 | A100 / SM80, native L0 suite | 23 | 6 | FP8 conversion unavailable on SM80; those cases are unverified here |
 | A100 / SM80, large-index L1 detector | 1 | 0 | Delta crosses the signed Int32 element boundary; owned prefix/tail canaries survive |
 | L40S / SM89, native L0 suite | 29 | 0 | Portable helper execution, not an SM89 SDPA engine claim |
+| P2021 / SM100, native L0 suite | 29 | 0 | Native shared helper at all new boundaries, with strict goldens |
+| P2021 / SM100, existing integration controls | 14 | 0 | Five physical-stride helper cases plus nine D512 THD graph/standalone numerical, rebind/replay and deterministic-repeat cases; regular-sized complete chains |
 | Host contract and cross-compilation, run on L40S | 14 | 1 | SM80 FP8 conversion skipped; half/FP8 compiled for SM89/90/100/103/107/120; no native claim for those other targets |
 
 Before the fix, the original helper at `68853830a1b520f91dd77220acfe44b1579a9379`
@@ -7390,11 +7392,13 @@ untouched live output rows; widening that multiplication passes. Its whole
 wrapped-address interval belongs to the test's prefix allocation. This L1
 case requires 28 GiB free and remains outside the smoke suite.
 
-Nine new small goldens were recorded only after the reference/replay checks,
+Fourteen new small goldens were recorded only after the reference/replay checks,
 then compared with recording disabled. No previous golden was replaced.
 FP16/BF16 delta output hashes agree on both tested devices; FP8 includes its
 explicit descale product. The new records are in runtime directories
-`a29ca37b88513cb6` (A100) and `98a9396f557b5d7c` (L40S).
+`a29ca37b88513cb6` (A100), `98a9396f557b5d7c` (L40S) and
+`3bada6ccd1cb05e1` (SM100). The SM100 combined packet was 43 passed / 46
+L1 cases deselected; those deselections are not additional hardware coverage.
 
 Commands from `test/python`, with the stated GPU visible and source import
 verified:
@@ -7406,5 +7410,6 @@ pytest sdpa/frost/test_sdpa_bwd_dot_grid_contract.py -m L0
 pytest sdpa/frost/test_sdpa_bwd_dot_large_index.py -m L1
 ```
 
-Native SM100/103/107/120 execution at the new boundary and full SDPA-chain
-qualification are pending. Existing API support rows retain their prior limits.
+Native SM103/107/120 execution at the new boundary and full SDPA-chain
+qualification at that boundary are pending. Existing API support rows retain
+their prior limits; the SM100 integration controls above cover regular shapes.

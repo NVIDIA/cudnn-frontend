@@ -34,10 +34,12 @@ for current-runtime checks and retained verification gaps.
 The shared SDPA backward delta preprocess retains per-row arithmetic when
 batch or head counts require a flat launch grid. Direct-helper replay,
 batch-isolation and changed-input capture checks cover FP16/BF16 on SM80 and
-FP16/BF16/E4M3 on SM89, including half THD with independent physical origins.
+FP16/BF16/E4M3 on SM89 and SM100, including half THD with independent physical origins.
 This helper evidence does not upgrade any full SDPA API status below, establish
-SDPA support on SM89, or qualify the new grid boundary on SM100/103, SM107 or
-SM120. See the [delta grid qualification record](../../test/python/determinism_goldens/README.md#shared-backward-delta-grid-boundaries-2026-11-16).
+SDPA support on SM89, or qualify the new grid boundary on SM103, SM107 or
+SM120. SM100 also retains the tested D512 THD graph/standalone integration;
+full attention chains at the new boundary remain unverified. See the
+[delta grid qualification record](../../test/python/determinism_goldens/README.md#shared-backward-delta-grid-boundaries-2026-11-16).
 
 The four linear-attention APIs are in `cudnn.linear_attention.ops`; bprop uses
 PyTorch autograd through the same API. The two fused GDN step entries
