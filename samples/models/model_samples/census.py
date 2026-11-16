@@ -22,7 +22,8 @@ The kernel check (:func:`check_forms`, :func:`compare`; a sample runs it with ``
 0. **Form, on the objects.**  Every field a provider row names in its ``form`` equals the entry's own form for the run's row
    count, and every logged call was served by an entry instance that states those same values.  A row of an entry that states
    its launch names at least one field: with none the entry would be called on its own pick, and nothing would be compared.
-   This is the only place a form is shown: see below.
+   A traced pass keeps one call log per traced step, and a step without its log fails the check (:meth:`Traced.judge`):
+   nothing would say what served its calls.  The objects are where a form is compared: see below.
 1. Every launch of a traced step is attributed.  The exact kernels must be there in the wiring order; a launch between two of
    them must belong to a family that a fallback or host row between them declares.  An unattributed kernel fails the run and is
    named.
@@ -1009,8 +1010,8 @@ class Target:
 # ---------------------------------------------------------------------------------------------------------- a traced pass
 @dataclass
 class Traced:
-    """What a session keeps of one traced pass for the kernel check: the sites of a step, the call log of every traced step and
-    the launch records, cut into steps -- or the reason there are none."""
+    """What a session keeps of one traced pass for the kernel check: the sites of a step, the call log of every traced step
+    (one list of calls per step) and the launch records, cut into steps -- or the reason there are none."""
 
     sites: List[Site]
     call_log: List[List[Call]]
@@ -1035,11 +1036,20 @@ class Traced:
         return cls(sites, call_log, steps, rows=rows, claim=claim)
 
     def judge(self) -> Tuple[str, List[str]]:
-        """Run the kernel check on this pass: ``(PASS | FAIL | NOT OBSERVED, the lines under the check's own line)``."""
+        """Run the kernel check on this pass: ``(PASS | FAIL | NOT OBSERVED, the lines under the check's own line)``.  Where the
+        pass has launch records it has one call log per traced step, or it fails: the form check reads from the log which
+        entry instance served a call, and the comparison whether a step made the calls of the wiring."""
         failures = check_forms(self.sites, self.call_log)
         lines = [f"form: {sentence}" for sentence in failures]
         if self.undeclared:
             lines.append(f"copies: {self.undeclared}: a block reads the device inside a step, and only the one host read of a step is declared")
+        if self.steps is not None and len(self.call_log) != len(self.steps):
+            logged, traced = len(self.call_log), len(self.steps)
+            has = "no step" if not logged else f"{logged} step{'s' if logged != 1 else ''}"
+            lines.append(
+                f"calls: the call log holds the block calls of {has} for {traced} traced step{'s' if traced != 1 else ''}: "
+                "without one log per traced step nothing shows which entry instance served a call"
+            )
         if self.steps is not None:
             recorded, name = (None, "") if self.claim is None else (self.claim.recorded, f"the {self.claim.name}")
             self.result = compare(self.steps, self.sites, self.call_log, recorded, name)

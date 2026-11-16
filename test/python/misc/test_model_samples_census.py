@@ -142,6 +142,13 @@ def _compare(steps, adjacent=False):
     return census.compare(steps, _sites(adjacent))
 
 
+def _log(sites, steps=1):
+    """The call log of ``steps`` traced steps that each made the calls of the wiring, every call served as its row says."""
+    from model_samples.census import Call
+
+    return [[Call(site.block, site.layer, 1, "", tuple(site.form)) for site in sites] for _ in range(steps)]
+
+
 def test_canonical_ids_of_the_kernel_families_a_sample_launches():
     """A name maps to the id of the first pattern that names it: an entry's symbol before any other cuDNN Frontend kernel, the
     gather before PyTorch's family, cuBLAS before PyTorch.  A copy is a copy in both spellings the profiler has for one."""
@@ -316,7 +323,7 @@ def test_a_clean_step_passes_and_says_what_it_attributed():
     from model_samples import census
 
     sites = _sites()
-    traced = census.Traced.of(sites, [], _step() + _step(), 2, "", rows=1)
+    traced = census.Traced.of(sites, _log(sites, 2), _step() + _step(), 2, "", rows=1)
     status, lines = traced.judge()
     assert status == census.PASS and lines == [], lines
     assert traced.summary() == (
@@ -462,6 +469,37 @@ def test_a_second_host_read_and_a_call_log_that_is_not_the_wiring_fail():
     ]
 
 
+def test_a_traced_step_without_its_call_log_fails_the_check():
+    """A traced pass keeps one call log per traced step: what the adapters wrote down after each call.  The form check reads
+    from it which entry instance served a call, and the comparison whether the step made the calls of the wiring.  A step
+    without its log shows neither, so a pass with launch records and no log, or fewer logs than steps, or more, fails --
+    whatever the launch records say."""
+    from model_samples import census
+
+    sites = _sites()
+    two = _step() + _step()
+    assert census.Traced.of(sites, _log(sites, 2), two, 2, "", rows=1).judge() == (census.PASS, []), "the control: one log per traced step"
+    said = (
+        "calls: the call log holds the block calls of {} for 2 traced steps: without one log per traced step nothing shows which entry instance served a call"
+    )
+    for log, has in (([], "no step"), (_log(sites, 1), "1 step"), (_log(sites, 3), "3 steps")):
+        traced = census.Traced.of(sites, log, two, 2, "", rows=1)
+        assert traced.judge() == (census.FAIL, [said.format(has)]), has
+        assert traced.summary() == "2 traced steps: 9 launches per step; 1 kind of difference between the launches and the plan"
+    # ... also where the records carry no launch arguments: it is a failure, not "nothing observed"
+    bare = [record._replace(grid=None, block=None, shared_memory=None) for record in two]
+    assert census.Traced.of(sites, [], bare, 2, "", rows=1).judge()[0] == census.FAIL
+    # a pass without launch records has no traced step to hold a log against: nothing was observed, and that is what it says
+    assert census.Traced.of(sites, [], [], 2, "the profiler failed (no tracing library)", rows=1).judge() == (census.NOT_OBSERVED, [])
+    # one step of one call: the singular
+    one = [sites[-1]]
+    at = _Clock()
+    status, lines = census.Traced.of(one, [], [at(ARGMAX), at(HOST_READ, kind="copy")], 1, "", rows=1).judge()
+    assert status == census.FAIL and lines == [
+        "calls: the call log holds the block calls of no step for 1 traced step: without one log per traced step nothing shows which entry instance served a call"
+    ]
+
+
 def test_the_form_is_checked_on_the_objects():
     """Item 0: every field a row names equals the entry's own form, and every logged call was served by an entry instance that
     states the row's form.  A launch record cannot show either; a row whose entry declines to state its launch is a wrong
@@ -499,11 +537,13 @@ def test_the_form_is_checked_on_the_objects():
     assert census.check_forms([bare]) == [no_form]
     assert census.check_forms([replace(bare, facts=None, wrong="declined")])[1:] == [no_form], "said also where the entry stated nothing"
     assert census.check_forms([replace(sites[0], form=())]) == [], "a kernel known by its name alone has no entry to pick anything"
-    status, lines = census.Traced.of([sites[0], sites[1], bare, *sites[3:]], [], _step(), 1, "", rows=1).judge()
+    held = [sites[0], sites[1], bare, *sites[3:]]
+    status, lines = census.Traced.of(held, _log(held), _step(), 1, "", rows=1).judge()
     assert status == census.FAIL and lines == [f"form: {no_form}"], "it fails a pass whose launch records are clean"
     # a form that does not hold fails a pass whose launch records are clean, and one that observed nothing
+    held = [sites[0], sites[1], other, *sites[3:]]
     for records, missing in ((_step(), ""), ([], "the profiler failed (no tracing library)")):
-        status, lines = census.Traced.of([sites[0], sites[1], other, *sites[3:]], [], records, 1, missing, rows=1).judge()
+        status, lines = census.Traced.of(held, _log(held), records, 1, missing, rows=1).judge()
         assert status == census.FAIL and lines == [
             "form: linear_attention.step: the row's form says PDL False, cudnn.GdnDecodeFused states PDL True for this run"
         ]
@@ -519,12 +559,12 @@ def test_kernels_that_were_not_observed_are_neither_a_pass_nor_a_failure():
     assert census.Traced.of(sites, [], [], 2, "", rows=1).judge()[0] == census.NOT_OBSERVED, "no record and no reason is still nothing observed"
     # records that carry names and no launch arguments: the name is compared, the launch shape cannot be
     bare = [record._replace(grid=None, block=None, shared_memory=None) for record in _step()]
-    shapeless = census.Traced.of(sites, [], bare, 1, "", rows=1)
+    shapeless = census.Traced.of(sites, _log(sites), bare, 1, "", rows=1)
     assert shapeless.judge() == (census.NOT_OBSERVED, [])
     assert shapeless.unobserved == "the profiler's kernel records carry no launch arguments (grid, block, shared memory)"
     assert shapeless.summary().endswith("; launch shapes not observed: the profiler's kernel records carry no launch arguments (grid, block, shared memory)")
     # ... and a kernel that is missing is a failure all the same
-    missing = census.Traced.of(sites, [], [record for record in bare if record.name != SYMBOL], 1, "", rows=1)
+    missing = census.Traced.of(sites, _log(sites), [record for record in bare if record.name != SYMBOL], 1, "", rows=1)
     assert missing.judge()[0] == census.FAIL
 
 
@@ -2096,7 +2136,7 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
     blocks = [site.block for site in sites]
     claim = Claim("kernel_census.json", "plain", "cc 10.0 / 148 SMs", 1, "2026-11-12", "recorded", False, blocks, identities, reasons=["fallback rows present"])
     assert claim.recorded == {0: GATHER_SHAPE, 2: SHAPE}
-    clean = census.Traced.of(sites, [], _step(), 1, "", rows=1, claim=claim)
+    clean = census.Traced.of(sites, _log(sites), _step(), 1, "", rows=1, claim=claim)
     assert clean.judge() == (census.PASS, [])
     assert clean.details()[0] == (
         "embedding: torch.index_select, 1 launch per step (1 call x 1 per call); embedding_gather by name, and in the launch shape the census records: "
@@ -2119,7 +2159,7 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
     other = ((48, 1, 1), (256, 1, 1), 42112)
     moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
     assert census.compare([_step(fused=(SYMBOL, other))], moved).ok, "without a census nothing is wrong with it"
-    traced = census.Traced.of(moved, [], _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim)
+    traced = census.Traced.of(moved, _log(moved), _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim)
     status, lines = traced.judge()
     assert status == census.FAIL and lines == [
         "step 0: linear_attention.step (layer 0) launched gdn_decode_fused with grid (48, 1, 1), block (256, 1, 1), shared memory 42,112 B; "
@@ -2132,7 +2172,7 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
         (((96, 1, 1), (256, 1, 1), 42128), "grid (96, 1, 1), block (256, 1, 1), shared memory 42,128 B"),
     ):
         moved = [sites[0], sites[1], replace(sites[2], facts=Facts((SYMBOL,), {"PDL": False, "PDL_RELEASE": False}, other)), *sites[3:]]
-        status, lines = census.Traced.of(moved, [], _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge()
+        status, lines = census.Traced.of(moved, _log(moved), _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge()
         assert status == census.FAIL and lines == [
             f"step 0: linear_attention.step (layer 0) launched gdn_decode_fused with {text}; "
             f"the {CENSUS} has grid (96, 1, 1), block (256, 1, 1), shared memory 42,112 B"
@@ -2143,20 +2183,21 @@ def test_a_target_launch_in_another_shape_than_the_recorded_one_fails():
     step = _step()
     step[0] = step[0]._replace(grid=(80, 1, 1))
     assert census.compare([step], sites).ok
-    status, lines = census.Traced.of(sites, [], step, 1, "", rows=1, claim=claim).judge()
+    status, lines = census.Traced.of(sites, _log(sites), step, 1, "", rows=1, claim=claim).judge()
     assert status == census.FAIL and lines == [
         f"step 0: embedding launched embedding_gather with grid (80, 1, 1), block (128, 1, 1), shared memory 0 B; the {CENSUS} has grid (40, 1, 1), "
         "block (128, 1, 1), shared memory 0 B"
     ]
     # records without launch arguments: the recorded shapes were not observed
     bare = [record._replace(grid=None, block=None, shared_memory=None) for record in _step()]
-    unseen = census.Traced.of([replace(site, facts=None) if site.facts else site for site in sites], [], bare, 1, "", rows=1, claim=claim)
+    unstated = [replace(site, facts=None) if site.facts else site for site in sites]
+    unseen = census.Traced.of(unstated, _log(unstated), bare, 1, "", rows=1, claim=claim)
     assert unseen.judge() == (census.NOT_OBSERVED, []) and unseen.details()[-1].endswith("; the launch shapes of its target launches were not observed")
     # a call that is not the target's (another form, a fallback row) is held to no recorded shape -- whatever its identity carries
     reason = "the row's form is [PDL False, PDL_RELEASE False], the target's [PDL True, PDL_RELEASE True]"
     claim.identities[2] = Identity(census.OTHER, "gdn_decode_fused", "code", reason, SHAPE)
     assert claim.recorded == {0: GATHER_SHAPE}, "only a call whose identity is target (or stand-in) is held to the census"
-    assert census.Traced.of(moved, [], _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge() == (census.PASS, [])
+    assert census.Traced.of(moved, _log(moved), _step(fused=(SYMBOL, other)), 1, "", rows=1, claim=claim).judge() == (census.PASS, [])
 
 
 def test_the_gate_entrys_adapter_over_a_stand_in_entry(monkeypatch):
@@ -2801,7 +2842,7 @@ def test_a_section_holds_for_the_layer_widths_it_was_recorded_with():
     unheld = Claim = census.Claim(
         "kernel_census.json", "plain", "cc 10.0 / 148 SMs", 1, "2026-11-12", "recorded", False, [s.block for s in sites], [], reasons=[reason]
     )
-    assert Claim.recorded == {} and census.Traced.of(sites, [], step, 1, "", rows=1, claim=unheld).judge() == (census.PASS, [])
+    assert Claim.recorded == {} and census.Traced.of(sites, _log(sites), step, 1, "", rows=1, claim=unheld).judge() == (census.PASS, [])
     # with the wide model's row count missing as well, the widths are what is said: the model comes first
     four = make_plan(other.provider_table, other.regimes, stated, 4, 1, "native", model=other, options={"device": "cpu"})
     assert target.claim(four, other, installed=RECORDED).reasons == ["fallback rows present", reason]
@@ -2930,7 +2971,7 @@ def test_equal_says_what_was_compared_and_a_file_that_records_less_is_refused():
     at = _Clock()
     step = [at(GATHER, GATHER_SHAPE), at(SYMBOL, other), at(ARGMAX), at(HOST_READ, kind="copy")]
     assert census.compare([step], sites).ok, "without a census nothing is wrong with it"
-    traced = census.Traced.of(sites, [], step, 1, "", rows=1, claim=complete)
+    traced = census.Traced.of(sites, _log(sites), step, 1, "", rows=1, claim=complete)
     status, lines = traced.judge()
     assert status == census.FAIL and len(lines) == 1 and f"the {CENSUS} has grid (96, 1, 1)" in lines[0], lines
     assert traced.details()[-1] == f"{CENSUS}: NOT EQUAL (the kernel check did not hold)"
@@ -3982,10 +4023,12 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
     """The norm row of the ``native`` stack through a real session on the CPU, on the stand-in of its entry.  Clean, the run
     holds: five calls of a step on four forms, each served by the instance of its site, the residual stream in place, the
     consumers on fallback rows reading the kernel's bytes as they are.  Then the negative controls, each of which must
-    fail the kernel check with its own sentence -- a call served in the form of another site (only the call log shows
-    it), a chain of other kernels under the row's name, a launch more in front of its kernel, a launch less, a launch in
-    another shape than the census recorded -- or fail the block in its band while the kernel check holds: a wrong code, a
-    wrong block scale, a wrong normed element, a wrong element of the residual stream."""
+    fail the kernel check with its own sentence -- a call served in the form of another site (the launch records of that
+    run are clean), a chain of other kernels under the row's name, a launch more in front of its kernel, a launch less, a
+    launch in another shape than the census recorded, a launch under the symbol of another form, a traced step without its
+    call log -- or fail the block in its band while the kernel check holds: a wrong code, a wrong block scale, a wrong
+    normed element, a wrong element of the residual stream.  And the one thing the check does not see, pinned as that: a
+    launch more BEHIND the kernel, in front of a fallback row, is counted as that row's."""
     from model_samples import census, tie_out
     from model_samples.qwen_dense import configs
 
@@ -4082,6 +4125,72 @@ def test_the_norm_row_through_a_session_and_what_fails_it(monkeypatch):
     ], checks.text()
     _, checks = run(sequences=1)
     assert checks.ok and any(f"{CENSUS}: NOT CLAIMED (" in line and COMPARED_8 in line for line in checks.lines), "held to the recorded shape, and said"
+
+    def tampered(change):
+        """The clean run at one sequence with the records of its traced pass changed before the checks read them."""
+        session = _recorded_run(monkeypatch, sequences=1, stack="native")[0]
+        session.trace(4)
+        change(session.traced)
+        return session, tie_out.run_checks(session, prompt_tokens=3)
+
+    def norms(step):
+        return [index for index, record in enumerate(step) if census.canonical(record) == "add_norm_quant"]
+
+    # (5a) a form also shows in a launch record, by the kernel's symbol: the first two norm launches of a step under each other's
+    # symbol, with a call log that says every call was served in the form of its site
+    def swap_symbols(traced):
+        for step in traced.steps:
+            first, second = norms(step)[:2]
+            step[first], step[second] = step[first]._replace(name=step[second].name), step[second]._replace(name=step[first].name)
+
+    _, checks = tampered(swap_symbols)
+    stored, added = (_norm_symbol(dict(row.site_form(site))) for site in ("linear_attention.first", "mlp"))
+    assert (
+        not checks.ok
+        and checks.kernels == census.FAIL
+        and sentences(checks)
+        == [
+            f"kernels: step 0 (and 3 more of the 4 traced steps): add_norm_quantize (layer 0) launched {launched!r}; cudnn.AddNormQuantDecode names {named!r} "
+            "for this run"
+            for launched, named in ((added, stored), (stored, added))
+        ]
+    ), checks.text()
+
+    # (5b) what the check does not see.  A launch more in FRONT of the first norm's kernel fails (case 3: the gather before it is
+    # judged one by one).  The same launch directly BEHIND that kernel sits in front of a fallback row, the in-projection, and is
+    # attributed to it: the check holds.  That the adapter launches nothing but its entry is held on the adapter itself
+    # (test_the_norm_entrys_adapter_over_a_stand_in_entry: the tensors it returns are the ones the entry wrote)
+    def one_more_behind(traced):
+        for step in traced.steps:
+            at = norms(step)[0]
+            step.insert(at + 1, census.Launch(ELEMENTWISE, "kernel", step[at].end + 0.01, step[at].end + 0.02, (1, 1, 1), (128, 1, 1), 0, 32))
+
+    clean, _ = tampered(lambda traced: None)
+    session, checks = tampered(one_more_behind)
+    assert checks.ok and checks.kernels == census.PASS, checks.text()
+    assert session.traced.result.launches == [count + 1 for count in clean.traced.result.launches]
+    assert session.traced.result.families["pytorch"] == [count + 1 for count in clean.traced.result.families["pytorch"]], "counted as the fallback row's"
+
+    # (5c) the call log is what item 0 reads: a traced pass that kept none, or the log of one step of four, fails -- the launch
+    # records are those of the clean run
+    def no_log(traced):
+        del traced.call_log[:]
+
+    def one_log(traced):
+        del traced.call_log[1:]
+
+    for change, has in ((no_log, "no step"), (one_log, "1 step")):
+        session, checks = tampered(change)
+        assert (
+            not checks.ok
+            and checks.kernels == census.FAIL
+            and sentences(checks)
+            == [
+                f"kernels: calls: the call log holds the block calls of {has} for 4 traced steps: without one log per traced step nothing shows which "
+                "entry instance served a call"
+            ]
+        ), checks.text()
+        assert not any(COMPARED_8 in line for line in checks.lines), "nothing is said to have been compared"
 
     # (6) wrong bytes: the block fails in its band, the kernel check holds
     for defect, said in (
