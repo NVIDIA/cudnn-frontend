@@ -104,7 +104,8 @@ def test_native_fp8_backward_declared_totals_preserve_results(monkeypatch, reque
     monkeypatch.setattr(cudnn.pygraph, "execute", execute)
     monkeypatch.setattr(fp8, "print_tensor_stats", collect_stats)
     runs = []
-    for declared in (False, True):
+    for declare_totals in (False, True):
+        declared = declare_totals
         outputs, records, inputs = {}, [], {}
         # Both runs retain the harness's independent quantized reference and
         # deterministic replay checks; observations do not replace assertions.
